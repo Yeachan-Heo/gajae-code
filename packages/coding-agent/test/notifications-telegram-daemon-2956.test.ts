@@ -94,16 +94,13 @@ function writeLiveOwner(agentDir: string, state: DaemonState): void {
 	);
 }
 
-test("ensure cooldown preserves the first reload and attaches on the second automatic attempt", async () => {
+test("failed generation reload stays blocked during cooldown and retries after expiry", async () => {
 	const agentDir = tempDir();
 	const s = settings(agentDir);
-	const now = 1_000;
-	const alive = new Set<number>([999, 4242]);
+	let now = 1_000;
 	const signals: Array<[number, NodeJS.Signals]> = [];
-	let spawns = 0;
-	let pending: { ownerId: string; pid: number } | undefined;
 	const fsImpl = daemonFs();
-	const initial: DaemonState = {
+	writeLiveOwner(agentDir, {
 		pid: 999,
 		incarnation: "linux:100",
 		ownerId: "old-owner",
@@ -116,78 +113,122 @@ test("ensure cooldown preserves the first reload and attaches on the second auto
 		generation: DAEMON_GENERATION - 1,
 		acquisitionId: "old-owner",
 		ownershipPhase: "ready",
-	};
-	writeLiveOwner(agentDir, initial);
+	});
+	const attemptPath = path.join(daemonPaths(agentDir).dir, "telegram-daemon.reload-attempt.json");
 	fs.writeFileSync(
-		path.join(daemonPaths(agentDir).dir, "telegram-daemon.reload-attempt.json"),
+		attemptPath,
 		JSON.stringify({ lastReloadAt: now, ownerId: "old-owner", targetGeneration: DAEMON_GENERATION - 1 }),
 	);
 	const deps = {
 		fs: fsImpl,
 		pid: 4242,
 		now: () => now,
-		pidAlive: (pid: number) => alive.has(pid),
+		pidAlive: (pid: number) => pid === 999,
 		pidIncarnation: () => "linux:100",
 		processReference: (pid: number) =>
 			pid === 999
 				? {
 						incarnation: "linux:100",
 						termination: "cooperative" as const,
-						signalRoot: (signal: NodeJS.Signals) => {
-							signals.push([pid, signal]);
-							if (signal === "SIGTERM") alive.delete(pid);
-						},
+						signalRoot: (signal: NodeJS.Signals) => signals.push([pid, signal]),
 					}
 				: undefined,
-		spawn: (_command: string, args: string[]) => {
-			spawns++;
-			const ownerId = args[args.indexOf("--owner-id") + 1]!;
-			const pid = 4244;
-			pending = { ownerId, pid };
-			alive.add(pid);
-			return { pid, unref() {} };
+		spawn: () => {
+			throw new Error("a live predecessor must not be replaced");
 		},
-		sleep: async () => {
-			if (!pending) return;
-			await renewDaemonHeartbeat({
-				settings: s,
-				ownerId: pending.ownerId,
-				acquisitionId: pending.ownerId,
-				pid: pending.pid,
-				pidIncarnation: () => "linux:100",
-				now: () => now,
-				fs: fsImpl,
-			});
+		sleep: async (ms: number) => {
+			now += ms;
 		},
-		waitStepMs: 1,
-		readinessTimeoutMs: 10,
+		waitStepMs: 10_000,
+		readinessTimeoutMs: 1,
 	};
 
-	const firstResult = await ensureTelegramDaemonRunningDetailed(
-		{ settings: s, cwd: path.join(agentDir, "first-session"), sessionId: "first-session" },
-		deps,
-	);
-	expect(firstResult).toBe("reloaded");
-	expect(spawns).toBe(1);
-	expect(signals).toContainEqual([999, "SIGTERM"]);
+	await expect(
+		ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "first-session"), sessionId: "first-session" },
+			deps,
+		),
+	).rejects.toThrow("Unable to replace stale Telegram daemon");
+	expect(signals).toEqual([
+		[999, "SIGTERM"],
+		[999, "SIGKILL"],
+	]);
+	const firstAttempt = JSON.parse(fs.readFileSync(attemptPath, "utf8")) as {
+		lastReloadAt: number;
+		targetGeneration: number;
+	};
+	expect(firstAttempt).toMatchObject({ lastReloadAt: 1_000, targetGeneration: DAEMON_GENERATION });
 
-	const current = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as DaemonState;
-	current.generation = DAEMON_GENERATION - 1;
-	current.heartbeatAt = now;
-	fs.writeFileSync(daemonPaths(agentDir).state, JSON.stringify(current));
-	const attempt = JSON.parse(
-		fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-daemon.reload-attempt.json"), "utf8"),
-	) as { lastReloadAt: number; ownerId: string; targetGeneration: number };
-	expect(attempt).toMatchObject({ lastReloadAt: now, ownerId: "old-owner", targetGeneration: DAEMON_GENERATION });
-
-	expect(
-		await ensureTelegramDaemonRunningDetailed(
+	await expect(
+		ensureTelegramDaemonRunningDetailed(
 			{ settings: s, cwd: path.join(agentDir, "second-session"), sessionId: "second-session" },
 			deps,
 		),
-	).toBe("attached");
-	expect(spawns).toBe(1);
-	expect(signals).toHaveLength(1);
+	).resolves.toBe("blocked_identity");
+	expect(signals).toHaveLength(2);
+	expect(JSON.parse(fs.readFileSync(attemptPath, "utf8"))).toMatchObject(firstAttempt);
+
+	now = 601_000;
+	const predecessor = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as DaemonState;
+	fs.writeFileSync(daemonPaths(agentDir).state, JSON.stringify({ ...predecessor, heartbeatAt: now }));
+	await expect(
+		ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "third-session"), sessionId: "third-session" },
+			deps,
+		),
+	).rejects.toThrow("Unable to replace stale Telegram daemon");
+	expect(signals).toHaveLength(4);
+	expect(signals.slice(2)).toEqual([
+		[999, "SIGTERM"],
+		[999, "SIGKILL"],
+	]);
+});
+
+test("cooldown never attaches a non-ready servingEpoch predecessor", async () => {
+	const agentDir = tempDir();
+	const s = settings(agentDir);
+	const now = 1_000;
+	const signals: Array<[number, NodeJS.Signals]> = [];
+	writeLiveOwner(agentDir, {
+		pid: 999,
+		incarnation: "linux:100",
+		ownerId: "provisional-owner",
+		tokenFingerprint: tokenFingerprint("123456:secret-token"),
+		chatId: "42",
+		startedAt: now,
+		heartbeatAt: now,
+		roots: [],
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION - 1,
+		servingEpoch: undefined,
+		acquisitionId: "provisional-owner",
+	});
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-daemon.reload-attempt.json"),
+		JSON.stringify({ lastReloadAt: now, ownerId: "provisional-owner", targetGeneration: DAEMON_GENERATION }),
+	);
+	const attemptPath = path.join(daemonPaths(agentDir).dir, "telegram-daemon.reload-attempt.json");
+	const deps = {
+		fs: daemonFs(),
+		pid: 4242,
+		now: () => now,
+		pidAlive: (pid: number) => pid === 999,
+		pidIncarnation: () => "linux:100",
+		sendSignal: (pid: number, signal: NodeJS.Signals) => signals.push([pid, signal]),
+		waitStepMs: 1,
+		readinessTimeoutMs: 1,
+		sleep: async () => undefined,
+		spawn: () => {
+			throw new Error("non-ready predecessor must not be replaced");
+		},
+	};
+	for (const sessionId of ["first", "second"]) {
+		expect(fs.existsSync(attemptPath)).toBe(true);
+		await expect(
+			ensureTelegramDaemonRunningDetailed({ settings: s, cwd: path.join(agentDir, sessionId), sessionId }, deps),
+		).resolves.toBe("blocked_identity");
+	}
+	expect(signals).toEqual([]);
 });
 
 test("concurrent generation upgrades reserve one reload attempt", async () => {

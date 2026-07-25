@@ -14,6 +14,7 @@ import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
 	type DaemonState,
 	readDaemonState,
+	readOwnerFreshnessSnapshot,
 	type TelegramDaemonOptions,
 	TelegramNotificationDaemon,
 } from "./telegram-daemon";
@@ -254,15 +255,19 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		if (!watchdogActive || watchdogTickInFlight || stopRequested) return;
 		watchdogTickInFlight = true;
 		try {
-			const state = await readState(settings as Settings);
+			const snapshot = deps.readDaemonState
+				? { state: await readState(settings as Settings), effectiveHeartbeatAt: undefined }
+				: await readOwnerFreshnessSnapshot({ settings: settings as Settings });
+			const state = snapshot.state;
+			const heartbeatAt = snapshot.effectiveHeartbeatAt ?? state?.heartbeatAt;
 			if (!watchdogActive || !state) return;
 			if (state.ownerId !== ownerId) {
 				stopRequested = true;
 				daemon.requestStop("stop");
 				return;
 			}
-			if (lastHeartbeatAt === undefined || state.heartbeatAt !== lastHeartbeatAt) {
-				lastHeartbeatAt = state.heartbeatAt;
+			if (lastHeartbeatAt === undefined || heartbeatAt !== lastHeartbeatAt) {
+				lastHeartbeatAt = heartbeatAt;
 				stalledSince = now();
 				return;
 			}
