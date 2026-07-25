@@ -450,6 +450,24 @@ def _fetch_core(
     def _jitter():
         time.sleep(random.uniform(_jmin / 1000.0, _jmax / 1000.0))
 
+    # 429 backoff: longer than normal jitter. Respects Retry-After header when
+    # available (capped at 30s to avoid stalling the grid indefinitely).
+    _rl_base = float(os.environ.get("INSANE_RATE_LIMIT_BACKOFF_S", "2.0"))
+    _rl_count = 0
+
+    def _rate_limit_backoff(resp=None):
+        nonlocal _rl_count
+        _rl_count += 1
+        delay = _rl_base * min(_rl_count, 5)  # linear: 2s, 4s, 6s, 8s, 10s cap
+        if resp is not None:
+            try:
+                ra = {k.lower(): v for k, v in dict(getattr(resp, "headers", {}) or {}).items()}.get("retry-after", "")
+                if ra.isdigit():
+                    delay = max(delay, min(int(ra), 30))
+            except Exception:
+                pass
+        time.sleep(delay)
+
     # Surface profile-loader failures as a diagnostic trace entry (not counted
     # as a network attempt).
     load_err = last_load_error()
@@ -571,13 +589,20 @@ def _fetch_core(
             if att.verdict in _TERMINAL_NONSUCCESS_VALUES:
                 stop_reason = att.verdict
                 break
+            # 429 rate-limit: transient — back off longer than normal jitter,
+            # then continue to the next candidate (a different TLS/referer
+            # combo may not be rate-limited). Do NOT break the grid.
+            if att.verdict == Verdict.RATE_LIMITED.value:
+                _rate_limit_backoff()
+                continue
         # continuing → polite jitter (only on non-terminal failure)
         _jitter()
     else:
         grid_exhausted = True
         stop_reason = "exhausted"
 
-    # If a terminal-nonsuccess (404/auth/429) stopped us, browser won't help.
+    # If a terminal-nonsuccess (404/auth) stopped us, browser won't help.
+    # NOTE: 429 is NOT terminal — browser fallback is still attempted.
     skip_browser = stop_reason in _TERMINAL_NONSUCCESS_VALUES
 
     # -------- Phase 3: Playwright fallback ----------------------------------
