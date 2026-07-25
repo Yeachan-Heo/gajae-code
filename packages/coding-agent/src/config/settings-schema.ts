@@ -309,7 +309,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"notifications.telegram.toolActivity.enabled": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "notifications",
 			label: "Telegram Tool Activity",

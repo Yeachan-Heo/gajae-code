@@ -29,7 +29,7 @@ describe("SessionSdkHost", () => {
 			token: "token",
 			connectionCapabilities: connectionId =>
 				connectionId === "authorized"
-					? new Set(["tool_activity_v1"])
+					? new Set(["tool_activity_v2"])
 					: connectionId === "initial"
 						? undefined
 						: new Set(),

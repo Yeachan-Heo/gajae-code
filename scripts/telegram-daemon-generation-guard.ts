@@ -8,10 +8,11 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 26;
+export const GUARD_CONTRACT_VERSION = 28;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
+const sdkHost = "packages/coding-agent/src/sdk/host/host.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
@@ -61,7 +62,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "9541718e76791cc6c19ed9870a8a0bc60a96341eb658b2307588f0146389a131";
+const PROTECTED_INVENTORY_SHA256 = "caea0dbab69af5b4eb3d94bfbeec64ec1c30a9b0894054cb7005bde687ee961b";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -113,6 +114,23 @@ export const CHAT_CONFIG_PROTECTED_DECLARATIONS = {
 	slack: ["getNotificationConfig", "notificationConfigFromFile", "isSlackConfigured", "tokenFingerprint"],
 } as const;
 
+/** Telegram tool-activity defaults and delivery admission must stay generation-fenced. */
+export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
+	[config]: ["parseNotificationSettingsSnapshot"],
+	[sdkHost]: ["TOOL_ACTIVITY_CAPABILITY"],
+	[telegramDaemon]: [
+		"TOOL_ACTIVITY_CAPABILITY",
+		"LEGACY_TOOL_ACTIVITY_CAPABILITY",
+		"negotiateToolActivityCapability",
+		"toolActivityOwner",
+		"toolActivityAuthorityIsCurrent",
+		"toolActivityDeliveryIsCurrent",
+		"handleSessionMessage",
+		"processTelegramUpdate",
+		"createSessionRouter",
+	],
+} as const;
+
 /** Chat credential, provenance, and persistence are shared takeover authority. */
 export const CHAT_OWNER_LOCK_PROTECTED_DECLARATIONS = [
 	"identityFor",
@@ -159,6 +177,14 @@ function validateChatConfigInventory(inventory: Inventory): void {
 	}
 }
 
+function validateTelegramToolActivityInventory(inventory: Inventory): void {
+	for (const [file, required] of Object.entries(TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS)) {
+		const symbols = inventory.telegram[file];
+		if (!symbols || required.some(symbol => !symbols.includes(symbol)))
+			throw new Error("telegram-daemon-generation-guard: Telegram tool-activity configuration and delivery policy must be protected by the Telegram generation contract");
+	}
+}
+
 function validateTelegramOwnerLockInventory(inventory: Inventory): void {
 	const symbols = inventory.telegram[telegramDaemon];
 	if (!symbols || TELEGRAM_OWNER_LOCK_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
@@ -191,7 +217,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 26) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 28) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -205,6 +231,7 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateChatOwnerLockInventory(inventory);
 	validateChatCliInventory(inventory);
 	validateChatConfigInventory(inventory);
+	validateTelegramToolActivityInventory(inventory);
 }
 
 export function validateManifest(value: unknown = manifest): asserts value is GuardManifest {
@@ -548,7 +575,7 @@ export function isLegacyBootstrapBase(base: ReadonlyMap<string, string | undefin
 			if (declaration?.type !== "VariableDeclaration") return [];
 			return declaration.declarations.map((item: any) => item.id?.name).filter((name: unknown): name is string => typeof name === "string");
 		});
-		if (exportedNames.sort().join(",") !== "DAEMON_GENERATION,NOTIFICATION_PROTOCOL_VERSION,SERVING_EPOCH") return false;
+		if (exportedNames.sort().join(",") !== "DAEMON_GENERATION,NOTIFICATION_PROTOCOL_VERSION") return false;
 		const protocol = declarationNode(program, "NOTIFICATION_PROTOCOL_VERSION");
 		const generation = declarationNode(program, "DAEMON_GENERATION");
 		const protocolDeclaration = protocol?.declarations?.find((item: any) => item.id?.name === "NOTIFICATION_PROTOCOL_VERSION");

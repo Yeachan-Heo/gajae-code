@@ -34,11 +34,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * concrete detached quarantine plus a proven-absent canonical lock pathname —
  * when deleting an observed owner-lock lease. Generation 12 refreshes retained
  * native path and process authority semantics. Generation 13 rejects special
- * files before retained native authority opens.
+ * files before retained native authority opens. Generation 14 reloads shared
+ * chat daemons after notification configuration parsing changes.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 13,
-	slack: 13,
+	discord: 14,
+	slack: 14,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

@@ -983,7 +983,10 @@ interface SessionRuntime {
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
 	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
-	inFlightTools: Map<string, { toolName: string; args: unknown }>;
+	inFlightTools: Map<
+		string,
+		{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
+	>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
@@ -1113,7 +1116,7 @@ const defaultConfig: NotificationConfig = {
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },
-	toolActivity: { enabled: true },
+	toolActivity: { enabled: false },
 	streaming: { enabled: true },
 	topics: {},
 	btw: { enabled: true },
@@ -3710,7 +3713,10 @@ export function createNotificationsExtension(
 			emitPromptLifecycle,
 			emitPromptEvent,
 			pendingInbound: new Set<number>(),
-			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
+			inFlightTools: new Map<
+				string,
+				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
+			>(),
 			deferredGatePresentations: [],
 			deferredInboundControls: [],
 			notificationRootRegistration: undefined,
@@ -4144,7 +4150,7 @@ export function createNotificationsExtension(
 					}
 					if (typeof inbound.redact === "boolean") {
 						if (inbound.redact && !runtime.committedRedact) {
-							terminalizeInFlightTools(runtime, runtime.id, "unknown");
+							terminalizeInFlightTools(runtime, runtime.id, "cancelled");
 						}
 						runtime.committedRedact = inbound.redact;
 						runtime.redact = inbound.redact;
@@ -4491,8 +4497,15 @@ export function createNotificationsExtension(
 				runtime.redact = true;
 				runtime.verbosity = "lean";
 				runtime.stream = false;
+				for (const [toolCallId, tool] of runtime.inFlightTools) {
+					runtime.inFlightTools.set(toolCallId, {
+						toolName: tool.toolName,
+						...(tool.pendingPhase ? { pendingPhase: tool.pendingPhase } : {}),
+					});
+				}
 				return;
 			}
+			const wasPolicySuspended = runtime.policySuspended;
 			const redactionEnabled = policy.redact && !runtime.committedRedact;
 			runtime.policyGeneration++;
 			runtime.committedRedact = policy.redact;
@@ -4500,7 +4513,8 @@ export function createNotificationsExtension(
 			runtime.redact = policy.redact;
 			runtime.verbosity = policy.verbosity;
 			runtime.stream = policy.stream;
-			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "unknown");
+			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "cancelled", true);
+			else if (wasPolicySuspended && !policy.redact) settleProvisionalToolTerminals(runtime, runtime.id);
 		},
 		activate: binding => {
 			const runtime = runtimes.get(binding.sessionId);
@@ -4743,8 +4757,22 @@ export function createNotificationsExtension(
 		await rotateSessionAuthority(event, ctx, false);
 	});
 
-	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
-		if (rt.notificationsActive && !rt.redact) {
+	const terminalizeInFlightTools = (
+		rt: SessionRuntime,
+		id: string,
+		phase: "cancelled" | "failed",
+		allowSafeRedactedFrame = false,
+	): void => {
+		if (rt.policySuspended && !allowSafeRedactedFrame) {
+			for (const [toolCallId, tool] of rt.inFlightTools) {
+				rt.inFlightTools.set(toolCallId, {
+					toolName: tool.toolName,
+					pendingPhase: tool.pendingPhase ?? phase,
+				});
+			}
+			return;
+		}
+		if (rt.notificationsActive && (!rt.redact || allowSafeRedactedFrame)) {
 			for (const [toolCallId, { toolName }] of rt.inFlightTools) {
 				try {
 					pushSessionFrame(rt, { type: "tool_activity", sessionId: id, toolCallId, toolName, phase });
@@ -4754,6 +4782,27 @@ export function createNotificationsExtension(
 			}
 		}
 		rt.inFlightTools.clear();
+	};
+
+	const settleProvisionalToolTerminals = (rt: SessionRuntime, id: string): void => {
+		for (const [toolCallId, tool] of rt.inFlightTools) {
+			if (!tool.pendingPhase) continue;
+			try {
+				if (rt.notificationsActive && !rt.redact) {
+					pushSessionFrame(rt, {
+						type: "tool_activity",
+						sessionId: id,
+						toolCallId,
+						toolName: tool.toolName,
+						phase: tool.pendingPhase,
+					});
+				}
+			} catch (e) {
+				logger.warn(`notifications: provisional tool_activity settlement failed: ${String(e)}`);
+			} finally {
+				rt.inFlightTools.delete(toolCallId);
+			}
+		}
 	};
 
 	const resetTurnStreamState = (rt: SessionRuntime): void => {
@@ -4913,7 +4962,7 @@ export function createNotificationsExtension(
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
 		rt.activePromptCorrelation = undefined;
-		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "unknown");
+		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "failed");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });
 		} catch (e) {
@@ -5064,7 +5113,21 @@ export function createNotificationsExtension(
 		if (!rt) return;
 		rt.emitPromptEvent(event);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
-		if (!rt.notificationsActive || rt.redact) {
+		if (!inFlight) return;
+		if (!rt.notificationsActive) {
+			rt.inFlightTools.delete(event.toolCallId);
+			return;
+		}
+		if (rt.policySuspended) {
+			if (!inFlight.pendingPhase) {
+				rt.inFlightTools.set(event.toolCallId, {
+					toolName: inFlight.toolName,
+					pendingPhase: event.isError ? "failed" : "completed",
+				});
+			}
+			return;
+		}
+		if (rt.redact) {
 			rt.inFlightTools.delete(event.toolCallId);
 			return;
 		}
@@ -5232,7 +5295,7 @@ export function createNotificationsExtension(
 		await Promise.allSettled([...branchStartupTasks]);
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (rt) terminalizeInFlightTools(rt, id, "unknown");
+		if (rt) terminalizeInFlightTools(rt, id, "cancelled");
 		// Startup is only genuinely in flight when a `sessionStartPromises` entry
 		// exists. Once startup has settled, the host is broker-visible and its
 		// post-start `reconcileCurrentSession` may already have minted a
