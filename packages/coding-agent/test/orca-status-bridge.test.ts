@@ -4,10 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import {
+	boundPreviewText,
+	boundToolInput,
+	buildOrcaHookUrl,
 	createOrcaStatusBridge,
 	extractAssistantText,
 	parseOrcaEndpointFile,
 	shouldRegisterOrcaStatusBridge,
+	validateOrcaHookToken,
 } from "../src/utils/orca-status-bridge";
 
 type ExtensionEventHandler = (event: unknown, ctx: ExtensionContext) => unknown;
@@ -109,10 +113,12 @@ function bridgeEnv(receiver: HookReceiver, extra: Record<string, string> = {}): 
 		ORCA_TAB_ID: "tab-1",
 		ORCA_WORKTREE_ID: "repo::wt",
 		ORCA_AGENT_HOOK_PORT: String(receiver.port),
-		ORCA_AGENT_HOOK_TOKEN: "test-token",
+		ORCA_AGENT_HOOK_TOKEN: "test-token-1234",
 		...extra,
 	} as NodeJS.ProcessEnv;
 }
+
+const REGISTER_BASE = { enabled: true } as const;
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -141,28 +147,93 @@ describe("parseOrcaEndpointFile", () => {
 	});
 });
 
+describe("buildOrcaHookUrl", () => {
+	it("builds a loopback URL for a strictly numeric port", () => {
+		expect(buildOrcaHookUrl("57343")).toBe("http://127.0.0.1:57343/hook/pi");
+		expect(buildOrcaHookUrl("007")).toBe("http://127.0.0.1:7/hook/pi");
+	});
+
+	it("rejects authority-injection and malformed port values", () => {
+		expect(buildOrcaHookUrl("80@evil.example")).toBeNull();
+		expect(buildOrcaHookUrl("80/evil")).toBeNull();
+		expect(buildOrcaHookUrl("80?x=1")).toBeNull();
+		expect(buildOrcaHookUrl("80#frag")).toBeNull();
+		expect(buildOrcaHookUrl("80 81")).toBeNull();
+		expect(buildOrcaHookUrl("-1")).toBeNull();
+		expect(buildOrcaHookUrl("0")).toBeNull();
+		expect(buildOrcaHookUrl("65536")).toBeNull();
+		expect(buildOrcaHookUrl("")).toBeNull();
+		expect(buildOrcaHookUrl(undefined)).toBeNull();
+	});
+});
+
+describe("validateOrcaHookToken", () => {
+	it("accepts UUID-shaped tokens and rejects injection attempts", () => {
+		expect(validateOrcaHookToken("a6d786d1-c208-4347-81c2-cf56872b16fd")).toBe(
+			"a6d786d1-c208-4347-81c2-cf56872b16fd",
+		);
+		expect(validateOrcaHookToken("bad\r\nX-Injected: 1")).toBeNull();
+		expect(validateOrcaHookToken("has space")).toBeNull();
+		expect(validateOrcaHookToken("short")).toBeNull();
+		expect(validateOrcaHookToken(undefined)).toBeNull();
+	});
+});
+
+describe("preview bounding", () => {
+	it("bounds preview text with a truncation marker", () => {
+		expect(boundPreviewText("short")).toBe("short");
+		const bounded = boundPreviewText("x".repeat(5000));
+		expect(bounded.length).toBeLessThan(2100);
+		expect(bounded.endsWith("…[truncated by GJC]")).toBe(true);
+	});
+
+	it("forwards small tool inputs verbatim and collapses oversized ones", () => {
+		const small = { command: "ls" };
+		expect(boundToolInput(small)).toBe(small);
+		const huge = { blob: "y".repeat(10000) };
+		const bounded = boundToolInput(huge) as { gjc_truncated: boolean; preview: string };
+		expect(bounded.gjc_truncated).toBe(true);
+		expect(bounded.preview.length).toBeLessThan(2100);
+	});
+});
+
 describe("shouldRegisterOrcaStatusBridge", () => {
 	it("requires an Orca pane identity", () => {
-		expect(shouldRegisterOrcaStatusBridge({ env: {} as NodeJS.ProcessEnv })).toBe(false);
-		expect(shouldRegisterOrcaStatusBridge({ env: { ORCA_PANE_KEY: "t:l" } as NodeJS.ProcessEnv })).toBe(true);
+		expect(shouldRegisterOrcaStatusBridge({ ...REGISTER_BASE, env: {} as NodeJS.ProcessEnv })).toBe(false);
+		expect(
+			shouldRegisterOrcaStatusBridge({ ...REGISTER_BASE, env: { ORCA_PANE_KEY: "t:l" } as NodeJS.ProcessEnv }),
+		).toBe(true);
+	});
+
+	it("respects the consent setting and the environment kill-switch", () => {
+		const env = { ORCA_PANE_KEY: "t:l" } as NodeJS.ProcessEnv;
+		expect(shouldRegisterOrcaStatusBridge({ env, enabled: false })).toBe(false);
+		expect(
+			shouldRegisterOrcaStatusBridge({
+				enabled: true,
+				env: { ORCA_PANE_KEY: "t:l", GJC_ORCA_STATUS_BRIDGE: "0" } as NodeJS.ProcessEnv,
+			}),
+		).toBe(false);
 	});
 
 	it("stays silent for helper and subagent sessions", () => {
 		const env = { ORCA_PANE_KEY: "t:l" } as NodeJS.ProcessEnv;
-		expect(shouldRegisterOrcaStatusBridge({ env, taskDepth: 1 })).toBe(false);
-		expect(shouldRegisterOrcaStatusBridge({ env, parentTaskPrefix: "6-Extensions" })).toBe(false);
-		expect(shouldRegisterOrcaStatusBridge({ env, currentAgentType: "executor" })).toBe(false);
+		expect(shouldRegisterOrcaStatusBridge({ ...REGISTER_BASE, env, taskDepth: 1 })).toBe(false);
+		expect(shouldRegisterOrcaStatusBridge({ ...REGISTER_BASE, env, parentTaskPrefix: "6-Extensions" })).toBe(false);
+		expect(shouldRegisterOrcaStatusBridge({ ...REGISTER_BASE, env, currentAgentType: "executor" })).toBe(false);
 	});
 
 	it("defers to a pane already owned by another process", () => {
 		const otherPid = String(process.pid + 1);
 		expect(
 			shouldRegisterOrcaStatusBridge({
+				...REGISTER_BASE,
 				env: { ORCA_PANE_KEY: "t:l", ORCA_PI_STATUS_OWNED: otherPid } as NodeJS.ProcessEnv,
 			}),
 		).toBe(false);
 		expect(
 			shouldRegisterOrcaStatusBridge({
+				...REGISTER_BASE,
 				env: { ORCA_PANE_KEY: "t:l", ORCA_PI_STATUS_OWNED: String(process.pid) } as NodeJS.ProcessEnv,
 			}),
 		).toBe(true);
@@ -202,7 +273,7 @@ describe("createOrcaStatusBridge delivery", () => {
 		handlers.get("session_start")?.({ type: "session_start" }, ctx);
 		let post = await delivery;
 		expect(post.url).toBe("/hook/pi");
-		expect(post.token).toBe("test-token");
+		expect(post.token).toBe("test-token-1234");
 		expect(post.body.paneKey).toBe("tab-1:leaf-1");
 		expect(post.body.tabId).toBe("tab-1");
 		expect(post.body.worktreeId).toBe("repo::wt");
@@ -234,7 +305,60 @@ describe("createOrcaStatusBridge delivery", () => {
 		expect(post.body.payload).toMatchObject({ hook_event_name: "message_end", role: "assistant", text: "done!" });
 	});
 
-	it("prefers coordinates from the endpoint file over the environment", async () => {
+	it("bounds oversized prompt and assistant text previews", async () => {
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, { env: bridgeEnv(receiver) });
+		const ctx = fakeContext();
+
+		const delivery = receiver.nextDelivery();
+		handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "p".repeat(6000) }, ctx);
+		const post = await delivery;
+		const prompt = post.body.payload.prompt as string;
+		expect(prompt.length).toBeLessThan(2100);
+		expect(prompt.endsWith("…[truncated by GJC]")).toBe(true);
+	});
+
+	it("drops delivery entirely for authority-injection port values", async () => {
+		const fetchCalls: string[] = [];
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: {
+				ORCA_PANE_KEY: "tab-1:leaf-1",
+				ORCA_AGENT_HOOK_PORT: "80@evil.example",
+				ORCA_AGENT_HOOK_TOKEN: "test-token-1234",
+			} as NodeJS.ProcessEnv,
+			fetchImpl: ((input: string | URL | Request) => {
+				fetchCalls.push(String(input));
+				return Promise.resolve(new Response("ok"));
+			}) as typeof fetch,
+		});
+		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		await Bun.sleep(20);
+		expect(fetchCalls).toEqual([]);
+	});
+
+	it("drops delivery when the token would allow header injection", async () => {
+		const fetchCalls: string[] = [];
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: {
+				ORCA_PANE_KEY: "tab-1:leaf-1",
+				ORCA_AGENT_HOOK_PORT: "57343",
+				ORCA_AGENT_HOOK_TOKEN: "bad\r\nX-Injected: 1",
+			} as NodeJS.ProcessEnv,
+			fetchImpl: ((input: string | URL | Request) => {
+				fetchCalls.push(String(input));
+				return Promise.resolve(new Response("ok"));
+			}) as typeof fetch,
+		});
+		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		await Bun.sleep(20);
+		expect(fetchCalls).toEqual([]);
+	});
+
+	it("prefers coordinates from a trusted endpoint file over the environment", async () => {
 		const receiver = startHookReceiver();
 		cleanups.push(receiver.stop);
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-orca-endpoint-"));
@@ -242,8 +366,9 @@ describe("createOrcaStatusBridge delivery", () => {
 		const endpointPath = path.join(dir, "endpoint.env");
 		await Bun.write(
 			endpointPath,
-			`ORCA_AGENT_HOOK_PORT=${receiver.port}\nORCA_AGENT_HOOK_TOKEN=file-token\nORCA_AGENT_HOOK_ENV=production\n`,
+			`ORCA_AGENT_HOOK_PORT=${receiver.port}\nORCA_AGENT_HOOK_TOKEN=file-token-1234\nORCA_AGENT_HOOK_ENV=production\n`,
 		);
+		await fs.chmod(endpointPath, 0o600);
 		const { api, handlers } = captureHandlers();
 		createOrcaStatusBridge(api, {
 			env: {
@@ -251,14 +376,75 @@ describe("createOrcaStatusBridge delivery", () => {
 				ORCA_AGENT_HOOK_ENDPOINT: endpointPath,
 				// Stale env coordinates that the endpoint file must win over.
 				ORCA_AGENT_HOOK_PORT: "1",
-				ORCA_AGENT_HOOK_TOKEN: "stale-token",
+				ORCA_AGENT_HOOK_TOKEN: "stale-token-1234",
 			} as NodeJS.ProcessEnv,
 		});
 		const delivery = receiver.nextDelivery();
 		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
 		const post = await delivery;
-		expect(post.token).toBe("file-token");
+		expect(post.token).toBe("file-token-1234");
 		expect(post.body.payload.hook_event_name).toBe("agent_start");
+	});
+
+	it("ignores a symlinked endpoint file and falls back to env coordinates", async () => {
+		if (process.platform === "win32") return;
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-orca-endpoint-"));
+		cleanups.push(() => void fs.rm(dir, { recursive: true, force: true }));
+		const realPath = path.join(dir, "real.env");
+		await Bun.write(realPath, `ORCA_AGENT_HOOK_PORT=${receiver.port}\nORCA_AGENT_HOOK_TOKEN=sneaky-token-1234\n`);
+		const linkPath = path.join(dir, "endpoint.env");
+		await fs.symlink(realPath, linkPath);
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: bridgeEnv(receiver, { ORCA_AGENT_HOOK_ENDPOINT: linkPath }),
+		});
+		const delivery = receiver.nextDelivery();
+		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		const post = await delivery;
+		// Symlink rejected (O_NOFOLLOW): trusted env token used, not the file's.
+		expect(post.token).toBe("test-token-1234");
+	});
+
+	it("ignores a group/world-writable endpoint file", async () => {
+		if (process.platform === "win32") return;
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-orca-endpoint-"));
+		cleanups.push(() => void fs.rm(dir, { recursive: true, force: true }));
+		const endpointPath = path.join(dir, "endpoint.env");
+		await Bun.write(endpointPath, `ORCA_AGENT_HOOK_PORT=${receiver.port}\nORCA_AGENT_HOOK_TOKEN=loose-token-1234\n`);
+		await fs.chmod(endpointPath, 0o666);
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: bridgeEnv(receiver, { ORCA_AGENT_HOOK_ENDPOINT: endpointPath }),
+		});
+		const delivery = receiver.nextDelivery();
+		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		const post = await delivery;
+		expect(post.token).toBe("test-token-1234");
+	});
+
+	it("ignores an endpoint file owned by another user", async () => {
+		if (process.platform === "win32") return;
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-orca-endpoint-"));
+		cleanups.push(() => void fs.rm(dir, { recursive: true, force: true }));
+		const endpointPath = path.join(dir, "endpoint.env");
+		await Bun.write(endpointPath, `ORCA_AGENT_HOOK_PORT=${receiver.port}\nORCA_AGENT_HOOK_TOKEN=alien-token-1234\n`);
+		await fs.chmod(endpointPath, 0o600);
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: bridgeEnv(receiver, { ORCA_AGENT_HOOK_ENDPOINT: endpointPath }),
+			// Simulate the file belonging to a different uid than the owner check expects.
+			ownerUid: (process.getuid?.() ?? 0) + 1,
+		});
+		const delivery = receiver.nextDelivery();
+		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		const post = await delivery;
+		expect(post.token).toBe("test-token-1234");
 	});
 
 	it("collapses bursts to the latest snapshot while a post is in flight", async () => {
@@ -354,24 +540,43 @@ describe("createOrcaStatusBridge delivery", () => {
 		await Bun.sleep(20);
 	});
 
-	it("falls back to Windows curl delivery on WSL when loopback posting fails", async () => {
+	it("falls back to hardened Windows curl delivery on WSL with a single-flight cap", async () => {
 		const { api, handlers } = captureHandlers();
 		const spawned: Array<{ command: string[]; body: string }> = [];
+		let releaseFirst: (() => void) | undefined;
 		createOrcaStatusBridge(api, {
 			env: {
 				ORCA_PANE_KEY: "tab-1:leaf-1",
 				ORCA_AGENT_HOOK_PORT: "1",
-				ORCA_AGENT_HOOK_TOKEN: "test-token",
+				ORCA_AGENT_HOOK_TOKEN: "test-token-1234",
 			} as NodeJS.ProcessEnv,
 			fetchImpl: (() => Promise.reject(new Error("loopback unreachable"))) as unknown as typeof fetch,
 			isWslRuntime: () => true,
-			spawnCurl: (command, body) => spawned.push({ command, body }),
+			spawnCurl: (command, body) => {
+				spawned.push({ command, body });
+				const { promise, resolve } = Promise.withResolvers<void>();
+				releaseFirst ??= resolve;
+				return promise;
+			},
 		});
-		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		const ctx = fakeContext();
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
 		await Bun.sleep(20);
 		expect(spawned).toHaveLength(1);
+		// curlrc processing disabled before any other option.
+		expect(spawned[0].command[1]).toBe("-q");
 		expect(spawned[0].command).toContain("http://127.0.0.1:1/hook/pi");
-		expect(spawned[0].command).toContain("X-Orca-Agent-Hook-Token: test-token");
+		expect(spawned[0].command).toContain("X-Orca-Agent-Hook-Token: test-token-1234");
 		expect(JSON.parse(spawned[0].body).payload.hook_event_name).toBe("agent_start");
+		// Second delivery attempt while the first child is alive is dropped.
+		handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "x" }, ctx);
+		await Bun.sleep(20);
+		expect(spawned).toHaveLength(1);
+		releaseFirst?.();
+		await Bun.sleep(20);
+		// Slot cleared: the next event spawns again.
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await Bun.sleep(20);
+		expect(spawned).toHaveLength(2);
 	});
 });

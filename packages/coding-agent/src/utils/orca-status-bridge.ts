@@ -13,11 +13,28 @@
  * filesystem extension discovery (which is quarantined) and without any
  * Orca-side changes.
  *
+ * Security contract (fail-closed):
+ * - Delivery only ever targets `http://127.0.0.1:<port>/hook/pi` where the
+ *   port is a strictly numeric TCP port; the constructed URL is re-asserted
+ *   component-by-component before any request. Coordinates that fail parsing
+ *   drop the post instead of degrading.
+ * - The hook token must match a conservative charset before it is placed in
+ *   a header or argv, so hostile env/file values cannot inject headers.
+ * - The endpoint file is opened `O_NOFOLLOW`, must be a regular file owned by
+ *   the current user without group/world write, its directory ancestry must
+ *   not be writable by other users, and contents are read through the pinned
+ *   file descriptor (no path re-dereference between validation and read).
+ * - Outbound previews are bounded (prompt/assistant text and serialized tool
+ *   input) and the bridge is gated by the `orca.statusBridge` setting plus a
+ *   `GJC_ORCA_STATUS_BRIDGE=0` environment kill-switch.
+ *
  * Delivery is strictly best-effort: a missing, restarting, or slow Orca must
  * never surface errors inside the session or delay the agent loop.
  */
 
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type {
 	AgentEndEvent,
@@ -38,9 +55,19 @@ const HOOK_POST_TIMEOUT_MS = 1000;
 const OWNERSHIP_ENV = "ORCA_PI_STATUS_OWNED";
 /** Startup editor prefill delivered by Orca when launching a pi-protocol agent. */
 const PREFILL_ENV = "ORCA_PI_PREFILL";
+/** Environment kill-switch honored in addition to the `orca.statusBridge` setting. */
+const KILL_SWITCH_ENV = "GJC_ORCA_STATUS_BRIDGE";
 const AGENT_END_IDLE_RECHECK_MS = 25;
 const AGENT_END_IDLE_RECHECK_MAX_MS = 250;
 const WINDOWS_CURL_PATH = "/mnt/c/Windows/System32/curl.exe";
+/** Bounds for exported previews; Orca renders previews, not transcripts. */
+const MAX_PREVIEW_TEXT_CHARS = 2000;
+const MAX_TOOL_INPUT_JSON_CHARS = 4096;
+const TRUNCATION_MARKER = "…[truncated by GJC]";
+/** Hook tokens are Orca-generated UUID-shaped values; anything outside this
+ * charset is treated as hostile (prevents header/argv injection). */
+const TOKEN_PATTERN = /^[A-Za-z0-9._-]{8,256}$/;
+const PORT_PATTERN = /^[0-9]{1,5}$/;
 
 export interface OrcaHookCoords {
 	port: string | undefined;
@@ -54,10 +81,56 @@ export interface OrcaStatusBridgeOptions {
 	env?: NodeJS.ProcessEnv;
 	/** Fetch implementation. Default: global `fetch`. */
 	fetchImpl?: typeof fetch;
-	/** WSL runtime probe override (default: cached `/proc` sniff). */
+	/** WSL runtime probe override (default: `WSL_DISTRO_NAME` presence). */
 	isWslRuntime?: () => boolean;
-	/** Spawn seam for the WSL → Windows curl fallback. */
-	spawnCurl?: (command: string[], body: string) => void;
+	/** Spawn seam for the WSL → Windows curl fallback. Resolves when the
+	 * spawned delivery finishes (used to bound concurrent children). */
+	spawnCurl?: (command: string[], body: string) => Promise<void> | void;
+	/** POSIX uid override for endpoint-file ownership checks (test seam). */
+	ownerUid?: number;
+}
+
+/** Validate a hook port value: strictly decimal, 1–65535. */
+export function validateOrcaHookPort(value: string | undefined): string | null {
+	if (!value || !PORT_PATTERN.test(value)) return null;
+	const port = Number(value);
+	if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+	return String(port);
+}
+
+/** Validate a hook token for safe use in a header value and argv. */
+export function validateOrcaHookToken(value: string | undefined): string | null {
+	if (!value || !TOKEN_PATTERN.test(value)) return null;
+	return value;
+}
+
+/**
+ * Build the loopback hook URL and re-assert every component after
+ * construction, so no input can smuggle authority, credentials, or an
+ * alternate path into the request target.
+ */
+export function buildOrcaHookUrl(portValue: string | undefined): string | null {
+	const port = validateOrcaHookPort(portValue);
+	if (!port) return null;
+	let url: URL;
+	try {
+		url = new URL(`http://127.0.0.1:${port}${ORCA_HOOK_PATH}`);
+	} catch {
+		return null;
+	}
+	if (
+		url.protocol !== "http:" ||
+		url.hostname !== "127.0.0.1" ||
+		url.port !== port ||
+		url.pathname !== ORCA_HOOK_PATH ||
+		url.username !== "" ||
+		url.password !== "" ||
+		url.search !== "" ||
+		url.hash !== ""
+	) {
+		return null;
+	}
+	return url.href;
 }
 
 /**
@@ -73,10 +146,34 @@ export function parseOrcaEndpointFile(contents: string): Record<string, string> 
 	return out;
 }
 
+/** Bound a preview string; previews feed Orca's dashboard, not transcripts. */
+export function boundPreviewText(text: string, maxChars: number = MAX_PREVIEW_TEXT_CHARS): string {
+	if (text.length <= maxChars) return text;
+	return text.slice(0, maxChars) + TRUNCATION_MARKER;
+}
+
+/**
+ * Bound a raw tool input for export. Small inputs are forwarded verbatim so
+ * Orca can derive tool-aware previews server-side; oversized or
+ * unserializable inputs collapse to a bounded preview wrapper.
+ */
+export function boundToolInput(input: unknown): unknown {
+	let serialized: string;
+	try {
+		serialized = JSON.stringify(input) ?? "";
+	} catch {
+		return { gjc_truncated: true, preview: "" };
+	}
+	if (serialized.length <= MAX_TOOL_INPUT_JSON_CHARS) return input;
+	return { gjc_truncated: true, preview: serialized.slice(0, MAX_PREVIEW_TEXT_CHARS) + TRUNCATION_MARKER };
+}
+
 /**
  * Gate for registering the bridge on a session.
  *
  * Only the root interactive/print session of the pane-owning process reports:
+ * - requires the `orca.statusBridge` setting (explicit consent surface) and
+ *   the `GJC_ORCA_STATUS_BRIDGE` kill-switch to allow it;
  * - requires an Orca pane identity in the environment;
  * - helper/subagent sessions (task depth, parent prefix, role agent) stay
  *   silent so in-process fan-out does not thrash the pane status;
@@ -85,10 +182,14 @@ export function parseOrcaEndpointFile(contents: string): Record<string, string> 
  */
 export function shouldRegisterOrcaStatusBridge(input: {
 	env: NodeJS.ProcessEnv;
+	/** Value of the `orca.statusBridge` setting. */
+	enabled: boolean;
 	taskDepth?: number;
 	parentTaskPrefix?: string;
 	currentAgentType?: string;
 }): boolean {
+	if (!input.enabled) return false;
+	if (input.env[KILL_SWITCH_ENV] === "0") return false;
 	if (!input.env.ORCA_PANE_KEY) return false;
 	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix !== undefined || input.currentAgentType !== undefined) {
 		return false;
@@ -126,11 +227,11 @@ interface PendingPost {
  *
  * Event mapping (GJC extension events → Orca `/hook/pi` payloads):
  * - `session_start` → `session_start` (also applies `ORCA_PI_PREFILL`)
- * - `before_agent_start` → `before_agent_start` + `prompt`
+ * - `before_agent_start` → `before_agent_start` + bounded `prompt`
  * - `agent_start` → `agent_start`
  * - `tool_call` / `tool_execution_start` / `tool_execution_end` → same names
- *   with `tool_name` / raw `tool_input` (Orca derives the preview server-side)
- * - assistant `message_end` → `message_end` + visible `text`
+ *   with `tool_name` / bounded `tool_input` (Orca derives previews server-side)
+ * - assistant `message_end` → `message_end` + bounded visible `text`
  * - `agent_end` → `agent_end`, deferred until `ctx.isIdle()` so queued
  *   follow-up work keeps the pane in `working` instead of flapping to done.
  */
@@ -145,12 +246,16 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	// snapshots, and status posting must stay off the agent-loop critical path.
 	let activePost = false;
 	let pendingPost: PendingPost | null = null;
-	// Endpoint-file cache keyed by stat identity: re-reading on every event is
-	// cheap but re-parsing during streaming tool execution is wasteful.
+	// Endpoint-file parse cache keyed by fstat identity of the pinned
+	// descriptor; ancestry approval is cached per resolved path.
 	let cachedEndpointKey = "";
 	let cachedEndpointValues: Record<string, string> | null = null;
+	let approvedAncestryPath: string | null = null;
 	let cachedIsWsl: boolean | null = null;
 	let cachedCurlAvailable: boolean | null = null;
+	// Bounded curl lifecycle: at most one Windows-side delivery in flight;
+	// bursts drop instead of accumulating child processes.
+	let curlInFlight = false;
 
 	function updateSessionMetadata(ctx: ExtensionContext): void {
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -172,14 +277,74 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 		}
 	}
 
+	function ownerUid(): number | null {
+		if (options.ownerUid !== undefined) return options.ownerUid;
+		return typeof process.getuid === "function" ? process.getuid() : null;
+	}
+
+	/** ssh-style strict ancestry: every parent directory must be owned by the
+	 * current user or root and must not be writable by group/other, so another
+	 * local user cannot swap the endpoint file or a parent directory. */
+	async function validateEndpointAncestry(endpointPath: string): Promise<boolean> {
+		const resolved = path.resolve(endpointPath);
+		if (approvedAncestryPath === resolved) return true;
+		const uid = ownerUid();
+		if (uid === null) {
+			// Windows: no POSIX ownership; rely on O_NOFOLLOW-equivalent open and
+			// the loopback-only URL contract.
+			approvedAncestryPath = resolved;
+			return true;
+		}
+		let current = path.dirname(resolved);
+		for (;;) {
+			const stat = await fs.lstat(current);
+			if (!stat.isDirectory()) return false;
+			if (stat.uid !== uid && stat.uid !== 0) return false;
+			// Writable-by-others directories are only tolerated with the sticky
+			// bit (e.g. /tmp), where other users cannot rename or unlink entries.
+			if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) return false;
+			const parent = path.dirname(current);
+			if (parent === current) break;
+			current = parent;
+		}
+		approvedAncestryPath = resolved;
+		return true;
+	}
+
+	/**
+	 * Read the endpoint file fail-closed: `O_NOFOLLOW` open pins the inode,
+	 * ownership/mode are validated on the pinned descriptor, and contents are
+	 * read through that descriptor so no path re-dereference can race the
+	 * validation. Any failure returns null (env coordinates are NOT replaced
+	 * by unvalidated file contents).
+	 */
+	function rejectEndpoint(endpointPath: string, reason: string): null {
+		if (!warnedBadEndpoint) {
+			warnedBadEndpoint = true;
+			logger.warn("Orca status bridge rejected hook endpoint file", { path: endpointPath, reason });
+		}
+		return null;
+	}
+
 	async function readEndpointFile(): Promise<Record<string, string> | null> {
 		const endpointPath = env.ORCA_AGENT_HOOK_ENDPOINT;
 		if (!endpointPath) return null;
+		let handle: fs.FileHandle | undefined;
 		try {
-			const stat = await fs.stat(endpointPath);
-			const cacheKey = `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
+			if (!(await validateEndpointAncestry(endpointPath))) {
+				return rejectEndpoint(endpointPath, "untrusted directory ancestry");
+			}
+			handle = await fs.open(endpointPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+			const stat = await handle.stat();
+			if (!stat.isFile()) return rejectEndpoint(endpointPath, "not a regular file");
+			const uid = ownerUid();
+			if (uid !== null) {
+				if (stat.uid !== uid) return rejectEndpoint(endpointPath, "not owned by the current user");
+				if ((stat.mode & 0o022) !== 0) return rejectEndpoint(endpointPath, "writable by group/other");
+			}
+			const cacheKey = `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
 			if (cacheKey === cachedEndpointKey && cachedEndpointValues) return cachedEndpointValues;
-			const contents = await Bun.file(endpointPath).text();
+			const contents = await handle.readFile("utf8");
 			cachedEndpointValues = parseOrcaEndpointFile(contents);
 			cachedEndpointKey = cacheKey;
 			return cachedEndpointValues;
@@ -189,12 +354,14 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 			const code = (error as { code?: string } | null)?.code;
 			if (code !== "ENOENT" && !warnedBadEndpoint) {
 				warnedBadEndpoint = true;
-				logger.warn("Orca status bridge failed to read hook endpoint file", {
+				logger.warn("Orca status bridge rejected hook endpoint file", {
 					path: endpointPath,
 					error: String(error),
 				});
 			}
 			return null;
+		} finally {
+			await handle?.close().catch(() => {});
 		}
 	}
 
@@ -217,10 +384,14 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 
 	// WSL loopback is not the Windows loopback, so a WSL-side POST cannot reach
 	// Orca. curl.exe runs on the Windows side, where 127.0.0.1 IS the listener
-	// Orca binds. Fire-and-forget: blocking on the spawn would stall the TUI.
+	// Orca binds. The URL and token are the already-validated values, `-q`
+	// disables curlrc config processing, and at most one child is in flight.
 	async function postViaWindowsCurl(url: string, token: string, body: string): Promise<void> {
+		if (curlInFlight) return;
 		const command = [
 			WINDOWS_CURL_PATH,
+			// Must be first: disables .curlrc processing before other options.
+			"-q",
 			"-sS",
 			// The spawn is detached from the event loop, so these bounds size a
 			// background process, not TUI latency; WSL→Win32 connects can be slow.
@@ -243,7 +414,16 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 			url,
 		];
 		if (options.spawnCurl) {
-			options.spawnCurl(command, body);
+			const spawnCurl = options.spawnCurl;
+			curlInFlight = true;
+			// Fire-and-forget like the real path: delivery completion only clears
+			// the single-flight slot, it never blocks the post queue.
+			void Promise.resolve()
+				.then(() => spawnCurl(command, body))
+				.catch(() => {})
+				.finally(() => {
+					curlInFlight = false;
+				});
 			return;
 		}
 		if (cachedCurlAvailable === null) {
@@ -253,11 +433,20 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 		}
 		if (!cachedCurlAvailable) return;
 		try {
+			curlInFlight = true;
 			const child = Bun.spawn(command, { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
 			child.stdin.write(body);
 			await child.stdin.end();
 			child.unref();
+			// Clear the slot when the bounded (--max-time) child exits; delivery
+			// itself stays fire-and-forget.
+			void child.exited
+				.catch(() => {})
+				.finally(() => {
+					curlInFlight = false;
+				});
 		} catch {
+			curlInFlight = false;
 			// Best-effort bridge; a failed spawn must not surface in the session.
 		}
 	}
@@ -265,8 +454,9 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	async function postOnce(hookEventName: string, extra: Record<string, unknown>): Promise<void> {
 		const coords = await resolveHookCoords();
 		const paneKey = env.ORCA_PANE_KEY;
-		if (!coords.port || !coords.token || !paneKey) return;
-		const url = `http://127.0.0.1:${coords.port}${ORCA_HOOK_PATH}`;
+		const url = buildOrcaHookUrl(coords.port);
+		const token = validateOrcaHookToken(coords.token);
+		if (!url || !token || !paneKey) return;
 		const body = JSON.stringify({
 			paneKey,
 			launchToken: env.ORCA_AGENT_LAUNCH_TOKEN || "",
@@ -281,7 +471,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
-					"X-Orca-Agent-Hook-Token": coords.token,
+					"X-Orca-Agent-Hook-Token": token,
 				},
 				body,
 				signal: AbortSignal.timeout(HOOK_POST_TIMEOUT_MS),
@@ -290,7 +480,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 			// Status reporting must never fail the run because Orca is unavailable
 			// or restarting; on WSL fall through to the Windows-side listener.
 			if (!isWslRuntime()) return;
-			await postViaWindowsCurl(url, coords.token, body);
+			await postViaWindowsCurl(url, token, body);
 		}
 	}
 
@@ -372,7 +562,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	});
 
 	pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-		post("before_agent_start", { prompt: event.prompt ?? "" });
+		post("before_agent_start", { prompt: boundPreviewText(event.prompt ?? "") });
 	});
 
 	pi.on("agent_start", () => {
@@ -382,11 +572,11 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	});
 
 	pi.on("tool_call", (event: ToolCallEvent) => {
-		post("tool_call", { tool_name: event.toolName, tool_input: event.input });
+		post("tool_call", { tool_name: event.toolName, tool_input: boundToolInput(event.input) });
 	});
 
 	pi.on("tool_execution_start", (event: ToolExecutionStartEvent) => {
-		post("tool_execution_start", { tool_name: event.toolName, tool_input: event.args });
+		post("tool_execution_start", { tool_name: event.toolName, tool_input: boundToolInput(event.args) });
 	});
 
 	pi.on("tool_execution_end", (event: ToolExecutionEndEvent) => {
@@ -400,7 +590,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 		if (message?.role !== "assistant") return;
 		const text = extractAssistantText(event.message);
 		if (!text) return;
-		post("message_end", { role: "assistant", text });
+		post("message_end", { role: "assistant", text: boundPreviewText(text) });
 	});
 
 	pi.on("agent_end", (_event: AgentEndEvent, ctx: ExtensionContext) => {

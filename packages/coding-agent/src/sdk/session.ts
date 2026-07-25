@@ -1823,10 +1823,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Orca terminal panes export a loopback agent-hook endpoint; the bridge
 		// reports pi-protocol status events so Orca shows live agent state for
-		// GJC sessions. Root pane-owning sessions only; strictly best-effort.
+		// GJC sessions. Gated by the orca.statusBridge consent setting; root
+		// pane-owning sessions only; strictly best-effort and loopback-only.
 		if (
 			shouldRegisterOrcaStatusBridge({
 				env: process.env,
+				enabled: settings.get("orca.statusBridge") !== false,
 				taskDepth,
 				parentTaskPrefix: options.parentTaskPrefix,
 				currentAgentType: options.currentAgentType,

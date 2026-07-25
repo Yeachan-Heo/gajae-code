@@ -40,6 +40,16 @@
 			},
 			"additionalProperties": false
 		},
+		"orca": {
+			"type": "object",
+			"properties": {
+				"statusBridge": {
+					"type": "boolean",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"notifications": {
 			"type": "object",
 			"properties": {

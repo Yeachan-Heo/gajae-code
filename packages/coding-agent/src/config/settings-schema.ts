@@ -276,6 +276,13 @@ export const SETTINGS_SCHEMA = {
 		default: "copy-retain",
 	},
 
+	// Orca terminal integration: pi-protocol agent-status bridge. When enabled
+	// and the session runs inside an Orca pane, bounded status previews
+	// (state, prompt, tool name/input, last assistant reply) are posted to
+	// Orca's loopback agent-hook endpoint. Disable to keep session content
+	// out of the terminal host. Env kill-switch: GJC_ORCA_STATUS_BRIDGE=0.
+	"orca.statusBridge": { type: "boolean", default: true },
+
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
 	"notifications.telegram.botToken": {
