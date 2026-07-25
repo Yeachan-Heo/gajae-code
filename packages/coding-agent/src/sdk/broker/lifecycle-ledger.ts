@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { isUnsupportedWindowsDirectorySyncError } from "../../utils/directory-sync";
+import { syncDirectoryBestEffort } from "../../utils/directory-sync";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { parseLifecycleJson } from "./lifecycle-codec";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
@@ -424,15 +424,8 @@ export class LifecycleLedger {
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
 	async #syncDirectory(): Promise<void> {
-		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
-		try {
-			await directory.sync();
-		} catch (error) {
-			// Windows cannot fsync a directory handle; rename durability is best-effort there.
-			if (!isUnsupportedWindowsDirectorySyncError(error)) throw error;
-		} finally {
-			await directory.close();
-		}
+		// Windows cannot fsync a directory handle; rename durability is best-effort there.
+		await syncDirectoryBestEffort(path.dirname(this.#file));
 	}
 	async #compact(replacement?: LifecycleLedgerEntry): Promise<boolean> {
 		const anchors = new Map<string, LifecycleLedgerEntry>();
