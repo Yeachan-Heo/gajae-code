@@ -6,7 +6,8 @@
  * events to it get live status (working / done), tool activity, prompt, and
  * last-reply previews in Orca's dashboard and pane badges.
  *
- * Orca has first-class support for the pi hook protocol (`/hook/pi`), which
+ * Orca supports the pi hook protocol (`/hook/gjc` on versions with
+ * first-class GJC support, `/hook/pi` everywhere else), which
  * GJC speaks natively as a pi-lineage agent. This module ports the semantics
  * of Orca's managed `orca-agent-status.ts` pi extension onto GJC's bundled
  * extension surface, so GJC panes inside Orca report status without any
@@ -14,7 +15,8 @@
  * Orca-side changes.
  *
  * Security contract (fail-closed):
- * - Delivery only ever targets `http://127.0.0.1:<port>/hook/pi` where the
+ * - Delivery only ever targets `http://127.0.0.1:<port>/hook/gjc` (or the
+ *   `/hook/pi` fallback after a 404 negotiation) where the
  *   port is a strictly numeric TCP port; the constructed URL is re-asserted
  *   component-by-component before any request. Coordinates that fail parsing
  *   drop the post instead of degrading.
@@ -48,7 +50,12 @@ import type {
 	ToolExecutionStartEvent,
 } from "../extensibility/extensions";
 
-const ORCA_HOOK_PATH = "/hook/pi";
+/** Preferred route on Orca versions with first-class GJC support. */
+const ORCA_GJC_HOOK_PATH = "/hook/gjc";
+/** Fallback route accepted by every Orca version with pi support. */
+const ORCA_PI_HOOK_PATH = "/hook/pi";
+const ORCA_HOOK_PATHS = [ORCA_GJC_HOOK_PATH, ORCA_PI_HOOK_PATH] as const;
+export type OrcaHookPath = (typeof ORCA_HOOK_PATHS)[number];
 const HOOK_POST_TIMEOUT_MS = 1000;
 /** Pane-scoped ownership marker shared with Orca's managed pi extension: child
  * processes inherit the pane env, and only one process per pane may report. */
@@ -109,12 +116,16 @@ export function validateOrcaHookToken(value: string | undefined): string | null 
  * construction, so no input can smuggle authority, credentials, or an
  * alternate path into the request target.
  */
-export function buildOrcaHookUrl(portValue: string | undefined): string | null {
+export function buildOrcaHookUrl(
+	portValue: string | undefined,
+	hookPath: OrcaHookPath = ORCA_GJC_HOOK_PATH,
+): string | null {
 	const port = validateOrcaHookPort(portValue);
 	if (!port) return null;
+	if (!ORCA_HOOK_PATHS.includes(hookPath)) return null;
 	let url: URL;
 	try {
-		url = new URL(`http://127.0.0.1:${port}${ORCA_HOOK_PATH}`);
+		url = new URL(`http://127.0.0.1:${port}${hookPath}`);
 	} catch {
 		return null;
 	}
@@ -122,7 +133,7 @@ export function buildOrcaHookUrl(portValue: string | undefined): string | null {
 		url.protocol !== "http:" ||
 		url.hostname !== "127.0.0.1" ||
 		url.port !== port ||
-		url.pathname !== ORCA_HOOK_PATH ||
+		url.pathname !== hookPath ||
 		url.username !== "" ||
 		url.password !== "" ||
 		url.search !== "" ||
@@ -225,7 +236,7 @@ interface PendingPost {
 /**
  * Register the Orca status bridge on an extension API surface.
  *
- * Event mapping (GJC extension events → Orca `/hook/pi` payloads):
+ * Event mapping (GJC extension events → Orca pi-protocol payloads):
  * - `session_start` → `session_start` (also applies `ORCA_PI_PREFILL`)
  * - `before_agent_start` → `before_agent_start` + bounded `prompt`
  * - `agent_start` → `agent_start`
@@ -451,12 +462,16 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 		}
 	}
 
+	// Route negotiation: prefer the first-class GJC route; an Orca without it
+	// answers 404 once and the bridge permanently falls back to the pi route
+	// (which such versions render with pi identity but full status support).
+	let activeHookPath: OrcaHookPath = ORCA_GJC_HOOK_PATH;
+
 	async function postOnce(hookEventName: string, extra: Record<string, unknown>): Promise<void> {
 		const coords = await resolveHookCoords();
 		const paneKey = env.ORCA_PANE_KEY;
-		const url = buildOrcaHookUrl(coords.port);
 		const token = validateOrcaHookToken(coords.token);
-		if (!url || !token || !paneKey) return;
+		if (!token || !paneKey) return;
 		const body = JSON.stringify({
 			paneKey,
 			launchToken: env.ORCA_AGENT_LAUNCH_TOKEN || "",
@@ -466,21 +481,31 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 			version: coords.version,
 			payload: { hook_event_name: hookEventName, ...(await getPersistedSessionMetadata()), ...extra },
 		});
-		try {
-			await fetchImpl(url, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"X-Orca-Agent-Hook-Token": token,
-				},
-				body,
-				signal: AbortSignal.timeout(HOOK_POST_TIMEOUT_MS),
-			});
-		} catch {
-			// Status reporting must never fail the run because Orca is unavailable
-			// or restarting; on WSL fall through to the Windows-side listener.
-			if (!isWslRuntime()) return;
-			await postViaWindowsCurl(url, token, body);
+		for (;;) {
+			const url = buildOrcaHookUrl(coords.port, activeHookPath);
+			if (!url) return;
+			try {
+				const response = await fetchImpl(url, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-Orca-Agent-Hook-Token": token,
+					},
+					body,
+					signal: AbortSignal.timeout(HOOK_POST_TIMEOUT_MS),
+				});
+				if (response.status === 404 && activeHookPath === ORCA_GJC_HOOK_PATH) {
+					activeHookPath = ORCA_PI_HOOK_PATH;
+					continue;
+				}
+				return;
+			} catch {
+				// Status reporting must never fail the run because Orca is unavailable
+				// or restarting; on WSL fall through to the Windows-side listener.
+				if (!isWslRuntime()) return;
+				await postViaWindowsCurl(url, token, body);
+				return;
+			}
 		}
 	}
 
