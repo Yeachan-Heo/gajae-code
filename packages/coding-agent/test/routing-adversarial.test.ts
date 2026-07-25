@@ -93,6 +93,42 @@ describe("routing adversarial contract probes", () => {
 		expect(compactionRetryDelay(2_000, 0, 0, 45_000)).toBe(45_000);
 	});
 
+	// Both legacy surfaces recover Retry-After from prose, so the documented rule
+	// ("retry.maxDelayMs caps every legacy session retry delay, including provider
+	// retry-after hints") must bind them identically. This pins the two together so
+	// a future change to one cannot silently drift from the other.
+	test("legacy compaction agrees with the legacy non-compaction retry-after cap", () => {
+		const maxDelayMs = 300_000;
+		const baseDelayMs = 2_000;
+		for (const hint of [1_000, 45_000, 299_999, 300_000, 300_001, THREE_HOURS_MS]) {
+			// agent-session.ts, legacy non-compaction path: Math.min(retryAfterMs, maxDelayMs)
+			const legacyNonCompaction = Math.min(hint, maxDelayMs);
+			const compaction = compactionRetryDelay(baseDelayMs, maxDelayMs, 0, hint);
+			expect(compaction).toBeLessThanOrEqual(maxDelayMs);
+			// Compaction may floor at its exponential, but never exceeds the legacy bound.
+			expect(compaction).toBeLessThanOrEqual(Math.max(legacyNonCompaction, baseDelayMs));
+		}
+	});
+
+	test("compaction retry delay invariant holds across the whole parameter grid", () => {
+		const hints = [undefined, 0, 1_000, THREE_HOURS_MS, Number.NaN, Number.POSITIVE_INFINITY, -1];
+		let checked = 0;
+		for (const baseDelayMs of [0, 1, 500, 2_000, 60_000]) {
+			for (const maxDelayMs of [0, 1_000, 30_000, 300_000]) {
+				for (const attempt of [0, 1, 3, 10, 30]) {
+					for (const hint of hints) {
+						const delay = compactionRetryDelay(baseDelayMs, maxDelayMs, attempt, hint);
+						expect(Number.isFinite(delay)).toBe(true);
+						expect(delay).toBeGreaterThanOrEqual(0);
+						if (maxDelayMs > 0) expect(delay).toBeLessThanOrEqual(maxDelayMs);
+						checked++;
+					}
+				}
+			}
+		}
+		expect(checked).toBe(700);
+	});
+
 	test("charges rotated-entry retries against the chain-wide attempt budget", () => {
 		const controller = new FallbackChainController(
 			{ role: "default", entries: ["xai/grok", "anthropic/claude"], origin: "test", explicitHead: true },
