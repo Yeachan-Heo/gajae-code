@@ -128,7 +128,10 @@ async function createPrFixture({ includeFork = true }: { includeFork?: boolean }
 	};
 }
 
-type RemoteFixture = Pick<Awaited<ReturnType<typeof createPrFixture>>, "baseDir" | "repoRoot" | "originBare" | "forkBare">;
+type RemoteFixture = Pick<
+	Awaited<ReturnType<typeof createPrFixture>>,
+	"baseDir" | "repoRoot" | "originBare" | "forkBare"
+>;
 
 async function createRemoteFixture(): Promise<RemoteFixture> {
 	const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "gh-remote-tool-"));

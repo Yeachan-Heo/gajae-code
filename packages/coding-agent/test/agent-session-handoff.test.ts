@@ -496,7 +496,9 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await waitFor(() => handoffSpy.mock.calls.length === 1 && events.some(event => event.type === "auto_compaction_end"));
+		await waitFor(
+			() => handoffSpy.mock.calls.length === 1 && events.some(event => event.type === "auto_compaction_end"),
+		);
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");

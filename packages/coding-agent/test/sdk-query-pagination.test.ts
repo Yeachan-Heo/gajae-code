@@ -382,39 +382,35 @@ it("keeps artifact range responses below the serialized one MiB ceiling", async 
 	expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);
 	expect((response.result as { complete: boolean }).complete).toBe(false);
 });
-it(
-	"keeps random-sized paginated responses below the one MiB ceiling",
-	async () => {
-		const seedCount = 12;
-		const maxBodyLength = 96 * 1024;
-		for (let seed = 1; seed <= seedCount; seed++) {
-			let state = seed;
-			const next = () => {
-				state = (state * 16_807) % 2_147_483_647;
-				return state;
-			};
-			const diff = Array.from({ length: 32 }, (_, index) => ({
-				id: String(index),
-				body: "x".repeat(next() % maxBodyLength),
-			}));
-			const store = new RevisionStore(`page-${seed}`);
-			const query = new QueryHandlers(
-				{ ...surface([]), getDiff: () => diff },
-				`page-${seed}`,
-				store,
-				new CursorRegistry("token", store),
-			);
-			let response = await query.dispatch({ query: "Q06", connectionId: "c" });
-			while (response.page) {
-				expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);
-				if (response.page.complete) break;
-				response = await query.dispatch({ query: "Q06", cursor: response.page.continuationCursor, connectionId: "c" });
-			}
-			await store.close();
+it("keeps random-sized paginated responses below the one MiB ceiling", async () => {
+	const seedCount = 12;
+	const maxBodyLength = 96 * 1024;
+	for (let seed = 1; seed <= seedCount; seed++) {
+		let state = seed;
+		const next = () => {
+			state = (state * 16_807) % 2_147_483_647;
+			return state;
+		};
+		const diff = Array.from({ length: 32 }, (_, index) => ({
+			id: String(index),
+			body: "x".repeat(next() % maxBodyLength),
+		}));
+		const store = new RevisionStore(`page-${seed}`);
+		const query = new QueryHandlers(
+			{ ...surface([]), getDiff: () => diff },
+			`page-${seed}`,
+			store,
+			new CursorRegistry("token", store),
+		);
+		let response = await query.dispatch({ query: "Q06", connectionId: "c" });
+		while (response.page) {
+			expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);
+			if (response.page.complete) break;
+			response = await query.dispatch({ query: "Q06", cursor: response.page.continuationCursor, connectionId: "c" });
 		}
-	},
-	30_000,
-);
+		await store.close();
+	}
+}, 30_000);
 
 it("describes an arbitrarily large indexed item from manifest metadata before reading its body", async () => {
 	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));

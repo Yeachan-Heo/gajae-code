@@ -35,9 +35,7 @@ class Bot implements BotApi {
 		body: Record<string, unknown>;
 		options?: { noRetry?: boolean; signal?: AbortSignal };
 	}> = [];
-	constructor(
-		private readonly beforeCall?: (method: string, body: Record<string, unknown>) => void | Promise<void>,
-	) {}
+	constructor(private readonly beforeCall?: (method: string, body: Record<string, unknown>) => void | Promise<void>) {}
 	async call(method: string, body: unknown, options?: { noRetry?: boolean; signal?: AbortSignal }): Promise<unknown> {
 		const callBody = body as Record<string, unknown>;
 		this.calls.push({ method, body: callBody, options });
@@ -222,15 +220,11 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 					release: PromiseWithResolvers<void>;
 					injected: boolean;
 					injectDuplicate: () => void;
-				  }
+			  }
 			| undefined;
 		const bot = new Bot((method, body) => {
 			const richMessage = body.rich_message as { markdown?: unknown } | undefined;
-			if (
-				!terminalReplyGate ||
-				method !== "sendRichMessage" ||
-				richMessage?.markdown !== terminalReplyGate.text
-			)
+			if (!terminalReplyGate || method !== "sendRichMessage" || richMessage?.markdown !== terminalReplyGate.text)
 				return;
 			terminalReplyGate.started.resolve();
 			if (!terminalReplyGate.injected) {
@@ -313,7 +307,9 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 			// This frame is not an operator-routed event; bypass the unrelated router so
 			// the duplicate test drives concurrent terminal-handler admissions directly.
 			const sessionRouter = (
-				daemon as unknown as { sessionRouter: { dispatch: (session: unknown, message: unknown) => Promise<boolean> } }
+				daemon as unknown as {
+					sessionRouter: { dispatch: (session: unknown, message: unknown) => Promise<boolean> };
+				}
 			).sessionRouter;
 			const originalDispatch = sessionRouter.dispatch;
 			sessionRouter.dispatch = async () => false;

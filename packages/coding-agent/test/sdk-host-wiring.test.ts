@@ -3557,15 +3557,17 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		events.push("gate-terminalized");
 		return resolved;
 	});
-	const pushFrameAndWait = spyOn(NotificationServer.prototype, "pushFrameAndWait").mockImplementation(
-		async function (this: NotificationServer, frame, timeout) {
-			if ((JSON.parse(frame) as { type?: unknown }).type === "session_closed") {
-				sessionClosedReached.resolve();
-				await sessionClosedBarrier.promise;
-			}
-			return await originalPushFrameAndWait.call(this, frame, timeout);
-		},
-	);
+	const pushFrameAndWait = spyOn(NotificationServer.prototype, "pushFrameAndWait").mockImplementation(async function (
+		this: NotificationServer,
+		frame,
+		timeout,
+	) {
+		if ((JSON.parse(frame) as { type?: unknown }).type === "session_closed") {
+			sessionClosedReached.resolve();
+			await sessionClosedBarrier.promise;
+		}
+		return await originalPushFrameAndWait.call(this, frame, timeout);
+	});
 	process.env.GJC_NOTIFICATIONS = "1";
 	const sessionContext = context(cwd, sessionId, "main", {}, emitter);
 	const handlers = start(sessionContext);
