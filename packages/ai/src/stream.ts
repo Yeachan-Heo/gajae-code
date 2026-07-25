@@ -162,6 +162,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	"qwen-portal": () => $pickCredentialEnv("QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"),
 	together: "TOGETHER_API_KEY",
 	zenmux: "ZENMUX_API_KEY",
+	opengateway: "OPENGATEWAY_API_KEY",
 	venice: "VENICE_API_KEY",
 	vllm: "VLLM_API_KEY",
 	xiaomi: "XIAOMI_API_KEY",

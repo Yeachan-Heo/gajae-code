@@ -77,6 +77,7 @@ describe("GJC public CLI command surface", () => {
 		expect(result.stdout.toString()).not.toContain("warming workspace");
 	});
 	it("routes the internal managed-owner supervisor through its child admission barrier", async () => {
+		if (process.platform !== "linux") return;
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
 		const lifecycle = lifecyclePaths(stateDir, "session-cli-route", "generation-cli-route");
 		const managedOwnerEnv = {

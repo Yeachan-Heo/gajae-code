@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { ControlServer, callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { RuntimeOwner, resolveOwner, resolveOwnerLive } from "../../src/harness-control-plane/owner";
-import { acquireLease, readLease, releaseLease } from "../../src/harness-control-plane/session-lease";
+import { acquireLease, heartbeat, readLease, releaseLease } from "../../src/harness-control-plane/session-lease";
 import type {
 	HarnessSessionTransport,
 	HarnessSessionTransportCloseContext,
@@ -802,10 +802,24 @@ describe("RuntimeOwner (in-process integration)", () => {
 
 	it("a fenced owner never releases a successor's lease", async () => {
 		const transport = new FakeTransport();
-		owner = new RuntimeOwner({ root, sessionId: SID, transport, heartbeatMs: 2, ttlMs: 10_000 });
+		const heartbeatEntered = Promise.withResolvers<void>();
+		const releaseHeartbeat = Promise.withResolvers<void>();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			heartbeatMs: 1,
+			ttlMs: 10_000,
+			leaseHeartbeat: async (heartbeatRoot, heartbeatSession, heartbeatOwner, ttlMs, clock) => {
+				heartbeatEntered.resolve();
+				await releaseHeartbeat.promise;
+				return heartbeat(heartbeatRoot, heartbeatSession, heartbeatOwner, ttlMs, clock);
+			},
+		});
 		const first = await owner.start();
+		await heartbeatEntered.promise;
 
-		// A successor legitimately takes over the lease before the original tears down.
+		// A successor legitimately takes over while the original's heartbeat is gated.
 		await releaseLease(root, SID, first.ownerId);
 		const { lease: successor } = await acquireLease(root, SID, {
 			ownerId: "successor-owner",
@@ -815,14 +829,15 @@ describe("RuntimeOwner (in-process integration)", () => {
 			ttlMs: 30_000,
 		});
 
-		// Original owner shuts down; fencing must not renew nor release the successor.
+		// Let the predecessor observe fencing before teardown; it must not renew or release the successor.
+		releaseHeartbeat.resolve();
 		await owner.stop();
 		owner = null;
 
 		const after = await readLease(root, SID);
 		expect(after?.ownerId).toBe("successor-owner");
 		expect(after?.leaseEpoch).toBe(successor.leaseEpoch);
-	});
+	}, 15_000);
 	it("releases the owner lease after successful transport cleanup and allows replacement takeover", async () => {
 		const transport = new FakeTransport();
 		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });

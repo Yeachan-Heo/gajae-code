@@ -147,6 +147,7 @@ export type KnownProvider =
 	| "minimax"
 	| "opencode-go"
 	| "opencode-zen"
+	| "opengateway"
 	| "synthetic"
 	| "cloudflare-ai-gateway"
 	| "huggingface"

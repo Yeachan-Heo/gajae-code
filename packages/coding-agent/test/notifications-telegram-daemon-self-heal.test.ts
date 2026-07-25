@@ -180,6 +180,60 @@ describe("telegram daemon self-heal (#2956)", () => {
 		expect(daemon.sessions.has("S")).toBe(true);
 	});
 
+	test("a transiently unreadable root is kept (not pruned) and does not block the live root", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const liveCwd = path.join(agentDir, "live");
+		const flakyCwd = path.join(agentDir, "flaky");
+		await registerNotificationRoot({ settings: s, cwd: liveCwd, sessionId: "S" });
+		await registerNotificationRoot({ settings: s, cwd: flakyCwd, sessionId: "F" });
+		const liveRoot = path.join(liveCwd, ".gjc", "state");
+		const flakyRoot = path.join(flakyCwd, ".gjc", "state");
+		for (const root of [liveRoot, flakyRoot]) fs.mkdirSync(path.join(root, "sdk"), { recursive: true });
+		fs.writeFileSync(path.join(liveRoot, "sdk", "S.json"), JSON.stringify({ url: "ws://s", token: "ts" }));
+
+		class FakeWs {
+			static instances: FakeWs[] = [];
+			readyState = 0;
+			constructor(public url: string) {
+				FakeWs.instances.push(this);
+			}
+			send() {}
+			close() {}
+			addEventListener() {}
+			removeEventListener() {}
+			dispatchEvent() {
+				return true;
+			}
+		}
+		const flakySdk = path.join(flakyRoot, "sdk");
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: { call: async () => ({ ok: true, result: {} }) } as never,
+			WebSocketImpl: FakeWs as never,
+			now: () => 0,
+			fs: {
+				...(fs.promises as unknown as Record<string, unknown>),
+				readdir: async (dir: string) => {
+					if (dir === flakySdk) throw Object.assign(new Error("transient"), { code: "EACCES" });
+					return await fs.promises.readdir(dir);
+				},
+			} as never,
+		});
+		await daemon.scanRoots();
+		const registry = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as {
+			roots: string[];
+		};
+		// Transient failure: the flaky root is KEPT (no prune) …
+		expect(registry.roots).toContain(flakyRoot);
+		expect(registry.roots).toContain(liveRoot);
+		// … and the live root was still scanned/connected in the same pass.
+		expect(daemon.sessions.has("S")).toBe(true);
+	});
+
 	test("healTelegramDaemonNotificationState combines prune and reap", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);

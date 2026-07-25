@@ -34,7 +34,7 @@ import {
 	releaseChatDaemonOwnership,
 } from "../src/sdk/bus/chat-daemon-control";
 import { tokenFingerprint } from "../src/sdk/bus/config";
-import { DAEMON_GENERATION, daemonPaths, renewDaemonHeartbeat } from "../src/sdk/bus/telegram-daemon";
+import { DAEMON_GENERATION, daemonPaths, renewDaemonHeartbeat, SERVING_EPOCH } from "../src/sdk/bus/telegram-daemon";
 import {
 	clearTelegramControlRequest,
 	type DaemonProcessReference,
@@ -122,6 +122,7 @@ function freshState(extra: Partial<Record<string, unknown>> = {}): Record<string
 		acquisitionId: "old",
 		ownershipPhase: "ready",
 		generation: DAEMON_GENERATION,
+		servingEpoch: SERVING_EPOCH,
 		...extra,
 	};
 }
@@ -411,7 +412,9 @@ describe("TelegramDaemonController.status", () => {
 	test("reports running for a fresh live owner and stopped for a dead one", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState());
+		const state = freshState();
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 
 		const running = await new TelegramDaemonController(s, {
 			pidAlive: () => true,
@@ -592,8 +595,9 @@ describe("TelegramDaemonController.reload", () => {
 	test("reload accepts a successor only when its PID incarnation still matches", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ generation: DAEMON_GENERATION - 1 }));
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const predecessor = freshState({ generation: DAEMON_GENERATION - 1 });
+		writeState(agentDir, predecessor);
+		writeOwnershipLock(agentDir, predecessor);
 		let oldAlive = true;
 		let published = false;
 		const result = await new TelegramDaemonController(s, {
@@ -604,10 +608,14 @@ describe("TelegramDaemonController.reload", () => {
 				if (published) return;
 				published = true;
 				oldAlive = false;
-				writeState(
-					agentDir,
-					freshState({ pid: 1001, incarnation: "linux:101", ownerId: "next", acquisitionId: "next" }),
-				);
+				const successor = freshState({
+					pid: 1001,
+					incarnation: "linux:101",
+					ownerId: "next",
+					acquisitionId: "next",
+				});
+				writeState(agentDir, successor);
+				writeOwnershipLock(agentDir, successor);
 			},
 			waitStepMs: 1,
 		}).reload({ gracefulTimeoutMs: 5 });
@@ -685,8 +693,9 @@ describe("TelegramDaemonController.reload", () => {
 	test("does not escalate or kill when ownership changes mid-wait", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState());
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const state = freshState();
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 
 		const alive = new Set<number>([999, process.pid, 1000]);
 		const signals: Array<[number, string]> = [];
@@ -700,7 +709,9 @@ describe("TelegramDaemonController.reload", () => {
 			sleep: async () => {
 				if (!mutated) {
 					mutated = true;
-					writeState(agentDir, freshState({ ownerId: "newer", pid: 1000 }));
+					const successor = freshState({ ownerId: "newer", pid: 1000 });
+					writeState(agentDir, successor);
+					writeOwnershipLock(agentDir, successor);
 				}
 			},
 			waitStepMs: 1,
@@ -716,8 +727,9 @@ describe("TelegramDaemonController.reload", () => {
 	test("without --force, an unresponsive old daemon is not killed or replaced", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState());
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const state = freshState();
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 		const alive = new Set<number>([999, process.pid]);
 		const signals: Array<[number, string]> = [];
 		let spawnCalls = 0;
@@ -934,7 +946,9 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	test("recovers when the steal lock is briefly held then released (bind-vs-heartbeat race)", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ heartbeatAt: 1 }));
+		const owner = freshState({ heartbeatAt: 1 });
+		writeState(agentDir, owner);
+		writeOwnershipLock(agentDir, owner);
 		const paths = daemonPaths(agentDir);
 		// A concurrent lifecycle op (e.g. bindProvisionalDaemonPid) holds the steal lock,
 		// releasing it after the first retry sleep.

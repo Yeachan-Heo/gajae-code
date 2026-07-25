@@ -204,4 +204,123 @@ describe("subagent warning injection", () => {
 		expect(result.rawOutput.includes("SYSTEM WARNING")).toBe(false);
 		expect(result.exitCode).toBe(0);
 	});
+
+	describe("rejected payload persistence", () => {
+		function rejectedEnvelope(result: ReturnType<typeof finalizeSubprocessOutput>) {
+			return JSON.parse(result.rawOutput) as { error: string; data: unknown };
+		}
+
+		it.each([499, 500, 501])("round-trips a rejected payload serialized to %i UTF-16 code units", length => {
+			const data = "x".repeat(length - 2);
+			expect(JSON.stringify(data)).toHaveLength(length);
+
+			const result = finalizeSubprocessOutput({
+				rawOutput: "ignored",
+				exitCode: 0,
+				stderr: "",
+				doneAborted: false,
+				signalAborted: false,
+				yieldItems: [{ status: "success", data }],
+				outputSchema: { type: "object" },
+			});
+
+			expect(rejectedEnvelope(result).data).toEqual(data);
+		});
+
+		it("preserves unicode and escaped content beyond the former preview boundary", () => {
+			const data = {
+				findings: [
+					{
+						message: `${"a".repeat(497)}😀"\\\n한국어`,
+						tail: "REJECTED-PAYLOAD-TAIL-SENTINEL",
+					},
+				],
+			};
+			const result = finalizeSubprocessOutput({
+				rawOutput: "ignored",
+				exitCode: 0,
+				stderr: "",
+				doneAborted: false,
+				signalAborted: false,
+				yieldItems: [{ status: "success", data }],
+				outputSchema: { type: "object", properties: { accepted: { type: "boolean" } }, required: ["accepted"] },
+			});
+
+			expect(rejectedEnvelope(result).data).toEqual(data);
+			expect(result.rawOutput).toContain("REJECTED-PAYLOAD-TAIL-SENTINEL");
+		});
+
+		it("preserves long findings in explicit yields, fallback completions, and placeholder rejections", () => {
+			const data = {
+				findings: Array.from({ length: 20 }, (_, index) => ({
+					title: `finding ${index}`,
+					body: `${"detail ".repeat(40)}${index === 19 ? "LONG-FINDINGS-TAIL-SENTINEL" : ""}`,
+					priority: 1,
+					confidence: 1,
+					file_path: "src/example.ts",
+					line_start: 1,
+					line_end: 1,
+				})),
+				tail: "LONG-FINDINGS-TAIL-SENTINEL",
+			};
+			const invalidSchema = {
+				type: "object",
+				properties: { accepted: { type: "boolean" } },
+				required: ["accepted"],
+			};
+			const explicit = finalizeSubprocessOutput({
+				rawOutput: "ignored",
+				exitCode: 0,
+				stderr: "",
+				doneAborted: false,
+				signalAborted: false,
+				yieldItems: [{ status: "success", data }],
+				outputSchema: invalidSchema,
+			});
+			const fallback = finalizeSubprocessOutput({
+				rawOutput: JSON.stringify({ data: { accepted: true } }),
+				exitCode: 0,
+				stderr: "",
+				doneAborted: false,
+				signalAborted: false,
+				yieldItems: undefined,
+				reportFindings: data.findings,
+				outputSchema: { ...invalidSchema, additionalProperties: false },
+			});
+			const placeholder = finalizeSubprocessOutput({
+				rawOutput: "ignored",
+				exitCode: 0,
+				stderr: "",
+				doneAborted: false,
+				signalAborted: false,
+				yieldItems: [{ status: "success", data: { ...data, plan_markdown: placeholderPlanText } }],
+				outputSchema: undefined,
+			});
+
+			for (const result of [explicit, fallback, placeholder]) {
+				expect(result.exitCode).toBe(1);
+				expect(result.rawOutput).toContain("LONG-FINDINGS-TAIL-SENTINEL");
+			}
+			expect(rejectedEnvelope(explicit).data).toEqual(data);
+			expect(rejectedEnvelope(fallback).data).toEqual({ accepted: true, findings: data.findings });
+			expect(rejectedEnvelope(placeholder).data).toEqual({ ...data, plan_markdown: placeholderPlanText });
+		});
+
+		it("preserves rejected data when the output schema itself is invalid", () => {
+			const data = { tail: "INVALID-SCHEMA-TAIL-SENTINEL", details: "x".repeat(600) };
+			const result = finalizeSubprocessOutput({
+				rawOutput: "ignored",
+				exitCode: 0,
+				stderr: "",
+				doneAborted: false,
+				signalAborted: false,
+				yieldItems: [{ status: "success", data }],
+				outputSchema: "{",
+			});
+
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain("invalid output schema");
+			expect(rejectedEnvelope(result).data).toEqual(data);
+		});
+	});
 });

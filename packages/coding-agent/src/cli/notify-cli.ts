@@ -413,6 +413,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 								settings,
 								cwd: process.cwd(),
 								sessionId: `notify-cli-${process.pid}`,
+								registerRoot: false,
 							}),
 				persistInactive: async marker => await persistTelegramActivationMarker(settings, marker),
 				clearInactive: async marker => await clearTelegramActivationMarker(settings, marker),

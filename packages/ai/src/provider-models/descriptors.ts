@@ -33,6 +33,7 @@ import {
 	openaiModelManagerOptions,
 	opencodeGoModelManagerOptions,
 	opencodeZenModelManagerOptions,
+	opengatewayModelManagerOptions,
 	openrouterModelManagerOptions,
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
@@ -311,6 +312,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"anthropic/claude-opus-4.6",
 		config => zenmuxModelManagerOptions(config),
 		catalog("ZenMux", ["ZENMUX_API_KEY"]),
+	),
+	catalogDescriptor(
+		"opengateway",
+		"openai/gpt-4o",
+		config => opengatewayModelManagerOptions(config),
+		catalog("OpenGateway by Sionic AI", ["OPENGATEWAY_API_KEY"]),
 	),
 	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
 	catalogDescriptor(

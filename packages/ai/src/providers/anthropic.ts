@@ -60,7 +60,12 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
-import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
+import {
+	getProviderFirstEventTimeoutFallbackMs,
+	getStreamFirstEventTimeoutMs,
+	getStreamIdleTimeoutMs,
+	iterateWithIdleTimeout,
+} from "../utils/idle-iterator";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -1416,7 +1421,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				firstTokenTime = undefined;
 			};
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
-			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
+			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
+			const firstEventTimeoutMs =
+				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.

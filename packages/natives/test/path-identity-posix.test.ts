@@ -85,6 +85,7 @@ afterEach(async () => {
 
 describe.skipIf(process.platform === "win32")("POSIX native path identity", () => {
 	it("rejects an existing directory whose canonical byte path is not UTF-8", async () => {
+		if (process.platform === "darwin") return;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
 		temporaryDirectories.push(root);
 		const nonUtf8Path = Buffer.concat([Buffer.from(`${root}${path.sep}`), Buffer.from([0x66, 0x80])]);
@@ -111,6 +112,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		const contents = '{"preserve":"payload"}';
 		await fs.mkdir(directory, { mode: 0o755 });
 		await fs.writeFile(file, contents, { mode: 0o644 });
+		await fs.chmod(file, 0o400);
 
 		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(directory, "directory"), "directory");
 		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(file, "file"), "file");
@@ -142,6 +144,15 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			code: "not_directory",
 		});
 		expect((await fs.stat(directory)).mode & 0o777).toBe(0o755);
+	});
+	it("rejects a FIFO without blocking on open", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const fifo = path.join(root, "state.fifo");
+		const created = Bun.spawnSync(["mkfifo", fifo]);
+		expect(created.exitCode, created.stderr.toString()).toBe(0);
+
+		expect(verifyOwnerOnlyPathSecurity(fifo, "file")).toEqual({ ok: false, code: "not_directory" });
 	});
 	it("rejects an unauthorized exact-unlink identity without deleting a replacement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));

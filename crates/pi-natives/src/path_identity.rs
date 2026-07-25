@@ -1,9 +1,8 @@
 //! Canonical directory identity and fail-closed path security helpers.
 
-use std::{
-	io::{self, Read},
-	path::{Component, Path, PathBuf},
-};
+#[cfg(any(unix, test))]
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 
 use napi::{
 	JsString,
@@ -339,6 +338,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn detached_failure_with_placeholder(
 		code: &str,
 		path: String,
@@ -354,6 +354,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn detached_failure_with_unknown(code: &str, path: String, unknown_path: String) -> Self {
 		Self {
 			ok: false,
@@ -365,6 +366,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn retained_placeholder_failure(code: &str, placeholder_path: String) -> Self {
 		Self {
 			ok: false,
@@ -376,6 +378,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn retained_unknown_failure(code: &str, unknown_path: String) -> Self {
 		Self {
 			ok: false,
@@ -418,6 +421,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 	hasher.finalize().into()
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn digest_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
 	let mut hasher = Sha256::new();
 	let mut chunk = [0u8; 16 * 1024];
@@ -507,6 +511,7 @@ impl NativeOwnerOnlySecurityResult {
 		}
 	}
 
+	#[cfg(target_os = "linux")]
 	fn linux_success(
 		kind: &str,
 		access_clear: &str,
@@ -534,6 +539,7 @@ impl NativeOwnerOnlySecurityResult {
 		}
 	}
 
+	#[cfg(target_os = "linux")]
 	fn linux_verified_success(kind: &str, access_query: &str, default_query: Option<&str>) -> Self {
 		Self {
 			ok:           true,
@@ -569,6 +575,7 @@ impl NativeOwnerOnlySecurityResult {
 		}
 	}
 
+	#[cfg(target_os = "linux")]
 	fn acl_failure(operation: &str, attribute: &str, category: &str) -> Self {
 		let code = match category {
 			"denied" => "acl_denied",
@@ -590,6 +597,7 @@ impl NativeOwnerOnlySecurityResult {
 	}
 }
 
+#[cfg(unix)]
 fn io_code(error: &io::Error) -> &'static str {
 	match error.kind() {
 		io::ErrorKind::NotFound => "not_found",
@@ -598,6 +606,7 @@ fn io_code(error: &io::Error) -> &'static str {
 	}
 }
 
+#[cfg(unix)]
 fn security_io_code(error: &io::Error) -> &'static str {
 	match error.kind() {
 		io::ErrorKind::NotFound => "not_found",
@@ -1024,15 +1033,18 @@ mod publication {
 }
 #[cfg(unix)]
 pub(crate) mod platform {
+	#[cfg(target_os = "linux")]
+	use std::os::unix::fs::MetadataExt;
 	#[cfg(test)]
 	use std::sync::{Mutex, OnceLock, mpsc};
 	use std::{
+		borrow::Cow,
 		ffi::CString,
 		fmt::Write as _,
 		fs::{self, File},
 		os::{
 			fd::{AsRawFd, FromRawFd},
-			unix::{ffi::OsStrExt, fs::MetadataExt},
+			unix::ffi::OsStrExt,
 		},
 		path::{Component, Path},
 	};
@@ -1064,7 +1076,7 @@ pub(crate) mod platform {
 	static AFTER_TREE_RENAME_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
 		OnceLock::new();
 
-	#[cfg(test)]
+	#[cfg(all(test, target_os = "linux"))]
 	pub(super) fn set_after_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*AFTER_EXCHANGE_HOOK
 			.get_or_init(|| Mutex::new(None))
@@ -1072,7 +1084,7 @@ pub(crate) mod platform {
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, target_os = "linux"))]
 	pub(super) fn set_before_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*BEFORE_EXCHANGE_HOOK
 			.get_or_init(|| Mutex::new(None))
@@ -1080,7 +1092,7 @@ pub(crate) mod platform {
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, target_os = "linux"))]
 	pub(super) fn set_after_placeholder_detach_hook(
 		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
 	) {
@@ -1090,17 +1102,7 @@ pub(crate) mod platform {
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
-	#[cfg(test)]
-	pub(super) fn set_after_tree_validation_hook(
-		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
-	) {
-		*AFTER_TREE_VALIDATION_HOOK
-			.get_or_init(|| Mutex::new(None))
-			.lock()
-			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
-	}
-
-	#[cfg(test)]
+	#[cfg(all(test, target_os = "linux"))]
 	pub(super) fn set_after_tree_rename_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*AFTER_TREE_RENAME_HOOK
 			.get_or_init(|| Mutex::new(None))
@@ -1295,6 +1297,22 @@ pub(crate) mod platform {
 		Ok(named)
 	}
 
+	#[allow(
+		clippy::missing_const_for_fn,
+		reason = "the macOS alias branch constructs a canonical owned path"
+	)]
+	fn descriptor_walk_path(path: &Path) -> Cow<'_, Path> {
+		#[cfg(target_os = "macos")]
+		{
+			for alias in ["/var", "/tmp", "/etc"] {
+				if let Ok(suffix) = path.strip_prefix(alias) {
+					return Cow::Owned(Path::new("/private").join(&alias[1..]).join(suffix));
+				}
+			}
+		}
+		Cow::Borrowed(path)
+	}
+
 	/// Open each component through retained directory descriptors. Every name is
 	/// lstat'd and then opened no-follow; the two identities must agree. `..`
 	/// is never accepted, so a pathname cannot escape the authority selected at
@@ -1307,7 +1325,12 @@ pub(crate) mod platform {
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
 		}
-		let base = if path.is_absolute() { b"/\0" } else { b".\0" };
+		let walk_path = descriptor_walk_path(path);
+		let base = if walk_path.is_absolute() {
+			b"/\0"
+		} else {
+			b".\0"
+		};
 		// SAFETY: base is a static NUL-terminated path and the flags request a
 		// no-follow directory descriptor.
 		let fd = unsafe {
@@ -1325,7 +1348,7 @@ pub(crate) mod platform {
 		let mut current = unsafe { File::from_raw_fd(fd) };
 		let mut edges = Vec::new();
 		let mut segments = Vec::new();
-		for component in path.components() {
+		for component in walk_path.components() {
 			match component {
 				Component::Normal(segment) => segments.push(segment.as_bytes().to_vec()),
 				Component::RootDir | Component::CurDir => {},
@@ -1371,13 +1394,39 @@ pub(crate) mod platform {
 		let name = CString::new(final_name)
 			.map_err(|_| NativeOwnerOnlySecurityResult::failure("io_error"))?;
 		let named = statat(&current, &name)?;
-		let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-		if kind == "directory" {
+		let expected_kind = if kind == "directory" {
+			libc::S_IFDIR
+		} else {
+			libc::S_IFREG
+		};
+		let is_directory = named.st_mode & libc::S_IFMT == libc::S_IFDIR;
+		if named.st_mode & libc::S_IFMT != expected_kind {
+			return Err(NativeOwnerOnlySecurityResult::failure("not_directory"));
+		}
+		let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDONLY;
+		if is_directory {
 			flags |= libc::O_DIRECTORY;
+		} else {
+			flags |= libc::O_NONBLOCK;
 		}
 		// SAFETY: current is retained, name is validated and NUL-terminated, and
 		// O_NOFOLLOW rejects symlinks.
 		let target_fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+		#[cfg(target_os = "macos")]
+		let target_fd = if target_fd < 0 && !is_directory {
+			let read_error = std::io::Error::last_os_error();
+			if read_error.raw_os_error() == Some(libc::EACCES) {
+				// A hostile macOS ACL may deny reads while leaving owner writes
+				// available. Retry only that denial with write authority so ACLs can
+				// be inspected and repaired without changing file contents.
+				// SAFETY: this retries the same retained parent and validated final component.
+				unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags | libc::O_WRONLY) }
+			} else {
+				return Err(NativeOwnerOnlySecurityResult::failure(security_code(&read_error)));
+			}
+		} else {
+			target_fd
+		};
 		if target_fd < 0 {
 			return Err(NativeOwnerOnlySecurityResult::failure(security_code(
 				&std::io::Error::last_os_error(),
@@ -1389,11 +1438,6 @@ pub(crate) mod platform {
 		if !stat_same_object(&named, &initial) {
 			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
 		}
-		let expected_kind = if kind == "directory" {
-			libc::S_IFDIR
-		} else {
-			libc::S_IFREG
-		};
 		if initial.st_mode & libc::S_IFMT != expected_kind {
 			return Err(NativeOwnerOnlySecurityResult::failure("not_directory"));
 		}
@@ -1875,7 +1919,7 @@ pub(crate) mod platform {
 	const ACL_FIRST_ENTRY: libc::c_int = 0;
 
 	#[cfg(target_os = "macos")]
-	fn macos_acl_unsupported(errno: Option<i32>) -> bool {
+	const fn macos_acl_unsupported(errno: Option<i32>) -> bool {
 		matches!(errno, Some(libc::ENOTSUP))
 	}
 
@@ -1893,6 +1937,7 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(target_os = "macos")]
+	#[allow(clippy::result_large_err, reason = "preserves operation-specific ACL failure evidence")]
 	fn clear_extended_acl(file: &File) -> Result<(), NativeOwnerOnlySecurityResult> {
 		// SAFETY: this creates an owned ACL allocation for the requested entry count.
 		let acl = unsafe { acl_init(1) };
@@ -1918,6 +1963,7 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(target_os = "macos")]
+	#[allow(clippy::result_large_err, reason = "preserves operation-specific ACL failure evidence")]
 	fn has_extended_acl(file: &File) -> Result<bool, NativeOwnerOnlySecurityResult> {
 		// SAFETY: the file descriptor is live; the returned ACL is freed exactly once.
 		let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
@@ -2575,7 +2621,12 @@ pub(crate) mod platform {
 		path: &Path,
 		identity: &ExactFileIdentity,
 	) -> NativeExactUnlinkResult {
-		let base = if path.is_absolute() { b"/\0" } else { b".\0" };
+		let walk_path = descriptor_walk_path(path);
+		let base = if walk_path.is_absolute() {
+			b"/\0"
+		} else {
+			b".\0"
+		};
 		// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 		// valid.
 		let mut parent_fd = unsafe {
@@ -2585,7 +2636,7 @@ pub(crate) mod platform {
 			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
 		}
 		let mut segments = Vec::new();
-		for component in path.components() {
+		for component in walk_path.components() {
 			match component {
 				Component::Normal(segment) => segments.push(segment.as_bytes().to_vec()),
 				Component::RootDir | Component::CurDir => {},
@@ -2892,7 +2943,12 @@ pub(crate) mod platform {
 	fn open_parent_no_follow(
 		path: &Path,
 	) -> Result<(libc::c_int, CString), Box<NativeExactUnlinkResult>> {
-		let base = if path.is_absolute() { b"/\0" } else { b".\0" };
+		let walk_path = descriptor_walk_path(path);
+		let base = if walk_path.is_absolute() {
+			b"/\0"
+		} else {
+			b".\0"
+		};
 		// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 		// valid.
 		let mut parent_fd = unsafe {
@@ -2904,7 +2960,7 @@ pub(crate) mod platform {
 			))));
 		}
 		let mut segments = Vec::new();
-		for component in path.components() {
+		for component in walk_path.components() {
 			match component {
 				Component::Normal(segment) => segments.push(segment.as_bytes().to_vec()),
 				Component::RootDir | Component::CurDir => {},

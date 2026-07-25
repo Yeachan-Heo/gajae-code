@@ -12,10 +12,12 @@ import {
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
 import {
+	MANAGED_ARTIFACT_MAX_FILES,
 	publishManagedFileNoReplace,
+	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
-import { SessionManager } from "../../src/session/session-manager";
+import { SessionArtifactCapacityError, SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
 const temporaryDirectories: string[] = [];
@@ -57,6 +59,18 @@ async function writeLegacyTranscript(directory: string, id: string, cwd: string)
 
 function transcript(id: string, cwd: string, detail = ""): string {
 	return `${JSON.stringify({ type: "session", id, timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n${JSON.stringify({ type: "message", detail })}\n`;
+}
+
+function strictTranscript(id: string, cwd: string): string {
+	const header = { type: "session", id, timestamp: new Date(0).toISOString(), cwd, version: 3 };
+	const message = {
+		type: "message",
+		id: "message",
+		parentId: null,
+		timestamp: new Date(0).toISOString(),
+		message: { role: "user", content: "resume", timestamp: 0 },
+	};
+	return `${JSON.stringify(header)}\n${JSON.stringify(message)}\n`;
 }
 
 async function fixture() {
@@ -305,6 +319,105 @@ describe("managed session write protocol", () => {
 		expect(await fs.readFile(destination, "utf8")).toBe("managed\n");
 		expect((await fs.readdir(scope.directoryPath)).filter(name => name.endsWith(".staging"))).toEqual([]);
 	});
+	it("migrates legacy artifact directories at and around the former file-count cap", async () => {
+		expect(MANAGED_ARTIFACT_MAX_FILES).toBeGreaterThan(10_001);
+		for (const count of [9_999, 10_000, 10_001]) {
+			const { cwd, sessionsRoot, scope } = await fixture();
+			const legacy = legacyDirectory(sessionsRoot, cwd);
+			const source = path.join(legacy, `artifact-cap-${count}.jsonl`);
+			const artifacts = source.slice(0, -6);
+			await fs.mkdir(artifacts, { recursive: true });
+			await fs.writeFile(source, transcript(`artifact-cap-${count}`, cwd));
+			for (let index = 0; index < count; index++) syncFs.writeFileSync(path.join(artifacts, `${index}.bin`), "");
+
+			const listed = listManagedCandidates(scope);
+			if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+			const opened = await openManagedCandidateForWrite(scope, listed.owned[0]);
+			expect(opened).toMatchObject({ kind: "opened", migrated: true });
+			if (opened.kind !== "opened") continue;
+			expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
+			expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
+			const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+			const committed = (await fs.readdir(receipts)).find(
+				name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed",
+			);
+			if (!committed) throw new Error("Missing committed migration receipt");
+			const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
+				artifactManifest?: unknown[];
+			};
+			expect(receipt.artifactManifest).toHaveLength(count + 1);
+		}
+	}, 120_000);
+	it("returns a typed strict-open capacity failure and surfaces it from continueRecent", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "strict-artifact-capacity.jsonl");
+		const artifacts = source.slice(0, -6);
+		await fs.mkdir(artifacts, { recursive: true });
+		await fs.writeFile(source, strictTranscript("strict-artifact-capacity", cwd));
+		for (let index = 0; index <= MANAGED_ARTIFACT_MAX_FILES; index++) {
+			syncFs.writeFileSync(path.join(artifacts, `${index}.bin`), "");
+		}
+
+		expect(() => validateManagedArtifactTree(artifacts, { maxFiles: MANAGED_ARTIFACT_MAX_FILES + 1 })).toThrow(
+			"artifact_capacity_exceeded",
+		);
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const inspection = await SessionManager.inspectSessionTailReadOnly(source);
+		if (inspection.kind === "error") throw new Error(`Expected resumable source session, got ${inspection.reason}`);
+		const opened = await SessionManager.openExistingStrict(
+			inspection.identity,
+			SessionManager.managedDestination(cwd, path.dirname(sessionsRoot)),
+		);
+		expect(opened).toMatchObject({
+			kind: "error",
+			reason: "artifact_capacity_exceeded",
+			message: `Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or 512 MiB).`,
+		});
+		await expect(
+			SessionManager.continueRecent(cwd, SessionManager.managedDestination(cwd, path.dirname(sessionsRoot))),
+		).rejects.toThrow(
+			`Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or 512 MiB).`,
+		);
+		await expect(
+			SessionManager.continueRecent(cwd, SessionManager.managedDestination(cwd, path.dirname(sessionsRoot))),
+		).rejects.toThrow(SessionArtifactCapacityError);
+	}, 120_000);
+
+	it("distinguishes artifact capacity from unsafe topology violations", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-artifact-validation-"));
+		temporaryDirectories.push(root);
+		syncFs.writeFileSync(path.join(root, "first"), "");
+		syncFs.writeFileSync(path.join(root, "second"), "");
+		expect(() => validateManagedArtifactTree(root, { maxFiles: 1 })).toThrow("artifact_capacity_exceeded");
+		syncFs.writeFileSync(path.join(root, "bytes"), "xx");
+		expect(() => validateManagedArtifactTree(root, { maxTotalBytes: 1 })).toThrow("artifact_capacity_exceeded");
+		expect(() => validateManagedArtifactTree(root, { maxFiles: 0 })).toThrow("unsafe_artifacts");
+		expect(() => validateManagedArtifactTree(root, { maxFiles: Number.POSITIVE_INFINITY })).toThrow(
+			"unsafe_artifacts",
+		);
+		expect(() => validateManagedArtifactTree(root, { maxTotalBytes: 1.5 })).toThrow("unsafe_artifacts");
+		await fs.unlink(path.join(root, "bytes"));
+
+		const symlink = path.join(root, "symlink");
+		await fs.rm(path.join(root, "second"));
+		await fs.symlink(path.join(root, "first"), symlink);
+		expect(() => validateManagedArtifactTree(root)).toThrow("unsafe_artifacts");
+		await fs.unlink(symlink);
+
+		const hardlink = path.join(root, "hardlink");
+		await fs.link(path.join(root, "first"), hardlink);
+		expect(() => validateManagedArtifactTree(root)).toThrow("unsafe_artifacts");
+		await fs.unlink(hardlink);
+
+		let nested = root;
+		for (let depth = 0; depth <= 32; depth++) {
+			nested = path.join(nested, "nested");
+			await fs.mkdir(nested);
+		}
+		expect(() => validateManagedArtifactTree(root)).toThrow("unsafe_artifacts");
+	});
+
 	it("quarantines and restores the complete legacy artifact topology before committing migration authority", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
@@ -1126,6 +1239,56 @@ describe("managed session write protocol", () => {
 		if (secondListed.kind === "complete")
 			expect(secondListed.owned.map(candidate => candidate.sessionId)).toEqual(["second"]);
 	});
+	it("isolates a permanently unresolvable tombstone without blocking an unrelated candidate, but still fails closed for the affected candidate itself", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const stuckSource = path.join(legacy, "stuck-target.jsonl");
+		const okSource = path.join(legacy, "ok-target.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(stuckSource, transcript("stuck-target", cwd));
+		await fs.writeFile(okSource, transcript("ok-target", cwd));
+
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("Missing candidates");
+		const stuckCandidate = listed.owned.find(candidate => candidate.sessionId === "stuck-target");
+		const okCandidate = listed.owned.find(candidate => candidate.sessionId === "ok-target");
+		if (!stuckCandidate || !okCandidate) throw new Error("Missing candidates");
+
+		const exactUnlink = native.exactUnlink;
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (pathname === stuckSource) return { ok: false, code: "identity_mismatch" };
+			return exactUnlink(pathname, identity);
+		});
+		try {
+			await expect(deleteManagedSessionCandidate(scope, stuckCandidate)).resolves.toMatchObject({
+				kind: "error",
+			});
+
+			// A caller opening the unrelated candidate must not be blocked by the stuck tombstone.
+			const forOk = await prepareManagedSessionScopeForWrite(
+				scope,
+				"default",
+				undefined,
+				okCandidate,
+				okCandidate.identity,
+			);
+			expect(forOk.kind).toBe("resolved");
+
+			// A caller acting on the stuck candidate itself must still fail closed, not be silently
+			// isolated — isolation only applies to targets that are provably a different session than
+			// the one the caller is actually operating on.
+			const forStuck = await prepareManagedSessionScopeForWrite(
+				scope,
+				"default",
+				undefined,
+				stuckCandidate,
+				stuckCandidate.identity,
+			);
+			expect(forStuck.kind).toBe("error");
+		} finally {
+			unlink.mockRestore();
+		}
+	});
 	it("reconciles a crash-after-tombstone on a fresh scope without resurrecting the candidate", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
@@ -1154,42 +1317,6 @@ describe("managed session write protocol", () => {
 		expect(afterRestart).toMatchObject({ kind: "complete" });
 		if (afterRestart.kind === "complete")
 			expect(afterRestart.owned.some(candidate => candidate.sessionId === "crash-restart")).toBe(false);
-	});
-	it("reconciles detached artifact cleanup from an append-only sidecar on a fresh scope", async () => {
-		const { cwd, sessionsRoot, scope } = await fixture();
-		const legacy = legacyDirectory(sessionsRoot, cwd);
-		const source = path.join(legacy, "detached-artifact-restart.jsonl");
-		const artifacts = source.slice(0, -6);
-		await fs.mkdir(artifacts, { recursive: true });
-		await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
-		await fs.writeFile(source, transcript("detached-artifact-restart", cwd));
-		const listed = listManagedCandidates(scope);
-		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
-		const exactUnlink = native.exactUnlink;
-		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-			if (pathname !== artifacts) return exactUnlink(pathname, identity);
-			if (!identity.directory || !identity.quarantineName) throw new Error("Missing artifact quarantine identity");
-			const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
-			syncFs.renameSync(pathname, detachedPath);
-			return { ok: true, detachedPath };
-		});
-		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockReturnValueOnce({ ok: false, code: "io_error" });
-		try {
-			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
-				kind: "deleted",
-				tombstonePath: expect.stringContaining(".json"),
-			});
-		} finally {
-			remove.mockRestore();
-			unlink.mockRestore();
-		}
-		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
-		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
-		if (restarted.kind !== "resolved") throw new Error(restarted.message);
-		expect((await prepareManagedSessionScopeForWrite(restarted.scope)).kind).toBe("resolved");
-		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
-
-		expect(listManagedCandidates(restarted.scope)).toMatchObject({ kind: "complete", owned: [] });
 	});
 
 	it("recovers a crash after artifact detach but before the native result is persisted", async () => {

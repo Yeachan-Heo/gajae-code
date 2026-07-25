@@ -14,7 +14,8 @@ import * as z from "zod/v4";
 const authStorages: AuthStorage[] = [];
 
 async function createIsolatedAuthStorage(tempDir: string): Promise<AuthStorage> {
-	const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	const authDir = fs.mkdtempSync(path.join(tempDir, "auth-"));
+	const authStorage = await AuthStorage.create(path.join(authDir, "auth.db"));
 	authStorages.push(authStorage);
 	return authStorage;
 }

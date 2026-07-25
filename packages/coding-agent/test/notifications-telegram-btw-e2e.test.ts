@@ -35,8 +35,11 @@ class Bot implements BotApi {
 		body: Record<string, unknown>;
 		options?: { noRetry?: boolean; signal?: AbortSignal };
 	}> = [];
+	constructor(private readonly beforeCall?: (method: string, body: Record<string, unknown>) => void | Promise<void>) {}
 	async call(method: string, body: unknown, options?: { noRetry?: boolean; signal?: AbortSignal }): Promise<unknown> {
-		this.calls.push({ method, body: body as Record<string, unknown>, options });
+		const callBody = body as Record<string, unknown>;
+		this.calls.push({ method, body: callBody, options });
+		if (this.beforeCall) await this.beforeCall(method, callBody);
 		switch (method) {
 			case "getChat":
 				return { ok: true, result: { type: "private" } };
@@ -210,7 +213,26 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 			inbound.push(frame as unknown as Record<string, unknown>);
 		});
 		await server.start();
-		const bot = new Bot();
+		let terminalReplyGate:
+			| {
+					text: string;
+					started: PromiseWithResolvers<void>;
+					release: PromiseWithResolvers<void>;
+					injected: boolean;
+					injectDuplicate: () => void;
+			  }
+			| undefined;
+		const bot = new Bot((method, body) => {
+			const richMessage = body.rich_message as { markdown?: unknown } | undefined;
+			if (!terminalReplyGate || method !== "sendRichMessage" || richMessage?.markdown !== terminalReplyGate.text)
+				return;
+			terminalReplyGate.started.resolve();
+			if (!terminalReplyGate.injected) {
+				terminalReplyGate.injected = true;
+				terminalReplyGate.injectDuplicate();
+			}
+			return terminalReplyGate.release.promise;
+		});
 		const daemon = new TelegramNotificationDaemon({
 			settings,
 			ownerId: "owner",
@@ -238,7 +260,9 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 			await sleep(80);
 			const terminalDispatchCount = () =>
 				bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage").length;
+			const terminalRichDispatchCount = () => bot.count("sendRichMessage");
 			const before = terminalDispatchCount();
+			const richBefore = terminalRichDispatchCount();
 			await daemon.handleTelegramUpdate({
 				update_id: 7,
 				message: { message_id: 70, chat: { id: 42 }, message_thread_id: THREAD_ID, text: "/btw status?" },
@@ -280,6 +304,15 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 				await sleep(40);
 				expect(terminalDispatchCount(), JSON.stringify(mismatch)).toBe(before);
 			}
+			// This frame is not an operator-routed event; bypass the unrelated router so
+			// the duplicate test drives concurrent terminal-handler admissions directly.
+			const sessionRouter = (
+				daemon as unknown as {
+					sessionRouter: { dispatch: (session: unknown, message: unknown) => Promise<boolean> };
+				}
+			).sessionRouter;
+			const originalDispatch = sessionRouter.dispatch;
+			sessionRouter.dispatch = async () => false;
 			const terminal = {
 				type: "ephemeral_turn_result",
 				sessionId,
@@ -288,15 +321,43 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 				messageId: 70,
 				threadId: String(THREAD_ID),
 				status: "ok",
-				text: "ephemeral answer",
+				text: "| Formula | Value |\n| --- | --- |\n| $x^2$ | 4 |",
+			};
+			// Let startup's identity/topic outbound traffic settle before arming a fresh,
+			// terminal-text-scoped barrier for the duplicate-delivery race.
+			await new Promise<void>(resolve => setImmediate(resolve));
+			await new Promise<void>(resolve => setImmediate(resolve));
+			let duplicate: Promise<void> | undefined;
+			const duplicateHandlerEntered = Promise.withResolvers<void>();
+			terminalReplyGate = {
+				text: terminal.text,
+				started: Promise.withResolvers<void>(),
+				release: Promise.withResolvers<void>(),
+				injected: false,
+				injectDuplicate: () => {
+					duplicate = daemon.handleSessionMessage(daemon.sessions.get(sessionId)!, terminal);
+					duplicateHandlerEntered.resolve();
+				},
 			};
 			server.sendTo(connectionId, JSON.stringify(terminal));
+			await terminalReplyGate.started.promise;
+			await duplicateHandlerEntered.promise;
+			await new Promise<void>(resolve => setImmediate(resolve));
+			expect(terminalRichDispatchCount()).toBe(richBefore + 1);
+			terminalReplyGate.release.resolve();
+			await duplicate;
 			await waitFor(() => terminalDispatchCount() === before + 1, "Telegram terminal dispatch");
+			await new Promise<void>(resolve => setImmediate(resolve));
+			await new Promise<void>(resolve => setImmediate(resolve));
+			expect(terminalDispatchCount()).toBe(before + 1);
+			// Once the first delivery has terminalized, the tombstone must also suppress a
+			// late duplicate after the in-flight-delivery guard has been released.
 			server.sendTo(connectionId, JSON.stringify(terminal));
-			await sleep(80);
+			await new Promise<void>(resolve => setImmediate(resolve));
 			expect(terminalDispatchCount()).toBe(before + 1);
 			const reply = bot.calls.at(-1)!;
 			expect(reply.body).toMatchObject({ chat_id: "42", message_thread_id: THREAD_ID });
+			sessionRouter.dispatch = originalDispatch;
 		} finally {
 			daemon.requestStop();
 			server.stop();

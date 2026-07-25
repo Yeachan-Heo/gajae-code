@@ -660,7 +660,7 @@ export class TUI extends Container {
 	readonly #useImeBlockCursor = $flag("GJC_TUI_IME_CURSOR", process.platform === "darwin");
 	// showHardwareCursor=false but cursor is shown for IME anchoring (macOS).
 	#imeCursorActive = false;
-	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
+	#clearOnShrink = $pickflag("GJC_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
 	// Default-on: reuse the previous normalized off-screen prefix and only normalize/diff the
 	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical;
 	// set PI_TUI_VIRTUAL_VIEWPORT=0 to restore legacy full-transcript normalization.
@@ -693,7 +693,7 @@ export class TUI extends Container {
 
 	static #readDebugRedrawFlag(): boolean {
 		TUI.#renderCounters.debugRedrawEnvReads += 1;
-		return $flag("PI_DEBUG_REDRAW");
+		return $pickflag("GJC_DEBUG_REDRAW", "PI_DEBUG_REDRAW");
 	}
 
 	#appendDebugRedrawLog(message: string): void {
@@ -2451,7 +2451,7 @@ export class TUI extends Container {
 
 		// Content shrunk below the previous render and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
-		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
+		// Configurable via setClearOnShrink() or GJC_CLEAR_ON_SHRINK=0 env var
 		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
 			if (
@@ -2662,7 +2662,7 @@ export class TUI extends Container {
 		buffer += seq;
 		buffer += "\x1b[?2026l"; // End synchronized output
 
-		if ($flag("PI_TUI_DEBUG")) {
+		if ($pickflag("GJC_TUI_DEBUG", "PI_TUI_DEBUG")) {
 			const debugDir = "/tmp/tui";
 			fs.mkdirSync(debugDir, { recursive: true });
 			const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);

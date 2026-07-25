@@ -547,6 +547,13 @@ export class SessionMigrationPolicyError extends Error {
 	}
 }
 
+export class SessionArtifactCapacityError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionArtifactCapacityError";
+	}
+}
+
 export type ResumeTailInspection = ResumeTailResumable | ResumeTailTerminal | ResumeTailError;
 export interface StrictSessionOpenSuccess {
 	kind: "opened";
@@ -555,7 +562,8 @@ export interface StrictSessionOpenSuccess {
 
 export interface StrictSessionOpenFailure {
 	kind: "error";
-	reason: ResumeTailError["reason"] | "identity-mismatch" | "migration-required";
+	reason: ResumeTailError["reason"] | "identity-mismatch" | "migration-required" | "artifact_capacity_exceeded";
+	message?: string;
 }
 
 /** Exact transcript bytes and authority captured from one descriptor-bound read. */
@@ -7347,6 +7355,7 @@ export class SessionManager {
 		if (opened.kind === "error") {
 			managedDestinationStore.assertBound();
 			if (opened.code === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
+			if (opened.code === "artifact_capacity_exceeded") throw new SessionArtifactCapacityError(opened.message);
 			throw new Error(`Could not open managed session: ${opened.message}`);
 		}
 		assertManagedDestinationBound();
@@ -7857,6 +7866,8 @@ export class SessionManager {
 			} catch (error) {
 				if (error instanceof SessionMigrationPolicyError)
 					return { kind: "error", reason: "legacy_migration_disabled" };
+				if (error instanceof SessionArtifactCapacityError)
+					return { kind: "error", reason: "artifact_capacity_exceeded", message: error.message };
 				if (
 					error instanceof Error &&
 					(error.message.includes("source_changed") || error.message.includes("changed before migration"))
@@ -7915,6 +7926,10 @@ export class SessionManager {
 			);
 			if (opened.kind === "error") {
 				if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
+				if (opened.reason === "artifact_capacity_exceeded")
+					throw new SessionArtifactCapacityError(
+						opened.message ?? "Session artifacts exceed the migration capacity.",
+					);
 				return undefined;
 			}
 			return opened.manager;

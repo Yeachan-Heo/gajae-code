@@ -55,6 +55,7 @@ describe("AgentSession retry fallback", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
 		authStorage.setRuntimeApiKey("openai", "openai-test-key");
+		authStorage.setRuntimeApiKey("alibaba-token-plan", "alibaba-token-plan-test-key");
 		authStorage.setRuntimeApiKey("google", "google-test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
@@ -446,6 +447,64 @@ describe("AgentSession retry fallback", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
 	});
 
+	it("does not replay a Kimi Code first-event timeout through a managed fallback chain", async () => {
+		const primary = getBundledModel("kimi-code", "kimi-k2.5");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback) throw new Error("Expected bundled Kimi and Anthropic test models");
+		authStorage.setRuntimeApiKey("kimi-code", "kimi-test-key");
+
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				const stream = new AssistantMessageEventStream();
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [],
+					api: requestedModel.api,
+					provider: requestedModel.provider,
+					model: requestedModel.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "error",
+					errorMessage: "Provider stream timed out while waiting for the first event",
+					timestamp: Date.now(),
+				};
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "error", reason: "error", error: message });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 2 });
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+
+		await session.prompt("slow Kimi request");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
+		expect(getLastAssistantMessage(session)).toMatchObject({
+			provider: "kimi-code",
+			stopReason: "error",
+			errorMessage: "Provider stream timed out while waiting for the first event",
+		});
+		expect(session.model).toMatchObject({ provider: primary.provider, id: primary.id });
+	});
 	it("keeps a managed fallback selection sticky across later user prompts", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
@@ -542,6 +601,88 @@ describe("AgentSession retry fallback", () => {
 			`${fallback.provider}/${fallback.id}`,
 			`${fallback.provider}/${fallback.id}`,
 		]);
+	});
+
+	it("surfaces an exact Alibaba timeout before managed transport fallback precedence", async () => {
+		const primary = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+
+		const requestedModels: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, _context, _options) => {
+				calls++;
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: requestedModel.api,
+						provider: requestedModel.provider,
+						model: requestedModel.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "error",
+						errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+						transportFailure: { kind: "transport", status: 503 },
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"fallback.maxAttempts": 1,
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") switches.push(event);
+		});
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Do not replay exact Alibaba timeout through managed fallback");
+		await session.waitForIdle();
+
+		expect(calls).toBe(1);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
+		expect(switches).toHaveLength(0);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(0);
+		expect(waitSpy).not.toHaveBeenCalled();
+		expect(session.isRetrying).toBe(false);
+		expect(session.isStreaming).toBe(false);
+		const final = getLastAssistantMessage(session);
+		expect(final).toMatchObject({
+			stopReason: "error",
+			provider: primary.provider,
+			api: primary.api,
+			model: primary.id,
+			errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+			transportFailure: { kind: "transport", status: 503 },
+		});
+		expect(final.errorMessage).not.toContain("Model fallback chain exhausted");
 	});
 
 	it("treats legacy usage-limit text without transport facts as terminal for a managed chain", async () => {

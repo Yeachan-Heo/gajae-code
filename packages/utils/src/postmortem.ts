@@ -5,9 +5,12 @@
  * in response to process exit, signals, or fatal exceptions. It is intended to
  * allow reliably releasing resources or shutting down subprocesses, files, sockets, etc.
  */
+import * as fs from "node:fs";
 import inspector from "node:inspector";
+import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
+import { getCrashLogPath } from "./dirs";
 import * as logger from "./logger";
 import { safeStderrWrite } from "./safe-stderr";
 
@@ -204,6 +207,104 @@ function formatFatalError(label: string, err: Error): string {
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
 	return `\n[${label}] ${name}: ${message}${formattedStack}\n`;
 }
+/** Cap for the durable crash log; it is reset past this so a crash loop cannot fill the disk. */
+export const CRASH_LOG_MAX_BYTES = 512 * 1024;
+/**
+ * Per-record budget so a single oversized error body cannot bypass the file
+ * cap: every persisted record is truncated to this many bytes (UTF-8 safe,
+ * with a marker) before the append/reset decision.
+ */
+export const CRASH_RECORD_MAX_BYTES = 64 * 1024;
+const CRASH_RECORD_TRUNCATION_MARKER = "\n… [crash record truncated]\n\n";
+
+/**
+ * Best-effort scrub of credential material from a crash record before it is
+ * persisted indefinitely. Covers bearer/basic-style headers, key=value or
+ * JSON key forms of common credential names, and well-known vendor token
+ * shapes. Normal messages and stack frames are untouched; matches are
+ * replaced in place so surrounding diagnostic context survives.
+ */
+function redactCrashSecrets(text: string): string {
+	let redacted = text;
+	redacted = redacted.replace(/\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "«redacted-auth»");
+	redacted = redacted.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "«redacted-jwt»");
+	redacted = redacted.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");
+	redacted = redacted.replace(/\bgh[opsur]_[A-Za-z0-9]{16,}\b/g, "«redacted-github-token»");
+	redacted = redacted.replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, "«redacted-slack-token»");
+	redacted = redacted.replace(/\bAKIA[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	redacted = redacted.replace(
+		/(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|secret[_-]?key|password|passwd|authorization)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		"$1«redacted»",
+	);
+	return redacted;
+}
+
+/**
+ * Bound one record to CRASH_RECORD_MAX_BYTES without splitting a UTF-8
+ * sequence. Keeps the header (timestamp/label/message) at the front, where
+ * the diagnostic value is highest.
+ */
+function boundCrashRecord(report: string): string {
+	if (Buffer.byteLength(report, "utf8") <= CRASH_RECORD_MAX_BYTES) return report;
+	const bytes = Buffer.from(report, "utf8");
+	const budget = CRASH_RECORD_MAX_BYTES - Buffer.byteLength(CRASH_RECORD_TRUNCATION_MARKER, "utf8");
+	let end = budget;
+	// Drop trailing continuation bytes of a truncated multi-byte sequence.
+	while (end > 0 && (bytes[end - 1] & 0xc0) === 0x80) end--;
+	// Drop the now-incomplete lead byte, if any.
+	if (end > 0 && bytes[end - 1] >= 0xc0) end--;
+	return bytes.subarray(0, end).toString("utf8") + CRASH_RECORD_TRUNCATION_MARKER;
+}
+
+/**
+ * Append a fatal-crash record to the dedicated, rotation-immune crash log
+ * (`~/.gjc/agent/gjc-crash.log`).
+ *
+ * The daily logger file is gzip-archived at date rollover by every gjc process
+ * independently; that shared-archive race can truncate a day's log to an empty
+ * `.gz`, destroying the `logger.error` crash record written here. This
+ * append-only file is never rotated, so a crash stays diagnosable regardless.
+ *
+ * Fully defensive: it never throws (a failing crash writer must not mask the
+ * original fatal) and uses synchronous IO so the record lands before
+ * `process.exit`. Returns the path written, or `undefined` on failure.
+ */
+export function recordFatalCrash(
+	label: string,
+	reason: unknown,
+	options: { path?: string; now?: Date } = {},
+): string | undefined {
+	try {
+		const err = errorForDiagnostic(reason);
+		const target = options.path ?? getCrashLogPath();
+		const now = options.now ?? new Date();
+		const report = boundCrashRecord(
+			`${now.toISOString()} pid=${process.pid} [${label}] ` +
+				`${err.name || "Error"}: ${redactCrashSecrets(err.message || "(no message)")}\n` +
+				`${redactCrashSecrets(err.stack ?? "")}\n\n`,
+		);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		let existingSize = 0;
+		try {
+			existingSize = fs.statSync(target).size;
+		} catch {}
+		// Reset (rather than append) when the file would exceed the cap so the
+		// newest crash is always retained without unbounded growth. Every record
+		// is individually bounded above, so no single crash can bypass the cap.
+		if (existingSize + Buffer.byteLength(report, "utf8") > CRASH_LOG_MAX_BYTES) {
+			fs.writeFileSync(target, report, { mode: 0o600 });
+		} else {
+			fs.appendFileSync(target, report, { mode: 0o600 });
+		}
+		// A pre-existing file may carry looser permissions; enforce owner-only.
+		try {
+			fs.chmodSync(target, 0o600);
+		} catch {}
+		return target;
+	} catch {
+		return undefined;
+	}
+}
 
 async function exitQuietlyForAttributableStdoutEpipe(reason: Reason): Promise<void> {
 	if (ordinaryFatalStarted || quietShutdownStarted) return;
@@ -226,7 +327,12 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	ordinaryFatalStarted = true;
 	process.exitCode = 1;
 	const err = errorForDiagnostic(reason);
+	// Persist first: the rotation-immune record must land before any
+	// best-effort stderr output, so a slow or failing stderr cannot cost the
+	// crash record. Cleanup (which may itself hang or fail) runs afterwards.
+	const crashLogPath = recordFatalCrash(label, err);
 	safeStderrWrite(formatFatalError(label, err));
+	if (crashLogPath) safeStderrWrite(`[${label}] crash recorded at ${crashLogPath}\n`);
 	if (!quietShutdownStarted) {
 		logger.error(label === "Uncaught Exception" ? "Uncaught exception" : "Unhandled rejection", {
 			err,

@@ -10,9 +10,11 @@ const script = path.join(packageRoot, "test", "fixtures", "sdk-mcp-entrypoint-e2
 // rejected before any send. It exits nonzero with a thrown error otherwise.
 test("gjc mcp-serve sdk serves the SDK MCP adapter end-to-end", async () => {
 	const child = Bun.spawn(["bun", script], { cwd: packageRoot, stdout: "pipe", stderr: "pipe" });
-	const exitCode = await child.exited;
-	const stdout = await new Response(child.stdout).text();
-	const stderr = await new Response(child.stderr).text();
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
 	expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
 	expect(stdout).toContain("MCP-SDK-E2E-OK");
 	expect(stdout).toContain("query_request");

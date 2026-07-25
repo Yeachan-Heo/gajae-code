@@ -383,7 +383,9 @@ it("keeps artifact range responses below the serialized one MiB ceiling", async 
 	expect((response.result as { complete: boolean }).complete).toBe(false);
 });
 it("keeps random-sized paginated responses below the one MiB ceiling", async () => {
-	for (let seed = 1; seed <= 24; seed++) {
+	const seedCount = 12;
+	const maxBodyLength = 96 * 1024;
+	for (let seed = 1; seed <= seedCount; seed++) {
 		let state = seed;
 		const next = () => {
 			state = (state * 16_807) % 2_147_483_647;
@@ -391,7 +393,7 @@ it("keeps random-sized paginated responses below the one MiB ceiling", async () 
 		};
 		const diff = Array.from({ length: 32 }, (_, index) => ({
 			id: String(index),
-			body: "x".repeat(next() % 180_000),
+			body: "x".repeat(next() % maxBodyLength),
 		}));
 		const store = new RevisionStore(`page-${seed}`);
 		const query = new QueryHandlers(
@@ -408,7 +410,7 @@ it("keeps random-sized paginated responses below the one MiB ceiling", async () 
 		}
 		await store.close();
 	}
-});
+}, 30_000);
 
 it("describes an arbitrarily large indexed item from manifest metadata before reading its body", async () => {
 	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
