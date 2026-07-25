@@ -49,7 +49,6 @@ import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
 	SessionResolutionError,
-	writeSessionActivityMarker,
 	writeSessionActivityMarkerForSession,
 } from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
@@ -600,7 +599,23 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 	reason: string;
 	currentGoalObjective?: string;
 }): Promise<UltragoalNudgeOutcome> {
-	const { cwd, sessionId, target, surface, budget, reason } = input;
+	const session = resolveUltragoalSessionForWrite(input.cwd, input.sessionId);
+	return recordUltragoalNudgeForSession(input, session);
+}
+
+/** @internal Context-preserving entry point for admitted-session callers and regressions. */
+export async function recordUltragoalNudgeForSession(
+	input: {
+		cwd: string;
+		target: UltragoalNudgeTarget;
+		surface: UltragoalNudgeSurface;
+		budget: number;
+		reason: string;
+		currentGoalObjective?: string;
+	},
+	session: GjcSessionContext,
+): Promise<UltragoalNudgeOutcome> {
+	const { cwd, target, surface, budget, reason } = input;
 	if (!Number.isFinite(budget) || budget <= 0) {
 		return {
 			nudged: false,
@@ -611,13 +626,11 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 			targetKind: target.targetKind,
 		};
 	}
-	const session = resolveUltragoalSessionForWrite(cwd, sessionId);
-	const resolvedSessionId = session.gjcSessionId;
 	const paths = getUltragoalPathsForSessionRoot(session.sessionRoot);
 	return withWorkflowStateLock(
 		paths.ledgerPath,
 		async () => {
-			const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+			const ledger = await readUltragoalLedgerForSession(session);
 			const count = countUltragoalNudges(ledger, target.goalId);
 			if (count >= budget) {
 				return {
@@ -630,20 +643,16 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 				} as const;
 			}
 			const attempt = count + 1;
-			const entry = (await appendLedger(
-				cwd,
-				{
-					event: "nudge",
-					goalId: target.goalId,
-					targetKind: target.targetKind,
-					surface,
-					attempt,
-					budget,
-					reason,
-					...(input.currentGoalObjective ? { currentGoalObjective: input.currentGoalObjective } : {}),
-				},
-				resolvedSessionId,
-			)) as UltragoalNudgeLedgerEvent;
+			const entry = (await appendLedgerForSession(cwd, session, {
+				event: "nudge",
+				goalId: target.goalId,
+				targetKind: target.targetKind,
+				surface,
+				attempt,
+				budget,
+				reason,
+				...(input.currentGoalObjective ? { currentGoalObjective: input.currentGoalObjective } : {}),
+			})) as UltragoalNudgeLedgerEvent;
 			return {
 				nudged: true,
 				attempt,
@@ -659,19 +668,36 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 
 export async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: string | null): Promise<void> {
 	const session = resolveUltragoalSessionForWrite(cwd, sessionId);
+	return writePlanForSession(cwd, plan, session);
+}
+
+/** @internal Context-preserving entry point for admitted-session callers and regressions. */
+export async function writePlanForSession(cwd: string, plan: UltragoalPlan, session: GjcSessionContext): Promise<void> {
 	const resolvedSessionId = session.gjcSessionId;
 	const paths = getUltragoalPathsForSessionRoot(session.sessionRoot);
 	await writeArtifact(paths.briefPath, `${plan.brief.trim()}\n`, {
 		cwd,
-		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
+		audit: {
+			category: "artifact",
+			verb: "write",
+			owner: "gjc-runtime",
+			sessionId: resolvedSessionId,
+			sessionRoot: session.sessionRoot,
+		},
 	});
 	await writeGuardedJsonAtomic(paths.goalsPath, plan, {
 		cwd,
 		policy: "source",
 		expectedRevision: typeof plan.state_revision === "number" ? persistedStateRevision(plan) : undefined,
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
+		audit: {
+			category: "state",
+			verb: "write",
+			owner: "gjc-runtime",
+			sessionId: resolvedSessionId,
+			sessionRoot: session.sessionRoot,
+		},
 	});
-	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.goalsPath });
+	await writeSessionActivityMarkerForSession(session, { writer: "ultragoal-runtime", path: paths.goalsPath });
 }
 
 function chooseReceiptKind(
@@ -1452,8 +1478,16 @@ function emptyCounts(): Record<UltragoalGoalStatus, number> {
 
 export async function getUltragoalStatus(cwd: string, sessionId?: string | null): Promise<UltragoalStatusSummary> {
 	const session = await resolveUltragoalSessionForRead(cwd, sessionId);
+	return getUltragoalStatusForSession(cwd, session);
+}
+
+/** @internal Context-preserving entry point for admitted-session callers and regressions. */
+export async function getUltragoalStatusForSession(
+	cwd: string,
+	session: GjcSessionContext,
+): Promise<UltragoalStatusSummary> {
 	const paths = getUltragoalPathsForSessionRoot(session.sessionRoot);
-	const plan = await readUltragoalPlan(cwd, session.gjcSessionId);
+	const plan = await readUltragoalPlanForSession(session);
 	const counts = emptyCounts();
 	if (!plan) return { exists: false, status: "missing", paths, counts, goals: [] };
 	for (const goal of plan.goals) counts[goal.status] += 1;
@@ -1469,7 +1503,7 @@ export async function getUltragoalStatus(cwd: string, sessionId?: string | null)
 	let nudgeFields: Partial<UltragoalStatusSummary> = {};
 	if (nudgeTarget) {
 		const { budget } = await resolveUltragoalNudgeBudget(cwd);
-		const ledger = await readUltragoalLedger(cwd, session.gjcSessionId);
+		const ledger = await readUltragoalLedgerForSession(session);
 		const nudgeCount = countUltragoalNudges(ledger, nudgeTarget.goalId);
 		nudgeFields = {
 			nudgeBudget: budget,

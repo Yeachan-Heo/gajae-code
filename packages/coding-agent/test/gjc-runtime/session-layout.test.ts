@@ -167,6 +167,31 @@ describe("session-resolution (boundary)", () => {
 		).rejects.toThrow();
 		await expect(fs.stat(path.join(legacySessionRoot(cwd, "duplicate"), ".session-activity.json"))).rejects.toThrow();
 	});
+	it("rejects explicit resolution through a symlinked canonical sessions parent", async () => {
+		const cwd = await tempDir();
+		const outside = await tempDir();
+		await fs.mkdir(path.join(outside, "_session-escaped"), { recursive: true });
+		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
+		await fs.symlink(outside, gjcSessionsRoot(cwd));
+
+		expect(() => resolveGjcSessionForWrite(cwd, { flagValue: "escaped" })).toThrow(
+			/must not traverse a symbolic link/,
+		);
+	});
+	it("rejects latest discovery through a symlinked canonical sessions parent", async () => {
+		const cwd = await tempDir();
+		const outside = await tempDir();
+		const escapedRoot = path.join(outside, "_session-escaped");
+		await fs.mkdir(escapedRoot, { recursive: true });
+		await fs.writeFile(
+			path.join(escapedRoot, ".session-activity.json"),
+			`${JSON.stringify({ updated_at: new Date().toISOString() })}\n`,
+		);
+		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
+		await fs.symlink(outside, gjcSessionsRoot(cwd));
+
+		await expect(detectLatestSession(cwd)).rejects.toThrow(/must not traverse a symbolic link/);
+	});
 
 	it("read resolution errors when zero session dirs exist", async () => {
 		const cwd = await tempDir();

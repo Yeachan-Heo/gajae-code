@@ -162,8 +162,36 @@ function duplicateSessionError(gjcSessionId: string): SessionResolutionError {
 	return new SessionResolutionError(`duplicate GJC session roots for session id "${gjcSessionId}"`, "duplicate");
 }
 
-function isDirectory(root: string): boolean {
+function assertSessionPathAuthority(cwd: string, candidate: string): void {
+	const projectGjcRoot = path.resolve(gjcRoot(cwd));
+	const resolvedCandidate = path.resolve(candidate);
+	const relative = path.relative(projectGjcRoot, resolvedCandidate);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) {
+		throw new SessionResolutionError(`GJC session path escapes project .gjc: ${candidate}`, "unsafe_session");
+	}
+	const segments = relative === "" ? [] : relative.split(path.sep);
+	let current = projectGjcRoot;
+	for (const segment of ["", ...segments]) {
+		if (segment) current = path.join(current, segment);
+		let stat: fsSync.Stats;
+		try {
+			stat = fsSync.lstatSync(current);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		if (stat.isSymbolicLink()) {
+			throw new SessionResolutionError(
+				`GJC session path must not traverse a symbolic link: ${current}`,
+				"unsafe_session",
+			);
+		}
+	}
+}
+
+function isDirectory(cwd: string, root: string): boolean {
 	try {
+		assertSessionPathAuthority(cwd, root);
 		const stat = fsSync.lstatSync(root);
 		if (stat.isSymbolicLink()) {
 			throw new SessionResolutionError(`GJC session root must not be a symbolic link: ${root}`, "unsafe_session");
@@ -179,8 +207,8 @@ function isDirectory(root: string): boolean {
 function resolveExistingSessionContext(cwd: string, gjcSessionId: string, source: GjcSessionSource): GjcSessionContext {
 	const canonicalRoot = canonicalSessionRoot(cwd, gjcSessionId);
 	const legacyRoot = legacySessionRoot(cwd, gjcSessionId);
-	const hasCanonical = isDirectory(canonicalRoot);
-	const hasLegacy = isDirectory(legacyRoot);
+	const hasCanonical = isDirectory(cwd, canonicalRoot);
+	const hasLegacy = isDirectory(cwd, legacyRoot);
 	if (hasCanonical && hasLegacy) throw duplicateSessionError(gjcSessionId);
 	if (hasLegacy) return { gjcSessionId, sessionRoot: legacyRoot, layout: "legacy", source };
 	return {
@@ -198,6 +226,7 @@ async function collectActiveSessionCandidates(cwd: string): Promise<SessionCandi
 	];
 	const sessions = new Map<string, { sessionRoot: string; layout: GjcSessionLayout }>();
 	for (const [layout, root] of roots) {
+		assertSessionPathAuthority(cwd, root);
 		let entries: Dirent[];
 		try {
 			entries = await fs.readdir(root, { withFileTypes: true });
