@@ -1045,7 +1045,7 @@ export class ModelRegistry {
 		{ fresh: boolean; modelIds: ReadonlySet<string>; authGeneration: string; endpoint: string }
 	>();
 	#descriptorDiscoveryGenerations = new Map<string, number>();
-	#configuredDiscoveryAuthGenerations = new Map<string, string>();
+	#configuredDiscoveryEvidence = new Map<string, { authGeneration: string; endpoint: string }>();
 	#discoveryManager = new ModelDiscoveryManager<DiscoveryProviderConfig>();
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
@@ -1151,7 +1151,7 @@ export class ModelRegistry {
 		this.#keylessProviders.clear();
 		this.#discoveryManager.reset();
 		for (const descriptor of PROVIDER_DESCRIPTORS) this.#clearDescriptorDiscoveryEvidence(descriptor.providerId);
-		this.#configuredDiscoveryAuthGenerations.clear();
+		this.#configuredDiscoveryEvidence.clear();
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
@@ -1768,10 +1768,15 @@ export class ModelRegistry {
 				? this.#discoveryManager.providers.filter(provider => providerFilter.has(provider.provider))
 				: this.#discoveryManager.providers
 		).filter(provider => !disabledProviders.has(provider.provider));
-		const configuredDiscoveryAuthGenerations = new Map(
+		const configuredDiscoveryEvidence = new Map(
 			selectedDiscoverableProviders.map(provider => [
 				provider.provider,
-				this.authStorage.getProviderEvidenceGeneration(provider.provider),
+				{
+					authGeneration: this.authStorage.getProviderEvidenceGeneration(provider.provider),
+					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(
+						this.#getProviderBaseUrlForDiscovery(provider.provider) ?? "",
+					),
+				},
 			]),
 		);
 		const configuredDiscoveriesPromise =
@@ -1786,17 +1791,26 @@ export class ModelRegistry {
 		]);
 		const discovered = [...configuredDiscovered, ...builtInDiscovered];
 		for (const provider of selectedDiscoverableProviders) {
-			const authGeneration = configuredDiscoveryAuthGenerations.get(provider.provider);
+			const evidence = configuredDiscoveryEvidence.get(provider.provider);
 			const state = this.#discoveryManager.getState(provider.provider);
 			const currentAuthGeneration = this.authStorage.getProviderEvidenceGeneration(provider.provider);
-			if (authGeneration !== undefined && state?.status === "ok" && currentAuthGeneration === authGeneration) {
-				this.#configuredDiscoveryAuthGenerations.set(provider.provider, authGeneration);
+			const currentEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(
+				this.#getProviderBaseUrlForDiscovery(provider.provider) ?? "",
+			);
+			if (
+				evidence !== undefined &&
+				state?.status === "ok" &&
+				currentAuthGeneration === evidence.authGeneration &&
+				currentEndpoint === evidence.endpoint
+			) {
+				this.#configuredDiscoveryEvidence.set(provider.provider, evidence);
 			} else if (
 				state?.status !== "cached" ||
 				state.error !== undefined ||
-				this.#configuredDiscoveryAuthGenerations.get(provider.provider) !== currentAuthGeneration
+				this.#configuredDiscoveryEvidence.get(provider.provider)?.authGeneration !== currentAuthGeneration ||
+				this.#configuredDiscoveryEvidence.get(provider.provider)?.endpoint !== currentEndpoint
 			) {
-				this.#configuredDiscoveryAuthGenerations.delete(provider.provider);
+				this.#configuredDiscoveryEvidence.delete(provider.provider);
 			}
 		}
 		this.#rebuildProviderActivity();
@@ -2287,7 +2301,7 @@ export class ModelRegistry {
 		try {
 			const parsed = new URL(endpoint);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
-			return `${parsed.protocol}//${parsed.host}${trimmedPath}`;
+			return `${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search}`;
 		} catch {
 			return endpoint.replace(/\/+$/g, "");
 		}
@@ -2687,8 +2701,10 @@ export class ModelRegistry {
 		const discoveryState = this.#discoveryManager.getState(model.provider);
 		return (
 			(discoveryState?.status === "ok" || discoveryState?.status === "cached") &&
-			this.#configuredDiscoveryAuthGenerations.get(model.provider) ===
+			this.#configuredDiscoveryEvidence.get(model.provider)?.authGeneration ===
 				this.authStorage.getProviderEvidenceGeneration(model.provider) &&
+			this.#configuredDiscoveryEvidence.get(model.provider)?.endpoint ===
+				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "") &&
 			discoveryState.models.includes(model.id)
 		);
 	}
@@ -2852,7 +2868,7 @@ export class ModelRegistry {
 			(this.#descriptorDiscoveryGenerations.get(providerName) ?? 0) + 1,
 		);
 		this.#descriptorDiscoveryEvidence.delete(providerName);
-		this.#configuredDiscoveryAuthGenerations.delete(providerName);
+		this.#configuredDiscoveryEvidence.delete(providerName);
 		this.#discoveryManager.invalidate(providerName);
 	}
 

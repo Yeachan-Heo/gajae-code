@@ -3707,6 +3707,34 @@ describe("ModelRegistry", () => {
 				{ provider: "discovery-provider", connectionKind: "credential" },
 			]);
 		});
+		test("invalidates configured discovery proof when its environment endpoint changes", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const restore = setEnvForTest("DISCOVERY_PROVIDER_BASE_URL", "https://tenant-a.example.com/v1");
+			try {
+				using _hook = hookFetch(input => {
+					expect(String(input)).toBe("https://tenant-a.example.com/v1/models");
+					return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("discovery-provider", "online");
+				Bun.env.DISCOVERY_PROVIDER_BASE_URL = "https://tenant-b.example.com/v1";
+				await registry.refreshProvider("discovery-provider", "offline");
+
+				expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+			} finally {
+				restore();
+			}
+		});
 		test("clears configured discovery proof after a failed online probe", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
@@ -3901,6 +3929,28 @@ describe("ModelRegistry", () => {
 			await registry.refreshProvider("vllm", "offline");
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
+		test("invalidates descriptor discovery evidence when its endpoint query changes", async () => {
+			const restore = setEnvForTest("VLLM_BASE_URL", "https://gateway.example/v1?tenant=a");
+			try {
+				authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+				using _hook = hookFetch(
+					() =>
+						new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						}),
+				);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("vllm", "online");
+				Bun.env.VLLM_BASE_URL = "https://gateway.example/v1?tenant=b";
+				await registry.refreshProvider("vllm", "offline");
+
+				expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+			} finally {
+				restore();
+			}
 		});
 		test("clears descriptor discovery evidence after a failed online refresh", async () => {
 			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
