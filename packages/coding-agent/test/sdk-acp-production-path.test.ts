@@ -454,6 +454,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(selectedPreset.configOptions).toEqual(
 		expect.arrayContaining([expect.objectContaining({ id: "model", currentValue: "codex-medium" })]),
 	);
+	expect(
+		await agent.extMethod("session/set_model", {
+			sessionId: created.sessionId,
+			modelId: "test-preset",
+		}),
+	).toEqual({});
+	expect(activeModelPreset).toBe("test-preset");
+	await agent.setSessionConfigOption({
+		sessionId: created.sessionId,
+		configId: "model",
+		value: "codex-medium",
+	});
 	await expect(
 		agent.setSessionConfigOption({
 			sessionId: created.sessionId,
@@ -1130,6 +1142,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: ["--stdio"] }],
 		}),
 	);
+	expect(
+		await followupAgent.extMethod("session/set_model", {
+			sessionId: created.sessionId,
+			modelId: "openai/gpt",
+		}),
+	).toEqual({});
+	expect(controlOperations.at(-1)).toBe("model.set");
 	const followupPrompt = followupAgent.prompt({
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "follow up" }],

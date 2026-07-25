@@ -9,7 +9,7 @@
 
 ### Added
 
-- JetBrains Air ACP sessions now preserve final answers across fast prompt completion, expose tool/retry/goal/notices and session title updates, accept client-supplied stdio/HTTP/SSE MCP servers, reject unsupported additional directories, and reject unavailable model presets before provider dispatch.
+- JetBrains Air ACP sessions now preserve final answers across fast prompt completion, expose tool/retry/goal/notices and session title updates, apply Air's legacy `session/set_model` preset changes through the canonical session configuration path, accept client-supplied stdio/HTTP/SSE MCP servers, reject unsupported additional directories, and reject unavailable model presets before provider dispatch.
 
 ## [0.11.10] - 2026-07-25
 ### Changed

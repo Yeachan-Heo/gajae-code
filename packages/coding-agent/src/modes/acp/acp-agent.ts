@@ -989,6 +989,14 @@ export class AcpAgent implements Agent {
 
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
 		try {
+			if (method === "session/set_model") {
+				const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+				const modelId = typeof params.modelId === "string" ? params.modelId : undefined;
+				if (!sessionId) throw new AcpSdkAdapterError("invalid_input", "sessionId is required.");
+				if (!modelId) throw new AcpSdkAdapterError("invalid_input", "modelId is required.");
+				await this.setSessionConfigOption({ sessionId, configId: MODEL_CONFIG_ID, value: modelId });
+				return {};
+			}
 			if (method === "_gjc/sdk/global") {
 				const result = await (await this.#brokerAdapter()).handle(method, params);
 				return object(result) ?? {};
