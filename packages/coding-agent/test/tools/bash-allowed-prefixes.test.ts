@@ -341,6 +341,41 @@ describe("checkBashAllowedPrefixes", () => {
 		}
 	});
 
+	it("blocks tildes at bash expansion positions inside compound `+=` assignment words", () => {
+		const gitPrefixes = [...ROLE_AGENT_PREFIXES, "git diff", "git show", "git log"];
+
+		// bash treats `name+=value` as an assignment word too, so its value expands
+		// tildes at the same positions as `name=value`.
+		for (const command of [
+			"git diff A+=~",
+			"git diff A+=~/p",
+			"git diff A+=~user",
+			"git diff A+=x:~",
+			"git diff A+=x:~:y:~",
+		]) {
+			const result = checkBashAllowedPrefixes(command, gitPrefixes);
+
+			expect({ command, allowed: result.allowed }).toMatchObject({ allowed: false });
+			expect(result.reason).toContain("shell expansion character '~'");
+		}
+	});
+
+	it("allows tildes that compound `+=` recognition must not newly block", () => {
+		const gitPrefixes = [...ROLE_AGENT_PREFIXES, "git diff", "git show", "git log"];
+
+		for (const command of [
+			// compound assignment words, but the tilde is not at an expansion position
+			"git diff a+=x~y",
+			"git diff a+=b=~",
+			// not assignment words: `a++`, an empty name, and `a+b` are not valid names
+			"git diff a++=~",
+			"git diff +=~",
+			"git diff a+b=~",
+		]) {
+			expect({ command, ...checkBashAllowedPrefixes(command, gitPrefixes) }).toMatchObject({ allowed: true });
+		}
+	});
+
 	it("allows tildes at positions bash does not expand in assignment-like words", () => {
 		const gitPrefixes = [...ROLE_AGENT_PREFIXES, "git diff", "git show", "git log"];
 

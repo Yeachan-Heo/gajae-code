@@ -23,8 +23,9 @@ const SHELL_CONTROL_CHARS = new Set([";", "|", "&", "<", ">", "(", ")"]);
 // directly after the first `=` or after a `:` in the assigned value. A tilde anywhere
 // else (e.g. the git revision `HEAD~1`) is a literal character.
 const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "}"]);
-// A bash assignment word has a plain assignment name before its first unquoted `=`.
-const ASSIGNMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+// A bash assignment word has a plain assignment name before its first unquoted `=`,
+// in either the `name=value` or the compound `name+=value` form.
+const ASSIGNMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*\+?$/u;
 const ALLOWED_STATE_ACTIONS = new Set(["read", "write", "contract"]);
 const CANONICAL_STATE_TARGETS = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 const READ_ONLY_COMMANDS = new Set(["grep", "rg", "tree", "ls", "pwd", "wc", "du", "file", "stat"]);
