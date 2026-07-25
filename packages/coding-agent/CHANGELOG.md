@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Orca terminal panes now get live GJC agent status: a bundled Orca status bridge detects the pane's agent-hook endpoint (`ORCA_PANE_KEY` / `ORCA_AGENT_HOOK_ENDPOINT`) and reports pi-protocol lifecycle events (working/done state, active tool and input, prompt, last assistant reply, session resume metadata, startup prefill) to Orca's `/hook/pi` receiver. Root pane-owning sessions only; delivery is latest-only and strictly best-effort, with a WSL→Windows curl fallback for split-loopback setups.
+
 ### Fixed
 
 - Restricted role-agent `bash` now accepts literal mid-word tildes, so git revision syntax such as `git diff HEAD~1` no longer has to be quoted. Bash performs tilde expansion only at the start of a word, so word-initial forms (`~`, `~/path`, `~user`) remain blocked.

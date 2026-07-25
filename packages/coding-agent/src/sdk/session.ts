@@ -164,6 +164,7 @@ import { getImageGenTools } from "../tools/image-gen";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
+import { createOrcaStatusBridge, shouldRegisterOrcaStatusBridge } from "../utils/orca-status-bridge";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import {
@@ -1825,6 +1826,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		} catch (error) {
 			logger.warn("Failed to load constrained GJC plugin hooks", { error });
+		}
+
+		// Orca terminal panes export a loopback agent-hook endpoint; the bridge
+		// reports pi-protocol status events so Orca shows live agent state for
+		// GJC sessions. Root pane-owning sessions only; strictly best-effort.
+		if (
+			shouldRegisterOrcaStatusBridge({
+				env: process.env,
+				taskDepth,
+				parentTaskPrefix: options.parentTaskPrefix,
+				currentAgentType: options.currentAgentType,
+			})
+		) {
+			inlineExtensions.push(async api => {
+				createOrcaStatusBridge(api);
+			});
 		}
 		let notificationCfg: NotificationConfig | undefined;
 		try {
