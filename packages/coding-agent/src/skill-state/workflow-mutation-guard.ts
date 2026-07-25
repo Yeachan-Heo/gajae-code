@@ -35,17 +35,28 @@ function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
 }
 
 const BLOCKED_TOOL_NAMES = new Set(["edit", "write", "ast_edit", "bash"]);
+/**
+ * Only `/dev/null` is exempt. `/dev/stdout`, `/dev/stderr`, and `/dev/fd/<n>` are descriptor
+ * aliases: `exec 1<>src/product.ts; printf x >/dev/stdout` reaches a real repository file
+ * through a rebound descriptor, so they must stay blocked.
+ */
+const DEVICE_SINK_PATHS = new Set(["/dev/null"]);
+/** Bash write forms the plain `>`/`>>` scanner misses: clobber, dup-to-path, and read-write open. */
+const BASH_EXTENDED_WRITE_RE = /(?:>\||<>|>&(?![\s;&|]*(?:\d+|-)(?:[\s;&|]|$)))\s*([^\s;&|]+)/g;
+/** Descriptor rebinding is not statically resolvable; any `exec` redirection forces a fail-closed verdict. */
+const BASH_EXEC_REDIRECT_RE = /(?:^|[;&|\n])\s*(?:sudo\s+)?exec\b[^;&|\n]*[<>]/i;
+
 const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|tar|db))(?:$|:)/i;
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
 const BASH_MUTATION_COMMAND_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
 const BASH_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:<<[-]?\s*['"]?\w+['"]?)[\s\S]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
-const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?dd\b([^;&|\n]*)/gi;
+const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?dd\b([^;&|\n]*)/gi;
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -371,6 +382,10 @@ function cleanShellWord(value: string): string {
 	return value.replace(/^['"]|['"]$/g, "");
 }
 
+function isDeviceSinkPath(value: string): boolean {
+	return DEVICE_SINK_PATHS.has(cleanShellWord(value));
+}
+
 function extractBashTargets(args: unknown): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -382,11 +397,25 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 	if (BASH_OPAQUE_INTERPRETER_WRITE_RE.test(command) || BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(command)) {
 		targets.unknown = true;
 	}
+	// `exec 1<>file` rebinds a descriptor, so a later `>/dev/null` may not reach the device at all.
+	if (BASH_EXEC_REDIRECT_RE.test(command)) {
+		targets.unknown = true;
+	}
+	for (const match of command.matchAll(BASH_EXTENDED_WRITE_RE)) {
+		const cleaned = cleanShellWord(match[1] ?? "");
+		if (!cleaned) targets.unknown = true;
+		else if (!isDeviceSinkPath(cleaned)) addPath(targets, cleaned);
+	}
 	for (const match of command.matchAll(BASH_DD_OUTPUT_RE)) {
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
-		const output = parts.find(part => part.startsWith("of="));
-		if (output) addPath(targets, output.slice(3));
-		else targets.unknown = true;
+		// Every `of=` counts: GNU dd honors the last one, so `of=/dev/null of=real.ts` writes real.ts.
+		const outputs = parts.filter(part => part.startsWith("of="));
+		if (outputs.length === 0) targets.unknown = true;
+		for (const output of outputs) {
+			const outputPath = cleanShellWord(output.slice(3));
+			if (!outputPath) targets.unknown = true;
+			else if (!isDeviceSinkPath(outputPath)) addPath(targets, outputPath);
+		}
 	}
 	for (const match of command.matchAll(BASH_IN_PLACE_MUTATION_COMMAND_RE)) {
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
@@ -399,12 +428,17 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 	for (const match of command.matchAll(BASH_MUTATION_COMMAND_RE)) {
 		const redirected = match[2]?.trim();
 		if (redirected) {
-			addPath(targets, cleanShellWord(redirected));
+			const cleaned = cleanShellWord(redirected);
+			// A capture that dequotes to nothing (e.g. `>" src.ts"`) is a truncated parse, not a safe no-op.
+			if (!cleaned) targets.unknown = true;
+			else if (!isDeviceSinkPath(cleaned)) addPath(targets, cleaned);
 			continue;
 		}
 		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]
-			?.match(/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\b/i)?.[1]
+			?.match(
+				/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\b/i,
+			)?.[1]
 			?.toLowerCase();
 		const targetParts =
 			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"

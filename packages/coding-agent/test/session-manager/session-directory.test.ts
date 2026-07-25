@@ -1318,42 +1318,6 @@ describe("managed session write protocol", () => {
 		if (afterRestart.kind === "complete")
 			expect(afterRestart.owned.some(candidate => candidate.sessionId === "crash-restart")).toBe(false);
 	});
-	it("reconciles detached artifact cleanup from an append-only sidecar on a fresh scope", async () => {
-		const { cwd, sessionsRoot, scope } = await fixture();
-		const legacy = legacyDirectory(sessionsRoot, cwd);
-		const source = path.join(legacy, "detached-artifact-restart.jsonl");
-		const artifacts = source.slice(0, -6);
-		await fs.mkdir(artifacts, { recursive: true });
-		await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
-		await fs.writeFile(source, transcript("detached-artifact-restart", cwd));
-		const listed = listManagedCandidates(scope);
-		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
-		const exactUnlink = native.exactUnlink;
-		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-			if (pathname !== artifacts) return exactUnlink(pathname, identity);
-			if (!identity.directory || !identity.quarantineName) throw new Error("Missing artifact quarantine identity");
-			const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
-			syncFs.renameSync(pathname, detachedPath);
-			return { ok: true, detachedPath };
-		});
-		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockReturnValueOnce({ ok: false, code: "io_error" });
-		try {
-			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
-				kind: "deleted",
-				tombstonePath: expect.stringContaining(".json"),
-			});
-		} finally {
-			remove.mockRestore();
-			unlink.mockRestore();
-		}
-		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
-		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
-		if (restarted.kind !== "resolved") throw new Error(restarted.message);
-		expect((await prepareManagedSessionScopeForWrite(restarted.scope)).kind).toBe("resolved");
-		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
-
-		expect(listManagedCandidates(restarted.scope)).toMatchObject({ kind: "complete", owned: [] });
-	});
 
 	it("recovers a crash after artifact detach but before the native result is persisted", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();

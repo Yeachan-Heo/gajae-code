@@ -303,6 +303,13 @@ describe("broker process completion", () => {
 	});
 });
 describe("SDK broker identity and discovery", () => {
+	it("atomically publishes one identity key for concurrent callers", async () => {
+		const dir = await temp();
+		const keys = await Promise.all(Array.from({ length: 16 }, () => getBrokerIdentityKey(dir)));
+		expect(new Set(keys)).toEqual(new Set([keys[0]]));
+		expect(await fs.readFile(path.join(dir, "sdk", "broker.identity"), "utf8")).toBe(`${keys[0]}\n`);
+	});
+
 	it("persists identity and writes a redacted private discovery record", async () => {
 		const dir = await temp();
 		const a = await getBrokerIdentityKey(dir);

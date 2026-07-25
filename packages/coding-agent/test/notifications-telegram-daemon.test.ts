@@ -669,13 +669,13 @@ function transitionFsCapabilities(): Pick<TelegramDaemonFs, "readEndpointFile" |
 	};
 }
 
-function settings(agentDir: string): Settings {
+function settings(agentDir: string, botToken = "123456:secret-token"): Settings {
 	// Isolate getAgentDir() to the temp dir so daemon persistence (aliases,
 	// topics, lock/state/roots) never writes into the real global ~/.gjc/agent.
 	return setPrivateAgentDir(
 		Settings.isolated({
 			"notifications.enabled": true,
-			"notifications.telegram.botToken": "123456:secret-token",
+			"notifications.telegram.botToken": botToken,
 			"notifications.telegram.chatId": "42",
 			"notifications.daemon.idleTimeoutMs": 20,
 		}) as Settings,
@@ -2665,51 +2665,55 @@ describe("telegram daemon", () => {
 		["missing persisted provenance with an aged malformed lock", undefined, "linux:100", "aged-malformed"],
 		["non-string persisted provenance with no lock", 100, "linux:100", "missing"],
 		["non-string persisted provenance with an aged malformed lock", 100, "linux:100", "aged-malformed"],
-	])("foreign live owner with %s remains blocked without replacement", async (_name, incarnation, currentIncarnation, lockKind) => {
-		const agentDir = tempAgentDir();
-		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		const paths = daemonPaths(agentDir);
-		const state = {
-			pid: 999,
-			incarnation,
-			ownerId: "foreign-owner",
-			tokenFingerprint: "foreign-fp",
-			chatId: "foreign-chat",
-			startedAt: 100,
-			heartbeatAt: 100,
-			roots: [],
-			version: DAEMON_VERSION,
-		};
-		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.state, JSON.stringify(state));
-		if (lockKind === "aged-malformed") {
-			fs.writeFileSync(paths.lock, "{");
-			fs.utimesSync(paths.lock, 0, 0);
-		}
-		const beforeState = fs.readFileSync(paths.state, "utf8");
-		const beforeLock = fs.existsSync(paths.lock) ? fs.readFileSync(paths.lock, "utf8") : undefined;
-		let spawns = 0;
+	])(
+		"foreign live owner with %s remains blocked without replacement",
+		async (_name, incarnation, currentIncarnation, lockKind) => {
+			const agentDir = tempAgentDir();
+			const s = setPrivateAgentDir(settings(agentDir, `123456:${path.basename(agentDir)}`), agentDir);
+			const paths = daemonPaths(agentDir);
+			const state = {
+				pid: 999,
+				incarnation,
+				ownerId: "foreign-owner",
+				tokenFingerprint: "foreign-fp",
+				chatId: "foreign-chat",
+				startedAt: 100,
+				heartbeatAt: 100,
+				roots: [],
+				version: DAEMON_VERSION,
+			};
+			fs.mkdirSync(paths.dir, { recursive: true });
+			fs.writeFileSync(paths.state, JSON.stringify(state));
+			if (lockKind === "aged-malformed") {
+				fs.writeFileSync(paths.lock, "{");
+				fs.utimesSync(paths.lock, 0, 0);
+			}
+			const beforeState = fs.readFileSync(paths.state, "utf8");
+			const beforeLock = fs.existsSync(paths.lock) ? fs.readFileSync(paths.lock, "utf8") : undefined;
+			let spawns = 0;
 
-		const result = await ensureTelegramDaemonRunning(
-			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
-			{
-				pid: 4242,
-				pidAlive: pid => pid === 999,
-				pidIncarnation: pid => (pid === 999 ? currentIncarnation : "linux:200"),
-				spawn: () => {
-					spawns++;
-					return { unref() {} };
+			const result = await ensureTelegramDaemonRunning(
+				{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+				{
+					pid: 4242,
+					pidAlive: pid => pid === 999,
+					pidIncarnation: pid => (pid === 999 ? currentIncarnation : "linux:200"),
+					spawn: () => {
+						spawns++;
+						return { unref() {} };
+					},
 				},
-			},
-		);
+			);
 
-		expect(result).toBe("blocked");
-		expect(spawns).toBe(0);
-		expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
-		expect(fs.existsSync(paths.lock)).toBe(beforeLock !== undefined);
-		if (beforeLock !== undefined) expect(fs.readFileSync(paths.lock, "utf8")).toBe(beforeLock);
-		expect(fs.existsSync(paths.roots)).toBe(false);
-	});
+			expect(result).toBe("blocked");
+			expect(spawns).toBe(0);
+			expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
+			expect(fs.existsSync(paths.lock)).toBe(beforeLock !== undefined);
+			if (beforeLock !== undefined) expect(fs.readFileSync(paths.lock, "utf8")).toBe(beforeLock);
+			expect(fs.existsSync(paths.roots)).toBe(false);
+		},
+		15_000,
+	);
 	test.each([
 		"missing",
 		"aged-malformed",

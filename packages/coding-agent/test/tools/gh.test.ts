@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -84,7 +84,7 @@ function runGit(cwd: string, args: string[]): string {
 	return new TextDecoder().decode(result.stdout).trim();
 }
 
-async function createPrFixture(): Promise<{
+async function createPrFixture({ includeFork = true }: { includeFork?: boolean } = {}): Promise<{
 	baseDir: string;
 	repoRoot: string;
 	originBare: string;
@@ -100,7 +100,7 @@ async function createPrFixture(): Promise<{
 
 	await fs.mkdir(repoRoot, { recursive: true });
 	runGit(baseDir, ["init", "--bare", originBare]);
-	runGit(baseDir, ["init", "--bare", forkBare]);
+	if (includeFork) runGit(baseDir, ["init", "--bare", forkBare]);
 	runGit(baseDir, ["init", "-b", "main", repoRoot]);
 	runGit(repoRoot, ["config", "user.name", "Test User"]);
 	runGit(repoRoot, ["config", "user.email", "test@example.com"]);
@@ -109,13 +109,13 @@ async function createPrFixture(): Promise<{
 	runGit(repoRoot, ["commit", "-m", "base commit"]);
 	runGit(repoRoot, ["remote", "add", "origin", originBare]);
 	runGit(repoRoot, ["push", "-u", "origin", "main"]);
-	runGit(repoRoot, ["remote", "add", "forksrc", forkBare]);
+	if (includeFork) runGit(repoRoot, ["remote", "add", "forksrc", forkBare]);
 	runGit(repoRoot, ["checkout", "-b", headRefName]);
 	await fs.writeFile(path.join(repoRoot, "README.md"), "base\nfeature\n");
 	runGit(repoRoot, ["add", "README.md"]);
 	runGit(repoRoot, ["commit", "-m", "feature commit"]);
 	const headRefOid = runGit(repoRoot, ["rev-parse", "HEAD"]);
-	runGit(repoRoot, ["push", "-u", "forksrc", headRefName]);
+	if (includeFork) runGit(repoRoot, ["push", "-u", "forksrc", headRefName]);
 	runGit(repoRoot, ["checkout", "main"]);
 
 	return {
@@ -126,6 +126,27 @@ async function createPrFixture(): Promise<{
 		headRefName,
 		headRefOid,
 	};
+}
+
+type RemoteFixture = Pick<
+	Awaited<ReturnType<typeof createPrFixture>>,
+	"baseDir" | "repoRoot" | "originBare" | "forkBare"
+>;
+
+async function createRemoteFixture(): Promise<RemoteFixture> {
+	const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "gh-remote-tool-"));
+	const repoRoot = path.join(baseDir, "repo");
+	const originBare = path.join(baseDir, "origin.git");
+	const forkBare = path.join(baseDir, "fork.git");
+
+	await fs.mkdir(repoRoot, { recursive: true });
+	runGit(baseDir, ["init", "--bare", originBare]);
+	runGit(baseDir, ["init", "--bare", forkBare]);
+	runGit(baseDir, ["init", "-b", "main", repoRoot]);
+	runGit(repoRoot, ["remote", "add", "origin", originBare]);
+	runGit(repoRoot, ["remote", "add", "forksrc", forkBare]);
+
+	return { baseDir, repoRoot, originBare, forkBare };
 }
 
 /**
@@ -1074,27 +1095,29 @@ describe("github tool", () => {
 		}
 	});
 
-	it("treats git.remote.add as a no-op when the remote already exists with the same URL", async () => {
-		const fixture = await createPrFixture();
-		try {
+	describe("git remote add", () => {
+		let fixture: RemoteFixture;
+
+		beforeAll(async () => {
+			fixture = await createRemoteFixture();
+		});
+
+		afterAll(async () => {
+			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+		});
+
+		it("treats git.remote.add as a no-op when the remote already exists with the same URL", async () => {
 			await git.remote.add(fixture.repoRoot, "forksrc", fixture.forkBare);
 			expect(runGit(fixture.repoRoot, ["remote", "get-url", "forksrc"])).toBe(fixture.forkBare);
-		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
-		}
-	});
+		});
 
-	it("rejects git.remote.add when the remote already exists with a different URL", async () => {
-		const fixture = await createPrFixture();
-		try {
+		it("rejects git.remote.add when the remote already exists with a different URL", async () => {
 			await expect(git.remote.add(fixture.repoRoot, "forksrc", fixture.originBare)).rejects.toThrow(
 				/already exists with URL/,
 			);
 			// Existing URL is preserved — we never overwrote it.
 			expect(runGit(fixture.repoRoot, ["remote", "get-url", "forksrc"])).toBe(fixture.forkBare);
-		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
-		}
+		});
 	});
 
 	it("serializes concurrent git mutations through withRepoLock so callers don't race git's internal locks", async () => {
@@ -1120,7 +1143,7 @@ describe("github tool", () => {
 	});
 
 	it("checks out multiple pull requests in a single call when pr is an array", async () => {
-		const fixture = await createPrFixture();
+		const fixture = await createPrFixture({ includeFork: false });
 		const tempHome = await setupTempHome();
 		try {
 			// PR #100 reuses the fixture's contributor branch; push it to origin so
@@ -1188,7 +1211,7 @@ describe("github tool", () => {
 			await tempHome.cleanup();
 			await fs.rm(fixture.baseDir, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	it("rejects PR pushes from branches without checkout metadata", async () => {
 		const fixture = await createPrFixture();

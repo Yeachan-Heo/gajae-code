@@ -2314,7 +2314,12 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 		const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
 		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 		try {
-			const handlers = start(ctx);
+			const startupCapability = new SdkStartupCapability();
+			const handlers = start(ctx, undefined, () => {}, false, new Map(), {
+				startupCapability,
+				lifecycleRequired: true,
+			});
+			await expect(startupCapability.promise).resolves.toEqual({ status: "started" });
 			const endpointAPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionA}.json`);
 			await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
 
@@ -3531,20 +3536,37 @@ test("session teardown drains admitted direct gate resolution before detaching i
 	const sessionId = `direct-resolution-drain-${Date.now()}`;
 	const emitter = new BrokerWorkflowGateEmitter(sessionId, new FileGateStore(path.join(cwd, "gates.json")));
 	const resolution = Promise.withResolvers<{ status: "accepted" }>();
+	const sessionClosedBarrier = Promise.withResolvers<void>();
+	const sessionClosedReached = Promise.withResolvers<void>();
+	const events: string[] = [];
 	let resolutionStarted = false;
-	let controllerDetached = false;
-	const registerController = spyOn(emitter, "registerGateTerminalController").mockImplementation(() => () => {
-		controllerDetached = true;
+	const originalRegisterController = emitter.registerGateTerminalController!.bind(emitter);
+	const originalResolveGate = emitter.resolveGate!.bind(emitter);
+	const originalPushFrameAndWait = NotificationServer.prototype.pushFrameAndWait;
+	const registerController = spyOn(emitter, "registerGateTerminalController").mockImplementation(controller => {
+		const detach = originalRegisterController(controller);
+		return () => {
+			events.push("controller-detached");
+			detach();
+		};
 	});
 	const resolveGate = spyOn(emitter, "resolveGate").mockImplementation(async response => {
 		resolutionStarted = true;
 		await resolution.promise;
-		return {
-			status: "accepted",
-			gate_id: response.gate_id,
-			answer_hash: "fixture",
-			resolved_at: new Date().toISOString(),
-		};
+		const resolved = await originalResolveGate(response);
+		events.push("gate-terminalized");
+		return resolved;
+	});
+	const pushFrameAndWait = spyOn(NotificationServer.prototype, "pushFrameAndWait").mockImplementation(async function (
+		this: NotificationServer,
+		frame,
+		timeout,
+	) {
+		if ((JSON.parse(frame) as { type?: unknown }).type === "session_closed") {
+			sessionClosedReached.resolve();
+			await sessionClosedBarrier.promise;
+		}
+		return await originalPushFrameAndWait.call(this, frame, timeout);
 	});
 	process.env.GJC_NOTIFICATIONS = "1";
 	const sessionContext = context(cwd, sessionId, "main", {}, emitter);
@@ -3581,12 +3603,14 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		);
 		await waitFor(() => resolutionStarted, "direct gate resolution");
 		const shutdown = handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		await Bun.sleep(0);
-		expect(controllerDetached).toBe(false);
+		await sessionClosedReached.promise;
+		expect(events).toEqual([]);
+		sessionClosedBarrier.resolve();
 		resolution.resolve({ status: "accepted" });
 		await shutdown;
-		expect(controllerDetached).toBe(true);
+		expect(events).toEqual(["gate-terminalized", "controller-detached"]);
 	} finally {
+		pushFrameAndWait.mockRestore();
 		resolveGate.mockRestore();
 		registerController.mockRestore();
 	}
