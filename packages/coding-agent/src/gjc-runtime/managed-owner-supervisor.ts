@@ -119,7 +119,9 @@ export function isManagedOwnerSupervisorArgv(args: readonly string[]): boolean {
 }
 
 /** Runs one exact child and publishes authority only for a directly observed Linux signal 6. */
-export async function runManagedOwnerSupervisor(): Promise<void> {
+export async function runManagedOwnerSupervisor(
+	readProcStartTime: typeof readLinuxProcStartTime = readLinuxProcStartTime,
+): Promise<void> {
 	const { root, stateDir, generation, sessionId, runId, incarnation } = lifecycleRoot();
 	const command = childCommand();
 	let sigtermPending = bootstrapSigtermPending;
@@ -128,7 +130,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	};
 	process.removeAllListeners("SIGTERM");
 	process.on("SIGTERM", captureEarlySigterm);
-	const supervisorStartTime = await readLinuxProcStartTime(process.pid);
+	const supervisorStartTime = await readProcStartTime(process.pid);
 	if (!supervisorStartTime) throw new Error("managed_owner_supervisor_start_time_unavailable");
 	await fs.mkdir(root, { recursive: true, mode: 0o700 });
 	const childToken = crypto.randomUUID();
@@ -153,7 +155,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		stderr: "inherit",
 		env: { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken },
 	});
-	const childStartTime = await readLinuxProcStartTime(child.pid);
+	const childStartTime = await readProcStartTime(child.pid);
 	if (!childStartTime) throw new Error("managed_owner_child_start_time_unavailable");
 	const childProcess = Process.fromPid(child.pid);
 	if (!childProcess) throw new Error("managed_owner_child_reference_unavailable");
