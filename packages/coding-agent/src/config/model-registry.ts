@@ -1768,6 +1768,7 @@ export class ModelRegistry {
 				? this.#discoveryManager.providers.filter(provider => providerFilter.has(provider.provider))
 				: this.#discoveryManager.providers
 		).filter(provider => !disabledProviders.has(provider.provider));
+		await Promise.all(selectedDiscoverableProviders.map(provider => this.#peekApiKeyForProvider(provider.provider)));
 		const configuredDiscoveryEvidence = new Map(
 			selectedDiscoverableProviders.map(provider => [
 				provider.provider,

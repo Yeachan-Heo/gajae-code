@@ -3655,6 +3655,34 @@ describe("ModelRegistry", () => {
 			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
 		});
+		test("records configured discovery evidence after resolving a stored command key", async () => {
+			authStorage.close();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async config => (config === "!discovery-key" ? "resolved-discovery-key" : undefined),
+			});
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("discovery-provider", [{ type: "api_key", key: "!discovery-key" }]);
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online");
+
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
 		test("does not retain configured discovery evidence after an in-flight credential change", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
