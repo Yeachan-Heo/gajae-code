@@ -2,9 +2,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Settings } from "../src/config/settings";
+import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension, projectToolSummary } from "../src/sdk/bus/index";
+import { NotificationSessionController } from "../src/sdk/bus/session-control";
+import type { EnsureDaemonResult } from "../src/sdk/bus/telegram-daemon";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { SessionSdkHost } from "../src/sdk/host";
+import { isolatedNotificationSettings } from "./helpers/notification-settings";
 
 const wait = () => new Promise(resolve => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -36,19 +41,43 @@ interface SetupResult {
 	token: string;
 }
 
+interface SetupOptions {
+	settingsOverrides?: Record<string, unknown>;
+	ensureTelegramDaemon?: (input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+	}) => Promise<EnsureDaemonResult>;
+}
+
 async function setup(
 	tool: { safeSummary?: (kind: "args" | "result", value: unknown) => string } = {},
-): Promise<SetupResult> {
+	options: SetupOptions = {},
+): Promise<SetupResult & { settings?: Settings; controller?: NotificationSessionController }> {
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
 
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-tool-"));
 	tempDirs.push(cwd);
+	const settings =
+		options.settingsOverrides === undefined
+			? undefined
+			: isolatedNotificationSettings(path.join(cwd, ".gjc", "agent"), options.settingsOverrides);
+	const controller =
+		settings === undefined
+			? undefined
+			: new NotificationSessionController({
+					eligible: true,
+					getConfig: () => getNotificationConfig(settings),
+				});
+	createNotificationsExtension(api, {
+		...(settings ? { settings, controller } : {}),
+		...(options.ensureTelegramDaemon ? { ensureTelegramDaemon: options.ensureTelegramDaemon } : {}),
+	});
 	const sessionId = `tool-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -73,10 +102,10 @@ async function setup(
 		ws.addEventListener("open", () => resolve());
 		ws.addEventListener("error", () => reject(new Error("websocket error")));
 	});
-	ws.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v1"] }));
+	ws.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2"] }));
 	await sleep(50);
 	await sleep(250);
-	return { handlers, ctx, frames, ws, sessionId, token };
+	return { handlers, ctx, frames, ws, sessionId, token, settings, controller };
 }
 
 async function setConfig(
@@ -119,7 +148,7 @@ describe("notification tool activity projection", () => {
 });
 
 describe("SDK replay capability filter", () => {
-	test("filters gated frames without tool_activity_v1 and keeps them with it", async () => {
+	test("filters gated frames without tool_activity_v2 and keeps them with it", async () => {
 		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
 		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
 		const host = new SessionSdkHost({
@@ -130,7 +159,7 @@ describe("SDK replay capability filter", () => {
 				connectionId === "legacy"
 					? new Set()
 					: connectionId === "capable"
-						? new Set(["tool_activity_v1"])
+						? new Set(["tool_activity_v2"])
 						: undefined,
 			sendFrame: (connectionId, frame) => {
 				sent.push({ connectionId, frame });
@@ -343,7 +372,7 @@ test("reasoning summaries require canonical summaryText and never fall back to e
 	});
 }, 30000);
 
-test("redact transition terminalizes visible tools before suppressing later detail", async () => {
+test("redact transition cancels visible tools before suppressing later detail", async () => {
 	await withNotifications(async () => {
 		const result = await setup();
 		await result.handlers.get("tool_execution_start")!(
@@ -356,13 +385,13 @@ test("redact transition terminalizes visible tools before suppressing later deta
 		await waitFor(
 			() =>
 				activityFrames(result.frames).some(
-					frame => frame.toolCallId === "redact-transition" && frame.phase === "unknown",
+					frame => frame.toolCallId === "redact-transition" && frame.phase === "cancelled",
 				),
 			"redact transition terminal frame",
 		);
 		const terminalIndex = result.frames.findIndex(
 			frame =>
-				frame.type === "tool_activity" && frame.toolCallId === "redact-transition" && frame.phase === "unknown",
+				frame.type === "tool_activity" && frame.toolCallId === "redact-transition" && frame.phase === "cancelled",
 		);
 		const configIndex = result.frames.findIndex(frame => frame.type === "config_update" && frame.redact === true);
 		expect(terminalIndex).toBeGreaterThanOrEqual(0);
@@ -382,17 +411,194 @@ test("redact transition terminalizes visible tools before suppressing later deta
 		const frames = activityFrames(result.frames).filter(frame => frame.toolCallId === "redact-transition");
 		expect(frames).toEqual([
 			expect.objectContaining({ phase: "started" }),
-			expect.objectContaining({ phase: "unknown" }),
+			expect.objectContaining({ phase: "cancelled" }),
 		]);
 	});
 }, 30000);
 
-test("agent end and session shutdown terminalize open tool activity", async () => {
+test("tool ending during Telegram owner preflight is cancelled once when redaction commits", async () => {
+	await withNotifications(async () => {
+		let deferEnsure = false;
+		const ensureEntered = Promise.withResolvers<void>();
+		const releaseEnsure = Promise.withResolvers<void>();
+		const result = await setup(
+			{ safeSummary: () => "sensitive summary" },
+			{
+				settingsOverrides: {
+					"notifications.enabled": true,
+					"notifications.redact": false,
+					"notifications.verbosity": "verbose",
+					"notifications.telegram.botToken": "123456:secret-token",
+					"notifications.telegram.chatId": "42",
+				},
+				ensureTelegramDaemon: async () => {
+					if (!deferEnsure) return "attached";
+					ensureEntered.resolve();
+					await releaseEnsure.promise;
+					return "attached";
+				},
+			},
+		);
+		if (!result.settings || !result.controller) throw new Error("Expected configured notification runtime.");
+
+		await result.handlers.get("tool_execution_start")!(
+			{
+				type: "tool_execution_start",
+				toolCallId: "preflight-redaction",
+				toolName: "shell",
+				args: { secret: "sensitive args" },
+			} as never,
+			result.ctx,
+		);
+		await waitFor(() => activityFrames(result.frames).length === 1, "started tool frame");
+
+		deferEnsure = true;
+		result.settings.set("notifications.redact", true);
+		const reconciliation = result.controller.reconcileCurrentSession(result.ctx);
+		await Promise.race([
+			ensureEntered.promise,
+			sleep(3000).then(() => {
+				throw new Error("Telegram owner preflight was not entered");
+			}),
+		]);
+		await result.handlers.get("tool_execution_end")!(
+			{
+				type: "tool_execution_end",
+				toolCallId: "preflight-redaction",
+				toolName: "shell",
+				result: { secret: "sensitive result" },
+				isError: false,
+			} as never,
+			result.ctx,
+		);
+		await sleep(50);
+		expect(activityFrames(result.frames)).toHaveLength(1);
+
+		releaseEnsure.resolve();
+		await reconciliation;
+		await waitFor(
+			() =>
+				activityFrames(result.frames).some(
+					frame => frame.toolCallId === "preflight-redaction" && frame.phase === "cancelled",
+				),
+			"committed redaction terminal frame",
+		);
+
+		const toolFrames = activityFrames(result.frames).filter(frame => frame.toolCallId === "preflight-redaction");
+		expect(toolFrames).toEqual([
+			expect.objectContaining({ phase: "started" }),
+			expect.objectContaining({ phase: "cancelled" }),
+		]);
+		for (const frame of toolFrames) {
+			expect(frame.argsSummary).toBeUndefined();
+			expect(frame.resultSummary).toBeUndefined();
+		}
+		expect(JSON.stringify(toolFrames)).not.toContain("sensitive");
+
+		deferEnsure = false;
+		result.settings.set("notifications.redact", false);
+		await result.controller.reconcileCurrentSession(result.ctx);
+		await result.handlers.get("agent_end")!({ type: "agent_end" } as never, result.ctx);
+		await sleep(50);
+		expect(activityFrames(result.frames).filter(frame => frame.toolCallId === "preflight-redaction")).toEqual(
+			toolFrames,
+		);
+	});
+}, 30000);
+
+test("tool ending during Telegram owner preflight completes once when non-redaction remains committed", async () => {
+	await withNotifications(async () => {
+		let deferEnsure = false;
+		const ensureEntered = Promise.withResolvers<void>();
+		const releaseEnsure = Promise.withResolvers<void>();
+		const result = await setup(
+			{ safeSummary: kind => `owner-preflight-${kind}-summary-sentinel` },
+			{
+				settingsOverrides: {
+					"notifications.enabled": true,
+					"notifications.redact": false,
+					"notifications.verbosity": "verbose",
+					"notifications.telegram.botToken": "123456:secret-token",
+					"notifications.telegram.chatId": "42",
+				},
+				ensureTelegramDaemon: async () => {
+					if (!deferEnsure) return "attached";
+					ensureEntered.resolve();
+					await releaseEnsure.promise;
+					return "attached";
+				},
+			},
+		);
+		if (!result.controller) throw new Error("Expected configured notification runtime.");
+
+		await result.handlers.get("tool_execution_start")!(
+			{
+				type: "tool_execution_start",
+				toolCallId: "preflight-non-redaction",
+				toolName: "shell",
+				args: { secret: "owner-preflight-args-sentinel" },
+			} as never,
+			result.ctx,
+		);
+		await waitFor(() => activityFrames(result.frames).length === 1, "started tool frame");
+
+		deferEnsure = true;
+		const reconciliation = result.controller.reconcileCurrentSession(result.ctx);
+		await Promise.race([
+			ensureEntered.promise,
+			sleep(3000).then(() => {
+				throw new Error("Telegram owner preflight was not entered");
+			}),
+		]);
+		await result.handlers.get("tool_execution_end")!(
+			{
+				type: "tool_execution_end",
+				toolCallId: "preflight-non-redaction",
+				toolName: "shell",
+				result: { secret: "owner-preflight-result-sentinel" },
+				isError: false,
+			} as never,
+			result.ctx,
+		);
+		await sleep(50);
+		expect(activityFrames(result.frames)).toHaveLength(1);
+
+		releaseEnsure.resolve();
+		await reconciliation;
+		await waitFor(
+			() =>
+				activityFrames(result.frames).some(
+					frame => frame.toolCallId === "preflight-non-redaction" && frame.phase === "completed",
+				),
+			"committed non-redaction terminal frame",
+		);
+
+		const toolFrames = activityFrames(result.frames).filter(frame => frame.toolCallId === "preflight-non-redaction");
+		expect(toolFrames).toEqual([
+			expect.objectContaining({ phase: "started" }),
+			expect.objectContaining({ phase: "completed" }),
+		]);
+		for (const frame of toolFrames) {
+			expect(frame.argsSummary).toBeUndefined();
+			expect(frame.resultSummary).toBeUndefined();
+		}
+		expect(JSON.stringify(toolFrames)).not.toContain("sentinel");
+
+		await result.handlers.get("agent_end")!({ type: "agent_end" } as never, result.ctx);
+		await result.handlers.get("session_shutdown")!({ type: "session_shutdown" } as never, result.ctx);
+		await sleep(50);
+		expect(activityFrames(result.frames).filter(frame => frame.toolCallId === "preflight-non-redaction")).toEqual(
+			toolFrames,
+		);
+	});
+}, 30000);
+
+test("agent end and session shutdown use explicit synthetic terminal phases", async () => {
 	await withNotifications(async () => {
 		const result = await setup();
 		for (const [toolCallId, stopReason, phase] of [
 			["cancelled-call", "cancelled", "cancelled"],
-			["unknown-call", undefined, "unknown"],
+			["failed-call", undefined, "failed"],
 		] as const) {
 			await result.handlers.get("tool_execution_start")!(
 				{ type: "tool_execution_start", toolCallId, toolName: "shell", args: {} } as never,
@@ -413,12 +619,12 @@ test("agent end and session shutdown terminalize open tool activity", async () =
 		await waitFor(
 			() =>
 				activityFrames(result.frames).some(
-					frame => frame.toolCallId === "shutdown-call" && frame.phase === "unknown",
+					frame => frame.toolCallId === "shutdown-call" && frame.phase === "cancelled",
 				),
 			"shutdown terminal frame",
 		);
 		const shutdownTerminals = activityFrames(result.frames).filter(
-			frame => frame.toolCallId === "shutdown-call" && frame.phase === "unknown",
+			frame => frame.toolCallId === "shutdown-call" && frame.phase === "cancelled",
 		);
 		expect(shutdownTerminals).toHaveLength(1);
 	});

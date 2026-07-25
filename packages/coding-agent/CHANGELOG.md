@@ -12,6 +12,9 @@
 - The built-in `claude-opus`, `opus-codex`, and `fable-opus-codex` presets now use `anthropic/claude-opus-5` instead of `anthropic/claude-opus-4-8`, with effort suffixes preserved; `packages/ai/src/models.json` was regenerated so `anthropic/claude-opus-5` resolves; non-opus roles (`anthropic/claude-sonnet-5` executor/planner overrides, codex and fable roles) are unchanged.
 
 ## [0.11.9] - 2026-07-24
+### Changed
+
+- Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 
 ### Fixed
 - Mouse support can now be enabled inside tmux and screen with `mouse.enabled: true`, so the wheel scrolls GJC's virtual session viewport before multiplexer scrollback. Dragging highlights rendered terminal text and copies it to the system clipboard on release while GJC owns mouse input. Mouse support remains disabled by default to preserve native terminal or tmux scrollback and selection behavior.
