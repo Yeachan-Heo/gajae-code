@@ -81,8 +81,11 @@ class Verdict(Enum):
 
 
 # Verdicts that mean "stop the grid — more TLS attempts cannot help".
+# NOTE: RATE_LIMITED (429) is intentionally EXCLUDED — it is transient.
+# The grid skips the rate-limited candidate, backs off, and continues;
+# a different TLS/referer combo may not be rate-limited.
 TERMINAL_NONSUCCESS = frozenset({
-    Verdict.AUTH_REQUIRED, Verdict.NOT_FOUND, Verdict.RATE_LIMITED,
+    Verdict.AUTH_REQUIRED, Verdict.NOT_FOUND,
 })
 
 
