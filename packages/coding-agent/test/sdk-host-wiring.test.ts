@@ -3535,18 +3535,22 @@ test("session teardown drains admitted direct gate resolution before detaching i
 	dirs.push(cwd);
 	const sessionId = `direct-resolution-drain-${Date.now()}`;
 	const emitter = new BrokerWorkflowGateEmitter(sessionId, new FileGateStore(path.join(cwd, "gates.json")));
-	const resolution = Promise.withResolvers<{ status: "accepted" }>();
-	const sessionClosedBarrier = Promise.withResolvers<void>();
-	const sessionClosedReached = Promise.withResolvers<void>();
+	const resolution = Promise.withResolvers<void>();
+	const preDrainBarrier = Promise.withResolvers<void>();
+	const sessionClosedDrained = Promise.withResolvers<void>();
+	const terminalized = Promise.withResolvers<void>();
 	const events: string[] = [];
+	let controllerAttached = false;
 	let resolutionStarted = false;
 	const originalRegisterController = emitter.registerGateTerminalController!.bind(emitter);
 	const originalResolveGate = emitter.resolveGate!.bind(emitter);
 	const originalPushFrameAndWait = NotificationServer.prototype.pushFrameAndWait;
 	const registerController = spyOn(emitter, "registerGateTerminalController").mockImplementation(controller => {
 		const detach = originalRegisterController(controller);
+		controllerAttached = true;
 		return () => {
 			events.push("controller-detached");
+			controllerAttached = false;
 			detach();
 		};
 	});
@@ -3555,6 +3559,7 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		await resolution.promise;
 		const resolved = await originalResolveGate(response);
 		events.push("gate-terminalized");
+		terminalized.resolve();
 		return resolved;
 	});
 	const pushFrameAndWait = spyOn(NotificationServer.prototype, "pushFrameAndWait").mockImplementation(async function (
@@ -3562,16 +3567,18 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		frame,
 		timeout,
 	) {
+		const delivered = await originalPushFrameAndWait.call(this, frame, timeout);
 		if ((JSON.parse(frame) as { type?: unknown }).type === "session_closed") {
-			sessionClosedReached.resolve();
-			await sessionClosedBarrier.promise;
+			sessionClosedDrained.resolve();
+			await preDrainBarrier.promise;
 		}
-		return await originalPushFrameAndWait.call(this, frame, timeout);
+		return delivered;
 	});
 	process.env.GJC_NOTIFICATIONS = "1";
 	const sessionContext = context(cwd, sessionId, "main", {}, emitter);
 	const handlers = start(sessionContext);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	let shutdown: Promise<unknown> | undefined;
 	try {
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -3585,7 +3592,11 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		emitter.onGateEmitted!(gate => {
 			gateId = gate.gate_id;
 		});
-		void emitter.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } }).catch(() => {});
+		const gateContinuation = emitter.emitGate({
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string" },
+		});
 		await waitFor(() => gateId !== "", "workflow gate");
 		socket.send(
 			JSON.stringify({
@@ -3602,14 +3613,22 @@ test("session teardown drains admitted direct gate resolution before detaching i
 			}),
 		);
 		await waitFor(() => resolutionStarted, "direct gate resolution");
-		const shutdown = handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		await sessionClosedReached.promise;
-		expect(events).toEqual([]);
-		sessionClosedBarrier.resolve();
-		resolution.resolve({ status: "accepted" });
+		shutdown = Promise.resolve(handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext));
+		await sessionClosedDrained.promise;
+		expect(controllerAttached).toBe(true);
+		preDrainBarrier.resolve();
+		await new Promise<void>(resolve => setImmediate(resolve));
+		expect(controllerAttached).toBe(true);
+		resolution.resolve();
+		expect(await gateContinuation).toBe("approve");
+		await terminalized.promise;
+		expect(controllerAttached).toBe(true);
 		await shutdown;
 		expect(events).toEqual(["gate-terminalized", "controller-detached"]);
 	} finally {
+		preDrainBarrier.resolve();
+		resolution.resolve();
+		await shutdown?.catch(() => {});
 		pushFrameAndWait.mockRestore();
 		resolveGate.mockRestore();
 		registerController.mockRestore();
