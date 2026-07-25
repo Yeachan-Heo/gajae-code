@@ -6,10 +6,17 @@ All sleeps are mocked — no real delays. Tests prove:
   2. Probe-phase 429 triggers backoff before the grid starts.
   3. Grid-phase 429 triggers backoff with the response, then continues.
   4. Repeated 429s remain bounded by attempt/browser budgets and terminate.
-  5. Abort/timeout handling is not defeated by backoff.
+  5. Abort/timeout handling is not defeated by backoff: a cancellation
+     (KeyboardInterrupt) raised during a backoff sleep propagates immediately,
+     and no single backoff sleep can exceed the 30s ceiling or become
+     non-finite, so a per-attempt deadline can rely on the bound and never hang.
+  6. The configured base (INSANE_RATE_LIMIT_BACKOFF_S) is validated and clamped
+     before sleeping: non-numeric, NaN, infinite, negative, or huge values can
+     neither crash _fetch_core nor bypass the advertised 30s bound.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import unittest
@@ -41,6 +48,45 @@ def _grid_plan(n=6):
               referer="self_root", known_bad_sizes=None)
         for i in range(n)
     ]
+
+
+def _run_all_429(env_value, max_attempts=4, retry_after=None):
+    """Run _fetch_core where every attempt is a 429, under a given
+    INSANE_RATE_LIMIT_BACKOFF_S value, with sleeps mocked.
+
+    Returns (result, sleeps, attempt_count). Deterministic: no real network or
+    delays. Used by the base-validation and timeout regressions below.
+    """
+    sleeps = []
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    resp_429 = _make_resp(429, headers=headers)
+    call_count = [0]
+
+    def fake_run_attempt(url, **kwargs):
+        from engine.fetch_chain import Attempt
+        call_count[0] += 1
+        att = Attempt(phase="grid" if call_count[0] > 1 else "probe",
+                      executor="curl_cffi", url=url,
+                      url_transform="original", impersonate="safari",
+                      referer="self_root", status=429,
+                      verdict=Verdict.RATE_LIMITED.value)
+        return att, resp_429
+
+    with patch.dict(os.environ, {"INSANE_RATE_LIMIT_BACKOFF_S": env_value}, clear=False), \
+         patch("engine.fetch_chain._run_attempt", side_effect=fake_run_attempt), \
+         patch("engine.fetch_chain._curl_probe", return_value=(resp_429, None)), \
+         patch("engine.fetch_chain.detect", return_value=[]), \
+         patch("engine.fetch_chain._build_plan", return_value=_grid_plan(10)), \
+         patch("engine.fetch_chain._load_profiles", return_value={}), \
+         patch("engine.fetch_chain.last_load_error", return_value=None), \
+         patch("engine.fetch_chain.time.sleep", side_effect=lambda d: sleeps.append(d)):
+        result = _fetch_core(
+            "https://example.com/page",
+            enable_playwright=False,
+            enable_phase0=False,
+            max_attempts=max_attempts,
+        )
+    return result, sleeps, call_count[0]
 
 
 class RateLimitBackoffUnitTest(unittest.TestCase):
@@ -323,6 +369,126 @@ class RateLimitBudgetTerminationTest(unittest.TestCase):
         expected = [2.0, 4.0, 6.0, 8.0, 10.0, 10.0]
         self.assertEqual(backoff_sleeps[:6], expected,
                          f"Expected linear escalation {expected}, got {backoff_sleeps}")
+
+
+class RateLimitBaseValidationTest(unittest.TestCase):
+    """The configured backoff base must be validated/clamped before sleeping.
+
+    Regression for the review finding that `_rl_base = float(env)` was neither
+    validated nor capped, so a large/negative/NaN/infinite/non-numeric value
+    could bypass the 30s bound, hang time.sleep, or crash _fetch_core.
+    """
+
+    def test_clamp_helper_rejects_pathological_values(self):
+        """_clamp_rate_limit_base is total: never raises, always safe & bounded."""
+        from engine.fetch_chain import (
+            _clamp_rate_limit_base, _RATE_LIMIT_MAX_DELAY, _RATE_LIMIT_DEFAULT_BASE,
+        )
+        # Non-numeric / NaN / infinite / negative / empty / None -> default.
+        for bad in ["abc", "nan", "inf", "-inf", "-5", "-0.1", "", "  ", None]:
+            base = _clamp_rate_limit_base(bad)
+            self.assertEqual(base, _RATE_LIMIT_DEFAULT_BASE,
+                             f"{bad!r} should fall back to default, got {base}")
+        # Valid values pass through, clamped to the ceiling.
+        self.assertEqual(_clamp_rate_limit_base("2.0"), 2.0)
+        self.assertEqual(_clamp_rate_limit_base("7"), 7.0)
+        self.assertEqual(_clamp_rate_limit_base("0"), 0.0)
+        self.assertEqual(_clamp_rate_limit_base("30"), _RATE_LIMIT_MAX_DELAY)
+        self.assertEqual(_clamp_rate_limit_base("999"), _RATE_LIMIT_MAX_DELAY)
+        self.assertEqual(_clamp_rate_limit_base("1e308"), _RATE_LIMIT_MAX_DELAY)
+        # Result is always finite and within [0, ceiling].
+        for v in ["abc", "nan", "inf", "-5", "1e308", "2.0", "999", None]:
+            b = _clamp_rate_limit_base(v)
+            self.assertTrue(math.isfinite(b), f"non-finite base for {v!r}: {b}")
+            self.assertGreaterEqual(b, 0.0)
+            self.assertLessEqual(b, _RATE_LIMIT_MAX_DELAY)
+
+    def test_huge_env_base_capped_end_to_end(self):
+        """A huge base must not produce a sleep beyond the 30s ceiling."""
+        _, sleeps, _ = _run_all_429("1000000000", max_attempts=4)
+        self.assertTrue(sleeps, "expected at least one backoff sleep")
+        for s in sleeps:
+            self.assertTrue(math.isfinite(s), f"non-finite sleep {s!r}")
+            self.assertLessEqual(s, 30.0, f"huge base produced sleep {s!r} > 30s")
+
+    def test_negative_env_base_no_crash_no_negative_sleep(self):
+        """A negative base must not raise nor hand time.sleep a negative value."""
+        _, sleeps, _ = _run_all_429("-5", max_attempts=4)  # must not raise
+        for s in sleeps:
+            self.assertGreaterEqual(s, 0.0, f"negative sleep {s!r}")
+            self.assertLessEqual(s, 30.0)
+
+    def test_nan_env_base_no_crash(self):
+        """A NaN base must not crash nor produce a non-finite sleep."""
+        _, sleeps, _ = _run_all_429("nan", max_attempts=4)  # must not raise
+        for s in sleeps:
+            self.assertTrue(math.isfinite(s), f"non-finite sleep {s!r}")
+            self.assertLessEqual(s, 30.0)
+
+    def test_infinite_env_base_does_not_hang(self):
+        """An infinite base must not produce an infinite (hanging) sleep."""
+        _, sleeps, _ = _run_all_429("inf", max_attempts=4)  # must not raise/hang
+        for s in sleeps:
+            self.assertTrue(math.isfinite(s), f"infinite sleep {s!r} would hang")
+            self.assertLessEqual(s, 30.0)
+
+    def test_nonnumeric_env_base_no_crash(self):
+        """A non-numeric base must not raise ValueError inside _fetch_core."""
+        result, _, n = _run_all_429("not-a-number", max_attempts=4)  # must not raise
+        self.assertFalse(result.ok)
+        self.assertGreaterEqual(n, 1)
+
+
+class RateLimitCancellationTest(unittest.TestCase):
+    """Abort/timeout handling must not be defeated by backoff (header claim 5)."""
+
+    def test_keyboardinterrupt_during_backoff_propagates(self):
+        """A cancellation raised during a backoff sleep propagates immediately;
+        backoff neither swallows it nor keeps the grid running."""
+        resp_429 = _make_resp(429, headers={"Retry-After": "10"})
+        call_count = [0]
+
+        def fake_run_attempt(url, **kwargs):
+            from engine.fetch_chain import Attempt
+            call_count[0] += 1
+            att = Attempt(phase="probe", executor="curl_cffi", url=url,
+                          url_transform="original", impersonate="safari",
+                          referer="self_root", status=429,
+                          verdict=Verdict.RATE_LIMITED.value)
+            return att, resp_429
+
+        def cancelling_sleep(d):
+            raise KeyboardInterrupt()
+
+        with patch("engine.fetch_chain._run_attempt", side_effect=fake_run_attempt), \
+             patch("engine.fetch_chain._curl_probe", return_value=(resp_429, None)), \
+             patch("engine.fetch_chain._load_profiles", return_value={}), \
+             patch("engine.fetch_chain.last_load_error", return_value=None), \
+             patch("engine.fetch_chain.time.sleep", side_effect=cancelling_sleep):
+            with self.assertRaises(KeyboardInterrupt):
+                _fetch_core(
+                    "https://example.com/page",
+                    enable_playwright=False,
+                    enable_phase0=False,
+                    max_attempts=6,
+                )
+        # Cancellation fired on the first backoff and stopped the chain before
+        # the grid could run to its budget — the abort was honoured promptly.
+        self.assertLess(call_count[0], 6,
+                        f"cancellation should cut the chain short, ran {call_count[0]}")
+
+    def test_per_sleep_bound_holds_under_pathological_inputs(self):
+        """Timeout regression: even with a huge base AND a huge Retry-After, no
+        single backoff sleep may exceed the 30s ceiling or become non-finite,
+        so a per-attempt deadline can rely on the bound and never hang."""
+        result, sleeps, _ = _run_all_429("1e9", max_attempts=5, retry_after="999999")
+        self.assertTrue(sleeps, "expected at least one backoff sleep")
+        for s in sleeps:
+            self.assertTrue(math.isfinite(s), f"non-finite sleep {s!r}")
+            self.assertGreaterEqual(s, 0.0, f"negative sleep {s!r}")
+            self.assertLessEqual(s, 30.0, f"sleep {s!r} exceeds the 30s ceiling")
+        # The chain still terminates within budget (it was not hung).
+        self.assertFalse(result.ok)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ No site-specific branching. Site knowledge enters only via:
 """
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
@@ -45,6 +46,34 @@ from .url_transforms import iter_transformed
 
 _OK_VALUES = (Verdict.STRONG_OK.value, Verdict.WEAK_OK.value)
 _TERMINAL_NONSUCCESS_VALUES = frozenset(v.value for v in TERMINAL_NONSUCCESS)
+
+
+# --- 429 rate-limit backoff bounds -------------------------------------------
+# The configured base (INSANE_RATE_LIMIT_BACKOFF_S) AND the final per-attempt
+# delay are both clamped to a hard 30s ceiling so a hostile or mis-set
+# environment value (huge, negative, NaN, or infinite) can never bypass the
+# advertised bound, hang time.sleep, or crash the fetch chain. Keeping each
+# sleep short and finite is also what makes the backoff cancellable: an
+# abort/KeyboardInterrupt between attempts is honoured promptly rather than
+# blocked behind an unbounded sleep.
+_RATE_LIMIT_MAX_DELAY = 30.0
+_RATE_LIMIT_DEFAULT_BASE = 2.0
+
+
+def _clamp_rate_limit_base(raw) -> float:
+    """Parse INSANE_RATE_LIMIT_BACKOFF_S into a safe, finite, non-negative base.
+
+    Rejects (falls back to the default) any value that is non-numeric, NaN,
+    infinite, or negative; clamps a valid value to the hard ceiling so the
+    linear escalation (base * 1..5) can never exceed the advertised bound.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _RATE_LIMIT_DEFAULT_BASE
+    if not math.isfinite(value) or value < 0:
+        return _RATE_LIMIT_DEFAULT_BASE
+    return min(value, _RATE_LIMIT_MAX_DELAY)
 
 
 # --- Referer strategies (name → function of original URL) --------------------
@@ -451,8 +480,11 @@ def _fetch_core(
         time.sleep(random.uniform(_jmin / 1000.0, _jmax / 1000.0))
 
     # 429 backoff: longer than normal jitter. Respects Retry-After header when
-    # available (capped at 30s to avoid stalling the grid indefinitely).
-    _rl_base = float(os.environ.get("INSANE_RATE_LIMIT_BACKOFF_S", "2.0"))
+    # available. The configured base is validated/clamped (_clamp_rate_limit_base)
+    # and the final delay is hard-capped to _RATE_LIMIT_MAX_DELAY (30s) so a
+    # pathological INSANE_RATE_LIMIT_BACKOFF_S can never bypass the advertised
+    # bound, hang time.sleep, or defeat cancellation.
+    _rl_base = _clamp_rate_limit_base(os.environ.get("INSANE_RATE_LIMIT_BACKOFF_S", "2.0"))
     _rl_count = 0
 
     def _rate_limit_backoff(resp=None):
@@ -463,10 +495,15 @@ def _fetch_core(
             try:
                 ra = {k.lower(): v for k, v in dict(getattr(resp, "headers", {}) or {}).items()}.get("retry-after", "")
                 if ra.isdigit():
-                    delay = max(delay, min(int(ra), 30))
+                    delay = max(delay, min(int(ra), _RATE_LIMIT_MAX_DELAY))
             except Exception:
                 pass
-        time.sleep(delay)
+        # Hard ceiling + NaN/negative guard: never hand time.sleep an unbounded
+        # or invalid value (it would hang or raise), and never exceed the
+        # advertised 30s bound.
+        if not math.isfinite(delay) or delay < 0:
+            delay = _RATE_LIMIT_DEFAULT_BASE
+        time.sleep(min(delay, _RATE_LIMIT_MAX_DELAY))
 
     # Surface profile-loader failures as a diagnostic trace entry (not counted
     # as a network attempt).
