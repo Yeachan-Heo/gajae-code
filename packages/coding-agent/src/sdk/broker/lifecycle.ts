@@ -29,7 +29,7 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
-import { isUnsupportedWindowsDirectorySyncError } from "../../utils/directory-sync";
+import { syncDirectoryBestEffort } from "../../utils/directory-sync";
 import { SdkClient, SdkClientError } from "../client/client";
 import {
 	type LogicalSessionCandidate,
@@ -868,15 +868,8 @@ function isLifecycleFailureArtifact(value: unknown): value is LifecycleFailureAr
 }
 
 async function syncDirectory(directory: string): Promise<void> {
-	const handle = await fs.open(directory, fsSync.constants.O_RDONLY);
-	try {
-		await handle.sync();
-	} catch (error) {
-		// Windows cannot fsync a directory handle; rename durability is best-effort there.
-		if (!isUnsupportedWindowsDirectorySyncError(error)) throw error;
-	} finally {
-		await handle.close();
-	}
+	// Windows cannot fsync a directory handle; rename durability is best-effort there.
+	await syncDirectoryBestEffort(directory);
 }
 
 /** The child writes bounded startup diagnostics before exiting without readiness. */
