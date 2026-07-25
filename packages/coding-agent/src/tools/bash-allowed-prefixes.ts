@@ -18,7 +18,9 @@ export interface BashRestrictionOptions {
 }
 
 const SHELL_CONTROL_CHARS = new Set([";", "|", "&", "<", ">", "(", ")"]);
-const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "}", "~"]);
+// `~` is handled separately: bash only performs tilde expansion at the start of a
+// word, so a mid-word `~` (e.g. the git revision `HEAD~1`) is a literal character.
+const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "}"]);
 const ALLOWED_STATE_ACTIONS = new Set(["read", "write", "contract"]);
 const CANONICAL_STATE_TARGETS = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 const READ_ONLY_COMMANDS = new Set(["grep", "rg", "tree", "ls", "pwd", "wc", "du", "file", "stat"]);
@@ -81,6 +83,13 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 		}
 		if (UNSAFE_UNQUOTED_EXPANSION_CHARS.has(char)) {
 			return { words, reason: `shell expansion character '${char}' is not allowed in restricted bash commands` };
+		}
+		// Tilde expansion is positional: bash expands `~`, `~/path`, and `~user` only when
+		// the tilde opens a word. A tilde inside a word is literal, which is what git
+		// revision syntax such as `HEAD~1` relies on, so only the word-initial form is
+		// rejected here.
+		if (char === "~" && !wordStarted) {
+			return { words, reason: "shell expansion character '~' is not allowed in restricted bash commands" };
 		}
 		if (/\s/u.test(char)) {
 			if (wordStarted) {

@@ -290,6 +290,34 @@ describe("checkBashAllowedPrefixes", () => {
 		expect(result.reason).toContain("shell expansion character");
 	});
 
+	it("allows literal mid-word tildes so git revision syntax works unquoted", () => {
+		const gitPrefixes = [...ROLE_AGENT_PREFIXES, "git diff", "git show", "git log", "git rev-parse"];
+
+		// bash performs tilde expansion only at the start of a word, so `HEAD~1` is a
+		// literal argument and must not be rejected as an expansion attempt.
+		for (const command of [
+			"git diff HEAD~1",
+			"git show HEAD~2",
+			"git diff HEAD~1..HEAD",
+			"git log HEAD~5",
+			"git rev-parse HEAD~3",
+			"git diff HEAD~1 -- src/a.ts",
+		]) {
+			expect({ command, ...checkBashAllowedPrefixes(command, gitPrefixes) }).toMatchObject({ allowed: true });
+		}
+	});
+
+	it("still blocks word-initial tildes that bash would expand to a home directory", () => {
+		const gitPrefixes = [...ROLE_AGENT_PREFIXES, "git diff", "git show", "git log"];
+
+		for (const command of ["git diff ~/secrets", "git show ~", "git log ~root", "git diff -- ~/x"]) {
+			const result = checkBashAllowedPrefixes(command, gitPrefixes);
+
+			expect({ command, allowed: result.allowed }).toMatchObject({ allowed: false });
+			expect(result.reason).toContain("shell expansion character");
+		}
+	});
+
 	it("blocks backslash escape smuggling", () => {
 		const result = checkBashAllowedPrefixes("gjc state ralplan\\ clear --json", ROLE_AGENT_PREFIXES);
 

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Restricted role-agent `bash` now accepts literal mid-word tildes, so git revision syntax such as `git diff HEAD~1` no longer has to be quoted. Bash performs tilde expansion only at the start of a word, so word-initial forms (`~`, `~/path`, `~user`) remain blocked.
 - Interactive prompt cancellation now reaches API-key preflight through `ModelRegistry`, allowing aborted submissions to clear immediately even while a shared credential-usage request continues in the background.
 - Alibaba Token Plan canonical first-event timeouts now surface without session retry/fallback replay and are not internally retried by auto-compaction, preventing repeated provider usage (#3026).
 - Delegated-task and subagent status surfaces now distinguish provider recovery from normal running, identify first-event versus idle-stream stalls, show retry budget and provider-progress age, and aggregate concurrent degradation by provider (#3071).
