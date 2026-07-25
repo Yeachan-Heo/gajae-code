@@ -4014,6 +4014,8 @@ interface TelegramQueuePayload {
 	selectedAck?: SelectedAckQueueItem;
 	btwDelivery?: BtwQueuedDelivery;
 	toolActivity?: ToolActivityOwner;
+	/** Exact admitted legacy-v1 start authorized for this terminal delivery. */
+	legacyToolStart?: LegacyToolStartSettlement;
 }
 
 interface PendingBtwTurn {
@@ -6240,6 +6242,21 @@ export class TelegramNotificationDaemon {
 		this.legacyToolStarts.set(key, state);
 		return state;
 	}
+	private legacyToolStartForTerminal(owner: ToolActivityOwner): LegacyToolStartSettlement | undefined {
+		if (owner.phase !== "terminal") return undefined;
+		const key = `${owner.sessionId}:tool:${owner.toolCallId}`;
+		const state = this.legacyToolStarts.get(key);
+		if (
+			state === undefined ||
+			state.key !== key ||
+			state.owner.session !== owner.session ||
+			state.owner.endpointDigest !== owner.endpointDigest ||
+			state.owner.toolName !== owner.toolName ||
+			state.policyEpoch !== owner.policyEpoch
+		)
+			return undefined;
+		return state;
+	}
 
 	private settleLegacyToolStart(state: LegacyToolStartSettlement, outcome: LegacyToolStartOutcome): void {
 		if (state.settledOutcome === undefined) {
@@ -6394,7 +6411,9 @@ export class TelegramNotificationDaemon {
 		const legacyStart =
 			toolActivity?.phase === "started"
 				? this.legacyToolStarts.get(`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`)
-				: undefined;
+				: toolActivity?.phase === "terminal"
+					? this.legacyToolStartForTerminal(toolActivity)
+					: undefined;
 		if (legacyStart !== undefined && legacyStart.owner === toolActivity) {
 			legacyStart.phase = "queued";
 			legacyStart.itemId ??= `legacy-tool-start:${this.nextLegacyToolStartId++}`;
@@ -6411,6 +6430,9 @@ export class TelegramNotificationDaemon {
 				topicLease,
 				...(socketLease ? { socketLease } : {}),
 				...(toolActivity ? { toolActivity } : {}),
+				...(legacyStart !== undefined && toolActivity?.phase === "terminal"
+					? { legacyToolStart: legacyStart }
+					: {}),
 			},
 		});
 		if (!submitted) {
@@ -7598,8 +7620,9 @@ export class TelegramNotificationDaemon {
 				this.pool.settle(item.itemId!, disposition);
 				if (toolActivity?.phase === "started") this.failLegacyToolStart(toolActivity);
 				if (toolActivity?.phase === "terminal") {
-					const state = this.legacyToolStarts.get(`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`);
-					if (state !== undefined && state.owner === toolActivity) this.settleLegacyToolStart(state, "terminal");
+					const state = item.payload.legacyToolStart;
+					if (state !== undefined && this.legacyToolStarts.get(state.key) === state)
+						this.settleLegacyToolStart(state, "terminal");
 				}
 				// A terminal tool frame owns the end of this coalescing key even when both
 				// edit and fallback delivery fail. Retaining the old message id would leak
@@ -7690,11 +7713,17 @@ export class TelegramNotificationDaemon {
 		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
 		if (send.identity && this.flatIdentitySent.has(sessionId)) return;
 		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
+		const legacyToolStart = toolActivity ? this.legacyToolStartForTerminal(toolActivity) : undefined;
 		this.submitPool({
 			sessionId,
 			lane: send.lane,
 			coalesceKey: send.coalesceKey,
-			payload: { send, ...(socketLease ? { socketLease } : {}), ...(toolActivity ? { toolActivity } : {}) },
+			payload: {
+				send,
+				...(socketLease ? { socketLease } : {}),
+				...(toolActivity ? { toolActivity } : {}),
+				...(legacyToolStart ? { legacyToolStart } : {}),
+			},
 		});
 		await this.flushPool();
 		if (socketLease && !this.#leaseTokenAllows(socketLease)) return;

@@ -14109,6 +14109,58 @@ describe("Telegram tool activity capability and routing", () => {
 
 		expect(bot.calls).toHaveLength(importantCallCount);
 	});
+	test("legacy-v1 normal terminal retires its exact settlement before the tool call id is reused", async () => {
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "reused-v1",
+			toolName: "read",
+			phase: "started",
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "reused-v1",
+			toolName: "read",
+			phase: "completed",
+		});
+
+		const runtime = daemon as unknown as { legacyToolStarts: Map<string, unknown> };
+		expect(runtime.legacyToolStarts.has("S:tool:reused-v1")).toBe(false);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+		expect(bot.calls.filter(call => call.method === "editMessageText")).toHaveLength(1);
+
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "reused-v1",
+			toolName: "read",
+			phase: "started",
+		});
+
+		expect(runtime.legacyToolStarts.has("S:tool:reused-v1")).toBe(true);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(2);
+		expect(bot.calls.filter(call => call.method === "editMessageText")).toHaveLength(1);
+	});
 	test("legacy-v1 unknown closes only an already-visible start as summary-free cancelled", async () => {
 		const bot = new FakeBotApi();
 		const daemon = new TelegramNotificationDaemon({
