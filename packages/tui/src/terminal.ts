@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import { $env, $flag, $pickenv } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
-import { isUnderTerminalMultiplexer } from "./terminal-capabilities";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -244,7 +243,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	setMouseEnabled(enabled: boolean): void {
-		this.#mouseEnabled = enabled && !isUnderTerminalMultiplexer(Bun.env);
+		this.#mouseEnabled = enabled;
 		if (this.#started) this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
 	}
 
@@ -271,8 +270,8 @@ export class ProcessTerminal implements Terminal {
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
-		// SGR mouse reporting is opt-in and never enabled inside tmux or screen.
-		if (this.#mouseEnabled) this.#safeWrite("\x1b[?1000h\x1b[?1006h");
+		// Establish the requested SGR mouse state, clearing stale reporting left by another application when disabled.
+		this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);

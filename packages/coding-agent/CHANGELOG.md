@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Mouse support is now enabled by default and works inside tmux and screen, so the wheel scrolls GJC's virtual session viewport before multiplexer scrollback. Disable `mouse.enabled` to retain terminal or tmux scrollback behavior.
 
 - Restricted role-agent `bash` now accepts literal mid-word tildes, so git revision syntax such as `git diff HEAD~1` no longer has to be quoted. Bash performs tilde expansion only at the start of a word, so word-initial forms (`~`, `~/path`, `~user`) remain blocked.
 - Restricted role-agent `bash` now rejects unquoted tildes at every bash expansion position inside assignment words, including the compound `name+=value` form, so `A=~`, `A+=~`, `foo=~root/bar`, `A=x:~`, `A+=x:~`, and repeated colon segments such as `a=x:~:y:~` fail closed. Tildes bash does not expand — mid-word git revisions (`HEAD~1`), non-assignment words (`--opt=~`, `1abc=~`, `a++=~`, `a+b=~`), and quoted forms — remain allowed (#3117).

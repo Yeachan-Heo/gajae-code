@@ -1240,11 +1240,12 @@ export const SETTINGS_SCHEMA = {
 
 	"mouse.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "interaction",
 			label: "Mouse Support",
-			description: "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+			description:
+				"Enable GJC session scrolling and overlay row selection with the mouse. Disable to use terminal or tmux scrollback.",
 		},
 	},
 	// Conversation flow

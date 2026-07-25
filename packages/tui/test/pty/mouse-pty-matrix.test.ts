@@ -118,12 +118,12 @@ describe.skipIf(!enabled || process.platform === "win32")("mouse PTY matrix", ()
 		}
 	});
 
-	test("emits no SGR mouse enable bytes under a multiplexer", async () => {
+	test("emits SGR mouse enable bytes under a multiplexer", async () => {
 		const { terminal, output } = launchFixture({ PTY_FIXTURE_MOUSE: "1", TMUX: "1" });
 		try {
 			await waitForOutput(output, "PTY_FIXTURE_READY");
-			expect(output()).not.toContain("\x1b[?1000h");
-			expect(output()).not.toContain("\x1b[?1006h");
+			expect(output()).toContain("\x1b[?1000h");
+			expect(output()).toContain("\x1b[?1006h");
 		} finally {
 			terminal.kill();
 		}

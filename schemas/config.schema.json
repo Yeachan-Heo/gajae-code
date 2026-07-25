@@ -913,8 +913,8 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean",
-					"description": "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
-					"default": false
+					"description": "Enable GJC session scrolling and overlay row selection with the mouse. Disable to use terminal or tmux scrollback.",
+					"default": true
 				}
 			},
 			"additionalProperties": false
