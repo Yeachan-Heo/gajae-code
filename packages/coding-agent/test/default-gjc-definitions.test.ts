@@ -21,6 +21,7 @@ import { parseInternalUrl } from "@gajae-code/coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@gajae-code/coding-agent/internal-urls/skill-protocol";
 import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
 import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
+import { checkBashAllowedPrefixes } from "@gajae-code/coding-agent/tools/bash-allowed-prefixes";
 import { prompt } from "@gajae-code/utils";
 
 const tempRoots: string[] = [];
@@ -444,7 +445,19 @@ describe("default GJC definitions", () => {
 			expect(agent?.tools).toContain("bash");
 			expect(agent?.tools).not.toContain("edit");
 			expect(agent?.tools).not.toContain("write");
-			expect(agent?.bashAllowedPrefixes).toEqual(["gjc ralplan --write", "gjc state"]);
+			expect(agent?.bashAllowedPrefixes).toEqual([
+				"gjc ralplan --write",
+				"gjc state",
+				"git status",
+				"git log",
+				"git show",
+				"git diff",
+				"git blame",
+				"git rev-parse",
+				"git ls-files",
+			]);
+			expect(agent?.tools).toContain("web_search");
+			expect(agent?.tools).toContain("irc");
 		}
 		for (const agent of [executor, architect, planner, critic]) {
 			expect(agent?.model).toBeUndefined();
@@ -455,6 +468,48 @@ describe("default GJC definitions", () => {
 		expect(planner?.systemPrompt).toContain("you do not implement");
 		expect(critic?.systemPrompt).toContain("OKAY");
 		expect(critic?.systemPrompt).toContain("REJECT");
+	});
+	it("allows read-only git and blocks mutating git for role agents through the real prefix check", () => {
+		const allowed = [
+			"git status",
+			"git log --oneline -20",
+			"git log -p src/a.ts",
+			"git show HEAD^",
+			"git diff",
+			"git diff 'HEAD~1'",
+			"git blame src/foo.ts",
+			"git rev-parse HEAD",
+			"git ls-files",
+			"gjc ralplan --write --stage architect --stage_n 1 --artifact 'verdict'",
+		];
+		const blocked = [
+			"git commit -m x",
+			"git push",
+			"git push --force origin main",
+			"git reset --hard",
+			"git checkout .",
+			"git branch -D main",
+			"git config user.name x",
+			"git status; rm -rf .gjc",
+			"rm -rf .gjc",
+			"echo verdict",
+		];
+
+		for (const name of ["architect", "planner", "critic"] as const) {
+			const prefixes = getBundledAgent(name)?.bashAllowedPrefixes;
+			expect(prefixes).toBeDefined();
+
+			for (const command of allowed) {
+				expect({ name, command, ...checkBashAllowedPrefixes(command, prefixes) }).toMatchObject({
+					allowed: true,
+				});
+			}
+			for (const command of blocked) {
+				expect({ name, command, ...checkBashAllowedPrefixes(command, prefixes) }).toMatchObject({
+					allowed: false,
+				});
+			}
+		}
 	});
 	it("renders shared ralplan partials while keeping the default executor prompt unchanged", () => {
 		const executor = getBundledAgent("executor");
