@@ -119,6 +119,56 @@ describe("claudeUsageProvider retry contract", () => {
 		expect(retryWait.mock.calls[0]?.[0]).toBe(1000);
 	});
 
+	it("caps an absurd Retry-After instead of stalling for hours", async () => {
+		let attempt = 0;
+		const retryWait = vi.fn(async (_delayMs: number, _signal?: AbortSignal) => {});
+		const fetchMock = (async () => {
+			attempt += 1;
+			if (attempt === 1) {
+				// A hostile/misconfigured endpoint asks for a 24h backoff. Honouring
+				// it verbatim would stall the usage fetch for a day.
+				return jsonResponse(429, { error: "rate_limited" }, { "retry-after": "86400" });
+			}
+			return jsonResponse(200, VALID_PAYLOAD);
+		}) as unknown as typeof fetch;
+
+		const report = await claudeUsageProvider.fetchUsage(baseParams(), makeContext(fetchMock, retryWait));
+		expect(report).not.toBeNull();
+		expect(retryWait).toHaveBeenCalledTimes(1);
+		expect(retryWait.mock.calls[0]?.[0]).toBe(60_000);
+	});
+
+	it("caps an absurd HTTP-date Retry-After too", async () => {
+		let attempt = 0;
+		const retryWait = vi.fn(async (_delayMs: number, _signal?: AbortSignal) => {});
+		const farFuture = new Date(Date.now() + 24 * 60 * 60 * 1000).toUTCString();
+		const fetchMock = (async () => {
+			attempt += 1;
+			if (attempt === 1) return jsonResponse(429, { error: "rate_limited" }, { "retry-after": farFuture });
+			return jsonResponse(200, VALID_PAYLOAD);
+		}) as unknown as typeof fetch;
+
+		const report = await claudeUsageProvider.fetchUsage(baseParams(), makeContext(fetchMock, retryWait));
+		expect(report).not.toBeNull();
+		expect(retryWait.mock.calls[0]?.[0]).toBe(60_000);
+	});
+
+	it("ignores a negative Retry-After and never sleeps negatively", async () => {
+		let attempt = 0;
+		const retryWait = vi.fn(async (_delayMs: number, _signal?: AbortSignal) => {});
+		const fetchMock = (async () => {
+			attempt += 1;
+			if (attempt === 1) return jsonResponse(429, { error: "rate_limited" }, { "retry-after": "-5" });
+			return jsonResponse(200, VALID_PAYLOAD);
+		}) as unknown as typeof fetch;
+
+		const report = await claudeUsageProvider.fetchUsage(baseParams(), makeContext(fetchMock, retryWait));
+		expect(report).not.toBeNull();
+		const delay = retryWait.mock.calls[0]?.[0] ?? -1;
+		expect(delay).toBeGreaterThanOrEqual(0);
+		expect(delay).toBeLessThanOrEqual(60_000);
+	});
+
 	it("aborts the retry sleep when the signal fires mid-backoff", async () => {
 		let attempt = 0;
 		const fetchMock = (async (_url: string | URL, init?: RequestInit) => {
