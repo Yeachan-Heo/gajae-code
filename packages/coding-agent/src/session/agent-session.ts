@@ -341,6 +341,7 @@ import {
 import {
 	type ConfiguredFallbackChain,
 	cappedExponentialWithFullJitter,
+	compactionRetryDelay,
 	effectiveFallbackDelay,
 	FallbackChainController,
 } from "./fallback-chain-controller";
@@ -12504,8 +12505,14 @@ export class AgentSession {
 								break;
 							}
 
-							const baseDelayMs = retrySettings.baseDelayMs * 2 ** attempt;
-							const delayMs = retryAfterMs !== undefined ? Math.max(baseDelayMs, retryAfterMs) : baseDelayMs;
+							// Legacy parsed Retry-After is capped at retry.maxDelayMs (see
+							// compactionRetryDelay); only managed fallback is uncapped.
+							const delayMs = compactionRetryDelay(
+								retrySettings.baseDelayMs,
+								retrySettings.maxDelayMs,
+								attempt,
+								retryAfterMs,
+							);
 
 							// If retry delay is too long (>30s), try next candidate instead of waiting
 							const maxAcceptableDelayMs = 30_000;

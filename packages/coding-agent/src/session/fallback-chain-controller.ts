@@ -186,6 +186,33 @@ export function cappedExponentialWithFullJitter(
 	return Math.floor(Math.max(0, cap) * Math.max(0, Math.min(1, random())));
 }
 
+/**
+ * Legacy auto-compaction retry delay.
+ *
+ * Deliberately the mirror image of `effectiveFallbackDelay`: this path recovers
+ * Retry-After by regex over provider error prose (`#parseRetryAfterMsFromError`),
+ * so it follows the documented legacy rule — `retry.maxDelayMs` caps every
+ * legacy session retry delay, including provider retry-after hints. Managed
+ * fallback stays uncapped because it retries within its own per-entry budget;
+ * compaction has no such budget, so the final candidate would otherwise sleep
+ * for the full server-suggested duration.
+ *
+ * `maxDelayMs <= 0` means "no cap", matching `cappedExponentialWithFullJitter`.
+ * A missing, NaN, or infinite hint collapses to "no usable hint".
+ */
+export function compactionRetryDelay(
+	baseDelayMs: number,
+	maxDelayMs: number,
+	attempt: number,
+	retryAfterMs: number | undefined,
+): number {
+	const exponential = baseDelayMs * 2 ** Math.max(0, attempt);
+	const hint = Number.isFinite(retryAfterMs) ? Math.max(0, retryAfterMs as number) : 0;
+	const hinted = Math.max(exponential, hint);
+	const bounded = maxDelayMs > 0 ? Math.min(hinted, maxDelayMs) : hinted;
+	return Math.max(0, bounded);
+}
+
 /** Retry-After is intentionally uncapped. */
 export function effectiveFallbackDelay(
 	baseDelayMs: number,
