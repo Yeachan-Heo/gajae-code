@@ -40,5 +40,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * cooldown and lazy Telegram topic lifecycle safeguards (#2956, #2960, #2984).
  * Generation 27 refreshes retained native path and process authority semantics.
  * Generation 28 rejects special files before retained native authority opens.
+ * Generation 29 adds opt-in tool activity delivery, closed lifecycle phases,
+ * and capability-versioned mixed-host compatibility.
  */
-export const DAEMON_GENERATION = 28;
+export const DAEMON_GENERATION = 29;
