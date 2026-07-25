@@ -45,7 +45,7 @@
 			"properties": {
 				"statusBridge": {
 					"type": "boolean",
-					"default": true
+					"default": false
 				}
 			},
 			"additionalProperties": false

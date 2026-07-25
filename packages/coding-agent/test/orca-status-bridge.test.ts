@@ -659,6 +659,123 @@ describe("createOrcaStatusBridge delivery", () => {
 		expect(env.ORCA_PI_STATUS_OWNED).toBe(otherPid);
 	});
 
+	it("survives malformed and out-of-range status lines from a hostile loopback peer", async () => {
+		const net = await import("node:net");
+		let responseLine = "HTTP/1.1 600 Broken\r\n\r\n";
+		const rawServer = net.createServer(socket => {
+			socket.on("data", () => {
+				socket.write(responseLine);
+				socket.end();
+			});
+			socket.on("error", () => {});
+		});
+		await new Promise<void>(resolve => rawServer.listen(0, "127.0.0.1", resolve));
+		const address = rawServer.address();
+		if (address === null || typeof address === "string") throw new Error("raw server failed to bind");
+		cleanups.push(() => rawServer.close());
+
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: {
+				ORCA_PANE_KEY: "tab-1:leaf-1",
+				ORCA_AGENT_HOOK_PORT: String(address.port),
+				ORCA_AGENT_HOOK_TOKEN: "test-token-1234",
+			} as NodeJS.ProcessEnv,
+		});
+		const ctx = fakeContext();
+		// 600 escapes the Response constructor's range; must be a silent drop,
+		// never an uncaught callback exception.
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await Bun.sleep(60);
+		// Garbage head without CRLF up to the cap: bounded reject, no crash.
+		responseLine = "x".repeat(4096);
+		handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "still alive" }, ctx);
+		await Bun.sleep(60);
+		// Bridge is still functional afterwards (state machine not poisoned).
+		responseLine = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+		handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolCallId: "c", toolName: "bash" }, ctx);
+		await Bun.sleep(60);
+	});
+
+	it("drops the post fail-closed when an envelope coordinate is oversized", async () => {
+		const fetchCalls: string[] = [];
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: {
+				ORCA_PANE_KEY: "x".repeat(4096),
+				ORCA_AGENT_HOOK_PORT: "57343",
+				ORCA_AGENT_HOOK_TOKEN: "test-token-1234",
+			} as NodeJS.ProcessEnv,
+			fetchImpl: ((input: string | URL | Request) => {
+				fetchCalls.push(String(input));
+				return Promise.resolve(new Response("ok"));
+			}) as typeof fetch,
+		});
+		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		await Bun.sleep(20);
+		expect(fetchCalls).toEqual([]);
+	});
+
+	it("aborts the in-flight request on shutdown and never retries the pi route afterwards", async () => {
+		const calls: Array<{ url: string; signal: AbortSignal | undefined }> = [];
+		let resolveFirst: ((response: Response) => void) | undefined;
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: {
+				ORCA_PANE_KEY: "tab-1:leaf-1",
+				ORCA_AGENT_HOOK_PORT: "57343",
+				ORCA_AGENT_HOOK_TOKEN: "test-token-1234",
+			} as NodeJS.ProcessEnv,
+			fetchImpl: ((input: string | URL | Request, init?: RequestInit) => {
+				calls.push({ url: String(input), signal: init?.signal ?? undefined });
+				const { promise, resolve } = Promise.withResolvers<Response>();
+				resolveFirst ??= resolve;
+				return promise;
+			}) as typeof fetch,
+		});
+		const ctx = fakeContext();
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await Bun.sleep(10);
+		expect(calls).toHaveLength(1);
+		expect(calls[0].signal?.aborted).toBe(false);
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		// Disposal aborts the in-flight non-flush request immediately.
+		expect(calls[0].signal?.aborted).toBe(true);
+		// Even if the held request now resolves 404, the pi-route retry is gone.
+		resolveFirst?.(new Response(null, { status: 404 }));
+		await Bun.sleep(20);
+		expect(calls).toHaveLength(1);
+	});
+
+	it("does not spawn the WSL curl fallback for work failing after shutdown", async () => {
+		const spawned: string[] = [];
+		let rejectFirst: ((error: Error) => void) | undefined;
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, {
+			env: {
+				ORCA_PANE_KEY: "tab-1:leaf-1",
+				ORCA_AGENT_HOOK_PORT: "57343",
+				ORCA_AGENT_HOOK_TOKEN: "test-token-1234",
+			} as NodeJS.ProcessEnv,
+			fetchImpl: (() => {
+				const { promise, reject } = Promise.withResolvers<Response>();
+				rejectFirst ??= reject;
+				return promise;
+			}) as unknown as typeof fetch,
+			isWslRuntime: () => true,
+			spawnCurl: command => {
+				spawned.push(command.join(" "));
+			},
+		});
+		const ctx = fakeContext();
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await Bun.sleep(10);
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		rejectFirst?.(new Error("loopback unreachable"));
+		await Bun.sleep(20);
+		expect(spawned).toEqual([]);
+	});
+
 	it("stays inert without Orca coordinates", async () => {
 		const { api, handlers } = captureHandlers();
 		createOrcaStatusBridge(api, { env: { ORCA_PANE_KEY: "tab-1:leaf-1" } as NodeJS.ProcessEnv });

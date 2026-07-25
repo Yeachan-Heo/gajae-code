@@ -80,6 +80,17 @@ const WINDOWS_CURL_PATH = "/mnt/c/Windows/System32/curl.exe";
 const MAX_PREVIEW_TEXT_CHARS = 2000;
 const MAX_TOOL_INPUT_JSON_CHARS = 4096;
 const TRUNCATION_MARKER = "…[truncated by GJC]";
+/** Bounds for envelope coordinates and the complete serialized request body:
+ * pane/tab/worktree/launch identities are UUID-shaped and endpoint env labels
+ * are short, so oversized values are hostile or corrupt and drop the post
+ * fail-closed instead of shipping an arbitrarily large request. */
+const MAX_COORDINATE_CHARS = 512;
+const MAX_SESSION_ID_CHARS = 256;
+const MAX_SESSION_PATH_CHARS = 1024;
+const MAX_HOOK_BODY_CHARS = 65536;
+/** Response-head cap for the raw loopback transport: only a status line is
+ * ever needed, so anything larger is malformed or hostile. */
+const MAX_RESPONSE_HEAD_BYTES = 2048;
 /** Hook tokens are Orca-generated UUID-shaped values; anything outside this
  * charset is treated as hostile (prevents header/argv injection). */
 const TOKEN_PATTERN = /^[A-Za-z0-9._-]{8,256}$/;
@@ -160,7 +171,15 @@ export function buildOrcaHookUrl(
  * environment variables even for 127.0.0.1 targets, which would route the
  * hook token and status payload through an arbitrary proxy. A raw TCP dial
  * to the loopback address cannot be redirected by environment configuration.
- * Exposed for tests; conforms to the `fetch` call shape the bridge uses.
+ *
+ * The response read is bounded: only the status line is consumed (capped at
+ * {@link MAX_RESPONSE_HEAD_BYTES}), the socket is destroyed as soon as the
+ * status is known, and any status outside 200–599 or malformed head rejects
+ * as a transport failure instead of reaching the `Response` constructor —
+ * a hostile local peer can neither crash the callback nor force unbounded
+ * allocation. The request is a single bounded buffer whose write failure is
+ * surfaced through the promise. Exposed for tests; conforms to the `fetch`
+ * call shape the bridge uses.
  */
 export async function loopbackHookFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 	const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
@@ -171,46 +190,71 @@ export async function loopbackHookFetch(input: string | URL | Request, init?: Re
 	const headers = (init?.headers ?? {}) as Record<string, string>;
 	const body = typeof init?.body === "string" ? Buffer.from(init.body) : Buffer.alloc(0);
 	const signal = init?.signal ?? undefined;
+	const headerLines = Object.entries(headers)
+		.map(([name, value]) => `${name}: ${value}\r\n`)
+		.join("");
+	// One bounded buffer: no interleaved writes, so backpressure reduces to a
+	// single write whose failure is reported via the callback.
+	const request = Buffer.concat([
+		Buffer.from(
+			`${method} ${url.pathname} HTTP/1.1\r\n` +
+				`Host: 127.0.0.1:${url.port}\r\n` +
+				"Connection: close\r\n" +
+				`Content-Length: ${body.byteLength}\r\n` +
+				`${headerLines}\r\n`,
+		),
+		body,
+	]);
 
 	return await new Promise<Response>((resolve, reject) => {
 		const socket = net.connect({ host: "127.0.0.1", port: Number(url.port) });
 		let settled = false;
 		let raw = "";
-		const fail = (error: Error): void => {
+		const settle = (outcome: { status: number } | { error: Error }): void => {
 			if (settled) return;
 			settled = true;
 			socket.destroy();
-			reject(error);
-		};
-		const onAbort = (): void => fail(new Error("Orca hook delivery aborted."));
-		signal?.addEventListener("abort", onAbort, { once: true });
-		socket.on("connect", () => {
-			const headerLines = Object.entries(headers)
-				.map(([name, value]) => `${name}: ${value}\r\n`)
-				.join("");
-			socket.write(
-				`${method} ${url.pathname} HTTP/1.1\r\n` +
-					`Host: 127.0.0.1:${url.port}\r\n` +
-					"Connection: close\r\n" +
-					`Content-Length: ${body.byteLength}\r\n` +
-					`${headerLines}\r\n`,
-			);
-			if (body.byteLength > 0) socket.write(body);
-		});
-		socket.on("data", chunk => {
-			raw += chunk.toString("utf8");
-		});
-		socket.on("error", error => fail(error instanceof Error ? error : new Error(String(error))));
-		socket.on("close", () => {
-			signal?.removeEventListener("abort", onAbort);
-			if (settled) return;
-			settled = true;
-			const match = raw.match(/^HTTP\/1\.[01] (\d{3})/);
-			if (!match) {
-				reject(new Error("Orca hook endpoint returned no HTTP status line."));
+			if ("error" in outcome) {
+				reject(outcome.error);
 				return;
 			}
-			resolve(new Response(null, { status: Number(match[1]) }));
+			// Constructor bounds re-checked defensively; a throw here must become
+			// a rejection, never an uncaught callback exception.
+			try {
+				resolve(new Response(null, { status: outcome.status }));
+			} catch (error) {
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		};
+		const onAbort = (): void => settle({ error: new Error("Orca hook delivery aborted.") });
+		signal?.addEventListener("abort", onAbort, { once: true });
+		socket.on("connect", () => {
+			socket.write(request, error => {
+				if (error) settle({ error });
+			});
+		});
+		socket.on("data", chunk => {
+			if (settled) return;
+			raw += chunk.toString("utf8");
+			const headEnd = raw.indexOf("\r\n");
+			if (headEnd === -1) {
+				if (raw.length > MAX_RESPONSE_HEAD_BYTES) {
+					settle({ error: new Error("Orca hook endpoint sent an oversized response head.") });
+				}
+				return;
+			}
+			const match = raw.slice(0, headEnd).match(/^HTTP\/1\.[01] (\d{3})(?: |$)/);
+			const status = match ? Number(match[1]) : Number.NaN;
+			if (!Number.isInteger(status) || status < 200 || status > 599) {
+				settle({ error: new Error("Orca hook endpoint sent a malformed status line.") });
+				return;
+			}
+			settle({ status });
+		});
+		socket.on("error", error => settle({ error: error instanceof Error ? error : new Error(String(error)) }));
+		socket.on("close", () => {
+			signal?.removeEventListener("abort", onAbort);
+			settle({ error: new Error("Orca hook endpoint closed before sending a status line.") });
 		});
 	});
 }
@@ -302,6 +346,9 @@ export function extractAssistantText(message: unknown): string {
 interface PendingPost {
 	hookEventName: string;
 	extra: Record<string, unknown>;
+	/** The single disposal-time snapshot exempt from dispose cancellation, so
+	 * shutdown can flush the final state without reviving the transport. */
+	finalFlush?: boolean;
 }
 
 /**
@@ -339,6 +386,10 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	// Bounded curl lifecycle: at most one Windows-side delivery in flight;
 	// bursts drop instead of accumulating child processes.
 	let curlInFlight = false;
+	let activeCurlChild: { kill(): void } | null = null;
+	// Disposal cancellation: aborts the in-flight loopback request so no
+	// post-shutdown transport work (including the 404 route retry) survives.
+	const disposeController = new AbortController();
 
 	function updateSessionMetadata(ctx: ExtensionContext): void {
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -496,6 +547,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 			"@-",
 			url,
 		];
+		if (disposed) return;
 		if (options.spawnCurl) {
 			const spawnCurl = options.spawnCurl;
 			curlInFlight = true;
@@ -518,15 +570,18 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 		try {
 			curlInFlight = true;
 			const child = Bun.spawn(command, { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+			activeCurlChild = child;
 			child.stdin.write(body);
 			await child.stdin.end();
 			child.unref();
 			// Clear the slot when the bounded (--max-time) child exits; delivery
-			// itself stays fire-and-forget.
+			// itself stays fire-and-forget. Disposal kills the child instead of
+			// letting it run out its ten-second budget.
 			void child.exited
 				.catch(() => {})
 				.finally(() => {
 					curlInFlight = false;
+					if (activeCurlChild === child) activeCurlChild = null;
 				});
 		} catch {
 			curlInFlight = false;
@@ -539,20 +594,59 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	// (which such versions render with pi identity but full status support).
 	let activeHookPath: OrcaHookPath = ORCA_GJC_HOOK_PATH;
 
-	async function postOnce(hookEventName: string, extra: Record<string, unknown>): Promise<void> {
+	/** Coordinate fields must stay within sane identity bounds; `null` means
+	 * the envelope is corrupt/hostile and the post is dropped fail-closed. */
+	function boundedCoordinate(value: string | undefined): string | null {
+		const text = value ?? "";
+		return text.length <= MAX_COORDINATE_CHARS ? text : null;
+	}
+
+	async function postOnce(hookEventName: string, extra: Record<string, unknown>, finalFlush: boolean): Promise<void> {
 		const coords = await resolveHookCoords();
-		const paneKey = env.ORCA_PANE_KEY;
+		const paneKey = boundedCoordinate(env.ORCA_PANE_KEY);
+		const launchToken = boundedCoordinate(env.ORCA_AGENT_LAUNCH_TOKEN);
+		const tabId = boundedCoordinate(env.ORCA_TAB_ID);
+		const worktreeId = boundedCoordinate(env.ORCA_WORKTREE_ID);
+		const hookEnv = boundedCoordinate(coords.env);
+		const hookVersion = boundedCoordinate(coords.version);
 		const token = validateOrcaHookToken(coords.token);
-		if (!token || !paneKey) return;
+		if (
+			!token ||
+			!paneKey ||
+			launchToken === null ||
+			tabId === null ||
+			worktreeId === null ||
+			hookEnv === null ||
+			hookVersion === null
+		) {
+			return;
+		}
+		const sessionMeta = await getPersistedSessionMetadata();
+		const sessionId = sessionMeta.session_id;
+		const sessionFile = sessionMeta.session_file;
+		// Session resume metadata is optional; oversized values are omitted
+		// rather than dropping the status update itself.
+		const boundedSessionMeta: Record<string, unknown> =
+			typeof sessionId === "string" && sessionId.length <= MAX_SESSION_ID_CHARS
+				? {
+						session_id: sessionId,
+						...(typeof sessionFile === "string" && sessionFile.length <= MAX_SESSION_PATH_CHARS
+							? { session_file: sessionFile }
+							: {}),
+					}
+				: {};
 		const body = JSON.stringify({
 			paneKey,
-			launchToken: env.ORCA_AGENT_LAUNCH_TOKEN || "",
-			tabId: env.ORCA_TAB_ID || "",
-			worktreeId: env.ORCA_WORKTREE_ID || "",
-			env: coords.env,
-			version: coords.version,
-			payload: { hook_event_name: hookEventName, ...(await getPersistedSessionMetadata()), ...extra },
+			launchToken,
+			tabId,
+			worktreeId,
+			env: hookEnv,
+			version: hookVersion,
+			payload: { hook_event_name: hookEventName, ...boundedSessionMeta, ...extra },
 		});
+		// Belt-and-braces total bound: previews and coordinates are individually
+		// bounded, so exceeding this means something upstream is corrupt.
+		if (body.length > MAX_HOOK_BODY_CHARS) return;
 		for (;;) {
 			const url = buildOrcaHookUrl(coords.port, activeHookPath);
 			if (!url) return;
@@ -564,8 +658,12 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 						"X-Orca-Agent-Hook-Token": token,
 					},
 					body,
-					signal: AbortSignal.timeout(HOOK_POST_TIMEOUT_MS),
+					signal: finalFlush
+						? AbortSignal.timeout(HOOK_POST_TIMEOUT_MS)
+						: AbortSignal.any([AbortSignal.timeout(HOOK_POST_TIMEOUT_MS), disposeController.signal]),
 				});
+				// Post-shutdown transport work must go inert: no route retry.
+				if (disposed) return;
 				if (response.status === 404 && activeHookPath === ORCA_GJC_HOOK_PATH) {
 					activeHookPath = ORCA_PI_HOOK_PATH;
 					continue;
@@ -574,7 +672,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 			} catch {
 				// Status reporting must never fail the run because Orca is unavailable
 				// or restarting; on WSL fall through to the Windows-side listener.
-				if (!isWslRuntime()) return;
+				if (disposed || !isWslRuntime()) return;
 				await postViaWindowsCurl(url, token, body);
 				return;
 			}
@@ -586,7 +684,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 		const next = pendingPost;
 		pendingPost = null;
 		activePost = true;
-		void postOnce(next.hookEventName, next.extra)
+		void postOnce(next.hookEventName, next.extra, next.finalFlush === true)
 			.catch(() => {})
 			.finally(() => {
 				activePost = false;
@@ -703,16 +801,35 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	// session cannot keep the agent_end recheck timer rescheduling forever,
 	// retain queued post state, or leave the pane ownership marker claimed —
 	// which would suppress reporting from the next process to own this pane.
+	//
 	// Shutdown is a definitive turn boundary: an agent_end still deferred on
-	// the idle recheck reports now (once), or the pane would stay 'working'
-	// forever after a shutdown that raced the deferred post. `post()` refuses
-	// new work after disposal, so the queue empties once and stays empty.
+	// the idle recheck (or a snapshot already queued) is promoted to a single
+	// timeout-bounded final flush — otherwise the pane would stay 'working'
+	// after a shutdown racing the deferred post. Everything else goes inert:
+	// `post()` refuses new work, the in-flight request is aborted, the 404
+	// route retry and the WSL curl fallback are disposal-guarded, and an
+	// active curl child is killed instead of running out its ten-second
+	// budget.
 	pi.on("session_shutdown", () => {
 		if (disposed) return;
 		const agentEndStillDeferred = pendingAgentEndContext !== null;
 		clearPendingAgentEndCheck();
-		if (agentEndStillDeferred) postAgentEndOnce();
+		if (agentEndStillDeferred && !agentEndReported) {
+			agentEndReported = true;
+			pendingPost = { hookEventName: "agent_end", extra: {}, finalFlush: true };
+		} else if (pendingPost) {
+			pendingPost.finalFlush = true;
+		}
 		disposed = true;
+		// Abort the in-flight (non-flush) request; its completion drains the
+		// promoted final snapshot, which carries a plain timeout-only signal.
+		disposeController.abort();
+		try {
+			activeCurlChild?.kill();
+		} catch {
+			// Child teardown is best-effort; the --max-time bound still applies.
+		}
+		activeCurlChild = null;
 		drainPosts();
 		if (env[OWNERSHIP_ENV] === String(process.pid)) {
 			delete env[OWNERSHIP_ENV];

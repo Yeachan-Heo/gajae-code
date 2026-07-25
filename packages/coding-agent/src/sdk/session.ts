@@ -1835,7 +1835,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (
 			shouldRegisterOrcaStatusBridge({
 				env: process.env,
-				enabled: settings.get("orca.statusBridge") !== false,
+				enabled: settings.get("orca.statusBridge") === true,
 				taskDepth,
 				parentTaskPrefix: options.parentTaskPrefix,
 				currentAgentType: options.currentAgentType,
