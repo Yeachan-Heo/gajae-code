@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `/model` preset selection now offers `Set as default` as the first action while retaining `Apply for this session`, custom preset rename, and delete actions.
+
 ### Fixed
 
 - `gjc resume` and delete no longer pay a durable (fsync-backed) lock acquisition for managed session tombstones that have nothing left to reconcile; a scope with many accumulated already-completed tombstones opens noticeably faster (#3067).

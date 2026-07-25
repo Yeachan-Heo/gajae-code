@@ -178,33 +178,64 @@ describe("model selector profile red-team", () => {
 		expect(rendered.match(/Profile Alpha/g) ?? []).toHaveLength(1);
 	});
 
-	test("profile actions wire Apply for this session to persistDefault false and Set as default to true", async () => {
+	test("profile actions default to persistence and retain session-only application", async () => {
 		const selections: ModelSelectorSelection[] = [];
-		const applySelector = createSelector(selection => {
+		const select = (selection: ModelSelectorSelection) => {
 			selections.push(selection);
-		});
-		await renderSelector(applySelector);
-		applySelector.handleInput("\x1b[C");
-		applySelector.handleInput("\x1b[B");
-		applySelector.handleInput("\n");
-		applySelector.handleInput("\n");
-		applySelector.handleInput("\n");
+		};
+		const persistentSelector = createSelector(select);
+		await renderSelector(persistentSelector);
+		persistentSelector.handleInput("\x1b[C");
+		persistentSelector.handleInput("\x1b[B");
+		persistentSelector.handleInput("\n");
+		persistentSelector.handleInput("\n");
 
-		const defaultSelector = createSelector(selection => {
-			selections.push(selection);
-		});
-		await renderSelector(defaultSelector);
-		defaultSelector.handleInput("\x1b[C");
-		defaultSelector.handleInput("\x1b[B");
-		defaultSelector.handleInput("\n");
-		defaultSelector.handleInput("\n");
-		defaultSelector.handleInput("\x1b[B");
-		defaultSelector.handleInput("\n");
+		const menu = normalizeRenderedText(persistentSelector.render(240).join("\n"));
+		expect(menu).toContain("Set as default");
+		expect(menu).toContain("Apply for this session");
+		persistentSelector.handleInput("\n");
+
+		const sessionSelector = createSelector(select);
+		await renderSelector(sessionSelector);
+		sessionSelector.handleInput("\x1b[C");
+		sessionSelector.handleInput("\x1b[B");
+		sessionSelector.handleInput("\n");
+		sessionSelector.handleInput("\n");
+		sessionSelector.handleInput("\x1b[B");
+		sessionSelector.handleInput("\n");
 
 		expect(selections).toEqual([
-			{ kind: "profile", profileName: "profile-a", setDefault: false },
 			{ kind: "profile", profileName: "profile-a", setDefault: true },
+			{ kind: "profile", profileName: "profile-a", setDefault: false },
 		]);
+	});
+
+	test("custom profile action indices retain rename and delete", async () => {
+		const renamed: ModelSelectorSelection[] = [];
+		const renameSelector = createSelector(selection => {
+			renamed.push(selection);
+		});
+		await renderSelector(renameSelector);
+		renameSelector.refreshPresetProfiles("profile-a");
+		renameSelector.handleInput("\n");
+		renameSelector.handleInput("\x1b[B");
+		renameSelector.handleInput("\x1b[B");
+		renameSelector.handleInput("\n");
+
+		const deleted: ModelSelectorSelection[] = [];
+		const deleteSelector = createSelector(selection => {
+			deleted.push(selection);
+		});
+		await renderSelector(deleteSelector);
+		deleteSelector.refreshPresetProfiles("profile-a");
+		deleteSelector.handleInput("\n");
+		deleteSelector.handleInput("\x1b[B");
+		deleteSelector.handleInput("\x1b[B");
+		deleteSelector.handleInput("\x1b[B");
+		deleteSelector.handleInput("\n");
+
+		expect(renamed).toEqual([{ kind: "renameProfile", profileName: "profile-a" }]);
+		expect(deleted).toEqual([{ kind: "deleteProfile", profileName: "profile-a" }]);
 	});
 
 	test("controller persists only Set as default and leaves Apply for this session non-default", async () => {
