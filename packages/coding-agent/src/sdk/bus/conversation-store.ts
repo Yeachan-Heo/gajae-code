@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isUnsupportedWindowsDirectorySyncError } from "../../utils/directory-sync";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 
 export const CONVERSATION_STORE_VERSION = 1;
@@ -349,14 +350,14 @@ async function syncParentDirectory(
 	try {
 		handle = await fs.open(directory, "r");
 	} catch (error) {
-		if (platform === "win32" && isUnsupportedDirectoryBarrierError(error)) return;
+		if (isUnsupportedWindowsDirectorySyncError(error, platform)) return;
 		throw error;
 	}
 	let syncError: unknown;
 	try {
 		await handle.sync();
 	} catch (error) {
-		if (!(platform === "win32" && isUnsupportedDirectoryBarrierError(error))) syncError = error;
+		if (!isUnsupportedWindowsDirectorySyncError(error, platform)) syncError = error;
 	}
 	let closeError: unknown;
 	try {
@@ -370,12 +371,6 @@ async function syncParentDirectory(
 	if (closeError) throw closeError;
 }
 
-function isUnsupportedDirectoryBarrierError(error: unknown): boolean {
-	return (
-		isRecord(error) &&
-		(error.code === "EINVAL" || error.code === "ENOTSUP" || error.code === "EOPNOTSUPP" || error.code === "EPERM")
-	);
-}
 function isAlreadyExists(error: unknown): error is NodeJS.ErrnoException {
 	return isRecord(error) && error.code === "EEXIST";
 }

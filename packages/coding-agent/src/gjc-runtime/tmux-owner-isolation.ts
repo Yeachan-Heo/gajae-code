@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { openRecoveryFsRoot } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { syncDirectoryBestEffort } from "../utils/directory-sync";
 import { parseLinuxProcStartTime } from "./linux-proc";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
@@ -2151,12 +2152,7 @@ async function atomicWrite(file: string, data: object): Promise<void> {
 	await fsyncDirectory(path.dirname(file));
 }
 async function fsyncDirectory(directoryPath: string): Promise<void> {
-	const directory = await fs.open(directoryPath, "r");
-	try {
-		await directory.sync();
-	} finally {
-		await directory.close();
-	}
+	await syncDirectoryBestEffort(directoryPath);
 }
 async function writeAttempt(
 	stateDir: string,

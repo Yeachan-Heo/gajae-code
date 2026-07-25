@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { withFileLock } from "../../config/file-lock";
+import { syncDirectoryBestEffort } from "../../utils/directory-sync";
 import {
 	assertSupportedSnapshotVersion,
 	assertSupportedStateVersion,
@@ -155,22 +156,7 @@ async function appendSync(file: string, value: string): Promise<void> {
 }
 
 async function syncDirectory(file: string): Promise<void> {
-	let handle: fs.FileHandle;
-	try {
-		handle = await fs.open(path.dirname(file), "r");
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) return;
-		throw error;
-	}
-	try {
-		await handle.sync();
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) throw error;
-	} finally {
-		await handle.close();
-	}
+	await syncDirectoryBestEffort(path.dirname(file));
 }
 
 async function writeAndSync(file: string, contents: Buffer | string): Promise<void> {

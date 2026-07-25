@@ -3,6 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@gajae-code/natives";
+import { syncDirectoryBestEffort } from "../utils/directory-sync";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
 import { lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
@@ -101,12 +102,7 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 	} finally {
 		await handle.close();
 	}
-	const directory = await fs.open(path.dirname(file), "r");
-	try {
-		await directory.sync();
-	} finally {
-		await directory.close();
-	}
+	await syncDirectoryBestEffort(path.dirname(file));
 	const persisted = JSON.parse(await fs.readFile(file, "utf8")) as unknown;
 	if (JSON.stringify(persisted) !== JSON.stringify(value)) throw new Error("managed_owner_durable_reread_failed");
 }
