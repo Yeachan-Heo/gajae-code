@@ -2015,7 +2015,9 @@ export class ModelRegistry {
 	): Promise<Model<Api>[]> {
 		const generation = (this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) + 1;
 		this.#descriptorDiscoveryGenerations.set(options.providerId, generation);
-		const endpoint = this.#getProviderBaseUrlForDiscovery(options.providerId) ?? "";
+		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(
+			this.#getProviderBaseUrlForDiscovery(options.providerId) ?? "",
+		);
 		try {
 			const manager = createModelManager({ ...options, cacheDbPath: this.#cacheDbPath });
 			const result = await manager.refresh(strategy);
@@ -2026,7 +2028,7 @@ export class ModelRegistry {
 				(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
 				this.authStorage.getProviderEvidenceGeneration(options.providerId) === authGeneration &&
 				(result.fetched ||
-					(strategy === "online" && !result.fetched) ||
+					(strategy !== "offline" && !result.fetched) ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.authGeneration !== authGeneration ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
 			) {

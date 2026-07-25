@@ -3969,6 +3969,27 @@ describe("ModelRegistry", () => {
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
 		});
+		test("preserves descriptor discovery evidence with a normalized endpoint across an offline refresh", async () => {
+			const restore = setEnvForTest("VLLM_BASE_URL", "https://gateway.example/v1/");
+			try {
+				authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+				using _hook = hookFetch(input => {
+					expect(String(input)).toBe("https://gateway.example/v1/models");
+					return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("vllm", "online");
+				await registry.refreshProvider("vllm", "offline");
+
+				expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+			} finally {
+				restore();
+			}
+		});
 		test("invalidates descriptor discovery evidence when its endpoint query changes", async () => {
 			const restore = setEnvForTest("VLLM_BASE_URL", "https://gateway.example/v1?tenant=a");
 			try {
@@ -3991,7 +4012,7 @@ describe("ModelRegistry", () => {
 				restore();
 			}
 		});
-		test("clears descriptor discovery evidence after a failed online refresh", async () => {
+		test("clears descriptor discovery evidence after a failed conditional online probe", async () => {
 			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
 			let calls = 0;
 			using _hook = hookFetch(() =>
@@ -4002,12 +4023,12 @@ describe("ModelRegistry", () => {
 						})
 					: new Response("unavailable", { status: 503 }),
 			);
-
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			await registry.refreshProvider("vllm", "online");
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
 
-			await registry.refreshProvider("vllm", "online");
+			writeModelCache("vllm", Date.now() - 5 * 60 * 1000, [], false, "", cacheDbPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
 		});
