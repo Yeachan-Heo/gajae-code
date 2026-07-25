@@ -1781,14 +1781,16 @@ export class ModelRegistry {
 		);
 		const configuredDiscoveriesPromise =
 			selectedDiscoverableProviders.length === 0
-				? Promise.resolve<Model<Api>[]>([])
+				? Promise.resolve<Array<{ provider: string; current: boolean; models: Model<Api>[] }>>([])
 				: Promise.all(
 						selectedDiscoverableProviders.map(provider => this.#discoverProviderModels(provider, strategy)),
-					).then(results => results.flat());
-		const [configuredDiscovered, builtInDiscovered] = await Promise.all([
+					);
+		const [configuredDiscoveryResults, builtInDiscovered] = await Promise.all([
 			configuredDiscoveriesPromise,
 			this.#discoverBuiltInProviderModels(strategy, providerFilter),
 		]);
+		const configuredDiscoveries = new Map(configuredDiscoveryResults.map(result => [result.provider, result]));
+		const configuredDiscovered = configuredDiscoveryResults.flatMap(result => result.models);
 		const discovered = [...configuredDiscovered, ...builtInDiscovered];
 		for (const provider of selectedDiscoverableProviders) {
 			const evidence = configuredDiscoveryEvidence.get(provider.provider);
@@ -1797,6 +1799,7 @@ export class ModelRegistry {
 			const currentEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(
 				this.#getProviderBaseUrlForDiscovery(provider.provider) ?? "",
 			);
+			if (!configuredDiscoveries.get(provider.provider)?.current) continue;
 			if (
 				evidence !== undefined &&
 				state?.status === "ok" &&
@@ -1838,7 +1841,7 @@ export class ModelRegistry {
 	async #discoverProviderModels(
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
-	): Promise<Model<Api>[]> {
+	): Promise<{ provider: string; current: boolean; models: Model<Api>[] }> {
 		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, strategy, {
 			cacheDbPath: this.#cacheDbPath,
@@ -1847,7 +1850,9 @@ export class ModelRegistry {
 			isAuthenticated,
 			fetchModels: provider => this.#discoverModelsByProviderType(provider),
 		});
-		if (!mergeInput.current) return [];
+		if (!mergeInput.current) {
+			return { provider: effectiveProviderConfig.provider, current: false, models: [] };
+		}
 		if (mergeInput.warning) {
 			logger.warn("model discovery failed for provider", {
 				provider: effectiveProviderConfig.provider,
@@ -1855,13 +1860,17 @@ export class ModelRegistry {
 				error: mergeInput.warning,
 			});
 		}
-		return this.#applyProviderModelOverrides(
-			effectiveProviderConfig.provider,
-			this.#normalizeDiscoverableModels(
-				effectiveProviderConfig,
-				this.#applyProviderCompat(effectiveProviderConfig.compat, [...mergeInput.models]),
+		return {
+			provider: effectiveProviderConfig.provider,
+			current: true,
+			models: this.#applyProviderModelOverrides(
+				effectiveProviderConfig.provider,
+				this.#normalizeDiscoverableModels(
+					effectiveProviderConfig,
+					this.#applyProviderCompat(effectiveProviderConfig.compat, [...mergeInput.models]),
+				),
 			),
-		);
+		};
 	}
 	#effectiveDiscoveryProviderConfig(providerConfig: DiscoveryProviderConfig): DiscoveryProviderConfig {
 		const override = this.#runtimeProviderOverrides.get(providerConfig.provider);

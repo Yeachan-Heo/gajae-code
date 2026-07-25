@@ -3681,6 +3681,45 @@ describe("ModelRegistry", () => {
 
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
 		});
+		test("does not let a stale configured refresh clear newer credential evidence", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			const { promise: olderResponse, resolve: resolveOlder } = Promise.withResolvers<Response>();
+			const { promise: newerResponse, resolve: resolveNewer } = Promise.withResolvers<Response>();
+			let calls = 0;
+			using _hook = hookFetch(() => (calls++ === 0 ? olderResponse : newerResponse));
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const olderRefresh = registry.refreshProvider("discovery-provider", "online");
+			await Bun.sleep(0);
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-b");
+			const newerRefresh = registry.refreshProvider("discovery-provider", "online");
+			await Bun.sleep(0);
+			resolveNewer(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await newerRefresh;
+			resolveOlder(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await olderRefresh;
+
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
 		test("retains configured discovery proof across an offline cache refresh", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
