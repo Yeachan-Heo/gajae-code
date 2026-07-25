@@ -29,6 +29,7 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
+import { isUnsupportedWindowsDirectorySyncError } from "../../utils/directory-sync";
 import { SdkClient, SdkClientError } from "../client/client";
 import {
 	type LogicalSessionCandidate,
@@ -870,6 +871,9 @@ async function syncDirectory(directory: string): Promise<void> {
 	const handle = await fs.open(directory, fsSync.constants.O_RDONLY);
 	try {
 		await handle.sync();
+	} catch (error) {
+		// Windows cannot fsync a directory handle; rename durability is best-effort there.
+		if (!isUnsupportedWindowsDirectorySyncError(error)) throw error;
 	} finally {
 		await handle.close();
 	}
