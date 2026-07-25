@@ -6,6 +6,8 @@ import { deflateSync } from "node:zlib";
 import {
 	activeEntryPath,
 	activeSnapshotPath,
+	canonicalSessionRoot,
+	legacySessionRoot,
 	modeStatePath as sessionModeStatePath,
 	sessionStateDir,
 	sessionUltragoalDir,
@@ -19,12 +21,17 @@ import {
 import {
 	addUltragoalSubgoal,
 	buildUltragoalHudSummary,
+	CRITIC_GATE_HARD_STOP_EVENT,
+	CRITIC_GATE_OVERRIDE_EVENT,
+	CRITIC_VERDICT_EVENT,
 	checkpointUltragoalGoal,
 	createUltragoalPlan,
 	getUltragoalStatus,
 	hashStructuredValue,
 	readUltragoalLedger,
 	readUltragoalPlan,
+	recordUltragoalCriticGateOverride,
+	recordUltragoalCriticVerdict,
 	resolveGitBase,
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
@@ -5236,6 +5243,81 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 	});
 });
 
+describe("critic mutator session affinity", () => {
+	async function moveSessionToLegacy(root: string): Promise<{ canonicalRoot: string; legacyRoot: string }> {
+		const canonicalRoot = canonicalSessionRoot(root, TEST_SESSION_ID);
+		const legacyRoot = legacySessionRoot(root, TEST_SESSION_ID);
+		await fs.rename(canonicalRoot, legacyRoot);
+		return { canonicalRoot, legacyRoot };
+	}
+
+	it("keeps a resolved legacy root for critic verdict reads and appends when a canonical duplicate appears", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Preserve critic authority" });
+		const { canonicalRoot, legacyRoot } = await moveSessionToLegacy(root);
+		const legacyLedgerPath = path.join(legacyRoot, "ultragoal", "ledger.jsonl");
+		await fs.appendFile(
+			legacyLedgerPath,
+			`${Array.from({ length: 4 }, (_, index) =>
+				JSON.stringify({
+					eventId: `legacy-verdict-${index}`,
+					event: CRITIC_VERDICT_EVENT,
+					timestamp: new Date().toISOString(),
+					verdict: "ITERATE",
+				}),
+			).join("\n")}\n`,
+		);
+
+		const pending = recordUltragoalCriticVerdict({
+			cwd: root,
+			terminus: "completion",
+			verdict: "ITERATE",
+			evidence: "The selected legacy session requires another review pass.",
+		});
+		await fs.mkdir(canonicalRoot, { recursive: true });
+		const verdict = await pending;
+
+		expect(verdict.event).toBe(CRITIC_VERDICT_EVENT);
+		const legacyLedger = await Bun.file(path.join(legacyRoot, "ultragoal", "ledger.jsonl")).text();
+		expect(legacyLedger).toContain(CRITIC_VERDICT_EVENT);
+		expect(legacyLedger).toContain(CRITIC_GATE_HARD_STOP_EVENT);
+		expect(await Bun.file(path.join(canonicalRoot, "ultragoal", "ledger.jsonl")).exists()).toBe(false);
+		const legacyMarker = await Bun.file(path.join(legacyRoot, ".session-activity.json")).text();
+		expect(legacyMarker).toContain(path.join(legacyRoot, "ultragoal", "ledger.jsonl"));
+		expect(await Bun.file(path.join(canonicalRoot, ".session-activity.json")).exists()).toBe(false);
+	});
+
+	it("keeps a resolved legacy root for critic gate override reads and appends when a canonical duplicate appears", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Preserve override authority" });
+		const { canonicalRoot, legacyRoot } = await moveSessionToLegacy(root);
+		const legacyLedgerPath = path.join(legacyRoot, "ultragoal", "ledger.jsonl");
+		await fs.appendFile(
+			legacyLedgerPath,
+			`${JSON.stringify({
+				eventId: "legacy-hard-stop",
+				event: CRITIC_GATE_HARD_STOP_EVENT,
+				timestamp: new Date().toISOString(),
+				planGeneration: "legacy-generation",
+			})}\n`,
+		);
+
+		const pending = recordUltragoalCriticGateOverride({
+			cwd: root,
+			evidence: "Authorized after the durable legacy hard stop.",
+		});
+		await fs.mkdir(canonicalRoot, { recursive: true });
+		const override = await pending;
+
+		expect(override.event).toBe(CRITIC_GATE_OVERRIDE_EVENT);
+		const legacyLedger = await Bun.file(legacyLedgerPath).text();
+		expect(legacyLedger).toContain(CRITIC_GATE_OVERRIDE_EVENT);
+		expect(await Bun.file(path.join(canonicalRoot, "ultragoal", "ledger.jsonl")).exists()).toBe(false);
+		const legacyMarker = await Bun.file(path.join(legacyRoot, ".session-activity.json")).text();
+		expect(legacyMarker).toContain(legacyLedgerPath);
+		expect(await Bun.file(path.join(canonicalRoot, ".session-activity.json")).exists()).toBe(false);
+	});
+});
 describe("resolveGitBase nearest integration base", () => {
 	async function git(cwd: string, args: string[]): Promise<void> {
 		const proc = Bun.spawn(["git", ...args], {

@@ -164,7 +164,10 @@ function duplicateSessionError(gjcSessionId: string): SessionResolutionError {
 
 function isDirectory(root: string): boolean {
 	try {
-		const stat = fsSync.statSync(root);
+		const stat = fsSync.lstatSync(root);
+		if (stat.isSymbolicLink()) {
+			throw new SessionResolutionError(`GJC session root must not be a symbolic link: ${root}`, "unsafe_session");
+		}
 		if (!stat.isDirectory()) throw new Error(`GJC session root is not a directory: ${root}`);
 		return true;
 	} catch (error) {
@@ -263,21 +266,29 @@ export interface ActivityMarkerInfo {
 /**
  * Best-effort write of the per-session activity marker. State-command callers
  * MUST treat a thrown error as a command failure (auto-detect depends on it);
- * non-critical writers may swallow it.
+ * non-critical writers may swallow it. This context-first variant writes to an
+ * already admitted session root so callers preserve layout affinity.
  */
+export async function writeSessionActivityMarkerForSession(
+	session: GjcSessionContext,
+	info: ActivityMarkerInfo,
+): Promise<void> {
+	const markerPath = path.join(session.sessionRoot, GJC_SESSION_ACTIVITY_FILE);
+	await fs.mkdir(path.dirname(markerPath), { recursive: true });
+	const payload = {
+		session_id: session.gjcSessionId,
+		updated_at: new Date().toISOString(),
+		writer: info.writer,
+		...(info.path ? { path: info.path } : {}),
+	};
+	await fs.writeFile(markerPath, `${JSON.stringify(payload, null, 2)}\n`, "utf-8");
+}
+
 export async function writeSessionActivityMarker(
 	cwd: string,
 	gjcSessionId: string,
 	info: ActivityMarkerInfo,
 ): Promise<void> {
 	const session = resolveExistingSessionContext(cwd, gjcSessionId, "payload");
-	const markerPath = path.join(session.sessionRoot, GJC_SESSION_ACTIVITY_FILE);
-	await fs.mkdir(path.dirname(markerPath), { recursive: true });
-	const payload = {
-		session_id: gjcSessionId,
-		updated_at: new Date().toISOString(),
-		writer: info.writer,
-		...(info.path ? { path: info.path } : {}),
-	};
-	await fs.writeFile(markerPath, `${JSON.stringify(payload, null, 2)}\n`, "utf-8");
+	await writeSessionActivityMarkerForSession(session, info);
 }

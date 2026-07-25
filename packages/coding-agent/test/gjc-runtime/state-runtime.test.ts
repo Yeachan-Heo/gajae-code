@@ -78,6 +78,60 @@ describe("native gjc state runtime", () => {
 		});
 		await expect(fs.access(legacySessionRoot(root, TEST_SESSION_ID))).rejects.toThrow();
 	});
+	it("reports post-commit audit failure without failing or skipping state synchronization", async () => {
+		const root = await tempDir();
+		const auditPath = path.join(sessionStateDir(root, TEST_SESSION_ID), "audit.jsonl");
+		await fs.mkdir(auditPath, { recursive: true });
+
+		const result = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "audit-warning" })],
+			root,
+		);
+
+		expect(result.status).toBe(0);
+		expect(result.stderr).toContain("WARNING:");
+		expect(JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"))).toMatchObject({
+			marker: "audit-warning",
+		});
+		expect(JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8"))).toMatchObject({
+			skill: "ralplan",
+			active: true,
+		});
+	});
+	it("fails closed when the canonical session root is a symlink outside project .gjc", async () => {
+		const root = await tempDir();
+		const canonicalRoot = sessionRoot(root, TEST_SESSION_ID);
+		const outsideRoot = path.join(root, "outside-session");
+		const outsideStatePath = path.join(outsideRoot, "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(canonicalRoot), { recursive: true });
+		await fs.mkdir(outsideRoot, { recursive: true });
+		await fs.symlink(outsideRoot, canonicalRoot);
+
+		const result = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "escaped" })],
+			root,
+		);
+
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("must not be a symbolic link");
+		await expect(fs.access(outsideStatePath)).rejects.toThrow();
+	});
+	it("rejects a session root symlink to another session inside project .gjc", async () => {
+		const root = await tempDir();
+		const targetRoot = sessionRoot(root, "other-session");
+		const linkedRoot = sessionRoot(root, TEST_SESSION_ID);
+		await fs.mkdir(targetRoot, { recursive: true });
+		await fs.symlink(targetRoot, linkedRoot);
+
+		const result = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "cross-session" })],
+			root,
+		);
+
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("must not be a symbolic link");
+		await expect(fs.access(path.join(targetRoot, "state", "ralplan-state.json"))).rejects.toThrow();
+	});
 	it("keeps an existing legacy state session layout-affine", async () => {
 		const root = await tempDir();
 		const legacyStatePath = path.join(legacySessionRoot(root, TEST_SESSION_ID), "state", "ralplan-state.json");

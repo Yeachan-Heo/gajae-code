@@ -238,7 +238,9 @@ describe("GJC state writer revision policy", () => {
 			});
 
 			expect(result.deleted).toBe(false);
-			await expect(readJson(root, ".gjc/_session-sess/state/active/deep-interview.json")).resolves.toMatchObject({
+			await expect(
+				readJson(root, ".gjc/sessions/_session-sess/state/active/deep-interview.json"),
+			).resolves.toMatchObject({
 				skill: "deep-interview",
 				source_state_revision: 5,
 			});
@@ -261,7 +263,7 @@ describe("GJC state writer revision policy", () => {
 
 			expect(result.deleted).toBe(true);
 			await expect(
-				fs.stat(path.join(root, ".gjc/_session-sess/state/active/deep-interview.json")),
+				fs.stat(path.join(root, ".gjc/sessions/_session-sess/state/active/deep-interview.json")),
 			).rejects.toThrow();
 		});
 	});
