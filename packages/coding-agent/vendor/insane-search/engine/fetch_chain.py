@@ -551,6 +551,10 @@ def _fetch_core(
             return _give_up(trace, profile_used, last_resp, last_attempt, best_suspect,
                             planned=0, executed=curl_attempts, grid_exhausted=False,
                             stop_reason=probe_attempt.verdict)
+        # Probe-phase 429: back off before entering the grid so the first
+        # grid candidate doesn't immediately hit the same rate window.
+        if probe_attempt.verdict == Verdict.RATE_LIMITED.value:
+            _rate_limit_backoff(probe_resp)
 
     # -------- Phase 2: detect + plan + execute ------------------------------
     if last_resp is not None:
@@ -593,7 +597,7 @@ def _fetch_core(
             # then continue to the next candidate (a different TLS/referer
             # combo may not be rate-limited). Do NOT break the grid.
             if att.verdict == Verdict.RATE_LIMITED.value:
-                _rate_limit_backoff()
+                _rate_limit_backoff(resp)
                 continue
         # continuing → polite jitter (only on non-terminal failure)
         _jitter()

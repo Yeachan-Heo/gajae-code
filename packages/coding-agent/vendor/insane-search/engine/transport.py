@@ -122,6 +122,15 @@ class SessionPool:
         """GET via the pooled session (cookie + connection reuse), with an SSRF
         guard: the initial URL and EVERY redirect hop are validated against the
         private/loopback/link-local/metadata block-list before being fetched.
+
+        SECURITY NOTE: This is a resolver-level (pre-connect) check only. It is
+        NOT transport-bound DNS validation — a TOCTOU gap exists between
+        resolution and connection (DNS rebinding), and redirect-to-private
+        authority changes after the initial check are only caught at the next
+        hop boundary. The TypeScript bridge disables the real engine for this
+        reason; this Python guard is a defense-in-depth layer, not equivalent
+        protection against DNS rebinding or redirect-to-private attacks.
+
         Falls back to a one-shot get if no session could be created."""
         from . import safety
         if allow_private is None:
