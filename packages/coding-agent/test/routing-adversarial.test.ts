@@ -13,6 +13,7 @@ import {
 } from "@gajae-code/coding-agent/session/cache-economics";
 import {
 	cappedExponentialWithFullJitter,
+	compactionRetryDelay,
 	effectiveFallbackDelay,
 	FallbackChainController,
 } from "@gajae-code/coding-agent/session/fallback-chain-controller";
@@ -58,6 +59,38 @@ describe("routing adversarial contract probes", () => {
 		expect(cappedExponentialWithFullJitter(100, 1_000, 10, () => 1)).toBe(1_000);
 		expect(Math.min(THREE_HOURS_MS, 1_000)).toBe(1_000);
 		expect(effectiveFallbackDelay(100, 1_000, 1, THREE_HOURS_MS, () => 1)).toBe(THREE_HOURS_MS);
+	});
+
+	// Mirror image of the contract above: auto-compaction recovers Retry-After by
+	// regex over provider error prose, so it is legacy and MUST stay capped.
+	// Managed fallback is uncapped only because it retries within its own
+	// per-entry budget; compaction has no such budget.
+	test("caps legacy compaction retry-after at retry.maxDelayMs", () => {
+		// A hostile/misconfigured provider asking for 3h cannot outrun the cap.
+		expect(compactionRetryDelay(100, 1_000, 0, THREE_HOURS_MS)).toBe(1_000);
+		// Same hint, managed fallback path: still honoured verbatim.
+		expect(effectiveFallbackDelay(100, 1_000, 1, THREE_HOURS_MS, () => 1)).toBe(THREE_HOURS_MS);
+	});
+
+	test("compaction retry delay honours hints below the cap and keeps exponential growth", () => {
+		// No hint → plain exponential (base * 2**attempt), unchanged behaviour.
+		expect(compactionRetryDelay(2_000, 300_000, 0, undefined)).toBe(2_000);
+		expect(compactionRetryDelay(2_000, 300_000, 3, undefined)).toBe(16_000);
+		// Hint below the cap wins over the exponential, exactly as before.
+		expect(compactionRetryDelay(2_000, 300_000, 0, 45_000)).toBe(45_000);
+		// Hint smaller than the exponential never shortens the backoff.
+		expect(compactionRetryDelay(2_000, 300_000, 3, 1_000)).toBe(16_000);
+	});
+
+	test("compaction retry delay never yields a negative, NaN, or infinite sleep", () => {
+		for (const hint of [undefined, Number.NaN, Number.POSITIVE_INFINITY, -5_000]) {
+			const delay = compactionRetryDelay(2_000, 300_000, 0, hint);
+			expect(Number.isFinite(delay)).toBe(true);
+			expect(delay).toBeGreaterThanOrEqual(0);
+			expect(delay).toBeLessThanOrEqual(300_000);
+		}
+		// maxDelayMs <= 0 means "no cap", matching cappedExponentialWithFullJitter.
+		expect(compactionRetryDelay(2_000, 0, 0, 45_000)).toBe(45_000);
 	});
 
 	test("charges rotated-entry retries against the chain-wide attempt budget", () => {
