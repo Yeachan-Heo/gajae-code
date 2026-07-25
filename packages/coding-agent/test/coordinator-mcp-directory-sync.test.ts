@@ -101,4 +101,31 @@ describe("coordinator idempotency-record directory barrier", () => {
 		});
 		expect(response).toMatchObject({ ok: false });
 	});
+
+	it("completes the mutation when the real barrier tolerates a classified Windows sync failure", async () => {
+		// Route the consumer through the REAL barrier implementation while the
+		// injected directory handle raises the genuine Windows EPERM.
+		mock.module("../src/utils/directory-sync", () => ({
+			...realDirectorySync,
+			syncDirectoryBestEffort: (directory: string) =>
+				realDirectorySync.syncDirectoryBestEffort(directory, {
+					platform: "win32",
+					open: async () => ({
+						sync: async () => {
+							throw errnoError("EPERM");
+						},
+						close: async () => {},
+					}),
+				}),
+		}));
+		const root = tempDir("gjc-coordinator-report-sync-tolerated-");
+		const stateRoot = tempDir("gjc-coordinator-report-state-tolerated-");
+		const response = await server(root, stateRoot).callTool("gjc_coordinator_report_status", {
+			status: "blocked",
+			summary: "Succeeds under the tolerated Windows directory barrier.",
+			idempotency_key: "report-sync-3",
+			allow_mutation: true,
+		});
+		expect(response).toMatchObject({ ok: true, report: { status: "blocked" } });
+	});
 });
