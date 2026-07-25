@@ -16,6 +16,7 @@ import type { CasReceipt } from "../src/config/atomic-yaml-patch";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../src/sdk/bus/config";
 import { createTelegramActivationMarker, telegramActivationIdentity } from "../src/sdk/bus/notification-orchestration";
+import { daemonPaths } from "../src/sdk/bus/telegram-daemon";
 import {
 	createLightweightDaemonSettings,
 	loadLightweightDaemonSettings,
@@ -486,6 +487,37 @@ describe("notify setup cli", () => {
 
 			expect(ensureTelegramDaemon).toHaveBeenCalledTimes(1);
 			expect(getNotificationConfig(settings)).toMatchObject({ enabled: true, botToken: token, chatId: "999" });
+		});
+
+		test("notify-cli setup leaves pre-existing root registrations untouched", async () => {
+			const settings = setupSettings();
+			const roots = daemonPaths(settings.getAgentDir()).roots;
+			const existing = {
+				version: 1,
+				roots: ["/existing/.gjc/state"],
+				managedRoots: ["/existing/.gjc/state"],
+				sessions: { existing: "/existing/.gjc/state" },
+			};
+			fs.mkdirSync(path.dirname(roots), { recursive: true });
+			fs.writeFileSync(roots, JSON.stringify(existing));
+			const { fetchImpl } = makeFetch({
+				getMe: [{ ok: true, result: userOn }],
+				getChat: [{ ok: true, result: { id: 999, type: "private" } }],
+			});
+
+			await captureOutput(() =>
+				runNotifyCommand(setupCommand, {
+					settings,
+					fetchImpl,
+					setupToken: token,
+					setupChatId: "999",
+					setupInteractive: false,
+					setupPreflight: NO_DAEMON_PREFLIGHT,
+					ensureTelegramDaemon: async () => "attached",
+				}),
+			);
+
+			expect(JSON.parse(fs.readFileSync(roots, "utf8"))).toEqual(existing);
 		});
 
 		test("blocked identity restores the previous configuration through the injected daemon boundary", async () => {

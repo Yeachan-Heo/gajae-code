@@ -549,6 +549,48 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 	}
 });
 
+test("session host fails closed when its lifecycle effect marker is corrupt", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-corrupt-marker-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "corrupt-marker";
+	const effectMarker = "corrupt-marker-effect";
+	const deadlines = deriveLifecycleDeadlines(1_000, 4_000);
+	const names = ["GJC_AGENT_DIR", "GJC_STATE_ROOT", "GJC_LIFECYCLE_REQUEST_ID", "GJC_SDK_LIFECYCLE_REQUEST"] as const;
+	const previous = names.map(name => process.env[name]);
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), "{");
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+		});
+		await expect(
+			runSessionHost({
+				now: () => deadlines.semanticReadyDeadlineAt,
+				sleep: async () => {},
+				cwd: root,
+				processIncarnation: () => "test-incarnation",
+			}),
+		).rejects.toThrow("marker authority was not published");
+		await expect(fs.stat(path.join(stateRoot, "sdk", `${sessionId}.json`))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("startup failure artifacts reject symlink and oversize collisions while accepting byte-identical owner evidence", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-artifact-"));
 	const id = "artifact-session";

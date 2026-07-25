@@ -1,4 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { CasReceipt } from "@gajae-code/coding-agent/config/atomic-yaml-patch";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
@@ -28,6 +30,11 @@ import type {
 	NotificationSessionReconcileResult,
 	NotificationSessionStatus,
 } from "@gajae-code/coding-agent/sdk/bus/session-control";
+import {
+	readNotificationRootRegistration,
+	registerNotificationRoot,
+	withNotificationRootRegistryFence,
+} from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -650,6 +657,150 @@ describe("notification settings controller adapter", () => {
 		expect(typeof committed.restore).toBe("function");
 		expect(typeof committed.retainCommitted).toBe("function");
 		expect(events).toEqual(["commit", "ensure", "enter-blocked", "commit", "notify"]);
+	});
+	it("removes the active tokenized production root and stops the last Telegram daemon", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-settings-remove-"));
+		const cwd = path.join(agentDir, "workspace");
+		const sessionId = "session-current";
+		const currentSnapshot = snapshot();
+		const events: string[] = [];
+		const settings = {
+			getAgentDir: () => agentDir,
+			getNotificationSettingsSnapshot: () => structuredClone(currentSnapshot),
+			commitAtomicBatch: async (patches: Array<{ path: string; op: string; value?: unknown }>) => {
+				events.push("commit");
+				for (const patch of patches) {
+					if (patch.path === "notifications.telegram.botToken" && patch.op === "unset")
+						currentSnapshot.telegram.botToken = undefined;
+					if (patch.path === "notifications.telegram.chatId" && patch.op === "unset")
+						currentSnapshot.telegram.chatId = undefined;
+					if (patch.path === "notifications.enabled" && patch.op === "set")
+						currentSnapshot.enabled = patch.value === true;
+				}
+				return receipt();
+			},
+		} as unknown as Settings;
+		const controller = {
+			query: () => sessionStatus(),
+			setLocalEnabled: async () => sessionResult(),
+			reconcileCurrentSession: async () => sessionResult(),
+			enterBlockedRuntime: async () => {
+				events.push("blocked");
+				return true;
+			},
+			clearBlockedRuntime: async () => {
+				events.push("cleared");
+			},
+		};
+		try {
+			const registration = await registerNotificationRoot({ settings, cwd, sessionId });
+			expect(registration.token).toBeTruthy();
+			const operations = createNotificationsEditorOperations(
+				{
+					settings,
+					session: { notificationSessionController: controller },
+					sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId },
+				} as unknown as NotificationsEditorAdapterContext,
+				{
+					stopTelegramDaemon: async input => {
+						expect(input).toBe(settings);
+						events.push("stop");
+						return { ok: true, message: "stopped", before: { health: "running" } };
+					},
+				},
+			);
+
+			await operations.removeTelegram();
+
+			expect(await readNotificationRootRegistration({ settings, sessionId })).toEqual({
+				root: undefined,
+				managed: false,
+				token: undefined,
+			});
+			expect(events).toEqual(["blocked", "stop", "commit", "cleared"]);
+			expect(currentSnapshot.enabled).toBe(false);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	it("does not stop a replacement tokenized root after a stale last-root observation", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-settings-remove-race-"));
+		const cwd = path.join(agentDir, "workspace");
+		const sessionId = "session-current";
+		const events: string[] = [];
+		const conditionalEntered = deferred<void>();
+		const resumeConditional = deferred<void>();
+		let stopCalls = 0;
+		const settings = {
+			getAgentDir: () => agentDir,
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => {
+				events.push("commit");
+				return receipt();
+			},
+		} as unknown as Settings;
+		const controller = {
+			query: () => sessionStatus(),
+			setLocalEnabled: async () => sessionResult(),
+			reconcileCurrentSession: async () => sessionResult(),
+			enterBlockedRuntime: async () => {
+				events.push("blocked");
+				return true;
+			},
+			clearBlockedRuntime: async () => {
+				events.push("cleared");
+			},
+		};
+		try {
+			const registration = await registerNotificationRoot({ settings, cwd, sessionId });
+			const operations = createNotificationsEditorOperations(
+				{
+					settings,
+					session: { notificationSessionController: controller },
+					sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId },
+				} as unknown as NotificationsEditorAdapterContext,
+				{
+					stopTelegramDaemon: async () => {
+						stopCalls += 1;
+						return { ok: true, message: "stopped", before: { health: "running" } };
+					},
+					stopTelegramDaemonIfRootRegistryFenceMatches: async input => {
+						conditionalEntered.resolve();
+						await resumeConditional.promise;
+						return await withNotificationRootRegistryFence({
+							settings: input.settings,
+							registryFingerprint: input.registryFingerprint,
+							action: async () => {
+								const stopped = await input.stop();
+								if (!stopped.ok) throw new Error(stopped.message);
+							},
+						});
+					},
+				},
+			);
+
+			const removal = operations.removeTelegram();
+			await conditionalEntered.promise;
+			expect(await readNotificationRootRegistration({ settings, sessionId })).toEqual({
+				root: undefined,
+				managed: false,
+				token: undefined,
+			});
+			const replacement = await registerNotificationRoot({ settings, cwd, sessionId });
+			expect(replacement.token).not.toBe(registration.token);
+			resumeConditional.resolve();
+			await removal;
+
+			expect(stopCalls).toBe(0);
+			expect(await readNotificationRootRegistration({ settings, sessionId })).toEqual({
+				root: path.join(cwd, ".gjc", "state"),
+				managed: true,
+				token: replacement.token,
+			});
+			expect(events).toEqual(["blocked", "commit", "cleared"]);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 });
 

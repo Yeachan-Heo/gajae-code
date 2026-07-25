@@ -40,6 +40,7 @@ import {
 	readAttestedLegacyDaemonOwner,
 	readDaemonRoots,
 	readDaemonState,
+	readOwnerFreshnessSnapshot,
 	spawnTelegramDaemonOwner,
 	type TelegramDaemonDeps,
 	type TelegramDaemonFs,
@@ -224,7 +225,8 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		if (!configured) {
 			return { kind: this.kind, configured: false, health: "not_configured", runtime };
 		}
-		const state = await readDaemonState(this.settings, this.fsImpl);
+		const snapshot = await readOwnerFreshnessSnapshot({ settings: this.settings, fs: this.fsImpl });
+		const state = snapshot.state;
 		const roots = await readDaemonRoots(this.settings, this.fsImpl);
 		const health: DaemonHealth =
 			!state || state.stoppedAt !== undefined || !this.pidAlive(state.pid)
@@ -236,6 +238,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 							chatId: cfg.chatId as string,
 							pidAlive: this.pidAlive,
 							pidIncarnation: this.deps.pidIncarnation,
+							effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 						})
 					? "running"
 					: "stale";
@@ -246,7 +249,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			pid: state?.pid,
 			ownerId: state?.ownerId,
 			startedAt: state?.startedAt,
-			heartbeatAt: state?.heartbeatAt,
+			heartbeatAt: snapshot.effectiveHeartbeatAt,
 			roots,
 			rootCount: roots.length,
 			runtime,
@@ -480,7 +483,8 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		const gracefulTimeoutMs = opts.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS;
 		const killTimeoutMs = opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
 
-		const state = await readDaemonState(this.settings, this.fsImpl);
+		const ownerSnapshot = await readOwnerFreshnessSnapshot({ settings: this.settings, fs: this.fsImpl });
+		const state = ownerSnapshot.state;
 		const attestedLegacyOwner = attestedLegacyUpgrade
 			? await readAttestedLegacyDaemonOwner({
 					settings: this.settings,
@@ -501,6 +505,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 					chatId,
 					pidAlive: this.pidAlive,
 					pidIncarnation: this.deps.pidIncarnation,
+					effectiveHeartbeatAt: ownerSnapshot.effectiveHeartbeatAt,
 				}) &&
 				isSignalableMatchingOwner({
 					state,
@@ -628,7 +633,8 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		let dead = await this.waitForPidDeath(oldPid, gracefulTimeoutMs);
 		if (!dead) {
 			// Old pid still alive after the cooperative SIGTERM. Inspect current ownership.
-			const current = await readDaemonState(this.settings, this.fsImpl);
+			const currentSnapshot = await readOwnerFreshnessSnapshot({ settings: this.settings, fs: this.fsImpl });
+			const current = currentSnapshot.state;
 			const changedToLiveOwner =
 				current !== undefined &&
 				current.ownerId !== oldOwnerId &&
@@ -639,6 +645,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 					chatId,
 					pidAlive: this.pidAlive,
 					pidIncarnation: this.deps.pidIncarnation,
+					effectiveHeartbeatAt: currentSnapshot.effectiveHeartbeatAt,
 				});
 			if (changedToLiveOwner) {
 				await this.clearOwnRequest(requestId);
@@ -701,7 +708,8 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		warnings.push(...spawned.warnings);
 		const after = await this.status();
 		if (spawned.result === "attached") {
-			const attachedState = await readDaemonState(this.settings, this.fsImpl);
+			const attachedSnapshot = await readOwnerFreshnessSnapshot({ settings: this.settings, fs: this.fsImpl });
+			const attachedState = attachedSnapshot.state;
 			if (
 				!isCurrentCompatibleOwner({
 					state: attachedState,
@@ -710,6 +718,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 					chatId,
 					pidAlive: this.pidAlive,
 					pidIncarnation: this.deps.pidIncarnation,
+					effectiveHeartbeatAt: attachedSnapshot.effectiveHeartbeatAt,
 				})
 			) {
 				return this.result(
