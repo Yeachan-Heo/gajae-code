@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
+import { isUnsupportedWindowsDirectorySyncError } from "../utils/directory-sync";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
 export type CoordinatorSessionState =
@@ -312,6 +313,9 @@ async function fsyncDirectory(directory: string): Promise<void> {
 	const handle = await fs.open(directory, "r");
 	try {
 		await handle.sync();
+	} catch (error) {
+		// Windows cannot fsync a directory handle; rename durability is best-effort there.
+		if (!isUnsupportedWindowsDirectorySyncError(error)) throw error;
 	} finally {
 		await handle.close();
 	}
