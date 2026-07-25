@@ -6,6 +6,7 @@ import {
 	type AuthenticateRequest,
 	type AuthenticateResponse,
 	type AuthMethod,
+	type AvailableCommand,
 	type ClientCapabilities,
 	type CloseSessionRequest,
 	type CloseSessionResponse,
@@ -33,7 +34,7 @@ import {
 	type SetSessionModeRequest,
 	type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { getAgentDir } from "@gajae-code/utils";
+import { getAgentDir, logger } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import {
 	type AcpProviderRegistration,
@@ -41,9 +42,15 @@ import {
 	AcpSdkAdapter,
 	AcpSdkAdapterError,
 } from "../../sdk/acp";
+import { resolveAcpFinalText } from "../../sdk/acp/final-text";
+import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
-import { mapAgentWireEventPayloadToAcpSessionUpdates } from "./acp-event-mapper";
+import {
+	buildToolCallStartUpdate,
+	mapAgentSessionEventToAcpSessionUpdates,
+	mapAgentWireEventPayloadToAcpSessionUpdates,
+} from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
 import type { AcpStartupOptions } from "./startup-options";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
@@ -52,6 +59,8 @@ const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
 const MODE_CONFIG_ID = "mode";
 const MODEL_CONFIG_ID = "model";
+const MODEL_PRESET_CONFIG_KEY = "modelPreset";
+const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
 export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
@@ -59,11 +68,10 @@ const MAX_ACP_REPLAY_PAGES = 10_000;
 
 type JsonObject = Record<string, unknown>;
 /**
- * ACP prompt completion is tied to a post-acknowledgement lifecycle boundary.
- * AgentSession events do not carry the command identity themselves, so the
- * host stamps command/turn identities into its replay ring and ACP also keeps
- * a per-endpoint ingress sequence. A frame observed before an acknowledgement
- * can never settle the waiter that acknowledgement creates.
+ * ACP prompt completion is tied to lifecycle activity observed after dispatch.
+ * A fast host may stream and finish a turn before acknowledging `turn.prompt`,
+ * so pre-ack activity is retained but cannot resolve the waiter until the
+ * acknowledgement supplies its command/turn correlation.
  */
 interface PromptWaiter {
 	cancelRequested: boolean;
@@ -75,6 +83,7 @@ interface PromptWaiter {
 	boundary: number;
 	correlation: PromptCorrelation;
 	messageProgress?: { textEmitted: boolean; thoughtEmitted: boolean };
+	emittedAssistantText: string;
 	pendingTerminal?: PromptCorrelation;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
@@ -97,6 +106,10 @@ type SessionRecord = {
 	inboundSequence: number;
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
 	busy: boolean;
+	/** Start/update args retained because tool_execution_end does not carry them. */
+	toolArgs: Map<string, unknown>;
+	/** Actionable model-profile authentication failure detected before prompt dispatch. */
+	authFailure?: string;
 	activePrompt?: PromptWaiter;
 };
 type Endpoint = { url: string; token: string };
@@ -106,6 +119,9 @@ type BrokerSession = {
 	locator?: { repo?: string };
 	live?: boolean;
 	endpointGeneration?: number;
+	endpointMtimeMs?: number;
+	title?: string;
+	updatedAt?: string;
 };
 
 function parseAcpStartupOptions(value: unknown): AcpStartupOptions | undefined {
@@ -136,7 +152,12 @@ function aggregateAcpFailure(code: string, message: string, failures: unknown[])
 }
 
 /** Applies ACP's offset cursor after narrowing the broker listing to the requested cwd. */
-export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, offset: number): ListSessionsResponse {
+export function paginateAcpSessions(
+	listed: unknown[],
+	cwd: string | undefined,
+	offset: number,
+	sessionMetadata: ReadonlyMap<string, { title?: string; updatedAt?: string }> = new Map(),
+): ListSessionsResponse {
 	const filtered = listed
 		.map(value => object(value) as BrokerSession | undefined)
 		.filter(
@@ -144,12 +165,28 @@ export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, 
 				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
 		)
 		.filter(value => !cwd || value.locator.repo === cwd);
-	const sessions = filtered
-		.slice(offset, offset + SESSION_PAGE_SIZE)
-		.map(
-			value =>
-				({ sessionId: value.sessionId, cwd: value.locator.repo, title: value.sessionId }) satisfies SessionInfo,
-		);
+	const sessions = filtered.slice(offset, offset + SESSION_PAGE_SIZE).map(value => {
+		const metadata = sessionMetadata.get(value.sessionId);
+		const updatedAt =
+			typeof metadata?.updatedAt === "string"
+				? metadata.updatedAt
+				: typeof value.updatedAt === "string"
+					? value.updatedAt
+					: typeof value.endpointMtimeMs === "number" && Number.isFinite(value.endpointMtimeMs)
+						? new Date(value.endpointMtimeMs).toISOString()
+						: undefined;
+		return {
+			sessionId: value.sessionId,
+			cwd: value.locator.repo,
+			title:
+				typeof metadata?.title === "string" && metadata.title
+					? metadata.title
+					: typeof value.title === "string" && value.title
+						? value.title
+						: value.sessionId,
+			...(updatedAt ? { updatedAt } : {}),
+		} satisfies SessionInfo;
+	});
 	return {
 		sessions,
 		nextCursor: offset + sessions.length < filtered.length ? String(offset + sessions.length) : undefined,
@@ -178,6 +215,26 @@ function pageItems(value: unknown): unknown[] {
 	const result = object(response?.result) ?? response;
 	const page = object(result?.page);
 	return Array.isArray(page?.items) ? page.items : [];
+}
+
+/** Build the ACP command palette from the shared builtins and live SDK skill state. */
+export function acpAvailableCommandsFromSkills(query: unknown): AvailableCommand[] {
+	const commands = new Map<string, AvailableCommand>();
+	for (const item of pageItems(query)) {
+		const skill = object(item);
+		if (typeof skill?.name !== "string" || !skill.name) continue;
+		const name = `skill:${skill.name}`;
+		if (commands.has(name)) continue;
+		commands.set(name, {
+			name,
+			description:
+				typeof skill.description === "string" && skill.description
+					? skill.description
+					: `Run the ${skill.name} skill`,
+			input: { hint: "[request]" },
+		});
+	}
+	return [...commands.values()];
 }
 
 function correlationFrom(...values: unknown[]): PromptCorrelation {
@@ -268,6 +325,7 @@ function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
 		const type = frame.state === "busy" ? "agent_start" : frame.state === "idle" ? "agent_end" : undefined;
 		return type ? { event: { type, ...correlationFrom(frame) } } : undefined;
 	}
+	if (frame.type === "agent_start" || frame.type === "agent_end") return { event: frame };
 	if (frame.type !== "event") return undefined;
 	const payload = object(frame.payload);
 	if (!payload) return undefined;
@@ -331,6 +389,19 @@ function configValues(query: unknown): Map<string, string> {
 	return values;
 }
 
+function modelPresetConfigOptions(query: unknown, current: string): { value: string; name: string }[] {
+	const options = new Map<string, string>();
+	for (const item of pageItems(query)) {
+		const profile = object(item);
+		if (!profile || typeof profile.id !== "string") continue;
+		if (profile.available === false && profile.id !== current) continue;
+		options.set(profile.id, typeof profile.displayName === "string" ? profile.displayName : profile.id);
+	}
+	if (current === ACP_CUSTOM_MODEL_PRESET) options.set(ACP_CUSTOM_MODEL_PRESET, "Custom (current model)");
+	else if (!options.has(current)) options.set(current, current);
+	return [...options].map(([value, name]) => ({ value, name }));
+}
+
 function modelConfigOptions(query: unknown, current: string | undefined): { value: string; name: string }[] {
 	const options = new Map<string, string>();
 	for (const item of pageItems(query)) {
@@ -348,9 +419,10 @@ const THINKING_CONFIG_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhi
 	name: value,
 }));
 
-/** Maps live canonical SDK config and model queries into the ACP 1.2.1 session state surface. */
-export function acpSessionStateFromConfig(query: unknown, modelsQuery?: unknown) {
+/** Maps live canonical SDK config and the selected model catalog into the ACP 1.2.1 session state surface. */
+export function acpSessionStateFromConfig(query: unknown, modelCatalogQuery?: unknown, modelPreset?: string) {
 	const values = configValues(query);
+	const useModelPresets = modelPreset !== undefined;
 	const currentModeId = values.get(MODE_CONFIG_ID) === ACP_PLAN_MODE_ID ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	return {
 		configOptions: [
@@ -365,15 +437,28 @@ export function acpSessionStateFromConfig(query: unknown, modelsQuery?: unknown)
 				],
 			},
 			...ACP_CONFIG_OPTIONS.flatMap(option => {
-				const value = values.get(option.id);
+				const value =
+					option.id === MODEL_CONFIG_ID && useModelPresets
+						? (values.get(MODEL_PRESET_CONFIG_KEY) ?? ACP_CUSTOM_MODEL_PRESET)
+						: values.get(option.id);
 				if (value === undefined) return [];
 				const options =
 					option.id === MODEL_CONFIG_ID
-						? modelConfigOptions(modelsQuery, value)
+						? useModelPresets
+							? modelPresetConfigOptions(modelCatalogQuery, value)
+							: modelConfigOptions(modelCatalogQuery, value)
 						: option.id === THINKING_CONFIG_ID
 							? THINKING_CONFIG_OPTIONS
 							: [...option.options];
-				return [{ ...option, type: "select" as const, currentValue: value, options }];
+				return [
+					{
+						...option,
+						...(option.id === MODEL_CONFIG_ID && useModelPresets ? { name: "Preset" } : {}),
+						type: "select" as const,
+						currentValue: value,
+						options,
+					},
+				];
 			}),
 		],
 		modes: {
@@ -572,6 +657,7 @@ export class AcpAgent implements Agent {
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
+	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
@@ -624,7 +710,14 @@ export class AcpAgent implements Agent {
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { embeddedContext: true, image: true },
-				sessionCapabilities: { list: {}, fork: {}, resume: {}, close: {}, delete: {} },
+				mcpCapabilities: { http: true, sse: true },
+				sessionCapabilities: {
+					list: {},
+					fork: {},
+					resume: {},
+					close: {},
+					delete: {},
+				},
 			},
 		};
 	}
@@ -636,16 +729,19 @@ export class AcpAgent implements Agent {
 	}
 
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-		this.#assertNoMcpServers(params);
+		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
-		const result = await (await this.#brokerAdapter()).global(
+		this.#assertNoAdditionalDirectories(params.additionalDirectories);
+		const result = await this.#launchSessionWithMcp(
 			"session.create",
 			{
 				cwd: params.cwd,
 				target: { path: params.cwd },
 				...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
+				...(mcpServers.length > 0 ? { mcpServers, readinessTimeoutMs: ACP_MCP_LIFECYCLE_TIMEOUT_MS } : {}),
 			},
 			randomUUID(),
+			mcpServers,
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
@@ -653,7 +749,7 @@ export class AcpAgent implements Agent {
 			await this.#attach(id, params.cwd, endpoint(result));
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
 			this.#scheduleBootstrap(id);
-			return { sessionId: id, ...(await this.#sessionState(id)) };
+			return { sessionId: id, ...(await this.#sessionState(id, true)) };
 		} catch (error) {
 			await this.#discardNewSession(id);
 			throw error;
@@ -661,35 +757,40 @@ export class AcpAgent implements Agent {
 	}
 
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-		this.#assertNoMcpServers(params);
+		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
-		await this.#attachExisting(params.sessionId, params.cwd);
+		this.#assertNoAdditionalDirectories(params.additionalDirectories);
+		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		await this.#replaySession(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
 		return await this.#sessionState(params.sessionId);
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
-		this.#assertNoMcpServers(params);
+		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
-		await this.#attachExisting(params.sessionId, params.cwd);
+		this.#assertNoAdditionalDirectories(params.additionalDirectories);
+		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		this.#scheduleBootstrap(params.sessionId);
 		return await this.#sessionState(params.sessionId);
 	}
 
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
-		this.#assertNoMcpServers(params);
+		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
+		this.#assertNoAdditionalDirectories(params.additionalDirectories);
 		const source = await this.#resolveSavedSession(params.sessionId, params.cwd);
-		const result = await (await this.#brokerAdapter()).global(
+		const result = await this.#launchSessionWithMcp(
 			"session.fork",
 			{
 				cwd: params.cwd,
 				sourceSessionId: params.sessionId,
 				sourceSessionPath: source,
 				target: { path: params.cwd },
+				...(mcpServers.length > 0 ? { mcpServers, readinessTimeoutMs: ACP_MCP_LIFECYCLE_TIMEOUT_MS } : {}),
 			},
 			randomUUID(),
+			mcpServers,
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
@@ -730,7 +831,12 @@ export class AcpAgent implements Agent {
 				this.#knownSessionCwds.set(candidate.sessionId, params.cwd);
 			}
 		}
-		return paginateAcpSessions(listed, params.cwd ?? undefined, this.#cursor(params.cursor));
+		return paginateAcpSessions(
+			listed,
+			params.cwd ?? undefined,
+			this.#cursor(params.cursor),
+			this.#knownSessionMetadata,
+		);
 	}
 
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -765,6 +871,7 @@ export class AcpAgent implements Agent {
 			} catch (error) {
 				if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
 					this.#knownSessionCwds.delete(params.sessionId);
+					this.#knownSessionMetadata.delete(params.sessionId);
 					return {};
 				}
 				throw error;
@@ -775,6 +882,7 @@ export class AcpAgent implements Agent {
 				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 			);
 			this.#knownSessionCwds.delete(params.sessionId);
+			this.#knownSessionMetadata.delete(params.sessionId);
 			return {};
 		} finally {
 			this.#finishTeardown(params.sessionId);
@@ -800,7 +908,11 @@ export class AcpAgent implements Agent {
 				await this.setSessionMode({ sessionId: params.sessionId, modeId: params.value });
 				break;
 			case MODEL_CONFIG_ID:
-				await this.#adapter(params.sessionId).setModel(params.value);
+				if (this.#startupOptions?.modelPreset === undefined) {
+					await this.#adapter(params.sessionId).setModel(params.value);
+				} else if (params.value !== ACP_CUSTOM_MODEL_PRESET) {
+					await this.#adapter(params.sessionId).control("model.profile.set", { id: params.value });
+				}
 				break;
 			case THINKING_CONFIG_ID:
 				await this.#adapter(params.sessionId).control("thinking.set", { level: params.value });
@@ -823,6 +935,7 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 		const payload = acpPromptPayload(params.prompt);
 		let waiter!: PromptWaiter;
 		const response = new Promise<PromptResponse>((resolve, reject) => {
@@ -833,6 +946,7 @@ export class AcpAgent implements Agent {
 				steeringAtAcknowledgement: record.busy,
 				boundary: record.inboundSequence,
 				correlation: {},
+				emittedAssistantText: "",
 				resolve,
 				reject,
 			};
@@ -946,12 +1060,14 @@ export class AcpAgent implements Agent {
 		return !["terminal_uncertain", "cleanup_pending", "broker_restarting", "unavailable"].includes(error.code);
 	}
 
-	async #attachExisting(id: string, cwd: string): Promise<void> {
+	async #attachExisting(id: string, cwd: string, mcpServers: SessionLifecycleMcpServer[] = []): Promise<void> {
 		const epoch = this.#sessionEpoch(id);
 		const attached = this.#sessions.get(id);
 		if (attached) {
 			if (path.resolve(attached.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			if (mcpServers.length > 0)
+				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -968,7 +1084,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
-		const task = this.#resolveExistingAttachment(id, cwd, epoch);
+		const task = this.#resolveExistingAttachment(id, cwd, epoch, mcpServers);
 		const pending = { epoch, task };
 		this.#resolvingExisting.set(id, pending);
 		try {
@@ -979,11 +1095,18 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #resolveExistingAttachment(id: string, cwd: string, epoch: number): Promise<void> {
+	async #resolveExistingAttachment(
+		id: string,
+		cwd: string,
+		epoch: number,
+		mcpServers: SessionLifecycleMcpServer[],
+	): Promise<void> {
 		this.#assertSessionEpoch(id, epoch);
 		const indexed = await this.#scopedBrokerSession(id, cwd);
 		this.#assertSessionEpoch(id, epoch);
 		if (indexed?.live) {
+			if (mcpServers.length > 0)
+				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
 			const result = await this.#brokerEndpoint(id, indexed.endpointGeneration);
 			this.#assertSessionEpoch(id, epoch);
 			await this.#attach(id, cwd, endpoint(result), epoch);
@@ -992,10 +1115,17 @@ export class AcpAgent implements Agent {
 
 		const saved = await this.#resolveSavedSession(id, cwd);
 		this.#assertSessionEpoch(id, epoch);
-		const result = await (await this.#brokerAdapter()).global(
+		const result = await this.#launchSessionWithMcp(
 			"session.resume",
-			{ cwd, sessionId: id, sessionPath: saved, target: { path: cwd } },
+			{
+				cwd,
+				sessionId: id,
+				sessionPath: saved,
+				target: { path: cwd },
+				...(mcpServers.length > 0 ? { mcpServers, readinessTimeoutMs: ACP_MCP_LIFECYCLE_TIMEOUT_MS } : {}),
+			},
 			randomUUID(),
+			mcpServers,
 		);
 		this.#assertSessionEpoch(id, epoch);
 		await this.#attach(id, cwd, endpoint(result), epoch);
@@ -1065,6 +1195,7 @@ export class AcpAgent implements Agent {
 				frameTail: Promise.resolve(),
 				inboundSequence: 0,
 				busy: false,
+				toolArgs: new Map(),
 			};
 			record.unsubscribe = adapter.onFrame(frame => this.#enqueueSdkFrame(id, adapter!, frame));
 			record.reconnectUnsubscribe = adapter.onReconnectFailed(error =>
@@ -1117,6 +1248,7 @@ export class AcpAgent implements Agent {
 	async #discardNewSession(id: string): Promise<void> {
 		await this.#teardownSession(id, "discarded", true);
 		this.#knownSessionCwds.delete(id);
+		this.#knownSessionMetadata.delete(id);
 	}
 
 	async #closeOwnedSession(id: string): Promise<CloseSessionResponse> {
@@ -1128,6 +1260,7 @@ export class AcpAgent implements Agent {
 			if (attaching) await Promise.allSettled([attaching.task]);
 			await this.#teardownSession(id, "closed", true);
 			this.#knownSessionCwds.delete(id);
+			this.#knownSessionMetadata.delete(id);
 			return {};
 		} finally {
 			this.#finishTeardown(id);
@@ -1307,13 +1440,23 @@ export class AcpAgent implements Agent {
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
+		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+		if (
+			toolCallId &&
+			(event.type === "tool_execution_start" || event.type === "tool_execution_update") &&
+			"args" in event
+		) {
+			record.toolArgs.set(toolCallId, event.args);
+		}
 		const correlation = correlationFrom(frame, event);
 		const activePrompt = record.activePrompt;
 		// Prompt ownership is updated before publishing client notifications, but a
-		// terminal waiter is resolved only after publication succeeds so a failed
-		// sessionUpdate rejects the prompt instead of reporting false completion.
+		// terminal waiter is resolved only after acknowledgement and publication
+		// succeed. Fast hosts may emit the whole turn before acknowledging the
+		// control request; retaining that activity prevents an idle ACP prompt from
+		// remaining open forever.
 		if (
-			activePrompt?.acknowledged &&
+			activePrompt &&
 			sequence > activePrompt.boundary &&
 			!correlationsConflict(activePrompt.correlation, correlation)
 		) {
@@ -1322,6 +1465,8 @@ export class AcpAgent implements Agent {
 			} else if (event.type === "agent_end") {
 				if (
 					correlationsMatch(activePrompt.correlation, correlation) ||
+					correlation.commandId !== undefined ||
+					correlation.turnId !== undefined ||
 					activePrompt.activityObserved ||
 					activePrompt.steeringAtAcknowledgement
 				)
@@ -1331,17 +1476,69 @@ export class AcpAgent implements Agent {
 		if (wirePayload) {
 			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
 				cwd: record.cwd,
+				getToolArgs: id => record.toolArgs.get(id),
 				getMessageProgress: message => {
 					if (!activePrompt || !object(message)) return undefined;
 					activePrompt.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
 					return activePrompt.messageProgress;
 				},
-			}))
+			})) {
+				if (
+					activePrompt &&
+					notification.update.sessionUpdate === "agent_message_chunk" &&
+					notification.update.content.type === "text"
+				)
+					activePrompt.emittedAssistantText += notification.update.content.text;
 				await this.#publishSessionUpdate(id, notification, adapter);
+			}
+		}
+		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
+		if (event.type === "agent_start") {
+			await this.#publishSessionUpdate(
+				id,
+				{
+					sessionId: id,
+					update: {
+						sessionUpdate: "session_info_update",
+						updatedAt: new Date().toISOString(),
+						_meta: { gjcPhase: "working", running: true, gjcRunning: true },
+					},
+				},
+				adapter,
+			);
 		}
 		if (event.type === "message_end" && object(event.message)?.role === "assistant" && activePrompt)
 			activePrompt.messageProgress = undefined;
-		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
+		if (event.type === "agent_end") {
+			const finalText = typeof event.finalText === "string" ? event.finalText : "";
+			if (activePrompt && finalText) {
+				const resolution = resolveAcpFinalText(activePrompt.emittedAssistantText, finalText);
+				if (resolution.kind === "emit") {
+					activePrompt.emittedAssistantText += resolution.text;
+					await this.#publishSessionUpdate(
+						id,
+						{
+							sessionId: id,
+							update: {
+								sessionUpdate: "agent_message_chunk",
+								content: { type: "text", text: resolution.text },
+								...(resolution.final.truncated ? { _meta: { gjcFinalTextTruncated: true } } : {}),
+							},
+						},
+						adapter,
+					);
+				} else if (resolution.kind === "divergent") {
+					logger.warn("acp_final_text_diverged", {
+						sessionId: id,
+						...(activePrompt.correlation.commandId ? { commandId: activePrompt.correlation.commandId } : {}),
+						...(activePrompt.correlation.turnId ? { turnId: activePrompt.correlation.turnId } : {}),
+						streamedLength: activePrompt.emittedAssistantText.length,
+						finalLength: resolution.final.text.length,
+					});
+				}
+			}
+			await this.#emitEndOfTurnUpdates(id, adapter);
+		}
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
 	}
 
@@ -1360,12 +1557,22 @@ export class AcpAgent implements Agent {
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter): Promise<void> {
 		let usage: JsonObject | undefined;
+		let title: string | undefined;
 		try {
 			const response = object(await adapter.query("context.get"));
 			const result = object(response?.result) ?? response;
 			usage = object(result?.usage);
 		} catch {
 			// Context usage is advisory ACP metadata; prompt completion remains authoritative.
+		}
+		try {
+			const response = object(await adapter.query("session.metadata"));
+			const result = object(response?.result) ?? response;
+			const metadata = pageItems(result)[0];
+			const item = object(metadata);
+			if (typeof item?.name === "string" && item.name) title = item.name;
+		} catch {
+			// Session naming is advisory; prompt completion remains authoritative.
 		}
 		if (typeof usage?.tokens === "number" && typeof usage.contextWindow === "number") {
 			await this.#publishSessionUpdate(
@@ -1381,13 +1588,16 @@ export class AcpAgent implements Agent {
 				adapter,
 			);
 		}
+		const updatedAt = new Date().toISOString();
+		this.#knownSessionMetadata.set(id, { ...(title ? { title } : {}), updatedAt });
 		await this.#publishSessionUpdate(
 			id,
 			{
 				sessionId: id,
 				update: {
 					sessionUpdate: "session_info_update",
-					updatedAt: new Date().toISOString(),
+					...(title ? { title } : {}),
+					updatedAt,
 					_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
 				},
 			},
@@ -1411,27 +1621,68 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #sessionState(id: string): Promise<Pick<NewSessionResponse, "configOptions" | "modes">> {
+	async #sessionState(
+		id: string,
+		rejectUnavailableStartupPreset = false,
+	): Promise<Pick<NewSessionResponse, "configOptions" | "modes">> {
 		const record = this.#sessions.get(id);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${id}`);
-		const [config, models] = await Promise.all([
+		const modelPreset = this.#startupOptions?.modelPreset;
+		const [config, modelCatalog] = await Promise.all([
 			record.adapter.query("config.list/get"),
-			record.adapter.query("models.list/current"),
+			record.adapter.query(modelPreset === undefined ? "models.list/current" : "models.profiles.list"),
 		]);
-		return acpSessionStateFromConfig(config, models);
+		record.authFailure = undefined;
+		if (modelPreset !== undefined) {
+			const activePreset = configValues(config).get(MODEL_PRESET_CONFIG_KEY);
+			const activeProfile = pageItems(modelCatalog)
+				.map(item => object(item))
+				.find(item => item?.id === activePreset);
+			if (activePreset && activeProfile?.available === false) {
+				record.authFailure =
+					`Model preset "${activePreset}" has no usable provider credentials. ` +
+					"Authenticate the required provider in Gajae Code or select an available preset before prompting.";
+				if (rejectUnavailableStartupPreset && activePreset === modelPreset)
+					throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+			}
+		}
+		return acpSessionStateFromConfig(config, modelCatalog, modelPreset);
+	}
+
+	async #publishAvailableCommands(id: string, adapter: AcpSdkAdapter): Promise<void> {
+		let skills: unknown;
+		try {
+			skills = await adapter.query("skill.list/state");
+		} catch {
+			// Builtins remain useful when an older SDK host cannot expose skill state.
+		}
+		await this.#publishSessionUpdate(
+			id,
+			{
+				sessionId: id,
+				update: {
+					sessionUpdate: "available_commands_update",
+					availableCommands: acpAvailableCommandsFromSkills(skills),
+				},
+			},
+			adapter,
+		);
 	}
 
 	async #replaySession(id: string): Promise<void> {
 		const adapter = this.#adapter(id);
+		const record = this.#sessions.get(id);
+		if (!record) return;
 		let cursor: string | undefined;
 		let imageLimitationReported = false;
+		const replayTools = new Map<string, { name: string; args: unknown }>();
 		for (let pageCount = 0; pageCount < MAX_ACP_REPLAY_PAGES; pageCount++) {
 			const response = object(await adapter.query("transcript.list", {}, cursor));
 			const result = object(response?.result) ?? response;
 			const page = object(result?.page);
 			for (const item of Array.isArray(page?.items) ? page.items : []) {
 				const message = object(item);
-				if (!message || (message.role !== "user" && message.role !== "assistant")) continue;
+				if (!message) continue;
 				const content = transcriptReplayContent(message);
 				if (!imageLimitationReported) {
 					imageLimitationReported = true;
@@ -1448,6 +1699,95 @@ export class AcpAgent implements Agent {
 					);
 				}
 				const messageId = typeof message.id === "string" ? message.id : undefined;
+				const richContent = Array.isArray(message.content) ? message.content : undefined;
+				if ((message.role === "user" || message.role === "assistant") && richContent) {
+					for (const rawBlock of richContent) {
+						const block = object(rawBlock);
+						if (!block || typeof block.type !== "string") continue;
+						if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
+							await this.#publishSessionUpdate(
+								id,
+								{
+									sessionId: id,
+									update: {
+										sessionUpdate: message.role === "user" ? "user_message_chunk" : "agent_message_chunk",
+										content: { type: "text", text: block.text },
+										...(messageId ? { messageId } : {}),
+									},
+								},
+								adapter,
+							);
+						} else if (
+							message.role === "assistant" &&
+							block.type === "thinking" &&
+							typeof block.thinking === "string" &&
+							block.thinking.length > 0
+						) {
+							await this.#publishSessionUpdate(
+								id,
+								{
+									sessionId: id,
+									update: {
+										sessionUpdate: "agent_thought_chunk",
+										content: { type: "text", text: block.thinking },
+										...(messageId ? { messageId } : {}),
+									},
+								},
+								adapter,
+							);
+						} else if (
+							message.role === "assistant" &&
+							block.type === "toolCall" &&
+							typeof block.id === "string" &&
+							typeof block.name === "string"
+						) {
+							const args = block.arguments ?? {};
+							replayTools.set(block.id, { name: block.name, args });
+							await this.#publishSessionUpdate(
+								id,
+								{
+									sessionId: id,
+									update: buildToolCallStartUpdate({
+										toolCallId: block.id,
+										toolName: block.name,
+										args,
+										cwd: record.cwd,
+									}),
+								},
+								adapter,
+							);
+						}
+					}
+					continue;
+				}
+				if (message.role === "toolResult" && typeof message.toolCallId === "string") {
+					const replayTool = replayTools.get(message.toolCallId);
+					const toolName = typeof message.toolName === "string" ? message.toolName : replayTool?.name;
+					if (!toolName) continue;
+					const resultContent = richContent
+						?.map(object)
+						.filter(
+							(block): block is JsonObject =>
+								block !== undefined && block.type === "text" && typeof block.text === "string",
+						)
+						.map(block => ({ type: "text" as const, text: String(block.text) }));
+					for (const notification of mapAgentSessionEventToAcpSessionUpdates(
+						{
+							type: "tool_execution_end",
+							toolCallId: message.toolCallId,
+							toolName,
+							result: { content: resultContent ?? content.blocks },
+							isError: message.isError === true,
+						} as never,
+						id,
+						{ cwd: record.cwd, getToolArgs: toolCallId => replayTools.get(toolCallId)?.args },
+					)) {
+						await this.#publishSessionUpdate(id, notification, adapter);
+					}
+					replayTools.delete(message.toolCallId);
+					continue;
+				}
+				if (message.role !== "user" && message.role !== "assistant") continue;
 				for (const block of content.blocks) {
 					await this.#publishSessionUpdate(
 						id,
@@ -1473,17 +1813,33 @@ export class AcpAgent implements Agent {
 		setTimeout(() => {
 			const record = this.#sessions.get(id);
 			if (!record || this.#connection.signal.aborted) return;
-			void this.#publishSessionUpdate(
-				id,
-				{
-					sessionId: id,
-					update: {
-						sessionUpdate: "session_info_update",
-						_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
+			void (async () => {
+				await this.#publishAvailableCommands(id, record.adapter);
+				if (record.authFailure) {
+					await this.#publishSessionUpdate(
+						id,
+						{
+							sessionId: id,
+							update: {
+								sessionUpdate: "agent_thought_chunk",
+								content: { type: "text", text: `[error:auth] ${record.authFailure}\n` },
+							},
+						},
+						record.adapter,
+					);
+				}
+				await this.#publishSessionUpdate(
+					id,
+					{
+						sessionId: id,
+						update: {
+							sessionUpdate: "session_info_update",
+							_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
+						},
 					},
-				},
-				record.adapter,
-			).catch(() => undefined);
+					record.adapter,
+				);
+			})().catch(() => undefined);
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
 
@@ -1498,9 +1854,138 @@ export class AcpAgent implements Agent {
 		if (!path.isAbsolute(cwd)) throw new Error(`ACP cwd must be an absolute path: ${cwd}`);
 	}
 
-	#assertNoMcpServers(params: { mcpServers?: unknown[] }): void {
-		if (params.mcpServers && params.mcpServers.length > 0)
-			throw new AcpSdkAdapterError("unsupported", "MCP servers are unsupported under SDK-backed ACP.");
+	#assertNoAdditionalDirectories(directories: string[] | null | undefined): void {
+		if (directories && directories.length > 0)
+			throw new AcpSdkAdapterError("unsupported", "ACP additional directories are not supported.");
+	}
+
+	#mcpServers(params: { mcpServers?: unknown[] }): SessionLifecycleMcpServer[] {
+		const servers = params.mcpServers ?? [];
+		if (servers.length > 64)
+			throw new AcpSdkAdapterError("unsupported", "ACP supports at most 64 MCP servers per session.");
+		const result: SessionLifecycleMcpServer[] = [];
+		const names = new Set<string>();
+		for (const value of servers) {
+			if (typeof value !== "object" || value === null || Array.isArray(value))
+				throw new AcpSdkAdapterError("invalid_input", "ACP MCP server definitions must be objects.");
+			const server = value as Record<string, unknown>;
+			if (typeof server.name !== "string" || !/^[A-Za-z0-9_.-]{1,100}$/.test(server.name) || names.has(server.name))
+				throw new AcpSdkAdapterError("invalid_input", "ACP MCP servers must have unique safe names.");
+			names.add(server.name);
+			if (server.type === "http" || server.type === "sse") {
+				if (
+					typeof server.url !== "string" ||
+					server.url.length > 8_192 ||
+					!Array.isArray(server.headers) ||
+					server.headers.length > 100
+				)
+					throw new AcpSdkAdapterError("invalid_input", "ACP remote MCP servers require a valid URL and headers.");
+				let parsedUrl: URL;
+				try {
+					parsedUrl = new URL(server.url);
+				} catch {
+					throw new AcpSdkAdapterError("invalid_input", "ACP MCP URL is invalid.");
+				}
+				if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:")
+					throw new AcpSdkAdapterError("invalid_input", "ACP MCP URLs must use HTTP or HTTPS.");
+				const headers: Record<string, string> = {};
+				for (const value of server.headers) {
+					const header = object(value);
+					if (
+						typeof header?.name !== "string" ||
+						header.name.length === 0 ||
+						header.name.length > 256 ||
+						header.name.includes("\r") ||
+						header.name.includes("\n") ||
+						typeof header.value !== "string" ||
+						header.value.length > 8_192 ||
+						header.value.includes("\r") ||
+						header.value.includes("\n") ||
+						Object.hasOwn(headers, header.name)
+					)
+						throw new AcpSdkAdapterError(
+							"invalid_input",
+							"ACP MCP headers must have unique valid names and values.",
+						);
+					headers[header.name] = header.value;
+				}
+				result.push({
+					type: server.type,
+					name: server.name,
+					url: parsedUrl.toString(),
+					...(Object.keys(headers).length > 0 ? { headers } : {}),
+				});
+				continue;
+			}
+			if (
+				(server.type !== undefined && server.type !== "stdio") ||
+				typeof server.command !== "string" ||
+				server.command.length > 4_096 ||
+				!path.isAbsolute(server.command) ||
+				!Array.isArray(server.args) ||
+				server.args.length > 100 ||
+				!server.args.every(argument => typeof argument === "string" && argument.length <= 8_192) ||
+				!Array.isArray(server.env) ||
+				server.env.length > 100
+			)
+				throw new AcpSdkAdapterError(
+					"invalid_input",
+					"ACP stdio MCP servers require an absolute command and bounded arguments and environment variables.",
+				);
+			const env: Record<string, string> = {};
+			for (const value of server.env) {
+				const variable = object(value);
+				if (
+					typeof variable?.name !== "string" ||
+					!/^[A-Za-z_][A-Za-z0-9_]*$/.test(variable.name) ||
+					typeof variable.value !== "string" ||
+					variable.value.length > 32_768 ||
+					Object.hasOwn(env, variable.name)
+				)
+					throw new AcpSdkAdapterError(
+						"invalid_input",
+						"ACP MCP environment variables must have unique valid names and string values.",
+					);
+				env[variable.name] = variable.value;
+			}
+			result.push({
+				name: server.name,
+				command: server.command,
+				args: server.args as string[],
+				...(Object.keys(env).length > 0 ? { env } : {}),
+			});
+		}
+		return result;
+	}
+
+	async #launchSessionWithMcp(
+		operation: "session.create" | "session.fork" | "session.resume",
+		input: JsonObject,
+		idempotencyKey: string,
+		mcpServers: SessionLifecycleMcpServer[],
+	): Promise<unknown> {
+		try {
+			return await (await this.#brokerAdapter()).global(operation, input, idempotencyKey);
+		} catch (error) {
+			const code =
+				typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+					? error.code
+					: undefined;
+			if (
+				mcpServers.length === 0 ||
+				code === "invalid_input" ||
+				code === "authentication_failed" ||
+				code === "unknown_model_profile" ||
+				code === "model_profile_registry_error"
+			)
+				throw error;
+			const names = mcpServers
+				.slice(0, 8)
+				.map(server => server.name)
+				.join(", ");
+			const suffix = mcpServers.length > 8 ? `, and ${mcpServers.length - 8} more` : "";
+			throw new AcpSdkAdapterError("unavailable", `MCP server request failed to start (${names}${suffix}).`);
+		}
 	}
 
 	#beginDispose(): void {
@@ -1526,6 +2011,7 @@ export class AcpAgent implements Agent {
 		this.#attaching.clear();
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
+		this.#knownSessionMetadata.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#closing.size === 0) this.#closing.clear();
 		this.#tearingDown.clear();

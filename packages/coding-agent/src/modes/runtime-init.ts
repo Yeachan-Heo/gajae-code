@@ -115,6 +115,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 			clearContext: () => session.clearContext(),
 			cycleModel: () => session.cycleModel(),
+			setModelProfile: name => session.activateModelProfileForControl(name),
 			cycleThinkingLevel: () => session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {

@@ -31,7 +31,8 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { logger, postmortem, VERSION } from "@gajae-code/utils";
-import { projectModelProfileCatalog } from "../../config/model-profile-contract";
+import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
+import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -54,6 +55,7 @@ import type {
 	AskSettlementResult,
 } from "../../tools";
 import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
+import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
 import { SessionSdkHost, shouldHostSdk } from "../host";
@@ -935,7 +937,13 @@ interface SessionRuntime {
 	emitPromptLifecycle: (
 		correlation: { commandId: string; turnId: string } | undefined,
 		frame:
-			| { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string }
+			| {
+					type: "agent_start" | "agent_end";
+					sessionId: string;
+					commandId?: string;
+					turnId?: string;
+					finalText?: string;
+			  }
 			| {
 					type: "agent_failed";
 					sessionId: string;
@@ -1698,6 +1706,7 @@ const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.regist
 
 const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"model.cycle": "cycleModel",
+	"model.profile.set": "setModelProfile",
 	"thinking.cycle": "cycleThinkingLevel",
 	"queue.steering_mode.set": "setQueueMode",
 	"queue.follow_up_mode.set": "setQueueMode",
@@ -1862,8 +1871,26 @@ function sdkQuerySurface(
 			const currentThinkingLevel = api.getThinkingLevel();
 			return projectQ10Models({ models, currentModel, currentThinkingLevel });
 		},
-		getModelProfiles: () =>
-			projectModelProfileCatalog(ctx.modelRegistry.getModelProfiles(), ctx.modelRegistry.getError()),
+		getModelProfiles: async () => {
+			const profiles = ctx.modelRegistry.getModelProfiles();
+			const catalog = projectModelProfileCatalog(profiles, ctx.modelRegistry.getError());
+			const providers = new Set([...profiles.values()].flatMap(profile => profile.requiredProviders));
+			const authenticatedProviders = new Set<string>();
+			await Promise.all(
+				[...providers].map(async provider => {
+					try {
+						const credential = await ctx.modelRegistry.getApiKeyForProvider(provider, id);
+						if (credential === kNoAuth || isAuthenticated(credential)) authenticatedProviders.add(provider);
+					} catch {
+						// A provider whose credential state cannot be read is not currently configurable.
+					}
+				}),
+			);
+			return catalog.map(item => ({
+				...item,
+				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
+			}));
+		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
 			const workflowGate = ctx.workflowGate;
@@ -2332,6 +2359,14 @@ function sdkControlSurface(
 					{ code: "invalid_input" },
 				);
 			return typed("model.set", { id: `${model.provider}/${model.id}`, thinkingLevel });
+		},
+		setModelProfile: async id => {
+			if (!bindings.has("setModelProfile") || !ctx.setModelProfile)
+				return unavailable("model.profile.set", "no model-profile activation seam is installed")();
+			if (!id) throw Object.assign(new Error("model.profile.set requires a profile id."), { code: "invalid_input" });
+			if (!ctx.modelRegistry.getModelProfile(id))
+				throw Object.assign(new Error(`Model profile ${id} was not found.`), { code: "invalid_input" });
+			return { changed: await ctx.setModelProfile(id), id };
 		},
 		cycleModel: async () => {
 			if (!bindings.has("cycleModel"))
@@ -3219,7 +3254,13 @@ export function createNotificationsExtension(
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
 		type PromptLifecycleFrame =
-			| { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string }
+			| {
+					type: "agent_start" | "agent_end";
+					sessionId: string;
+					commandId?: string;
+					turnId?: string;
+					finalText?: string;
+			  }
 			| {
 					type: "agent_failed";
 					sessionId: string;
@@ -4851,8 +4892,22 @@ export function createNotificationsExtension(
 				});
 			else {
 				rt.notePromptReconciliation(correlation, { type: "agent_end" });
-				if (rt.recordPromptTerminal(correlation))
-					rt.emitPromptLifecycle(correlation, { type: "agent_end", sessionId: id, ...correlation });
+				if (rt.recordPromptTerminal(correlation)) {
+					const finalAssistant = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).find(
+						message =>
+							message &&
+							typeof message === "object" &&
+							(message as { role?: unknown }).role === "assistant" &&
+							(message as { stopReason?: unknown }).stopReason === "stop",
+					);
+					const finalText = finalAssistant ? acpFinalTextFromMessage(finalAssistant).text : "";
+					rt.emitPromptLifecycle(correlation, {
+						type: "agent_end",
+						sessionId: id,
+						...correlation,
+						...(finalText ? { finalText } : {}),
+					});
+				}
 			}
 		} else {
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
@@ -4976,14 +5031,13 @@ export function createNotificationsExtension(
 	// path and ordered before it — unlike message_update, which is queued async),
 	// then flushed here before the ask tool's execute calls registerAsk.
 	api.on("tool_execution_start", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		rt?.emitPromptEvent(event);
 		if (event.toolName === "ask") {
-			const id = sessionId(ctx);
-			const rt = runtimes.get(id);
 			if (!rt?.notificationsActive || rt.redact) return;
 			flushTurnText(rt, id, rt.currentTurnText, false);
 		}
-		const id = sessionId(ctx);
-		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || rt.redact) return;
 		rt.inFlightTools.set(event.toolCallId, { toolName: event.toolName, args: event.args });
 		try {
@@ -4999,10 +5053,16 @@ export function createNotificationsExtension(
 		}
 	});
 
+	api.on("tool_execution_update", (event, ctx) => {
+		const rt = runtimes.get(sessionId(ctx));
+		rt?.emitPromptEvent(event);
+	});
+
 	api.on("tool_execution_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
+		rt.emitPromptEvent(event);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!rt.notificationsActive || rt.redact) {
 			rt.inFlightTools.delete(event.toolCallId);

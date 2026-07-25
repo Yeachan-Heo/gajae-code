@@ -172,6 +172,7 @@ import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../a
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
+import { activateModelProfile } from "../config/model-profile-activation";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
@@ -233,7 +234,7 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../extensibility/extensions";
-import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
+import type { CompactOptions, ContextUsage, ExtensionTranscriptEntry } from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import {
 	type LoadedSubskillActivation,
@@ -243,7 +244,13 @@ import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injec
 import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
-import { buildSkillPromptMessage, type Skill, type SkillWarning } from "../extensibility/skills";
+import {
+	buildSkillPromptMessage,
+	getSkillSlashCommandName,
+	parseSkillInvocations,
+	type Skill,
+	type SkillWarning,
+} from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { assertDeepInterviewIntentManifest } from "../gjc-runtime/deep-interview-state";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
@@ -6587,9 +6594,11 @@ export class AgentSession {
 	/** Live SDK configuration values exposed through the session query surface. */
 	getSdkConfigItems(): Record<string, string> {
 		const model = this.model;
+		const modelPreset = this.getActiveModelProfile() ?? this.settings.get("modelProfile.default");
 		return {
 			mode: this.#planModeState?.enabled ? "plan" : "default",
 			...(model ? { model: `${model.provider}/${model.id}` } : {}),
+			...(modelPreset ? { modelPreset } : {}),
 			thinking: this.#thinkingLevel ?? "off",
 			steeringMode: this.steeringMode,
 			followUpMode: this.followUpMode,
@@ -6608,6 +6617,7 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
+		options?: Pick<PromptOptions, "onPreflightAccepted">,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -6640,7 +6650,7 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
-		await this.promptCustomMessage(skillPromptMessage);
+		await this.promptCustomMessage(skillPromptMessage, options);
 		return {
 			name: skill.name,
 			path: skill.filePath,
@@ -6686,22 +6696,49 @@ export class AgentSession {
 		}
 	}
 
-	getTranscript(): Array<{ id: string; role: string; textSummary: string; ts: string; body: string }> {
+	getTranscript(): ExtensionTranscriptEntry[] {
 		return getEntriesForInternalRead(this.sessionManager).flatMap(entry => {
 			if (entry.type !== "message") return [];
-			const message = entry.message as unknown as { role?: unknown; content?: unknown };
+			const message = entry.message as unknown as {
+				role?: unknown;
+				content?: unknown;
+				toolCallId?: unknown;
+				toolName?: unknown;
+				isError?: unknown;
+			};
+			const content: NonNullable<ExtensionTranscriptEntry["content"]> | undefined = Array.isArray(message.content)
+				? message.content.reduce<NonNullable<ExtensionTranscriptEntry["content"]>>((blocks, part) => {
+						if (typeof part !== "object" || part === null || !("type" in part)) return blocks;
+						if (part.type === "text" && "text" in part && typeof part.text === "string") {
+							blocks.push({ type: "text", text: part.text });
+							return blocks;
+						}
+						if (part.type === "thinking" && "thinking" in part && typeof part.thinking === "string") {
+							blocks.push({ type: "thinking", thinking: part.thinking });
+							return blocks;
+						}
+						if (
+							part.type === "toolCall" &&
+							"id" in part &&
+							typeof part.id === "string" &&
+							"name" in part &&
+							typeof part.name === "string"
+						) {
+							blocks.push({
+								type: "toolCall",
+								id: part.id,
+								name: part.name,
+								arguments: "arguments" in part ? part.arguments : {},
+							});
+						}
+						return blocks;
+					}, [])
+				: undefined;
 			const body =
 				typeof message.content === "string"
 					? message.content
-					: Array.isArray(message.content)
-						? message.content
-								.map(part =>
-									typeof part === "object" && part !== null && "text" in part && typeof part.text === "string"
-										? part.text
-										: "",
-								)
-								.filter(Boolean)
-								.join("\n")
+					: content
+						? content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n")
 						: "";
 			return [
 				{
@@ -6710,6 +6747,10 @@ export class AgentSession {
 					textSummary: body.slice(0, 500),
 					ts: entry.timestamp,
 					body,
+					...(content ? { content } : {}),
+					...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}),
+					...(typeof message.toolName === "string" ? { toolName: message.toolName } : {}),
+					...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
 				},
 			];
 		});
@@ -7267,6 +7308,22 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
+		if (expandPromptTemplates && text.startsWith("/skill:") && !options?.images?.length) {
+			const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
+			const invocations = parseSkillInvocations(text, skillCommands);
+			if (invocations.length === 1) {
+				const invocation = invocations[0];
+				if (invocation) {
+					await this.invokeSkill(
+						invocation.skill.name,
+						invocation.args,
+						options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : undefined,
+					);
+					return;
+				}
+			}
+		}
+
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			const handled = await this.#tryExecuteExtensionCommand(text);
@@ -7446,7 +7503,7 @@ export class AgentSession {
 
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "followUpQueuePolicy">,
+		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted">,
 	): Promise<void> {
 		const textContent =
 			typeof message.content === "string"
@@ -7845,6 +7902,7 @@ export class AgentSession {
 				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
 			},
 			cycleModel: () => this.cycleModel(),
+			setModelProfile: name => this.activateModelProfileForControl(name),
 			cycleThinkingLevel: () => this.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {
@@ -7872,6 +7930,7 @@ export class AgentSession {
 			getJobs: () => undefined,
 			sdkBindings: () => [
 				"cycleModel",
+				"setModelProfile",
 				"cycleThinkingLevel",
 				"setQueueMode",
 				"getSkillState",
@@ -9352,6 +9411,17 @@ export class AgentSession {
 
 	getActiveModelProfile(): string | undefined {
 		return this.#activeModelProfile;
+	}
+
+	/** Activate a complete model profile through a nonvisual session control. */
+	async activateModelProfileForControl(profileName: string): Promise<boolean> {
+		await activateModelProfile({
+			session: this,
+			modelRegistry: this.#modelRegistry,
+			settings: this.settings,
+			profileName,
+		});
+		return this.getActiveModelProfile() === profileName;
 	}
 
 	/** Return the persisted configured fallback selectors for a model role. */

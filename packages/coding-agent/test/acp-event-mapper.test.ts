@@ -109,16 +109,76 @@ describe("ACP event mapper", () => {
 		);
 	});
 
-	it("returns no ACP updates for whitelisted unrepresented events", () => {
+	it("keeps lifecycle-only events hidden while exposing user-visible notices", () => {
 		expect(
 			mapAgentSessionEventToAcpSessionUpdates({ type: "agent_start" } as AgentSessionEvent, "session-1"),
 		).toEqual([]);
-		expect(
-			mapAgentSessionEventToAcpSessionUpdates(
-				{ type: "notice", level: "info", message: "visible elsewhere" } as AgentSessionEvent,
-				"session-1",
-			),
-		).toEqual([]);
+		const notices = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "notice",
+				level: "warning",
+				message: "credentials need attention",
+				source: "auth",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		expect(notices).toEqual([
+			{
+				sessionId: "session-1",
+				update: {
+					sessionUpdate: "agent_thought_chunk",
+					content: { type: "text", text: "[warning:auth] credentials need attention\n" },
+				},
+			},
+		]);
+		expectAcpNotifications(notices);
+	});
+
+	it("maps retry, thinking, and goal progress into ACP session metadata", () => {
+		const retry = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "auto_retry_start",
+				attempt: 2,
+				maxAttempts: 4,
+				delayMs: 1_500,
+				errorMessage: "rate limited",
+			} as AgentSessionEvent,
+			"session-1",
+		)[0]!.update._meta;
+		expect(retry).toMatchObject({
+			gjcPhase: "retrying",
+			gjcRetryAttempt: 2,
+			gjcRetryMaxAttempts: 4,
+			gjcRetryDelayMs: 1_500,
+			running: true,
+		});
+		const thinking = mapAgentSessionEventToAcpSessionUpdates(
+			{ type: "thinking_level_changed", thinkingLevel: "high" } as AgentSessionEvent,
+			"session-1",
+		);
+		expect(thinking[0]!.update._meta).toEqual({ gjcThinkingLevel: "high" });
+		const goal = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "goal_updated",
+				goal: {
+					id: "goal-1",
+					objective: "Finish ACP support",
+					status: "active",
+					tokensUsed: 10,
+					timeUsedSeconds: 2,
+					createdAt: 1,
+					updatedAt: 2,
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		expect(goal[0]!.update._meta).toMatchObject({
+			gjcGoalActive: true,
+			gjcGoalId: "goal-1",
+			gjcGoalStatus: "active",
+			gjcGoalObjective: "Finish ACP support",
+		});
+		expectAcpNotifications([...thinking, ...goal]);
 	});
 
 	it("maps model fallback switches to one ACP session notice", () => {
@@ -522,6 +582,34 @@ describe("ACP event mapper", () => {
 		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
 		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
+	});
+
+	it("preserves start-argument locations on a final update", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-read-final",
+				toolName: "read",
+				isError: true,
+				result: { content: [{ type: "text", text: "not found" }] },
+			} as AgentSessionEvent,
+			"session-1",
+			{
+				cwd: "/repo",
+				getToolArgs: toolCallId => (toolCallId === "tc-read-final" ? { path: "missing.ts" } : undefined),
+			},
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		expect(updates[0]!.update).toMatchObject({
+			sessionUpdate: "tool_call_update",
+			toolCallId: "tc-read-final",
+			status: "failed",
+			title: "Failed: read: missing.ts",
+			kind: "other",
+			locations: [{ path: path.resolve("/repo", "missing.ts") }],
+		});
 	});
 
 	it("keeps terminal content alongside readable error and message fields", () => {

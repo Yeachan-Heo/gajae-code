@@ -36,6 +36,8 @@ try {
 function validateRowReceipts(rows: ManifestAdapterRow[]): void {
 	const ids = new Set<string>();
 	const counts = new Map<string, number>();
+	// Each operation has one receipt, plus the dedicated config.patch secret-input receipt.
+	const expectedRowsPerAdapter = OPERATIONS.length + 1;
 	for (const row of rows) {
 		if (ids.has(row.adapterTestId)) throw new Error(`Duplicate adapter test ID: ${row.adapterTestId}`);
 		ids.add(row.adapterTestId);
@@ -60,11 +62,11 @@ function validateRowReceipts(rows: ManifestAdapterRow[]): void {
 		}
 		counts.set(row.adapter, (counts.get(row.adapter) ?? 0) + 1);
 	}
-	if (rows.length !== ADAPTERS.length * 93)
-		throw new Error(`Expected ${ADAPTERS.length * 93} adapter rows; received ${rows.length}.`);
+	if (rows.length !== ADAPTERS.length * expectedRowsPerAdapter)
+		throw new Error(`Expected ${ADAPTERS.length * expectedRowsPerAdapter} adapter rows; received ${rows.length}.`);
 	for (const adapter of ADAPTERS) {
-		if (counts.get(adapter) !== 93)
-			throw new Error(`Expected 93 ${adapter} rows; received ${counts.get(adapter) ?? 0}.`);
+		if (counts.get(adapter) !== expectedRowsPerAdapter)
+			throw new Error(`Expected ${expectedRowsPerAdapter} ${adapter} rows; received ${counts.get(adapter) ?? 0}.`);
 	}
 	process.stdout.write(
 		`manifest check: ${rows.length} row receipts (${[...counts].map(([adapter, count]) => `${adapter}=${count}`).join(", ")})\n`,

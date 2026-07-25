@@ -116,6 +116,7 @@ const controls = [
 	["retry.last", "Retry the last interrupted or failed turn."],
 	["retry.now", "Immediately retry pending backoff."],
 	["bash.background", "Move active managed bash to the background."],
+	["model.profile.set", "Activate a model profile for the current session."],
 ] as const;
 
 const globals = [

@@ -68,7 +68,7 @@ type ConnectionTask = {
 
 const STARTUP_TIMEOUT_MS = 250;
 const STARTUP_TIMEOUT_GRACE_MS = 500;
-const MAX_STARTUP_TIMEOUT_MS = 1_750;
+const MAX_STARTUP_TIMEOUT_MS = 30_500;
 
 function resolveStartupTimeoutMs(configs: MCPServerConfig[]): number {
 	const configuredTimeouts = configs

@@ -167,6 +167,8 @@ function invoke(
 			return surface.replaceTodo(input.items);
 		case "model.set":
 			return surface.setModel(text(input, "id"), input.thinkingLevel);
+		case "model.profile.set":
+			return surface.setModelProfile(text(input, "id"));
 		case "model.cycle":
 			return surface.cycleModel();
 		case "thinking.set":

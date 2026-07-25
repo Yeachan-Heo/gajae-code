@@ -92,6 +92,42 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
 	});
+	test("honors a configured startup timeout for a slow stdio gateway", async () => {
+		const manager = new MCPManager(process.cwd());
+		const delayedServer = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-gateway', version: '1' } } }) + '\\n');
+    }, 2200);
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [] } }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+
+		try {
+			const result = await manager.connectServers(
+				{
+					"slow-gateway": {
+						command: process.execPath,
+						args: ["-e", delayedServer],
+						timeout: 5_000,
+					},
+				},
+				{},
+			);
+
+			expect(result.errors).toEqual(new Map());
+			expect(result.connectedServers).toEqual(["slow-gateway"]);
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
 	test("factory creates a tools-only exact-config manager and redacts real server errors", async () => {
 		const sentinel = "EXACT_SERVER_SECRET";
 		const server = Bun.serve({

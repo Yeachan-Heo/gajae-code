@@ -9,6 +9,12 @@ import {
 	paginateAcpSessions,
 } from "../src/modes/acp/acp-agent";
 import type { CreateAgentSessionOptions } from "../src/sdk";
+import {
+	ACP_FINAL_TEXT_LIMIT,
+	acpFinalTextFromMessage,
+	boundAcpFinalText,
+	resolveAcpFinalText,
+} from "../src/sdk/acp/final-text";
 
 const model = { provider: "openai-codex", id: "gpt-5.6" } as CreateAgentSessionOptions["model"];
 
@@ -41,35 +47,200 @@ test("ACP paginates after cwd filtering and terminates the filtered cursor", () 
 		sessionId: `foreign-${index}`,
 		locator: { repo: "/other" },
 	}));
-	const sessions = [...foreign, { sessionId: "workspace", locator: { repo: "/workspace" } }];
+	const sessions = [
+		...foreign,
+		{
+			sessionId: "workspace",
+			locator: { repo: "/workspace" },
+			title: "MCP inspection",
+			endpointMtimeMs: 1_784_998_000_000,
+		},
+	];
 	expect(paginateAcpSessions(sessions, "/workspace", 0)).toEqual({
-		sessions: [{ sessionId: "workspace", cwd: "/workspace", title: "workspace" }],
+		sessions: [
+			{
+				sessionId: "workspace",
+				cwd: "/workspace",
+				title: "MCP inspection",
+				updatedAt: new Date(1_784_998_000_000).toISOString(),
+			},
+		],
 		nextCursor: undefined,
 	});
 });
 
-test("ACP reports live SDK config values and mode rather than hard-coded defaults", () => {
-	const state = acpSessionStateFromConfig({
-		result: {
-			page: {
-				items: [
-					{
-						mode: "plan",
-						model: "openai-codex/gpt-5.6",
-						thinking: "high",
-						steeringMode: "one-at-a-time",
-					},
-				],
+test("ACP final text resolution is exact, suffix-only, bounded, and Unicode-safe", () => {
+	expect(resolveAcpFinalText("", "hello")).toEqual({
+		kind: "emit",
+		final: { text: "hello", truncated: false },
+		text: "hello",
+	});
+	expect(resolveAcpFinalText("hello", "hello").kind).toBe("none");
+	expect(resolveAcpFinalText("hello ", "hello world")).toEqual({
+		kind: "emit",
+		final: { text: "hello world", truncated: false },
+		text: "world",
+	});
+	expect(resolveAcpFinalText("prefix hello world suffix", "hello world").kind).toBe("none");
+	expect(resolveAcpFinalText("streamed", "different").kind).toBe("divergent");
+	expect(resolveAcpFinalText("안녕 ", "안녕 세계")).toEqual({
+		kind: "emit",
+		final: { text: "안녕 세계", truncated: false },
+		text: "세계",
+	});
+
+	const oversized = `${"a".repeat(ACP_FINAL_TEXT_LIMIT - 1)}😀tail`;
+	const bounded = boundAcpFinalText(oversized);
+	expect(bounded.truncated).toBe(true);
+	expect(bounded.text.length).toBe(ACP_FINAL_TEXT_LIMIT - 1);
+	expect(bounded.text.endsWith("\ud83d")).toBe(false);
+	expect(acpFinalTextFromMessage({ content: [{ type: "text", text: "  exact\n" }] }).text).toBe("  exact\n");
+});
+
+test("ACP reports model presets when --mpreset is provided", () => {
+	const state = acpSessionStateFromConfig(
+		{
+			result: {
+				page: {
+					items: [
+						{
+							mode: "plan",
+							model: "openai-codex/gpt-5.6",
+							modelPreset: "opus-codex",
+							thinking: "high",
+							steeringMode: "one-at-a-time",
+						},
+					],
+				},
 			},
 		},
-	});
+		{
+			result: {
+				page: {
+					items: [
+						{ id: "codex-medium", displayName: "Codex Medium", source: "builtin", available: true },
+						{ id: "cursor-pro", displayName: "Cursor Pro", source: "builtin", available: false },
+						{ id: "opus-codex", displayName: "Opus Codex", source: "configured", available: true },
+					],
+				},
+			},
+		},
+		"opus-codex",
+	);
 	expect(state.modes.currentModeId).toBe("plan");
 	expect(state.configOptions).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({ id: "mode", currentValue: "plan" }),
-			expect.objectContaining({ id: "model", currentValue: "openai-codex/gpt-5.6" }),
+			expect.objectContaining({
+				id: "model",
+				name: "Preset",
+				currentValue: "opus-codex",
+				options: [
+					{ value: "codex-medium", name: "Codex Medium" },
+					{ value: "opus-codex", name: "Opus Codex" },
+				],
+			}),
 			expect.objectContaining({ id: "thinking", currentValue: "high" }),
 			expect.objectContaining({ id: "steeringMode", currentValue: "one-at-a-time" }),
+		]),
+	);
+});
+
+test("ACP hides unavailable presets but retains an unavailable active preset", () => {
+	const profiles = {
+		result: {
+			page: {
+				items: [
+					{ id: "codex-medium", displayName: "Codex Medium", available: true },
+					{ id: "cursor-pro", displayName: "Cursor Pro", available: false },
+				],
+			},
+		},
+	};
+	const available = acpSessionStateFromConfig(
+		{ result: { page: { items: [{ modelPreset: "codex-medium" }] } } },
+		profiles,
+		"codex-medium",
+	);
+	expect(available.configOptions.find(option => option.id === "model")?.options).toEqual([
+		{ value: "codex-medium", name: "Codex Medium" },
+	]);
+
+	const activeUnavailable = acpSessionStateFromConfig(
+		{ result: { page: { items: [{ modelPreset: "cursor-pro" }] } } },
+		profiles,
+		"cursor-pro",
+	);
+	expect(activeUnavailable.configOptions.find(option => option.id === "model")?.options).toEqual([
+		{ value: "codex-medium", name: "Codex Medium" },
+		{ value: "cursor-pro", name: "Cursor Pro" },
+	]);
+});
+
+test("ACP exposes presets without misrepresenting an unprofiled current model", () => {
+	const state = acpSessionStateFromConfig(
+		{ result: { page: { items: [{ model: "openai-codex/gpt-5.6" }] } } },
+		{
+			result: {
+				page: {
+					items: [{ id: "codex-medium", displayName: "Codex Medium", source: "builtin" }],
+				},
+			},
+		},
+		"codex-medium",
+	);
+	expect(state.configOptions).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				id: "model",
+				name: "Preset",
+				currentValue: "__custom__",
+				options: [
+					{ value: "codex-medium", name: "Codex Medium" },
+					{ value: "__custom__", name: "Custom (current model)" },
+				],
+			}),
+		]),
+	);
+});
+
+test("ACP reports the existing model list when --mpreset is absent", () => {
+	const state = acpSessionStateFromConfig(
+		{
+			result: {
+				page: {
+					items: [
+						{
+							model: "openai-codex/gpt-5.6",
+							modelPreset: "persisted-default",
+							thinking: "high",
+						},
+					],
+				},
+			},
+		},
+		{
+			result: {
+				page: {
+					items: [
+						{ provider: "openai-codex", id: "gpt-5.6", name: "GPT-5.6" },
+						{ provider: "anthropic", id: "claude-opus", name: "Claude Opus" },
+					],
+				},
+			},
+		},
+	);
+	expect(state.configOptions).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				id: "model",
+				name: "Model",
+				currentValue: "openai-codex/gpt-5.6",
+				options: [
+					{ value: "openai-codex/gpt-5.6", name: "GPT-5.6" },
+					{ value: "anthropic/claude-opus", name: "Claude Opus" },
+				],
+			}),
 		]),
 	);
 });

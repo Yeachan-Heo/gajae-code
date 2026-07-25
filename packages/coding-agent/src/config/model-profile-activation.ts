@@ -222,6 +222,7 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 }
 
 export class ModelProfileCredentialError extends Error {
+	readonly code = "authentication_failed";
 	readonly profileLabel: string;
 	readonly providers: readonly string[];
 

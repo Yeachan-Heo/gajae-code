@@ -425,6 +425,7 @@ export class ExtensionUiController {
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			clearContext: () => this.ctx.session.clearContext(),
 			cycleModel: () => this.ctx.session.cycleModel(),
+			setModelProfile: name => this.ctx.session.activateModelProfileForControl(name),
 			cycleThinkingLevel: () => this.ctx.session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {
@@ -446,11 +447,7 @@ export class ExtensionUiController {
 			operateGoal: (op, objective) => this.ctx.session.operateGoal(op, objective),
 			getSkillState: () =>
 				this.ctx.session.skills.map(skill => ({ name: skill.name, description: skill.description })),
-			getConfigItems: () => ({
-				steeringMode: this.ctx.session.steeringMode,
-				followUpMode: this.ctx.session.followUpMode,
-				interruptMode: this.ctx.session.interruptMode,
-			}),
+			getConfigItems: () => this.ctx.session.getSdkConfigItems(),
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
@@ -727,6 +724,7 @@ export class ExtensionUiController {
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			clearContext: () => this.ctx.session.clearContext(),
 			cycleModel: () => this.ctx.session.cycleModel(),
+			setModelProfile: name => this.ctx.session.activateModelProfileForControl(name),
 			cycleThinkingLevel: () => this.ctx.session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {
@@ -745,11 +743,7 @@ export class ExtensionUiController {
 			},
 			getSkillState: () =>
 				this.ctx.session.skills.map(skill => ({ name: skill.name, description: skill.description })),
-			getConfigItems: () => ({
-				steeringMode: this.ctx.session.steeringMode,
-				followUpMode: this.ctx.session.followUpMode,
-				interruptMode: this.ctx.session.interruptMode,
-			}),
+			getConfigItems: () => this.ctx.session.getSdkConfigItems(),
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),

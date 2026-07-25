@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
+import { ACP_MCP_REQUEST_TIMEOUT_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
@@ -287,15 +289,53 @@ export async function runSessionHost(
 
 	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined };
 	let created: CreateLifecycleAgentSessionResult;
+	let mcpConfigDirectory: string | undefined;
 	try {
 		opened = await openLifecycleSessionManager(request, cwd, agentDir);
-		created = await createLifecycleAgentSession({ cwd, agentDir, sessionManager: opened.sessionManager });
+		let mcpConfigPath: string | undefined;
+		if (request.mcpServers && request.mcpServers.length > 0) {
+			mcpConfigDirectory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")));
+			mcpConfigPath = path.join(mcpConfigDirectory, "mcp.json");
+			await Bun.write(
+				mcpConfigPath,
+				JSON.stringify({
+					mcpServers: Object.fromEntries(
+						request.mcpServers.map(server => [
+							server.name,
+							"url" in server
+								? {
+										type: server.type,
+										url: server.url,
+										...(server.headers ? { headers: server.headers } : {}),
+										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+									}
+								: {
+										type: "stdio",
+										command: server.command,
+										args: server.args,
+										...(server.env ? { env: server.env } : {}),
+										noInheritEnv: true,
+										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+									},
+						]),
+					),
+				}),
+			);
+		}
+		created = await createLifecycleAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: opened.sessionManager,
+			...(mcpConfigPath ? { mcpConfigPath } : {}),
+		});
 	} catch (error) {
 		const rollback = new SdkStartupRollbackTracker();
 		rollback.recordAbsent();
 		const failure = normalizeSdkStartupFailure("registration", "failed", error);
 		await writeFailure(failure, rollback.result);
 		throw failure;
+	} finally {
+		if (mcpConfigDirectory) await fs.rm(mcpConfigDirectory, { recursive: true, force: true });
 	}
 	const { parsed } = opened;
 	if ("failure" in created) {

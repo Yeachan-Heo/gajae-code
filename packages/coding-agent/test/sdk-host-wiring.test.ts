@@ -1539,6 +1539,35 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		},
 		sessionContext,
 	);
+	await handlers.get("tool_execution_start")?.(
+		{
+			type: "tool_execution_start",
+			toolCallId: "tool-read-1",
+			toolName: "read",
+			args: { path: "README.md" },
+		},
+		sessionContext,
+	);
+	await handlers.get("tool_execution_update")?.(
+		{
+			type: "tool_execution_update",
+			toolCallId: "tool-read-1",
+			toolName: "read",
+			args: { path: "README.md" },
+			partialResult: { content: [{ type: "text", text: "reading" }] },
+		},
+		sessionContext,
+	);
+	await handlers.get("tool_execution_end")?.(
+		{
+			type: "tool_execution_end",
+			toolCallId: "tool-read-1",
+			toolName: "read",
+			result: { content: [{ type: "text", text: "# Gajae-Code" }] },
+			isError: false,
+		},
+		sessionContext,
+	);
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -1555,11 +1584,24 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		ok: false,
 		error: { code: "busy" },
 	});
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_end")?.(
+		{
+			type: "agent_end",
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "final answer" }],
+					stopReason: "stop",
+				},
+			],
+		} as never,
+		sessionContext,
+	);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start") && frames.some(frame => frame.type === "agent_end"),
 		"correlated accepted prompt lifecycle",
 	);
+	expect(frames.find(frame => frame.type === "agent_end")).toMatchObject({ finalText: "final answer" });
 	await waitFor(
 		() =>
 			frames.some(
@@ -1570,6 +1612,13 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 						?.assistantMessageEvent?.delta === "hi",
 			),
 		"correlated assistant message event",
+	);
+	await waitFor(
+		() =>
+			frames.some(frame => frame.type === "event" && frame.kind === "tool_execution_start") &&
+			frames.some(frame => frame.type === "event" && frame.kind === "tool_execution_update") &&
+			frames.some(frame => frame.type === "event" && frame.kind === "tool_execution_end"),
+		"correlated tool lifecycle events",
 	);
 	observer.send(JSON.stringify({ type: "event_replay", id: "observer-replay", sinceSeq: 0 }));
 	await waitFor(
@@ -1591,6 +1640,15 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 	]);
 	expect(observerFrames.some(frame => frame.type === "agent_start" || frame.type === "agent_end")).toBe(false);
 	expect(observerFrames.some(frame => frame.type === "event" && frame.kind === "message_update")).toBe(false);
+	expect(
+		observerFrames.some(
+			frame =>
+				frame.type === "event" &&
+				(frame.kind === "tool_execution_start" ||
+					frame.kind === "tool_execution_update" ||
+					frame.kind === "tool_execution_end"),
+		),
+	).toBe(false);
 	expect(observerReplay.events?.some(frame => frame.kind === "message_update")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });

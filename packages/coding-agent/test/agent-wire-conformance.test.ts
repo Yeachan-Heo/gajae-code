@@ -28,16 +28,18 @@ const ACP_EMPTY_WHITELIST = new Set([
 	"turn_start",
 	"turn_end",
 	"message_start",
+	"irc_message",
+]);
+
+const ACP_NOTICE_EVENT_TYPES = [
 	"auto_retry_start",
 	"auto_retry_end",
 	"ttsr_triggered",
-	"irc_message",
 	"notice",
+	"model_fallback_switched",
 	"thinking_level_changed",
 	"goal_updated",
-]);
-
-const ACP_NOTICE_EVENT_TYPES = ["model_fallback_switched"] as const;
+] as const;
 
 describe("agent-wire conformance matrix", () => {
 	it("fixture coverage equals AGENT_WIRE_EVENT_TYPES exactly", () => {

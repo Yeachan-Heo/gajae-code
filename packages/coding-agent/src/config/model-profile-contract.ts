@@ -10,6 +10,7 @@ export interface ModelProfileCatalogItem {
 	id: string;
 	displayName: string;
 	source: "builtin" | "configured";
+	available?: boolean;
 }
 
 export interface UnknownModelProfileDetails {
@@ -122,6 +123,18 @@ export function projectModelProfileCatalog(
 			source: definition.source === "user" ? ("configured" as const) : ("builtin" as const),
 		}))
 		.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export function isModelProfileProviderAvailable(
+	profile: ModelProfileDefinition,
+	authenticatedProviders: ReadonlySet<string>,
+): boolean {
+	const alternativeGroups = profile.alternativeProviderGroups ?? [];
+	const alternativeProviders = new Set(alternativeGroups.flat());
+	for (const provider of profile.requiredProviders) {
+		if (!alternativeProviders.has(provider) && !authenticatedProviders.has(provider)) return false;
+	}
+	return alternativeGroups.every(group => group.some(provider => authenticatedProviders.has(provider)));
 }
 
 export function isModelProfileError(value: unknown): value is {

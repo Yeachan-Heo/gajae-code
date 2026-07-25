@@ -15,13 +15,7 @@ const WHITELISTED_EMPTY_EVENT_TYPES = [
 	"turn_start",
 	"turn_end",
 	"message_start",
-	"auto_retry_start",
-	"auto_retry_end",
-	"ttsr_triggered",
 	"irc_message",
-	"notice",
-	"thinking_level_changed",
-	"goal_updated",
 ] as const;
 
 function makeAssistantMessage(id: string, text: string) {

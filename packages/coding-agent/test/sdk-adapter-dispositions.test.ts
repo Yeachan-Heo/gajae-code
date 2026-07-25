@@ -28,7 +28,7 @@ const parityRows = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRows).toHaveLength(558);
+expect(parityRows).toHaveLength(564);
 const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
 	discord: "D",
@@ -93,6 +93,7 @@ const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"skill.invoke": "invalid_input",
 	"turn.prompt_status": "invalid_request",
 	"mode.plan.set": "unavailable",
+	"model.profile.set": "invalid_input",
 };
 const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.create": "invalid_input",
@@ -157,6 +158,8 @@ function inputFor(operation: Operation, secret = false): Record<string, unknown>
 			return { items: [] };
 		case "model.set":
 			return { id: "openai/gpt-4o-mini" };
+		case "model.profile.set":
+			return { id: "missing-profile" };
 		case "thinking.set":
 			return { level: "low" };
 		case "permission_mode.set":

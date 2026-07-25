@@ -201,6 +201,7 @@ export class ExtensionRunner {
 	#getAllToolsFn: ExtensionContext["getAllTools"] = () => [];
 	#getResolveToolFn: ExtensionContext["resolveTool"] = () => undefined;
 	#cycleModelFn: ExtensionContextActions["cycleModel"] = undefined;
+	#setModelProfileFn: ExtensionContextActions["setModelProfile"] = undefined;
 	#cycleThinkingLevelFn: ExtensionContextActions["cycleThinkingLevel"] = undefined;
 	#setQueueModeFn: ExtensionContextActions["setQueueMode"] = undefined;
 	#getSkillStateFn: ExtensionContextActions["getSkillState"] = undefined;
@@ -313,6 +314,7 @@ export class ExtensionRunner {
 		this.#getAllToolsFn = contextActions.getAllTools ?? (() => []);
 		this.#getResolveToolFn = contextActions.resolveTool ?? (() => undefined);
 		this.#cycleModelFn = contextActions.cycleModel;
+		this.#setModelProfileFn = contextActions.setModelProfile;
 		this.#cycleThinkingLevelFn = contextActions.cycleThinkingLevel;
 		this.#setQueueModeFn = contextActions.setQueueMode;
 		this.#getSkillStateFn = contextActions.getSkillState;
@@ -562,6 +564,7 @@ export class ExtensionRunner {
 			getAllTools: () => this.#getAllToolsFn(),
 			resolveTool: name => this.#getResolveToolFn(name),
 			cycleModel: async () => await this.#cycleModelFn?.(),
+			setModelProfile: async name => (await this.#setModelProfileFn?.(name)) ?? false,
 			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
 			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
 			invokeSkill: async (name, args) => await this.#invokeSkillFn?.(name, args),
@@ -581,6 +584,7 @@ export class ExtensionRunner {
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
 			sdkBindings: () => [
 				...(this.#cycleModelFn ? ["cycleModel"] : []),
+				...(this.#setModelProfileFn ? ["setModelProfile"] : []),
 				...(this.#cycleThinkingLevelFn ? ["cycleThinkingLevel"] : []),
 				...(this.#setQueueModeFn ? ["setQueueMode"] : []),
 				...(this.#getSkillStateFn ? ["getSkillState"] : []),

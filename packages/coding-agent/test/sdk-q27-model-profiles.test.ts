@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	isModelProfileProviderAvailable,
 	MODEL_PROFILE_DISCOVERY_QUERY,
 	MODEL_PROFILE_ERROR_DETAIL_MAX_BYTES,
 	ModelProfileRegistryError,
@@ -87,6 +88,21 @@ describe("model profile capability contract", () => {
 			source: "configured",
 		});
 		expect(catalog.some(item => Object.hasOwn(item, "description"))).toBe(false);
+	});
+
+	it("classifies strict and alternative provider requirements for clients", () => {
+		const [strict] = [...mergeModelProfiles().values()].filter(profile => profile.name === "codex-medium");
+		expect(strict).toBeDefined();
+		expect(isModelProfileProviderAvailable(strict!, new Set(["openai-codex"]))).toBe(true);
+		expect(isModelProfileProviderAvailable(strict!, new Set())).toBe(false);
+
+		const alternative = {
+			...strict!,
+			requiredProviders: ["provider-a", "provider-b"],
+			alternativeProviderGroups: [["provider-a", "provider-b"]],
+		};
+		expect(isModelProfileProviderAvailable(alternative, new Set(["provider-b"]))).toBe(true);
+		expect(isModelProfileProviderAvailable(alternative, new Set())).toBe(false);
 	});
 
 	it("uses exact membership before the fallback-only legacy alias", () => {

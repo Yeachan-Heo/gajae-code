@@ -1729,8 +1729,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const resultTools = result.tools as CustomTool[];
 			exactMcpToolNames.push(...resultTools.map(tool => tool.name));
 			customTools.push(...resultTools);
-			if (result.errors.size > 0 || result.tools.length === 0) {
-				logger.warn("MCP tools could not be loaded.");
+			if (result.errors.size > 0) {
+				const server = [...result.errors.keys()].find(name => name !== "$config") ?? "requested";
+				throw Object.assign(new Error(`MCP server "${server}" failed to start.`), { code: "unavailable" });
 			}
 		} else if (!mcpManager && !isCanonicalSubSession) {
 			// Always-on GJC plugin-bundle MCP servers. Top-level sessions own a manager

@@ -16,6 +16,7 @@ const methodByOperation: Record<string, string> = {
 	"mode.goal.operate": "operateGoal",
 	"todo.replace": "replaceTodo",
 	"model.set": "setModel",
+	"model.profile.set": "setModelProfile",
 	"model.cycle": "cycleModel",
 	"thinking.set": "setThinking",
 	"thinking.cycle": "cycleThinking",

@@ -546,7 +546,36 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 
 ---
 
-## 11) Removed ingress modes
+## 11) ACP permission handling
+
+| Variable | Values | Default | Behavior |
+| --- | --- | --- | --- |
+| `GJC_ACP_PERMISSION_MODE` | `prompt`, `auto`, `always-allow` | `prompt` | Controls whether ACP tool calls use the client's permission prompt or the SDK allow policy. `auto` and `always-allow` both allow gated tool calls without prompting. Invalid values fail safely to `prompt`. |
+
+ACP client metadata at `_meta.gjc.permissionHandling` takes precedence when the client supplies that field; the process environment is the fallback. JetBrains Air custom agents can set the fallback per agent in `acp.json`:
+
+```json
+{
+  "agent_servers": {
+    "Gajae-Local-Opus": {
+      "command": "/absolute/path/to/gjc",
+      "args": ["acp", "--mpreset", "opus-codex"],
+      "env": {
+        "GJC_ACP_PERMISSION_MODE": "always-allow"
+      }
+    }
+  }
+}
+```
+
+Use `always-allow` only for workspaces and tool configurations you trust. It removes the approval boundary for gated shell, monitor, eval, delete, and move operations. Changes apply to newly launched ACP agent processes.
+GJC does not expose a separate ACP `--yolo` flag.
+
+See [External control readiness](./external-control-readiness.md#jetbrains-air-custom-agent) for the Air setup flow.
+
+---
+
+## 12) Removed ingress modes
 
 `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. The retired bridge-prefixed variables and `GJC_RPC_EMIT_TITLE` are not runtime configuration variables. Use the [SDK machine interface](./sdk.md) for external machine control.
 

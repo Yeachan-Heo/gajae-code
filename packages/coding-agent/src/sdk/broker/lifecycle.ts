@@ -29,6 +29,7 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
+import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
 import {
 	type LogicalSessionCandidate,
@@ -215,6 +216,7 @@ export interface SessionLifecycleLaunchRequest {
 	/** Broker-issued effect marker which the child echoes only after host readiness. */
 	effectMarker?: string;
 	modelPreset?: string;
+	mcpServers?: SessionLifecycleMcpServer[];
 	worktree?: SessionLifecycleWorktreeTarget;
 	receivedAt: number;
 	requestedReadinessTimeoutMs: number;
@@ -248,6 +250,77 @@ function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is 
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
 }
 
+function isSessionLifecycleMcpServer(value: unknown): value is SessionLifecycleMcpServer {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const server = value as Record<string, unknown>;
+	if (server.type === "http" || server.type === "sse") {
+		if (
+			!Object.keys(server).every(key => key === "type" || key === "name" || key === "url" || key === "headers") ||
+			typeof server.name !== "string" ||
+			!/^[A-Za-z0-9_.-]{1,100}$/.test(server.name) ||
+			typeof server.url !== "string" ||
+			server.url.length > 8_192
+		)
+			return false;
+		try {
+			const url = new URL(server.url);
+			if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+		} catch {
+			return false;
+		}
+		if (server.headers === undefined) return true;
+		if (typeof server.headers !== "object" || server.headers === null || Array.isArray(server.headers)) return false;
+		const headers = server.headers as Record<string, unknown>;
+		return (
+			Object.keys(headers).length <= 100 &&
+			Object.entries(headers).every(
+				([name, headerValue]) =>
+					name.length > 0 &&
+					name.length <= 256 &&
+					!name.includes("\r") &&
+					!name.includes("\n") &&
+					typeof headerValue === "string" &&
+					headerValue.length <= 8_192 &&
+					!headerValue.includes("\r") &&
+					!headerValue.includes("\n"),
+			)
+		);
+	}
+	const env = server.env;
+	return (
+		Object.keys(server).every(
+			key => key === "type" || key === "name" || key === "command" || key === "args" || key === "env",
+		) &&
+		(server.type === undefined || server.type === "stdio") &&
+		typeof server.name === "string" &&
+		/^[A-Za-z0-9_.-]{1,100}$/.test(server.name) &&
+		typeof server.command === "string" &&
+		server.command.length <= 4_096 &&
+		path.isAbsolute(server.command) &&
+		Array.isArray(server.args) &&
+		server.args.length <= 100 &&
+		server.args.every(argument => typeof argument === "string" && argument.length <= 8_192) &&
+		(env === undefined ||
+			(typeof env === "object" &&
+				env !== null &&
+				!Array.isArray(env) &&
+				Object.keys(env).length <= 100 &&
+				Object.entries(env).every(
+					([name, envValue]) =>
+						/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && typeof envValue === "string" && envValue.length <= 32_768,
+				)))
+	);
+}
+
+function isSessionLifecycleMcpServers(value: unknown): value is SessionLifecycleMcpServer[] {
+	return (
+		Array.isArray(value) &&
+		value.length <= 64 &&
+		value.every(isSessionLifecycleMcpServer) &&
+		new Set(value.map(server => server.name)).size === value.length
+	);
+}
+
 export function readSessionLifecycleLaunchRequest(
 	value: string | undefined,
 	now = Date.now(),
@@ -278,6 +351,7 @@ export function readSessionLifecycleLaunchRequest(
 		(request.effectMarker !== undefined &&
 			(typeof request.effectMarker !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(request.effectMarker))) ||
 		(request.modelPreset !== undefined && (typeof request.modelPreset !== "string" || !request.modelPreset)) ||
+		(request.mcpServers !== undefined && !isSessionLifecycleMcpServers(request.mcpServers)) ||
 		!hasValidLifecycleDeadlines(
 			{
 				receivedAt: request.receivedAt as number,
@@ -310,6 +384,7 @@ type SessionLaunch = {
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
 	modelPreset?: string;
+	mcpServers?: SessionLifecycleMcpServer[];
 	worktree?: SessionLifecycleWorktreeTarget;
 	worktreePlan?: GjcLaunchWorktreePlan;
 };
@@ -2299,9 +2374,12 @@ async function launchInput(
 	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
 		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
 	const modelPreset = text(input.modelPreset);
+	if (input.mcpServers !== undefined && !isSessionLifecycleMcpServers(input.mcpServers))
+		return fail("invalid_input", "mcpServers must contain unique valid stdio, HTTP, or SSE server definitions.");
+	const mcpServers = input.mcpServers as SessionLifecycleMcpServer[] | undefined;
 
 	if (operation === "session.create")
-		return { id: randomUUID(), cwd, root: resolvedRoot, modelPreset, worktree, worktreePlan };
+		return { id: randomUUID(), cwd, root: resolvedRoot, modelPreset, mcpServers, worktree, worktreePlan };
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
 		const savedPath = text(input.sessionPath);
@@ -2315,6 +2393,7 @@ async function launchInput(
 			sessionPath: saved.path,
 			sessionIdentity: saved.identity,
 			modelPreset,
+			mcpServers,
 			worktree,
 			worktreePlan,
 		};
@@ -2336,6 +2415,7 @@ async function launchInput(
 		sourceSessionIdentity: source.identity,
 		sourceCwd,
 		modelPreset,
+		mcpServers,
 		worktree,
 		worktreePlan,
 	};
@@ -2805,6 +2885,7 @@ async function executeLifecycleResponse(
 			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
 			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
 			...(launch.modelPreset ? { modelPreset: launch.modelPreset } : {}),
+			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
 		};
 		let child: ChildProcess | undefined;

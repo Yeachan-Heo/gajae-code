@@ -138,6 +138,7 @@ describe("ACP initialize conformance", () => {
 			expect.objectContaining({
 				loadSession: true,
 				promptCapabilities: expect.objectContaining({ embeddedContext: true, image: true }),
+				mcpCapabilities: { http: true, sse: true },
 				sessionCapabilities: expect.objectContaining({
 					list: expect.any(Object),
 					fork: expect.any(Object),
@@ -147,6 +148,5 @@ describe("ACP initialize conformance", () => {
 				}),
 			}),
 		);
-		expect(response.agentCapabilities).not.toHaveProperty("mcpCapabilities");
 	});
 });

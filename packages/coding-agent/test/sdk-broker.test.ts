@@ -186,6 +186,47 @@ it("SDK lifecycle model presets reach the session host parser", async () => {
 	}
 });
 
+it("SDK lifecycle launch requests preserve validated ACP MCP transports", async () => {
+	const agentDir = await temp();
+	const cwd = path.join(agentDir, "repo");
+	await fs.mkdir(cwd);
+	const request: SessionLifecycleLaunchRequest = {
+		operation: "session.create",
+		sessionId: "session-1",
+		stateRoot: path.join(cwd, ".gjc", "state"),
+		cwd,
+		mcpServers: [
+			{
+				name: "Air",
+				command: "/Applications/Air.app/Contents/bin/mcp-proxy",
+				args: ["--stdio"],
+				env: { AIR_MODE: "acp" },
+			},
+			{
+				type: "http",
+				name: "remote",
+				url: "https://mcp.example.test/api",
+				headers: { Authorization: "Bearer test" },
+			},
+			{ type: "sse", name: "legacy", url: "http://127.0.0.1:7337/events" },
+		],
+		...deriveLifecycleDeadlines(Date.now(), 10_000),
+	};
+	try {
+		expect(readSessionLifecycleLaunchRequest(JSON.stringify(request)).mcpServers).toEqual(request.mcpServers);
+		expect(() =>
+			readSessionLifecycleLaunchRequest(
+				JSON.stringify({
+					...request,
+					mcpServers: [{ name: "Air", command: "relative-command", args: [] }],
+				}),
+			),
+		).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 it("initializes the managed target scope before lifecycle fork arguments expose it", async () => {
 	const agentDir = await temp();
 	const cwd = path.join(agentDir, "fork-target");

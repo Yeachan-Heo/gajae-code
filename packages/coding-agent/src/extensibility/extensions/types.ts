@@ -290,6 +290,18 @@ export interface ExtensionTranscriptEntry {
 	textSummary: string;
 	ts: string;
 	body?: string;
+	/**
+	 * Durable, image-free message blocks used by rich transcript consumers such
+	 * as ACP replay. Binary image payloads intentionally remain unavailable.
+	 */
+	content?: Array<
+		| { type: "text"; text: string }
+		| { type: "thinking"; thinking: string }
+		| { type: "toolCall"; id: string; name: string; arguments: unknown }
+	>;
+	toolCallId?: string;
+	toolName?: string;
+	isError?: boolean;
 }
 
 export interface ContextUsage {
@@ -361,6 +373,7 @@ export interface ExtensionContext {
 	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 	/** Session control seams used by the SDK host. */
 	cycleModel(): Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
+	setModelProfile?(name: string): Promise<boolean>;
 	cycleThinkingLevel(): ThinkingLevel | undefined;
 	setQueueMode(kind: "steering" | "follow_up" | "interrupt", mode: unknown): boolean;
 	getSkillState(): unknown;
@@ -1429,6 +1442,7 @@ export interface ExtensionContextActions {
 	clearContext?: () => Promise<boolean>;
 	/** Session control and query seams exposed to the per-session SDK host. */
 	cycleModel?: () => Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
+	setModelProfile?: (name: string) => Promise<boolean>;
 	cycleThinkingLevel?: () => ThinkingLevel | undefined;
 	setQueueMode?: (kind: "steering" | "follow_up" | "interrupt", mode: unknown) => boolean;
 	getSkillState?: () => unknown;

@@ -197,21 +197,26 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_end": {
+			const args = getToolExecutionEndArgs(event, options);
 			const resultContent = [...extractDiffToolCallContent(event.result), ...extractToolCallContent(event.result)];
-			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolName, getToolExecutionEndArgs(event, options)),
-				resultContent,
-			);
+			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
 				status: event.isError ? "failed" : "completed",
 				rawOutput: event.result,
 			};
+			if (event.isError) {
+				update.title = `Failed: ${buildToolTitle(event.toolName, args, undefined)}`;
+				update.kind = "other";
+			}
 			if (content.length > 0) {
 				update.content = content;
 			}
-			const locations = extractToolLocationsFromResult(event.result, options.cwd);
+			const locations = mergeToolLocations(
+				extractToolLocations(args, options.cwd),
+				extractToolLocationsFromResult(event.result, options.cwd),
+			);
 			if (locations.length > 0) {
 				update.locations = locations;
 			}
@@ -295,14 +300,83 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			return [toSessionNotification(sessionId, { sessionUpdate: "session_info_update", _meta: meta })];
 		}
 		case "auto_retry_start":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcPhase: "retrying",
+						gjcRetryState: "waiting",
+						gjcRetryAttempt: event.attempt,
+						gjcRetryMaxAttempts: event.maxAttempts,
+						gjcRetryDelayMs: event.delayMs,
+						gjcRetryErrorMessage: event.errorMessage,
+						gjcRetryUnbounded: event.unbounded ?? false,
+						running: true,
+						gjcRunning: true,
+					},
+				}),
+			];
 		case "auto_retry_end":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcPhase: event.success ? "responding" : "retry_failed",
+						gjcRetryState: event.success ? "succeeded" : "failed",
+						gjcRetryAttempt: event.attempt,
+						...(event.finalError ? { gjcRetryFinalError: event.finalError } : {}),
+						running: true,
+						gjcRunning: true,
+					},
+				}),
+			];
 		case "ttsr_triggered":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcTtsrTriggered: true,
+						gjcTtsrRuleCount: event.rules.length,
+					},
+				}),
+			];
 		case "irc_message":
 		case "subagent_steer_message":
-		case "notice":
-		case "thinking_level_changed":
-		case "goal_updated":
 			return [];
+		case "notice":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "agent_thought_chunk",
+					content: {
+						type: "text",
+						text: `[${event.level}${event.source ? `:${event.source}` : ""}] ${event.message}\n`,
+					},
+				}),
+			];
+		case "thinking_level_changed":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: { gjcThinkingLevel: event.thinkingLevel ?? "off" },
+				}),
+			];
+		case "goal_updated":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcGoalActive: event.goal !== null,
+						...(event.goal
+							? {
+									gjcGoalId: event.goal.id,
+									gjcGoalStatus: event.goal.status,
+									gjcGoalObjective: event.goal.objective,
+								}
+							: {}),
+						...(event.state ? { gjcGoalModeState: event.state } : {}),
+					},
+				}),
+			];
 		default:
 			return assertNeverAcp(event);
 	}
@@ -545,6 +619,19 @@ function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: 
 		merged.push(item);
 	}
 	return merged;
+}
+
+function mergeToolLocations(...groups: ToolCallLocation[][]): ToolCallLocation[] {
+	const locations: ToolCallLocation[] = [];
+	const seen = new Set<string>();
+	for (const group of groups) {
+		for (const location of group) {
+			if (seen.has(location.path)) continue;
+			seen.add(location.path);
+			locations.push(location);
+		}
+	}
+	return locations;
 }
 
 function isCommandToolName(toolName: string): boolean {

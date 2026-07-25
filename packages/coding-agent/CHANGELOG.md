@@ -7,13 +7,16 @@
 - Aligned the startup GJC Forge splash border with the composer trailing gutter, including the one-row constrained fallback.
 - `gjc resume` and delete no longer pay a durable (fsync-backed) lock acquisition for managed session tombstones that have nothing left to reconcile; a scope with many accumulated already-completed tombstones opens noticeably faster (#3067).
 
+### Added
+
+- JetBrains Air ACP sessions now preserve final answers across fast prompt completion, expose tool/retry/goal/notices and session title updates, accept client-supplied stdio/HTTP/SSE MCP servers, reject unsupported additional directories, and reject unavailable model presets before provider dispatch.
+
 ## [0.11.10] - 2026-07-25
 ### Changed
 
 - The built-in `claude-opus`, `opus-codex`, and `fable-opus-codex` presets now use `anthropic/claude-opus-5` instead of `anthropic/claude-opus-4-8`, with effort suffixes preserved; `packages/ai/src/models.json` was regenerated so `anthropic/claude-opus-5` resolves; non-opus roles (`anthropic/claude-sonnet-5` executor/planner overrides, codex and fable roles) are unchanged.
 
 ## [0.11.9] - 2026-07-24
-
 ### Fixed
 - Mouse support can now be enabled inside tmux and screen with `mouse.enabled: true`, so the wheel scrolls GJC's virtual session viewport before multiplexer scrollback. Dragging highlights rendered terminal text and copies it to the system clipboard on release while GJC owns mouse input. Mouse support remains disabled by default to preserve native terminal or tmux scrollback and selection behavior.
 

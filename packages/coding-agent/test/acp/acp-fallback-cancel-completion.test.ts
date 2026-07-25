@@ -38,6 +38,7 @@ describe("ACP production cancellation completion", () => {
 		const token = "acp-cancel-token";
 		const updates: SessionNotification[] = [];
 		const promptWaiters: Array<PromiseWithResolvers<void>> = [];
+		const controlOperations: string[] = [];
 		let promptSocket: TestSocket | undefined;
 		let abortAcknowledged = true;
 
@@ -87,6 +88,7 @@ describe("ACP production cancellation completion", () => {
 						return;
 					}
 					if (frame.type !== "control_request") return;
+					if (typeof frame.operation === "string") controlOperations.push(frame.operation);
 					if (frame.operation === "turn.prompt") {
 						promptSocket = socket;
 						promptWaiters.shift()?.resolve();
@@ -133,6 +135,26 @@ describe("ACP production cancellation completion", () => {
 		} as unknown as AgentSideConnection;
 		const acp = new AcpAgent(connection, { agentDir });
 		const created = await bounded(acp.newSession({ cwd, mcpServers: [] }), "new session");
+		expect(created.configOptions).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "model",
+					name: "Model",
+					currentValue: "openai/gpt",
+					options: [{ value: "openai/gpt", name: "GPT" }],
+				}),
+			]),
+		);
+		await bounded(
+			acp.setSessionConfigOption({
+				sessionId: created.sessionId,
+				configId: "model",
+				value: "openai/gpt",
+			}),
+			"set model",
+		);
+		expect(controlOperations).toContain("model.set");
+		expect(controlOperations).not.toContain("model.profile.set");
 
 		const firstDelivered = Promise.withResolvers<void>();
 		promptWaiters.push(firstDelivered);

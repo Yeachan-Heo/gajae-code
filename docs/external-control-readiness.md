@@ -20,6 +20,36 @@ The SDK endpoint is loopback-only and is created with the session. It provides t
 
 ACP remains a stdio editor protocol. Its session control uses the SDK adapter internally; it is not a replacement external bot-control protocol.
 
+### JetBrains Air custom agent
+
+Add GJC through Air's **Add Custom Agent** action, then configure the Air-managed `acp.json`. With only `["acp"]`, Air shows GJC's existing model list. Add `--mpreset <id>` only when the Air model selector should show the available GJC preset list and create new sessions with that preset.
+
+The following example starts the `opus-codex` model preset and allows tool calls without permission prompts:
+
+```json
+{
+  "agent_servers": {
+    "Gajae-Local-Opus": {
+      "command": "/absolute/path/to/gjc",
+      "args": ["acp", "--mpreset", "opus-codex"],
+      "env": {
+        "GJC_ACP_PERMISSION_MODE": "always-allow"
+      }
+    }
+  }
+}
+```
+
+`always-allow` gives the agent permission to execute gated tools, including shell commands, without an Air approval prompt. Omit `GJC_ACP_PERMISSION_MODE` or set it to `prompt` when manual approval is required. Start a new Air task after changing `acp.json`; restart Air if it reuses an already-running agent process.
+
+Air supplies MCP servers through ACP session requests. GJC accepts client-supplied stdio, HTTP, and SSE definitions for new sessions and offline resume. Do not add `--mcp-config` to the ACP command: that CLI option is intentionally unsupported for broker-backed ACP. A live session's MCP configuration is immutable; close or resume the offline session to change it.
+
+Air-created Git worktrees are supported because each ACP request's absolute `cwd` becomes the session workspace. Additional ACP workspace roots are not currently supported and are rejected instead of being advertised.
+
+Session title and update metadata are advisory state for the active ACP process. Text, thought, tool-call, and tool-result history is replayed on load, but historical binary image bytes are not replayed.
+
+See [Environment Variables](./environment-variables.md#11-acp-permission-handling) for supported values and precedence.
+
 ## Verification references
 
 - `packages/coding-agent/test/sdk-*.test.ts`

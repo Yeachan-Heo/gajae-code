@@ -179,7 +179,14 @@ export class AcpSdkAdapter {
 		this.#assertGenericDisposition("global", operation);
 		if (isLifecycleOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
-		return await this.#client.global(operation, input, { idempotencyKey });
+		const readinessTimeoutMs =
+			typeof input.readinessTimeoutMs === "number" && Number.isSafeInteger(input.readinessTimeoutMs)
+				? input.readinessTimeoutMs
+				: undefined;
+		return await this.#client.global(operation, input, {
+			idempotencyKey,
+			...(readinessTimeoutMs ? { timeoutMs: readinessTimeoutMs + 1_000 } : {}),
+		});
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
