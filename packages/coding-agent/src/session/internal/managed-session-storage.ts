@@ -18,7 +18,6 @@ import {
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
-import { syncDirectoryBestEffortSync } from "../../utils/directory-sync";
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,
@@ -1142,7 +1141,13 @@ export function shouldFsyncManagedDirectory(platform: NodeJS.Platform = process.
 }
 
 function fsyncDirectory(pathname: string): void {
-	syncDirectoryBestEffortSync(pathname);
+	if (!shouldFsyncManagedDirectory()) return;
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+	try {
+		fs.fsyncSync(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
 }
 
 function bootId(): string | undefined {
