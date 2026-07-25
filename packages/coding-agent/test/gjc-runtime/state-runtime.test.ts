@@ -113,7 +113,7 @@ describe("native gjc state runtime", () => {
 		);
 
 		expect(result.status).not.toBe(0);
-		expect(result.stderr).toContain("must not be a symbolic link");
+		expect(result.stderr).toContain("must not traverse a symbolic link");
 		await expect(fs.access(outsideStatePath)).rejects.toThrow();
 	});
 	it("rejects a session root symlink to another session inside project .gjc", async () => {
@@ -129,7 +129,7 @@ describe("native gjc state runtime", () => {
 		);
 
 		expect(result.status).not.toBe(0);
-		expect(result.stderr).toContain("must not be a symbolic link");
+		expect(result.stderr).toContain("must not traverse a symbolic link");
 		await expect(fs.access(path.join(targetRoot, "state", "ralplan-state.json"))).rejects.toThrow();
 	});
 	it("keeps an existing legacy state session layout-affine", async () => {
