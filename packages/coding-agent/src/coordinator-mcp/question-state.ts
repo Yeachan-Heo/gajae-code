@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
-import { isUnsupportedWindowsDirectorySyncError } from "../utils/directory-sync";
+import { syncDirectoryBestEffort } from "../utils/directory-sync";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
 export type CoordinatorSessionState =
@@ -309,17 +309,6 @@ export function transactionPath(paths: CoordinatorStatePaths, sessionId: string)
 export function transactionLockPath(paths: CoordinatorStatePaths, sessionId: string): string {
 	return path.join(paths.sessions, safeSessionId(sessionId), "transaction.lock");
 }
-async function fsyncDirectory(directory: string): Promise<void> {
-	const handle = await fs.open(directory, "r");
-	try {
-		await handle.sync();
-	} catch (error) {
-		// Windows cannot fsync a directory handle; rename durability is best-effort there.
-		if (!isUnsupportedWindowsDirectorySyncError(error)) throw error;
-	} finally {
-		await handle.close();
-	}
-}
 async function ensureNamespaceParents(paths: CoordinatorStatePaths): Promise<void> {
 	await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
 }
@@ -335,7 +324,8 @@ async function writeAtomic(file: string, value: unknown): Promise<void> {
 		await handle.close();
 	}
 	await fs.rename(temp, file);
-	await fsyncDirectory(path.dirname(file));
+	// Windows cannot fsync a directory handle; rename durability is best-effort there.
+	await syncDirectoryBestEffort(path.dirname(file));
 }
 async function readJson<T>(file: string): Promise<T | null> {
 	try {
