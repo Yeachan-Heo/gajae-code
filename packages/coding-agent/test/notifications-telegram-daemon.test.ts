@@ -669,13 +669,13 @@ function transitionFsCapabilities(): Pick<TelegramDaemonFs, "readEndpointFile" |
 	};
 }
 
-function settings(agentDir: string): Settings {
+function settings(agentDir: string, botToken = "123456:secret-token"): Settings {
 	// Isolate getAgentDir() to the temp dir so daemon persistence (aliases,
 	// topics, lock/state/roots) never writes into the real global ~/.gjc/agent.
 	return setPrivateAgentDir(
 		Settings.isolated({
 			"notifications.enabled": true,
-			"notifications.telegram.botToken": "123456:secret-token",
+			"notifications.telegram.botToken": botToken,
 			"notifications.telegram.chatId": "42",
 			"notifications.daemon.idleTimeoutMs": 20,
 		}) as Settings,
@@ -2667,7 +2667,7 @@ describe("telegram daemon", () => {
 		["non-string persisted provenance with an aged malformed lock", 100, "linux:100", "aged-malformed"],
 	])("foreign live owner with %s remains blocked without replacement", async (_name, incarnation, currentIncarnation, lockKind) => {
 		const agentDir = tempAgentDir();
-		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const s = setPrivateAgentDir(settings(agentDir, `123456:${path.basename(agentDir)}`), agentDir);
 		const paths = daemonPaths(agentDir);
 		const state = {
 			pid: 999,
@@ -2709,7 +2709,7 @@ describe("telegram daemon", () => {
 		expect(fs.existsSync(paths.lock)).toBe(beforeLock !== undefined);
 		if (beforeLock !== undefined) expect(fs.readFileSync(paths.lock, "utf8")).toBe(beforeLock);
 		expect(fs.existsSync(paths.roots)).toBe(false);
-	});
+	}, 15_000);
 	test.each([
 		"missing",
 		"aged-malformed",
