@@ -275,19 +275,17 @@ async function touchStateActivityMarker(
 }
 
 async function readActivePhaseForSkill(
-	cwd: string,
-	sessionId: string,
+	sessionRoot: string,
 	mode: CanonicalGjcWorkflowSkill,
 ): Promise<string | undefined> {
-	const state = await readVisibleSkillActiveState(cwd, sessionId);
+	const state = (await readJsonFile(activeStateFileForRoot(sessionRoot))) as SkillActiveState | null;
 	const entries = listActiveSkills(state);
 	const entry = entries.find(item => item.skill === mode) ?? (state?.skill === mode ? state : undefined);
 	return isPlainObject(entry) && typeof entry.phase === "string" ? entry.phase.trim() || undefined : undefined;
 }
 
 async function describeStaleClearState(
-	cwd: string,
-	sessionId: string,
+	sessionRoot: string,
 	mode: CanonicalGjcWorkflowSkill,
 	existing: Record<string, unknown>,
 ): Promise<string | undefined> {
@@ -295,7 +293,7 @@ async function describeStaleClearState(
 	if (phase && getSkillManifest(mode).stopReleasingPhases.includes(phase) && phase !== "inactive") {
 		return `mode-state is already terminal (${phase})`;
 	}
-	const activePhase = await readActivePhaseForSkill(cwd, sessionId, mode);
+	const activePhase = await readActivePhaseForSkill(sessionRoot, mode);
 	if (activePhase && phase && activePhase !== phase) {
 		return `active-state phase ${activePhase} differs from mode-state phase ${phase}`;
 	}
@@ -1420,7 +1418,7 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 				);
 			}
 			const existing = existingRead.kind === "valid" ? existingRead.value : {};
-			const staleReason = await describeStaleClearState(cwd, sessionId, mode, existing);
+			const staleReason = await describeStaleClearState(sessionRoot, mode, existing);
 			if (staleReason && !forced) {
 				throw new StateCommandError(
 					2,

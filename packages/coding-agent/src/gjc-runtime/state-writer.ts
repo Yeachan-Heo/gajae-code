@@ -956,21 +956,25 @@ async function recordInvalidWorkflowTransition(args: {
 	// internal write skipped a manifest edge.
 	const cwd = path.resolve(options?.audit?.cwd ?? options?.cwd ?? process.cwd());
 	try {
-		await appendAuditEntry(cwd, options?.audit?.sessionId ?? "", {
-			ts: new Date().toISOString(),
-			skill,
-			category: "state",
-			verb: "invalid_transition_detected",
-			owner: options?.audit?.owner ?? "gjc-runtime",
-			mutation_id: options?.audit?.mutationId ?? `${skill}:invalid-transition:${new Date().toISOString()}`,
-			from_phase: fromPhase,
-			to_phase: toPhase,
-			forced: false,
-			paths: [filePath],
-		});
-	} catch {
-		// Audit logging is best-effort diagnostics; never fail a sanctioned write because the
-		// audit append failed (e.g. cwd is not a writable project root).
+		await appendAuditEntry(
+			cwd,
+			options?.audit?.sessionId ?? "",
+			{
+				ts: new Date().toISOString(),
+				skill,
+				category: "state",
+				verb: "invalid_transition_detected",
+				owner: options?.audit?.owner ?? "gjc-runtime",
+				mutation_id: options?.audit?.mutationId ?? `${skill}:invalid-transition:${new Date().toISOString()}`,
+				from_phase: fromPhase,
+				to_phase: toPhase,
+				forced: false,
+				paths: [filePath],
+			},
+			options?.audit?.sessionRoot,
+		);
+	} catch (error) {
+		notifyPostCommitAuditFailure(options, error instanceof Error ? error.message : String(error));
 	}
 }
 
@@ -1503,20 +1507,25 @@ export async function hardPrune(
 	if (options?.audit && removed.length > 0) {
 		const audit = options.audit;
 		try {
-			await appendAuditEntry(path.resolve(audit.cwd ?? options.cwd ?? process.cwd()), audit.sessionId ?? "", {
-				ts: new Date().toISOString(),
-				skill: audit.skill,
-				category: audit.category,
-				verb: audit.verb,
-				owner: audit.owner,
-				mutation_id: audit.mutationId ?? randomUUID(),
-				from_phase: audit.fromPhase,
-				to_phase: audit.toPhase,
-				forced: audit.forced ?? false,
-				paths: removed,
-			});
-		} catch {
-			// The authoritative removals are already committed; audit is diagnostic only.
+			await appendAuditEntry(
+				path.resolve(audit.cwd ?? options.cwd ?? process.cwd()),
+				audit.sessionId ?? "",
+				{
+					ts: new Date().toISOString(),
+					skill: audit.skill,
+					category: audit.category,
+					verb: audit.verb,
+					owner: audit.owner,
+					mutation_id: audit.mutationId ?? randomUUID(),
+					from_phase: audit.fromPhase,
+					to_phase: audit.toPhase,
+					forced: audit.forced ?? false,
+					paths: removed,
+				},
+				audit.sessionRoot,
+			);
+		} catch (error) {
+			notifyPostCommitAuditFailure(options, error instanceof Error ? error.message : String(error));
 		}
 	}
 	return removed;
@@ -1564,10 +1573,11 @@ export async function appendAuditEntry(
 	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
 	if (!entry) throw new Error("audit entry is required");
 	const resolvedCwd = path.resolve(cwd);
+	const selectedRoot = sessionRoot?.trim()
+		? validatedSessionRoot(resolvedCwd, { sessionId, sessionRoot }, "appendAuditEntry")
+		: undefined;
 	const filePath = resolveGjcTarget(
-		sessionRoot?.trim()
-			? path.join(path.resolve(sessionRoot), "state", "audit.jsonl")
-			: layoutAuditPath(resolvedCwd, sessionId),
+		selectedRoot ? path.join(selectedRoot, "state", "audit.jsonl") : layoutAuditPath(resolvedCwd, sessionId),
 		resolvedCwd,
 	);
 	await assertMutationAuthority(filePath, projectGjcRoot(resolvedCwd));
