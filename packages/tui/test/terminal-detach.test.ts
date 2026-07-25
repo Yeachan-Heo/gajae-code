@@ -182,7 +182,7 @@ describe("terminal detach handling", () => {
 					() => {},
 				);
 				const output = writeSpy.mock.calls.map(call => String(call[0])).join("");
-				expect(output).toContain("\x1b[?1000h");
+				expect(output).toContain("\x1b[?1002h");
 				expect(output).toContain("\x1b[?1006h");
 			});
 		} finally {
@@ -211,8 +211,10 @@ describe("terminal detach handling", () => {
 				);
 				const output = writeSpy.mock.calls.map(call => String(call[0])).join("");
 				expect(output).toContain("\x1b[?1000l");
+				expect(output).toContain("\x1b[?1002l");
 				expect(output).toContain("\x1b[?1006l");
 				expect(output).not.toContain("\x1b[?1000h");
+				expect(output).not.toContain("\x1b[?1002h");
 				expect(output).not.toContain("\x1b[?1006h");
 			});
 		} finally {

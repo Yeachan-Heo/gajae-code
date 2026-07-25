@@ -1245,7 +1245,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Mouse Support",
 			description:
-				"Enable GJC session scrolling and overlay row selection with the mouse. Disable to use terminal or tmux scrollback.",
+				"Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disable to use native terminal or tmux scrollback and selection.",
 		},
 	},
 	// Conversation flow

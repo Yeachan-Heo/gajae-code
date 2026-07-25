@@ -47,6 +47,7 @@ import type { SessionContext, SessionManager } from "../session/session-manager"
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
 import type { LspStartupServerInfo } from "../tools";
 import { formatPhaseDisplayName } from "../tools/todo-write";
+import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
@@ -510,6 +511,14 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"), {
 			enableMouse: settings.get("mouse.enabled"),
+			copySelection: async text => {
+				try {
+					await copyToClipboard(text);
+					this.showStatus("Selection copied to clipboard");
+				} catch (error) {
+					this.showError(`Failed to copy selection: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			},
 		});
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
 		this.chatContainer = new Container();

@@ -51,6 +51,7 @@ export function emergencyTerminalRestore(): void {
 			process.stdout.write(
 				"\x1b[?2004l" + // Disable bracketed paste
 					"\x1b[?1000l" + // Disable normal mouse reporting
+					"\x1b[?1002l" + // Disable button-event mouse reporting
 					"\x1b[?1006l" + // Disable SGR extended mouse reporting
 					"\x1b[?2031l" + // Disable Mode 2031 appearance notifications
 					"\x1b[<u" + // Pop kitty keyboard protocol
@@ -244,7 +245,10 @@ export class ProcessTerminal implements Terminal {
 
 	setMouseEnabled(enabled: boolean): void {
 		this.#mouseEnabled = enabled;
-		if (this.#started) this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
+		if (this.#started)
+			this.#safeWrite(
+				this.#mouseEnabled ? "\x1b[?1000l\x1b[?1002h\x1b[?1006h" : "\x1b[?1000l\x1b[?1002l\x1b[?1006l",
+			);
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
@@ -270,8 +274,9 @@ export class ProcessTerminal implements Terminal {
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
-		// Establish the requested SGR mouse state, clearing stale reporting left by another application when disabled.
-		this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
+		// Button-event reporting preserves wheel input while also letting the TUI implement drag selection.
+		// Clear both tracking variants first so stale modes from another application cannot leak across startup.
+		this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000l\x1b[?1002h\x1b[?1006h" : "\x1b[?1000l\x1b[?1002l\x1b[?1006l");
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);
@@ -707,6 +712,7 @@ export class ProcessTerminal implements Terminal {
 		this.#mouseEnabled = false;
 		this.#safeWrite("\x1b[?2004l");
 		this.#safeWrite("\x1b[?1000l");
+		this.#safeWrite("\x1b[?1002l");
 		this.#safeWrite("\x1b[?1006l");
 
 		// Disable Mode 2031 appearance change notifications

@@ -242,6 +242,8 @@ providers:
 
 This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support still captures the wheel for virtual session scrolling by default; add `set -g mouse on` to your own `~/.tmux.conf` only when you also disable `mouse.enabled` and want tmux copy-mode scrolling.
 
+When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release. Set `mouse.enabled: false` to use the terminal's or tmux's native selection behavior instead.
+
 | Variable | Behavior |
 | --- | --- |
 | `GJC_LAUNCH_POLICY` | Launch policy for `--tmux` startup: `tmux` (default) or `direct` (skip the tmux session) |

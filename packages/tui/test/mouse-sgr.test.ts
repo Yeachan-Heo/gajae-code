@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { isSgrMouseSequence, StdinBuffer } from "../src/stdin-buffer";
 import { type Component, parseSgrMouseEvent, TUI } from "../src/tui";
+import { VirtualTerminal } from "./virtual-terminal";
 
 describe("SGR mouse input", () => {
 	test("parses wheel and left-click reports", () => {
@@ -9,9 +10,9 @@ describe("SGR mouse input", () => {
 		expect(parseSgrMouseEvent("\x1b[<0;3;4M")).toEqual({ kind: "click", button: 0, x: 3, y: 4 });
 	});
 
-	test("ignores drag and release reports", () => {
-		expect(parseSgrMouseEvent("\x1b[<32;3;4M")).toBeUndefined();
-		expect(parseSgrMouseEvent("\x1b[<0;3;4m")).toBeUndefined();
+	test("parses left-button drag and release reports", () => {
+		expect(parseSgrMouseEvent("\x1b[<32;3;4M")).toEqual({ kind: "drag", button: 0, x: 3, y: 4 });
+		expect(parseSgrMouseEvent("\x1b[<0;3;4m")).toEqual({ kind: "release", button: 0, x: 3, y: 4 });
 	});
 
 	test("keeps complete SGR reports as a single control sequence", () => {
@@ -189,5 +190,97 @@ describe("SGR mouse input", () => {
 		tui.start();
 		input!("\x1b[<0;4;5M");
 		expect(clicks).toEqual([{ kind: "click", button: 0, x: 4, y: 5 }]);
+	});
+	test("highlights a drag selection and copies the selected terminal text on release", async () => {
+		const terminal = new VirtualTerminal(20, 3);
+		const copied: string[] = [];
+		const tui = new TUI(terminal, undefined, {
+			enableMouse: true,
+			copySelection: text => {
+				copied.push(text);
+			},
+		});
+		tui.addChild({
+			render: () => ["alpha", "bravo", "tail "],
+			invalidate: () => {},
+		});
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWriteLog();
+
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<32;6;2M");
+		await terminal.waitForRender();
+		expect(terminal.getWriteLog().join("")).toContain("\x1b[7m");
+
+		terminal.sendInput("\x1b[<0;6;2m");
+		await terminal.waitForRender();
+		expect(copied).toEqual(["lpha\nbravo"]);
+		terminal.sendInput("\x1b[<0;5;3M");
+		terminal.sendInput("\x1b[<32;5;3M");
+		terminal.sendInput("\x1b[<0;5;3m");
+		await terminal.waitForRender();
+		expect(copied).toEqual(["lpha\nbravo", " "]);
+		tui.stop();
+	});
+	test("snaps forward and reverse selections to wide graphemes and strips terminal controls", async () => {
+		for (const [pressX, releaseX] of [
+			[2, 3],
+			[3, 2],
+		]) {
+			const terminal = new VirtualTerminal(20, 1);
+			const copied: string[] = [];
+			const tui = new TUI(terminal, undefined, {
+				enableMouse: true,
+				copySelection: text => {
+					copied.push(text);
+				},
+			});
+			tui.addChild({
+				render: () => ["A\x1b]8;;https://example.test\x07\x1b[31m表\x1b[0m\x1b]8;;\x07B"],
+				invalidate: () => {},
+			});
+			tui.start();
+			await terminal.waitForRender();
+
+			terminal.sendInput(`\x1b[<0;${pressX};1M`);
+			terminal.sendInput(`\x1b[<32;${releaseX};1M`);
+			terminal.sendInput(`\x1b[<0;${releaseX};1m`);
+			await terminal.waitForRender();
+
+			expect(copied).toEqual(["表"]);
+			expect(copied[0]).not.toContain("\x1b");
+			tui.stop();
+		}
+	});
+	test("strips ST terminal strings and reapplies selection after embedded SGR resets", async () => {
+		const terminal = new VirtualTerminal(30, 1);
+		const copied: string[] = [];
+		const tui = new TUI(terminal, undefined, {
+			enableMouse: true,
+			copySelection: text => {
+				copied.push(text);
+			},
+		});
+		tui.addChild({
+			render: () => [
+				"A\x1b]8;;https://example.test\x1b\\\x1bPignored-dcs\x1b\\\x1b^ignored-pm\x1b\\\x1b_ignored-apc\x1b\\\x1bXignored-sos\x1b\\\x1b[31m表\x1b[0m\x1b]8;;\x1b\\B",
+			],
+			invalidate: () => {},
+		});
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWriteLog();
+
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<32;3;1M");
+		await terminal.waitForRender();
+		expect(terminal.getWriteLog().join("")).toContain("\x1b[0m\x1b[7m");
+		terminal.sendInput("\x1b[<0;3;1m");
+		await terminal.waitForRender();
+
+		expect(copied).toEqual(["表"]);
+		expect(copied[0]).not.toContain("\x1b");
+		tui.stop();
 	});
 });
