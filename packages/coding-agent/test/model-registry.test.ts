@@ -4026,6 +4026,8 @@ describe("ModelRegistry", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			await registry.refreshProvider("vllm", "online");
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
 
 			writeModelCache("vllm", Date.now() - 5 * 60 * 1000, [], false, "", cacheDbPath);
 			await registry.refreshProvider("vllm", "online-if-uncached");

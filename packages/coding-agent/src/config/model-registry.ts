@@ -2028,7 +2028,7 @@ export class ModelRegistry {
 				(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
 				this.authStorage.getProviderEvidenceGeneration(options.providerId) === authGeneration &&
 				(result.fetched ||
-					(strategy !== "offline" && !result.fetched) ||
+					result.stale ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.authGeneration !== authGeneration ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
 			) {
