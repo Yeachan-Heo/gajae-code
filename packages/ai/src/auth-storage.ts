@@ -930,7 +930,7 @@ export class AuthStorage {
 			)
 			.map(
 				credential =>
-					`${credential.key}\u0000${this.#resolvedStoredApiKeyValues.get(storageProvider)?.get(credential.key) ?? process.env[credential.key] ?? ""}`,
+					`${credential.key}\u0000${process.env[credential.key] ?? this.#resolvedStoredApiKeyValues.get(storageProvider)?.get(credential.key) ?? ""}`,
 			)
 			.join("\u0001");
 		return `${this.getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}`;

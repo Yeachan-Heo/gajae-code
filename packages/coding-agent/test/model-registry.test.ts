@@ -3886,6 +3886,22 @@ describe("ModelRegistry", () => {
 			expect(registry.find("vllm", "stored-vllm-model")).toBeDefined();
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
 		});
+		test("preserves descriptor discovery evidence across an offline refresh", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			await registry.refreshProvider("vllm", "offline");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
 		test("invalidates descriptor discovery evidence when the credential changes", async () => {
 			authStorage.setRuntimeApiKey("vllm", "credential-a");
 			using _hook = hookFetch(
