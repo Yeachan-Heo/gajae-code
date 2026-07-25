@@ -9041,8 +9041,10 @@ export class AgentSession {
 			if (!options?.drop) await this.sessionManager.flush();
 			await this.sessionManager.newSession(options);
 			// Gate the successor local:// root before the successor identity is
-			// published to the agent, the workflow-gate emitter, hooks, or any
-			// synchronous resolver (#2797 / #2925).
+			// published to the agent, the workflow-gate emitter, or hooks. Note
+			// sessionManager.newSession() above already rotated the manager's own
+			// session id, which is what resolveLocalUrlToPath() keys on, so this
+			// does not close that window — see #3138 (#2797 / #2925).
 			await initializeLocalRoot(this.#localProtocolOptions());
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
@@ -9112,8 +9114,9 @@ export class AgentSession {
 			this.agent.reset();
 			await this.sessionManager.newSession(options);
 			// Gate the successor local:// root before the successor identity is
-			// published to the agent, the workflow-gate emitter, hooks, or any
-			// synchronous resolver (#2797 / #2925).
+			// published to the agent, the workflow-gate emitter, or hooks. As above,
+			// the manager's own session id rotated in newSession(); that window is
+			// tracked in #3138 (#2797 / #2925).
 			await initializeLocalRoot(this.#localProtocolOptions());
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
@@ -14600,8 +14603,10 @@ export class AgentSession {
 			try {
 				await this.sessionManager.setSessionFile(sessionPath);
 				// The successor identity is already rotated in the manager but not yet
-				// published; gate its local:// root before publication so no observer
-				// can resolve against an ungated root (#2797 / #2925).
+				// published; gate its local:// root before publication so the agent,
+				// workflow-gate emitter, and hooks cannot resolve against an ungated
+				// root. The manager-rotation window itself is tracked in #3138
+				// (#2797 / #2925).
 				if (switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();

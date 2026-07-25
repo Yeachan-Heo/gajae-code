@@ -299,9 +299,14 @@ describe("createAgentSession session storage isolation", () => {
 
 		try {
 			const predecessorSessionId = manager.getSessionId();
-			// Observe every identity publication that follows the manager's rotation.
-			// The gate must already have produced the successor marker by then, so a
-			// synchronous observer can never resolve local:// against an ungated root.
+			// Intercept agent-identity publication and assert the successor's marker
+			// already exists at each publication, so the agent, workflow-gate emitter,
+			// and hooks never observe an ungated root.
+			//
+			// Scope: this pins agent-identity publication only. The manager rotates its
+			// own session id inside sessionManager.newSession(), before the gate, and
+			// resolveLocalUrlToPath() keys on *that* id — so this test cannot and does
+			// not cover the manager-rotation window tracked in #3138.
 			const observations: Array<{ sessionId: string; markerExists: boolean }> = [];
 			const agentState = session.agent as unknown as { sessionId: string | undefined };
 			let publishedSessionId = agentState.sessionId;
