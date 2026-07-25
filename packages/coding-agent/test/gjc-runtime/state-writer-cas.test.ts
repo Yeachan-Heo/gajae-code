@@ -6,6 +6,7 @@ import { sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-la
 import {
 	updateJsonAtomic,
 	withWorkflowStateLock,
+	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "@gajae-code/coding-agent/skill-state/workflow-state-contract";
@@ -148,5 +149,66 @@ describe("state-writer concurrency (issue #646)", () => {
 		const final = await readJson(filePath);
 		expect(final.marker).toBe("second");
 		expect(final.state_revision).toBe(2);
+	});
+	it("reports committed-with-audit-warning results for guarded writes", async () => {
+		const root = await tempDir();
+		const target = path.relative(root, path.join(sessionStateDir(root, "test-session"), "audit-warning.json"));
+		const filePath = path.join(root, target);
+		const jsonTarget = path.relative(
+			root,
+			path.join(sessionStateDir(root, "test-session"), "audit-warning-data.json"),
+		);
+		const escapedAuditRoot = path.join(root, ".gjc", "sessions", "_session-audit-escape");
+		const outsideAuditRoot = path.join(root, "outside-audit");
+		await fs.mkdir(outsideAuditRoot, { recursive: true });
+		await fs.mkdir(path.dirname(escapedAuditRoot), { recursive: true });
+		await fs.symlink(outsideAuditRoot, escapedAuditRoot);
+		const envelope = {
+			skill: "ralplan" as const,
+			version: WORKFLOW_STATE_VERSION,
+			active: true,
+			current_phase: "planner",
+			updated_at: "2026-01-01T00:00:00.000Z",
+			marker: "committed",
+		};
+		const audit = {
+			sessionId: "test-session",
+			sessionRoot: escapedAuditRoot,
+			category: "state" as const,
+			verb: "write",
+			owner: "gjc-state-cli" as const,
+		};
+		const envelopeResult = await writeGuardedWorkflowEnvelopeAtomic(target, envelope, {
+			cwd: root,
+			policy: "source",
+			audit,
+			receipt: {
+				cwd: root,
+				skill: "ralplan",
+				owner: "gjc-state-cli",
+				command: "audit-warning-test",
+				sessionId: "test-session",
+			},
+		});
+		const jsonResult = await writeGuardedJsonAtomic(
+			jsonTarget,
+			{ marker: "committed" },
+			{
+				cwd: root,
+				policy: "source",
+				audit,
+			},
+		);
+
+		expect(envelopeResult).toMatchObject({
+			written: true,
+			warnings: [{ code: "POST_COMMIT_AUDIT_FAILED" }],
+		});
+		expect(jsonResult).toMatchObject({
+			written: true,
+			warnings: [{ code: "POST_COMMIT_AUDIT_FAILED" }],
+		});
+		expect((await readJson(filePath)).marker).toBe("committed");
+		await expect(fs.access(path.join(outsideAuditRoot, "state", "audit.jsonl"))).rejects.toThrow();
 	});
 });

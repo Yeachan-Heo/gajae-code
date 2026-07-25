@@ -103,6 +103,22 @@ describe("gjc state integrity", () => {
 			expect(entries).toEqual([]);
 		});
 	});
+	it("keeps handoff mode state and transaction journal in an admitted legacy root", async () => {
+		await withTempCwd(async cwd => {
+			const legacyRoot = path.join(cwd, ".gjc", `_session-${TEST_SESSION_ID}`);
+			await fs.mkdir(path.join(legacyRoot, "state"), { recursive: true });
+			const write = await runNativeStateCommand(
+				["write", "--mode", "deep-interview", "--input", JSON.stringify({ current_phase: "interviewing" })],
+				cwd,
+			);
+			expect(write.status).toBe(0);
+
+			const handoff = await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan"], cwd);
+			expect(handoff.status).toBe(0);
+			await fs.access(path.join(legacyRoot, "state", "ralplan-state.json"));
+			await expect(fs.access(path.join(cwd, ".gjc", "sessions", `_session-${TEST_SESSION_ID}`))).rejects.toThrow();
+		});
+	});
 
 	it("an injected mid-handoff failure leaves a same-mutation journal while unrelated writes still proceed", async () => {
 		await withTempCwd(async cwd => {

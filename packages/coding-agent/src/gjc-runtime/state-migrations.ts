@@ -19,11 +19,13 @@ export interface MigrateAndPersistLegacyStateArgs {
 	skill: string;
 	statePath: string;
 	sessionId: string;
+	sessionRoot?: string;
 }
 
 export interface MigrateAndPersistLegacyStateResult {
 	migrated: boolean;
 	path: string;
+	warnings?: Array<{ code: "POST_COMMIT_AUDIT_FAILED"; message: string }>;
 }
 export interface MigrateWorkflowStateResult {
 	state: Record<string, unknown>;
@@ -158,6 +160,7 @@ export async function migrateAndPersistLegacyState(
 	const { state, changed } = normalizeLegacyState(raw as Record<string, unknown>, canonicalSkill);
 	if (!changed) return { migrated: false, path: args.statePath };
 
+	const warnings: Array<{ code: "POST_COMMIT_AUDIT_FAILED"; message: string }> = [];
 	const persistedPath = await writeWorkflowEnvelopeAtomic(args.statePath, state, {
 		cwd: args.cwd,
 		receipt: {
@@ -174,7 +177,9 @@ export async function migrateAndPersistLegacyState(
 			owner: "gjc-state-cli",
 			category: "state",
 			sessionId: args.sessionId,
+			sessionRoot: args.sessionRoot,
 		},
+		onPostCommitWarning: warning => warnings.push(warning),
 	});
-	return { migrated: true, path: persistedPath };
+	return { migrated: true, path: persistedPath, ...(warnings.length > 0 ? { warnings } : {}) };
 }

@@ -85,7 +85,8 @@ export function canonicalSessionRoot(cwd: string, gjcSessionId: string): string 
 
 function existingDirectory(candidate: string): boolean {
 	try {
-		const stat = fs.statSync(candidate);
+		const stat = fs.lstatSync(candidate);
+		if (stat.isSymbolicLink()) throw new Error(`GJC session root must not be a symbolic link: ${candidate}`);
 		if (!stat.isDirectory()) throw new Error(`GJC session root is not a directory: ${candidate}`);
 		return true;
 	} catch (error) {

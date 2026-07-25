@@ -44,12 +44,13 @@ export {
 	terminalCriticGateOverridden,
 } from "./ultragoal-receipt-freshness";
 
-import { gjcRoot, sessionUltragoalDir } from "./session-layout";
+import { type GjcSessionContext, gjcRoot, sessionUltragoalDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
 	SessionResolutionError,
 	writeSessionActivityMarker,
+	writeSessionActivityMarkerForSession,
 } from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { reconcileWorkflowSkillState } from "./state-runtime";
@@ -441,29 +442,46 @@ export function isEnoent(error: unknown): boolean {
 	);
 }
 
-export async function appendLedger(
+async function appendLedgerForSession(
 	cwd: string,
+	session: GjcSessionContext,
 	event: JsonObject,
-	sessionId?: string | null,
 ): Promise<UltragoalLedgerEvent> {
-	const session = resolveUltragoalSessionForWrite(cwd, sessionId);
-	const resolvedSessionId = session.gjcSessionId;
 	const paths = getUltragoalPathsForSessionRoot(session.sessionRoot);
 	const entry: UltragoalLedgerEvent = {
 		eventId: typeof event.eventId === "string" ? event.eventId : crypto.randomUUID(),
 		...event,
 		timestamp: new Date().toISOString(),
 	};
+	const postCommitWarnings: Array<{ code: "POST_COMMIT_AUDIT_FAILED"; message: string }> = [];
 	await appendJsonl(paths.ledgerPath, entry, {
 		cwd,
-		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
+		audit: {
+			category: "ledger",
+			verb: "append",
+			owner: "gjc-runtime",
+			sessionId: session.gjcSessionId,
+			sessionRoot: session.sessionRoot,
+		},
+		onPostCommitWarning: warning => postCommitWarnings.push(warning),
 	});
-	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
-	return entry;
+	await writeSessionActivityMarkerForSession(session, {
+		writer: "ultragoal-runtime",
+		path: paths.ledgerPath,
+	});
+	return postCommitWarnings.length > 0 ? { ...entry, postCommitWarnings } : entry;
 }
 
-export async function readUltragoalLedger(cwd: string, sessionId?: string | null): Promise<UltragoalLedgerEvent[]> {
-	const session = await resolveUltragoalSessionForRead(cwd, sessionId);
+export async function appendLedger(
+	cwd: string,
+	event: JsonObject,
+	sessionId?: string | null,
+): Promise<UltragoalLedgerEvent> {
+	const session = resolveUltragoalSessionForWrite(cwd, sessionId);
+	return await appendLedgerForSession(cwd, session, event);
+}
+
+async function readUltragoalLedgerForSession(session: GjcSessionContext): Promise<UltragoalLedgerEvent[]> {
 	try {
 		const raw = await Bun.file(getUltragoalPathsForSessionRoot(session.sessionRoot).ledgerPath).text();
 		return raw
@@ -475,6 +493,19 @@ export async function readUltragoalLedger(cwd: string, sessionId?: string | null
 		if (isEnoent(error)) return [];
 		throw error;
 	}
+}
+
+async function readUltragoalPlanForSession(session: GjcSessionContext): Promise<UltragoalPlan | null> {
+	try {
+		return normalizePlan(await Bun.file(getUltragoalPathsForSessionRoot(session.sessionRoot).goalsPath).json());
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
+}
+
+export async function readUltragoalLedger(cwd: string, sessionId?: string | null): Promise<UltragoalLedgerEvent[]> {
+	return await readUltragoalLedgerForSession(await resolveUltragoalSessionForRead(cwd, sessionId));
 }
 
 export const DEFAULT_ULTRAGOAL_NUDGE_BUDGET = 10;
@@ -1404,13 +1435,7 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 }
 
 export async function readUltragoalPlan(cwd: string, sessionId?: string | null): Promise<UltragoalPlan | null> {
-	const session = await resolveUltragoalSessionForRead(cwd, sessionId);
-	try {
-		return normalizePlan(await Bun.file(getUltragoalPathsForSessionRoot(session.sessionRoot).goalsPath).json());
-	} catch (error) {
-		if (isEnoent(error)) return null;
-		throw error;
-	}
+	return await readUltragoalPlanForSession(await resolveUltragoalSessionForRead(cwd, sessionId));
 }
 
 function emptyCounts(): Record<UltragoalGoalStatus, number> {
@@ -3755,16 +3780,14 @@ export async function recordUltragoalCriticVerdict(input: {
 	if (input.terminus === "pause" && !classificationEventId) {
 		throw new Error("record-critic-verdict --classification-event-id is required for pause verdicts");
 	}
-	const resolvedSessionId = resolveGjcSessionForWrite(input.cwd, {
-		envSessionId: process.env.GJC_SESSION_ID,
-	}).gjcSessionId;
-	const paths = getUltragoalPaths(input.cwd, resolvedSessionId);
+	const session = resolveUltragoalSessionForWrite(input.cwd);
+	const paths = getUltragoalPathsForSessionRoot(session.sessionRoot);
 	return withWorkflowStateLock(
 		paths.ledgerPath,
 		async () => {
-			const plan = await readUltragoalPlan(input.cwd, resolvedSessionId);
+			const plan = await readUltragoalPlanForSession(session);
 			if (!plan) throw new Error("record-critic-verdict requires an active ultragoal plan");
-			const ledger = await readUltragoalLedger(input.cwd, resolvedSessionId);
+			const ledger = await readUltragoalLedgerForSession(session);
 			if (input.terminus === "pause") {
 				const latestClassification = [...ledger].reverse().find(event => event.event === "blocker_classified");
 				if (
@@ -3796,33 +3819,25 @@ export async function recordUltragoalCriticVerdict(input: {
 			) {
 				throw new Error("OKAY critic verdict must have empty blockers");
 			}
-			const criticVerdict = await appendLedger(
-				input.cwd,
-				{
-					event: CRITIC_VERDICT_EVENT,
-					terminus: input.terminus,
-					verdict: input.verdict,
-					evidence,
-					blockers,
-					planGeneration,
-					...(classificationEventId ? { classificationEventId } : {}),
-					...(input.goalId?.trim() ? { goalId: input.goalId.trim() } : {}),
-				},
-				resolvedSessionId,
-			);
+			const criticVerdict = await appendLedgerForSession(input.cwd, session, {
+				event: CRITIC_VERDICT_EVENT,
+				terminus: input.terminus,
+				verdict: input.verdict,
+				evidence,
+				blockers,
+				planGeneration,
+				...(classificationEventId ? { classificationEventId } : {}),
+				...(input.goalId?.trim() ? { goalId: input.goalId.trim() } : {}),
+			});
 			const updatedLedger = [...ledger, criticVerdict];
 			const count = countNonOkayTerminalCriticVerdicts(updatedLedger);
 			if (count >= TERMINAL_CRITIC_CEILING && !terminalCriticHardStopReached(updatedLedger)) {
-				await appendLedger(
-					input.cwd,
-					{
-						event: CRITIC_GATE_HARD_STOP_EVENT,
-						planGeneration,
-						reason: "Terminal critic verdict ceiling reached.",
-						count,
-					},
-					resolvedSessionId,
-				);
+				await appendLedgerForSession(input.cwd, session, {
+					event: CRITIC_GATE_HARD_STOP_EVENT,
+					planGeneration,
+					reason: "Terminal critic verdict ceiling reached.",
+					count,
+				});
 			}
 			return criticVerdict;
 		},
@@ -3836,18 +3851,16 @@ export async function recordUltragoalCriticGateOverride(input: {
 }): Promise<UltragoalLedgerEvent> {
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("record-critic-gate-override --evidence is required");
-	const resolvedSessionId = resolveGjcSessionForWrite(input.cwd, {
-		envSessionId: process.env.GJC_SESSION_ID,
-	}).gjcSessionId;
-	const paths = getUltragoalPaths(input.cwd, resolvedSessionId);
+	const session = resolveUltragoalSessionForWrite(input.cwd);
+	const paths = getUltragoalPathsForSessionRoot(session.sessionRoot);
 	return withWorkflowStateLock(
 		paths.ledgerPath,
 		async () => {
-			const ledger = await readUltragoalLedger(input.cwd, resolvedSessionId);
+			const ledger = await readUltragoalLedgerForSession(session);
 			if (!terminalCriticHardStopReached(ledger)) {
 				throw new Error("record-critic-gate-override requires a durably recorded terminal critic hard stop");
 			}
-			return appendLedger(input.cwd, { event: CRITIC_GATE_OVERRIDE_EVENT, evidence }, resolvedSessionId);
+			return appendLedgerForSession(input.cwd, session, { event: CRITIC_GATE_OVERRIDE_EVENT, evidence });
 		},
 		{ cwd: input.cwd },
 	);
@@ -4954,7 +4967,7 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 			persistedStateRevision(await readUltragoalPlan(cwd, sessionId)),
 			ledgerText.split(/\r?\n/).filter(line => line.trim().length > 0).length,
 		);
-		await reconcileWorkflowSkillState({
+		const reconciliation = await reconcileWorkflowSkillState({
 			cwd,
 			mode: "ultragoal",
 			sessionId,
@@ -4963,6 +4976,9 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 			payload,
 			...(sourceRevision > 0 ? { sourceRevision } : {}),
 		});
+		for (const warning of reconciliation.warnings) {
+			process.stderr.write(`ultragoal state reconciliation warning: ${warning.message}\n`);
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		process.stderr.write(`ultragoal state reconciliation failed: ${message}\n`);
