@@ -207,6 +207,19 @@ describe("model selector profile red-team", () => {
 		]);
 	});
 
+	test("shortcut 'd' key activates profile with Set as default (setDefault: true)", async () => {
+		const selections: ModelSelectorSelection[] = [];
+		const selector = createSelector(selection => {
+			selections.push(selection);
+		});
+		await renderSelector(selector);
+		selector.handleInput("\x1b[C");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		selector.handleInput("d");
+
+		expect(selections).toEqual([{ kind: "profile", profileName: "profile-a", setDefault: true }]);
+	});
 	test("controller persists only Set as default and leaves Apply for this session non-default", async () => {
 		const sessionOnly = createControllerContext();
 		await selectProfileThroughController(new SelectorController(sessionOnly.ctx as never), false);
