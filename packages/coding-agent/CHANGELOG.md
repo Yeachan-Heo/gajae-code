@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Orca terminal panes now get live GJC agent status: a bundled Orca status bridge detects the pane's agent-hook endpoint (`ORCA_PANE_KEY` / `ORCA_AGENT_HOOK_ENDPOINT`) and reports pi-protocol lifecycle events (working/done state, active tool and input, prompt, last assistant reply, session resume metadata, startup prefill) to Orca's `/hook/pi` receiver. Root pane-owning sessions only; delivery is latest-only and strictly best-effort, with a WSL→Windows curl fallback for split-loopback setups.
+
 ### Fixed
 
 - Interactive prompt cancellation now reaches API-key preflight through `ModelRegistry`, allowing aborted submissions to clear immediately even while a shared credential-usage request continues in the background.
