@@ -93,7 +93,7 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_TARGETED_UNICODE_VARIANTS: readonly
 	{ stateId: "narrow-scroll", viewport: NOTIFICATIONS_SETTINGS_SHOWCASE_NARROW_VIEWPORT },
 ];
 
-export type NotificationsSettingsShowcaseRenderMode = "unicode-color" | "ascii-no-color";
+export type NotificationsSettingsShowcaseRenderMode = "unicode-color" | "unicode-256-color" | "ascii-no-color";
 export type NotificationsSettingsShowcaseTheme = "red-claw" | "red-claw-light" | "blue-crab-light";
 
 export interface NotificationsSettingsShowcaseCopy {
@@ -1057,8 +1057,8 @@ async function configureDeterministicTheme(
 ): Promise<() => void> {
 	const originalColorTerm = Bun.env.COLORTERM;
 	const originalChalkLevel = chalk.level;
-	Bun.env.COLORTERM = "truecolor";
-	chalk.level = 3;
+	Bun.env.COLORTERM = renderMode === "unicode-color" ? "truecolor" : "256color";
+	chalk.level = renderMode === "unicode-color" ? 3 : renderMode === "unicode-256-color" ? 2 : 3;
 	try {
 		await initTheme(false, renderMode === "ascii-no-color" ? "ascii" : "unicode", false, themeName, themeName);
 	} catch (error) {

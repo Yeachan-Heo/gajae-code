@@ -35,6 +35,26 @@ function contrastRatio(foreground: string, background: string): number {
 	return (lighter! + 0.05) / (darker! + 0.05);
 }
 
+function quantizeAnsi256(hex: string): string {
+	const [red, green, blue] = [1, 3, 5].map(offset => Number.parseInt(hex.slice(offset, offset + 2), 16));
+	let index: number;
+	if (red === green && green === blue) {
+		index = red! < 8 ? 16 : red! > 248 ? 231 : Math.round(((red! - 8) / 247) * 24) + 232;
+	} else {
+		index =
+			16 + 36 * Math.round((red! / 255) * 5) + 6 * Math.round((green! / 255) * 5) + Math.round((blue! / 255) * 5);
+	}
+	if (index >= 232) {
+		const channel = (index - 232) * 10 + 8;
+		return `#${channel.toString(16).padStart(2, "0").repeat(3)}`;
+	}
+	const value = index - 16;
+	const channels = [Math.floor(value / 36), Math.floor((value % 36) / 6), value % 6].map(component =>
+		component === 0 ? 0 : component * 40 + 55,
+	);
+	return `#${channels.map(channel => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
 type LightThemeJson = {
 	name: string;
 	vars: Record<string, string>;
@@ -308,6 +328,14 @@ describe("GJC red-claw redesign defaults", () => {
 			expect(
 				new Set([colors.accent, colors.success, colors.error, colors.warning, colors.toolDiffRemoved]).size,
 			).toBe(5);
+			expect(
+				new Set(
+					[colors.accent, colors.success, colors.error, colors.warning, colors.toolDiffRemoved].map(
+						quantizeAnsi256,
+					),
+				).size,
+				`${name} 256-color semantic cues must remain distinct`,
+			).toBe(5);
 
 			const sentinelEntries = [...themeModule.THEME_COLOR_KEYS].sort().map(role => [role, colors[role]!] as const);
 			const sentinel = JSON.stringify({
@@ -327,6 +355,12 @@ describe("GJC red-claw redesign defaults", () => {
 				expect(
 					contrastRatio(foreground!, background!),
 					`${name}/${id}: ${foregroundRole} ${foreground} on ${backgroundRole} ${background}`,
+				).toBeGreaterThanOrEqual(minimumContrast);
+				const ansi256Foreground = quantizeAnsi256(foreground!);
+				const ansi256Background = quantizeAnsi256(background!);
+				expect(
+					contrastRatio(ansi256Foreground, ansi256Background),
+					`${name}/${id} ANSI-256: ${foregroundRole} ${ansi256Foreground} on ${backgroundRole} ${ansi256Background}`,
 				).toBeGreaterThanOrEqual(minimumContrast);
 			}
 		}
