@@ -332,6 +332,102 @@ describe("workflow mutation guard", () => {
 		}
 	});
 
+	it("allows the /dev/null sink during active deep-interview", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of [
+			"echo hi > /dev/null",
+			"echo hi 2>/dev/null",
+			"grep -rn pattern src 2>/dev/null | head -5",
+			"cmd >/dev/null 2>&1",
+			'echo hi > "/dev/null"',
+			"dd if=/dev/zero of=/dev/null",
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(false);
+			expect(decision.targets).toEqual([]);
+		}
+	});
+
+	it("blocks every descriptor alias during active deep-interview", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		// `/dev/stdout`, `/dev/stderr`, and `/dev/fd/<n>` all name a descriptor that `exec` can
+		// rebind onto a real repository file, so none of them may be treated as a sink.
+		for (const [command, expected] of [
+			["echo x >/dev/fd/3", "/dev/fd/3"],
+			["echo hi > /dev/stdout", "/dev/stdout"],
+			["echo hi 2> /dev/stderr", "/dev/stderr"],
+		] as const) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(true);
+			expect(decision.targets).toContain(expected);
+		}
+	});
+
+	it("blocks sink-suppression bypasses during active deep-interview", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		// Every case pairs a real write with a `/dev/null` sink: suppressing the sink must not
+		// leave an empty target list that reads as "safe".
+		for (const command of [
+			"exec 1<>src/product.ts; printf x >/dev/stdout",
+			"exec 1<>.gjc/_session-session-a/state/deep-interview-state.json; printf x >/dev/stdout",
+			"/bin/dd if=/dev/zero of=src/product.ts count=1 2>/dev/null",
+			"printf x | /usr/bin/tee src/product.ts >/dev/null",
+			"dd if=/dev/zero of=/dev/null of=src/product.ts count=1",
+			"printf x >|src/product.ts 2>/dev/null",
+			"printf x >&src/product.ts 2>/dev/null",
+			"printf x >|.gjc/_session-session-a/state/deep-interview-state.json 2>/dev/null",
+			'dd if=/dev/zero of=" /dev/null"',
+			'printf x >" src.ts"',
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(true);
+		}
+	});
+
+	it("keeps project, .gjc, mixed, dd, and exact-match-negative targets blocked", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of [
+			"echo x > src/product.ts",
+			"echo x > .gjc/_session-test/state/deep-interview-state.json",
+			"echo hi > /dev/null; touch src/product.ts",
+			"dd if=/dev/zero of=src/product.ts",
+			"echo x > /dev/nullx",
+			"echo x > dev/null",
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(true);
+			expect(decision.targets.length).toBeGreaterThan(0);
+		}
+	});
+
 	it("blocks vim file-switches into .gjc", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
