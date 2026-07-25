@@ -1016,7 +1016,7 @@ export function deepInterviewAnswerIdentityEqual(
 			component: a.component ?? null,
 			dimension: a.dimension ?? null,
 			question_text: a.question_text ?? null,
-			question_hash: a.question_hash,
+			question_hash: a.question_hash ?? null,
 			selected_options: a.selected_options ?? [],
 			custom_input: a.custom_input ?? null,
 		}) ===
@@ -1028,7 +1028,7 @@ export function deepInterviewAnswerIdentityEqual(
 			component: b.component ?? null,
 			dimension: b.dimension ?? null,
 			question_text: b.question_text ?? null,
-			question_hash: b.question_hash,
+			question_hash: b.question_hash ?? null,
 			selected_options: b.selected_options ?? [],
 			custom_input: b.custom_input ?? null,
 		})
@@ -1076,15 +1076,17 @@ export function applyDeepInterviewRoundResultV1(
 	/**
 	 * Rounds must be scored in order, but the Round 0 topology gate is not a
 	 * scorable round: the recorder persists it as an `answered` shell to bind the
-	 * locked intent contract, and `apply-round-result` rejects `--round 0`
-	 * outright. Counting it here would deadlock every later round forever, so the
-	 * ordering precondition only covers real interview rounds (>= 1).
+	 * locked intent contract, `apply-round-result` rejects `--round 0`, and
+	 * `validateDeepInterviewV1Envelope` refuses to persist a round-0 record that
+	 * is anything other than an answered, score-less shell. Counting it here would
+	 * deadlock every later round forever, so the gate is excluded by identity
+	 * rather than by an ordering range.
 	 */
 	if (
 		rounds.some(
 			round =>
 				round.lifecycle !== "scored" &&
-				round.round >= 1 &&
+				round.round !== 0 &&
 				(round.round < shell.round || (round.round === shell.round && round.round_key < shell.round_key)),
 		)
 	)

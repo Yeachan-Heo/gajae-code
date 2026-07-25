@@ -353,19 +353,25 @@ describe("deep-interview v1 core contracts", () => {
 		// encoding bug, not an absent field.
 		expect(() => canonicalDeepInterviewJson([1, undefined])).toThrow("canonical JSON rejects undefined");
 		expect(() => canonicalDeepInterviewJson(undefined)).toThrow("canonical JSON rejects undefined");
+		// `null` must survive the collapse. If the skip predicate ever loosened to
+		// `!value[key]` or `== undefined`, null/0/""/false would fold into "absent"
+		// and silently change the meaning of every persisted round_result_digest.
+		expect(canonicalDeepInterviewJson({ a: null })).toBe('{"a":null}');
+		expect(canonicalDeepInterviewJson({ a: 0, b: "", c: false })).toBe('{"a":0,"b":"","c":false}');
 
 		// `0.69 * 10_000` is `6900.000000000001` in IEEE-754; ambiguity round-trips
-		// through `units / 10_000`, so these ordinary scores must convert cleanly
-		// while genuinely off-grid precision stays rejected.
-		expect(scoreToUnits(0.69)).toBe(6_900);
-		expect(scoreToUnits(0.07)).toBe(700);
-		expect(scoreToUnits(0.29)).toBe(2_900);
-		expect(scoreToUnits(0.0001)).toBe(1);
-		expect(scoreToUnits(0)).toBe(0);
-		expect(scoreToUnits(1)).toBe(10_000);
-		expect(() => scoreToUnits(0.00005)).toThrow("integral 1e-4 units");
-		expect(() => scoreToUnits(0.05000000000000001)).toThrow("integral 1e-4 units");
-		expect(() => scoreToUnits(1.5)).toThrow("finite in [0, 1]");
+		// through `units / 10_000`, so every value on the 1e-4 grid must convert
+		// exactly while genuinely off-grid precision stays rejected. The sweep is the
+		// real contract: spot checks alone cannot show which floats miss the grid.
+		const offGrid: number[] = [];
+		for (let units = 0; units <= 10_000; units += 1) if (scoreToUnits(units / 10_000) !== units) offGrid.push(units);
+		expect(offGrid).toEqual([]);
+		expect(scoreToUnits(-0)).toBe(0);
+		expect(scoreToUnits(0.9999)).toBe(9_999);
+		for (const rejected of [0.00005, 0.05000000000000001, 0.30000000000000004, 1e-7])
+			expect(() => scoreToUnits(rejected)).toThrow("integral 1e-4 units");
+		for (const rejected of [1.5, -0.1, Number.NaN, Number.POSITIVE_INFINITY])
+			expect(() => scoreToUnits(rejected)).toThrow("finite in [0, 1]");
 
 		const filePath = "/tmp/state.json";
 		const envelope = {
@@ -480,5 +486,64 @@ describe("deep-interview v1 core contracts", () => {
 				"2026-01-01T00:02:00.000Z",
 			),
 		).toThrow("DI_ROUND_RESULT_CONFLICT");
+
+		// The Round-0 gate is excluded from the "earlier rounds must be scored"
+		// precondition only because a round-0 record can never carry scoring. Pin
+		// that premise with a positive control and a negative case differing by
+		// exactly one field, so the assertion cannot pass for an unrelated reason: if
+		// the validator's round-0 rule is deleted, the scored fixture below becomes
+		// valid and this test goes red.
+		const gateShell = {
+			round: 0,
+			round_key: "r0",
+			question_id: "round0-topology",
+			question_text: "Confirm locked intent",
+			question_hash: "question",
+			answer_hash: "answer",
+			lifecycle: "answered",
+			answered_at: "2026-01-01T00:00:00.000Z",
+		};
+		const withRoundZero = (record: Record<string, unknown>): Record<string, unknown> => {
+			const candidate = structuredClone(applied.envelope) as Record<string, unknown>;
+			(candidate.state as { rounds: Record<string, unknown>[] }).rounds.unshift(record);
+			return candidate;
+		};
+		validateDeepInterviewV1Envelope(withRoundZero({ ...gateShell }));
+		expect(() =>
+			validateDeepInterviewV1Envelope(
+				withRoundZero({ ...gateShell, scores: { goal: 0.2, constraints: 0.3, criteria: 0.4 } }),
+			),
+		).toThrow("DI_STATE_SCHEMA_INVALID");
+		// The gate's `review-topology`/`topology` metadata is accepted only while the
+		// record stays a score-less shell, which is what keeps it unscorable.
+		validateDeepInterviewV1Envelope(
+			withRoundZero({ ...gateShell, component: "review-topology", dimension: "topology" }),
+		);
+	});
+
+	it("refuses to score the Round-0 topology gate through the repair CLI", async () => {
+		const cwd = await tempDir();
+		await seedRecorderState(cwd);
+		const rejected = await runDeepInterviewRepairCommand(
+			[
+				"apply-round-result",
+				"--session-id",
+				TEST_SESSION_ID,
+				"--schema-version",
+				"1",
+				"--expected-revision",
+				"1",
+				"--round",
+				"0",
+				"--question-id",
+				"round0-topology",
+				"--result-json",
+				JSON.stringify({ global_scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 } }),
+				"--json",
+			],
+			cwd,
+		);
+		expect(rejected.status).toBe(2);
+		expect(rejected.stderr).toContain("DI_INVALID_ROUND");
 	});
 });

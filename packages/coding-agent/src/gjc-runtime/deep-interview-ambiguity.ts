@@ -217,12 +217,12 @@ export function scoreToUnits(score: number): number {
 	 * genuine 1e-4 value has at most four fraction digits, while off-grid
 	 * precision keeps its digits (`0.00005`, `0.05000000000000001`) and is
 	 * rejected. An epsilon on the product cannot separate those two cases -- both
-	 * residuals are ~1e-13.
+	 * residuals are ~1e-13. The `[0, 1]` guard plus the four-digit cap already
+	 * bound the result to an integer in `[0, 10_000]`.
 	 */
 	const decimal = /^(\d+)(?:\.(\d{1,4}))?$/.exec(String(score));
 	if (!decimal) throw new RangeError("score must be expressed in integral 1e-4 units");
 	const units = Number(decimal[1]) * 10_000 + Number((decimal[2] ?? "").padEnd(4, "0"));
-	if (!Number.isSafeInteger(units)) throw new RangeError("score must be expressed in integral 1e-4 units");
 	return units;
 }
 

@@ -809,6 +809,33 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		};
 		expect(persisted.state.rounds.find(round => round.round === 0)?.lifecycle).toBe("answered");
 		expect(persisted.state.rounds.find(round => round.round === 1)?.lifecycle).toBe("scored");
+		// The result JSON above omits `targeting`/`ontology`/`bookkeeping`, so the
+		// decoder materializes them as `undefined`. Replaying it must digest to the
+		// same value and settle as an idempotent noop rather than a conflict.
+		const replay = await runDeepInterviewRepairCommand(
+			[
+				"apply-round-result",
+				"--session-id",
+				TEST_SESSION_ID,
+				"--schema-version",
+				"1",
+				"--expected-revision",
+				String(before.state_revision + 1),
+				"--round",
+				"1",
+				"--question-id",
+				"q1",
+				"--result-json",
+				JSON.stringify({
+					global_scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 },
+					component_updates: [{ component_id: "alpha", scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 } }],
+				}),
+				"--json",
+			],
+			cwd,
+		);
+		expect(replay.status, replay.stderr).toBe(0);
+		expect(JSON.parse(replay.stdout ?? "{}")).toMatchObject({ ok: true, written: false });
 	});
 
 	it("canonicalizes an agent-supplied dimension label before persisting the shell", () => {
