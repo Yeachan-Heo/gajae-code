@@ -340,8 +340,9 @@ export function findExactModelReferenceMatch(
 		return undefined;
 	}
 
-	const exactMatch = availableModels.find(model => `${model.provider}/${model.id}` === trimmedReference);
-	if (exactMatch) return exactMatch;
+	const exactMatches = availableModels.filter(model => `${model.provider}/${model.id}` === trimmedReference);
+	if (exactMatches.length === 1) return exactMatches[0];
+	if (exactMatches.length > 1) return undefined;
 	const normalizedReference = trimmedReference.toLowerCase();
 	const caseInsensitiveMatches = availableModels.filter(
 		model => `${model.provider}/${model.id}`.toLowerCase() === normalizedReference,

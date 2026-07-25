@@ -3902,6 +3902,26 @@ describe("ModelRegistry", () => {
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
 		});
+		test("clears descriptor discovery evidence after a failed online refresh", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			let calls = 0;
+			using _hook = hookFetch(() =>
+				calls++ === 0
+					? new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						})
+					: new Response("unavailable", { status: 503 }),
+			);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+
+			await registry.refreshProvider("vllm", "online");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
 		test("invalidates descriptor discovery evidence when the credential changes", async () => {
 			authStorage.setRuntimeApiKey("vllm", "credential-a");
 			using _hook = hookFetch(

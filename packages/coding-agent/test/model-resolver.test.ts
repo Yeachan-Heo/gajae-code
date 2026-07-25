@@ -654,6 +654,23 @@ describe("resolveCliModel", () => {
 		expect(result.model?.provider).toBe("env/provider");
 		expect(result.model?.id).toBe("model");
 	});
+	test("rejects colliding exact full selectors", () => {
+		const registry = {
+			getAll: () => [
+				...allModels,
+				{ ...allModels[0], provider: "env/provider", id: "model" },
+				{ ...allModels[0], provider: "env", id: "provider/model" },
+			],
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliModel: "env/provider/model",
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain("not found");
+	});
 	test("rejects an ambiguous case-folded full selector", () => {
 		const registry = {
 			getAll: () => [
