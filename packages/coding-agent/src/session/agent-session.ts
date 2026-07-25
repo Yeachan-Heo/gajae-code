@@ -1048,10 +1048,14 @@ function createHandoffContext(document: string): string {
 // ============================================================================
 
 /** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "edit", "delete", "move"]);
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move"]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
 	return toolName === "bash" || toolName === "monitor";
+}
+
+function isExecutionPermissionTool(toolName: string): boolean {
+	return isShellExecutionPermissionTool(toolName) || toolName === "eval";
 }
 
 /** Permission options presented to the client on each gated tool call. */
@@ -1120,6 +1124,18 @@ function getPermissionIntent(
 	if (isShellExecutionPermissionTool(toolName)) {
 		const cmd = getStringProperty(a, "command")?.slice(0, 80);
 		return { toolName, title: cmd || toolName, cacheKey: toolName };
+	}
+	if (toolName === "eval") {
+		const cells = Array.isArray(a.cells) ? a.cells : [];
+		const firstCell = cells.find(cell => cell && typeof cell === "object" && !Array.isArray(cell));
+		const cell = firstCell as Record<string, unknown> | undefined;
+		const title = cell ? getStringProperty(cell, "title") : undefined;
+		const language = cell ? getStringProperty(cell, "language") : undefined;
+		return {
+			toolName,
+			title: title ?? (language ? `Eval ${language}` : "eval"),
+			cacheKey: toolName,
+		};
 	}
 	if (toolName === "delete") {
 		const p = getStringProperty(a, "path");
@@ -5502,6 +5518,12 @@ export class AgentSession {
 		return undefined;
 	}
 
+	/** Get a registered tool with the same guards used for model-facing execution. */
+	getToolForExecution(name: string): AgentTool | undefined {
+		const tool = this.getToolByName(name);
+		return tool ? this.#prepareToolForExecution(tool) : undefined;
+	}
+
 	/**
 	 * Register a UI/control-plane request handler for a currently foregrounded
 	 * managed bash execution. This is intentionally narrower than generic
@@ -5766,6 +5788,7 @@ export class AgentSession {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					const isShellExecutionTool = isShellExecutionPermissionTool(target.name);
+					const isExecutionTool = isExecutionPermissionTool(target.name);
 					const command =
 						isShellExecutionTool && args && typeof args === "object" && !Array.isArray(args)
 							? getStringProperty(args as Record<string, unknown>, "command")
@@ -5808,7 +5831,7 @@ export class AgentSession {
 								toolCallId,
 								toolName: target.name,
 								title: permissionIntent.title,
-								...(isShellExecutionTool ? { kind: "execute" } : {}),
+								...(isExecutionTool ? { kind: "execute" } : {}),
 								status: "pending",
 								rawInput: args,
 								...(commandContent ? { content: commandContent } : {}),

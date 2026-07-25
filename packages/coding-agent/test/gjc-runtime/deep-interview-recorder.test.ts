@@ -717,4 +717,26 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		expect(compact.recent_scored_rounds).toEqual([]);
 		expect(compact.pending_shells).toEqual([]);
 	});
+
+	it("canonicalizes an agent-supplied dimension label before persisting the shell", () => {
+		// `deepInterview.dimension` is free text on post-topology asks; the persisted envelope
+		// only accepts canonical ids, so a display label must not reach state verbatim.
+		for (const [supplied, expected] of [
+			["Constraints", "constraints"],
+			["Goal Clarity", "goal"],
+			["Success Criteria", undefined],
+			["criteria", "criteria"],
+			["topology", "topology"],
+			["not-a-dimension", undefined],
+		] as const) {
+			const shell = buildAnswerShell({
+				round: 1,
+				questionId: "q",
+				questionText: "question",
+				selectedOptions: ["a"],
+				dimension: supplied,
+			} as never);
+			expect(shell.dimension).toBe(expected as never);
+		}
+	});
 });

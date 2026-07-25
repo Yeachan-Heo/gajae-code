@@ -774,7 +774,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/coding-agent",
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
-			"check:@gajae-code/stats",
+			"check:@gajae-code/stats", "test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
 			"check:@gajae-code/utils", "test:@gajae-code/utils",

@@ -32,6 +32,39 @@ function createSession(tools: AgentTool[]): ToolSession {
 }
 
 describe("callSessionTool", () => {
+	it("prefers the session's prepared tool dispatch over the raw registry lookup", async () => {
+		const rawExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "raw" }] });
+		const preparedExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "prepared" }] });
+		const rawTool = createTool("bash", rawExecute);
+		const preparedTool = createTool("bash", preparedExecute);
+		const session = {
+			...createSession([]),
+			getToolByName: () => rawTool,
+			getToolForExecution: () => preparedTool,
+		};
+
+		await expect(callSessionTool("bash", { command: "echo guarded" }, { session })).resolves.toBe("prepared");
+		expect(preparedExecute).toHaveBeenCalledTimes(1);
+		expect(rawExecute).not.toHaveBeenCalled();
+	});
+
+	it("does not fall back to the raw registry when prepared dispatch rejects a tool", async () => {
+		const rawExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "raw" }] });
+		const rawTool = createTool("bash", rawExecute);
+		const rawLookup = vi.fn(() => rawTool);
+		const session = {
+			...createSession([]),
+			getToolByName: rawLookup,
+			getToolForExecution: () => undefined,
+		};
+
+		await expect(callSessionTool("bash", { command: "echo unguarded" }, { session })).rejects.toThrow(
+			"Unknown tool from js runtime: bash",
+		);
+		expect(rawLookup).not.toHaveBeenCalled();
+		expect(rawExecute).not.toHaveBeenCalled();
+	});
+
 	it("injects js intent and summarizes text results", async () => {
 		const execute = vi.fn().mockResolvedValue({
 			content: [{ type: "text", text: "hello" }],

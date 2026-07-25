@@ -7,7 +7,11 @@ import {
 	runDeepInterviewRepairCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-repair";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { validateDeepInterviewV1Envelope } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
+import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { stampWorkflowEnvelopeChecksum } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { WORKFLOW_MANIFEST } from "@gajae-code/coding-agent/gjc-runtime/workflow-manifest";
+import { ensureWorkflowSkillActivationState } from "@gajae-code/coding-agent/hooks/skill-state";
 
 describe("deep-interview typed repair CLI", () => {
 	it("keeps typed repair verbs aligned with the public workflow manifest", () => {
@@ -1216,6 +1220,179 @@ describe("deep-interview typed repair CLI", () => {
 				"--json",
 			]);
 			expect(invalidGreenfieldContextResult.stderr).toContain("DI_INVALID_RESULT_JSON");
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+	it("creates an initialize-context draft from a hook-seeded session", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+		const session = "hook-seeded-draft";
+		try {
+			await ensureWorkflowSkillActivationState({
+				cwd,
+				skill: "deep-interview",
+				sessionId: session,
+				nowIso: "2026-01-01T00:00:00.000Z",
+			});
+			const result = await runNativeDeepInterviewCommand(
+				["draft", "create", "--for", "initialize-context", "--session-id", session, "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(0);
+			const output = JSON.parse(result.stdout!);
+			expect(output).toMatchObject({ ok: true });
+			expect(output.draft.id).toMatch(/^[a-f0-9]{32}$/);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("consumes a real initial_idea on a hook-seeded session without DI_SETUP_CONFLICT", async () => {
+		for (const type of ["greenfield", "brownfield"] as const) {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+			const session = "hook-seeded-idea";
+			try {
+				await ensureWorkflowSkillActivationState({ cwd, skill: "deep-interview", sessionId: session });
+				const created = await runNativeDeepInterviewCommand(
+					["draft", "create", "--for", "initialize-context", "--session-id", session, "--json"],
+					cwd,
+				);
+				expect(created.status).toBe(0);
+				const draft = JSON.parse(created.stdout!).draft;
+				let revision = draft.draft_revision;
+				for (const [pointer, value] of [
+					["/type", type],
+					["/threshold", "0.05"],
+					["/initial_idea", "a real user idea"],
+				]) {
+					const edited = await runNativeDeepInterviewCommand(
+						[
+							"draft",
+							"edit",
+							"--draft-id",
+							draft.id,
+							"--expected-draft-revision",
+							String(revision),
+							"--op",
+							"set",
+							"--path",
+							pointer,
+							"--value",
+							value,
+							"--json",
+						],
+						cwd,
+					);
+					expect(edited.status).toBe(0);
+					revision = JSON.parse(edited.stdout!).draft.draft_revision;
+				}
+				const consumed = await runNativeDeepInterviewCommand(
+					["initialize-context", "--draft-id", draft.id, "--expected-draft-revision", String(revision), "--json"],
+					cwd,
+				);
+				expect(consumed.status).toBe(0);
+				expect(JSON.parse(consumed.stdout!)).toMatchObject({ ok: true, consumed: true });
+			} finally {
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("keeps hook and runtime deep-interview seed shapes in parity", async () => {
+		const hookCwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+		const runtimeCwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+		const hookSession = "hook-shape";
+		const runtimeSession = "runtime-shape";
+		try {
+			await ensureWorkflowSkillActivationState({
+				cwd: hookCwd,
+				skill: "deep-interview",
+				sessionId: hookSession,
+				nowIso: "2026-01-01T00:00:00.000Z",
+			});
+			const runtimeResult = await runNativeDeepInterviewCommand(
+				["--session-id", runtimeSession, "--json", "shape parity"],
+				runtimeCwd,
+			);
+			expect(runtimeResult.status).toBe(0);
+
+			const hookEnvelope = JSON.parse(
+				await fs.readFile(modeStatePath(hookCwd, hookSession, "deep-interview"), "utf8"),
+			) as Record<string, unknown>;
+			const runtimeEnvelope = JSON.parse(
+				await fs.readFile(modeStatePath(runtimeCwd, runtimeSession, "deep-interview"), "utf8"),
+			) as Record<string, unknown>;
+			expect(() => validateDeepInterviewV1Envelope(hookEnvelope)).not.toThrow();
+			expect(() => validateDeepInterviewV1Envelope(runtimeEnvelope)).not.toThrow();
+			expect(
+				Object.keys(hookEnvelope)
+					.filter(key => key !== "cwd" && key !== "state_revision")
+					.sort(),
+			).toEqual(
+				Object.keys(runtimeEnvelope)
+					.filter(key => key !== "state_revision")
+					.sort(),
+			);
+			// The hook seeds no `initial_idea`: activation carries no user idea yet, and pre-seeding
+			// an empty string would make a later typed initialize-context fail with DI_SETUP_CONFLICT.
+			expect(Object.keys(hookEnvelope.state as Record<string, unknown>).sort()).toEqual(
+				Object.keys(runtimeEnvelope.state as Record<string, unknown>)
+					.filter(key => key !== "initial_idea")
+					.sort(),
+			);
+			expect((hookEnvelope.state as Record<string, unknown>).initial_idea).toBeUndefined();
+		} finally {
+			await fs.rm(hookCwd, { recursive: true, force: true });
+			await fs.rm(runtimeCwd, { recursive: true, force: true });
+		}
+	});
+
+	it("still rejects a malformed native v1 envelope during draft creation", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+		const session = "malformed-native-draft";
+		try {
+			await ensureWorkflowSkillActivationState({ cwd, skill: "deep-interview", sessionId: session });
+			const statePath = modeStatePath(cwd, session, "deep-interview");
+			const malformed = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+			(malformed.state as Record<string, unknown>).threshold_units = 499;
+			await fs.writeFile(statePath, JSON.stringify(stampWorkflowEnvelopeChecksum(malformed, statePath)));
+
+			const result = await runNativeDeepInterviewCommand(
+				["draft", "create", "--for", "initialize-context", "--session-id", session, "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(JSON.parse(result.stderr!)).toEqual({
+				ok: false,
+				issue: { code: "DI_STATE_SCHEMA_INVALID", message: "DI_STATE_SCHEMA_INVALID" },
+			});
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps non-deep-interview hook seeds minimal", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+		const session = "ralplan-minimal-seed";
+		try {
+			await ensureWorkflowSkillActivationState({ cwd, skill: "ralplan", sessionId: session });
+			const state = JSON.parse(await fs.readFile(modeStatePath(cwd, session, "ralplan"), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(Object.keys(state).sort()).toEqual([
+				"active",
+				"current_phase",
+				"cwd",
+				"receipt",
+				"session_id",
+				"skill",
+				"state_revision",
+				"updated_at",
+				"version",
+			]);
+			expect(state.schema_version).toBeUndefined();
+			expect(state.state).toBeUndefined();
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}

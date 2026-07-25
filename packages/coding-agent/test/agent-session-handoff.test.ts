@@ -21,6 +21,15 @@ describe("AgentSession handoff", () => {
 	let modelRegistry: ModelRegistry;
 	let events: AgentSessionEvent[];
 
+	async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (predicate()) return;
+			await Bun.sleep(10);
+		}
+		throw new Error("Timed out waiting for handoff maintenance observation");
+	}
+
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-handoff-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
@@ -487,7 +496,9 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await waitFor(
+			() => handoffSpy.mock.calls.length === 1 && events.some(event => event.type === "auto_compaction_end"),
+		);
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");

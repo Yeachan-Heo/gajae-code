@@ -18,7 +18,14 @@ export interface BashRestrictionOptions {
 }
 
 const SHELL_CONTROL_CHARS = new Set([";", "|", "&", "<", ">", "(", ")"]);
-const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "}", "~"]);
+// `~` is handled separately: bash performs tilde expansion only at positions where a
+// tilde can open an expansion - the start of a word, and inside an assignment word
+// directly after the first `=` or after a `:` in the assigned value. A tilde anywhere
+// else (e.g. the git revision `HEAD~1`) is a literal character.
+const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "}"]);
+// A bash assignment word has a plain assignment name before its first unquoted `=`,
+// in either the `name=value` or the compound `name+=value` form.
+const ASSIGNMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*\+?$/u;
 const ALLOWED_STATE_ACTIONS = new Set(["read", "write", "contract"]);
 const CANONICAL_STATE_TARGETS = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 const READ_ONLY_COMMANDS = new Set(["grep", "rg", "tree", "ls", "pwd", "wc", "du", "file", "stat"]);
@@ -29,6 +36,14 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 	let quote: "single" | "double" | null = null;
 
 	let wordStarted = false;
+	// Per-token tilde-expansion state. `assignmentNameCandidate` stays true while the
+	// characters before the first unquoted `=` could still form an assignment name (any
+	// quoting in that region disqualifies the token), `sawAssignmentEquals` records that
+	// the token is an assignment word, and `tildeExpandable` means an unquoted `~` at the
+	// current index would actually be expanded by bash.
+	let assignmentNameCandidate = true;
+	let sawAssignmentEquals = false;
+	let tildeExpandable = false;
 	for (let index = 0; index < command.length; index += 1) {
 		const char = command[index]!;
 		const next = command[index + 1];
@@ -63,11 +78,15 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 		if (char === "'") {
 			quote = "single";
 			wordStarted = true;
+			if (!sawAssignmentEquals) assignmentNameCandidate = false;
+			tildeExpandable = false;
 			continue;
 		}
 		if (char === '"') {
 			quote = "double";
 			wordStarted = true;
+			if (!sawAssignmentEquals) assignmentNameCandidate = false;
+			tildeExpandable = false;
 			continue;
 		}
 		if (char === "`" || (char === "$" && next === "(")) {
@@ -82,16 +101,41 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 		if (UNSAFE_UNQUOTED_EXPANSION_CHARS.has(char)) {
 			return { words, reason: `shell expansion character '${char}' is not allowed in restricted bash commands` };
 		}
+		// Tilde expansion is positional: bash expands a tilde only where one can open an
+		// expansion, i.e. at the start of a word or, inside an assignment word, directly
+		// after the first `=` or after a `:` in the assigned value. A tilde anywhere else
+		// is literal, which is what git revision syntax such as `HEAD~1` relies on.
+		if (char === "~" && (!wordStarted || tildeExpandable)) {
+			return { words, reason: "shell expansion character '~' is not allowed in restricted bash commands" };
+		}
 		if (/\s/u.test(char)) {
 			if (wordStarted) {
 				words.push(current);
 				current = "";
 				wordStarted = false;
 			}
+			assignmentNameCandidate = true;
+			sawAssignmentEquals = false;
+			tildeExpandable = false;
 			continue;
 		}
 		if (char === "\\") {
 			return { words, reason: "backslash escapes are not allowed in restricted bash commands" };
+		}
+		if (char === "=" && !sawAssignmentEquals) {
+			// Only a plain assignment name before the first unquoted `=` makes this an
+			// assignment word whose value bash scans for tilde expansions.
+			if (assignmentNameCandidate && ASSIGNMENT_NAME_PATTERN.test(current)) {
+				sawAssignmentEquals = true;
+				tildeExpandable = true;
+			} else {
+				assignmentNameCandidate = false;
+				tildeExpandable = false;
+			}
+		} else if (char === ":" && sawAssignmentEquals) {
+			tildeExpandable = true;
+		} else {
+			tildeExpandable = false;
 		}
 		current += char;
 		wordStarted = true;

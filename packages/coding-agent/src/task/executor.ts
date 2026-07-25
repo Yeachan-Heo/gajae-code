@@ -1593,6 +1593,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							? { requestedModel, reason: modelSubstitutionWarning.reason }
 							: undefined,
 					toolNames,
+					alwaysActiveToolNames: ircEnabled ? ["irc"] : undefined,
 					outputSchema,
 					requireYieldTool: true,
 					contextFiles: options.contextFiles,
