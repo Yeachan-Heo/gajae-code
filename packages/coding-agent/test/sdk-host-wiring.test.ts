@@ -671,10 +671,36 @@ test("session_start swallows startup plus owner-release failure without surfacin
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
 	dirs.push(cwd);
 	const sessionId = `startup-cleanup-double-failure-${Date.now()}`;
-	const serverStart = spyOn(NotificationServer.prototype, "start").mockRejectedValueOnce(
-		new Error("server start failed"),
-	);
-	const hostStop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
+	// `mockRejectedValueOnce` on a shared prototype is a one-shot global: a peer
+	// test scheduled concurrently in the same shard can consume the single
+	// rejection, after which this test's own `start`/`stop` resolve, startup
+	// never sets `suppressExtensionError`, and the error surfaces. Scope the
+	// rejection to this test's first call instead so shard composition cannot
+	// steal it.
+	let serverStartRejected = false;
+	const serverStartImpl = NotificationServer.prototype.start;
+	const serverStart = spyOn(NotificationServer.prototype, "start").mockImplementation(async function (
+		this: NotificationServer,
+		...args: Parameters<NotificationServer["start"]>
+	) {
+		if (!serverStartRejected) {
+			serverStartRejected = true;
+			throw new Error("server start failed");
+		}
+		return await serverStartImpl.apply(this, args);
+	});
+	let hostStopRejected = false;
+	const hostStopImpl = SessionSdkHost.prototype.stop;
+	const hostStop = spyOn(SessionSdkHost.prototype, "stop").mockImplementation(async function (
+		this: SessionSdkHost,
+		...args: Parameters<SessionSdkHost["stop"]>
+	) {
+		if (!hostStopRejected) {
+			hostStopRejected = true;
+			throw new Error("host stop failed");
+		}
+		return await hostStopImpl.apply(this, args);
+	});
 	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 	let restored = false;
 	try {
