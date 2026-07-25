@@ -960,6 +960,40 @@ export interface ModelRequestTransform {
 	extraBody?: Record<string, unknown>;
 }
 
+/**
+ * One archived documentation snapshot a bundled catalog row was transcribed from.
+ *
+ * A live URL is mutable, so it cannot prove what the row was derived from. The
+ * snapshot is committed in-repo and the digest binds the row to those exact
+ * bytes: re-reading `artifact`, hashing it, and comparing to `sha256` reproduces
+ * the evidence at any later revision without a network fetch.
+ */
+export interface CatalogProvenanceSource {
+	/** Canonical URL the snapshot was fetched from. */
+	url: string;
+	/** Repository-relative path of the committed snapshot. */
+	artifact: string;
+	/** SHA-256 (hex) of the committed snapshot bytes. */
+	sha256: string;
+	/** ISO `YYYY-MM-DD` date the snapshot was fetched. */
+	retrievedAt: string;
+}
+
+/**
+ * Published provider documentation a bundled catalog row was transcribed from.
+ *
+ * Set by the catalog generator for first-party models it seeds from typed inputs
+ * (a model published after the last upstream snapshot, or any regeneration
+ * without network access or provider credentials). Rows resolved from a live
+ * upstream source carry no provenance, so the presence of this field identifies
+ * exactly which fields came from a documented transcription — and the archived
+ * snapshots plus digests make that transcription auditable offline.
+ */
+export interface CatalogProvenance {
+	/** Archived, digest-bound documentation snapshots backing this row. */
+	sources: readonly CatalogProvenanceSource[];
+}
+
 export interface Model<TApi extends Api = any> {
 	id: string;
 	name: string;
@@ -1045,4 +1079,9 @@ export interface Model<TApi extends Api = any> {
 	 * `options.isOAuth = true` for the underlying provider call.
 	 */
 	isOAuth?: boolean;
+	/**
+	 * Documentation the generator transcribed this bundled row from. Only set for
+	 * typed generator seeds; live upstream rows leave it unset.
+	 */
+	catalogProvenance?: CatalogProvenance;
 }

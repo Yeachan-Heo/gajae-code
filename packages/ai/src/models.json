@@ -7,12 +7,25 @@
 			"provider": "alibaba-token-plan",
 			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 			"reasoning": true,
-			"input": ["text"],
-			"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
 			"contextWindow": 1000000,
 			"maxTokens": 384000,
-			"compat": { "supportsDeveloperRole": false },
-			"thinking": { "mode": "effort", "minLevel": "minimal", "maxLevel": "xhigh" }
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
 		},
 		"glm-5.2": {
 			"id": "glm-5.2",
@@ -21,12 +34,25 @@
 			"provider": "alibaba-token-plan",
 			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 			"reasoning": true,
-			"input": ["text"],
-			"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
 			"contextWindow": 1000000,
 			"maxTokens": 131072,
-			"compat": { "supportsDeveloperRole": false },
-			"thinking": { "mode": "effort", "minLevel": "minimal", "maxLevel": "xhigh" }
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
 		},
 		"qwen3.8-max-preview": {
 			"id": "qwen3.8-max-preview",
@@ -35,12 +61,25 @@
 			"provider": "alibaba-token-plan",
 			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 			"reasoning": true,
-			"input": ["text"],
-			"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
 			"contextWindow": 1000000,
 			"maxTokens": 65536,
-			"compat": { "supportsDeveloperRole": false },
-			"thinking": { "mode": "effort", "minLevel": "minimal", "maxLevel": "xhigh" }
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
 		}
 	},
 	"amazon-bedrock": {
@@ -3531,6 +3570,22 @@
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
+			"catalogProvenance": {
+				"sources": [
+					{
+						"url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+						"artifact": "artifacts/anthropic-catalog-sources/claude-models-overview.md",
+						"sha256": "174387f3189c864cccf3f0b4424803e8347a355667967e2dbf94892c41524442",
+						"retrievedAt": "2026-07-25"
+					},
+					{
+						"url": "https://platform.claude.com/docs/en/about-claude/pricing",
+						"artifact": "artifacts/anthropic-catalog-sources/claude-pricing.md",
+						"sha256": "0769b253017dc3552f02cd2181eb69599370c68bc32c2e7d3742f3a47f768088",
+						"retrievedAt": "2026-07-25"
+					}
+				]
+			},
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
@@ -61359,26 +61414,6 @@
 		}
 	},
 	"opengateway": {
-		"openai/gpt-4o": {
-			"id": "openai/gpt-4o",
-			"name": "GPT-4o (OpenGateway)",
-			"api": "openai-completions",
-			"provider": "opengateway",
-			"baseUrl": "https://apis.opengateway.ai/v1",
-			"reasoning": false,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 2.5,
-				"output": 10,
-				"cacheRead": 1.25,
-				"cacheWrite": 0
-			},
-			"contextWindow": 128000,
-			"maxTokens": 16384
-		},
 		"anthropic/claude-sonnet-4-5": {
 			"id": "anthropic/claude-sonnet-4-5",
 			"name": "Anthropic Sonnet 4.5 (OpenGateway)",
@@ -61401,7 +61436,7 @@
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "xhigh"
 			}
 		},
 		"google/gemini-2.5-pro": {
@@ -61428,6 +61463,26 @@
 				"minLevel": "minimal",
 				"maxLevel": "high"
 			}
+		},
+		"openai/gpt-4o": {
+			"id": "openai/gpt-4o",
+			"name": "GPT-4o (OpenGateway)",
+			"api": "openai-completions",
+			"provider": "opengateway",
+			"baseUrl": "https://apis.opengateway.ai/v1",
+			"reasoning": false,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.5,
+				"output": 10,
+				"cacheRead": 1.25,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384
 		}
 	},
 	"openrouter": {
