@@ -378,6 +378,105 @@ describe("agentLoop with AgentMessage", () => {
 		}
 	});
 
+	it("recovers without tools after repeated malformed tool calls", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["answered without tools"] },
+			],
+		});
+		const streamedToolCounts: number[] = [];
+		const streamedMessages: Message[][] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			streamedToolCounts.push(args[1].tools?.length ?? 0);
+			streamedMessages.push(args[1].messages);
+			return mock.stream(...args);
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			inspectingStream,
+		);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(2);
+		expect(streamedToolCounts).toEqual([1, 1, 0]);
+		expect(streamedMessages[2].at(-1)).toMatchObject({
+			role: "user",
+			content: expect.stringContaining("Do not call any tools"),
+			synthetic: true,
+		});
+		expect(events.at(-1)).toMatchObject({ type: "agent_end", stopReason: "completed" });
+		expect(
+			events.findLast(
+				event =>
+					event.type === "message_end" &&
+					event.message.role === "assistant" &&
+					event.message.content.some(block => block.type === "text" && block.text === "answered without tools"),
+			),
+		).toBeDefined();
+	});
+
+	it("keeps tools available when repeated calls fail during execution", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				executions += 1;
+				throw new Error("transient execution failure");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "same" } }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "same" } }] },
+				{ content: ["recovered normally"] },
+			],
+		});
+		const streamedToolCounts: number[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			streamedToolCounts.push(args[1].tools?.length ?? 0);
+			return mock.stream(...args);
+		};
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			inspectingStream,
+		);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(executions).toBe(2);
+		expect(streamedToolCounts).toEqual([1, 1, 1]);
+	});
+
 	it("injects and strips intent when intent tracing is enabled", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		const executedParams: Record<string, unknown>[] = [];

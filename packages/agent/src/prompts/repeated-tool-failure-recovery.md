@@ -1,0 +1,1 @@
+The immediately preceding tool calls failed because their arguments were malformed. Do not call any tools. Answer the original user request now using the conversation and any successful tool results already available. If the evidence is incomplete, state that limitation instead of returning an empty response.

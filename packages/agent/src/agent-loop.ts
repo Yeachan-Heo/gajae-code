@@ -32,6 +32,7 @@ import {
 	shouldMitigateHarmonyLeak,
 	signalListLabel,
 } from "./harmony-leak";
+import repeatedToolFailureRecoveryPrompt from "./prompts/repeated-tool-failure-recovery.md" with { type: "text" };
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
 	type AgentTelemetry,
@@ -1247,6 +1248,9 @@ async function runLoopBody(
 	// Fires at most one repaired resend per run for the poisoned-history
 	// `invalid_prompt` circuit breaker below.
 	let invalidPromptRepairAttempted = false;
+	let previousMalformedToolSignatures = new Set<string>();
+	let recoverWithoutTools = false;
+	let malformedToolRecoveryAttempted = false;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -1331,8 +1335,24 @@ async function runLoopBody(
 								attemptTransaction.stageAssistantMessageEvent(partial, event),
 						}
 					: config;
+				const responseContext = recoverWithoutTools
+					? {
+							...currentContext,
+							messages: [
+								...currentContext.messages,
+								{
+									role: "user" as const,
+									content: repeatedToolFailureRecoveryPrompt,
+									synthetic: true,
+									timestamp: Date.now(),
+								},
+							],
+							tools: [],
+						}
+					: currentContext;
+				recoverWithoutTools = false;
 				message = await streamAssistantResponse(
-					currentContext,
+					responseContext,
 					attemptConfig,
 					loopSignal,
 					attemptTransaction ? (attemptTransaction as unknown as EventStream<AgentEvent, AgentMessage[]>) : stream,
@@ -1527,6 +1547,7 @@ async function runLoopBody(
 			hasMoreToolCalls = toolCalls.length > 0;
 
 			const toolResults: ToolResultMessage[] = [];
+			let repeatedMalformedToolCall = false;
 			if (hasMoreToolCalls) {
 				const executionResult = await executeToolCalls(
 					currentContext,
@@ -1540,6 +1561,18 @@ async function runLoopBody(
 
 				toolResults.push(...executionResult.toolResults);
 				steeringMessagesFromExecution = executionResult.steeringMessages;
+
+				const malformedSignatures = executionResult.malformedToolCallSignatures;
+				const allToolCallsMalformed = toolResults.length > 0 && malformedSignatures.length === toolResults.length;
+				if (allToolCallsMalformed) {
+					const uniqueMalformedSignatures = new Set(malformedSignatures);
+					repeatedMalformedToolCall =
+						uniqueMalformedSignatures.size < malformedSignatures.length ||
+						[...uniqueMalformedSignatures].some(signature => previousMalformedToolSignatures.has(signature));
+					previousMalformedToolSignatures = uniqueMalformedSignatures;
+				} else {
+					previousMalformedToolSignatures = new Set();
+				}
 
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
@@ -1559,6 +1592,10 @@ async function runLoopBody(
 				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
 				stream.end(newMessages);
 				return;
+			}
+			if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
+				recoverWithoutTools = true;
+				malformedToolRecoveryAttempted = true;
 			}
 		}
 
@@ -1910,7 +1947,11 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
-): Promise<{ toolResults: ToolResultMessage[]; steeringMessages?: AgentMessage[] }> {
+): Promise<{
+	toolResults: ToolResultMessage[];
+	steeringMessages?: AgentMessage[];
+	malformedToolCallSignatures: string[];
+}> {
 	const tools = currentContext.tools;
 	const {
 		getSteeringMessages,
@@ -1951,6 +1992,7 @@ async function executeToolCalls(
 		skipped: false,
 		toolResultMessage: undefined as ToolResultMessage | undefined,
 		resultEmitted: false,
+		argumentValidationFailed: false,
 	}));
 
 	const checkSteering = async (): Promise<void> => {
@@ -2070,6 +2112,7 @@ async function executeToolCalls(
 		await runInActiveSpan(toolSpan, async () => {
 			try {
 				if (toolCall.incompleteArguments) {
+					record.argumentValidationFailed = true;
 					// The provider flagged this call's argument JSON as truncated
 					// (the model hit its output-token limit mid-call). Executing the
 					// best-effort partial parse would run the tool on wrong input, so
@@ -2104,6 +2147,7 @@ async function executeToolCalls(
 					if (tool.lenientArgValidation) {
 						effectiveArgs = argsForExecution;
 					} else {
+						record.argumentValidationFailed = true;
 						throw validationError;
 					}
 				}
@@ -2255,7 +2299,12 @@ async function executeToolCalls(
 		}
 	}
 
-	return { toolResults: emittedToolResults, steeringMessages };
+	const malformedToolCallSignatures = records.flatMap(record =>
+		record.argumentValidationFailed && record.toolResultMessage?.isError
+			? [`${record.toolCall.name}:${JSON.stringify(record.toolCall.arguments)}`]
+			: [],
+	);
+	return { toolResults: emittedToolResults, steeringMessages, malformedToolCallSignatures };
 }
 
 /**

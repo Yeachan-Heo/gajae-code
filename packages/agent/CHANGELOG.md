@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Repeated malformed tool calls now get one tool-free recovery response, preventing argument-validation loops from ending without an answer while leaving ordinary execution-error retries unchanged.
+
 ## [0.11.10] - 2026-07-25
 
 ## [0.11.8] - 2026-07-23
