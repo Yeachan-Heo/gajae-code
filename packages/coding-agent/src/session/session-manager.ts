@@ -568,6 +568,8 @@ function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set()
 		return refs;
 	}
 	if (!value || typeof value !== "object") return refs;
+	if (isRecord(value) && value.kind === "cold_spill" && typeof value.ref === "string" && parseBlobRef(value.ref))
+		refs.add(value.ref);
 	if (isImageBlock(value) && key === TEXT_CONTENT_KEY) addRef(value.data);
 	if (hasImageUrl(value)) {
 		if (typeof value.image_url === "string") addRef(value.image_url);
@@ -4669,6 +4671,7 @@ export class SessionManager {
 
 	/** Start a new session. Closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
+		this.#assertRecoveryHydrationWritable();
 		const prepared = await this.prepareNewSession(options);
 		try {
 			this.commitPreparedNewSession(prepared);
@@ -4693,6 +4696,7 @@ export class SessionManager {
 	 * @internal
 	 */
 	async prepareNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
+		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
 		await this.#closePersistWriter();
 		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
@@ -5046,6 +5050,7 @@ export class SessionManager {
 
 	/** Publish a prepared successor synchronously after all readiness awaits succeed. @internal */
 	commitPreparedNewSession(prepared: PreparedNewSession): void {
+		this.#assertRecoveryHydrationWritable();
 		const stage = prepared as PreparedNewSessionState;
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
 			throw new Error("Prepared session is no longer available.");
@@ -6594,13 +6599,13 @@ export class SessionManager {
 		const transcriptRelativePath = memoryGuardParticipantRelativePath(sessionId, "transcript.jsonl");
 		const blobRootRelativePath = memoryGuardParticipantRelativePath(sessionId, "blobs");
 		const blobManifestRelativePath = memoryGuardParticipantRelativePath(sessionId, "blob-manifest.json");
-		await ensureOwnerOnlyDirectory(participantRoot);
-		await writeOwnerOnlyFileNoReplace(
-			path.join(input.checkpointRoot, transcriptRelativePath),
-			captured.snapshot.content,
-		);
+		const refs = [...collectCheckpointBlobRefs(entries)].sort();
+		if (refs.length > MEMORY_GUARD_CHECKPOINT_BLOB_MAX_ENTRIES)
+			throw new Error("memory_guard_checkpoint_blob_count_exceeded");
 		const blobManifestEntries: MemoryGuardCheckpointBlobManifestEntryV1[] = [];
-		for (const ref of [...collectCheckpointBlobRefs(entries)].sort()) {
+		const blobWrites: Array<{ data: Buffer; relativePath: string }> = [];
+		let aggregateBlobBytes = 0;
+		for (const ref of refs) {
 			const hash = parseBlobRef(ref);
 			if (!hash) continue;
 			const data =
@@ -6610,14 +6615,27 @@ export class SessionManager {
 			if (!data) throw new Error(`memory_guard_checkpoint_blob_missing:${hash}`);
 			if (data.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
 				throw new Error(`memory_guard_checkpoint_blob_capacity_exceeded:${hash}`);
+			aggregateBlobBytes += data.byteLength;
+			if (aggregateBlobBytes > MEMORY_GUARD_CHECKPOINT_BLOB_TOTAL_MAX_BYTES)
+				throw new Error("memory_guard_checkpoint_blob_total_capacity_exceeded");
 			const relativePath = hash;
-			await writeOwnerOnlyFileNoReplace(path.join(input.checkpointRoot, blobRootRelativePath, relativePath), data);
+			blobWrites.push({ data, relativePath });
 			blobManifestEntries.push({
 				bytes: String(data.byteLength),
 				relative_path: relativePath,
 				sha256: memoryGuardSha256Hex(data),
 			});
 		}
+		await ensureOwnerOnlyDirectory(participantRoot);
+		await writeOwnerOnlyFileNoReplace(
+			path.join(input.checkpointRoot, transcriptRelativePath),
+			captured.snapshot.content,
+		);
+		for (const write of blobWrites)
+			await writeOwnerOnlyFileNoReplace(
+				path.join(input.checkpointRoot, blobRootRelativePath, write.relativePath),
+				write.data,
+			);
 		blobManifestEntries.sort((left, right) => left.relative_path.localeCompare(right.relative_path));
 		const blobManifest: MemoryGuardCheckpointBlobManifestV1 = {
 			entries: blobManifestEntries,
