@@ -270,6 +270,12 @@ export abstract class Command {
 			}
 		}
 
+		if (strict && posIdx < positionals.length) {
+			const unexpected = positionals.slice(posIdx);
+			const rendered = unexpected.map(value => JSON.stringify(value)).join(", ");
+			throw new CliParseError(`Unexpected argument${unexpected.length === 1 ? "" : "s"}: ${rendered}`);
+		}
+
 		return { flags, args, argv: positionals } as never;
 	}
 }
