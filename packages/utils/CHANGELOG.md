@@ -5,6 +5,7 @@
 ### Fixed
 
 - Strict CLI commands now reject unexpected positional arguments with usage guidance instead of silently ignoring typos or unsupported trailing input; non-strict passthrough commands and variadic arguments retain their existing behavior (#3173).
+- Integer CLI flags now reject trailing characters, decimals, exponent notation, surrounding whitespace, and values outside JavaScript's safe-integer range instead of silently truncating or rounding them.
 
 ## [0.11.10] - 2026-07-25
 
@@ -13,9 +14,6 @@
 ### Fixed
 
 - Fatal crashes (`uncaughtException` / `unhandledRejection`) are now also persisted to a dedicated, append-only crash log (`~/.gjc/agent/gjc-crash.log`) before any stderr output, and the fatal handler prints the crash-log path. The daily logger file is gzip-archived independently by every gjc process at date rollover; that shared-archive race can truncate a day's log to an empty `.gz` and destroy the `logger.error` crash record, leaving crashes undiagnosable. The rotation-immune crash log is capped at 512 KB, bounds every individual record (UTF-8-safe truncation with a marker), scrubs credential material (bearer/auth headers, key=value credential fields, and well-known vendor token shapes) before persisting, and enforces owner-only file permissions.
-### Fixed
-
-- Integer CLI flags now reject trailing characters, decimals, exponent notation, surrounding whitespace, and values outside JavaScript's safe-integer range instead of silently truncating or rounding them.
 
 ## [0.11.8] - 2026-07-23
 
