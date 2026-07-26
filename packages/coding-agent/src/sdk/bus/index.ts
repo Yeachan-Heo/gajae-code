@@ -3846,6 +3846,21 @@ export function createNotificationsExtension(
 						ok: false,
 						error: { code: "conflict", message: "session identity mutation is already active" },
 					};
+				const requireNativeControlDrain =
+					(request as { requireNativeControlDrain?: unknown }).requireNativeControlDrain === true ||
+					(!!request.input &&
+						typeof request.input === "object" &&
+						!Array.isArray(request.input) &&
+						(request.input as { requireNativeControlDrain?: unknown }).requireNativeControlDrain === true);
+				if (requireNativeControlDrain && !isNativeControlDrainAvailable())
+					return {
+						id: requestId,
+						ok: false,
+						error: {
+							code: "unavailable",
+							message: "SDK identity control requires the native control-drain lease.",
+						},
+					};
 				if (rotatesIdentity) identityControlInFlight = true;
 				const response = await controlRequesterContext.run(connectionId, () =>
 					dispatchControl(
@@ -4975,7 +4990,11 @@ export function createNotificationsExtension(
 			const pendingStartup = sessionStartPromises.get(newId);
 			if (pendingStartup) {
 				if (awaitStartup) {
-					await pendingStartup;
+					const result = await pendingStartup;
+					if (!lifecycleStartupCapability && result.status === "failed")
+						throw new Error(
+							`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`,
+						);
 					if (!extensionShuttingDown && runtimes.has(newId) && activeRuntimeId === newId)
 						await controller.reconcileCurrentSession(ctx);
 				} else {
