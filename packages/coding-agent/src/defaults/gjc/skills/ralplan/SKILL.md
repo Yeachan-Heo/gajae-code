@@ -107,7 +107,7 @@ The consensus workflow:
 ## Consensus iteration cap (operator contract)
 
 - Default max consensus iterations: **5** (`gjc.ralplan.maxIterations`).
-- On cap: exit code **3**, marker **`PLANNING-STUCK`** (stdout), no silent re-loop, no automatic ultragoal/team handoff.
+- On cap: exit code **3**, marker **`PLANNING-STUCK`** (stdout), no silent re-loop, no automatic ultragoal/team handoff. Opener budget is `max(index.jsonl openers, on-disk stage-*-{planner,revision}.md count)` so a missing/empty/malformed ledger cannot fail open after prior openers.
 - Headless/CI: treat `PLANNING-STUCK` / exit 3 as terminal planning failure for orchestration/watchdogs.
 - Interactive: present best existing plan via the final approval gate; residual critic findings stay as caveats.
 - Override example (project `.gjc/settings.json`):

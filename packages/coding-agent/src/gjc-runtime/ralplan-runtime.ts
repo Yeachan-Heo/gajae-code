@@ -94,11 +94,16 @@ export type RalplanIterationCapDecision =
  * A `planner` or `revision` write opens a new iteration (same definition as
  * `summarizeRalplanIndex`). Other stages never open iterations and are always
  * allowed by this gate — including `final` after the cap is already reached.
+ *
+ * `iterationFloor` raises the observed opener count when on-disk evidence or a
+ * recovered ledger is higher than the parsed index (fail-closed vs wipe/truncate).
  */
 export function evaluateRalplanIterationCap(input: {
 	rows: readonly RalplanIndexRow[];
 	stage: string;
 	maxIterations?: number;
+	/** Minimum opener count (e.g. on-disk stage-*-{planner,revision}.md). */
+	iterationFloor?: number;
 }): RalplanIterationCapDecision {
 	const maxIterations =
 		typeof input.maxIterations === "number" &&
@@ -107,7 +112,12 @@ export function evaluateRalplanIterationCap(input: {
 		input.maxIterations <= RALPLAN_MAX_ITERATIONS_LIMIT
 			? input.maxIterations
 			: RALPLAN_DEFAULT_MAX_ITERATIONS;
-	const currentIterations = summarizeRalplanIndex(input.rows).iteration;
+	const fromIndex = summarizeRalplanIndex(input.rows).iteration;
+	const floor =
+		typeof input.iterationFloor === "number" && Number.isInteger(input.iterationFloor) && input.iterationFloor > 0
+			? input.iterationFloor
+			: 0;
+	const currentIterations = Math.max(fromIndex, floor);
 	if (!RALPLAN_ITERATION_OPENER_STAGES.has(input.stage as RalplanStage)) {
 		return {
 			allowed: true,
@@ -118,6 +128,7 @@ export function evaluateRalplanIterationCap(input: {
 	}
 	const projectedIterations = currentIterations + 1;
 	if (projectedIterations > maxIterations) {
+		const ledgerNote = floor > fromIndex ? ` (ledger under-count: index=${fromIndex}, on-disk openers=${floor})` : "";
 		return {
 			allowed: false,
 			currentIterations,
@@ -125,7 +136,7 @@ export function evaluateRalplanIterationCap(input: {
 			maxIterations,
 			reason:
 				`ralplan consensus iteration cap exceeded: opening ${input.stage} would start ` +
-				`iteration ${projectedIterations} (max ${maxIterations})`,
+				`iteration ${projectedIterations} (max ${maxIterations})${ledgerNote}`,
 		};
 	}
 	return {
@@ -134,6 +145,63 @@ export function evaluateRalplanIterationCap(input: {
 		projectedIterations,
 		maxIterations,
 	};
+}
+
+/** Filename pattern for persisted planner/revision stage artifacts. */
+const OPENER_ARTIFACT_RE = /^stage-\d{2,}-(planner|revision)\.md$/;
+
+/**
+ * Count on-disk planner/revision stage artifacts for a run. Used as a floor when
+ * `index.jsonl` is missing, empty, truncated, or otherwise under-counts openers.
+ */
+export async function countRalplanOnDiskOpeners(cwd: string, sessionId: string, runId: string): Promise<number> {
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
+	try {
+		const entries = await fs.readdir(runDir);
+		let count = 0;
+		for (const name of entries) {
+			if (OPENER_ARTIFACT_RE.test(name)) count += 1;
+		}
+		return count;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Load index rows for cap enforcement. Unlike HUD reads, returns structural
+ * signals so callers can fail closed when the ledger is empty/malformed while
+ * opener artifacts already exist on disk.
+ */
+export async function loadRalplanIndexForCap(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+): Promise<{ rows: RalplanIndexRow[]; indexPresent: boolean; parseableLines: number; rawLineCount: number }> {
+	const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
+	try {
+		const text = await fs.readFile(indexPath, "utf8");
+		const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
+		const rows: RalplanIndexRow[] = [];
+		for (const line of lines) {
+			const row = parseRalplanIndexLine(line);
+			if (row) rows.push(row);
+		}
+		return {
+			rows,
+			indexPresent: true,
+			parseableLines: rows.length,
+			rawLineCount: lines.length,
+		};
+	} catch (error) {
+		const code =
+			error && typeof error === "object" && "code" in error ? (error as { code?: string }).code : undefined;
+		if (code === "ENOENT") {
+			return { rows: [], indexPresent: false, parseableLines: 0, rawLineCount: 0 };
+		}
+		// Unreadable index: treat as present-but-untrusted empty parse.
+		return { rows: [], indexPresent: true, parseableLines: 0, rawLineCount: 0 };
+	}
 }
 
 function parseMaxIterationsValue(value: unknown): number | null {
@@ -899,12 +967,16 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	// Consensus iteration budget (#3165): refuse new planner/revision openers past the cap.
 	// Dedupe returns above so identical re-writes never stuck-signal. Non-openers (architect,
 	// critic, final, …) remain allowed so operators can escalate without auto-implementation.
-	const indexRows = await readRalplanIndexRows(cwd, resolved.sessionId, resolved.runId);
+	// On-disk opener artifacts floor the count so a wiped/truncated/malformed index.jsonl cannot
+	// under-count and fail open after prior planner/revision writes.
+	const indexLoad = await loadRalplanIndexForCap(cwd, resolved.sessionId, resolved.runId);
+	const onDiskOpeners = await countRalplanOnDiskOpeners(cwd, resolved.sessionId, resolved.runId);
 	const { maxIterations, source: maxIterationsSource } = await resolveRalplanMaxIterations(cwd);
 	const capDecision = evaluateRalplanIterationCap({
-		rows: indexRows,
+		rows: indexLoad.rows,
 		stage: resolved.stage,
 		maxIterations,
+		iterationFloor: onDiskOpeners,
 	});
 	if (!capDecision.allowed) {
 		return buildPlanningStuckResult({
