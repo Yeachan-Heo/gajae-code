@@ -76,7 +76,11 @@ function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	);
 }
 
-function sharedAskGate(gateId: string, runtimeTurnId: string): WorkflowGate & { id: string; tag: "pending" } {
+function sharedAskGate(
+	gateId: string,
+	runtimeTurnId: string,
+	stage: WorkflowGate["stage"] = "deep-interview",
+): WorkflowGate & { id: string; tag: "pending" } {
 	const labels = ["Continue", "Stop"];
 	const schema = buildAskGateAnswerSchema({ multi: false, allowEmpty: false }, labels);
 	return {
@@ -85,7 +89,7 @@ function sharedAskGate(gateId: string, runtimeTurnId: string): WorkflowGate & { 
 		type: "workflow_gate",
 		gate_id: gateId,
 		runtime_turn_id: runtimeTurnId,
-		stage: "deep-interview",
+		stage,
 		kind: "question",
 		schema,
 		schema_hash: schemaHash(schema),
@@ -1360,7 +1364,11 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				return cursor
 					? {
 							ok: true,
-							page: { items: [sharedAskGate("gate-q12", runtimeTurnId)], complete: true, revision: "q12-r1" },
+							page: {
+								items: [sharedAskGate("gate-q12", runtimeTurnId, "ralplan")],
+								complete: true,
+								revision: "q12-r1",
+							},
 						}
 					: {
 							ok: true,
@@ -1378,7 +1386,12 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			undefined,
 			{
 				controlResult: control =>
-					control.operation === "workflow.gate_answer" ? { status: "accepted" } : undefined,
+					control.operation === "workflow.gate_answer"
+						? {
+								ok: true,
+								result: { status: "accepted", resolved_at: "2026-07-17T00:01:00.000Z" },
+							}
+						: undefined,
 			},
 		);
 		await registerSdkSession(server, root);
@@ -1398,6 +1411,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(question).toMatchObject({
 			question_id: "gate-q12",
 			status: "pending",
+			stage: "ralplan",
 		});
 		expect(JSON.stringify(question)).not.toContain("codec");
 		if (typeof question.answer_binding !== "string") throw new Error("missing answer binding");
@@ -1446,7 +1460,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 	});
 
-	it("rejects malformed complete Q12 snapshots without mutating question authority", async () => {
+	it("diagnoses malformed gate rows without misclassifying legal Q12 pagination", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "unbound";
@@ -1473,10 +1487,13 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const second = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
 		expect(first).toMatchObject({
 			questions: [],
-			diagnostics: expect.arrayContaining([expect.objectContaining({ reason: "pagination_malformed" })]),
-			reconciliation: { complete: false, reason: "pagination_malformed" },
+			diagnostics: expect.arrayContaining([
+				expect.objectContaining({ reason: "missing_runtime_turn", gate_id: "bad-runtime" }),
+				expect.objectContaining({ reason: "unsupported_gate", gate_id: "unsupported" }),
+			]),
+			reconciliation: { complete: true, reason: null },
 		});
-		expect(second).toMatchObject({ questions: [], reconciliation: { complete: false } });
+		expect(second).toMatchObject({ questions: [], reconciliation: { complete: true, reason: null } });
 	});
 
 	it("does not fabricate stale questions from incomplete or paginated Q12 observations", async () => {

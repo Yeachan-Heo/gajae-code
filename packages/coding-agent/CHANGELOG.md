@@ -39,6 +39,9 @@
 - Task output-limit environment overrides now honor values loaded from agent, config-root, and home dotenv files through the shared utils env loader while retaining strict positive safe-integer validation and canonical GJC-first alias precedence.
 - `--thinking` now advertises the supported Effort levels and fails closed with a usage error for invalid, missing, empty, or flag-adjacent values, rather than silently ignoring a token or consuming another flag.
 - MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. An ACP launch that reaches the readiness cutoff before MCP startup now fails fast as a pending startup instead of silently falling back to the ordinary ceiling.
+### Fixed
+
+- Coordinator MCP now reconciles canonical structured questions from every workflow stage without misclassifying row-level gate diagnostics as malformed pagination, and unwraps accepted SDK gate-answer envelopes before reporting the terminal resolution.
 
 ## [0.11.10] - 2026-07-25
 ### Changed
