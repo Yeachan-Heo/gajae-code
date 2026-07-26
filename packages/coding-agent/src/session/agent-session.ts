@@ -6511,6 +6511,9 @@ export class AgentSession {
 	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: AgentMemoryGuardPromotionFence): Promise<void> {
 		const context = this.#recoveryHydrationContext;
 		if (!context) throw new Error("Agent session is not awaiting recovery hydration promotion.");
+		if (!isMemoryGuardClaimsLease(fence.claimsLease)) {
+			throw new Error("Recovery hydration promotion requires a live memory-guard claims lease.");
+		}
 		if (this.#memoryGuardClaimsLease !== fence.claimsLease) {
 			throw new Error("Recovery hydration promotion requires the acquired memory-guard claims lease.");
 		}

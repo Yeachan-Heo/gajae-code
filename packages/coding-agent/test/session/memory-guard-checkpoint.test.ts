@@ -57,7 +57,8 @@ describe("memory guard checkpoint export/restore", () => {
 		if (!model) throw new Error("Expected bundled model");
 		let authority: RecoveryFsRoot | undefined;
 		try {
-			manager.appendMessage({ role: "user", content: "hello checkpoint", timestamp: 0 });
+			manager.appendMessage({ role: "user", content: "x".repeat(1024 * 1024 + 1), timestamp: 0 });
+			manager.appendMessage({ role: "user", content: `blob:sha256:${"a".repeat(64)}`, timestamp: 1 });
 			await manager.setSessionName("checkpoint-session", "user");
 			await manager.flush();
 			const lease = manager.acquireMemoryGuardParticipantIngressLease();

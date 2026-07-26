@@ -567,17 +567,23 @@ async function writeOwnerOnlyFileNoReplace(filePath: string, content: Uint8Array
 	await fsyncDirectoryPath(path.dirname(filePath));
 }
 
-function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set()): Set<string> {
-	if (typeof value === "string") {
-		if (isBlobRef(value)) refs.add(value);
-		return refs;
-	}
+function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set(), key?: string): Set<string> {
+	const addRef = (candidate: unknown): void => {
+		if (typeof candidate === "string" && parseBlobRef(candidate)) refs.add(candidate);
+	};
 	if (Array.isArray(value)) {
-		for (const item of value) collectCheckpointBlobRefs(item, refs);
+		for (const item of value) collectCheckpointBlobRefs(item, refs, key);
 		return refs;
 	}
-	if (value && typeof value === "object") {
-		for (const item of Object.values(value as Record<string, unknown>)) collectCheckpointBlobRefs(item, refs);
+	if (!value || typeof value !== "object") return refs;
+	if (isImageBlock(value) && key === TEXT_CONTENT_KEY) addRef(value.data);
+	if (hasImageUrl(value)) {
+		if (typeof value.image_url === "string") addRef(value.image_url);
+		else addRef(value.image_url.url);
+	}
+	for (const [childKey, item] of Object.entries(value as Record<string, unknown>)) {
+		if (childKey === "data" && key !== TEXT_CONTENT_KEY) addRef(item);
+		collectCheckpointBlobRefs(item, refs, childKey);
 	}
 	return refs;
 }
@@ -684,8 +690,9 @@ function readCheckpointAuthorityFile(
 	relativePath: string,
 	maxBytes: number,
 ): Uint8Array | null {
-	const result = authority.read(relativePath, maxBytes);
-	return result.ok && result.data ? result.data : null;
+	const result = authority.readManaged(relativePath);
+	if (!result.ok || !result.data || result.data.byteLength > maxBytes) return null;
+	return result.data;
 }
 
 function toCanonicalRevisionString(name: keyof SessionManagerRevisionSnapshot, value: number): string {
@@ -8594,11 +8601,26 @@ export class SessionManager {
 		if (!header?.cwd) throw new Error("Session has no valid workspace header.");
 		const projectGjcDir = path.join(path.resolve(header.cwd), ".gjc");
 		if (isProjectSessionTranscriptPath(projectGjcDir, sessionPath)) {
-			const inspected = inspectResumeSessionFile(sessionPath, storage);
-			if ("kind" in inspected) throw new Error("Project session is no longer an authorized candidate.");
-			await fs.promises.unlink(inspected.identity.canonicalPath);
-			await fsyncDirectoryPath(path.dirname(inspected.identity.canonicalPath));
-			return;
+			const relativePath = path.relative(projectGjcDir, path.resolve(sessionPath)).split(path.sep).join("/");
+			const authority = native.openRecoveryFsRoot(projectGjcDir);
+			try {
+				const captured = authority.readManaged(relativePath);
+				if (!captured.ok || !captured.identity || !captured.data || !captured.identity.sha256)
+					throw new Error("Project session is no longer an authorized candidate.");
+				const removed = authority.removeManaged(
+					relativePath,
+					captured.identity.dev,
+					captured.identity.ino,
+					captured.identity.size,
+					captured.identity.mtimeNs,
+					captured.identity.ctimeNs,
+					captured.identity.sha256,
+				);
+				if (!removed.ok) throw new Error(removed.code ?? "Could not delete project session.");
+				return;
+			} finally {
+				authority.close();
+			}
 		}
 		const sessionsRoot = path.resolve(sessionPath, "../..");
 		const resolved = resolveManagedScope({
