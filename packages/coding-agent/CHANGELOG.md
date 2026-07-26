@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Questions about `ultragoal` behavior now stay on the direct-answer path instead of being misclassified as requests to start the durable workflow.
 - Aligned the startup GJC Forge splash border with the composer trailing gutter, including the one-row constrained fallback.
 - `gjc resume` and delete no longer pay a durable (fsync-backed) lock acquisition for managed session tombstones that have nothing left to reconcile; a scope with many accumulated already-completed tombstones opens noticeably faster (#3067).
 
