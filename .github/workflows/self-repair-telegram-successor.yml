@@ -1,0 +1,70 @@
+name: Self-repair Telegram successor
+
+on:
+  push:
+    branches:
+      - successor/telegram-tool-activity-current-v2
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor == 'twoimo'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: successor/telegram-tool-activity-current-v2
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3'
+
+      - name: Move changelog entry to Unreleased
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('packages/coding-agent/CHANGELOG.md')
+          text = path.read_text()
+          entry = '- Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.'
+          text = text.replace(entry + '\n', '')
+          marker = '## [Unreleased]\n'
+          if marker not in text:
+              raise SystemExit('Unreleased section missing')
+          prefix, rest = text.split(marker, 1)
+          unreleased, released = rest.split('\n## [', 1)
+          if '### Changed\n' in unreleased:
+              before, after = unreleased.split('### Changed\n', 1)
+              unreleased = before + '### Changed\n\n' + entry + '\n' + after.lstrip('\n')
+          else:
+              unreleased = '\n### Changed\n\n' + entry + '\n' + unreleased.lstrip('\n')
+          path.write_text(prefix + marker + unreleased.rstrip() + '\n\n## [' + released)
+          PY
+
+      - name: Verify
+        run: |
+          bun install --frozen-lockfile
+          bun test --timeout 30000 \
+            packages/coding-agent/test/notifications-tool-activity.test.ts \
+            packages/coding-agent/test/notifications-telegram-daemon.test.ts \
+            packages/coding-agent/test/sdk-host.test.ts \
+            packages/coding-agent/test/sdk-host-wiring.test.ts \
+            scripts/telegram-daemon-generation-guard.test.ts
+          bun scripts/telegram-daemon-generation-guard.ts --validate-current-tree
+          bun --cwd=packages/coding-agent run check
+          cargo fmt --all -- --check
+
+      - name: Commit verified fix
+        shell: bash
+        run: |
+          git config user.name "twoimo"
+          git config user.email "32544727+twoimo@users.noreply.github.com"
+          git rm .github/workflows/self-repair-telegram-successor.yml
+          git add packages/coding-agent/CHANGELOG.md
+          git commit -m "fix(notifications): refresh tool activity successor"
+          git push origin HEAD:successor/telegram-tool-activity-current-v2
