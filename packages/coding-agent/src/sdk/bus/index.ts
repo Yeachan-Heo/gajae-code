@@ -64,6 +64,7 @@ import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } fro
 import { projectQ10Models } from "../models.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -1891,6 +1892,14 @@ function sdkQuerySurface(
 				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
 			}));
 		},
+		getActiveProviders: () => {
+			try {
+				return ctx.modelRegistry.getActiveProviders(ctx.model);
+			} catch {
+				throw new ActiveProviderResolutionError();
+			}
+		}
+		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
 			const workflowGate = ctx.workflowGate;
@@ -2007,6 +2016,21 @@ function sdkControlSurface(
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
+		const selector = id.trim();
+		const exactMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}` === selector);
+		if (exactMatches.length === 1) return exactMatches[0];
+		if (exactMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
+
+		const normalized = selector.toLowerCase();
+		const caseInsensitiveMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalized);
+		if (caseInsensitiveMatches.length === 1) return caseInsensitiveMatches[0];
+		if (caseInsensitiveMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
 		const [provider, ...modelId] = id.split("/");
 		const model =
 			modelId.length > 0

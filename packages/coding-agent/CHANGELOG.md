@@ -9,6 +9,7 @@
 - Added cross-platform memory-pressure observability with effective host/cgroup limits, configurable GC and restart advisory thresholds, typed Linux process probes, and a Windows Job Object native probe; unsupported lifecycle actions remain advisory-only.
 - Ralplan consensus planning now enforces a finite planner/revision iteration budget at the native write path (default 5, configurable via `gjc.ralplan.maxIterations`). Opening another planner/revision pass past the cap fails closed with exit code 3 and an operator-visible `PLANNING-STUCK` marker instead of silent unbounded re-review; `final`/post-interview escalation remains allowed without auto-implementation. The cap also floors against on-disk `stage-*-{planner,revision}.md` artifacts so a wiped, truncated, or malformed `index.jsonl` cannot fail open after prior openers (#3165).
 - Added `grok-45-eco`, `grok-45-medium`, and `grok-45-pro` built-in xAI presets for `grok-4.5`; every role stays within the model's `high` reasoning cap, while the `xai` provider recommendation remains `grok-medium` to preserve existing defaults (#3177).
+- Added the paginated public SDK query `providers.list/active` (Q28), returning deterministic, deduplicated `{ provider, connectionKind }` descriptors for locally eligible providers without exposing credentials or performing remote health probes.
 
 ### Fixed
 

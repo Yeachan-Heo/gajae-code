@@ -56,6 +56,8 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 export interface ModelResolutionResult<TApi extends Api = Api> {
 	models: Model<TApi>[];
 	stale: boolean;
+	/** Whether this resolution successfully fetched dynamic models. */
+	fetched: boolean;
 }
 
 /**
@@ -147,13 +149,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	) {
 		const cachedModels = passModelList<TApi>(cache.models);
 		if (!hasStaticTransportDrift(staticModels, cachedModels)) {
-			return { models: cachedModels, stale: false };
+			return { models: cachedModels, stale: false, fetched: false };
 		}
 		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
 		if (options.canPublishCache?.() ?? true) {
 			writeModelCache(options.providerId, now(), repairedModels, true, staticFingerprint, dbPath);
 		}
-		return { models: repairedModels, stale: false };
+		return { models: repairedModels, stale: false, fetched: false };
 	}
 
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
@@ -200,6 +202,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	return {
 		models,
 		stale: !dynamicAuthoritative,
+		fetched: shouldFetchFromNetwork && dynamicFetchSucceeded,
 	};
 }
 

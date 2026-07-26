@@ -37,6 +37,7 @@ export interface DiscoveryMergeInput {
 	models: readonly Model<Api>[];
 	state: ProviderDiscoveryState;
 	warning?: string;
+	authGeneration?: string;
 }
 
 export interface ProviderDiscoveryCallbacks<TProvider extends DiscoveryProvider> {
@@ -44,7 +45,8 @@ export interface ProviderDiscoveryCallbacks<TProvider extends DiscoveryProvider>
 	requiresAuth: (provider: TProvider) => boolean;
 	peekApiKey: (provider: TProvider) => Promise<string | undefined>;
 	isAuthenticated: (apiKey: string | undefined) => boolean;
-	fetchModels: (provider: TProvider) => Promise<Model<Api>[]>;
+	fetchModels: (provider: TProvider, apiKey: string | undefined) => Promise<Model<Api>[]>;
+	getEvidenceGeneration?: (provider: TProvider) => string;
 }
 
 /** Owns configured discovery inputs, status, cache lifecycle, and refresh generations. */
@@ -88,6 +90,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 	getState(provider: string): ProviderDiscoveryState | undefined {
 		const state = this.#states.get(provider);
 		return state === undefined ? undefined : this.#snapshot(state);
+	}
+	invalidate(provider: string): void {
+		this.#invalidate(provider);
+		this.#states.delete(provider);
+		this.#lastWarnings.delete(provider);
 	}
 
 	loadCached(provider: TProvider, cacheDbPath?: string): readonly Model<Api>[] {
@@ -133,11 +140,13 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				models: models.map(model => model.id),
 			});
 
+		let apiKey: string | undefined;
 		if (callbacks.requiresAuth(provider)) {
-			const apiKey = await callbacks.peekApiKey(provider);
+			apiKey = await callbacks.peekApiKey(provider);
 			if (!this.isCurrent(token)) return this.#stale(token);
 			if (!callbacks.isAuthenticated(apiKey)) return unauthenticated(cachedModels);
 		}
+		const authGeneration = callbacks.getEvidenceGeneration?.(provider);
 
 		let error: string | undefined;
 		const manager = createModelManager<Api>({
@@ -148,7 +157,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			canPublishCache: () => this.isCurrent(token),
 			fetchDynamicModels: async () => {
 				try {
-					return await callbacks.fetchModels(provider);
+					return await callbacks.fetchModels(provider, apiKey);
 				} catch (cause) {
 					error = cause instanceof Error ? cause.message : String(cause);
 					return null;
@@ -165,9 +174,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				? cached
 					? "cached"
 					: "idle"
-				: result.models.length > 0
+				: result.fetched && result.models.length > 0
 					? "ok"
-					: "empty";
+					: result.models.length > 0
+						? "cached"
+						: "empty";
 		const state: ProviderDiscoveryState = {
 			provider: provider.provider,
 			status,
@@ -177,7 +188,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			models: result.models.map(model => model.id),
 			error,
 		};
-		return this.#complete(token, result.models, state, error);
+		return this.#complete(token, result.models, state, error, authGeneration);
 	}
 
 	#complete(
@@ -185,6 +196,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		models: readonly Model<Api>[],
 		state: ProviderDiscoveryState,
 		error?: string,
+		authGeneration?: string,
 	): DiscoveryMergeInput {
 		const current = this.isCurrent(token);
 		if (current) this.#states.set(token.provider, this.#snapshot(state));
@@ -193,7 +205,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			if (error) this.#lastWarnings.set(token.provider, error);
 			else this.#lastWarnings.delete(token.provider);
 		}
-		return this.#snapshot({ provider: token.provider, token, current, models, state, warning });
+		return this.#snapshot({ provider: token.provider, token, current, models, state, warning, authGeneration });
 	}
 
 	#stale(token: DiscoveryRefreshToken): DiscoveryMergeInput {

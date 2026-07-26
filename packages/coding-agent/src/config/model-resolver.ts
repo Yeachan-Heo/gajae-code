@@ -340,6 +340,15 @@ export function findExactModelReferenceMatch(
 		return undefined;
 	}
 
+	const exactMatches = availableModels.filter(model => `${model.provider}/${model.id}` === trimmedReference);
+	if (exactMatches.length === 1) return exactMatches[0];
+	if (exactMatches.length > 1) return undefined;
+	const normalizedReference = trimmedReference.toLowerCase();
+	const caseInsensitiveMatches = availableModels.filter(
+		model => `${model.provider}/${model.id}`.toLowerCase() === normalizedReference,
+	);
+	if (caseInsensitiveMatches.length === 1) return caseInsensitiveMatches[0];
+	if (caseInsensitiveMatches.length > 1) return undefined;
 	const slashIndex = trimmedReference.indexOf("/");
 	if (slashIndex !== -1) {
 		const provider = trimmedReference.substring(0, slashIndex).trim();
@@ -414,6 +423,13 @@ function tryMatchModel(
 	if (exactRefMatch) {
 		return exactRefMatch;
 	}
+	if (
+		modelPattern.includes("/") &&
+		availableModels.filter(
+			model => `${model.provider}/${model.id}`.toLowerCase() === modelPattern.trim().toLowerCase(),
+		).length > 1
+	)
+		return undefined;
 
 	// Exact canonical ids coalesce provider variants before bare-id matching.
 	const exactCanonicalMatch = findExactCanonicalModelMatch(

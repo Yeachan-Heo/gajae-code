@@ -8,6 +8,7 @@
  * - `SqliteAuthCredentialStore`: concrete SQLite-backed implementation
  */
 import { Database, type Statement } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
@@ -834,6 +835,7 @@ export class AuthStorage {
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#store: AuthCredentialStore;
 	#configValueResolver: (config: string) => Promise<string | undefined>;
+	#resolvedStoredApiKeyValues: Map<string, Map<string, string>> = new Map();
 	#refreshOAuthCredentialOverride?: AuthStorageOptions["refreshOAuthCredential"];
 	#fetchUsageReportsOverride?: AuthStorageOptions["fetchUsageReports"];
 	#sourceLabel?: string;
@@ -848,6 +850,7 @@ export class AuthStorage {
 	 */
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
 	#generation = 1;
+	#providerGenerations = new Map<string, number>();
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<OAuthCredentials>> = new Map();
@@ -904,7 +907,47 @@ export class AuthStorage {
 	getGeneration(): number {
 		return this.#generation;
 	}
-
+	getProviderGeneration(provider: string): number {
+		return this.#providerGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	getProviderEvidenceGeneration(provider: string): string {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider);
+		const credentials = selectedCredential
+			? [selectedCredential.credential]
+			: this.#getCredentialsForProvider(provider);
+		const hasApiKey = credentials.some(credential => credential.type === "api_key");
+		const hasUsableOAuth = credentials.some(
+			credential =>
+				credential.type === "oauth" && Number.isFinite(credential.expires) && credential.expires > Date.now(),
+		);
+		const effectiveEnvKey =
+			this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider) || hasApiKey || hasUsableOAuth
+				? undefined
+				: getEnvApiKey(provider);
+		const storedApiKeyFingerprint = credentials
+			.filter(
+				(credential): credential is Extract<AuthCredential, { type: "api_key" }> => credential.type === "api_key",
+			)
+			.map(
+				credential =>
+					`${credential.key}\u0000${
+						credential.key.startsWith("!")
+							? (this.#resolvedStoredApiKeyValues.get(storageProvider)?.get(credential.key) ?? "")
+							: (process.env[credential.key] ?? credential.key)
+					}`,
+			)
+			.join("\u0001");
+		const storedOAuthFingerprint = credentials
+			.filter((credential): credential is Extract<AuthCredential, { type: "oauth" }> => credential.type === "oauth")
+			.map(credential => `${credential.expires}\u0000${credential.expires > Date.now() ? "usable" : "expired"}`)
+			.join("\u0001");
+		return createHash("sha256")
+			.update(
+				`${this.getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}`,
+			)
+			.digest("hex");
+	}
 	onGenerationChanged(listener: (generation: number) => void): () => void {
 		this.#generationListeners.add(listener);
 		return () => {
@@ -916,8 +959,12 @@ export class AuthStorage {
 		this.#generationListeners.delete(listener);
 	}
 
-	#bumpGeneration(reason: string): void {
+	#bumpGeneration(reason: string, provider?: string): void {
 		this.#generation += 1;
+		if (provider) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			this.#providerGenerations.set(storageProvider, this.getProviderGeneration(storageProvider) + 1);
+		}
 		for (const listener of [...this.#generationListeners]) {
 			try {
 				listener(this.#generation);
@@ -966,7 +1013,7 @@ export class AuthStorage {
 	 */
 	setRuntimeApiKey(provider: string, apiKey: string): void {
 		this.#runtimeOverrides.set(provider, apiKey);
-		this.#bumpGeneration("set-runtime-api-key");
+		this.#bumpGeneration("set-runtime-api-key", provider);
 	}
 
 	/**
@@ -977,20 +1024,22 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		this.#assertCredentialSelectorUsable(storageProvider, selector);
 		this.#runtimeCredentialSelectors.set(storageProvider, selector);
+		this.#bumpGeneration("set-runtime-credential-selector", provider);
 	}
 
 	/**
 	 * Remove a runtime credential selector.
 	 */
 	removeRuntimeCredentialSelector(provider: string): void {
-		this.#runtimeCredentialSelectors.delete(resolveOAuthStorageProvider(provider));
+		if (this.#runtimeCredentialSelectors.delete(resolveOAuthStorageProvider(provider)))
+			this.#bumpGeneration("remove-runtime-credential-selector", provider);
 	}
 
 	/**
 	 * Remove a runtime API key override.
 	 */
 	removeRuntimeApiKey(provider: string): void {
-		if (this.#runtimeOverrides.delete(provider)) this.#bumpGeneration("remove-runtime-api-key");
+		if (this.#runtimeOverrides.delete(provider)) this.#bumpGeneration("remove-runtime-api-key", provider);
 	}
 
 	/** Whether a provider is currently authenticated by a runtime API-key override. */
@@ -1010,14 +1059,14 @@ export class AuthStorage {
 	 */
 	setConfigApiKey(provider: string, apiKey: string): void {
 		this.#configOverrides.set(provider, apiKey);
-		this.#bumpGeneration("set-config-api-key");
+		this.#bumpGeneration("set-config-api-key", provider);
 	}
 
 	/**
 	 * Remove a single config-sourced API key override.
 	 */
 	removeConfigApiKey(provider: string): void {
-		if (this.#configOverrides.delete(provider)) this.#bumpGeneration("remove-config-api-key");
+		if (this.#configOverrides.delete(provider)) this.#bumpGeneration("remove-config-api-key", provider);
 	}
 
 	/**
@@ -1025,9 +1074,10 @@ export class AuthStorage {
 	 * re-parsing `models.yml` so removed entries actually disappear.
 	 */
 	clearConfigApiKeys(): void {
-		if (this.#configOverrides.size === 0) return;
+		const providers = [...this.#configOverrides.keys()];
+		if (providers.length === 0) return;
 		this.#configOverrides.clear();
-		this.#bumpGeneration("clear-config-api-keys");
+		for (const provider of providers) this.#bumpGeneration("clear-config-api-keys", provider);
 	}
 
 	/**
@@ -1092,7 +1142,7 @@ export class AuthStorage {
 		} else {
 			this.#data.set(provider, credentials);
 		}
-		this.#bumpGeneration("credentials");
+		this.#bumpGeneration("credentials", provider);
 	}
 
 	#resolveOAuthDedupeIdentityKey(provider: string, credential: OAuthCredential): string | null {
@@ -3409,6 +3459,15 @@ export class AuthStorage {
 		return undefined;
 	}
 
+	async #resolveStoredApiKey(provider: string, key: string): Promise<string | undefined> {
+		const value = await this.#configValueResolver(key);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const values = this.#resolvedStoredApiKeyValues.get(storageProvider) ?? new Map<string, string>();
+		values.set(key, value ?? "");
+		this.#resolvedStoredApiKeyValues.set(storageProvider, values);
+		return value;
+	}
+
 	/**
 	 * Peek at API key for a provider without refreshing OAuth tokens.
 	 * Used for model discovery where we only need to know if credentials exist
@@ -3426,12 +3485,31 @@ export class AuthStorage {
 			return configKey;
 		}
 
-		const apiKeySelection = this.#selectCredentialByType(provider, "api_key");
-		if (apiKeySelection) {
-			return this.#configValueResolver(apiKeySelection.credential.key);
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider);
+		if (selectedCredential?.credential.type === "api_key") {
+			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 		}
 
 		// Return current OAuth access token only if it is not already expired.
+		if (selectedCredential?.credential.type === "oauth") {
+			const expiresAt = selectedCredential.credential.expires;
+			if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+				if (provider === "github-copilot") {
+					return JSON.stringify({
+						token: selectedCredential.credential.access,
+						enterpriseUrl: selectedCredential.credential.enterpriseUrl,
+					});
+				}
+				return selectedCredential.credential.access;
+			}
+			return undefined;
+		}
+
+		const apiKeySelection = this.#selectCredentialByType(provider, "api_key");
+		if (apiKeySelection) {
+			return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+		}
+
 		const oauthSelection = this.#selectCredentialByType(provider, "oauth");
 		if (oauthSelection) {
 			const expiresAt = oauthSelection.credential.expires;
@@ -3483,14 +3561,14 @@ export class AuthStorage {
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
-			return this.#configValueResolver(selectedCredential.credential.key);
+			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 		}
 
 		if (!selectedCredential) {
 			const apiKeySelection = this.#selectCredentialByType(provider, "api_key", sessionId);
 			if (apiKeySelection) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
-				return this.#configValueResolver(apiKeySelection.credential.key);
+				return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 			}
 		}
 
