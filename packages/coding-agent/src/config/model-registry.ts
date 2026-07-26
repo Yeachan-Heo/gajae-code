@@ -2082,6 +2082,12 @@ export class ModelRegistry {
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
 				});
 			}
+			if (
+				(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) !== generation ||
+				this.authStorage.getProviderEvidenceGeneration(options.providerId) !== authGeneration
+			) {
+				return [];
+			}
 			return models;
 		} catch (error) {
 			if (

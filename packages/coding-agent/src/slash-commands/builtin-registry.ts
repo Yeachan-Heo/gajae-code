@@ -286,11 +286,8 @@ function parseProviderQualifiedSelector(
 		normalizedSelector.startsWith(`${candidate.toLowerCase()}/`),
 	);
 	const provider =
-		exactProviders.length === 1
-			? exactProviders[0]
-			: exactProviders.length === 0 && caseFoldedProviders.length === 1
-				? caseFoldedProviders[0]
-				: undefined;
+		[...exactProviders].sort((left, right) => right.length - left.length)[0] ??
+		(exactProviders.length === 0 && caseFoldedProviders.length === 1 ? caseFoldedProviders[0] : undefined);
 	if (provider) {
 		const modelId = splitSelector.baseSelector.slice(provider.length + 1);
 		return modelId ? { provider, modelId } : undefined;
