@@ -458,6 +458,12 @@ export interface CreateAgentSessionOptions {
 	sdkHostModeSupported?: boolean;
 	/** Override configured Discord/Slack daemon readiness, primarily for embedded hosts and deterministic tests. */
 	ensureNotificationProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
+	/**
+	 * Graceful shutdown owned by the launcher. A broker-spawned host uses this to
+	 * reclaim itself once its client is gone, so the session is disposed and persisted
+	 * instead of the process exiting from inside an extension.
+	 */
+	requestSessionShutdown?: (reason: string) => void;
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation forwarded to the underlying Agent.
@@ -1890,6 +1896,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						spawnedByGjc,
 						sdkHostModeSupported: options.sdkHostModeSupported,
 						ensureProviderDaemon: options.ensureNotificationProviderDaemon,
+						requestShutdown: options.requestSessionShutdown,
 						runBtwTurn: async (question, signal) => {
 							if (!session) throw new Error("Ephemeral turns are unavailable.");
 							const { replyText } = await session.runEphemeralTurn({

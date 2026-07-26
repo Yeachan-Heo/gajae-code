@@ -2904,6 +2904,12 @@ async function executeLifecycleResponse(
 					GJC_STATE_ROOT: launch.root,
 					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
 					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+					// The host reclaims itself when its client is gone; forward the tuning knob
+					// and the client's pid, since a killed client sends no connection-close.
+					...(process.env.GJC_SDK_HOST_IDLE_REAP_MS
+						? { GJC_SDK_HOST_IDLE_REAP_MS: process.env.GJC_SDK_HOST_IDLE_REAP_MS }
+						: {}),
+					...(process.env.GJC_SDK_CLIENT_PID ? { GJC_SDK_CLIENT_PID: process.env.GJC_SDK_CLIENT_PID } : {}),
 				},
 			});
 			child = spawned;

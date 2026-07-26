@@ -9,6 +9,9 @@ export interface AcpModeOptions {
 }
 
 export function createAcpConnection(transport: Stream, options: AcpModeOptions = {}): AgentSideConnection {
+	// Session hosts outlive this process and a killed client sends no connection-close,
+	// so publish the pid they should watch for liveness before any host is launched.
+	process.env.GJC_SDK_CLIENT_PID ??= String(process.pid);
 	return new AgentSideConnection(conn => new AcpAgent(conn, options), transport);
 }
 

@@ -1983,6 +1983,12 @@ function sdkControlSurface(
 	gatePresentations: PresentationArbiter | undefined,
 	api: ExtensionAPI,
 	isBusy: () => boolean,
+	/**
+	 * Discard prompts that were accepted but never reached `agent_start`. Only that
+	 * event drains them, so a turn aborted before it starts would otherwise leave the
+	 * session permanently "busy" and refuse every later prompt.
+	 */
+	discardUnstartedPrompts: () => void,
 	onPromptAccepted: (
 		correlation: { commandId: string; turnId: string },
 		requesterConnectionId?: string,
@@ -2073,6 +2079,10 @@ function sdkControlSurface(
 	const awaitAbortReady = async () => {
 		cancelPendingPreflights();
 		await (ctx.abort as () => unknown)();
+		// `isSessionBusy()` counts pending prompt correlations, and a prompt aborted
+		// before `agent_start` never drains its own. Without this the loop below would
+		// wait forever on a turn that can no longer start.
+		discardUnstartedPrompts();
 		while (isSessionBusy()) {
 			await Bun.sleep(10);
 		}
@@ -2203,6 +2213,9 @@ function sdkControlSurface(
 		abort: () => {
 			cancelPendingPreflights();
 			ctx.abort();
+			// A prompt aborted before `agent_start` never drains its pending correlation,
+			// which would keep the session busy forever.
+			discardUnstartedPrompts();
 			return { aborted: true };
 		},
 		abortAndPrompt: async text => {
@@ -2590,6 +2603,26 @@ const EPHEMERAL_TURN_TTL_MS = 300_000;
 const EPHEMERAL_TURN_MAX_RECORDS = 256;
 const EPHEMERAL_TURN_MAX_ACTIVE_PER_SESSION = 2;
 const EPHEMERAL_TURN_MAX_RESULT_BYTES = 262_144;
+
+/** Read a positive integer millisecond override, ignoring junk values. */
+function positiveEnvMs(value: string | undefined): number | undefined {
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** Read a positive integer process id, ignoring junk values. */
+function positivePid(value: string | undefined): number | undefined {
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * A broker-spawned session host outlives its client so the client can reconnect.
+ * Reclaim one only after this long with no live client and no work in flight, so a
+ * crashed or force-quit client cannot leak the process forever.
+ */
+const SESSION_HOST_IDLE_REAP_MS = positiveEnvMs(process.env.GJC_SDK_HOST_IDLE_REAP_MS) ?? 30 * 60_000;
+const SESSION_HOST_IDLE_POLL_MS = Math.min(60_000, Math.max(250, Math.floor(SESSION_HOST_IDLE_REAP_MS / 4)));
 
 interface EphemeralTurnTuple {
 	sessionId: string;
@@ -3018,6 +3051,12 @@ export function createNotificationsExtension(
 		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 		readNotificationFile?: (path: string) => Promise<Buffer>;
 		readNotificationDiffStat?: (cwd: string) => Promise<string | undefined>;
+		/**
+		 * Graceful shutdown owned by the lifecycle host. The idle reaper uses this so a
+		 * reclaimed host still runs full session disposal (job drain, MCP/LSP teardown,
+		 * `session_shutdown`, persistence) instead of exiting the process from here.
+		 */
+		requestShutdown?: (reason: string) => void;
 	} = {},
 ): void {
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
@@ -3382,6 +3421,30 @@ export function createNotificationsExtension(
 		};
 
 		const hostCapCache = new Map<string, ReadonlySet<string>>();
+		let idleReaperTimer: ReturnType<typeof setInterval> | undefined;
+		let unusedSince: number | undefined = lifecycleRequired ? Date.now() : undefined;
+		/**
+		 * Connection-close callbacks do not arrive when a client is killed rather than
+		 * closed, so a stale capability entry cannot prove a peer is alive. The launching
+		 * client's pid is the authoritative signal for THAT client, but a later client can
+		 * reattach to this same host, so a live connection always wins.
+		 */
+		const clientPid = positivePid(process.env.GJC_SDK_CLIENT_PID);
+		const launcherAlive = (): boolean => {
+			if (clientPid === undefined) return true;
+			try {
+				process.kill(clientPid, 0);
+				return true;
+			} catch (error) {
+				return (error as NodeJS.ErrnoException).code === "EPERM";
+			}
+		};
+		const noteHostInUse = () => {
+			if (unusedSince !== undefined) unusedSince = undefined;
+		};
+		const noteHostMaybeUnused = () => {
+			if (lifecycleRequired && hostCapCache.size === 0) unusedSince ??= Date.now();
+		};
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -3660,6 +3723,14 @@ export function createNotificationsExtension(
 			gatePresentations,
 			api,
 			() => runtime?.busy === true || pendingPromptCorrelations.length > 0,
+			() => {
+				// Correlations still queued here never reached `agent_start`, so nothing else
+				// will ever drain them. Route through the failure path so reconciliation
+				// reaches a terminal state instead of staying `accepted` forever.
+				for (const correlation of [...pendingPromptCorrelations])
+					recordPromptFailure(correlation, new Error("Prompt aborted before the turn started."));
+				pendingPromptCorrelations.length = 0;
+			},
 			recordPromptAccepted,
 			recordPromptFailure,
 			() => runtime?.stopping !== true,
@@ -4059,6 +4130,7 @@ export function createNotificationsExtension(
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
 				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
+				noteHostInUse();
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
@@ -4066,6 +4138,7 @@ export function createNotificationsExtension(
 				hostCapCache.delete(connectionId);
 				for (const submission of promptSubmissions.values())
 					if (submission.connectionId === connectionId) abandonPrompt(submission);
+				noteHostMaybeUnused();
 			});
 
 			server.onReply((err, reply) => {
@@ -4564,6 +4637,45 @@ export function createNotificationsExtension(
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
 				}
+			}
+
+			if (lifecycleRequired) {
+				idleReaperTimer = setInterval(() => {
+					const runtime = runtimes.get(id);
+					// Stop polling once this runtime is gone or replaced; the timer is ref'd, so
+					// leaving it armed would also keep the process alive.
+					if (!runtime || runtime !== initializedRuntime || runtime.stopping) {
+						if (runtime !== initializedRuntime || runtime?.stopping) {
+							if (idleReaperTimer) clearInterval(idleReaperTimer);
+							idleReaperTimer = undefined;
+						}
+						return;
+					}
+					// A live launcher, a live connection, or a turn in flight all mean the host
+					// is still wanted. A reattached client keeps it alive even once the process
+					// that originally launched it is gone.
+					if (
+						launcherAlive() ||
+						hostCapCache.size > 0 ||
+						runtime.busy ||
+						runtime.pendingPromptCorrelations.length > 0
+					) {
+						unusedSince = undefined;
+						return;
+					}
+					unusedSince ??= Date.now();
+					if (Date.now() - unusedSince < SESSION_HOST_IDLE_REAP_MS) return;
+					logger.info(
+						`sdk: reclaiming session host ${id} after ${Math.round(SESSION_HOST_IDLE_REAP_MS / 60_000)}m with no client connection.`,
+					);
+					if (idleReaperTimer) clearInterval(idleReaperTimer);
+					idleReaperTimer = undefined;
+					// Hand shutdown to the lifecycle owner so the session is disposed and
+					// persisted; exiting from here would skip job drain and teardown.
+					options.requestShutdown?.("idle-reap");
+				}, SESSION_HOST_IDLE_POLL_MS);
+				// Deliberately not unref'd: this timer is the only thing that reclaims a host
+				// whose client vanished, so it must keep the event loop alive to fire at all.
 			}
 
 			const startedRuntime = initializedRuntime;

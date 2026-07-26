@@ -374,6 +374,9 @@ export async function runSessionHost(
 				sessionManager: opened.sessionManager,
 				...(mcpConfigPath ? { mcpConfigPath } : {}),
 				...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
+				// The idle reaper reclaims this host once its client is gone; route that
+				// through the same graceful teardown a signal would use.
+				requestSessionShutdown: () => stop(),
 			});
 		} catch (error) {
 			throw await registrationFailure(error);
