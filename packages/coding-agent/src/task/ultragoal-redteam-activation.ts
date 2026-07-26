@@ -8,8 +8,7 @@
  * completion QA/red-team or asks for `executorQa` red-team evidence."
  */
 
-const ULTRAGOAL_COMPLETION_QA =
-	/\bultragoal\s+completion\s+(?:qa|red[-\s]?team)\b/i;
+const ULTRAGOAL_COMPLETION_QA = /\bultragoal\s+completion\s+(?:qa|red[-\s]?team)\b/i;
 
 /** `executorQa` within a short window of red-team / matrix / evidence framing. */
 const EXECUTOR_QA_EVIDENCE =
@@ -21,7 +20,5 @@ const EXECUTOR_QA_LANE = /\bexecutor\b[\s\S]{0,48}\b(?:qa|red[-\s]?team)\s+lane\
 export function assignmentRequestsUltragoalRedTeam(assignment: string | undefined): boolean {
 	const text = assignment?.trim() ?? "";
 	if (text.length === 0) return false;
-	return (
-		ULTRAGOAL_COMPLETION_QA.test(text) || EXECUTOR_QA_EVIDENCE.test(text) || EXECUTOR_QA_LANE.test(text)
-	);
+	return ULTRAGOAL_COMPLETION_QA.test(text) || EXECUTOR_QA_EVIDENCE.test(text) || EXECUTOR_QA_LANE.test(text);
 }

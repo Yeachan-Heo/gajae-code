@@ -53,7 +53,6 @@ import { validateAllocatedTaskId } from "./id";
 import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
-import { assignmentRequestsUltragoalRedTeam } from "./ultragoal-redteam-activation";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -68,6 +67,7 @@ import {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	type TaskToolDetails,
 } from "./types";
+import { assignmentRequestsUltragoalRedTeam } from "./ultragoal-redteam-activation";
 
 /** Agent event types to forward for progress tracking. */
 const agentEventTypes = new Set<AgentEvent["type"]>([
