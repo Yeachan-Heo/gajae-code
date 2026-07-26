@@ -40,9 +40,10 @@ interface RouteMatch {
 const PROMPT_PREVIEW_LIMIT = 240;
 
 const DURABLE_TRACKING_PATTERNS = [
-	/\/skill:ultragoal\b/i,
+	/^\s*\/skill:ultragoal\b/i,
 	/\b(?:use|run|start|create|activate|invoke|execute)\s+(?:the\s+)?ultragoal\b/i,
 	/\bultragoal(?:로|으로)[^.!?\n]{0,40}(?:해|진행|실행|관리|처리)/i,
+	/\bultragoal(?:을|를)\s+(?:(?:사용|실행|시작|활성화|호출|진행|관리|처리)(?:해줘|해주세요|하세요)|(?:써|쓰)(?:줘|주세요|세요)|해줘|해주세요|하세요)/i,
 	/\bdurable (?:goal|tracking|ledger|plan)\b/i,
 	/\b(?:goal|tracking|plan) ledger\b/i,
 	/\bcheckpoint(?:ed|ing)? (?:goal|plan|workflow|release|work)\b/i,

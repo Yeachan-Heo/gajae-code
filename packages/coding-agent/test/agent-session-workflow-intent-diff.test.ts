@@ -195,12 +195,44 @@ describe("AgentSession workflow intent-diff tracking", () => {
 			"ultragoal 같은거 쓰면 합의 몇번이나 하게 되어 있음? 끝도 없이 하는 경우도 있는거 같은데 제약 할수 있는 옵션 있음?",
 		);
 
-		for (const entry of workflowIntentEntries()) {
+		const entries = workflowIntentEntries();
+		expect(entries).toHaveLength(2);
+
+		for (const entry of entries) {
 			expect(entry.data).toMatchObject({
 				route: "direct",
 				directTracking: "custom-entry-only",
 			});
 		}
+	});
+
+	it("distinguishes slash-command invocations from questions that mention the command", async () => {
+		await session.prompt("How many consensus rounds does /skill:ultragoal run, and can I limit them?");
+		await session.prompt("/skill:ultragoal");
+
+		const [question, invocation] = workflowIntentEntries();
+		expect(question?.data).toMatchObject({
+			route: "direct",
+			directTracking: "custom-entry-only",
+		});
+		expect(invocation?.data).toMatchObject({
+			route: "ultragoal",
+			recommendedSkill: "ultragoal",
+			recommendedInvocation: "/skill:ultragoal",
+			directTracking: "not-direct",
+		});
+	});
+
+	it("routes Korean object-particle ultragoal requests to the durable workflow", async () => {
+		await session.prompt("ultragoal을 사용해줘");
+
+		const [entry] = workflowIntentEntries();
+		expect(entry?.data).toMatchObject({
+			route: "ultragoal",
+			recommendedSkill: "ultragoal",
+			recommendedInvocation: "/skill:ultragoal",
+			directTracking: "not-direct",
+		});
 	});
 
 	it("lets ambiguous requirements take precedence over durable tracking words", async () => {
