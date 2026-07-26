@@ -567,6 +567,8 @@ async function writeOwnerOnlyFileNoReplace(filePath: string, content: Uint8Array
 	await fsyncDirectoryPath(path.dirname(filePath));
 }
 
+const MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES = 64 * 1024 * 1024;
+
 function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set(), key?: string): Set<string> {
 	const addRef = (candidate: unknown): void => {
 		if (typeof candidate === "string" && parseBlobRef(candidate)) refs.add(candidate);
@@ -6587,6 +6589,8 @@ export class SessionManager {
 		if (captured.kind !== "captured") {
 			throw new Error(`memory_guard_checkpoint_capture_failed:${captured.reason}`);
 		}
+		if (captured.snapshot.content.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
+			throw new Error("memory_guard_checkpoint_transcript_capacity_exceeded");
 		const transcriptText = decodeCheckpointUtf8(captured.snapshot.content);
 		if (transcriptText === null) throw new Error("memory_guard_checkpoint_transcript_unreadable");
 		const entries = parseSessionEntries(transcriptText);
@@ -6609,6 +6613,8 @@ export class SessionManager {
 				this.#residentImageBlobStore.getCheckedSync(hash) ??
 				this.#blobStore.getCheckedSync(hash);
 			if (!data) throw new Error(`memory_guard_checkpoint_blob_missing:${hash}`);
+			if (data.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
+				throw new Error(`memory_guard_checkpoint_blob_capacity_exceeded:${hash}`);
 			const relativePath = hash;
 			await writeOwnerOnlyFile(path.join(input.checkpointRoot, blobRootRelativePath, relativePath), data);
 			blobManifestEntries.push({
