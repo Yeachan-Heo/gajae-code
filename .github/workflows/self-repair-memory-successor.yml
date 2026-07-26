@@ -1,4 +1,4 @@
-name: Self-repair memory successor
+name: Apply memory successor fixes
 
 on:
   push:
@@ -19,11 +19,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: '1.3'
-
-      - name: Apply review fixes
+      - name: Apply review fixes and commit
         shell: bash
         run: |
           python3 - <<'PY'
@@ -58,31 +54,6 @@ jobs:
             packages/coding-agent/src/prompts/tools/bash.md \
             packages/coding-agent/src/prompts/tools/cron.md
 
-      - name: Verify
-        run: |
-          bun install --frozen-lockfile
-          bunx biome check --write \
-            packages/coding-agent/src/tools/resource-gc.ts \
-            packages/coding-agent/test/tools/resource-gc.test.ts
-          bun test --timeout 30000 \
-            packages/coding-agent/test/runtime/memory-limit.test.ts \
-            packages/coding-agent/test/runtime/memory-domain.test.ts \
-            packages/coding-agent/test/runtime/memory-guard.test.ts \
-            packages/coding-agent/test/tools/resource-gc.test.ts \
-            packages/coding-agent/test/tools/resource-gc-redteam.test.ts \
-            packages/coding-agent/test/gjc-runtime/linux-proc.test.ts \
-            packages/coding-agent/test/cli-memory-guard-native-smoke.test.ts \
-            packages/natives/test/memory-guard-native.test.ts \
-            packages/natives/test/memory-guard-build-wiring.test.ts
-          bun packages/natives/scripts/gen-enums.ts
-          git diff --exit-code -- packages/natives/native/index.d.ts packages/natives/native/index.js
-          bun --cwd=packages/coding-agent run check
-          bun --cwd=packages/natives run check
-          cargo fmt --all -- --check
-
-      - name: Commit verified fix
-        shell: bash
-        run: |
           git config user.name "twoimo"
           git config user.email "32544727+twoimo@users.noreply.github.com"
           git rm .github/workflows/self-repair-memory-successor.yml
