@@ -40,11 +40,7 @@ async function readTaskOutputLimits(
 		await fs.mkdir(agentDir, { recursive: true });
 
 		const dotenvDirectory =
-			options.dotenv.location === "agent"
-				? agentDir
-				: options.dotenv.location === "config-root"
-					? configRoot
-					: home;
+			options.dotenv.location === "agent" ? agentDir : options.dotenv.location === "config-root" ? configRoot : home;
 		const dotenvContents = Object.entries(options.dotenv.values)
 			.map(([key, value]) => `${key}=${value}`)
 			.join("\n");
@@ -106,11 +102,15 @@ describe("task output limit environment parsing", () => {
 		).toEqual({ bytes: 32_000, lines: 125 });
 	});
 
-	it.each(["agent", "config-root", "home"] as const)(
-		"honors task output limits from the %s dotenv file managed by utils",
-		async location => {
-			expect(
-				await readTaskOutputLimits({}, {
+	it.each([
+		"agent",
+		"config-root",
+		"home",
+	] as const)("honors task output limits from the %s dotenv file managed by utils", async location => {
+		expect(
+			await readTaskOutputLimits(
+				{},
+				{
 					dotenv: {
 						location,
 						values: {
@@ -118,10 +118,10 @@ describe("task output limit environment parsing", () => {
 							GJC_TASK_MAX_OUTPUT_LINES: "250",
 						},
 					},
-				}),
-			).toEqual({ bytes: 64_000, lines: 250 });
-		},
-	);
+				},
+			),
+		).toEqual({ bytes: 64_000, lines: 250 });
+	});
 
 	it.each([
 		"500000oops",
