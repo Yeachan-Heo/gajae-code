@@ -20131,6 +20131,40 @@ describe("forum_topic_created user-topic adoption", () => {
 		});
 		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
 	});
+	test("control-unavailable create removes the intent so the same topic can retry", async () => {
+		const agentDir = tempAgentDir();
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		const daemonRuntime = daemon as unknown as {
+			submitLifecycleFrame: (frame: SessionLifecycleRequest) => Promise<SessionLifecycleResponse>;
+		};
+		const daemonPrototype = Object.getPrototypeOf(daemon) as typeof daemonRuntime;
+		daemonRuntime.submitLifecycleFrame = daemonPrototype.submitLifecycleFrame.bind(daemon);
+		await authorizePendingTopic(daemon, 93, 593);
+
+		for (const updateId of [94, 95]) {
+			await daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from: { id: 42, is_bot: false },
+					message_thread_id: 593,
+					text: `/session_create path ${dir}`,
+				},
+			});
+			expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		}
+
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.message_thread_id === 593 &&
+					String(call.body.text).includes("Nothing was left running"),
+			),
+		).toHaveLength(2);
+	});
 
 	test("readiness_timeout retains the durable intent (late spawn within TTL)", async () => {
 		const agentDir = tempAgentDir();
