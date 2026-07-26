@@ -1,7 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
+import {
+	evaluateRalplanIterationCap,
+	PLANNING_STUCK_MARKER,
+	RALPLAN_DEFAULT_MAX_ITERATIONS,
+	runNativeRalplanCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
 	GJC_RALPLAN_ARTIFACT_ENV,
 	GJC_RESTRICTED_ROLE_AGENT_BASH_ENV,
@@ -1152,5 +1157,125 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		const after = await readState(root);
 		expect(after.active).toBe(false);
 		expect(after.current_phase).toBe("complete");
+	});
+});
+describe("ralplan consensus iteration cap (#3165)", () => {
+	it("evaluateRalplanIterationCap allows openers up to max and rejects the next", () => {
+		const rows = [
+			{ stage: "planner", stageN: 1 },
+			{ stage: "architect", stageN: 1 },
+			{ stage: "critic", stageN: 1 },
+			{ stage: "revision", stageN: 2 },
+			{ stage: "revision", stageN: 3 },
+			{ stage: "revision", stageN: 4 },
+			{ stage: "revision", stageN: 5 },
+		];
+		expect(evaluateRalplanIterationCap({ rows, stage: "revision" })).toMatchObject({
+			allowed: false,
+			currentIterations: 5,
+			projectedIterations: 6,
+			maxIterations: RALPLAN_DEFAULT_MAX_ITERATIONS,
+		});
+		expect(evaluateRalplanIterationCap({ rows, stage: "final" }).allowed).toBe(true);
+		expect(evaluateRalplanIterationCap({ rows, stage: "architect" }).allowed).toBe(true);
+		expect(
+			evaluateRalplanIterationCap({
+				rows: [{ stage: "planner", stageN: 1 }],
+				stage: "revision",
+				maxIterations: 2,
+			}).allowed,
+		).toBe(true);
+		expect(
+			evaluateRalplanIterationCap({
+				rows: [
+					{ stage: "planner", stageN: 1 },
+					{ stage: "revision", stageN: 2 },
+				],
+				stage: "revision",
+				maxIterations: 2,
+			}).allowed,
+		).toBe(false);
+	});
+
+	it("rejects a 6th revision opener with PLANNING-STUCK and still allows final", async () => {
+		const root = await tempDir();
+		const runId = "cap-run";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p1")).status).toBe(0);
+		expect((await write("architect", 1, "# a1")).status).toBe(0);
+		expect((await write("critic", 1, "Verdict: ITERATE")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+			expect((await write("architect", n, `# a${n}`)).status).toBe(0);
+			expect((await write("critic", n, "Verdict: ITERATE")).status).toBe(0);
+		}
+
+		const stuck = await write("revision", 6, "# r6 perpetual iterate");
+		expect(stuck.status).toBe(3);
+		expect(stuck.stdout).toContain(PLANNING_STUCK_MARKER);
+		expect(stuck.stderr).toContain(PLANNING_STUCK_MARKER);
+		const payload = JSON.parse(stuck.stdout ?? "{}");
+		expect(payload).toMatchObject({
+			ok: false,
+			planning_stuck: true,
+			marker: PLANNING_STUCK_MARKER,
+			max_iterations: 5,
+			projected_iteration: 6,
+		});
+
+		const final = await write("final", 6, "# best effort pending approval");
+		expect(final.status).toBe(0);
+		expect(final.stdout).toContain("pending_approval_path");
+	});
+
+	it("honors project settings maxIterations=2 and resets budget on new run_id", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { maxIterations: 2 } } }),
+			"utf-8",
+		);
+
+		const write = async (runId: string, stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("run-a", "planner", 1, "# p")).status).toBe(0);
+		expect((await write("run-a", "revision", 2, "# r2")).status).toBe(0);
+		const stuck = await write("run-a", "revision", 3, "# r3");
+		expect(stuck.status).toBe(3);
+		expect(JSON.parse(stuck.stdout ?? "{}").max_iterations).toBe(2);
+
+		// Fresh run_id must not inherit the stuck budget.
+		expect((await write("run-b", "planner", 1, "# p-b")).status).toBe(0);
+		expect((await write("run-b", "revision", 2, "# r2-b")).status).toBe(0);
+	});
+
+	it("dedupes an identical revision write at the cap without PLANNING-STUCK", async () => {
+		const root = await tempDir();
+		const runId = "dedupe-cap";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+		}
+		const first = await write("revision", 5, "# r5");
+		expect(first.status).toBe(0);
+		const payload = JSON.parse(first.stdout ?? "{}");
+		expect(payload.deduplicated).toBe(true);
+		expect(payload.planning_stuck).toBeUndefined();
 	});
 });
