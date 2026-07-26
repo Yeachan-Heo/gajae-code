@@ -554,6 +554,18 @@ async function writeOwnerOnlyFile(filePath: string, content: Uint8Array | string
 	await fs.promises.chmod(filePath, 0o600).catch(() => undefined);
 	await fsyncDirectoryPath(path.dirname(filePath));
 }
+async function writeOwnerOnlyFileNoReplace(filePath: string, content: Uint8Array | string): Promise<void> {
+	await ensureOwnerOnlyDirectory(path.dirname(filePath));
+	const handle = await fs.promises.open(filePath, "wx", 0o600);
+	try {
+		await handle.writeFile(content);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await fs.promises.chmod(filePath, 0o600).catch(() => undefined);
+	await fsyncDirectoryPath(path.dirname(filePath));
+}
 
 function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set()): Set<string> {
 	if (typeof value === "string") {
@@ -4602,6 +4614,7 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	async setSessionFile(sessionFile: string): Promise<void> {
+		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const strictAdoption = this.#pendingStrictAdoption;
 		this.#pendingStrictAdoption = undefined;
@@ -6548,11 +6561,12 @@ export class SessionManager {
 	}
 
 	#stageMemoryGuardCheckpointBlobs(blobs: Map<string, Buffer>): void {
-		const stagedStore = new MemoryBlobStore();
-		for (const blob of blobs.values()) stagedStore.putSync(blob);
-		this.#disposeResidentTextBlobStore();
-		this.#residentTextBlobStore = stagedStore;
-		this.#residentImageBlobStore = stagedStore;
+		const stagedImageStore = new MemoryBlobStore();
+		for (const blob of blobs.values()) {
+			this.#residentTextBlobStore.putSync(blob);
+			stagedImageStore.putSync(blob);
+		}
+		this.#residentImageBlobStore = stagedImageStore;
 		this.#memoryGuardCheckpointBlobs = blobs;
 	}
 
@@ -6905,7 +6919,11 @@ export class SessionManager {
 	 * @param source - "user" for explicit renames (/rename command, RPC); "auto" for generated titles.
 	 *   Auto-generated titles are silently ignored when the user has already set a name.
 	 */
+	#assertRecoveryHydrationWritable(): void {
+		if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
+	}
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
+		this.#assertRecoveryHydrationWritable();
 		// User-set names take permanent precedence over auto-generated ones.
 		if (this.#titleSource === "user" && source === "auto") return false;
 
@@ -7031,6 +7049,7 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
+		this.#assertRecoveryHydrationWritable();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = prepareEntryForResidentSync(normalizedEntry, this.#residentBlobStores()) as SessionEntry;
 		this.#fileEntries.push(residentEntry);
@@ -7249,6 +7268,7 @@ export class SessionManager {
 	 * the canonical store. This applies such mutations for real.
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
+		this.#assertRecoveryHydrationWritable();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "message") continue;
@@ -7265,6 +7285,7 @@ export class SessionManager {
 
 	/** Write mutated custom-message entries back into the canonical entry store by id. */
 	applyCustomMessageEntryUpdates(entries: readonly CustomMessageEntry[]): void {
+		this.#assertRecoveryHydrationWritable();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "custom_message") continue;
@@ -7284,6 +7305,7 @@ export class SessionManager {
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */
 	async rewriteEntries(): Promise<void> {
+		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
 	}
@@ -8297,7 +8319,20 @@ export class SessionManager {
 			relativeToManagedRoot === "" ||
 			(!relativeToManagedRoot.startsWith("..") && !path.isAbsolute(relativeToManagedRoot));
 
-		if (!isManagedPath) return filePath;
+		if (!isManagedPath) {
+			assertManagedDestinationBound();
+			const adoptedName = `${header.id}-${inspected.identity.sha256.slice(0, 12)}.jsonl`;
+			try {
+				await managedDestinationStore.publishNoReplace(adoptedName, inspected.content);
+			} catch (error) {
+				if (!(error instanceof Error && error.message.includes("destination_conflict"))) throw error;
+			}
+			const adoptedPath = path.join(destination.directory, adoptedName);
+			const adopted = inspectResumeSessionFile(adoptedPath, storage);
+			if ("kind" in adopted || adopted.identity.sha256 !== inspected.identity.sha256)
+				throw new Error("Managed adoption did not preserve the selected session.");
+			return adoptedPath;
+		}
 		assertManagedDestinationBound();
 		const resolved = resolveManagedScope({
 			cwd: header.cwd,
@@ -8551,12 +8586,20 @@ export class SessionManager {
 		}
 	}
 
-	/** Tombstone and exact-delete a default-managed candidate. */
+	/** Delete an authorized managed or project-local picker candidate. */
 	static async deleteManagedCandidate(sessionPath: string): Promise<void> {
 		const storage = new FileSessionStorage();
 		const entries = await loadEntriesFromFile(sessionPath, storage);
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (!header?.cwd) throw new Error("Session has no valid managed workspace header.");
+		if (!header?.cwd) throw new Error("Session has no valid workspace header.");
+		const projectGjcDir = path.join(path.resolve(header.cwd), ".gjc");
+		if (isProjectSessionTranscriptPath(projectGjcDir, sessionPath)) {
+			const inspected = inspectResumeSessionFile(sessionPath, storage);
+			if ("kind" in inspected) throw new Error("Project session is no longer an authorized candidate.");
+			await fs.promises.unlink(inspected.identity.canonicalPath);
+			await fsyncDirectoryPath(path.dirname(inspected.identity.canonicalPath));
+			return;
+		}
 		const sessionsRoot = path.resolve(sessionPath, "../..");
 		const resolved = resolveManagedScope({
 			cwd: header.cwd,
@@ -8838,7 +8881,12 @@ export class SessionManager {
 		const seenBlobPaths = new Set<string>();
 		const checkpointBlobs = new Map<string, Buffer>();
 		for (const entry of blobManifest.entries) {
-			if (seenBlobPaths.has(entry.relative_path)) return { kind: "blocked", reason: "blob-manifest-mismatch" };
+			if (
+				entry.relative_path !== entry.sha256 ||
+				seenBlobPaths.has(entry.relative_path) ||
+				checkpointBlobs.has(entry.sha256)
+			)
+				return { kind: "blocked", reason: "blob-manifest-mismatch" };
 			seenBlobPaths.add(entry.relative_path);
 			const blobBytes = Number(entry.bytes);
 			if (!Number.isSafeInteger(blobBytes) || blobBytes < 0)
@@ -8867,12 +8915,15 @@ export class SessionManager {
 			.stat(destination.directory)
 			.then(() => true)
 			.catch(() => false);
-		const transcriptPath = path.join(destination.directory, `${input.checkpoint.session_id}.memory-guard.jsonl`);
+		const transcriptPath = path.join(
+			destination.directory,
+			`.${input.checkpoint.session_id}.memory-guard.${crypto.randomUUID()}.jsonl`,
+		);
 		let opened: RecoveryHydrationOpenResult;
 		let transcriptIdentity: ResumeSessionIdentity;
 		try {
 			await ensureOwnerOnlyDirectory(destination.directory);
-			await writeOwnerOnlyFile(transcriptPath, transcriptData);
+			await writeOwnerOnlyFileNoReplace(transcriptPath, transcriptData);
 			const captured = SessionManager.captureTranscriptStrict(transcriptPath, storage);
 			if (captured.kind !== "captured") {
 				await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
@@ -8983,7 +9034,7 @@ export class SessionManager {
 			throw new Error("Recovery transcript authority changed before promotion.");
 		}
 		if (this.#memoryGuardCheckpointBlobs) {
-			for (const blob of this.#memoryGuardCheckpointBlobs.values()) this.#blobStore.putSync(blob);
+			for (const blob of this.#memoryGuardCheckpointBlobs.values()) this.#blobStore.putImmutableSync(blob);
 			this.#residentImageBlobStore = this.#blobStore;
 			this.#memoryGuardCheckpointBlobs = undefined;
 		}

@@ -27,7 +27,8 @@ export interface MemoryGuardClaimsLease {
 const issuedMemoryGuardClaimsLeases = new WeakSet<MemoryGuardClaimsLease>();
 
 function issueMemoryGuardClaimsLease(lease: MemoryGuardClaimsLease): MemoryGuardClaimsLease {
-	const issued = Object.freeze(lease);
+	const owner = Object.freeze({ ...lease.owner });
+	const issued = Object.freeze({ ...lease, owner });
 	issuedMemoryGuardClaimsLeases.add(issued);
 	return issued;
 }
@@ -304,6 +305,7 @@ export async function releaseMemoryGuardClaims(stateDir: string, claim: MemoryGu
 		const ttyChanges = deleteExactClaimRow(database, "tty", claim.ttyEpoch, claim.owner);
 		if (writerChanges !== 1 || ttyChanges !== 1) throw new Error("memory_guard_claim_release_mismatch");
 		database.exec("COMMIT");
+		issuedMemoryGuardClaimsLeases.delete(claim);
 	} catch (error) {
 		rollbackQuietly(database);
 		throw error;
