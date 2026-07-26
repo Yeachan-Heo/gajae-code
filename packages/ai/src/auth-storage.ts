@@ -1642,6 +1642,11 @@ export class AuthStorage {
 	 */
 	hasAuth(provider: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		try {
+			this.#resolveSelectedStoredCredential(storageProvider);
+		} catch {
+			return false;
+		}
 		if (this.#runtimeOverrides.has(storageProvider)) return true;
 		if (this.#configOverrides.has(storageProvider)) return true;
 		if (this.#getCredentialsForProvider(storageProvider).length > 0) return true;
