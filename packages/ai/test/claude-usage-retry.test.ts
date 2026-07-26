@@ -119,37 +119,51 @@ describe("claudeUsageProvider retry contract", () => {
 		expect(retryWait.mock.calls[0]?.[0]).toBe(1000);
 	});
 
-	it("caps an absurd Retry-After instead of stalling for hours", async () => {
+	it("fails fast when Retry-After exceeds the delay cap (matches fetchWithRetry)", async () => {
 		let attempt = 0;
 		const retryWait = vi.fn(async (_delayMs: number, _signal?: AbortSignal) => {});
 		const fetchMock = (async () => {
 			attempt += 1;
-			if (attempt === 1) {
-				// A hostile/misconfigured endpoint asks for a 24h backoff. Honouring
-				// it verbatim would stall the usage fetch for a day.
-				return jsonResponse(429, { error: "rate_limited" }, { "retry-after": "86400" });
-			}
-			return jsonResponse(200, VALID_PAYLOAD);
+			// Over-cap hint means the quota window is longer than we will wait.
+			// Sibling fetchWithRetry returns immediately; clamp-and-retry would
+			// burn up to MAX_ATTEMPTS * 60s for a credential that cannot recover.
+			return jsonResponse(429, { error: "rate_limited" }, { "retry-after": "86400" });
 		}) as unknown as typeof fetch;
 
 		const report = await claudeUsageProvider.fetchUsage(baseParams(), makeContext(fetchMock, retryWait));
-		expect(report).not.toBeNull();
-		expect(retryWait).toHaveBeenCalledTimes(1);
-		expect(retryWait.mock.calls[0]?.[0]).toBe(60_000);
+		expect(report).toBeNull();
+		expect(attempt).toBe(1);
+		expect(retryWait).not.toHaveBeenCalled();
 	});
 
-	it("caps an absurd HTTP-date Retry-After too", async () => {
+	it("fails fast when an HTTP-date Retry-After exceeds the delay cap", async () => {
 		let attempt = 0;
 		const retryWait = vi.fn(async (_delayMs: number, _signal?: AbortSignal) => {});
 		const farFuture = new Date(Date.now() + 24 * 60 * 60 * 1000).toUTCString();
 		const fetchMock = (async () => {
 			attempt += 1;
-			if (attempt === 1) return jsonResponse(429, { error: "rate_limited" }, { "retry-after": farFuture });
+			return jsonResponse(429, { error: "rate_limited" }, { "retry-after": farFuture });
+		}) as unknown as typeof fetch;
+
+		const report = await claudeUsageProvider.fetchUsage(baseParams(), makeContext(fetchMock, retryWait));
+		expect(report).toBeNull();
+		expect(attempt).toBe(1);
+		expect(retryWait).not.toHaveBeenCalled();
+	});
+
+	it("still retries when Retry-After is exactly at the delay cap", async () => {
+		let attempt = 0;
+		const retryWait = vi.fn(async (_delayMs: number, _signal?: AbortSignal) => {});
+		const fetchMock = (async () => {
+			attempt += 1;
+			if (attempt === 1) return jsonResponse(429, { error: "rate_limited" }, { "retry-after": "60" });
 			return jsonResponse(200, VALID_PAYLOAD);
 		}) as unknown as typeof fetch;
 
 		const report = await claudeUsageProvider.fetchUsage(baseParams(), makeContext(fetchMock, retryWait));
 		expect(report).not.toBeNull();
+		expect(attempt).toBe(2);
+		expect(retryWait).toHaveBeenCalledTimes(1);
 		expect(retryWait.mock.calls[0]?.[0]).toBe(60_000);
 	});
 

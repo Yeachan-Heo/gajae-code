@@ -19,9 +19,9 @@ const MAX_ATTEMPTS = 3;
 const BASE_RETRY_DELAY_MS = 500;
 /**
  * Ceiling for a server-supplied `Retry-After`. Matches `OPENAI_RETRY_DELAY_CAP_MS`
- * and `fetchWithRetry`'s `DEFAULT_MAX_DELAY_MS`. Without it a hostile or
- * misconfigured endpoint stalls the usage fetch for as long as it likes
- * (`Retry-After: 86400` previously produced a 24h sleep).
+ * and `fetchWithRetry`'s `DEFAULT_MAX_DELAY_MS`. Hints above this fail fast
+ * (no sleep, no further attempts) — same contract as `fetchWithRetry` — so a
+ * quota window longer than the cap cannot burn stacked 60s backoffs.
  */
 const MAX_RETRY_DELAY_MS = 60_000;
 
@@ -148,22 +148,37 @@ function isAbortError(error: unknown, signal?: AbortSignal): boolean {
 }
 
 /**
- * Honour the server hint but never exceed `MAX_RETRY_DELAY_MS`, and never
- * return a negative/non-finite delay. Keeps the sleep bounded so an abort has
- * an upper bound to fire within.
+ * Parse a `Retry-After` header into milliseconds.
+ * Returns `undefined` for missing/invalid/negative numeric hints so callers
+ * fall back to the exponential baseline. Past HTTP-dates collapse to 0.
  */
-function clampRetryDelay(baseline: number, hintMs: number): number {
-	const hint = Number.isFinite(hintMs) ? Math.max(0, hintMs) : 0;
-	return Math.min(Math.max(baseline, hint), MAX_RETRY_DELAY_MS);
+function parseRetryAfterMs(retryAfter: string | null): number | undefined {
+	if (!retryAfter?.trim()) return undefined;
+	const seconds = Number.parseFloat(retryAfter);
+	if (Number.isFinite(seconds)) {
+		if (seconds < 0) return undefined;
+		return seconds * 1000;
+	}
+	const dateDelay = Date.parse(retryAfter) - Date.now();
+	if (!Number.isFinite(dateDelay)) return undefined;
+	return Math.max(0, dateDelay);
 }
 
-function retryDelayMs(attempt: number, retryAfter: string | null): number {
+/**
+ * Resolve the next backoff. Mirrors `fetchWithRetry`:
+ * - no/invalid hint → exponential baseline
+ * - hint within cap → max(baseline, hint)
+ * - hint above cap → fail fast (do not sleep or retry)
+ */
+function resolveRetryDelayMs(
+	attempt: number,
+	retryAfter: string | null,
+): { kind: "delay"; ms: number } | { kind: "fail_fast" } {
 	const baseline = BASE_RETRY_DELAY_MS * 2 ** attempt;
-	if (!retryAfter?.trim()) return baseline;
-	const seconds = Number.parseFloat(retryAfter);
-	if (Number.isFinite(seconds)) return clampRetryDelay(baseline, seconds * 1000);
-	const dateDelay = Date.parse(retryAfter) - Date.now();
-	return Number.isFinite(dateDelay) ? clampRetryDelay(baseline, dateDelay) : baseline;
+	const hint = parseRetryAfterMs(retryAfter);
+	if (hint === undefined) return { kind: "delay", ms: baseline };
+	if (hint > MAX_RETRY_DELAY_MS) return { kind: "fail_fast" };
+	return { kind: "delay", ms: Math.max(baseline, hint) };
 }
 
 async function waitBeforeRetry(
@@ -174,12 +189,13 @@ async function waitBeforeRetry(
 ): Promise<boolean> {
 	if (signal?.aborted) return false;
 	if (attempt >= MAX_ATTEMPTS - 1) return false;
+	const resolved = resolveRetryDelayMs(attempt, retryAfter);
+	if (resolved.kind === "fail_fast") return false;
 	try {
-		const delayMs = retryDelayMs(attempt, retryAfter);
 		if (retryWait) {
-			await retryWait(delayMs, signal);
+			await retryWait(resolved.ms, signal);
 		} else {
-			await scheduler.wait(delayMs, { signal });
+			await scheduler.wait(resolved.ms, { signal });
 		}
 		return !signal?.aborted;
 	} catch (error) {
