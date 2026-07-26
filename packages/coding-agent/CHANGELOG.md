@@ -1,4 +1,8 @@
 # Changelog
+## [Unreleased]
+### Added
+
+- User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 
 ## [Unreleased]
 
