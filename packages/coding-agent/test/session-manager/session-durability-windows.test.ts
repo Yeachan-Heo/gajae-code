@@ -286,13 +286,14 @@ describe("managed session Windows durability", () => {
 		if (!treeRoot) throw new Error("Native root missing");
 		const stat = syncFs.lstatSync(originalPath, { bigint: true });
 
-		// On this host Bun's directory size and the native root size agree, so a
-		// plain run cannot tell the two authorities apart. Inject the Windows
-		// divergence -- native root reports 4096 while Bun keeps its own value --
-		// so the assertion below can only pass if the producer reads the native
-		// root. Reverting the win32 branch makes this test fail.
+		// On this host Bun's directory size and the native root size often agree,
+		// so a plain run cannot tell the two authorities apart. Inject a size that
+		// is guaranteed to differ from the real native root so the assertion below
+		// can only pass if the producer reads the mocked native root. Hardcoding
+		// 4096 is not hermetic: Linux directory sizes can already be 4096.
+		// Reverting the win32 branch makes this test fail.
 		const originalSnapshot = native.snapshotDirectoryTree;
-		const divergentSize = "4096";
+		const divergentSize = (BigInt(treeRoot.size) + 1n).toString();
 		expect(divergentSize).not.toBe(treeRoot.size);
 		// Scope the divergence to the retained placeholder only; the detached
 		// original is validated by a separate upstream check that must see real
