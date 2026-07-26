@@ -83,7 +83,11 @@ import {
 	sessionTag,
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
-import { runIdentityControlSuccessPath, type TerminalSendOutcome } from "./control-drain-lease";
+import {
+	isNativeControlDrainAvailable,
+	runIdentityControlSuccessPath,
+	type TerminalSendOutcome,
+} from "./control-drain-lease";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";

@@ -8,8 +8,12 @@ import {
 test("identity control terminal path waits for successor before sending and stopping predecessor", async () => {
 	const order: string[] = [];
 	const outcome = await runIdentityControlSuccessPath({
-		fence: () => order.push("fence"),
-		ensurePredecessorSendCapable: () => order.push("send-capable"),
+		fence: () => {
+			order.push("fence");
+		},
+		ensurePredecessorSendCapable: () => {
+			order.push("send-capable");
+		},
 		startSuccessor: async () => {
 			order.push("start");
 		},
@@ -29,13 +33,19 @@ test("identity control terminal path waits for successor before sending and stop
 test("identity control terminal path releases predecessor after a failed terminal write", async () => {
 	const order: string[] = [];
 	const outcome = await runIdentityControlSuccessPath({
-		fence: () => order.push("fence"),
-		startSuccessor: async () => order.push("start"),
+		fence: () => {
+			order.push("fence");
+		},
+		startSuccessor: async () => {
+			order.push("start");
+		},
 		sendTerminal: async (): Promise<TerminalSendOutcome> => {
 			order.push("terminal");
 			return "write_failed";
 		},
-		stopPredecessor: async () => order.push("stop"),
+		stopPredecessor: async () => {
+			order.push("stop");
+		},
 	});
 
 	expect(outcome).toBe("write_failed");
@@ -47,10 +57,16 @@ test("identity control terminal path fails closed when detach is required withou
 	if (isNativeControlDrainAvailable()) return;
 	await expect(
 		runIdentityControlSuccessPath({
-			fence: () => order.push("fence"),
-			startSuccessor: async () => order.push("start"),
+			fence: () => {
+				order.push("fence");
+			},
+			startSuccessor: async () => {
+				order.push("start");
+			},
 			sendTerminal: async () => "written",
-			stopPredecessor: async () => order.push("stop"),
+			stopPredecessor: async () => {
+				order.push("stop");
+			},
 			requireNativeControlDrain: true,
 		}),
 	).rejects.toThrow("native control-drain lease");
