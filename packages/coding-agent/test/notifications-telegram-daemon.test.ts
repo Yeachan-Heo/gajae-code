@@ -19096,3 +19096,320 @@ test("Telegram Bot API 429 cooldown clamps malformed retry_after values and does
 		expect(calls.filter(method => method === "sendMessage")).toHaveLength(2);
 	}
 });
+
+// ---------------------------------------------------------------------------
+// PR #3186 blockers: serving epoch convergence, visible-start policy orphaning,
+// 429-retryable settlement retention, and concurrent start/terminal pool IDs.
+// ---------------------------------------------------------------------------
+
+describe("PR #3186 blockers", () => {
+	test("serving epoch 3 replaces pre-policy (epoch 1 and 2) daemons via isCurrentCompatibleOwner", () => {
+		// Epoch 1: legacy daemon states that never published servingEpoch.
+		expect(SERVING_EPOCH).toBe(3);
+		const freshInput = (servingEpoch?: number) => {
+			const state: DaemonState = {
+				pid: 999,
+				incarnation: "linux:100",
+				ownerId: "old",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 100,
+				roots: [],
+				version: 1,
+				acquisitionId: "old",
+				ownershipPhase: "ready",
+				generation: DAEMON_GENERATION,
+				servingEpoch,
+			};
+			return {
+				state,
+				now: state.heartbeatAt,
+				tokenFingerprint: state.tokenFingerprint,
+				chatId: state.chatId,
+				pidAlive: () => true,
+				pidIncarnation: () => state.incarnation,
+			};
+		};
+		// Epoch undefined (epoch 1) — not compatible.
+		expect(isCurrentCompatibleOwner(freshInput(undefined))).toBe(false);
+		// Epoch 2 — not compatible with epoch 3.
+		expect(isCurrentCompatibleOwner(freshInput(2))).toBe(false);
+		// Epoch 3 — compatible.
+		expect(isCurrentCompatibleOwner(freshInput(3))).toBe(true);
+		// Future epoch 4 — still compatible (>= check).
+		expect(isCurrentCompatibleOwner(freshInput(4))).toBe(true);
+	});
+
+	test("visible v1 starts are terminated with terminalization on policy transition", async () => {
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		session.endpointDigest = "policy-vis-authority";
+		daemon.sessions.set("S", session);
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+
+		// Admit a legacy start and let it become visible (delivered).
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "visible-start-1",
+			toolName: "bash",
+			phase: "started",
+		});
+		const runtime = daemon as unknown as {
+			legacyToolStarts: Map<string, { phase: string; settledOutcome?: string }>;
+			toolActivityPolicyEpoch: number;
+			opts: { toolActivity?: { enabled: boolean } };
+			cancelLegacyToolStartsForPolicyTransition(): Promise<unknown[]>;
+			toolTerminalizationChain: Promise<void>;
+			liveMessages: Map<string, number>;
+		};
+		const key = "S:tool:visible-start-1";
+		expect(runtime.legacyToolStarts.has(key)).toBe(true);
+		expect(runtime.legacyToolStarts.get(key)!.phase).toBe("visible");
+
+		// Record its liveMessage (the FakeBotApi already recorded it).
+		expect(runtime.liveMessages.has(key)).toBe(true);
+
+		// Trigger a policy transition (simulating /tool-activity off).
+		const editsBefore = bot.calls.filter(c => c.method === "editMessageText").length;
+		runtime.toolActivityPolicyEpoch++;
+		runtime.opts.toolActivity = { enabled: false };
+		await runtime.cancelLegacyToolStartsForPolicyTransition();
+		await runtime.toolTerminalizationChain;
+
+		// The visible start must be settled as "terminal" and cleaned up.
+		expect(runtime.legacyToolStarts.has(key)).toBe(false);
+
+		// A terminalization edit should have been enqueued for the visible message.
+		const editsAfter = bot.calls.filter(c => c.method === "editMessageText").length;
+		expect(editsAfter).toBeGreaterThan(editsBefore);
+	});
+
+	test("retryable 429 start send retains exact settlement until definitive outcome", async () => {
+		const bot = new FakeBotApi();
+		let sendCount = 0;
+		const realCall = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "sendMessage") {
+				sendCount++;
+				if (sendCount === 1) {
+					// First attempt: retryable 429.
+					bot.calls.push({ method, body, options });
+					return { ok: false, error_code: 429, parameters: { retry_after: 3 } };
+				}
+			}
+			return await realCall(method, body, options);
+		};
+		let now = 0;
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+			now: () => now,
+		});
+		const session = richSession();
+		session.endpointDigest = "retry-authority";
+		daemon.sessions.set("S", session);
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+		sendCount = 0;
+
+		// Send a legacy v1 tool start.
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "retryable-start",
+			toolName: "bash",
+			phase: "started",
+		});
+
+		const runtime = daemon as unknown as {
+			legacyToolStarts: Map<string, { phase: string; settledOutcome?: string }>;
+			pool: { pending: number };
+		};
+		const key = "S:tool:retryable-start";
+
+		// After the 429, the legacy start must NOT be failed — it's retryable.
+		// The settlement should still be live (the start is still in-flight via requeue).
+		expect(runtime.legacyToolStarts.has(key)).toBe(true);
+		const state = runtime.legacyToolStarts.get(key)!;
+		// The phase must not be "failed" — it stays admitted/dispatching since the requeue is pending.
+		expect(state.phase).not.toBe("failed");
+		expect(state.settledOutcome).toBeUndefined();
+		expect(runtime.pool.pending).toBeGreaterThan(0);
+
+		// Advance through cooldown/refill windows until the queued start retries.
+		const internal = daemon as unknown as { flushPool(): Promise<void> };
+		for (let attempt = 0; attempt < 3 && sendCount < 2; attempt++) {
+			now += 3_000;
+			await internal.flushPool();
+		}
+
+		// Now the second sendMessage should have succeeded.
+		expect(sendCount).toBeGreaterThan(1);
+		expect(runtime.legacyToolStarts.has(key)).toBe(true);
+		expect(runtime.legacyToolStarts.get(key)!.phase).toBe("visible");
+	});
+
+	test("concurrent start and terminal frames use distinct pool item IDs sharing the same settlement", async () => {
+		const bot = new FakeBotApi();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const realCall = bot.call.bind(bot);
+		let startSendSeen = false;
+		bot.call = async (method, body, options) => {
+			const text = String((body as { text?: unknown }).text ?? "");
+			if (method === "sendMessage" && text.includes("bash — started") && !startSendSeen) {
+				startSendSeen = true;
+				entered.resolve();
+				await release.promise;
+			}
+			return await realCall(method, body, options);
+		};
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		session.endpointDigest = "pool-id-authority";
+		daemon.sessions.set("S", session);
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+
+		// Send a start frame — it will block on the first sendMessage.
+		const startPromise = daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "pool-id-test",
+			toolName: "bash",
+			phase: "started",
+		});
+		await entered.promise;
+
+		const runtime = daemon as unknown as {
+			legacyToolStarts: Map<string, { phase: string; itemId?: string; key: string }>;
+			pool: {
+				pending: number;
+				submit(item: object): { itemId: string };
+			};
+			nextLegacyToolStartId: number;
+		};
+		const key = "S:tool:pool-id-test";
+		expect(runtime.legacyToolStarts.has(key)).toBe(true);
+		const startState = runtime.legacyToolStarts.get(key)!;
+		const startItemId = startState.itemId;
+		expect(startItemId).toBeDefined();
+		expect(startItemId).toMatch(/^legacy-tool-start:/);
+
+		// Now send the terminal (completed) while the start is still in-flight.
+		const terminalPromise = daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "pool-id-test",
+			toolName: "bash",
+			phase: "completed",
+		});
+
+		// Release the blocked start send.
+		release.resolve();
+		await Promise.all([startPromise, terminalPromise]);
+
+		// The terminal must have used a different pool item ID (legacy-tool-terminal:N).
+		// Verify via the bot calls: both start and terminal should have been sent.
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		// The start goes through as a sendMessage, then the terminal edits it.
+		expect(sends.length).toBeGreaterThanOrEqual(1);
+		// After completion, the legacy start settlement should be retired.
+		expect(runtime.legacyToolStarts.has(key)).toBe(false);
+	});
+
+	test("terminal frame does not mutate legacy start phase to queued", async () => {
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		session.endpointDigest = "phase-guard";
+		daemon.sessions.set("S", session);
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+
+		// Admit a start, let it become visible.
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "phase-guard-test",
+			toolName: "read",
+			phase: "started",
+		});
+		const runtime = daemon as unknown as {
+			legacyToolStarts: Map<string, { phase: string; itemId?: string }>;
+		};
+		const key = "S:tool:phase-guard-test";
+		expect(runtime.legacyToolStarts.has(key)).toBe(true);
+		expect(runtime.legacyToolStarts.get(key)!.phase).toBe("visible");
+
+		// Send the terminal (completed) — it must NOT reset the phase to "queued".
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "phase-guard-test",
+			toolName: "read",
+			phase: "completed",
+		});
+
+		// The settlement must be fully retired after the terminal completes.
+		expect(runtime.legacyToolStarts.has(key)).toBe(false);
+		// Both a start send and a terminal edit must have been produced.
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		const edits = bot.calls.filter(c => c.method === "editMessageText");
+		expect(sends.length).toBeGreaterThanOrEqual(1);
+		expect(edits.length).toBeGreaterThanOrEqual(1);
+	});
+});

@@ -46,7 +46,7 @@ export const DAEMON_GENERATION = 30;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
- * all builds published before this field existed; bump this to force serving
- * convergence and reload of compatible live predecessors.
+ * all builds published before this field existed; epoch 2 covered generation 29;
+ * bump this to force serving convergence and reload of compatible live predecessors.
  */
-export const SERVING_EPOCH = 2;
+export const SERVING_EPOCH = 3;

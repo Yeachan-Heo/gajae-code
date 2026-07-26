@@ -6327,17 +6327,31 @@ export class TelegramNotificationDaemon {
 	}
 	private cancelLegacyToolStartsForPolicyTransition(): Promise<LegacyToolStartOutcome[]> {
 		const dispatching: Promise<LegacyToolStartOutcome>[] = [];
+		const visibleTerminalizations: Array<{ messageId: number; owner: ToolActivityOwner }> = [];
 		for (const state of [...this.legacyToolStarts.values()]) {
 			if (state.phase === "dispatching")
 				dispatching.push(
 					state.settled.then(outcome => {
-						if (outcome === "visible" && this.legacyToolStarts.get(state.key) === state)
+						if (outcome === "visible" && this.legacyToolStarts.get(state.key) === state) {
+							const messageId = this.liveMessages.get(state.key);
 							this.settleLegacyToolStart(state, "terminal");
+							if (messageId !== undefined) {
+								void this.enqueueToolTerminalization([{ messageId, owner: state.owner }], false);
+							}
+						}
 						return outcome;
 					}),
 				);
-			else if (state.phase === "visible") this.settleLegacyToolStart(state, "terminal");
-			else this.cancelUnsentLegacyToolStart(state);
+			else if (state.phase === "visible") {
+				const messageId = this.liveMessages.get(state.key);
+				this.settleLegacyToolStart(state, "terminal");
+				if (messageId !== undefined) {
+					visibleTerminalizations.push({ messageId, owner: state.owner });
+				}
+			} else this.cancelUnsentLegacyToolStart(state);
+		}
+		if (visibleTerminalizations.length > 0) {
+			void this.enqueueToolTerminalization(visibleTerminalizations, false);
 		}
 		return Promise.all(dispatching);
 	}
@@ -6435,16 +6449,24 @@ export class TelegramNotificationDaemon {
 					? this.legacyToolStartForTerminal(toolActivity)
 					: undefined;
 		if (legacyStart !== undefined && legacyStart.owner === toolActivity) {
-			legacyStart.phase = "queued";
-			legacyStart.itemId ??= `legacy-tool-start:${this.nextLegacyToolStartId++}`;
+			if (toolActivity!.phase === "started") {
+				legacyStart.phase = "queued";
+				legacyStart.itemId ??= `legacy-tool-start:${this.nextLegacyToolStartId++}`;
+			}
 		}
+		// Terminal frames get a distinct pool item identity so they cannot collide
+		// with an in-flight start for the same legacy settlement.
+		const poolItemId =
+			legacyStart !== undefined && legacyStart.owner === toolActivity
+				? toolActivity!.phase === "terminal"
+					? `legacy-tool-terminal:${this.nextLegacyToolStartId++}`
+					: legacyStart.itemId
+				: undefined;
 		const submitted = this.submitPool({
 			sessionId,
 			lane: send.lane,
 			coalesceKey: send.coalesceKey,
-			...(legacyStart !== undefined && legacyStart.owner === toolActivity && legacyStart.itemId !== undefined
-				? { itemId: legacyStart.itemId }
-				: {}),
+			...(poolItemId !== undefined ? { itemId: poolItemId } : {}),
 			payload: {
 				send,
 				topicLease,
@@ -7638,7 +7660,7 @@ export class TelegramNotificationDaemon {
 					disposition = "rejected";
 				}
 				this.pool.settle(item.itemId!, disposition);
-				if (toolActivity?.phase === "started") this.failLegacyToolStart(toolActivity);
+				if (toolActivity?.phase === "started" && !retryable) this.failLegacyToolStart(toolActivity);
 				if (toolActivity?.phase === "terminal") {
 					const state = item.payload.legacyToolStart;
 					if (state !== undefined && this.legacyToolStarts.get(state.key) === state)
