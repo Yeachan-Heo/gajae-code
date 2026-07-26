@@ -4,6 +4,9 @@
 
 - Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
 
+### Changed
+
+- Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 ### Added
 
 - Ralplan consensus planning now enforces a finite planner/revision iteration budget at the native write path (default 5, configurable via `gjc.ralplan.maxIterations`). Opening another planner/revision pass past the cap fails closed with exit code 3 and an operator-visible `PLANNING-STUCK` marker instead of silent unbounded re-review; `final`/post-interview escalation remains allowed without auto-implementation. The cap also floors against on-disk `stage-*-{planner,revision}.md` artifacts so a wiped, truncated, or malformed `index.jsonl` cannot fail open after prior openers (#3165).
@@ -33,7 +36,6 @@
 ## [0.11.9] - 2026-07-24
 ### Changed
 
-- Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 
 ### Fixed
 - Mouse support can now be enabled inside tmux and screen with `mouse.enabled: true`, so the wheel scrolls GJC's virtual session viewport before multiplexer scrollback. Dragging highlights rendered terminal text and copies it to the system clipboard on release while GJC owns mouse input. Mouse support remains disabled by default to preserve native terminal or tmux scrollback and selection behavior.
