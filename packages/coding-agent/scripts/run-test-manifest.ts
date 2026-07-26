@@ -34,7 +34,6 @@ try {
 }
 
 function validateRowReceipts(rows: ManifestAdapterRow[]): void {
-	const expectedRowsPerAdapter = OPERATIONS.length + 1; // C36 also has one secret-rejection receipt.
 	const ids = new Set<string>();
 	const counts = new Map<string, number>();
 	// Each operation has one receipt, plus the dedicated config.patch secret-input receipt.

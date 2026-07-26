@@ -273,11 +273,21 @@ type ModelCommandResolution =
 	| { ok: true; selection: ModelCommandSelection }
 	| { ok: false; failure: ModelCommandResolutionFailure };
 
-function parseProviderQualifiedSelector(selector: string): { provider: string; modelId: string } | undefined {
+function parseProviderQualifiedSelector(
+	selector: string,
+	discoverableProviders: readonly string[],
+): { provider: string; modelId: string } | undefined {
 	const splitSelector = splitExplicitThinkingSelector(selector);
+	const normalizedSelector = splitSelector.baseSelector.toLowerCase();
+	const provider = [...discoverableProviders]
+		.sort((left, right) => right.length - left.length)
+		.find(candidate => normalizedSelector.startsWith(`${candidate.toLowerCase()}/`));
+	if (provider) {
+		const modelId = splitSelector.baseSelector.slice(provider.length + 1);
+		return modelId ? { provider, modelId } : undefined;
+	}
 	const parsed = parseModelString(splitSelector.baseSelector);
-	if (!parsed) return undefined;
-	return { provider: parsed.provider, modelId: parsed.id };
+	return parsed ? { provider: parsed.provider, modelId: parsed.id } : undefined;
 }
 
 function resolveModelCommandSelectionFromAvailable(
@@ -352,8 +362,8 @@ async function resolveModelCommandSelection(
 		return { ok: true, selection: initialSelection };
 	}
 
-	const providerRef = parseProviderQualifiedSelector(selector);
 	const discoverableProviders = runtime.session.modelRegistry?.getDiscoverableProviders?.() ?? [];
+	const providerRef = parseProviderQualifiedSelector(selector, discoverableProviders);
 	if (providerRef && discoverableProviders.includes(providerRef.provider)) {
 		await runtime.session.modelRegistry.refreshProvider?.(providerRef.provider, "online");
 		availableModels = runtime.session.getAvailableModels?.() ?? [];

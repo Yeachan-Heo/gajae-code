@@ -1898,7 +1898,6 @@ function sdkQuerySurface(
 			} catch {
 				throw new ActiveProviderResolutionError();
 			}
-		}
 		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {

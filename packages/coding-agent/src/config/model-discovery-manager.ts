@@ -141,13 +141,21 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				models: models.map(model => model.id),
 			});
 
+		let authGeneration = callbacks.getEvidenceGeneration?.(provider);
 		let apiKey: string | undefined;
 		if (callbacks.requiresAuth(provider)) {
 			apiKey = await callbacks.peekApiKey(provider);
+			const resolvedGeneration = callbacks.getEvidenceGeneration?.(provider);
 			if (!this.isCurrent(token)) return this.#stale(token);
+			if (authGeneration !== resolvedGeneration) {
+				authGeneration = resolvedGeneration;
+				apiKey = await callbacks.peekApiKey(provider);
+				if (!this.isCurrent(token) || authGeneration !== callbacks.getEvidenceGeneration?.(provider)) {
+					return this.#stale(token);
+				}
+			}
 			if (!callbacks.isAuthenticated(apiKey)) return unauthenticated(cachedModels);
 		}
-		const authGeneration = callbacks.getEvidenceGeneration?.(provider);
 
 		let error: string | undefined;
 		const manager = createModelManager<Api>({

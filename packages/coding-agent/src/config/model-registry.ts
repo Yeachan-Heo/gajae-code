@@ -2002,11 +2002,16 @@ export class ModelRegistry {
 		// The token is only needed if the dynamic fetch fires (cache miss),
 		// and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
-			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId);
-			return {
-				apiKey,
-				authGeneration: this.authStorage.getProviderEvidenceGeneration(descriptor.providerId),
-			};
+			let authGeneration = this.authStorage.getProviderEvidenceGeneration(descriptor.providerId);
+			let apiKey = await this.#peekApiKeyForProvider(descriptor.providerId);
+			const resolvedGeneration = this.authStorage.getProviderEvidenceGeneration(descriptor.providerId);
+			if (authGeneration === resolvedGeneration) return { apiKey, authGeneration };
+			authGeneration = resolvedGeneration;
+			apiKey = await this.#peekApiKeyForProvider(descriptor.providerId);
+			if (authGeneration === this.authStorage.getProviderEvidenceGeneration(descriptor.providerId)) {
+				return { apiKey, authGeneration };
+			}
+			return { apiKey: undefined, authGeneration: undefined };
 		};
 		const [standardProviderCredentials, specialProviderCredentials] = await Promise.all([
 			Promise.all(standardProviderDescriptors.map(peekKey)),
