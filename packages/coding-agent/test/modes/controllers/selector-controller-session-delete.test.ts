@@ -114,8 +114,10 @@ function createContext(currentSessionFile: string): {
 			}),
 			removeChild: vi.fn(function (this: { children: unknown[] }, child: unknown) {
 				this.children = this.children.filter(candidate => candidate !== child);
+				(child as { dispose?: () => void }).dispose?.();
 			}),
 			clear: vi.fn(function (this: { children: unknown[] }) {
+				for (const child of this.children) (child as { dispose?: () => void }).dispose?.();
 				this.children = [];
 				calls.push("statusContainer.clear");
 			}),
