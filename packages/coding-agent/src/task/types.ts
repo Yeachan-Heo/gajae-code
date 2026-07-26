@@ -68,6 +68,9 @@ export interface SubagentLifecyclePayload {
 }
 
 const assignmentDescription = "per-task instructions; self-contained";
+export const TASK_EXECUTION_MODES = ["default", "ultragoal-red-team"] as const;
+export type TaskExecutionMode = (typeof TASK_EXECUTION_MODES)[number];
+
 const spawnPlanSchema = z
 	.object({
 		whyParallel: z.string(),
@@ -96,6 +99,12 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 		id: z.string().max(48).refine(isValidTaskId, TASK_ID_DESCRIPTION).describe("filesystem-safe task identifier"),
 		description: z.string().describe("ui label, not seen by subagent"),
 		assignment: z.string().describe(assignmentDescription),
+		executionMode: z
+			.enum(TASK_EXECUTION_MODES)
+			.optional()
+			.describe(
+				"explicit subagent execution mode; use ultragoal-red-team only for the mandatory Ultragoal completion QA lane",
+			),
 		inheritContext: z
 			.enum(["none", "receipt", "last-turn", "bounded", "full"])
 			.optional()

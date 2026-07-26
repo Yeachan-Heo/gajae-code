@@ -402,6 +402,8 @@ describe("default GJC definitions", () => {
 
 		expect(section).toContain("reruns the cleaner until blocking findings are zero");
 		expect(section).toContain("Advisory findings are included in the gate report only");
+		expect(section).toContain('executionMode: "ultragoal-red-team"');
+		expect(section).toContain("assignment wording never activates the mode");
 	});
 
 	it("keeps the four role agents bundled when project .gjc is absent", async () => {

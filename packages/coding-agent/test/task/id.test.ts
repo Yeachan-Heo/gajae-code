@@ -120,3 +120,18 @@ describe("task id validation", () => {
 		await expect(fs.stat(outsidePath)).rejects.toThrow();
 	});
 });
+describe("task execution mode validation", () => {
+	it.each(["default", "ultragoal-red-team"] as const)("accepts the supported mode %s", executionMode => {
+		const params = validParams("Mode");
+		params.tasks[0]!.executionMode = executionMode;
+		expect(taskSchema.safeParse(params).success).toBe(true);
+	});
+
+	it("rejects unknown execution modes", () => {
+		const params = validParams("Mode") as unknown as {
+			tasks: Array<Record<string, unknown>>;
+		};
+		params.tasks[0]!.executionMode = "executorQa";
+		expect(taskSchema.safeParse(params).success).toBe(false);
+	});
+});

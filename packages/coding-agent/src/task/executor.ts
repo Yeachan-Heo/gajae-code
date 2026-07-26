@@ -65,6 +65,7 @@ import {
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
+	type TaskExecutionMode,
 	type TaskToolDetails,
 } from "./types";
 
@@ -190,6 +191,7 @@ export interface ExecutorOptions {
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
+	executionMode?: TaskExecutionMode;
 	context?: string;
 	description?: string;
 	index: number;
@@ -1603,9 +1605,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					systemPrompt: defaultPrompt => {
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 							agent: prompt.render(agent.systemPrompt, {
-								ultragoalRedTeam: /ultragoal\s+completion\s+(?:qa|red-team)|executorQa/i.test(
-									options.assignment ?? task,
-								),
+								ultragoalRedTeam: options.executionMode === "ultragoal-red-team",
 							}),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
