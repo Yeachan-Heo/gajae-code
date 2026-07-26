@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
-import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpPromptPayload } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 
 type TestServer = {
@@ -564,7 +564,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	await expect(
 		agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "second" }] }),
-	).rejects.toThrow("ACP session already has an active prompt.");
+	).rejects.toThrow("ACP session already has an active prompt; send session/cancel before prompting again.");
 	await Bun.sleep(20);
 	expect(firstSettled).toBe(false);
 	promptSocket!.send(
@@ -750,17 +750,16 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		),
 	).toBe(true);
 
-	await expect(
-		agent.prompt({
-			sessionId: created.sessionId,
-			prompt: [
-				{
-					type: "resource",
-					resource: { uri: "file:///workspace/archive.bin", blob: "bytes", mimeType: "application/octet-stream" },
-				},
-			],
-		}),
-	).rejects.toThrow("Unsupported embedded resource MIME type");
+	// Only images have a model representation, so a non-image blob is rejected rather
+	// than reported as a successful prompt whose bytes were silently dropped.
+	expect(() =>
+		acpPromptPayload([
+			{
+				type: "resource",
+				resource: { uri: "file:///workspace/archive.bin", blob: "bytes", mimeType: "application/octet-stream" },
+			},
+		] as never),
+	).toThrow("Unsupported embedded resource MIME type");
 	await expect(
 		agent.newSession({
 			cwd,
@@ -923,34 +922,42 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		expect.objectContaining({ input: { sessionId: created.sessionId, endpointGeneration: 1 } }),
 	]);
 	expect(providerRegistrations).toHaveLength(registrationsBeforeLiveAttach + 2);
+	// `session/load` and `session/resume` REQUIRE `mcpServers`, so a reattach that carries
+	// them must not fail: the live session keeps its own immutable configuration and the
+	// request reaches the broker for nothing beyond the endpoint it already resolved.
 	const requestsBeforeImmutableMcp = brokerRequests.length;
-	await expect(
+	await bounded(
 		loader.resumeSession({
 			sessionId: created.sessionId,
 			cwd,
 			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: [], env: [] }],
 		}),
-	).rejects.toMatchObject({ code: "conflict" });
+		"live reattach with client MCP servers",
+	);
 	expect(brokerRequests).toHaveLength(requestsBeforeImmutableMcp);
 
 	const liveMcpAbort = new AbortController();
 	const liveMcpLoader = new AcpAgent(
 		{
+			sessionUpdate: async () => {},
 			signal: liveMcpAbort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
 		{ agentDir },
 	);
 	const requestsBeforeLiveMcp = brokerRequests.length;
-	await expect(
+	await bounded(
 		liveMcpLoader.loadSession({
 			sessionId: created.sessionId,
 			cwd,
 			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: [], env: [] }],
 		}),
-	).rejects.toMatchObject({ code: "conflict" });
+		"fresh connection reattach with client MCP servers",
+	);
+	// Only discovery runs: the live host's MCP configuration is never renegotiated.
 	expect(brokerRequests.slice(requestsBeforeLiveMcp)).toEqual([
 		expect.objectContaining({ operation: "session.list", input: { cwd } }),
+		expect.objectContaining({ operation: "session.get_endpoint" }),
 	]);
 	liveMcpAbort.abort();
 	const firstGenerationCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;

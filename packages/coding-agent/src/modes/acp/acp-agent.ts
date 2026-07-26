@@ -66,6 +66,9 @@ const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
 export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
+/** `turn.abort` requests an abort; a host mid-unwind may still refuse the next prompt. */
+const ACP_ORPHAN_ABORT_RETRIES = 200;
+const ACP_ORPHAN_ABORT_POLL_MS = 25;
 
 type JsonObject = Record<string, unknown>;
 /**
@@ -513,14 +516,15 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 					break;
 				}
 				const mimeType = resource.mimeType ?? "application/octet-stream";
-				if (!mimeType.startsWith("image/"))
-					throw new AcpSdkAdapterError(
-						"unsupported_content",
-						`Unsupported embedded resource MIME type: ${mimeType}`,
-					);
-				text.push(`[Resource: ${resource.uri}]\nMIME: ${mimeType}`);
-				images.push({ data: resource.blob, mimeType });
-				break;
+				if (mimeType.startsWith("image/")) {
+					text.push(`[Resource: ${resource.uri}]\nMIME: ${mimeType}`);
+					images.push({ data: resource.blob, mimeType });
+					break;
+				}
+				// Only images have a model representation on this transport. Accepting the
+				// prompt after dropping the bytes would report success for context the model
+				// never saw, so fail explicitly until a real representation exists.
+				throw new AcpSdkAdapterError("unsupported_content", `Unsupported embedded resource MIME type: ${mimeType}`);
 			}
 			case "audio":
 				throw new AcpSdkAdapterError("unsupported_content", "ACP audio prompts are not supported.");
@@ -559,6 +563,20 @@ export function acpRequestFailure(error: unknown): unknown {
 			// branch on retry/reconnect instead of parsing an English message.
 			return RequestError.internalError({ code, details: message }, message);
 	}
+}
+
+/**
+ * The host refuses a prompt while its own turn is still running. Restate that in
+ * ACP terms: `session/cancel` is the protocol's only way to interrupt a turn.
+ */
+function acpPromptFailure(error: unknown): unknown {
+	const message = error instanceof Error ? error.message : "";
+	if (typeof error === "object" && error !== null && "code" in error && error.code === "busy")
+		return RequestError.internalError(
+			{ details: message },
+			"session is still running a turn; send session/cancel before prompting again",
+		);
+	return acpRequestFailure(error);
 }
 
 /** Registers a permission provider only when the ACP client requires prompts. */
@@ -626,9 +644,10 @@ export function createAcpExtensionUiContext(
 		dialog: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void } | undefined,
 	): Promise<unknown> => {
 		if (!capabilities?.elicitation?.form || dialog?.signal?.aborted) return undefined;
-		const request = (
-			connection as unknown as { unstable_createElicitation(input: JsonObject): Promise<JsonObject> }
-		).unstable_createElicitation({
+		const request = connection.unstable_createElicitation({
+			// `mode` is the required discriminator of CreateElicitationRequest; without
+			// it the payload matches no variant of the union.
+			mode: "form",
 			sessionId: getSessionId(),
 			message,
 			requestedSchema: {
@@ -652,7 +671,8 @@ export function createAcpExtensionUiContext(
 					});
 		try {
 			const response = timeout ? await Promise.race([request, timeout]) : await request;
-			return object(object(response)?.content)?.value;
+			// Only an accepted elicitation carries content; decline/cancel resolve empty.
+			return response?.action === "accept" ? object(object(response)?.content)?.value : undefined;
 		} catch {
 			return undefined;
 		} finally {
@@ -790,6 +810,7 @@ export class AcpAgent implements Agent {
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
+		await this.#abandonOrphanedTurn(params.sessionId);
 		await this.#replaySession(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
 		return await this.#sessionState(params.sessionId);
@@ -800,6 +821,7 @@ export class AcpAgent implements Agent {
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
+		await this.#abandonOrphanedTurn(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
 		return await this.#sessionState(params.sessionId);
 	}
@@ -962,9 +984,19 @@ export class AcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
-		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${params.sessionId}`);
-		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
-		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+		// These pre-dispatch refusals are reported to the client, so they must carry a
+		// real JSON-RPC code instead of collapsing to `-32603 Internal error`.
+		if (!record)
+			throw acpRequestFailure(new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${params.sessionId}`));
+		if (record.activePrompt)
+			throw acpRequestFailure(
+				new AcpSdkAdapterError(
+					"conflict",
+					"ACP session already has an active prompt; send session/cancel before prompting again.",
+				),
+			);
+		if (record.authFailure)
+			throw acpRequestFailure(new AcpSdkAdapterError("authentication_failed", record.authFailure));
 		const payload = acpPromptPayload(params.prompt);
 		let waiter!: PromptWaiter;
 		const response = new Promise<PromptResponse>((resolve, reject) => {
@@ -982,10 +1014,7 @@ export class AcpAgent implements Agent {
 			record.activePrompt = waiter;
 		});
 		try {
-			const acknowledgement = await record.adapter.prompt({
-				text: payload.text,
-				...(payload.images.length ? { images: payload.images } : {}),
-			});
+			const acknowledgement = await this.#dispatchPrompt(record, payload);
 			waiter.steeringAtAcknowledgement = record.busy;
 			// Capture the ingress boundary after the command acknowledgement. Frames
 			// queued before this point are stale with respect to this ACP prompt.
@@ -995,9 +1024,51 @@ export class AcpAgent implements Agent {
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
-			throw error;
+			throw acpPromptFailure(error);
 		}
 		return await response;
+	}
+
+	/**
+	 * A session host outlives the ACP connection that started its turn, so a reattached
+	 * client can dispatch onto a host still finishing a turn nobody owns — its
+	 * `session/prompt` was lost with the previous connection and can never be answered.
+	 * `#abandonOrphanedTurn` requests the abort on reattach, but `turn.abort` only
+	 * *requests* it: the host may still be unwinding when this prompt arrives. A busy
+	 * refusal here is observed evidence of exactly that orphan, so re-abort and retry
+	 * once rather than making the user reconnect again.
+	 */
+	async #dispatchPrompt(
+		record: SessionRecord,
+		payload: { text: string; images: Array<{ data: string; mimeType: string }> },
+	): Promise<unknown> {
+		const send = async () =>
+			await record.adapter.prompt({
+				text: payload.text,
+				...(payload.images.length ? { images: payload.images } : {}),
+			});
+		try {
+			return await send();
+		} catch (error) {
+			const busy = typeof error === "object" && error !== null && "code" in error && error.code === "busy";
+			// Only an orphan is retried: a turn this connection owns is a real conflict.
+			if (!busy || record.activePrompt?.acknowledged) throw error;
+			await record.adapter.cancel();
+			for (let attempt = 0; attempt < ACP_ORPHAN_ABORT_RETRIES; attempt++) {
+				await Bun.sleep(ACP_ORPHAN_ABORT_POLL_MS);
+				try {
+					return await send();
+				} catch (retryError) {
+					const stillBusy =
+						typeof retryError === "object" &&
+						retryError !== null &&
+						"code" in retryError &&
+						retryError.code === "busy";
+					if (!stillBusy) throw retryError;
+				}
+			}
+			throw error;
+		}
 	}
 
 	async cancel(params: { sessionId: string }): Promise<void> {
@@ -1110,8 +1181,11 @@ export class AcpAgent implements Agent {
 		if (attached) {
 			if (path.resolve(attached.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			// Already attached in this connection: the session's MCP configuration is
+			// already established, and a spec-required `mcpServers` on load/resume must
+			// not turn a re-entrant attach into a hard failure.
 			if (mcpServers.length > 0)
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
+				logger.warn(`ACP session ${id} is already attached; keeping its existing MCP configuration.`);
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -1149,8 +1223,15 @@ export class AcpAgent implements Agent {
 		const indexed = await this.#scopedBrokerSession(id, cwd);
 		this.#assertSessionEpoch(id, epoch);
 		if (indexed?.live) {
+			// MCP configuration is fixed when the session is created and the running host
+			// already owns it. `session/load` and `session/resume` REQUIRE `mcpServers`, so
+			// refusing a reattach here would make every MCP-configured client permanently
+			// unable to reopen the session; the live session's own configuration satisfies
+			// the request instead.
 			if (mcpServers.length > 0)
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
+				logger.warn(
+					`ACP session ${id} is live; keeping its existing MCP configuration and ignoring the reattach request.`,
+				);
 			const result = await this.#brokerEndpoint(id, indexed.endpointGeneration);
 			this.#assertSessionEpoch(id, epoch);
 			await this.#attach(id, cwd, endpoint(result), epoch);
@@ -1453,6 +1534,36 @@ export class AcpAgent implements Agent {
 		};
 	}
 
+	/**
+	 * A session host outlives the ACP connection that started its turn, so a client
+	 * that reconnects (or restarts) can find the host still running a turn nobody
+	 * owns: its `session/prompt` was lost with the previous connection and can never
+	 * be answered with a stop reason. ACP has no concurrent-turn semantics, so that
+	 * orphan would block every later prompt. Abort it, which is what the client would
+	 * have done with `session/cancel` had it still owned the turn.
+	 *
+	 * `record.busy` only reflects activity frames observed on this connection, and a
+	 * freshly attached record has seen none, so the abort is unconditional. Aborting an
+	 * already-idle host is a no-op.
+	 */
+	async #abandonOrphanedTurn(id: string): Promise<void> {
+		const record = this.#sessions.get(id);
+		// A live waiter means this connection owns the turn; it is not an orphan.
+		if (!record || record.activePrompt) return;
+		try {
+			await record.adapter.cancel();
+		} catch (error) {
+			// Best effort: a host that refuses the abort still reports busy on the next
+			// prompt, which now carries an actionable message instead of an opaque failure.
+			logger.warn(`ACP could not abandon an orphaned turn for session ${id}: ${String(error)}`);
+			return;
+		}
+		// `turn.abort` only requests the abort; the host unwinds on its own schedule, so
+		// this deliberately does not block. A prompt that still lands on a busy host
+		// retries the abort at the point of failure, where "busy" is observed evidence
+		// rather than a guess about a host this connection has not yet heard from.
+	}
+
 	#observeSessionActivity(record: SessionRecord, frame: JsonObject): void {
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") record.busy = true;
@@ -1478,9 +1589,92 @@ export class AcpAgent implements Agent {
 		);
 	}
 
+	/**
+	 * A headless `ask` reaches ACP as an `action_needed` frame. ACP has no session
+	 * update that poses a question, so the protocol answer is `elicitation/create`
+	 * form mode. Per the elicitation RFD an agent MUST NOT request a mode the client
+	 * has not advertised and SHOULD "describe what they're requesting in turn content
+	 * (text) as fallback", so an unadvertised client still sees the question and can
+	 * answer in its next prompt instead of watching an unexplained spinner.
+	 *
+	 * Permission requests are deliberately not reused here: the same RFD keeps
+	 * security decisions separate from clarification.
+	 */
+	async #presentActionNeeded(id: string, record: SessionRecord, frame: JsonObject): Promise<void> {
+		const actionId = typeof frame.id === "string" ? frame.id : undefined;
+		const question = typeof frame.question === "string" ? frame.question : undefined;
+		if (!actionId || frame.kind !== "ask" || !question) return;
+		const options = Array.isArray(frame.options)
+			? frame.options.filter((option): option is string => typeof option === "string")
+			: [];
+
+		if (this.#clientCapabilities?.elicitation?.form) {
+			const answer = await this.#elicitAskAnswer(id, question, options);
+			if (answer !== undefined) {
+				// A gate-backed ask is answered through its workflow gate; only a plain
+				// interactive ask is addressed by action id.
+				const gateId = typeof frame.workflowGateId === "string" ? frame.workflowGateId : undefined;
+				try {
+					if (gateId)
+						await record.adapter.control("workflow.gate_answer", {
+							id: gateId,
+							response: { selected: [answer] },
+							expectedSessionId: id,
+						});
+					else await record.adapter.control("ask.answer", { id: actionId, answer });
+				} catch (error) {
+					// Another surface (Telegram, TUI) may answer the same ask while this form
+					// is open. A stale answer is a benign race, not a frame failure — letting
+					// it escape would tear down the whole ACP attachment.
+					logger.warn(`ACP answer for session ${id} was already resolved elsewhere: ${String(error)}`);
+				}
+				return;
+			}
+		}
+		// Elicitation is unavailable, or the user declined/cancelled it. Surface the
+		// question as turn content so it is visible, and leave the ask pending: the host
+		// has no neutral "unanswered" resolution, and answering on the user's behalf
+		// would fabricate consent for a choice they never made. Other surfaces (Telegram,
+		// TUI) can still answer it, and `session/cancel` remains available to the client.
+		const lines = [question, ...options.map((option, index) => `${index + 1}. ${option}`)];
+		await this.#publishSessionUpdate(id, {
+			sessionId: id,
+			update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${lines.join("\n")}\n` } },
+		});
+	}
+
+	/** Ask the client for one option through stable form-mode elicitation. */
+	async #elicitAskAnswer(id: string, question: string, options: string[]): Promise<string | undefined> {
+		try {
+			const response = await this.#connection.unstable_createElicitation({
+				mode: "form",
+				sessionId: id,
+				message: question,
+				requestedSchema: {
+					type: "object",
+					properties: {
+						value: { type: "string", ...(options.length > 0 ? { enum: options } : {}) },
+					},
+					required: ["value"],
+				},
+			});
+			// Only `accept` carries content; `decline`/`cancel` fall through to the text path.
+			if (response?.action !== "accept") return undefined;
+			const value = object(object(response)?.content)?.value;
+			return typeof value === "string" ? value : undefined;
+		} catch (error) {
+			logger.warn(`ACP elicitation for session ${id} failed: ${String(error)}`);
+			return undefined;
+		}
+	}
+
 	async #handleSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject, sequence: number): Promise<void> {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		if (frame.type === "action_needed") {
+			await this.#presentActionNeeded(id, record, frame);
+			return;
+		}
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;

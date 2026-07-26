@@ -224,6 +224,32 @@ describe("ACP production cancellation completion", () => {
 		expect(await bounded(secondPrompt, "second prompt completion")).toEqual({ stopReason: "end_turn" });
 		expect(secondResolutions).toBe(1);
 
+		// A second prompt while a turn is active is refused. ACP has no concurrent-turn
+		// semantics, so the refusal must name `session/cancel` rather than surfacing a
+		// bare "Internal error" the client can only show as an unexplained failure.
+		const thirdDelivered = Promise.withResolvers<void>();
+		promptWaiters.push(thirdDelivered);
+		const activePrompt = acp.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-0000000000fe",
+			prompt: [{ type: "text", text: "still running" }],
+		} as PromptRequest);
+		await bounded(thirdDelivered.promise, "third prompt delivery");
+
+		const refusal = await acp
+			.prompt({
+				sessionId: created.sessionId,
+				messageId: "00000000-0000-4000-8000-0000000000ff",
+				prompt: [{ type: "text", text: "hi" }],
+			} as PromptRequest)
+			.catch((error: unknown) => error);
+		expect(refusal).toBeInstanceOf(RequestError);
+		expect((refusal as RequestError).message).toContain("session/cancel");
+
+		promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
+		promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+		expect(await bounded(activePrompt, "third prompt completion")).toEqual({ stopReason: "end_turn" });
+
 		expect(
 			updates.filter(update => {
 				const payload = update.update as {
@@ -255,6 +281,16 @@ describe("ACP request failure codes", () => {
 			agentDir: "/tmp",
 		});
 	}
+
+	it("reports an unknown session as resource-not-found rather than an opaque internal error", async () => {
+		const error = await agent()
+			.prompt({ sessionId: "missing", prompt: [{ type: "text", text: "hi" }] } as PromptRequest)
+			.catch((e: unknown) => e);
+
+		expect(error).toBeInstanceOf(RequestError);
+		// -32603 (internal error) hides the reason and blocks client-side recovery.
+		expect((error as RequestError).code).toBe(-32002);
+	});
 
 	it("rejects an unknown ext method with method-not-found instead of a successful result", async () => {
 		const error = await agent()
