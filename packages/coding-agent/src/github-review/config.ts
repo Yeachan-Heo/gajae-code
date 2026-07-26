@@ -55,7 +55,14 @@ export interface GithubReviewConfig {
 	allowedAssociations: string[];
 	/** `author_association` values allowed to use `learn` (persistent prompt state). */
 	learnAssociations: string[];
-	/** Per-repo config filename fetched from the PR head, e.g. ".gajae.yaml". */
+	/**
+	 * Bash command prefixes review sessions may execute. Sessions run with the
+	 * restricted "workflow" bash profile: one command per call, prefix-matched
+	 * against this list, and shell control/expansion syntax (pipes, redirects,
+	 * `$(...)`, `$VAR`) is rejected by the tool itself.
+	 */
+	sessionBashPrefixes: string[];
+	/** Per-repo config filename fetched from the PR **base** branch, e.g. ".gajae.yaml". */
 	repoConfigFile: string;
 	/** In-flight reviews older than this are considered crashed (seconds). */
 	inflightStaleSeconds: number;
@@ -84,6 +91,7 @@ const DEFAULTS = {
 	maxInflight: 4,
 	turnTimeoutMinutes: 45,
 	ignoreRepos: [] as string[],
+	sessionBashPrefixes: ["gh pr", "gh api", "gh issue view", "gjc github-review", "gitleaks"],
 	repoConfigFile: ".gjc-review.yml",
 	inflightStaleSeconds: 20 * 60,
 	sweepIntervalSeconds: 90,
@@ -108,6 +116,15 @@ function num(v: unknown): number | undefined {
 	if (typeof v === "number" && Number.isFinite(v)) return v;
 	if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
 	return undefined;
+}
+
+/** Comma-separated env list → trimmed non-empty entries; undefined when unset/empty. */
+function envList(v: string | undefined): string[] | undefined {
+	const items = v
+		?.split(",")
+		.map(p => p.trim())
+		.filter(Boolean);
+	return items && items.length > 0 ? items : undefined;
 }
 
 function strList(v: unknown): string[] | undefined {
@@ -164,6 +181,8 @@ export function loadGithubReviewConfig(filePath?: string, env: NodeJS.ProcessEnv
 		cwd: expandHome(env.GJC_GHR_CWD ?? str(file.cwd) ?? os.homedir()),
 		dataDir: expandHome(dataDir),
 		ignoreRepos: strList(file.ignoreRepos) ?? DEFAULTS.ignoreRepos,
+		sessionBashPrefixes:
+			envList(env.GJC_GHR_SESSION_PREFIXES) ?? strList(file.sessionBashPrefixes) ?? DEFAULTS.sessionBashPrefixes,
 		allowedAssociations: strList(file.allowedAssociations) ?? ["OWNER", "MEMBER", "COLLABORATOR"],
 		learnAssociations: strList(file.learnAssociations) ?? ["OWNER"],
 		repoConfigFile: str(file.repoConfigFile) ?? DEFAULTS.repoConfigFile,

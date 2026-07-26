@@ -50,15 +50,18 @@ Env overrides use the `GJC_GHR_*` namespace: `GJC_GHR_CONFIG`,
 `GJC_GHR_WEBHOOK_SECRET`, `GJC_GHR_BOT_LOGIN`, `GJC_GHR_HOST`, `GJC_GHR_PORT`,
 `GJC_GHR_MAX_INFLIGHT`, `GJC_GHR_TURN_TIMEOUT_MIN`, `GJC_GHR_MODEL`,
 `GJC_GHR_CWD`, `GJC_GHR_DATA_DIR`, `GJC_GHR_INFLIGHT_STALE_SEC`,
-`GJC_GHR_SWEEP_MIN`.
+`GJC_GHR_SWEEP_MIN`, `GJC_GHR_SESSION_PREFIXES` (comma-separated bash
+command prefixes for review sessions).
 
 ### Per-repo config
 
-A YAML file at the PR head (default `.gjc-review.yml`) tunes the bot per
-repository: `enabled`, `diagrams`, `poem`, `pr_summary`, `tone`,
+A YAML file on the PR **base** branch (default `.gjc-review.yml`) tunes the
+bot per repository: `enabled`, `diagrams`, `poem`, `pr_summary`, `tone`,
 `max_comments`, `ignore_paths`, and `path_instructions`
-(`- path: "glob"` / `instructions: ...` pairs). A broken or missing file
-never blocks reviews.
+(`- path: "glob"` / `instructions: ...` pairs). The file is deliberately
+never read from the PR head: config keys flow into the review prompt, so
+head-loading would let any fork PR inject instructions into its own review.
+A broken or missing file never blocks reviews.
 
 ## Authorization model
 
@@ -72,7 +75,16 @@ never blocks reviews.
   session; the drop is logged as an `unauthorized` event.
 - **`learn`** appends persistent instructions to every future review prompt
   and is therefore gated separately by `learnAssociations` (default
-  `OWNER` only).
+  `OWNER` only). The learnings file is capped (oldest entries drop) so it
+  cannot grow without bound.
+- **Review sessions are sandboxed.** Every session consumes
+  attacker-controlled PR content, so it gets a narrow tool surface (read,
+  search, find, write, bash — no edit, no subagents, no tool discovery) and
+  bash runs under the restricted `workflow` profile: exactly one command per
+  call, prefix-matched against `sessionBashPrefixes` (default `gh pr`,
+  `gh api`, `gh issue view`, `gjc github-review`, `gitleaks`), with pipes,
+  redirects, command substitution, and `$VAR` expansion rejected by the tool
+  itself — prompt-level bans are backed by hard enforcement.
 
 Webhook deliveries are HMAC-verified (constant-time), bounded in size, and
 deduplicated by delivery id inside a persisted time window
@@ -106,5 +118,6 @@ The runner force-fails a review whose session ends abnormally
   to 150 s to finish. Check `/health` for `running: 0` before restarting if
   you cannot tolerate interrupting a review.
 - Reviews are remote-read-only by design (`gh pr diff` / compare API). The
-  prompts ban cloning, redirects, and heredocs; the security guard enforces
-  the same at tool level.
+  prompts ban cloning, redirects, heredocs, and command substitution; the
+  restricted session bash profile enforces the same at tool level (see the
+  authorization model above).

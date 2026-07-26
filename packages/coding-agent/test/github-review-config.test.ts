@@ -46,6 +46,7 @@ describe("loadGithubReviewConfig", () => {
 		expect(config.markerPrefix).toBe("gajae-code");
 		expect(config.maxInflight).toBe(4);
 		expect(config.localWebhookUrl).toBe("http://127.0.0.1:8644/webhooks/github-review");
+		expect(config.sessionBashPrefixes).toEqual(["gh pr", "gh api", "gh issue view", "gjc github-review", "gitleaks"]);
 	});
 
 	test("env overrides beat file values", () => {
@@ -56,6 +57,11 @@ describe("loadGithubReviewConfig", () => {
 		});
 		expect(config.port).toBe(2222);
 		expect(config.maxInflight).toBe(9);
+		expect(
+			loadGithubReviewConfig(writeConfig({ sessionBashPrefixes: ["gh pr"] }), {
+				GJC_GHR_SESSION_PREFIXES: "gh api, gitleaks detect",
+			}).sessionBashPrefixes,
+		).toEqual(["gh api", "gitleaks detect"]);
 		expect(config.botLogin).toBe("other-bot");
 	});
 });
@@ -129,5 +135,12 @@ describe("DeliveryLog persistence and replay window", () => {
 		// outside the window the id is forgotten (bounded replay acceptance)
 		now += 1500;
 		expect(reloaded.alreadySeen("d1")).toBe(false);
+	});
+
+	test.skipIf(process.platform === "win32")("delivery log file is mode-locked to 0600", () => {
+		const file = path.join(tmpDir(), "deliveries.json");
+		const log = new DeliveryLog(file);
+		log.alreadySeen("d1");
+		expect(fs.statSync(file).mode & 0o777).toBe(0o600);
 	});
 });

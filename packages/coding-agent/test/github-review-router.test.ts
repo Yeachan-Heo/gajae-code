@@ -33,6 +33,7 @@ function testConfig(dataDir: string, overrides: Partial<GithubReviewConfig> = {}
 		ignoreRepos: ["polybetbot"],
 		allowedAssociations: ["OWNER", "MEMBER", "COLLABORATOR"],
 		learnAssociations: ["OWNER"],
+		sessionBashPrefixes: ["gh pr", "gh api", "gjc github-review", "gitleaks"],
 		repoConfigFile: ".gajae.yaml",
 		inflightStaleSeconds: 20 * 60,
 		sweepIntervalSeconds: 0,
@@ -50,6 +51,7 @@ interface Harness {
 	service: ReviewService;
 	acks: Array<{ commentId: number | undefined; reviewComment: boolean }>;
 	startAcks: Array<{ repo: string; pr: number; sha: string }>;
+	apiPaths: string[];
 }
 
 /** Router harness with all network lanes stubbed out. */
@@ -62,8 +64,10 @@ function makeHarness(
 	const service = new ReviewService(config);
 	const acks: Harness["acks"] = [];
 	const startAcks: Harness["startAcks"] = [];
+	const apiPaths: string[] = [];
 	service.tokens.tokenOrEmpty = async () => "test-token";
 	service.api.tryRequest = (async (apiPath: string) => {
+		apiPaths.push(apiPath);
 		if (apiPath.includes("/contents/") && options.repoConfig !== undefined) {
 			// Serve the repo config as a contents API blob.
 			const yaml = Object.entries(options.repoConfig)
@@ -82,7 +86,7 @@ function makeHarness(
 		startAcks.push({ repo, pr, sha });
 		return null;
 	};
-	return { router: new WebhookRouter(config, service), service, acks, startAcks };
+	return { router: new WebhookRouter(config, service), service, acks, startAcks, apiPaths };
 }
 
 function prEvent(
@@ -97,6 +101,7 @@ function prEvent(
 			author_association: "OWNER",
 			user: { login: "human", type: "User" },
 			head: { sha: "abc1234def" },
+			base: { ref: "main" },
 			...prOverrides,
 		},
 		repository: { full_name: "acme/web" },
@@ -213,6 +218,31 @@ describe("pull_request auto review", () => {
 		expect(action.instruction).toContain("학습된 규칙");
 		expect(action.instruction).toContain("problem+json");
 	});
+
+	test("repo config is fetched from the base branch, never the PR head", async () => {
+		const h = makeHarness({ repoConfig: { poem: false } });
+		asRun(await h.router.route(prEvent()));
+		const contents = h.apiPaths.filter(p => p.includes("/contents/"));
+		expect(contents.length).toBe(1);
+		expect(contents[0]).toContain("ref=main");
+		expect(contents[0]).not.toContain("abc1234def");
+	});
+
+	test("missing base ref → config skipped fail-closed, review still runs", async () => {
+		const h = makeHarness({ repoConfig: { enabled: false } });
+		const action = await h.router.route(prEvent({}, { base: undefined }));
+		expect(action.kind).toBe("run"); // enabled:false was NOT honored — never fetched
+		expect(h.apiPaths.some(p => p.includes("/contents/"))).toBe(false);
+	});
+
+	test("learnings file is capped: oldest entries drop past the limit", async () => {
+		const h = makeHarness();
+		for (let i = 0; i < 205; i++) h.service.addLearning("acme/web", `rule-${i}`);
+		const learned = h.service.getLearnings("acme/web");
+		expect(learned).not.toContain("rule-0\n");
+		expect(learned).toContain("rule-204");
+		expect(learned.split("\n").length).toBe(200);
+	});
 });
 
 describe("issue_comment commands", () => {
@@ -237,10 +267,10 @@ describe("issue_comment commands", () => {
 		expect(action.review).toEqual({ repo: "acme/web", pr: 42, sha: "abc1234def" });
 	});
 
-	test("@gajae review with unresolvable sha falls back to $SHA flow", async () => {
+	test("@gajae review with unresolvable sha falls back to the <SHA> literal flow", async () => {
 		const h = makeHarness({ headSha: "" });
 		const action = asRun(await h.router.route(commentEvent("@gajae review")));
-		expect(action.instruction).toContain("$SHA");
+		expect(action.instruction).toContain("<SHA>");
 		expect(action.review).toBeUndefined();
 	});
 

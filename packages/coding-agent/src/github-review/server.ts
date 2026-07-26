@@ -75,7 +75,7 @@ export class DeliveryLog {
 		if (!this.filePath) return;
 		try {
 			fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-			fs.writeFileSync(this.filePath, JSON.stringify(Object.fromEntries(this.seen)));
+			fs.writeFileSync(this.filePath, JSON.stringify(Object.fromEntries(this.seen)), { mode: 0o600 });
 		} catch {
 			/* memory dedup still works */
 		}

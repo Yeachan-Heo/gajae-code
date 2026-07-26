@@ -8,8 +8,37 @@
  * state released, waiters drained.
  */
 import { completeReviewRun } from "./complete";
+import type { GithubReviewConfig } from "./config";
 import type { RouteAction } from "./router";
 import type { ReviewService } from "./service";
+
+/**
+ * Review sessions consume attacker-controlled PR content (diff, title, body,
+ * comments), so they get a deliberately narrow tool surface: no edit, no task
+ * fan-out, no tool discovery, and bash locked to the "workflow" restriction
+ * profile — one prefix-allowlisted command per call, with pipes, redirects,
+ * command substitution, and `$VAR` expansion rejected by the tool itself.
+ */
+export const REVIEW_SESSION_TOOLS = ["read", "search", "find", "write", "bash"] as const;
+
+/** Session options for one review run (pure; unit-tested without the SDK). */
+export function reviewSessionOptions(config: GithubReviewConfig): {
+	cwd: string;
+	modelPattern?: string;
+	toolNames: string[];
+	bashRestrictionProfile: "workflow";
+	bashAllowedPrefixes: string[];
+	discoverableToolAllowedNames: readonly string[];
+} {
+	return {
+		cwd: config.cwd,
+		...(config.modelPattern ? { modelPattern: config.modelPattern } : {}),
+		toolNames: [...REVIEW_SESSION_TOOLS],
+		bashRestrictionProfile: "workflow",
+		bashAllowedPrefixes: [...config.sessionBashPrefixes],
+		discoverableToolAllowedNames: [],
+	};
+}
 
 export interface RunnerStatus {
 	running: number;
@@ -69,10 +98,7 @@ export class InstructionRunner {
 			// Lazy: pulls in the full SDK (incl. native addons) only when a
 			// session actually starts, keeping CLI/tests light.
 			const { createAgentSession } = await import("../sdk/session");
-			const { session } = await createAgentSession({
-				cwd: config.cwd,
-				...(config.modelPattern ? { modelPattern: config.modelPattern } : {}),
-			});
+			const { session } = await createAgentSession(reviewSessionOptions(config));
 			const { promise, resolve } = Promise.withResolvers<string | null>();
 			const unsubscribe = session.subscribe(event => {
 				if (event.type !== "agent_end") return;

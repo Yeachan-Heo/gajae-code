@@ -1,5 +1,8 @@
 /**
- * Per-repo review config, fetched from the PR head ref (e.g. `.gjc-review.yml`).
+ * Per-repo review config, fetched from the PR **base** branch (e.g.
+ * `.gjc-review.yml`). Never load this from the PR head: config keys flow
+ * into the review prompt, so head-loading would let any fork PR inject
+ * instructions into its own review.
  *
  * Supported keys: enabled(bool), max_comments(int), tone(str),
  * ignore_paths(list[str]), pr_summary(bool), diagrams(bool), poem(bool),

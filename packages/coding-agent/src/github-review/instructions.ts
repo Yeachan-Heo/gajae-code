@@ -93,21 +93,22 @@ export function summaryInstr(ctx: InstructionContext, repo: string, num: number,
 	const bodyStep =
 		cfg.pr_summary === false
 			? ""
-			: `5) PR **본문**에도 요약 반영: B=$(gh pr view ${num} --repo ${repo} --json body --jq .body) 로 현재 본문 확보 → ` +
+			: `5) PR **본문**에도 요약 반영: gh pr view ${num} --repo ${repo} --json body --jq .body 로 현재 본문 확보 → ` +
 				`'${pb.open}' 마커 블록이 있으면 그 블록만 교체, 없으면 본문 **끝에** 추가` +
 				`(작성자 원문은 절대 수정 금지. 블록 형식: 마커 줄 + '## 🦞 요약' + 2~4문장 + 마커 닫는 줄 '${pb.close}'). ` +
 				`→ file 도구로 /tmp/${ctx.markerPrefix}-prbody-${num}.md 에 새 본문 전체 저장 후 ` +
 				`${ctx.postCmd} api --method PATCH repos/${repo}/pulls/${num} -F body=@/tmp/${ctx.markerPrefix}-prbody-${num}.md\n`;
 	return (
 		`${repo} PR #${num} 의 walkthrough 요약을 upsert(있으면 갱신, 없으면 생성)한다. ` +
-		"**shell 리다이렉트/heredoc/파이프(`>`,`<<`,`|`) 금지**(보안가드에 막힘):\n" +
+		"**shell 리다이렉트/heredoc/파이프/명령치환/변수(`>`,`<<`,`|`,`$( )`,`$VAR`) 금지**(제한 셸이 차단) — " +
+		"명령 출력값은 읽어서 다음 명령에 리터럴로 넣는다:\n" +
 		`1) gh pr diff ${num} --repo ${repo} 로 변경 파악.\n` +
 		`2) 요약 본문(첫 줄 마커 '${marker}' 필수): ## 🦞 Walkthrough + 1~2문장 목적 + 파일별 표. ` +
 		diagram +
 		poem +
 		`→ **file 도구로** /tmp/${ctx.markerPrefix}-summary-${num}.md 에 저장(terminal 아님).\n` +
-		`3) 기존 요약 CID 찾기: CID=$(gh api repos/${repo}/issues/${num}/comments --jq 'map(select(.user.login=="${ctx.botLogin}[bot]" and (.body|contains("${marker}"))))[0].id // empty')\n` +
-		`4) CID 있으면 갱신: ${ctx.postCmd} api --method PATCH repos/${repo}/issues/comments/$CID -F body=@/tmp/${ctx.markerPrefix}-summary-${num}.md\n` +
+		`3) 기존 요약 코멘트 찾기: gh api repos/${repo}/issues/${num}/comments --jq 'map(select(.user.login=="${ctx.botLogin}[bot]" and (.body|contains("${marker}"))))[0].id // empty' → 출력된 id 가 CID.\n` +
+		`4) CID 있으면 갱신: ${ctx.postCmd} api --method PATCH repos/${repo}/issues/comments/<CID> -F body=@/tmp/${ctx.markerPrefix}-summary-${num}.md (<CID> 는 3)의 값 리터럴)\n` +
 		`   없으면 생성:   ${ctx.postCmd} pr comment ${num} --repo ${repo} --body-file /tmp/${ctx.markerPrefix}-summary-${num}.md\n` +
 		bodyStep
 	);
@@ -128,10 +129,11 @@ const REVIEW_JSON =
  * release, pending/queued drain). Owned by code, not the LLM.
  */
 export function closeLineFor(ctx: InstructionContext, repo: string, num: number, sha: string): string {
-	const note = sha === "$SHA" ? " ($SHA 는 0)에서 확보한 값 리터럴로 치환)" : "";
+	const shown = sha === "$SHA" ? "<SHA>" : sha;
+	const note = sha === "$SHA" ? " (<SHA> 는 0)에서 확보한 sha 리터럴 — 셸 변수/치환 금지)" : "";
 	return (
 		"마지막) **반드시**(리뷰 게시 성공/실패 무관) 완료 헬퍼 실행(terminal, 멱등):\n" +
-		`   ${ctx.completeCmd} ${repo} ${num} ${sha} success${note}\n` +
+		`   ${ctx.completeCmd} ${repo} ${num} ${shown} success${note}\n` +
 		"   게시에 실패했으면 success 대신 failure. 체크런 닫기·상태 해제·대기 리뷰 재개를 " +
 		"이 명령 하나가 다 처리한다. check-runs 를 손으로 PATCH 하지 마라.\n"
 	);
@@ -173,10 +175,12 @@ export function buildReview(
 		resolveOutdatedThreads = false,
 	} = options;
 	const cfg = options.config ?? {};
-	const jsonTemplate = REVIEW_JSON.replace("<COMMIT>", headSha);
+	const shownSha = headSha === "$SHA" ? "<SHA>" : headSha;
+	const jsonTemplate = REVIEW_JSON.replace("<COMMIT>", shownSha);
 	const fetch =
 		headSha === "$SHA"
-			? `0) head sha 확보: SHA=$(gh pr view ${num} --repo ${repo} --json headRefOid --jq .headRefOid) — JSON의 commit_id에 이 값(리터럴)을 넣어라.\n`
+			? `0) head sha 확보: gh pr view ${num} --repo ${repo} --json headRefOid --jq .headRefOid → ` +
+				"출력된 sha 를 아래 <SHA>·JSON commit_id 자리에 **리터럴로** 넣어라(셸 변수/치환 금지).\n"
 			: "";
 	const inc = incremental && !!baseSha;
 	const diffCmd = inc ? `gh api repos/${repo}/compare/${baseSha}...${headSha}` : `gh pr diff ${num} --repo ${repo}`;
@@ -196,7 +200,7 @@ export function buildReview(
 		`시크릿 스캔: diff를 **file 쓰기 도구로** /tmp/${ctx.markerPrefix}-diff-scan-${num}.txt 에 저장해 ` +
 		`gitleaks detect --no-git --source /tmp/${ctx.markerPrefix}-diff-scan-${num}.txt 실행, ` +
 		"발견 시 해당 라인을 인라인 지적 **최우선**으로 포함. " +
-		`CI 컨텍스트: gh api repos/${repo}/commits/${headSha}/check-runs ` +
+		`CI 컨텍스트: gh api repos/${repo}/commits/${shownSha}/check-runs ` +
 		`--jq '[.check_runs[]|select(.conclusion=="failure")|{name,summary:.output.summary}]' 로 ` +
 		"실패 체크를 확인해 관련 원인 코드에 집중하되, CI 린터가 이미 잡은 항목은 재지적 금지. " +
 		`리뷰 결과는 설명 없이 JSON 하나로 정리한다(게시는 3에서): ${jsonTemplate}. ` +
@@ -228,10 +232,11 @@ export function buildReview(
 			"App 토큰은 FORBIDDEN 난다). 애매하면 건드리지 마라.\n";
 	const summary = `4) 게시 후 walkthrough 요약 upsert:\n${summaryInstr(ctx, repo, num, cfg)}`;
 	return (
-		`GitHub ${repo} PR #${num} 자동 코드리뷰 (head ${headSha}, ${inc ? "증분" : "전체"}). ` +
+		`GitHub ${repo} PR #${num} 자동 코드리뷰 (head ${headSha === "$SHA" ? "<SHA>" : headSha}, ${inc ? "증분" : "전체"}). ` +
 		"게시는 terminal로 직접, aside 금지. 인사말 없이 한국어로.\n" +
-		"⚠️ 리포를 clone 하지 마라. `git clone`·`rm`·로컬 git 조작·파일 리다이렉트(`>`) 전부 금지" +
-		"(보안 가드에 막혀 리뷰가 실패한다). 변경은 오직 `gh pr diff` / `gh api .../compare` 로만 본다.\n" +
+		"⚠️ 리포를 clone 하지 마라. `git clone`·`rm`·로컬 git 조작·파일 리다이렉트(`>`)·파이프(`|`)·" +
+		"명령치환(`$( )`)·셸 변수(`$VAR`) 전부 금지(제한 셸이 차단해 리뷰가 실패한다). " +
+		"명령 출력값은 읽어서 다음 명령에 리터럴로 넣고, 변경은 오직 `gh pr diff` / `gh api .../compare` 로만 본다.\n" +
 		`${extras}\n${fetch}${dedup}${core}${post}${summary}${outdated}${closeLine}`
 	);
 }
@@ -248,11 +253,11 @@ export function forceReviewInstr(ctx: InstructionContext, repo: string, num: num
 export function fixInstr(ctx: InstructionContext, repo: string, num: number, args: string): string {
 	return (
 		`'${ctx.mention} fix' 요청: "${args}". **절대 push/commit/브랜치 수정 금지 — suggestion 으로만** 처리(terminal):\n` +
-		`0) SHA=$(gh pr view ${num} --repo ${repo} --json headRefOid --jq .headRefOid)\n` +
+		`0) gh pr view ${num} --repo ${repo} --json headRefOid --jq .headRefOid 로 head sha 확보(출력 리터럴 사용 — 셸 변수/치환 금지).\n` +
 		`1) gh pr diff ${num} --repo ${repo} 로 코드 확인(read-only — 로컬 수정·게시 금지).\n` +
 		"2) 수정을 committable suggestion 으로 게시(작성자 1클릭 커밋): " +
 		`${ctx.postCmd} api --method POST repos/${repo}/pulls/${num}/reviews 로 ` +
-		"event=COMMENT, commit_id=$SHA, comments 각 body 에 ```suggestion 블록(해당 라인). " +
+		"event=COMMENT, commit_id=<0)의 sha 리터럴>, comments 각 body 에 ```suggestion 블록(해당 라인). " +
 		"suggestion 으로 표현 안 되면 코멘트로 설명+코드블록.\n" +
 		`${ignoreClause(ctx)} 인사말 없이 한국어로.`
 	);

@@ -46,6 +46,7 @@ function testConfig(overrides: Partial<GithubReviewConfig> = {}): GithubReviewCo
 		ignoreRepos: [],
 		allowedAssociations: ["OWNER", "MEMBER", "COLLABORATOR"],
 		learnAssociations: ["OWNER"],
+		sessionBashPrefixes: ["gh pr", "gh api", "gjc github-review", "gitleaks"],
 		repoConfigFile: ".gajae.yaml",
 		inflightStaleSeconds: 20 * 60,
 		sweepIntervalSeconds: 0,

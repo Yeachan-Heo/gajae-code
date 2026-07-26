@@ -27,7 +27,7 @@ import {
 	reviewThreadReplyInstr,
 	summaryInstr,
 } from "./instructions";
-import { loadRepoConfig } from "./repo-config";
+import { loadRepoConfig, type RepoReviewConfig } from "./repo-config";
 import type { ReviewService } from "./service";
 import { mentionsBot, parseCommand } from "./service";
 
@@ -271,6 +271,7 @@ export class WebhookRouter {
 			draft?: boolean;
 			user?: GithubUser;
 			head?: { sha?: string };
+			base?: { ref?: string };
 			author_association?: unknown;
 		};
 		if (pr.draft) return silent("draft");
@@ -280,7 +281,13 @@ export class WebhookRouter {
 		if (prState.paused) return silent("paused"); // `<mention> pause` 된 PR은 자동 리뷰 안 함
 		const headSha = pr.head?.sha ?? "";
 		const token = await this.service.tokens.tokenOrEmpty();
-		const cfg = await loadRepoConfig(this.service.api, token, repo, headSha, this.config.repoConfigFile);
+		// Repo config comes from the PR **base** branch, never the head: a fork
+		// PR could otherwise inject path_instructions/tone into its own review
+		// prompt. No base ref → no config (fail-closed).
+		const baseRef = pr.base?.ref ?? "";
+		const cfg: RepoReviewConfig = baseRef
+			? await loadRepoConfig(this.service.api, token, repo, baseRef, this.config.repoConfigFile)
+			: {};
 		if (cfg.enabled === false) return silent("disabled by repo config");
 		const lastSha = prState.last_reviewed_sha;
 		if (lastSha && lastSha === headSha) return silent("sha already reviewed"); // 재배달/무변경 push 방지

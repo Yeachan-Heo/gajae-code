@@ -12,6 +12,9 @@ import type { GithubReviewConfig } from "./config";
 import { AppTokenProvider, GithubApi } from "./github";
 import { appendEvent, ReviewStateStore } from "./state";
 
+/** Hard cap for learnings entries per repo (each is one prompt line). */
+const MAX_LEARNING_ENTRIES = 200;
+
 export interface CheckRunInfo {
 	id: number;
 	status?: string;
@@ -225,13 +228,21 @@ export class ReviewService {
 		}
 	}
 
+	/**
+	 * Append one learning note. The file is injected into every future review
+	 * prompt, so growth is bounded: oldest entries are dropped past the cap.
+	 */
 	addLearning(repo: string, note: string): void {
 		const trimmed = (note ?? "").trim();
 		if (!trimmed) return;
 		try {
 			const p = this.learnPath(repo);
 			fs.mkdirSync(path.dirname(p), { recursive: true });
-			fs.appendFileSync(p, `- ${trimmed}\n`);
+			const existing = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+			const lines = existing.split("\n").filter(Boolean);
+			lines.push(`- ${trimmed.split("\n").join(" ")}`);
+			while (lines.length > MAX_LEARNING_ENTRIES) lines.shift();
+			fs.writeFileSync(p, `${lines.join("\n")}\n`);
 		} catch {
 			/* best-effort */
 		}
