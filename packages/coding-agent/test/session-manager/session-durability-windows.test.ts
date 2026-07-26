@@ -273,7 +273,7 @@ describe("managed session Windows durability", () => {
 		).toBe(true);
 	});
 
-	it("captures cleanup identity from the native root so the producer's own authority check passes on Windows", async () => {
+	it("forces the win32 producer branch so cleanup identity comes from the native root", async () => {
 		const root = temporaryDirectory("gjc-cleanup-producer-");
 		temporaryDirectories.push(root);
 		const originalPath = path.join(root, "artifacts");
@@ -286,26 +286,54 @@ describe("managed session Windows durability", () => {
 		if (!treeRoot) throw new Error("Native root missing");
 		const stat = syncFs.lstatSync(originalPath, { bigint: true });
 
-		// Host-verified: the real producer runs end to end and the cleanup record
-		// it writes satisfies its own authority check. Before the fix the producer
-		// captured Bun's directory size while the check consulted the native root,
-		// so on Windows that record could never validate itself.
-		const detached = detachArtifactRootForMigration({
-			originalPath,
-			detachedPath: path.join(root, ".gjc-migrate-fork-artifacts"),
-			identity: {
-				dev: stat.dev,
-				ino: stat.ino,
-				size: process.platform === "win32" ? BigInt(treeRoot.size) : stat.size,
-				mtimeNs: process.platform === "win32" ? BigInt(treeRoot.mtimeNs) : stat.mtimeNs,
-			},
-			tree: tree.snapshot,
+		// On this host Bun's directory size and the native root size agree, so a
+		// plain run cannot tell the two authorities apart. Inject the Windows
+		// divergence -- native root reports 4096 while Bun keeps its own value --
+		// so the assertion below can only pass if the producer reads the native
+		// root. Reverting the win32 branch makes this test fail.
+		const originalSnapshot = native.snapshotDirectoryTree;
+		const divergentSize = "4096";
+		expect(divergentSize).not.toBe(treeRoot.size);
+		// Scope the divergence to the retained placeholder only; the detached
+		// original is validated by a separate upstream check that must see real
+		// values.
+		const placeholderPrefix = ".gjc-exact-unlink-placeholder-";
+		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname => {
+			const actual = originalSnapshot(pathname);
+			if (!path.basename(String(pathname)).startsWith(placeholderPrefix)) return actual;
+			if (!actual.ok || !actual.snapshot) return actual;
+			return {
+				...actual,
+				snapshot: {
+					...actual.snapshot,
+					entries: actual.snapshot.entries.map(entry =>
+						entry.relativePath === "" && entry.kind === "directory" ? { ...entry, size: divergentSize } : entry,
+					),
+				},
+			};
 		});
+
+		const detached = detachArtifactRootForMigration(
+			{
+				originalPath,
+				detachedPath: path.join(root, ".gjc-migrate-fork-artifacts"),
+				identity: {
+					dev: stat.dev,
+					ino: stat.ino,
+					size: BigInt(treeRoot.size),
+					mtimeNs: BigInt(treeRoot.mtimeNs),
+				},
+				tree: tree.snapshot,
+			},
+			"win32",
+		);
 
 		expect(detached.detachOutcome === "clean" || detached.detachOutcome === "cleanup_pending").toBe(true);
 		if (detached.detachOutcome === "cleanup_pending") {
-			// Seam-verified for win32: the persisted record must re-validate under
-			// the native-authoritative branch, which a Bun-sourced size cannot.
+			// Only a native-root read yields the injected divergent size; a
+			// Bun-sourced capture would carry the real directory size instead.
+			expect(detached.cleanup.identity.size).toBe(BigInt(divergentSize));
+			expect(detached.cleanup.identity.size).not.toBe(stat.size);
 			expect(cleanupAuthorityMatches(detached.cleanup, root, "win32")).toBe(true);
 		}
 	});

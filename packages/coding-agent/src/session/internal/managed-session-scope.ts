@@ -2444,6 +2444,7 @@ export function cleanupAuthorityMatches(
 
 export function detachArtifactRootForMigration(
 	plan: DetachedArtifactRoot,
+	platform: NodeJS.Platform = process.platform,
 ):
 	| { detached: DetachedArtifactRoot; detachOutcome: "clean" }
 	| { detached: DetachedArtifactRoot; detachOutcome: "cleanup_pending"; cleanup: SourceArtifactCleanup } {
@@ -2494,12 +2495,13 @@ export function detachArtifactRootForMigration(
 		identity: {
 			dev: stat.dev,
 			ino: stat.ino,
-			size: process.platform === "win32" ? BigInt(placeholderRoot.size) : stat.size,
-			mtimeNs: process.platform === "win32" ? BigInt(placeholderRoot.mtimeNs) : stat.mtimeNs,
+			size: platform === "win32" ? BigInt(placeholderRoot.size) : stat.size,
+			mtimeNs: platform === "win32" ? BigInt(placeholderRoot.mtimeNs) : stat.mtimeNs,
 		},
 		tree: snapshot.snapshot,
 	};
-	if (!cleanupAuthorityMatches(cleanup, path.dirname(plan.originalPath))) throw new Error("durability_failed");
+	if (!cleanupAuthorityMatches(cleanup, path.dirname(plan.originalPath), platform))
+		throw new Error("durability_failed");
 	return { detached, detachOutcome: "cleanup_pending", cleanup };
 }
 

@@ -1,24 +1,25 @@
 ## [Unreleased]
 
-### Fixed
-
-- Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
-- Windows artifact migration no longer captures the retained cleanup placeholder's directory size and mtime from Bun's `lstat`, which reports `0` for a directory, while validating them against the native tree root. The producer and its own authority check now share the native authority, so a freshly written `cleanup_pending` record can validate itself instead of failing with `durability_failed` (#2913).
-
 ### Changed
 
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
+- Model preset landing now shows explicit `Enter: apply` and `d: set as default` hints; pressing `d` applies the highlighted profile as the default while Enter keeps the session-only apply path (#3161).
 
 ### Added
 
 - Added cross-platform memory-pressure observability with effective host/cgroup limits, configurable GC and restart advisory thresholds, typed Linux process probes, and a Windows Job Object native probe; unsupported lifecycle actions remain advisory-only.
 - Ralplan consensus planning now enforces a finite planner/revision iteration budget at the native write path (default 5, configurable via `gjc.ralplan.maxIterations`). Opening another planner/revision pass past the cap fails closed with exit code 3 and an operator-visible `PLANNING-STUCK` marker instead of silent unbounded re-review; `final`/post-interview escalation remains allowed without auto-implementation. The cap also floors against on-disk `stage-*-{planner,revision}.md` artifacts so a wiped, truncated, or malformed `index.jsonl` cannot fail open after prior openers (#3165).
 - Added `grok-45-eco`, `grok-45-medium`, and `grok-45-pro` built-in xAI presets for `grok-4.5`; every role stays within the model's `high` reasoning cap, while the `xai` provider recommendation remains `grok-medium` to preserve existing defaults (#3177).
+- JetBrains Air ACP sessions now preserve final answers across fast prompt completion, expose tool/retry/goal/notices and session title updates, apply Air's legacy `session/set_model` preset changes through the canonical session configuration path, accept client-supplied stdio/HTTP/SSE MCP servers, reject unsupported additional directories, and reject unavailable model presets before provider dispatch.
 
 ### Fixed
 
+- Windows artifact-migration cleanup identity capture is now provable off-Windows: `detachArtifactRootForMigration` takes an injectable platform seam so the `win32` producer branch is exercised deterministically, and its regression fails if the native-root capture is reverted (#2913).
+- Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
+- Windows managed-session artifact migration now uses the native directory-tree root for retained cleanup identity both when producing `cleanup_pending` records and when validating them, avoiding Bun's zero-valued directory `lstat` metadata and false `durability_failed` results while preserving fail-closed authority checks (#2913).
+- Legacy-session artifact migration now retries transient EINTR interruptions during no-replace artifact publishes and classifies exhausted interruptions as pre-mutation failures instead of surfacing `durability_failed` (#3077).
 - Alibaba Token Plan first-event timeouts also match the exported lazy-stream watchdog text, preserve sticky fallback selection across later turns, avoid same-candidate auto-compaction replay, and reset attempt/overflow budgets only when an accepted queued steering/follow-up successor starts (#3026).
-- Interrupted managed-session artifact cleanup on Windows now validates the retained directory's size and mtime from the native snapshot root instead of Bun's directory metadata, avoiding false `durability_failed` results while preserving fail-closed authority checks (#2913).
+- Legacy auto-compaction now caps provider `Retry-After` delays at `retry.maxDelayMs` instead of sleeping for an unbounded server hint (#3156).
 - Queued steering and follow-up successors now reset predecessor fallback attempt budgets and overflow-maintenance counters only after `continue()` accepts the queued turn, without clearing the sticky fallback cursor.
 - Questions about `ultragoal` behavior now stay on the direct-answer path instead of being misclassified as requests to start the durable workflow.
 - Workflow intent routing now requires a leading `/skill:ultragoal` for slash-command escalation and recognizes Korean object-particle requests such as `ultragoal을 사용해줘` without routing questions that merely mention the command.
@@ -27,11 +28,9 @@
 - `gjc deep-interview apply-round-result` no longer fails with `DI_INTERNAL_ERROR` on every call, which made the deep-interview workflow unable to score a single round. Three defects stacked: the Round-0 topology gate is recorded as a permanently unscorable `answered` shell (`--round` must be >= 1) yet counted toward the "earlier rounds must be scored" precondition, deadlocking every later round; the round-result decoder materializes omitted optional keys as `undefined`, which canonical JSON rejected outright, so any request omitting `targeting`/`ontology`/`bookkeeping` could not be digested; and `scoreToUnits` tested the raw float product, so ordinary scores whose scaling misses the integer grid (`0.69 * 10_000` is `6900.000000000001`) were rejected as non-integral 1e-4 units. Round-0 gate shells are now excluded from the ordering precondition, canonical JSON drops `undefined` object properties like `JSON.stringify` (array elements and the top-level value stay strict), and 1e-4 unit conversion is decided from the shortest round-trip decimal so genuinely off-grid precision such as `0.00005` and `0.05000000000000001` is still rejected.
 - Task output-limit environment overrides now accept only complete positive decimal safe integers; malformed, fractional, exponent-form, whitespace-padded, and precision-losing values fall back to the documented defaults instead of being partially parsed (#3175).
 - Task output-limit environment overrides now honor values loaded from agent, config-root, and home dotenv files through the shared utils env loader while retaining strict positive safe-integer validation and canonical GJC-first alias precedence.
+- `--thinking` now advertises the supported Effort levels and fails closed with a usage error for invalid, missing, empty, or flag-adjacent values, rather than silently ignoring a token or consuming another flag.
 - MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. An ACP launch that reaches the readiness cutoff before MCP startup now fails fast as a pending startup instead of silently falling back to the ordinary ceiling.
 
-### Added
-
-- JetBrains Air ACP sessions now preserve final answers across fast prompt completion, expose tool/retry/goal/notices and session title updates, apply Air's legacy `session/set_model` preset changes through the canonical session configuration path, accept client-supplied stdio/HTTP/SSE MCP servers, reject unsupported additional directories, and reject unavailable model presets before provider dispatch.
 
 ## [0.11.10] - 2026-07-25
 ### Changed
