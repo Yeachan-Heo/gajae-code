@@ -79,6 +79,8 @@ function createContext(currentSessionFile: string): {
 			requestRender: vi.fn(() => {
 				calls.push("ui.requestRender");
 			}),
+			requestRenderWithGeneration: vi.fn(() => 1),
+			waitForRenderCommit: vi.fn(async () => true),
 			resetViewportAnchorIntent: vi.fn(() => {
 				calls.push("ui.resetViewportAnchorIntent");
 			}),
@@ -106,7 +108,15 @@ function createContext(currentSessionFile: string): {
 			}),
 		},
 		statusContainer: {
-			clear: vi.fn(() => {
+			children: [] as unknown[],
+			addChild: vi.fn(function (this: { children: unknown[] }, child: unknown) {
+				this.children.push(child);
+			}),
+			removeChild: vi.fn(function (this: { children: unknown[] }, child: unknown) {
+				this.children = this.children.filter(candidate => candidate !== child);
+			}),
+			clear: vi.fn(function (this: { children: unknown[] }) {
+				this.children = [];
 				calls.push("statusContainer.clear");
 			}),
 		},
@@ -256,7 +266,9 @@ describe("SelectorController session deletion", () => {
 		await controller.handleResumeSession(legacyPath);
 
 		expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledWith(legacyPath, "copy-retain", identity);
-		expect(switchSession).toHaveBeenCalledWith(migratedPath);
+		expect(switchSession).toHaveBeenCalledWith(migratedPath, {
+			transition: { origin: "interactive_selector_resume" },
+		});
 	});
 
 	it("keeps explicit selections out of the managed migration fence", async () => {
@@ -271,7 +283,9 @@ describe("SelectorController session deletion", () => {
 
 		expect(inspection).not.toHaveBeenCalled();
 		expect(prepareManagedCandidateForStrictAdoption).not.toHaveBeenCalled();
-		expect(switchSession).toHaveBeenCalledWith(explicitPath);
+		expect(switchSession).toHaveBeenCalledWith(explicitPath, {
+			transition: { origin: "interactive_selector_resume" },
+		});
 	});
 
 	it("does not switch after a managed replacement race rejects the inspected identity", async () => {
