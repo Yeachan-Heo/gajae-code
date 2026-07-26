@@ -2390,7 +2390,7 @@ test("SDK session switches rotate endpoint authority before publishing the repla
 });
 
 for (const eventType of ["session_switch", "session_branch"] as const) {
-	test(`SDK ${eventType} rotation swallows a retained owner-release failure without surfacing an extension error`, async () => {
+	test(`SDK ${eventType} rotation fails closed when predecessor release is uncertain`, async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-rotate-fail-${eventType}-`));
 		dirs.push(cwd);
 		const sessionA = `rotate-fail-a-${Date.now()}`;
@@ -2414,7 +2414,6 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 		// Fail A's owner release exactly once so the rotate-time stopSession(prevId)
 		// throws the retained-retry AggregateError.
 		const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
-		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 		try {
 			const startupCapability = new SdkStartupCapability();
 			const handlers = start(ctx, undefined, () => {}, false, new Map(), {
@@ -2426,55 +2425,20 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
 
 			activeSessionId = sessionB;
-			// Drive the rotation handler through a real ExtensionRunner so the onError
-			// seam proves the swallowed failure is not surfaced as a red extension error.
-			const rotationExt = {
-				path: "test-rotation-ext",
-				handlers: new Map([
-					[
-						eventType,
-						[
-							async () => {
-								await handlers.get(eventType)!(
-									{
-										type: eventType,
-										reason: "new",
-										previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
-									},
-									ctx,
-								);
-							},
-						],
-					],
-				]),
+			// A retained predecessor cleanup must fail closed and rethrow before any
+			// successor endpoint can publish.
+			const rotationEvent = {
+				type: eventType,
+				reason: "new",
+				previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
 			};
-			const runner = new ExtensionRunner([rotationExt as never], {} as never, cwd, {} as never, {} as never);
-			runner.initialize({} as never, {} as never);
-			const surfaced: Array<{ event: string }> = [];
-			runner.onError(error => surfaced.push(error));
-			await expect(
-				runner.emit({
-					type: eventType,
-					reason: "new",
-					previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
-				} as never),
-			).resolves.toBeUndefined();
-			expect(surfaced).toEqual([]);
+			await expect(handlers.get(eventType)!(rotationEvent, ctx)).rejects.toThrow(
+				`SDK notification runtime ${sessionA} owner release failed`,
+			);
 
-			// Rotation still publishes B and retires A despite the swallowed failure.
+			// The failed predecessor release quarantines B: no successor endpoint is published.
 			const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
-			await waitFor(() => !fs.existsSync(endpointAPath) && fs.existsSync(endpointBPath), "rotated session endpoint");
-
-			// The failure is logged at error severity with the shared prefix and A's
-			// identity, never surfaced as a red extension error.
-			const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
-			expect(
-				breadcrumbs.some(
-					message =>
-						message.startsWith("notifications: SDK notification runtime cleanup failed: ") &&
-						message.includes(`SDK notification runtime ${sessionA} owner release failed`),
-				),
-			).toBe(true);
+			expect(fs.existsSync(endpointBPath)).toBe(false);
 
 			// With the mock restored, A's retained cleanup can still complete.
 			stop.mockRestore();
@@ -2488,7 +2452,6 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
 		} finally {
 			stop.mockRestore();
-			errorSpy.mockRestore();
 		}
 	});
 }

@@ -30,6 +30,7 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../../extensibility/plugins/marketplace";
+import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import {
 	getAvailableThemes,
 	getCurrentThemeName,
@@ -165,6 +166,7 @@ import type { JobsObserver } from "../jobs-observer";
 import type { SessionObserverRegistry } from "../session-observer-registry";
 import type { TasksAggregator } from "../tasks-aggregator";
 import type { TranscriptItemRegistry } from "../transcript-item-registry";
+import { acquireResumeProgressLease } from "../utils/ui-helpers";
 
 const CALLBACK_SERVER_PROVIDERS = new Set<string>([
 	"anthropic",
@@ -2262,28 +2264,42 @@ export class SelectorController {
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
 		this.#clearTransientSessionUi();
-		const migrationPolicy =
-			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-		let writableSessionPath = sessionPath;
-		if (this.ctx.sessionManager.isManagedDestination()) {
-			const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
-			if (inspection.kind === "error") throw new Error(`Could not inspect selected session: ${inspection.reason}`);
-			writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
-				sessionPath,
-				migrationPolicy,
-				inspection.identity,
-			);
-		}
-		// Switch session via AgentSession (emits hook and tool session events)
-		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
-		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
-		if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
-		this.#refreshSessionTerminalTitle();
-		this.ctx.updateEditorBorderColor();
+		const progressLease = acquireResumeProgressLease(this.ctx);
+		try {
+			await progressLease.committed;
+			const migrationPolicy =
+				this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+			let writableSessionPath = sessionPath;
+			if (this.ctx.sessionManager.isManagedDestination()) {
+				const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
+				if (inspection.kind === "error")
+					throw new Error(`Could not inspect selected session: ${inspection.reason}`);
+				writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
+					sessionPath,
+					migrationPolicy,
+					inspection.identity,
+				);
+			}
+			// Switch session via AgentSession (emits hook and tool session events)
+			if (
+				!(await this.ctx.session.switchSession(writableSessionPath, {
+					transition: { origin: INTERACTIVE_SELECTOR_RESUME_ORIGIN },
+				}))
+			)
+				return;
+			const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
+			if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
+			this.#refreshSessionTerminalTitle();
+			this.ctx.updateEditorBorderColor();
 
-		this.ctx.rebuildInitialMessages(switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript");
-		await this.ctx.reloadTodos();
-		this.ctx.showStatus("Resumed session");
+			this.ctx.rebuildInitialMessages(
+				switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript",
+			);
+			await this.ctx.reloadTodos();
+			this.ctx.showStatus("Resumed session");
+		} finally {
+			progressLease.clear();
+		}
 	}
 
 	async handleSessionDeleteCommand(): Promise<void> {

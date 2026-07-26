@@ -623,6 +623,10 @@ type TuiRenderCounterSnapshot = {
 	debugRedrawAppendWrites: number;
 	differentialGuardVisibleWidthCalls: number;
 };
+type RenderCommitWaiter = {
+	resolve: (committed: boolean) => void;
+	timer: NodeJS.Timeout;
+};
 
 /**
  * TUI - Main class for managing terminal UI with differential rendering
@@ -651,6 +655,11 @@ export class TUI extends Container {
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	onDebug?: () => void;
 	#renderRequested = false;
+	#nextRenderGeneration = 0;
+	#renderRequestedGeneration = 0;
+	#committedRenderGeneration = 0;
+	#renderCommitWaiters = new Map<number, Set<RenderCommitWaiter>>();
+	#lastRenderWriteSucceeded = false;
 	#renderTimer: NodeJS.Timeout | undefined;
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
@@ -1118,6 +1127,57 @@ export class TUI extends Container {
 		this.requestRender(true);
 	}
 
+	/**
+	 * Wait for a specific render request generation to be written successfully.
+	 *
+	 * Render requests are coalesced, so committing a newer generation also commits
+	 * every older generation represented by that frame. A stopped or unavailable
+	 * terminal resolves waiters false so UI callers can fail open instead of
+	 * holding a session operation behind a dead renderer.
+	 */
+	waitForRenderCommit(generation: number, timeoutMs = 250): Promise<boolean> {
+		if (generation <= 0 || generation <= this.#committedRenderGeneration) return Promise.resolve(true);
+		if (this.#stopped || !this.terminalAvailable) return Promise.resolve(false);
+		return new Promise<boolean>(resolve => {
+			const waiter: RenderCommitWaiter = {
+				resolve,
+				timer: setTimeout(
+					() => {
+						const waiters = this.#renderCommitWaiters.get(generation);
+						if (waiters) {
+							waiters.delete(waiter);
+							if (waiters.size === 0) this.#renderCommitWaiters.delete(generation);
+						}
+						resolve(false);
+					},
+					Math.max(0, timeoutMs),
+				),
+			};
+			waiter.timer.unref?.();
+			const waiters = this.#renderCommitWaiters.get(generation) ?? new Set();
+			waiters.add(waiter);
+			this.#renderCommitWaiters.set(generation, waiters);
+		});
+	}
+
+	#settleRenderCommitWaiters(committed: boolean, generation = Number.POSITIVE_INFINITY): void {
+		if (committed) this.#committedRenderGeneration = Math.max(this.#committedRenderGeneration, generation);
+		for (const [waiterGeneration, waiters] of this.#renderCommitWaiters) {
+			if (committed && waiterGeneration > generation) continue;
+			this.#renderCommitWaiters.delete(waiterGeneration);
+			for (const waiter of waiters) {
+				clearTimeout(waiter.timer);
+				waiter.resolve(committed);
+			}
+		}
+	}
+
+	#commitRenderGeneration(generation: number): void {
+		if (generation <= 0) return;
+		if (this.#lastRenderWriteSucceeded) this.#settleRenderCommitWaiters(true, generation);
+		else if (this.#stopped || !this.terminalAvailable) this.#settleRenderCommitWaiters(false, generation);
+	}
+
 	get terminalAvailable(): boolean {
 		return !this.#terminalUnavailable && this.terminal.available;
 	}
@@ -1126,6 +1186,7 @@ export class TUI extends Container {
 		this.#terminalUnavailable = true;
 		this.#stopped = true;
 		this.#renderRequested = false;
+		this.#settleRenderCommitWaiters(false);
 		if (this.#renderTimer) {
 			clearTimeout(this.#renderTimer);
 			this.#renderTimer = undefined;
@@ -1324,6 +1385,7 @@ export class TUI extends Container {
 		this.flushTerminalCleanup();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
+		this.#settleRenderCommitWaiters(false);
 		if (this.#renderTimer) {
 			clearTimeout(this.#renderTimer);
 			this.#renderTimer = undefined;
@@ -1395,6 +1457,17 @@ export class TUI extends Container {
 	}
 
 	requestRender(force = false, source = "unknown"): void {
+		this.requestRenderWithGeneration(force, source);
+	}
+
+	requestRenderWithGeneration(force = false, source = "unknown"): number {
+		const generation = ++this.#nextRenderGeneration;
+		this.#renderRequestedGeneration = Math.max(this.#renderRequestedGeneration, generation);
+		this.#requestRenderCore(force, source, generation);
+		return generation;
+	}
+
+	#requestRenderCore(force: boolean, source: string, generation: number): void {
 		if (!this.terminalAvailable) {
 			this.#markTerminalUnavailable();
 			return;
@@ -1429,12 +1502,17 @@ export class TUI extends Container {
 			this.#renderRequested = true;
 			process.nextTick(() => {
 				if (this.#stopped || !this.#renderRequested) {
+					this.#settleRenderCommitWaiters(false, generation);
 					return;
 				}
+				const requestedGeneration = this.#renderRequestedGeneration;
+				this.#renderRequestedGeneration = 0;
 				this.#renderRequested = false;
 				this.#lastRenderAt = performance.now();
+				this.#lastRenderWriteSucceeded = false;
 				const t0 = renderMetrics.now();
 				this.#doRender();
+				this.#commitRenderGeneration(requestedGeneration);
 				if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			});
 			return;
@@ -1455,6 +1533,7 @@ export class TUI extends Container {
 		if (this.#renderRequested) return;
 		this.#renderRequested = true;
 		process.nextTick(() => this.#scheduleRender());
+		return;
 	}
 
 	#scheduleRender(): void {
@@ -1469,10 +1548,14 @@ export class TUI extends Container {
 			if (this.#stopped || !this.#renderRequested) {
 				return;
 			}
+			const requestedGeneration = this.#renderRequestedGeneration;
+			this.#renderRequestedGeneration = 0;
 			this.#renderRequested = false;
 			this.#lastRenderAt = performance.now();
+			this.#lastRenderWriteSucceeded = false;
 			const t0 = renderMetrics.now();
 			this.#doRender();
+			this.#commitRenderGeneration(requestedGeneration);
 			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			if (this.#renderRequested) {
 				this.#scheduleRender();
@@ -1495,10 +1578,14 @@ export class TUI extends Container {
 			this.#renderTimer = undefined;
 			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
+		const requestedGeneration = this.#renderRequestedGeneration;
+		this.#renderRequestedGeneration = 0;
 		this.#renderRequested = false;
 		this.#lastRenderAt = performance.now();
+		this.#lastRenderWriteSucceeded = false;
 		const t0 = renderMetrics.now();
 		this.#doRender();
+		this.#commitRenderGeneration(requestedGeneration);
 		if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 	}
 
@@ -3004,8 +3091,13 @@ export class TUI extends Container {
 			buffer += `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
 		}
 		if (!this.#writeTerminal(buffer)) return false;
-		if (!this.#imeCursorActive) return true;
-		return this.#writeCursorPosition(cursorPos, totalLines);
+		if (!this.#imeCursorActive) {
+			this.#lastRenderWriteSucceeded = true;
+			return true;
+		}
+		const cursorWritten = this.#writeCursorPosition(cursorPos, totalLines);
+		if (cursorWritten) this.#lastRenderWriteSucceeded = true;
+		return cursorWritten;
 	}
 
 	/**

@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, ImageContent, Message } from "@gajae-code/ai";
-import { type Component, Spacer, Text, TruncatedText, type TUI, truncateToWidth } from "@gajae-code/tui";
+import { type Component, Loader, Spacer, Text, TruncatedText, type TUI, truncateToWidth } from "@gajae-code/tui";
 import { settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
@@ -84,6 +84,43 @@ class BoundedIrcTextComponent implements Component {
 export function prepareTranscriptRebuild(ui: TUI, policy: TranscriptRebuildPolicy): void {
 	if (policy === "replace-identity") ui.resetViewportAnchorIntent();
 	else ui.prepareViewportAnchorForTranscriptRebuild();
+}
+
+export const RESUME_PROGRESS_COMMIT_TIMEOUT_MS = 250;
+
+export interface ResumeProgressLease {
+	readonly committed: Promise<boolean>;
+	clear(): void;
+}
+
+/**
+ * Mount a resume loader on the live status rail and wait for its render generation
+ * to commit before session I/O begins. The commit is advisory: a stopped or
+ * unavailable terminal resolves false and callers continue without blocking.
+ */
+export function acquireResumeProgressLease(
+	ctx: Pick<InteractiveModeContext, "ui" | "statusContainer">,
+): ResumeProgressLease {
+	const loader = new Loader(
+		ctx.ui,
+		spinner => theme?.fg?.("accent", spinner) ?? spinner,
+		message => theme?.fg?.("muted", message) ?? message,
+		"Resuming session…",
+	);
+	ctx.statusContainer.addChild(loader);
+	const generation = ctx.ui.requestRenderWithGeneration(false, "resume-progress");
+	let active = true;
+	const committed = ctx.ui.waitForRenderCommit(generation, RESUME_PROGRESS_COMMIT_TIMEOUT_MS).catch(() => false);
+	return {
+		committed,
+		clear(): void {
+			if (!active) return;
+			active = false;
+			if (ctx.statusContainer.children.includes(loader)) ctx.statusContainer.removeChild(loader);
+			else loader.stop();
+			ctx.ui.requestRender(false, "resume-progress-clear");
+		},
+	};
 }
 type TextBlock = { type: "text"; text: string };
 interface RenderInitialMessagesOptions {

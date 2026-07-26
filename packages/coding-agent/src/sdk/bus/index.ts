@@ -43,6 +43,7 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -81,6 +82,7 @@ import {
 	type NotificationSettingsReader,
 	sessionTag,
 } from "./config";
+import { runIdentityControlSuccessPath, type TerminalSendOutcome } from "./control-drain-lease";
 import { telegramControlCommandUsage } from "./config-commands";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
@@ -96,6 +98,8 @@ import {
 	type RegisterNotificationRootResult,
 	unregisterNotificationRoot,
 } from "./telegram-daemon";
+export { isNativeControlDrainAvailable, runIdentityControlSuccessPath, runIdentityControlTerminalPath } from "./control-drain-lease";
+export type { IdentityControlSuccessPathInput, IdentityControlTerminalPathInput, TerminalSendOutcome } from "./control-drain-lease";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -888,6 +892,8 @@ interface SessionRuntime {
 	disposeGateListener: () => void;
 	/** Whether notification-only delivery and answer resources are active. */
 	notificationsActive: boolean;
+	/** Rejects new SDK frames while a leased terminal response drains. */
+	inboundFenced: boolean;
 	/** Set as soon as terminal teardown is requested, before startup settles. */
 	stopping: boolean;
 	/** Recreates notification-only resources after `/notify on`. */
@@ -2964,6 +2970,18 @@ export async function ensureConfiguredProviderDaemons(
 	if (isSlackConfigured(cfg)) await ensureProviderDaemon("slack", settings);
 }
 
+/**
+ * Classify whether a session identity event must await notification endpoint startup.
+ * Only an interactive selector resume may defer this ancillary startup; all other
+ * events, including branches and unknown origins, fail closed to awaiting it.
+ */
+export function shouldAwaitNotificationStartup(event: {
+	type: "session_switch" | "session_branch";
+	transition?: { origin: string };
+}): boolean {
+	return event.type !== "session_switch" || event.transition?.origin !== INTERACTIVE_SELECTOR_RESUME_ORIGIN;
+}
+
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -3007,7 +3025,11 @@ export function createNotificationsExtension(
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation:
-		| { event: { previousSessionFile?: string }; ctx: ExtensionContext; awaitStartup: boolean }
+		| {
+			event: { previousSessionFile?: string; transition?: { origin: string } };
+			ctx: ExtensionContext;
+			awaitStartup: boolean;
+		}
 		| undefined;
 	let extensionShuttingDown = false;
 
@@ -3068,6 +3090,7 @@ export function createNotificationsExtension(
 		const requestedRuntime = retryRuntime ?? activeRuntime;
 		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
 		if (reason === "session" && requestedRuntime) {
+			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
 			requestedRuntime.abortEphemeralTurns();
 		}
@@ -3706,6 +3729,73 @@ export function createNotificationsExtension(
 				};
 			},
 			onRequest: options.onSdkRequest,
+			beforeControlResponse: async (connectionId, request, response, sendTerminal) => {
+				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
+				const pending = deferredIdentityRotation;
+				deferredIdentityRotation = undefined;
+				identityControlInFlight = false;
+				if (response.ok !== true || !pending) return;
+
+				const predecessorId = activeRuntimeId ?? sessionIdFromFile(pending.event.previousSessionFile);
+				if (!predecessorId) throw new Error("notifications: identity control predecessor is unknown.");
+				let terminalAttempted = false;
+				let terminalOutcome: TerminalSendOutcome | undefined;
+				try {
+					terminalOutcome = await runIdentityControlSuccessPath({
+						fence: () => {
+							const predecessor = runtimes.get(predecessorId);
+							if (!predecessor || predecessor.stopping || predecessor.serverStopped)
+								throw new Error(`notifications: predecessor runtime ${predecessorId} cannot be fenced.`);
+							predecessor.inboundFenced = true;
+						},
+						ensurePredecessorSendCapable: () => {
+							const predecessor = runtimes.get(predecessorId);
+							if (!predecessor || predecessor.stopping || predecessor.serverStopped)
+								throw new Error(`notifications: predecessor runtime ${predecessorId} is not send-capable.`);
+						},
+						startSuccessor: async () => {
+							const successorId = sessionId(pending.ctx);
+							try {
+								await rotateSessionAuthority(pending.event, pending.ctx, true, {
+									deferPredecessorStop: true,
+								});
+								const successor = runtimes.get(successorId);
+								if (!successor || !successor.host.started || activeRuntimeId !== successorId)
+									throw new Error(`notifications: successor runtime ${successorId} was not ready.`);
+							} catch (error) {
+								(response as Record<string, unknown>).ok = false;
+								delete (response as Record<string, unknown>).result;
+								(response as Record<string, unknown>).error = {
+									code: "unavailable",
+									message: error instanceof Error ? error.message : "Successor session was not ready.",
+								};
+							}
+						},
+						sendTerminal: async () => {
+							terminalAttempted = true;
+							try {
+								await sendTerminal();
+								return "written";
+							} catch {
+								return "write_failed";
+							}
+						},
+						stopPredecessor: async () => {
+							try {
+								await stopSession(predecessorId);
+							} catch (error) {
+								if (!terminalAttempted) throw error;
+								logger.error(`notifications: deferred predecessor cleanup failed: ${String(error)}`);
+							}
+						},
+						requireNativeControlDrain:
+							(request as { requireNativeControlDrain?: unknown }).requireNativeControlDrain === true,
+					});
+				} catch (error) {
+					if (!terminalAttempted) throw error;
+					logger.error(`notifications: identity terminal delivery failed (${terminalOutcome ?? "unknown"}): ${String(error)}`);
+				}
+			},
 			afterControlResponse: async (connectionId, request, response) => {
 				if (
 					(request.operation === "turn.prompt" ||
@@ -3726,13 +3816,6 @@ export function createNotificationsExtension(
 				}
 
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
-				if (typeof request.operation === "string" && identityControlOperations.has(request.operation)) {
-					const pending = deferredIdentityRotation;
-					deferredIdentityRotation = undefined;
-					identityControlInFlight = false;
-					if (response.ok === true && pending)
-						await rotateSessionAuthority(pending.event, pending.ctx, pending.awaitStartup);
-				}
 			},
 			control: async (connectionId, frame) => {
 				const request = frame as {
@@ -3823,6 +3906,7 @@ export function createNotificationsExtension(
 			workflowGate: undefined,
 			gatePresentations,
 			stopping: false,
+			inboundFenced: false,
 			abortEphemeralTurns: () => {},
 			disableEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
@@ -3906,6 +3990,22 @@ export function createNotificationsExtension(
 					const frame = JSON.parse(inbound.json) as unknown;
 					if (!frame || typeof frame !== "object") return;
 					const typedFrame = frame as Record<string, unknown>;
+					if (initializedRuntime.inboundFenced) {
+						if (typedFrame.type === "control_request" && typeof typedFrame.id === "string") {
+							try {
+								server.sendTo(
+									inbound.connectionId,
+									JSON.stringify({
+										type: "control_response",
+										id: typedFrame.id,
+										ok: false,
+										error: { code: "endpoint_stale", message: "session endpoint is draining." },
+									}),
+								);
+							} catch {}
+						}
+						return;
+					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
 						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
@@ -3940,7 +4040,7 @@ export function createNotificationsExtension(
 
 			server.onReply((err, reply) => {
 				if (err || !reply) return;
-				if (runtime?.stopping || runtime?.policySuspended || runtimes.get(id) !== runtime) {
+				if (runtime?.inboundFenced || runtime?.stopping || runtime?.policySuspended || runtimes.get(id) !== runtime) {
 					try {
 						server.closeClaimInvalid(reply.replyReceiptId, "session_stopping");
 					} catch {}
@@ -4182,6 +4282,7 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound((err, inbound) => {
 				if (err || !inbound) return;
+				if (initializedRuntime.inboundFenced) return;
 				const authenticatedInbound = inbound as typeof inbound & {
 					connectionId: string;
 					messageId?: number;
@@ -4829,10 +4930,28 @@ export function createNotificationsExtension(
 		});
 	};
 
+	const preparePredecessorForTerminal = async (id: string): Promise<void> => {
+		const predecessor = runtimes.get(id);
+		if (!predecessor || cleanupRetries.has(id))
+			throw new Error(`notifications: predecessor runtime ${id} is not safely send-capable.`);
+		predecessor.inboundFenced = true;
+		// Release broker/host authority while leaving the native server alive for
+		// the one accepted terminal response. stopAndWait is deferred to stopSession.
+		const stopped = await predecessor.host.stop();
+		if (stopped !== "stopped" && predecessor.host.started)
+			throw new Error(`notifications: predecessor runtime ${id} host release was not proven.`);
+		predecessor.hostStopped = true;
+		predecessor.brokerRegistrationReleased = !predecessor.brokerRegistrationActive || predecessor.hostStopped;
+		if (predecessor.brokerRegistrationActive && predecessor.hostStopped)
+			predecessor.brokerRegistrationActive = false;
+		predecessor.host.reverse.dispose();
+	};
+
 	const rotateSessionAuthority = async (
 		event: { previousSessionFile?: string },
 		ctx: ExtensionContext,
 		awaitStartup: boolean,
+		options: { deferPredecessorStop?: boolean } = {},
 	): Promise<void> => {
 		if (extensionShuttingDown) return;
 		const newId = sessionId(ctx);
@@ -4856,14 +4975,14 @@ export function createNotificationsExtension(
 		}
 		if (prevId && prevId !== newId) {
 			controller.rekeySession(prevId, newId);
-			try {
-				await stopSession(prevId);
-			} catch (error) {
-				// A retained owner-release failure keeps the exact runtime in
-				// cleanupRetries for an explicit later retry; log it rather than
-				// surfacing a red extension error
-				// while rotating session authority (/new, fork, resume, branch).
-				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			if (options.deferPredecessorStop) {
+				await preparePredecessorForTerminal(prevId);
+			} else {
+				const stopped = await stopSession(prevId);
+				if (cleanupRetries.has(prevId) || runtimes.has(prevId) || sessionStartPromises.has(prevId))
+					throw new Error(`notifications: predecessor runtime ${prevId} release is uncertain.`);
+				if (!stopped && activeRuntimeId === prevId)
+					throw new Error(`notifications: predecessor runtime ${prevId} release was not proven.`);
 			}
 		}
 		if (extensionShuttingDown) return;
@@ -4884,18 +5003,19 @@ export function createNotificationsExtension(
 		trackBranchStartup(newId, ctx, startup);
 	};
 	api.on("session_switch", async (event, ctx) => {
+		const awaitStartup = shouldAwaitNotificationStartup(event);
+		if (identityControlInFlight) {
+			deferredIdentityRotation = { event, ctx, awaitStartup };
+			return;
+		}
+		await rotateSessionAuthority(event, ctx, awaitStartup);
+	});
+	api.on("session_branch", async (event, ctx) => {
 		if (identityControlInFlight) {
 			deferredIdentityRotation = { event, ctx, awaitStartup: true };
 			return;
 		}
 		await rotateSessionAuthority(event, ctx, true);
-	});
-	api.on("session_branch", async (event, ctx) => {
-		if (identityControlInFlight) {
-			deferredIdentityRotation = { event, ctx, awaitStartup: false };
-			return;
-		}
-		await rotateSessionAuthority(event, ctx, false);
 	});
 
 	const terminalizeInFlightTools = (
