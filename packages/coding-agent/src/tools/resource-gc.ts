@@ -18,9 +18,15 @@ function safeProbeWindowsJobMemory(): WindowsJobMemoryProbeResult {
 
 import { logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
+import { executeGjcTeamApiOperation, listGjcTeams, readGjcWorkerHeartbeat } from "../gjc-runtime/team-runtime";
 import { computeMemoryGuardDomain } from "../runtime/memory-domain";
-import { chooseMemoryGuardAction, MemoryGuardHost, resolveMemoryGuardPolicy } from "../runtime/memory-guard";
-import type { MemoryGuardPolicy } from "../runtime/memory-guard-contract";
+import {
+	chooseMemoryGuardAction,
+	MemoryGuardHost,
+	resolveMemoryGuardPolicy,
+	revalidateMemoryGuardAction,
+} from "../runtime/memory-guard";
+import type { MemoryGuardPolicy, MemoryGuardWorkerSample } from "../runtime/memory-guard-contract";
 import { resolveEffectiveMemoryLimit } from "../runtime/memory-limit";
 import { listTabsForGc, releaseTabIfGcEligible, type TabGcSnapshot } from "./browser/tab-supervisor";
 import { cleanupStaleScreenshotFallbackDirs, hasCreatedScreenshotFallbackDir } from "./computer-gc";
@@ -85,6 +91,14 @@ export interface ResourceGcDeps {
 	releaseTab: (name: string, policy: { now: () => number; idleMs: number }) => Promise<boolean>;
 	cleanupScreenshots: (opts: { now: () => number; staleMs: number }) => Promise<{ scanned: number; removed: number }>;
 	screenshotArmed: () => boolean;
+	listTeamWorkers?: (cwd: string, sessionId: string) => Promise<MemoryGuardWorkerSample[]>;
+	applyTeamWorkerGuard?: (
+		cwd: string,
+		sessionId: string,
+		workerId: string,
+		excessBytes: number,
+		incidentId: string,
+	) => Promise<void>;
 }
 
 const defaultDeps: ResourceGcDeps = {
@@ -98,10 +112,13 @@ const defaultDeps: ResourceGcDeps = {
 	releaseTab: (name, policy) => releaseTabIfGcEligible(name, policy),
 	cleanupScreenshots: opts => cleanupStaleScreenshotFallbackDirs(opts),
 	screenshotArmed: () => hasCreatedScreenshotFallbackDir(),
+	listTeamWorkers: (cwd, sessionId) => sampleTeamWorkers(cwd, sessionId),
+	applyTeamWorkerGuard: (cwd, sessionId, workerId, excessBytes, incidentId) =>
+		applySelectedTeamWorker(cwd, sessionId, workerId, excessBytes, incidentId),
 };
 
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
-const activeSessions = new Map<string, Settings>();
+const activeSessions = new Map<string, { settings: Settings; cwd: () => string }>();
 const scheduler = new MemoryGuardHost({
 	run: async () => {
 		await sweepOnce(deps);
@@ -114,11 +131,13 @@ const memoryGuardGcActive = new Set<string>();
 const memoryGuardLastEvaluatedAt = new Map<string, number>();
 const memoryGuardRestartAboveSince = new Map<string, number>();
 const memoryGuardRestartCooldownUntil = new Map<string, number>();
+const memoryGuardWorkerIncidentIds = new Map<string, string>();
 let deps: ResourceGcDeps = defaultDeps;
 
 export interface ResourceGcRegistration {
 	sessionId: string;
 	settings: Settings;
+	cwd?: string | (() => string);
 }
 
 function resolveSessionSweepIntervalMs(settings: Settings): number {
@@ -134,7 +153,9 @@ function resolveSessionSweepIntervalMs(settings: Settings): number {
  * session unregisters.
  */
 export function registerResourceGcSession(reg: ResourceGcRegistration): () => void {
-	activeSessions.set(reg.sessionId, reg.settings);
+	const registeredCwd = reg.cwd;
+	const cwd = typeof registeredCwd === "function" ? registeredCwd : () => registeredCwd ?? process.cwd();
+	activeSessions.set(reg.sessionId, { settings: reg.settings, cwd });
 	const unregisterSchedule = scheduler.register({
 		ownerId: reg.sessionId,
 		intervalMs: resolveSessionSweepIntervalMs(reg.settings),
@@ -149,6 +170,7 @@ export function registerResourceGcSession(reg: ResourceGcRegistration): () => vo
 			if (path === "memoryGuard.enabled" && !resolveMemoryGuardPolicy(reg.settings).enabled) {
 				memoryGuardGcActive.delete(reg.sessionId);
 				memoryGuardRestartAboveSince.delete(reg.sessionId);
+				memoryGuardWorkerIncidentIds.delete(reg.sessionId);
 				memoryGuardRestartCooldownUntil.delete(reg.sessionId);
 				memoryGuardLastEvaluatedAt.delete(reg.sessionId);
 			}
@@ -162,6 +184,7 @@ export function registerResourceGcSession(reg: ResourceGcRegistration): () => vo
 		memoryGuardLastEvaluatedAt.delete(reg.sessionId);
 		memoryGuardGcActive.delete(reg.sessionId);
 		memoryGuardRestartAboveSince.delete(reg.sessionId);
+		memoryGuardWorkerIncidentIds.delete(reg.sessionId);
 		memoryGuardRestartCooldownUntil.delete(reg.sessionId);
 		unregisterSchedule();
 		unregisterSettings();
@@ -479,13 +502,14 @@ export function __selectMemoryPressureDomainForTest(
 
 function sweepMemoryPressureGuard(d: ResourceGcDeps): Promise<void> | undefined {
 	let enabled = false;
-	for (const [sessionId, settings] of activeSessions) {
+	for (const [sessionId, { settings }] of activeSessions) {
 		if (resolveMemoryGuardPolicy(settings).enabled) {
 			enabled = true;
 			continue;
 		}
 		memoryGuardGcActive.delete(sessionId);
 		memoryGuardRestartAboveSince.delete(sessionId);
+		memoryGuardWorkerIncidentIds.delete(sessionId);
 		memoryGuardRestartCooldownUntil.delete(sessionId);
 		memoryGuardLastEvaluatedAt.delete(sessionId);
 	}
@@ -493,14 +517,107 @@ function sweepMemoryPressureGuard(d: ResourceGcDeps): Promise<void> | undefined 
 	return sweepEnabledMemoryPressureGuard(d);
 }
 
+async function readLinuxWorkerRssBytes(pid: number): Promise<number | null> {
+	if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return null;
+	try {
+		const status = await Bun.file(`/proc/${pid}/status`).text();
+		const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
+		if (!match) return null;
+		const kibibytes = Number(match[1]);
+		return Number.isSafeInteger(kibibytes) ? kibibytes * 1024 : null;
+	} catch {
+		return null;
+	}
+}
+
+async function readLinuxProcessStartTime(pid: number): Promise<string | null> {
+	try {
+		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		const commandEnd = stat.lastIndexOf(")");
+		if (commandEnd < 0) return null;
+		const startTime = stat
+			.slice(commandEnd + 2)
+			.trim()
+			.split(/\s+/)[19];
+		return startTime && /^\d+$/.test(startTime) ? startTime : null;
+	} catch {
+		return null;
+	}
+}
+
+async function sampleTeamWorkers(cwd: string, sessionId: string): Promise<MemoryGuardWorkerSample[]> {
+	if (process.platform !== "linux") return [];
+	const samples: MemoryGuardWorkerSample[] = [];
+	for (const team of await listGjcTeams(cwd, { ...process.env, GJC_SESSION_ID: sessionId })) {
+		if (team.phase === "complete" || team.phase === "cancelled") continue;
+		for (const worker of team.workers) {
+			try {
+				const heartbeat = await readGjcWorkerHeartbeat(team.team_name, worker.id, cwd, {
+					...process.env,
+					GJC_SESSION_ID: sessionId,
+				});
+				const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? "");
+				if (
+					!heartbeat?.alive ||
+					!heartbeat.process_start_time ||
+					!Number.isFinite(heartbeatAt) ||
+					Date.now() - heartbeatAt >= 120_000 ||
+					(await readLinuxProcessStartTime(heartbeat.pid)) !== heartbeat.process_start_time
+				)
+					continue;
+				const guard = (await executeGjcTeamApiOperation(
+					"read-worker-memory-guard",
+					{ team_name: team.team_name, worker: worker.id, platform: process.platform },
+					cwd,
+					{ ...process.env, GJC_SESSION_ID: sessionId },
+				)) as { automatic_action_allowed?: boolean; state?: string };
+				if (!guard.automatic_action_allowed || guard.state === "blocked") continue;
+				const bytes = await readLinuxWorkerRssBytes(heartbeat.pid);
+				if (bytes === null) continue;
+				samples.push({ workerId: `${team.team_name}/${worker.id}`, bytes, accepted: true });
+			} catch {
+				// Missing or malformed worker authority is not eligible for automatic mutation.
+			}
+		}
+	}
+	return samples;
+}
+
+async function applySelectedTeamWorker(
+	cwd: string,
+	sessionId: string,
+	workerId: string,
+	excessBytes: number,
+	incidentId: string,
+): Promise<void> {
+	const separator = workerId.lastIndexOf("/");
+	if (separator <= 0 || separator === workerId.length - 1) return;
+	const teamName = workerId.slice(0, separator);
+	const worker = workerId.slice(separator + 1);
+	await executeGjcTeamApiOperation(
+		"apply-worker-memory-guard",
+		{
+			team_name: teamName,
+			worker,
+			platform: process.platform,
+			reason: "production_memory_pressure_sweep",
+			incident_id: incidentId,
+			candidates: [{ worker_id: worker, platform: process.platform, excess_bytes: excessBytes }],
+		},
+		cwd,
+		{ ...process.env, GJC_SESSION_ID: sessionId },
+	);
+}
 async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void> {
 	const now = d.monotonicNow();
-	const dueSessions: Array<{ sessionId: string; policy: MemoryGuardPolicy }> = [];
-	for (const [sessionId, settings] of activeSessions) {
+	const dueSessions: Array<{ sessionId: string; policy: MemoryGuardPolicy; cwd: string }> = [];
+	for (const [sessionId, { settings, cwd: resolveCwd }] of activeSessions) {
 		const policy = resolveMemoryGuardPolicy(settings);
+		const cwd = resolveCwd();
 		if (!policy.enabled) {
 			memoryGuardGcActive.delete(sessionId);
 			memoryGuardRestartAboveSince.delete(sessionId);
+			memoryGuardWorkerIncidentIds.delete(sessionId);
 			memoryGuardRestartCooldownUntil.delete(sessionId);
 			memoryGuardLastEvaluatedAt.delete(sessionId);
 			continue;
@@ -508,14 +625,15 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		const lastEvaluated = memoryGuardLastEvaluatedAt.get(sessionId);
 		if (lastEvaluated !== undefined && now - lastEvaluated < policy.checkIntervalMs) continue;
 		memoryGuardLastEvaluatedAt.set(sessionId, now);
-		dueSessions.push({ sessionId, policy });
+		dueSessions.push({ sessionId, policy, cwd });
 	}
 	if (dueSessions.length === 0) return;
 
 	const snapshot = await d.memorySnapshot();
 	let gcRequested = false;
 	const gcTelemetry: Array<{ sessionId: string } & Record<string, unknown>> = [];
-	for (const { sessionId, policy } of dueSessions) {
+	let workerActionTaken = false;
+	for (const { sessionId, policy, cwd } of dueSessions) {
 		const pressure = __selectMemoryPressureDomainForTest(snapshot, policy.policyLimitBytes);
 		const limit = resolveEffectiveMemoryLimit({
 			hardCapBytes: pressure.hardCapBytes,
@@ -524,20 +642,23 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		if (limit.effectiveBytes === null) {
 			memoryGuardGcActive.delete(sessionId);
 			memoryGuardRestartAboveSince.delete(sessionId);
+			memoryGuardWorkerIncidentIds.delete(sessionId);
 			memoryGuardRestartCooldownUntil.delete(sessionId);
 			continue;
 		}
+		const workerSamples = await (d.listTeamWorkers ?? (async () => []))(cwd, sessionId);
 		const domain = computeMemoryGuardDomain({
 			effectiveLimitBytes: limit.effectiveBytes,
 			totalUsageBytes: pressure.totalUsageBytes,
 			parentBytes: pressure.parentBytes,
 			parentReserveBytes: policy.parentReserveBytes,
-			workers: [],
+			workers: workerSamples,
 		});
 		const decision = chooseMemoryGuardAction({
 			domain,
 			hostSupported: false,
-			workerSupported: () => false,
+			workerSupported: workerId =>
+				workerSamples.some(worker => worker.workerId === workerId && worker.accepted !== false),
 		});
 		const usageRatio = pressure.totalUsageBytes / limit.effectiveBytes;
 		if (usageRatio >= policy.gcThresholdRatio) {
@@ -560,17 +681,57 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 
 		if (usageRatio < policy.restartThresholdRatio) {
 			memoryGuardRestartAboveSince.delete(sessionId);
+			memoryGuardWorkerIncidentIds.delete(sessionId);
 			continue;
 		}
 		const aboveSince = memoryGuardRestartAboveSince.get(sessionId);
 		if (aboveSince === undefined) {
 			memoryGuardRestartAboveSince.set(sessionId, now);
+			memoryGuardWorkerIncidentIds.set(sessionId, `worker-pressure:${sessionId}:${Math.trunc(now)}`);
 			continue;
 		}
 		const cooldownUntil = memoryGuardRestartCooldownUntil.get(sessionId) ?? 0;
 		if (now - aboveSince < policy.restartThresholdWindowMs || now < cooldownUntil) continue;
-		memoryGuardRestartCooldownUntil.set(sessionId, now + policy.cooldownMs);
-		d.logWarn("Memory guard: restart threshold sustained; restart remains advisory-only", {
+		const workerIncidentId =
+			memoryGuardWorkerIncidentIds.get(sessionId) ?? `worker-pressure:${sessionId}:${Math.trunc(aboveSince)}`;
+		let workerActionAttemptedForSession = false;
+		if (decision.kind === "execute" && decision.target.kind === "worker" && !workerActionTaken) {
+			const refreshedWorkers = await (d.listTeamWorkers ?? (async () => []))(cwd, sessionId);
+			const refreshedDomain = computeMemoryGuardDomain({
+				effectiveLimitBytes: limit.effectiveBytes,
+				totalUsageBytes: pressure.totalUsageBytes,
+				parentBytes: pressure.parentBytes,
+				parentReserveBytes: policy.parentReserveBytes,
+				workers: refreshedWorkers,
+			});
+			const refreshedDecision = chooseMemoryGuardAction({
+				domain: refreshedDomain,
+				hostSupported: false,
+				workerSupported: workerId =>
+					refreshedWorkers.some(worker => worker.workerId === workerId && worker.accepted !== false),
+			});
+			const revalidated = revalidateMemoryGuardAction(decision, refreshedDecision);
+			if (revalidated.kind !== "execute" || revalidated.target.kind !== "worker") continue;
+			workerActionTaken = true;
+			workerActionAttemptedForSession = true;
+			try {
+				await (d.applyTeamWorkerGuard ?? (async () => undefined))(
+					cwd,
+					sessionId,
+					revalidated.target.workerId,
+					revalidated.target.excessBytes,
+					workerIncidentId,
+				);
+			} catch (error) {
+				d.logWarn("Memory guard: team worker action failed; continuing sweep", {
+					sessionId,
+					workerId: revalidated.target.workerId,
+					error: String(error),
+				});
+			}
+		}
+		if (workerActionAttemptedForSession) memoryGuardRestartCooldownUntil.set(sessionId, now + policy.cooldownMs);
+		d.logWarn("Memory guard: restart threshold sustained", {
 			sessionId,
 			parentBytes: pressure.parentBytes,
 			totalUsageBytes: pressure.totalUsageBytes,
@@ -598,9 +759,9 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 
 function ownerBrowserPolicy(snapshot: TabGcSnapshot): BrowserGcPolicy | null {
 	if (!snapshot.ownerId) return null;
-	const settings = activeSessions.get(snapshot.ownerId);
-	if (!settings) return null;
-	return resolveBrowserGcPolicy(settings);
+	const registration = activeSessions.get(snapshot.ownerId);
+	if (!registration) return null;
+	return resolveBrowserGcPolicy(registration.settings);
 }
 
 /** Coarse, ordering-only eligibility; the live recheck in releaseTabIfGcEligible is authoritative. */
@@ -639,7 +800,7 @@ async function sweepBrowserTabs(d: ResourceGcDeps): Promise<void> {
 function pressuredOwnerIds(d: ResourceGcDeps): Set<string> {
 	const rss = d.rssBytes();
 	const owners = new Set<string>();
-	for (const [sessionId, settings] of activeSessions) {
+	for (const [sessionId, { settings }] of activeSessions) {
 		const policy = resolveBrowserGcPolicy(settings);
 		if (policy.enabled && rss > policy.rssLimitBytes) owners.add(sessionId);
 	}
@@ -678,7 +839,7 @@ async function sweepScreenshots(d: ResourceGcDeps): Promise<void> {
 
 	let staleMs: number | null = null;
 	let scanIntervalMs = Number.POSITIVE_INFINITY;
-	for (const settings of activeSessions.values()) {
+	for (const { settings } of activeSessions.values()) {
 		const policy = resolveComputerGcPolicy(settings);
 		if (!policy.enabled) continue;
 		staleMs = staleMs === null ? policy.staleMs : Math.min(staleMs, policy.staleMs);
@@ -698,6 +859,8 @@ export function __setResourceGcDepsForTest(overrides: Partial<ResourceGcDeps>): 
 		...defaultDeps,
 		...overrides,
 		monotonicNow: overrides.monotonicNow ?? overrides.now ?? defaultDeps.monotonicNow,
+		listTeamWorkers: overrides.listTeamWorkers ?? (async () => []),
+		applyTeamWorkerGuard: overrides.applyTeamWorkerGuard ?? (async () => undefined),
 	};
 }
 
@@ -749,6 +912,7 @@ export function __resetResourceGcForTest(): void {
 	rssWarningActive = false;
 	memoryGuardGcActive.clear();
 	memoryGuardRestartAboveSince.clear();
+	memoryGuardWorkerIncidentIds.clear();
 	memoryGuardRestartCooldownUntil.clear();
 	memoryGuardLastEvaluatedAt.clear();
 	lastScreenshotScanAt = 0;

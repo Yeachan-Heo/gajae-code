@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
+import * as util from "node:util";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -244,6 +245,7 @@ import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injec
 import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { SessionSwitchEvent } from "../extensibility/shared-events";
 import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandName,
@@ -254,6 +256,11 @@ import {
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { assertDeepInterviewIntentManifest } from "../gjc-runtime/deep-interview-state";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import {
+	isMemoryGuardClaimsLease,
+	isMemoryGuardClaimsLeaseForStateDir,
+	type MemoryGuardClaimsLease,
+} from "../gjc-runtime/memory-guard-owner-claims";
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
@@ -368,6 +375,7 @@ import {
 	prepareContributionPrep,
 } from "./contribution-prep";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
+import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
@@ -613,6 +621,24 @@ export interface AgentSessionConfig {
 	providerCacheSessionId?: string;
 }
 
+export interface AgentSessionMemoryGuardRestoreInput
+	extends Omit<AgentSessionConfig, "sessionManager" | "recoveryHydrationContext"> {
+	staged: Extract<MemoryGuardRestoreResult, { kind: "staged" }>;
+	claimsLease: MemoryGuardClaimsLease;
+	claimsStateDir: string;
+}
+
+export interface AgentMemoryGuardPromotionFence extends RecoveryHydrationPromotionFence {
+	readonly claimsLease: MemoryGuardClaimsLease;
+}
+
+export type AgentMemoryGuardRestoreResult =
+	| { kind: "staged"; session: AgentSession; promotionFence: AgentMemoryGuardPromotionFence }
+	| {
+			kind: "blocked";
+			reason: "transcript-mismatch" | "hydration-context-mismatch" | "claim-mismatch" | "agent-messages-mismatch";
+	  };
+
 type MidRunMaintenanceLifecycle = Parameters<NonNullable<AgentLoopConfig["maintainContext"]>>[1];
 
 type AutoCompactionTerminalStatus =
@@ -642,8 +668,16 @@ export interface PromptOptions {
 	/**
 	 * Invoked after all prompt preflight checks pass and immediately before agent execution begins.
 	 * Cancellation before this callback rejects the prompt.
+	 * Prefer `onPreflightAcceptCommit` for async durable acceptance (#3031/#3032).
 	 */
 	onPreflightAccepted?: () => void;
+	/**
+	 * Awaitable durable-accept fence. Called after preflight and before queue mutation
+	 * or `#promptAgentWithIdleRetry`. SDK bus installs a closure that fsyncs acceptance.
+	 */
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
+	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -1789,6 +1823,7 @@ export class AgentSession {
 	#constructorMCPToolSelection: string[] | undefined;
 	#constructorDiscoveredBuiltinToolSelection: string[] | undefined;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
+	#memoryGuardClaimsLease: MemoryGuardClaimsLease | undefined;
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
@@ -2244,6 +2279,7 @@ export class AgentSession {
 			this.#unregisterResourceGc = registerResourceGcSession({
 				sessionId: resourceGcSessionId,
 				settings: this.settings,
+				cwd: () => this.sessionManager.getCwd(),
 			});
 		}
 		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
@@ -6441,17 +6477,65 @@ export class AgentSession {
 		return this.#promptGeneration;
 	}
 
+	static async restoreFromMemoryGuardCheckpoint(
+		input: AgentSessionMemoryGuardRestoreInput,
+	): Promise<AgentMemoryGuardRestoreResult> {
+		const { staged, claimsLease, claimsStateDir, ...config } = input;
+		if (
+			staged.manager.getSessionId() !== staged.transcriptIdentity.sessionId ||
+			staged.hydrationContext.identity.sessionId !== staged.transcriptIdentity.sessionId
+		) {
+			await staged.cleanup();
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		if (
+			!isMemoryGuardClaimsLeaseForStateDir(claimsLease, claimsStateDir) ||
+			claimsLease.owner.sessionId !== staged.transcriptIdentity.sessionId
+		) {
+			await staged.cleanup();
+			return { kind: "blocked", reason: "claim-mismatch" };
+		}
+		const checkpointMessages = staged.manager.buildSessionContext().messages;
+		if (!util.isDeepStrictEqual(config.agent.state.messages, checkpointMessages)) {
+			await staged.cleanup();
+			return { kind: "blocked", reason: "agent-messages-mismatch" };
+		}
+		const session = new AgentSession({
+			...config,
+			sessionManager: staged.manager,
+			recoveryHydrationContext: staged.hydrationContext,
+		});
+		session.#memoryGuardClaimsLease = claimsLease;
+		if (session.recoveryHydrationContext !== staged.hydrationContext) {
+			await session.dispose();
+			await staged.cleanup();
+			return { kind: "blocked", reason: "hydration-context-mismatch" };
+		}
+		return {
+			kind: "staged",
+			session,
+			promotionFence: Object.freeze({ ownershipReady: true, claimsLease }),
+		};
+	}
+
 	/** The immutable recovery authority, present only before external ownership promotion. */
 	get recoveryHydrationContext(): RecoveryHydrationContext | undefined {
 		return this.#recoveryHydrationContext;
 	}
 
 	/** Enables normal session mutations after the owner has published its durable fence and writer lease. */
-	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: RecoveryHydrationPromotionFence): Promise<void> {
+	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: AgentMemoryGuardPromotionFence): Promise<void> {
 		const context = this.#recoveryHydrationContext;
 		if (!context) throw new Error("Agent session is not awaiting recovery hydration promotion.");
+		if (!isMemoryGuardClaimsLease(fence.claimsLease)) {
+			throw new Error("Recovery hydration promotion requires a live memory-guard claims lease.");
+		}
+		if (this.#memoryGuardClaimsLease !== fence.claimsLease) {
+			throw new Error("Recovery hydration promotion requires the acquired memory-guard claims lease.");
+		}
 		await this.sessionManager.promoteRecoveryHydrationAfterOwnershipReadyFence(context, fence);
 		this.#recoveryHydrationContext = undefined;
+		this.#memoryGuardClaimsLease = undefined;
 	}
 
 	/** Recovery hydration must not start a continuation before ownership promotion. */
@@ -6662,7 +6746,7 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<PromptOptions, "onPreflightAccepted">,
+		options?: Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared">,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -6695,6 +6779,12 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
+		options?.onSkillPrepared?.({
+			name: skill.name,
+			path: skill.filePath,
+			lineCount: built.details.lineCount,
+			cleanedArgs: activation.cleanedArgs || undefined,
+		});
 		await this.promptCustomMessage(skillPromptMessage, options);
 		return {
 			name: skill.name,
@@ -7350,6 +7440,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		if (expandPromptTemplates && text.startsWith("/skill:") && !options?.images?.length) {
@@ -7361,7 +7452,14 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : undefined,
+						options?.onPreflightAccepted || options?.onPreflightAcceptCommit
+							? {
+									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
+									...(options.onPreflightAcceptCommit
+										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
+										: {}),
+								}
+							: undefined,
 					);
 					return;
 				}
@@ -7415,7 +7513,8 @@ export class AgentSession {
 			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
-			options?.onPreflightAccepted?.();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
 			return;
 		}
 
@@ -7547,7 +7646,10 @@ export class AgentSession {
 
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted">,
+		options?: Pick<
+			PromptOptions,
+			"streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+		>,
 	): Promise<void> {
 		const textContent =
 			typeof message.content === "string"
@@ -7609,7 +7711,10 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted"> & {
+		options?: Pick<
+			PromptOptions,
+			"toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
@@ -7716,7 +7821,7 @@ export class AgentSession {
 				// A newer abort/prompt cycle superseded this preflight. Callers awaiting
 				// acceptance (onPreflightAccepted) must be told it never ran; direct
 				// callers (e.g. prompt() aborted during a TTSR wait) resolve gracefully.
-				if (options?.onPreflightAccepted) throw promptPreflightCancelledError();
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
 			}
 
@@ -7830,7 +7935,7 @@ export class AgentSession {
 				this.#resetInjectedContextSignatures();
 				// Ack-waiting callers are told the preflight never ran; direct callers
 				// (aborted after setup) resolve gracefully as before f24f46ff5.
-				if (options?.onPreflightAccepted) throw promptPreflightCancelledError();
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
 			}
 
@@ -7843,7 +7948,8 @@ export class AgentSession {
 					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
 				},
 			};
-			options?.onPreflightAccepted?.();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
@@ -7862,7 +7968,12 @@ export class AgentSession {
 			// Session identity changes historically cancel local setup silently. Only SDK
 			// submissions provide an acceptance callback and require an explicit terminal
 			// preflight failure for their remote request authority.
-			if (isPromptPreflightCancelledError(error) && !options?.onPreflightAccepted) return;
+			if (
+				isPromptPreflightCancelledError(error) &&
+				!options?.onPreflightAccepted &&
+				!options?.onPreflightAcceptCommit
+			)
+				return;
 			throw error;
 		} finally {
 			this.#removeEphemeralCustomMessages();
@@ -7963,7 +8074,7 @@ export class AgentSession {
 				}
 				return false;
 			},
-			invokeSkill: (name, args) => this.invokeSkill(name, args),
+			invokeSkill: (name, args, options) => this.invokeSkill(name, args, options),
 			setPlanMode: on => this.setSdkPlanMode(on),
 			operateGoal: (op, objective) => this.operateGoal(op, objective),
 			getSkillState: () => this.skills.map(skill => ({ name: skill.name, description: skill.description })),
@@ -8078,6 +8189,7 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -8095,6 +8207,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: Pick<PromptOptions, "followUpQueuePolicy">,
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -8329,6 +8442,7 @@ export class AgentSession {
 			followUpQueuePolicy?: "respect-mode" | "sequential";
 		},
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
 			customType: message.customType,
@@ -8470,8 +8584,13 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+		options?: {
+			deliverAs?: "steer" | "followUp";
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -8493,11 +8612,13 @@ export class AgentSession {
 		}
 
 		if (options?.deliverAs === "followUp") {
+			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueFollowUp(text, images, { claimsGenuineUserIntent: true });
 			options.onPreflightAccepted?.();
 			return;
 		}
 		if (options?.deliverAs === "steer") {
+			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
 			options.onPreflightAccepted?.();
 			return;
@@ -8509,6 +8630,7 @@ export class AgentSession {
 		// in-flight compaction internally, and #queueSteer would otherwise park
 		// the message in the steering queue with no turn to consume it.
 		if (this.isStreaming) {
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
 			options?.onPreflightAccepted?.();
 			return;
@@ -8519,6 +8641,7 @@ export class AgentSession {
 			expandPromptTemplates: false,
 			images,
 			onPreflightAccepted: options?.onPreflightAccepted,
+			onPreflightAcceptCommit: options?.onPreflightAcceptCommit,
 		});
 	}
 
@@ -14656,7 +14779,10 @@ export class AgentSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(
+		sessionPath: string,
+		options?: { transition?: SessionSwitchEvent["transition"] },
+	): Promise<boolean> {
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -14792,6 +14918,7 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
+				if (!switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
 
 				if (switchingToDifferentSession) {
 					// The local:// migration gate for this successor already ran above,
@@ -14814,6 +14941,7 @@ export class AgentSession {
 						type: "session_switch",
 						reason: "resume",
 						previousSessionFile,
+						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
 				return true;

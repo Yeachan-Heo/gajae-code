@@ -307,7 +307,7 @@ GJC ports team-mode concepts from `../../oh-my-codex`, not code or OMX/Codex-spe
 | Startup ACK | `gjc team api worker-startup-ack`, persisted as `workers/<worker>/startup-ack.json`. |
 | Claim-safe lifecycle APIs | `claim-task`, `transition-task-status`, and `release-task-claim` with worker ownership and claim-token guards. |
 | Delivery states and deferred pane attempts | Native notification records under `.gjc/_session-{sessionid}/state/team/<team>/notifications/` with `pending`, `sent`, `queued`, `deferred`, `failed`, `delivered`, and `acknowledged` states. |
-| Non-destructive leader nudges | Lifecycle nudge records under `workers/<worker>/nudges/`; GJC suggests inspection/relaunch but never auto-kills or auto-relaunches workers. |
+| Opt-in memory-guard relaunch | Lifecycle nudges remain non-destructive by default. On Linux only, a worker whose durable `memory-guard.json` explicitly enables automatic action may be checkpointed and relaunched after sustained pressure, bounded retries, current claim validation, and a continuation-safe handoff; unsupported platforms and missing authority remain advisory-only. |
 
 Forbidden assumptions: do not copy OMX paths, Codex notify payload formats, OMX process names, or source code directly. Keep tmux as the current runtime; native split-worker TUI remains roadmap-only.
 

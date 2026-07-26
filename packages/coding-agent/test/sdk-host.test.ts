@@ -299,4 +299,41 @@ describe("SessionSdkHost", () => {
 			await host.stop();
 		}
 	});
+	test("beforeControlResponse gates terminal delivery until the successor hook resolves", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		const sent: Array<Record<string, unknown>> = [];
+		const successorReady = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const host = new SessionSdkHost({
+			sessionId: "control-drain-order",
+			stateRoot: "/tmp/control-drain-order",
+			token: "token",
+			sendFrame: (_connectionId, frame) => {
+				order.push("send");
+				sent.push(frame);
+			},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+			control: (_connectionId, frame) => ({ id: frame.id, ok: true, result: {} }),
+			beforeControlResponse: async (_connectionId, _request, _response, sendTerminal) => {
+				order.push("before");
+				await successorReady.promise;
+				order.push("ready");
+				await sendTerminal();
+			},
+		});
+		await host.start();
+		receive("client", { type: "control_request", id: "c1", operation: "session.switch", input: {} });
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(sent).toEqual([]);
+		expect(order).toEqual(["before"]);
+		successorReady.resolve();
+		await new Promise(resolve => setTimeout(resolve, 0));
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(sent).toEqual([expect.objectContaining({ type: "control_response", id: "c1", ok: true })]);
+		expect(order).toEqual(["before", "ready", "send"]);
+		await host.stop();
+	});
 });

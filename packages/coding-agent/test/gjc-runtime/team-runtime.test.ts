@@ -10,6 +10,7 @@ import {
 	buildWorkerCommand,
 	claimGjcTeamTask,
 	classifyGjcTeamCheckpointFiles,
+	classifyWorkerCheckpointStatus,
 	executeGjcTeamApiOperation,
 	type GjcTeamConfig,
 	type GjcTeamWorker,
@@ -38,6 +39,7 @@ import {
 	GjcTeamTaskStore,
 	withGjcTeamTaskMutation,
 } from "../../src/gjc-runtime/team-store";
+import { workerMemoryGuardLedgerPath } from "../../src/gjc-runtime/team-worker-memory-guard";
 import { gjcContinuationReservationDigest, isValidGjcContinuationOutcome } from "../../src/gjc-runtime/team-workers";
 
 const TEST_SESSION_ID = "test-session";
@@ -101,12 +103,11 @@ case "$1" in
       fi
     done
     case "$target" in
-      %2) echo "test-session:0 %2" ;;
-      %9) echo "other-session:0 %9" ;;
-      %1) echo "test-session:0 %1" ;;
-      =test-session:*|=test-session|test-session:*|test-session) echo "test-session:0 %1" ;;
-      =other-session:*|=other-session|other-session:*|other-session) echo "other-session:0 %9" ;;
-      *) echo "test-session:0 %1" ;;
+      %9) echo "other-session:0 %9 4242" ;;
+      %*) echo "test-session:0 $target 4242" ;;
+      =test-session:*|=test-session|test-session:*|test-session) echo "test-session:0 %1 4242" ;;
+      =other-session:*|=other-session|other-session:*|other-session) echo "other-session:0 %9 4242" ;;
+      *) echo "test-session:0 %1 4242" ;;
     esac
     `
 }
@@ -366,11 +367,18 @@ describe("native gjc team runtime", () => {
 
 		const startupAck = (await executeGjcTeamApiOperation(
 			"worker-startup-ack",
-			{ team_name: "worker-lifecycle-team", worker_id: "worker-1", pid: 1234, protocol_version: "1" },
+			{
+				team_name: "worker-lifecycle-team",
+				worker_id: "worker-1",
+				pid: 1234,
+				protocol_version: "1",
+				replacement_token: "startup-generation-1",
+			},
 			cleanupRoot,
 			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
-		)) as { pid?: number };
+		)) as { pid?: number; replacement_token?: string };
 		expect(startupAck.pid).toBe(1234);
+		expect(startupAck.replacement_token).toBe("startup-generation-1");
 
 		let snapshot = await readGjcTeamSnapshot("worker-lifecycle-team", cleanupRoot, {
 			PATH: "",
@@ -2840,6 +2848,15 @@ describe("native gjc team runtime", () => {
 		expect(await Bun.file(path.join(cleanupRoot, ".omx", "reports", "team-commit-hygiene")).exists()).toBe(false);
 	});
 
+	it("decodes quoted porcelain paths for worker checkpoints", async () => {
+		cleanupRoot = await createGitRepo();
+		const spacedPath = path.join(cleanupRoot, "report draft.md");
+		await Bun.write(spacedPath, "checkpoint me\n");
+		expect(classifyWorkerCheckpointStatus(cleanupRoot)).toEqual({
+			kind: "eligible",
+			files: ["report draft.md"],
+		});
+	});
 	it("checkpoint classification excludes GJC runtime paths from worker auto-commits", async () => {
 		const protectedTeamPath = `.gjc/_session-${TEST_SESSION_ID}/state/team/demo/worker.json`;
 		const protectedReportPath = `.gjc/_session-${TEST_SESSION_ID}/reports/team-commit-hygiene/demo.ledger.json`;
@@ -3449,6 +3466,230 @@ describe("resolveGjcWorkerCommand invocation authority", () => {
 
 		expect(command).toBe("'C:\\Program Files\\GJC\\gjc.exe'");
 		expect(command).not.toMatch(/B:\/~BUN|B:\\~BUN|\/\$bunfs|\\\$bunfs/i);
+	});
+});
+
+describe("team worker memory guard wiring", () => {
+	it("launches per-worker ledgers and publishes the worker ledger path to tmux commands", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Memory guard launch wiring",
+			teamName: "memory-guard-launch-team",
+			cwd: cleanupRoot,
+			platform: "linux",
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			},
+		});
+		const ledgerPath = workerMemoryGuardLedgerPath(snapshot.state_dir, "worker-1");
+		const ledger = (await Bun.file(ledgerPath).json()) as Record<string, unknown>;
+		expect(ledger).toMatchObject({
+			schema_version: 1,
+			worker_id: "worker-1",
+			platform: "linux",
+			state: "idle",
+			automatic_action_allowed: false,
+			retry_count: 0,
+			retry_limit: 2,
+		});
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("GJC_TEAM_WORKER_MEMORY_GUARD_PATH");
+		expect(tmuxLog).toContain(ledgerPath);
+	});
+
+	it("keeps Windows and macOS worker memory guard actions advisory-only", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-memory-guard-"));
+		for (const platform of ["win32", "darwin"] as const) {
+			const teamName = `advisory-${platform}-memory-guard`;
+			await startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: `Advisory only ${platform}`,
+				teamName,
+				cwd: cleanupRoot,
+				dryRun: true,
+				platform,
+				env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			});
+			const before = await readGjcTeamSnapshot(teamName, cleanupRoot, { PATH: "", GJC_SESSION_ID: TEST_SESSION_ID });
+			const result = (await executeGjcTeamApiOperation(
+				"apply-worker-memory-guard",
+				{
+					team_name: teamName,
+					worker_id: "worker-1",
+					platform,
+					automatic_action_allowed: true,
+					reason: "advisory-check",
+				},
+				cleanupRoot,
+				{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+			)) as { result: string; lifecycle_mutated: boolean; ledger: { state: string; last_reason?: string } };
+			expect(result.result).toBe("advisory");
+			expect(result.lifecycle_mutated).toBe(false);
+			expect(result.ledger.state).toBe("advisory");
+			expect(result.ledger.last_reason).toContain(`unsupported_platform:${platform}`);
+			const after = await readGjcTeamSnapshot(teamName, cleanupRoot, { PATH: "", GJC_SESSION_ID: TEST_SESSION_ID });
+			expect(after.workers[0]?.pane_id).toBe(before.workers[0]?.pane_id);
+			expect(after.worker_lifecycle_by_id["worker-1"]?.lifecycle_state).toBe(
+				before.worker_lifecycle_by_id["worker-1"]?.lifecycle_state,
+			);
+		}
+	});
+
+	it("selects the hottest Linux worker, checkpoints it, and syncs config and manifest on replacement", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const env = {
+			GJC_SESSION_ID: TEST_SESSION_ID,
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_WORKER_COMMAND: "true",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS: "0",
+		};
+		const snapshot = await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Selector replacement",
+			teamName: "memory-guard-selector-team",
+			cwd: cleanupRoot,
+			platform: "linux",
+			env,
+		});
+		const workerWorktree = snapshot.workers.find(worker => worker.id === "worker-2")?.worktree_path;
+		expect(workerWorktree).toBeTruthy();
+		const protectedPath = `.gjc/_session-${TEST_SESSION_ID}/state/team/runtime.json`;
+		await Bun.write(path.join(workerWorktree!, protectedPath), "{}\n");
+		await Bun.write(path.join(workerWorktree!, "report draft.md"), "eligible\n");
+		runGit(workerWorktree!, ["add", "-f", "--", protectedPath]);
+		const claim = await claimGjcTeamTask("memory-guard-selector-team", "worker-2", cleanupRoot, env, "task-2");
+		expect(claim.ok).toBe(true);
+		const successorAck = Bun.sleep(50).then(() =>
+			executeGjcTeamApiOperation(
+				"worker-startup-ack",
+				{
+					team_name: "memory-guard-selector-team",
+					worker_id: "worker-2",
+					protocol_version: "1",
+					replacement_token: "replacement-generation-1",
+				},
+				cleanupRoot,
+				env,
+			),
+		);
+		const oldPaneId = snapshot.workers.find(worker => worker.id === "worker-2")?.pane_id;
+		const result = (await executeGjcTeamApiOperation(
+			"apply-worker-memory-guard",
+			{
+				team_name: "memory-guard-selector-team",
+				platform: "linux",
+				automatic_action_allowed: true,
+				reason: "rss_exceeded",
+				replacement_token: "replacement-generation-1",
+				candidates: [
+					{ worker_id: "worker-1", platform: "linux", excess_bytes: 1, retry_count: 0, retry_limit: 2 },
+					{ worker_id: "worker-2", platform: "linux", excess_bytes: 10, retry_count: 0, retry_limit: 2 },
+				],
+			},
+			cleanupRoot,
+			env,
+		)) as {
+			result: string;
+			lifecycle_mutated: boolean;
+			ledger: { worker_id: string; state: string; current_task_id?: string; last_checkpoint?: { kind: string } };
+		};
+		await successorAck;
+		expect(result.result).toBe("replaced");
+		expect(result.lifecycle_mutated).toBe(true);
+		expect(result.ledger.worker_id).toBe("worker-2");
+		expect(result.ledger.state).toBe("replaced");
+		expect(result.ledger.current_task_id).toBe("task-2");
+		expect(result.ledger.last_checkpoint?.kind).toBe("eligible");
+		const config = await readTeamConfig(snapshot.state_dir);
+		const manifest = (await Bun.file(path.join(snapshot.state_dir, "manifest.v2.json")).json()) as {
+			workers: Array<{ id: string; pane_id?: string }>;
+		};
+		const configWorker = config.workers.find(worker => worker.id === "worker-2");
+		const manifestWorker = manifest.workers.find(worker => worker.id === "worker-2");
+		expect(configWorker?.assigned_tasks).toEqual(["task-2"]);
+		expect(configWorker?.pane_id).toBeTruthy();
+		expect(configWorker?.pane_id).not.toBe(oldPaneId);
+		expect(manifestWorker?.pane_id).toBe(configWorker?.pane_id);
+		const task = await readGjcTeamTask("memory-guard-selector-team", "task-2", cleanupRoot, env);
+		expect(task.status).toBe("in_progress");
+		const committedPaths = runGit(workerWorktree!, ["show", "--name-only", "--format="])
+			.split(/\r?\n/)
+			.filter(Boolean);
+		expect(committedPaths).toContain("report draft.md");
+		expect(committedPaths).not.toContain(protectedPath);
+		expect(runGit(workerWorktree!, ["diff", "--cached", "--name-only"]).split(/\r?\n/)).toContain(protectedPath);
+		expect(task.claim?.owner).toBe("worker-2");
+	});
+
+	it("caps Linux replacement retries and blocks the claimed task on the terminal failure", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const env = {
+			GJC_SESSION_ID: TEST_SESSION_ID,
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_WORKER_COMMAND: "true",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+		};
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Retry cap replacement",
+			teamName: "memory-guard-retry-team",
+			cwd: cleanupRoot,
+			platform: "linux",
+			env,
+		});
+		const claim = await claimGjcTeamTask("memory-guard-retry-team", "worker-1", cleanupRoot, env, "task-1");
+		expect(claim.ok).toBe(true);
+		const workerPath = snapshot.workers[0]?.worktree_path;
+		expect(workerPath).toBeTruthy();
+		await fs.rm(workerPath!, { recursive: true, force: true });
+		const first = (await executeGjcTeamApiOperation(
+			"apply-worker-memory-guard",
+			{
+				team_name: "memory-guard-retry-team",
+				worker_id: "worker-1",
+				platform: "linux",
+				automatic_action_allowed: true,
+				reason: "worktree-missing",
+			},
+			cleanupRoot,
+			env,
+		)) as { result: string; lifecycle_mutated: boolean; ledger: { state: string; retry_count: number } };
+		expect(first.result).toBe("retrying");
+		expect(first.lifecycle_mutated).toBe(false);
+		expect(first.ledger).toMatchObject({ state: "retrying", retry_count: 1 });
+		const second = (await executeGjcTeamApiOperation(
+			"apply-worker-memory-guard",
+			{
+				team_name: "memory-guard-retry-team",
+				worker_id: "worker-1",
+				platform: "linux",
+				automatic_action_allowed: true,
+				reason: "worktree-missing",
+			},
+			cleanupRoot,
+			env,
+		)) as { result: string; lifecycle_mutated: boolean; ledger: { state: string; retry_count: number } };
+		expect(second.result).toBe("blocked");
+		expect(second.lifecycle_mutated).toBe(true);
+		expect(second.ledger).toMatchObject({ state: "blocked", retry_count: 2 });
+		const after = await readGjcTeamSnapshot("memory-guard-retry-team", cleanupRoot, env);
+		expect(after.worker_lifecycle_by_id["worker-1"]?.lifecycle_state).toBe("failed");
+		expect(after.worker_lifecycle_by_id["worker-1"]?.worker_status_state).toBe("blocked");
+		const task = await readGjcTeamTask("memory-guard-retry-team", "task-1", cleanupRoot, env);
+		expect(task.status).toBe("blocked");
+		expect(task.claim?.owner).toBe("worker-1");
 	});
 });
 

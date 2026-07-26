@@ -158,6 +158,147 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("does not retain a duplicated row when streaming reflow pulls history back into the viewport", async () => {
+			const term = new VirtualTerminal(64, 10, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const repeated = "이 요구사항은 작은 인증 변경이 아니라 제품 아키텍처 변경입니다.";
+			const prefix = ["context-0", "context-1", "context-2", "context-3", "현재 PRD에 미치는 영향", repeated];
+			const component = new MutableLinesComponent([...prefix, ...rows("initial-", 6)]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(countMatches(visible(term), /제품 아키텍처 변경입니다/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("draft-", 14)]);
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(term.getScrollBuffer(), /제품 아키텍처 변경입니다/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("reflowed-", 6)]);
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(visible(term), /제품 아키텍처 변경입니다/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("final-", 18)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /제품 아키텍처 변경입니다/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /final-4/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("final-", 22)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /제품 아키텍처 변경입니다/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /final-8/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("re-enables native scrollback admission after transcript identity replacement", async () => {
+			const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("old-", 8));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				component.setLines(rows("old-expanded-", 14));
+				tui.requestRender();
+				await settle(term);
+				component.setLines(rows("old-contracted-", 8));
+				tui.requestRender();
+				await settle(term);
+
+				tui.resetViewportAnchorIntent();
+				const replacement = ["new-0", "new-1", "new-2", "new-sentinel", ...rows("new-tail-", 4)];
+				component.setLines(replacement);
+				tui.requestRender();
+				await settle(term);
+				component.setLines([...replacement, ...rows("new-growth-", 6)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /new-sentinel/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("keeps scrollback admission suspended across a preserving forced contraction", async () => {
+			Bun.env.TMUX = "1";
+			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
+			const term = new VirtualTerminal(48, 8, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const marker = "forced-reflow-marker";
+			const prefix = ["a", "b", "c", marker];
+			const component = new MutableLinesComponent([...prefix, ...rows("initial-", 6)]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				component.setLines([...prefix, ...rows("expanded-", 14)]);
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(term.getScrollBuffer(), /forced-reflow-marker/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("contracted-", 6)]);
+				tui.requestRender(true);
+				await settle(term);
+				component.setLines([...prefix, ...rows("regrown-", 18)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /forced-reflow-marker/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /regrown-6/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("uses the native committed frontier after manual viewport contraction", async () => {
+			const term = new VirtualTerminal(40, 10, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("history-", 20));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				component.setLines(rows("history-", 30));
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(term.getScrollBuffer(), /history-12/)).toBe(1);
+				expect(tui.scrollViewportPages(-1)).toBe(true);
+				await term.flush();
+
+				component.setLines(rows("history-", 20));
+				tui.requestRender();
+				await settle(term);
+				component.setLines([...rows("history-", 20), ...rows("growth-", 14)]);
+				tui.requestRender();
+				await settle(term);
+				expect(tui.followLiveViewport()).toBe(true);
+				await term.flush();
+
+				component.setLines([...rows("history-", 20), ...rows("growth-", 15)]);
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term)).toEqual(rows("growth-", 15).slice(-10));
+
+				expect(countMatches(term.getScrollBuffer(), /history-12/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /growth-0/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("repaints live viewport when overflowed content shrinks only at the tail", async () => {
 			const term = new VirtualTerminal(20, 5);
 			const tui = new TUI(term);

@@ -12,6 +12,7 @@ import type {
 	GjcTeamWorkerLifecycle,
 	GjcTeamWorktreeMode,
 } from "./team-runtime";
+import { createInitialGjcTeamWorkerMemoryGuardLedger, workerMemoryGuardLedgerPath } from "./team-worker-memory-guard";
 
 /** Launch-specific option wiring kept separate from runtime dispatch. */
 export function withTeamLaunchTransport(
@@ -34,6 +35,7 @@ export function buildWorkerCommand(
 	config: GjcTeamConfig,
 	worker: GjcTeamWorker,
 	platform: NodeJS.Platform = process.platform,
+	promptOverride?: string,
 ): string {
 	const quote = platform === "win32" ? powershellQuote : shellQuote;
 	const envAssignment = (key: string, value: string): string =>
@@ -41,7 +43,8 @@ export function buildWorkerCommand(
 	const workspace = worker.worktree_path
 		? `Worker worktree: ${worker.worktree_path}.`
 		: `Worker cwd: ${config.leader.cwd}.`;
-	const prompt =
+	const initialPrompt =
+		promptOverride ??
 		[
 			`You are ${worker.id} in gjc team ${config.team_name}.`,
 			`Team state root: ${config.state_root}.`,
@@ -50,8 +53,9 @@ export function buildWorkerCommand(
 			"Before implementation, claim your worker-owned task and treat the claimed task record as the source of truth. Do not implement directly from the broad team brief.",
 			`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
 			"Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; keep heartbeat current during long work, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.",
-		]
-			.join("\n")
+		].join("\n");
+	const prompt =
+		initialPrompt
 			.replace(/[\uFEFF\u200B]/g, "")
 			.replace(/\r?\n+/g, " ")
 			.trim() || `Worker ${worker.id} ready.`;
@@ -66,6 +70,10 @@ export function buildWorkerCommand(
 		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
 		envAssignment(SPAWN_PROVENANCE_ENV, config.leader.session_id.trim() || config.team_name),
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
+		envAssignment(
+			"GJC_TEAM_WORKER_MEMORY_GUARD_PATH",
+			workerMemoryGuardLedgerPath(path.join(config.state_root, config.team_name), worker.id),
+		),
 	];
 	const joined = envLines.join(" ");
 	const clearInheritedSession = config.gjc_session_id
@@ -146,6 +154,7 @@ async function initializeStateDirs(
 	runtime: GjcTeamLaunchRuntime,
 	dir: string,
 	workers: GjcTeamWorker[],
+	platform: NodeJS.Platform,
 ): Promise<void> {
 	await fs.mkdir(path.join(dir, "mailbox"), { recursive: true });
 	for (const worker of workers) {
@@ -167,6 +176,14 @@ async function initializeStateDirs(
 			turn_count: 0,
 			alive: true,
 		});
+		await runtime.writeJson(
+			workerMemoryGuardLedgerPath(dir, worker.id),
+			createInitialGjcTeamWorkerMemoryGuardLedger({
+				workerId: worker.id,
+				platform,
+				now: runtime.now(),
+			}),
+		);
 	}
 	await fs.mkdir(runtime.mailboxDirPath(dir, "leader-fixed"), { recursive: true });
 	await runtime.writeJson(runtime.mailboxPath(dir, "leader-fixed"), { messages: [] });
@@ -217,6 +234,18 @@ export async function startGjcTeamLaunch(
 		await runtime.rollbackCreatedWorktrees(workers);
 		throw error;
 	}
+	const tasksByOwner = new Map<string, string[]>();
+	for (const task of initialTasks) {
+		const owner = task.owner?.trim();
+		if (!owner) continue;
+		const assigned = tasksByOwner.get(owner) ?? [];
+		assigned.push(task.id);
+		tasksByOwner.set(owner, assigned);
+	}
+	const workersWithAssignments = workers.map(worker => ({
+		...worker,
+		assigned_tasks: tasksByOwner.get(worker.id) ?? worker.assigned_tasks,
+	}));
 	const config: GjcTeamConfig = {
 		team_name: teamName,
 		display_name: displayName,
@@ -242,11 +271,11 @@ export async function startGjcTeamLaunch(
 		},
 		leader_cwd: cwd,
 		team_state_root: stateRoot,
-		workers,
+		workers: workersWithAssignments,
 		created_at: createdAt,
 		updated_at: createdAt,
 	};
-	await initializeStateDirs(runtime, dir, config.workers);
+	await initializeStateDirs(runtime, dir, config.workers, platform);
 	await runtime.writeJson(path.join(dir, "config.json"), config);
 	await runtime.writeJson(path.join(dir, "manifest.v2.json"), {
 		version: 2,

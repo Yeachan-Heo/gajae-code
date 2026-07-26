@@ -6,8 +6,9 @@ import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "../src/config/model-registry";
 import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../src/extensibility/shared-events";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
-import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { createNotificationsExtension, shouldAwaitNotificationStartup } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { SessionSdkHost } from "../src/sdk/host";
 import { AgentSession } from "../src/session/agent-session";
@@ -69,6 +70,18 @@ async function withNotifications<T>(fn: () => Promise<T>): Promise<T> {
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
 }
+
+test("session transition startup classifier defers only interactive selector resumes", () => {
+	expect([
+		shouldAwaitNotificationStartup({
+			type: "session_switch",
+			transition: { origin: INTERACTIVE_SELECTOR_RESUME_ORIGIN },
+		}),
+		shouldAwaitNotificationStartup({ type: "session_switch" }),
+		shouldAwaitNotificationStartup({ type: "session_switch", transition: { origin: "other" } }),
+		shouldAwaitNotificationStartup({ type: "session_branch" }),
+	]).toEqual([false, true, true, true]);
+});
 
 function createHarness(
 	prefix: string,
@@ -305,9 +318,13 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 	createNotificationsExtension({
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		registerCommand: () => {},
-		sendUserMessage: (_content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
-			options?.onPreflightAccepted?.();
-			return Promise.reject(Object.assign(new Error("submission failed after acceptance"), { code: "unavailable" }));
+		sendUserMessage: async (
+			_content: unknown,
+			options?: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void | Promise<void> },
+		) => {
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
+			throw Object.assign(new Error("submission failed after acceptance"), { code: "unavailable" });
 		},
 	} as never);
 	const sessionId = `terminal-failure-${process.pid}-${Date.now()}`;
@@ -487,7 +504,7 @@ test("session_branch rotates endpoint authority", async () => {
 	});
 });
 
-test("session_branch with the same id does not await optional startup and reconciles after it settles", async () => {
+test("session_branch with the same id awaits startup before settling", async () => {
 	await withNotifications(async () => {
 		const entered = deferred();
 		const release = deferred();
@@ -519,7 +536,7 @@ test("session_branch with the same id does not await optional startup and reconc
 			});
 			await Promise.resolve();
 			await Promise.resolve();
-			expect(branchSettled).toBe(true);
+			expect(branchSettled).toBe(false);
 
 			release.resolve();
 			await startup;
@@ -534,11 +551,10 @@ test("session_branch with the same id does not await optional startup and reconc
 	});
 });
 
-test("session_branch settles before optional startup, publishes later, and shutdown drains its startup", async () => {
+test("session_branch awaits startup before publishing and settling", async () => {
 	await withNotifications(async () => {
 		const entered = deferred();
 		const release = deferred();
-		const startupSettled = deferred<{ sessionId: string; status: string }>();
 		const hostStart = SessionSdkHost.prototype.start;
 		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
 			this: SessionSdkHost,
@@ -547,9 +563,7 @@ test("session_branch settles before optional startup, publishes later, and shutd
 			await release.promise;
 			return await hostStart.call(this);
 		});
-		const harness = createHarness("gjc-notif-branch-new-pending-", "Original", receipt =>
-			startupSettled.resolve(receipt),
-		);
+		const harness = createHarness("gjc-notif-branch-new-pending-");
 		try {
 			const previousId = `previous-${harness.sid}`;
 			let branchSettled = false;
@@ -564,12 +578,12 @@ test("session_branch settles before optional startup, publishes later, and shutd
 			await entered.promise;
 			await Promise.resolve();
 			await Promise.resolve();
-			expect(branchSettled).toBe(true);
+			expect(branchSettled).toBe(false);
 			expect(fs.existsSync(harness.endpoint())).toBe(false);
 
 			release.resolve();
 			await branch;
-			expect((await startupSettled.promise).status).toBe("started");
+			expect(branchSettled).toBe(true);
 			expect(fs.existsSync(harness.endpoint())).toBe(true);
 			expect(getTelegramFileSink(harness.sid)).toBeDefined();
 
@@ -582,7 +596,7 @@ test("session_branch settles before optional startup, publishes later, and shutd
 	});
 });
 
-test("session_branch cleans up a failed deferred startup", async () => {
+test("session_branch propagates failed startup", async () => {
 	await withNotifications(async () => {
 		const entered = deferred();
 		const release = deferred();
@@ -591,33 +605,47 @@ test("session_branch cleans up a failed deferred startup", async () => {
 		) {
 			entered.resolve();
 			await release.promise;
-			throw new Error("deferred branch startup failed");
+			throw new Error("branch startup failed");
 		});
-		const startupSettled = deferred<{ sessionId: string; status: string }>();
-		const harness = createHarness("gjc-notif-branch-failed-pending-", "Original", receipt =>
-			startupSettled.resolve(receipt),
-		);
+		const harness = createHarness("gjc-notif-branch-failed-pending-");
 		try {
-			const branch = harness.handlers.get("session_branch")!(
-				{ type: "session_branch", previousSessionFile: harness.previousSessionFile(`previous-${harness.sid}`) },
-				harness.ctx,
+			let branchSettled = false;
+			let branchError: unknown;
+			const branch = Promise.resolve(
+				harness.handlers.get("session_branch")!(
+					{ type: "session_branch", previousSessionFile: harness.previousSessionFile(`previous-${harness.sid}`) },
+					harness.ctx,
+				),
+			).then(
+				() => {
+					branchSettled = true;
+				},
+				error => {
+					branchSettled = true;
+					branchError = error;
+				},
 			);
 			await entered.promise;
-			await branch;
-			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
+			await Promise.resolve();
+			expect(branchSettled).toBe(false);
+
 			release.resolve();
-			expect((await startupSettled.promise).status).toBe("failed");
+			await branch;
+			expect(branchSettled).toBe(true);
+			expect(branchError).toBeInstanceOf(Error);
+			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
 			expect(fs.existsSync(harness.endpoint())).toBe(false);
 			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
 			expect(fs.existsSync(harness.endpoint())).toBe(false);
 			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
 		} finally {
+			release.resolve();
 			startSpy.mockRestore();
 		}
 	});
 });
 
-test("session_shutdown fences and drains deferred branch startup", async () => {
+test("session_branch remains pending while startup is blocked", async () => {
 	await withNotifications(async () => {
 		const entered = deferred();
 		const release = deferred();
@@ -631,22 +659,24 @@ test("session_shutdown fences and drains deferred branch startup", async () => {
 		});
 		const harness = createHarness("gjc-notif-branch-shutdown-pending-");
 		try {
-			const branch = harness.handlers.get("session_branch")!(
-				{ type: "session_branch", previousSessionFile: harness.previousSessionFile(`previous-${harness.sid}`) },
-				harness.ctx,
-			);
-			await entered.promise;
-			await branch;
-			let shutdownSettled = false;
-			const shutdown = Promise.resolve(
-				harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx),
+			let branchSettled = false;
+			const branch = Promise.resolve(
+				harness.handlers.get("session_branch")!(
+					{ type: "session_branch", previousSessionFile: harness.previousSessionFile(`previous-${harness.sid}`) },
+					harness.ctx,
+				),
 			).then(() => {
-				shutdownSettled = true;
+				branchSettled = true;
 			});
+			await entered.promise;
 			await Promise.resolve();
-			expect(shutdownSettled).toBe(false);
+			expect(branchSettled).toBe(false);
+
 			release.resolve();
-			await shutdown;
+			await branch;
+			expect(branchSettled).toBe(true);
+			expect(fs.existsSync(harness.endpoint())).toBe(true);
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
 			expect(fs.existsSync(harness.endpoint())).toBe(false);
 			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
 		} finally {

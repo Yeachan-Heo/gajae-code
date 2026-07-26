@@ -1,25 +1,19 @@
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import * as native from "@gajae-code/natives";
 import { TempDir } from "@gajae-code/utils";
+import {
+	injectManagedFileRename,
+	injectManagedTreeFsync,
+	injectManagedTreeRename,
+	injectManagedTreeSnapshot,
+	publishFailure,
+} from "./managed-failure-injection";
 
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-function publishFailure(code: string, reason: "io_failure" | "identity_violation") {
-	return {
-		ok: false,
-		code,
-		mutationState: "not_committed",
-		durabilityState: "not_attempted",
-		reason,
-		primitive: "renameat2_noreplace",
-		phase: "preflight",
-		diagnostic: { schemaVersion: 1, collectionState: "complete" },
-	} as const;
-}
 function expectUuidV7SessionId(session: SessionManager): string {
 	const sessionId = session.getSessionId();
 	expect(sessionId).toMatch(UUID_V7_RE);
@@ -107,26 +101,19 @@ describe("SessionManager session ids", () => {
 		const oldSessionFile = session.getSessionFile();
 		const oldSessionId = session.getSessionId();
 		if (!oldSessionFile) throw new Error("Expected session file");
-		const realRename = native.RecoveryFsRoot.prototype.renameManagedTreeNoReplace;
-		const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "renameManagedTreeNoReplace").mockImplementation(function (
-			this: native.RecoveryFsRoot,
-			source,
-			destination,
-			expected,
-		) {
-			return source.includes(".fork-staging")
-				? publishFailure("io_error", "io_failure")
-				: realRename.call(this, source, destination, expected);
-		});
+		const injection = injectManagedTreeRename((source, _destination) =>
+			source.includes(".fork-staging") ? publishFailure("io_error", "io_failure") : "passthrough",
+		);
 		try {
 			await expect(session.fork()).rejects.toThrow("io_error");
+			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 			expect(session.getSessionId()).toBe(oldSessionId);
 			const entries = await fs.readdir(path.dirname(oldSessionFile));
 			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
 			expect(entries.some(entry => entry.includes("fork-staging"))).toBe(false);
 		} finally {
-			spy.mockRestore();
+			injection.restore();
 			await session.close();
 		}
 	});
@@ -157,15 +144,14 @@ describe("SessionManager session ids", () => {
 		const oldSessionFile = session.getSessionFile();
 		const oldSessionId = session.getSessionId();
 		if (!oldSessionFile) throw new Error("Expected session file");
-		const spy = vi
-			.spyOn(native.RecoveryFsRoot.prototype, "renameManagedTreeNoReplace")
-			.mockReturnValue(publishFailure("identity_mismatch", "identity_violation"));
+		const injection = injectManagedTreeRename(() => publishFailure("identity_mismatch", "identity_violation"));
 		try {
 			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 			expect(session.getSessionId()).toBe(oldSessionId);
 		} finally {
-			spy.mockRestore();
+			injection.restore();
 			await session.close();
 		}
 	});
@@ -179,14 +165,13 @@ describe("SessionManager session ids", () => {
 		await session.saveArtifact("artifact", "test");
 		const oldSessionFile = session.getSessionFile();
 		if (!oldSessionFile) throw new Error("Expected session file");
-		const spy = vi
-			.spyOn(native.RecoveryFsRoot.prototype, "renameManagedTreeNoReplace")
-			.mockReturnValue(publishFailure("identity_mismatch", "identity_violation"));
+		const injection = injectManagedTreeRename(() => publishFailure("identity_mismatch", "identity_violation"));
 		try {
 			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 		} finally {
-			spy.mockRestore();
+			injection.restore();
 			await session.close();
 		}
 	});
@@ -200,14 +185,13 @@ describe("SessionManager session ids", () => {
 		await session.saveArtifact("artifact", "test");
 		const oldSessionFile = session.getSessionFile();
 		if (!oldSessionFile) throw new Error("Expected session file");
-		const spy = vi
-			.spyOn(native.RecoveryFsRoot.prototype, "snapshotManagedTree")
-			.mockReturnValue({ ok: false, code: "identity_mismatch" });
+		const injection = injectManagedTreeSnapshot({ ok: false, code: "identity_mismatch" });
 		try {
 			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 		} finally {
-			spy.mockRestore();
+			injection.restore();
 			await session.close();
 		}
 	});
@@ -221,34 +205,16 @@ describe("SessionManager session ids", () => {
 		await session.saveArtifact("artifact", "test");
 		const oldSessionFile = session.getSessionFile();
 		if (!oldSessionFile) throw new Error("Expected session file");
-		const realFsyncExpected = native.RecoveryFsRoot.prototype.fsyncExpected;
-		const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "fsyncExpected").mockImplementation(function (
-			this: native.RecoveryFsRoot,
-			relativePath,
-			directory,
-			expectedDev,
-			expectedIno,
-			expectedSize,
-			expectedMtimeNs,
-			expectedSha256,
-		) {
-			if (relativePath.endsWith(".log")) return { ok: false, code: "identity_mismatch" };
-			return realFsyncExpected.call(
-				this,
-				relativePath,
-				directory,
-				expectedDev,
-				expectedIno,
-				expectedSize,
-				expectedMtimeNs,
-				expectedSha256,
-			);
+		const injection = injectManagedTreeFsync({
+			shouldFail: relativePath => relativePath.endsWith(".log"),
+			code: "identity_mismatch",
 		});
 		try {
 			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 		} finally {
-			spy.mockRestore();
+			injection.restore();
 			await session.close();
 		}
 	});
@@ -263,33 +229,12 @@ describe("SessionManager session ids", () => {
 		const oldSessionFile = session.getSessionFile();
 		const oldSessionId = session.getSessionId();
 		if (!oldSessionFile) throw new Error("Expected session file");
-		const realRename = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
-		const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "renameManagedFileNoReplace").mockImplementation(function (
-			this: native.RecoveryFsRoot,
-			sourceRelativePath,
-			destinationRelativePath,
-			expectedDev,
-			expectedIno,
-			expectedSize,
-			expectedMtimeNs,
-			expectedCtimeNs,
-			expectedSha256,
-		) {
-			if (destinationRelativePath.endsWith(".jsonl")) return publishFailure("io_error", "io_failure");
-			return realRename.call(
-				this,
-				sourceRelativePath,
-				destinationRelativePath,
-				expectedDev,
-				expectedIno,
-				expectedSize,
-				expectedMtimeNs,
-				expectedCtimeNs,
-				expectedSha256,
-			);
-		});
+		const injection = injectManagedFileRename((_source, destination) =>
+			destination.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
+		);
 		try {
 			await expect(session.fork()).rejects.toThrow("io_error");
+			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 			expect(session.getSessionId()).toBe(oldSessionId);
 			const entries = await fs.readdir(path.dirname(oldSessionFile));
@@ -300,7 +245,7 @@ describe("SessionManager session ids", () => {
 			expect(artifactDirectories).toContain(path.basename(oldSessionFile, ".jsonl"));
 			expect(artifactDirectories).toHaveLength(1);
 		} finally {
-			spy.mockRestore();
+			injection.restore();
 			await session.close();
 		}
 	});

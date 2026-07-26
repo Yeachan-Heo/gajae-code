@@ -1252,6 +1252,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			receipt: AskRemoteReceipt;
 			settlement?: AskSettlement;
 		};
+		const ignoreRemoteAnswerFailure = (error: unknown): Promise<never> => {
+			if (!(error instanceof Error && error.name === "AbortError")) {
+				logger.warn("Ask remote answer source failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return new Promise<never>(() => {});
+		};
 		const settleActiveRemote = async (settlement: AskSettlement): Promise<void> => {
 			const receipt = activeRemoteReceipt;
 			activeRemoteReceipt = undefined;
@@ -1304,60 +1312,62 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 								remoteController.signal,
 							)
 						: source.awaitAnswer(prompt, options, remoteController.signal)
-				).then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
-					if (answer === undefined) return new Promise<never>(() => {});
-					const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
-					if (generation !== remoteGeneration) {
-						return receipt
-							.settle({ kind: "resolve_without_commit", reason: "aborted" })
-							.then(() => new Promise<never>(() => {}));
-					}
-					const remoteValue = receipt.interaction.kind === "value" ? receipt.interaction.value : undefined;
-					const value = remoteValue ?? REMOTE_NAVIGATION_FORWARD;
-					const selectedValue =
-						remoteValue === undefined
-							? value
-							: (options.find(
-									option =>
-										option === remoteValue ||
-										option === `${theme.checkbox.checked} ${remoteValue}` ||
-										option === `${theme.checkbox.unchecked} ${remoteValue}`,
-								) ?? value);
-					const normalizedRemoteValue = remoteValue?.startsWith(`${theme.checkbox.checked} `)
-						? remoteValue.slice(`${theme.checkbox.checked} `.length)
-						: remoteValue?.startsWith(`${theme.checkbox.unchecked} `)
-							? remoteValue.slice(`${theme.checkbox.unchecked} `.length)
-							: remoteValue;
-					const semanticRemoteValue = normalizedRemoteValue?.replace(/^\s*\d+[.)]\s+/, "");
-					const transitionReason =
-						semanticRemoteValue === OTHER_OPTION
-							? "other_transition"
-							: semanticRemoteValue === ASK_CLARIFICATION_OPTION
-								? "clarification_transition"
-								: undefined;
-					if (transitionReason) {
-						return {
-							winner: "remote" as const,
-							value: selectedValue,
-							receipt,
-							settlement: { kind: "resolve_without_commit", reason: transitionReason },
-						};
-					}
-					if (
-						remoteValue !== undefined &&
-						activeRemoteRequest?.interaction === "selector" &&
-						activeRemoteRequest.controls.length > 0 &&
-						activeRemoteRequest.options.includes(remoteValue)
-					) {
-						return {
-							winner: "remote" as const,
-							value: selectedValue,
-							receipt,
-							settlement: { kind: "resolve_without_commit", reason: "toggle" },
-						};
-					}
-					return { winner: "remote" as const, value: selectedValue, receipt };
-				});
+				)
+					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
+						if (answer === undefined) return new Promise<never>(() => {});
+						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
+						if (generation !== remoteGeneration) {
+							return receipt
+								.settle({ kind: "resolve_without_commit", reason: "aborted" })
+								.then(() => new Promise<never>(() => {}));
+						}
+						const remoteValue = receipt.interaction.kind === "value" ? receipt.interaction.value : undefined;
+						const value = remoteValue ?? REMOTE_NAVIGATION_FORWARD;
+						const selectedValue =
+							remoteValue === undefined
+								? value
+								: (options.find(
+										option =>
+											option === remoteValue ||
+											option === `${theme.checkbox.checked} ${remoteValue}` ||
+											option === `${theme.checkbox.unchecked} ${remoteValue}`,
+									) ?? value);
+						const normalizedRemoteValue = remoteValue?.startsWith(`${theme.checkbox.checked} `)
+							? remoteValue.slice(`${theme.checkbox.checked} `.length)
+							: remoteValue?.startsWith(`${theme.checkbox.unchecked} `)
+								? remoteValue.slice(`${theme.checkbox.unchecked} `.length)
+								: remoteValue;
+						const semanticRemoteValue = normalizedRemoteValue?.replace(/^\s*\d+[.)]\s+/, "");
+						const transitionReason =
+							semanticRemoteValue === OTHER_OPTION
+								? "other_transition"
+								: semanticRemoteValue === ASK_CLARIFICATION_OPTION
+									? "clarification_transition"
+									: undefined;
+						if (transitionReason) {
+							return {
+								winner: "remote" as const,
+								value: selectedValue,
+								receipt,
+								settlement: { kind: "resolve_without_commit", reason: transitionReason },
+							};
+						}
+						if (
+							remoteValue !== undefined &&
+							activeRemoteRequest?.interaction === "selector" &&
+							activeRemoteRequest.controls.length > 0 &&
+							activeRemoteRequest.options.includes(remoteValue)
+						) {
+							return {
+								winner: "remote" as const,
+								value: selectedValue,
+								receipt,
+								settlement: { kind: "resolve_without_commit", reason: "toggle" },
+							};
+						}
+						return { winner: "remote" as const, value: selectedValue, receipt };
+					})
+					.catch(ignoreRemoteAnswerFailure);
 
 				const local = extensionUi
 					.select(prompt, options, { ...dialogOptions, signal: localController.signal })
@@ -1419,18 +1429,20 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 								remoteController.signal,
 							)
 						: source.awaitAnswer(title, [], remoteController.signal)
-				).then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
-					if (answer === undefined) return new Promise<never>(() => {});
-					const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
-					if (generation !== remoteGeneration) {
-						return receipt
-							.settle({ kind: "resolve_without_commit", reason: "aborted" })
-							.then(() => new Promise<never>(() => {}));
-					}
-					const value =
-						receipt.interaction.kind === "control" ? REMOTE_NAVIGATION_FORWARD : receipt.interaction.value;
-					return { winner: "remote" as const, value, receipt };
-				});
+				)
+					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
+						if (answer === undefined) return new Promise<never>(() => {});
+						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
+						if (generation !== remoteGeneration) {
+							return receipt
+								.settle({ kind: "resolve_without_commit", reason: "aborted" })
+								.then(() => new Promise<never>(() => {}));
+						}
+						const value =
+							receipt.interaction.kind === "control" ? REMOTE_NAVIGATION_FORWARD : receipt.interaction.value;
+						return { winner: "remote" as const, value, receipt };
+					})
+					.catch(ignoreRemoteAnswerFailure);
 				const local = extensionUi
 					.editor(title, prefill, { ...(dialogOptions ?? {}), signal: localController.signal }, editorOptions)
 					.then(answer => {

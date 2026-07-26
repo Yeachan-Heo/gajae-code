@@ -795,6 +795,34 @@ describe("AskTool remote semantic settlements", () => {
 		expect(result.details?.selectedOptions).toEqual(["remote"]);
 		expect(settlements).toEqual([{ kind: "commit" }]);
 	});
+	it("does not leak an aborted remote selector rejection into the next ask", async () => {
+		let remoteCalls = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: (_request, signal) => {
+				remoteCalls++;
+				return new Promise<AskRemoteReceipt | undefined>((_resolve, reject) => {
+					signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+						once: true,
+					});
+				});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+
+		for (const id of ["first", "second"]) {
+			const result = await tool.execute(
+				`local-wins-${id}`,
+				{ questions: [{ id, question: `Choose ${id}`, options: [{ label: "local" }, { label: "remote" }] }] },
+				undefined,
+				undefined,
+				createContext({ select: () => Promise.resolve("local") }),
+			);
+			expect(result.details?.selectedOptions).toEqual(["local"]);
+		}
+		await Promise.resolve();
+		expect(remoteCalls).toBe(2);
+	});
 
 	it("atomically selects a same-microtask remote editor receipt over local text", async () => {
 		const settlements: unknown[] = [];

@@ -15,6 +15,15 @@ import type {
 	ExtensionContextActions,
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
+
+async function firePreflightAccept(options?: {
+	onPreflightAccepted?: () => void;
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+}): Promise<void> {
+	if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+	else options?.onPreflightAccepted?.();
+}
+
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import {
@@ -134,8 +143,15 @@ function start(
 			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
 		) => {
 			if (forwardPreflightCallbacks) return Promise.resolve(sendUserMessage(content, options));
-			const { onPreflightAccepted, ...delivery } = options ?? {};
+			const { onPreflightAccepted, onPreflightAcceptCommit, ...delivery } = options ?? {};
 			const submission = sendUserMessage(content, Object.keys(delivery).length > 0 ? delivery : undefined);
+			// Prefer awaitable durable fence; fall back to legacy sync accept for older mocks.
+			if (onPreflightAcceptCommit) {
+				return Promise.resolve(onPreflightAcceptCommit()).then(() => {
+					onPreflightAccepted?.();
+					return submission;
+				});
+			}
 			onPreflightAccepted?.();
 			return Promise.resolve(submission);
 		},
@@ -469,13 +485,11 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 	const settings = telegramSettings(path.join(cwd, "agent"), true);
 	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
 	const unregisterImpl = telegramDaemon.unregisterNotificationRoot;
-	let initialRegistrationToken: string | undefined;
-	let failedInitialCleanup = false;
+	let unregisterAttempts = 0;
 	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot").mockImplementation(async input => {
-		if (!failedInitialCleanup && input.registrationToken === initialRegistrationToken) {
-			failedInitialCleanup = true;
-			throw new Error("roots write failed");
-		}
+		unregisterAttempts++;
+		// Fail the first owner-release attempt for the live registration token.
+		if (unregisterAttempts === 1) throw new Error("roots write failed");
 		return await unregisterImpl(input);
 	});
 	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
@@ -488,31 +502,33 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 			false,
 			new Map(),
 			{ startupCapability: capability, lifecycleRequired: true },
-			true,
+			false,
 			async input => {
 				const registration = await telegramDaemon.registerNotificationRoot(input);
-				initialRegistrationToken ??= registration.token;
 				input.onRegistered?.(registration);
 				return "attached";
 			},
 		);
+		// Await full start+reconcile so shutdown uses the final replacement token only.
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
 		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(unregister).toHaveBeenCalledTimes(2);
-		expect(unregister.mock.calls.map(call => call[0].registrationToken)).toEqual([
-			expect.any(String),
-			expect.any(String),
-		]);
-		expect(unregister.mock.calls[1]?.[0].registrationToken).not.toBe(unregister.mock.calls[0]?.[0].registrationToken);
+		// First shutdown retains the failed owner release (exactly one attempt).
+		expect(unregister).toHaveBeenCalledTimes(1);
+		expect(unregister.mock.calls[0]?.[0].registrationToken).toEqual(expect.any(String));
 		expect(
 			errorSpy.mock.calls.some(([message]) =>
 				String(message).includes(`SDK notification runtime ${sessionId} owner release failed`),
 			),
 		).toBe(true);
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBeUndefined();
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
+		// Explicit later lifecycle shutdown retries the retained release and succeeds.
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).toHaveBeenCalledTimes(2);
+		expect(unregister.mock.calls[1]?.[0].registrationToken).toBe(unregister.mock.calls[0]?.[0].registrationToken);
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBeUndefined();
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
 			version: 1,
 			roots: [],
@@ -520,10 +536,10 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 			sessions: {},
 			registrationTokens: {},
 		});
-		expect(unregister).toHaveBeenCalledTimes(3);
 		await expect(
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
+		expect(unregister).toHaveBeenCalledTimes(2);
 	} finally {
 		unregister.mockRestore();
 		errorSpy.mockRestore();
@@ -1662,8 +1678,8 @@ test("SDK host buffers synchronous pre-ack start and end until after acknowledge
 	handlers = start(
 		sessionContext,
 		undefined,
-		(_content, options) => {
-			options?.onPreflightAccepted?.();
+		async (_content, options) => {
+			await firePreflightAccept(options);
 			void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 			void handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
 		},
@@ -1720,8 +1736,8 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 	handlers = start(
 		sessionContext,
 		undefined,
-		(_content, options) => {
-			options?.onPreflightAccepted?.();
+		async (_content, options) => {
+			await firePreflightAccept(options);
 			void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 			throw Object.assign(new Error("synchronous accepted failure"), { code: "unavailable" });
 		},
@@ -1867,7 +1883,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 			submissions.push(String(content));
 			preflightStarted.resolve();
 			await releasePreflight.promise;
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -2044,7 +2060,7 @@ test("SDK host terminalizes a cancelled preflight and releases prompt authority"
 					throw Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
 				}
 			}
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -2111,7 +2127,9 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 		undefined,
 		async (content, options) => {
 			if (content !== "never resolve") return;
-			latePreflightAccepted = options?.onPreflightAccepted;
+			latePreflightAccepted = options?.onPreflightAcceptCommit
+				? () => void options.onPreflightAcceptCommit?.()
+				: options?.onPreflightAccepted;
 			preflightStarted.resolve();
 			await neverPreflight.promise;
 		},
@@ -2191,7 +2209,7 @@ test("SDK host abort-and-prompt cancels a never-resolving preflight before repla
 				preflightStarted.resolve();
 				await neverPreflight.promise;
 			}
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -2270,9 +2288,9 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 	const handlers = start(
 		sessionContext,
 		undefined,
-		(content, options) => {
+		async (content, options) => {
 			deliveries.push([content, options]);
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -2372,7 +2390,7 @@ test("SDK session switches rotate endpoint authority before publishing the repla
 });
 
 for (const eventType of ["session_switch", "session_branch"] as const) {
-	test(`SDK ${eventType} rotation swallows a retained owner-release failure without surfacing an extension error`, async () => {
+	test(`SDK ${eventType} rotation fails closed when predecessor release is uncertain`, async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-rotate-fail-${eventType}-`));
 		dirs.push(cwd);
 		const sessionA = `rotate-fail-a-${Date.now()}`;
@@ -2396,7 +2414,6 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 		// Fail A's owner release exactly once so the rotate-time stopSession(prevId)
 		// throws the retained-retry AggregateError.
 		const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
-		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 		try {
 			const startupCapability = new SdkStartupCapability();
 			const handlers = start(ctx, undefined, () => {}, false, new Map(), {
@@ -2408,55 +2425,20 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
 
 			activeSessionId = sessionB;
-			// Drive the rotation handler through a real ExtensionRunner so the onError
-			// seam proves the swallowed failure is not surfaced as a red extension error.
-			const rotationExt = {
-				path: "test-rotation-ext",
-				handlers: new Map([
-					[
-						eventType,
-						[
-							async () => {
-								await handlers.get(eventType)!(
-									{
-										type: eventType,
-										reason: "new",
-										previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
-									},
-									ctx,
-								);
-							},
-						],
-					],
-				]),
+			// A retained predecessor cleanup must fail closed and rethrow before any
+			// successor endpoint can publish.
+			const rotationEvent = {
+				type: eventType,
+				reason: "new",
+				previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
 			};
-			const runner = new ExtensionRunner([rotationExt as never], {} as never, cwd, {} as never, {} as never);
-			runner.initialize({} as never, {} as never);
-			const surfaced: Array<{ event: string }> = [];
-			runner.onError(error => surfaced.push(error));
-			await expect(
-				runner.emit({
-					type: eventType,
-					reason: "new",
-					previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
-				} as never),
-			).resolves.toBeUndefined();
-			expect(surfaced).toEqual([]);
+			await expect(handlers.get(eventType)!(rotationEvent, ctx)).rejects.toThrow(
+				`SDK notification runtime ${sessionA} owner release failed`,
+			);
 
-			// Rotation still publishes B and retires A despite the swallowed failure.
+			// The failed predecessor release quarantines B: no successor endpoint is published.
 			const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
-			await waitFor(() => !fs.existsSync(endpointAPath) && fs.existsSync(endpointBPath), "rotated session endpoint");
-
-			// The failure is logged at error severity with the shared prefix and A's
-			// identity, never surfaced as a red extension error.
-			const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
-			expect(
-				breadcrumbs.some(
-					message =>
-						message.startsWith("notifications: SDK notification runtime cleanup failed: ") &&
-						message.includes(`SDK notification runtime ${sessionA} owner release failed`),
-				),
-			).toBe(true);
+			expect(fs.existsSync(endpointBPath)).toBe(false);
 
 			// With the mock restored, A's retained cleanup can still complete.
 			stop.mockRestore();
@@ -2470,7 +2452,6 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
 		} finally {
 			stop.mockRestore();
-			errorSpy.mockRestore();
 		}
 	});
 }
@@ -4604,12 +4585,17 @@ test("clientRef admission reservation is released when a submission is rejected 
 	const handlers = start(
 		sessionContext,
 		undefined,
-		(content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
+		async (
+			content: unknown,
+			options:
+				| { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void | Promise<void> }
+				| undefined,
+		) => {
 			const text = String(content);
 			deliveries.push(text);
 			if (text === "doomed preflight")
 				return Promise.reject(Object.assign(new Error("submission lost"), { code: "unavailable" }));
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 			return Promise.resolve();
 		},
 		true,
@@ -4709,8 +4695,13 @@ test("accepted-then-failed submission retains its reconciliation record and bloc
 	const handlers = start(
 		sessionContext,
 		undefined,
-		(_content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
-			options?.onPreflightAccepted?.();
+		async (
+			_content: unknown,
+			options:
+				| { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void | Promise<void> }
+				| undefined,
+		) => {
+			await firePreflightAccept(options);
 			throw Object.assign(new Error("synchronous accepted failure"), { code: "unavailable" });
 		},
 		true,

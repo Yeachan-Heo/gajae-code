@@ -9,6 +9,13 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	/** Best-effort diagnostic observation of accepted control/query frames. */
 	onRequest?: SdkRequestObserver;
+	/** Runs before a control response is sent; identity transitions use sendTerminal. */
+	beforeControlResponse?: (
+		connectionId: string,
+		request: SdkFrame,
+		response: SdkFrame,
+		sendTerminal: () => Promise<void>,
+	) => void | Promise<void>;
 	/** Runs only after a successful control response has been sent to the client. */
 	afterControlResponse?: (connectionId: string, request: SdkFrame, response: SdkFrame) => void | Promise<void>;
 	installProviderDefinitions?: (capability: string, definitions: unknown) => void;
@@ -36,6 +43,14 @@ function errorFrame(connectionId: string, frame: SdkFrame, error: unknown): SdkF
 				? candidate.code
 				: "internal";
 	const message = typeof candidate?.message === "string" ? candidate.message : "SDK host operation failed.";
+	if (frame.type === "control_request") {
+		return {
+			type: "control_response",
+			id: typeof frame.id === "string" ? frame.id : "",
+			ok: false,
+			error: { code, message },
+		};
+	}
 	return {
 		type: "reverse_response",
 		id: typeof frame.id === "string" ? frame.id : "",
@@ -214,7 +229,14 @@ export class SessionSdkHost {
 					const result = await this.#options.control?.(connectionId, frame);
 					if (result !== undefined) {
 						const response = { type: "control_response", ...(result as SdkFrame) };
-						await this.#send(connectionId, response);
+						let terminalSent = false;
+						const sendTerminal = async (): Promise<void> => {
+							if (terminalSent) return;
+							terminalSent = true;
+							await this.#send(connectionId, response);
+						};
+						await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
+						await sendTerminal();
 						await this.#options.afterControlResponse?.(connectionId, frame, response);
 					}
 					break;

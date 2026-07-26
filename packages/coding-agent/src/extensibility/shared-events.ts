@@ -38,6 +38,9 @@ export interface SessionBeforeSwitchEvent {
 	targetSessionFile?: string;
 }
 
+/** Origin used when an interactive session selector resumes a session. */
+export const INTERACTIVE_SELECTOR_RESUME_ORIGIN = "interactive_selector_resume";
+
 /** Fired after switching to another session */
 export interface SessionSwitchEvent {
 	type: "session_switch";
@@ -45,6 +48,8 @@ export interface SessionSwitchEvent {
 	reason: "new" | "resume" | "fork";
 	/** Session file we came from */
 	previousSessionFile: string | undefined;
+	/** Optional provenance for this session transition. */
+	transition?: { origin: string };
 }
 
 /** Fired before branching a session (can be cancelled) */

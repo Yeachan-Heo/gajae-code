@@ -352,6 +352,7 @@ export async function writeGjcWorkerStartupAck(
 		pid: typeof input.pid === "number" ? input.pid : undefined,
 		session: typeof input.session === "string" ? input.session : undefined,
 		protocol_version: String(input.protocol_version ?? "1"),
+		replacement_token: typeof input.replacement_token === "string" ? input.replacement_token : undefined,
 		ack_at: runtime.now(),
 	};
 	await runtime.writeJson(path.join(runtime.workerDir(dir, worker), "startup-ack.json"), ack);

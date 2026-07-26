@@ -19,7 +19,7 @@ export interface ControlSurface {
 		idempotencyKey?: string,
 	): Promise<ControlValue> | ControlValue;
 	approvePlan(id: string, choice: ControlValue, expectedSessionId?: string): Promise<ControlValue> | ControlValue;
-	invokeSkill(name: string, args: ControlValue): Promise<ControlValue> | ControlValue;
+	invokeSkill(name: string, args: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;

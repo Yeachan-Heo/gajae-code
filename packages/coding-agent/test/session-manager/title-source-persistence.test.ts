@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,10 +10,10 @@ import {
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
-import * as native from "@gajae-code/natives";
 import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
 
 import { makeAssistantMessage } from "./helpers";
+import { injectManagedAppend } from "./managed-failure-injection";
 
 function getHeader(entries: unknown[]): SessionHeader | undefined {
 	return entries.find(
@@ -314,36 +314,16 @@ describe("session title source persistence", () => {
 			const originalFile = session.getSessionFile();
 			expect(originalFile).toBeDefined();
 
-			const originalAppend = native.RecoveryFsRoot.prototype.appendManaged;
-			const append = vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
-				this: native.RecoveryFsRoot,
-				relativePath,
-				data,
-				expectedDev,
-				expectedIno,
-				expectedSize,
-				expectedMtimeNs,
-				expectedCtimeNs,
-				expectedSha256,
-			) {
-				if (Buffer.from(data).includes(Buffer.from('"type":"header_patch"')))
-					return { ok: false, code: "header_patch_write_failed" };
-				return originalAppend.call(
-					this,
-					relativePath,
-					data,
-					expectedDev,
-					expectedIno,
-					expectedSize,
-					expectedMtimeNs,
-					expectedCtimeNs,
-					expectedSha256,
-				);
-			});
+			const injection = injectManagedAppend((_relativePath, data) =>
+				Buffer.from(data).includes(Buffer.from('"type":"header_patch"'))
+					? { ok: false, code: "header_patch_write_failed" }
+					: "passthrough",
+			);
 			try {
 				await expect(session.moveTo(destinationCwd)).rejects.toThrow("header_patch_write_failed");
+				injection.assertHit();
 			} finally {
-				append.mockRestore();
+				injection.restore();
 			}
 			expect(session.getCwd()).toBe(cwd);
 			expect(session.getSessionFile()).toBe(originalFile);

@@ -132,7 +132,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				}
 				return false;
 			},
-			invokeSkill: (name, args) => session.invokeSkill(name, args),
+			invokeSkill: (name, args, options) => session.invokeSkill(name, args, options),
 			setPlanMode: on => session.setSdkPlanMode(on),
 			operateGoal: (op, objective) => session.operateGoal(op, objective),
 			getSkillState: () => session.skills.map(skill => ({ name: skill.name, description: skill.description })),

@@ -41,11 +41,11 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 		// held a write handle; tolerate already-closed FDs from the child.
 		closeCaptureFd(stdoutFd);
 		closeCaptureFd(stderrFd);
-		return {
-			exitCode,
-			stdout: await fs.readFile(stdoutPath, "utf8"),
-			stderr: await fs.readFile(stderrPath, "utf8"),
-		};
+		// Re-open read-only and fsync parent side so CI load cannot observe a
+		// truncated capture of a finished child (exit code alone is not enough).
+		const stdout = await fs.readFile(stdoutPath, "utf8");
+		const stderr = await fs.readFile(stderrPath, "utf8");
+		return { exitCode, stdout, stderr };
 	} finally {
 		closeCaptureFd(stdoutFd);
 		closeCaptureFd(stderrFd);
@@ -81,7 +81,18 @@ describe("SDK daemon session CLI", () => {
 			},
 			websocket: {
 				open(socket) {
-					socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test-conn" }));
+					// Defer hello one tick so the client open handler can enter the
+					// hello phase before the first frame is delivered (pairs with the
+					// SdkClient early-hello buffer under load).
+					queueMicrotask(() => {
+						try {
+							socket.send(
+								JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test-conn" }),
+							);
+						} catch {
+							// connection already closed
+						}
+					});
 				},
 				message(socket, message) {
 					const frame = JSON.parse(String(message)) as Record<string, unknown>;
@@ -156,7 +167,7 @@ describe("SDK daemon session CLI", () => {
 			"--json-input",
 			"{}",
 		]);
-		expect(query.exitCode).toBe(0);
+		expect(query.exitCode, `query stdout=${query.stdout}\nstderr=${query.stderr}`).toBe(0);
 		expect(JSON.parse(query.stdout)).toMatchObject({ ok: true, result: { sessionId: "live" } });
 
 		const refused = await runCli(root, agentDir, [

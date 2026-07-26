@@ -12,7 +12,8 @@
  * - Terminal records are retained for TERMINAL_TTL_MS and bounded to
  *   TERMINAL_CAPACITY, evicted oldest-terminal-first by terminalAt; only then
  *   does a lookup honestly report `unknown`.
- * - The durability floor is the live session process: restart means `unknown`.
+ * - Process-local durability floor is the live session process: restart means `unknown`.
+ *   Session-scoped durable retention (kind-aware store) is provided by reconciliation-store.ts (#3032).
  * - The clientRef index is session-runtime scoped; a ref conflicts only while
  *   retained and must never be reused as a retry mechanism.
  * - Terminal transitions settle once: the first terminal outcome wins.

@@ -313,17 +313,31 @@ The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
 `error.code` and `error.message`. Cursors, partial generated-ID pairs, mixed
 selectors, and extra selector fields are rejected.
 
-Reconciliation state survives client disconnect/reconnect, not session-process
-restart. Active records are capped at 128 and are never aged or evicted. Terminal
-records are retained for 15 minutes, capped at 256, and evicted oldest-terminal
-first. Restart or eviction honestly returns `unknown`; that means the prior outcome
-is unknowable, not that execution did not occur.
+Reconciliation state survives client disconnect/reconnect. With the session-private
+durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also
+survive **GJC session-process restart** for the same session identity within
+capacity/TTL, subject to crash-consistent fsync. Active records that were not
+terminal at death are settled as `failed` with `error.code = process_restart`
+(reconciliation incomplete — not proof of agent failure). Eviction or absence still
+returns honest `unknown`; that means the prior outcome is unknowable, not that
+execution did not occur. Active records are capped at 128 per kind and are never aged
+into terminal. Terminal records are retained for 15 minutes, capped at 256 per kind,
+and evicted oldest-terminal first.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
 `clientRef` fails before execution with `client_ref_conflict`, but callers must not
 reuse a `clientRef` as a retry mechanism: after eviction the same value can identify
 a new prompt while the old outcome remains unknown.
+
+## Skill invoke reconciliation (Q28)
+
+`skill.invoke` accepts optional `clientRef` and returns an early accepted receipt
+`{ accepted: true, commandId, turnId, clientRef?, name, path, lineCount?, args? }` after
+durable/preflight accept (SDK control path), not after skill completion. Query prior
+status with `Q28` / `skill.invoke_status` using the same selectors as Q26. Kind-scoped
+indexes mean prompt and skill `clientRef` values never collide. Same capacity/TTL and
+process_restart settlement rules as prompt reconciliation apply.
 
 ## Model profile discovery and validation (Q27)
 

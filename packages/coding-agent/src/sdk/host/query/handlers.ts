@@ -46,6 +46,11 @@ export interface SessionSurface {
 	getJobs(): unknown | Promise<unknown>;
 	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
 	getPromptStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
+	getSkillInvokeStatus?(selector: {
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}): unknown | Promise<unknown>;
 	/** Q27 effective model-profile catalog from the live session registry. */
 	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/** Query rows backed by the session's installed binding map. */
@@ -127,6 +132,7 @@ const names = [
 	"runtime.jobs.list",
 	"turn.prompt_status",
 	"models.profiles.list",
+	"skill.invoke_status",
 ];
 
 export class QueryHandlers {
@@ -156,6 +162,7 @@ export class QueryHandlers {
 			if (query === "Q02") return await this.#transcriptBody(request);
 			if (query === "Q23") return await this.#resourceBody(request);
 			if (query === "Q26") return await this.#promptStatus(request);
+			if (query === "Q28") return await this.#skillInvokeStatus(request);
 			if (query === "Q24") return await this.#artifact(request);
 			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
 				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
@@ -515,6 +522,54 @@ export class QueryHandlers {
 			page.preview = true;
 		}
 		return { id: request.id, ok: true, page };
+	}
+
+	async #skillInvokeStatus(request: QueryRequest): Promise<QueryResponse> {
+		if (request.cursor)
+			return this.#error(request, "invalid_request", false, "skill.invoke_status does not support cursors.");
+		const input = request.input ?? {};
+		for (const key of Object.keys(input))
+			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
+				return this.#error(
+					request,
+					"invalid_request",
+					false,
+					`skill.invoke_status does not accept selector field "${key}".`,
+				);
+		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
+		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
+		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
+		const trimmedClientRef = rawClientRef?.trim();
+		if (rawClientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"clientRef must be a non-empty string of at most 128 characters.",
+			);
+		const clientRef = trimmedClientRef || undefined;
+		if ((commandId === undefined) !== (turnId === undefined))
+			return this.#error(request, "invalid_request", false, "commandId and turnId must be provided together.");
+		if (commandId !== undefined && clientRef !== undefined)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"Provide exactly one selector: a commandId/turnId pair or a clientRef.",
+			);
+		if (commandId === undefined && clientRef === undefined)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"skill.invoke_status requires a commandId/turnId pair or a clientRef.",
+			);
+		if (typeof this.surface.getSkillInvokeStatus !== "function")
+			return this.#error(request, "unavailable", false, "skill.invoke_status is unavailable for this session.");
+		const result = await this.surface.getSkillInvokeStatus(
+			clientRef !== undefined ? { clientRef } : { commandId: commandId!, turnId: turnId! },
+		);
+		return { id: request.id, ok: true, result };
 	}
 
 	async #promptStatus(request: QueryRequest): Promise<QueryResponse> {

@@ -623,6 +623,10 @@ type TuiRenderCounterSnapshot = {
 	debugRedrawAppendWrites: number;
 	differentialGuardVisibleWidthCalls: number;
 };
+type RenderCommitWaiter = {
+	resolve: (committed: boolean) => void;
+	timer: NodeJS.Timeout;
+};
 
 /**
  * TUI - Main class for managing terminal UI with differential rendering
@@ -651,6 +655,11 @@ export class TUI extends Container {
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	onDebug?: () => void;
 	#renderRequested = false;
+	#nextRenderGeneration = 0;
+	#renderRequestedGeneration = 0;
+	#committedRenderGeneration = 0;
+	#renderCommitWaiters = new Map<number, Set<RenderCommitWaiter>>();
+	#lastRenderWriteSucceeded = false;
 	#renderTimer: NodeJS.Timeout | undefined;
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
@@ -662,6 +671,9 @@ export class TUI extends Container {
 	#cursorRow = 0; // Logical cursor row (end of rendered content)
 	#hardwareCursorRow = 0; // Actual terminal cursor row (may differ due to IME positioning)
 	#viewportTopRow = 0; // Content row currently mapped to screen row 0
+	#scrollbackResumeViewportTop: number | undefined; // Reflowed history below this frontier is already committed
+	#nativeScrollbackViewportTop = 0;
+	#transcriptIdentityResetPending = false;
 	#manualViewportTop: number | undefined;
 	#viewportAnchorComponent: Component | null = null;
 	#viewportAnchorFrame: ViewportAnchorFrame | null = null;
@@ -835,6 +847,9 @@ export class TUI extends Container {
 		this.#manualViewportFallbackAnchors = [];
 		this.#reconcileMissingViewportAnchor = false;
 		this.#viewportAnchorFrame = null;
+		this.#scrollbackResumeViewportTop = undefined;
+		this.#nativeScrollbackViewportTop = 0;
+		this.#transcriptIdentityResetPending = true;
 	}
 
 	/** Allow one semantic-neighbor reconciliation after a definitive same-transcript rebuild. */
@@ -1112,6 +1127,57 @@ export class TUI extends Container {
 		this.requestRender(true);
 	}
 
+	/**
+	 * Wait for a specific render request generation to be written successfully.
+	 *
+	 * Render requests are coalesced, so committing a newer generation also commits
+	 * every older generation represented by that frame. A stopped or unavailable
+	 * terminal resolves waiters false so UI callers can fail open instead of
+	 * holding a session operation behind a dead renderer.
+	 */
+	waitForRenderCommit(generation: number, timeoutMs = 250): Promise<boolean> {
+		if (generation <= 0 || generation <= this.#committedRenderGeneration) return Promise.resolve(true);
+		if (this.#stopped || !this.terminalAvailable) return Promise.resolve(false);
+		return new Promise<boolean>(resolve => {
+			const waiter: RenderCommitWaiter = {
+				resolve,
+				timer: setTimeout(
+					() => {
+						const waiters = this.#renderCommitWaiters.get(generation);
+						if (waiters) {
+							waiters.delete(waiter);
+							if (waiters.size === 0) this.#renderCommitWaiters.delete(generation);
+						}
+						resolve(false);
+					},
+					Math.max(0, timeoutMs),
+				),
+			};
+			waiter.timer.unref?.();
+			const waiters = this.#renderCommitWaiters.get(generation) ?? new Set();
+			waiters.add(waiter);
+			this.#renderCommitWaiters.set(generation, waiters);
+		});
+	}
+
+	#settleRenderCommitWaiters(committed: boolean, generation = Number.POSITIVE_INFINITY): void {
+		if (committed) this.#committedRenderGeneration = Math.max(this.#committedRenderGeneration, generation);
+		for (const [waiterGeneration, waiters] of this.#renderCommitWaiters) {
+			if (committed && waiterGeneration > generation) continue;
+			this.#renderCommitWaiters.delete(waiterGeneration);
+			for (const waiter of waiters) {
+				clearTimeout(waiter.timer);
+				waiter.resolve(committed);
+			}
+		}
+	}
+
+	#commitRenderGeneration(generation: number): void {
+		if (generation <= 0) return;
+		if (this.#lastRenderWriteSucceeded) this.#settleRenderCommitWaiters(true, generation);
+		else if (this.#stopped || !this.terminalAvailable) this.#settleRenderCommitWaiters(false, generation);
+	}
+
 	get terminalAvailable(): boolean {
 		return !this.#terminalUnavailable && this.terminal.available;
 	}
@@ -1120,6 +1186,7 @@ export class TUI extends Container {
 		this.#terminalUnavailable = true;
 		this.#stopped = true;
 		this.#renderRequested = false;
+		this.#settleRenderCommitWaiters(false);
 		if (this.#renderTimer) {
 			clearTimeout(this.#renderTimer);
 			this.#renderTimer = undefined;
@@ -1318,6 +1385,7 @@ export class TUI extends Container {
 		this.flushTerminalCleanup();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
+		this.#settleRenderCommitWaiters(false);
 		if (this.#renderTimer) {
 			clearTimeout(this.#renderTimer);
 			this.#renderTimer = undefined;
@@ -1389,13 +1457,25 @@ export class TUI extends Container {
 	}
 
 	requestRender(force = false, source = "unknown"): void {
+		this.requestRenderWithGeneration(force, source);
+	}
+
+	requestRenderWithGeneration(force = false, source = "unknown"): number {
+		const generation = ++this.#nextRenderGeneration;
+		this.#renderRequestedGeneration = Math.max(this.#renderRequestedGeneration, generation);
+		this.#requestRenderCore(force, source, generation);
+		return generation;
+	}
+
+	#requestRenderCore(force: boolean, source: string, generation: number): void {
 		if (!this.terminalAvailable) {
 			this.#markTerminalUnavailable();
 			return;
 		}
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
-			const preserveViewportCursor = useViewportRepaintPath(this.terminal);
+			const preserveViewportCursor =
+				useViewportRepaintPath(this.terminal) || shouldPreserveScrollbackOnFullClear(this.terminal);
 			// A forced full redraw supersedes any queued input-priority render.
 			this.#inputRenderPending = false;
 			this.#previousLines = [];
@@ -1422,12 +1502,17 @@ export class TUI extends Container {
 			this.#renderRequested = true;
 			process.nextTick(() => {
 				if (this.#stopped || !this.#renderRequested) {
+					this.#settleRenderCommitWaiters(false, generation);
 					return;
 				}
+				const requestedGeneration = this.#renderRequestedGeneration;
+				this.#renderRequestedGeneration = 0;
 				this.#renderRequested = false;
 				this.#lastRenderAt = performance.now();
+				this.#lastRenderWriteSucceeded = false;
 				const t0 = renderMetrics.now();
 				this.#doRender();
+				this.#commitRenderGeneration(requestedGeneration);
 				if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			});
 			return;
@@ -1448,6 +1533,7 @@ export class TUI extends Container {
 		if (this.#renderRequested) return;
 		this.#renderRequested = true;
 		process.nextTick(() => this.#scheduleRender());
+		return;
 	}
 
 	#scheduleRender(): void {
@@ -1462,10 +1548,14 @@ export class TUI extends Container {
 			if (this.#stopped || !this.#renderRequested) {
 				return;
 			}
+			const requestedGeneration = this.#renderRequestedGeneration;
+			this.#renderRequestedGeneration = 0;
 			this.#renderRequested = false;
 			this.#lastRenderAt = performance.now();
+			this.#lastRenderWriteSucceeded = false;
 			const t0 = renderMetrics.now();
 			this.#doRender();
+			this.#commitRenderGeneration(requestedGeneration);
 			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			if (this.#renderRequested) {
 				this.#scheduleRender();
@@ -1488,10 +1578,14 @@ export class TUI extends Container {
 			this.#renderTimer = undefined;
 			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
+		const requestedGeneration = this.#renderRequestedGeneration;
+		this.#renderRequestedGeneration = 0;
 		this.#renderRequested = false;
 		this.#lastRenderAt = performance.now();
+		this.#lastRenderWriteSucceeded = false;
 		const t0 = renderMetrics.now();
 		this.#doRender();
+		this.#commitRenderGeneration(requestedGeneration);
 		if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 	}
 
@@ -2393,6 +2487,19 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		this.#latestRenderedLines = newLines;
+		const naturalViewportTop = Math.max(0, newLines.length - height);
+		const priorLogicalLineCount = Math.max(this.#previousLines.length, this.#maxLinesRendered);
+		if (this.#transcriptIdentityResetPending) {
+			this.#transcriptIdentityResetPending = false;
+		} else if (
+			newLines.length < priorLogicalLineCount &&
+			(naturalViewportTop < prevViewportTop || this.#manualViewportTop !== undefined)
+		) {
+			this.#scrollbackResumeViewportTop = Math.max(
+				this.#scrollbackResumeViewportTop ?? 0,
+				this.#nativeScrollbackViewportTop,
+			);
+		}
 
 		if (this.#manualViewportTop !== undefined) {
 			let resolvedAnchorTop = anchorFrame === null ? null : this.#resolveManualAnchor(anchorFrame);
@@ -2473,7 +2580,16 @@ export class TUI extends Container {
 			return;
 		}
 		// Helper to clear scrollback and viewport and render all new lines
+		let viewportRepaint: (reason: string, targetViewportTop?: number) => void;
 		const fullRender = (clear: boolean, reason = "full render"): void => {
+			if (
+				clear &&
+				shouldPreserveScrollbackOnFullClear(this.terminal) &&
+				this.#scrollbackResumeViewportTop !== undefined
+			) {
+				viewportRepaint(`preserving full replay blocked after scrollback-unsafe contraction: ${reason}`);
+				return;
+			}
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
@@ -2500,15 +2616,21 @@ export class TUI extends Container {
 				this.#maxLinesRendered = Math.max(this.#maxLinesRendered, newLines.length);
 			}
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+			this.#nativeScrollbackViewportTop = clear
+				? this.#viewportTopRow
+				: Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
+			if (clear && !shouldPreserveScrollbackOnFullClear(this.terminal)) {
+				this.#scrollbackResumeViewportTop = undefined;
+			}
 			this.#previousLines = newLines;
 			this.#previousWidth = width;
 			this.#previousHeight = height;
 		};
 
-		const viewportRepaint = (reason: string): void => {
+		viewportRepaint = (reason: string, targetViewportTop = Math.max(0, newLines.length - height)): void => {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
-			const nextViewportTop = Math.max(0, newLines.length - height);
+			const nextViewportTop = targetViewportTop;
 			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
 			let buffer = "\x1b[?2026h";
 			if (currentScreenRow > 0) {
@@ -2644,7 +2766,7 @@ export class TUI extends Container {
 			}
 			lastChanged = newLines.length - 1;
 		}
-		const appendStart = appendedLines && firstChanged === this.#previousLines.length && firstChanged > 0;
+		let appendStart = appendedLines && firstChanged === this.#previousLines.length && firstChanged > 0;
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
@@ -2657,6 +2779,32 @@ export class TUI extends Container {
 		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
 			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
 			return;
+		}
+		if (appendedLines && this.#scrollbackResumeViewportTop !== undefined && nextLiveViewportTop > prevViewportTop) {
+			const resumeViewportTop = this.#scrollbackResumeViewportTop;
+			if (nextLiveViewportTop <= resumeViewportTop) {
+				viewportRepaint(
+					`content expansion below committed scrollback frontier (${prevViewportTop} -> ${nextLiveViewportTop}, frontier=${resumeViewportTop})`,
+				);
+				return;
+			}
+
+			const previousLines = this.#previousLines;
+			const previousWidth = this.#previousWidth;
+			const previousHeight = this.#previousHeight;
+			viewportRepaint(
+				`staging committed scrollback frontier before resumed admission (${prevViewportTop} -> ${resumeViewportTop} -> ${nextLiveViewportTop})`,
+				resumeViewportTop,
+			);
+			this.#previousLines = previousLines;
+			this.#previousWidth = previousWidth;
+			this.#previousHeight = previousHeight;
+			prevViewportTop = resumeViewportTop;
+			viewportTop = resumeViewportTop;
+			hardwareCursorRow = this.#hardwareCursorRow;
+			firstChanged = resumeViewportTop;
+			appendStart = false;
+			this.#scrollbackResumeViewportTop = undefined;
 		}
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
@@ -2855,6 +3003,7 @@ export class TUI extends Container {
 		// Track content height for viewport calculation
 		this.#maxLinesRendered = newLines.length;
 		this.#viewportTopRow = Math.max(0, newLines.length - height);
+		this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
 
 		this.#previousLines = newLines;
 		this.#previousWidth = width;
@@ -2942,8 +3091,13 @@ export class TUI extends Container {
 			buffer += `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
 		}
 		if (!this.#writeTerminal(buffer)) return false;
-		if (!this.#imeCursorActive) return true;
-		return this.#writeCursorPosition(cursorPos, totalLines);
+		if (!this.#imeCursorActive) {
+			this.#lastRenderWriteSucceeded = true;
+			return true;
+		}
+		const cursorWritten = this.#writeCursorPosition(cursorPos, totalLines);
+		if (cursorWritten) this.#lastRenderWriteSucceeded = true;
+		return cursorWritten;
 	}
 
 	/**

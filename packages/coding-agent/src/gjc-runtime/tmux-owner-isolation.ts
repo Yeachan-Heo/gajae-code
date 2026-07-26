@@ -960,6 +960,24 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 	};
 }
 
+export interface MemoryGuardClaimPaths {
+	root: string;
+	databaseFile: string;
+	walFile: string;
+	shmFile: string;
+}
+
+export function memoryGuardClaimPaths(stateDir: string, sessionId: string): MemoryGuardClaimPaths {
+	const root = path.join(stateDir, "memory-guard-claims", sessionId);
+	const databaseFile = path.join(root, "claims.sqlite");
+	return {
+		root,
+		databaseFile,
+		walFile: `${databaseFile}-wal`,
+		shmFile: `${databaseFile}-shm`,
+	};
+}
+
 export async function replaceOwnerGeneration(
 	stateDir: string,
 	sessionId: string,

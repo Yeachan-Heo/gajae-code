@@ -183,6 +183,25 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 	});
 });
 
+test("SdkClient accepts hello that races ahead of the open handler", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const connecting = client.connect();
+		const socket = FakeWebSocket.instances[0];
+		// Deliver hello while still in the opening phase (before open()).
+		socket.message({ type: "server_hello", connectionId: "early" });
+		socket.open();
+		await connecting;
+		const request = client.query("session.metadata", {});
+		await flush();
+		const frame = sent(socket);
+		expect(frame).toMatchObject({ type: "query_request", query: "session.metadata" });
+		socket.message({ type: "query_response", id: frame.id, ok: true, result: { sessionId: "live" } });
+		await expect(request).resolves.toMatchObject({ ok: true, result: { sessionId: "live" } });
+		await client.close();
+	});
+});
+
 test("SdkClient close resolves only after the owned transport closes", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token");

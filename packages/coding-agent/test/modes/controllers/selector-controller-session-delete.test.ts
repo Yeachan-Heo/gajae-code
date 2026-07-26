@@ -256,7 +256,7 @@ describe("SelectorController session deletion", () => {
 		await controller.handleResumeSession(legacyPath);
 
 		expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledWith(legacyPath, "copy-retain", identity);
-		expect(switchSession).toHaveBeenCalledWith(migratedPath);
+		expect(switchSession).toHaveBeenCalledWith(migratedPath, expect.any(Object));
 	});
 
 	it("keeps explicit selections out of the managed migration fence", async () => {
@@ -271,7 +271,7 @@ describe("SelectorController session deletion", () => {
 
 		expect(inspection).not.toHaveBeenCalled();
 		expect(prepareManagedCandidateForStrictAdoption).not.toHaveBeenCalled();
-		expect(switchSession).toHaveBeenCalledWith(explicitPath);
+		expect(switchSession).toHaveBeenCalledWith(explicitPath, expect.any(Object));
 	});
 
 	it("does not switch after a managed replacement race rejects the inspected identity", async () => {

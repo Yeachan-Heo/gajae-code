@@ -678,18 +678,30 @@ describe("ModelRegistry", () => {
 			expect(resolved?.provider).toBe("demo");
 			expect(resolved?.id).toBe("anthropic/claude-sonnet-4.5");
 		});
+		/** Hermetic candidate set for fixture providers only (excludes ambient host providers). */
+		function fixtureCandidates(
+			registry: ModelRegistry,
+			providers: readonly string[] = ["alpha", "beta"],
+			modelId = "anthropic/claude-sonnet-4.5",
+		) {
+			return providers
+				.map(provider => registry.find(provider, modelId))
+				.filter((model): model is NonNullable<typeof model> => model !== undefined);
+		}
 
 		test("keeps available canonical variants sticky across refreshes and releases unavailable variants", async () => {
 			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
 			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
 			writeRawModelsJson({ alpha, beta });
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = () => fixtureCandidates(registry);
 			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
 				availableOnly: true,
-				candidates: registry.getAvailable(),
+				candidates: candidates(),
 				sessionId: "session-a",
 			});
 			expect(initial).toBeDefined();
+			expect(["alpha", "beta"]).toContain(initial!.provider);
 
 			await Bun.sleep(10);
 			writeRawModelsJson({ beta, alpha });
@@ -697,7 +709,7 @@ describe("ModelRegistry", () => {
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
-					candidates: registry.getAvailable(),
+					candidates: candidates(),
 					sessionId: "session-a",
 				}),
 			).toMatchObject({ provider: initial!.provider, id: initial!.id });
@@ -713,7 +725,7 @@ describe("ModelRegistry", () => {
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
-					candidates: registry.getAvailable(),
+					candidates: candidates(),
 					sessionId: "session-a",
 				})?.provider,
 			).not.toBe(initial!.provider);
@@ -725,19 +737,20 @@ describe("ModelRegistry", () => {
 				beta: providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
 			});
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = () => fixtureCandidates(registry);
 			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
 				availableOnly: true,
-				candidates: registry.getAvailable(),
+				candidates: candidates(),
 				sessionId: "session-0",
 			});
 			for (let index = 1; index < 65; index += 1) {
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
-					candidates: registry.getAvailable(),
+					candidates: candidates(),
 					sessionId: `session-${index}`,
 				});
 			}
-			const reversedCandidates = [...registry.getAvailable()].reverse();
+			const reversedCandidates = [...candidates()].reverse();
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
@@ -888,10 +901,13 @@ describe("ModelRegistry", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
 			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+			const fixtureModels = () => fixtureCandidates(registry);
 			const childA = "subagent:parent-session:child-a";
 			const childB = "subagent:parent-session:child-b";
 			const lookup: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey"> = {
-				getAvailable: () => registry.getAvailable(),
+				// Pin availability to fixture providers so ambient host credentials
+				// (e.g. OpenGateway) cannot change canonical resolution in this test.
+				getAvailable: () => fixtureModels(),
 				resolveCanonicalModel: registry.resolveCanonicalModel.bind(registry),
 				seedCanonicalVariant: registry.seedCanonicalVariant.bind(registry),
 				getApiKey: async model => (model.provider === "alpha" ? "test-key" : undefined),
@@ -910,7 +926,7 @@ describe("ModelRegistry", () => {
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
-					candidates: registry.getAvailable().reverse(),
+					candidates: [...fixtureModels()].reverse(),
 					sessionId: "parent-session",
 				}),
 			).toBe(betaModel);
@@ -918,7 +934,7 @@ describe("ModelRegistry", () => {
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
-					candidates: registry.getAvailable(),
+					candidates: fixtureModels(),
 					sessionId: childB,
 				}),
 			).toBe(betaModel);
@@ -926,7 +942,7 @@ describe("ModelRegistry", () => {
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
-					candidates: registry.getAvailable().reverse(),
+					candidates: [...fixtureModels()].reverse(),
 					sessionId: childA,
 				}),
 			).toBe(alphaModel);

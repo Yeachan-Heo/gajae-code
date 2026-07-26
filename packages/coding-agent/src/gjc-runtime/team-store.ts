@@ -126,6 +126,38 @@ export interface GjcTeamApiClaimResult {
 	claim_token?: string;
 	reason?: string;
 }
+export type GjcTeamWorkerClaimSelection =
+	| { kind: "none" }
+	| { kind: "exact"; task: GjcTeamTask; claim: GjcTeamTaskClaim }
+	| { kind: "ambiguous"; tasks: GjcTeamTask[] };
+
+export function selectCurrentClaimedTaskForWorker(
+	tasks: readonly GjcTeamTask[],
+	workerId: string,
+): GjcTeamWorkerClaimSelection {
+	const claimed = tasks.filter(
+		task =>
+			task.status === "in_progress" &&
+			task.assignee === workerId &&
+			task.claim?.owner === workerId &&
+			task.owner === workerId,
+	);
+	if (claimed.length === 0) return { kind: "none" };
+	if (claimed.length === 1) {
+		const task = claimed[0]!;
+		return { kind: "exact", task, claim: task.claim! };
+	}
+	return { kind: "ambiguous", tasks: claimed };
+}
+export function findGjcTeamClaimedTaskForWorker(
+	tasks: readonly GjcTeamTask[],
+	workerId: string,
+): GjcTeamTask | undefined {
+	const active = selectCurrentClaimedTaskForWorker(tasks, workerId);
+	if (active.kind === "exact") return active.task;
+	if (active.kind === "ambiguous") return undefined;
+	return tasks.find(task => task.status === "blocked" && task.assignee === workerId && task.claim?.owner === workerId);
+}
 
 type EventAppender = (event: {
 	type: string;

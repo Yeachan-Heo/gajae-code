@@ -158,7 +158,11 @@ function invoke(
 		case "workflow.plan_approve":
 			return surface.approvePlan(text(input, "id"), input.choice, input.expectedSessionId as string | undefined);
 		case "skill.invoke":
-			return surface.invokeSkill(text(input, "name"), input.args);
+			return surface.invokeSkill(
+				text(input, "name"),
+				input.args,
+				typeof input.clientRef === "string" ? input.clientRef : undefined,
+			);
 		case "mode.plan.set":
 			return surface.setPlanMode(input.on as boolean);
 		case "mode.goal.operate":

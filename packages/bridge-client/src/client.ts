@@ -59,6 +59,8 @@ type Incarnation = {
 	openTimer?: ReturnType<typeof setTimeout>;
 	failure?: Error;
 	helloTimer?: ReturnType<typeof setTimeout>;
+	/** Hello frames that arrived before the open handler advanced phase to "hello". */
+	earlyHello?: Frame;
 	resolveOpen?: () => void;
 	rejectOpen?: (error: Error) => void;
 	resolveHello?: () => void;
@@ -425,6 +427,12 @@ export class SdkClient {
 					incarnation.resolveOpen = undefined;
 					incarnation.rejectOpen = undefined;
 					this.#beginHello(incarnation);
+					const earlyHello = incarnation.earlyHello;
+					if (earlyHello) {
+						incarnation.earlyHello = undefined;
+						this.#acceptHello(incarnation, earlyHello);
+						if (this.#isActive(incarnation)) this.#notifyFrameHandlers(earlyHello);
+					}
 				}) as EventListener,
 				true,
 			);
@@ -513,6 +521,11 @@ export class SdkClient {
 			return;
 		}
 		if (frame.type === "hello" || frame.type === "server_hello" || frame.type === "broker_hello") {
+			if (incarnation.phase === "opening" && this.#isCandidate(incarnation.cycle, incarnation)) {
+				// Buffer until the open handler advances phase; do not drop.
+				incarnation.earlyHello = frame;
+				return;
+			}
 			if (incarnation.phase === "hello" && this.#isCandidate(incarnation.cycle, incarnation)) {
 				this.#acceptHello(incarnation, frame);
 				if (this.#isActive(incarnation)) this.#notifyFrameHandlers(frame);

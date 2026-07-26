@@ -8,6 +8,7 @@ import * as native from "@gajae-code/natives";
 import {
 	canonicalBindingOpenFlags,
 	cleanupAuthorityMatches,
+	detachArtifactRootForMigration,
 	fsyncCanonicalBinding,
 	listManagedCandidates,
 	matchesMigrationArtifactRoot,
@@ -270,6 +271,72 @@ describe("managed session Windows durability", () => {
 		expect(
 			cleanupAuthorityMatches({ ...cleanup, identity: { ...cleanup.identity, size: 0n } }, parent, "darwin"),
 		).toBe(true);
+	});
+
+	it("forces the win32 producer branch so cleanup identity comes from the native root", async () => {
+		const root = temporaryDirectory("gjc-cleanup-producer-");
+		temporaryDirectories.push(root);
+		const originalPath = path.join(root, "artifacts");
+		await fs.mkdir(originalPath);
+		await fs.writeFile(path.join(originalPath, "kept.txt"), "kept");
+
+		const tree = native.snapshotDirectoryTree(originalPath);
+		if (!tree.ok || !tree.snapshot) throw new Error("Native snapshot unavailable");
+		const treeRoot = tree.snapshot.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
+		if (!treeRoot) throw new Error("Native root missing");
+		const stat = syncFs.lstatSync(originalPath, { bigint: true });
+
+		// On this host Bun's directory size and the native root size often agree,
+		// so a plain run cannot tell the two authorities apart. Inject a size that
+		// is guaranteed to differ from the real native root so the assertion below
+		// can only pass if the producer reads the mocked native root. Hardcoding
+		// 4096 is not hermetic: Linux directory sizes can already be 4096.
+		// Reverting the win32 branch makes this test fail.
+		const originalSnapshot = native.snapshotDirectoryTree;
+		const divergentSize = (BigInt(treeRoot.size) + 1n).toString();
+		expect(divergentSize).not.toBe(treeRoot.size);
+		// Scope the divergence to the retained placeholder only; the detached
+		// original is validated by a separate upstream check that must see real
+		// values.
+		const placeholderPrefix = ".gjc-exact-unlink-placeholder-";
+		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname => {
+			const actual = originalSnapshot(pathname);
+			if (!path.basename(String(pathname)).startsWith(placeholderPrefix)) return actual;
+			if (!actual.ok || !actual.snapshot) return actual;
+			return {
+				...actual,
+				snapshot: {
+					...actual.snapshot,
+					entries: actual.snapshot.entries.map(entry =>
+						entry.relativePath === "" && entry.kind === "directory" ? { ...entry, size: divergentSize } : entry,
+					),
+				},
+			};
+		});
+
+		const detached = detachArtifactRootForMigration(
+			{
+				originalPath,
+				detachedPath: path.join(root, ".gjc-migrate-fork-artifacts"),
+				identity: {
+					dev: stat.dev,
+					ino: stat.ino,
+					size: BigInt(treeRoot.size),
+					mtimeNs: BigInt(treeRoot.mtimeNs),
+				},
+				tree: tree.snapshot,
+			},
+			"win32",
+		);
+
+		expect(detached.detachOutcome === "clean" || detached.detachOutcome === "cleanup_pending").toBe(true);
+		if (detached.detachOutcome === "cleanup_pending") {
+			// Only a native-root read yields the injected divergent size; a
+			// Bun-sourced capture would carry the real directory size instead.
+			expect(detached.cleanup.identity.size).toBe(BigInt(divergentSize));
+			expect(detached.cleanup.identity.size).not.toBe(stat.size);
+			expect(cleanupAuthorityMatches(detached.cleanup, root, "win32")).toBe(true);
+		}
 	});
 
 	it("tolerates a POSIX root ctime change caused by detaching artifacts", async () => {

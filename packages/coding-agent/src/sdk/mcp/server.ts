@@ -301,9 +301,16 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 export async function runSdkMcpStdio(options: SdkMcpServerOptions = {}): Promise<void> {
 	const server = createSdkMcpServer(options);
 	let buffer = "";
+	const inflight = new Set<Promise<void>>();
 	process.stdin.setEncoding("utf8");
-	await new Promise<void>(resolve => {
-		process.stdin.on("data", (chunk: string) => {
+
+	const track = (work: Promise<void>): void => {
+		inflight.add(work);
+		void work.finally(() => inflight.delete(work));
+	};
+
+	await new Promise<void>((resolve, reject) => {
+		const onData = (chunk: string) => {
 			buffer += chunk;
 			let index = buffer.indexOf("\n");
 			while (index >= 0) {
@@ -311,22 +318,43 @@ export async function runSdkMcpStdio(options: SdkMcpServerOptions = {}): Promise
 				buffer = buffer.slice(index + 1);
 				index = buffer.indexOf("\n");
 				if (!line) continue;
-				void (async () => {
-					let request: JsonRpcRequest;
-					try {
-						request = JSON.parse(line) as JsonRpcRequest;
-					} catch {
-						process.stdout.write(
-							`${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse_error" } })}\n`,
-						);
-						return;
-					}
-					const response = await server.handleJsonRpc(request);
-					// JSON-RPC notifications (no id) receive no response.
-					if (request.id !== undefined) process.stdout.write(`${JSON.stringify(response)}\n`);
-				})();
+				track(
+					(async () => {
+						let request: JsonRpcRequest;
+						try {
+							request = JSON.parse(line) as JsonRpcRequest;
+						} catch {
+							process.stdout.write(
+								`${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse_error" } })}\n`,
+							);
+							return;
+						}
+						const response = await server.handleJsonRpc(request);
+						// JSON-RPC notifications (no id) receive no response.
+						if (request.id !== undefined) process.stdout.write(`${JSON.stringify(response)}\n`);
+					})(),
+				);
 			}
-		});
-		process.stdin.on("end", () => resolve());
+		};
+		const onEnd = () => {
+			process.stdin.off("data", onData);
+			process.stdin.off("end", onEnd);
+			process.stdin.off("error", onError);
+			resolve();
+		};
+		const onError = (error: Error) => {
+			process.stdin.off("data", onData);
+			process.stdin.off("end", onEnd);
+			process.stdin.off("error", onError);
+			reject(error);
+		};
+		process.stdin.on("data", onData);
+		process.stdin.on("end", onEnd);
+		process.stdin.on("error", onError);
 	});
+
+	// Stdin EOF must not drop in-flight tools/call handlers (WS connect/query).
+	// Awaiting them also prevents the process from exiting before responses flush,
+	// and lets clients close so the event loop can drain deterministically.
+	await Promise.allSettled([...inflight]);
 }

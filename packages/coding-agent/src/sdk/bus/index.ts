@@ -35,6 +35,7 @@ import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import {
 	NotificationGatePolicyChangedError,
@@ -82,9 +83,16 @@ import {
 	sessionTag,
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
+import {
+	isNativeControlDrainAvailable,
+	runIdentityControlSuccessPath,
+	type TerminalSendOutcome,
+} from "./control-drain-lease";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
+import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
+import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
@@ -94,6 +102,17 @@ import {
 	type RegisterNotificationRootResult,
 	unregisterNotificationRoot,
 } from "./telegram-daemon";
+
+export type {
+	IdentityControlSuccessPathInput,
+	IdentityControlTerminalPathInput,
+	TerminalSendOutcome,
+} from "./control-drain-lease";
+export {
+	isNativeControlDrainAvailable,
+	runIdentityControlSuccessPath,
+	runIdentityControlTerminalPath,
+} from "./control-drain-lease";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -886,6 +905,8 @@ interface SessionRuntime {
 	disposeGateListener: () => void;
 	/** Whether notification-only delivery and answer resources are active. */
 	notificationsActive: boolean;
+	/** Rejects new SDK frames while a leased terminal response drains. */
+	inboundFenced: boolean;
 	/** Set as soon as terminal teardown is requested, before startup settles. */
 	stopping: boolean;
 	/** Recreates notification-only resources after `/notify on`. */
@@ -1807,6 +1828,9 @@ function sdkQuerySurface(
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
 	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
+	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 ): SessionSurface {
 	const metadata = () => ({
 		sessionId: id,
@@ -1935,6 +1959,8 @@ function sdkQuerySurface(
 		getJobs: () => ctx.getJobs(),
 		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			promptStatusLookup(selector),
+		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
+			skillStatusLookup(selector),
 		installedQueries: installedOperations(ctx, "query"),
 	};
 }
@@ -1962,7 +1988,7 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation?: boolean,
-	) => void = () => {},
+	) => void | Promise<void> = () => {},
 	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
@@ -1971,6 +1997,20 @@ function sdkControlSurface(
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
+	skillRecon?: {
+		admit: (clientRef?: string) => void;
+		release: (clientRef?: string) => void;
+		noteAccepted: (
+			correlation: { commandId: string; turnId: string },
+			clientRef?: string,
+			extra?: { skillName?: string },
+		) => Promise<void>;
+		noteTransition: (
+			correlation: { commandId: string; turnId: string } | undefined,
+			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+		) => Promise<void>;
+		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+	},
 ): ControlSurface {
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
@@ -2101,11 +2141,16 @@ function sdkControlSurface(
 				error: Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
 			});
 		pendingPreflightCancellations.add(cancelPreflight);
-		const onPreflightAccepted = () => {
+		const settleAccepted = async () => {
 			if (preflightSettled) return;
 			accepted = true;
-			onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
+			await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
 			settlePreflight({ status: "accepted" });
+		};
+		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
+		const onPreflightAcceptCommit = settleAccepted;
+		const onPreflightAccepted = () => {
+			void settleAccepted();
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
 		// succeeds. The terminal result records correlation before agent_start can fire.
@@ -2114,6 +2159,7 @@ function sdkControlSurface(
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
+					onPreflightAcceptCommit,
 					onPreflightAccepted,
 				}),
 			);
@@ -2324,13 +2370,84 @@ function sdkControlSurface(
 				code: "terminal_uncertain",
 			});
 		},
-		invokeSkill: (name, args) => {
+		invokeSkill: async (name, args, clientRef) => {
 			if (!bindings.has("invokeSkill") || !ctx.invokeSkill)
 				return unavailable("skill.invoke", "no skill invocation seam is installed")();
 
 			if (typeof args !== "undefined" && typeof args !== "string")
 				throw Object.assign(new Error("skill.invoke args must be a string."), { code: "invalid_input" });
-			return ctx.invokeSkill(name, args);
+			const trimmedClientRef =
+				typeof clientRef === "string" ? clientRef.trim() : clientRef === undefined ? undefined : "";
+			if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > 128))
+				throw Object.assign(new Error("clientRef must be a non-empty string of at most 128 characters."), {
+					code: "invalid_input",
+				});
+			const commandId = crypto.randomUUID();
+			const turnId = crypto.randomUUID();
+			const correlation = { commandId, turnId };
+			if (skillRecon) skillRecon.admit(trimmedClientRef);
+			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
+			let phase: "pending" | "accepted" | "rejected" = "pending";
+			const settleAccept = (value: Record<string, unknown>) => {
+				if (phase !== "pending") return;
+				phase = "accepted";
+				resolve(value);
+			};
+			const settleReject = (error: unknown) => {
+				if (phase !== "pending") return;
+				phase = "rejected";
+				reject(error);
+			};
+			let prepared: { name: string; path: string; lineCount?: number; cleanedArgs?: string } | undefined;
+			const run = Promise.resolve(
+				ctx.invokeSkill(name, args as string | undefined, {
+					onSkillPrepared: meta => {
+						prepared = meta;
+					},
+					onPreflightAcceptCommit: async () => {
+						const meta = prepared ?? { name: String(name), path: "" };
+						if (skillRecon)
+							await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
+						settleAccept({
+							accepted: true,
+							commandId,
+							turnId,
+							name: meta.name,
+							path: meta.path,
+							...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
+							...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
+							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
+						});
+					},
+				}),
+			).then(
+				result => {
+					if (phase === "pending") {
+						// Completed without fence (e.g. queue path) — still surface result.
+						settleAccept({
+							accepted: true,
+							commandId,
+							turnId,
+							...(typeof result === "object" && result ? (result as object) : {}),
+							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
+						});
+					} else if (skillRecon) {
+						void skillRecon.noteTransition(correlation, { type: "agent_end" });
+					}
+					return result;
+				},
+				error => {
+					if (phase === "pending") {
+						if (skillRecon) skillRecon.release(trimmedClientRef);
+						settleReject(error);
+					} else if (skillRecon) {
+						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+					}
+					throw error;
+				},
+			);
+			void run.catch(() => {});
+			return await acceptedP;
 		},
 		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
@@ -2866,6 +2983,18 @@ export async function ensureConfiguredProviderDaemons(
 	if (isSlackConfigured(cfg)) await ensureProviderDaemon("slack", settings);
 }
 
+/**
+ * Classify whether a session identity event must await notification endpoint startup.
+ * Only an interactive selector resume may defer this ancillary startup; all other
+ * events, including branches and unknown origins, fail closed to awaiting it.
+ */
+export function shouldAwaitNotificationStartup(event: {
+	type: "session_switch" | "session_branch";
+	transition?: { origin: string };
+}): boolean {
+	return event.type !== "session_switch" || event.transition?.origin !== INTERACTIVE_SELECTOR_RESUME_ORIGIN;
+}
+
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -2905,10 +3034,15 @@ export function createNotificationsExtension(
 	const cleanupRetries = new Map<string, SessionRuntime>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
 	const branchStartupTasks = new Set<Promise<void>>();
+	const sessionLifecycleTasks = new Set<Promise<void>>();
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation:
-		| { event: { previousSessionFile?: string }; ctx: ExtensionContext; awaitStartup: boolean }
+		| {
+				event: { previousSessionFile?: string; transition?: { origin: string } };
+				ctx: ExtensionContext;
+				awaitStartup: boolean;
+		  }
 		| undefined;
 	let extensionShuttingDown = false;
 
@@ -2969,6 +3103,7 @@ export function createNotificationsExtension(
 		const requestedRuntime = retryRuntime ?? activeRuntime;
 		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
 		if (reason === "session" && requestedRuntime) {
+			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
 			requestedRuntime.abortEphemeralTurns();
 		}
@@ -3288,10 +3423,29 @@ export function createNotificationsExtension(
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
+		const sessionFile =
+			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
+		const reconciliationSessionId =
+			typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
+		const durableStore =
+			sessionFile && reconciliationSessionId
+				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
+				: null;
+		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
+		if (durableStore) void kindReconciliation.hydrateFromStore();
+		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
+		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
-		const admitPromptSubmission = reconciliation.admit;
-		const notePromptReconciliationAccepted = reconciliation.noteAccepted;
-		const lookupPromptStatus = reconciliation.lookup;
+		const admitPromptSubmission = (clientRef?: string) => kindReconciliation.admit("prompt", clientRef);
+		const notePromptReconciliationAccepted = async (
+			correlation: { commandId: string; turnId: string },
+			clientRef?: string,
+		) => {
+			await kindReconciliation.noteAccepted("prompt", correlation, clientRef);
+		};
+		const lookupPromptStatus = (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
+			kindReconciliation.lookup("prompt", selector);
+		const releasePromptAdmission = (clientRef?: string) => kindReconciliation.releaseAdmission("prompt", clientRef);
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
@@ -3318,6 +3472,7 @@ export function createNotificationsExtension(
 			addTerminalTombstone(key);
 		};
 		const cleanupPromptRecords = (now = Date.now()) => {
+			kindReconciliation.cleanup();
 			reconciliation.cleanup();
 			for (const [key, expiresAt] of promptTerminalTombstones)
 				if (expiresAt <= now) promptTerminalTombstones.delete(key);
@@ -3396,7 +3551,7 @@ export function createNotificationsExtension(
 				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
 			}
 		};
-		const recordPromptAccepted = (
+		const recordPromptAccepted = async (
 			correlation: { commandId: string; turnId: string },
 			requesterConnectionId?: string,
 			clientRef?: string,
@@ -3405,10 +3560,11 @@ export function createNotificationsExtension(
 			if (!requesterConnectionId) {
 				// No delivery owner: tracked prompts cannot be reconciled. Release
 				// their admission reservation instead of leaking the active slot.
-				if (trackReconciliation) reconciliation.releaseAdmission(clientRef);
+				if (trackReconciliation) releasePromptAdmission(clientRef);
 				return;
 			}
-			if (trackReconciliation) notePromptReconciliationAccepted(correlation, clientRef);
+			// Register delivery ownership synchronously before any await so post-accept
+			// failures that race the durable write still emit correlated terminals.
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
 				const oldest = promptSubmissions.entries().next().value as [string, PromptSubmission] | undefined;
@@ -3427,6 +3583,7 @@ export function createNotificationsExtension(
 				createdAt: Date.now(),
 				bufferedFrames: [],
 			});
+			if (trackReconciliation) await notePromptReconciliationAccepted(correlation, clientRef);
 		};
 		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
 			if (!correlation) return false;
@@ -3440,7 +3597,7 @@ export function createNotificationsExtension(
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const sanitized = sanitizePromptFailure(error);
-			reconciliation.noteTransition(correlation, { type: "agent_failed", error: sanitized });
+			void kindReconciliation.noteTransition("prompt", correlation, { type: "agent_failed", error: sanitized });
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || !runtime || !recordPromptTerminal(correlation)) return;
 			emitPromptLifecycle(correlation, {
@@ -3491,6 +3648,7 @@ export function createNotificationsExtension(
 				},
 				configOverrides,
 				lookupPromptStatus,
+				selector => kindReconciliation.lookup("skill", selector),
 			),
 			id,
 			revisions,
@@ -3507,10 +3665,18 @@ export function createNotificationsExtension(
 			() => runtime?.stopping !== true,
 			trackGateResolution,
 			admitPromptSubmission,
-			reconciliation.releaseAdmission,
+			releasePromptAdmission,
 			settings,
 			configOverrides,
 			configRevision,
+			{
+				admit: (clientRef?: string) => kindReconciliation.admit("skill", clientRef),
+				release: (clientRef?: string) => kindReconciliation.releaseAdmission("skill", clientRef),
+				noteAccepted: (correlation, clientRef, extra) =>
+					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
+				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
+				lookup: selector => kindReconciliation.lookup("skill", selector),
+			},
 		);
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
 			if (
@@ -3576,6 +3742,75 @@ export function createNotificationsExtension(
 				};
 			},
 			onRequest: options.onSdkRequest,
+			beforeControlResponse: async (_connectionId, request, response, sendTerminal) => {
+				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
+				const pending = deferredIdentityRotation;
+				deferredIdentityRotation = undefined;
+				identityControlInFlight = false;
+				if (response.ok !== true || !pending) return;
+
+				const predecessorId = activeRuntimeId ?? sessionIdFromFile(pending.event.previousSessionFile);
+				if (!predecessorId) throw new Error("notifications: identity control predecessor is unknown.");
+				let terminalAttempted = false;
+				let terminalOutcome: TerminalSendOutcome | undefined;
+				try {
+					terminalOutcome = await runIdentityControlSuccessPath({
+						fence: () => {
+							const predecessor = runtimes.get(predecessorId);
+							if (!predecessor || predecessor.stopping || predecessor.serverStopped)
+								throw new Error(`notifications: predecessor runtime ${predecessorId} cannot be fenced.`);
+							predecessor.inboundFenced = true;
+						},
+						ensurePredecessorSendCapable: () => {
+							const predecessor = runtimes.get(predecessorId);
+							if (!predecessor || predecessor.stopping || predecessor.serverStopped)
+								throw new Error(`notifications: predecessor runtime ${predecessorId} is not send-capable.`);
+						},
+						startSuccessor: async () => {
+							const successorId = sessionId(pending.ctx);
+							try {
+								await rotateSessionAuthority(pending.event, pending.ctx, true, {
+									deferPredecessorStop: true,
+								});
+								const successor = runtimes.get(successorId);
+								if (!successor?.host.started || activeRuntimeId !== successorId)
+									throw new Error(`notifications: successor runtime ${successorId} was not ready.`);
+							} catch (error) {
+								(response as Record<string, unknown>).ok = false;
+								delete (response as Record<string, unknown>).result;
+								(response as Record<string, unknown>).error = {
+									code: "unavailable",
+									message: error instanceof Error ? error.message : "Successor session was not ready.",
+								};
+							}
+						},
+						sendTerminal: async () => {
+							terminalAttempted = true;
+							try {
+								await sendTerminal();
+								return "written";
+							} catch {
+								return "write_failed";
+							}
+						},
+						stopPredecessor: async () => {
+							try {
+								await stopSession(predecessorId);
+							} catch (error) {
+								if (!terminalAttempted) throw error;
+								logger.error(`notifications: deferred predecessor cleanup failed: ${String(error)}`);
+							}
+						},
+						requireNativeControlDrain:
+							(request as { requireNativeControlDrain?: unknown }).requireNativeControlDrain === true,
+					});
+				} catch (error) {
+					if (!terminalAttempted) throw error;
+					logger.error(
+						`notifications: identity terminal delivery failed (${terminalOutcome ?? "unknown"}): ${String(error)}`,
+					);
+				}
+			},
 			afterControlResponse: async (connectionId, request, response) => {
 				if (
 					(request.operation === "turn.prompt" ||
@@ -3596,13 +3831,6 @@ export function createNotificationsExtension(
 				}
 
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
-				if (typeof request.operation === "string" && identityControlOperations.has(request.operation)) {
-					const pending = deferredIdentityRotation;
-					deferredIdentityRotation = undefined;
-					identityControlInFlight = false;
-					if (response.ok === true && pending)
-						await rotateSessionAuthority(pending.event, pending.ctx, pending.awaitStartup);
-				}
 			},
 			control: async (connectionId, frame) => {
 				const request = frame as {
@@ -3621,6 +3849,21 @@ export function createNotificationsExtension(
 						id: requestId,
 						ok: false,
 						error: { code: "conflict", message: "session identity mutation is already active" },
+					};
+				const requireNativeControlDrain =
+					(request as { requireNativeControlDrain?: unknown }).requireNativeControlDrain === true ||
+					(!!request.input &&
+						typeof request.input === "object" &&
+						!Array.isArray(request.input) &&
+						(request.input as { requireNativeControlDrain?: unknown }).requireNativeControlDrain === true);
+				if (requireNativeControlDrain && !isNativeControlDrainAvailable())
+					return {
+						id: requestId,
+						ok: false,
+						error: {
+							code: "unavailable",
+							message: "SDK identity control requires the native control-drain lease.",
+						},
 					};
 				if (rotatesIdentity) identityControlInFlight = true;
 				const response = await controlRequesterContext.run(connectionId, () =>
@@ -3693,6 +3936,7 @@ export function createNotificationsExtension(
 			workflowGate: undefined,
 			gatePresentations,
 			stopping: false,
+			inboundFenced: false,
 			abortEphemeralTurns: () => {},
 			disableEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
@@ -3708,7 +3952,9 @@ export function createNotificationsExtension(
 			pendingPromptCorrelations,
 			activePromptCorrelation: undefined,
 			recordPromptTerminal,
-			notePromptReconciliation: reconciliation.noteTransition,
+			notePromptReconciliation: (correlation, frame) => {
+				void kindReconciliation.noteTransition("prompt", correlation, frame);
+			},
 			emitPromptFailure,
 			emitPromptLifecycle,
 			emitPromptEvent,
@@ -3774,6 +4020,22 @@ export function createNotificationsExtension(
 					const frame = JSON.parse(inbound.json) as unknown;
 					if (!frame || typeof frame !== "object") return;
 					const typedFrame = frame as Record<string, unknown>;
+					if (initializedRuntime.inboundFenced) {
+						if (typedFrame.type === "control_request" && typeof typedFrame.id === "string") {
+							try {
+								server.sendTo(
+									inbound.connectionId,
+									JSON.stringify({
+										type: "control_response",
+										id: typedFrame.id,
+										ok: false,
+										error: { code: "endpoint_stale", message: "session endpoint is draining." },
+									}),
+								);
+							} catch {}
+						}
+						return;
+					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
 						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
@@ -3808,7 +4070,12 @@ export function createNotificationsExtension(
 
 			server.onReply((err, reply) => {
 				if (err || !reply) return;
-				if (runtime?.stopping || runtime?.policySuspended || runtimes.get(id) !== runtime) {
+				if (
+					runtime?.inboundFenced ||
+					runtime?.stopping ||
+					runtime?.policySuspended ||
+					runtimes.get(id) !== runtime
+				) {
 					try {
 						server.closeClaimInvalid(reply.replyReceiptId, "session_stopping");
 					} catch {}
@@ -4050,6 +4317,7 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound((err, inbound) => {
 				if (err || !inbound) return;
+				if (initializedRuntime.inboundFenced) return;
 				const authenticatedInbound = inbound as typeof inbound & {
 					connectionId: string;
 					messageId?: number;
@@ -4642,7 +4910,16 @@ export function createNotificationsExtension(
 	};
 
 	api.on("session_start", async (_event, ctx) => {
-		await startAndReconcileSession(ctx);
+		const task = startAndReconcileSession(ctx);
+		// Track full start+reconcile so settled startups join replacement-token
+		// reconcile before owner release. Pending native startup (/notify on) stays
+		// nonblocking: shutdown only awaits these tasks when sessionStartPromises is clear.
+		sessionLifecycleTasks.add(task);
+		try {
+			await task;
+		} finally {
+			sessionLifecycleTasks.delete(task);
+		}
 	});
 
 	// A session endpoint's token and generation are authority for exactly one
@@ -4688,10 +4965,27 @@ export function createNotificationsExtension(
 		});
 	};
 
+	const preparePredecessorForTerminal = async (id: string): Promise<void> => {
+		const predecessor = runtimes.get(id);
+		if (!predecessor || cleanupRetries.has(id))
+			throw new Error(`notifications: predecessor runtime ${id} is not safely send-capable.`);
+		predecessor.inboundFenced = true;
+		// Release broker/host authority while leaving the native server alive for
+		// the one accepted terminal response. stopAndWait is deferred to stopSession.
+		const stopped = await predecessor.host.stop();
+		if (stopped !== "stopped" && predecessor.host.started)
+			throw new Error(`notifications: predecessor runtime ${id} host release was not proven.`);
+		predecessor.hostStopped = true;
+		predecessor.brokerRegistrationReleased = !predecessor.brokerRegistrationActive || predecessor.hostStopped;
+		if (predecessor.brokerRegistrationActive && predecessor.hostStopped) predecessor.brokerRegistrationActive = false;
+		predecessor.host.reverse.dispose();
+	};
+
 	const rotateSessionAuthority = async (
 		event: { previousSessionFile?: string },
 		ctx: ExtensionContext,
 		awaitStartup: boolean,
+		options: { deferPredecessorStop?: boolean } = {},
 	): Promise<void> => {
 		if (extensionShuttingDown) return;
 		const newId = sessionId(ctx);
@@ -4700,7 +4994,11 @@ export function createNotificationsExtension(
 			const pendingStartup = sessionStartPromises.get(newId);
 			if (pendingStartup) {
 				if (awaitStartup) {
-					await pendingStartup;
+					const result = await pendingStartup;
+					if (!lifecycleStartupCapability && result.status === "failed")
+						throw new Error(
+							`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`,
+						);
 					if (!extensionShuttingDown && runtimes.has(newId) && activeRuntimeId === newId)
 						await controller.reconcileCurrentSession(ctx);
 				} else {
@@ -4715,14 +5013,14 @@ export function createNotificationsExtension(
 		}
 		if (prevId && prevId !== newId) {
 			controller.rekeySession(prevId, newId);
-			try {
-				await stopSession(prevId);
-			} catch (error) {
-				// A retained owner-release failure keeps the exact runtime in
-				// cleanupRetries for an explicit later retry; log it rather than
-				// surfacing a red extension error
-				// while rotating session authority (/new, fork, resume, branch).
-				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			if (options.deferPredecessorStop) {
+				await preparePredecessorForTerminal(prevId);
+			} else {
+				const stopped = await stopSession(prevId);
+				if (cleanupRetries.has(prevId) || runtimes.has(prevId) || sessionStartPromises.has(prevId))
+					throw new Error(`notifications: predecessor runtime ${prevId} release is uncertain.`);
+				if (!stopped && activeRuntimeId === prevId)
+					throw new Error(`notifications: predecessor runtime ${prevId} release was not proven.`);
 			}
 		}
 		if (extensionShuttingDown) return;
@@ -4743,18 +5041,19 @@ export function createNotificationsExtension(
 		trackBranchStartup(newId, ctx, startup);
 	};
 	api.on("session_switch", async (event, ctx) => {
+		const awaitStartup = shouldAwaitNotificationStartup(event);
+		if (identityControlInFlight) {
+			deferredIdentityRotation = { event, ctx, awaitStartup };
+			return;
+		}
+		await rotateSessionAuthority(event, ctx, awaitStartup);
+	});
+	api.on("session_branch", async (event, ctx) => {
 		if (identityControlInFlight) {
 			deferredIdentityRotation = { event, ctx, awaitStartup: true };
 			return;
 		}
 		await rotateSessionAuthority(event, ctx, true);
-	});
-	api.on("session_branch", async (event, ctx) => {
-		if (identityControlInFlight) {
-			deferredIdentityRotation = { event, ctx, awaitStartup: false };
-			return;
-		}
-		await rotateSessionAuthority(event, ctx, false);
 	});
 
 	const terminalizeInFlightTools = (
@@ -5292,8 +5591,12 @@ export function createNotificationsExtension(
 		extensionShuttingDown = true;
 		identityControlInFlight = false;
 		deferredIdentityRotation = undefined;
-		await Promise.allSettled([...branchStartupTasks]);
 		const id = sessionId(ctx);
+		// Join settled start+reconcile before owner release. Keep pending native
+		// startup (/notify on) nonblocking — do not await sessionLifecycleTasks while
+		// sessionStartPromises still has this id.
+		if (!sessionStartPromises.has(id)) await Promise.allSettled([...sessionLifecycleTasks]);
+		await Promise.allSettled([...branchStartupTasks]);
 		const rt = runtimes.get(id);
 		if (rt) terminalizeInFlightTools(rt, id, "cancelled");
 		// Startup is only genuinely in flight when a `sessionStartPromises` entry

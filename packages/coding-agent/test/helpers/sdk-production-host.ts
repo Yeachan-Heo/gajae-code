@@ -91,7 +91,8 @@ export async function startProductionSdkHost(
 			});
 			if (options.acceptPromptPreflightWithoutExecution) {
 				session.sendUserMessage = async (_content, promptOptions) => {
-					promptOptions?.onPreflightAccepted?.();
+					if (promptOptions?.onPreflightAcceptCommit) await promptOptions.onPreflightAcceptCommit();
+					else promptOptions?.onPreflightAccepted?.();
 				};
 			}
 			const priorNotifications = process.env.GJC_NOTIFICATIONS;

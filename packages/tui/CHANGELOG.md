@@ -1,6 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- `waitForRenderCommit` / generation-scoped render tokens resolve only after a successful buffer write (or fail open on stopped/unavailable terminals), enabling awaitable progress frames for interactive resume without hanging (#2914).
+
+### Fixed
+
+- Streaming layout contraction followed by regrowth no longer re-admits an already committed logical row into native terminal scrollback, preventing occasional duplicated assistant lines after Markdown reflow.
 
 ## [0.11.10] - 2026-07-25
 

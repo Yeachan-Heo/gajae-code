@@ -110,11 +110,16 @@ describe("continueRecent with --worktree sessions", () => {
 			`${JSON.stringify({ type: "session", id: "unmanaged", timestamp: "2025-01-01T00:00:00Z", cwd: worktree, version: 3 })}\n${JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: "unmanaged", timestamp: 1 } })}\n`,
 		);
 		writeBreadcrumb(worktree, unmanagedFile);
+		const before = fs.readFileSync(unmanagedFile, "utf8");
 
 		writeSession(worktree, "managed-worktree-session");
 		const resumed = await SessionManager.continueRecent(repo);
 		try {
+			// Terminal-specific explicit breadcrumb paths must stay at the verified path.
+			// Managed resume must not adopt/copy them into agent/sessions/v2-* storage.
 			expect(resumed.getSessionFile()).toBe(unmanagedFile);
+			expect(fs.readFileSync(unmanagedFile, "utf8")).toBe(before);
+			expect(resumed.getSessionFile()?.includes(`${path.sep}agent${path.sep}sessions${path.sep}`)).toBe(false);
 		} finally {
 			await resumed.close();
 		}

@@ -442,7 +442,7 @@ export class ExtensionUiController {
 				}
 				return false;
 			},
-			invokeSkill: (name, args) => this.ctx.session.invokeSkill(name, args),
+			invokeSkill: (name, args, options) => this.ctx.session.invokeSkill(name, args, options),
 			setPlanMode: on => this.ctx.session.setSdkPlanMode(on),
 			operateGoal: (op, objective) => this.ctx.session.operateGoal(op, objective),
 			getSkillState: () =>

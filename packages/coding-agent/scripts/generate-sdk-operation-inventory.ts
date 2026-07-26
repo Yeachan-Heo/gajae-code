@@ -119,6 +119,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:continuePersistedHistory": "internal startup lifecycle plumbing, not a user-facing control seam",
 	"agent_session:promoteRecoveryHydrationAfterOwnershipReadyFence":
 		"internal owner-recovery authority transition after a durable writer fence, never a user-facing SDK operation",
+	"agent_session:restoreFromMemoryGuardCheckpoint":
+		"internal owner-recovery staged restore builder after durable claims/fencing, never a user-facing SDK operation",
 	"agent_session:setActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionDefaultModelSelector": "internal accessor/plumbing, not a user-facing control seam",
