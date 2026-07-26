@@ -3652,7 +3652,7 @@ describe("ModelRegistry", () => {
 			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
 			await registry.refreshProvider("discovery-provider", "online-if-uncached");
-			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("ok");
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
 		});
 		test("records configured discovery evidence after resolving a stored command key", async () => {

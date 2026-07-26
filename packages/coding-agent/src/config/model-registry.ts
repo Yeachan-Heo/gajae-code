@@ -1780,6 +1780,7 @@ export class ModelRegistry {
 							models: Model<Api>[];
 							authGeneration: string;
 							endpoint: string;
+							fetched: boolean;
 						}>,
 					)
 				: Promise.all(
@@ -1815,6 +1816,7 @@ export class ModelRegistry {
 			if (
 				evidence !== undefined &&
 				state?.status === "ok" &&
+				configuredDiscoveries.get(provider.provider)?.fetched &&
 				currentAuthGeneration === evidence.authGeneration &&
 				currentEndpoint === evidence.endpoint
 			) {
@@ -1859,6 +1861,7 @@ export class ModelRegistry {
 		models: Model<Api>[];
 		authGeneration: string;
 		endpoint: string;
+		fetched: boolean;
 	}> {
 		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
@@ -1879,6 +1882,7 @@ export class ModelRegistry {
 				models: [],
 				authGeneration,
 				endpoint,
+				fetched: false,
 			};
 		}
 		if (mergeInput.warning) {
@@ -1893,6 +1897,7 @@ export class ModelRegistry {
 			current: true,
 			authGeneration,
 			endpoint,
+			fetched: mergeInput.fetched ?? false,
 			models: this.#applyProviderModelOverrides(
 				effectiveProviderConfig.provider,
 				this.#normalizeDiscoverableModels(

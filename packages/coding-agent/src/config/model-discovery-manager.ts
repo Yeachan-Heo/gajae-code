@@ -38,6 +38,7 @@ export interface DiscoveryMergeInput {
 	state: ProviderDiscoveryState;
 	warning?: string;
 	authGeneration?: string;
+	fetched?: boolean;
 }
 
 export interface ProviderDiscoveryCallbacks<TProvider extends DiscoveryProvider> {
@@ -174,11 +175,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				? cached
 					? "cached"
 					: "idle"
-				: result.fetched && result.models.length > 0
-					? "ok"
-					: result.models.length > 0
+				: result.models.length > 0
+					? result.stale
 						? "cached"
-						: "empty";
+						: "ok"
+					: "empty";
 		const state: ProviderDiscoveryState = {
 			provider: provider.provider,
 			status,
@@ -188,7 +189,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			models: result.models.map(model => model.id),
 			error,
 		};
-		return this.#complete(token, result.models, state, error, authGeneration);
+		return this.#complete(token, result.models, state, error, authGeneration, result.fetched);
 	}
 
 	#complete(
@@ -197,6 +198,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		state: ProviderDiscoveryState,
 		error?: string,
 		authGeneration?: string,
+		fetched?: boolean,
 	): DiscoveryMergeInput {
 		const current = this.isCurrent(token);
 		if (current) this.#states.set(token.provider, this.#snapshot(state));
@@ -205,7 +207,16 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			if (error) this.#lastWarnings.set(token.provider, error);
 			else this.#lastWarnings.delete(token.provider);
 		}
-		return this.#snapshot({ provider: token.provider, token, current, models, state, warning, authGeneration });
+		return this.#snapshot({
+			provider: token.provider,
+			token,
+			current,
+			models,
+			state,
+			warning,
+			authGeneration,
+			fetched,
+		});
 	}
 
 	#stale(token: DiscoveryRefreshToken): DiscoveryMergeInput {
