@@ -13,6 +13,7 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 } from "../src/sdk/bus/html-format";
+import type { SessionLifecycleRequest, SessionLifecycleResponse } from "../src/sdk/bus/index";
 import {
 	acquireDaemonTransitionLock,
 	classifyNotificationEndpoint,
@@ -20,7 +21,9 @@ import {
 	releaseDaemonTransitionLock,
 } from "../src/sdk/bus/notification-service";
 import { RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
+import * as recentActivity from "../src/sdk/bus/recent-activity";
 import { deliverRichWithFallback } from "../src/sdk/bus/rich-render";
+import { TelegramAdoptionIntentStore } from "../src/sdk/bus/telegram-adoption-intent";
 import {
 	acquireDaemonOwnership,
 	type BotApi,
@@ -76,6 +79,16 @@ interface AttachmentTestAccess {
 }
 function attachmentAccess(daemon: TelegramNotificationDaemon): AttachmentTestAccess {
 	return daemon as unknown as AttachmentTestAccess;
+}
+interface TopicTestAccess {
+	topics: {
+		sessionForTopic(topicId: string): string | undefined;
+		get(sessionId: string): { topicId: string } | undefined;
+	};
+}
+
+function topicAccess(daemon: TelegramNotificationDaemon): TopicTestAccess {
+	return daemon as unknown as TopicTestAccess;
 }
 
 test("steady ownership heartbeat advances only the owner-tagged sidecar", async () => {
@@ -760,6 +773,7 @@ function topicStateFs(onTopicStateWrite: () => Promise<void>): TelegramDaemonFs 
 		open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
 		readdir: file => fs.promises.readdir(file),
 		chmod: (file, mode) => fs.promises.chmod(file, mode),
+		stat: file => fs.promises.stat(file),
 	};
 }
 
@@ -19477,5 +19491,782 @@ describe("PR #3186 blockers", () => {
 		const edits = bot.calls.filter(c => c.method === "editMessageText");
 		expect(sends.length).toBeGreaterThanOrEqual(1);
 		expect(edits.length).toBeGreaterThanOrEqual(1);
+	});
+});
+function forumTopicCreatedUpdate(
+	updateId: number,
+	threadId: number,
+	{
+		chat = { id: 42 },
+		from = { id: 42, is_bot: false },
+		name = "New topic",
+	}: {
+		chat?: { id: number | string };
+		from?: { id: number; is_bot?: boolean } | null;
+		name?: string;
+	} = {},
+) {
+	return {
+		update_id: updateId,
+		message: {
+			chat,
+			...(from === null ? {} : { from }),
+			message_thread_id: threadId,
+			forum_topic_created: { name },
+		},
+	};
+}
+
+async function authorizePendingTopic(
+	daemon: TelegramNotificationDaemon,
+	updateId: number,
+	topicId: number,
+): Promise<void> {
+	await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(updateId, topicId));
+}
+
+async function seedAdoptionIntent(
+	agentDir: string,
+	intent: {
+		intendedSessionId: string;
+		topicId: number;
+		path?: string;
+	},
+): Promise<void> {
+	const store = new TelegramAdoptionIntentStore({ agentDir });
+	await store.put({
+		intendedSessionId: intent.intendedSessionId,
+		topicId: intent.topicId,
+		chatId: "42",
+		target: { kind: "existing_path", path: intent.path ?? agentDir },
+		createdAt: Date.now(),
+		expiresAt: Date.now() + 600_000,
+	});
+}
+
+interface AdoptionLifecycleHarness {
+	daemon: TelegramNotificationDaemon;
+	bot: FakeBotApi;
+	agentDir: string;
+	frames: SessionLifecycleRequest[];
+}
+
+async function adoptionLifecycleHarness({
+	agentDir = tempAgentDir(),
+	lifecycleResponse,
+	bot = new FakeBotApi(),
+	fs: fsImpl,
+}: {
+	agentDir?: string;
+	lifecycleResponse?: SessionLifecycleResponse;
+	bot?: FakeBotApi;
+	fs?: TelegramDaemonFs;
+} = {}): Promise<AdoptionLifecycleHarness> {
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		WebSocketImpl: FakeWs as any,
+		fs: fsImpl,
+	});
+	Object.assign(daemon, { lifecycleControlActive: true, controlToken: "ctrl" });
+	const frames: SessionLifecycleRequest[] = [];
+	const pending = Promise.withResolvers<SessionLifecycleResponse>();
+	// Default to a successful create response so the adoption submit completes and
+	// the durable sidecar is retained (status "ok" keeps it). Tests that exercise
+	// the spawn_failed / readiness_timeout paths override lifecycleResponse.
+	pending.resolve(
+		lifecycleResponse ?? ({ type: "session_create_response", requestId: "adoption-default", status: "ok" } as any),
+	);
+	// Stub the private lifecycle submit so tests control the response without a
+	// real control endpoint. The adoption path writes the durable intent before submit.
+	(daemon as any).submitLifecycleFrame = async (frame: SessionLifecycleRequest) => {
+		frames.push(frame);
+		return pending.promise;
+	};
+	return { daemon, bot, agentDir, frames };
+}
+
+function adoptionIntentFiles(agentDir: string): string[] {
+	const dir = daemonPaths(agentDir).dir;
+	try {
+		return fs.readdirSync(dir).filter(f => f.endsWith(".adoption-intent.json"));
+	} catch {
+		return [];
+	}
+}
+
+describe("forum_topic_created user-topic adoption", () => {
+	test("forged chat/from/bot update is rejected with no side effect", async () => {
+		const { daemon, bot } = await adoptionLifecycleHarness();
+		await daemon.handleTelegramUpdate(
+			forumTopicCreatedUpdate(10, 500, { chat: { id: 999 }, from: { id: 42, is_bot: false } }),
+		);
+		await daemon.handleTelegramUpdate(
+			forumTopicCreatedUpdate(11, 501, { chat: { id: 42 }, from: { id: 999, is_bot: false } }),
+		);
+		await daemon.handleTelegramUpdate(
+			forumTopicCreatedUpdate(12, 502, { chat: { id: 42 }, from: { id: 42, is_bot: true } }),
+		);
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+		expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(false);
+	});
+
+	test("dedupes a replayed created update (handler runs once)", async () => {
+		const { daemon, bot } = await adoptionLifecycleHarness();
+		const update = forumTopicCreatedUpdate(20, 510);
+		await daemon.handleTelegramUpdate(update);
+		const firstNotices = bot.calls.filter(
+			c => c.method === "sendMessage" && typeof c.body.message_thread_id === "number",
+		);
+		await daemon.handleTelegramUpdate(update);
+		const secondNotices = bot.calls.filter(
+			c => c.method === "sendMessage" && typeof c.body.message_thread_id === "number",
+		);
+		// The created update is consumed exactly once; the replay is a no-op.
+		expect(firstNotices).toHaveLength(secondNotices.length);
+	});
+
+	test("retries a created update when picker delivery fails before marking it seen", async () => {
+		class FailFirstPickerBot extends FakeBotApi {
+			failures = 1;
+			override async call(
+				method: string,
+				body: unknown,
+				options?: { noRetry?: boolean; signal?: AbortSignal },
+			): Promise<unknown> {
+				if (method === "sendMessage" && this.failures-- > 0) {
+					this.calls.push({ method, body, options });
+					throw new Error("temporary send failure");
+				}
+				return super.call(method, body, options);
+			}
+		}
+		const bot = new FailFirstPickerBot();
+		const { daemon } = await adoptionLifecycleHarness({ bot });
+		const update = forumTopicCreatedUpdate(21, 511);
+		await daemon.handleTelegramUpdate(update);
+		await daemon.handleTelegramUpdate(update);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(2);
+	});
+
+	test("picker callback creates one adoption intent and is one-shot", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "picker-workspace");
+		fs.mkdirSync(workspace);
+		const recentSpy = spyOn(recentActivity, "listRecentSessions").mockResolvedValue({
+			kind: "complete",
+			entries: [
+				{
+					sessionId: "recent",
+					path: workspace,
+					sessionStateFile: path.join(agentDir, "recent.jsonl"),
+					mtimeMs: 1,
+				},
+			],
+			warnings: [],
+		});
+		try {
+			const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+			await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(22, 512));
+			const rootPicker = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup);
+			const rootButtons = rootPicker?.body.reply_markup.inline_keyboard.flat() ?? [];
+			expect(rootButtons.map((button: { text: string }) => button.text)).toEqual([
+				"1. Home (~)",
+				"2. Recent work folders",
+				"3. Enter a path",
+			]);
+			const recentAlias = rootButtons.find((button: { text: string }) =>
+				button.text.startsWith("2."),
+			)?.callback_data;
+			expect(typeof recentAlias).toBe("string");
+
+			await daemon.handleTelegramUpdate({
+				update_id: 23,
+				callback_query: {
+					id: "picker-recent",
+					data: recentAlias,
+					from: { id: 42, is_bot: false },
+					message: { chat: { id: 42 }, message_thread_id: 512 },
+				},
+			});
+			const recentPicker = bot.calls.find(
+				call => call.method === "sendMessage" && String(call.body.text).includes("Pick a recent work folder"),
+			);
+			const alias = recentPicker?.body.reply_markup.inline_keyboard[0][0].callback_data;
+			expect(typeof alias).toBe("string");
+
+			const callback = {
+				update_id: 24,
+				callback_query: {
+					id: "picker-folder",
+					data: alias,
+					from: { id: 42, is_bot: false },
+					message: { chat: { id: 42 }, message_thread_id: 512 },
+				},
+			};
+			await daemon.handleTelegramUpdate(callback);
+			await daemon.handleTelegramUpdate({ ...callback, update_id: 25 });
+			expect(frames).toHaveLength(1);
+			expect((frames[0] as { target?: unknown }).target).toEqual({ kind: "existing_path", path: workspace });
+			expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		} finally {
+			recentSpy.mockRestore();
+		}
+	});
+
+	test("home picker choice starts the session in ~", async () => {
+		const { daemon, bot, frames } = await adoptionLifecycleHarness();
+		await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(26, 513));
+		const picker = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup);
+		const homeAlias = picker?.body.reply_markup.inline_keyboard[0][0].callback_data;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 27,
+			callback_query: {
+				id: "picker-home",
+				data: homeAlias,
+				from: { id: 42, is_bot: false },
+				message: { chat: { id: 42 }, message_thread_id: 513 },
+			},
+		});
+
+		expect(frames).toHaveLength(1);
+		expect((frames[0] as { target?: unknown }).target).toEqual({
+			kind: "existing_path",
+			path: os.homedir(),
+		});
+	});
+
+	test("direct-entry choice accepts the next message as a folder path", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace with spaces");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(28, 514));
+		const picker = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup);
+		const directAlias = picker?.body.reply_markup.inline_keyboard[2][0].callback_data;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 29,
+			callback_query: {
+				id: "picker-direct",
+				data: directAlias,
+				from: { id: 42, is_bot: false },
+				message: { chat: { id: 42 }, message_thread_id: 514 },
+			},
+		});
+		expect(
+			bot.calls.some(
+				call => call.method === "sendMessage" && String(call.body.text).includes("Send the folder path"),
+			),
+		).toBe(true);
+
+		await daemon.handleTelegramUpdate({
+			update_id: 30,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 514,
+				text: workspace,
+			},
+		});
+
+		expect(frames).toHaveLength(1);
+		expect((frames[0] as { target?: unknown }).target).toEqual({
+			kind: "existing_path",
+			path: workspace,
+		});
+	});
+
+	test("exact /session_create path <dir> in a pending topic submits an adoption frame", async () => {
+		const agentDir = tempAgentDir();
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		const { daemon, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 49, 540);
+		await daemon.handleTelegramUpdate({
+			update_id: 50,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 540,
+				text: `/session_create path ${dir}`,
+			},
+		});
+		expect(frames).toHaveLength(1);
+		const frame = frames[0]! as SessionLifecycleRequest;
+		expect(frame.type).toBe("session_create");
+		expect((frame as any).target).toEqual({ kind: "existing_path", path: dir });
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+	});
+
+	test("direct path cannot adopt an unobserved topic", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await daemon.handleTelegramUpdate({
+			update_id: 57,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 999,
+				text: `/session_create path ${workspace}`,
+			},
+		});
+		expect(frames).toHaveLength(0);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect(
+			bot.calls.some(
+				call =>
+					call.method === "sendMessage" && String(call.body.text).includes("was not opened for a new GJC session"),
+			),
+		).toBe(true);
+	});
+	test("pending topics reject dir and worktree creates instead of spawning duplicate topics", async () => {
+		const { daemon, bot, frames } = await adoptionLifecycleHarness();
+		await authorizePendingTopic(daemon, 58, 998);
+		for (const [updateId, text] of [
+			[59, "/session_create dir /tmp/new-session"],
+			[60, "/session_create worktree /tmp/repo feature"],
+		] as const) {
+			await daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from: { id: 42, is_bot: false },
+					message_thread_id: 998,
+					text,
+				},
+			});
+		}
+		expect(frames).toHaveLength(0);
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendMessage" && String(call.body.text).includes("only with /session_create path <dir>"),
+			),
+		).toHaveLength(2);
+	});
+	test("direct adoption rejects forged senders and bot messages", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 51, 542);
+		for (const [updateId, from] of [
+			[52, { id: 999, is_bot: false }],
+			[53, { id: 42, is_bot: true }],
+		] as const) {
+			await daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from,
+					message_thread_id: 542,
+					text: `/session_create path ${workspace}`,
+				},
+			});
+		}
+		expect(frames).toHaveLength(0);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+	});
+
+	test("concurrent direct commands start only one session for a topic", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 53, 543);
+		const direct = (updateId: number) =>
+			daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from: { id: 42, is_bot: false },
+					message_thread_id: 543,
+					text: `/session_create path ${workspace}`,
+				},
+			});
+		await Promise.all([direct(54), direct(55)]);
+		expect(frames).toHaveLength(1);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		expect(
+			bot.calls.some(
+				c => c.method === "sendMessage" && c.body.text === "A session is already starting in this topic.",
+			),
+		).toBe(true);
+	});
+	test("durable intent persistence failure is reported in-topic without submitting", async () => {
+		const root = tempAgentDir();
+		const agentDir = path.join(root, "agent");
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 50, 541);
+		fs.rmSync(agentDir, { recursive: true, force: true });
+		fs.writeFileSync(agentDir, "not a directory");
+		await daemon.handleTelegramUpdate({
+			update_id: 51,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 541,
+				text: `/session_create path ${workspace}`,
+			},
+		});
+		expect(frames).toHaveLength(0);
+		expect(
+			bot.calls.some(
+				c =>
+					c.method === "sendMessage" &&
+					c.body.message_thread_id === 541 &&
+					String(c.body.text).includes("durable topic binding could not be saved"),
+			),
+		).toBe(true);
+	});
+	test("a missing folder is rejected immediately before lifecycle submit", async () => {
+		const agentDir = tempAgentDir();
+		const missing = path.join(agentDir, "deleted-before-submit");
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 55, 544);
+		await daemon.handleTelegramUpdate({
+			update_id: 56,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 544,
+				text: `/session_create path ${missing}`,
+			},
+		});
+		expect(frames).toHaveLength(0);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect(
+			bot.calls.some(
+				c =>
+					c.method === "sendMessage" &&
+					c.body.message_thread_id === 544 &&
+					c.body.text === "That folder is no longer available.",
+			),
+		).toBe(true);
+	});
+
+	test("free text in a pending topic is never treated as a path", async () => {
+		const { daemon, frames } = await adoptionLifecycleHarness();
+		await authorizePendingTopic(daemon, 59, 560);
+		await daemon.handleTelegramUpdate({
+			update_id: 60,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 560,
+				text: "just some arbitrary sentence",
+			},
+		});
+		expect(frames).toHaveLength(0);
+	});
+
+	test("happy adoption: ensureTopic adopts the user topicId with zero createForumTopic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		// Seed the durable intent directly (picker wiring is covered by the store's
+		// own tests); the daemon's own store reads it after rehydrate.
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 570, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopted", "ts");
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "adopter",
+			repo: "r",
+			branch: "b",
+		});
+		expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.message_thread_id === 570)).toBe(true);
+		// Sidecar removed after the registry commit.
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect((topicAccess(daemon).topics.get("adopter") as { topicOrigin?: string } | undefined)?.topicOrigin).toBe(
+			"user_created",
+		);
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "adopter" });
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(0);
+		expect(topicAccess(daemon).topics.get("adopter")).toBeUndefined();
+	});
+
+	test("restart reconciliation settles adopted delete fences locally without deleting the user topic", async () => {
+		const { daemon, bot } = await adoptionLifecycleHarness();
+		(topicAccess(daemon).topics as unknown as { load(state: unknown): void }).load({
+			topics: {
+				adopter: {
+					topicId: "571",
+					identitySent: true,
+					createdAt: 1,
+					authorityEpoch: 2,
+					authorityState: "delete_pending",
+					topicOrigin: "user_created",
+					chatId: "42",
+					endpointKey: "ws://adopted",
+					endpointDigest: "digest",
+					endpointIncarnation: 0,
+				},
+			},
+			fences: { adopter: 2 },
+		});
+		await (daemon as unknown as { reconcilePendingTopicDeletes(): Promise<void> }).reconcilePendingTopicDeletes();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(0);
+		expect(topicAccess(daemon).topics.get("adopter")).toBeUndefined();
+	});
+
+	test("registry commit failure releases the adoption claim so the same topic can retry", async () => {
+		const agentDir = tempAgentDir();
+		let failTopicWrite = true;
+		const fsImpl = topicStateFs(async () => {
+			if (failTopicWrite) throw new Error("injected adoption registry write failure");
+		});
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir, fs: fsImpl });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "retry-adopter", topicId: 572, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("retry-adopter", "ws://adopted", "ts");
+		const identity = {
+			type: "identity_header" as const,
+			sessionId: "retry-adopter",
+			repo: "r",
+			branch: "b",
+		};
+		await expect(daemon.handleSessionMessage(session, identity)).rejects.toThrow(
+			"injected adoption registry write failure",
+		);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		expect(topicAccess(daemon).topics.get("retry-adopter")).toBeUndefined();
+
+		failTopicWrite = false;
+		await daemon.handleSessionMessage(session, identity);
+		expect(topicAccess(daemon).topics.get("retry-adopter")?.topicId).toBe("572");
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+	});
+
+	test("post-commit sidecar cleanup failure is reconciled on restart", async () => {
+		const agentDir = tempAgentDir();
+		const fsImpl = topicStateFs(async () => {});
+		const unlink = fsImpl.unlink.bind(fsImpl);
+		let failCleanup = true;
+		fsImpl.unlink = async file => {
+			if (failCleanup && file.endsWith(".adoption-intent.json")) {
+				throw new Error("injected adoption cleanup failure");
+			}
+			await unlink(file);
+		};
+		const first = await adoptionLifecycleHarness({ agentDir, fs: fsImpl });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "cleanup-adopter", topicId: 573, path: agentDir });
+		await first.daemon.loadAdoptionIntents();
+		const session = first.daemon.connectSession("cleanup-adopter", "ws://adopted", "ts");
+		await first.daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "cleanup-adopter",
+			repo: "r",
+			branch: "b",
+		});
+		expect(topicAccess(first.daemon).topics.get("cleanup-adopter")?.topicId).toBe("573");
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+
+		failCleanup = false;
+		const restarted = await adoptionLifecycleHarness({ agentDir, fs: fsImpl });
+		await restarted.daemon.loadTopics();
+		await restarted.daemon.loadAdoptionIntents();
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect(topicAccess(restarted.daemon).topics.get("cleanup-adopter")?.topicId).toBe("573");
+		expect(restarted.bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
+	});
+
+	test("same-session concurrent first frames adopt once with zero createForumTopic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 580, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopted", "ts");
+		// Concurrent first frames: getOrCreateTopic's inflight promise joins them.
+		await Promise.all([
+			daemon.handleSessionMessage(session, {
+				type: "identity_header",
+				sessionId: "adopter",
+				repo: "r",
+				branch: "b",
+			}),
+			daemon.handleSessionMessage(session, { type: "turn_stream", sessionId: "adopter", text: "hi" }),
+			daemon.handleSessionMessage(session, { type: "context_update", sessionId: "adopter", text: "ctx" }),
+		]);
+		expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
+	});
+
+	test("definite spawn_failed removes the intent; readiness_timeout retains it", async () => {
+		// spawn_failed path: the adoption submit returns spawn_failed and the
+		// daemon removes the durable sidecar.
+		const agentDir = tempAgentDir();
+		const { daemon } = await adoptionLifecycleHarness({
+			agentDir,
+			lifecycleResponse: {
+				type: "session_lifecycle_error",
+				requestId: "x",
+				status: "error",
+				reason: "spawn_failed",
+				message: "spawn refused",
+			} as any,
+		});
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		await authorizePendingTopic(daemon, 89, 590);
+		// Drive the submit via the direct-path handler (writes intent + submits).
+		await daemon.handleTelegramUpdate({
+			update_id: 90,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 590,
+				text: `/session_create path ${dir}`,
+			},
+		});
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+	});
+
+	test("readiness_timeout retains the durable intent (late spawn within TTL)", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon } = await adoptionLifecycleHarness({
+			agentDir,
+			lifecycleResponse: {
+				type: "session_lifecycle_error",
+				requestId: "y",
+				status: "error",
+				reason: "readiness_timeout",
+				message: "timed out",
+			} as any,
+		});
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		await authorizePendingTopic(daemon, 91, 592);
+		await daemon.handleTelegramUpdate({
+			update_id: 92,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 592,
+				text: `/session_create path ${dir}`,
+			},
+		});
+		// Timeout is not a definite spawn failure: the sidecar is retained so a late
+		// socket can still adopt the original topic.
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		expect(topicAccess(daemon).topics.sessionForTopic("592")).toBeUndefined();
+	});
+
+	test("restart reconciliation removes a stale sidecar whose record already committed", async () => {
+		const agentDir = tempAgentDir();
+		// Commit a topic record for "adopter" on topic 600, then leave a stale sidecar.
+		const first = await adoptionLifecycleHarness({ agentDir });
+		await first.daemon.loadAdoptionIntents();
+		const session = first.daemon.connectSession("adopter", "ws://adopted", "ts");
+		// Commit a daemon-created topic record (not adoption) so a record exists.
+		await first.daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "adopter",
+			repo: "r",
+			branch: "b",
+		});
+		// Now drop a stale adoption sidecar targeting the same session/topic.
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 600 });
+		// Re-point the seeded sidecar at the actually-committed topic id.
+		const committed = topicAccess(first.daemon).topics.get("adopter")!;
+		const fix = new TelegramAdoptionIntentStore({ agentDir });
+		await fix.remove("adopter");
+		await fix.put({
+			intendedSessionId: "adopter",
+			topicId: Number(committed.topicId),
+			chatId: "42",
+			target: { kind: "existing_path", path: agentDir },
+			createdAt: Date.now(),
+			expiresAt: Date.now() + 600_000,
+		});
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		const restarted = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner-2",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		await restarted.loadTopics();
+		await restarted.loadAdoptionIntents();
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+	});
+
+	test("a bound topic refuses adoption without deleting the user topic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		// Pre-bind a topic to another session via a daemon-created record.
+		const other = daemon.connectSession("other-session", "ws://other", "to");
+		await daemon.handleSessionMessage(other, {
+			type: "identity_header",
+			sessionId: "other-session",
+			repo: "r",
+			branch: "b",
+		});
+		const otherRecord = topicAccess(daemon).topics.get("other-session")!;
+		// Seed an intent targeting the already-bound topic; adoption must fail closed.
+		await seedAdoptionIntent(agentDir, {
+			intendedSessionId: "adopter",
+			topicId: Number(otherRecord.topicId),
+			path: agentDir,
+		});
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopter", "ta");
+		await expect(
+			daemon.handleSessionMessage(session, {
+				type: "identity_header",
+				sessionId: "adopter",
+				repo: "r",
+				branch: "b",
+			}),
+		).rejects.toThrow("topic adoption refused");
+		// The user topic was never deleted.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	});
+
+	test("lease revocation during adoption does not delete the user topic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 620, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopted", "ts");
+		const identity = daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "adopter",
+			repo: "r",
+			branch: "b",
+		});
+		// Revoke the creation lease mid-flight by dropping the session.
+		daemon.sessions.delete("adopter");
+		await identity.catch(() => undefined);
+		// No compensation delete of the user topic ever fires for an adoption.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic" && c.body.message_thread_id === 620)).toBe(false);
+	});
+
+	test("same-topic TTL dedup: a created update with a live intent shows 'already starting'", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 610, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		bot.calls = [];
+		await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(110, 610));
+		const notices = bot.calls.filter(
+			c => c.method === "sendMessage" && c.body.text === "A session is already starting in this topic.",
+		);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]!.body.message_thread_id).toBe(610);
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.reply_markup)).toBe(false);
 	});
 });
