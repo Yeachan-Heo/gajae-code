@@ -271,6 +271,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-telegram-adoption-intent.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-telegram-btw-e2e.test.ts"
 			]
 		},

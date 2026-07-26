@@ -4486,8 +4486,8 @@ export class TelegramNotificationDaemon {
 					type: "session_lifecycle_error",
 					requestId: frame.requestId,
 					status: "error",
-					reason: "terminal_uncertain",
-					message: "lifecycle control unavailable",
+					reason: "spawn_failed",
+					message: "lifecycle control unavailable; no session was started",
 				});
 				return;
 			}
@@ -4511,8 +4511,8 @@ export class TelegramNotificationDaemon {
 					type: "session_lifecycle_error",
 					requestId: frame.requestId,
 					status: "error",
-					reason: "terminal_uncertain",
-					message: `lifecycle send failed: ${String(e)}`,
+					reason: "spawn_failed",
+					message: `lifecycle send failed before session start: ${String(e)}`,
 				});
 			}
 		});
@@ -9565,9 +9565,9 @@ export class TelegramNotificationDaemon {
 
 	/**
 	 * Build an authenticated lifecycle frame, durably persist the adoption intent
-	 * BEFORE submit, then submit. A definite spawn failure removes the intent;
-	 * readiness_timeout / terminal_uncertain retain it (a late spawn within TTL
-	 * may still adopt the original topic). Never deletes the user topic.
+	 * BEFORE submit, then submit. Definite no-spawn failures remove the intent;
+	 * readiness_timeout / terminal_uncertain retain it because a late spawn may
+	 * still adopt the original topic. Never deletes the user topic.
 	 */
 	async #submitAdoptionFrame(
 		topicId: number,
