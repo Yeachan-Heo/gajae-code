@@ -1,6 +1,5 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
-import { $pickenv } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
@@ -14,23 +13,28 @@ export type AgentSource = "bundled" | "user" | "project";
 export type ForkContextPolicy = "forbidden" | "allowed";
 export type ForkContextMode = "none" | "receipt" | "last-turn" | "bounded" | "full";
 
-const parseNumber = (value: string | undefined, defaultValue: number): number => {
-	if (value) {
-		try {
-			const number = Number.parseInt(value, 10);
-			if (!Number.isNaN(number) && number > 0) {
-				return number;
-			}
-		} catch {}
+const parsePositiveIntegerEnvironment = (keys: string[], defaultValue: number): number => {
+	for (const key of keys) {
+		const value = Bun.env[key];
+		if (!value || value.trim().length === 0) continue;
+		if (!/^\d+$/.test(value)) return defaultValue;
+		const number = Number(value);
+		return Number.isSafeInteger(number) && number > 0 ? number : defaultValue;
 	}
 	return defaultValue;
 };
 
 /** Maximum output bytes per agent */
-export const MAX_OUTPUT_BYTES = parseNumber($pickenv("GJC_TASK_MAX_OUTPUT_BYTES", "PI_TASK_MAX_OUTPUT_BYTES"), 500_000);
+export const MAX_OUTPUT_BYTES = parsePositiveIntegerEnvironment(
+	["GJC_TASK_MAX_OUTPUT_BYTES", "PI_TASK_MAX_OUTPUT_BYTES"],
+	500_000,
+);
 
 /** Maximum output lines per agent */
-export const MAX_OUTPUT_LINES = parseNumber($pickenv("GJC_TASK_MAX_OUTPUT_LINES", "PI_TASK_MAX_OUTPUT_LINES"), 5000);
+export const MAX_OUTPUT_LINES = parsePositiveIntegerEnvironment(
+	["GJC_TASK_MAX_OUTPUT_LINES", "PI_TASK_MAX_OUTPUT_LINES"],
+	5000,
+);
 
 /** EventBus channel for raw subagent events */
 export const TASK_SUBAGENT_EVENT_CHANNEL = "task:subagent:event";
