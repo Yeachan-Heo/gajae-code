@@ -530,6 +530,76 @@ describe("AgentSession managed fallback upstream request counts", () => {
 			expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 		});
 	}
+	it("keeps sticky Alibaba fallback cursor when a queued successor starts after terminal timeout", async () => {
+		const primary = getBundledModel("openai", "gpt-4o-mini");
+		const fallback = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const calls: string[] = [];
+		const timeoutStarted = Promise.withResolvers<void>();
+		const releaseTimeout = Promise.withResolvers<void>();
+		let fallbackCalls = 0;
+		createSession(
+			1,
+			(model, _context, _options) => {
+				calls.push(selector(model));
+				if (selector(model) === selector(primary)) {
+					return typedRateLimitStream(model, 50);
+				}
+				fallbackCalls += 1;
+				if (fallbackCalls === 1) {
+					timeoutStarted.resolve();
+					return alibabaFirstEventTimeoutStream(model, releaseTimeout.promise);
+				}
+				if (fallbackCalls === 2) return typedOpaqueOverflowStream(model);
+				if (fallbackCalls === 3) return typedRateLimitStream(model, 50);
+				return successfulStream(model, "Recovered sticky Alibaba successor");
+			},
+			{ primary, fallback },
+		);
+		const events: AgentSessionEvent[] = [];
+		const successorQueued = Promise.withResolvers<void>();
+		let queuedSuccessor = false;
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type !== "agent_end" || queuedSuccessor) return;
+			queuedSuccessor = true;
+			queueMicrotask(() => {
+				void session!.followUp("Queued successor after sticky Alibaba timeout").then(
+					() => successorQueued.resolve(),
+					error => successorQueued.reject(error),
+				);
+			});
+		});
+
+		const predecessor = session!.prompt("Reach sticky Alibaba then terminalize");
+		await timeoutStarted.promise;
+		releaseTimeout.resolve();
+		await successorQueued.promise;
+		await predecessor;
+		await session!.waitForIdle();
+
+		// primary rate-limit -> sticky Alibaba timeout (terminal) -> successor overflow -> Alibaba rate-limit -> next fallback or success path
+		expect(calls[0]).toBe(selector(primary));
+		expect(calls.filter(call => call === selector(fallback)).length).toBeGreaterThanOrEqual(2);
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "model_fallback_switched",
+				from: selector(primary),
+				to: selector(fallback),
+			}),
+		);
+		expect(session!.messages).toContainEqual(
+			expect.objectContaining({
+				role: "assistant",
+				provider: fallback.provider,
+				stopReason: "error",
+				errorMessage: "Provider stream timed out while waiting for the first event",
+			}),
+		);
+		// Successor continued on sticky Alibaba (second/third fallback calls) rather than resetting to primary.
+		expect(calls.slice(1, 3).every(call => call === selector(fallback))).toBe(true);
+		expect(session!.agent.hasQueuedMessages()).toBe(false);
+	});
 	it("N=3 performs exactly three upstream attempts before switching and reports attemptsUsed", async () => {
 		const calls: StreamCall[] = [];
 		const fallbackSwitches: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];

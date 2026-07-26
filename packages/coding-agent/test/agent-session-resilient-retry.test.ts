@@ -775,8 +775,20 @@ describe("AgentSession resilient retry", () => {
 				bareDefault: false,
 			},
 			{
+				model: responsesModel,
+				errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+				settingsOverrides: { "retry.maxRetries": 10 },
+				bareDefault: false,
+			},
+			{
 				model: completionsModel,
 				errorMessage: "Provider stream timed out while waiting for the first event",
+				settingsOverrides: undefined,
+				bareDefault: true,
+			},
+			{
+				model: completionsModel,
+				errorMessage: "OpenAI completions stream timed out while waiting for the first event",
 				settingsOverrides: undefined,
 				bareDefault: true,
 			},
