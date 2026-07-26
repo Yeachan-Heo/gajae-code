@@ -122,6 +122,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let holdPermissionModeSet = false;
 	let releasePermissionModeSet: (() => void) | undefined;
 	let activeModelPreset = "test-preset";
+	let holdFastFrameDelivery = false;
+	let releaseFastFrameDelivery = Promise.withResolvers<void>();
+	let needsAuthAvailable = false;
 	let completeNextPromptBeforeAck = false;
 
 	let server!: ReturnType<typeof Bun.serve>;
@@ -269,7 +272,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 											id: "needs-auth",
 											displayName: "Needs Authentication",
 											source: "configured",
-											available: false,
+											available: needsAuthAvailable,
 										},
 									]
 								: frame.query === "skill.list/state"
@@ -362,6 +365,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 							completeNextPromptBeforeAck = false;
 							socket.send(
 								JSON.stringify({
+									type: "agent_start",
+									sessionId: "owned-session",
+									commandId: "prompt-command",
+									turnId: "prompt-turn",
+								}),
+							);
+							socket.send(
+								JSON.stringify({
 									type: "agent_end",
 									sessionId: "owned-session",
 									commandId: "prompt-command",
@@ -409,6 +420,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const agent = new AcpAgent(
 		{
 			sessionUpdate: async (update: SessionNotification) => {
+				if (holdFastFrameDelivery) await releaseFastFrameDelivery.promise;
 				updates.push(update);
 			},
 			signal: controller.signal,
@@ -785,19 +797,47 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	);
 	expect(await bounded(steeringPrompt, "steering prompt completion")).toEqual({ stopReason: "end_turn" });
 
+	releaseFastFrameDelivery = Promise.withResolvers<void>();
+	holdFastFrameDelivery = true;
 	completeNextPromptBeforeAck = true;
 	const fastPrompt = agent.prompt({
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "complete before acknowledgement" }],
 	});
 	expect(await bounded(fastPrompt, "pre-acknowledgement prompt completion")).toEqual({ stopReason: "end_turn" });
+	const replayFollowupPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "follow up while replay is blocked" }],
+	});
+	await waitFor(() => promptInputs.length === 6, "follow-up prompt delivery while replay is blocked");
+	holdFastFrameDelivery = false;
+	releaseFastFrameDelivery.resolve();
+	await waitFor(
+		() =>
+			updates.some(
+				update =>
+					update.update.sessionUpdate === "agent_message_chunk" &&
+					(update.update as { content?: { text?: string } }).content?.text === "fast",
+			),
+		"fast prompt final text",
+	);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	expect(await bounded(replayFollowupPrompt, "follow-up prompt completion")).toEqual({ stopReason: "end_turn" });
 	expect(
-		updates.some(
+		updates.filter(
 			update =>
 				update.update.sessionUpdate === "agent_message_chunk" &&
 				(update.update as { content?: { text?: string } }).content?.text === "fast",
 		),
-	).toBe(true);
+	).toHaveLength(1);
 
 	await expect(
 		agent.prompt({
@@ -1111,7 +1151,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		() => undefined,
 		(error: unknown) => error,
 	);
-	await waitFor(() => promptInputs.length === 6, "delete prompt delivery");
+	await waitFor(() => promptInputs.length === 7, "delete prompt delivery");
 	await expect(
 		bounded(agent.deleteSession({ sessionId: created.sessionId }), "owned session delete"),
 	).resolves.toEqual({});
@@ -1152,7 +1192,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "frame failure" }],
 	});
-	await waitFor(() => promptInputs.length === 7, "frame failure prompt delivery");
+	await waitFor(() => promptInputs.length === 8, "frame failure prompt delivery");
 	rejectFrameUpdates = true;
 	promptSocket!.send(
 		JSON.stringify({
@@ -1208,7 +1248,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "follow up" }],
 	});
-	await waitFor(() => promptInputs.length === 8, "restored-session follow-up prompt delivery");
+	await waitFor(() => promptInputs.length === 9, "restored-session follow-up prompt delivery");
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
 	promptSocket!.send(
@@ -1223,6 +1263,40 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(await bounded(followupPrompt, "restored-session follow-up prompt completion")).toEqual({
 		stopReason: "end_turn",
 	});
+	const authRecoveryAbort = new AbortController();
+	activeModelPreset = "needs-auth";
+	needsAuthAvailable = false;
+	const authRecoveryAgent = new AcpAgent(
+		{
+			sessionUpdate: async () => {},
+			signal: authRecoveryAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir, startupOptions: { modelPreset: "needs-auth" } },
+	);
+	await bounded(
+		authRecoveryAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		"cached auth failure attach",
+	);
+	needsAuthAvailable = true;
+	const recoveredPrompt = authRecoveryAgent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "after auth" }],
+	});
+	await waitFor(() => promptInputs.length === 10, "revalidated auth prompt delivery");
+	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
+	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	expect(await bounded(recoveredPrompt, "revalidated auth prompt completion")).toEqual({ stopReason: "end_turn" });
+	authRecoveryAbort.abort();
 	followupAbort.abort();
 	loaderAbort.abort();
 	controller.abort();

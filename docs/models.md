@@ -36,7 +36,12 @@ equivalence:
     - <provider-id>/<model-id>
 ```
 
-`provider-id` is the canonical provider key used across selection and auth lookup.
+`provider-id` is the stored provider key used in authentication and SDK responses.
+Existing `models.yml` files and extension registrations may use legacy mixed-case,
+spaced, punctuated, or longer keys; GJC preserves stored IDs byte-for-byte and
+does not rewrite them. Q10/Q29 joins use those exact stored IDs. Model selectors
+trim and case-fold provider/model text for lookup; ambiguous case-insensitive matches
+do not guess.
 
 `equivalence` is optional and configures canonical model grouping on top of concrete provider models:
 

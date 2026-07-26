@@ -96,6 +96,36 @@ describe("ModelDiscoveryManager", () => {
 			warning: "connection refused",
 		});
 	});
+	test("reuses the first resolved key when its evidence generation changes", async () => {
+		const provider = { provider: "test" };
+		const manager = new ModelDiscoveryManager<typeof provider>();
+		manager.setProviders([provider]);
+		const { promise: apiKey, resolve: resolveApiKey } = Promise.withResolvers<string | undefined>();
+		let authGeneration = "before-resolution";
+		let peekCount = 0;
+
+		const discovery = manager.discover(provider, "online", {
+			requiresAuth: () => true,
+			peekApiKey: async () => (peekCount++ === 0 ? apiKey : "credential-b"),
+			isAuthenticated: key => key !== undefined,
+			fetchModels: async (_provider, key) => {
+				expect(key).toBe("credential-a");
+				return [model("current")];
+			},
+			getEvidenceGeneration: () => authGeneration,
+		});
+		authGeneration = "after-resolution";
+		resolveApiKey("credential-a");
+
+		expect(await discovery).toMatchObject({
+			current: true,
+			authGeneration: "after-resolution",
+			fetched: true,
+			models: [expect.objectContaining({ id: "current" })],
+			state: { status: "ok", models: ["current"] },
+		});
+		expect(peekCount).toBe(1);
+	});
 
 	test("rejects stale same-provider results without blocking independent providers", async () => {
 		const manager = new ModelDiscoveryManager<{ provider: string }>();

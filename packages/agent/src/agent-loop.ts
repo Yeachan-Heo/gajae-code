@@ -59,6 +59,8 @@ import type {
 	AgentTool,
 	AgentToolResult,
 	ManagedAttemptOutcome,
+	RunResourceLedger,
+	RunResourceProducerLease,
 	StandaloneRunOwnership,
 	StreamFn,
 } from "./types";
@@ -110,6 +112,7 @@ interface StandaloneOwnershipState {
 }
 
 const standaloneOwnershipStates = new WeakMap<StandaloneRunOwnership, StandaloneOwnershipState>();
+const logicalResourceLeases = new WeakMap<RunResourceLedger, Map<string, RunResourceProducerLease>>();
 
 /**
  * Terminal bound for argument-validation loops: how many CONSECUTIVE turns may
@@ -299,7 +302,7 @@ export function agentLoop(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
-	emitAgentStart = true,
+	emitManagedAgentStart = true,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
 
@@ -315,12 +318,13 @@ export function agentLoop(
 		const attemptStream = transaction ?? stream;
 		try {
 			prepareResourceOwnership(config, false);
-			if (emitAgentStart) stream.push({ type: "agent_start" });
+			if (emitManagedAgentStart) stream.push({ type: "agent_start" });
 			attemptStream.push({ type: "turn_start" });
 			for (const prompt of prompts) {
 				stream.push({ type: "message_start", message: prompt });
 				stream.push({ type: "message_end", message: prompt });
 			}
+
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
 			sealStandaloneOnError(config);
@@ -344,7 +348,7 @@ export function agentLoopContinue(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
-	emitAgentStart = true,
+	emitManagedAgentStart = true,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
@@ -365,8 +369,9 @@ export function agentLoopContinue(
 		const attemptStream = transaction ?? stream;
 		try {
 			prepareResourceOwnership(config, true);
-			if (emitAgentStart) stream.push({ type: "agent_start" });
+			if (emitManagedAgentStart) stream.push({ type: "agent_start" });
 			attemptStream.push({ type: "turn_start" });
+
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
 			sealStandaloneOnError(config);
@@ -383,6 +388,37 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
 }
+function ensureLogicalResourceLease(config: AgentLoopConfig): void {
+	if (!config.resourceLedger || !config.resourceRunId || !config.resourceCancellationDomain) return;
+	let leases = logicalResourceLeases.get(config.resourceLedger);
+	if (!leases) {
+		leases = new Map();
+		logicalResourceLeases.set(config.resourceLedger, leases);
+	}
+	if (leases.has(config.resourceRunId)) return;
+	const reservation = config.resourceLedger.reserveProducer(
+		config.resourceRunId,
+		config.resourceCancellationDomain,
+		"post_prompt",
+		"agent-loop",
+	);
+	if (!reservation.ok) throw new Error("Prompt resource ownership is unavailable");
+	leases.set(config.resourceRunId, reservation.lease);
+}
+
+function closeLogicalResourceLease(config: AgentLoopConfig): void {
+	if (!config.resourceLedger || !config.resourceRunId) return;
+	const leases = logicalResourceLeases.get(config.resourceLedger);
+	const lease = leases?.get(config.resourceRunId);
+	if (!lease) return;
+	lease.closeDiscovery();
+	leases?.delete(config.resourceRunId);
+}
+
+function logicalResourceLease(config: AgentLoopConfig): RunResourceProducerLease | undefined {
+	if (!config.resourceLedger || !config.resourceRunId) return undefined;
+	return logicalResourceLeases.get(config.resourceLedger)?.get(config.resourceRunId);
+}
 
 function prepareResourceOwnership(config: AgentLoopConfig, continuation: boolean): void {
 	if (!config.resourceLedger || !config.resourceRunId) return;
@@ -395,6 +431,7 @@ function prepareResourceOwnership(config: AgentLoopConfig, continuation: boolean
 		const domain = config.resourceCancellationDomain ?? existing ?? config.resourceLedger.open(config.resourceRunId);
 		if (!domain) throw new Error("Prompt resource cancellation domain is unavailable");
 		config.resourceCancellationDomain = domain;
+		ensureLogicalResourceLease(config);
 		return;
 	}
 
@@ -424,6 +461,7 @@ function prepareResourceOwnership(config: AgentLoopConfig, continuation: boolean
 			state.continuationAvailable = false;
 		}
 		config.resourceCancellationDomain = existing;
+		ensureLogicalResourceLease(config);
 		return;
 	}
 	if (existing) {
@@ -461,6 +499,7 @@ function prepareResourceOwnership(config: AgentLoopConfig, continuation: boolean
 	};
 	standaloneOwnershipStates.set(ownership, state);
 	config.standaloneRunOwnership = ownership;
+	ensureLogicalResourceLease(config);
 }
 
 function sealStandaloneOnError(config: AgentLoopConfig): void {
@@ -468,6 +507,7 @@ function sealStandaloneOnError(config: AgentLoopConfig): void {
 		? standaloneOwnershipStates.get(config.standaloneRunOwnership)
 		: undefined;
 	if (standalone) standalone.terminal = true;
+	closeLogicalResourceLease(config);
 	if (config.resourceSealOwner !== "caller" && config.resourceLedger && config.resourceRunId) {
 		config.resourceLedger.seal(config.resourceRunId);
 	}
@@ -495,6 +535,7 @@ function publishAgentEnd(
 		return;
 	}
 	if (standalone) standalone.terminal = true;
+	closeLogicalResourceLease(config);
 	if (config.resourceSealOwner !== "caller" && config.resourceLedger && config.resourceRunId) {
 		config.resourceLedger.seal(config.resourceRunId);
 	}
@@ -1704,6 +1745,13 @@ async function runLoopBody(
 			// Check for tool calls
 			const toolCalls = message.content.filter(c => c.type === "toolCall");
 			hasMoreToolCalls = toolCalls.length > 0;
+			if (!hasMoreToolCalls) {
+				// A tool-free assistant turn demonstrates that the model has
+				// recovered; malformed turns before it must not poison a later
+				// follow-up turn's consecutive-run budget.
+				consecutiveMalformedTurns = 0;
+				previousMalformedToolSignatures = new Set();
+			}
 
 			const toolResults: ToolResultMessage[] = [];
 			let repeatedMalformedToolCall = false;
@@ -1793,10 +1841,16 @@ async function runLoopBody(
 				// count, not argument signatures, so rotating invalid shapes are bounded
 				// too.
 				message.stopReason = "error";
-				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
+				const breakerMessage = `Invalid request: stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
 				message.errorMessage = message.errorMessage
 					? `${message.errorMessage} | ${breakerMessage}`
 					: breakerMessage;
+				if (config.fallbackManaged) {
+					// A malformed-loop breaker is a local deterministic terminal,
+					// not provider failure evidence. Report it as terminal so the
+					// managed fallback controller cannot rotate and replay it.
+					await config.onManagedAttemptOutcome?.({ type: "run_terminal", reason: "error" });
+				}
 				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
 				stream.end(newMessages);
 				return;
@@ -1975,15 +2029,22 @@ async function streamAssistantResponse(
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			const fallbackAttempt = config.fallbackManaged ? config.nextFallbackAttempt?.(config.model) : undefined;
+			const logicalLease = logicalResourceLease(config);
 			const providerReservation =
-				config.resourceLedger && config.resourceRunId
-					? config.resourceLedger.reserveProducer(
-							config.resourceRunId,
+				logicalLease && config.resourceCancellationDomain
+					? logicalLease.fork(
 							config.resourceCancellationDomain,
 							"provider_factory",
 							`${config.model.provider}/${config.model.id}`,
 						)
-					: undefined;
+					: config.resourceLedger && config.resourceRunId
+						? config.resourceLedger.reserveProducer(
+								config.resourceRunId,
+								config.resourceCancellationDomain,
+								"provider_factory",
+								`${config.model.provider}/${config.model.id}`,
+							)
+						: undefined;
 			if (providerReservation && !providerReservation.ok)
 				throw new Error("Prompt resource ownership is unavailable");
 			if (requestSignal?.aborted) {
@@ -2051,6 +2112,10 @@ async function streamAssistantResponse(
 					() => providerReservation.lease.closeDiscovery(),
 					() => providerReservation.lease.closeDiscovery(),
 				);
+			} else {
+				// The response promise is still awaited below; consume this duplicate
+				// lifecycle rejection when no ledger is configured.
+				void providerLifecycle.catch(() => {});
 			}
 			let response: Awaited<typeof responsePromise>;
 			if (requestSignal) {
@@ -2077,21 +2142,28 @@ async function streamAssistantResponse(
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;
 
-			const responseIterator = response[Symbol.asyncIterator]();
+			let responseIterator: AsyncIterator<AssistantMessageEvent>;
+			try {
+				responseIterator = response[Symbol.asyncIterator]();
+			} catch (error) {
+				settleIterator();
+				throw error;
+			}
 			let iteratorClosed = false;
-			const closeIterator = (): void => {
-				if (iteratorClosed) return;
+			let iteratorClosePromise: Promise<void> | undefined;
+			const closeIterator = (): Promise<void> => {
+				if (iteratorClosed) return iteratorClosePromise ?? Promise.resolve();
 				iteratorClosed = true;
-
-				void Promise.resolve()
+				iteratorClosePromise = Promise.resolve()
 					.then(() => responseIterator.return?.())
 					.then(
 						() => settleIterator(),
 						() => settleIterator(),
 					);
+				return iteratorClosePromise;
 			};
 			const finishResponse = async (): Promise<AssistantMessage> => {
-				closeIterator();
+				await closeIterator();
 				await iteratorSettled;
 				return getResponseResult();
 			};
@@ -2103,7 +2175,7 @@ async function streamAssistantResponse(
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
-					closeIterator();
+					void closeIterator();
 					const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
 					await finishChat(aborted);
 					return aborted;
@@ -2121,7 +2193,7 @@ async function streamAssistantResponse(
 					if (abortRacePromise) {
 						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
 						if (result === ABORTED) {
-							closeIterator();
+							void closeIterator();
 							const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
 							await finishChat(aborted);
 							return aborted;
@@ -2206,12 +2278,12 @@ async function streamAssistantResponse(
 				}
 			} finally {
 				detachAbortListener?.();
-				closeIterator();
+				void closeIterator();
 			}
 
 			const trailing = config.fallbackManaged
-				? managedAssistantShell(await finishResponse(), config.model)
-				: await finishResponse();
+				? managedAssistantShell(await getResponseResult(), config.model)
+				: await getResponseResult();
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -2397,8 +2469,10 @@ async function executeToolCalls(
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
 		if (interruptState.triggered) {
 			// Skip both span emission and the collector orphan record here. The
-			// scheduler-task finalizer emits the skipped result and collector record;
-			// the tail sweep below remains a defensive fallback for unexpected throws.
+			// tail sweep below (after `Promise.allSettled`) is the single path
+			// that handles "no result message was produced" — it calls
+			// `recordSkippedTool` and `emitToolResult` once per record, so any
+			// work we did here would double-count.
 			record.skipped = true;
 			return;
 		}
@@ -2514,7 +2588,7 @@ async function executeToolCalls(
 							toolCalls: toolCallInfos,
 						})
 					: undefined;
-				const execution = tool.execute(
+				const rawResult = await tool.execute(
 					toolCall.id,
 					transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs,
 					tool.nonAbortable ? undefined : toolSignal,
@@ -2529,7 +2603,6 @@ async function executeToolCalls(
 					},
 					toolContext,
 				);
-				const rawResult = await execution;
 				const coerced = coerceToolResult(rawResult);
 				result = coerced.result;
 				if (coerced.malformed || result.isError) isError = true;
@@ -2609,19 +2682,26 @@ async function executeToolCalls(
 	let sharedTasks: Promise<void>[] = [];
 	const tasks: Promise<void>[] = [];
 
+	const logicalLease = logicalResourceLease(config);
 	for (let index = 0; index < records.length; index++) {
 		const record = records[index];
 		const concurrency = record.tool?.concurrency ?? "shared";
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
 		const reservation =
-			config.resourceLedger && config.resourceRunId
-				? config.resourceLedger.reserveProducer(
-						config.resourceRunId,
+			logicalLease && config.resourceCancellationDomain
+				? logicalLease.fork(
 						config.resourceCancellationDomain,
 						"tool",
 						`${record.toolCall.name}:${record.toolCall.id}`,
 					)
-				: undefined;
+				: config.resourceLedger && config.resourceRunId
+					? config.resourceLedger.reserveProducer(
+							config.resourceRunId,
+							config.resourceCancellationDomain,
+							"tool",
+							`${record.toolCall.name}:${record.toolCall.id}`,
+						)
+					: undefined;
 		if (reservation && !reservation.ok) {
 			record.skipped = true;
 			recordSkippedTool(telemetry, {

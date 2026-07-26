@@ -112,6 +112,75 @@ export interface LifecycleTiming {
 	now(): number;
 	sleep(ms: number): Promise<void>;
 }
+export interface LifecycleRequestProtectionCommandResult {
+	exitCode: number | null;
+	stdout: string;
+}
+
+export type LifecycleRequestProtectionCommandRunner = (
+	command: string,
+	args: readonly string[],
+) => LifecycleRequestProtectionCommandResult | undefined;
+
+export interface LifecycleRequestProtectionOptions {
+	platform?: typeof process.platform;
+	runCommand?: LifecycleRequestProtectionCommandRunner;
+}
+
+const WINDOWS_LIFECYCLE_REQUEST_PROTECTION_COMMAND = "powershell.exe";
+const WINDOWS_LIFECYCLE_REQUEST_PROTECTION_SCRIPT = [
+	"$ErrorActionPreference = 'Stop'",
+	"$path = [IO.Path]::GetFullPath($args[0])",
+	"$acl = Get-Acl -LiteralPath $path",
+	"$acl.SetAccessRuleProtection($true, $false)",
+	"foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) }",
+	"$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+	"if ($null -eq $sid) { throw 'Current Windows user SID is unavailable.' }",
+	"$rights = [Security.AccessControl.FileSystemRights]::Read -bor [Security.AccessControl.FileSystemRights]::Delete",
+	"$allow = [Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)",
+	"$acl.AddAccessRule($allow)",
+	"Set-Acl -LiteralPath $path -AclObject $acl",
+	"$verify = Get-Acl -LiteralPath $path",
+	"$entries = @($verify.Access)",
+	"if (-not $verify.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].IdentityReference.Value -ne $sid.Value -or $entries[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or (($entries[0].FileSystemRights -band $rights) -ne $rights)) { throw 'Lifecycle request DACL verification failed.' }",
+	"[Console]::Out.WriteLine('GJC_LIFECYCLE_REQUEST_DACL_OK')",
+].join("; ");
+
+function runLifecycleRequestProtectionCommand(
+	command: string,
+	args: readonly string[],
+): LifecycleRequestProtectionCommandResult | undefined {
+	try {
+		const result = Bun.spawnSync([command, ...args], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		return { exitCode: result.exitCode, stdout: Buffer.from(result.stdout).toString("utf8") };
+	} catch {
+		return undefined;
+	}
+}
+
+function protectLifecycleRequestFile(filePath: string, options: LifecycleRequestProtectionOptions = {}): void {
+	if ((options.platform ?? process.platform) !== "win32") return;
+	const runner = options.runCommand ?? runLifecycleRequestProtectionCommand;
+	let result: LifecycleRequestProtectionCommandResult | undefined;
+	try {
+		result = runner(WINDOWS_LIFECYCLE_REQUEST_PROTECTION_COMMAND, [
+			"-NoLogo",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			WINDOWS_LIFECYCLE_REQUEST_PROTECTION_SCRIPT,
+			filePath,
+		]);
+	} catch {
+		result = undefined;
+	}
+	if (result?.exitCode !== 0 || result.stdout.trim() !== "GJC_LIFECYCLE_REQUEST_DACL_OK")
+		throw new Error("Unable to establish a user-restricted DACL for the lifecycle request file.");
+}
 
 const defaultLifecycleTiming: LifecycleTiming = {
 	now: Date.now,
@@ -371,6 +440,59 @@ export function readSessionLifecycleLaunchRequest(
 	)
 		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 	return request as SessionLifecycleLaunchRequest;
+}
+export async function readSessionLifecycleLaunchRequestFile(
+	filePath: string | undefined,
+	now = Date.now(),
+): Promise<SessionLifecycleLaunchRequest> {
+	const requestPath = filePath?.trim();
+	if (!requestPath || !path.isAbsolute(requestPath)) throw new Error("GJC_SDK_LIFECYCLE_REQUEST_FILE is required.");
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(requestPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const stat = await handle.stat();
+		if (!stat.isFile() || (process.platform !== "win32" && (stat.mode & 0o077) !== 0))
+			throw new Error("GJC_SDK_LIFECYCLE_REQUEST_FILE is not restrictive.");
+		const value = await handle.readFile("utf8");
+		return readSessionLifecycleLaunchRequest(value, now);
+	} finally {
+		await handle?.close().catch(() => {});
+		await fs.unlink(requestPath).catch(error => {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		});
+	}
+}
+
+export async function writeSessionLifecycleLaunchRequest(
+	root: string,
+	id: string,
+	request: SessionLifecycleLaunchRequest,
+	options: LifecycleRequestProtectionOptions = {},
+): Promise<string> {
+	const directory = path.join(root, "sdk");
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const requestPath = path.join(directory, `.${id}.lifecycle-request.${randomUUID()}.json`);
+	const handle = await fs.open(
+		requestPath,
+		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_NOFOLLOW | fsSync.constants.O_WRONLY,
+		0o600,
+	);
+	let closed = false;
+	try {
+		await handle.writeFile(JSON.stringify(request));
+		await handle.sync();
+		await handle.close();
+		closed = true;
+		protectLifecycleRequestFile(requestPath, options);
+	} catch (error) {
+		if (!closed) {
+			await handle.close().catch(() => {});
+			closed = true;
+		}
+		await fs.rm(requestPath, { force: true });
+		throw error;
+	}
+	return requestPath;
 }
 
 type SessionLaunch = {
@@ -2909,7 +3031,9 @@ async function executeLifecycleResponse(
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
+		let lifecycleRequestPath: string | undefined;
 		try {
+			lifecycleRequestPath = await writeSessionLifecycleLaunchRequest(launch.root, launch.id, request);
 			const cmd = command(broker);
 			const spawned = spawn(cmd.file, cmd.args, {
 				cwd: launch.cwd,
@@ -2922,7 +3046,7 @@ async function executeLifecycleResponse(
 					GJC_SESSION_ID: launch.id,
 					GJC_STATE_ROOT: launch.root,
 					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
-					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+					GJC_SDK_LIFECYCLE_REQUEST_FILE: lifecycleRequestPath,
 				},
 			});
 			child = spawned;
@@ -2949,6 +3073,7 @@ async function executeLifecycleResponse(
 						timing,
 					)
 				: true;
+			if (lifecycleRequestPath) await fs.rm(lifecycleRequestPath, { force: true });
 
 			return terminated
 				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
@@ -2973,6 +3098,7 @@ async function executeLifecycleResponse(
 				spawnedAuthority,
 				timing,
 			);
+			if (lifecycleRequestPath) await fs.rm(lifecycleRequestPath, { force: true });
 
 			if (!terminated)
 				return fail(

@@ -48,6 +48,7 @@ import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "..
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "../../slash-commands/acp-builtins";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -80,8 +81,10 @@ interface PromptWaiter {
 	emittedAssistantText: string;
 	settled: boolean;
 	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
+	terminalFrame?: JsonObject;
 	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
 	deferredFrames: JsonObject[];
+	responseResolved: boolean;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -111,6 +114,9 @@ type SessionRecord = {
 	settledPromptCorrelations: PromptCorrelation[];
 	authFailure?: string;
 	activePrompt?: PromptWaiter;
+	/** Prompt waiters released early while their deferred terminal frame still needs replay. */
+	replayPrompts: PromptWaiter[];
+	pendingFrames: number;
 };
 type Endpoint = { url: string; token: string };
 
@@ -220,6 +226,7 @@ function pageItems(value: unknown): unknown[] {
 /** Build the ACP command palette from the shared builtins and live SDK skill state. */
 export function acpAvailableCommandsFromSkills(query: unknown): AvailableCommand[] {
 	const commands = new Map<string, AvailableCommand>();
+	for (const command of ACP_BUILTIN_SLASH_COMMANDS) commands.set(command.name, command);
 	for (const item of pageItems(query)) {
 		const skill = object(item);
 		if (typeof skill?.name !== "string" || !skill.name) continue;
@@ -995,7 +1002,10 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
-		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+		if (record.authFailure) {
+			await this.#sessionState(params.sessionId);
+			if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+		}
 		const payload = acpPromptPayload(params.prompt);
 		let waiter!: PromptWaiter;
 		const response = new Promise<PromptResponse>((resolve, reject) => {
@@ -1006,6 +1016,7 @@ export class AcpAgent implements Agent {
 				emittedAssistantText: "",
 				settled: false,
 				deferredFrames: [],
+				responseResolved: false,
 				resolve,
 				reject,
 			};
@@ -1029,11 +1040,38 @@ export class AcpAgent implements Agent {
 			// Frames held while ownership was unknown belong to this prompt only when the
 			// acknowledgement proves their complete correlation matches exactly.
 			const deferred = waiter.deferredFrames.splice(0);
-			for (const deferredFrame of deferred)
-				if (correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame)))
-					record.frameTail = record.frameTail.then(
-						async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
-					);
+			const blockedByEarlierFrame =
+				record.pendingFrames > 0 ||
+				deferred.length > 1 ||
+				deferred.some(frame => {
+					const event = receivedSdkEvent(frame)?.event;
+					return event?.type !== "agent_end" && event?.type !== "agent_failed";
+				});
+			for (const deferredFrame of deferred) {
+				if (!correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame))) continue;
+				const deferredEvent = receivedSdkEvent(deferredFrame)?.event;
+				const deferredOutcome =
+					deferredEvent && (deferredEvent.type === "agent_end" || deferredEvent.type === "agent_failed")
+						? terminalOutcome(deferredEvent)
+						: undefined;
+				if (blockedByEarlierFrame && deferredOutcome && !waiter.terminal) {
+					waiter.terminalFrame = deferredFrame;
+					waiter.terminal = { outcome: deferredOutcome, correlation: waiter.correlation };
+					this.#resolvePromptResponse(waiter, deferredOutcome);
+					if (record.activePrompt === waiter) {
+						record.activePrompt = undefined;
+						record.replayPrompts.push(waiter);
+					}
+				}
+				++record.pendingFrames;
+				record.frameTail = record.frameTail.then(async () => {
+					try {
+						await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame, waiter);
+					} finally {
+						--record.pendingFrames;
+					}
+				});
+			}
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
 			waiter.deferredFrames.length = 0;
@@ -1297,6 +1335,8 @@ export class AcpAgent implements Agent {
 				connectionId: adapter.connectionId,
 				busy: false,
 				toolArgs: new Map(),
+				pendingFrames: 0,
+				replayPrompts: [],
 			};
 			record.unsubscribe = adapter.onFrame(frame => this.#enqueueSdkFrame(id, adapter!, frame));
 			record.reconnectUnsubscribe = adapter.onReconnectFailed(error =>
@@ -1517,22 +1557,68 @@ export class AcpAgent implements Agent {
 		// Ingress ordering is recorded before queued work begins.
 		this.#observeSessionActivity(record, frame);
 		++record.inboundSequence;
-		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
+		const received = receivedSdkEvent(frame);
+		const event = received?.event;
+		const correlation =
+			event && (event.type === "agent_end" || event.type === "agent_failed")
+				? strictCorrelationFrom(frame, event)
+				: undefined;
+		// Snapshot prompt ownership at ingress; null keeps a no-owner frame from adopting a later prompt.
+		const owner = record.activePrompt;
+		if (
+			owner &&
+			!owner.acknowledged &&
+			event &&
+			(event.type === "agent_end" || event.type === "agent_failed") &&
+			correlation &&
+			hasCompleteCorrelation(correlation)
+		) {
+			// Capture complete pre-ack terminals at ingress. A preceding frame may be
+			// blocked delivering an update, so waiting for the serialized queue would
+			// otherwise deadlock prompt completion.
+			owner.deferredFrames.push(frame);
+			return;
+		}
+		++record.pendingFrames;
+		const task = record.frameTail.then(async () => {
+			try {
+				await this.#handleSdkFrame(id, adapter, frame, owner ?? null);
+			} finally {
+				--record.pendingFrames;
+			}
+		});
 		record.frameTail = task.catch(
 			async error => await this.#failSession(id, adapter, this.#frameProcessingFailure(error)),
 		);
 	}
 
-	async #handleSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): Promise<void> {
+	async #handleSdkFrame(
+		id: string,
+		adapter: AcpSdkAdapter,
+		frame: JsonObject,
+		owner?: PromptWaiter | null,
+	): Promise<void> {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		const activePrompt =
+			owner === null
+				? undefined
+				: owner
+					? owner === record.activePrompt || record.replayPrompts.includes(owner)
+						? owner
+						: undefined
+					: record.activePrompt;
 		if ((frame.type === "hello" || frame.type === "server_hello") && typeof frame.connectionId === "string") {
 			const reconnected = record.connectionId !== undefined && record.connectionId !== frame.connectionId;
 			record.connectionId = frame.connectionId;
 			if (reconnected) {
-				const waiter = record.activePrompt;
+				// Delayed hello frames retain their ingress owner; never reject a prompt
+				// that became active while this frame waited behind delivery.
+				const waiter = owner;
 				if (waiter && !waiter.settled && !waiter.terminal) {
-					record.activePrompt = undefined;
+					if (record.activePrompt === waiter) record.activePrompt = undefined;
+					const replayIndex = record.replayPrompts.indexOf(waiter);
+					if (replayIndex >= 0) record.replayPrompts.splice(replayIndex, 1);
 					waiter.settled = true;
 					if (hasCorrelation(waiter.correlation)) {
 						record.settledPromptCorrelations.push(waiter.correlation);
@@ -1554,7 +1640,6 @@ export class AcpAgent implements Agent {
 		const { event, wirePayload } = received;
 		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
 		const correlation = (isTerminal ? strictCorrelationFrom(frame, event) : correlationFrom(frame, event)) ?? {};
-		const activePrompt = record.activePrompt;
 		const outcome = isTerminal ? terminalOutcome(event) : undefined;
 		if (isTerminal) {
 			// Terminal ownership requires a complete identity. Unowned, partial, and
@@ -1565,7 +1650,11 @@ export class AcpAgent implements Agent {
 				activePrompt.deferredFrames.push(frame);
 				return;
 			}
-			if (!correlationsExactlyMatch(activePrompt.correlation, correlation) || activePrompt.terminal) return;
+			if (
+				!correlationsExactlyMatch(activePrompt.correlation, correlation) ||
+				(activePrompt.terminal && activePrompt.terminalFrame !== frame)
+			)
+				return;
 			if (!outcome) {
 				const detail =
 					typeof (event as { error?: { message?: unknown } }).error?.message === "string"
@@ -1578,7 +1667,8 @@ export class AcpAgent implements Agent {
 				);
 				return;
 			}
-			activePrompt.terminal = { outcome, correlation };
+			activePrompt.terminalFrame = frame;
+			activePrompt.terminal ??= { outcome, correlation };
 		}
 		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
 		if (
@@ -1600,9 +1690,9 @@ export class AcpAgent implements Agent {
 			}
 			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
 		}
-		// After a correlated settlement with no active prompt, correlationless wire frames
+		// After a correlated settlement with no prompt owner, correlationless wire frames
 		// have no prompt to belong to and must not publish further updates.
-		if (!record.activePrompt && record.settledPromptCorrelations.length > 0 && !hasCorrelation(correlation)) return;
+		if (!activePrompt && record.settledPromptCorrelations.length > 0 && !hasCorrelation(correlation)) return;
 		if (wirePayload) {
 			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
 				cwd: record.cwd,
@@ -1671,13 +1761,25 @@ export class AcpAgent implements Agent {
 		} else if (event.type === "agent_failed") {
 			await this.#emitEndOfTurnUpdates(id, adapter);
 		}
+		if (event.type === "agent_end" || event.type === "agent_failed")
+			if (activePrompt?.terminalFrame === frame) activePrompt.terminalFrame = undefined;
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
 	}
 
+	#resolvePromptResponse(waiter: PromptWaiter, outcome: SdkPromptTerminalOutcome): void {
+		if (waiter.responseResolved) return;
+		waiter.responseResolved = true;
+		if (outcome.kind === "stopped") {
+			waiter.resolve({ stopReason: outcome.reason });
+			return;
+		}
+		waiter.reject(new AcpSdkAdapterError(outcome.code, outcome.message));
+	}
 	#rejectPrompt(record: SessionRecord, waiter: PromptWaiter, error: AcpSdkAdapterError): void {
 		if (record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
 		waiter.settled = true;
+		waiter.responseResolved = true;
 		waiter.deferredFrames.length = 0;
 		waiter.terminal = undefined;
 		if (hasCompleteCorrelation(waiter.correlation)) {
@@ -1689,14 +1791,18 @@ export class AcpAgent implements Agent {
 	}
 
 	#settlePrompt(record: SessionRecord, waiter: PromptWaiter): void {
-		if (record.activePrompt !== waiter || waiter.settled || !waiter.acknowledged || !waiter.terminal) return;
+		const ownsActivePrompt = record.activePrompt === waiter;
+		const replayIndex = record.replayPrompts.indexOf(waiter);
+		if ((!ownsActivePrompt && replayIndex < 0) || waiter.settled || !waiter.acknowledged || !waiter.terminal) return;
+		if (waiter.responseResolved && waiter.terminalFrame) return;
 		// A terminal captured before acknowledgement is only this prompt's terminal when the
 		// eventual acknowledgement correlates with it; otherwise it belonged to an earlier prompt.
 		if (!correlationsExactlyMatch(waiter.correlation, waiter.terminal.correlation)) {
 			waiter.terminal = undefined;
 			return;
 		}
-		record.activePrompt = undefined;
+		if (ownsActivePrompt) record.activePrompt = undefined;
+		if (replayIndex >= 0) record.replayPrompts.splice(replayIndex, 1);
 		waiter.settled = true;
 		if (hasCorrelation(waiter.correlation)) {
 			record.settledPromptCorrelations.push(waiter.correlation);
@@ -1704,11 +1810,7 @@ export class AcpAgent implements Agent {
 				record.settledPromptCorrelations.shift();
 		}
 		const { outcome } = waiter.terminal;
-		if (outcome.kind === "stopped") {
-			waiter.resolve({ stopReason: outcome.reason });
-			return;
-		}
-		waiter.reject(new AcpSdkAdapterError(outcome.code, outcome.message));
+		this.#resolvePromptResponse(waiter, outcome);
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter): Promise<void> {

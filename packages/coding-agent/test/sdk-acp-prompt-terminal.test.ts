@@ -14,6 +14,9 @@ type Fixture = {
 	sessionId: string;
 	updates: SessionNotification[];
 	promptDelivered: Promise<void>;
+	promptDeliveryCount: number;
+	blockedUpdateStarted: Promise<void>;
+	releaseBlockedUpdate(): void;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
 	sendAssistantMessage(text: string): void;
@@ -46,6 +49,8 @@ async function createFixture(
 		terminalBeforeAcknowledgement?: boolean;
 		preAcknowledgementTerminal?: Record<string, unknown>;
 		promptAcknowledgement?: Record<string, unknown>;
+		preAcknowledgementFrames?: Record<string, unknown>[];
+		blockAgentMessageChunk?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -61,6 +66,22 @@ async function createFixture(
 	const abort = new AbortController();
 	let promptSocket: TestSocket | undefined;
 	let server!: ReturnType<typeof Bun.serve>;
+	const blockedUpdateStarted = Promise.withResolvers<void>();
+	const blockedUpdate = Promise.withResolvers<void>();
+	let promptDeliveryCount = 0;
+	let blockedUpdateReleased = false;
+	const releaseBlockedUpdate = (): void => {
+		if (blockedUpdateReleased) return;
+		blockedUpdateReleased = true;
+		blockedUpdate.resolve();
+	};
+	const sessionUpdate = async (update: SessionNotification): Promise<void> => {
+		updates.push(update);
+		if (options.blockAgentMessageChunk && update.update.sessionUpdate === "agent_message_chunk") {
+			blockedUpdateStarted.resolve();
+			await blockedUpdate.promise;
+		}
+	};
 
 	const send = (frame: Record<string, unknown>): void => {
 		if (!promptSocket) throw new Error("Expected prompt socket");
@@ -151,8 +172,12 @@ async function createFixture(
 				}
 				if (frame.type !== "control_request") return;
 				if (frame.operation === "turn.prompt") {
+					++promptDeliveryCount;
 					promptSocket = socket;
 					delivered.resolve();
+					if (promptDeliveryCount === 1)
+						for (const preAcknowledgementFrame of options.preAcknowledgementFrames ?? [])
+							send(preAcknowledgementFrame);
 					if (options.terminalBeforeAcknowledgement)
 						sendTerminal(
 							options.preAcknowledgementTerminal ?? {
@@ -195,7 +220,7 @@ async function createFixture(
 	});
 	const agent = new AcpAgent(
 		{
-			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			sessionUpdate,
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
@@ -217,6 +242,11 @@ async function createFixture(
 		sessionId: created.sessionId,
 		updates,
 		promptDelivered: delivered.promise,
+		get promptDeliveryCount() {
+			return promptDeliveryCount;
+		},
+		blockedUpdateStarted: blockedUpdateStarted.promise,
+		releaseBlockedUpdate,
 		sendStopped,
 		sendFailed,
 		sendAssistantMessage,
@@ -295,6 +325,106 @@ test("ACP prompt rejects prompt_deadline_exceeded terminal outcomes with their c
 	}
 });
 
+test("ACP delayed hello settles the captured early-terminal owner, not a later prompt", async () => {
+	const fixture = await createFixture({
+		blockAgentMessageChunk: true,
+		preAcknowledgementFrames: [
+			{
+				type: "event",
+				payload: {
+					event_type: "message_end",
+					event: {
+						type: "message_end",
+						message: { role: "assistant", content: [{ type: "text", text: "blocked" }] },
+					},
+				},
+			},
+			{ type: "server_hello", connectionId: "sdk-acp-prompt-terminal-reconnected" },
+			{
+				type: "agent_end",
+				sessionId: "prompt-terminal-session",
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		],
+	});
+	try {
+		const first = prompt(fixture, "early terminal owner");
+		await bounded(fixture.blockedUpdateStarted, "blocked assistant update");
+		expect(await bounded(first, "early terminal owner completion")).toEqual({ stopReason: "end_turn" });
+
+		const second = prompt(fixture, "later prompt");
+		await waitFor(() => fixture.promptDeliveryCount === 2, "later prompt delivery");
+		let secondSettled = false;
+		void second.then(
+			() => {
+				secondSettled = true;
+			},
+			() => {
+				secondSettled = true;
+			},
+		);
+		await Bun.sleep(20);
+		expect(secondSettled).toBe(false);
+
+		fixture.releaseBlockedUpdate();
+		fixture.sendStopped("end_turn");
+		expect(await bounded(second, "later prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+test("ACP queued frames retain their no-owner ingress snapshot across a later prompt", async () => {
+	const fixture = await createFixture({
+		blockAgentMessageChunk: true,
+		preAcknowledgementFrames: [
+			{
+				type: "event",
+				payload: {
+					event_type: "message_end",
+					event: {
+						type: "message_end",
+						message: { role: "assistant", content: [{ type: "text", text: "blocked" }] },
+					},
+				},
+			},
+			{ type: "server_hello", connectionId: "sdk-acp-prompt-terminal-reconnected" },
+			{
+				type: "agent_end",
+				sessionId: "prompt-terminal-session",
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		],
+	});
+	try {
+		const first = prompt(fixture, "initial prompt");
+		await bounded(fixture.blockedUpdateStarted, "blocked assistant update");
+		expect(await bounded(first, "initial prompt completion")).toEqual({ stopReason: "end_turn" });
+
+		fixture.sendAssistantMessage("stale no-owner frame");
+		await Bun.sleep(20);
+		const second = prompt(fixture, "later prompt");
+		await waitFor(() => fixture.promptDeliveryCount === 2, "later prompt delivery");
+
+		fixture.releaseBlockedUpdate();
+		fixture.sendStopped("end_turn");
+		expect(await bounded(second, "later prompt completion")).toEqual({ stopReason: "end_turn" });
+		await Bun.sleep(30);
+		expect(
+			fixture.updates.some(
+				update =>
+					update.update.sessionUpdate === "agent_message_chunk" &&
+					update.update.content.type === "text" &&
+					update.update.content.text === "stale no-owner frame",
+			),
+		).toBe(false);
+	} finally {
+		fixture.dispose();
+	}
+});
 test("ACP prompt settles exactly once when terminal arrives before acknowledgement", async () => {
 	const fixture = await createFixture({ terminalBeforeAcknowledgement: true });
 	try {

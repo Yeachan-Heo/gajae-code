@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +19,7 @@ import {
 	validateBrokerModelPresetForTest,
 	writeSessionLifecycleFailure,
 } from "../src/sdk/broker/lifecycle";
+import { sdkQuerySurface } from "../src/sdk/bus/index";
 import { CursorRegistry, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 
@@ -151,6 +152,48 @@ describe("model profile capability contract", () => {
 });
 
 describe("Q27 models.profiles.list", () => {
+	it("keeps a refreshable OAuth profile available without refreshing its credential", async () => {
+		const mutatingLookup = vi.fn(async () => {
+			throw new Error("getApiKeyForProvider must not be used for profile availability");
+		});
+		const peekLookup = vi.fn(async () => undefined);
+		const hasConfiguredProviderAuth = vi.fn(() => true);
+		const surface = sdkQuerySurface(
+			{
+				modelRegistry: {
+					getModelProfiles: () =>
+						new Map([
+							[
+								"probe-profile",
+								{
+									name: "probe-profile",
+									requiredProviders: ["provider-a"],
+									displayName: "Probe Profile",
+									modelMapping: { default: "provider-a/model" },
+									source: "builtin",
+								},
+							],
+						]),
+					getError: () => undefined,
+					getApiKeyForProvider: mutatingLookup,
+					peekApiKeyForProvider: peekLookup,
+					hasConfiguredProviderAuth,
+				},
+			} as never,
+			"q27-probe",
+			{} as never,
+			undefined,
+			undefined,
+			undefined,
+			() => undefined,
+		);
+		await expect(surface.getModelProfiles?.()).resolves.toEqual([
+			{ id: "probe-profile", displayName: "Probe Profile", source: "builtin", available: true },
+		]);
+		expect(hasConfiguredProviderAuth).toHaveBeenCalledWith("provider-a");
+		expect(peekLookup).not.toHaveBeenCalled();
+		expect(mutatingLookup).not.toHaveBeenCalled();
+	});
 	it("retains one sorted catalog revision across pages and refreshes on a cursorless request", async () => {
 		const oldCatalog = Array.from({ length: 6 }, (_, index) => ({
 			id: `old-${index}`,

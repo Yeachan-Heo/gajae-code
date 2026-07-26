@@ -20,6 +20,7 @@ import {
 	setLifecycleCommandResolverForTest,
 	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
+	writeSessionLifecycleLaunchRequest,
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
@@ -271,6 +272,7 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 		effectMarker: "subprocess-proof",
 		...deriveLifecycleDeadlines(Date.now(), 10_000),
 	} as const;
+	const requestPath = await writeSessionLifecycleLaunchRequest(stateRoot, sessionId, request);
 	const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "sdk", "session-host-internal"], {
 		cwd: root,
 		env: {
@@ -280,7 +282,7 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 			GJC_CODING_AGENT_DIR: agentDir,
 			GJC_SESSION_ID: sessionId,
 			GJC_LIFECYCLE_REQUEST_ID: "subprocess-proof",
-			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+			GJC_SDK_LIFECYCLE_REQUEST_FILE: requestPath,
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -501,7 +503,12 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 	const sessionId = "exact-cutoff";
 	const effectMarker = "exact-cutoff-marker";
 	const deadlines = deriveLifecycleDeadlines(1_000, 4_000);
-	const names = ["GJC_AGENT_DIR", "GJC_STATE_ROOT", "GJC_LIFECYCLE_REQUEST_ID", "GJC_SDK_LIFECYCLE_REQUEST"] as const;
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST_FILE",
+	] as const;
 	const previous = names.map(name => process.env[name]);
 	try {
 		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
@@ -512,7 +519,7 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 		process.env.GJC_AGENT_DIR = agentDir;
 		process.env.GJC_STATE_ROOT = stateRoot;
 		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
-		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
+		const requestPath = await writeSessionLifecycleLaunchRequest(stateRoot, sessionId, {
 			operation: "session.create",
 			sessionId,
 			cwd: root,
@@ -520,6 +527,7 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 			effectMarker,
 			...deadlines,
 		});
+		process.env.GJC_SDK_LIFECYCLE_REQUEST_FILE = requestPath;
 		await expect(
 			runSessionHost({
 				now: () => deadlines.semanticReadyDeadlineAt,
@@ -528,6 +536,7 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 				processIncarnation: () => "test-incarnation",
 			}),
 		).rejects.toThrow("readiness cutoff");
+		await expect(fs.stat(requestPath)).rejects.toMatchObject({ code: "ENOENT" });
 		const artifact = JSON.parse(
 			await fs.readFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`), "utf8"),
 		) as { rollback: Record<string, unknown>; reason: string };
@@ -556,7 +565,12 @@ test("session host fails closed when its lifecycle effect marker is corrupt", as
 	const sessionId = "corrupt-marker";
 	const effectMarker = "corrupt-marker-effect";
 	const deadlines = deriveLifecycleDeadlines(1_000, 4_000);
-	const names = ["GJC_AGENT_DIR", "GJC_STATE_ROOT", "GJC_LIFECYCLE_REQUEST_ID", "GJC_SDK_LIFECYCLE_REQUEST"] as const;
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST_FILE",
+	] as const;
 	const previous = names.map(name => process.env[name]);
 	try {
 		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
@@ -564,7 +578,7 @@ test("session host fails closed when its lifecycle effect marker is corrupt", as
 		process.env.GJC_AGENT_DIR = agentDir;
 		process.env.GJC_STATE_ROOT = stateRoot;
 		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
-		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
+		const requestPath = await writeSessionLifecycleLaunchRequest(stateRoot, sessionId, {
 			operation: "session.create",
 			sessionId,
 			cwd: root,
@@ -572,6 +586,7 @@ test("session host fails closed when its lifecycle effect marker is corrupt", as
 			effectMarker,
 			...deadlines,
 		});
+		process.env.GJC_SDK_LIFECYCLE_REQUEST_FILE = requestPath;
 		await expect(
 			runSessionHost({
 				now: () => deadlines.semanticReadyDeadlineAt,
@@ -580,6 +595,7 @@ test("session host fails closed when its lifecycle effect marker is corrupt", as
 				processIncarnation: () => "test-incarnation",
 			}),
 		).rejects.toThrow("marker authority was not published");
+		await expect(fs.stat(requestPath)).rejects.toMatchObject({ code: "ENOENT" });
 		await expect(fs.stat(path.join(stateRoot, "sdk", `${sessionId}.json`))).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
 		names.forEach((name, index) => {
@@ -720,6 +736,46 @@ test("broker fails closed for failed or malformed Windows FILETIME process-incar
 		).toBeUndefined();
 	}
 });
+test("lifecycle request files require a verified Windows user DACL before publication", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-request-dacl-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const request = {
+		operation: "session.create" as const,
+		sessionId: "dacl-test",
+		cwd: root,
+		stateRoot,
+		...deriveLifecycleDeadlines(Date.now(), 4_000),
+	};
+	try {
+		const calls: Array<{ command: string; args: readonly string[] }> = [];
+		const requestPath = await writeSessionLifecycleLaunchRequest(stateRoot, request.sessionId, request, {
+			platform: "win32",
+			runCommand(command, args) {
+				calls.push({ command, args });
+				return { exitCode: 0, stdout: "GJC_LIFECYCLE_REQUEST_DACL_OK\n" };
+			},
+		});
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.command).toBe("powershell.exe");
+		expect(calls[0]?.args.slice(0, 4)).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+		expect(calls[0]?.args[4]).toContain("FileSystemRights]::Delete");
+		expect(calls[0]?.args.at(-1)).toBe(requestPath);
+		await fs.access(requestPath);
+
+		await expect(
+			writeSessionLifecycleLaunchRequest(stateRoot, request.sessionId, request, {
+				platform: "win32",
+				runCommand: () => ({ exitCode: 1, stdout: "DACL failed" }),
+			}),
+		).rejects.toThrow("user-restricted DACL");
+		const requestFiles = (await fs.readdir(path.join(stateRoot, "sdk"))).filter(name =>
+			name.includes(".lifecycle-request."),
+		);
+		expect(requestFiles).toEqual([path.basename(requestPath)]);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
 
 test("broker bounds a hanging WebSocket upgrade by the lifecycle deadline and cleans its child", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-hanging-upgrade-"));
@@ -727,6 +783,7 @@ test("broker bounds a hanging WebSocket upgrade by the lifecycle deadline and cl
 	const fixture = path.join(agentDir, "hanging-upgrade.js");
 	const fixturePidPath = path.join(agentDir, "hanging-upgrade.pid");
 	const fixtureRequestPath = path.join(agentDir, "hanging-upgrade.request.json");
+	const fixtureEnvPath = path.join(agentDir, "hanging-upgrade.env.json");
 	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
 	const previousUrl = process.env.GJC_HANGING_UPGRADE_URL;
 	const hangingUpgrade = Bun.serve({
@@ -746,7 +803,8 @@ const fs=require('fs'), path=require('path'), crypto=require('crypto');
 const root=process.env.GJC_STATE_ROOT, id=process.env.GJC_SESSION_ID, agent=process.env.GJC_AGENT_DIR;
 fs.mkdirSync(path.join(root,'sdk'),{recursive:true});
 fs.writeFileSync(${JSON.stringify(fixturePidPath)},String(process.pid));
-fs.writeFileSync(${JSON.stringify(fixtureRequestPath)},process.env.GJC_SDK_LIFECYCLE_REQUEST);
+fs.writeFileSync(${JSON.stringify(fixtureRequestPath)},fs.readFileSync(process.env.GJC_SDK_LIFECYCLE_REQUEST_FILE,'utf8'));
+fs.writeFileSync(${JSON.stringify(fixtureEnvPath)},JSON.stringify(process.env));
 const endpoint=path.join(root,'sdk',id+'.json');
 fs.writeFileSync(endpoint,JSON.stringify({sessionId:id,pid:process.pid,url:process.env.GJC_HANGING_UPGRADE_URL,token:'hang'}));
 const m=fs.statSync(endpoint).mtimeMs;
@@ -762,7 +820,19 @@ setInterval(()=>{},1000);
 		const started = Date.now();
 		const lifecycle = broker.handleRequest(
 			"session.create",
-			{ cwd: agentDir, stateRoot, readinessTimeoutMs: 4_000 },
+			{
+				cwd: agentDir,
+				stateRoot,
+				readinessTimeoutMs: 4_000,
+				mcpServers: [
+					{
+						name: "secret-mcp",
+						command: "/usr/bin/true",
+						args: [],
+						env: { GJC_LIFECYCLE_CREDENTIAL: "request-only-secret" },
+					},
+				],
+			},
 			"hanging-upgrade",
 		);
 		const request = await waitFor(async () => {
@@ -775,6 +845,14 @@ setInterval(()=>{},1000);
 				return undefined;
 			}
 		}, "hanging-upgrade lifecycle request");
+		const childEnvironment = JSON.parse(await fs.readFile(fixtureEnvPath, "utf8")) as Record<
+			string,
+			string | undefined
+		>;
+		expect(childEnvironment.GJC_SDK_LIFECYCLE_REQUEST).toBeUndefined();
+		expect(childEnvironment.GJC_LIFECYCLE_CREDENTIAL).toBeUndefined();
+		expect(JSON.stringify(childEnvironment)).not.toContain("request-only-secret");
+		expect(JSON.stringify(request)).toContain("request-only-secret");
 		fixturePid = Number(await fs.readFile(fixturePidPath, "utf8"));
 		const incarnation = processIncarnation(fixturePid);
 		if (!incarnation || !request.effectMarker || !request.sessionId)
@@ -813,7 +891,7 @@ const fs=require('fs'), path=require('path'), crypto=require('crypto');
 const root=process.env.GJC_STATE_ROOT, id=process.env.GJC_SESSION_ID, agent=process.env.GJC_AGENT_DIR;
 fs.mkdirSync(path.join(root,'sdk'),{recursive:true});
 fs.writeFileSync(path.join(agent,'fixture.pid'),String(process.pid));
-fs.writeFileSync(path.join(agent,'fixture.request.json'),process.env.GJC_SDK_LIFECYCLE_REQUEST);
+fs.writeFileSync(path.join(agent,'fixture.request.json'),fs.readFileSync(process.env.GJC_SDK_LIFECYCLE_REQUEST_FILE,'utf8'));
 
 fs.writeFileSync(path.join(root,'sdk',id+'.json'),JSON.stringify({sessionId:id,pid:process.pid,url:'ws://127.0.0.1:1',token:'fake'}));
 const m=fs.statSync(path.join(root,'sdk',id+'.json')).mtimeMs;
@@ -2216,7 +2294,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SessionIndex } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/session-index.ts"))};
 import { writeSessionLifecycleFailure } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"))};
-const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+const requestPath = process.env.GJC_SDK_LIFECYCLE_REQUEST_FILE!;
+const request = JSON.parse(await fs.readFile(requestPath, "utf8"));
+await fs.unlink(requestPath);
 const endpoint = path.join(request.stateRoot, "sdk", request.sessionId + ".json");
 await fs.mkdir(path.dirname(endpoint), { recursive: true, mode: 0o700 });
 await fs.writeFile(endpoint, JSON.stringify({ sessionId: request.sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "owned-startup-failure" }), { mode: 0o600 });
@@ -2985,6 +3065,14 @@ test("session-host-internal exits with a sanitized startup failure before writin
 	try {
 		await fs.mkdir(path.dirname(stateRoot), { recursive: true });
 		await fs.writeFile(stateRoot, "not-a-directory");
+		const requestPath = await writeSessionLifecycleLaunchRequest(path.join(root, "bootstrap"), sessionId, {
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker: "startup-failure-proof",
+			...deriveLifecycleDeadlines(Date.now(), 10_000),
+		});
 		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "sdk", "session-host-internal"], {
 			cwd: root,
 			env: {
@@ -2994,14 +3082,7 @@ test("session-host-internal exits with a sanitized startup failure before writin
 				GJC_CODING_AGENT_DIR: agentDir,
 				GJC_SESSION_ID: sessionId,
 				GJC_LIFECYCLE_REQUEST_ID: "startup-failure-proof",
-				GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify({
-					operation: "session.create",
-					sessionId,
-					cwd: root,
-					stateRoot,
-					effectMarker: "startup-failure-proof",
-					...deriveLifecycleDeadlines(Date.now(), 10_000),
-				}),
+				GJC_SDK_LIFECYCLE_REQUEST_FILE: requestPath,
 			},
 			stdout: "pipe",
 			stderr: "pipe",

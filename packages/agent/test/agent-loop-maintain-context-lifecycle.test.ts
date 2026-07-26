@@ -384,6 +384,7 @@ it("rejects reuse of a consumed standalone continuation claim before provider wo
 		streamFn,
 	);
 	await expect(duplicate.result()).rejects.toThrow("Standalone prompt continuation ownership is unavailable");
+	expect(duplicate.queue.map(event => event.type)).toEqual([]);
 
 	const terminal = createAssistantMessage([{ type: "text", text: "late completion" }]);
 	pendingContinuation.push({ type: "done", reason: "stop", message: terminal });
@@ -445,6 +446,7 @@ it("keeps one Agent logical resource domain across single-model maintenance cont
 	});
 
 	await agent.prompt("run tool");
+	expect(events.filter(event => event.type === "agent_start")).toHaveLength(1);
 	expect(maintenanceHandle).toBeDefined();
 	expect(maintenanceDomain).toBeDefined();
 	await agent.continue({

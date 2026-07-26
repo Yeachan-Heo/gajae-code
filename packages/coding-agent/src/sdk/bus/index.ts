@@ -32,7 +32,6 @@ import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
-import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
@@ -67,6 +66,7 @@ import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } fro
 import { projectQ10Models } from "../models.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -1967,7 +1967,7 @@ function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): 
 	return new Set(candidates.map(operation => operation.sdkId));
 }
 
-function sdkQuerySurface(
+export function sdkQuerySurface(
 	ctx: ExtensionContext,
 	id: string,
 	api: ExtensionAPI,
@@ -2057,8 +2057,8 @@ function sdkQuerySurface(
 			await Promise.all(
 				[...providers].map(async provider => {
 					try {
-						const credential = await ctx.modelRegistry.getApiKeyForProvider(provider, id);
-						if (credential === kNoAuth || isAuthenticated(credential)) authenticatedProviders.add(provider);
+						// Availability is advisory; inspect configured credential state without refreshing OAuth or altering session credentials.
+						if (ctx.modelRegistry.hasConfiguredProviderAuth(provider)) authenticatedProviders.add(provider);
 					} catch {
 						// A provider whose credential state cannot be read is not currently configurable.
 					}
@@ -2068,6 +2068,13 @@ function sdkQuerySurface(
 				...item,
 				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
 			}));
+		},
+		getActiveProviders: () => {
+			try {
+				return ctx.modelRegistry.getActiveProviders(ctx.model);
+			} catch {
+				throw new ActiveProviderResolutionError();
+			}
 		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
@@ -2213,6 +2220,21 @@ function sdkControlSurface(
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
+		const selector = id.trim();
+		const exactMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}` === selector);
+		if (exactMatches.length === 1) return exactMatches[0];
+		if (exactMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
+
+		const normalized = selector.toLowerCase();
+		const caseInsensitiveMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalized);
+		if (caseInsensitiveMatches.length === 1) return caseInsensitiveMatches[0];
+		if (caseInsensitiveMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
 		const [provider, ...modelId] = id.split("/");
 		const model =
 			modelId.length > 0

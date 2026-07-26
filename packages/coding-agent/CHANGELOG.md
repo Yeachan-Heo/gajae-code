@@ -13,6 +13,19 @@
 
 - Canonical wrapped first-event timeouts now continue the same clean turn through bounded retries and configured fallback rotation, while preserving replay-safety, cancellation, provider-terminal policies, exact attempt diagnostics, and task/subagent retry-status truth (#3553).
 - Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
+### Added
+- Added the paginated public SDK query `providers.list/active` (Q29), returning deterministic, deduplicated `{ provider, connectionKind }` descriptors for locally eligible providers without exposing credentials or performing remote health probes.
+- Added cross-platform memory-pressure observability with effective host/cgroup limits, configurable GC and restart advisory thresholds, typed Linux process probes, and a Windows Job Object native probe; unsupported lifecycle actions remain advisory-only.
+
+### Fixed
+- Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
+- `model.profile.set` now exposes `model_profile_registry_error` to SDK clients when profile activation detects an invalid model registry, and Windows memory-pressure probing uses the compile-safe top-level native loader rather than a function-local CommonJS dependency.
+- Profile availability checks now reject dangling selected credentials even when a runtime or configuration API-key override exists, matching the authoritative profile-activation path without refreshing credentials.
+- First-pass provider discovery now retains the initially resolved command-backed credential when resolution changes its evidence generation, preventing multi-key round-robin from discarding valid discovery results as stale.
+- Descriptor-only provider discovery now retains the first resolved command-backed credential through evidence-generation updates, and malformed tool-call circuit breakers mark their synthetic terminal as non-retryable even for single-model sessions.
+- Keyless providers now take their no-auth fallback before irrelevant selected-credential validation, so dangling selectors cannot make available profiles disagree with activation.
+- Windows memory-pressure sampling now caches the resolved native probe, avoiding repeated native-loader setup work while retaining its unsupported-platform fallback.
+- MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. Both explicit and default MCP startup waits honor that ceiling, so an ACP launch that reaches the readiness cutoff before MCP startup fails fast as pending startup instead of silently crossing its deadline.
 
 ## [0.12.4] - 2026-07-30
 

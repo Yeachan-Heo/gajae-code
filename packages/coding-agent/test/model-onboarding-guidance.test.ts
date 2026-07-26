@@ -131,6 +131,96 @@ describe("model onboarding guidance", () => {
 		expectProviderOnboardingGuidance(output);
 		expect(output).not.toContain("Use ACP `session/setModel`");
 	});
+	it("refreshes slash-containing discoverable providers before rejecting a selector", async () => {
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "model");
+		expect(command?.handle).toBeTruthy();
+		const outputs: string[] = [];
+		const refreshedProviders: string[] = [];
+		const runtime = createRuntime(outputs);
+		Object.defineProperty(runtime.session, "modelRegistry", {
+			value: {
+				getDiscoverableProviders: () => ["env/provider"],
+				refreshProvider: async (provider: string) => {
+					refreshedProviders.push(provider);
+				},
+				getProviderDiscoveryState: () => ({
+					provider: "env/provider",
+					status: "empty",
+					optional: false,
+					stale: false,
+					models: [],
+				}),
+			},
+		});
+
+		await command?.handle?.(
+			{ name: "model", args: "env/provider/model", text: "/model env/provider/model" },
+			runtime,
+		);
+
+		expect(refreshedProviders).toEqual(["env/provider"]);
+		expect(outputs.join("\n")).toContain("Provider env/provider discovery succeeded but returned no models.");
+	});
+	it("uses exact casing only for equal-length prefixes, chooses the longest prefix, and rejects ambiguous prefixes", async () => {
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "model");
+		expect(command?.handle).toBeTruthy();
+		const outputs: string[] = [];
+		const refreshedProviders: string[] = [];
+		const runtime = createRuntime(outputs);
+		Object.defineProperty(runtime.session, "modelRegistry", {
+			value: {
+				getDiscoverableProviders: () => ["foo", "Foo", "env", "env/provider"],
+				refreshProvider: async (provider: string) => {
+					refreshedProviders.push(provider);
+				},
+				getProviderDiscoveryState: () => ({
+					provider: "Foo",
+					status: "empty",
+					optional: false,
+					stale: false,
+					models: [],
+				}),
+			},
+		});
+
+		await command?.handle?.({ name: "model", args: "Foo/model", text: "/model Foo/model" }, runtime);
+		await command?.handle?.({ name: "model", args: "fOo/model", text: "/model fOo/model" }, runtime);
+		await command?.handle?.(
+			{ name: "model", args: "ENV/PROVIDER/model", text: "/model ENV/PROVIDER/model" },
+			runtime,
+		);
+
+		expect(refreshedProviders).toEqual(["Foo", "env/provider"]);
+	});
+	it("chooses a longer case-folded provider over a shorter exact prefix", async () => {
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "model");
+		expect(command?.handle).toBeTruthy();
+		const outputs: string[] = [];
+		const refreshedProviders: string[] = [];
+		const runtime = createRuntime(outputs);
+		Object.defineProperty(runtime.session, "modelRegistry", {
+			value: {
+				getDiscoverableProviders: () => ["env", "Env/provider"],
+				refreshProvider: async (provider: string) => {
+					refreshedProviders.push(provider);
+				},
+				getProviderDiscoveryState: () => ({
+					provider: "Env/provider",
+					status: "empty",
+					optional: false,
+					stale: false,
+					models: [],
+				}),
+			},
+		});
+
+		await command?.handle?.(
+			{ name: "model", args: "env/provider/model", text: "/model env/provider/model" },
+			runtime,
+		);
+
+		expect(refreshedProviders).toEqual(["Env/provider"]);
+	});
 
 	it("uses shared provider onboarding text for SDK no-model fallback", async () => {
 		const agentDir = await createTempDir();

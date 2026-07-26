@@ -227,4 +227,133 @@ describe("malformed tool-call circuit breaker", () => {
 		if (last?.role !== "assistant") throw new Error("expected an assistant message");
 		expect(last.stopReason).not.toBe("error");
 	}, 30_000);
+	it("resets malformed state after a healthy tool-free turn", async () => {
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [throwingTool()],
+		};
+		let followUpDelivered = false;
+		const malformedResponses = Array.from({ length: 8 }, (_value, index) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id: `tool-${index}`,
+					name: "echo",
+					arguments: { rotating: index },
+				},
+			],
+		}));
+		const mock = createMockModel({
+			responses: [
+				...malformedResponses.slice(0, 4),
+				{ content: ["healthy answer"] },
+				...malformedResponses.slice(4),
+				{ content: ["healthy follow-up answer"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			getFollowUpMessages: async () => {
+				if (followUpDelivered) return [];
+				followUpDelivered = true;
+				return [createUserMessage("continue")];
+			},
+		};
+
+		const stream = agentLoopContinue(context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+		const produced = (await stream.result()) as AgentMessage[];
+
+		expect(mock.calls.length).toBe(10);
+		const last = produced.findLast(message => message.role === "assistant");
+		if (last?.role !== "assistant") throw new Error("expected an assistant message");
+		expect(last.stopReason).not.toBe("error");
+		expect(last.content.some(block => block.type === "text" && block.text === "healthy follow-up answer")).toBe(true);
+	});
+
+	it("reports the malformed-loop breaker as terminal under managed fallback", async () => {
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [throwingTool()],
+		};
+		const outcomes: string[] = [];
+		let calls = 0;
+		const mock = createMockModel({
+			handler: () => {
+				calls += 1;
+				return {
+					content: [
+						{
+							type: "toolCall" as const,
+							id: `tool-${calls}`,
+							name: "echo",
+							arguments: { rotating: calls },
+						},
+					],
+				};
+			},
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome.type);
+				return { type: "retry", continuation: () => {} };
+			},
+		};
+
+		const stream = agentLoopContinue(context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+		await stream.result();
+
+		expect(calls).toBeLessThan(RUNAWAY_CAP);
+		expect(outcomes).toEqual(["run_terminal"]);
+	});
+	it("stops a single-model session without replaying the breaker", async () => {
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [throwingTool()],
+		};
+		let calls = 0;
+		const mock = createMockModel({
+			handler: () => {
+				calls += 1;
+				return {
+					content: [
+						{
+							type: "toolCall" as const,
+							id: `tool-${calls}`,
+							name: "echo",
+							arguments: { rotating: calls },
+						},
+					],
+				};
+			},
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoopContinue(context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+		const produced = (await stream.result()) as AgentMessage[];
+
+		// The one-entry/single-model path has no managed callback to classify the
+		// synthetic breaker as terminal, so its message carries a non-retryable
+		// invalid-request marker instead of being replayed as an unknown error.
+		expect(calls).toBe(5);
+		const last = produced.findLast(message => message.role === "assistant");
+		if (last?.role !== "assistant") throw new Error("expected an assistant message");
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("Invalid request:");
+	}, 30_000);
 });

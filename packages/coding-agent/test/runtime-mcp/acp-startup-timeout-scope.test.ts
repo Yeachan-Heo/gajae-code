@@ -36,6 +36,10 @@ describe("MCP startup ceiling is ACP-scoped (PR #3164 Option B)", () => {
 		// A modest timeout still gets timeout + grace, below the ceiling.
 		expect(resolveStartupTimeoutMs([stdioServer(400)])).toBe(400 + GRACE_MS);
 	});
+	it("caps the default no-timeout wait to a sub-250 ms readiness ceiling", () => {
+		expect(resolveStartupTimeoutMs([stdioServer()], 1)).toBe(1);
+		expect(resolveStartupTimeoutMs([stdioServer()], 249)).toBe(249);
+	});
 
 	it("grants an ACP lifecycle launch the larger budget it was given", () => {
 		// With ample budget, an ACP MCP server gets its full configured timeout
@@ -60,9 +64,8 @@ describe("MCP startup ceiling is ACP-scoped (PR #3164 Option B)", () => {
 		}
 	});
 
-	it("never returns less than the base startup wait", () => {
-		// A tiny ACP budget still cannot starve startup below the floor.
-		expect(resolveStartupTimeoutMs([stdioServer(600_000)], 10)).toBe(BASE_STARTUP_MS);
+	it("honors a tiny lifecycle startup ceiling", () => {
+		expect(resolveStartupTimeoutMs([stdioServer(600_000)], 10)).toBe(10);
 	});
 
 	it("reserves headroom so MCP startup cannot consume the whole readiness window", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Message } from "@gajae-code/ai";
+import type { AssistantMessageEvent, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
@@ -342,6 +342,7 @@ test("real settlement wakes a waiter well before the grace timer", async () => {
 test("the provider lifecycle memoizes response.result() across iterator completion", async () => {
 	const model = createMockModel().model;
 	const ledger = createRunResourceLedger();
+	ledger.open("provider-run");
 	const finalMessage = createAssistantMessage([{ type: "text", text: "done" }]);
 	let resultCalls = 0;
 	const streamFn = () => {
@@ -366,7 +367,14 @@ test("the provider lifecycle memoizes response.result() across iterator completi
 	const stream = agentLoop(
 		[createUserMessage("hello")],
 		context,
-		{ model, convertToLlm, resourceLedger: ledger, resourceRunId: "provider-run" },
+		{
+			model,
+			convertToLlm,
+			resourceLedger: ledger,
+			resourceRunId: "provider-run",
+			resourceSealOwner: "caller",
+			resourceCancellationDomain: ledger.lookupDomain("provider-run"),
+		},
 		undefined,
 		streamFn,
 	);
@@ -375,12 +383,86 @@ test("the provider lifecycle memoizes response.result() across iterator completi
 	}
 
 	expect(resultCalls).toBe(1);
+	ledger.seal("provider-run");
 	expect(await ledger.waitForSettlement("provider-run", { graceMs: 25 })).toEqual({ status: "settled" });
 });
 
+test("a cancelled provider remains fenced through blocked cleanup and result settlement", async () => {
+	const model = createMockModel().model;
+	const ledger = createRunResourceLedger();
+	ledger.open("provider-cancel");
+	const controller = new AbortController();
+	const releaseIterator = Promise.withResolvers<void>();
+	const releaseResult = Promise.withResolvers<void>();
+	const pendingNext = Promise.withResolvers<IteratorResult<AssistantMessageEvent>>();
+	const finalMessage = createAssistantMessage([{ type: "text", text: "done" }]);
+	const response = new AssistantMessageEventStream();
+	let firstEvent = true;
+	response[Symbol.asyncIterator] = () => ({
+		next: async (): Promise<IteratorResult<AssistantMessageEvent>> => {
+			if (firstEvent) {
+				firstEvent = false;
+				return { done: false, value: { type: "start", partial: finalMessage } };
+			}
+			return pendingNext.promise;
+		},
+		return: () => releaseIterator.promise.then(() => ({ done: true, value: undefined })),
+	});
+	response.result = () => releaseResult.promise.then(() => finalMessage);
+
+	const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+	const convertToLlm = (messages: AgentMessage[]): Message[] =>
+		messages.filter(
+			(message): message is Message =>
+				message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+		);
+	const stream = agentLoop(
+		[createUserMessage("hello")],
+		context,
+		{
+			model,
+			convertToLlm,
+			resourceLedger: ledger,
+			resourceRunId: "provider-cancel",
+			resourceSealOwner: "caller",
+			resourceCancellationDomain: ledger.lookupDomain("provider-cancel"),
+		},
+		controller.signal,
+		() => response,
+	);
+	const draining = (async () => {
+		for await (const _event of stream) {
+			// Drain terminal lifecycle before checking provider cleanup fencing.
+		}
+	})();
+
+	while (!ledger.pending("provider-cancel").some(entry => entry.kind === "provider_factory")) {
+		await Promise.resolve();
+	}
+	controller.abort();
+	await draining;
+
+	ledger.seal("provider-cancel");
+	const settlement = ledger.waitForSettlement("provider-cancel", { graceMs: 1_000 });
+	let settled = false;
+	void settlement.then(() => {
+		settled = true;
+	});
+	await Promise.resolve();
+	expect(settled).toBe(false);
+	expect(ledger.pending("provider-cancel").some(entry => entry.kind === "provider_factory")).toBe(true);
+
+	releaseIterator.resolve();
+	await Promise.resolve();
+	expect(ledger.pending("provider-cancel").some(entry => entry.kind === "provider_factory")).toBe(true);
+	releaseResult.resolve();
+	expect(await settlement).toEqual({ status: "settled" });
+	expect(ledger.pending("provider-cancel")).toEqual([]);
+});
 test("scheduler ownership fences dependency waits and tool hooks", async () => {
 	const toolSchema = z.object({ value: z.string() });
 	const ledger = createRunResourceLedger();
+	ledger.open("tool-run");
 	const hookStarted = Promise.withResolvers<void>();
 	const releaseHook = Promise.withResolvers<void>();
 	let beforeCalls = 0;
@@ -414,6 +496,8 @@ test("scheduler ownership fences dependency waits and tool hooks", async () => {
 			convertToLlm,
 			resourceLedger: ledger,
 			resourceRunId: "tool-run",
+			resourceSealOwner: "caller",
+			resourceCancellationDomain: ledger.lookupDomain("tool-run"),
 			beforeToolCall: async () => {
 				beforeCalls++;
 				hookStarted.resolve();
@@ -437,9 +521,18 @@ test("scheduler ownership fences dependency waits and tool hooks", async () => {
 		.pending("tool-run")
 		.some(entry => entry.kind === "tool" && entry.label === "echo:tool-1");
 	expect(hasToolLease).toBe(true);
+	const settlement = ledger.waitForSettlement("tool-run", { graceMs: 1_000 });
+	ledger.seal("tool-run");
+	let settled = false;
+	void settlement.then(() => {
+		settled = true;
+	});
+	await Promise.resolve();
+	expect(settled).toBe(false);
 	releaseHook.resolve();
 	await draining;
 	expect(beforeCalls).toBe(1);
 	expect(afterCalls).toBe(1);
 	expect(await ledger.waitForSettlement("tool-run", { graceMs: 25 })).toEqual({ status: "settled" });
+	expect(await settlement).toEqual({ status: "settled" });
 });

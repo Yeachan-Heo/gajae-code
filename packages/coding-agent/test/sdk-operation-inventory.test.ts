@@ -36,7 +36,7 @@ describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(7);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(28);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(29);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS) {
 			expect(Object.keys(operation.adapterDispositions).sort()).toEqual([...ADAPTERS].sort());
@@ -59,6 +59,10 @@ describe("SDK operation inventory", () => {
 				acp: "provider_only",
 				daemonCli: "prohibited",
 			});
+		expect(OPERATIONS.find(operation => operation.id === "C53")?.errorCodes).toEqual([
+			"authentication_failed",
+			"model_profile_registry_error",
+		]);
 	});
 
 	it("accepts the committed generated matrix", () => {

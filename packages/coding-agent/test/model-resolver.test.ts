@@ -640,6 +640,54 @@ describe("resolveCliModel", () => {
 		expect(result.model?.provider).toBe("openai");
 		expect(result.model?.id).toBe("gpt-4o");
 	});
+	test("resolves a slash-containing provider from a full selector", () => {
+		const registry = {
+			getAll: () => [...allModels, { ...allModels[0], provider: "env/provider", id: "model" }],
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliModel: "env/provider/model",
+			modelRegistry: registry,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("env/provider");
+		expect(result.model?.id).toBe("model");
+	});
+	test("rejects colliding exact full selectors", () => {
+		const registry = {
+			getAll: () => [
+				...allModels,
+				{ ...allModels[0], provider: "env/provider", id: "model" },
+				{ ...allModels[0], provider: "env", id: "provider/model" },
+			],
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliModel: "env/provider/model",
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain("not found");
+	});
+	test("rejects an ambiguous case-folded full selector", () => {
+		const registry = {
+			getAll: () => [
+				...allModels,
+				{ ...allModels[0], provider: "Foo", id: "Bar" },
+				{ ...allModels[0], provider: "foo", id: "bar" },
+			],
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliModel: "FOO/BAR",
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain("not found");
+	});
 
 	test("resolves fuzzy patterns within an explicit provider", () => {
 		const registry = {

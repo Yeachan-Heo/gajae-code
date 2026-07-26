@@ -3,6 +3,7 @@ import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { parseArgs } from "../src/cli/args";
 import { resolveAcpStartupOptions } from "../src/main";
 import {
+	acpAvailableCommandsFromSkills,
 	acpProviderRegistrations,
 	acpSessionStateFromConfig,
 	applyAcpPermissionMode,
@@ -17,6 +18,7 @@ import {
 	boundAcpFinalText,
 	resolveAcpFinalText,
 } from "../src/sdk/acp/final-text";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
 
 const model = { provider: "openai-codex", id: "gpt-5.6" } as CreateAgentSessionOptions["model"];
 
@@ -128,6 +130,20 @@ test("ACP paginates after cwd filtering and terminates the filtered cursor", () 
 		],
 		nextCursor: undefined,
 	});
+});
+test("ACP available commands merge shared builtins before live skills", () => {
+	expect(
+		acpAvailableCommandsFromSkills({
+			result: { page: { items: [{ name: "live-skill", description: "Live skill" }] } },
+		}),
+	).toEqual([
+		...ACP_BUILTIN_SLASH_COMMANDS,
+		{
+			name: "skill:live-skill",
+			description: "Live skill",
+			input: { hint: "[request]" },
+		},
+	]);
 });
 
 test("ACP final text resolution is exact, suffix-only, bounded, and Unicode-safe", () => {

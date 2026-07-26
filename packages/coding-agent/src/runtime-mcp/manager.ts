@@ -80,12 +80,12 @@ const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
 	const ceiling =
 		typeof maxStartupTimeoutMs === "number" && Number.isFinite(maxStartupTimeoutMs) && maxStartupTimeoutMs > 0
-			? Math.max(STARTUP_TIMEOUT_MS, maxStartupTimeoutMs)
+			? maxStartupTimeoutMs
 			: MAX_STARTUP_TIMEOUT_MS;
 	const configuredTimeouts = configs
 		.map(config => config.timeout)
 		.filter((timeout): timeout is number => typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0);
-	if (configuredTimeouts.length === 0) return STARTUP_TIMEOUT_MS;
+	if (configuredTimeouts.length === 0) return Math.min(ceiling, STARTUP_TIMEOUT_MS);
 	return Math.min(ceiling, Math.max(STARTUP_TIMEOUT_MS, Math.max(...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS));
 }
 

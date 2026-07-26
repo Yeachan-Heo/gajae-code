@@ -12,7 +12,7 @@ import { Broker } from "../sdk/broker/broker";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
-	readSessionLifecycleLaunchRequest,
+	readSessionLifecycleLaunchRequestFile,
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
 	writeSessionLifecycleFailure,
@@ -209,7 +209,12 @@ export async function runSessionHost(
 	const now = timing.now ?? Date.now;
 	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
-	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
+	let request: SessionLifecycleLaunchRequest;
+	try {
+		request = await readSessionLifecycleLaunchRequestFile(process.env.GJC_SDK_LIFECYCLE_REQUEST_FILE, now());
+	} finally {
+		delete process.env.GJC_SDK_LIFECYCLE_REQUEST_FILE;
+	}
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
 	const cwd = timing.cwd ?? process.cwd();

@@ -131,6 +131,8 @@
 		},
 		"./sdk/models": null,
 		"./sdk/models.js": null,
+		"./sdk/providers": null,
+		"./sdk/providers.js": null,
 		"./sdk/lifecycle-session": null,
 		"./sdk/lifecycle-session.js": null,
 		"./sdk/startup-capability": null,

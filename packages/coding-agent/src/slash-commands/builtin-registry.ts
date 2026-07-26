@@ -273,11 +273,35 @@ type ModelCommandResolution =
 	| { ok: true; selection: ModelCommandSelection }
 	| { ok: false; failure: ModelCommandResolutionFailure };
 
-function parseProviderQualifiedSelector(selector: string): { provider: string; modelId: string } | undefined {
+function parseProviderQualifiedSelector(
+	selector: string,
+	discoverableProviders: readonly string[],
+): { provider: string; modelId: string } | undefined {
 	const splitSelector = splitExplicitThinkingSelector(selector);
+	const normalizedSelector = splitSelector.baseSelector.toLowerCase();
+	const matchingProviders = [...new Set(discoverableProviders)].filter(
+		candidate =>
+			splitSelector.baseSelector.startsWith(`${candidate}/`) ||
+			normalizedSelector.startsWith(`${candidate.toLowerCase()}/`),
+	);
+	if (matchingProviders.length > 0) {
+		const longestLength = Math.max(...matchingProviders.map(candidate => candidate.length));
+		const longestProviders = matchingProviders.filter(candidate => candidate.length === longestLength);
+		const exactLongestProviders = longestProviders.filter(candidate =>
+			splitSelector.baseSelector.startsWith(`${candidate}/`),
+		);
+		const provider =
+			exactLongestProviders.length === 1
+				? exactLongestProviders[0]
+				: longestProviders.length === 1
+					? longestProviders[0]
+					: undefined;
+		if (!provider) return undefined;
+		const modelId = splitSelector.baseSelector.slice(provider.length + 1);
+		return modelId ? { provider, modelId } : undefined;
+	}
 	const parsed = parseModelString(splitSelector.baseSelector);
-	if (!parsed) return undefined;
-	return { provider: parsed.provider, modelId: parsed.id };
+	return parsed ? { provider: parsed.provider, modelId: parsed.id } : undefined;
 }
 
 function resolveModelCommandSelectionFromAvailable(
@@ -352,8 +376,8 @@ async function resolveModelCommandSelection(
 		return { ok: true, selection: initialSelection };
 	}
 
-	const providerRef = parseProviderQualifiedSelector(selector);
 	const discoverableProviders = runtime.session.modelRegistry?.getDiscoverableProviders?.() ?? [];
+	const providerRef = parseProviderQualifiedSelector(selector, discoverableProviders);
 	if (providerRef && discoverableProviders.includes(providerRef.provider)) {
 		await runtime.session.modelRegistry.refreshProvider?.(providerRef.provider, "online");
 		availableModels = runtime.session.getAvailableModels?.() ?? [];

@@ -2,16 +2,30 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { WindowsJobMemoryProbeResult } from "@gajae-code/natives";
+import { loadNative as loadNativeBindings } from "../../../natives/native/loader-state.js";
 
-function safeProbeWindowsJobMemory(): WindowsJobMemoryProbeResult {
+let cachedWindowsJobMemoryProbe: (() => WindowsJobMemoryProbeResult) | null | undefined;
+
+function resolveWindowsJobMemoryProbe(): (() => WindowsJobMemoryProbeResult) | undefined {
+	if (cachedWindowsJobMemoryProbe !== undefined) return cachedWindowsJobMemoryProbe ?? undefined;
 	try {
-		// eslint-disable-next-line @typescript-eslint/no-var-requires
-		const natives = require("@gajae-code/natives") as { probeWindowsJobMemory?: () => unknown };
-		if (typeof natives.probeWindowsJobMemory === "function") {
-			return natives.probeWindowsJobMemory() as WindowsJobMemoryProbeResult;
-		}
+		const probe = loadNativeBindings().probeWindowsJobMemory;
+		cachedWindowsJobMemoryProbe = typeof probe === "function" ? (probe as () => WindowsJobMemoryProbeResult) : null;
 	} catch {
 		// Native addon unbuilt or missing
+		cachedWindowsJobMemoryProbe = null;
+	}
+	return cachedWindowsJobMemoryProbe ?? undefined;
+}
+
+function safeProbeWindowsJobMemory(): WindowsJobMemoryProbeResult {
+	const probe = resolveWindowsJobMemoryProbe();
+	if (probe) {
+		try {
+			return probe();
+		} catch {
+			// Native probe unavailable
+		}
 	}
 	return { kind: "unsupported_platform", platform: process.platform };
 }
@@ -916,5 +930,6 @@ export function __resetResourceGcForTest(): void {
 	memoryGuardRestartCooldownUntil.clear();
 	memoryGuardLastEvaluatedAt.clear();
 	lastScreenshotScanAt = 0;
+	cachedWindowsJobMemoryProbe = undefined;
 	deps = defaultDeps;
 }

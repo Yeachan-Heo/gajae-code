@@ -37,6 +37,11 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils
 import { $pickCredentialEnv, isRecord, logger } from "@gajae-code/utils";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
+import {
+	type ActiveProviderDescriptor,
+	ActiveProviderResolutionError,
+	projectActiveProviderDescriptors,
+} from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
@@ -1014,6 +1019,22 @@ function getConfiguredProviderOrderFromSettings(): string[] {
 		return [];
 	}
 }
+interface ProviderActivityEvidence {
+	staticModelIds: ReadonlySet<string>;
+	staticConfigured: boolean;
+	discoveryConfigured: boolean;
+	implicitDiscovery: boolean;
+	descriptorBacked: boolean;
+	descriptorFresh: boolean;
+	descriptorModelIds: ReadonlySet<string>;
+	authGeneration: string;
+	endpoint: string;
+}
+
+interface ModelManagerDiscoveryOptions {
+	options: ModelManagerOptions<Api>;
+	authGeneration: string;
+}
 
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
@@ -1028,6 +1049,20 @@ export class ModelRegistry {
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
+	#optionalAuthProviders: Set<string> = new Set();
+	#credentiallessAuthFallbackProviders: Set<string> = new Set();
+	#providerActivity: ReadonlyMap<string, ProviderActivityEvidence> = new Map();
+	#configuredProviderIds: ReadonlySet<string> = new Set();
+	#configuredDiscoveryProviderIds: ReadonlySet<string> = new Set();
+	#descriptorDiscoveryEvidence = new Map<
+		string,
+		{ fresh: boolean; modelIds: ReadonlySet<string>; authGeneration: string; endpoint: string }
+	>();
+	#descriptorDiscoveryGenerations = new Map<string, number>();
+	#configuredDiscoveryEvidence = new Map<
+		string,
+		{ authGeneration: string; endpoint: string; modelIds: ReadonlySet<string> }
+	>();
 	#discoveryManager = new ModelDiscoveryManager<DiscoveryProviderConfig>();
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
@@ -1038,6 +1073,7 @@ export class ModelRegistry {
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#lastStaticLoadMtime: number | null = null;
+	#staticModelsLoaded = false;
 	#registeredProviderSources: Set<string> = new Set();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
@@ -1122,7 +1158,7 @@ export class ModelRegistry {
 
 	#reloadStaticModels(): void {
 		const currentMtime = this.#modelsConfigFile.getMtimeMs();
-		if (currentMtime !== null && currentMtime === this.#lastStaticLoadMtime) {
+		if (this.#staticModelsLoaded && currentMtime === this.#lastStaticLoadMtime) {
 			// models.json unchanged since last load; reload + canonical rebuild would be redundant.
 			return;
 		}
@@ -1130,7 +1166,11 @@ export class ModelRegistry {
 		this.#customProviderApiKeys.clear();
 		this.#providerWebSearchModes.clear();
 		this.#keylessProviders.clear();
+		this.#optionalAuthProviders.clear();
+		this.#credentiallessAuthFallbackProviders.clear();
 		this.#discoveryManager.reset();
+		for (const descriptor of PROVIDER_DESCRIPTORS) this.#clearDescriptorDiscoveryEvidence(descriptor.providerId);
+		this.#configuredDiscoveryEvidence.clear();
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
@@ -1172,6 +1212,8 @@ export class ModelRegistry {
 		this.#configError = configError;
 		this.#keylessProviders = keylessProviders;
 		this.#discoveryManager.setProviders(discoverableProviders);
+		this.#configuredProviderIds = new Set(configuredProviders);
+		this.#configuredDiscoveryProviderIds = new Set(discoverableProviders.map(provider => provider.provider));
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
 		this.#modelOverrides = modelOverrides;
@@ -1192,10 +1234,56 @@ export class ModelRegistry {
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
+		this.#staticModelsLoaded = true;
 	}
 
+	#rebuildProviderActivity(): void {
+		const staticModelIds = new Map<string, Set<string>>();
+		const addStaticModel = (provider: string, id: string) => {
+			const modelIds = staticModelIds.get(provider) ?? new Set<string>();
+			modelIds.add(id);
+			staticModelIds.set(provider, modelIds);
+		};
+		for (const provider of getBundledProviders()) {
+			for (const model of getBundledModels(provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[])
+				addStaticModel(provider, model.id);
+		}
+		for (const overlay of [...this.#customModelOverlays, ...this.#runtimeModelOverlays])
+			addStaticModel(overlay.provider, overlay.id);
+
+		const runtimeProviderIds = new Set(this.#runtimeProviderSourceByName.keys());
+		const providerIds = new Set<string>([
+			...this.#configuredProviderIds,
+			...this.#keylessProviders,
+			...this.#discoveryManager.providerIds(),
+			...this.#descriptorDiscoveryEvidence.keys(),
+			...runtimeProviderIds,
+			...staticModelIds.keys(),
+		]);
+		const activity = new Map<string, ProviderActivityEvidence>();
+		for (const provider of providerIds) {
+			const discoveryConfigured = this.#configuredDiscoveryProviderIds.has(provider);
+			const isDiscoveryProvider = this.#discoveryManager.providerIds().has(provider);
+			const descriptorEvidence = this.#descriptorDiscoveryEvidence.get(provider);
+			activity.set(provider, {
+				staticModelIds: new Set(staticModelIds.get(provider) ?? []),
+				staticConfigured: staticModelIds.has(provider),
+				discoveryConfigured,
+				implicitDiscovery: isDiscoveryProvider && !discoveryConfigured,
+				descriptorBacked:
+					descriptorEvidence !== undefined ||
+					PROVIDER_DESCRIPTORS.some(descriptor => descriptor.providerId === provider),
+				descriptorFresh: descriptorEvidence?.fresh ?? false,
+				descriptorModelIds: new Set(descriptorEvidence?.modelIds ?? []),
+				authGeneration: descriptorEvidence?.authGeneration ?? "",
+				endpoint: descriptorEvidence?.endpoint ?? "",
+			});
+		}
+		this.#providerActivity = activity;
+	}
 	/** Load built-in models, applying provider-level overrides only.
 	 *  Per-model overrides are applied later by #applyModelOverrides. */
 	#loadBuiltInModels(overrides: Map<string, ProviderOverride>): Model<Api>[] {
@@ -1375,10 +1463,9 @@ export class ModelRegistry {
 				discovery: { type: "llama.cpp" },
 				optional: true,
 			});
-			// Only mark as keyless if no API key is configured
-			if (!this.authStorage.hasAuth("llama.cpp")) {
-				this.#keylessProviders.add("llama.cpp");
-			}
+			// Implicit llama.cpp auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("llama.cpp");
+			this.#keylessProviders.add("llama.cpp");
 		}
 		if (!configuredProviders.has("lm-studio") && !disabledProviders.has("lm-studio")) {
 			this.#discoveryManager.addProvider({
@@ -1701,15 +1788,65 @@ export class ModelRegistry {
 		).filter(provider => !disabledProviders.has(provider.provider));
 		const configuredDiscoveriesPromise =
 			selectedDiscoverableProviders.length === 0
-				? Promise.resolve<Model<Api>[]>([])
+				? Promise.resolve(
+						[] as Array<{
+							provider: string;
+							current: boolean;
+							models: Model<Api>[];
+							authGeneration: string;
+							endpoint: string;
+							fetched: boolean;
+						}>,
+					)
 				: Promise.all(
 						selectedDiscoverableProviders.map(provider => this.#discoverProviderModels(provider, strategy)),
-					).then(results => results.flat());
-		const [configuredDiscovered, builtInDiscovered] = await Promise.all([
+					);
+		const [configuredDiscoveryResults, builtInDiscovered] = await Promise.all([
 			configuredDiscoveriesPromise,
 			this.#discoverBuiltInProviderModels(strategy, providerFilter),
 		]);
+		const configuredDiscoveryEvidence = new Map(
+			configuredDiscoveryResults
+				.filter(result => result.current)
+				.map(result => [
+					result.provider,
+					{
+						authGeneration: result.authGeneration,
+						endpoint: result.endpoint,
+						modelIds: new Set(result.models.map(model => model.id)),
+					},
+				]),
+		);
+		const configuredDiscoveries = new Map(configuredDiscoveryResults.map(result => [result.provider, result]));
+		const configuredDiscovered = configuredDiscoveryResults.flatMap(result => result.models);
 		const discovered = [...configuredDiscovered, ...builtInDiscovered];
+		for (const provider of selectedDiscoverableProviders) {
+			const evidence = configuredDiscoveryEvidence.get(provider.provider);
+			const discovery = configuredDiscoveries.get(provider.provider);
+			const state = this.#discoveryManager.getState(provider.provider);
+			const currentAuthGeneration = this.#getProviderEvidenceGeneration(provider.provider);
+			const currentEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(
+				this.#effectiveDiscoveryProviderConfig(provider).baseUrl ?? "",
+			);
+			if (!discovery?.current) continue;
+			if (
+				evidence !== undefined &&
+				state?.status === "ok" &&
+				discovery.fetched &&
+				currentAuthGeneration === evidence.authGeneration &&
+				currentEndpoint === evidence.endpoint
+			) {
+				this.#configuredDiscoveryEvidence.set(provider.provider, evidence);
+			} else if (
+				(state?.status !== "cached" && !(state?.status === "ok" && !discovery.fetched)) ||
+				state.error !== undefined ||
+				this.#configuredDiscoveryEvidence.get(provider.provider)?.authGeneration !== currentAuthGeneration ||
+				this.#configuredDiscoveryEvidence.get(provider.provider)?.endpoint !== currentEndpoint
+			) {
+				this.#configuredDiscoveryEvidence.delete(provider.provider);
+			}
+		}
+		this.#rebuildProviderActivity();
 		if (discovered.length === 0) {
 			return;
 		}
@@ -1734,40 +1871,90 @@ export class ModelRegistry {
 	async #discoverProviderModels(
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
-	): Promise<Model<Api>[]> {
-		const mergeInput = await this.#discoveryManager.discover(providerConfig, strategy, {
+	): Promise<{
+		provider: string;
+		current: boolean;
+		models: Model<Api>[];
+		authGeneration: string;
+		endpoint: string;
+		fetched: boolean;
+	}> {
+		const provider = providerConfig.provider;
+		if (this.#optionalAuthProviders.has(provider) && this.authStorage.hasAuth(provider)) {
+			this.#credentiallessAuthFallbackProviders.delete(provider);
+			const apiKey = await this.#peekApiKeyForProvider(provider);
+			if (apiKey === undefined) {
+				this.#credentiallessAuthFallbackProviders.add(provider);
+			}
+		}
+		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
+		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
+		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, strategy, {
 			cacheDbPath: this.#cacheDbPath,
-			requiresAuth: provider => !this.#keylessProviders.has(provider.provider),
+			requiresAuth: provider => !this.#isCredentiallessProvider(provider.provider),
 			peekApiKey: provider => this.#peekApiKeyForProvider(provider.provider),
 			isAuthenticated,
-			fetchModels: provider => this.#discoverModelsByProviderType(provider),
+			fetchModels: (provider, apiKey) => this.#discoverModelsByProviderType(provider, apiKey),
+			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider),
 		});
-		if (!mergeInput.current) return [];
+		const authGeneration =
+			mergeInput.authGeneration ?? this.#getProviderEvidenceGeneration(effectiveProviderConfig.provider);
+		if (!mergeInput.current) {
+			return {
+				provider: effectiveProviderConfig.provider,
+				current: false,
+				models: [],
+				authGeneration,
+				endpoint,
+				fetched: false,
+			};
+		}
 		if (mergeInput.warning) {
 			logger.warn("model discovery failed for provider", {
-				provider: providerConfig.provider,
-				url: providerConfig.baseUrl,
+				provider: effectiveProviderConfig.provider,
+				url: effectiveProviderConfig.baseUrl,
 				error: mergeInput.warning,
 			});
 		}
-		return this.#applyProviderModelOverrides(
-			providerConfig.provider,
-			this.#normalizeDiscoverableModels(
-				providerConfig,
-				this.#applyProviderCompat(providerConfig.compat, [...mergeInput.models]),
+		return {
+			provider: effectiveProviderConfig.provider,
+			current: true,
+			authGeneration,
+			endpoint,
+			fetched: mergeInput.fetched ?? false,
+			models: this.#applyProviderModelOverrides(
+				effectiveProviderConfig.provider,
+				this.#normalizeDiscoverableModels(
+					effectiveProviderConfig,
+					this.#applyProviderCompat(effectiveProviderConfig.compat, [...mergeInput.models]),
+				),
 			),
-		);
+		};
+	}
+	#effectiveDiscoveryProviderConfig(providerConfig: DiscoveryProviderConfig): DiscoveryProviderConfig {
+		const override = this.#runtimeProviderOverrides.get(providerConfig.provider);
+		return {
+			...providerConfig,
+			baseUrl: this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
+			headers: override?.headers ? { ...providerConfig.headers, ...override.headers } : providerConfig.headers,
+			compat: override?.compat ? mergeCompat(providerConfig.compat, override.compat) : providerConfig.compat,
+			requestTransform: mergeRequestTransform(providerConfig.requestTransform, override?.requestTransform),
+			cacheRetention: override?.cacheRetention ?? providerConfig.cacheRetention,
+		};
 	}
 
-	#discoverModelsByProviderType(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
+	#discoverModelsByProviderType(
+		providerConfig: DiscoveryProviderConfig,
+		apiKey: string | undefined,
+	): Promise<Model<Api>[]> {
 		switch (providerConfig.discovery.type) {
 			case "ollama":
 				return this.#discoverOllamaModels(providerConfig);
 			case "llama.cpp":
-				return this.#discoverLlamaCppModels(providerConfig);
+				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
 			case "openai-models-list":
-				return this.#discoverOpenAIModelsList(providerConfig);
+				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 		}
 	}
 
@@ -1777,22 +1964,22 @@ export class ModelRegistry {
 	): Promise<Model<Api>[]> {
 		// Skip providers already handled by configured discovery (e.g. user-configured ollama with discovery.type)
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(p => p.provider));
-		const managerOptions = (await this.#collectBuiltInModelManagerOptions()).filter(opts => {
-			if (configuredDiscoveryProviders.has(opts.providerId)) {
+		const managerOptions = (await this.#collectBuiltInModelManagerOptions()).filter(entry => {
+			if (configuredDiscoveryProviders.has(entry.options.providerId)) {
 				return false;
 			}
-			return providerFilter ? providerFilter.has(opts.providerId) : true;
+			return providerFilter ? providerFilter.has(entry.options.providerId) : true;
 		});
 		if (managerOptions.length === 0) {
 			return [];
 		}
 		const discoveries = await Promise.all(
-			managerOptions.map(options => this.#discoverWithModelManager(options, strategy)),
+			managerOptions.map(entry => this.#discoverWithModelManager(entry, strategy)),
 		);
 		return discoveries.flat();
 	}
 
-	async #collectBuiltInModelManagerOptions(): Promise<ModelManagerOptions<Api>[]> {
+	async #collectBuiltInModelManagerOptions(): Promise<ModelManagerDiscoveryOptions[]> {
 		const specialProviderDescriptors: Array<{
 			providerId: string;
 			resolveKey: (value: string | undefined) => string | undefined;
@@ -1838,47 +2025,112 @@ export class ModelRegistry {
 		// Use peekApiKey to avoid OAuth token refresh during discovery.
 		// The token is only needed if the dynamic fetch fires (cache miss),
 		// and failures there are handled gracefully.
-		const peekKey = (descriptor: { providerId: string }) => this.#peekApiKeyForProvider(descriptor.providerId);
-		const [standardProviderKeys, specialKeys] = await Promise.all([
+		const peekKey = async (descriptor: { providerId: string }) => {
+			let authGeneration = this.#getProviderEvidenceGeneration(descriptor.providerId);
+			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId);
+			const resolvedGeneration = this.#getProviderEvidenceGeneration(descriptor.providerId);
+			// Keep the key resolved for this refresh while accepting the generation update.
+			// Re-peeking would advance round-robin selection to a different credential.
+			if (authGeneration !== resolvedGeneration) {
+				authGeneration = resolvedGeneration;
+				if (authGeneration !== this.#getProviderEvidenceGeneration(descriptor.providerId)) {
+					return { apiKey: undefined, authGeneration: undefined };
+				}
+			}
+			return { apiKey, authGeneration };
+		};
+		const [standardProviderCredentials, specialProviderCredentials] = await Promise.all([
 			Promise.all(standardProviderDescriptors.map(peekKey)),
 			Promise.all(enabledSpecialProviderDescriptors.map(peekKey)),
 		]);
-		const options: ModelManagerOptions<Api>[] = [];
+		const options: ModelManagerDiscoveryOptions[] = [];
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
 			const descriptor = standardProviderDescriptors[i];
-			const apiKey = standardProviderKeys[i];
-			if (isAuthenticated(apiKey) || descriptor.allowUnauthenticated) {
-				options.push(
-					descriptor.createModelManagerOptions({
+			const { apiKey, authGeneration } = standardProviderCredentials[i];
+			if (
+				authGeneration !== undefined &&
+				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId) &&
+				(isAuthenticated(apiKey) || descriptor.allowUnauthenticated)
+			) {
+				options.push({
+					options: descriptor.createModelManagerOptions({
 						apiKey: isAuthenticated(apiKey) ? apiKey : undefined,
 						baseUrl: this.#getProviderBaseUrlForDiscovery(descriptor.providerId),
 					}),
-				);
+					authGeneration,
+				});
 			}
 		}
 
 		for (let i = 0; i < enabledSpecialProviderDescriptors.length; i++) {
 			const descriptor = enabledSpecialProviderDescriptors[i];
-			const key = descriptor.resolveKey(specialKeys[i]);
-			if (!isAuthenticated(key)) {
-				continue;
+			const { apiKey: apiKeyValue, authGeneration } = specialProviderCredentials[i];
+			const key = descriptor.resolveKey(apiKeyValue);
+			if (
+				authGeneration !== undefined &&
+				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId) &&
+				isAuthenticated(key)
+			) {
+				options.push({ options: descriptor.createOptions(key), authGeneration });
 			}
-			options.push(descriptor.createOptions(key));
 		}
 		return options;
 	}
 
 	async #discoverWithModelManager(
-		options: ModelManagerOptions<Api>,
+		{ options, authGeneration }: ModelManagerDiscoveryOptions,
 		strategy: ModelRefreshStrategy,
 	): Promise<Model<Api>[]> {
+		const generation = (this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) + 1;
+		this.#descriptorDiscoveryGenerations.set(options.providerId, generation);
+		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(
+			this.#getProviderBaseUrlForDiscovery(options.providerId) ?? "",
+		);
 		try {
 			const manager = createModelManager({ ...options, cacheDbPath: this.#cacheDbPath });
-			const result = await manager.refresh(strategy);
-			return result.models.map(model =>
+			const evidence = this.#descriptorDiscoveryEvidence.get(options.providerId);
+			const refreshStrategy =
+				strategy === "online-if-uncached" &&
+				(evidence?.authGeneration !== authGeneration || evidence.endpoint !== endpoint)
+					? "online"
+					: strategy;
+			const result = await manager.refresh(refreshStrategy);
+			const models = result.models.map(model =>
 				model.provider === options.providerId ? model : { ...model, provider: options.providerId },
 			);
+			if (
+				(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
+				this.#getProviderEvidenceGeneration(options.providerId) === authGeneration &&
+				(result.fetched ||
+					result.stale ||
+					this.#descriptorDiscoveryEvidence.get(options.providerId)?.authGeneration !== authGeneration ||
+					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
+			) {
+				this.#descriptorDiscoveryEvidence.set(options.providerId, {
+					fresh: result.fetched,
+					modelIds: new Set(models.map(model => model.id)),
+					authGeneration,
+					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
+				});
+			}
+			if (
+				(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) !== generation ||
+				this.#getProviderEvidenceGeneration(options.providerId) !== authGeneration
+			) {
+				return [];
+			}
+			return models;
 		} catch (error) {
+			if (
+				(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
+				this.#getProviderEvidenceGeneration(options.providerId) === authGeneration
+			)
+				this.#descriptorDiscoveryEvidence.set(options.providerId, {
+					fresh: false,
+					modelIds: new Set(),
+					authGeneration,
+					endpoint,
+				});
 			logger.warn("model discovery failed for provider", {
 				provider: options.providerId,
 				error: error instanceof Error ? error.message : String(error),
@@ -1892,7 +2144,7 @@ export class ModelRegistry {
 		modelId: string,
 		headers: Record<string, string> | undefined,
 	): Promise<OllamaDiscoveredModelMetadata | null> {
-		const showUrl = `${endpoint}/api/show`;
+		const showUrl = this.#appendOllamaPath(endpoint, "api/show");
 		try {
 			const response = await fetch(showUrl, {
 				method: "POST",
@@ -1940,7 +2192,7 @@ export class ModelRegistry {
 
 	async #discoverOllamaModels(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
 		const endpoint = this.#normalizeOllamaBaseUrl(providerConfig.baseUrl);
-		const tagsUrl = `${endpoint}/api/tags`;
+		const tagsUrl = this.#appendOllamaPath(endpoint, "api/tags");
 		const headers = { ...(providerConfig.headers ?? {}) };
 		const response = await fetch(tagsUrl, {
 			headers,
@@ -1968,7 +2220,7 @@ export class ModelRegistry {
 				name: entry.name,
 				api: providerConfig.api,
 				provider: providerConfig.provider,
-				baseUrl: `${endpoint}/v1`,
+				baseUrl: this.#appendOllamaPath(endpoint, "v1"),
 				reasoning: metadata?.reasoning ?? false,
 				input: metadata?.input ?? ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -1984,7 +2236,8 @@ export class ModelRegistry {
 		baseUrl: string,
 		headers: Record<string, string> | undefined,
 	): Promise<LlamaCppDiscoveredServerMetadata | null> {
-		const propsUrl = `${this.#toLlamaCppNativeBaseUrl(baseUrl)}/props`;
+		const propsUrl = new URL(this.#toLlamaCppNativeBaseUrl(baseUrl));
+		propsUrl.pathname = `${propsUrl.pathname.replace(/\/+$/g, "")}/props`;
 		try {
 			const response = await fetch(propsUrl, {
 				headers,
@@ -2006,12 +2259,20 @@ export class ModelRegistry {
 		}
 	}
 
-	async #discoverLlamaCppModels(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
+	async #discoverLlamaCppModels(
+		providerConfig: DiscoveryProviderConfig,
+		discoveryApiKey?: string,
+	): Promise<Model<Api>[]> {
 		const baseUrl = this.#normalizeLlamaCppBaseUrl(providerConfig.baseUrl);
-		const modelsUrl = `${baseUrl}/models`;
+		const modelsUrl = new URL(baseUrl);
+		modelsUrl.pathname = `${modelsUrl.pathname.replace(/\/+$/g, "")}/models`;
 
 		const headers: Record<string, string> = { ...(providerConfig.headers ?? {}) };
-		const apiKey = await this.authStorage.getApiKey(providerConfig.provider);
+		const apiKey =
+			discoveryApiKey ??
+			(this.#isCredentiallessProvider(providerConfig.provider)
+				? kNoAuth
+				: await this.authStorage.getApiKey(providerConfig.provider));
 		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
 			headers.Authorization = `Bearer ${apiKey}`;
 		}
@@ -2056,15 +2317,24 @@ export class ModelRegistry {
 		return this.#applyProviderModelOverrides(providerConfig.provider, discovered);
 	}
 
-	async #discoverOpenAIModelsList(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
+	async #discoverOpenAIModelsList(
+		providerConfig: DiscoveryProviderConfig,
+		discoveryApiKey?: string,
+	): Promise<Model<Api>[]> {
 		const baseUrl = this.#normalizeOpenAIModelsListBaseUrl(providerConfig.baseUrl);
-		const modelsUrl = `${baseUrl}/models`;
+		const modelsUrl = new URL(baseUrl);
+		const requestBaseUrl = this.#stripEndpointQuery(baseUrl);
+		modelsUrl.pathname = `${modelsUrl.pathname.replace(/\/+$/g, "")}/models`;
 
 		const headers: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 		// Resolve with the same baseUrl context completion requests use so an
 		// endpoint-scoped (or config-pinned) credential wins here exactly as it
 		// does for chat completions.
-		const apiKey = await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl });
+		const apiKey =
+			discoveryApiKey ??
+			(this.#isCredentiallessProvider(providerConfig.provider)
+				? kNoAuth
+				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
 		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
 			headers.Authorization = `Bearer ${apiKey}`;
 		}
@@ -2095,7 +2365,7 @@ export class ModelRegistry {
 					name: id,
 					api: providerConfig.api,
 					provider: providerConfig.provider,
-					baseUrl,
+					baseUrl: requestBaseUrl,
 					reasoning: false,
 					input: ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -2119,7 +2389,7 @@ export class ModelRegistry {
 		try {
 			const parsed = new URL(raw);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
-			return `${parsed.protocol}//${parsed.host}${trimmedPath}`;
+			return `${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search}`;
 		} catch {
 			return raw;
 		}
@@ -2130,13 +2400,44 @@ export class ModelRegistry {
 			const parsed = new URL(baseUrl);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
 			parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath.slice(0, -3) || "/" : trimmedPath || "/";
-			const normalized = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+			const normalized = `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
 			return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
 		} catch {
 			return baseUrl.endsWith("/v1") ? baseUrl.slice(0, -3) : baseUrl;
 		}
 	}
-
+	#normalizeDiscoveryEvidenceEndpoint(endpoint: string): string {
+		try {
+			const parsed = new URL(endpoint);
+			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
+			return `${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search}`;
+		} catch {
+			return endpoint.replace(/\/+$/g, "");
+		}
+	}
+	#stripEndpointQuery(baseUrl: string): string {
+		try {
+			const parsed = new URL(baseUrl);
+			parsed.search = "";
+			return parsed.toString();
+		} catch {
+			return baseUrl;
+		}
+	}
+	#isCredentiallessProvider(provider: string): boolean {
+		return (
+			this.#keylessProviders.has(provider) &&
+			(!this.#optionalAuthProviders.has(provider) ||
+				!this.authStorage.hasAuth(provider) ||
+				this.#credentiallessAuthFallbackProviders.has(provider))
+		);
+	}
+	#getProviderEvidenceGeneration(provider: string): string {
+		if (this.#isCredentiallessProvider(provider)) {
+			return `credentialless:${provider}`;
+		}
+		return this.authStorage.getProviderEvidenceGeneration(provider);
+	}
 	#normalizeOpenAIModelsListBaseUrl(baseUrl?: string): string {
 		const defaultBaseUrl = "http://127.0.0.1:1234/v1";
 		const raw = baseUrl || defaultBaseUrl;
@@ -2144,18 +2445,30 @@ export class ModelRegistry {
 			const parsed = new URL(raw);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
 			parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath || "/v1" : `${trimmedPath}/v1`;
-			return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+			return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
 		} catch {
 			return raw;
+		}
+	}
+	#appendOllamaPath(baseUrl: string, path: string): string {
+		try {
+			const parsed = new URL(baseUrl);
+			const pathname = parsed.pathname.replace(/\/+$/g, "");
+			parsed.pathname = `${pathname}/${path}`;
+			return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
+		} catch {
+			return `${baseUrl.replace(/\/+$/g, "")}/${path}`;
 		}
 	}
 	#normalizeOllamaBaseUrl(baseUrl?: string): string {
 		const raw = baseUrl || "http://127.0.0.1:11434";
 		try {
 			const parsed = new URL(raw);
-			return `${parsed.protocol}//${parsed.host}`;
+			const pathname = parsed.pathname.replace(/\/+$/g, "");
+			const normalizedPath = pathname.endsWith("/v1") ? pathname.slice(0, -3) : pathname;
+			return `${parsed.protocol}//${parsed.host}${normalizedPath}${parsed.search}`;
 		} catch {
-			return "http://127.0.0.1:11434";
+			return raw.endsWith("/v1") ? raw.slice(0, -3) : raw.replace(/\/+$/g, "");
 		}
 	}
 
@@ -2189,6 +2502,7 @@ export class ModelRegistry {
 
 	#getProviderBaseUrlForDiscovery(provider: string): string | undefined {
 		return (
+			this.#runtimeProviderOverrides.get(provider)?.baseUrl ??
 			this.#providerOverrides.get(provider)?.baseUrl ??
 			resolveProviderBaseUrlFromEnv(provider) ??
 			this.getProviderBaseUrl(provider)
@@ -2216,6 +2530,7 @@ export class ModelRegistry {
 			"baseUrl" | "headers" | "authHeader" | "apiKey" | "transport" | "requestTransform" | "cacheRetention"
 		>,
 	): T {
+		const baseUrl = override.baseUrl ?? entry.baseUrl;
 		const headers = mergeAuthHeader(
 			override.headers ? { ...entry.headers, ...override.headers } : entry.headers,
 			override.authHeader,
@@ -2223,7 +2538,7 @@ export class ModelRegistry {
 		);
 		return {
 			...entry,
-			baseUrl: override.baseUrl ?? entry.baseUrl,
+			baseUrl: baseUrl === undefined ? undefined : this.#stripEndpointQuery(baseUrl),
 			headers,
 			// Preserve the model's existing transport when the override omits one;
 			// providers without a `transport` field keep the default per-API dispatch.
@@ -2505,6 +2820,76 @@ export class ModelRegistry {
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
 	}
+	#hasFreshOrStaticModelEvidence(model: Model<Api>): boolean {
+		const evidence = this.#providerActivity.get(model.provider);
+		if (
+			!evidence ||
+			(!evidence.staticConfigured &&
+				!evidence.discoveryConfigured &&
+				!evidence.implicitDiscovery &&
+				!evidence.descriptorBacked)
+		) {
+			return false;
+		}
+		if (evidence.staticConfigured && (!evidence.discoveryConfigured || evidence.staticModelIds.has(model.id))) {
+			return true;
+		}
+		if (
+			evidence.descriptorFresh &&
+			evidence.authGeneration === this.#getProviderEvidenceGeneration(model.provider) &&
+			evidence.endpoint ===
+				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "") &&
+			evidence.descriptorModelIds.has(model.id)
+		)
+			return true;
+		const discoveryState = this.#discoveryManager.getState(model.provider);
+		const configuredEvidence = this.#configuredDiscoveryEvidence.get(model.provider);
+		return (
+			(discoveryState?.status === "ok" || discoveryState?.status === "cached") &&
+			configuredEvidence?.authGeneration === this.#getProviderEvidenceGeneration(model.provider) &&
+			configuredEvidence.endpoint ===
+				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "") &&
+			configuredEvidence.modelIds.has(model.id)
+		);
+	}
+
+	#activeConnectionKind(model: Model<Api>): ActiveProviderDescriptor["connectionKind"] | undefined {
+		const evidence = this.#providerActivity.get(model.provider);
+		if (!this.#isCredentiallessProvider(model.provider) && this.authStorage.hasAuth(model.provider)) {
+			if (!evidence) return undefined;
+			const discoveryOnly =
+				!evidence.staticConfigured &&
+				(evidence.discoveryConfigured || evidence.implicitDiscovery || evidence.descriptorBacked);
+			return !discoveryOnly || this.#hasFreshOrStaticModelEvidence(model) ? "credential" : undefined;
+		}
+		if (this.#isCredentiallessProvider(model.provider) && this.#hasFreshOrStaticModelEvidence(model)) {
+			return "credentialless";
+		}
+		return undefined;
+	}
+
+	getActiveProviders(currentModel?: Model<Api>): ActiveProviderDescriptor[] {
+		try {
+			const descriptors: ActiveProviderDescriptor[] = [];
+			const available = this.getAvailable();
+			for (const model of available) {
+				const connectionKind = this.#activeConnectionKind(model);
+				if (connectionKind) descriptors.push({ provider: model.provider, connectionKind });
+			}
+			if (currentModel) {
+				const loadedModel = available.find(
+					model => model.provider === currentModel.provider && model.id === currentModel.id,
+				);
+				if (loadedModel) {
+					const connectionKind = this.#activeConnectionKind(loadedModel);
+					if (connectionKind) descriptors.push({ provider: loadedModel.provider, connectionKind });
+				}
+			}
+			return projectActiveProviderDescriptors(descriptors);
+		} catch {
+			throw new ActiveProviderResolutionError();
+		}
+	}
 
 	/**
 	 * Check whether auth is configured for a model's provider.
@@ -2571,7 +2956,7 @@ export class ModelRegistry {
 	}
 
 	async #getApiKeyOrNoAuth(provider: string, lookup: () => Promise<string | undefined>): Promise<string | undefined> {
-		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
+		if (this.#isCredentiallessProvider(provider)) {
 			return kNoAuth;
 		}
 		return lookup();
@@ -2612,8 +2997,22 @@ export class ModelRegistry {
 			}),
 		);
 	}
+	/**
+	 * Peek at API key for a provider without refreshing OAuth tokens.
+	 */
+	async peekApiKeyForProvider(provider: string): Promise<string | undefined> {
+		return this.#peekApiKeyForProvider(provider);
+	}
 
 	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {
+		if (this.#isCredentiallessProvider(provider)) {
+			return kNoAuth;
+		}
+		try {
+			this.authStorage.getProviderEvidenceGeneration(provider);
+		} catch {
+			return undefined;
+		}
 		return this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider));
 	}
 
@@ -2628,11 +3027,22 @@ export class ModelRegistry {
 		return this.authStorage.getSessionCredentialType(provider, sessionId);
 	}
 
+	#clearDescriptorDiscoveryEvidence(providerName: string): void {
+		this.#descriptorDiscoveryGenerations.set(
+			providerName,
+			(this.#descriptorDiscoveryGenerations.get(providerName) ?? 0) + 1,
+		);
+		this.#descriptorDiscoveryEvidence.delete(providerName);
+		this.#configuredDiscoveryEvidence.delete(providerName);
+		this.#discoveryManager.invalidate(providerName);
+	}
+
 	#clearRuntimeProviderState(providerName: string): void {
 		this.#runtimeProviderApiKeys.delete(providerName);
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
 		this.authStorage.removeConfigApiKey(providerName);
+		this.#clearDescriptorDiscoveryEvidence(providerName);
 	}
 
 	/**
@@ -2654,6 +3064,7 @@ export class ModelRegistry {
 			this.#clearRuntimeProviderState(providerName);
 		}
 		this.#lastStaticLoadMtime = null;
+		this.#staticModelsLoaded = false;
 		this.#reloadStaticModels();
 		this.#rebuildCanonicalIndex();
 	}
@@ -2698,6 +3109,8 @@ export class ModelRegistry {
 			},
 			"runtime-register",
 		);
+		this.#clearDescriptorDiscoveryEvidence(providerName);
+		this.#rebuildProviderActivity();
 
 		if (config.streamSimple && config.api) {
 			const streamSimple = config.streamSimple;
@@ -2734,6 +3147,7 @@ export class ModelRegistry {
 		}
 		if (sourceHandoff) {
 			this.#lastStaticLoadMtime = null;
+			this.#staticModelsLoaded = false;
 			this.#reloadStaticModels();
 		}
 
@@ -2791,12 +3205,14 @@ export class ModelRegistry {
 						config.oauth.modifyModels(withRuntimeTransportOverride, credential),
 					);
 					this.#rebuildCanonicalIndex();
+					this.#rebuildProviderActivity();
 					return;
 				}
 			}
 
 			this.#models = applyFinalCodexGpt56ContextCap(withRuntimeTransportOverride);
 			this.#rebuildCanonicalIndex();
+			this.#rebuildProviderActivity();
 			return;
 		}
 
@@ -2826,6 +3242,7 @@ export class ModelRegistry {
 				return this.#applyProviderTransportOverride(m, transportOverride);
 			});
 			this.#rebuildCanonicalIndex();
+			this.#rebuildProviderActivity();
 		}
 	}
 
