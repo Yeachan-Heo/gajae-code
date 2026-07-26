@@ -2205,7 +2205,8 @@ export class ModelRegistry {
 		baseUrl: string,
 		headers: Record<string, string> | undefined,
 	): Promise<LlamaCppDiscoveredServerMetadata | null> {
-		const propsUrl = `${this.#toLlamaCppNativeBaseUrl(baseUrl)}/props`;
+		const propsUrl = new URL(this.#toLlamaCppNativeBaseUrl(baseUrl));
+		propsUrl.pathname = `${propsUrl.pathname.replace(/\/+$/g, "")}/props`;
 		try {
 			const response = await fetch(propsUrl, {
 				headers,
@@ -2229,7 +2230,8 @@ export class ModelRegistry {
 
 	async #discoverLlamaCppModels(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
 		const baseUrl = this.#normalizeLlamaCppBaseUrl(providerConfig.baseUrl);
-		const modelsUrl = `${baseUrl}/models`;
+		const modelsUrl = new URL(baseUrl);
+		modelsUrl.pathname = `${modelsUrl.pathname.replace(/\/+$/g, "")}/models`;
 
 		const headers: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 		const apiKey = await this.authStorage.getApiKey(providerConfig.provider);
@@ -2345,7 +2347,7 @@ export class ModelRegistry {
 		try {
 			const parsed = new URL(raw);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
-			return `${parsed.protocol}//${parsed.host}${trimmedPath}`;
+			return `${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search}`;
 		} catch {
 			return raw;
 		}
@@ -2356,7 +2358,7 @@ export class ModelRegistry {
 			const parsed = new URL(baseUrl);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
 			parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath.slice(0, -3) || "/" : trimmedPath || "/";
-			const normalized = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+			const normalized = `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
 			return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
 		} catch {
 			return baseUrl.endsWith("/v1") ? baseUrl.slice(0, -3) : baseUrl;

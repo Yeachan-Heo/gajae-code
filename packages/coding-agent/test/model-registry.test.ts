@@ -2713,6 +2713,35 @@ describe("ModelRegistry", () => {
 			expect(llama?.maxTokens).toBe(8192);
 			expect(llama?.input).toEqual(["text", "image"]);
 		});
+		test("llama.cpp discovery preserves query parameters for models and props", async () => {
+			writeRawModelsJson({
+				"query-llama": {
+					baseUrl: "https://gateway.example/v1?tenant=alpha",
+					api: "openai-completions",
+					discovery: { type: "llama.cpp" },
+				},
+			});
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://gateway.example/v1/models?tenant=alpha") {
+					return new Response(JSON.stringify({ data: [{ id: "query-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://gateway.example/props?tenant=alpha") {
+					return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 32768 } }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("query-llama");
+
+			expect(registry.find("query-llama", "query-model")?.contextWindow).toBe(32768);
+		});
 	});
 	describe("bundled Anthropic catalog availability", () => {
 		test("includes native Opus 4.7 in available models when Anthropic auth exists", async () => {

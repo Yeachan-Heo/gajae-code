@@ -285,9 +285,15 @@ function parseProviderQualifiedSelector(
 	const caseFoldedProviders = discoverableProviders.filter(candidate =>
 		normalizedSelector.startsWith(`${candidate.toLowerCase()}/`),
 	);
+	const longestExactProvider = [...exactProviders].sort((left, right) => right.length - left.length)[0];
+	const longestCaseFoldedProviders = [...caseFoldedProviders].sort((left, right) => right.length - left.length);
+	const longestCaseFoldedProvider = longestCaseFoldedProviders[0];
 	const provider =
-		[...exactProviders].sort((left, right) => right.length - left.length)[0] ??
-		(exactProviders.length === 0 && caseFoldedProviders.length === 1 ? caseFoldedProviders[0] : undefined);
+		longestExactProvider ??
+		(longestCaseFoldedProvider &&
+		longestCaseFoldedProviders.filter(candidate => candidate.length === longestCaseFoldedProvider.length).length === 1
+			? longestCaseFoldedProvider
+			: undefined);
 	if (provider) {
 		const modelId = splitSelector.baseSelector.slice(provider.length + 1);
 		return modelId ? { provider, modelId } : undefined;
