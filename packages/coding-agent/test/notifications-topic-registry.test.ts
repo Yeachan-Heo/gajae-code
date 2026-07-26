@@ -506,3 +506,114 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
+describe("isTopicIdAvailable (user-topic adoption)", () => {
+	test.each([
+		["empty", ""],
+		["non-decimal", "1e2"],
+		["zero", "0"],
+		["negative", "-1"],
+		["non-safe", "9007199254740992"],
+		["non-string numeric", 123 as unknown as string],
+		["null", null as unknown as string],
+	])("rejects invalid topic ids without mutation (%s)", (_name, topicId) => {
+		const reg = new TopicRegistry();
+		expect(reg.isTopicIdAvailable(topicId)).toBe(false);
+		expect(reg.serialize()).toEqual({ topics: {}, fences: {} });
+	});
+
+	test("reports an id available when no record, route, or stage claims it", () => {
+		const reg = new TopicRegistry();
+		expect(reg.isTopicIdAvailable("42")).toBe(true);
+	});
+
+	test("rejects an id once an active topic is committed for it", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "42");
+		expect(reg.isTopicIdAvailable("42")).toBe(false);
+		expect(reg.isTopicIdAvailable("43")).toBe(true);
+	});
+
+	test("rejects an id held by a delete-pending (fenced) record", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "42", Date.now, undefined, {
+			chatId: "42",
+			endpointKey: "ws://s1",
+			endpointDigest: "digest-s1",
+			endpointGeneration: 1,
+		});
+		reg.beginDelete("s1");
+		expect(reg.get("s1")?.authorityState).toBe("delete_pending");
+		expect(reg.isTopicIdAvailable("42")).toBe(false);
+	});
+
+	test("rejects an id that is ambiguous across two records", async () => {
+		const reg = new TopicRegistry();
+		const binding = (sessionId: string) => ({
+			chatId: "42",
+			endpointKey: `ws://${sessionId}`,
+			endpointDigest: `digest-${sessionId}`,
+			endpointGeneration: 1,
+		});
+		await reg.getOrCreateTopic("A", async () => "42", Date.now, undefined, binding("A"));
+		await reg.getOrCreateTopic("B", async () => "42", Date.now, undefined, binding("B"));
+		expect(reg.sessionForTopic("42")).toBeUndefined();
+		expect(reg.isTopicIdAvailable("42")).toBe(false);
+	});
+
+	test("rejects an id held by a staged (not-yet-committed) create without mutating state", async () => {
+		const reg = new TopicRegistry();
+		const commitGate = Promise.withResolvers<void>();
+		const creating = reg.getOrCreateTopic(
+			"s1",
+			async () => "42",
+			Date.now,
+			undefined,
+			undefined,
+			async () => {
+				// During the durable commit the record is staged-but-uncommitted;
+				// adoption must refuse the topic id to avoid a duplicate authority.
+				expect(reg.isTopicIdAvailable("42")).toBe(false);
+				await commitGate.promise;
+			},
+		);
+		commitGate.resolve();
+		await creating;
+		expect(reg.isTopicIdAvailable("42")).toBe(false);
+		expect(reg.sessionForTopic("42")).toBe("s1");
+	});
+
+	test("adoption via getOrCreateTopic create callback commits exactly once with the user topic id", async () => {
+		const reg = new TopicRegistry();
+		const binding = {
+			chatId: "42",
+			endpointKey: "ws://s1",
+			endpointDigest: "digest-s1",
+			endpointGeneration: 1,
+		};
+		// The create callback returns a user-created topicId only after confirming
+		// pure availability; getOrCreateTopic then commits the full record once.
+		const record = await reg.getOrCreateTopic(
+			"s1",
+			async () => {
+				expect(reg.isTopicIdAvailable("77")).toBe(true);
+				return "77";
+			},
+			() => 1000,
+			"repo/main",
+			binding,
+			undefined,
+			undefined,
+			"user_created",
+		);
+		expect(record.topicId).toBe("77");
+		expect(record.creationLeaseEpoch).toBe(0);
+		expect(record.chatId).toBe("42");
+		expect(reg.sessionForTopic("77")).toBe("s1");
+		expect(reg.get("s1")?.endpointDigest).toBe("digest-s1");
+		expect(reg.isTopicIdAvailable("77")).toBe(false);
+		expect(record.topicOrigin).toBe("user_created");
+		const reloaded = new TopicRegistry();
+		reloaded.load(reg.serialize());
+		expect(reloaded.get("s1")?.topicOrigin).toBe("user_created");
+	});
+});

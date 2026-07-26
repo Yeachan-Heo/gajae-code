@@ -63,6 +63,7 @@ import {
 	isLifecycleCommandText,
 	type LifecycleCommandVerb,
 	lifecycleUsage,
+	normalizeLifecyclePath,
 	parseLifecycleCommand,
 	validateLifecycleTarget,
 } from "./lifecycle-commands";
@@ -77,7 +78,7 @@ import {
 import type { OrchestratorDeps } from "./lifecycle-orchestrator";
 import { NotificationOperatorRuntime, OperatorBackoffPolicy, OperatorEventRouter } from "./operator-runtime";
 import { RateLimitPool } from "./rate-limit-pool";
-import { listRecentSessions } from "./recent-activity";
+import { type ListRecentSessionsResult, listRecentSessions } from "./recent-activity";
 import { ReplySentStore } from "./reply-sent-store";
 import { DraftStreamState, deliverDraft, shouldStreamDraft } from "./rich-draft";
 import {
@@ -86,6 +87,13 @@ import {
 	isBtwRichEligible,
 	shouldPromoteRich,
 } from "./rich-render";
+import {
+	type AdoptionIntentFs,
+	buildAdoptionIntent,
+	DEFAULT_ADOPTION_INTENT_TTL_MS,
+	TelegramAdoptionIntentStore,
+	type TelegramAdoptionTarget,
+} from "./telegram-adoption-intent";
 import {
 	type AliasTable,
 	buildActionMarkdown,
@@ -145,7 +153,14 @@ export interface TelegramDaemonFs {
 	open(path: string, flags: string, mode?: number): Promise<{ close(): Promise<void> }>;
 	readdir(path: string): Promise<string[]>;
 	chmod(path: string, mode: number): Promise<void>;
-	stat?(path: string): Promise<{ mtimeMs: number; size?: number; dev?: number; ino?: number; ctimeMs?: number }>;
+	stat?(path: string): Promise<{
+		mtimeMs: number;
+		size?: number;
+		dev?: number;
+		ino?: number;
+		ctimeMs?: number;
+		isDirectory?: () => boolean;
+	}>;
 	readEndpointFile?(path: string): Promise<NotificationEndpointFile>;
 	exactUnlink?(path: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 }
@@ -301,6 +316,8 @@ const CONSUMED_REACTION = "✅";
 const MODEL_CALLBACK_PREFIX = "m:";
 const MODEL_CHOICE_TTL_MS = 10 * 60 * 1_000;
 const BTW_PENDING_TTL_MS = 300_000;
+const PICKER_CALLBACK_PREFIX = "p:";
+const ADOPTION_INTENT_SWEEP_INTERVAL_MS = 60_000;
 const BTW_MAX_PENDING = 256;
 const BTW_SHUTDOWN_JOIN_MS = 1_000;
 const BTW_USAGE_TEXT = "Usage: /btw <question>";
@@ -3818,6 +3835,8 @@ export interface TelegramDaemonOptions {
 	clearIntervalImpl?: typeof clearInterval;
 	btw?: { enabled: boolean };
 	idleTimeoutMs?: number;
+	/** TTL for durable topic-adoption intents (default 10 minutes). Observed, not a fixed contract. */
+	adoptionIntentTtlMs?: number;
 	scanIntervalMs?: number;
 	pid?: number;
 	/** Liveness probe for skipping dead-PID endpoint records in {@link TelegramNotificationDaemon.scanRoots}. */
@@ -3911,6 +3930,24 @@ interface ModelChoiceRoute {
 interface RenderedModelChoice {
 	selector: string;
 	label: string;
+}
+type TopicPickerAction = { kind: "select"; target: TelegramAdoptionTarget } | { kind: "recent" } | { kind: "direct" };
+
+interface TopicPickerRoute {
+	/** Telegram forum topic id the user created and that this picker controls. */
+	topicId: number;
+	/** Preallocated session id that will adopt this topic once created. */
+	intendedSessionId: string;
+	/** Configured chat id this picker was rendered for; replay into another chat is refused. */
+	chatId: string;
+	action: TopicPickerAction;
+	expiresAt: number;
+}
+
+interface PendingAdoptionPathInput {
+	chatId: string;
+	intendedSessionId: string;
+	expiresAt: number;
 }
 
 interface TopicAuthorityLease {
@@ -4127,6 +4164,18 @@ export class TelegramNotificationDaemon {
 	readonly sessions = new Map<string, SessionSocket>();
 	/** Ephemeral aliases for model choices; deliberately never serialized across daemon restarts. */
 	#modelChoiceAliases = new Map<string, ModelChoiceRoute>();
+	/** One-shot picker aliases for user-created topic adoption; consumed before submit. */
+	#adoptionPickerAliases = new Map<string, TopicPickerRoute>();
+	/** Topics whose next authenticated text message is treated as an explicitly requested path. */
+	#pendingAdoptionPathInputs = new Map<number, PendingAdoptionPathInput>();
+	/** Durable, non-routable topic-adoption intents; sole claim authority is getOrCreateTopic. */
+	#adoptionIntents: TelegramAdoptionIntentStore;
+	/** Configured adoption-intent TTL (default 10 minutes); observed, not a fixed contract. */
+	#adoptionIntentTtlMs: number;
+	/** Periodic sweep handle for expired adoption intents. */
+	#adoptionSweepTimer: NodeJS.Timeout | undefined;
+	/** In-flight submissions close the pre-sidecar race across picker and direct-path entry points. */
+	readonly #adoptionStartingTopics = new Set<number>();
 
 	private readonly runtime: NotificationOperatorRuntime;
 	private readonly sessionRouter: OperatorEventRouter<SessionSocket>;
@@ -4481,6 +4530,7 @@ export class TelegramNotificationDaemon {
 			| { kind: "close"; target: SessionCloseTarget }
 			| { kind: "resume"; target: SessionResumeTarget },
 		updateId: number,
+		intendedSessionId?: string,
 	): SessionLifecycleRequest {
 		const requestId = this.nextLifecycleRequestId();
 		const token = this.controlToken ?? "";
@@ -4490,7 +4540,7 @@ export class TelegramNotificationDaemon {
 				type: "session_create",
 				requestId,
 				lifecycleRequestId: requestId,
-				intendedSessionId: `s${crypto.randomBytes(6).toString("hex")}`,
+				intendedSessionId: intendedSessionId ?? `s${crypto.randomBytes(6).toString("hex")}`,
 				updateId,
 				chatId,
 				token,
@@ -4650,6 +4700,30 @@ export class TelegramNotificationDaemon {
 		this.fsImpl = opts.fs ?? nodeFs;
 		this.replyStore = new ReplySentStore({ agentDir: opts.settings.getAgentDir(), fs: opts.fs });
 		this.aliasTable = createAliasTable();
+		this.#adoptionIntentTtlMs = opts.adoptionIntentTtlMs ?? DEFAULT_ADOPTION_INTENT_TTL_MS;
+		const adoptionFs: AdoptionIntentFs = {
+			mkdir: (directory, options) => this.fsImpl.mkdir(directory, options),
+			chmod: (target, mode) => this.fsImpl.chmod(target, mode),
+			readFile: (file, encoding) => this.fsImpl.readFile(file, encoding),
+			writeFile: (file, data, options) => this.fsImpl.writeFile(file, data, options),
+			rename: (from, to) => this.fsImpl.rename(from, to),
+			unlink: file => this.fsImpl.unlink(file),
+			readdir: directory => this.fsImpl.readdir(directory),
+			open: async (file, flags) => {
+				const handle = await this.fsImpl.open(file, flags);
+				const sync = (handle as { sync?: () => Promise<void> }).sync;
+				if (typeof sync !== "function") {
+					await handle.close();
+					throw new Error("adoption sidecar durability requires filesystem sync support");
+				}
+				return { sync: () => sync.call(handle), close: () => handle.close() };
+			},
+		};
+		this.#adoptionIntents = new TelegramAdoptionIntentStore({
+			agentDir: opts.settings.getAgentDir(),
+			now: opts.now,
+			fs: adoptionFs,
+		});
 		const rawBotApi =
 			opts.botApi ??
 			new TelegramBotTransport({
@@ -5160,7 +5234,7 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	connectSession(sessionId: string, url: string, token: string): void {
+	connectSession(sessionId: string, url: string, token: string): SessionSocket {
 		const WS = this.opts.WebSocketImpl ?? WebSocket;
 		const ws = new WS(`${url}/?token=${encodeURIComponent(token)}`);
 		const endpointKey = endpointGenerationKey(url, token);
@@ -5264,6 +5338,7 @@ export class TelegramNotificationDaemon {
 		ws.addEventListener("close", () => {
 			this.dropSession(session, "socket_closed");
 		});
+		return session;
 	}
 
 	/**
@@ -6632,12 +6707,42 @@ export class TelegramNotificationDaemon {
 		let acceptedTopicCompensated = false;
 		let acceptedTopicDeleteAttempted = false;
 		let creationSuppressed = false;
+		/** User-created topicId adopted in this callback, if any (for sidecar reconciliation). */
+		let adoptedTopicId: number | undefined;
+		const adoptionIntentCandidate = this.#adoptionIntents.bySession(sessionId);
 		try {
 			const rec = await this.topics.getOrCreateTopic(
 				sessionId,
 				async () => {
 					if (capturedCreationLease && !this.#leaseTokenAllows(capturedCreationLease))
 						throw new Error("topic authority was revoked during creation");
+					// Adoption path: if a durable non-routable intent targets this
+					// session, synchronously claim its user-created topicId, validate
+					// chat/binding/pure availability, and RETURN it so getOrCreateTopic
+					// commits the full record exactly once. createForumTopic is never
+					// called for an adopted topic; acceptedTopicId stays unset so no
+					// compensation path can delete the user topic.
+					const adoptionIntent = adoptionIntentCandidate ? this.#adoptionIntents.bySession(sessionId) : undefined;
+					if (adoptionIntentCandidate && !adoptionIntent) {
+						throw new Error("topic adoption refused: intent expired before consumption");
+					}
+					if (adoptionIntent) {
+						const chatId = String(this.opts.chatId);
+						const topicIdStr = String(adoptionIntent.topicId);
+						const chatMatches = adoptionIntent.chatId === chatId;
+						const bindingChatMatches = !creationBinding || creationBinding.chatId === chatId;
+						const available = this.topics.isTopicIdAvailable(topicIdStr);
+						if (!chatMatches || !bindingChatMatches || !available) {
+							// Fail closed: never fall back to remote-create over a user topic.
+							throw new Error("topic adoption refused: intent chat/binding/topic unavailable");
+						}
+						if (!this.#adoptionIntents.tryClaim(adoptionIntent.topicId, sessionId)) {
+							throw new Error("topic adoption refused: concurrent claim held");
+						}
+						this.#malformedTopicCreateEndpoints.delete(sessionId);
+						adoptedTopicId = adoptionIntent.topicId;
+						return topicIdStr;
+					}
 					const res = (await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name })) as
 						| { result?: { message_thread_id?: unknown } }
 						| undefined;
@@ -6696,7 +6801,25 @@ export class TelegramNotificationDaemon {
 				creationBinding,
 				() => this.persistTopics(),
 				session,
+				adoptionIntentCandidate ? "user_created" : undefined,
 			);
+			// Adoption commit success: remove the durable sidecar. A cleanup failure
+			// cannot roll back the committed record; topic success is retained and the
+			// stale sidecar is left for startup reconciliation to remove safely.
+			if (adoptedTopicId !== undefined) {
+				if (adoptionIntentCandidate)
+					logger.info(
+						`notifications: topic-adoption committed age_ms=${Math.max(0, this.runtime.now() - adoptionIntentCandidate.createdAt)}`,
+					);
+				try {
+					await this.#adoptionIntents.remove(sessionId);
+					await this.#adoptionIntents.removePendingTopic(adoptedTopicId);
+				} catch (error) {
+					logger.warn(
+						`notifications: topic-adoption sidecar cleanup failed; retained for reconciliation: ${sanitizeDiagnostic(String(error))}`,
+					);
+				}
+			}
 			// getOrCreateTopic deduplicates callers, so an accepted create can be
 			// observed by a successor after its initiating socket was revoked. Check
 			// the immutable lease again before exposing that record to frame delivery.
@@ -6729,6 +6852,11 @@ export class TelegramNotificationDaemon {
 			return rec.topicId;
 		} catch (err) {
 			if (creationSuppressed || err instanceof ThreadedModeCapabilityRefusal) return undefined;
+			// Adoption commit failure: release the in-memory claim so a retry can
+			// re-claim, and retain the durable sidecar (never delete the user topic).
+			if (adoptedTopicId !== undefined) {
+				this.#adoptionIntents.releaseClaim(adoptedTopicId, sessionId);
+			}
 			if (
 				acceptedTopicId &&
 				!acceptedTopicCompensated &&
@@ -6833,6 +6961,26 @@ export class TelegramNotificationDaemon {
 		try {
 			await this.flushPool();
 			if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
+			if (record.topicOrigin === "user_created") {
+				this.topics.settleDelete(sessionId, record.topicId);
+				for (const k of [...this.liveMessages.keys()])
+					if (k.startsWith(`${sessionId}:`)) {
+						this.liveMessages.delete(k);
+						this.toolActivityOwners.delete(k);
+					}
+				this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
+					if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
+				});
+				this.pendingThreadedFrames.delete(sessionId);
+				try {
+					await this.persistTopics();
+					return "settled";
+				} catch {
+					this.topics.restoreDeleteFence(deleteSnapshot);
+					await this.#persistTopicsWithRetry().catch(() => undefined);
+					return "post_dispatch_pending";
+				}
+			}
 			const res = (await this.botApi.call("deleteForumTopic", {
 				chat_id: this.opts.chatId,
 				message_thread_id: Number(record.topicId),
@@ -6947,6 +7095,56 @@ export class TelegramNotificationDaemon {
 				)
 					this.closedEndpointKeys.set(sessionId, binding);
 			}
+		}
+	}
+
+	/**
+	 * Rehydrate durable adoption intents after restart, then reconcile: a
+	 * non-expired sidecar whose target session already has a committed topic
+	 * record is a stale leftover (commit succeeded but sidecar cleanup failed)
+	 * and is removed safely without touching the user topic.
+	 */
+	async loadAdoptionIntents(): Promise<void> {
+		await this.#adoptionIntents.rehydrate();
+		const expired = await this.#adoptionIntents.sweepExpired();
+		if (expired > 0) logger.info(`notifications: topic-adoption expired count=${expired}`);
+		for (const sessionId of this.topics.sessionIds()) {
+			const intent = this.#adoptionIntents.bySession(sessionId);
+			if (!intent) continue;
+			const record = this.topics.get(sessionId);
+			if (record && record.topicId === String(intent.topicId)) {
+				try {
+					await this.#adoptionIntents.remove(sessionId);
+					await this.#adoptionIntents.removePendingTopic(intent.topicId);
+				} catch (error) {
+					logger.warn(
+						`notifications: stale topic-adoption sidecar cleanup failed: ${sanitizeDiagnostic(String(error))}`,
+					);
+				}
+			}
+		}
+	}
+
+	/** Periodic sweep of expired adoption-intent sidecars (files only; no Telegram API). */
+	private startAdoptionSweepTimer(): void {
+		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
+		this.#adoptionSweepTimer = setIntervalImpl(() => {
+			this.#sweepExpiredAdoptionPickerAliases();
+			void this.#adoptionIntents
+				.sweepExpired()
+				.then(expired => {
+					if (expired > 0) logger.info(`notifications: topic-adoption expired count=${expired}`);
+				})
+				.catch(error => {
+					logger.warn(`notifications: adoption-intent sweep failed: ${sanitizeDiagnostic(String(error))}`);
+				});
+		}, ADOPTION_INTENT_SWEEP_INTERVAL_MS);
+	}
+
+	private stopAdoptionSweepTimer(): void {
+		if (this.#adoptionSweepTimer !== undefined) {
+			(this.opts.clearIntervalImpl ?? clearInterval)(this.#adoptionSweepTimer);
+			this.#adoptionSweepTimer = undefined;
 		}
 	}
 
@@ -8904,6 +9102,568 @@ export class TelegramNotificationDaemon {
 			parse_mode: TELEGRAM_PARSE_MODE,
 		});
 	}
+	/**
+	 * Consume a user-created forum topic (`forum_topic_created` service message)
+	 * before edited/text routing. Authenticates the chat, user, privacy, and
+	 * lifecycle state; offers home, recent folders, or explicit path entry. The
+	 * selected path (or an exact `/session_create path <dir>`) creates a session
+	 * that adopts this topic — never a duplicate topic. Non-routable durable
+	 * intents prevent duplicate creation across concurrent first frames.
+	 */
+	private async handleForumTopicCreatedUpdate(update: unknown): Promise<"not-topic" | TelegramUpdateOutcome> {
+		const parsed = update as {
+			update_id?: unknown;
+			message?: {
+				chat?: { id?: unknown };
+				from?: { id?: unknown; is_bot?: unknown };
+				message_thread_id?: unknown;
+				forum_topic_created?: { name?: unknown };
+			};
+		};
+		const message = parsed.message;
+		if (!message?.forum_topic_created) return "not-topic";
+		const updateId = parsed.update_id;
+		if (typeof updateId !== "number" || !Number.isSafeInteger(updateId) || updateId < 0) return "consumed";
+		if (this.dispatchState.seenUpdateIds.has(updateId)) return "consumed";
+		const configuredUserId = Number(this.opts.chatId);
+		if (
+			!Number.isSafeInteger(configuredUserId) ||
+			typeof message.chat?.id !== "number" ||
+			message.chat.id !== configuredUserId ||
+			message.from?.id !== configuredUserId ||
+			message.from?.is_bot !== false
+		)
+			return "consumed";
+		const privacy = await this.resolvePairedChatPrivacy();
+		if (privacy === "indeterminate") return "retry";
+		if (privacy !== "private") return "consumed";
+		const threadId = message.message_thread_id;
+		if (typeof threadId !== "number" || !Number.isSafeInteger(threadId) || threadId <= 0) return "consumed";
+		if (!this.lifecycleControlActive) return "consumed";
+		// A non-expired intent for this topic means a session is already starting;
+		// do not mint a new intendedSessionId or render a second picker.
+		if (this.#adoptionIntents.hasNonExpiredTopic(threadId)) {
+			try {
+				await this.botApi.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: threadId,
+					text: "A session is already starting in this topic.",
+				});
+			} catch {
+				// Best-effort notice; never block on the side message.
+			}
+			await this.rememberSeenUpdateId(updateId);
+			return "consumed";
+		}
+		// The topic may already be bound to an active session (late duplicate of a
+		// created update whose adoption already committed). Do not re-offer.
+		if (this.topics.sessionForTopic(String(threadId))) {
+			await this.rememberSeenUpdateId(updateId);
+			return "consumed";
+		}
+		let pendingTopic = this.#adoptionIntents.pendingTopic(threadId);
+		if (!pendingTopic) {
+			const now = this.runtime.now();
+			pendingTopic = {
+				topicId: threadId,
+				chatId: String(this.opts.chatId),
+				createdAt: now,
+				expiresAt: now + this.#adoptionIntentTtlMs,
+			};
+			try {
+				await this.#adoptionIntents.putPendingTopic(pendingTopic);
+			} catch (error) {
+				logger.warn(
+					`notifications: failed to persist pending user topic: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+				);
+				return "retry";
+			}
+		}
+		if (!(await this.#renderAdoptionPicker(threadId))) return "retry";
+		await this.rememberSeenUpdateId(updateId);
+		return "consumed";
+	}
+
+	/** Render the top-level folder source choices for a user-created topic. */
+	async #renderAdoptionPicker(threadId: number): Promise<boolean> {
+		const intendedSessionId = `s${crypto.randomBytes(6).toString("hex")}`;
+		const chatId = String(this.opts.chatId);
+		const choices: Array<{ label: string; action: TopicPickerAction }> = [
+			{ label: "1. Home (~)", action: { kind: "select", target: { kind: "existing_path", path: os.homedir() } } },
+			{ label: "2. Recent work folders", action: { kind: "recent" } },
+			{ label: "3. Enter a path", action: { kind: "direct" } },
+		];
+		const aliases = choices.map(choice => ({
+			...choice,
+			alias: this.#putAdoptionPickerAlias({
+				topicId: threadId,
+				intendedSessionId,
+				chatId,
+				action: choice.action,
+			}),
+		}));
+		try {
+			const response = await this.botApi.call("sendMessage", {
+				chat_id: this.opts.chatId,
+				message_thread_id: threadId,
+				text: "Choose where to start the GJC session:",
+				reply_markup: {
+					inline_keyboard: aliases.map(choice => [{ text: choice.label, callback_data: choice.alias }]),
+				},
+			});
+			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
+				for (const choice of aliases) this.#adoptionPickerAliases.delete(choice.alias);
+				return false;
+			}
+			return true;
+		} catch {
+			for (const choice of aliases) this.#adoptionPickerAliases.delete(choice.alias);
+			logger.warn("notifications: failed to send topic-adoption picker keyboard");
+			return false;
+		}
+	}
+
+	/** Render verified recent work folders as one-shot picker buttons. */
+	async #renderRecentFolderChoices(threadId: number, intendedSessionId: string): Promise<boolean> {
+		let recent: ListRecentSessionsResult;
+		try {
+			recent = await listRecentSessions({
+				cwd: process.cwd(),
+				agentDir: this.opts.settings.getAgentDir(),
+				limit: 8,
+				includeInternal: false,
+				allWorkspaces: true,
+			});
+		} catch (error) {
+			logger.warn(
+				`notifications: failed to list recent folders for topic adoption: ${sanitizeDiagnostic(String(error))}`,
+			);
+			return false;
+		}
+		const entries = recent.kind === "complete" ? recent.entries.filter(entry => entry.path) : [];
+		const chatId = String(this.opts.chatId);
+		if (entries.length === 0) {
+			const text =
+				recent.kind === "error"
+					? `Recent work folders could not be verified: ${recent.message}. Choose “Enter a path” from a new topic or use /session_create path <dir>.`
+					: "No recent verified work folders were found. Choose “Enter a path” from a new topic or use /session_create path <dir>.";
+			try {
+				const response = await this.botApi.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: threadId,
+					text,
+				});
+				return Boolean(response && typeof response === "object" && (response as { ok?: unknown }).ok === true);
+			} catch {
+				return false;
+			}
+		}
+		const aliases = entries.map(entry => {
+			const target = { kind: "existing_path" as const, path: entry.path! };
+			const alias = this.#putAdoptionPickerAlias({
+				topicId: threadId,
+				intendedSessionId,
+				chatId,
+				action: { kind: "select", target },
+			});
+			return { alias, label: this.#pickerLabel(entry) };
+		});
+		const inline_keyboard = buildButtonGrid(
+			aliases.map(a => a.label),
+			index => aliases[index]!.alias,
+		);
+		try {
+			const response = await this.botApi.call("sendMessage", {
+				chat_id: this.opts.chatId,
+				message_thread_id: threadId,
+				text: "Pick a recent work folder to start a session here:",
+				reply_markup: { inline_keyboard },
+			});
+			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
+				for (const a of aliases) this.#adoptionPickerAliases.delete(a.alias);
+				return false;
+			}
+			return true;
+		} catch {
+			for (const a of aliases) this.#adoptionPickerAliases.delete(a.alias);
+			logger.warn("notifications: failed to send recent-folder picker keyboard");
+			return false;
+		}
+	}
+
+	#pickerLabel(entry: { sessionId: string; path?: string; branch?: string; title?: string }): string {
+		const base = path.basename(entry.path ?? entry.sessionId);
+		const raw = entry.branch ? `${base} (${entry.branch})` : base;
+		return safeModelButtonLabel(raw) ?? "workspace";
+	}
+
+	#sweepExpiredAdoptionPickerAliases(): void {
+		const now = this.runtime.now();
+		for (const [alias, route] of this.#adoptionPickerAliases) {
+			if (route.expiresAt <= now) this.#adoptionPickerAliases.delete(alias);
+		}
+		for (const [topicId, pending] of this.#pendingAdoptionPathInputs) {
+			if (pending.expiresAt <= now) this.#pendingAdoptionPathInputs.delete(topicId);
+		}
+	}
+
+	#putAdoptionPickerAlias(route: Omit<TopicPickerRoute, "expiresAt">): string {
+		this.#sweepExpiredAdoptionPickerAliases();
+		let alias: string;
+		do {
+			alias = `${PICKER_CALLBACK_PREFIX}${crypto.randomBytes(16).toString("base64url")}`;
+		} while (this.#adoptionPickerAliases.has(alias));
+		this.#adoptionPickerAliases.set(alias, { ...route, expiresAt: this.runtime.now() + this.#adoptionIntentTtlMs });
+		return alias;
+	}
+	#deleteAdoptionPickerAliasesForTopic(topicId: number): void {
+		for (const [alias, route] of this.#adoptionPickerAliases) {
+			if (route.topicId === topicId) this.#adoptionPickerAliases.delete(alias);
+		}
+	}
+
+	/** Handle a one-shot picker button tap. Re-validates chat/topic/expiry/target before submit. */
+	async #handleAdoptionPickerCallback(update: unknown, callbackId: unknown): Promise<boolean> {
+		const parsed = update as {
+			update_id?: unknown;
+			callback_query?: {
+				data?: unknown;
+				from?: { id?: unknown; is_bot?: unknown };
+				message?: { chat?: { id?: unknown }; message_id?: unknown; message_thread_id?: unknown };
+			};
+		};
+		const callback = parsed.callback_query;
+		const alias = callback?.data;
+		if (typeof alias !== "string" || !alias.startsWith(PICKER_CALLBACK_PREFIX)) return false;
+		this.#sweepExpiredAdoptionPickerAliases();
+		const route = this.#adoptionPickerAliases.get(alias);
+		if (!route) {
+			await this.answerCallbackQueryBestEffort(callbackId, "Button is stale");
+			return true;
+		}
+		const configuredUserId = Number(this.opts.chatId);
+		const updateId = parsed.update_id;
+		if (
+			!Number.isSafeInteger(configuredUserId) ||
+			String(callback?.message?.chat?.id) !== route.chatId ||
+			route.chatId !== String(this.opts.chatId) ||
+			callback?.from?.id !== configuredUserId ||
+			callback?.from?.is_bot !== false ||
+			callback?.message?.message_thread_id !== route.topicId ||
+			typeof updateId !== "number" ||
+			!Number.isSafeInteger(updateId) ||
+			updateId < 0 ||
+			!this.lifecycleControlActive
+		) {
+			await this.answerCallbackQueryBestEffort(callbackId, "Not authorized");
+			return true;
+		}
+		if (route.expiresAt <= this.runtime.now()) {
+			this.#deleteAdoptionPickerAliasesForTopic(route.topicId);
+			await this.answerCallbackQueryBestEffort(callbackId, "Button is stale");
+			return true;
+		}
+		if (!this.#adoptionIntents.hasPendingTopic(route.topicId, route.chatId)) {
+			this.#deleteAdoptionPickerAliasesForTopic(route.topicId);
+			await this.answerCallbackQueryBestEffort(callbackId, "Button is stale");
+			return true;
+		}
+		if (
+			this.dispatchState.seenUpdateIds.has(updateId) ||
+			this.#adoptionIntents.hasNonExpiredTopic(route.topicId) ||
+			this.#adoptionStartingTopics.has(route.topicId)
+		) {
+			this.#deleteAdoptionPickerAliasesForTopic(route.topicId);
+			await this.answerCallbackQueryBestEffort(callbackId, "A session is already starting in this topic.");
+			return true;
+		}
+		if (route.action.kind === "select") {
+			const valid = validateLifecycleTarget("session_create", route.action.target);
+			if (!valid.ok) {
+				this.#deleteAdoptionPickerAliasesForTopic(route.topicId);
+				await this.answerCallbackQueryBestEffort(callbackId, "That folder is no longer valid.");
+				return true;
+			}
+		}
+		// Consume the whole picker synchronously before the first successful-path await.
+		this.#deleteAdoptionPickerAliasesForTopic(route.topicId);
+		if (!(await this.pairedChatIsPrivate())) {
+			await this.answerCallbackQueryBestEffort(callbackId, "Not authorized");
+			return true;
+		}
+		await this.rememberSeenUpdateId(updateId);
+		await this.answerCallbackQueryBestEffort(callbackId);
+		if (route.action.kind === "recent") {
+			if (!(await this.#renderRecentFolderChoices(route.topicId, route.intendedSessionId))) {
+				await this.botApi
+					.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						message_thread_id: route.topicId,
+						text: "Recent work folders could not be loaded. Open a new topic and try again, or use /session_create path <dir>.",
+					})
+					.catch(() => undefined);
+			}
+			return true;
+		}
+		if (route.action.kind === "direct") {
+			this.#pendingAdoptionPathInputs.set(route.topicId, {
+				chatId: route.chatId,
+				intendedSessionId: route.intendedSessionId,
+				expiresAt: route.expiresAt,
+			});
+			await this.botApi
+				.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: route.topicId,
+					text: "Send the folder path in your next message. Examples: ~ or ~/projects/my-app",
+				})
+				.catch(() => undefined);
+			return true;
+		}
+		await this.#submitAdoptionFrame(
+			route.topicId,
+			route.action.target,
+			route.chatId,
+			updateId,
+			route.intendedSessionId,
+		);
+		return true;
+	}
+
+	/** Handle the next text message after the user explicitly chooses direct path entry. */
+	async #handleAdoptionPathInput(update: unknown): Promise<boolean> {
+		const parsed = update as { update_id?: unknown; message?: Record<string, unknown> };
+		const message = parsed.message;
+		const threadId = message?.message_thread_id;
+		if (typeof threadId !== "number" || !Number.isSafeInteger(threadId) || threadId <= 0) return false;
+		this.#sweepExpiredAdoptionPickerAliases();
+		const pending = this.#pendingAdoptionPathInputs.get(threadId);
+		if (!pending) return false;
+
+		const text = typeof message?.text === "string" ? message.text.trim() : undefined;
+		const chat = message?.chat as { id?: unknown; type?: unknown } | undefined;
+		const from = message?.from as { id?: unknown; is_bot?: unknown } | undefined;
+		const updateId = parsed.update_id;
+		const commandCtx = {
+			chatType: typeof chat?.type === "string" ? chat.type : undefined,
+			botUsername: this.botUsername,
+		};
+		if (isLifecycleCommandText(text, commandCtx)) return false;
+		const configuredUserId = Number(this.opts.chatId);
+		if (
+			!Number.isSafeInteger(configuredUserId) ||
+			String(chat?.id) !== pending.chatId ||
+			pending.chatId !== String(this.opts.chatId) ||
+			from?.id !== configuredUserId ||
+			from?.is_bot !== false ||
+			typeof updateId !== "number" ||
+			!Number.isSafeInteger(updateId) ||
+			updateId < 0
+		)
+			return true;
+		if (!this.lifecycleControlActive || this.dispatchState.seenUpdateIds.has(updateId)) return true;
+		if (!(await this.pairedChatIsPrivate())) return true;
+		if (
+			!this.#adoptionIntents.hasPendingTopic(threadId, pending.chatId) ||
+			this.#adoptionIntents.hasNonExpiredTopic(threadId) ||
+			this.#adoptionStartingTopics.has(threadId)
+		) {
+			this.#pendingAdoptionPathInputs.delete(threadId);
+			return true;
+		}
+
+		const normalized = text ? normalizeLifecyclePath(text) : undefined;
+		const target = normalized ? ({ kind: "existing_path", path: normalized } as const) : undefined;
+		if (!target || !validateLifecycleTarget("session_create", target).ok) {
+			await this.rememberSeenUpdateId(updateId);
+			await this.botApi
+				.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: threadId,
+					text: "That path is invalid. Send a folder path such as ~ or ~/projects/my-app.",
+				})
+				.catch(() => undefined);
+			return true;
+		}
+
+		this.#pendingAdoptionPathInputs.delete(threadId);
+		await this.rememberSeenUpdateId(updateId);
+		await this.#submitAdoptionFrame(threadId, target, pending.chatId, updateId, pending.intendedSessionId);
+		return true;
+	}
+	/**
+	 * Handle an exact `/session_create path <dir>` typed inside a pending
+	 * (user-created, not-yet-adopted) topic without requiring the direct-entry choice.
+	 */
+	async #handleAdoptionDirectPath(update: unknown): Promise<boolean> {
+		const parsedUpdate = update as { update_id?: unknown; message?: Record<string, unknown> };
+		const message = parsedUpdate.message;
+		const text = typeof message?.text === "string" ? message.text : undefined;
+		const chat = message?.chat as { id?: unknown; type?: unknown } | undefined;
+		const from = message?.from as { id?: unknown; is_bot?: unknown } | undefined;
+		const commandCtx = {
+			chatType: typeof chat?.type === "string" ? chat.type : undefined,
+			botUsername: this.botUsername,
+		};
+		if (!isLifecycleCommandText(text, commandCtx)) return false;
+		const parsed = parseLifecycleCommand(text, commandCtx);
+		if (parsed.kind !== "create") return false;
+		const configuredUserId = Number(this.opts.chatId);
+		const threadId = message?.message_thread_id;
+		const updateId = parsedUpdate.update_id;
+		if (typeof threadId !== "number" || !Number.isSafeInteger(threadId) || threadId <= 0) return false;
+		if (
+			!Number.isSafeInteger(configuredUserId) ||
+			String(chat?.id) !== String(this.opts.chatId) ||
+			from?.id !== configuredUserId ||
+			from?.is_bot !== false ||
+			typeof updateId !== "number" ||
+			!Number.isSafeInteger(updateId) ||
+			updateId < 0
+		)
+			return true;
+		if (!this.lifecycleControlActive) return false;
+		if (this.dispatchState.seenUpdateIds.has(updateId)) return true;
+		if (!(await this.pairedChatIsPrivate())) return true;
+		if (this.topics.sessionForTopic(String(threadId))) return false;
+		if (!this.#adoptionIntents.hasPendingTopic(threadId, String(this.opts.chatId))) {
+			await this.rememberSeenUpdateId(updateId);
+			await this.botApi
+				.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: threadId,
+					text: "This topic was not opened for a new GJC session, or its folder picker expired. Open a new topic and try again.",
+				})
+				.catch(error => {
+					logger.warn(
+						`notifications: failed to report stale topic adoption: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+					);
+				});
+			return true;
+		}
+		if (parsed.target.kind !== "existing_path") {
+			await this.rememberSeenUpdateId(updateId);
+			await this.botApi
+				.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: threadId,
+					text: "This topic can start a session only with /session_create path <dir>.",
+				})
+				.catch(error => {
+					logger.warn(
+						`notifications: failed to report unsupported topic-adoption target: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+					);
+				});
+			return true;
+		}
+		const valid = validateLifecycleTarget("session_create", parsed.target);
+		if (!valid.ok) return false;
+		await this.rememberSeenUpdateId(updateId);
+		await this.#submitAdoptionFrame(threadId, parsed.target, String(this.opts.chatId), updateId);
+		return true;
+	}
+
+	/**
+	 * Build an authenticated lifecycle frame, durably persist the adoption intent
+	 * BEFORE submit, then submit. A definite spawn failure removes the intent;
+	 * readiness_timeout / terminal_uncertain retain it (a late spawn within TTL
+	 * may still adopt the original topic). Never deletes the user topic.
+	 */
+	async #submitAdoptionFrame(
+		topicId: number,
+		target: TelegramAdoptionTarget,
+		chatId: string,
+		updateId: number,
+		preallocatedSessionId?: string,
+	): Promise<void> {
+		if (this.#adoptionStartingTopics.has(topicId) || this.#adoptionIntents.hasNonExpiredTopic(topicId)) {
+			await this.botApi
+				.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: topicId,
+					text: "A session is already starting in this topic.",
+				})
+				.catch(() => undefined);
+			return;
+		}
+		this.#adoptionStartingTopics.add(topicId);
+		try {
+			const frame = this.buildLifecycleFrame({ kind: "create", target }, updateId, preallocatedSessionId);
+			if (frame.type !== "session_create") throw new Error("topic adoption requires a create frame");
+			const intendedSessionId = frame.intendedSessionId;
+			const intent = buildAdoptionIntent({
+				intendedSessionId,
+				topicId,
+				chatId,
+				target,
+				now: this.runtime.now(),
+				ttlMs: this.#adoptionIntentTtlMs,
+			});
+			try {
+				await this.#adoptionIntents.put(intent);
+			} catch (error) {
+				logger.warn(`notifications: failed to persist topic-adoption intent: ${sanitizeDiagnostic(String(error))}`);
+				try {
+					await this.botApi.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						message_thread_id: topicId,
+						text: "Could not start a session because its durable topic binding could not be saved.",
+					});
+				} catch (noticeError) {
+					logger.warn(
+						`notifications: failed to report topic-adoption persistence failure: ${sanitizeDiagnostic(String(noticeError))}`,
+					);
+				}
+				return;
+			}
+			const normalizedPath = target.kind === "existing_path" ? normalizeLifecyclePath(target.path) : undefined;
+			let targetExists = false;
+			if (normalizedPath) {
+				try {
+					const stat = await this.fsImpl.stat?.(normalizedPath);
+					targetExists = stat?.isDirectory?.() === true;
+				} catch {
+					targetExists = false;
+				}
+			}
+			if (!targetExists || !validateLifecycleTarget("session_create", target).ok) {
+				await this.#adoptionIntents.remove(intendedSessionId);
+				await this.botApi
+					.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						message_thread_id: topicId,
+						text: "That folder is no longer available.",
+					})
+					.catch(() => undefined);
+				return;
+			}
+			const response = await this.submitLifecycleFrame(frame);
+			await this.botApi
+				.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: topicId,
+					text: this.formatLifecycleResponse(response, "session_create"),
+				})
+				.catch(error => {
+					logger.warn(
+						`notifications: failed to report topic-adoption lifecycle result: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+					);
+				});
+			if (response.status === "ok") return;
+			if (response.type === "session_lifecycle_error" && response.reason === "spawn_failed") {
+				try {
+					await this.#adoptionIntents.remove(intendedSessionId);
+				} catch (error) {
+					logger.warn(
+						`notifications: failed to remove rejected topic-adoption intent: ${sanitizeDiagnostic(String(error))}`,
+					);
+				}
+			}
+			// readiness_timeout / terminal_uncertain: spawn may still be in flight; retain intent.
+		} finally {
+			this.#adoptionStartingTopics.delete(topicId);
+		}
+	}
 
 	/** Consume Telegram forum-topic rename service messages before text routing. */
 	private async handleForumTopicEdited(update: unknown): Promise<"not-topic" | TelegramUpdateOutcome> {
@@ -8967,6 +9727,8 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async processTelegramUpdate(update: unknown): Promise<TelegramUpdateOutcome> {
+		const createdOutcome = await this.handleForumTopicCreatedUpdate(update);
+		if (createdOutcome !== "not-topic") return createdOutcome;
 		const topicOutcome = await this.handleForumTopicEdited(update);
 		if (topicOutcome !== "not-topic") return topicOutcome;
 		try {
@@ -8978,7 +9740,19 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleTelegramUpdate(update: unknown): Promise<void> {
+		// A user-created forum topic (`forum_topic_created`) is consumed first: it
+		// authenticates the chat/user, shows the folder-source picker, and emits the
+		// "already starting" dedup notice for a topic with a live adoption intent.
+		// This mirrors the poll-loop ordering in processTelegramUpdate so direct
+		// (test/orchestration) callers observe identical created-topic handling.
+		if ((await this.handleForumTopicCreatedUpdate(update)) !== "not-topic") return;
 		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
+		// A raw path is accepted only after the explicit direct-entry choice. The exact
+		// `/session_create path <dir>` form remains available in any pending topic.
+		// Both must precede the general lifecycle handler, which would otherwise create
+		// a separate daemon-owned topic.
+		if (await this.#handleAdoptionPathInput(update)) return;
+		if (await this.#handleAdoptionDirectPath(update)) return;
 		// Session-lifecycle command (/session_*): handled ONLY from the paired chat,
 		// gated before any arg parsing or side effect, and routed through the control
 		// endpoint. Must run before threaded-injection so commands are not treated as
@@ -9489,6 +10263,7 @@ export class TelegramNotificationDaemon {
 			}
 		}
 		const callbackId = (update as { callback_query?: { id?: unknown } }).callback_query?.id;
+		if (await this.#handleAdoptionPickerCallback(update, callbackId)) return;
 		if (await this.#handleModelChoiceCallback(update, callbackId)) return;
 		const decision = routeInboundUpdate(update, {
 			aliasTable: this.aliasTable,
@@ -9601,6 +10376,8 @@ export class TelegramNotificationDaemon {
 			await this.registerBotCommands();
 			await this.loadAliases();
 			await this.loadTopics();
+			await this.loadAdoptionIntents();
+			this.startAdoptionSweepTimer();
 			await this.loadSeenUpdateIds();
 			await this.replyStore.load();
 			await this.runScan();
@@ -9676,6 +10453,7 @@ export class TelegramNotificationDaemon {
 					this.stopFlushTimer();
 					this.stopScanTimer();
 					this.stopTypingTimer();
+					this.stopAdoptionSweepTimer();
 					this.stopLifecycleControl();
 					await this.cleanupAllAttachmentDirs();
 					await this.persistAliases();
