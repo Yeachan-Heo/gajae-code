@@ -2282,7 +2282,8 @@ export class ModelRegistry {
 		discoveryApiKey?: string,
 	): Promise<Model<Api>[]> {
 		const baseUrl = this.#normalizeOpenAIModelsListBaseUrl(providerConfig.baseUrl);
-		const modelsUrl = `${baseUrl}/models`;
+		const modelsUrl = new URL(baseUrl);
+		modelsUrl.pathname = `${modelsUrl.pathname.replace(/\/+$/g, "")}/models`;
 
 		const headers: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 		// Resolve with the same baseUrl context completion requests use so an
@@ -2377,7 +2378,7 @@ export class ModelRegistry {
 			const parsed = new URL(raw);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
 			parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath || "/v1" : `${trimmedPath}/v1`;
-			return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+			return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
 		} catch {
 			return raw;
 		}
