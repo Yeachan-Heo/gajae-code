@@ -2757,9 +2757,7 @@ export class ModelRegistry {
 			evidence.descriptorFresh &&
 			evidence.authGeneration === this.authStorage.getProviderEvidenceGeneration(model.provider) &&
 			evidence.endpoint ===
-				this.#normalizeDiscoveryEvidenceEndpoint(
-					this.#resolveProviderOverride(model.provider)?.baseUrl ?? this.getProviderBaseUrl(model.provider) ?? "",
-				) &&
+				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "") &&
 			evidence.descriptorModelIds.has(model.id)
 		)
 			return true;
