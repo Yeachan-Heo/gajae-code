@@ -4156,6 +4156,33 @@ describe("ModelRegistry", () => {
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
 		});
+		test("invalidates descriptor discovery evidence after an OAuth-only registration", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+
+			registry.registerProvider(
+				"vllm",
+				{
+					oauth: {
+						name: "VLLM",
+						login: async () => "unused",
+					},
+				},
+				"test-vllm-oauth",
+			);
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+			registry.clearSourceRegistrations("test-vllm-oauth");
+		});
 		test("does not restore descriptor evidence after an in-flight discovery is invalidated", async () => {
 			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
 			const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();

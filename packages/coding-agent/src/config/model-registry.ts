@@ -2998,6 +2998,7 @@ export class ModelRegistry {
 			"runtime-register",
 		);
 		this.#clearDescriptorDiscoveryEvidence(providerName);
+		this.#rebuildProviderActivity();
 
 		if (config.streamSimple && config.api) {
 			const streamSimple = config.streamSimple;
