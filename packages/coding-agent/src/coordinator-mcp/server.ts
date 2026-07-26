@@ -859,7 +859,7 @@ interface RuntimePromptAcknowledgement {
 	turn_id: string;
 }
 
-function acknowledgementPayload(result: unknown): Record<string, unknown> | null {
+function sdkResultPayload(result: unknown): Record<string, unknown> | null {
 	const response = asRecord(result);
 	if (!response) return null;
 	const envelope = ["ok", "result", "error"].some(key => Object.hasOwn(response, key));
@@ -887,7 +887,7 @@ function runtimeAcknowledgementIdentity(
 }
 
 function normalizeRuntimePromptAcknowledgement(result: unknown): RuntimePromptAcknowledgement {
-	const acknowledgement = acknowledgementPayload(result);
+	const acknowledgement = sdkResultPayload(result);
 	if (acknowledgement?.accepted !== true)
 		throw new SdkClientError("unavailable", "SDK did not acknowledge prompt delivery.");
 	return {
@@ -2458,15 +2458,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				items.push(...pageItems);
 				if (complete) {
 					const valid = items.every(item => {
-						if (!item || typeof item !== "object" || Buffer.byteLength(JSON.stringify(item)) > 16 * 1024)
-							return false;
-						const gate = item as WorkflowGateQueryRecord & WorkflowGate;
-						return (
-							gate.tag === "pending" &&
-							typeof gate.gate_id === "string" &&
-							gate.gate_id.length > 0 &&
-							!!decodeAskGateV1(gate)
-						);
+						const encoded = JSON.stringify(item);
+						return typeof encoded === "string" && Buffer.byteLength(encoded) <= 16 * 1024;
 					});
 					return valid
 						? { items, revision, complete: true, reason: null }
@@ -4492,7 +4485,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								{ id: gateId, response: translated, expectedSessionId: sessionId },
 								(claimed as { requestId: string }).requestId,
 							);
-							const resolution = asRecord(result);
+							const resolution = sdkResultPayload(result);
 							const status = resolution?.status;
 							if (status === "rejected") {
 								await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
