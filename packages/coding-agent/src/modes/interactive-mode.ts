@@ -18,6 +18,7 @@ import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import {
 	type AppKeybinding,
+	defaultMessageQueueKeysForPlatform,
 	formatKeyHint,
 	formatKeyHints,
 	KeybindingsManager,
@@ -47,6 +48,7 @@ import type { SessionContext, SessionManager } from "../session/session-manager"
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
 import type { LspStartupServerInfo } from "../tools";
 import { formatPhaseDisplayName } from "../tools/todo-write";
+import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
@@ -113,16 +115,60 @@ import {
 import type { ParsedIrcMessage } from "./utils/irc-message";
 import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-helpers";
 
-export function getDefaultComposerPlaceholder(context: KeyDisplayContext = { platform: process.platform }): string {
+function buildComposerPlaceholder(
+	keybindings: Pick<KeybindingsManager, "getDisplayString">,
+	context: KeyDisplayContext,
+	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue" },
+): string {
+	const parts: string[] = [];
+	const submitKey = options.busy ? keybindings.getDisplayString("tui.input.submit", context) : "";
+	if (submitKey) {
+		const submitAction = options.busyPromptMode === "steer" ? "Steer" : "Queue";
+		parts.push(`${submitKey}: ${submitAction}`);
+	}
+
+	const queueKey = keybindings.getDisplayString("app.message.queue", context);
+	const submitQueues = options.busy && options.busyPromptMode === "queue" && submitKey;
+	if (queueKey && !submitQueues) parts.push(`${queueKey}: ${options.busy ? "Queue" : "Queue (busy)"}`);
+
+	const actionHints = [
+		["app.thinking.cycle", "Thinking"],
+		["app.model.select", "Model"],
+		["app.history.search", "History"],
+	] as const;
+	for (const [id, label] of actionHints) {
+		const key = keybindings.getDisplayString(id, context);
+		if (key) parts.push(`${key}: ${label}`);
+	}
+
 	const newlineKeys = context.platform === "win32" ? ["alt+enter", "ctrl+j"] : ["shift+enter", "ctrl+j"];
-	return `Type your message... ${formatKeyHints(newlineKeys, context)}: New line · ${formatKeyHint(
-		"ctrl+c",
-		context,
-	)}: Clear · ${formatKeyHint("ctrl+r", context)}: Search history · ${formatKeyHint("shift+tab", context)}: Reasoning`;
+	parts.push(`${formatKeyHints(newlineKeys, context)}: New line`, `${formatKeyHint("ctrl+c", context)}: Clear`);
+	return `Type your message... ${parts.join(" · ")}`;
+}
+
+export function getDefaultComposerPlaceholder(
+	context: KeyDisplayContext = { platform: process.platform },
+	keybindings?: Pick<KeybindingsManager, "getDisplayString">,
+): string {
+	const effectiveKeybindings =
+		keybindings ??
+		KeybindingsManager.inMemory({
+			"app.message.queue": defaultMessageQueueKeysForPlatform(context.platform),
+		});
+	return buildComposerPlaceholder(effectiveKeybindings, context, { busy: false, busyPromptMode: "steer" });
 }
 
 export const DEFAULT_COMPOSER_PLACEHOLDER = getDefaultComposerPlaceholder();
+
+export function getComposerPlaceholder(
+	keybindings: Pick<KeybindingsManager, "getDisplayString">,
+	context: KeyDisplayContext,
+	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue" },
+): string {
+	return buildComposerPlaceholder(keybindings, context, options);
+}
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
+const COMPOSER_RIGHT_GUTTER_WIDTH = 1;
 
 const IRC_SIDEBAR_TOGGLE_SHADOWING_ACTIONS: readonly AppKeybinding[] = [
 	"app.plan.toggle",
@@ -169,7 +215,7 @@ function configureDefaultComposerChrome(editor: CustomEditor): void {
 	editor.setInputPrefix(getDefaultInputPrefix());
 	editor.setPlaceholder(getDefaultComposerPlaceholder());
 	editor.setPaddingX(1);
-	editor.setRightGutterWidth(1);
+	editor.setRightGutterWidth(COMPOSER_RIGHT_GUTTER_WIDTH);
 	editor.setTopBorder(undefined);
 }
 
@@ -510,6 +556,14 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"), {
 			enableMouse: settings.get("mouse.enabled"),
+			copySelection: async text => {
+				try {
+					await copyToClipboard(text);
+					this.showStatus("Selection copied to clipboard");
+				} catch (error) {
+					this.showError(`Failed to copy selection: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			},
 		});
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
 		this.chatContainer = new Container();
@@ -660,6 +714,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					getViewportRows: () => this.ui.terminal.rows,
 					getReservedBottomRows: getWelcomeReservedBottomRows,
 					changelogMarkdown: this.#changelogMarkdown,
+					rightGutterWidth: COMPOSER_RIGHT_GUTTER_WIDTH,
 					collapseChangelog: settings.get("collapseChangelog"),
 					keyDisplayContext: this.#keyDisplayContext,
 				},
@@ -1056,27 +1111,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.session.isStreaming || this.session.isCompacting;
 	}
 
-	#getFirstKeyForAction(action: AppKeybinding): string | undefined {
-		return this.keybindings.getKeys(action)[0];
-	}
-
-	#getMessageQueueShortcut(): string | undefined {
-		const preferredAction: AppKeybinding =
-			process.platform === "darwin" ? "app.message.followUp" : "app.message.queue";
-		const fallbackAction: AppKeybinding =
-			process.platform === "darwin" ? "app.message.queue" : "app.message.followUp";
-		return this.#getFirstKeyForAction(preferredAction) ?? this.#getFirstKeyForAction(fallbackAction);
-	}
-
 	#getComposerPlaceholder(): string {
-		const defaultPlaceholder = getDefaultComposerPlaceholder(this.#keyDisplayContext);
-		if (!this.#isPromptDeliveryBusy()) return defaultPlaceholder;
-		const submitAction = this.settings.get("busyPromptMode") === "steer" ? "Steer" : "Queue";
-		const submitKey = this.keybindings.getDisplayString("tui.input.submit", this.#keyDisplayContext);
-		const parts = submitKey ? [`${submitKey}: ${submitAction}`] : [];
-		const queueKey = this.#getMessageQueueShortcut();
-		if (queueKey) parts.push(`${formatKeyHint(queueKey, this.#keyDisplayContext)}: Queue`);
-		return parts.length > 0 ? `${defaultPlaceholder} · ${parts.join(" · ")}` : defaultPlaceholder;
+		return getComposerPlaceholder(this.keybindings, this.#keyDisplayContext, {
+			busy: this.#isPromptDeliveryBusy(),
+			busyPromptMode: this.settings.get("busyPromptMode"),
+		});
 	}
 
 	#getWelcomeReservedRows(width: number): number {

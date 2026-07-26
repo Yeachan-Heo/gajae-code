@@ -937,8 +937,20 @@ function canonicalJsonValue(value: unknown): unknown {
 		if (value === undefined) throw new TypeError("canonical JSON rejects undefined");
 		return value;
 	}
+	/**
+	 * Object properties set to `undefined` are dropped, matching `JSON.stringify`:
+	 * an omitted optional key and a present-but-undefined one must digest
+	 * identically. Decoded requests routinely materialize every optional key (an
+	 * omitted `targeting` becomes `targeting: undefined`), so rejecting them here
+	 * would make every request carrying an absent optional field unserializable.
+	 * Array elements and the top-level value stay strict: `undefined` there is a
+	 * real encoding bug, not an absent field.
+	 */
 	const output: Record<string, unknown> = {};
-	for (const key of Object.keys(value).sort()) output[key] = canonicalJsonValue(value[key]);
+	for (const key of Object.keys(value).sort()) {
+		if (value[key] === undefined) continue;
+		output[key] = canonicalJsonValue(value[key]);
+	}
 	return output;
 }
 
@@ -1004,7 +1016,7 @@ export function deepInterviewAnswerIdentityEqual(
 			component: a.component ?? null,
 			dimension: a.dimension ?? null,
 			question_text: a.question_text ?? null,
-			question_hash: a.question_hash,
+			question_hash: a.question_hash ?? null,
 			selected_options: a.selected_options ?? [],
 			custom_input: a.custom_input ?? null,
 		}) ===
@@ -1016,7 +1028,7 @@ export function deepInterviewAnswerIdentityEqual(
 			component: b.component ?? null,
 			dimension: b.dimension ?? null,
 			question_text: b.question_text ?? null,
-			question_hash: b.question_hash,
+			question_hash: b.question_hash ?? null,
 			selected_options: b.selected_options ?? [],
 			custom_input: b.custom_input ?? null,
 		})
@@ -1061,10 +1073,20 @@ export function applyDeepInterviewRoundResultV1(
 		typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 	if (!dimensions.every(dimension => finiteScore(result.global_scores[dimension])))
 		throw new Error("DI_STATE_SCHEMA_INVALID");
+	/**
+	 * Rounds must be scored in order, but the Round 0 topology gate is not a
+	 * scorable round: the recorder persists it as an `answered` shell to bind the
+	 * locked intent contract, `apply-round-result` rejects `--round 0`, and
+	 * `validateDeepInterviewV1Envelope` refuses to persist a round-0 record that
+	 * is anything other than an answered, score-less shell. Counting it here would
+	 * deadlock every later round forever, so the gate is excluded by identity
+	 * rather than by an ordering range.
+	 */
 	if (
 		rounds.some(
 			round =>
 				round.lifecycle !== "scored" &&
+				round.round !== 0 &&
 				(round.round < shell.round || (round.round === shell.round && round.round_key < shell.round_key)),
 		)
 	)

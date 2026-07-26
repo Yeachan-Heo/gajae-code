@@ -33,6 +33,13 @@ import type { PasteTextContext } from "../components/custom-editor";
 import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 
+const QUEUE_SELECTOR_NAVIGATION_ACTIONS = [
+	"tui.select.up",
+	"tui.select.down",
+	"tui.select.pageUp",
+	"tui.select.pageDown",
+] as const;
+
 interface Expandable {
 	setExpanded(expanded: boolean): void;
 	setManuallyExpanded?(expanded: boolean): void;
@@ -151,15 +158,24 @@ export class InputController {
 			case "app.editor.external":
 				return Boolean(getEditorCommand());
 			case "app.message.followUp":
-			case "app.message.queue":
 				return (
 					this.ctx.session.isStreaming ||
 					this.ctx.session.isCompacting ||
 					this.ctx.session.isBashRunning ||
 					this.ctx.session.isEvalRunning
 				);
+			case "app.message.queue":
+				return (
+					this.ctx.editor.getText().trim().length > 0 &&
+					(this.ctx.session.isStreaming ||
+						this.ctx.session.isCompacting ||
+						this.ctx.session.isBashRunning ||
+						this.ctx.session.isEvalRunning)
+				);
 			case "app.message.dequeue":
-				return this.ctx.session.queuedMessageCount > 0;
+				return (
+					this.ctx.session.getQueuedMessageEntries().length > 0 || this.ctx.compactionQueuedMessages.length > 0
+				);
 			case "app.clipboard.copyPrompt":
 				return this.ctx.editor.getText().length > 0;
 			case "app.session.tree":
@@ -1037,6 +1053,21 @@ export class InputController {
 		};
 		const pane = new QueuePaneComponent(entries, {
 			selectedIndex,
+			formatKeyHint: key => this.ctx.keybindings.formatKeyHint(key),
+			formatSelectAction: action => this.ctx.keybindings.getDisplayString(action),
+			matchesSelectAction: (keyData, action) =>
+				this.ctx.keybindings.getKeys(action).some(key => matchesKey(keyData, key)),
+			resolveSelectNavigation: keyData =>
+				QUEUE_SELECTOR_NAVIGATION_ACTIONS.find(action =>
+					this.ctx.keybindings.getKeys(action).some(key => matchesKey(keyData, key)),
+				),
+			onSelect: entry => {
+				const restored = this.#restoreQueuedMessageToEditor(entry);
+				close();
+				this.ctx.showStatus(
+					restored === 0 ? "Queued message is no longer available" : "Restored queued message to editor",
+				);
+			},
 			onDelete: (entry, index) => {
 				const deleted = this.ctx.session.removeQueuedMessageForEditing(entry.id) !== undefined;
 				const remaining = this.ctx.session.getQueuedMessageEntries();
@@ -1209,7 +1240,17 @@ export class InputController {
 				this.#restoreEditorFocus();
 				this.ctx.ui.requestRender();
 			},
-			{ selectedIndex },
+			{
+				selectedIndex,
+				formatKeyHint: key => this.ctx.keybindings.formatKeyHint(key),
+				formatSelectAction: action => this.ctx.keybindings.getDisplayString(action),
+				matchesSelectAction: (keyData, action) =>
+					this.ctx.keybindings.getKeys(action).some(key => matchesKey(keyData, key)),
+				resolveSelectNavigation: keyData =>
+					QUEUE_SELECTOR_NAVIGATION_ACTIONS.find(action =>
+						this.ctx.keybindings.getKeys(action).some(key => matchesKey(keyData, key)),
+					),
+			},
 		);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(selector);

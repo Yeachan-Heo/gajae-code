@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { AutocompleteProvider } from "@gajae-code/tui";
+import { type AutocompleteProvider, parseKey } from "@gajae-code/tui";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { defaultMessageQueueKeysForPlatform, KEYBINDINGS } from "../src/config/keybindings";
 import { CustomEditor } from "../src/modes/components/custom-editor";
@@ -109,6 +109,29 @@ describe("CustomEditor queue keybinding", () => {
 		editor.handleInput(inputForKey(defaultMessageQueueKeysForPlatform()));
 
 		expect(onQueue).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("parses and dispatches macOS Option queue and dequeue sequences", () => {
+		const inputs = [
+			{ data: "\x1bq", key: "alt+q" },
+			{ data: "\x1b[1;3A", key: "alt+up" },
+			{ data: "\x1b[1;3B", key: "alt+down" },
+		] as const;
+		for (const { data, key } of inputs) expect(parseKey(data)).toBe(key);
+
+		const editor = createEditor();
+		const onQueue = vi.fn();
+		const onDequeue = vi.fn();
+		editor.onQueue = onQueue;
+		editor.onDequeue = onDequeue;
+		editor.setActionKeys("app.message.queue", ["alt+q"]);
+		editor.setActionKeys("app.message.dequeue", ["alt+up", "alt+down"]);
+
+		for (const { data } of inputs) editor.handleInput(data);
+
+		expect(onQueue).toHaveBeenCalledTimes(1);
+		expect(onDequeue).toHaveBeenCalledTimes(2);
 		expect(editor.getText()).toBe("");
 	});
 

@@ -14,8 +14,11 @@ on:
             type: choice
             options: [tag-build-verify, main-nontag]
 
+# Least privilege by default: only `publish` needs write, and it declares its
+# own job-level `contents: write` override. This keeps rehearsal dispatches
+# (and every build/verify job) on a read-scoped GITHUB_TOKEN.
 permissions:
-   contents: write
+   contents: read
 
 concurrency:
    # Release tags never cancel; ordinary CI is cancellable per ref.

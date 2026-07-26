@@ -501,6 +501,11 @@ export const SETTINGS_SCHEMA = {
 		default: 0.05,
 		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 1,
 	},
+	"gjc.ralplan.maxIterations": {
+		type: "number",
+		default: 5,
+		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 20,
+	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Appearance
@@ -1244,7 +1249,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "interaction",
 			label: "Mouse Support",
-			description: "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+			description:
+				"Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection.",
 		},
 	},
 	// Conversation flow

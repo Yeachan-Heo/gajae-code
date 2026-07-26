@@ -67,14 +67,15 @@ The consensus workflow:
    - **Plan-only Critic lane**: independently check quality, principle-option consistency, alternatives, risks, acceptance criteria, and verification; when the plan is thin, request concrete expansion rather than only defects. Persist with `gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return receipt/path plus `OKAY`/`ITERATE`/`REJECT`.
    - **Sequential fallback**: if Critic must evaluate Architect findings, verdict, antithesis, tradeoffs, synthesis, status, or any Architect-produced artifact, await the Architect result before issuing that Architect-dependent Critic pass.
 4. **Review join gate**: before consensus, revision, reconciliation, finalization, or approval, verify both Architect and Critic receipts/verdicts exist for the same Planner artifact/pass (`path`, `sha256`, `stage_n`). A non-`CLEAR` Architect verdict, non-`APPROVE` Architect decision, or any non-`OKAY` Critic verdict routes back to Planner revision; do not finalize from only one review lane.
-5. **Re-review loop** (max 5 iterations): Any non-`OKAY` Critic verdict (`ITERATE` or `REJECT`) or Architect result that is not `CLEAR`/`APPROVE` MUST run the same full closed loop:
+5. **Re-review loop** (max 5 iterations; **runtime-enforced**): Any non-`OKAY` Critic verdict (`ITERATE` or `REJECT`) or Architect result that is not `CLEAR`/`APPROVE` MUST run the same full closed loop:
    a. Collect Architect + Critic feedback
    b. Revise the plan by resuming the SAME persisted Planner subagent with consolidated Architect + Critic feedback (see **Persisted Planner** below); fall back to a fresh Planner spawn only per the fallback routing table
    c. Return to the review fan-out or sequential fallback path above
       - Persist each Planner revision with `gjc ralplan --write --stage revision --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json` before re-review, then pass the receipt/path forward instead of duplicating the full revision markdown in the parent conversation.
    d. Re-join Architect and Critic verdicts for the same revised Planner artifact/pass
    e. Repeat this loop until Critic returns `OKAY` **and** Architect is `CLEAR`/`APPROVE` for the same Planner artifact/pass, or 5 iterations are reached
-   f. If 5 iterations are reached without Critic `OKAY` plus Architect `CLEAR`/`APPROVE`, present the best version to the user
+   f. If 5 iterations are reached without Critic `OKAY` plus Architect `CLEAR`/`APPROVE`, **stop opening further planner/revision passes**. Present the best version to the user (interactive) or surface `PLANNING-STUCK` (headless). Do **not** auto-start implementation.
+   g. **Runtime budget (#3165):** native `gjc ralplan --write` refuses a new `planner`/`revision` that would open consensus iteration **> max** (default **5**, overridable via `gjc.ralplan.maxIterations` in project/user `.gjc/settings.json`, integer 1..20). Cap uses the same iteration definition as the HUD (`planner`/`revision` openers in `index.jsonl`). Overflow exits **3**, prints operator-visible **`PLANNING-STUCK`** on stdout (and stderr detail; JSON includes `planning_stuck: true`), and still allows `architect`/`critic` within an already-opened pass plus `post-interview`/`adr`/`final` so the best plan can be escalated to `pending approval` without auto-execution. A new `--run-id` starts a fresh budget.
 6. **Post-ralplan interview** (intent reconciliation gate): After the review join gate has both Critic `OKAY` and Architect `CLEAR`/`APPROVE` for the same Planner artifact/pass, and before the plan is finalized, reconcile the consensus plan against the user's actual intent. The goal is to make sure ralplan did not silently bake in assumptions that conflict with what the user wants.
    a. **Collect open items** from the run: every assumption the Planner/Architect/Critic resolved by assumption rather than by stated fact, every ambiguity flagged during review, and every decision the loop made without explicit user input. Source these from the persisted `planner`/`architect`/`critic`/`revision` stage artifacts, not from memory.
    b. **Cross-check prior context for conflicts**: glob `.gjc/_session-{sessionid}/specs/deep-interview-*.md` and other prior specs/plans/context relevant by topic. For each, list points where the consensus plan contradicts, weakens, or expands beyond a previously crystallized decision, constraint, or non-goal. Cite the conflicting artifact and line/section.
@@ -102,6 +103,24 @@ The consensus workflow:
    The skill tool then dispatches the execution skill same-turn and runs `gjc state ralplan handoff --to <team|ultragoal> --json` in-process to atomically demote ralplan, promote the callee, and sync `.gjc/_session-{sessionid}/state/skill-active-state.json`. You do not need to run the handoff verb yourself.
 
 > **Important:** Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane after Planner persistence. Any Architect-dependent Critic pass MUST remain sequential: await Architect before issuing Critic, then apply the same review join gate before consensus.
+
+## Consensus iteration cap (operator contract)
+
+- Default max consensus iterations: **5** (`gjc.ralplan.maxIterations`).
+- On cap: exit code **3**, marker **`PLANNING-STUCK`** (stdout), no silent re-loop, no automatic ultragoal/team handoff. Opener budget is `max(index.jsonl openers, on-disk stage-*-{planner,revision}.md count)` so a missing/empty/malformed ledger cannot fail open after prior openers.
+- Headless/CI: treat `PLANNING-STUCK` / exit 3 as terminal planning failure for orchestration/watchdogs.
+- Interactive: present best existing plan via the final approval gate; residual critic findings stay as caveats.
+- Override example (project `.gjc/settings.json`):
+
+```json
+{
+  "gjc": {
+    "ralplan": {
+      "maxIterations": 3
+    }
+  }
+}
+```
 
 
 Follow this ralplan-internal consensus workflow for consensus mode details.

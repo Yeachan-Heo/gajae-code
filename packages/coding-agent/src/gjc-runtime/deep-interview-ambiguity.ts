@@ -207,8 +207,22 @@ export function deriveAmbiguityMilestone(
 
 export function scoreToUnits(score: number): number {
 	if (!Number.isFinite(score) || score < 0 || score > 1) throw new RangeError("score must be finite in [0, 1]");
-	const units = score * 10_000;
-	if (!Number.isSafeInteger(units)) throw new RangeError("score must be expressed in integral 1e-4 units");
+	/**
+	 * Scores carry at most four decimal places, but `score * 10_000` misses the
+	 * integer grid for ordinary values: `0.69 * 10_000` is `6900.000000000001` and
+	 * `0.07 * 10_000` is `700.0000000000001`. Ambiguity is fed straight back in as
+	 * `units / 10_000`, so testing the float product rejected most real scores.
+	 *
+	 * Decide from the shortest round-trip decimal instead. That is exact: every
+	 * genuine 1e-4 value has at most four fraction digits, while off-grid
+	 * precision keeps its digits (`0.00005`, `0.05000000000000001`) and is
+	 * rejected. An epsilon on the product cannot separate those two cases -- both
+	 * residuals are ~1e-13. The `[0, 1]` guard plus the four-digit cap already
+	 * bound the result to an integer in `[0, 10_000]`.
+	 */
+	const decimal = /^(\d+)(?:\.(\d{1,4}))?$/.exec(String(score));
+	if (!decimal) throw new RangeError("score must be expressed in integral 1e-4 units");
+	const units = Number(decimal[1]) * 10_000 + Number((decimal[2] ?? "").padEnd(4, "0"));
 	return units;
 }
 

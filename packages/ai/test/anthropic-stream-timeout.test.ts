@@ -300,4 +300,55 @@ describe("anthropic first-event timeout retries", () => {
 			},
 		]);
 	});
+
+	it("does not let Anthropic ping events keep a stalled response alive", async () => {
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			const response = new Response(null, { status: 200, headers: { "request-id": "req_ping_stall" } });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					yield {
+						type: "message_start",
+						message: {
+							id: "msg_ping_stall",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					};
+					yield {
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "text", text: "" },
+					};
+					yield {
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "text_delta", text: "checking" },
+					};
+					while (!requestOptions?.signal?.aborted) {
+						await Bun.sleep(1);
+						yield { type: "ping" };
+					}
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: "req_ping_stall" };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, {
+			client,
+			streamFirstEventTimeoutMs: 5000,
+			streamIdleTimeoutMs: 5,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
+	});
 });

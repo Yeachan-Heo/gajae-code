@@ -761,10 +761,11 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(sess).stopReason).toBe("stop");
 	});
 
-	it("surfaces exact Alibaba Token Plan first-event timeouts without retrying", async () => {
+	it("surfaces exact Alibaba Token Plan first-event timeouts without duplicate model retries", async () => {
 		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
 		const completionsModel = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
 		if (!responsesModel || !completionsModel) throw new Error("Expected bundled Alibaba Token Plan models");
+		expect(responsesModel.api).toBe("openai-responses");
 
 		const cases = [
 			{
@@ -798,6 +799,7 @@ describe("AgentSession resilient retry", () => {
 			await session.waitForIdle();
 
 			expect(requestedModels).toEqual([`${testCase.model.provider}/${testCase.model.id}`]);
+			expect(new Set(requestedModels).size).toBe(requestedModels.length);
 			expect(retryStartEvents).toHaveLength(0);
 			expect(retryEndEvents).toHaveLength(0);
 			expect(waitSpy).not.toHaveBeenCalled();

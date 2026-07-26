@@ -34,6 +34,7 @@ function registerAction(
 		| "app.commandPalette.open"
 		| "app.plan.toggle"
 		| "app.model.select"
+		| "app.thinking.cycle"
 		| "app.history.search"
 		| "app.message.queue"
 		| "app.message.sendNow",
@@ -45,6 +46,7 @@ function registerAction(
 			"app.commandPalette.open": "Open command palette",
 			"app.plan.toggle": "Toggle plan mode",
 			"app.model.select": "Select model",
+			"app.thinking.cycle": "Cycle thinking level",
 			"app.history.search": "Search history",
 			"app.message.queue": "Queue message",
 			"app.message.sendNow": "Send message now",
@@ -64,20 +66,20 @@ describe("status line action hints", () => {
 		registerAction(registry, "app.commandPalette.open", () => !streaming);
 		registerAction(registry, "app.plan.toggle", () => !streaming);
 		registerAction(registry, "app.model.select", () => !streaming);
+		registerAction(registry, "app.thinking.cycle", () => !streaming);
 		registerAction(registry, "app.history.search", () => !streaming);
 		registerAction(registry, "app.message.queue", () => streaming);
 		registerAction(registry, "app.message.sendNow", () => streaming);
 		const keybindings = KeybindingsManager.inMemory({ "app.message.sendNow": "ctrl+enter" });
 
-		const idle80 = getAvailableActionHints(registry, () => keybindings, 80, "composer");
+		const idle40 = getAvailableActionHints(registry, () => keybindings, 40, "composer");
 		const idle120 = getAvailableActionHints(registry, () => keybindings, 120, "composer");
-		expect(idle80.length).toBeLessThan(idle120.length);
-		expect(idle120.map(hint => hint.id)).toEqual([
-			"app.commandPalette.open",
-			"app.plan.toggle",
-			"app.model.select",
-			"app.history.search",
-		]);
+		expect(idle40.length).toBeLessThan(idle120.length);
+		expect(idle120.map(hint => hint.id)).toEqual(["app.commandPalette.open", "app.plan.toggle"]);
+		expect(idle120.map(hint => hint.id)).not.toContain("app.message.queue");
+		expect(idle120.map(hint => hint.id)).not.toContain("app.thinking.cycle");
+		expect(idle120.map(hint => hint.id)).not.toContain("app.model.select");
+		expect(idle120.map(hint => hint.id)).not.toContain("app.history.search");
 		const paletteDefault = KEYBINDINGS["app.commandPalette.open"].defaultKeys;
 		expect(idle120[0]?.content).toContain(formatKeyHints(paletteDefault));
 
@@ -92,13 +94,13 @@ describe("status line action hints", () => {
 			separator: "pipe",
 			showSkillHud: false,
 		});
-		const status80 = component.render(80);
+		const status40 = component.render(40);
 		const status120 = component.render(120);
-		expect(status80.every(line => visibleWidth(line) <= 80)).toBe(true);
+		expect(status40.every(line => visibleWidth(line) <= 40)).toBe(true);
 		expect(status120.every(line => visibleWidth(line) <= 120)).toBe(true);
-		expect(status80.join("\n")).not.toBe(status120.join("\n"));
-		expect(status80.join("\n")).not.toContain("Search history");
-		expect(status120.join("\n")).toContain("Search history");
+		expect(status40.join("\n")).not.toBe(status120.join("\n"));
+		expect(status40.join("\n")).not.toContain("Select model");
+		expect(status120.join("\n")).toContain("Open command palette");
 
 		streaming = true;
 		await Promise.resolve();
@@ -106,6 +108,10 @@ describe("status line action hints", () => {
 		expect(streamingHints.map(hint => hint.id)).toEqual(["app.message.sendNow", "app.message.queue"]);
 		expect(streamingHints[0]?.content).toContain(keybindings.getDisplayString("app.message.sendNow"));
 		expect(streamingHints.map(hint => hint.id)).not.toContain("app.commandPalette.open");
+		expect(streamingHints.map(hint => hint.id)).toContain("app.message.queue");
+		expect(streamingHints.map(hint => hint.id)).not.toContain("app.thinking.cycle");
+		expect(streamingHints.map(hint => hint.id)).not.toContain("app.model.select");
+		expect(streamingHints.map(hint => hint.id)).not.toContain("app.history.search");
 		const streamingStatus = component.render(120).join("\n");
 		expect(streamingStatus).toContain("Send message now");
 		expect(streamingStatus).toContain("Queue message");
@@ -125,7 +131,7 @@ describe("status line action hints", () => {
 		const darwin = getAvailableActionHints(registry, () => keybindings, 120, "composer", { platform: "darwin" });
 		const linux = getAvailableActionHints(registry, () => keybindings, 120, "composer", { platform: "linux" });
 
-		expect(darwin.map(hint => hint.id)).toEqual(["app.commandPalette.open", "app.history.search"]);
+		expect(darwin.map(hint => hint.id)).toEqual(["app.commandPalette.open"]);
 		expect(Bun.stripANSI(darwin[0]?.content ?? "")).toBe("⌥⌘P Open command palette");
 		expect(Bun.stripANSI(linux[0]?.content ?? "")).toBe("Alt+Super+P Open command palette");
 		expect(darwin.map(hint => hint.id)).not.toContain("app.plan.toggle");
@@ -138,6 +144,19 @@ describe("status line action hints", () => {
 		expect(
 			getAvailableActionHints(registry, () => keybindings, firstHintWidth - 1, "composer", { platform: "darwin" }),
 		).toEqual([]);
+	});
+	it("keeps persistent placeholder actions out of status while allowing an actionable queue hint", () => {
+		const registry = new ActionRegistry<void>({ context: undefined, showError: () => {} });
+		registerAction(registry, "app.message.queue", () => true);
+		registerAction(registry, "app.thinking.cycle", () => true);
+		registerAction(registry, "app.model.select", () => true);
+		registerAction(registry, "app.history.search", () => true);
+		registerAction(registry, "app.plan.toggle", () => true);
+
+		const hints = getAvailableActionHints(registry, () => KeybindingsManager.inMemory(), 240, "composer", {
+			platform: "darwin",
+		});
+		expect(hints.map(hint => hint.id)).toEqual(["app.message.queue", "app.plan.toggle"]);
 	});
 
 	it("hides contextual hints without suppressing configured status segments", () => {

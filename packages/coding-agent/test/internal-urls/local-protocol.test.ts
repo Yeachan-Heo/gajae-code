@@ -407,6 +407,44 @@ describe("LocalProtocolHandler", () => {
 		expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
 	});
 
+	it("resolves against a cleanup_pending root the async gate already settled", async () => {
+		// The async gate treats `cleanup_pending` as settled: entries are installed and
+		// content-verified, only legacy-source retirement is outstanding. The sync
+		// resolver used to reject that same marker as unsafe, so a session whose
+		// migration ended in `cleanup_pending` failed closed on every local:// read.
+		await withTempDir(async artifactsDir => {
+			const sessionId = `cleanup-pending-sync-${path.basename(artifactsDir)}`;
+			await withLocalRoot(sessionId, async localRoot => {
+				await Bun.write(path.join(localRoot, "carried.json"), '{"carried":true}');
+				await fs.writeFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "cleanup_pending\n", {
+					mode: 0o600,
+				});
+
+				const options = localOptions(sessionId, artifactsDir);
+				expect(resolveLocalUrlToPath("local://carried.json", options)).toBe(path.join(localRoot, "carried.json"));
+				// Idempotent: a second resolution must not rewrite or reject the marker.
+				expect(resolveLocalUrlToPath("local://", options)).toBe(localRoot);
+				expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe(
+					"cleanup_pending\n",
+				);
+			});
+		});
+	});
+
+	it("still rejects an unrecognized migration marker value", async () => {
+		await withTempDir(async artifactsDir => {
+			const sessionId = `unsafe-marker-sync-${path.basename(artifactsDir)}`;
+			await withLocalRoot(sessionId, async localRoot => {
+				await fs.writeFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "definitely-not-a-state\n", {
+					mode: 0o600,
+				});
+				expect(() => resolveLocalUrlToPath("local://memo.txt", localOptions(sessionId, artifactsDir))).toThrow(
+					"Unsafe local:// migration marker",
+				);
+			});
+		});
+	});
+
 	it("blocks symlink escapes outside local root", async () => {
 		if (process.platform === "win32") return;
 

@@ -19,6 +19,16 @@ Chord names are case-insensitive. New configuration should use canonical textual
 Configuration uses portable canonical key IDs, not the labels printed by a particular host: use `ctrl`, `alt`, `shift`, and `super` with a key name, for example `ctrl+p`, `alt+enter`, `shift+tab`, and `super+c`. Matching is case-insensitive, but new configuration should use this canonical textual form so the same file remains portable.
 
 Runtime UI labels are platform-native. On macOS, `Ctrl`, `Alt`, `Shift`, and `Super` display as `⌃`, `⌥`, `⇧`, and `⌘`; MacBook keycaps such as Return, Escape, Tab, Delete, and the arrow keys display as `↩`, `⎋`, `⇥`, `⌫`/`⌦`, and arrows. These glyphs are display labels only: configure `super+c`, not `⌘C`, and `alt+enter`, not `⌥↩`.
+On macOS, Option shortcuts work only when the terminal sends Option as Meta/Esc or uses an enhanced keyboard protocol that reports the modifier. Command/Super is usually handled by the terminal or operating system and does not reach GJC. Windows Alt and macOS Option both use the canonical `alt` ID in configuration. Text produced by an Option key as composed Unicode cannot be reverse-inferred as an Option chord.
+
+For terminals that do not forward Option, remap the queue actions to canonical Control chords (choose unclaimed chords appropriate for your terminal), for example:
+
+```json
+{
+  "app.message.queue": "ctrl+q",
+  "app.message.dequeue": ["ctrl+pageup", "ctrl+pagedown"]
+}
+```
 Static onboarding and generated reference material describe shipped defaults and must stay host-independent. The active runtime surface is authoritative for effective bindings after user remaps and extensions load: use `/hotkeys` to see those bindings on the current platform.
 
 Set an action to an empty array to disable it:
@@ -46,7 +56,7 @@ Set an action to an empty array to disable it:
 | `app.editor.external` | `ctrl+g` | Edit the draft in `$VISUAL` / `$EDITOR` |
 | `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `ctrl+enter` is reserved for editor newline |
 | `app.message.queue` | `alt+enter` (`alt+q` on darwin/win32) | Explicitly queue a message for the next turn |
-| `app.message.dequeue` | `alt+up` | Dequeue a queued message back into the editor |
+| `app.message.dequeue` | `alt+up`, `alt+down` | Open the queue and select a queued message to edit |
 
 | `app.clipboard.copyLine` | `alt+shift+l` | Copy the current line |
 | `app.clipboard.copyPrompt` | `alt+shift+c` | Copy the whole prompt |
@@ -55,7 +65,9 @@ Set an action to an empty array to disable it:
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 
-On macOS and native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q`; Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
+On macOS, Option+Q queues a message for the next turn; on native Windows terminals, the equivalent default is Alt+Q. Windows Terminal and PowerShell commonly reserve Alt+Enter for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
+
+When messages are queued, use Option+Up/Down on macOS (Alt+Up/Down on Windows) to open the queue and select a message. In the queue, Return edits the selected message, Forward Delete (`⌦`; Fn+Delete on compact Mac keyboards) removes it, Control+Up/Down reorders it within its delivery group, and Escape closes the queue. Reordering does not convert compaction, steer, and follow-up messages into one another.
 
 In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcript viewport instead of browsing prompt history; use `Up` / `Down` or `Ctrl+R` for prompt history. Autocomplete and selector surfaces still use `PageUp` / `PageDown` for list paging while they have focus.
 

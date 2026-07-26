@@ -13,6 +13,7 @@ import {
 } from "@gajae-code/coding-agent/session/cache-economics";
 import {
 	cappedExponentialWithFullJitter,
+	compactionRetryDelay,
 	effectiveFallbackDelay,
 	FallbackChainController,
 } from "@gajae-code/coding-agent/session/fallback-chain-controller";
@@ -60,29 +61,104 @@ describe("routing adversarial contract probes", () => {
 		expect(effectiveFallbackDelay(100, 1_000, 1, THREE_HOURS_MS, () => 1)).toBe(THREE_HOURS_MS);
 	});
 
-	test("charges rotated-entry retries against the chain-wide attempt budget", () => {
-		const controller = new FallbackChainController(
-			{ role: "default", entries: ["xai/grok", "anthropic/claude"], origin: "test", explicitHead: true },
-			1,
-		);
-		controller.onAttemptStarted();
-		expect(controller.onAttemptFailure("quota", "429")).toBe("advance");
-		expect(controller.currentSelector()).toBe("anthropic/claude");
-
-		expect(controller.restorePreviousEntryForRetry()).toBe(true);
-		expect(controller.currentSelector()).toBe("xai/grok");
-		expect(controller.attemptsUsed).toBe(0);
-		expect(controller.totalAttemptsUsed).toBe(1);
-		expect(controller.tried).toHaveLength(1);
-
-		controller.onAttemptStarted();
-		expect(controller.onAttemptFailure("quota", "429 again")).toBe("exhausted");
-		expect(controller.totalAttemptsUsed).toBe(2);
-		expect(controller.tried).toHaveLength(2);
-		expect(controller.currentSelector()).toBeUndefined();
+	// Mirror image of the contract above: auto-compaction recovers Retry-After by
+	// regex over provider error prose, so it is legacy and MUST stay capped.
+	// Managed fallback is uncapped only because it retries within its own
+	// per-entry budget; compaction has no such budget.
+	test("caps legacy compaction retry-after at retry.maxDelayMs", () => {
+		// A hostile/misconfigured provider asking for 3h cannot outrun the cap.
+		expect(compactionRetryDelay(100, 1_000, 0, THREE_HOURS_MS)).toBe(1_000);
+		// Same hint, managed fallback path: still honoured verbatim.
+		expect(effectiveFallbackDelay(100, 1_000, 1, THREE_HOURS_MS, () => 1)).toBe(THREE_HOURS_MS);
 	});
 
-	test("caps multiple credential rotations at the configured chain budget", () => {
+	test("compaction retry delay honours hints below the cap and keeps exponential growth", () => {
+		// No hint → plain exponential (base * 2**attempt), unchanged behaviour.
+		expect(compactionRetryDelay(2_000, 300_000, 0, undefined)).toBe(2_000);
+		expect(compactionRetryDelay(2_000, 300_000, 3, undefined)).toBe(16_000);
+		// Hint below the cap wins over the exponential, exactly as before.
+		expect(compactionRetryDelay(2_000, 300_000, 0, 45_000)).toBe(45_000);
+		// Hint smaller than the exponential never shortens the backoff.
+		expect(compactionRetryDelay(2_000, 300_000, 3, 1_000)).toBe(16_000);
+	});
+
+	test("compaction retry delay never yields a negative, NaN, or infinite sleep", () => {
+		for (const hint of [undefined, Number.NaN, Number.POSITIVE_INFINITY, -5_000]) {
+			const delay = compactionRetryDelay(2_000, 300_000, 0, hint);
+			expect(Number.isFinite(delay)).toBe(true);
+			expect(delay).toBeGreaterThanOrEqual(0);
+			expect(delay).toBeLessThanOrEqual(300_000);
+		}
+		// maxDelayMs <= 0 means "no cap", matching cappedExponentialWithFullJitter.
+		expect(compactionRetryDelay(2_000, 0, 0, 45_000)).toBe(45_000);
+	});
+
+	// Both legacy surfaces recover Retry-After from prose, so the documented rule
+	// ("retry.maxDelayMs caps every legacy session retry delay, including provider
+	// retry-after hints") must bind them identically. This pins the two together so
+	// a future change to one cannot silently drift from the other.
+	test("legacy compaction agrees with the legacy non-compaction retry-after cap", () => {
+		const maxDelayMs = 300_000;
+		const baseDelayMs = 2_000;
+		for (const hint of [1_000, 45_000, 299_999, 300_000, 300_001, THREE_HOURS_MS]) {
+			// agent-session.ts, legacy non-compaction path: Math.min(retryAfterMs, maxDelayMs)
+			const legacyNonCompaction = Math.min(hint, maxDelayMs);
+			const compaction = compactionRetryDelay(baseDelayMs, maxDelayMs, 0, hint);
+			expect(compaction).toBeLessThanOrEqual(maxDelayMs);
+			// Compaction may floor at its exponential, but never exceeds the legacy bound.
+			expect(compaction).toBeLessThanOrEqual(Math.max(legacyNonCompaction, baseDelayMs));
+		}
+	});
+
+	test("compaction retry delay invariant holds across the whole parameter grid", () => {
+		const hints = [undefined, 0, 1_000, THREE_HOURS_MS, Number.NaN, Number.POSITIVE_INFINITY, -1];
+		let checked = 0;
+		for (const baseDelayMs of [0, 1, 500, 2_000, 60_000]) {
+			for (const maxDelayMs of [0, 1_000, 30_000, 300_000]) {
+				for (const attempt of [0, 1, 3, 10, 30]) {
+					for (const hint of hints) {
+						const delay = compactionRetryDelay(baseDelayMs, maxDelayMs, attempt, hint);
+						expect(Number.isFinite(delay)).toBe(true);
+						expect(delay).toBeGreaterThanOrEqual(0);
+						if (maxDelayMs > 0) expect(delay).toBeLessThanOrEqual(maxDelayMs);
+						checked++;
+					}
+				}
+			}
+		}
+		expect(checked).toBe(700);
+	});
+
+	test("tries a rotated Fable credential once before falling back to Opus", () => {
+		const fable = "anthropic/claude-fable-5:high";
+		const opus = "anthropic/claude-opus-5:high";
+		const controller = new FallbackChainController(
+			{ role: "default", entries: [fable, opus], origin: "test", explicitHead: true },
+			3,
+		);
+
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			controller.onAttemptStarted();
+			expect(controller.onAttemptFailure("quota", `Fable credential A ${attempt}`)).toBe(
+				attempt < 3 ? "retry" : "advance",
+			);
+		}
+		expect(controller.currentSelector()).toBe(opus);
+
+		expect(controller.restorePreviousEntryForRetry()).toBe(true);
+		expect(controller.currentSelector()).toBe(fable);
+		expect(controller.attemptsUsed).toBe(2);
+		expect(controller.totalAttemptsUsed).toBe(3);
+
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "Fable credential B")).toBe("advance");
+		expect(controller.currentSelector()).toBe(opus);
+		expect(controller.restorePreviousEntryForRetry()).toBe(false);
+		expect(controller.totalAttemptsUsed).toBe(4);
+		expect(controller.tried.map(failure => failure.selector)).toEqual([fable, fable, fable, fable]);
+	});
+
+	test("bounds credential rotations without starving downstream entries", () => {
 		const controller = new FallbackChainController(
 			{
 				role: "default",
@@ -93,25 +169,27 @@ describe("routing adversarial contract probes", () => {
 			1,
 		);
 
-		for (let attempt = 1; attempt <= 3; attempt += 1) {
-			controller.onAttemptStarted();
-			const outcome = controller.onAttemptFailure("quota", `429 credential ${attempt}`);
-			expect(controller.totalAttemptsUsed).toBe(attempt);
-			expect(controller.tried).toHaveLength(attempt);
-			if (attempt < 3) {
-				expect(outcome).toBe("advance");
-				expect(controller.restorePreviousEntryForRetry()).toBe(true);
-				expect(controller.attemptsUsed).toBe(0);
-			} else {
-				expect(outcome).toBe("exhausted");
-			}
-		}
-
-		expect(controller.currentSelector()).toBeUndefined();
 		controller.onAttemptStarted();
-		expect(controller.onAttemptFailure("quota", "budget already exhausted")).toBe("exhausted");
-		expect(controller.totalAttemptsUsed).toBe(3);
-		expect(controller.tried).toHaveLength(3);
+		expect(controller.onAttemptFailure("quota", "grok credential A")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(true);
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "grok credential B")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(false);
+		expect(controller.currentSelector()).toBe("anthropic/claude");
+
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "claude credential A")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(true);
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "claude credential B")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(false);
+		expect(controller.currentSelector()).toBe("openai/gpt");
+
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "gpt exhausted")).toBe("exhausted");
+		expect(controller.totalAttemptsUsed).toBe(5);
+		expect(controller.tried).toHaveLength(5);
+		expect(controller.currentSelector()).toBeUndefined();
 	});
 
 	test("invalidates availability for every auth and environment mutation while preserving identity between mutations", () => {

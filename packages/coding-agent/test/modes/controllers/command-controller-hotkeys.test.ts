@@ -104,6 +104,28 @@ describe("buildHotkeysMarkdown", () => {
 		expect(customizedMarkdown).toContain("| `⌥A (Option+A)/⌃A (Control+A)` | Start of line |");
 		expect(customizedMarkdown).toContain("| `Disabled/⌃E (Control+E)` | End of line |");
 	});
+	it("shows accessible Darwin queue controls from effective bindings", () => {
+		const defaults = KeybindingsManager.inMemory({ "app.message.queue": "alt+q" });
+		defaults.setDisplayContext({ platform: "darwin" });
+
+		const defaultMarkdown = buildHotkeysMarkdown({ keybindings: defaults });
+
+		expect(defaultMarkdown).toContain("| `⌥Q (Option+Q)` | Queue message for next turn |");
+		expect(defaultMarkdown).toContain("| `⌥↑ (Option+Up)/⌥↓ (Option+Down)` | Select queued message to edit |");
+		expect(defaults.getDisplayString("app.message.queue")).toBe("⌥Q");
+		expect(defaults.getDisplayString("app.message.dequeue")).toBe("⌥↑/⌥↓");
+
+		const customized = KeybindingsManager.inMemory({
+			"app.message.queue": "ctrl+q",
+			"app.message.dequeue": [],
+		});
+		customized.setDisplayContext({ platform: "darwin" });
+
+		const customizedMarkdown = buildHotkeysMarkdown({ keybindings: customized });
+
+		expect(customizedMarkdown).toContain("| `⌃Q (Control+Q)` | Queue message for next turn |");
+		expect(customizedMarkdown).toContain("| `Disabled` | Select queued message to edit |");
+	});
 
 	it("uses injected Darwin labels while keeping fixed editor delete chords after remapping", () => {
 		const keybindings = KeybindingsManager.inMemory({
@@ -207,5 +229,25 @@ describe("buildHelpMarkdown", () => {
 		expect(markdown).toContain("| Start a fresh session | `⇧⇥ (Shift+Tab)` or `/new` |");
 		expect(markdown).toContain("| Select a model | `/model` or `⌃L (Control+L)` |");
 		expect(markdown).toContain("then use `⌃L (Control+L)/⇧⇥ (Shift+Tab)/↓ (Down)` and `↩ (Enter)/⇥ (Tab)`.");
+	});
+	it("exposes accessible Darwin queue controls from effective bindings", () => {
+		const defaults = KeybindingsManager.inMemory({ "app.message.queue": "alt+q" });
+		defaults.setDisplayContext({ platform: "darwin" });
+
+		const defaultMarkdown = buildHelpMarkdown(defaults);
+
+		expect(defaultMarkdown).toContain("| Queue a message for the next turn | `⌥Q (Option+Q)` |");
+		expect(defaultMarkdown).toContain("| Select or edit a queued message | `⌥↑ (Option+Up)/⌥↓ (Option+Down)` |");
+
+		const customized = KeybindingsManager.inMemory({
+			"app.message.queue": "ctrl+q",
+			"app.message.dequeue": [],
+		});
+		customized.setDisplayContext({ platform: "darwin" });
+
+		const customizedMarkdown = buildHelpMarkdown(customized);
+
+		expect(customizedMarkdown).toContain("| Queue a message for the next turn | `⌃Q (Control+Q)` |");
+		expect(customizedMarkdown).toContain("| Select or edit a queued message | `Disabled` |");
 	});
 });

@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
@@ -21,7 +22,7 @@ import {
 	RepositoryBindingError,
 } from "./repository-binding";
 import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
-import { modeStatePath, sessionPlansDir } from "./session-layout";
+import { gjcRoot, modeStatePath, sessionPlansDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
@@ -63,6 +64,231 @@ export interface RalplanCommandResult {
 
 const KNOWN_STAGES = ["planner", "architect", "critic", "revision", "post-interview", "adr", "final"] as const;
 type RalplanStage = (typeof KNOWN_STAGES)[number];
+/** Default consensus iterations (planner + revision openers) per run. Matches SKILL.md re-review cap. */
+export const RALPLAN_DEFAULT_MAX_ITERATIONS = 5;
+/** Inclusive upper bound for `gjc.ralplan.maxIterations` settings overrides. */
+export const RALPLAN_MAX_ITERATIONS_LIMIT = 20;
+/** Operator-visible stuck signal for headless/CI orchestration (#3165). */
+export const PLANNING_STUCK_MARKER = "PLANNING-STUCK";
+
+const RALPLAN_ITERATION_OPENER_STAGES = new Set<RalplanStage>(["planner", "revision"]);
+
+export type RalplanIterationCapDecision =
+	| {
+			allowed: true;
+			currentIterations: number;
+			projectedIterations: number;
+			maxIterations: number;
+	  }
+	| {
+			allowed: false;
+			currentIterations: number;
+			projectedIterations: number;
+			maxIterations: number;
+			reason: string;
+	  };
+
+/**
+ * Pure consensus-iteration budget gate (#3165).
+ *
+ * A `planner` or `revision` write opens a new iteration (same definition as
+ * `summarizeRalplanIndex`). Other stages never open iterations and are always
+ * allowed by this gate — including `final` after the cap is already reached.
+ *
+ * `iterationFloor` raises the observed opener count when on-disk evidence or a
+ * recovered ledger is higher than the parsed index (fail-closed vs wipe/truncate).
+ */
+export function evaluateRalplanIterationCap(input: {
+	rows: readonly RalplanIndexRow[];
+	stage: string;
+	maxIterations?: number;
+	/** Minimum opener count (e.g. on-disk stage-*-{planner,revision}.md). */
+	iterationFloor?: number;
+}): RalplanIterationCapDecision {
+	const maxIterations =
+		typeof input.maxIterations === "number" &&
+		Number.isInteger(input.maxIterations) &&
+		input.maxIterations >= 1 &&
+		input.maxIterations <= RALPLAN_MAX_ITERATIONS_LIMIT
+			? input.maxIterations
+			: RALPLAN_DEFAULT_MAX_ITERATIONS;
+	const fromIndex = summarizeRalplanIndex(input.rows).iteration;
+	const floor =
+		typeof input.iterationFloor === "number" && Number.isInteger(input.iterationFloor) && input.iterationFloor > 0
+			? input.iterationFloor
+			: 0;
+	const currentIterations = Math.max(fromIndex, floor);
+	if (!RALPLAN_ITERATION_OPENER_STAGES.has(input.stage as RalplanStage)) {
+		return {
+			allowed: true,
+			currentIterations,
+			projectedIterations: currentIterations,
+			maxIterations,
+		};
+	}
+	const projectedIterations = currentIterations + 1;
+	if (projectedIterations > maxIterations) {
+		const ledgerNote = floor > fromIndex ? ` (ledger under-count: index=${fromIndex}, on-disk openers=${floor})` : "";
+		return {
+			allowed: false,
+			currentIterations,
+			projectedIterations,
+			maxIterations,
+			reason:
+				`ralplan consensus iteration cap exceeded: opening ${input.stage} would start ` +
+				`iteration ${projectedIterations} (max ${maxIterations})${ledgerNote}`,
+		};
+	}
+	return {
+		allowed: true,
+		currentIterations,
+		projectedIterations,
+		maxIterations,
+	};
+}
+
+/** Filename pattern for persisted planner/revision stage artifacts. */
+const OPENER_ARTIFACT_RE = /^stage-\d{2,}-(planner|revision)\.md$/;
+
+/**
+ * Count on-disk planner/revision stage artifacts for a run. Used as a floor when
+ * `index.jsonl` is missing, empty, truncated, or otherwise under-counts openers.
+ */
+export async function countRalplanOnDiskOpeners(cwd: string, sessionId: string, runId: string): Promise<number> {
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
+	try {
+		const entries = await fs.readdir(runDir);
+		let count = 0;
+		for (const name of entries) {
+			if (OPENER_ARTIFACT_RE.test(name)) count += 1;
+		}
+		return count;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Load index rows for cap enforcement. Unlike HUD reads, returns structural
+ * signals so callers can fail closed when the ledger is empty/malformed while
+ * opener artifacts already exist on disk.
+ */
+export async function loadRalplanIndexForCap(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+): Promise<{ rows: RalplanIndexRow[]; indexPresent: boolean; parseableLines: number; rawLineCount: number }> {
+	const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
+	try {
+		const text = await fs.readFile(indexPath, "utf8");
+		const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
+		const rows: RalplanIndexRow[] = [];
+		for (const line of lines) {
+			const row = parseRalplanIndexLine(line);
+			if (row) rows.push(row);
+		}
+		return {
+			rows,
+			indexPresent: true,
+			parseableLines: rows.length,
+			rawLineCount: lines.length,
+		};
+	} catch (error) {
+		const code =
+			error && typeof error === "object" && "code" in error ? (error as { code?: string }).code : undefined;
+		if (code === "ENOENT") {
+			return { rows: [], indexPresent: false, parseableLines: 0, rawLineCount: 0 };
+		}
+		// Unreadable index: treat as present-but-untrusted empty parse.
+		return { rows: [], indexPresent: true, parseableLines: 0, rawLineCount: 0 };
+	}
+}
+
+function parseMaxIterationsValue(value: unknown): number | null {
+	return typeof value === "number" &&
+		Number.isFinite(value) &&
+		Number.isInteger(value) &&
+		value >= 1 &&
+		value <= RALPLAN_MAX_ITERATIONS_LIMIT
+		? value
+		: null;
+}
+
+async function readSettingsMaxIterations(settingsPath: string): Promise<number | null> {
+	try {
+		const raw = await Bun.file(settingsPath).text();
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		const flat = parseMaxIterationsValue(parsed["gjc.ralplan.maxIterations"]);
+		if (flat !== null) return flat;
+		const gjc = parsed.gjc;
+		if (gjc && typeof gjc === "object") {
+			const ralplan = (gjc as Record<string, unknown>).ralplan;
+			if (ralplan && typeof ralplan === "object") {
+				return parseMaxIterationsValue((ralplan as Record<string, unknown>).maxIterations);
+			}
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Resolve ralplan consensus iteration cap. Project `./.gjc/settings.json` overrides
+ * user settings, else default 5.
+ */
+export async function resolveRalplanMaxIterations(cwd: string): Promise<{ maxIterations: number; source: string }> {
+	const projectPath = path.join(gjcRoot(cwd), "settings.json");
+	const project = await readSettingsMaxIterations(projectPath);
+	if (project !== null) return { maxIterations: project, source: projectPath };
+	const userDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
+	const userPath = path.join(userDir, "settings.json");
+	const user = await readSettingsMaxIterations(userPath);
+	if (user !== null) return { maxIterations: user, source: userPath };
+	return { maxIterations: RALPLAN_DEFAULT_MAX_ITERATIONS, source: "default" };
+}
+
+function buildPlanningStuckResult(input: {
+	json: boolean;
+	stage: RalplanStage;
+	stageN: number;
+	runId: string;
+	decision: Extract<RalplanIterationCapDecision, { allowed: false }>;
+	source: string;
+}): RalplanCommandResult {
+	const detail =
+		`${PLANNING_STUCK_MARKER}: ${input.decision.reason} ` +
+		`(run_id=${input.runId}, stage=${input.stage}, stage_n=${input.stageN}, source=${input.source}). ` +
+		`Stop opening planner/revision passes; escalate the best existing plan via final/pending-approval without auto-implementation.`;
+	if (input.json) {
+		return {
+			status: 3,
+			stdout: `${JSON.stringify(
+				{
+					ok: false,
+					planning_stuck: true,
+					marker: PLANNING_STUCK_MARKER,
+					run_id: input.runId,
+					stage: input.stage,
+					stage_n: input.stageN,
+					iteration: input.decision.currentIterations,
+					projected_iteration: input.decision.projectedIterations,
+					max_iterations: input.decision.maxIterations,
+					max_iterations_source: input.source,
+					reason: input.decision.reason,
+				},
+				null,
+				2,
+			)}\n`,
+			stderr: `${detail}\n`,
+		};
+	}
+	return {
+		status: 3,
+		stdout: `${PLANNING_STUCK_MARKER}\n`,
+		stderr: `${detail}\n`,
+	};
+}
 
 const KNOWN_ARCHITECT_KINDS = new Set(["openai-code"]);
 const KNOWN_CRITIC_KINDS = new Set(["openai-code"]);
@@ -736,6 +962,31 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 			);
 		}
 		return buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd, repositoryBinding);
+	}
+
+	// Consensus iteration budget (#3165): refuse new planner/revision openers past the cap.
+	// Dedupe returns above so identical re-writes never stuck-signal. Non-openers (architect,
+	// critic, final, …) remain allowed so operators can escalate without auto-implementation.
+	// On-disk opener artifacts floor the count so a wiped/truncated/malformed index.jsonl cannot
+	// under-count and fail open after prior planner/revision writes.
+	const indexLoad = await loadRalplanIndexForCap(cwd, resolved.sessionId, resolved.runId);
+	const onDiskOpeners = await countRalplanOnDiskOpeners(cwd, resolved.sessionId, resolved.runId);
+	const { maxIterations, source: maxIterationsSource } = await resolveRalplanMaxIterations(cwd);
+	const capDecision = evaluateRalplanIterationCap({
+		rows: indexLoad.rows,
+		stage: resolved.stage,
+		maxIterations,
+		iterationFloor: onDiskOpeners,
+	});
+	if (!capDecision.allowed) {
+		return buildPlanningStuckResult({
+			json: resolved.json,
+			stage: resolved.stage,
+			stageN: resolved.stageN,
+			runId: resolved.runId,
+			decision: capDecision,
+			source: maxIterationsSource,
+		});
 	}
 
 	// Keep run-state `current_phase` coherent with the stage being persisted.

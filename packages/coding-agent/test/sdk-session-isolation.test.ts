@@ -226,6 +226,123 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	}, 30_000);
+	it("initializes the successor local:// root after newSession before resolution (#2925 follow-up)", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-new-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: manager,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			expect(await session.newSession()).toBe(true);
+
+			// The successor is a managed session with a session file, so the
+			// synchronous resolver fails closed until verified legacy migration
+			// ran for the *new* session identity — /new must await it like
+			// cold start (#2797) and /resume (#2925).
+			const localOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				isManagedDestination: () => session.sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			const resolved = resolveLocalUrlToPath("local://fresh.md", localOptions);
+			expect(resolved).toBe(path.join(resolveLocalRoot(localOptions), "fresh.md"));
+			const marker = fs.readFileSync(
+				path.join(resolveLocalRoot(localOptions), ".gjc-local-legacy-migrated-v1"),
+				"utf8",
+			);
+			expect(marker === "verified\n" || marker === "absent\n" || marker === "cleanup_pending\n").toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("gates the successor local:// root before publishing the new session identity", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-order-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: manager,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			const predecessorSessionId = manager.getSessionId();
+			// Intercept agent-identity publication and assert the successor's marker
+			// already exists at each publication, so the agent, workflow-gate emitter,
+			// and hooks never observe an ungated root.
+			//
+			// Scope: this pins agent-identity publication only. The manager rotates its
+			// own session id inside sessionManager.newSession(), before the gate, and
+			// resolveLocalUrlToPath() keys on *that* id — so this test cannot and does
+			// not cover the manager-rotation window tracked in #3138.
+			const observations: Array<{ sessionId: string; markerExists: boolean }> = [];
+			const agentState = session.agent as unknown as { sessionId: string | undefined };
+			let publishedSessionId = agentState.sessionId;
+			Object.defineProperty(session.agent, "sessionId", {
+				configurable: true,
+				get: () => publishedSessionId,
+				set: (value: string | undefined) => {
+					publishedSessionId = value;
+					if (value && value !== predecessorSessionId) {
+						observations.push({
+							sessionId: value,
+							markerExists: fs.existsSync(
+								path.join(
+									resolveLocalRoot({
+										getArtifactsDir: () => manager.getArtifactsDir(),
+										isManagedDestination: () => manager.isManagedDestination(),
+										getSessionId: () => value,
+									}),
+									".gjc-local-legacy-migrated-v1",
+								),
+							),
+						});
+					}
+				},
+			});
+
+			expect(await session.newSession()).toBe(true);
+			const successorSessionId = manager.getSessionId();
+			expect(successorSessionId).not.toBe(predecessorSessionId);
+			expect(observations.length).toBeGreaterThan(0);
+			expect(observations.filter(o => !o.markerExists)).toEqual([]);
+			expect(observations.at(0)?.sessionId).toBe(successorSessionId);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
 
 	it("initializes a default local root without shadowing an explicit owner", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-owner-${Snowflake.next()}-`));

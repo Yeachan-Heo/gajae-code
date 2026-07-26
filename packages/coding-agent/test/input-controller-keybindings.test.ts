@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
+import { formatKeyHint as formatKeyHintForPlatform } from "../src/config/keybindings";
 import { CustomEditor, type PasteTextContext } from "../src/modes/components/custom-editor";
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
@@ -67,6 +68,8 @@ async function createContext(options?: {
 		"app.message.followUp": options?.followUpKeys ?? [],
 		"app.message.dequeue": ["alt+up", "alt+down"],
 		"app.irc.sidebar.toggle": options?.ircSidebarToggleKeys ?? ["alt+i"],
+		"tui.select.confirm": ["enter"],
+		"tui.select.cancel": ["escape"],
 	};
 
 	const setActionKeys = vi.fn();
@@ -198,6 +201,12 @@ async function createContext(options?: {
 		keybindings: {
 			getKeys(action: string) {
 				return keyMap[action] ? [...keyMap[action]] : [];
+			},
+			getDisplayString(action: string) {
+				return (keyMap[action] ?? []).map(key => formatKeyHintForPlatform(key, { platform: "darwin" })).join("/");
+			},
+			formatKeyHint(key: string) {
+				return formatKeyHintForPlatform(key, { platform: "darwin" });
 			},
 		} as InteractiveModeContext["keybindings"],
 		pendingImages: [],
@@ -331,6 +340,9 @@ describe("InputController keybinding setup", () => {
 		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(true);
 		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
 
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		ctx.editor.setText("queue this");
+		await Promise.resolve();
 		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(true);
 	});
 
@@ -547,6 +559,28 @@ describe("InputController keybinding setup", () => {
 		expect(spies.popLastQueuedMessage).not.toHaveBeenCalled();
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
+	it("dispatches the dequeue shortcut for a compaction-only queued message", async () => {
+		const { InputController, ctx, editor, queues } = await createContext();
+		queues.compactionQueuedMessages.push({ text: "shortcut compaction queue", mode: "followUp" });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onDequeue?.();
+
+		expect(editor.getText()).toBe("shortcut compaction queue");
+		expect(queues.compactionQueuedMessages).toEqual([]);
+	});
+	it("does not advertise dequeue for hidden next-turn work without editable entries", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		Object.defineProperty(ctx.session, "queuedMessageCount", { value: 1 });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onDequeue?.();
+
+		expect(editor.getText()).toBe("");
+		expect(spies.popLastQueuedMessage).not.toHaveBeenCalled();
+	});
 
 	it("restores a single session queued message for editing", async () => {
 		const { InputController, ctx, editor, spies, queues } = await createContext();
@@ -576,8 +610,14 @@ describe("InputController keybinding setup", () => {
 			throw new Error("Expected queued message selector to be shown");
 		}
 		expect(editor.getText()).toBe("current draft");
-		selector.getSelectList().setSelectedIndex(0);
-		selector.getSelectList().handleInput("\n");
+		const rendered = selector.render(160).join("\n");
+		expect(rendered).toContain("⌥↑/⌥↓ select");
+		expect(rendered).toContain("↩ edit");
+		expect(rendered).toContain("⌦ remove");
+		expect(rendered).toContain("⌃↑/⌃↓ move");
+		expect(rendered).toContain("⎋ cancel");
+		selector.handleInput("\x1b[1;3A");
+		selector.handleInput("\n");
 
 		expect(editor.getText()).toBe("older session queue");
 		expect(queues.sessionQueuedMessages).toEqual(["newest session queue"]);

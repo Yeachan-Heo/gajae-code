@@ -30,6 +30,7 @@ export class FallbackChainController {
 
 	#attemptStarted = false;
 	#totalAttemptsUsed = 0;
+	#restoredEntryIndices = new Set<number>();
 	skips: Array<{ selector: string; reason: string }> = [];
 	exhaustedForTurn = false;
 
@@ -46,6 +47,10 @@ export class FallbackChainController {
 		return this.#totalAttemptsUsed;
 	}
 
+	#maxTotalAttempts(): number {
+		return this.maxAttempts * this.chain.entries.length + this.#restoredEntryIndices.size;
+	}
+
 	currentSelector(): string | undefined {
 		return this.chain.entries[this.activeIndex];
 	}
@@ -59,7 +64,7 @@ export class FallbackChainController {
 	/** Charge an upstream request at its concrete transport boundary. */
 	onAttemptStarted(): void {
 		if (!this.currentSelector() || this.exhaustedForTurn) return;
-		if (this.#totalAttemptsUsed >= this.maxAttempts * this.chain.entries.length) {
+		if (this.#totalAttemptsUsed >= this.#maxTotalAttempts()) {
 			this.activeIndex = this.chain.entries.length;
 			this.exhaustedForTurn = true;
 			return;
@@ -82,6 +87,7 @@ export class FallbackChainController {
 		this.attemptsUsed = 0;
 		this.#totalAttemptsUsed = 0;
 		this.tried = [];
+		this.#restoredEntryIndices.clear();
 		this.#attemptStarted = false;
 	}
 
@@ -91,6 +97,7 @@ export class FallbackChainController {
 		this.skips = [...skips];
 		this.attemptsUsed = 0;
 		this.#totalAttemptsUsed = 0;
+		this.#restoredEntryIndices.clear();
 		this.#attemptStarted = false;
 		this.exhaustedForTurn = this.activeIndex >= this.chain.entries.length;
 	}
@@ -104,7 +111,7 @@ export class FallbackChainController {
 		}
 		this.#attemptStarted = false;
 		this.tried.push({ selector, triggerClass, reason });
-		if (this.#totalAttemptsUsed >= this.maxAttempts * this.chain.entries.length) {
+		if (this.#totalAttemptsUsed >= this.#maxTotalAttempts()) {
 			this.activeIndex = this.chain.entries.length;
 			this.exhaustedForTurn = true;
 			return "exhausted";
@@ -126,19 +133,23 @@ export class FallbackChainController {
 	}
 
 	/**
-	 * Restore the entry that just advanced when credential rotation permits a retry.
-	 * The chain-wide budget and failure history remain charged.
+	 * Restore the entry that just advanced for one attempt with a rotated credential.
+	 * Each non-terminal entry may be restored once, so credential rotation remains
+	 * bounded and cannot consume the attempts reserved for downstream entries.
 	 */
 	restorePreviousEntryForRetry(): boolean {
+		const previousIndex = this.activeIndex - 1;
 		if (
-			this.activeIndex === 0 ||
+			previousIndex < 0 ||
 			this.exhaustedForTurn ||
-			this.#totalAttemptsUsed >= this.maxAttempts * this.chain.entries.length
+			this.#restoredEntryIndices.has(previousIndex) ||
+			this.#totalAttemptsUsed >= this.#maxTotalAttempts()
 		) {
 			return false;
 		}
-		this.activeIndex -= 1;
-		this.attemptsUsed = 0;
+		this.#restoredEntryIndices.add(previousIndex);
+		this.activeIndex = previousIndex;
+		this.attemptsUsed = this.maxAttempts - 1;
 		this.exhaustedForTurn = false;
 		this.#attemptStarted = false;
 		return true;
@@ -157,6 +168,7 @@ export class FallbackChainController {
 		this.attemptsUsed = 0;
 		this.#totalAttemptsUsed = 0;
 		this.tried = [];
+		this.#restoredEntryIndices.clear();
 		this.skips = [];
 		this.exhaustedForTurn = this.chain.entries.length === 0;
 		this.#attemptStarted = false;
@@ -172,6 +184,33 @@ export function cappedExponentialWithFullJitter(
 	const exponential = baseDelayMs * 2 ** Math.max(0, attemptK - 1);
 	const cap = maxDelayMs > 0 ? Math.min(exponential, maxDelayMs) : exponential;
 	return Math.floor(Math.max(0, cap) * Math.max(0, Math.min(1, random())));
+}
+
+/**
+ * Legacy auto-compaction retry delay.
+ *
+ * Deliberately the mirror image of `effectiveFallbackDelay`: this path recovers
+ * Retry-After by regex over provider error prose (`#parseRetryAfterMsFromError`),
+ * so it follows the documented legacy rule — `retry.maxDelayMs` caps every
+ * legacy session retry delay, including provider retry-after hints. Managed
+ * fallback stays uncapped because it retries within its own per-entry budget;
+ * compaction has no such budget, so the final candidate would otherwise sleep
+ * for the full server-suggested duration.
+ *
+ * `maxDelayMs <= 0` means "no cap", matching `cappedExponentialWithFullJitter`.
+ * A missing, NaN, or infinite hint collapses to "no usable hint".
+ */
+export function compactionRetryDelay(
+	baseDelayMs: number,
+	maxDelayMs: number,
+	attempt: number,
+	retryAfterMs: number | undefined,
+): number {
+	const exponential = baseDelayMs * 2 ** Math.max(0, attempt);
+	const hint = Number.isFinite(retryAfterMs) ? Math.max(0, retryAfterMs as number) : 0;
+	const hinted = Math.max(exponential, hint);
+	const bounded = maxDelayMs > 0 ? Math.min(hinted, maxDelayMs) : hinted;
+	return Math.max(0, bounded);
 }
 
 /** Retry-After is intentionally uncapped. */

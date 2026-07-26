@@ -718,6 +718,126 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		expect(compact.pending_shells).toEqual([]);
 	});
 
+	it("scores Round 1 even though the unscorable Round-0 topology gate shell stays answered", async () => {
+		// Regression: the Round-0 topology gate is recorded as an `answered` shell so the
+		// locked intent contract can bind to its answer hash, but `apply-round-result`
+		// rejects `--round 0`, so that shell can never reach `scored`. Counting it in the
+		// "earlier rounds must be scored" precondition deadlocked every later round, making
+		// the whole interview unable to score a single answer.
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
+		expect(
+			(
+				await runDeepInterviewRepairCommand(
+					[
+						"confirm-topology",
+						"--session-id",
+						TEST_SESSION_ID,
+						"--schema-version",
+						"1",
+						"--expected-revision",
+						"1",
+						"--input-json",
+						'{"components":[{"id":"alpha","name":"Alpha"}],"deferred_components":[]}',
+						"--json",
+					],
+					cwd,
+				)
+			).status,
+		).toBe(0);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 0,
+				questionId: "round0-topology",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" }],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				questionText: "Q?",
+				component: "alpha",
+				dimension: "goal",
+				selectedOptions: ["a"],
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		const before = JSON.parse(await fs.readFile(statePath, "utf-8")) as {
+			state_revision: number;
+			state: { rounds: DeepInterviewRoundRecord[] };
+		};
+		expect(before.state.rounds.find(round => round.round === 0)?.lifecycle).toBe("answered");
+		const scored = await runDeepInterviewRepairCommand(
+			[
+				"apply-round-result",
+				"--session-id",
+				TEST_SESSION_ID,
+				"--schema-version",
+				"1",
+				"--expected-revision",
+				String(before.state_revision),
+				"--round",
+				"1",
+				"--question-id",
+				"q1",
+				"--result-json",
+				JSON.stringify({
+					global_scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 },
+					component_updates: [{ component_id: "alpha", scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 } }],
+				}),
+				"--json",
+			],
+			cwd,
+		);
+		expect(scored.status, scored.stderr).toBe(0);
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8")) as {
+			state: { rounds: DeepInterviewRoundRecord[] };
+		};
+		expect(persisted.state.rounds.find(round => round.round === 0)?.lifecycle).toBe("answered");
+		expect(persisted.state.rounds.find(round => round.round === 1)?.lifecycle).toBe("scored");
+		// The result JSON above omits `targeting`/`ontology`/`bookkeeping`, so the
+		// decoder materializes them as `undefined`. Replaying it must digest to the
+		// same value and settle as an idempotent noop rather than a conflict.
+		const replay = await runDeepInterviewRepairCommand(
+			[
+				"apply-round-result",
+				"--session-id",
+				TEST_SESSION_ID,
+				"--schema-version",
+				"1",
+				"--expected-revision",
+				String(before.state_revision + 1),
+				"--round",
+				"1",
+				"--question-id",
+				"q1",
+				"--result-json",
+				JSON.stringify({
+					global_scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 },
+					component_updates: [{ component_id: "alpha", scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 } }],
+				}),
+				"--json",
+			],
+			cwd,
+		);
+		expect(replay.status, replay.stderr).toBe(0);
+		expect(JSON.parse(replay.stdout ?? "{}")).toMatchObject({ ok: true, written: false });
+	});
+
 	it("canonicalizes an agent-supplied dimension label before persisting the shell", () => {
 		// `deepInterview.dimension` is free text on post-topology asks; the persisted envelope
 		// only accepts canonical ids, so a display label must not reach state verbatim.

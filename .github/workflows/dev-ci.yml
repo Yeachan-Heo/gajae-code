@@ -20,6 +20,12 @@ on:
         required: true
         type: string
 
+# Least privilege by default: no dev-ci job needs a write-scoped GITHUB_TOKEN.
+# Every job only checks out, installs, tests, and exchanges artifacts through the
+# Actions artifact API, so a read-scoped token is sufficient.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

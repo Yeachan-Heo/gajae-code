@@ -156,8 +156,10 @@ describe("AgentSession workflow intent-diff tracking", () => {
 		await session.prompt("I'm not sure what this product should be, don't assume the requirements");
 		await session.prompt("create a durable goal ledger for this multi-step release");
 		await session.prompt("create a durable goal ledger for this production release");
+		await session.prompt("use ultragoal to track this release");
+		await session.prompt("ultragoal로 이 작업 처리해줘");
 
-		const [deepInterview, ultragoal, productionUltragoal] = workflowIntentEntries();
+		const [deepInterview, ultragoal, productionUltragoal, namedUltragoal, koreanUltragoal] = workflowIntentEntries();
 		expect(deepInterview?.data).toMatchObject({
 			route: "deep-interview",
 			recommendedSkill: "deep-interview",
@@ -177,6 +179,28 @@ describe("AgentSession workflow intent-diff tracking", () => {
 			directTracking: "not-direct",
 			rootCausePhase: { status: "active", triggers: ["high-risk transition"] },
 		});
+		expect(namedUltragoal?.data).toMatchObject({
+			route: "ultragoal",
+			recommendedSkill: "ultragoal",
+		});
+		expect(koreanUltragoal?.data).toMatchObject({
+			route: "ultragoal",
+			recommendedSkill: "ultragoal",
+		});
+	});
+
+	it("keeps questions about ultragoal behavior on the direct path", async () => {
+		await session.prompt("How many consensus rounds does ultragoal run, and can I limit them?");
+		await session.prompt(
+			"ultragoal 같은거 쓰면 합의 몇번이나 하게 되어 있음? 끝도 없이 하는 경우도 있는거 같은데 제약 할수 있는 옵션 있음?",
+		);
+
+		for (const entry of workflowIntentEntries()) {
+			expect(entry.data).toMatchObject({
+				route: "direct",
+				directTracking: "custom-entry-only",
+			});
+		}
 	});
 
 	it("lets ambiguous requirements take precedence over durable tracking words", async () => {

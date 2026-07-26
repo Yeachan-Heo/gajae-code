@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import { PlanPreviewOverlay } from "../src/modes/components/plan-preview-overlay";
 import { TranscriptViewerOverlay } from "../src/modes/components/transcript-viewer-overlay";
 import { initTheme } from "../src/modes/theme/theme";
@@ -6,6 +7,9 @@ import { initTheme } from "../src/modes/theme/theme";
 initTheme();
 
 describe("G006 WS6 overlay mouse red team", () => {
+	test("keeps GJC mouse ownership opt-in by default", () => {
+		expect(SETTINGS_SCHEMA["mouse.enabled"].default).toBe(false);
+	});
 	test("transcript ignores header, out-of-bounds, and fullscreen clicks", () => {
 		let renders = 0;
 		const overlay = new TranscriptViewerOverlay({

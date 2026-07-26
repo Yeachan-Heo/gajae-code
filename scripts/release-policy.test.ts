@@ -116,6 +116,29 @@ describe("stable release policy", () => {
 		expect(publicSync).toContain("bun scripts/check-public-version-sync.ts --live");
 	});
 
+	// #3139 least-privilege invariant: CI keeps its workflow default read-scoped.
+	test("pins the ci.yml workflow default to contents read", async () => {
+		const ci = await workflow();
+		const header = ci.slice(0, ci.indexOf("\njobs:"));
+		const permissionsStart = header.indexOf("\npermissions:");
+		const permissionsEnd = header.indexOf("\n\n", permissionsStart);
+		const permissions = header.slice(permissionsStart, permissionsEnd);
+
+		expect(header).toMatch(/permissions:\n   contents: read/u);
+		expect(permissions).not.toMatch(/:\s+write(?:\s|$)/u);
+	});
+
+	// #3139 least-privilege invariant: only publish may hold contents write.
+	test("pins publish as the only job-level contents write permission", async () => {
+		const ci = await workflow();
+		const jobs = [...ci.slice(ci.indexOf("\njobs:")).matchAll(/^ {3}[a-z_][a-z0-9_]*:$/gmu)].map(job => job[0].trim().slice(0, -1));
+		for (const job of jobs) {
+			const section = jobSection(ci, job);
+			if (job === "publish") expect(section).toContain("contents: write");
+			else expect(section).not.toContain("contents: write");
+		}
+	});
+
 	test("rejects reused or moved tags and directs corrections to a newer stable version", async () => {
 		const releaseScript = await Bun.file(releaseScriptPath).text();
 

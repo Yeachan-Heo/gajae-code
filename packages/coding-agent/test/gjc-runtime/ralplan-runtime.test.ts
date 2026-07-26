@@ -1,7 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
+import {
+	evaluateRalplanIterationCap,
+	PLANNING_STUCK_MARKER,
+	RALPLAN_DEFAULT_MAX_ITERATIONS,
+	runNativeRalplanCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
 	GJC_RALPLAN_ARTIFACT_ENV,
 	GJC_RESTRICTED_ROLE_AGENT_BASH_ENV,
@@ -1152,5 +1157,261 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		const after = await readState(root);
 		expect(after.active).toBe(false);
 		expect(after.current_phase).toBe("complete");
+	});
+});
+describe("ralplan consensus iteration cap (#3165)", () => {
+	it("evaluateRalplanIterationCap allows openers up to max and rejects the next", () => {
+		const rows = [
+			{ stage: "planner", stageN: 1 },
+			{ stage: "architect", stageN: 1 },
+			{ stage: "critic", stageN: 1 },
+			{ stage: "revision", stageN: 2 },
+			{ stage: "revision", stageN: 3 },
+			{ stage: "revision", stageN: 4 },
+			{ stage: "revision", stageN: 5 },
+		];
+		expect(evaluateRalplanIterationCap({ rows, stage: "revision" })).toMatchObject({
+			allowed: false,
+			currentIterations: 5,
+			projectedIterations: 6,
+			maxIterations: RALPLAN_DEFAULT_MAX_ITERATIONS,
+		});
+		expect(evaluateRalplanIterationCap({ rows, stage: "final" }).allowed).toBe(true);
+		expect(evaluateRalplanIterationCap({ rows, stage: "architect" }).allowed).toBe(true);
+		expect(
+			evaluateRalplanIterationCap({
+				rows: [{ stage: "planner", stageN: 1 }],
+				stage: "revision",
+				maxIterations: 2,
+			}).allowed,
+		).toBe(true);
+		expect(
+			evaluateRalplanIterationCap({
+				rows: [
+					{ stage: "planner", stageN: 1 },
+					{ stage: "revision", stageN: 2 },
+				],
+				stage: "revision",
+				maxIterations: 2,
+			}).allowed,
+		).toBe(false);
+		// Floor from on-disk openers wins over an empty/under-counted index.
+		expect(
+			evaluateRalplanIterationCap({
+				rows: [],
+				stage: "revision",
+				maxIterations: 5,
+				iterationFloor: 5,
+			}),
+		).toMatchObject({
+			allowed: false,
+			currentIterations: 5,
+			projectedIterations: 6,
+		});
+		expect(
+			evaluateRalplanIterationCap({
+				rows: [{ stage: "planner", stageN: 1 }],
+				stage: "revision",
+				maxIterations: 5,
+				iterationFloor: 3,
+			}).allowed,
+		).toBe(true);
+	});
+
+	it("rejects a 6th revision opener with PLANNING-STUCK and still allows final", async () => {
+		const root = await tempDir();
+		const runId = "cap-run";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p1")).status).toBe(0);
+		expect((await write("architect", 1, "# a1")).status).toBe(0);
+		expect((await write("critic", 1, "Verdict: ITERATE")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+			expect((await write("architect", n, `# a${n}`)).status).toBe(0);
+			expect((await write("critic", n, "Verdict: ITERATE")).status).toBe(0);
+		}
+
+		const stuck = await write("revision", 6, "# r6 perpetual iterate");
+		expect(stuck.status).toBe(3);
+		expect(stuck.stdout).toContain(PLANNING_STUCK_MARKER);
+		expect(stuck.stderr).toContain(PLANNING_STUCK_MARKER);
+		const payload = JSON.parse(stuck.stdout ?? "{}");
+		expect(payload).toMatchObject({
+			ok: false,
+			planning_stuck: true,
+			marker: PLANNING_STUCK_MARKER,
+			max_iterations: 5,
+			projected_iteration: 6,
+		});
+
+		const final = await write("final", 6, "# best effort pending approval");
+		expect(final.status).toBe(0);
+		expect(final.stdout).toContain("pending_approval_path");
+	});
+
+	it("honors project settings maxIterations=2 and resets budget on new run_id", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { maxIterations: 2 } } }),
+			"utf-8",
+		);
+
+		const write = async (runId: string, stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("run-a", "planner", 1, "# p")).status).toBe(0);
+		expect((await write("run-a", "revision", 2, "# r2")).status).toBe(0);
+		const stuck = await write("run-a", "revision", 3, "# r3");
+		expect(stuck.status).toBe(3);
+		expect(JSON.parse(stuck.stdout ?? "{}").max_iterations).toBe(2);
+
+		// Fresh run_id must not inherit the stuck budget.
+		expect((await write("run-b", "planner", 1, "# p-b")).status).toBe(0);
+		expect((await write("run-b", "revision", 2, "# r2-b")).status).toBe(0);
+	});
+
+	it("dedupes an identical revision write at the cap without PLANNING-STUCK", async () => {
+		const root = await tempDir();
+		const runId = "dedupe-cap";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+		}
+		const first = await write("revision", 5, "# r5");
+		expect(first.status).toBe(0);
+		const payload = JSON.parse(first.stdout ?? "{}");
+		expect(payload.deduplicated).toBe(true);
+		expect(payload.planning_stuck).toBeUndefined();
+	});
+	it("fails closed when index.jsonl is emptied after max openers (ledger wipe)", async () => {
+		const root = await tempDir();
+		const runId = "wipe-cap";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+		}
+
+		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
+		await fs.writeFile(indexPath, "", "utf-8");
+
+		const stuck = await write("revision", 6, "# after wipe");
+		expect(stuck.status).toBe(3);
+		const payload = JSON.parse(stuck.stdout ?? "{}");
+		expect(payload.planning_stuck).toBe(true);
+		expect(payload.reason).toContain("on-disk openers");
+		// Non-openers still escalate after untrusted ledger.
+		expect((await write("final", 6, "# final after wipe")).status).toBe(0);
+	});
+
+	it("fails closed when index.jsonl is truncated under on-disk openers", async () => {
+		const root = await tempDir();
+		const runId = "trunc-cap";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+		}
+
+		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
+		const full = await fs.readFile(indexPath, "utf-8");
+		const firstLine = full.split(/\r?\n/).find(line => line.trim().length > 0) ?? "";
+		await fs.writeFile(indexPath, `${firstLine}\n`, "utf-8");
+
+		const stuck = await write("revision", 6, "# after truncate");
+		expect(stuck.status).toBe(3);
+		expect(JSON.parse(stuck.stdout ?? "{}").planning_stuck).toBe(true);
+	});
+
+	it("fails closed when index.jsonl is only malformed lines while openers exist on disk", async () => {
+		const root = await tempDir();
+		const runId = "malformed-cap";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+		}
+
+		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
+		await fs.writeFile(indexPath, '{not-json\nnot a row\n{"stage":1}\n', "utf-8");
+
+		const stuck = await write("revision", 6, "# after malformed");
+		expect(stuck.status).toBe(3);
+		expect(JSON.parse(stuck.stdout ?? "{}").planning_stuck).toBe(true);
+		// architect/critic remain allowed (not openers)
+		expect((await write("architect", 6, "# a")).status).toBe(0);
+		expect((await write("critic", 6, "Verdict: ITERATE")).status).toBe(0);
+	});
+
+	it("fails closed when index is deleted but opener stage files remain", async () => {
+		const root = await tempDir();
+		const runId = "delete-index-cap";
+		const write = async (stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("planner", 1, "# p")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("revision", n, `# r${n}`)).status).toBe(0);
+		}
+
+		await fs.rm(path.join(ralplanRunDir(root, runId), "index.jsonl"), { force: true });
+
+		const stuck = await write("revision", 6, "# after delete index");
+		expect(stuck.status).toBe(3);
+		expect(JSON.parse(stuck.stdout ?? "{}").planning_stuck).toBe(true);
+	});
+
+	it("clean new run_id still allows openers after another run is ledger-stuck", async () => {
+		const root = await tempDir();
+		const write = async (runId: string, stage: string, stageN: number, body: string) =>
+			runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
+				root,
+			);
+
+		expect((await write("run-old", "planner", 1, "# p")).status).toBe(0);
+		for (let n = 2; n <= 5; n++) {
+			expect((await write("run-old", "revision", n, `# r${n}`)).status).toBe(0);
+		}
+		await fs.writeFile(path.join(ralplanRunDir(root, "run-old"), "index.jsonl"), "", "utf-8");
+		expect((await write("run-old", "revision", 6, "# stuck")).status).toBe(3);
+
+		// Fresh run is independent even while the old run remains at cap under wipe.
+		expect((await write("run-new", "planner", 1, "# p-new")).status).toBe(0);
+		expect((await write("run-new", "revision", 2, "# r2-new")).status).toBe(0);
 	});
 });

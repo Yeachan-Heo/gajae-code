@@ -5173,9 +5173,21 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (rt) terminalizeInFlightTools(rt, id, "unknown");
+		// Startup is only genuinely in flight when a `sessionStartPromises` entry
+		// exists. Once startup has settled, the host is broker-visible and its
+		// post-start `reconcileCurrentSession` may already have minted a
+		// replacement notification-root token whose unregister is still awaiting
+		// its file lock and atomic registry write. Returning before that settles
+		// leaves a stale `sessions[id]` row that the retained older token is
+		// correctly fenced from removing, so shutdown must join it.
+		const startupWasPending = sessionStartPromises.has(id);
 		const controllerStop =
 			typeof ctx.sessionManager.getCwd === "function" ? controller.stopCurrentSession(ctx) : Promise.resolve(false);
-		void controllerStop.catch(error => logger.warn(`notifications: controller shutdown failed: ${String(error)}`));
+		const settledControllerStop = controllerStop.catch(error => {
+			logger.warn(`notifications: controller shutdown failed: ${String(error)}`);
+			return false;
+		});
+		if (startupWasPending) void settledControllerStop;
 		try {
 			await stopSession(id);
 		} catch (error) {
@@ -5186,5 +5198,10 @@ export function createNotificationsExtension(
 			// error severity (matching the postmortem cleanup precedent).
 			logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
 		}
+		// Keep shutdown nonblocking only while native startup is genuinely
+		// pending (the `/notify on` path); otherwise await the controller queue so
+		// completed-start reconciliation and its replacement-token cleanup are
+		// joined before lifecycle shutdown returns.
+		if (!startupWasPending) await settledControllerStop;
 	});
 }

@@ -67,11 +67,11 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "claude-opus",
 		requiredProviders: ["anthropic"],
 		mapping: {
-			default: "anthropic/claude-opus-4-8:xhigh",
+			default: "anthropic/claude-opus-5:xhigh",
 			executor: "anthropic/claude-sonnet-5",
-			planner: "anthropic/claude-opus-4-8:low",
-			critic: "anthropic/claude-opus-4-8:high",
-			architect: "anthropic/claude-opus-4-8:xhigh",
+			planner: "anthropic/claude-opus-5:low",
+			critic: "anthropic/claude-opus-5:high",
+			architect: "anthropic/claude-opus-5:xhigh",
 		},
 	},
 	{
@@ -320,7 +320,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "opus-codex",
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
-			default: "anthropic/claude-opus-4-8:xhigh",
+			default: "anthropic/claude-opus-5:xhigh",
 			executor: "openai-codex/gpt-5.6-terra:low",
 			planner: "anthropic/claude-sonnet-5",
 			critic: "openai-codex/gpt-5.6-sol:xhigh",
@@ -344,8 +344,8 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		mapping: {
 			default: "anthropic/claude-fable-5:high",
 			executor: "openai-codex/gpt-5.6-terra:medium",
-			planner: "anthropic/claude-opus-4-8:medium",
-			critic: "anthropic/claude-opus-4-8:high",
+			planner: "anthropic/claude-opus-5:medium",
+			critic: "anthropic/claude-opus-5:high",
 			architect: "openai-codex/gpt-5.6-sol:xhigh",
 		},
 	},
@@ -390,7 +390,7 @@ function substituteCodexFamily(selector: string, source: "sol" | "terra", target
 
 const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> = {
 	"opus-codex": {
-		default: "anthropic/claude-opus-4-8:xhigh",
+		default: "anthropic/claude-opus-5:xhigh",
 		planner: "anthropic/claude-sonnet-5",
 	},
 	"codex-opencodego": {
@@ -400,8 +400,8 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 	},
 	"fable-opus-codex": {
 		default: "anthropic/claude-fable-5:high",
-		planner: "anthropic/claude-opus-4-8:medium",
-		critic: "anthropic/claude-opus-4-8:high",
+		planner: "anthropic/claude-opus-5:medium",
+		critic: "anthropic/claude-opus-5:high",
 	},
 };
 

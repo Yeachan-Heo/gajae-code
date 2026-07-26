@@ -20,6 +20,7 @@ export interface WelcomeComponentOptions {
 	getViewportRows?: () => number | undefined;
 	getReservedBottomRows?: (termWidth: number) => number;
 	changelogMarkdown?: string;
+	rightGutterWidth?: number;
 	collapseChangelog?: boolean;
 	buildLabel?: string;
 	keyDisplayContext?: KeyDisplayContext;
@@ -110,7 +111,8 @@ export class WelcomeComponent implements Component {
 	}
 
 	render(termWidth: number): string[] {
-		const boxWidth = Math.max(0, termWidth);
+		const rightGutterWidth = this.#rightGutterWidth(termWidth);
+		const boxWidth = Math.max(0, termWidth - rightGutterWidth);
 		if (boxWidth < 4) {
 			return [];
 		}
@@ -245,7 +247,7 @@ export class WelcomeComponent implements Component {
 			lines.push(tl + titleStyled + theme.fg("dim", hChar.repeat(afterTitle)) + tr);
 		}
 		if (outputRows === 1) {
-			return lines;
+			return this.#withRightGutter(lines, rightGutterWidth);
 		}
 
 		if (showRightColumn) {
@@ -273,7 +275,7 @@ export class WelcomeComponent implements Component {
 			lines.push(bl + h.repeat(leftCol) + br);
 		}
 
-		return lines;
+		return this.#withRightGutter(lines, rightGutterWidth);
 	}
 
 	/** Center text within a given width */
@@ -295,6 +297,19 @@ export class WelcomeComponent implements Component {
 		}
 		return str + padding(width - visLen);
 	}
+	#rightGutterWidth(termWidth: number): number {
+		const configured = this.options.rightGutterWidth ?? 0;
+		if (!Number.isFinite(configured) || configured <= 0) return 0;
+		const gutterWidth = Math.floor(configured);
+		return Math.min(gutterWidth, Math.max(0, termWidth - 4));
+	}
+
+	#withRightGutter(lines: string[], rightGutterWidth: number): string[] {
+		if (rightGutterWidth <= 0) return lines;
+		const gutter = padding(rightGutterWidth);
+		return lines.map(line => line + gutter);
+	}
+
 	#targetRows(termWidth: number): number | undefined {
 		const viewportRows = this.options.getViewportRows?.();
 		if (typeof viewportRows !== "number" || !Number.isFinite(viewportRows) || viewportRows <= 0) {

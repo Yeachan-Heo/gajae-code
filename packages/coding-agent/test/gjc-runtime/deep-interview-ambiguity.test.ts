@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { deriveAmbiguityMilestone } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-ambiguity";
+import { deriveAmbiguityMilestone, scoreToUnits } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-ambiguity";
 import {
 	answerHash,
 	appendOrMergeDeepInterviewRound,
@@ -338,6 +338,40 @@ describe("deep-interview v1 core contracts", () => {
 			deepInterviewRoundResultDigest({ result: { a: { alpha: 1, beta: 2 }, z: ["x"] }, round: 1, question_id: "q" }),
 		);
 		expect(canonicalDeepInterviewJson({ b: 1, a: 2 })).toBe('{"a":2,"b":1}');
+		// Decoded requests materialize every optional key, so an absent optional field
+		// arrives as `undefined`. It must serialize like an omitted key instead of
+		// throwing, and both spellings must digest identically.
+		expect(canonicalDeepInterviewJson({ a: 1, targeting: undefined })).toBe('{"a":1}');
+		expect(
+			deepInterviewRoundResultDigest({
+				round: 1,
+				question_id: "q",
+				result: { global_scores: { goal: 0.5 }, targeting: undefined, ontology: undefined },
+			}),
+		).toBe(deepInterviewRoundResultDigest({ round: 1, question_id: "q", result: { global_scores: { goal: 0.5 } } }));
+		// Array elements and the top-level value stay strict: `undefined` there is an
+		// encoding bug, not an absent field.
+		expect(() => canonicalDeepInterviewJson([1, undefined])).toThrow("canonical JSON rejects undefined");
+		expect(() => canonicalDeepInterviewJson(undefined)).toThrow("canonical JSON rejects undefined");
+		// `null` must survive the collapse. If the skip predicate ever loosened to
+		// `!value[key]` or `== undefined`, null/0/""/false would fold into "absent"
+		// and silently change the meaning of every persisted round_result_digest.
+		expect(canonicalDeepInterviewJson({ a: null })).toBe('{"a":null}');
+		expect(canonicalDeepInterviewJson({ a: 0, b: "", c: false })).toBe('{"a":0,"b":"","c":false}');
+
+		// `0.69 * 10_000` is `6900.000000000001` in IEEE-754; ambiguity round-trips
+		// through `units / 10_000`, so every value on the 1e-4 grid must convert
+		// exactly while genuinely off-grid precision stays rejected. The sweep is the
+		// real contract: spot checks alone cannot show which floats miss the grid.
+		const offGrid: number[] = [];
+		for (let units = 0; units <= 10_000; units += 1) if (scoreToUnits(units / 10_000) !== units) offGrid.push(units);
+		expect(offGrid).toEqual([]);
+		expect(scoreToUnits(-0)).toBe(0);
+		expect(scoreToUnits(0.9999)).toBe(9_999);
+		for (const rejected of [0.00005, 0.05000000000000001, 0.30000000000000004, 1e-7])
+			expect(() => scoreToUnits(rejected)).toThrow("integral 1e-4 units");
+		for (const rejected of [1.5, -0.1, Number.NaN, Number.POSITIVE_INFINITY])
+			expect(() => scoreToUnits(rejected)).toThrow("finite in [0, 1]");
 
 		const filePath = "/tmp/state.json";
 		const envelope = {
@@ -452,5 +486,64 @@ describe("deep-interview v1 core contracts", () => {
 				"2026-01-01T00:02:00.000Z",
 			),
 		).toThrow("DI_ROUND_RESULT_CONFLICT");
+
+		// The Round-0 gate is excluded from the "earlier rounds must be scored"
+		// precondition only because a round-0 record can never carry scoring. Pin
+		// that premise with a positive control and a negative case differing by
+		// exactly one field, so the assertion cannot pass for an unrelated reason: if
+		// the validator's round-0 rule is deleted, the scored fixture below becomes
+		// valid and this test goes red.
+		const gateShell = {
+			round: 0,
+			round_key: "r0",
+			question_id: "round0-topology",
+			question_text: "Confirm locked intent",
+			question_hash: "question",
+			answer_hash: "answer",
+			lifecycle: "answered",
+			answered_at: "2026-01-01T00:00:00.000Z",
+		};
+		const withRoundZero = (record: Record<string, unknown>): Record<string, unknown> => {
+			const candidate = structuredClone(applied.envelope) as Record<string, unknown>;
+			(candidate.state as { rounds: Record<string, unknown>[] }).rounds.unshift(record);
+			return candidate;
+		};
+		validateDeepInterviewV1Envelope(withRoundZero({ ...gateShell }));
+		expect(() =>
+			validateDeepInterviewV1Envelope(
+				withRoundZero({ ...gateShell, scores: { goal: 0.2, constraints: 0.3, criteria: 0.4 } }),
+			),
+		).toThrow("DI_STATE_SCHEMA_INVALID");
+		// The gate's `review-topology`/`topology` metadata is accepted only while the
+		// record stays a score-less shell, which is what keeps it unscorable.
+		validateDeepInterviewV1Envelope(
+			withRoundZero({ ...gateShell, component: "review-topology", dimension: "topology" }),
+		);
+	});
+
+	it("refuses to score the Round-0 topology gate through the repair CLI", async () => {
+		const cwd = await tempDir();
+		await seedRecorderState(cwd);
+		const rejected = await runDeepInterviewRepairCommand(
+			[
+				"apply-round-result",
+				"--session-id",
+				TEST_SESSION_ID,
+				"--schema-version",
+				"1",
+				"--expected-revision",
+				"1",
+				"--round",
+				"0",
+				"--question-id",
+				"round0-topology",
+				"--result-json",
+				JSON.stringify({ global_scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 } }),
+				"--json",
+			],
+			cwd,
+		);
+		expect(rejected.status).toBe(2);
+		expect(rejected.stderr).toContain("DI_INVALID_ROUND");
 	});
 });

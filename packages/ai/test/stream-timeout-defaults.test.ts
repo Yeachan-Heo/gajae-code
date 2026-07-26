@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+	getOpenAIStreamIdleTimeoutMs,
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
@@ -17,6 +18,7 @@ import {
 const ENV_KEYS = [
 	"PI_STREAM_IDLE_TIMEOUT_MS",
 	"PI_OPENAI_STREAM_IDLE_TIMEOUT_MS",
+	"GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS",
 	"PI_STREAM_FIRST_EVENT_TIMEOUT_MS",
 ] as const;
 
@@ -62,6 +64,35 @@ describe("getStreamIdleTimeoutMs(fallbackMs)", () => {
 	it("treats PI_STREAM_IDLE_TIMEOUT_MS=0 as a watchdog disable", () => {
 		Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = "0";
 		expect(getStreamIdleTimeoutMs(300_000)).toBeUndefined();
+	});
+
+	it("honors the documented GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS override", () => {
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "77";
+		expect(getStreamIdleTimeoutMs(300_000)).toBe(77);
+	});
+
+	it("resolves GJC-first: GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS wins over legacy PI_STREAM_IDLE_TIMEOUT_MS", () => {
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "77";
+		Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = "42";
+		expect(getStreamIdleTimeoutMs(300_000)).toBe(77);
+	});
+
+	it("treats GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS=0 as a watchdog disable", () => {
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "0";
+		expect(getStreamIdleTimeoutMs(300_000)).toBeUndefined();
+	});
+});
+
+describe("getOpenAIStreamIdleTimeoutMs()", () => {
+	it("honors the documented GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS first", () => {
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "88";
+		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
+		expect(getOpenAIStreamIdleTimeoutMs()).toBe(88);
+	});
+
+	it("falls back to the legacy PI_OPENAI_STREAM_IDLE_TIMEOUT_MS alias", () => {
+		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
+		expect(getOpenAIStreamIdleTimeoutMs()).toBe(42);
 	});
 });
 

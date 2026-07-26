@@ -92,6 +92,22 @@ export class SelectList implements Component {
 			this.#findEnabledIndex(clamped, 1, false) ?? this.#findEnabledIndex(clamped, -1, false) ?? -1;
 		this.#syncViewportToIndex(this.#selectedIndex >= 0 ? this.#selectedIndex : clamped);
 	}
+	handleNavigation(action: "tui.select.up" | "tui.select.down" | "tui.select.pageUp" | "tui.select.pageDown"): void {
+		switch (action) {
+			case "tui.select.up":
+				this.#moveSelection(-1);
+				break;
+			case "tui.select.down":
+				this.#moveSelection(1);
+				break;
+			case "tui.select.pageUp":
+				this.#movePage(-1);
+				break;
+			case "tui.select.pageDown":
+				this.#movePage(1);
+				break;
+		}
+	}
 
 	invalidate(): void {
 		// No cached state to invalidate currently

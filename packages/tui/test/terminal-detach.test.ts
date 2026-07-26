@@ -166,6 +166,66 @@ describe("terminal detach handling", () => {
 		}
 	});
 
+	it("enables SGR mouse reporting inside tmux", () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const previousTmux = process.env.TMUX;
+		process.env.TMUX = "/tmp/tmux/default,1,0";
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.setMouseEnabled(true);
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				const output = writeSpy.mock.calls.map(call => String(call[0])).join("");
+				expect(output).toContain("\x1b[?1002h");
+				expect(output).toContain("\x1b[?1006h");
+			});
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			if (previousTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = previousTmux;
+		}
+	});
+	it("disables stale SGR mouse reporting inside tmux when mouse support is off", () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const previousTmux = process.env.TMUX;
+		process.env.TMUX = "/tmp/tmux/default,1,0";
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.setMouseEnabled(false);
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				const output = writeSpy.mock.calls.map(call => String(call[0])).join("");
+				expect(output).toContain("\x1b[?1000l");
+				expect(output).toContain("\x1b[?1002l");
+				expect(output).toContain("\x1b[?1006l");
+				expect(output).not.toContain("\x1b[?1000h");
+				expect(output).not.toContain("\x1b[?1002h");
+				expect(output).not.toContain("\x1b[?1006h");
+			});
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			if (previousTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = previousTmux;
+		}
+	});
 	it("marks ProcessTerminal unavailable when stdout emits an async EIO", () => {
 		const terminal = new ProcessTerminal();
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);

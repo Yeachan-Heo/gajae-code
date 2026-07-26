@@ -1,12 +1,13 @@
 import { Container, matchesKey, type SelectItem, SelectList, Spacer, Text } from "@gajae-code/tui";
+import { formatKeyHint } from "../../config/keybindings";
 import type { QueuedMessageEditEntry } from "../../session/agent-session";
 import { getSelectListTheme, theme } from "../theme/theme";
 import { DynamicBorder } from "./dynamic-border";
 
 const MAX_VISIBLE_QUEUED_MESSAGES = 8;
-const RAW_UP = "\x1b[A";
-const RAW_DOWN = "\x1b[B";
 type QueuedMessageMoveDirection = "up" | "down";
+type QueueSelectorAction = "tui.select.confirm" | "tui.select.cancel";
+type QueueSelectorNavigationAction = "tui.select.up" | "tui.select.down" | "tui.select.pageUp" | "tui.select.pageDown";
 
 export type { QueuedMessageMoveDirection };
 
@@ -16,32 +17,61 @@ export class QueuedMessageSelectorComponent extends Container {
 	#selectedIndex = 0;
 	#onDelete: (entry: QueuedMessageEditEntry, selectedIndex: number) => void;
 	#onMove: (entry: QueuedMessageEditEntry, selectedIndex: number, direction: QueuedMessageMoveDirection) => void;
-
+	#onSelect: (entry: QueuedMessageEditEntry) => void;
+	#onCancel: () => void;
+	#entries: QueuedMessageEditEntry[];
+	#matchesSelectAction: (keyData: string, action: QueueSelectorAction) => boolean;
+	#resolveSelectNavigation: (keyData: string) => QueueSelectorNavigationAction | undefined;
 	constructor(
 		entries: QueuedMessageEditEntry[],
 		onSelect: (entry: QueuedMessageEditEntry) => void,
 		onDelete: (entry: QueuedMessageEditEntry, selectedIndex: number) => void,
 		onMove: (entry: QueuedMessageEditEntry, selectedIndex: number, direction: QueuedMessageMoveDirection) => void,
 		onCancel: () => void,
-		options?: { selectedIndex?: number },
+		options?: {
+			selectedIndex?: number;
+			formatKeyHint?: (key: string) => string;
+			formatSelectAction?: (action: QueueSelectorAction) => string;
+			matchesSelectAction?: (keyData: string, action: QueueSelectorAction) => boolean;
+			resolveSelectNavigation?: (keyData: string) => QueueSelectorNavigationAction | undefined;
+		},
 	) {
 		super();
 
 		this.#onDelete = onDelete;
 		this.#onMove = onMove;
+		this.#onSelect = onSelect;
+		this.#onCancel = onCancel;
+		this.#entries = entries;
+		this.#matchesSelectAction =
+			options?.matchesSelectAction ??
+			((keyData, action) => matchesKey(keyData, action === "tui.select.confirm" ? "enter" : "escape"));
+		this.#resolveSelectNavigation = options?.resolveSelectNavigation ?? (() => undefined);
 		const byId = new Map(entries.map(entry => [entry.id, entry]));
 		this.#selectedIndex = Math.max(0, Math.min(options?.selectedIndex ?? 0, entries.length - 1));
 		this.#selectedEntry = entries[this.#selectedIndex];
+		const displayKey = options?.formatKeyHint ?? formatKeyHint;
+		const selectKeys = `${displayKey("alt+up")}/${displayKey("alt+down")}`;
+		const editKey = options?.formatSelectAction
+			? options.formatSelectAction("tui.select.confirm") || "Disabled"
+			: displayKey("enter");
+		const deleteKey = displayKey("delete");
+		const moveKeys = `${displayKey("ctrl+up")}/${displayKey("ctrl+down")}`;
+		const cancelKey = options?.formatSelectAction
+			? options.formatSelectAction("tui.select.cancel") || "Disabled"
+			: displayKey("escape");
+		const itemHint = `${editKey} edit · ${deleteKey} remove · ${moveKeys} move`;
+		const controlsHint = `${selectKeys} select · ${itemHint} · ${cancelKey} cancel`;
 		const items: SelectItem[] = entries.map((entry, index) => ({
 			value: entry.id,
 			label: `${entry.label} ${index + 1}`,
 			description: entry.text,
-			hint: "Enter edit · Del remove · Ctrl+↑/↓ move",
+			hint: itemHint,
 		}));
 
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.bold("Queued messages"), 1, 0));
-		this.addChild(new Text(theme.fg("muted", "Enter edit · Del remove · Ctrl+↑/↓ move · Esc cancel"), 1, 0));
+		this.addChild(new Text(theme.fg("muted", controlsHint), 1, 0));
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
 
@@ -63,12 +93,25 @@ export class QueuedMessageSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
-		if (matchesKey(keyData, "alt+up")) {
-			this.#selectList.handleInput(RAW_UP);
+		if (this.#matchesSelectAction(keyData, "tui.select.confirm")) {
+			if (this.#selectedEntry) this.#onSelect(this.#selectedEntry);
 			return;
 		}
-		if (matchesKey(keyData, "alt+down")) {
-			this.#selectList.handleInput(RAW_DOWN);
+		if (this.#matchesSelectAction(keyData, "tui.select.cancel")) {
+			this.#onCancel();
+			return;
+		}
+		const navigation = this.#resolveSelectNavigation(keyData);
+		if (navigation) {
+			this.#selectList.handleNavigation(navigation);
+			return;
+		}
+		if (matchesKey(keyData, "enter") || matchesKey(keyData, "escape")) return;
+		if (matchesKey(keyData, "alt+up") || matchesKey(keyData, "alt+down")) {
+			const direction = matchesKey(keyData, "alt+up") ? -1 : 1;
+			this.#selectedIndex = (this.#selectedIndex + direction + this.#entries.length) % this.#entries.length;
+			this.#selectedEntry = this.#entries[this.#selectedIndex];
+			this.#selectList.setSelectedIndex(this.#selectedIndex);
 			return;
 		}
 		if (matchesKey(keyData, "ctrl+up") || matchesKey(keyData, "ctrl+shift+up")) {

@@ -1245,8 +1245,14 @@ export class ModelSelectorComponent extends Container {
 					new Text(`${prefix}${i === this.#presetScopeIndex ? theme.fg("accent", label) : label}`, 0, 0),
 				);
 			}
+			this.#listContainer.addChild(new Spacer(1));
+			this.#listContainer.addChild(
+				new Text(theme.fg("muted", "  Enter: apply | d: set as default | Esc: back"), 0, 0),
+			);
 		} else {
-			this.#listContainer.addChild(new Text(theme.fg("muted", "  Press Enter to apply this preset"), 0, 0));
+			this.#listContainer.addChild(
+				new Text(theme.fg("muted", "  Press Enter to apply or d to set as default"), 0, 0),
+			);
 		}
 	}
 
@@ -1558,6 +1564,14 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#handlePresetLandingInput(keyData: string): void {
+		if (keyData === "d" || keyData === "D") {
+			if (this.#previewProfileName) {
+				this.#presetScopeMenuOpen = true;
+				this.#presetScopeIndex = 1;
+				this.#handlePresetEnter();
+				return;
+			}
+		}
 		if (isPrintableCharacter(keyData)) {
 			this.#switchToModelMode(keyData);
 			return;

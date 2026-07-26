@@ -65,6 +65,8 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 	const displayKey = (action: Keybinding): string => keybindings.getAccessibleDisplayString(action) || "Disabled";
 	const sessionNewKey = formatHotkeyMarkdownCode(displayKey("app.session.new"));
 	const selectModelKey = formatHotkeyMarkdownCode(displayKey("app.model.select"));
+	const queueMessageKey = formatHotkeyMarkdownCode(displayKey("app.message.queue"));
+	const dequeueMessageKey = formatHotkeyMarkdownCode(displayKey("app.message.dequeue"));
 	const autocompleteNavigationKeys = formatHotkeyMarkdownCode(
 		`${displayKey("tui.select.up")}/${displayKey("tui.select.down")}`,
 		false,
@@ -84,6 +86,8 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 		"| Show session details | `/session info` |",
 		"| Delete current session transcript/artifacts | `/session delete` |",
 		`| Select a model | \`/model\` or ${selectModelKey} |`,
+		`| Queue a message for the next turn | ${queueMessageKey} |`,
+		`| Select or edit a queued message | ${dequeueMessageKey} |`,
 		"| Show all shortcuts | `?` on an empty prompt or `/hotkeys` |",
 		"",
 		"**Finding commands**",

@@ -70,16 +70,13 @@ export interface StatusLineActionHint {
 
 const ACTION_HINT_PRIORITY: readonly AppKeybinding[] = [
 	"app.message.sendNow",
-	"app.message.queue",
 	"app.message.followUp",
+	"app.message.queue",
 	"app.message.dequeue",
 	"app.commandPalette.open",
 	"app.plan.toggle",
 	"app.mode.cycle",
-	"app.thinking.cycle",
-	"app.model.select",
 	"app.model.cycleForward",
-	"app.history.search",
 	"app.session.togglePath",
 	"app.session.toggleSort",
 	"app.session.rename",

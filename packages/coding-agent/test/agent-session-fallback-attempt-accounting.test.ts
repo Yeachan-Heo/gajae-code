@@ -72,6 +72,17 @@ describe("FallbackChainController attempt accounting", () => {
 		expect(controller.currentSelector()).toBe("a/1");
 	});
 
+	it("refreshes the bounded credential-rotation retry after an accepted request", () => {
+		const controller = new FallbackChainController(chain(["a/1", "b/2"]), 1);
+		expect(controller.onAttemptFailure("quota", "credential A")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(true);
+		controller.resetAttemptBudget();
+
+		expect(controller.onAttemptFailure("quota", "credential B")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(true);
+		expect(controller.currentSelector()).toBe("a/1");
+	});
+
 	it("rejects a non-positive maxAttempts", () => {
 		expect(() => new FallbackChainController(chain(["a/1"]), 0)).toThrow(/positive integer/);
 	});

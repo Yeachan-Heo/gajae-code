@@ -2,7 +2,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { readWorkflowStateJson, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import * as logger from "@gajae-code/utils/logger";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -175,13 +176,24 @@ describe("gjc state write hardening", () => {
 		const root = await tempDir();
 		await writeRawState(root, "ralplan", "{broken json");
 		const stderr = captureStderrWrites();
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const read = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
 			expect(read.status).toBe(0);
 			const status = await runNativeStateCommand(["status", "--mode", "ralplan", "--json"], root);
 			expect(status.status).toBe(0);
-			expect(stderr.writes.join("")).toContain("ignoring corrupt state");
+			// #3002: never paint raw warning bytes onto the (TUI alternate-screen) stderr stream,
+			// but still surface the corrupt-state signal to CLI/automation via the structured
+			// command result and the TUI-safe file logger — so corrupt state stays distinguishable
+			// from absent state.
+			expect(stderr.writes.join("")).not.toContain("ignoring corrupt state");
+			expect(read.stderr ?? "").toContain("ignoring corrupt state");
+			expect(status.stderr ?? "").toContain("ignoring corrupt state");
+			expect(
+				warn.mock.calls.some(call => typeof call[0] === "string" && call[0].includes("ignoring corrupt state")),
+			).toBe(true);
 		} finally {
+			warn.mockRestore();
 			stderr.restore();
 		}
 
@@ -200,6 +212,27 @@ describe("gjc state write hardening", () => {
 		const forcedClear = await runNativeStateCommand(["clear", "--mode", "ralplan", "--json", "--force"], root);
 		expect(forcedClear.status).toBe(0);
 		expect(receiptFrom(forcedClear.stdout).current_phase).toBe("complete");
+	});
+
+	it("in-process readWorkflowStateJson never writes corrupt-state warnings to process.stderr (#3002)", async () => {
+		// The interactive (in-process, no command-result) read path — e.g. ultragoal reading
+		// its own state while the TUI composer is live — must route the warning through the
+		// file logger only, never onto the terminal stream, and must fail open as {}.
+		const root = await tempDir();
+		await writeRawState(root, "ralplan", "{broken json");
+		const stderr = captureStderrWrites();
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const state = await readWorkflowStateJson(root, "ralplan", TEST_SESSION_ID);
+			expect(state).toEqual({});
+			expect(stderr.writes.join("")).not.toContain("ignoring corrupt state");
+			expect(
+				warn.mock.calls.some(call => typeof call[0] === "string" && call[0].includes("ignoring corrupt state")),
+			).toBe(true);
+		} finally {
+			warn.mockRestore();
+			stderr.restore();
+		}
 	});
 
 	it("allows seeds with no prior phase", async () => {

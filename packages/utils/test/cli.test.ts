@@ -12,6 +12,7 @@ class Demo extends Command {
 	};
 	static flags = {
 		scope: Flags.string({ description: "scope", options: ["user", "project"] }),
+		count: Flags.integer({ description: "count" }),
 	};
 	async run(): Promise<void> {
 		const { args } = await this.parse(Demo);
@@ -103,6 +104,60 @@ describe("cli parse — CliParseError for invalid input", () => {
 		await expect(cmd.parse(Demo)).rejects.toThrow(/Expected --scope to be one of: user, project/);
 	});
 
+	it.each([
+		"12oops",
+		"1.5",
+		"1e3",
+		" 12 ",
+		"9007199254740992",
+	])("throws CliParseError for a non-exact integer flag value %j", async value => {
+		const cmd = new Demo(["build", "--count", value], CFG);
+		await expect(cmd.parse(Demo)).rejects.toBeInstanceOf(CliParseError);
+		await expect(cmd.parse(Demo)).rejects.toThrow(`Expected integer for --count, got "${value}"`);
+	});
+
+	it.each([
+		["--count=0", 0],
+		["--count=-12", -12],
+		["--count=0012", 12],
+	])("accepts exact integer flag token %j", async (flag, expected) => {
+		const cmd = new Demo(["build", flag], CFG);
+		const { flags } = await cmd.parse(Demo);
+		expect(flags.count).toBe(expected);
+	});
+
+	it("throws CliParseError for extra positional arguments in strict commands", async () => {
+		const cmd = new Demo(["build", "unexpected", "also-unexpected"], CFG);
+		await expect(cmd.parse(Demo)).rejects.toBeInstanceOf(CliParseError);
+		await expect(cmd.parse(Demo)).rejects.toThrow('Unexpected arguments: "unexpected", "also-unexpected"');
+	});
+
+	it("preserves extra positional arguments for commands that opt out of strict parsing", async () => {
+		class NonStrict extends Command {
+			static strict = false;
+			static args = { action: Args.string({}) };
+			async run(): Promise<void> {
+				await this.parse(NonStrict);
+			}
+		}
+		const cmd = new NonStrict(["build", "passthrough"], CFG);
+		const parsed = await cmd.parse(NonStrict);
+		expect(parsed.args.action).toBe("build");
+		expect(parsed.argv).toEqual(["build", "passthrough"]);
+	});
+
+	it("allows a multiple positional descriptor to consume every remaining argument", async () => {
+		class Multiple extends Command {
+			static args = { values: Args.string({ multiple: true }) };
+			async run(): Promise<void> {
+				await this.parse(Multiple);
+			}
+		}
+		const cmd = new Multiple(["one", "two"], CFG);
+		const parsed = await cmd.parse(Multiple);
+		expect(parsed.args.values).toEqual(["one", "two"]);
+	});
+
 	it("wraps node:util unknown-flag errors as CliParseError (strict command)", async () => {
 		class Strict extends Command {
 			static flags = { verbose: Flags.boolean({}) };
@@ -141,6 +196,15 @@ describe("cli run — usage instead of uncaught crash", () => {
 		expect(out.toLowerCase()).toContain("usage"); // renderCommandHelp printed the command usage
 		expect(exitCode).toBe(2);
 		expect(sideEffect.ran).toBe(false); // command body never ran
+	});
+
+	it("renders usage and skips execution for extra positional arguments", async () => {
+		sideEffect.ran = false;
+		const { err, out, exitCode } = await runCapturing(["demo", "build", "extra"]);
+		expect(err).toContain('Unexpected argument: "extra"');
+		expect(out.toLowerCase()).toContain("usage");
+		expect(exitCode).toBe(2);
+		expect(sideEffect.ran).toBe(false);
 	});
 
 	it("runs the command normally for valid input and leaves exitCode unset", async () => {

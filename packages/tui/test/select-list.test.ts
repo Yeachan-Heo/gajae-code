@@ -233,6 +233,26 @@ describe("SelectList", () => {
 
 		expect(changed).toEqual(["one", "three"]);
 	});
+	it("applies resolved navigation actions without keybinding resolution", () => {
+		const list = new SelectList(
+			[
+				{ value: "one", label: "one" },
+				{ value: "two", label: "two" },
+				{ value: "three", label: "three" },
+			],
+			2,
+			testTheme,
+		);
+
+		list.handleNavigation("tui.select.down");
+		expect(list.getSelectedItem()?.value).toBe("two");
+		list.handleNavigation("tui.select.pageDown");
+		expect(list.getSelectedItem()?.value).toBe("three");
+		list.handleNavigation("tui.select.pageUp");
+		expect(list.getSelectedItem()?.value).toBe("one");
+		list.handleNavigation("tui.select.up");
+		expect(list.getSelectedItem()?.value).toBe("three");
+	});
 
 	it("dims disabled items and excludes them from selection", () => {
 		const selected: string[] = [];
