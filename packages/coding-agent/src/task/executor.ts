@@ -53,6 +53,7 @@ import { validateAllocatedTaskId } from "./id";
 import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
+import { assignmentRequestsUltragoalRedTeam } from "./ultragoal-redteam-activation";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -1603,9 +1604,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					systemPrompt: defaultPrompt => {
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 							agent: prompt.render(agent.systemPrompt, {
-								ultragoalRedTeam: /ultragoal\s+completion\s+(?:qa|red-team)|executorQa/i.test(
-									options.assignment ?? task,
-								),
+								// Explicit activation only — bare `executorQa` mentions must not flip mode (#2698).
+								ultragoalRedTeam: assignmentRequestsUltragoalRedTeam(options.assignment ?? task),
 							}),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
