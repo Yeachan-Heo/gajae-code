@@ -3,6 +3,7 @@
 ### Fixed
 
 - Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
+- Windows artifact migration no longer captures the retained cleanup placeholder's directory size and mtime from Bun's `lstat`, which reports `0` for a directory, while validating them against the native tree root. The producer and its own authority check now share the native authority, so a freshly written `cleanup_pending` record can validate itself instead of failing with `durability_failed` (#2913).
 
 ### Changed
 

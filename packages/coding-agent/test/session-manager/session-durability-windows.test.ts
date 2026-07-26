@@ -8,6 +8,7 @@ import * as native from "@gajae-code/natives";
 import {
 	canonicalBindingOpenFlags,
 	cleanupAuthorityMatches,
+	detachArtifactRootForMigration,
 	fsyncCanonicalBinding,
 	listManagedCandidates,
 	matchesMigrationArtifactRoot,
@@ -270,6 +271,43 @@ describe("managed session Windows durability", () => {
 		expect(
 			cleanupAuthorityMatches({ ...cleanup, identity: { ...cleanup.identity, size: 0n } }, parent, "darwin"),
 		).toBe(true);
+	});
+
+	it("captures cleanup identity from the native root so the producer's own authority check passes on Windows", async () => {
+		const root = temporaryDirectory("gjc-cleanup-producer-");
+		temporaryDirectories.push(root);
+		const originalPath = path.join(root, "artifacts");
+		await fs.mkdir(originalPath);
+		await fs.writeFile(path.join(originalPath, "kept.txt"), "kept");
+
+		const tree = native.snapshotDirectoryTree(originalPath);
+		if (!tree.ok || !tree.snapshot) throw new Error("Native snapshot unavailable");
+		const treeRoot = tree.snapshot.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
+		if (!treeRoot) throw new Error("Native root missing");
+		const stat = syncFs.lstatSync(originalPath, { bigint: true });
+
+		// Host-verified: the real producer runs end to end and the cleanup record
+		// it writes satisfies its own authority check. Before the fix the producer
+		// captured Bun's directory size while the check consulted the native root,
+		// so on Windows that record could never validate itself.
+		const detached = detachArtifactRootForMigration({
+			originalPath,
+			detachedPath: path.join(root, ".gjc-migrate-fork-artifacts"),
+			identity: {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: process.platform === "win32" ? BigInt(treeRoot.size) : stat.size,
+				mtimeNs: process.platform === "win32" ? BigInt(treeRoot.mtimeNs) : stat.mtimeNs,
+			},
+			tree: tree.snapshot,
+		});
+
+		expect(detached.detachOutcome === "clean" || detached.detachOutcome === "cleanup_pending").toBe(true);
+		if (detached.detachOutcome === "cleanup_pending") {
+			// Seam-verified for win32: the persisted record must re-validate under
+			// the native-authoritative branch, which a Bun-sourced size cannot.
+			expect(cleanupAuthorityMatches(detached.cleanup, root, "win32")).toBe(true);
+		}
 	});
 
 	it("tolerates a POSIX root ctime change caused by detaching artifacts", async () => {

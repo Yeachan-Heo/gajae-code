@@ -2442,7 +2442,7 @@ export function cleanupAuthorityMatches(
 	}
 }
 
-function detachArtifactRootForMigration(
+export function detachArtifactRootForMigration(
 	plan: DetachedArtifactRoot,
 ):
 	| { detached: DetachedArtifactRoot; detachOutcome: "clean" }
@@ -2479,15 +2479,27 @@ function detachArtifactRootForMigration(
 	if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(placeholder) !== path.dirname(plan.originalPath))
 		throw new Error("durability_failed");
 	const snapshot = native.snapshotDirectoryTree(placeholder);
+	if (!snapshot.ok || !snapshot.snapshot) throw new Error("durability_failed");
+	// Windows directory size/mtime authority is the native tree root, never Bun's
+	// zero-valued directory lstat. Capturing Bun values here would guarantee a
+	// mismatch against the native-authoritative check below.
+	const placeholderRoot = snapshot.snapshot.entries.find(
+		entry => entry.relativePath === "" && entry.kind === "directory",
+	);
+	if (!placeholderRoot) throw new Error("durability_failed");
 	const cleanup: SourceArtifactCleanup = {
 		state: "cleanup_pending",
 		role: "exchange_placeholder",
 		retainedPath: placeholder,
-		identity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs },
-		tree: snapshot.snapshot!,
+		identity: {
+			dev: stat.dev,
+			ino: stat.ino,
+			size: process.platform === "win32" ? BigInt(placeholderRoot.size) : stat.size,
+			mtimeNs: process.platform === "win32" ? BigInt(placeholderRoot.mtimeNs) : stat.mtimeNs,
+		},
+		tree: snapshot.snapshot,
 	};
-	if (!snapshot.ok || !snapshot.snapshot || !cleanupAuthorityMatches(cleanup, path.dirname(plan.originalPath)))
-		throw new Error("durability_failed");
+	if (!cleanupAuthorityMatches(cleanup, path.dirname(plan.originalPath))) throw new Error("durability_failed");
 	return { detached, detachOutcome: "cleanup_pending", cleanup };
 }
 
