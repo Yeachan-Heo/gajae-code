@@ -33,7 +33,6 @@ import {
 import type { TtsrInjectionRecord } from "../export/ttsr";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
-
 import * as git from "../utils/git";
 import { ArtifactManager } from "./artifacts";
 import {
@@ -79,6 +78,23 @@ import {
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
+import {
+	hasOnlyKeys as hasOnlyMemoryGuardKeys,
+	isMemoryGuardDecimalString,
+	isMemoryGuardRelativePath,
+	isMemoryGuardSha256Hex,
+	type MemoryGuardCheckpointBlobAuthorityV1,
+	type MemoryGuardCheckpointBlobManifestEntryV1,
+	type MemoryGuardCheckpointBlobManifestV1,
+	type MemoryGuardCreateCheckpointInput,
+	type MemoryGuardParticipantDescriptorV1,
+	type MemoryGuardParticipantIngressLease,
+	type MemoryGuardRestoreInput,
+	type MemoryGuardRestoreResult,
+	type MemoryGuardSessionManagerCheckpointV1,
+	memoryGuardCanonicalJson,
+	memoryGuardSha256Hex,
+} from "./memory-guard-checkpoint-participant";
 
 import {
 	type BashExecutionMessage,
@@ -480,6 +496,195 @@ export type DefaultModelSelectionStage = {
 	readonly tempPath: string | undefined;
 	readonly persistsToExistingFile: boolean;
 };
+export interface SessionManagerRevisionSnapshot {
+	entry: number;
+	leaf: number;
+	headerExport: number;
+	label: number;
+	replayMetadata: number;
+}
+
+export interface SessionManagerCheckpointRevisionStrings {
+	entry: string;
+	leaf: string;
+	headerExport: string;
+	label: string;
+	replayMetadata: string;
+}
+
+function memoryGuardParticipantRoot(checkpointRoot: string, sessionId: string): string {
+	return path.join(checkpointRoot, "participants", sessionId);
+}
+
+function memoryGuardParticipantRelativePath(sessionId: string, suffix: string): string {
+	return `participants/${sessionId}/${suffix}`;
+}
+
+async function fsyncDirectoryPath(directoryPath: string): Promise<void> {
+	const directory = await fs.promises.open(directoryPath, "r");
+	try {
+		await directory.sync();
+	} finally {
+		await directory.close();
+	}
+}
+
+async function ensureOwnerOnlyDirectory(directoryPath: string): Promise<void> {
+	await fs.promises.mkdir(directoryPath, { recursive: true, mode: 0o700 });
+	await fs.promises.chmod(directoryPath, 0o700).catch(() => undefined);
+	await fsyncDirectoryPath(directoryPath);
+}
+
+async function writeOwnerOnlyFile(filePath: string, content: Uint8Array | string): Promise<void> {
+	await ensureOwnerOnlyDirectory(path.dirname(filePath));
+	const handle = await fs.promises.open(filePath, "w", 0o600);
+	try {
+		await handle.writeFile(content);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await fs.promises.chmod(filePath, 0o600).catch(() => undefined);
+	await fsyncDirectoryPath(path.dirname(filePath));
+}
+
+function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set()): Set<string> {
+	if (typeof value === "string") {
+		if (isBlobRef(value)) refs.add(value);
+		return refs;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) collectCheckpointBlobRefs(item, refs);
+		return refs;
+	}
+	if (value && typeof value === "object") {
+		for (const item of Object.values(value as Record<string, unknown>)) collectCheckpointBlobRefs(item, refs);
+	}
+	return refs;
+}
+
+function decodeCheckpointUtf8(data: Uint8Array): string | null {
+	try {
+		return new TextDecoder("utf-8", { fatal: true }).decode(data);
+	} catch {
+		return null;
+	}
+}
+
+function validateMemoryGuardBlobAuthority(value: unknown): value is MemoryGuardCheckpointBlobAuthorityV1 {
+	if (
+		!isRecord(value) ||
+		!hasOnlyMemoryGuardKeys(value, ["kind", "manifest_relative_path", "manifest_sha256", "root_relative_path"])
+	)
+		return false;
+	return (
+		value.kind === "checkpoint_blob_tree_v1" &&
+		isMemoryGuardRelativePath(value.manifest_relative_path) &&
+		isMemoryGuardSha256Hex(value.manifest_sha256) &&
+		isMemoryGuardRelativePath(value.root_relative_path)
+	);
+}
+
+function validateMemoryGuardTranscriptDescriptor(
+	value: unknown,
+): value is MemoryGuardSessionManagerCheckpointV1["transcript"] {
+	if (!isRecord(value) || !hasOnlyMemoryGuardKeys(value, ["bytes", "relative_path", "sha256"])) return false;
+	return (
+		isMemoryGuardDecimalString(value.bytes) &&
+		isMemoryGuardRelativePath(value.relative_path) &&
+		isMemoryGuardSha256Hex(value.sha256)
+	);
+}
+
+function validateMemoryGuardRevisions(value: unknown): value is SessionManagerCheckpointRevisionStrings {
+	if (!isRecord(value) || !hasOnlyMemoryGuardKeys(value, ["entry", "leaf", "headerExport", "label", "replayMetadata"]))
+		return false;
+	return (
+		isMemoryGuardDecimalString(value.entry) &&
+		isMemoryGuardDecimalString(value.leaf) &&
+		isMemoryGuardDecimalString(value.headerExport) &&
+		isMemoryGuardDecimalString(value.label) &&
+		isMemoryGuardDecimalString(value.replayMetadata)
+	);
+}
+
+function validateMemoryGuardCheckpoint(value: unknown): value is MemoryGuardSessionManagerCheckpointV1 {
+	if (
+		!isRecord(value) ||
+		!hasOnlyMemoryGuardKeys(value, [
+			"blob_authority",
+			"revisions",
+			"schema_version",
+			"session_id",
+			"session_name",
+			"transcript",
+		])
+	)
+		return false;
+	return (
+		value.schema_version === 1 &&
+		typeof value.session_id === "string" &&
+		value.session_id.length > 0 &&
+		(value.session_name === null || typeof value.session_name === "string") &&
+		validateMemoryGuardBlobAuthority(value.blob_authority) &&
+		validateMemoryGuardRevisions(value.revisions) &&
+		validateMemoryGuardTranscriptDescriptor(value.transcript)
+	);
+}
+
+function validateMemoryGuardBlobManifestEntry(value: unknown): value is MemoryGuardCheckpointBlobManifestEntryV1 {
+	if (!isRecord(value) || !hasOnlyMemoryGuardKeys(value, ["bytes", "relative_path", "sha256"])) return false;
+	return (
+		isMemoryGuardDecimalString(value.bytes) &&
+		isMemoryGuardRelativePath(value.relative_path) &&
+		isMemoryGuardSha256Hex(value.sha256)
+	);
+}
+
+function validateMemoryGuardBlobManifest(value: unknown): value is MemoryGuardCheckpointBlobManifestV1 {
+	if (!isRecord(value) || !hasOnlyMemoryGuardKeys(value, ["entries", "schema_version"])) return false;
+	if (value.schema_version !== 1 || !Array.isArray(value.entries)) return false;
+	return value.entries.every(validateMemoryGuardBlobManifestEntry);
+}
+
+function memoryGuardParticipantMatchesCheckpoint(
+	participant: MemoryGuardParticipantDescriptorV1,
+	checkpoint: MemoryGuardSessionManagerCheckpointV1,
+): boolean {
+	return (
+		participant.session_id === checkpoint.session_id &&
+		participant.session_name === checkpoint.session_name &&
+		JSON.stringify(participant.checkpoint) === JSON.stringify(checkpoint.blob_authority) &&
+		JSON.stringify(participant.revisions) === JSON.stringify(checkpoint.revisions) &&
+		JSON.stringify(participant.transcript) === JSON.stringify(checkpoint.transcript)
+	);
+}
+
+function readCheckpointAuthorityFile(
+	authority: native.RecoveryFsRoot,
+	relativePath: string,
+	maxBytes: number,
+): Uint8Array | null {
+	const result = authority.read(relativePath, maxBytes);
+	return result.ok && result.data ? result.data : null;
+}
+
+function toCanonicalRevisionString(name: keyof SessionManagerRevisionSnapshot, value: number): string {
+	if (!Number.isSafeInteger(value) || value < 0) throw new Error(`invalid_session_manager_revision:${name}`);
+	return String(value);
+}
+
+export function toSessionManagerCheckpointRevisionStrings(
+	snapshot: SessionManagerRevisionSnapshot,
+): SessionManagerCheckpointRevisionStrings {
+	return {
+		entry: toCanonicalRevisionString("entry", snapshot.entry),
+		leaf: toCanonicalRevisionString("leaf", snapshot.leaf),
+		headerExport: toCanonicalRevisionString("headerExport", snapshot.headerExport),
+		label: toCanonicalRevisionString("label", snapshot.label),
+		replayMetadata: toCanonicalRevisionString("replayMetadata", snapshot.replayMetadata),
+	};
+}
 
 export type DefaultModelSelectionPromotion =
 	| { readonly kind: "promoted" }
@@ -3506,6 +3711,77 @@ class NdjsonFileWriter {
 	}
 }
 
+const PROJECT_SESSION_SCAN_MAX_DIRECTORIES = 4096;
+const PROJECT_SESSION_SCAN_MAX_FILES = 1000;
+
+function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
+	const relative = path.relative(projectGjcDir, filePath);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
+	const segments = relative.split(path.sep);
+	if (segments.length === 1) return true;
+	const parent = segments.at(-2);
+	return parent === "agent-session" || segments.includes("sessions");
+}
+
+/**
+ * Discover resumable transcripts intentionally stored inside a project's `.gjc`.
+ * Runtime token/audit JSONL files are excluded by requiring a known transcript
+ * container (`agent-session` or `sessions`).
+ */
+function listProjectSessionTranscriptFiles(cwd: string): string[] {
+	const projectGjcDir = path.join(path.resolve(cwd), ".gjc");
+	let rootStat: fs.Stats;
+	try {
+		rootStat = fs.lstatSync(projectGjcDir);
+	} catch {
+		return [];
+	}
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [];
+
+	const directories = [projectGjcDir];
+	const files: string[] = [];
+	let scannedDirectories = 0;
+	while (directories.length > 0 && scannedDirectories < PROJECT_SESSION_SCAN_MAX_DIRECTORIES) {
+		const directory = directories.pop()!;
+		scannedDirectories++;
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(directory, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (entry.isSymbolicLink()) continue;
+			const entryPath = path.join(directory, entry.name);
+			if (entry.isDirectory()) {
+				directories.push(entryPath);
+				continue;
+			}
+			if (
+				entry.isFile() &&
+				entry.name.endsWith(".jsonl") &&
+				isProjectSessionTranscriptPath(projectGjcDir, entryPath)
+			) {
+				files.push(entryPath);
+				if (files.length >= PROJECT_SESSION_SCAN_MAX_FILES) return files;
+			}
+		}
+	}
+	return files;
+}
+
+async function collectProjectSessions(cwd: string, storage: FileSessionStorage): Promise<SessionInfo[]> {
+	return await collectSessionsFromFiles(listProjectSessionTranscriptFiles(cwd), storage);
+}
+
+function mergeSessionInventories(...inventories: SessionInfo[][]): SessionInfo[] {
+	const sessions = new Map<string, SessionInfo>();
+	for (const inventory of inventories) {
+		for (const session of inventory) sessions.set(path.resolve(session.path), session);
+	}
+	return [...sessions.values()].sort((left, right) => right.modified.getTime() - left.modified.getTime());
+}
+
 const DEFAULT_WELCOME_RECENT_SESSION_LIMIT = 20;
 
 /** Get recent sessions for display in welcome screen */
@@ -3515,6 +3791,21 @@ export async function getRecentSessions(
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<RecentSessionInfo[]> {
 	return getSortedSessions(sessionDir, storage, limit);
+}
+
+export function getRecentSessionDisplay(
+	sessions: readonly SessionInfo[],
+	limit = DEFAULT_WELCOME_RECENT_SESSION_LIMIT,
+): Array<{ name: string; timeAgo: string }> {
+	return sessions.slice(0, limit).map(session => {
+		const recent = new RecentSessionInfo(
+			session.path,
+			session.modified.getTime(),
+			{ title: session.title, timestamp: session.created.toISOString() },
+			session.firstMessage,
+		);
+		return { name: recent.name, timeAgo: recent.timeAgo };
+	});
 }
 
 /**
@@ -4015,6 +4306,7 @@ export class SessionManager {
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
+	#memoryGuardParticipantIngressToken: symbol | undefined;
 	#fileEntries: FileEntry[] = [];
 	#pendingStrictAdoption: { canonicalPath: string; identity: ResumeSessionIdentity } | undefined;
 	#byId: Map<string, SessionEntry> = new Map();
@@ -4178,13 +4470,7 @@ export class SessionManager {
 	 * revision contract). Tests assert the invalidation mapping through this;
 	 * future export/label-view caches key off their respective domains.
 	 */
-	revisionSnapshot(): {
-		entry: number;
-		leaf: number;
-		headerExport: number;
-		label: number;
-		replayMetadata: number;
-	} {
+	revisionSnapshot(): SessionManagerRevisionSnapshot {
 		return {
 			entry: this.#entryRevision,
 			leaf: this.#leafRevision,
@@ -6230,6 +6516,102 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
+	acquireMemoryGuardParticipantIngressLease(): MemoryGuardParticipantIngressLease {
+		if (this.#memoryGuardParticipantIngressToken)
+			throw new Error("memory_guard_participant_ingress_lease_already_held");
+		const token = Symbol("memory_guard_participant_ingress_lease");
+		this.#memoryGuardParticipantIngressToken = token;
+		let released = false;
+		return Object.freeze({
+			token,
+			release: () => {
+				if (released) return;
+				released = true;
+				if (this.#memoryGuardParticipantIngressToken === token)
+					this.#memoryGuardParticipantIngressToken = undefined;
+			},
+		});
+	}
+
+	#assertMemoryGuardParticipantIngressLease(lease: MemoryGuardParticipantIngressLease): void {
+		if (this.#memoryGuardParticipantIngressToken !== lease.token) {
+			throw new Error("memory_guard_participant_ingress_lease_invalid");
+		}
+	}
+
+	#seedMemoryGuardCheckpointBlob(data: Buffer): void {
+		this.#residentTextBlobStore.putSync(data);
+		this.#residentImageBlobStore.putSync(data);
+	}
+
+	async createMemoryGuardCheckpoint(
+		input: MemoryGuardCreateCheckpointInput,
+	): Promise<MemoryGuardSessionManagerCheckpointV1> {
+		this.#assertMemoryGuardParticipantIngressLease(input.ingressLease);
+		if (!this.#sessionFile) throw new Error("memory_guard_checkpoint_session_file_unavailable");
+		await this.flush();
+		const captured = SessionManager.captureTranscriptStrict(this.#sessionFile, this.storage);
+		if (captured.kind !== "captured") {
+			throw new Error(`memory_guard_checkpoint_capture_failed:${captured.reason}`);
+		}
+		const transcriptText = decodeCheckpointUtf8(captured.snapshot.content);
+		if (transcriptText === null) throw new Error("memory_guard_checkpoint_transcript_unreadable");
+		const entries = parseSessionEntries(transcriptText);
+		const sessionId = this.getSessionId();
+		const participantRoot = memoryGuardParticipantRoot(input.checkpointRoot, sessionId);
+		const transcriptRelativePath = memoryGuardParticipantRelativePath(sessionId, "transcript.jsonl");
+		const blobRootRelativePath = memoryGuardParticipantRelativePath(sessionId, "blobs");
+		const blobManifestRelativePath = memoryGuardParticipantRelativePath(sessionId, "blob-manifest.json");
+		await ensureOwnerOnlyDirectory(participantRoot);
+		await writeOwnerOnlyFile(path.join(input.checkpointRoot, transcriptRelativePath), captured.snapshot.content);
+		const blobManifestEntries: MemoryGuardCheckpointBlobManifestEntryV1[] = [];
+		for (const ref of [...collectCheckpointBlobRefs(entries)].sort()) {
+			const hash = parseBlobRef(ref);
+			if (!hash) continue;
+			const data =
+				this.#residentTextBlobStore.getCheckedSync(hash) ??
+				this.#residentImageBlobStore.getCheckedSync(hash) ??
+				this.#blobStore.getCheckedSync(hash);
+			if (!data) throw new Error(`memory_guard_checkpoint_blob_missing:${hash}`);
+			const relativePath = hash;
+			await writeOwnerOnlyFile(path.join(input.checkpointRoot, blobRootRelativePath, relativePath), data);
+			blobManifestEntries.push({
+				bytes: String(data.byteLength),
+				relative_path: relativePath,
+				sha256: memoryGuardSha256Hex(data),
+			});
+		}
+		blobManifestEntries.sort((left, right) => left.relative_path.localeCompare(right.relative_path));
+		const blobManifest: MemoryGuardCheckpointBlobManifestV1 = {
+			entries: blobManifestEntries,
+			schema_version: 1,
+		};
+		const blobManifestText = memoryGuardCanonicalJson(blobManifest);
+		await writeOwnerOnlyFile(path.join(input.checkpointRoot, blobManifestRelativePath), blobManifestText);
+		const checkpoint: MemoryGuardSessionManagerCheckpointV1 = {
+			blob_authority: {
+				kind: "checkpoint_blob_tree_v1",
+				manifest_relative_path: blobManifestRelativePath,
+				manifest_sha256: memoryGuardSha256Hex(blobManifestText),
+				root_relative_path: blobRootRelativePath,
+			},
+			revisions: toSessionManagerCheckpointRevisionStrings(this.revisionSnapshot()),
+			schema_version: 1,
+			session_id: sessionId,
+			session_name: this.getSessionName() ?? null,
+			transcript: {
+				bytes: String(captured.snapshot.content.byteLength),
+				relative_path: transcriptRelativePath,
+				sha256: captured.snapshot.identity.sha256,
+			},
+		};
+		await writeOwnerOnlyFile(
+			path.join(input.checkpointRoot, memoryGuardParticipantRelativePath(sessionId, "session-manager.json")),
+			memoryGuardCanonicalJson(checkpoint),
+		);
+		return checkpoint;
+	}
+
 	/**
 	 * Returns the session artifacts directory path (session file path without .jsonl).
 	 * Returns null when the session is not persisted to a file.
@@ -8112,10 +8494,11 @@ export class SessionManager {
 		if (resolved.kind === "error") return [];
 		const listing = listManagedCandidates(resolved.scope);
 		if (listing.kind === "error") return [];
-		return await collectSessionsFromFiles(
+		const managed = await collectSessionsFromFiles(
 			listing.owned.map(candidate => candidate.path),
 			storage,
 		);
+		return mergeSessionInventories(managed, await collectProjectSessions(cwd, storage));
 	}
 
 	/**
@@ -8347,6 +8730,118 @@ export class SessionManager {
 			}
 			throw error;
 		}
+	}
+
+	static async restoreMemoryGuardCheckpoint(input: MemoryGuardRestoreInput): Promise<MemoryGuardRestoreResult> {
+		if (!validateMemoryGuardCheckpoint(input.checkpoint)) return { kind: "blocked", reason: "checkpoint-mismatch" };
+		if (!memoryGuardParticipantMatchesCheckpoint(input.participant, input.checkpoint)) {
+			return { kind: "blocked", reason: "participant-mismatch" };
+		}
+		const checkpointText = readCheckpointAuthorityFile(
+			input.incidentAuthority,
+			memoryGuardParticipantRelativePath(input.checkpoint.session_id, "session-manager.json"),
+			256 * 1024,
+		);
+		if (!checkpointText) return { kind: "blocked", reason: "checkpoint-mismatch" };
+		const checkpointCanonical = memoryGuardCanonicalJson(input.checkpoint);
+		if (decodeCheckpointUtf8(checkpointText) !== checkpointCanonical) {
+			return { kind: "blocked", reason: "checkpoint-mismatch" };
+		}
+		const transcriptBytes = Number(input.checkpoint.transcript.bytes);
+		if (!Number.isSafeInteger(transcriptBytes) || transcriptBytes < 0) {
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		const transcriptData = readCheckpointAuthorityFile(
+			input.incidentAuthority,
+			input.checkpoint.transcript.relative_path,
+			transcriptBytes + 1,
+		);
+		if (!transcriptData || transcriptData.byteLength !== transcriptBytes) {
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		if (memoryGuardSha256Hex(transcriptData) !== input.checkpoint.transcript.sha256) {
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		const transcriptText = decodeCheckpointUtf8(transcriptData);
+		if (transcriptText === null) return { kind: "blocked", reason: "transcript-mismatch" };
+		let transcriptEntries: FileEntry[];
+		try {
+			transcriptEntries = parseSessionEntries(transcriptText);
+		} catch {
+			return { kind: "blocked", reason: "malformed" };
+		}
+		const transcriptHeader = transcriptEntries[0] as SessionHeader | undefined;
+		if (
+			transcriptHeader?.type !== "session" ||
+			transcriptHeader.id !== input.checkpoint.session_id ||
+			(transcriptHeader.title ?? null) !== input.checkpoint.session_name
+		) {
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		const manifestData = readCheckpointAuthorityFile(
+			input.incidentAuthority,
+			input.checkpoint.blob_authority.manifest_relative_path,
+			8 * 1024 * 1024,
+		);
+		if (!manifestData) return { kind: "blocked", reason: "blob-authority-mismatch" };
+		if (memoryGuardSha256Hex(manifestData) !== input.checkpoint.blob_authority.manifest_sha256) {
+			return { kind: "blocked", reason: "blob-authority-mismatch" };
+		}
+		const manifestText = decodeCheckpointUtf8(manifestData);
+		if (manifestText === null) return { kind: "blocked", reason: "blob-manifest-mismatch" };
+		let blobManifest: unknown;
+		try {
+			blobManifest = JSON.parse(manifestText);
+		} catch {
+			return { kind: "blocked", reason: "blob-manifest-mismatch" };
+		}
+		if (!validateMemoryGuardBlobManifest(blobManifest)) return { kind: "blocked", reason: "blob-manifest-mismatch" };
+		if (memoryGuardCanonicalJson(blobManifest) !== manifestText)
+			return { kind: "blocked", reason: "blob-manifest-mismatch" };
+		const seenBlobPaths = new Set<string>();
+		const checkpointBlobs = new Map<string, Buffer>();
+		for (const entry of blobManifest.entries) {
+			if (seenBlobPaths.has(entry.relative_path)) return { kind: "blocked", reason: "blob-manifest-mismatch" };
+			seenBlobPaths.add(entry.relative_path);
+			const blobBytes = Number(entry.bytes);
+			if (!Number.isSafeInteger(blobBytes) || blobBytes < 0)
+				return { kind: "blocked", reason: "blob-manifest-mismatch" };
+			const blobPath = `${input.checkpoint.blob_authority.root_relative_path}/${entry.relative_path}`;
+			const blobData = readCheckpointAuthorityFile(input.incidentAuthority, blobPath, blobBytes + 1);
+			if (!blobData || blobData.byteLength !== blobBytes) return { kind: "blocked", reason: "blob-missing" };
+			if (memoryGuardSha256Hex(blobData) !== entry.sha256) return { kind: "blocked", reason: "blob-hash-mismatch" };
+			checkpointBlobs.set(entry.sha256, Buffer.from(blobData));
+		}
+		const storage = new FileSessionStorage();
+		const destination =
+			input.destination === undefined
+				? explicitDestination(path.join(os.tmpdir(), `gjc-memory-guard-${input.checkpoint.session_id}`))
+				: destinationFor(getProjectDir(), input.destination, storage);
+		await ensureOwnerOnlyDirectory(destination.directory);
+		const transcriptPath = path.join(destination.directory, `${input.checkpoint.session_id}.memory-guard.jsonl`);
+		await writeOwnerOnlyFile(transcriptPath, transcriptData);
+		const captured = SessionManager.captureTranscriptStrict(transcriptPath, storage);
+		if (captured.kind !== "captured") return { kind: "blocked", reason: captured.reason };
+		const opened = await SessionManager.openExistingForRecoveryHydrationStrict(
+			captured.snapshot.identity,
+			input.destination,
+			storage,
+		);
+		if (opened.kind === "error") return { kind: "blocked", reason: opened.reason };
+		if (
+			opened.manager.getSessionId() !== input.checkpoint.session_id ||
+			(opened.manager.getSessionName() ?? null) !== input.checkpoint.session_name
+		) {
+			await opened.manager.close();
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		for (const blob of checkpointBlobs.values()) opened.manager.#seedMemoryGuardCheckpointBlob(blob);
+		return {
+			kind: "staged",
+			manager: opened.manager,
+			hydrationContext: opened.context,
+			transcriptIdentity: captured.snapshot.identity,
+		};
 	}
 
 	/** Inspect a selected session without acquiring write-capable ownership. */

@@ -368,6 +368,7 @@ import {
 	prepareContributionPrep,
 } from "./contribution-prep";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
+import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
@@ -612,6 +613,15 @@ export interface AgentSessionConfig {
 	/** Optional provider-facing cache identity, distinct from logical session identity. */
 	providerCacheSessionId?: string;
 }
+
+export interface AgentSessionMemoryGuardRestoreInput
+	extends Omit<AgentSessionConfig, "sessionManager" | "recoveryHydrationContext"> {
+	staged: Extract<MemoryGuardRestoreResult, { kind: "staged" }>;
+}
+
+export type AgentMemoryGuardRestoreResult =
+	| { kind: "staged"; session: AgentSession; promotionFence: RecoveryHydrationPromotionFence }
+	| { kind: "blocked"; reason: "transcript-mismatch" | "hydration-context-mismatch" };
 
 type MidRunMaintenanceLifecycle = Parameters<NonNullable<AgentLoopConfig["maintainContext"]>>[1];
 
@@ -6439,6 +6449,28 @@ export class AgentSession {
 	}
 	get transcriptPromptGeneration(): number {
 		return this.#promptGeneration;
+	}
+
+	static async restoreFromMemoryGuardCheckpoint(
+		input: AgentSessionMemoryGuardRestoreInput,
+	): Promise<AgentMemoryGuardRestoreResult> {
+		const { staged, ...config } = input;
+		if (
+			staged.manager.getSessionId() !== staged.transcriptIdentity.sessionId ||
+			staged.hydrationContext.identity.sessionId !== staged.transcriptIdentity.sessionId
+		) {
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		const session = new AgentSession({
+			...config,
+			sessionManager: staged.manager,
+			recoveryHydrationContext: staged.hydrationContext,
+		});
+		if (session.recoveryHydrationContext !== staged.hydrationContext) {
+			await session.dispose();
+			return { kind: "blocked", reason: "hydration-context-mismatch" };
+		}
+		return { kind: "staged", session, promotionFence: { ownershipReady: true } };
 	}
 
 	/** The immutable recovery authority, present only before external ownership promotion. */
@@ -14792,6 +14824,7 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
+				await initializeLocalRoot(this.#localProtocolOptions());
 
 				if (switchingToDifferentSession) {
 					// The local:// migration gate for this successor already ran above,
