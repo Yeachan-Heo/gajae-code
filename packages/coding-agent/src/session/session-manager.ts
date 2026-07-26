@@ -542,18 +542,6 @@ async function ensureOwnerOnlyDirectory(directoryPath: string): Promise<void> {
 	await fsyncDirectoryPath(directoryPath);
 }
 
-async function writeOwnerOnlyFile(filePath: string, content: Uint8Array | string): Promise<void> {
-	await ensureOwnerOnlyDirectory(path.dirname(filePath));
-	const handle = await fs.promises.open(filePath, "w", 0o600);
-	try {
-		await handle.writeFile(content);
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	await fs.promises.chmod(filePath, 0o600).catch(() => undefined);
-	await fsyncDirectoryPath(path.dirname(filePath));
-}
 async function writeOwnerOnlyFileNoReplace(filePath: string, content: Uint8Array | string): Promise<void> {
 	await ensureOwnerOnlyDirectory(path.dirname(filePath));
 	const handle = await fs.promises.open(filePath, "wx", 0o600);
@@ -568,6 +556,8 @@ async function writeOwnerOnlyFileNoReplace(filePath: string, content: Uint8Array
 }
 
 const MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES = 64 * 1024 * 1024;
+const MEMORY_GUARD_CHECKPOINT_BLOB_MAX_ENTRIES = 4096;
+const MEMORY_GUARD_CHECKPOINT_BLOB_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
 
 function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set(), key?: string): Set<string> {
 	const addRef = (candidate: unknown): void => {
@@ -3805,7 +3795,9 @@ async function collectProjectSessions(cwd: string, storage: FileSessionStorage):
 function mergeSessionInventories(...inventories: SessionInfo[][]): SessionInfo[] {
 	const sessions = new Map<string, SessionInfo>();
 	for (const inventory of inventories) {
-		for (const session of inventory) sessions.set(path.resolve(session.path), session);
+		for (const session of inventory) {
+			if (!sessions.has(session.id)) sessions.set(session.id, session);
+		}
 	}
 	return [...sessions.values()].sort((left, right) => right.modified.getTime() - left.modified.getTime());
 }
@@ -6603,7 +6595,10 @@ export class SessionManager {
 		const blobRootRelativePath = memoryGuardParticipantRelativePath(sessionId, "blobs");
 		const blobManifestRelativePath = memoryGuardParticipantRelativePath(sessionId, "blob-manifest.json");
 		await ensureOwnerOnlyDirectory(participantRoot);
-		await writeOwnerOnlyFile(path.join(input.checkpointRoot, transcriptRelativePath), captured.snapshot.content);
+		await writeOwnerOnlyFileNoReplace(
+			path.join(input.checkpointRoot, transcriptRelativePath),
+			captured.snapshot.content,
+		);
 		const blobManifestEntries: MemoryGuardCheckpointBlobManifestEntryV1[] = [];
 		for (const ref of [...collectCheckpointBlobRefs(entries)].sort()) {
 			const hash = parseBlobRef(ref);
@@ -6616,7 +6611,7 @@ export class SessionManager {
 			if (data.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
 				throw new Error(`memory_guard_checkpoint_blob_capacity_exceeded:${hash}`);
 			const relativePath = hash;
-			await writeOwnerOnlyFile(path.join(input.checkpointRoot, blobRootRelativePath, relativePath), data);
+			await writeOwnerOnlyFileNoReplace(path.join(input.checkpointRoot, blobRootRelativePath, relativePath), data);
 			blobManifestEntries.push({
 				bytes: String(data.byteLength),
 				relative_path: relativePath,
@@ -6629,7 +6624,7 @@ export class SessionManager {
 			schema_version: 1,
 		};
 		const blobManifestText = memoryGuardCanonicalJson(blobManifest);
-		await writeOwnerOnlyFile(path.join(input.checkpointRoot, blobManifestRelativePath), blobManifestText);
+		await writeOwnerOnlyFileNoReplace(path.join(input.checkpointRoot, blobManifestRelativePath), blobManifestText);
 		const checkpoint: MemoryGuardSessionManagerCheckpointV1 = {
 			blob_authority: {
 				kind: "checkpoint_blob_tree_v1",
@@ -6651,7 +6646,7 @@ export class SessionManager {
 			input.checkpointRoot,
 			memoryGuardParticipantRelativePath(sessionId, "session-manager.json"),
 		);
-		await writeOwnerOnlyFile(checkpointPath, memoryGuardCanonicalJson(checkpoint));
+		await writeOwnerOnlyFileNoReplace(checkpointPath, memoryGuardCanonicalJson(checkpoint));
 		const currentRevisions = this.revisionSnapshot();
 		const recaptured = SessionManager.captureTranscriptStrict(this.#sessionFile, this.storage);
 		if (
@@ -7484,6 +7479,7 @@ export class SessionManager {
 	}
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
+		this.#assertRecoveryHydrationWritable();
 		const firstKept = this.#byId.get(firstKeptEntryId);
 		const compaction = this.#byId.get(compactionEntryId);
 		if (!firstKept) throw new Error(`Entry ${firstKeptEntryId} not found`);
@@ -7877,6 +7873,7 @@ export class SessionManager {
 	}
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries without persisting it. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
+		this.#assertRecoveryHydrationWritable();
 		return this.#sanitizeLoadedOpenAIResponsesReplayMetadata().length > 0;
 	}
 
@@ -8032,6 +8029,7 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
+		this.#assertRecoveryHydrationWritable();
 		if (!this.#byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -8045,6 +8043,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		this.#assertRecoveryHydrationWritable();
 		this.#leafId = null;
 		this.#leafRevision++;
 	}
@@ -8055,6 +8054,7 @@ export class SessionManager {
 	 * context from the abandoned conversation path.
 	 */
 	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromExtension?: boolean): string {
+		this.#assertRecoveryHydrationWritable();
 		if (branchFromId !== null && !this.#byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -8906,6 +8906,9 @@ export class SessionManager {
 		if (!validateMemoryGuardBlobManifest(blobManifest)) return { kind: "blocked", reason: "blob-manifest-mismatch" };
 		if (memoryGuardCanonicalJson(blobManifest) !== manifestText)
 			return { kind: "blocked", reason: "blob-manifest-mismatch" };
+		if (blobManifest.entries.length > MEMORY_GUARD_CHECKPOINT_BLOB_MAX_ENTRIES)
+			return { kind: "blocked", reason: "blob-manifest-mismatch" };
+		let checkpointBlobBytes = 0;
 		const seenBlobPaths = new Set<string>();
 		const checkpointBlobs = new Map<string, Buffer>();
 		for (const entry of blobManifest.entries) {
@@ -8918,6 +8921,9 @@ export class SessionManager {
 			seenBlobPaths.add(entry.relative_path);
 			const blobBytes = Number(entry.bytes);
 			if (!Number.isSafeInteger(blobBytes) || blobBytes < 0)
+				return { kind: "blocked", reason: "blob-manifest-mismatch" };
+			checkpointBlobBytes += blobBytes;
+			if (checkpointBlobBytes > MEMORY_GUARD_CHECKPOINT_BLOB_TOTAL_MAX_BYTES)
 				return { kind: "blocked", reason: "blob-manifest-mismatch" };
 			const blobPath = `${input.checkpoint.blob_authority.root_relative_path}/${entry.relative_path}`;
 			const blobData = readCheckpointAuthorityFile(input.incidentAuthority, blobPath, blobBytes + 1);
@@ -8939,10 +8945,6 @@ export class SessionManager {
 		} catch {
 			return { kind: "blocked", reason: "destination-unavailable" };
 		}
-		const destinationExisted = await fs.promises
-			.stat(destination.directory)
-			.then(() => true)
-			.catch(() => false);
 		const transcriptPath = path.join(
 			destination.directory,
 			`.${input.checkpoint.session_id}.memory-guard.${crypto.randomUUID()}.jsonl`,
@@ -8955,8 +8957,6 @@ export class SessionManager {
 			const captured = SessionManager.captureTranscriptStrict(transcriptPath, storage);
 			if (captured.kind !== "captured") {
 				await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
-				if (!destinationExisted)
-					await fs.promises.rm(destination.directory, { recursive: true, force: true }).catch(() => undefined);
 				return { kind: "blocked", reason: captured.reason };
 			}
 			transcriptIdentity = captured.snapshot.identity;
@@ -8967,14 +8967,10 @@ export class SessionManager {
 			);
 		} catch {
 			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
-			if (!destinationExisted)
-				await fs.promises.rm(destination.directory, { recursive: true, force: true }).catch(() => undefined);
 			return { kind: "blocked", reason: "destination-unavailable" };
 		}
 		if (opened.kind === "error") {
 			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
-			if (!destinationExisted)
-				await fs.promises.rm(destination.directory, { recursive: true, force: true }).catch(() => undefined);
 			return { kind: "blocked", reason: opened.reason };
 		}
 		if (
