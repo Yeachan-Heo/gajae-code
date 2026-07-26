@@ -161,6 +161,33 @@ describe("model onboarding guidance", () => {
 		expect(refreshedProviders).toEqual(["env/provider"]);
 		expect(outputs.join("\n")).toContain("Provider env/provider discovery succeeded but returned no models.");
 	});
+	it("prefers exact provider IDs and rejects ambiguous case-folded discovery prefixes", async () => {
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "model");
+		expect(command?.handle).toBeTruthy();
+		const outputs: string[] = [];
+		const refreshedProviders: string[] = [];
+		const runtime = createRuntime(outputs);
+		Object.defineProperty(runtime.session, "modelRegistry", {
+			value: {
+				getDiscoverableProviders: () => ["foo", "Foo"],
+				refreshProvider: async (provider: string) => {
+					refreshedProviders.push(provider);
+				},
+				getProviderDiscoveryState: () => ({
+					provider: "Foo",
+					status: "empty",
+					optional: false,
+					stale: false,
+					models: [],
+				}),
+			},
+		});
+
+		await command?.handle?.({ name: "model", args: "Foo/model", text: "/model Foo/model" }, runtime);
+		await command?.handle?.({ name: "model", args: "fOo/model", text: "/model fOo/model" }, runtime);
+
+		expect(refreshedProviders).toEqual(["Foo"]);
+	});
 
 	it("uses shared provider onboarding text for SDK no-model fallback", async () => {
 		const agentDir = await createTempDir();

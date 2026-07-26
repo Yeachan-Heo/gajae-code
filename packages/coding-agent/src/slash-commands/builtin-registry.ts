@@ -279,13 +279,23 @@ function parseProviderQualifiedSelector(
 ): { provider: string; modelId: string } | undefined {
 	const splitSelector = splitExplicitThinkingSelector(selector);
 	const normalizedSelector = splitSelector.baseSelector.toLowerCase();
-	const provider = [...discoverableProviders]
-		.sort((left, right) => right.length - left.length)
-		.find(candidate => normalizedSelector.startsWith(`${candidate.toLowerCase()}/`));
+	const exactProviders = discoverableProviders.filter(candidate =>
+		splitSelector.baseSelector.startsWith(`${candidate}/`),
+	);
+	const caseFoldedProviders = discoverableProviders.filter(candidate =>
+		normalizedSelector.startsWith(`${candidate.toLowerCase()}/`),
+	);
+	const provider =
+		exactProviders.length === 1
+			? exactProviders[0]
+			: exactProviders.length === 0 && caseFoldedProviders.length === 1
+				? caseFoldedProviders[0]
+				: undefined;
 	if (provider) {
 		const modelId = splitSelector.baseSelector.slice(provider.length + 1);
 		return modelId ? { provider, modelId } : undefined;
 	}
+	if (caseFoldedProviders.length > 0) return undefined;
 	const parsed = parseModelString(splitSelector.baseSelector);
 	return parsed ? { provider: parsed.provider, modelId: parsed.id } : undefined;
 }

@@ -1807,22 +1807,23 @@ export class ModelRegistry {
 		const discovered = [...configuredDiscovered, ...builtInDiscovered];
 		for (const provider of selectedDiscoverableProviders) {
 			const evidence = configuredDiscoveryEvidence.get(provider.provider);
+			const discovery = configuredDiscoveries.get(provider.provider);
 			const state = this.#discoveryManager.getState(provider.provider);
 			const currentAuthGeneration = this.authStorage.getProviderEvidenceGeneration(provider.provider);
 			const currentEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(
 				this.#getProviderBaseUrlForDiscovery(provider.provider) ?? "",
 			);
-			if (!configuredDiscoveries.get(provider.provider)?.current) continue;
+			if (!discovery?.current) continue;
 			if (
 				evidence !== undefined &&
 				state?.status === "ok" &&
-				configuredDiscoveries.get(provider.provider)?.fetched &&
+				discovery.fetched &&
 				currentAuthGeneration === evidence.authGeneration &&
 				currentEndpoint === evidence.endpoint
 			) {
 				this.#configuredDiscoveryEvidence.set(provider.provider, evidence);
 			} else if (
-				state?.status !== "cached" ||
+				(state?.status !== "cached" && !(state?.status === "ok" && !discovery.fetched)) ||
 				state.error !== undefined ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.authGeneration !== currentAuthGeneration ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.endpoint !== currentEndpoint

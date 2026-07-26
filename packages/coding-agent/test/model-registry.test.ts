@@ -3682,6 +3682,12 @@ describe("ModelRegistry", () => {
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
 				{ provider: "discovery-provider", connectionKind: "credential" },
 			]);
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("ok");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
 		});
 		test("does not retain configured discovery evidence after an in-flight credential change", async () => {
 			writeRawModelsJson({
