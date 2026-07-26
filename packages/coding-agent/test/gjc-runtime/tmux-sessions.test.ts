@@ -456,6 +456,47 @@ describe("GJC tmux session management", () => {
 		expect(calls.some(cmd => cmd.includes("new-session"))).toBe(true);
 		expect(calls.some(cmd => cmd.includes("set-option") || cmd.includes("set-window-option"))).toBe(false);
 	});
+	it("fsyncs the scoped creation attempt file and its parent directory before execution", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-attempt-"));
+		fixtureDirectories.push(stateDir);
+		const lifecycleRoot = path.join(stateDir, "persisted-attempt", "owner-lifecycle");
+		const opened: Array<{ file: fsSync.PathOrFileDescriptor; flags: string | number }> = [];
+		const originalOpenSync = fsSync.openSync;
+		spyOn(fsSync, "openSync").mockImplementation((file, flags, mode) => {
+			opened.push({ file, flags });
+			return originalOpenSync(file, flags, mode);
+		});
+		const fsyncSpy = spyOn(fsSync, "fsyncSync");
+		__setCreateOwnerIsolationForTests({
+			probe: {
+				readCallerCgroup: () => "0::/user.slice/user-1000.slice/user@1000.service/app.slice/gateway.service\n",
+				probeServer: () => ({ state: "absent" }),
+			},
+			execute: () => ({ ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" }),
+		});
+
+		expect(() =>
+			createGjcTmuxSession(
+				{
+					GJC_PSMUX_DETECTION: "off",
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_TMUX_SESSION: "persisted-attempt",
+					GJC_COORDINATOR_SESSION_ID: "persisted-attempt",
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(stateDir, "runtime-state.json"),
+				},
+				{ platform: "linux" },
+			),
+		).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+
+		const attempt = fsSync.readdirSync(lifecycleRoot).find(file => file.startsWith("attempt-"));
+		expect(attempt).toBeDefined();
+		expect(opened).toContainEqual({
+			file: path.join(lifecycleRoot, attempt!),
+			flags: "wx",
+		});
+		expect(opened).toContainEqual({ file: lifecycleRoot, flags: "r" });
+		expect(fsyncSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+	});
 	it("rejects psmux before creating or tagging a managed session", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-sessions-test-"));
 		fixtureDirectories.push(stateDir);
