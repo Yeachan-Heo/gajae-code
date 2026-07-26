@@ -2400,7 +2400,11 @@ type SourceArtifactCleanup = {
 	tree: NativeDirectoryTreeSnapshot;
 };
 
-function cleanupAuthorityMatches(cleanup: SourceArtifactCleanup, parent: string): boolean {
+export function cleanupAuthorityMatches(
+	cleanup: SourceArtifactCleanup,
+	parent: string,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
 	try {
 		const stat = fs.lstatSync(cleanup.retainedPath, { bigint: true });
 		if (
@@ -2408,15 +2412,26 @@ function cleanupAuthorityMatches(cleanup: SourceArtifactCleanup, parent: string)
 			!stat.isDirectory() ||
 			stat.isSymbolicLink() ||
 			stat.dev !== cleanup.identity.dev ||
-			stat.ino !== cleanup.identity.ino ||
-			stat.size !== cleanup.identity.size ||
-			stat.mtimeNs !== cleanup.identity.mtimeNs
+			stat.ino !== cleanup.identity.ino
 		)
 			return false;
 		const snapshot = native.snapshotDirectoryTree(cleanup.retainedPath);
+		const observedRoot = snapshot.snapshot?.entries.find(
+			entry => entry.relativePath === "" && entry.kind === "directory",
+		);
+		if (
+			!snapshot.ok ||
+			!snapshot.snapshot ||
+			!observedRoot ||
+			(platform === "win32"
+				? observedRoot.dev !== cleanup.identity.dev.toString() ||
+					observedRoot.ino !== cleanup.identity.ino.toString() ||
+					BigInt(observedRoot.size) !== cleanup.identity.size ||
+					BigInt(observedRoot.mtimeNs) !== cleanup.identity.mtimeNs
+				: stat.size !== cleanup.identity.size || stat.mtimeNs !== cleanup.identity.mtimeNs)
+		)
+			return false;
 		return (
-			!!snapshot.ok &&
-			!!snapshot.snapshot &&
 			sameArtifactTree(snapshot.snapshot, cleanup.tree) &&
 			cleanup.tree.entries.length === 1 &&
 			cleanup.tree.entries[0]?.relativePath === "" &&

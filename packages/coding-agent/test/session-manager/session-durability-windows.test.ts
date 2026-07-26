@@ -7,6 +7,7 @@ import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import {
 	canonicalBindingOpenFlags,
+	cleanupAuthorityMatches,
 	fsyncCanonicalBinding,
 	listManagedCandidates,
 	matchesMigrationArtifactRoot,
@@ -204,6 +205,71 @@ describe("managed session Windows durability", () => {
 		expect(matchesMigrationArtifactRoot(artifacts, identity, expectedTree, "win32")).toBe(true);
 		await fs.writeFile(payload, "modified");
 		expect(matchesMigrationArtifactRoot(artifacts, identity, expectedTree, "win32")).toBe(false);
+	});
+
+	it("uses native root metadata for cleanup authority on Windows without changing non-Windows checks", async () => {
+		const root = temporaryDirectory("gjc-cleanup-authority-root-");
+		temporaryDirectories.push(root);
+		const retainedPath = path.join(root, "retained");
+		await fs.mkdir(retainedPath);
+		const originalSnapshotDirectoryTree = native.snapshotDirectoryTree;
+		const observed = originalSnapshotDirectoryTree(retainedPath);
+		if (!observed.ok || !observed.snapshot) throw new Error("Native snapshot unavailable");
+		const nativeRoot = observed.snapshot.entries.find(
+			entry => entry.relativePath === "" && entry.kind === "directory",
+		);
+		if (!nativeRoot) throw new Error("Native root missing");
+		const expectedTree: NativeDirectoryTreeSnapshot = {
+			...observed.snapshot,
+			entries: observed.snapshot.entries.map(entry =>
+				entry.relativePath === "" && entry.kind === "directory" ? { ...entry, size: "4096" } : entry,
+			),
+		};
+		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname =>
+			pathname === retainedPath ? { ok: true, snapshot: expectedTree } : originalSnapshotDirectoryTree(pathname),
+		);
+		const stat = syncFs.lstatSync(retainedPath, { bigint: true });
+		stat.dev = BigInt(nativeRoot.dev);
+		stat.ino = BigInt(nativeRoot.ino);
+		stat.size = 0n;
+		stat.mtimeNs = BigInt(nativeRoot.mtimeNs);
+		vi.spyOn(syncFs, "lstatSync").mockReturnValue(stat);
+		const cleanup = {
+			state: "cleanup_pending" as const,
+			role: "exchange_placeholder" as const,
+			retainedPath,
+			identity: {
+				dev: BigInt(nativeRoot.dev),
+				ino: BigInt(nativeRoot.ino),
+				size: 4096n,
+				mtimeNs: BigInt(nativeRoot.mtimeNs),
+			},
+			tree: expectedTree,
+		};
+		const parent = path.dirname(retainedPath);
+
+		expect(cleanupAuthorityMatches(cleanup, parent, "win32")).toBe(true);
+		expect(
+			cleanupAuthorityMatches({ ...cleanup, identity: { ...cleanup.identity, size: 4097n } }, parent, "win32"),
+		).toBe(false);
+		expect(
+			cleanupAuthorityMatches(
+				{ ...cleanup, identity: { ...cleanup.identity, mtimeNs: cleanup.identity.mtimeNs + 1n } },
+				parent,
+				"win32",
+			),
+		).toBe(false);
+		expect(
+			cleanupAuthorityMatches(
+				{ ...cleanup, identity: { ...cleanup.identity, dev: cleanup.identity.dev + 1n } },
+				parent,
+				"win32",
+			),
+		).toBe(false);
+		expect(cleanupAuthorityMatches(cleanup, path.join(root, "other"), "win32")).toBe(false);
+		expect(
+			cleanupAuthorityMatches({ ...cleanup, identity: { ...cleanup.identity, size: 0n } }, parent, "darwin"),
+		).toBe(true);
 	});
 
 	it("tolerates a POSIX root ctime change caused by detaching artifacts", async () => {
