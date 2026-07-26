@@ -1182,6 +1182,40 @@ function shouldIgnoreAnthropicPreambleEvent(eventType: unknown): boolean {
 	return !ANTHROPIC_PRE_MESSAGE_START_EVENT_TYPES.has(eventType);
 }
 
+function createAnthropicStreamProgressPredicate(): (event: unknown) => boolean {
+	let outputTokens = -1;
+
+	return event => {
+		if (!isRecord(event) || typeof event.type !== "string") return false;
+		if (
+			event.type === "message_start" ||
+			event.type === "content_block_start" ||
+			event.type === "content_block_stop" ||
+			event.type === "message_stop"
+		) {
+			return true;
+		}
+		if (event.type === "content_block_delta") {
+			if (!isRecord(event.delta)) return false;
+			const delta = event.delta;
+			return (
+				(typeof delta.text === "string" && delta.text.length > 0) ||
+				(typeof delta.thinking === "string" && delta.thinking.length > 0) ||
+				(typeof delta.partial_json === "string" && delta.partial_json.length > 0) ||
+				(typeof delta.signature === "string" && delta.signature.length > 0)
+			);
+		}
+		if (event.type === "message_delta") {
+			if (isRecord(event.delta) && event.delta.stop_reason != null) return true;
+			if (!isRecord(event.usage) || typeof event.usage.output_tokens !== "number") return false;
+			if (event.usage.output_tokens <= outputTokens) return false;
+			outputTokens = event.usage.output_tokens;
+			return true;
+		}
+		return false;
+	};
+}
+
 function isTransientStreamEnvelopeError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	return (
@@ -1457,6 +1491,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					let sawEvent = false;
 					let sawMessageStart = false;
 					let sawTerminalEnvelope = false;
+					const isProgressEvent = createAnthropicStreamProgressPredicate();
 
 					for await (const event of iterateWithIdleTimeout(anthropicStream, {
 						idleTimeoutMs,
@@ -1466,6 +1501,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						onIdle: () => activeAbortTracker.abortLocally(idleTimeoutAbortError),
 						onFirstItemTimeout: () => activeAbortTracker.abortLocally(firstEventTimeoutAbortError),
 						abortSignal: options?.signal,
+						isProgressItem: isProgressEvent,
 					})) {
 						sawEvent = true;
 						if (sawProviderSafetyStop) {

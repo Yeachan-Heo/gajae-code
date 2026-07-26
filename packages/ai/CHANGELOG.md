@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Anthropic `ping` keepalives no longer reset stream progress, so responses that stop producing content now reach the idle timeout instead of hanging indefinitely.
+
 ## [0.11.10] - 2026-07-25
 
 ## [0.11.9] - 2026-07-24

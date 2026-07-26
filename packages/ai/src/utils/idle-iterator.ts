@@ -173,8 +173,6 @@ export async function* iterateWithIdleTimeout<T>(
 			}
 		}
 
-		const nextResultPromise = withRacy(iterator.next());
-
 		const racers: Array<
 			Promise<
 				| { kind: "next"; result: IteratorResult<T> }
@@ -182,7 +180,7 @@ export async function* iterateWithIdleTimeout<T>(
 				| { kind: "timeout" }
 				| { kind: "abort" }
 			>
-		> = [nextResultPromise];
+		> = [];
 
 		let timer: NodeJS.Timeout | undefined;
 		let resolveTimeout: ((value: { kind: "timeout" }) => void) | undefined;
@@ -206,6 +204,13 @@ export async function* iterateWithIdleTimeout<T>(
 			abortSignal.addEventListener("abort", abortListener, { once: true });
 			racers.push(promise);
 		}
+
+		// Arm timeout/abort races before asking the source for its next item. A
+		// periodic keepalive iterator commonly registers its own timer inside
+		// `next()`; registering that first lets equal-deadline keepalives win every
+		// race and extend the idle window forever. Already-buffered items still
+		// settle as microtasks before a 0ms watchdog.
+		racers.unshift(withRacy(iterator.next()));
 
 		try {
 			const outcome = await Promise.race(racers);
