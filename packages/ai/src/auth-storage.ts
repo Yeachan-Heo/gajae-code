@@ -8,7 +8,7 @@
  * - `SqliteAuthCredentialStore`: concrete SQLite-backed implementation
  */
 import { Database, type Statement } from "bun:sqlite";
-import { createHash } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
@@ -942,7 +942,8 @@ export class AuthStorage {
 			.filter((credential): credential is Extract<AuthCredential, { type: "oauth" }> => credential.type === "oauth")
 			.map(credential => `${credential.expires}\u0000${credential.expires > Date.now() ? "usable" : "expired"}`)
 			.join("\u0001");
-		return createHash("sha256")
+		return crypto
+			.createHash("sha256")
 			.update(
 				`${this.getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}`,
 			)
