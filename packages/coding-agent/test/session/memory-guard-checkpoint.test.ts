@@ -6,6 +6,10 @@ import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	acquireMemoryGuardClaims,
+	releaseMemoryGuardClaims,
+} from "@gajae-code/coding-agent/gjc-runtime/memory-guard-owner-claims";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type {
@@ -97,6 +101,22 @@ describe("memory guard checkpoint export/restore", () => {
 			const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 			authStores.push(authStorage);
 			authStorage.setRuntimeApiKey("anthropic", "test-key");
+			const claimsLease = await acquireMemoryGuardClaims(
+				path.join(root, "claims"),
+				{
+					sessionId: checkpoint.session_id,
+					generation: "generation-1",
+					runId: "run-1",
+					childToken: "child-1",
+					pid: process.pid,
+					processStartTime: "1",
+					ttyDevice: "0",
+				},
+				{
+					now: () => "2026-01-01T00:00:00.000Z",
+					probePid: async () => ({ kind: "live", startTime: "1", ttyDevice: "0" }),
+				},
+			);
 			const session = await AgentSession.restoreFromMemoryGuardCheckpoint({
 				agent: new Agent({
 					initialState: {
@@ -109,6 +129,7 @@ describe("memory guard checkpoint export/restore", () => {
 				settings: Settings.isolated({}),
 				modelRegistry: new ModelRegistry(authStorage),
 				staged: restored,
+				claimsLease,
 			});
 			expect(session.kind).toBe("staged");
 			if (session.kind !== "staged") return;
@@ -116,6 +137,7 @@ describe("memory guard checkpoint export/restore", () => {
 			await session.session.promoteRecoveryHydrationAfterOwnershipReadyFence(session.promotionFence);
 			expect(session.session.recoveryHydrationContext).toBeUndefined();
 			await session.session.dispose();
+			await releaseMemoryGuardClaims(path.join(root, "claims"), claimsLease);
 		} finally {
 			authority?.close();
 			await manager.close();
@@ -153,5 +175,33 @@ describe("memory guard checkpoint export/restore", () => {
 			authority.close();
 			await manager.close();
 		}
+	});
+
+	it("rejects unsafe checkpoint session IDs before resolving incident paths", async () => {
+		const checkpoint = {
+			blob_authority: {
+				kind: "checkpoint_blob_tree_v1" as const,
+				manifest_relative_path: "participants/safe/blob-manifest.json",
+				manifest_sha256: "0".repeat(64),
+				root_relative_path: "participants/safe/blobs",
+			},
+			revisions: { entry: "0", leaf: "0", headerExport: "0", label: "0", replayMetadata: "0" },
+			schema_version: 1 as const,
+			session_id: "../../victim",
+			session_name: null,
+			transcript: {
+				bytes: "0",
+				relative_path: "participants/safe/transcript.jsonl",
+				sha256: "0".repeat(64),
+			},
+		};
+		await expect(
+			SessionManager.restoreMemoryGuardCheckpoint({
+				incidentAuthority: {} as RecoveryFsRoot,
+				participant: participantFromCheckpoint(checkpoint),
+				checkpoint,
+				destination: path.join(await makeTempRoot(), "restore-root"),
+			}),
+		).resolves.toEqual({ kind: "blocked", reason: "checkpoint-mismatch" });
 	});
 });

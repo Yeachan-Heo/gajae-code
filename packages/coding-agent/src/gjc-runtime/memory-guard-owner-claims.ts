@@ -5,6 +5,7 @@ import { assertSafePathComponent } from "./session-layout";
 import { memoryGuardClaimPaths } from "./tmux-owner-isolation";
 
 const MEMORY_GUARD_CLAIM_RESOURCES = ["writer", "tty"] as const;
+const MEMORY_GUARD_SQLITE_BUSY_TIMEOUT_MS = 5_000;
 type MemoryGuardClaimResource = (typeof MEMORY_GUARD_CLAIM_RESOURCES)[number];
 
 export interface MemoryGuardClaimOwner {
@@ -21,6 +22,20 @@ export interface MemoryGuardClaimsLease {
 	writerEpoch: number;
 	ttyEpoch: number;
 	owner: MemoryGuardClaimOwner;
+}
+
+const issuedMemoryGuardClaimsLeases = new WeakSet<MemoryGuardClaimsLease>();
+
+function issueMemoryGuardClaimsLease(lease: MemoryGuardClaimsLease): MemoryGuardClaimsLease {
+	const issued = Object.freeze(lease);
+	issuedMemoryGuardClaimsLeases.add(issued);
+	return issued;
+}
+
+export function isMemoryGuardClaimsLease(value: unknown): value is MemoryGuardClaimsLease {
+	return (
+		typeof value === "object" && value !== null && issuedMemoryGuardClaimsLeases.has(value as MemoryGuardClaimsLease)
+	);
 }
 
 export type MemoryGuardClaimsReleasedProof = MemoryGuardClaimsLease;
@@ -80,7 +95,7 @@ async function enforceDatabaseModes(databaseFile: string): Promise<void> {
 function configureClaimsDatabase(database: Database): void {
 	database.exec("PRAGMA journal_mode = WAL");
 	database.exec("PRAGMA synchronous = FULL");
-	database.exec("PRAGMA busy_timeout = 1");
+	database.exec(`PRAGMA busy_timeout = ${MEMORY_GUARD_SQLITE_BUSY_TIMEOUT_MS}`);
 	database.exec(`
 		CREATE TABLE IF NOT EXISTS meta(
 			key TEXT PRIMARY KEY,
@@ -163,6 +178,21 @@ async function classifyExistingRow(
 	throw new Error(`memory_guard_claim_existing_owner_unverifiable:${probe.reason}`);
 }
 
+function claimRowsEqual(left: PersistedMemoryGuardClaimRow[], right: PersistedMemoryGuardClaimRow[]): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function inspectExistingRows(
+	rows: PersistedMemoryGuardClaimRow[],
+	deps: MemoryGuardOwnerClaimsDeps,
+	liveError: (resource: MemoryGuardClaimResource) => Error,
+): Promise<void> {
+	for (const row of rows) {
+		const state = await classifyExistingRow(row, deps);
+		if (state === "live") throw liveError(row.resource);
+	}
+}
+
 function insertClaimRow(
 	database: Database,
 	resource: MemoryGuardClaimResource,
@@ -232,23 +262,34 @@ export async function acquireMemoryGuardClaims(
 	await assertLiveOwner(owner, deps);
 	const { database, databaseFile } = await openClaimsDatabase(stateDir, owner.sessionId);
 	try {
-		database.exec("BEGIN IMMEDIATE");
-		for (const row of readClaimRows(database)) {
-			const state = await classifyExistingRow(row, deps);
-			if (state === "live") throw new Error(`memory_guard_claim_live_contention:${row.resource}`);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			const inspectedRows = readClaimRows(database);
+			await inspectExistingRows(
+				inspectedRows,
+				deps,
+				resource => new Error(`memory_guard_claim_live_contention:${resource}`),
+			);
+			database.exec("BEGIN IMMEDIATE");
+			try {
+				if (!claimRowsEqual(inspectedRows, readClaimRows(database))) {
+					database.exec("ROLLBACK");
+					continue;
+				}
+				database.exec("DELETE FROM claims");
+				const acquiredAt = deps.now();
+				const writerEpoch = allocateEpoch(database);
+				insertClaimRow(database, "writer", writerEpoch, owner, acquiredAt);
+				const ttyEpoch = allocateEpoch(database);
+				insertClaimRow(database, "tty", ttyEpoch, owner, acquiredAt);
+				database.exec("COMMIT");
+				await enforceDatabaseModes(databaseFile);
+				return issueMemoryGuardClaimsLease({ writerEpoch, ttyEpoch, owner });
+			} catch (error) {
+				rollbackQuietly(database);
+				throw error;
+			}
 		}
-		database.exec("DELETE FROM claims");
-		const acquiredAt = deps.now();
-		const writerEpoch = allocateEpoch(database);
-		insertClaimRow(database, "writer", writerEpoch, owner, acquiredAt);
-		const ttyEpoch = allocateEpoch(database);
-		insertClaimRow(database, "tty", ttyEpoch, owner, acquiredAt);
-		database.exec("COMMIT");
-		await enforceDatabaseModes(databaseFile);
-		return { writerEpoch, ttyEpoch, owner };
-	} catch (error) {
-		rollbackQuietly(database);
-		throw error;
+		throw new Error("memory_guard_claim_rows_changed");
 	} finally {
 		database.close();
 	}
@@ -280,25 +321,36 @@ export async function probeMemoryGuardClaimsReleased(
 	await assertLiveOwner(owner, deps);
 	const { database, databaseFile } = await openClaimsDatabase(stateDir, owner.sessionId);
 	try {
-		database.exec("BEGIN IMMEDIATE");
-		for (const row of readClaimRows(database)) {
-			const state = await classifyExistingRow(row, deps);
-			if (state === "live") throw new Error(`memory_guard_claims_still_live:${row.resource}`);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			const inspectedRows = readClaimRows(database);
+			await inspectExistingRows(
+				inspectedRows,
+				deps,
+				resource => new Error(`memory_guard_claims_still_live:${resource}`),
+			);
+			database.exec("BEGIN IMMEDIATE");
+			try {
+				if (!claimRowsEqual(inspectedRows, readClaimRows(database))) {
+					database.exec("ROLLBACK");
+					continue;
+				}
+				database.exec("DELETE FROM claims");
+				const acquiredAt = deps.now();
+				const writerEpoch = allocateEpoch(database);
+				insertClaimRow(database, "writer", writerEpoch, owner, acquiredAt);
+				const ttyEpoch = allocateEpoch(database);
+				insertClaimRow(database, "tty", ttyEpoch, owner, acquiredAt);
+				database.exec("COMMIT");
+				await enforceDatabaseModes(databaseFile);
+				const proof = issueMemoryGuardClaimsLease({ writerEpoch, ttyEpoch, owner });
+				await releaseMemoryGuardClaims(stateDir, proof);
+				return proof;
+			} catch (error) {
+				rollbackQuietly(database);
+				throw error;
+			}
 		}
-		database.exec("DELETE FROM claims");
-		const acquiredAt = deps.now();
-		const writerEpoch = allocateEpoch(database);
-		insertClaimRow(database, "writer", writerEpoch, owner, acquiredAt);
-		const ttyEpoch = allocateEpoch(database);
-		insertClaimRow(database, "tty", ttyEpoch, owner, acquiredAt);
-		database.exec("COMMIT");
-		await enforceDatabaseModes(databaseFile);
-		const proof = { writerEpoch, ttyEpoch, owner };
-		await releaseMemoryGuardClaims(stateDir, proof);
-		return proof;
-	} catch (error) {
-		rollbackQuietly(database);
-		throw error;
+		throw new Error("memory_guard_claim_rows_changed");
 	} finally {
 		database.close();
 	}

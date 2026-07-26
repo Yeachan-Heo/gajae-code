@@ -75,6 +75,43 @@ describe("memory guard owner claims", () => {
 		}
 	});
 
+	it("allows predecessor release while a successor probes the incumbent", async () => {
+		const stateDir = await tempStateDir();
+		const incumbent = owner();
+		const challenger = owner({ childToken: "child-2682", pid: 2682, processStartTime: "333" });
+		const incumbentDeps = deps(
+			new Map([
+				[incumbent.pid, { kind: "live", startTime: incumbent.processStartTime, ttyDevice: incumbent.ttyDevice }],
+			]),
+		);
+		const incumbentLease = await acquireMemoryGuardClaims(stateDir, incumbent, incumbentDeps);
+		const probeStarted = Promise.withResolvers<void>();
+		const continueProbe = Promise.withResolvers<void>();
+		try {
+			const challengerAcquire = acquireMemoryGuardClaims(stateDir, challenger, {
+				now: () => "2026-07-23T00:00:01.000Z",
+				probePid: async pid => {
+					if (pid === challenger.pid) {
+						return { kind: "live", startTime: challenger.processStartTime, ttyDevice: challenger.ttyDevice };
+					}
+					probeStarted.resolve();
+					await continueProbe.promise;
+					return { kind: "absent" };
+				},
+			});
+			await probeStarted.promise;
+			await releaseMemoryGuardClaims(stateDir, incumbentLease);
+			continueProbe.resolve();
+			const challengerLease = await challengerAcquire;
+			const acquired = await readMemoryGuardClaimsForTest(stateDir, challenger.sessionId);
+			expect(acquired.claims.map(row => row.pid)).toEqual([challenger.pid, challenger.pid]);
+			await releaseMemoryGuardClaims(stateDir, challengerLease);
+		} finally {
+			continueProbe.resolve();
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects live contention and reclaims only absent or reincarnated owners", async () => {
 		const stateDir = await tempStateDir();
 		const incumbent = owner();

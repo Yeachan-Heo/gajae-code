@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
+import * as util from "node:util";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -254,6 +255,7 @@ import {
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { assertDeepInterviewIntentManifest } from "../gjc-runtime/deep-interview-state";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import { isMemoryGuardClaimsLease, type MemoryGuardClaimsLease } from "../gjc-runtime/memory-guard-owner-claims";
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
@@ -617,11 +619,19 @@ export interface AgentSessionConfig {
 export interface AgentSessionMemoryGuardRestoreInput
 	extends Omit<AgentSessionConfig, "sessionManager" | "recoveryHydrationContext"> {
 	staged: Extract<MemoryGuardRestoreResult, { kind: "staged" }>;
+	claimsLease: MemoryGuardClaimsLease;
+}
+
+export interface AgentMemoryGuardPromotionFence extends RecoveryHydrationPromotionFence {
+	readonly claimsLease: MemoryGuardClaimsLease;
 }
 
 export type AgentMemoryGuardRestoreResult =
-	| { kind: "staged"; session: AgentSession; promotionFence: RecoveryHydrationPromotionFence }
-	| { kind: "blocked"; reason: "transcript-mismatch" | "hydration-context-mismatch" };
+	| { kind: "staged"; session: AgentSession; promotionFence: AgentMemoryGuardPromotionFence }
+	| {
+			kind: "blocked";
+			reason: "transcript-mismatch" | "hydration-context-mismatch" | "claim-mismatch" | "agent-messages-mismatch";
+	  };
 
 type MidRunMaintenanceLifecycle = Parameters<NonNullable<AgentLoopConfig["maintainContext"]>>[1];
 
@@ -1799,6 +1809,7 @@ export class AgentSession {
 	#constructorMCPToolSelection: string[] | undefined;
 	#constructorDiscoveredBuiltinToolSelection: string[] | undefined;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
+	#memoryGuardClaimsLease: MemoryGuardClaimsLease | undefined;
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
@@ -6454,23 +6465,41 @@ export class AgentSession {
 	static async restoreFromMemoryGuardCheckpoint(
 		input: AgentSessionMemoryGuardRestoreInput,
 	): Promise<AgentMemoryGuardRestoreResult> {
-		const { staged, ...config } = input;
+		const { staged, claimsLease, ...config } = input;
 		if (
 			staged.manager.getSessionId() !== staged.transcriptIdentity.sessionId ||
 			staged.hydrationContext.identity.sessionId !== staged.transcriptIdentity.sessionId
 		) {
+			await staged.manager.close();
 			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		if (
+			!isMemoryGuardClaimsLease(claimsLease) ||
+			claimsLease.owner.sessionId !== staged.transcriptIdentity.sessionId
+		) {
+			await staged.manager.close();
+			return { kind: "blocked", reason: "claim-mismatch" };
+		}
+		const checkpointMessages = staged.manager.buildSessionContext().messages;
+		if (!util.isDeepStrictEqual(config.agent.state.messages, checkpointMessages)) {
+			await staged.manager.close();
+			return { kind: "blocked", reason: "agent-messages-mismatch" };
 		}
 		const session = new AgentSession({
 			...config,
 			sessionManager: staged.manager,
 			recoveryHydrationContext: staged.hydrationContext,
 		});
+		session.#memoryGuardClaimsLease = claimsLease;
 		if (session.recoveryHydrationContext !== staged.hydrationContext) {
 			await session.dispose();
 			return { kind: "blocked", reason: "hydration-context-mismatch" };
 		}
-		return { kind: "staged", session, promotionFence: { ownershipReady: true } };
+		return {
+			kind: "staged",
+			session,
+			promotionFence: Object.freeze({ ownershipReady: true, claimsLease }),
+		};
 	}
 
 	/** The immutable recovery authority, present only before external ownership promotion. */
@@ -6479,11 +6508,15 @@ export class AgentSession {
 	}
 
 	/** Enables normal session mutations after the owner has published its durable fence and writer lease. */
-	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: RecoveryHydrationPromotionFence): Promise<void> {
+	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: AgentMemoryGuardPromotionFence): Promise<void> {
 		const context = this.#recoveryHydrationContext;
 		if (!context) throw new Error("Agent session is not awaiting recovery hydration promotion.");
+		if (this.#memoryGuardClaimsLease !== fence.claimsLease) {
+			throw new Error("Recovery hydration promotion requires the acquired memory-guard claims lease.");
+		}
 		await this.sessionManager.promoteRecoveryHydrationAfterOwnershipReadyFence(context, fence);
 		this.#recoveryHydrationContext = undefined;
+		this.#memoryGuardClaimsLease = undefined;
 	}
 
 	/** Recovery hydration must not start a continuation before ownership promotion. */
@@ -14824,7 +14857,7 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
-				await initializeLocalRoot(this.#localProtocolOptions());
+				if (!switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
 
 				if (switchingToDifferentSession) {
 					// The local:// migration gate for this successor already ran above,
