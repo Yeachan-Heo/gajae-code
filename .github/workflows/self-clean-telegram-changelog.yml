@@ -1,0 +1,44 @@
+name: Clean Telegram successor changelog
+
+on:
+  push:
+    branches:
+      - successor/telegram-tool-activity-current-v2
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    if: github.actor == 'twoimo'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: successor/telegram-tool-activity-current-v2
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normalize changelog sections
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('packages/coding-agent/CHANGELOG.md')
+          text = path.read_text()
+          entry = '- Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.'
+          text = text.replace(entry + '\n### Added', entry + '\n\n### Added', 1)
+          text = text.replace(
+              '## [0.11.9] - 2026-07-24\n### Changed\n\n\n### Fixed',
+              '## [0.11.9] - 2026-07-24\n### Fixed',
+              1,
+          )
+          path.write_text(text)
+          PY
+          git config user.name "twoimo"
+          git config user.email "32544727+twoimo@users.noreply.github.com"
+          git rm .github/workflows/self-clean-telegram-changelog.yml
+          git add packages/coding-agent/CHANGELOG.md
+          git commit -m "chore(changelog): normalize tool activity entry"
+          git push origin HEAD:successor/telegram-tool-activity-current-v2
