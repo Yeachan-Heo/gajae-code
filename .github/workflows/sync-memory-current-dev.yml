@@ -1,0 +1,75 @@
+name: Sync memory successor to current dev
+
+on:
+  push:
+    branches:
+      - successor/memory-guard-current-v4
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    if: github.actor == 'twoimo'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: successor/memory-guard-current-v4
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge current upstream dev and report conflicts
+        id: merge
+        shell: bash
+        run: |
+          git config user.name "twoimo"
+          git config user.email "32544727+twoimo@users.noreply.github.com"
+          git fetch origin tmp/upstream-dev-41d6850
+          set +e
+          git merge --no-ff --no-commit origin/tmp/upstream-dev-41d6850
+          rc=$?
+          set -e
+
+          prompt_files=(
+            packages/coding-agent/src/prompts/agent-fragments/ralplan-persistence.md
+            packages/coding-agent/src/prompts/agent-fragments/restricted-bash.md
+            packages/coding-agent/src/prompts/system/rlm-research.md
+            packages/coding-agent/src/prompts/system/system-prompt.md
+            packages/coding-agent/src/prompts/tools/bash.md
+            packages/coding-agent/src/prompts/tools/cron.md
+          )
+          for file in "${prompt_files[@]}"; do
+            if git diff --name-only --diff-filter=U | grep -Fxq "$file"; then
+              git checkout --theirs -- "$file"
+              git add "$file"
+            fi
+          done
+
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [ -n "$conflicts" ]; then
+            printf '%s\n' "$conflicts" > /tmp/memory-conflicts.txt
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            git merge --abort
+            exit 0
+          fi
+
+          echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          git rm .github/workflows/sync-memory-current-dev.yml
+          git commit -m "chore: merge current dev into memory successor"
+          git push origin HEAD:successor/memory-guard-current-v4
+
+      - name: Report unresolved conflicts
+        if: steps.merge.outputs.conflicts == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const conflicts = fs.readFileSync('/tmp/memory-conflicts.txt', 'utf8').trim();
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 27,
+              body: `MEMORY_SYNC_CONFLICTS\n\n\`\`\`\n${conflicts}\n\`\`\``,
+            });
