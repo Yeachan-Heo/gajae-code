@@ -1,5 +1,6 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
+import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
@@ -15,7 +16,7 @@ export type ForkContextMode = "none" | "receipt" | "last-turn" | "bounded" | "fu
 
 const parsePositiveIntegerEnvironment = (keys: string[], defaultValue: number): number => {
 	for (const key of keys) {
-		const value = Bun.env[key];
+		const value = $env[key];
 		if (!value || value.trim().length === 0) continue;
 		if (!/^\d+$/.test(value)) return defaultValue;
 		const number = Number(value);
