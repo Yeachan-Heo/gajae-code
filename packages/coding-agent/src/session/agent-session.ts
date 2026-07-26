@@ -1638,7 +1638,6 @@ export class AgentSession {
 	#defaultFallbackController: FallbackChainController | undefined;
 	#overflowMaintenanceAttempts = 0;
 	#defaultFallbackExhaustedLastTurn = false;
-
 	#fallbackInvocationId = 0;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
@@ -12763,6 +12762,7 @@ export class AgentSession {
 			this.#isAlibabaTokenPlanCompactionTimeout(candidate, errorMessage)
 		);
 	}
+
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
@@ -13005,7 +13005,6 @@ export class AgentSession {
 
 	async #resetDefaultFallbackForNewTurn(): Promise<void> {
 		const controller = this.#defaultFallbackChain();
-
 		if (this.#defaultFallbackExhaustedLastTurn) {
 			this.#defaultFallbackExhaustedLastTurn = false;
 			controller.resetForNewTurn();
