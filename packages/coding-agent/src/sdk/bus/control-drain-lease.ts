@@ -9,11 +9,15 @@
 
 export type TerminalSendOutcome = "written" | "disconnected" | "write_failed";
 
+/** Fence/capability hooks may return false to reject; undefined means ok. */
+export type IdentityControlGateResult = boolean | undefined;
+export type IdentityControlGate = () => IdentityControlGateResult | Promise<IdentityControlGateResult>;
+
 export interface IdentityControlSuccessPathInput {
 	/** Fence predecessor inbound work. The fence must not close its response writer. */
-	fence: () => void | boolean | Promise<void | boolean>;
+	fence: IdentityControlGate;
 	/** Optional explicit proof that the predecessor writer is still usable. */
-	ensurePredecessorSendCapable?: () => void | boolean | Promise<void | boolean>;
+	ensurePredecessorSendCapable?: IdentityControlGate;
 	/** Start successor B and resolve only after its public endpoint is ready. */
 	startSuccessor: () => Promise<void>;
 	/** Write and flush either the success or non-success terminal response. */
@@ -25,8 +29,8 @@ export interface IdentityControlSuccessPathInput {
 }
 
 export interface IdentityControlTerminalPathInput {
-	fenceInbound: () => void | boolean | Promise<void | boolean>;
-	ensurePredecessorSendCapable?: () => void | boolean | Promise<void | boolean>;
+	fenceInbound: IdentityControlGate;
+	ensurePredecessorSendCapable?: IdentityControlGate;
 	startSuccessorReady: () => Promise<void>;
 	sendTerminal: () => Promise<TerminalSendOutcome>;
 	stopPredecessor: () => Promise<void>;

@@ -35,6 +35,7 @@ import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import {
 	NotificationGatePolicyChangedError,
@@ -43,7 +44,6 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -82,8 +82,8 @@ import {
 	type NotificationSettingsReader,
 	sessionTag,
 } from "./config";
-import { runIdentityControlSuccessPath, type TerminalSendOutcome } from "./control-drain-lease";
 import { telegramControlCommandUsage } from "./config-commands";
+import { runIdentityControlSuccessPath, type TerminalSendOutcome } from "./control-drain-lease";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
@@ -98,8 +98,17 @@ import {
 	type RegisterNotificationRootResult,
 	unregisterNotificationRoot,
 } from "./telegram-daemon";
-export { isNativeControlDrainAvailable, runIdentityControlSuccessPath, runIdentityControlTerminalPath } from "./control-drain-lease";
-export type { IdentityControlSuccessPathInput, IdentityControlTerminalPathInput, TerminalSendOutcome } from "./control-drain-lease";
+
+export type {
+	IdentityControlSuccessPathInput,
+	IdentityControlTerminalPathInput,
+	TerminalSendOutcome,
+} from "./control-drain-lease";
+export {
+	isNativeControlDrainAvailable,
+	runIdentityControlSuccessPath,
+	runIdentityControlTerminalPath,
+} from "./control-drain-lease";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -3026,10 +3035,10 @@ export function createNotificationsExtension(
 	let identityControlInFlight = false;
 	let deferredIdentityRotation:
 		| {
-			event: { previousSessionFile?: string; transition?: { origin: string } };
-			ctx: ExtensionContext;
-			awaitStartup: boolean;
-		}
+				event: { previousSessionFile?: string; transition?: { origin: string } };
+				ctx: ExtensionContext;
+				awaitStartup: boolean;
+		  }
 		| undefined;
 	let extensionShuttingDown = false;
 
@@ -3729,7 +3738,7 @@ export function createNotificationsExtension(
 				};
 			},
 			onRequest: options.onSdkRequest,
-			beforeControlResponse: async (connectionId, request, response, sendTerminal) => {
+			beforeControlResponse: async (_connectionId, request, response, sendTerminal) => {
 				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
 				const pending = deferredIdentityRotation;
 				deferredIdentityRotation = undefined;
@@ -3760,7 +3769,7 @@ export function createNotificationsExtension(
 									deferPredecessorStop: true,
 								});
 								const successor = runtimes.get(successorId);
-								if (!successor || !successor.host.started || activeRuntimeId !== successorId)
+								if (!successor?.host.started || activeRuntimeId !== successorId)
 									throw new Error(`notifications: successor runtime ${successorId} was not ready.`);
 							} catch (error) {
 								(response as Record<string, unknown>).ok = false;
@@ -3793,7 +3802,9 @@ export function createNotificationsExtension(
 					});
 				} catch (error) {
 					if (!terminalAttempted) throw error;
-					logger.error(`notifications: identity terminal delivery failed (${terminalOutcome ?? "unknown"}): ${String(error)}`);
+					logger.error(
+						`notifications: identity terminal delivery failed (${terminalOutcome ?? "unknown"}): ${String(error)}`,
+					);
 				}
 			},
 			afterControlResponse: async (connectionId, request, response) => {
@@ -4040,7 +4051,12 @@ export function createNotificationsExtension(
 
 			server.onReply((err, reply) => {
 				if (err || !reply) return;
-				if (runtime?.inboundFenced || runtime?.stopping || runtime?.policySuspended || runtimes.get(id) !== runtime) {
+				if (
+					runtime?.inboundFenced ||
+					runtime?.stopping ||
+					runtime?.policySuspended ||
+					runtimes.get(id) !== runtime
+				) {
 					try {
 						server.closeClaimInvalid(reply.replyReceiptId, "session_stopping");
 					} catch {}
@@ -4942,8 +4958,7 @@ export function createNotificationsExtension(
 			throw new Error(`notifications: predecessor runtime ${id} host release was not proven.`);
 		predecessor.hostStopped = true;
 		predecessor.brokerRegistrationReleased = !predecessor.brokerRegistrationActive || predecessor.hostStopped;
-		if (predecessor.brokerRegistrationActive && predecessor.hostStopped)
-			predecessor.brokerRegistrationActive = false;
+		if (predecessor.brokerRegistrationActive && predecessor.hostStopped) predecessor.brokerRegistrationActive = false;
 		predecessor.host.reverse.dispose();
 	};
 

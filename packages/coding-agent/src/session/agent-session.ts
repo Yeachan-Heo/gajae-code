@@ -235,7 +235,6 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../extensibility/extensions";
-import type { SessionSwitchEvent } from "../extensibility/shared-events";
 import type { CompactOptions, ContextUsage, ExtensionTranscriptEntry } from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import {
@@ -246,6 +245,7 @@ import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injec
 import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { SessionSwitchEvent } from "../extensibility/shared-events";
 import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandName,
