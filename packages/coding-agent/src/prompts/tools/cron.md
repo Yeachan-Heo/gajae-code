@@ -12,12 +12,12 @@ Use a single `op` field to select the operation:
 
 `op: "create"` accepts 5-field cron: `minute hour day-of-month month day-of-week`. All fields support `*`, single values (`5`), steps (`*/15`), ranges (`1-5`), and comma lists (`1,15,30`). Day-of-week uses `0`/`7` for Sunday through `6` for Saturday. Extended syntax like `L`, `W`, `?`, or month/weekday names is not supported.
 
-|Example|Meaning|
-|:---|:---|
-|`*/5 * * * *`|Every 5 minutes|
-|`0 * * * *`|Every hour on the hour|
-|`0 9 * * *`|Every day at 9am local|
-|`0 9 * * 1-5`|Weekdays at 9am local|
+| Example       | Meaning                      |
+| :------------ | :--------------------------- |
+| `*/5 * * * *` | Every 5 minutes              |
+| `0 * * * *`   | Every hour on the hour       |
+| `0 9 * * *`   | Every day at 9am local       |
+| `0 9 * * 1-5` | Weekdays at 9am local        |
 
 ## Lifecycle
 

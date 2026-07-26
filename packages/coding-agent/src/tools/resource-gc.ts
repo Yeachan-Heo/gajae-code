@@ -279,11 +279,10 @@ async function sampleLinuxCgroupDirectory(
 			readMemoryLimit(path.join(current, limitName), fsType),
 			readMemoryCounter(path.join(current, usageName)),
 		]);
-		if (limit !== null && usage !== null) {
-			const zeroLimit = limit.kind === "finite" && limit.bytes === 0;
+		if (limit !== null && usage !== null && (limit.kind === "unlimited" || limit.bytes > 0)) {
 			domains.push({
-				hardCapBytes: limit.kind === "unlimited" ? hostBytes : Math.min(hostBytes, Math.max(1, limit.bytes)),
-				totalUsageBytes: zeroLimit ? Math.max(1, usage) : usage,
+				hardCapBytes: limit.kind === "unlimited" ? hostBytes : Math.min(hostBytes, limit.bytes),
+				totalUsageBytes: usage,
 				source,
 			});
 		}

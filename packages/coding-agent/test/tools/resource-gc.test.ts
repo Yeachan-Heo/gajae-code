@@ -288,10 +288,7 @@ describe("Linux cgroup memory sampling", () => {
 			writeCounters(path.join(zeroMount, "app"), "0", "0");
 			await expect(
 				__sampleLinuxCgroupHierarchyForTest(mountLine(53, "/", zeroMount), "/app", "cgroup2", 5000, 100),
-			).resolves.toMatchObject({
-				hardCapBytes: 1,
-				totalUsageBytes: 100,
-			});
+			).resolves.toBeNull();
 			const clampedMount = path.join(root, "clamped");
 			writeCounters(path.join(clampedMount, "app"), "9000", "4500");
 			await expect(
