@@ -93,7 +93,7 @@
     "build": "bun run --workspaces --if-present build",
     "build:native": "bun --cwd=packages/natives run build",
     "test": "bun run --parallel test:ts test:rs",
-    "test:ts": "bun run test:release && bun run --workspaces --if-present test",
+    "test:ts": "bun run test:release && bun test scripts/build-dependency-order.test.ts && bun run --workspaces --if-present test",
     "test:release": "bun test scripts/release-publish-order.test.ts scripts/restart-sdk-broker.test.ts",
     "generate-schemas": "bun scripts/generate-json-schemas.ts",
     "check:schemas": "bun scripts/generate-json-schemas.ts --check",
