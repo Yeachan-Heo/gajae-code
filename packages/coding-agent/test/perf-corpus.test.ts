@@ -50,6 +50,19 @@ describe("perf corpus schema + runner", () => {
 			expect(Number.isFinite(fixture.rssMemory.growthBytes)).toBe(true);
 		}
 	});
+	test("prefers checked-out HEAD over workflow SHA provenance", () => {
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
+		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
+		const previousGitSha = process.env.GITHUB_SHA;
+		process.env.GITHUB_SHA = "b".repeat(40);
+		try {
+			expect(runPerfCorpusBenchmark().gitSha).toBe(expectedSha);
+		} finally {
+			if (previousGitSha === undefined) delete process.env.GITHUB_SHA;
+			else process.env.GITHUB_SHA = previousGitSha;
+		}
+	});
 
 	test("emits detailed memory baselines for every required product surface", () => {
 		const report = runPerfCorpusBenchmark();

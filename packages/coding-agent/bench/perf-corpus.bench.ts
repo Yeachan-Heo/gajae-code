@@ -83,18 +83,17 @@ function measureRss(work: () => void): RssMemoryMetric {
 }
 function resolveGitProvenance(): { sha: string; dirty: boolean } {
 	const environmentSha = process.env.GITHUB_SHA?.trim();
-	let sha = environmentSha ?? "";
+	let sha = "";
 	let dirty = true;
 	try {
-		if (!sha) {
-			const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-			if (revision.exitCode === 0) sha = new TextDecoder().decode(revision.stdout).trim();
-		}
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+		if (revision.exitCode === 0) sha = new TextDecoder().decode(revision.stdout).trim();
 		const status = Bun.spawnSync(["git", "status", "--porcelain"]);
 		if (status.exitCode === 0) dirty = new TextDecoder().decode(status.stdout).trim().length > 0;
 	} catch {
-		// The report records conservative dirty provenance and validation rejects a missing SHA.
+		// The report records conservative dirty provenance when Git is unavailable.
 	}
+	if (!sha) sha = environmentSha ?? "";
 	return { sha, dirty };
 }
 
