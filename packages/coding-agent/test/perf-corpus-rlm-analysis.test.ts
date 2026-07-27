@@ -1203,6 +1203,131 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			expect.arrayContaining([expect.objectContaining({ attemptId: "soak-02", blockId: "soak-slot-01" })]),
 		);
 	});
+	test("fails closed when an authenticated report is mutated in place with its mtime restored after byte capture", async () => {
+		const input = path.join(temporaryRoot, "post-capture-drift-input");
+		const output = path.join(temporaryRoot, "post-capture-drift-output");
+		await writeCorpus(input);
+		const sealedDigests = sealedDigestsByDirectory.get(path.resolve(input));
+		if (!sealedDigests) throw new Error("sealed digests are unavailable for post-capture drift test");
+		const harness = [
+			"import importlib.util, json, os, pathlib, sys",
+			"spec = importlib.util.spec_from_file_location('analysis', os.environ['DRIVER'])",
+			"module = importlib.util.module_from_spec(spec)",
+			"sys.modules['analysis'] = module",
+			"spec.loader.exec_module(module)",
+			"original = module._validate_sealed_inputs",
+			"def capture_then_mutate_in_place(*args):",
+			"    captured = original(*args)",
+			"    report = pathlib.Path(os.environ['INPUT']) / 'short-01.json'",
+			"    original_stat = report.stat()",
+			"    with report.open('r+b') as handle:",
+			"        first = handle.read(1)",
+			"        handle.seek(0)",
+			"        handle.write(b' ' if first != b' ' else b'\\t')",
+			"        handle.flush()",
+			"        os.fsync(handle.fileno())",
+			"    os.utime(report, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))",
+			"    if report.stat().st_ctime_ns == original_stat.st_ctime_ns:",
+			"        raise RuntimeError('in-place mutation did not update ctime_ns')",
+			"    return captured",
+			"module._validate_sealed_inputs = capture_then_mutate_in_place",
+			"result = module.run_analysis(",
+			"    os.environ['INPUT'], os.environ['OUTPUT'], pathlib.Path(os.environ['PREREG']).read_bytes(),",
+			"    os.environ['GIT_SHA'], os.environ['TREE_SHA'], os.environ['CLOSURE_DIGEST'],",
+			"    os.environ['WORKTREE_FINGERPRINT'], os.environ['CONTROL_IDENTITY'], os.environ['CAPTURE_ID'],",
+			"    os.environ['SCHEDULE_DIGEST'], os.environ['PROTOCOL_DIGEST'], os.environ['DRIVER_DIGEST'],",
+			"    os.environ['PREREG_DIGEST'], os.environ['TEMPLATE_DIGEST'], os.environ['LEDGER_DIGEST'],",
+			"    os.environ['MANIFEST_DIGEST'],",
+			")",
+			"print(json.dumps(result['result']))",
+		].join("\n");
+		const subprocess = Bun.spawnSync(["python3", "-S", "-c", harness], {
+			env: {
+				...process.env,
+				DRIVER: driverPath,
+				INPUT: input,
+				OUTPUT: output,
+				PREREG: preregistrationPath,
+				GIT_SHA: gitSha,
+				TREE_SHA: treeSha,
+				CLOSURE_DIGEST: expectedClosureDigest,
+				WORKTREE_FINGERPRINT: worktreeFingerprint,
+				CONTROL_IDENTITY: captureRuntimeControlIdentity,
+				CAPTURE_ID: captureId,
+				SCHEDULE_DIGEST: expectedScheduleDigest,
+				PROTOCOL_DIGEST: expectedProtocolDigest,
+				DRIVER_DIGEST: driverSha256,
+				PREREG_DIGEST: preregistrationSha256,
+				TEMPLATE_DIGEST: expectedTemplateSha256,
+				LEDGER_DIGEST: sealedDigests.attemptLedgerSha256,
+				MANIFEST_DIGEST: sealedDigests.rawManifestSha256,
+			},
+		});
+		expect(subprocess.exitCode).toBe(0);
+		const result = JSON.parse(decoder.decode(subprocess.stdout)) as ValidationResult;
+		expect(result.evidenceStatus).toBe("INSUFFICIENT_EVIDENCE");
+		expect(validationCodes(result)).toContain("AUTHENTICATED_INPUT_METADATA_DRIFT");
+	});
+	test.each([
+		["report", "short-01.json"],
+		["attempt ledger", "perf-corpus-attempt-ledger.json"],
+		["raw manifest", "perf-corpus-raw-manifest.json"],
+	] as const)("fails closed when an authenticated %s disappears after byte capture", async (_label, filename) => {
+		const input = path.join(temporaryRoot, `post-capture-disappearance-${filename}`);
+		const output = path.join(temporaryRoot, `post-capture-disappearance-output-${filename}`);
+		await writeCorpus(input);
+		const sealedDigests = sealedDigestsByDirectory.get(path.resolve(input));
+		if (!sealedDigests) throw new Error("sealed digests are unavailable for post-capture disappearance test");
+		const harness = [
+			"import importlib.util, json, os, pathlib, sys",
+			"spec = importlib.util.spec_from_file_location('analysis', os.environ['DRIVER'])",
+			"module = importlib.util.module_from_spec(spec)",
+			"sys.modules['analysis'] = module",
+			"spec.loader.exec_module(module)",
+			"original = module._validate_sealed_inputs",
+			"def capture_then_remove(*args):",
+			"    captured = original(*args)",
+			"    (pathlib.Path(os.environ['INPUT']) / os.environ['TARGET']).unlink()",
+			"    return captured",
+			"module._validate_sealed_inputs = capture_then_remove",
+			"result = module.run_analysis(",
+			"    os.environ['INPUT'], os.environ['OUTPUT'], pathlib.Path(os.environ['PREREG']).read_bytes(),",
+			"    os.environ['GIT_SHA'], os.environ['TREE_SHA'], os.environ['CLOSURE_DIGEST'],",
+			"    os.environ['WORKTREE_FINGERPRINT'], os.environ['CONTROL_IDENTITY'], os.environ['CAPTURE_ID'],",
+			"    os.environ['SCHEDULE_DIGEST'], os.environ['PROTOCOL_DIGEST'], os.environ['DRIVER_DIGEST'],",
+			"    os.environ['PREREG_DIGEST'], os.environ['TEMPLATE_DIGEST'], os.environ['LEDGER_DIGEST'],",
+			"    os.environ['MANIFEST_DIGEST'],",
+			")",
+			"print(json.dumps(result['result']))",
+		].join("\n");
+		const subprocess = Bun.spawnSync(["python3", "-S", "-c", harness], {
+			env: {
+				...process.env,
+				DRIVER: driverPath,
+				INPUT: input,
+				OUTPUT: output,
+				PREREG: preregistrationPath,
+				TARGET: filename,
+				GIT_SHA: gitSha,
+				TREE_SHA: treeSha,
+				CLOSURE_DIGEST: expectedClosureDigest,
+				WORKTREE_FINGERPRINT: worktreeFingerprint,
+				CONTROL_IDENTITY: captureRuntimeControlIdentity,
+				CAPTURE_ID: captureId,
+				SCHEDULE_DIGEST: expectedScheduleDigest,
+				PROTOCOL_DIGEST: expectedProtocolDigest,
+				DRIVER_DIGEST: driverSha256,
+				PREREG_DIGEST: preregistrationSha256,
+				TEMPLATE_DIGEST: expectedTemplateSha256,
+				LEDGER_DIGEST: sealedDigests.attemptLedgerSha256,
+				MANIFEST_DIGEST: sealedDigests.rawManifestSha256,
+			},
+		});
+		expect(subprocess.exitCode).toBe(0);
+		const result = JSON.parse(decoder.decode(subprocess.stdout)) as ValidationResult;
+		expect(result.evidenceStatus).toBe("INSUFFICIENT_EVIDENCE");
+		expect(validationCodes(result)).toContain("AUTHENTICATED_INPUT_METADATA_DRIFT");
+	});
 
 	test("defaults insufficient evidence to NOT_EVALUATED with truthful missing-member accounting", async () => {
 		const input = path.join(temporaryRoot, "missing-input");

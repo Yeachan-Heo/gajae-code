@@ -227,8 +227,8 @@ def _read_file_bytes(path: Path, maximum_bytes: int) -> tuple[bytes, os.stat_res
         raise EvidenceError(f"cannot read {path.name}: {error.strerror}") from error
     if (
         not stat.S_ISREG(before.st_mode)
-        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
         or len(raw) != before.st_size
     ):
         raise EvidenceError(f"file changed while reading: {path.name}")
@@ -1640,10 +1640,10 @@ def _validate_sealed_inputs(
     input_dir: Path,
     prereg: dict[str, Any],
     expected_bindings: dict[str, str],
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, bytes], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, bytes], dict[str, Any], dict[str, os.stat_result]]:
     contract = prereg["sealedInputContract"]
     ledger_raw, ledger_info = _read_file_bytes(input_dir / ATTEMPT_LEDGER_FILENAME, contract["maximumLedgerBytes"])
-    manifest_raw, _ = _read_file_bytes(input_dir / RAW_MANIFEST_FILENAME, contract["maximumManifestBytes"])
+    manifest_raw, manifest_info = _read_file_bytes(input_dir / RAW_MANIFEST_FILENAME, contract["maximumManifestBytes"])
     ledger_digest = _sha256_bytes(ledger_raw)
     manifest_digest = _sha256_bytes(manifest_raw)
     if ledger_digest != expected_bindings["attemptLedgerSha256"]:
@@ -1873,6 +1873,10 @@ def _validate_sealed_inputs(
     bindings: dict[str, dict[str, Any]] = {}
     ordered_report_hashes: list[dict[str, Any]] = []
     authenticated_report_bytes: dict[str, bytes] = {}
+    authenticated_file_stats: dict[str, os.stat_result] = {
+        ATTEMPT_LEDGER_FILENAME: ledger_info,
+        RAW_MANIFEST_FILENAME: manifest_info,
+    }
     for index, (raw_entry, attempt) in enumerate(zip(manifest_reports, validated_attempts)):
         label = f"{RAW_MANIFEST_FILENAME}.reports[{index}]"
         entry = _expect_dict(raw_entry, label)
@@ -1900,15 +1904,16 @@ def _validate_sealed_inputs(
             }
         )
     for filename, binding in bindings.items():
-        report_raw, _ = _read_file_bytes(input_dir / filename, prereg["bounds"]["maximumBytesPerFile"])
+        report_raw, report_info = _read_file_bytes(input_dir / filename, prereg["bounds"]["maximumBytesPerFile"])
         if len(report_raw) != binding["sizeBytes"] or _sha256_bytes(report_raw) != binding["sha256"]:
             raise EvidenceError(f"{filename}: report filename/size/SHA-256 binding mismatch")
         authenticated_report_bytes[filename] = report_raw
+        authenticated_file_stats[filename] = report_info
     return validated_attempts, bindings, authenticated_report_bytes, {
         "attemptLedgerSha256": ledger_digest,
         "rawManifestSha256": manifest_digest,
         "orderedReportHashes": ordered_report_hashes,
-    }
+    }, authenticated_file_stats
 
 def _safe_directory(path: Path, *, create: bool = False) -> Path:
     if path.exists() or path.is_symlink():
@@ -2024,11 +2029,13 @@ def run_analysis(
     }
     bounds = prereg["bounds"]
     try:
-        ledger_attempts, raw_bindings, authenticated_report_bytes, sealed_hashes = _validate_sealed_inputs(
-            input_real,
-            prereg,
-            expected_bindings,
-        )
+        (
+            ledger_attempts,
+            raw_bindings,
+            authenticated_report_bytes,
+            sealed_hashes,
+            authenticated_file_stats,
+        ) = _validate_sealed_inputs(input_real, prereg, expected_bindings)
         hashes.update(sealed_hashes)
     except (EvidenceError, FileNotFoundError) as error:
         finding = _finding(
@@ -2086,12 +2093,43 @@ def run_analysis(
             )
             continue
         present_names.add(entry.name)
+        authenticated_info = authenticated_file_stats.get(entry.name)
+        if authenticated_info is not None and (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ) != (
+            authenticated_info.st_dev,
+            authenticated_info.st_ino,
+            authenticated_info.st_size,
+            authenticated_info.st_mtime_ns,
+            authenticated_info.st_ctime_ns,
+        ):
+            global_findings.append(
+                _finding(
+                    "AUTHENTICATED_INPUT_METADATA_DRIFT",
+                    "PROTOCOL",
+                    f"authenticated input changed after byte capture: {entry.name}",
+                )
+            )
         if entry.name not in expected_names or not entry.name.endswith(".json"):
             global_findings.append(
                 _finding(
                     "UNEXPECTED_INPUT_ENTRY",
                     "STRUCTURE",
                     f"unexpected input directory entry: {entry.name}",
+                )
+            )
+
+    for filename in sorted(authenticated_file_stats):
+        if filename not in entry_info:
+            global_findings.append(
+                _finding(
+                    "AUTHENTICATED_INPUT_METADATA_DRIFT",
+                    "PROTOCOL",
+                    f"authenticated input disappeared after byte capture: {filename}",
                 )
             )
 
@@ -2138,29 +2176,6 @@ def run_analysis(
                 "admissionNumber": admitted[profile] + 1,
                 "surfaceOrder": row["surfaceOrder"],
             }
-            info = entry_info[filename]
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                attempt_findings.append(
-                    _finding(
-                        "UNSAFE_INPUT_ENTRY",
-                        "STRUCTURE",
-                        f"input entry is not a regular non-symlink file: {filename}",
-                        schedule,
-                    )
-                )
-                invalid[profile] += 1
-                continue
-            if info.st_size > bounds["maximumBytesPerFile"]:
-                attempt_findings.append(
-                    _finding(
-                        "BYTE_BOUND_EXCEEDED",
-                        "RESOURCE_BOUND",
-                        f"file exceeds byte bound: {filename}",
-                        schedule,
-                    )
-                )
-                invalid[profile] += 1
-                continue
             try:
                 ledger_attempt = ledger_by_filename[filename]
                 binding = raw_bindings[filename]
