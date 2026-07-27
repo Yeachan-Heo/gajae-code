@@ -104,7 +104,7 @@ describe("sticky viewport production evidence verifier", () => {
 			"color:rgb(8,8,8);background-color:rgb(238,238,238)",
 		);
 	});
-	it("round-trips xterm cube and grayscale artifacts and rejects HTML color corruption", async () => {
+	it("round-trips xterm cube and grayscale artifacts and rejects ANSI color corruption", async () => {
 		const root = await capture();
 		const cubeKey = "manual-new-output/80x24/unicode-color";
 		const grayscaleKey = "manual-new-output/120x36/unicode-color";
@@ -113,12 +113,12 @@ describe("sticky viewport production evidence verifier", () => {
 		await rebindReviewInput(root);
 		await verifyStickyViewportShowcase(root);
 
-		const htmlPath = path.join(root, cubeKey, "terminal.html");
-		await Bun.write(
-			htmlPath,
-			(await fs.readFile(htmlPath, "utf8")).replace("color:rgb(255,0,0)", "color:rgb(0,0,0)"),
-		);
-		await rehash(root, cubeKey, "terminal.html");
+		const ansiPath = path.join(root, cubeKey, "terminal-ansi.txt");
+		const ansi = await fs.readFile(ansiPath, "utf8");
+		const corrupted = ansi.replace("\x1b[38;5;196;48;5;51m", "\x1b[38;5;46;48;5;21m");
+		if (corrupted === ansi) throw new Error("expected injected xterm SGR sequence");
+		await Bun.write(ansiPath, corrupted);
+		await rehash(root, cubeKey, "terminal-ansi.txt");
 		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow(
 			"HTML artifact is not canonical ANSI conversion",
 		);
