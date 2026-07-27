@@ -41,6 +41,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and Bot API cooldown structural fixes (#2956, #2960, #3048).
  * Generation 30 adds opt-in tool activity delivery, closed lifecycle phases,
  * and capability-versioned mixed-host compatibility.
+ * Generation 31 adds user-created topic adoption (forum-topic folder picker).
  */
 export const DAEMON_GENERATION = 31;
 

@@ -2910,11 +2910,11 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 30 adds capability-versioned tool activity", () => {
+	test("keeps wire protocol 3 while generation 31 adds topic-adoption folder picker", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 29 adds structural serving safeguards; generation 30 adds
-		// capability-versioned tool activity without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(30);
+		// Generation 30 added capability-versioned tool activity; generation 31 adds
+		// the user-topic adoption folder picker without changing the wire protocol.
+		expect(DAEMON_GENERATION).toBe(31);
 	});
 	test.each([
 		"1",
