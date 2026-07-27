@@ -1,10 +1,11 @@
-import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createTuiWorkload } from "../bench/memory-baseline-tui-child";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
 import {
+	buildMemoryFixture,
 	calculateMemorySlope,
 	gitWorktreeFingerprint,
 	normalizeProcessTreeRss,
@@ -30,13 +31,14 @@ import {
 } from "../bench/perf-threshold.ledger";
 
 const memoryControlKeys = ["GJC_MEMORY_PROFILE", "GJC_MEMORY_ITERATIONS", "GJC_MEMORY_DURATION_MS"] as const;
-const originalMemoryControls = new Map(memoryControlKeys.map(key => [key, process.env[key]]));
+let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
 
-beforeAll(() => {
+beforeEach(() => {
+	originalMemoryControls = new Map(memoryControlKeys.map(key => [key, process.env[key]]));
 	for (const key of memoryControlKeys) delete process.env[key];
 });
 
-afterAll(() => {
+afterEach(() => {
 	for (const [key, value] of originalMemoryControls) {
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = value;
@@ -255,8 +257,9 @@ describe("perf corpus schema + runner", () => {
 					: candidate,
 			),
 		} as unknown as PerfCorpusReport;
-		expect(() => validatePerfCorpusReport(malformed)).not.toThrow();
-		expect(validatePerfCorpusReport(malformed).ok).toBe(false);
+		const malformedResult = validatePerfCorpusReport(malformed);
+		expect(malformedResult.ok).toBe(false);
+		expect(malformedResult.errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline sample 1 invalid`);
 		const malformedTeardown = {
 			...report,
 			fixtures: report.fixtures.map((candidate, index) =>
@@ -268,8 +271,11 @@ describe("perf corpus schema + runner", () => {
 					: candidate,
 			),
 		} as unknown as PerfCorpusReport;
-		expect(() => validatePerfCorpusReport(malformedTeardown)).not.toThrow();
-		expect(validatePerfCorpusReport(malformedTeardown).ok).toBe(false);
+		const malformedTeardownResult = validatePerfCorpusReport(malformedTeardown);
+		expect(malformedTeardownResult.ok).toBe(false);
+		expect(malformedTeardownResult.errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline sample ${baseline.samples.length} invalid`,
+		);
 		const earlyTeardown = {
 			...report,
 			fixtures: report.fixtures.map((candidate, index) =>
@@ -287,6 +293,41 @@ describe("perf corpus schema + runner", () => {
 		expect(validatePerfCorpusReport(earlyTeardown).errors).toContain(
 			`fixture ${fixture.fixtureId}: memoryBaseline postTeardown predates workload samples`,
 		);
+	});
+
+	test("rejects physically impossible memory samples", () => {
+		const report = runPerfCorpusBenchmark();
+		const fixture = report.fixtures.find(candidate => candidate.memoryBaseline);
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = fixture.memoryBaseline;
+		const sample = baseline.samples[0];
+		const impossible = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								samples: [
+									{ ...sample, heapTotalBytes: sample.heapUsedBytes - 1 },
+									...baseline.samples.slice(1),
+								],
+							},
+						}
+					: candidate,
+			),
+		} satisfies PerfCorpusReport;
+		expect(validatePerfCorpusReport(impossible).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline sample 0 heapUsedBytes exceeds heapTotalBytes`,
+		);
+	});
+
+	test("records workload high-water callbacks before teardown", () => {
+		const workload = createMemoryBaselineWorkloads()[0];
+		if (!workload) throw new Error("memory workload unavailable");
+		const fixture = buildMemoryFixture(workload, "short", 0);
+		expect(fixture.memoryBaseline?.samples.length).toBeGreaterThan((fixture.memoryBaseline?.iterations ?? 0) + 1);
 	});
 
 	test("rejects an empty corpus instead of skipping required memory surfaces", () => {
@@ -552,11 +593,12 @@ describe("perf corpus schema + runner", () => {
 		});
 	});
 	test("treats a missing process-table sampler as unavailable", () => {
-		const previousGitSha = process.env.GITHUB_SHA;
-		process.env.GITHUB_SHA = "a".repeat(40);
-		const spawnSyncSpy = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
-			throw new Error("ENOENT");
-		});
+		const originalSpawnSync = Bun.spawnSync;
+		const spawnSyncSpy = vi.spyOn(Bun, "spawnSync");
+		spawnSyncSpy.mockImplementation(((command: string[], options?: object) => {
+			if (command[0] === "ps") throw new Error("ENOENT");
+			return originalSpawnSync(command, options as never);
+		}) as unknown as typeof Bun.spawnSync);
 		try {
 			const report = runPerfCorpusBenchmark();
 			for (const fixture of report.fixtures) {
@@ -568,8 +610,6 @@ describe("perf corpus schema + runner", () => {
 			expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 		} finally {
 			spawnSyncSpy.mockRestore();
-			if (previousGitSha === undefined) delete process.env.GITHUB_SHA;
-			else process.env.GITHUB_SHA = previousGitSha;
 		}
 	});
 	test("does not claim post-GC return metrics when GC is unavailable", () => {

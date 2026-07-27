@@ -4,7 +4,7 @@ export interface MemoryWorkload {
 	id: string;
 	surface: MemorySurface;
 	tags: string[];
-	run(iterations: number): number;
+	run(iterations: number, sampleHighWater?: () => void): number;
 	teardown(): void;
 }
 
@@ -26,9 +26,12 @@ function statefulWorkload(
 		id,
 		surface,
 		tags,
-		run(iterations) {
+		run(iterations, sampleHighWater) {
 			let operations = 0;
-			for (let offset = 0; offset < iterations; offset++) operations += step(state, nextIndex++);
+			for (let offset = 0; offset < iterations; offset++) {
+				operations += step(state, nextIndex++);
+				sampleHighWater?.();
+			}
 			return operations;
 		},
 		teardown() {

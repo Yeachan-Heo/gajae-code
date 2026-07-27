@@ -13,7 +13,7 @@ export function createTuiWorkload(): TuiMemoryWorkload {
 		id: "tui-component-churn",
 		surface: "tui",
 		tags: ["mount", "render", "dispose"],
-		run(iterations) {
+		run(iterations, sampleHighWater) {
 			let renderedLines = 0;
 			for (let offset = 0; offset < iterations; offset++) {
 				const index = nextIndex++;
@@ -22,6 +22,7 @@ export function createTuiWorkload(): TuiMemoryWorkload {
 				container.addChild(new Text(`body-${index}:${"─".repeat(40)}`, 0, 0));
 				container.addChild(new Text(`footer-${index}`, 0, 0));
 				renderedLines += container.render(80).length;
+				sampleHighWater?.();
 				container.dispose();
 			}
 			return renderedLines;

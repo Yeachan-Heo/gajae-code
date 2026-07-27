@@ -117,14 +117,12 @@ function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerpr
 	let sha = "";
 	let dirty = true;
 	let worktreeFingerprint = "unavailable";
-	try {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
-		if (revision.exitCode === 0) sha = new TextDecoder().decode(revision.stdout).trim();
+	const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+	if (revision.exitCode === 0) {
+		sha = new TextDecoder().decode(revision.stdout).trim();
 		const worktree = gitWorktreeFingerprint(repositoryRoot);
 		worktreeFingerprint = worktree.fingerprint;
 		dirty = worktree.dirty;
-	} catch {
-		// The report records conservative dirty provenance when Git is unavailable.
 	}
 	if (!sha) sha = environmentSha ?? "";
 	return { sha, dirty, worktreeFingerprint };
@@ -143,6 +141,7 @@ function reproductionInvocation(
 	const argv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
 	return { command: argv.join(" "), argv, environment };
 }
+const MEMORY_CHILD_ARGUMENT = "--gjc-memory-child";
 function memorySample(startedAt: number): MemoryUsageSample {
 	const usage = process.memoryUsage();
 	return {
@@ -229,7 +228,7 @@ export function buildMemoryFixture(
 	const chunkSize = profile === "soak" ? 1 : Math.max(1, Math.ceil(minimumIterations / 20));
 	const sampleIntervalMs = profile === "soak" ? 50 : 0;
 	while (iterations < minimumIterations || performance.now() - startedAt < targetDurationMs) {
-		operations += workload.run(chunkSize);
+		operations += workload.run(chunkSize, () => samples.push(memorySample(startedAt)));
 		iterations += chunkSize;
 		const elapsedSinceLastSample = performance.now() - startedAt - (samples.at(-1)?.elapsedMs ?? 0);
 		if (elapsedSinceLastSample >= sampleIntervalMs) samples.push(memorySample(startedAt));
@@ -326,7 +325,7 @@ function buildIsolatedMemoryFixtures(
 	targetDurationMs: number,
 ): PerfCorpusFixtureResult[] {
 	return REQUIRED_MEMORY_SURFACES.map(surface => {
-		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface)], {
+		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface), MEMORY_CHILD_ARGUMENT], {
 			env: {
 				...process.env,
 				GJC_MEMORY_CHILD_SURFACE: surface,
@@ -462,7 +461,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 }
 
 if (import.meta.main) {
-	const childSurface = process.env.GJC_MEMORY_CHILD_SURFACE;
+	const childSurface = process.argv.includes(MEMORY_CHILD_ARGUMENT) ? process.env.GJC_MEMORY_CHILD_SURFACE : undefined;
 	if (isMemorySurface(childSurface)) {
 		const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
 		const durationTargetMs = Number(process.env.GJC_MEMORY_DURATION_MS) || 0;

@@ -10,7 +10,7 @@ function createSessionWorkload(): MemoryWorkload {
 		id: "agent-session-lifecycle",
 		surface: "agent-session",
 		tags: ["messages", "materialization", "clear"],
-		run(iterations) {
+		run(iterations, sampleHighWater) {
 			for (let index = 0; index < iterations; index++) {
 				manager.appendMessage({
 					role: "user",
@@ -18,6 +18,7 @@ function createSessionWorkload(): MemoryWorkload {
 					timestamp: entryCount,
 				});
 				entryCount++;
+				sampleHighWater?.();
 				if (entryCount % 128 === 0) {
 					manager.getEntries();
 					manager = SessionManager.inMemory();

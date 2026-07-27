@@ -426,6 +426,14 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond does not match operations`);
 				}
 			}
+			if (
+				report.runner.profile === "soak" &&
+				(!Number.isFinite(runElapsedMs) ||
+					runElapsedMs === undefined ||
+					runElapsedMs < (report.runner.durationTargetMs ?? 0))
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: soak run shorter than runner duration target`);
+			}
 			for (const [name, value] of [
 				["processTreeBaselineRssBytes", baseline.processTreeBaselineRssBytes],
 				["processTreePostTeardownRssBytes", baseline.processTreePostTeardownRssBytes],
@@ -464,6 +472,20 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.${name} invalid`);
 					}
 				}
+				if (
+					Object.hasOwn(sample, "heapUsedBytes") &&
+					Object.hasOwn(sample, "heapTotalBytes") &&
+					sample.heapUsedBytes > sample.heapTotalBytes
+				) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index} heapUsedBytes exceeds heapTotalBytes`);
+				}
+				if (
+					Object.hasOwn(sample, "arrayBuffersBytes") &&
+					Object.hasOwn(sample, "externalBytes") &&
+					sample.arrayBuffersBytes > sample.externalBytes
+				) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index} arrayBuffersBytes exceeds externalBytes`);
+				}
 				if (Object.hasOwn(sample, "activeResourceCount") && !Number.isInteger(sample.activeResourceCount)) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
 				}
@@ -476,6 +498,13 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 						break;
 					}
 				}
+			}
+			if (
+				report.runner.profile === "soak" &&
+				samplesAreValid &&
+				(samples.at(-1)?.elapsedMs ?? 0) < (report.runner.durationTargetMs ?? 0)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: soak samples shorter than runner duration target`);
 			}
 			for (const [name, key] of [
 				["rssSlopeBytesPerSecond", "rssBytes"],
