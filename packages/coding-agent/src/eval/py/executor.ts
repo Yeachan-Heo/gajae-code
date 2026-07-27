@@ -518,10 +518,7 @@ async function executeWithKernel(
 			// Remaining wall-clock budget can shrink after async setup (Settings.init,
 			// kernel start) and would otherwise flake Math.round() second formatting.
 			const annotation = result.timedOut
-				? formatKernelTimeoutAnnotation(
-						options?.timeoutMs ?? executionTimeoutMs,
-						result.kernelKilled ?? false,
-					)
+				? formatKernelTimeoutAnnotation(options?.timeoutMs ?? executionTimeoutMs, result.kernelKilled ?? false)
 				: undefined;
 			let crashNotice: string | null = null;
 			if (result.kernelKilled) {
