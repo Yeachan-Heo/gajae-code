@@ -36,7 +36,7 @@ async function rehash(root: string, key: string, name: string): Promise<void> {
 async function replaceAnsiColor(root: string, key: string, replacement: string): Promise<void> {
 	const ansiPath = path.join(root, key, "terminal-ansi.txt");
 	const ansi = await fs.readFile(ansiPath, "utf8");
-	const rewritten = ansi.replace(/\x1b\[38;2;\d+;\d+;\d+m/, replacement);
+	const rewritten = ansi.replace(/\x1b\[[0-9;]*m/, replacement);
 	if (rewritten === ansi) throw new Error(`expected a replaceable ANSI color in ${key}`);
 	await Bun.write(ansiPath, rewritten);
 	await Bun.write(path.join(root, key, "terminal.html"), ansiToHtml(rewritten));
