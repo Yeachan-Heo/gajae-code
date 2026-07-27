@@ -25,6 +25,23 @@ class StaticComponent implements Component {
 		return [this.#line];
 	}
 }
+class MultiLineComponent implements Component {
+	#lines: string[];
+
+	constructor(lines: string[]) {
+		this.#lines = [...lines];
+	}
+
+	setLines(lines: string[]): void {
+		this.#lines = [...lines];
+	}
+
+	invalidate(): void {}
+
+	render(): string[] {
+		return this.#lines;
+	}
+}
 
 class DetachingTerminal implements Terminal {
 	#writes: string[] = [];
@@ -510,5 +527,41 @@ describe("terminal detach handling", () => {
 			if (previousIme === undefined) delete Bun.env.GJC_TUI_IME_CURSOR;
 			else Bun.env.GJC_TUI_IME_CURSOR = previousIme;
 		}
+	});
+	it("marks an auto-follow repaint write as fatal and recovers fresh on restart", async () => {
+		const terminal = new DetachingTerminal();
+		const tui = new TUI(terminal);
+		const component = new MultiLineComponent(Array.from({ length: 30 }, (_value, index) => `line-${index}`));
+		tui.addChild(component);
+
+		tui.start();
+		await settle();
+		expect(tui.terminalAvailable).toBe(true);
+
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await settle();
+
+		// The next write — the auto-follow live repaint — is set to fail.
+		const writesBeforeFollow = terminal.writes.length;
+		terminal.setWriteFailureAt(writesBeforeFollow + 1);
+
+		expect(tui.scrollViewportPages(1)).toBe(false);
+		expect(tui.terminalAvailable).toBe(false);
+
+		// The failed one-shot transition already cleared manual ownership, so a second follow is a no-op.
+		const attemptsAfterFailure = terminal.attempts.length;
+		expect(tui.followLiveViewport()).toBe(false);
+		expect(terminal.attempts).toHaveLength(attemptsAfterFailure);
+
+		// stop/start recovery renders fresh content, not the stale manual frame.
+		terminal.setWriteFailureAt(undefined);
+		component.setLines(Array.from({ length: 30 }, (_value, index) => `line-${index}`).concat("fresh-recovery"));
+		tui.stop();
+		const recoveryStart = terminal.writes.length;
+		tui.start();
+		await settle();
+		expect(tui.terminalAvailable).toBe(true);
+		const recoveryFrame = terminal.writes.slice(recoveryStart).join("");
+		expect(recoveryFrame).toContain("fresh-recovery");
 	});
 });

@@ -867,6 +867,16 @@ export class TUI extends Container {
 	/** Report the logical output producer revision without coupling TUI to message types. */
 	setViewportOutputSource(source: ViewportOutputSource | null): void {
 		const previous = this.#viewportOutputSource;
+		if (
+			(source === null && previous === null) ||
+			(source !== null &&
+				previous !== null &&
+				source.identity === previous.identity &&
+				source.revision === previous.revision)
+		) {
+			renderMetrics.recordStructuralCounter("viewportOutputSourceEqualNoops");
+			return;
+		}
 		const identityReset = source === null || previous === null || previous.identity !== source.identity;
 		// Same-identity revisions are a high-water mark. A delayed stale observation
 		// must not lower it, because observing that revision again would otherwise
@@ -984,6 +994,15 @@ export class TUI extends Container {
 			currentViewportTop = Math.max(0, Math.min(maxViewportTop, resolvedViewportTop));
 		}
 		const targetViewportTop = Math.max(0, Math.min(maxViewportTop, currentViewportTop + delta));
+		// When manual ownership is active and a downward movement clamps to the
+		// true maximum transcript top for the current effective manual capacity,
+		// transition through the existing live-follow transaction instead of
+		// painting another manual frame. Wheel steps and PageDown reach this
+		// automatically; a partial downward movement falls through to the manual
+		// repaint below, and upward movement never follows.
+		if (this.#manualViewportTop !== undefined && direction > 0 && targetViewportTop === maxViewportTop) {
+			return this.followLiveViewport();
+		}
 		if (frame !== null) {
 			const desiredScreenRow =
 				this.#manualViewportAnchor?.desiredScreenRow ??
@@ -2362,7 +2381,13 @@ export class TUI extends Container {
 	}
 
 	#constrainedPinnedChildLines(lines: string[], remaining: number): string[] {
-		const cursorLine = lines.findIndex(line => line.includes(CURSOR_MARKER));
+		let cursorLine = -1;
+		for (let index = 0; index < lines.length; index++) {
+			if (lines[index].includes(CURSOR_MARKER)) {
+				cursorLine = index;
+				break;
+			}
+		}
 		if (cursorLine < 0) return lines.slice(-remaining);
 		const start = Math.max(0, Math.min(cursorLine, lines.length - remaining));
 		return lines.slice(start, start + remaining);
@@ -2379,11 +2404,22 @@ export class TUI extends Container {
 		if (component === null || height <= 0) return lines;
 		const pinnedStart = this.children.indexOf(component);
 		if (pinnedStart < 0) return lines;
-		const suffixChildren = this.children.slice(pinnedStart);
-		const suffixRows = suffixChildren.flatMap(child => this.#pinnedChildLines(child, renderedChildren));
-		if (suffixRows.length <= height) return lines;
 
-		const focusedChild = suffixChildren.find(child => this.#componentContains(child, this.#focusedComponent)) ?? null;
+		let suffixRowCount = 0;
+		for (let index = pinnedStart; index < this.children.length; index++) {
+			suffixRowCount += this.#pinnedChildLines(this.children[index], renderedChildren).length;
+		}
+		if (suffixRowCount <= height) return lines;
+
+		renderMetrics.recordStructuralCounter("pinnedSuffixOverflowFrames");
+		let focusedChild: Component | null = null;
+		for (let index = pinnedStart; index < this.children.length; index++) {
+			const child = this.children[index];
+			if (this.#componentContains(child, this.#focusedComponent)) {
+				focusedChild = child;
+				break;
+			}
+		}
 		const selectedRowCounts = new Map<Component, number>();
 		let remaining = height;
 		const allocate = (child: Component, maximumRows?: number): void => {
@@ -2401,18 +2437,25 @@ export class TUI extends Container {
 		// focused child retain adjacent rows only after those priorities are satisfied.
 		if (focusedChild !== null) allocate(focusedChild, 1);
 		if (component !== focusedChild) allocate(component);
-		for (const child of [...suffixChildren].reverse()) {
+		for (let index = this.children.length - 1; index >= pinnedStart; index--) {
+			const child = this.children[index];
 			if (child !== focusedChild && child !== component) allocate(child);
 		}
 		if (focusedChild !== null) allocate(focusedChild);
 
-		const selected = new Map<Component, string[]>();
-		for (const [child, count] of selectedRowCounts) {
-			selected.set(child, this.#constrainedPinnedChildLines(this.#pinnedChildLines(child, renderedChildren), count));
+		const transcriptEnd = lines.length - suffixRowCount;
+		lines.length = transcriptEnd;
+		let selectedRows = 0;
+		for (let index = pinnedStart; index < this.children.length; index++) {
+			const child = this.children[index];
+			const count = selectedRowCounts.get(child);
+			if (count === undefined) continue;
+			const constrained = this.#constrainedPinnedChildLines(this.#pinnedChildLines(child, renderedChildren), count);
+			selectedRows += constrained.length;
+			for (const row of constrained) lines.push(row);
 		}
-		const constrainedSuffix = suffixChildren.flatMap(child => selected.get(child) ?? []);
-		const transcript = lines.slice(0, lines.length - suffixRows.length);
-		return [...transcript, ...constrainedSuffix];
+		renderMetrics.recordStructuralCounter("pinnedSuffixSelectedRows", selectedRows);
+		return lines;
 	}
 
 	#padBeforeBottomPinnedComponent(
@@ -2644,9 +2687,9 @@ export class TUI extends Container {
 		const widthChanged = this.#previousWidth !== 0 && this.#previousWidth !== width;
 		const heightChanged = this.#previousHeight !== 0 && this.#previousHeight !== height;
 
-		// Normalize/truncate lines for emission. With the opt-in virtual-viewport flag
-		// (PI_TUI_VIRTUAL_VIEWPORT) we reuse the previous frame's normalized prefix when the
-		// off-screen raw prefix is unchanged (raw value equality per line; fast reference
+		// Normalize/truncate lines for emission. The virtual viewport is default-on;
+		// PI_TUI_VIRTUAL_VIEWPORT=0 opts out. When enabled, reuse the previous frame's
+		// normalized prefix when the off-screen raw prefix is unchanged (raw value equality
 		// short-circuit for cached components), so only the visible window is
 		// re-normalized and the diff starts at the window. Output is byte-identical to the
 		// full path (reused entries are deterministic normalizations of identical raw lines).

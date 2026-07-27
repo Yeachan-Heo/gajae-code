@@ -124,6 +124,7 @@ export interface RenderMetricsSnapshot {
 	timerGauges: Record<string, number>;
 	helperStats: Record<string, HelperStat>;
 	lineCounts: Record<string, LineCountGauge>;
+	structuralCounters: Record<string, number>;
 }
 
 function emptyDurationStats(): DurationStats {
@@ -160,6 +161,7 @@ export class RenderMetrics {
 	#timerGauges = new Map<string, number>();
 	#helpers = new Map<string, { count: number; totalMs: number }>();
 	#lineGauges = new Map<string, LineCountGauge>();
+	#structuralCounters = new Map<string, number>();
 	#rssReturn: number | null = null;
 	#heapBaseline: number | null = null;
 	#heapReturn: number | null = null;
@@ -200,6 +202,7 @@ export class RenderMetrics {
 		this.#timerGauges.clear();
 		this.#helpers.clear();
 		this.#lineGauges.clear();
+		this.#structuralCounters.clear();
 		this.#rssReturn = null;
 		this.#heapBaseline = null;
 		this.#heapReturn = null;
@@ -296,6 +299,13 @@ export class RenderMetrics {
 		this.#lineGauges.set(retained, cur);
 	}
 
+	/** Accumulate deterministic structural render work without retaining frame data. */
+	recordStructuralCounter(name: string, value = 1): void {
+		if (!this.#enabled) return;
+		const retained = retainedLabel(this.#structuralCounters, name);
+		this.#structuralCounters.set(retained, (this.#structuralCounters.get(retained) ?? 0) + value);
+	}
+
 	/**
 	 * Force a GC when the runtime exposes one and sample RSS as the post-run
 	 * "return" value used by the memory-leak gate. Callers should drop large
@@ -345,6 +355,10 @@ export class RenderMetrics {
 		return out;
 	}
 
+	#structuralCounterStats(): Record<string, number> {
+		return Object.fromEntries(this.#structuralCounters);
+	}
+
 	snapshot(): RenderMetricsSnapshot {
 		return {
 			enabled: this.#enabled,
@@ -374,6 +388,7 @@ export class RenderMetrics {
 			timerGauges: Object.fromEntries(this.#timerGauges),
 			helperStats: this.#helperStats(),
 			lineCounts: this.#lineCountStats(),
+			structuralCounters: this.#structuralCounterStats(),
 		};
 	}
 }
