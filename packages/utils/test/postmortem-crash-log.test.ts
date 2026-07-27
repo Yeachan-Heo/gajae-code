@@ -125,6 +125,24 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('"refresh_token": "«redacted»');
 	});
 
+	it("redacts current vendor token formats, not just the legacy prefixes", () => {
+		const target = tempCrashLog();
+		// GitHub fine-grained PATs use `github_pat_`, not the classic `gh[opsur]_`.
+		const fineGrained = "github_pat_11ABCDEFG0hijklmnopq_RSTUVWXYZ0123456789abcdefghijklmnopqr";
+		// ASIA is the temporary/STS access key id; AKIA is the long-term one.
+		const temporaryAws = "ASIA1234567890ABCDEF";
+		const err = new Error(`upload failed: ${fineGrained} ${temporaryAws}`);
+
+		recordFatalCrash("Uncaught Exception", err, { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("upload failed");
+		expect(contents).not.toContain(fineGrained);
+		expect(contents).not.toContain(temporaryAws);
+		expect(contents).toContain("«redacted-github-token»");
+		expect(contents).toContain("«redacted-aws-key»");
+	});
+
 	it("enforces owner-only permissions on a pre-existing file", () => {
 		if (process.platform === "win32") return;
 		const target = tempCrashLog();
