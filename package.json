@@ -105,6 +105,8 @@
     "check:plugins": "bun scripts/generate-gjc-plugins.ts --check && bun scripts/verify-gjc-plugins.ts",
     "check:sdk-closure": "bun --cwd=packages/coding-agent run check:sdk-closure && bun run check:plugins",
     "check:docker-context": "bun scripts/verify-docker-context.ts",
+    "verify:codex-app-server-parity": "bun scripts/verify-codex-app-server-parity.ts",
+    "test:sync-codex-app-server-schema": "bun test scripts/sync-codex-app-server-schema.test.ts",
     "test:rs": "bun scripts/run-rs-task.ts test:rs",
     "check": "bun run --parallel check:ts check:rs",
     "check:ts": "bun run check:tools && bun run check:publish-types && bun run check:node20-baseline && bun run check:public-sync && bun run check:schemas && bun run check:sdk-closure && bun run check:docker-context && bun run check:gjc-ui && bun run --workspaces --if-present check",

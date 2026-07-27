@@ -40,6 +40,7 @@ import {
 } from "../session-directory";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
+import { deriveEndpointIncarnation as endpointIncarnation } from "./endpoint-authority";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
@@ -62,6 +63,7 @@ export {
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 };
+export { endpointIncarnation };
 
 const READY_TIMEOUT_MS = 10_000;
 const MIN_READY_TIMEOUT_MS = 4_000;
@@ -2884,8 +2886,8 @@ async function validateDeletePath(
 		},
 	};
 }
-type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
-type CloseRecord = {
+export type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
+export type CloseRecord = {
 	locator: { repo: string; stateRoot: string };
 	endpointGeneration: number;
 	pid: number;
@@ -2893,28 +2895,7 @@ type CloseRecord = {
 	lifecycleRequestId?: string;
 };
 
-function endpointIncarnation(record: CloseRecord, sessionId: string): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			JSON.stringify({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
+
 
 function requestedCloseAuthority(input: Input): { authority: CloseAuthority | undefined } | { error: BrokerResponse } {
 	const endpointGeneration = input.endpointGeneration;
@@ -2933,7 +2914,7 @@ function requestedCloseAuthority(input: Input): { authority: CloseAuthority | un
 	return { authority: { endpointGeneration, endpointIncarnation } };
 }
 
-function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sessionId: string): boolean {
+export function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sessionId: string): boolean {
 	return (
 		authority.endpointGeneration === record.endpointGeneration &&
 		authority.endpointIncarnation === endpointIncarnation(record, sessionId)
@@ -3052,6 +3033,9 @@ async function executeLifecycleResponse(
 						sessionId: requestedSessionId,
 						cwd: finalScope.cwd,
 						endpointGeneration: current.endpointGeneration,
+						endpointIncarnation: initialIncarnation,
+						endpointMtimeMs: current.endpointMtimeMs,
+						pid: current.pid,
 						endpoint: endpoint.result,
 						reused: true,
 					},
@@ -3160,12 +3144,23 @@ async function executeLifecycleResponse(
 		let spawnedAuthority: EffectMarker | undefined;
 		try {
 			const cmd = command(broker);
+			const inheritedEnv = "kind" in cmd ? cmd.env : process.env;
+			const { GJC_TEST_MODEL_PROVIDER: _testModelProvider, GJC_TEST_MODEL_PROVIDER_AUTHORITY: _testModelProviderAuthority, ...childEnv } =
+				inheritedEnv;
+			const testProviderEnv =
+				process.env.GJC_TEST_MODEL_PROVIDER_AUTHORITY === "1"
+					? {
+							GJC_TEST_MODEL_PROVIDER: inheritedEnv.GJC_TEST_MODEL_PROVIDER,
+							GJC_TEST_MODEL_PROVIDER_AUTHORITY: "1",
+						}
+					: {};
 			const spawned = spawn(cmd.file, cmd.args, {
 				cwd: launch.cwd,
 				detached: true,
 				stdio: "ignore",
 				env: {
-					...("kind" in cmd ? cmd.env : process.env),
+					...childEnv,
+					...testProviderEnv,
 					GJC_AGENT_DIR: broker.settings.agentDir,
 					GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 					GJC_SESSION_ID: launch.id,
@@ -3270,11 +3265,25 @@ async function executeLifecycleResponse(
 						"Session readiness authority changed and its spawned process could not be verified dead.",
 					);
 		}
+		const endpointAuthority = endpointIncarnation(
+			{
+				endpointGeneration: verified.endpointGeneration,
+				endpointMtimeMs: verified.endpointMtimeMs,
+				pid: spawnedAuthority.pid,
+			},
+			launch.id,
+		);
+		if (!endpointAuthority)
+			return fail("endpoint_stale", "Session endpoint incarnation is unavailable after readiness.");
 		return {
 			ok: true,
 			result: {
 				sessionId: launch.id,
 				cwd: launch.cwd,
+				endpointGeneration: verified.endpointGeneration,
+				endpointIncarnation: endpointAuthority,
+				endpointMtimeMs: verified.endpointMtimeMs,
+				pid: spawnedAuthority.pid,
 				endpoint: verified.endpoint,
 				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),

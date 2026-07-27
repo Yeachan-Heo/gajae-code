@@ -13,6 +13,11 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
 
+import {
+	appendAppServerProjection,
+	readAppServerProjections,
+	validateAppServerProjectionAfterRevision,
+} from "../session/app-server-projection";
 import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
 
@@ -270,6 +275,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 							);
 						return { backgrounded: true };
 					}
+					case "projection.append":
+						return appendAppServerProjection(session.sessionManager, input.envelope);
+					case "projection.read":
+						return readAppServerProjections(session.sessionManager, validateAppServerProjectionAfterRevision(input.afterRevision));
 					case "compaction.auto.set":
 						session.setAutoCompactionEnabled(input.on === true);
 						return { changed: true };

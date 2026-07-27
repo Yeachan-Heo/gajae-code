@@ -25,6 +25,7 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
+import { deriveEndpointIncarnation } from "./endpoint-authority";
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
 import {
@@ -283,6 +284,7 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 	}
 	return { input: normalized };
 }
+
 function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -292,33 +294,7 @@ function canonicalJson(value: unknown): string {
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
 }
-
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
-function endpointIncarnation(
-	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
-	sessionId: string,
-): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			canonicalJson({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
 function expectedEndpointAuthority(input: Record<string, unknown>): EndpointAuthority | BrokerResponse {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;
@@ -340,7 +316,7 @@ function matchesEndpointAuthority(record: IndexedSession, authority: EndpointAut
 	return (
 		(authority.endpointGeneration === undefined || authority.endpointGeneration === record.endpointGeneration) &&
 		(authority.endpointIncarnation === undefined ||
-			authority.endpointIncarnation === endpointIncarnation(record, record.sessionId))
+			authority.endpointIncarnation === deriveEndpointIncarnation(record, record.sessionId))
 	);
 }
 function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): boolean {
@@ -793,7 +769,18 @@ export class Broker {
 			const current = this.index.listSessions().sessions.find(session => session.sessionId === record.sessionId);
 			if (!current || !sameEndpointRecord(record, current) || !matchesEndpointAuthority(current, authority))
 				return error("endpoint_stale", "session endpoint is stale");
-			return { ok: true, result: endpoint };
+			const incarnation = deriveEndpointIncarnation(record, record.sessionId);
+			if (!incarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
+			return {
+				ok: true,
+				result: {
+					...endpoint,
+					endpointGeneration: record.endpointGeneration,
+					endpointIncarnation: incarnation,
+					endpointMtimeMs: record.endpointMtimeMs,
+					pid: record.pid,
+				},
+			};
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "ENOENT")
 				return error("resource_gone", "session endpoint record is gone");

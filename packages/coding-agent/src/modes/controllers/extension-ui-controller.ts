@@ -36,6 +36,11 @@ import {
 	stopInteractiveActivityIndicator,
 	syncInteractiveActivityIndicator,
 } from "../../modes/types";
+import {
+	appendAppServerProjection,
+	readAppServerProjections,
+	validateAppServerProjectionAfterRevision,
+} from "../../session/app-server-projection";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
@@ -246,6 +251,10 @@ export class ExtensionUiController {
 						code: "not_foldable",
 					});
 				return { backgrounded: true };
+			case "projection.append":
+				return appendAppServerProjection(session.sessionManager, input.envelope);
+			case "projection.read":
+				return readAppServerProjections(session.sessionManager, validateAppServerProjectionAfterRevision(input.afterRevision));
 			case "compaction.auto.set":
 				session.setAutoCompactionEnabled(input.on === true);
 				return { changed: true };

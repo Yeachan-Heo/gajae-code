@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
@@ -27,10 +26,12 @@ import {
 	registerBrokerOwnerForTest,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
+import { deriveEndpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
+	endpointIncarnation as lifecycleEndpointIncarnation,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 } from "../src/sdk/broker/lifecycle";
@@ -1115,9 +1116,10 @@ describe("SDK broker identity and discovery", () => {
 			pid: process.pid,
 			endpointMtimeMs,
 		});
-		const endpointIncarnation = createHash("sha256")
-			.update(JSON.stringify({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid, sessionId: "s" }))
-			.digest("hex");
+		const authorityInput = { endpointGeneration: 3, endpointMtimeMs, pid: process.pid };
+		const endpointIncarnation = deriveEndpointIncarnation(authorityInput, "s");
+		expect(lifecycleEndpointIncarnation(authorityInput, "s")).toBe(endpointIncarnation);
+		expect(deriveEndpointIncarnation({ ...authorityInput, endpointMtimeMs: undefined }, "s")).toBeUndefined();
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
 				sessionId: "s",
@@ -1126,7 +1128,14 @@ describe("SDK broker identity and discovery", () => {
 			}),
 		).toEqual({
 			ok: true,
-			result: { sessionId: "s", pid: process.pid, token: "session-secret" },
+			result: {
+				sessionId: "s",
+				pid: process.pid,
+				token: "session-secret",
+				endpointGeneration: 3,
+				endpointIncarnation,
+				endpointMtimeMs,
+			},
 		});
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
