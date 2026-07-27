@@ -172,6 +172,7 @@ export interface PerfCorpusReport {
 		memoryIsolation: "in-process" | "process-per-surface";
 		iterationsTarget: number;
 		gcExposed: boolean;
+		memoryChildGcExposed: boolean;
 	};
 	fixtures: PerfCorpusFixtureResult[];
 	hotspotClassifications: HotspotClassification[];
@@ -302,6 +303,9 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (typeof report.runner.gcExposed !== "boolean") {
 		errors.push("runner.gcExposed invalid");
 	}
+	if (typeof report.runner.memoryChildGcExposed !== "boolean") {
+		errors.push("runner.memoryChildGcExposed invalid");
+	}
 	if (!(MEMORY_ISOLATION_MODES as readonly string[]).includes(report.runner.memoryIsolation)) {
 		errors.push("runner.memoryIsolation invalid");
 	}
@@ -371,6 +375,9 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			}
 			if (!Number.isInteger(baseline.iterations) || baseline.iterations <= 0) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.iterations must be a positive integer`);
+			}
+			if (baseline.iterations < report.runner.iterationsTarget) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.iterations below runner target`);
 			}
 			if (!Number.isInteger(baseline.operations) || baseline.operations < 0) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operations must be a non-negative integer`);
@@ -448,17 +455,42 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match samples`);
 				}
 			}
+			if (samplesAreValid && samples.length > 0) {
+				const firstSample = samples[0];
+				const peakRssBytes = Math.max(...samples.map(sample => sample.rssBytes));
+				const childGcExposed =
+					report.runner.memoryIsolation === "process-per-surface"
+						? report.runner.memoryChildGcExposed
+						: report.runner.gcExposed;
+				const expectedSummary = {
+					baselineBytes: firstSample.rssBytes,
+					peakBytes: peakRssBytes,
+					growthBytes: peakRssBytes - firstSample.rssBytes,
+					returnBytes: childGcExposed ? baseline.postTeardown.rssBytes : null,
+					heapBaselineBytes: firstSample.heapUsedBytes,
+					heapReturnBytes: childGcExposed ? baseline.postTeardown.heapUsedBytes : null,
+				};
+				for (const [name, expected] of Object.entries(expectedSummary)) {
+					if (fixture.rssMemory[name as keyof typeof expectedSummary] !== expected) {
+						errors.push(`fixture ${fixture.fixtureId}: rssMemory.${name} does not match detailed samples`);
+					}
+				}
+			}
+			const memoryGcExposed =
+				report.runner.memoryIsolation === "process-per-surface"
+					? report.runner.memoryChildGcExposed
+					: report.runner.gcExposed;
 			if (
-				report.runner.gcExposed &&
+				memoryGcExposed &&
 				(fixture.rssMemory.returnBytes === null || fixture.rssMemory.heapReturnBytes === null)
 			) {
-				errors.push(`fixture ${fixture.fixtureId}: gcExposed requires post-GC return metrics`);
+				errors.push(`fixture ${fixture.fixtureId}: exposed memory GC requires post-GC return metrics`);
 			}
 			if (
-				!report.runner.gcExposed &&
+				!memoryGcExposed &&
 				(fixture.rssMemory.returnBytes !== null || fixture.rssMemory.heapReturnBytes !== null)
 			) {
-				errors.push(`fixture ${fixture.fixtureId}: unavailable GC requires null return metrics`);
+				errors.push(`fixture ${fixture.fixtureId}: unavailable memory GC requires null return metrics`);
 			}
 		}
 	}

@@ -125,7 +125,8 @@ describe("perf corpus schema + runner", () => {
 			GJC_MEMORY_PROFILE: "short",
 			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
 		});
-		expect(report.runner.gcExposed).toBe(true);
+		expect(report.runner.gcExposed).toBe(typeof globalThis.gc === "function");
+		expect(report.runner.memoryChildGcExposed).toBe(true);
 		expect(baselines.every(baseline => baseline.samples[0]!.rssBytes > 0)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 	}, 15_000);
@@ -306,6 +307,34 @@ describe("perf corpus schema + runner", () => {
 			runner: { ...report.runner, profile: undefined },
 		} as unknown as PerfCorpusReport;
 		expect(validatePerfCorpusReport(missingRunnerProfile).errors).toContain("runner.profile invalid");
+		const missingMemoryChildGc = {
+			...report,
+			runner: { ...report.runner, memoryChildGcExposed: undefined },
+		} as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(missingMemoryChildGc).errors).toContain("runner.memoryChildGcExposed invalid");
+		const insufficientIterations = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex ? { ...candidate, memoryBaseline: { ...validBaseline, iterations: 1 } } : candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(insufficientIterations).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.iterations below runner target`,
+		);
+		const inconsistentSummary = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							rssMemory: { ...candidate.rssMemory, growthBytes: candidate.rssMemory.growthBytes + 1 },
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(inconsistentSummary).errors).toContain(
+			`fixture ${fixture.fixtureId}: rssMemory.growthBytes does not match detailed samples`,
+		);
 		const mismatchedEnvironment = {
 			...report,
 			runner: {
@@ -319,7 +348,7 @@ describe("perf corpus schema + runner", () => {
 		);
 		const gcUnavailableWithReturns = {
 			...report,
-			runner: { ...report.runner, gcExposed: false },
+			runner: { ...report.runner, gcExposed: false, memoryChildGcExposed: false },
 			fixtures: report.fixtures.map((candidate, index) =>
 				index === fixtureIndex
 					? {
@@ -330,11 +359,11 @@ describe("perf corpus schema + runner", () => {
 			),
 		};
 		expect(validatePerfCorpusReport(gcUnavailableWithReturns).errors).toContain(
-			`fixture ${fixture.fixtureId}: unavailable GC requires null return metrics`,
+			`fixture ${fixture.fixtureId}: unavailable memory GC requires null return metrics`,
 		);
 		const gcExposedWithoutReturns = {
 			...report,
-			runner: { ...report.runner, gcExposed: true },
+			runner: { ...report.runner, gcExposed: true, memoryChildGcExposed: true },
 			fixtures: report.fixtures.map((candidate, index) =>
 				index === fixtureIndex
 					? {
@@ -345,7 +374,7 @@ describe("perf corpus schema + runner", () => {
 			),
 		};
 		expect(validatePerfCorpusReport(gcExposedWithoutReturns).errors).toContain(
-			`fixture ${fixture.fixtureId}: gcExposed requires post-GC return metrics`,
+			`fixture ${fixture.fixtureId}: exposed memory GC requires post-GC return metrics`,
 		);
 	});
 

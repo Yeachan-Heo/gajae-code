@@ -11,6 +11,7 @@
  */
 
 import * as path from "node:path";
+import * as url from "node:url";
 import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
 import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
@@ -291,10 +292,10 @@ function isMemorySurface(value: string | undefined): value is MemorySurface {
 
 function isolatedMemoryEntry(surface: MemorySurface): string {
 	if (surface === "agent-session") {
-		return new URL("./memory-baseline-session-child.ts", import.meta.url).pathname;
+		return url.fileURLToPath(new URL("./memory-baseline-session-child.ts", import.meta.url));
 	}
 	if (surface === "tui") {
-		return new URL("./memory-baseline-tui-child.ts", import.meta.url).pathname;
+		return url.fileURLToPath(new URL("./memory-baseline-tui-child.ts", import.meta.url));
 	}
 	return import.meta.path;
 }
@@ -388,6 +389,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 				: 1_000
 			: 0;
 	const iterationsTarget = workloadIterations(profile);
+	const initialGit = resolveGitProvenance();
 	const fixtures: PerfCorpusFixtureResult[] = [
 		buildFixture("startup-load", "startup-session-load", ["startup", "session-load"], startupWorkload, 0x51ed),
 		buildFixture("streaming-ttft", "streaming-ttft", ["streaming", "ttft"], streamingWorkload, 0x9e37),
@@ -396,7 +398,11 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			? buildIsolatedMemoryFixtures(profile, durationTargetMs)
 			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
-	const git = resolveGitProvenance();
+	const finalGit = resolveGitProvenance();
+	if (initialGit.sha !== finalGit.sha || initialGit.dirty !== finalGit.dirty) {
+		throw new Error("benchmark checkout provenance changed while workloads were running");
+	}
+	const git = initialGit;
 	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, options.isolatedMemory === true);
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
@@ -415,7 +421,8 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			durationTargetMs,
 			memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
 			iterationsTarget,
-			gcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
+			gcExposed: typeof globalThis.gc === "function",
+			memoryChildGcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
 		},
 		fixtures,
 		hotspotClassifications: [...V1_V3_RECLASSIFICATION],
