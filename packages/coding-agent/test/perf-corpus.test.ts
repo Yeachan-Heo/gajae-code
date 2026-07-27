@@ -4,6 +4,7 @@ import {
 	type HotspotClassification,
 	hasProfilerSelfTimeEvidence,
 	isHotspotStatus,
+	type MemoryUsageSample,
 	PERF_CORPUS_SCHEMA,
 	type PerfCorpusReport,
 	REQUIRED_FIXTURE_CLASSES,
@@ -59,6 +60,13 @@ describe("perf corpus schema + runner", () => {
 			}
 			expect(Number.isFinite(baseline.operationsPerSecond)).toBe(true);
 			expect(baseline.samples.every(sample => sample.externalBytes >= sample.arrayBuffersBytes)).toBe(true);
+			expect(baseline.rssSlopeBytesPerSecond === null || Number.isFinite(baseline.rssSlopeBytesPerSecond)).toBe(
+				true,
+			);
+			expect(baseline.heapSlopeBytesPerSecond === null || Number.isFinite(baseline.heapSlopeBytesPerSecond)).toBe(
+				true,
+			);
+			expect(baseline.postTeardown.rssBytes).toBeGreaterThan(0);
 		}
 	});
 
@@ -70,7 +78,7 @@ describe("perf corpus schema + runner", () => {
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 	});
 
-	test("fails closed when a required surface or detailed sample is invalid", () => {
+	test("fails closed when a required surface or detailed sample is invalid or incomplete", () => {
 		const report = runPerfCorpusBenchmark();
 		const withoutTui: PerfCorpusReport = {
 			...report,
@@ -100,6 +108,34 @@ describe("perf corpus schema + runner", () => {
 		expect(validation.ok).toBe(false);
 		expect(validation.errors.some(error => error.includes("requires at least two samples"))).toBe(true);
 		expect(validation.errors.some(error => error.includes(".rssBytes invalid"))).toBe(true);
+		const incompleteSample: Partial<MemoryUsageSample> = { ...baseline.samples[0] };
+		delete incompleteSample.heapUsedBytes;
+		const incomplete: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								samples: [incompleteSample as MemoryUsageSample, baseline.samples[1]!],
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(incomplete).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline sample 0.heapUsedBytes invalid`,
+		);
+	});
+	test("does not claim post-GC return metrics when GC is unavailable", () => {
+		const report = runPerfCorpusBenchmark();
+		if (globalThis.gc) return;
+		for (const fixture of report.fixtures) {
+			if (!fixture.memoryBaseline) continue;
+			expect(fixture.rssMemory.returnBytes).toBeNull();
+			expect(fixture.rssMemory.heapReturnBytes).toBeNull();
+		}
 	});
 
 	test("the base runner attaches no profiler, so no hotspot is CPU-self-time confirmed", () => {

@@ -91,6 +91,15 @@ export interface MemoryUsageSample {
 	arrayBuffersBytes: number;
 	activeResourceCount: number;
 }
+const MEMORY_USAGE_SAMPLE_FIELDS = [
+	"elapsedMs",
+	"rssBytes",
+	"heapUsedBytes",
+	"heapTotalBytes",
+	"externalBytes",
+	"arrayBuffersBytes",
+	"activeResourceCount",
+] as const satisfies readonly (keyof MemoryUsageSample)[];
 
 export interface MemoryBaselineMetric {
 	surface: MemorySurface;
@@ -295,8 +304,9 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline requires at least two samples`);
 			}
 			for (const [index, sample] of [...baseline.samples, baseline.postTeardown].entries()) {
-				for (const [name, value] of Object.entries(sample)) {
-					if (!Number.isFinite(value) || value < 0) {
+				for (const name of MEMORY_USAGE_SAMPLE_FIELDS) {
+					const value = sample[name];
+					if (!Object.hasOwn(sample, name) || !Number.isFinite(value) || value < 0) {
 						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.${name} invalid`);
 					}
 				}

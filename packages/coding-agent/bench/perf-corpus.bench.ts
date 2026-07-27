@@ -97,8 +97,15 @@ function memorySample(startedAt: number): MemoryUsageSample {
 function memorySlope(samples: MemoryUsageSample[], key: "rssBytes" | "heapUsedBytes"): number | null {
 	const first = samples[0];
 	const last = samples.at(-1);
-	if (!first || !last || last.elapsedMs - first.elapsedMs < 250) return null;
-	return ((last[key] - first[key]) * 1_000) / (last.elapsedMs - first.elapsedMs);
+	if (!first || !last) return null;
+	const observedDurationMs = last.elapsedMs - first.elapsedMs;
+	if (observedDurationMs < 250) return null;
+	const warmupCutoffMs = first.elapsedMs + Math.min(250, observedDurationMs / 4);
+	const steadyStateSamples = samples.filter(sample => sample.elapsedMs >= warmupCutoffMs);
+	const steadyStateFirst = steadyStateSamples[0];
+	const steadyStateLast = steadyStateSamples.at(-1);
+	if (!steadyStateFirst || !steadyStateLast || steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs < 250) return null;
+	return ((steadyStateLast[key] - steadyStateFirst[key]) * 1_000) / (steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs);
 }
 function processTreeRssBytes(): number | null {
 	if (process.platform === "win32") return null;
@@ -116,6 +123,8 @@ function processTreeRssBytes(): number | null {
 		parents.set(pid, parent);
 		rssByPid.set(pid, rssKiB * 1_024);
 	}
+	rssByPid.delete(result.pid);
+	parents.delete(result.pid);
 	const descendants = new Set([process.pid]);
 	let changed = true;
 	while (changed) {
@@ -140,8 +149,8 @@ function buildMemoryFixture(
 	const gc = (globalThis as { gc?: () => void }).gc;
 	const minimumIterations = workloadIterations(profile);
 	workload.teardown();
-	const processTreeBaselineRssBytes = processTreeRssBytes();
 	gc?.();
+	const processTreeBaselineRssBytes = processTreeRssBytes();
 	const startedAt = performance.now();
 	const cpuStart = process.cpuUsage();
 	const samples = [memorySample(startedAt)];
@@ -193,9 +202,9 @@ function buildMemoryFixture(
 			baselineBytes,
 			peakBytes,
 			growthBytes: peakBytes - (baselineBytes ?? peakBytes),
-			returnBytes: postTeardown.rssBytes,
+			returnBytes: gc ? postTeardown.rssBytes : null,
 			heapBaselineBytes: samples[0]?.heapUsedBytes ?? null,
-			heapReturnBytes: postTeardown.heapUsedBytes,
+			heapReturnBytes: gc ? postTeardown.heapUsedBytes : null,
 		},
 		byteParity: {
 			renderedGolden: "not-run",
