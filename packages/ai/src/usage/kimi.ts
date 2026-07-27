@@ -1,4 +1,4 @@
-import { $env } from "@gajae-code/utils";
+import { $credentialEnv } from "@gajae-code/utils";
 import type {
 	UsageAmount,
 	UsageFetchContext,
@@ -31,10 +31,24 @@ type KimiUsageRow = {
 	window?: UsageWindow;
 };
 
+/**
+ * Usage endpoint base, with the environment override resolved from trusted
+ * sources only.
+ *
+ * The result becomes the usage URL that the request sends
+ * `Authorization: Bearer <accessToken>` to, so whatever can set it receives the
+ * user's Kimi access token. `$env` merges the caller's `cwd/.env`, so reading it
+ * there would let repository content collect that token.
+ */
 function normalizeBaseUrl(baseUrl?: string): string {
-	const envBase = $env.KIMI_CODE_BASE_URL?.trim();
+	const envBase = $credentialEnv("KIMI_CODE_BASE_URL");
 	const candidate = baseUrl?.trim() || envBase || DEFAULT_BASE_URL;
 	return candidate.replace(/\/+$/, "");
+}
+
+/** Test seam: the usage base URL as resolved from a caller value plus trusted env. */
+export function normalizeKimiUsageBaseUrlForTest(baseUrl?: string): string {
+	return normalizeBaseUrl(baseUrl);
 }
 
 function buildUsageUrl(baseUrl: string): string {
