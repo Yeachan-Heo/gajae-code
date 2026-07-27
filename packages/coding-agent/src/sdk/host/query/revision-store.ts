@@ -2,6 +2,32 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { postmortem } from "@gajae-code/utils";
+
+/**
+ * Spill directories this process created under the system temp dir.
+ *
+ * `close()` removes a store's own directory, but an abnormal exit never reaches
+ * it, and these hold real spilled snapshot data rather than a marker. The two
+ * sibling temp-artifact caches (`shell-snapshot`, `python-runner-artifact`)
+ * already register a postmortem sweep; this does the same.
+ *
+ * Only `mkdtemp` directories are tracked. A caller-supplied `storageDir` is
+ * durable session storage and must never be swept here.
+ */
+const processSpillDirectories = new Set<string>();
+
+/** Test seam: spill directories currently tracked for postmortem cleanup. */
+export function trackedSpillDirectoriesForTest(): string[] {
+	return [...processSpillDirectories];
+}
+
+postmortem.register("sdk-revision-store:spill", async () => {
+	for (const dir of [...processSpillDirectories]) {
+		processSpillDirectories.delete(dir);
+		await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+	}
+});
 
 export const MAX_REVISIONS_PER_RESOURCE = 8;
 export const MAX_PINNED_REVISIONS = 128;
@@ -512,7 +538,10 @@ export class RevisionStore {
 			this.#memoryBytes = 0;
 			this.#chunkRefs.clear();
 			this.#manifestRefs.clear();
-			if (this.#directory) await rm(this.#directory, { recursive: true, force: true });
+			if (this.#directory) {
+				processSpillDirectories.delete(this.#directory);
+				await rm(this.#directory, { recursive: true, force: true });
+			}
 		})();
 		return this.#closePromise;
 	}
@@ -1040,7 +1069,12 @@ export class RevisionStore {
 	}
 
 	async #spillDirectory(): Promise<string> {
-		if (!this.#directory) this.#directory = await mkdtemp(join(tmpdir(), "gjc-sdk-snapshots-"));
+		if (!this.#directory) {
+			this.#directory = await mkdtemp(join(tmpdir(), "gjc-sdk-snapshots-"));
+			// Only temp spill directories are swept on abnormal exit; a caller-supplied
+			// storageDir is durable and never enters this set.
+			processSpillDirectories.add(this.#directory);
+		}
 		await mkdir(join(this.#directory, "objects"), { recursive: true, mode: 0o700 });
 		await mkdir(join(this.#directory, "manifests"), { recursive: true, mode: 0o700 });
 		await chmod(this.#directory, 0o700);
