@@ -21,7 +21,7 @@ This document covers the media/system/conversion exports in `@gajae-code/natives
 
 | JS export                                           | Rust N-API export              | Rust module         |
 | --------------------------------------------------- | ------------------------------ | ------------------- |
-| `encodeSixel(bytes, targetWidthPx, targetHeightPx)` | `encode_sixel`                 | `image.rs`          |
+| `encodeSixel(bytes, targetWidthPx, targetHeightPx)` | `encode_sixel`                 | `sixel.rs`          |
 | `htmlToMarkdown(html, options?)`                    | `html_to_markdown`             | `html.rs`           |
 | `copyToClipboard(text)`                             | `copy_to_clipboard`            | `clipboard.rs`      |
 | `readImageFromClipboard()`                          | `read_image_from_clipboard`    | `clipboard.rs`      |
