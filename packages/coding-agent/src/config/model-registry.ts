@@ -76,6 +76,8 @@ export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, 
 
 export { isAuthenticated, kNoAuth };
 
+export type CredentialRecovery = (provider: string) => Promise<boolean>;
+
 const MAX_SESSION_CANONICAL_VARIANTS = 64;
 
 function envAvailabilityFingerprint(): string {
@@ -1039,6 +1041,8 @@ export class ModelRegistry {
 	#runtimeProviderSourceByName: Map<string, string> = new Map();
 	#rebuildPending: boolean = false;
 	#rebuildSuspended: number = 0;
+	#credentialRecovery?: CredentialRecovery;
+	#credentialRecoveryInFlight = new Map<string, Promise<boolean>>();
 
 	/**
 	 * @param authStorage - Auth storage for API key resolution
@@ -2558,9 +2562,45 @@ export class ModelRegistry {
 		};
 	}
 
-	async #getApiKeyOrNoAuth(provider: string, lookup: () => Promise<string | undefined>): Promise<string | undefined> {
+	/**
+	 * Configure an optional last-resort credential recovery callback.
+	 *
+	 * The callback runs only after normal credential lookup returns no key.
+	 * Calls for the same provider share one recovery attempt, then retry the
+	 * original lookup exactly once when recovery reports success.
+	 */
+	setCredentialRecovery(recovery?: CredentialRecovery): void {
+		this.#credentialRecovery = recovery;
+	}
+
+	async #recoverCredential(provider: string): Promise<boolean> {
+		if (!this.#credentialRecovery) return false;
+		const existing = this.#credentialRecoveryInFlight.get(provider);
+		if (existing) return existing;
+		const recovery = this.#credentialRecovery;
+		const attempt = recovery(provider)
+			.catch(() => {
+				logger.warn("Credential recovery failed", { provider, classification: "callback-failed" });
+				return false;
+			})
+			.finally(() => {
+				this.#credentialRecoveryInFlight.delete(provider);
+			});
+		this.#credentialRecoveryInFlight.set(provider, attempt);
+		return attempt;
+	}
+
+	async #getApiKeyOrNoAuth(
+		provider: string,
+		lookup: () => Promise<string | undefined>,
+		allowRecovery: boolean = true,
+	): Promise<string | undefined> {
 		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
 			return kNoAuth;
+		}
+		const apiKey = await lookup();
+		if (apiKey !== undefined || !allowRecovery || !(await this.#recoverCredential(provider))) {
+			return apiKey;
 		}
 		return lookup();
 	}
@@ -2602,7 +2642,7 @@ export class ModelRegistry {
 	}
 
 	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {
-		return this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider));
+		return this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider), false);
 	}
 
 	/**

@@ -3506,6 +3506,68 @@ describe("ModelRegistry", () => {
 		expect(model?.wireModelId).toBe("proxy-gpt-4o-mini");
 		expect(model?.requestTransform).toEqual({ extraBody: { routed: true } });
 	});
+
+	test("retries credential lookup once after configured recovery succeeds", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const recoveredProviders: string[] = [];
+		registry.setCredentialRecovery(async provider => {
+			recoveredProviders.push(provider);
+			authStorage.setRuntimeApiKey(provider, "recovered-key");
+			return true;
+		});
+
+		expect(await registry.getApiKeyForProvider("openai-codex")).toBe("recovered-key");
+		expect(recoveredProviders).toEqual(["openai-codex"]);
+	});
+
+	test("single-flights concurrent credential recovery for the same provider", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const recoveryStarted = Promise.withResolvers<void>();
+		const releaseRecovery = Promise.withResolvers<void>();
+		let recoveryCalls = 0;
+		registry.setCredentialRecovery(async provider => {
+			recoveryCalls += 1;
+			recoveryStarted.resolve();
+			await releaseRecovery.promise;
+			authStorage.setRuntimeApiKey(provider, "recovered-key");
+			return true;
+		});
+
+		const first = registry.getApiKeyForProvider("openai-codex");
+		await recoveryStarted.promise;
+		const second = registry.getApiKeyForProvider("openai-codex");
+		releaseRecovery.resolve();
+
+		expect(await Promise.all([first, second])).toEqual(["recovered-key", "recovered-key"]);
+		expect(recoveryCalls).toBe(1);
+	});
+
+	test("does not invoke credential recovery when normal lookup succeeds", async () => {
+		authStorage.setRuntimeApiKey("openai-codex", "existing-key");
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		let recoveryCalls = 0;
+		registry.setCredentialRecovery(async () => {
+			recoveryCalls += 1;
+			return true;
+		});
+
+		expect(await registry.getApiKeyForProvider("openai-codex")).toBe("existing-key");
+		expect(recoveryCalls).toBe(0);
+	});
+
+	test("does not invoke credential recovery during non-mutating model refresh", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		let recoveryCalls = 0;
+		registry.setCredentialRecovery(async () => {
+			recoveryCalls += 1;
+			return true;
+		});
+
+		await registry.refresh("offline");
+
+		expect(recoveryCalls).toBe(0);
+	});
+
 	describe("generic local OpenAI-compatible provider config", () => {
 		test("does not add a generic local provider by default", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);

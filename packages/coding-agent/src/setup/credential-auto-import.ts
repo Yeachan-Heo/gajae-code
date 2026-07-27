@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type {
@@ -6,6 +6,7 @@ import type {
 	AuthCredentialIfAbsentReason,
 	AuthCredentialIfAbsentSnapshotResult,
 	AuthStorage,
+	CredentialDisabledEvent,
 } from "@gajae-code/ai";
 import { getAgentDir, logger, VERSION } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
@@ -37,7 +38,7 @@ export const CREDENTIAL_AUTO_IMPORT_STATE_UNREADABLE_WARNING =
 	"Credential import preference could not be read. External credential discovery was skipped; use /provider to import credentials manually.";
 
 export type CredentialAutoImportSourceLabel = "claude-code-file" | "claude-code-keychain" | "codex-file";
-export type CredentialAutoImportTrigger = "startup" | "bare-login" | "setup-cli";
+export type CredentialAutoImportTrigger = "startup" | "bare-login" | "setup-cli" | "oauth-recovery";
 export type InitialImportResolution = "accepted" | "declined";
 export type CredentialAutoImportStateProblem =
 	| "invalid-initial-import-resolution"
@@ -149,7 +150,7 @@ async function writeCredentialAutoImportStateAtomic(
 	state: CredentialAutoImportStateFile,
 	rename: (oldPath: string, newPath: string) => Promise<void> = fs.rename,
 ): Promise<void> {
-	const temporaryPath = `${statePath}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
+	const temporaryPath = `${statePath}.tmp.${process.pid}.${Date.now()}.${crypto.randomUUID()}`;
 	try {
 		const handle = await fs.open(temporaryPath, "wx", 0o600);
 		try {
@@ -428,12 +429,31 @@ export function formatCredentialAutoImportResult(result: CredentialAutoImportRes
 }
 
 export interface StartupCredentialAutoImportOptions {
-	authStorage: CredentialAutoImportOptions["authStorage"];
-	modelRegistry: Pick<ModelRegistry, "refresh">;
+	authStorage: CredentialAutoImportOptions["authStorage"] &
+		Partial<Pick<AuthStorage, "onCredentialDisabled" | "onGenerationChanged">>;
+	modelRegistry: Pick<ModelRegistry, "refresh"> & Partial<Pick<ModelRegistry, "setCredentialRecovery">>;
 	discover?: CredentialAutoImportOptions["discover"];
 	version?: string;
 	agentDir?: string;
 	stateStore?: CredentialAutoImportStateStore;
+}
+
+export interface AcceptedExternalCredentialRecoveryOptions {
+	authStorage: CredentialAutoImportOptions["authStorage"] &
+		Pick<AuthStorage, "onCredentialDisabled" | "onGenerationChanged">;
+	modelRegistry: Pick<ModelRegistry, "refresh">;
+	discover?: CredentialAutoImportOptions["discover"];
+	agentDir?: string;
+	stateStore?: CredentialAutoImportStateStore;
+}
+
+function supportsAcceptedExternalCredentialRecovery(
+	authStorage: StartupCredentialAutoImportOptions["authStorage"],
+): authStorage is CredentialAutoImportOptions["authStorage"] &
+	Pick<AuthStorage, "onCredentialDisabled" | "onGenerationChanged"> {
+	return (
+		typeof authStorage.onCredentialDisabled === "function" && typeof authStorage.onGenerationChanged === "function"
+	);
 }
 
 function appendNoticeLine(notice: string | undefined, line: string): string {
@@ -461,6 +481,87 @@ async function writeStateSafely(
 	}
 }
 
+function fingerprintOAuthCandidates(candidates: readonly ImportableCredential[]): string | undefined {
+	const fingerprints: string[] = [];
+	for (const candidate of candidates) {
+		if (candidate.credential.type !== "oauth") continue;
+		const credential = candidate.credential;
+		const hash = crypto.createHash("sha256");
+		hash.update(candidate.provider);
+		hash.update("\0");
+		hash.update(candidate.origin);
+		hash.update("\0");
+		hash.update(credential.access);
+		hash.update("\0");
+		hash.update(credential.refresh);
+		hash.update("\0");
+		hash.update(String(credential.expires));
+		hash.update("\0");
+		hash.update(credential.accountId ?? "");
+		hash.update("\0");
+		hash.update(credential.email ?? "");
+		fingerprints.push(hash.digest("hex"));
+	}
+	if (fingerprints.length === 0) return undefined;
+	return crypto.createHash("sha256").update(fingerprints.sort().join("\0")).digest("hex");
+}
+
+function isRecoverableCodexDisable(event: CredentialDisabledEvent): boolean {
+	return event.provider === "openai-codex" && event.disabledCause.startsWith("oauth refresh failed:");
+}
+
+export function createAcceptedExternalCredentialRecovery({
+	authStorage,
+	modelRegistry,
+	discover = discoverExternalCredentials,
+	agentDir,
+	stateStore,
+}: AcceptedExternalCredentialRecoveryOptions): (provider: string) => Promise<boolean> {
+	const store = stateStore ?? createCredentialAutoImportStateStore(agentDir);
+	const pendingProviders = new Set<string>();
+	const attemptedFingerprints = new Map<string, string>();
+	authStorage.onGenerationChanged(() => {
+		pendingProviders.clear();
+	});
+	authStorage.onCredentialDisabled(event => {
+		if (isRecoverableCodexDisable(event)) pendingProviders.add(event.provider);
+	});
+
+	return async provider => {
+		if (provider !== "openai-codex" || !pendingProviders.delete(provider)) return false;
+		const stateRead = await readStateSafely(store);
+		if (stateRead.unreadable || stateRead.state.initialImportResolution !== "accepted") return false;
+
+		const result = await runExternalCredentialAutoImport({
+			authStorage,
+			discover: async options => {
+				const discovered = await discover(options);
+				const scoped: CredentialDiscoveryResult = {
+					importable: discovered.importable.filter(credential => credential.provider === provider),
+					skipped: discovered.skipped.filter(credential => credential.origin === "codex-file"),
+					environment: discovered.environment.filter(credential => credential.provider === provider),
+				};
+				const candidates = filterAutoImportOAuthCredentials(scoped.importable);
+				const fingerprint = fingerprintOAuthCandidates(candidates);
+				if (!fingerprint || attemptedFingerprints.get(provider) === fingerprint) {
+					return { ...scoped, importable: [] };
+				}
+				attemptedFingerprints.set(provider, fingerprint);
+				return scoped;
+			},
+			trigger: "oauth-recovery",
+		});
+		if (result.failures.length > 0) logCredentialAutoImportFailures("oauth-recovery", result.failures);
+		if (!result.imported.some(credential => credential.provider === provider)) return false;
+		try {
+			await modelRegistry.refresh("offline");
+		} catch {
+			logger.warn("Credential recovery model refresh failed", { provider, classification: "refresh-failed" });
+		}
+		return true;
+	};
+}
+
 export async function runStartupCredentialAutoImportIfNeeded({
 	authStorage: activeAuthStorage,
 	modelRegistry: activeModelRegistry,
@@ -470,6 +571,17 @@ export async function runStartupCredentialAutoImportIfNeeded({
 	stateStore,
 }: StartupCredentialAutoImportOptions): Promise<string | undefined> {
 	const store = stateStore ?? createCredentialAutoImportStateStore(agentDir);
+	if (activeModelRegistry.setCredentialRecovery && supportsAcceptedExternalCredentialRecovery(activeAuthStorage)) {
+		activeModelRegistry.setCredentialRecovery(
+			createAcceptedExternalCredentialRecovery({
+				authStorage: activeAuthStorage,
+				modelRegistry: activeModelRegistry,
+				discover,
+				agentDir,
+				stateStore: store,
+			}),
+		);
+	}
 	const stateRead = await readStateSafely(store);
 	if (stateRead.unreadable) {
 		logger.warn("Credential auto-import state unavailable", { classification: "state-unreadable" });

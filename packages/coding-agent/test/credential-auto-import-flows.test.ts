@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AuthCredentialIfAbsentSnapshotResult } from "@gajae-code/ai";
+import { type AuthCredentialIfAbsentSnapshotResult, AuthStorage } from "@gajae-code/ai";
 import { Container } from "@gajae-code/tui";
 import { logger, VERSION } from "@gajae-code/utils";
 
 import { handleCredentialsSetup } from "../src/cli/setup-cli";
+import { ModelRegistry } from "../src/config/model-registry";
 import { ProviderOnboardingSelectorComponent } from "../src/modes/components/provider-onboarding-selector";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
@@ -19,6 +20,7 @@ import {
 	type CredentialAutoImportStateMutation,
 	type CredentialAutoImportStateStore,
 	type CredentialAutoImportStateStoreDependencies,
+	createAcceptedExternalCredentialRecovery,
 	createCredentialAutoImportStateStore,
 	getCredentialAutoImportStatePath,
 	readCredentialAutoImportState,
@@ -379,6 +381,250 @@ describe("startup credential auto-import marker matrix", () => {
 		});
 		expect(marker.resolution).toBe("accepted");
 		expect(notice).toContain(CREDENTIAL_AUTO_IMPORT_REFRESH_WARNING);
+	});
+});
+
+describe("accepted external credential recovery", () => {
+	function stateStore(initialImportResolution: "accepted" | "declined"): CredentialAutoImportStateStore {
+		return {
+			read: async () => ({
+				state: { initialImportResolution, lastImportVersion: VERSION },
+				problems: [],
+				unreadable: false,
+			}),
+			write: async () => true,
+		};
+	}
+
+	function createHarness(options: {
+		initialImportResolution?: "accepted" | "declined";
+		candidate?: ImportableCredential;
+	}) {
+		let disabledListener: ((event: { provider: string; disabledCause: string }) => void | Promise<void>) | undefined;
+		let generationListener: ((generation: number) => void) | undefined;
+		let candidate =
+			options.candidate ??
+			oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				source: "Codex CLI (test)",
+				credential: {
+					type: "oauth",
+					access: "codex-access-1",
+					refresh: "codex-refresh-1",
+					expires: Date.now() + 60_000,
+				},
+			});
+		const importedRefreshTokens: string[] = [];
+		let discoveryReads = 0;
+		const recover = createAcceptedExternalCredentialRecovery({
+			authStorage: {
+				onCredentialDisabled: listener => {
+					disabledListener = listener;
+					return () => {
+						disabledListener = undefined;
+					};
+				},
+				onGenerationChanged: listener => {
+					generationListener = listener;
+					return () => {
+						generationListener = undefined;
+					};
+				},
+				importCredentialIfAbsent: async (provider, credential) => {
+					if (credential.type === "oauth") importedRefreshTokens.push(credential.refresh);
+					return inserted(provider);
+				},
+			},
+			modelRegistry: { refresh: async () => {} },
+			stateStore: stateStore(options.initialImportResolution ?? "accepted"),
+			discover: async () => {
+				discoveryReads += 1;
+				return discovery([candidate]);
+			},
+		});
+		return {
+			recover,
+			emitDisabled: async (disabledCause = "oauth refresh failed: invalid_grant") => {
+				await disabledListener?.({ provider: "openai-codex", disabledCause });
+			},
+			emitGenerationChanged: (generation = 2) => {
+				generationListener?.(generation);
+			},
+			replaceCandidate: (next: ImportableCredential) => {
+				candidate = next;
+			},
+			importedRefreshTokens,
+			get discoveryReads() {
+				return discoveryReads;
+			},
+		};
+	}
+
+	test("does not inspect external credentials for an ordinary missing key", async () => {
+		const harness = createHarness({});
+
+		expect(await harness.recover("openai-codex")).toBe(false);
+		expect(harness.discoveryReads).toBe(0);
+		expect(harness.importedRefreshTokens).toEqual([]);
+	});
+
+	test("recovers Codex OAuth only after a definitive refresh disable", async () => {
+		const harness = createHarness({});
+		await harness.emitDisabled();
+
+		expect(await harness.recover("openai-codex")).toBe(true);
+		expect(harness.discoveryReads).toBe(1);
+		expect(harness.importedRefreshTokens).toEqual(["codex-refresh-1"]);
+	});
+
+	test("does not recover after user deletion or when external imports were declined", async () => {
+		const deleted = createHarness({});
+		await deleted.emitDisabled("deleted by user");
+		expect(await deleted.recover("openai-codex")).toBe(false);
+		expect(deleted.discoveryReads).toBe(0);
+
+		const declined = createHarness({ initialImportResolution: "declined" });
+		await declined.emitDisabled();
+		expect(await declined.recover("openai-codex")).toBe(false);
+		expect(declined.discoveryReads).toBe(0);
+	});
+
+	test("clears an unconsumed disable trigger when logout changes the credential generation", async () => {
+		const harness = createHarness({});
+		await harness.emitDisabled();
+		harness.emitGenerationChanged();
+
+		expect(await harness.recover("openai-codex")).toBe(false);
+		expect(harness.discoveryReads).toBe(0);
+		expect(harness.importedRefreshTokens).toEqual([]);
+	});
+
+	test("does not re-import the same rejected Codex credential generation", async () => {
+		const harness = createHarness({});
+		await harness.emitDisabled();
+		expect(await harness.recover("openai-codex")).toBe(true);
+
+		await harness.emitDisabled();
+		expect(await harness.recover("openai-codex")).toBe(false);
+		expect(harness.importedRefreshTokens).toEqual(["codex-refresh-1"]);
+
+		harness.replaceCandidate(
+			oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				source: "Codex CLI (test)",
+				credential: {
+					type: "oauth",
+					access: "codex-access-2",
+					refresh: "codex-refresh-2",
+					expires: Date.now() + 120_000,
+				},
+			}),
+		);
+		await harness.emitDisabled();
+		expect(await harness.recover("openai-codex")).toBe(true);
+		expect(harness.importedRefreshTokens).toEqual(["codex-refresh-1", "codex-refresh-2"]);
+	});
+
+	test("startup installs recovery before a resolved accepted marker skips discovery", async () => {
+		let disabledListener: ((event: { provider: string; disabledCause: string }) => void | Promise<void>) | undefined;
+		let recovery: ((provider: string) => Promise<boolean>) | undefined;
+		let discoveryReads = 0;
+		const importedProviders: string[] = [];
+		await runStartupCredentialAutoImportIfNeeded({
+			authStorage: {
+				onCredentialDisabled: listener => {
+					disabledListener = listener;
+					return () => {};
+				},
+				onGenerationChanged: () => () => {},
+				importCredentialIfAbsent: async provider => {
+					importedProviders.push(provider);
+					return inserted(provider);
+				},
+			},
+			modelRegistry: {
+				refresh: async () => {},
+				setCredentialRecovery: callback => {
+					recovery = callback;
+				},
+			},
+			stateStore: stateStore("accepted"),
+			discover: async () => {
+				discoveryReads += 1;
+				return discovery([
+					oauthCredential({
+						provider: "openai-codex",
+						origin: "codex-file",
+						source: "Codex CLI (test)",
+					}),
+				]);
+			},
+		});
+
+		expect(discoveryReads).toBe(0);
+		await disabledListener?.({
+			provider: "openai-codex",
+			disabledCause: "oauth refresh failed: invalid_grant",
+		});
+		expect(await recovery?.("openai-codex")).toBe(true);
+		expect(discoveryReads).toBe(1);
+		expect(importedProviders).toEqual(["openai-codex"]);
+	});
+
+	test("retries the failed live lookup with the newly imported Codex credential", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-codex-oauth-recovery-"));
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(path.join(agentDir, "agent.db"), {
+				refreshOAuthCredential: async () => {
+					throw new Error("401 invalid_grant");
+				},
+			});
+			await authStorage.importCredentialIfAbsent("openai-codex", {
+				type: "oauth",
+				access: "stale-access",
+				refresh: "stale-refresh",
+				expires: Date.now() - 1,
+			});
+			const registry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"));
+			let discoveryReads = 0;
+			registry.setCredentialRecovery(
+				createAcceptedExternalCredentialRecovery({
+					authStorage,
+					modelRegistry: registry,
+					stateStore: stateStore("accepted"),
+					discover: async () => {
+						discoveryReads += 1;
+						return discovery([
+							oauthCredential({
+								provider: "openai-codex",
+								origin: "codex-file",
+								source: "Codex CLI (test)",
+								credential: {
+									type: "oauth",
+									access: "fresh-access",
+									refresh: "fresh-refresh",
+									expires: Date.now() + 10 * 60_000,
+								},
+								expiresAt: Date.now() + 10 * 60_000,
+							}),
+						]);
+					},
+				}),
+			);
+
+			expect(await registry.getApiKeyForProvider("openai-codex")).toBe("fresh-access");
+			expect(discoveryReads).toBe(1);
+
+			await authStorage.remove("openai-codex");
+			expect(await registry.getApiKeyForProvider("openai-codex")).toBeUndefined();
+			expect(discoveryReads).toBe(1);
+		} finally {
+			authStorage?.close();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
 	});
 });
 
