@@ -395,7 +395,7 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("Hello from file URL");
 		});
 
-		it("should truncate files exceeding line limit", async () => {
+		it("truncates files exceeding the line limit to the tail by default", async () => {
 			const testFile = path.join(testDir, "large.txt");
 			const lines = Array.from({ length: 3500 }, (_, i) => `Line ${i + 1}`);
 			fs.writeFileSync(testFile, lines.join("\n"));
@@ -404,13 +404,15 @@ describe("Coding Agent Tools", () => {
 			const result = await readTool.execute("test-call-3", { path: testFile });
 			const output = getTextOutput(result);
 
-			expect(output).toContain("Line 1");
-			expect(output).toContain(`Line ${defaultLimit}`);
-			expect(output).not.toContain(`Line ${defaultLimit + 1}`);
-			expect(output).toContain(`[Showing lines 1-${defaultLimit} of 3500. Use :${defaultLimit + 1} to continue]`);
+			// The default direction is `last`, so a bare read keeps the end of the file.
+			const firstKept = 3500 - defaultLimit + 1;
+			expect(output).toContain(`Line ${firstKept}`);
+			expect(output).toContain("Line 3500");
+			expect(output).not.toContain(`Line ${firstKept - 1}\n`);
+			expect(output).toContain(`[Showing last ${defaultLimit} of 3500 lines`);
 		});
 
-		it("should truncate when byte limit exceeded", async () => {
+		it("truncates to the tail when the byte limit is exceeded", async () => {
 			const testFile = path.join(testDir, "large-bytes.txt");
 			// Create file with long lines so the byte budget triggers before the line limit.
 			const lines = Array.from({ length: 1000 }, (_, i) => `Line ${i + 1}: ${"x".repeat(600)}`);
@@ -419,9 +421,10 @@ describe("Coding Agent Tools", () => {
 			const result = await readTool.execute("test-call-4", { path: testFile });
 			const output = getTextOutput(result);
 
-			expect(output).toContain("Line 1:");
-			// Should show byte limit message
-			expect(output).toMatch(/\[Showing lines 1-\d+ of 1000 \(\d+(\.\d+)?\s*KB limit\)\. Use :\d+ to continue\]/);
+			// Byte budget trips before the line budget; the tail is retained.
+			expect(output).toContain("Line 1000:");
+			expect(output).not.toContain("Line 1:");
+			expect(output).toMatch(/\[Showing last \d+ of 1000 lines/);
 		});
 
 		it("should handle offset parameter (with leading context expansion)", async () => {

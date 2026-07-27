@@ -1536,7 +1536,7 @@
 			"properties": {
 				"defaultLimit": {
 					"type": "number",
-					"description": "Default number of lines returned when agent calls read without a limit",
+					"description": "Default collection/selection limit for read operations; bare local receipts use the separate 50-line / 10 KiB receipt budgets",
 					"default": 300
 				},
 				"receiptBudgetLines": {
@@ -1548,6 +1548,16 @@
 					"type": "number",
 					"description": "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
 					"default": 10
+				},
+				"truncation": {
+					"type": "string",
+					"enum": [
+						"head",
+						"last",
+						"both"
+					],
+					"description": "Configured default direction for routes that support directional truncation; bare local and archive reads use this value (factory default: last), while explicit truncation always wins",
+					"default": "last"
 				},
 				"summaryMaxBytes": {
 					"type": "number",

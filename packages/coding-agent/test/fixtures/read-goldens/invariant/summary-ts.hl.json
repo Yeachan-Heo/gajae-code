@@ -1,0 +1,14 @@
+{
+  "text": "1ls-84rk|export function readGoldensSummaryFixture(input: string): string { .. }\n\n[82 lines across 1 elided region; read {TMP}/summary.ts:raw or a line range like {TMP}/summary.ts:1-9999 for verbatim content]",
+  "displayContent": {
+    "text": "export function readGoldensSummaryFixture(input: string): string { .. }",
+    "startLine": 1
+  },
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/summary.ts"
+    }
+  }
+}

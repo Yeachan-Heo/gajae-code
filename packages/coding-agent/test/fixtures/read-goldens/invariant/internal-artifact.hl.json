@@ -1,0 +1,14 @@
+{
+  "text": "artifact fixture line 1\nartifact fixture line 2\nartifact fixture line 3\nartifact fixture line 4\nartifact fixture line 5\nartifact fixture line 6\nartifact fixture line 7\nartifact fixture line 8\nartifact fixture line 9\nartifact fixture line 10\nartifact fixture line 11\nartifact fixture line 12",
+  "displayContent": {
+    "text": "artifact fixture line 1\nartifact fixture line 2\nartifact fixture line 3\nartifact fixture line 4\nartifact fixture line 5\nartifact fixture line 6\nartifact fixture line 7\nartifact fixture line 8\nartifact fixture line 9\nartifact fixture line 10\nartifact fixture line 11\nartifact fixture line 12",
+    "startLine": 1
+  },
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "internal",
+      "value": "artifact://0"
+    }
+  }
+}

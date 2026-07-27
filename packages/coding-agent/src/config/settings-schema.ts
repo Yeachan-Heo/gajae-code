@@ -2054,7 +2054,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "editing",
 			label: "Default Read Limit",
-			description: "Default number of lines returned when agent calls read without a limit",
+			description:
+				"Default collection/selection limit for read operations; bare local receipts use the separate 50-line / 10 KiB receipt budgets",
 			options: [
 				{ value: "200", label: "200 lines" },
 				{ value: "300", label: "300 lines" },
@@ -2091,6 +2092,22 @@ export const SETTINGS_SCHEMA = {
 				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
 				{ value: "20", label: "20 KB", description: "~5K tokens" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+			],
+		},
+	},
+	"read.truncation": {
+		type: "enum",
+		values: ["head", "last", "both"] as const,
+		default: "last",
+		ui: {
+			tab: "editing",
+			label: "Read Truncation",
+			description:
+				"Configured default direction for routes that support directional truncation; bare local and archive reads use this value (factory default: last), while explicit truncation always wins",
+			options: [
+				{ value: "head", label: "Head", description: "Keep the first N lines" },
+				{ value: "last", label: "Last", description: "Keep the last N lines (default)" },
+				{ value: "both", label: "Both", description: "Keep the start and the end, elide the middle" },
 			],
 		},
 	},

@@ -56,6 +56,13 @@ describe("read-tool artifact spill (Finding 4)", () => {
 		expect(getDefault("tools.fileMentionInlineBytes")).toBe(10);
 	});
 
+	it("defaults read truncation to last for configs without the key", () => {
+		const settings = Settings.isolated();
+		expect(getDefault("read.truncation")).toBe("last");
+		expect(settings.has("read.truncation")).toBe(false);
+		expect(settings.get("read.truncation")).toBe("last");
+	});
+
 	let testDir: string;
 	let bigFile: string;
 	const fullBytes = 80 * 1024;

@@ -1,0 +1,14 @@
+{
+  "text": "poem-1\npoem-2\npoem-3\npoem-4\npoem-5\npoem-6\npoem-7\n\n[1 more lines in archive entry. Use :8 to continue]",
+  "displayContent": {
+    "text": "poem-1\npoem-2\npoem-3\npoem-4\npoem-5\npoem-6\npoem-7",
+    "startLine": 1
+  },
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/bundle.tar.gz"
+    }
+  }
+}

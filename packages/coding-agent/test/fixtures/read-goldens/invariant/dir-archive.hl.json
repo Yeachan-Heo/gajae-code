@@ -1,0 +1,11 @@
+{
+  "text": "docs/\nnested/\nroot.txt (12B)",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/bundle.tar.gz"
+    }
+  }
+}

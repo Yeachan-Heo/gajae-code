@@ -8,10 +8,12 @@ import {
 	formatTailTruncationNotice,
 	OutputSink,
 	TailBuffer,
+	truncateContent,
 	truncateHead,
 	truncateHeadBytes,
 	truncateLine,
 	truncateMiddle,
+	truncateMiddleWindows,
 	truncateTail,
 	truncateTailBytes,
 } from "../src/session/streaming-output";
@@ -557,6 +559,140 @@ describe("truncateMiddle", () => {
 	test("formatMiddleElisionMarker pluralises and formats bytes", () => {
 		expect(formatMiddleElisionMarker(1, 100)).toBe("[… 1 line elided (100B) …]");
 		expect(formatMiddleElisionMarker(123, 4096)).toBe("[… 123 lines elided (4.0KB) …]");
+	});
+});
+
+describe("truncateContent", () => {
+	test("defaults to head and preserves the head dispatcher result", () => {
+		const content = "first\nsecond\nthird";
+		const options = { maxLines: 2, maxBytes: 100 };
+		expect(truncateContent(content, options)).toEqual(truncateHead(content, options));
+		expect(truncateContent(content, { ...options, direction: "head" })).toEqual(truncateHead(content, options));
+	});
+
+	test("maps last and both to the existing tail and middle implementations", () => {
+		const content = "first\nsecond\nthird\nfourth";
+		const options = { maxLines: 3, maxBytes: 100, maxHeadLines: 1, maxHeadBytes: 20 };
+		expect(truncateContent(content, { ...options, direction: "last" })).toEqual(truncateTail(content, options));
+		expect(truncateContent(content, { ...options, direction: "both" })).toEqual(truncateMiddle(content, options));
+	});
+});
+
+describe("truncateMiddleWindows", () => {
+	test("classifies all four window kinds and reports actual ranges", () => {
+		expect(truncateMiddleWindows("a\nb", { maxLines: 10, maxBytes: 100 })).toEqual({
+			kind: "full",
+			head: {
+				kind: "lines",
+				content: "a\nb",
+				lines: 2,
+				bytes: 3,
+				origin: { startLine: 1, endLine: 2 },
+				lastLinePartial: false,
+			},
+			overlap: "disjoint",
+			elidedLines: 0,
+			elidedBytes: 0,
+			totalLines: 2,
+			totalBytes: 3,
+		});
+
+		const headOnly = truncateMiddleWindows("a\nb\nc\nd", {
+			maxLines: 2,
+			maxBytes: 100,
+			maxHeadLines: 2,
+		});
+		expect(headOnly.kind).toBe("head-only");
+		expect(headOnly.truncatedBy).toBe("lines");
+		expect(headOnly.head).toMatchObject({ content: "a\nb", lines: 2, origin: { startLine: 1, endLine: 2 } });
+
+		const tailOnly = truncateMiddleWindows("abcdef\nb\nc", {
+			maxLines: 10,
+			maxBytes: 5,
+			maxHeadBytes: 0,
+		});
+		expect(tailOnly.kind).toBe("tail-only");
+		expect(tailOnly.truncatedBy).toBe("bytes");
+
+		const giantFirstLine = truncateMiddleWindows(`${"x".repeat(200)}\nshort-2\nshort-3`, {
+			maxBytes: 40,
+			maxLines: 10,
+			maxHeadBytes: 8,
+			maxHeadLines: 1,
+		});
+		expect(giantFirstLine.kind).toBe("tail-only");
+		expect(giantFirstLine.truncatedBy).toBe("bytes");
+		expect(tailOnly.tail).toMatchObject({ content: "b\nc", lines: 2, origin: { startLine: 2, endLine: 3 } });
+
+		const middle = truncateMiddleWindows(`${"a".repeat(5)}\nb\nc\nd\ne\nf\ng`, {
+			maxLines: 10,
+			maxBytes: 12,
+		});
+		expect(middle.kind).toBe("middle");
+		expect(middle.truncatedBy).toBe("middle");
+		expect(middle.head).toMatchObject({ lines: 1, origin: { startLine: 1, endLine: 1 } });
+		expect(middle.tail).toMatchObject({ lines: 3, origin: { startLine: 5, endLine: 7 } });
+
+		expect(middle.head?.lines).not.toBe(Math.ceil(((middle.head?.lines ?? 0) + (middle.tail?.lines ?? 0)) / 2));
+
+		const overlap = truncateMiddleWindows("a\nb\nc\nd", { maxLines: 4, maxBytes: 6 });
+		expect(overlap.kind).toBe("full");
+		expect(overlap.overlap).toBe("adjacent");
+	});
+
+	test("classifies disjoint and overlapping retained candidates", () => {
+		const disjoint = truncateMiddleWindows("a\nb\nc\nd\ne\nf", { maxLines: 4, maxBytes: 100 });
+		expect(disjoint.kind).toBe("middle");
+		expect(disjoint.overlap).toBe("disjoint");
+	});
+
+	test("records the full source line byte count for partial-line segments", () => {
+		const source = `short\n${"x".repeat(100)}`;
+		const window = truncateMiddleWindows(source, {
+			maxLines: 10,
+			maxBytes: 20,
+			maxHeadLines: 5,
+			maxHeadBytes: 10,
+		});
+		expect(window.kind).toBe("middle");
+		expect(window.tail).toMatchObject({
+			kind: "partial-line",
+			bytes: 10,
+			sourceLineBytes: 100,
+			origin: { startLine: 2, endLine: 2 },
+		});
+	});
+
+	test("keeps the historical truncateMiddle result shape and bytes", () => {
+		const content = "aa\nbb\ncc\ndd";
+		const options = { maxLines: 4, maxBytes: 7, maxHeadLines: 2, maxHeadBytes: 3 };
+		const result = truncateMiddle(content, options);
+		expect(result).toEqual({
+			content: "aa\n[… 2 lines elided (7B) …]\ndd",
+			truncated: true,
+			truncatedBy: "middle",
+			totalLines: 4,
+			totalBytes: 11,
+			outputLines: 3,
+			outputBytes: 35,
+			elidedLines: 2,
+			elidedBytes: 7,
+			lastLinePartial: false,
+			firstLineExceedsLimit: false,
+		});
+		expect(Object.keys(result)).toEqual([
+			"content",
+			"truncated",
+			"truncatedBy",
+			"totalLines",
+			"totalBytes",
+			"outputLines",
+			"outputBytes",
+			"elidedLines",
+			"elidedBytes",
+			"lastLinePartial",
+			"firstLineExceedsLimit",
+		]);
 	});
 });
 
