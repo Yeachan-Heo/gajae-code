@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
-import { calculateMemorySlope, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
+import { calculateMemorySlope, normalizeProcessTreeRss, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
 import {
 	type HotspotClassification,
 	hasProfilerSelfTimeEvidence,
@@ -291,6 +291,23 @@ describe("perf corpus schema + runner", () => {
 		);
 	});
 
+	test("normalizes partial process-table failures to unavailable endpoints", () => {
+		expect(normalizeProcessTreeRss(1_024, null)).toEqual({
+			baselineBytes: null,
+			postTeardownBytes: null,
+			sampler: "unavailable",
+		});
+		expect(normalizeProcessTreeRss(null, 2_048)).toEqual({
+			baselineBytes: null,
+			postTeardownBytes: null,
+			sampler: "unavailable",
+		});
+		expect(normalizeProcessTreeRss(1_024, 2_048)).toEqual({
+			baselineBytes: 1_024,
+			postTeardownBytes: 2_048,
+			sampler: "ps",
+		});
+	});
 	test("treats a missing process-table sampler as unavailable", () => {
 		const previousGitSha = process.env.GITHUB_SHA;
 		process.env.GITHUB_SHA = "a".repeat(40);

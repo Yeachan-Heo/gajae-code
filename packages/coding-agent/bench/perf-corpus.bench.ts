@@ -174,6 +174,19 @@ function processTreeRssBytes(): number | null {
 	for (const pid of descendants) total += rssByPid.get(pid) ?? 0;
 	return total > 0 ? total : null;
 }
+export function normalizeProcessTreeRss(
+	baselineBytes: number | null,
+	postTeardownBytes: number | null,
+): {
+	baselineBytes: number | null;
+	postTeardownBytes: number | null;
+	sampler: "ps" | "unavailable";
+} {
+	if (baselineBytes === null || postTeardownBytes === null) {
+		return { baselineBytes: null, postTeardownBytes: null, sampler: "unavailable" };
+	}
+	return { baselineBytes, postTeardownBytes, sampler: "ps" };
+}
 
 function buildMemoryFixture(
 	workload: MemoryWorkload,
@@ -207,6 +220,7 @@ function buildMemoryFixture(
 	gc?.();
 	const postTeardown = memorySample(startedAt);
 	const processTreePostTeardownRssBytes = processTreeRssBytes();
+	const processTree = normalizeProcessTreeRss(processTreeBaselineRssBytes, processTreePostTeardownRssBytes);
 	const baselineBytes = samples[0]?.rssBytes ?? null;
 	const peakBytes = Math.max(...samples.map(sample => sample.rssBytes));
 	const fixtureClass =
@@ -258,10 +272,9 @@ function buildMemoryFixture(
 			postTeardown,
 			rssSlopeBytesPerSecond: calculateMemorySlope(samples, "rssBytes"),
 			heapSlopeBytesPerSecond: calculateMemorySlope(samples, "heapUsedBytes"),
-			processTreeBaselineRssBytes,
-			processTreePostTeardownRssBytes,
-			processTreeSampler:
-				processTreeBaselineRssBytes === null || processTreePostTeardownRssBytes === null ? "unavailable" : "ps",
+			processTreeBaselineRssBytes: processTree.baselineBytes,
+			processTreePostTeardownRssBytes: processTree.postTeardownBytes,
+			processTreeSampler: processTree.sampler,
 		},
 	};
 }
