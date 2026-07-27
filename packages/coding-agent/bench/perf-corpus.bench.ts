@@ -266,12 +266,13 @@ export function buildMemoryFixture(
 		const elapsedSinceLastSample = performance.now() - startedAt - (samples.at(-1)?.elapsedMs ?? 0);
 		if (elapsedSinceLastSample >= sampleIntervalMs) samples.push(memorySample(startedAt));
 	}
+	const elapsedMs = performance.now() - startedAt;
+	if ((samples.at(-1)?.elapsedMs ?? 0) < elapsedMs) samples.push(memorySample(startedAt));
+	const slopeSamples = [...samples];
 	for (const sample of new Set(Object.values(highWaterSamples))) {
 		if (sample !== baselineSample && !samples.includes(sample)) samples.push(sample);
 	}
 	samples.sort((left, right) => left.elapsedMs - right.elapsedMs);
-	const elapsedMs = performance.now() - startedAt;
-	if ((samples.at(-1)?.elapsedMs ?? 0) < elapsedMs) samples.push(memorySample(startedAt));
 	const cpu = process.cpuUsage(cpuStart);
 	workload.teardown();
 	gc?.();
@@ -326,9 +327,10 @@ export function buildMemoryFixture(
 			operations,
 			operationsPerSecond: operations / Math.max(elapsedMs / 1_000, 1e-6),
 			samples,
+			slopeSamples,
 			postTeardown,
-			rssSlopeBytesPerSecond: calculateMemorySlope(samples, "rssBytes"),
-			heapSlopeBytesPerSecond: calculateMemorySlope(samples, "heapUsedBytes"),
+			rssSlopeBytesPerSecond: calculateMemorySlope(slopeSamples, "rssBytes"),
+			heapSlopeBytesPerSecond: calculateMemorySlope(slopeSamples, "heapUsedBytes"),
 			processTreeBaselineRssBytes: processTree.baselineBytes,
 			processTreePostTeardownRssBytes: processTree.postTeardownBytes,
 			processTreeSampler: processTree.sampler,

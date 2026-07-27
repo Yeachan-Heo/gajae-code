@@ -433,7 +433,7 @@ describe("perf corpus schema + runner", () => {
 		expect(calculateMemorySlope(growingSteadyState, "rssBytes")).toBe(100);
 		expect(calculateMemorySlope([sample(0, 100), sample(200, 200)], "rssBytes")).toBeNull();
 	});
-	test("rejects reported slopes that do not match the raw samples", () => {
+	test("rejects reported slopes that do not match periodic slope samples", () => {
 		const report = runPerfCorpusBenchmark();
 		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
 		const fixture = report.fixtures[fixtureIndex];
@@ -454,8 +454,18 @@ describe("perf corpus schema + runner", () => {
 			),
 		};
 		expect(validatePerfCorpusReport(tampered).errors).toContain(
-			`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond does not match samples`,
+			`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond does not match slope samples`,
 		);
+	});
+	test("keeps independently retained peaks out of slope evidence", () => {
+		const report = runPerfCorpusBenchmark();
+		for (const fixture of report.fixtures) {
+			const baseline = fixture.memoryBaseline;
+			if (!baseline) continue;
+			expect(baseline.slopeSamples.length).toBeLessThanOrEqual(baseline.samples.length);
+			expect(baseline.rssSlopeBytesPerSecond).toBe(calculateMemorySlope(baseline.slopeSamples, "rssBytes"));
+			expect(baseline.heapSlopeBytesPerSecond).toBe(calculateMemorySlope(baseline.slopeSamples, "heapUsedBytes"));
+		}
 	});
 	test("preserves stateful workload indices across sampling chunks", () => {
 		const workload = createMemoryBaselineWorkloads().find(candidate => candidate.surface === "shared-native");

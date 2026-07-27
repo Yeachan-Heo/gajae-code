@@ -108,6 +108,7 @@ export interface MemoryBaselineMetric {
 	operations: number;
 	operationsPerSecond: number;
 	samples: MemoryUsageSample[];
+	slopeSamples: MemoryUsageSample[];
 	postTeardown: MemoryUsageSample;
 	rssSlopeBytesPerSecond: number | null;
 	heapSlopeBytesPerSecond: number | null;
@@ -460,6 +461,10 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			if (!Array.isArray(baseline.samples) || baseline.samples.length < 2) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline requires at least two samples`);
 			}
+			if (!Array.isArray(baseline.slopeSamples) || baseline.slopeSamples.length < 2) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline requires at least two slope samples`);
+			}
+			const slopeSamples = Array.isArray(baseline.slopeSamples) ? baseline.slopeSamples : [];
 			const samples = Array.isArray(baseline.samples) ? baseline.samples : [];
 			for (const [index, sample] of [...samples, baseline.postTeardown].entries()) {
 				if (typeof sample !== "object" || sample === null) {
@@ -483,6 +488,11 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
 				}
 			}
+			for (const [index, sample] of slopeSamples.entries()) {
+				if (!isValidMemoryUsageSample(sample)) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline slope sample ${index} invalid`);
+				}
+			}
 			const samplesAreValid = samples.every(isValidMemoryUsageSample);
 			if (samplesAreValid) {
 				for (let index = 1; index < samples.length; index++) {
@@ -492,10 +502,19 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					}
 				}
 			}
+			const slopeSamplesAreValid = slopeSamples.every(isValidMemoryUsageSample);
+			if (slopeSamplesAreValid) {
+				for (let index = 1; index < slopeSamples.length; index++) {
+					if (slopeSamples[index].elapsedMs < slopeSamples[index - 1].elapsedMs) {
+						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline slope samples must be chronological`);
+						break;
+					}
+				}
+			}
 			if (
 				report.runner.profile === "soak" &&
-				samplesAreValid &&
-				(samples.at(-1)?.elapsedMs ?? 0) < (report.runner.durationTargetMs ?? 0)
+				slopeSamplesAreValid &&
+				(slopeSamples.at(-1)?.elapsedMs ?? 0) < (report.runner.durationTargetMs ?? 0)
 			) {
 				errors.push(`fixture ${fixture.fixtureId}: soak samples shorter than runner duration target`);
 			}
@@ -507,13 +526,13 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				if (value !== null && !Number.isFinite(value)) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
 				}
-				if (!samplesAreValid) continue;
-				const expected = calculateMemorySlope(samples, key);
+				if (!slopeSamplesAreValid) continue;
+				const expected = calculateMemorySlope(slopeSamples, key);
 				if (
 					(value === null) !== (expected === null) ||
 					(value !== null && expected !== null && Math.abs(value - expected) > Math.max(1e-9, Math.abs(expected) * 1e-12))
 				) {
-					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match samples`);
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match slope samples`);
 				}
 			}
 			const postTeardownIsValid = isValidMemoryUsageSample(baseline.postTeardown);
