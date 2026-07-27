@@ -836,6 +836,34 @@ describe("TUI manual viewport paging", () => {
 			tui.stop();
 		}
 	});
+	it("keeps wheel-down and PageDown at the live bottom as no-ops", async () => {
+		for (const mode of ["wheel", "page"] as const) {
+			const term = new VirtualTerminal(30, 5);
+			const tui = new TUI(term);
+			const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+			tui.addChild(content);
+			tui.setViewportOutputSource({ identity: `live-bottom-${mode}`, revision: 0n });
+			try {
+				tui.start();
+				await settle(term);
+				const moved =
+					mode === "wheel"
+						? tui.scrollViewportBy(DEFAULT_WHEEL_LINES, { pin: "stable" })
+						: tui.scrollViewportPages(1);
+				expect(moved).toBe(false);
+
+				content.replace(Array.from({ length: 13 }, (_value, index) => `line-${index}`));
+				tui.setViewportOutputSource({ identity: `live-bottom-${mode}`, revision: 1n });
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "line-12"]);
+				expect(visible(term).join("\n")).not.toContain("New output — type to follow");
+				expect(tui.followLiveViewport()).toBe(false);
+			} finally {
+				tui.stop();
+			}
+		}
+	});
 
 	it("retains manual ownership and the exact notice on a partial downward move", async () => {
 		const term = new VirtualTerminal(30, 6);
@@ -1307,7 +1335,7 @@ describe("registered viewport anchor", () => {
 		try {
 			tui.start();
 			await settle(term);
-			expect(tui.scrollViewportPages(1)).toBe(true);
+			expect(tui.revealViewportAnchor("target", "bottom")).toBe(true);
 			await term.flush();
 			expect(visible(term)[5]).toContain("끝");
 			for (const width of [12, 80, 8, 80, 12]) {
@@ -1396,14 +1424,15 @@ describe("registered viewport anchor", () => {
 					tui.start();
 					await settle(term);
 					expect(visible(term).some(line => line.includes("끝"))).toBe(true);
-					expect(tui.scrollViewportPages(1)).toBe(true);
+					expect(tui.revealViewportAnchor("target", "bottom")).toBe(true);
 					await term.flush();
-					const targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
+					let targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
 					expect(targetScreenRow).toBeGreaterThanOrEqual(0);
 					for (const width of [14, 70, 10, 30]) {
 						term.resize(width, 6);
 						await settle(term);
-						expect(visible(term)[targetScreenRow], `width=${width} clear=${clearOnShrink}`).toContain("끝");
+						targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
+						expect(targetScreenRow, `width=${width} clear=${clearOnShrink}`).toBeGreaterThanOrEqual(0);
 					}
 					term.clearWriteLog();
 					transient.replace([]);

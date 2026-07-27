@@ -528,40 +528,93 @@ describe("terminal detach handling", () => {
 			else Bun.env.GJC_TUI_IME_CURSOR = previousIme;
 		}
 	});
-	it("marks an auto-follow repaint write as fatal and recovers fresh on restart", async () => {
+	it("preserves manual follow intent when the repaint write fails and retries after restart", async () => {
 		const terminal = new DetachingTerminal();
 		const tui = new TUI(terminal);
 		const component = new MultiLineComponent(Array.from({ length: 30 }, (_value, index) => `line-${index}`));
 		tui.addChild(component);
+		tui.setViewportOutputSource({ identity: "transactional-follow", revision: 0n });
 
 		tui.start();
 		await settle();
 		expect(tui.terminalAvailable).toBe(true);
-
 		expect(tui.scrollViewportPages(-1)).toBe(true);
 		await settle();
+		tui.setViewportOutputSource({ identity: "transactional-follow", revision: 1n });
+		await settle();
 
-		// The next write — the auto-follow live repaint — is set to fail.
+		// The next write — the auto-follow live repaint — is set to fail before commit.
 		const writesBeforeFollow = terminal.writes.length;
 		terminal.setWriteFailureAt(writesBeforeFollow + 1);
-
 		expect(tui.scrollViewportPages(1)).toBe(false);
 		expect(tui.terminalAvailable).toBe(false);
 
-		// The failed one-shot transition already cleared manual ownership, so a second follow is a no-op.
 		const attemptsAfterFailure = terminal.attempts.length;
 		expect(tui.followLiveViewport()).toBe(false);
 		expect(terminal.attempts).toHaveLength(attemptsAfterFailure);
 
-		// stop/start recovery renders fresh content, not the stale manual frame.
+		// Restart paints the retained manual frame and notice; follow can then commit.
 		terminal.setWriteFailureAt(undefined);
-		component.setLines(Array.from({ length: 30 }, (_value, index) => `line-${index}`).concat("fresh-recovery"));
 		tui.stop();
-		const recoveryStart = terminal.writes.length;
+		const restartStart = terminal.writes.length;
 		tui.start();
 		await settle();
 		expect(tui.terminalAvailable).toBe(true);
+		expect(terminal.writes.slice(restartStart).join("")).toContain("New output — type to follow");
+		expect(tui.followLiveViewport()).toBe(true);
+		await settle();
+		expect(tui.followLiveViewport()).toBe(false);
+
+		component.setLines(Array.from({ length: 30 }, (_value, index) => `line-${index}`).concat("fresh-recovery"));
+		const recoveryStart = terminal.writes.length;
+		tui.requestRender();
+		await settle();
 		const recoveryFrame = terminal.writes.slice(recoveryStart).join("");
 		expect(recoveryFrame).toContain("fresh-recovery");
+		expect(recoveryFrame).not.toContain("New output — type to follow");
+	});
+	it("commits the follow-live transition before a later IME cursor write fails", async () => {
+		const previousIme = Bun.env.GJC_TUI_IME_CURSOR;
+		Bun.env.GJC_TUI_IME_CURSOR = "1";
+		const terminal = new DetachingTerminal();
+		const tui = new TUI(terminal, false);
+		const component = new MultiLineComponent(
+			Array.from({ length: 29 }, (_value, index) => `line-${index}`).concat(`${CURSOR_MARKER}line-29`),
+		);
+		tui.addChild(component);
+		tui.setViewportOutputSource({ identity: "cursor-follow", revision: 0n });
+		try {
+			tui.start();
+			await settle();
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await settle();
+			tui.setViewportOutputSource({ identity: "cursor-follow", revision: 1n });
+			await settle();
+
+			const committedWrites = terminal.writes.length;
+			terminal.setWriteFailureAt(committedWrites + 2);
+			expect(tui.scrollViewportPages(1)).toBe(false);
+			expect(terminal.writes).toHaveLength(committedWrites + 1);
+			expect(tui.terminalAvailable).toBe(false);
+			const attemptsAfterFailure = terminal.attempts.length;
+			expect(tui.followLiveViewport()).toBe(false);
+			expect(terminal.attempts).toHaveLength(attemptsAfterFailure);
+
+			tui.stop();
+			terminal.setWriteFailureAt(undefined);
+			component.setLines(
+				Array.from({ length: 29 }, (_value, index) => `fresh-${index}`).concat(`${CURSOR_MARKER}fresh-live`),
+			);
+			const recoveryStart = terminal.writes.length;
+			tui.start();
+			await settle();
+			const recoveryFrame = terminal.writes.slice(recoveryStart).join("");
+			expect(recoveryFrame).toContain("fresh-live");
+			expect(recoveryFrame).not.toContain("New output — type to follow");
+		} finally {
+			tui.stop();
+			if (previousIme === undefined) delete Bun.env.GJC_TUI_IME_CURSOR;
+			else Bun.env.GJC_TUI_IME_CURSOR = previousIme;
+		}
 	});
 });

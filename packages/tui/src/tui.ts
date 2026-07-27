@@ -929,7 +929,15 @@ export class TUI extends Container {
 		if (height <= 0 || width <= 0 || transcriptCapacity === 0 || this.#previousLines.length === 0 || frame === null)
 			return false;
 
-		const selectedRow = frame.anchors.findIndex(anchor => anchor?.id === id);
+		let selectedRow = frame.anchors.findIndex(anchor => anchor?.id === id);
+		if (alignment === "bottom") {
+			for (let row = frame.anchors.length - 1; row >= 0; row--) {
+				if (frame.anchors[row]?.id === id) {
+					selectedRow = row;
+					break;
+				}
+			}
+		}
 		const selected = selectedRow < 0 ? null : frame.anchors[selectedRow];
 		if (selected === null) return false;
 
@@ -938,8 +946,11 @@ export class TUI extends Container {
 		const targetViewportTop = Math.max(0, frame.startRow + selectedRow - desiredScreenRow);
 		this.#manualViewportAnchor = {
 			id: selected.id,
-			graphemeIndex: selected.graphemeStart,
-			cellOffset: selected.cellStart,
+			graphemeIndex:
+				alignment === "bottom"
+					? Math.max(selected.graphemeStart, selected.graphemeEnd - 1)
+					: selected.graphemeStart,
+			cellOffset: alignment === "bottom" ? Math.max(selected.cellStart, selected.cellEnd - 1) : selected.cellStart,
 			desiredScreenRow,
 		};
 		const firstCandidateRow = Math.max(0, targetViewportTop - frame.startRow);
@@ -994,14 +1005,12 @@ export class TUI extends Container {
 			currentViewportTop = Math.max(0, Math.min(maxViewportTop, resolvedViewportTop));
 		}
 		const targetViewportTop = Math.max(0, Math.min(maxViewportTop, currentViewportTop + delta));
-		// When manual ownership is active and a downward movement clamps to the
-		// true maximum transcript top for the current effective manual capacity,
-		// transition through the existing live-follow transaction instead of
-		// painting another manual frame. Wheel steps and PageDown reach this
-		// automatically; a partial downward movement falls through to the manual
-		// repaint below, and upward movement never follows.
-		if (this.#manualViewportTop !== undefined && direction > 0 && targetViewportTop === maxViewportTop) {
-			return this.followLiveViewport();
+		// Downward input at an already-live bottom is a no-op; it must not silently
+		// acquire manual ownership and freeze the next semantic output. Manual owners
+		// that reach the same boundary transition through the existing live transaction.
+		if (direction > 0 && targetViewportTop === maxViewportTop) {
+			if (this.#manualViewportTop === undefined && currentViewportTop === maxViewportTop) return false;
+			if (this.#manualViewportTop !== undefined) return this.followLiveViewport();
 		}
 		if (frame !== null) {
 			const desiredScreenRow =
@@ -1100,35 +1109,37 @@ export class TUI extends Container {
 			this.#manualSuffixLineCount,
 		);
 		const liveLines = paddedLiveLines.lines;
-		if (this.#lastCursorPosition !== null && this.#lastCursorPosition.row >= paddedLiveLines.insertionRow) {
-			this.#lastCursorPosition = {
-				...this.#lastCursorPosition,
-				row: this.#lastCursorPosition.row + paddedLiveLines.insertedBlankRows,
+		let liveCursorPosition = this.#lastCursorPosition;
+		if (liveCursorPosition !== null && liveCursorPosition.row >= paddedLiveLines.insertionRow) {
+			liveCursorPosition = {
+				...liveCursorPosition,
+				row: liveCursorPosition.row + paddedLiveLines.insertedBlankRows,
 			};
 		}
 		const liveViewportTop = Math.max(0, liveLines.length - height);
-		this.#manualViewportTop = undefined;
-		this.#manualViewportAnchor = null;
-		this.#manualViewportFallbackAnchors = [];
-		this.#reconcileMissingViewportAnchor = false;
-		this.#manualOutputNotice = false;
-		this.#committedTranscriptRows = [];
-		this.#paintedManualOutputNotice = false;
-		const repainted = this.#repaintViewportFromLines(
+		return this.#repaintViewportFromLines(
 			liveLines,
 			width,
 			height,
 			liveViewportTop,
-			this.#lastCursorPosition,
+			liveCursorPosition,
 			"manual viewport follow live",
 			false,
 			() => {
+				this.#manualViewportTop = undefined;
+				this.#manualViewportAnchor = null;
+				this.#manualViewportFallbackAnchors = [];
+				this.#reconcileMissingViewportAnchor = false;
+				this.#manualOutputNotice = false;
+				this.#committedTranscriptRows = [];
+				this.#paintedManualOutputNotice = false;
+				this.#lastCursorPosition = liveCursorPosition;
+				this.#previousLines = liveLines;
 				this.#scrollbackResumeViewportTop = undefined;
 				this.#nativeScrollbackViewportTop = liveViewportTop;
 			},
+			true,
 		);
-		if (repainted) this.#previousLines = liveLines;
-		return repainted;
 	}
 
 	/**
@@ -2535,11 +2546,13 @@ export class TUI extends Container {
 		reason: string,
 		allowPastLiveBottom = false,
 		onPainted?: () => void,
+		paintLive = false,
 	): boolean {
+		const paintManual = this.#manualViewportTop !== undefined && !paintLive;
 		if (height <= 0 || width <= 0) return false;
 		const maxViewportTop = Math.max(
 			0,
-			this.#manualViewportTop === undefined
+			!paintManual
 				? lines.length - (allowPastLiveBottom ? 1 : height)
 				: allowPastLiveBottom
 					? lines.length - 1
@@ -2553,12 +2566,8 @@ export class TUI extends Container {
 		}
 		buffer += "\r";
 
-		const transcriptCapacity =
-			this.#manualViewportTop === undefined ? height : this.#manualTranscriptCapacity(height);
-		const noticeRows =
-			this.#manualViewportTop !== undefined && this.#manualOutputNotice && height > this.#manualSuffixLineCount
-				? 1
-				: 0;
+		const transcriptCapacity = paintManual ? this.#manualTranscriptCapacity(height) : height;
+		const noticeRows = paintManual && this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
 		const committedTranscriptRows: Array<number | null> = [];
 		for (let screenRow = 0; screenRow < height; screenRow++) {
 			if (screenRow > 0) buffer += "\r\n";
@@ -2566,11 +2575,11 @@ export class TUI extends Container {
 			const lineIndex = nextViewportTop + screenRow;
 			const suffixRow = screenRow - transcriptCapacity - noticeRows;
 			const line =
-				this.#manualViewportTop !== undefined && screenRow === transcriptCapacity && noticeRows > 0
+				paintManual && screenRow === transcriptCapacity && noticeRows > 0
 					? "New output — type to follow"
-					: this.#manualViewportTop !== undefined && suffixRow >= 0
+					: paintManual && suffixRow >= 0
 						? (lines[this.#manualTranscriptLineCount + suffixRow] ?? "")
-						: this.#manualViewportTop !== undefined && lineIndex >= this.#manualTranscriptLineCount
+						: paintManual && lineIndex >= this.#manualTranscriptLineCount
 							? ""
 							: (lines[lineIndex] ?? "");
 			committedTranscriptRows.push(
