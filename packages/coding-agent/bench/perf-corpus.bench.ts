@@ -84,6 +84,33 @@ function measureRss(work: () => void): RssMemoryMetric {
 		heapReturnBytes,
 	};
 }
+export function gitWorktreeFingerprint(repositoryRoot: string): { dirty: boolean; fingerprint: string } {
+	const status = Bun.spawnSync(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+		cwd: repositoryRoot,
+	});
+	const diff = Bun.spawnSync(["git", "diff", "--binary", "HEAD", "--"], { cwd: repositoryRoot });
+	const untracked = Bun.spawnSync(["git", "ls-files", "--others", "--exclude-standard", "-z"], {
+		cwd: repositoryRoot,
+	});
+	if (status.exitCode !== 0 || diff.exitCode !== 0 || untracked.exitCode !== 0) {
+		throw new Error("git worktree fingerprint commands failed");
+	}
+	const hasher = new Bun.CryptoHasher("sha256");
+	hasher.update(status.stdout);
+	hasher.update(diff.stdout);
+	const untrackedPaths = new TextDecoder().decode(untracked.stdout).split("\0").filter(Boolean);
+	for (const untrackedPath of untrackedPaths) {
+		const contentHash = Bun.spawnSync(["git", "hash-object", "--", untrackedPath], { cwd: repositoryRoot });
+		if (contentHash.exitCode !== 0) throw new Error(`git hash-object failed for ${untrackedPath}`);
+		hasher.update(untrackedPath);
+		hasher.update(contentHash.stdout);
+	}
+	return {
+		dirty: status.stdout.length > 0,
+		fingerprint: hasher.digest("hex"),
+	};
+}
+
 function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerprint: string } {
 	const environmentSha = process.env.GITHUB_SHA?.trim();
 	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
@@ -93,11 +120,9 @@ function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerpr
 	try {
 		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
 		if (revision.exitCode === 0) sha = new TextDecoder().decode(revision.stdout).trim();
-		const status = Bun.spawnSync(["git", "status", "--porcelain"], { cwd: repositoryRoot });
-		if (status.exitCode === 0) {
-			worktreeFingerprint = new TextDecoder().decode(status.stdout);
-			dirty = worktreeFingerprint.trim().length > 0;
-		}
+		const worktree = gitWorktreeFingerprint(repositoryRoot);
+		worktreeFingerprint = worktree.fingerprint;
+		dirty = worktree.dirty;
 	} catch {
 		// The report records conservative dirty provenance when Git is unavailable.
 	}

@@ -1,8 +1,15 @@
 import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
+import * as path from "node:path";
 import { createTuiWorkload } from "../bench/memory-baseline-tui-child";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
-import { calculateMemorySlope, normalizeProcessTreeRss, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
+import {
+	calculateMemorySlope,
+	gitWorktreeFingerprint,
+	normalizeProcessTreeRss,
+	runPerfCorpusBenchmark,
+} from "../bench/perf-corpus.bench";
 import {
 	type HotspotClassification,
 	hasProfilerSelfTimeEvidence,
@@ -96,6 +103,37 @@ describe("perf corpus schema + runner", () => {
 			expect(runPerfCorpusBenchmark().gitSha).toBe(expectedSha);
 		} finally {
 			process.chdir(previousCwd);
+		}
+	});
+	test("fingerprints dirty file contents even when porcelain status is unchanged", async () => {
+		const repository = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-perf-fingerprint-"));
+		try {
+			const runGit = (args: string[]) => {
+				const result = Bun.spawnSync(["git", ...args], { cwd: repository });
+				if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			};
+			runGit(["init", "--quiet"]);
+			await Bun.write(path.join(repository, "tracked.txt"), "tracked\n");
+			runGit(["add", "tracked.txt"]);
+			runGit([
+				"-c",
+				"user.name=GJC Test",
+				"-c",
+				"user.email=gjc@example.invalid",
+				"commit",
+				"--quiet",
+				"-m",
+				"base",
+			]);
+			await Bun.write(path.join(repository, "untracked.txt"), "first\n");
+			const first = gitWorktreeFingerprint(repository);
+			await Bun.write(path.join(repository, "untracked.txt"), "second\n");
+			const second = gitWorktreeFingerprint(repository);
+			expect(first.dirty).toBe(true);
+			expect(second.dirty).toBe(true);
+			expect(second.fingerprint).not.toBe(first.fingerprint);
+		} finally {
+			await fs.rm(repository, { recursive: true, force: true });
 		}
 	});
 
