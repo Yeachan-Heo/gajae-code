@@ -3,6 +3,8 @@
 ## [Unreleased]
 ### Fixed
 
+- Align managed fallback abort-after-exhaustion expectations with #3257 ownership release: a subscriber abort at terminal `message_end` no longer expects a second `requestRunTerminal(cancelled)` because the logical-run owner is already cleared.
+- Python eval timeout annotations now prefer the caller-configured `timeoutMs` over remaining wall-clock budget so async setup cannot flake second formatting in CI.
 - Overflow maintenance now stops cleanly when no-op compaction would replay the same oversized request; the runtime status explains that `/clear` preserves the current session ID before retrying.
 - The `ask` tool no longer rejects a JSON-string-encoded single-sided Round 0 payload before coercion; only the retired contract+review pair stays terminal, so a provider that serializes `questions` as a string no longer drives the model into an unbounded retry loop.
 - Browser launch overrides (`PUPPETEER_EXECUTABLE_PATH`, `PUPPETEER_PROXY`, `PUPPETEER_PROXY_BYPASS_LOOPBACK`, `PUPPETEER_PROXY_IGNORE_CERT_ERRORS`) are now resolved from trusted environment sources only. `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` that chose the browser binary, routed every request through its own proxy, and disabled certificate validation. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); shell-level configuration is unchanged.
@@ -21,6 +23,8 @@
 - Added an isolated Bun memory-baseline corpus with short/soak profiles across CLI, AgentSession, blob buffers, workers, Telegram, TUI, and shared/native boundaries; reports keep RSS, heap, external buffers, process-tree endpoints, active resources, throughput, and teardown evidence separate and advisory until variance is characterized.
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - `/model`, `/login`, and `/provider` now order providers through one shared ranking: providers you already have (valid auth, in-flight validation, or a configured non-OAuth provider) come first, then providers whose stored credentials failed validation, then a curated list of well-known providers with regional and device variants grouped behind their primary, then everything else by display name. In `/model` rows, role/default rank and recent usage still take precedence over provider order (#3243).
+
+## [0.11.11] - 2026-07-26
 
 ### Added
 

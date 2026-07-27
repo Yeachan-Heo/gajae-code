@@ -1,11 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.11] - 2026-07-26
 ### Added
 
 - Added the `probeWindowsJobMemory` native API for advisory Windows Job Object memory-limit and usage snapshots.
-
-## [0.11.10] - 2026-07-25
 
 ## [0.11.8] - 2026-07-23
 ### Fixed

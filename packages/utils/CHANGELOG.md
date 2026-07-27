@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-07-26
+
 ### Fixed
 
 - Strict CLI commands now reject unexpected positional arguments with usage guidance instead of silently ignoring typos or unsupported trailing input; non-strict passthrough commands and variadic arguments retain their existing behavior (#3173).
@@ -9,15 +11,11 @@
 - The documented `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` environment variables now take effect for the spawn shell configuration, resolved GJC-first ahead of the legacy `PI_*` / `CLAUDE_*` aliases (previously only the legacy names were read, so the documented names were silent no-ops). Both now follow the canonical boolean-flag contract (`1`/`Y`/`TRUE`/`YES`/`ON`, case-insensitive) instead of any-non-empty-string, so `GJC_BASH_NO_CI=0` no longer suppresses `CI=true`. Adds `resetShellConfigCache()` for deterministic shell-config testing, and corrects `docs/environment-variables.md`, which advertised non-functional `ANTHROPIC_MODEL_*` aliases.
 - The shell command prefix (`PI_SHELL_PREFIX` / `CLAUDE_CODE_SHELL_PREFIX`) is now resolved from trusted sources only. `$env` merges the caller's `cwd/.env`, so a repository could previously plant a `.env` that set the prefix, which the bash executor interpolates ahead of every command (`${prefix} ${command}`) and runs through the shell — arbitrary command execution from repository content. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files), matching how provider credentials are resolved; user-level configuration is unchanged.
 
-## [0.11.10] - 2026-07-25
-
 ## [0.11.9] - 2026-07-24
 
 ### Fixed
 
 - Fatal crashes (`uncaughtException` / `unhandledRejection`) are now also persisted to a dedicated, append-only crash log (`~/.gjc/agent/gjc-crash.log`) before any stderr output, and the fatal handler prints the crash-log path. The daily logger file is gzip-archived independently by every gjc process at date rollover; that shared-archive race can truncate a day's log to an empty `.gz` and destroy the `logger.error` crash record, leaving crashes undiagnosable. The rotation-immune crash log is capped at 512 KB, bounds every individual record (UTF-8-safe truncation with a marker), scrubs credential material (bearer/auth headers, key=value credential fields, and well-known vendor token shapes) before persisting, and enforces owner-only file permissions.
-
-## [0.11.8] - 2026-07-23
 
 ## [0.11.7] - 2026-07-22
 ### Added

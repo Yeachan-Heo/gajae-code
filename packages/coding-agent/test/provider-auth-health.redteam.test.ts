@@ -176,7 +176,7 @@ describe("provider auth health state attacks", () => {
 		}
 
 		expect(Reflect.ownKeys(Object.prototype)).toEqual(objectPrototypeKeysBefore);
-		expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
 		expect(Object.prototype.constructor).toBe(Object);
 		expect(typeof Object.prototype.toString).toBe("function");
 
