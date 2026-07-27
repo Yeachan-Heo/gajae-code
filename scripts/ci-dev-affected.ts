@@ -1493,6 +1493,8 @@ export interface AffectedAggregateResults {
 	python: string;
 	windowsDoctor: string;
 	windowsDoctorRequired: string;
+	windowsNativeToolchain: string;
+	windowsNativeToolchainRequired: string;
 	telegramGuard: string;
 	telegramGuardRequired: string;
 	telegramWindows: string;
@@ -1514,6 +1516,8 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.python !== (results.hasPython === "true" ? "success" : "skipped")) throw new Error(results.hasPython === "true" ? "required Python matrix did not succeed" : "unplanned Python matrix was not skipped");
 	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
 	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
+	if (results.windowsNativeToolchainRequired !== "true" && results.windowsNativeToolchainRequired !== "false") throw new Error(`planner emitted invalid windows_native_toolchain_required=${results.windowsNativeToolchainRequired}`);
+	if (results.windowsNativeToolchain !== (results.windowsNativeToolchainRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsNativeToolchainRequired === "true" ? "required Windows native build toolchain check did not succeed" : "unplanned Windows native build toolchain check was not skipped");
 	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
 	if (results.darwinArm64TabWorkerSmoke !== (results.darwinArm64TabWorkerSmokeRequired === "true" ? "success" : "skipped")) throw new Error(results.darwinArm64TabWorkerSmokeRequired === "true" ? "required Darwin arm64 tab-worker smoke did not succeed" : "unplanned Darwin arm64 tab-worker smoke was not skipped");
 	if (results.telegramGuardRequired !== "true" && results.telegramGuardRequired !== "false") throw new Error(`planner emitted invalid telegram_guard_required=${results.telegramGuardRequired}`);
@@ -1530,6 +1534,8 @@ async function validateAggregate(): Promise<void> {
 		python: Bun.env.CI_DEV_PYTHON_RESULT?.trim() || "",
 		windowsDoctor: Bun.env.CI_DEV_WINDOWS_DOCTOR_RESULT?.trim() || "",
 		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
+		windowsNativeToolchain: Bun.env.CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_RESULT?.trim() || "",
+		windowsNativeToolchainRequired: Bun.env.CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_REQUIRED?.trim() || "",
 		telegramGuard: Bun.env.CI_DEV_TELEGRAM_GUARD_RESULT?.trim() || "",
 		telegramGuardRequired: Bun.env.CI_DEV_TELEGRAM_GUARD_REQUIRED?.trim() || "",
 		telegramWindows: Bun.env.CI_DEV_TELEGRAM_WINDOWS_RESULT?.trim() || "",
@@ -1551,6 +1557,8 @@ async function validateAggregate(): Promise<void> {
 	console.log(`planned Python work: ${results.hasPython}`);
 	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
 	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
+	console.log(`windows-native-build-toolchain: ${results.windowsNativeToolchain}`);
+	console.log(`planned Windows native build toolchain: ${results.windowsNativeToolchainRequired}`);
 	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
 	console.log(`planned Darwin arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmokeRequired}`);
 	console.log(`telegram-daemon-generation: ${results.telegramGuard}`);
@@ -1643,6 +1651,8 @@ function aggregateFromEnv(): AffectedAggregateResults {
 		python: requiredEnv("CI_DEV_PYTHON_RESULT"),
 		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
 		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
+		windowsNativeToolchain: requiredEnv("CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_RESULT"),
+		windowsNativeToolchainRequired: requiredEnv("CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_REQUIRED"),
 		telegramGuard: requiredEnv("CI_DEV_TELEGRAM_GUARD_RESULT"),
 		telegramGuardRequired: requiredEnv("CI_DEV_TELEGRAM_GUARD_REQUIRED"),
 		telegramWindows: requiredEnv("CI_DEV_TELEGRAM_WINDOWS_RESULT"),
@@ -1665,6 +1675,8 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 			"windowsDoctor",
 			"python",
 			"windowsDoctorRequired",
+			"windowsNativeToolchain",
+			"windowsNativeToolchainRequired",
 			"telegramGuard",
 			"telegramGuardRequired",
 			"telegramWindows",
@@ -1685,6 +1697,8 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 		python: value.python as string,
 		windowsDoctor: value.windowsDoctor as string,
 		windowsDoctorRequired: value.windowsDoctorRequired as string,
+		windowsNativeToolchain: value.windowsNativeToolchain as string,
+		windowsNativeToolchainRequired: value.windowsNativeToolchainRequired as string,
 		telegramGuard: value.telegramGuard as string,
 		telegramGuardRequired: value.telegramGuardRequired as string,
 		telegramWindows: value.telegramWindows as string,
