@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { MouseEvent } from "@gajae-code/tui";
+import { Container, type MouseEvent, Text, TUI } from "@gajae-code/tui";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { SessionObserverOverlayComponent } from "../src/modes/components/session-observer-overlay";
 import { type TranscriptViewerEntry, TranscriptViewerOverlay } from "../src/modes/components/transcript-viewer-overlay";
 import { InputController } from "../src/modes/controllers/input-controller";
@@ -238,6 +239,69 @@ describe("G002 WS1 red-team: observer adapter parity", () => {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
+});
+
+it("renders observer transcript entries in a constrained sticky TUI overlay after manual history navigation", async () => {
+	const priorRows = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+	Object.defineProperty(process.stdout, "rows", { configurable: true, value: 10 });
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "g002-observer-tui-"));
+	try {
+		const file = sessionFile(
+			dir,
+			"overlay",
+			Array.from({ length: 24 }, (_, index) =>
+				message(`u${index}`, {
+					role: "user",
+					content: `observer transcript entry ${index}`,
+					timestamp: Date.now(),
+				}),
+			),
+		);
+		const overlay = new SessionObserverOverlayComponent(observerRegistry([
+			{
+				id: "overlay",
+				kind: "subagent",
+				label: "Overlay Agent",
+				status: "active",
+				sessionFile: file,
+				lastUpdate: 1,
+			},
+		]), () => {}, ["ctrl+s"]);
+		const transcript = new Container();
+		for (let index = 0; index < 20; index++) transcript.addChild(new Text(`main transcript ${index}`, 0, 0));
+		const status = new Text("status: pinned", 0, 0);
+		const editor = new Text("> editor: pinned", 0, 0);
+		const terminal = new VirtualTerminal(80, 10, { isProcessTerminal: true });
+		const tui = new TUI(terminal);
+		try {
+			tui.addChild(transcript);
+			tui.setViewportAnchorComponent(transcript);
+			tui.addChild(status);
+			tui.addChild(editor);
+			tui.setBottomPinnedComponent(status);
+			tui.setViewportOutputSource({ identity: "observer-subagent-view", revision: 0n });
+			tui.start();
+			await terminal.waitForRender();
+			expect(tui.scrollViewportBy(-3, { pin: "stable" })).toBe(true);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			tui.scrollViewportBy(10_000, { pin: "edge" });
+			tui.showOverlay(overlay, { anchor: "bottom-center", width: "100%", maxHeight: "100%", margin: 0 });
+			tui.setFocus(overlay);
+			await terminal.waitForRender();
+			expect(terminal.getViewport().join("\n")).toContain("observer transcript entry 23");
+
+			overlay.handleInput("\x1b[5~");
+			tui.requestRender();
+			await terminal.waitForRender();
+			expect(terminal.getViewport().join("\n")).toContain("observer transcript entry");
+		} finally {
+			tui.stop();
+		}
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+		if (priorRows) Object.defineProperty(process.stdout, "rows", priorRows);
+		else delete (process.stdout as { rows?: number }).rows;
+	}
 });
 
 it("preserves tool arguments, intent, empty errors, thinking caps, paging, and observer chrome", () => {

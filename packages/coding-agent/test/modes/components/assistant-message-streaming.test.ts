@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { Container, Spacer, Text } from "@gajae-code/tui";
 import {
@@ -327,5 +327,91 @@ describe("AssistantMessageComponent streaming markdown", () => {
 		const fresh = new AssistantMessageComponent(message([{ type: "text", text: block.text }], stopReason));
 		expect(finalized).toContain("late");
 		expect(finalized).toBe(render(fresh));
+	});
+
+	it("only revises streaming finalization when it can alter rendered Markdown", () => {
+		const visibleTextMutation = vi.fn();
+		const visibleText = new AssistantMessageComponent(
+			message([{ type: "text", text: "visible text" }]),
+			false,
+			undefined,
+			undefined,
+			visibleTextMutation,
+		);
+		visibleText.updateContent(message([{ type: "text", text: "visible text" }]), { streaming: true });
+		visibleTextMutation.mockClear();
+		visibleText.updateContent(message([{ type: "text", text: "visible text" }]), { streaming: false });
+		expect(visibleTextMutation).toHaveBeenCalledTimes(1);
+
+		const visibleThinkingMutation = vi.fn();
+		const visibleThinking = new AssistantMessageComponent(
+			message([{ type: "thinking", thinking: "visible thinking" }]),
+			false,
+			undefined,
+			undefined,
+			visibleThinkingMutation,
+		);
+		visibleThinking.updateContent(message([{ type: "thinking", thinking: "visible thinking" }]), { streaming: true });
+		visibleThinkingMutation.mockClear();
+		visibleThinking.updateContent(message([{ type: "thinking", thinking: "visible thinking" }]), {
+			streaming: false,
+		});
+		expect(visibleThinkingMutation).toHaveBeenCalledTimes(1);
+
+		const hiddenThinkingMutation = vi.fn();
+		const hiddenThinking = new AssistantMessageComponent(
+			message([{ type: "thinking", thinking: "hidden thinking" }]),
+			true,
+			undefined,
+			undefined,
+			hiddenThinkingMutation,
+		);
+		hiddenThinking.updateContent(message([{ type: "thinking", thinking: "hidden thinking" }]), { streaming: true });
+		hiddenThinkingMutation.mockClear();
+		hiddenThinking.updateContent(message([{ type: "thinking", thinking: "hidden thinking" }]), { streaming: false });
+		expect(hiddenThinkingMutation).not.toHaveBeenCalled();
+	});
+	it("suppresses terminal errors and visible revisions for tool-call assistants", () => {
+		let visibleMutations = 0;
+		const component = new AssistantMessageComponent(
+			message([
+				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "x" } },
+			] as AssistantMessage["content"]),
+			false,
+			undefined,
+			undefined,
+			() => visibleMutations++,
+		);
+		component.updateContent(
+			{
+				...message(
+					[
+						{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "x" } },
+					] as AssistantMessage["content"],
+					"error",
+				),
+				errorMessage: "tool failed",
+			},
+			{ streaming: false },
+		);
+
+		expect(render(component)).not.toContain("Error:");
+		expect(visibleMutations).toBe(0);
+	});
+
+	it("does not revise identical tool-result images", () => {
+		let visibleMutations = 0;
+		const component = new AssistantMessageComponent(
+			message([{ type: "text", text: "result" }]),
+			false,
+			undefined,
+			undefined,
+			() => visibleMutations++,
+		);
+		const images = [{ type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" }];
+		component.setToolResultImages("read-1", images);
+		expect(visibleMutations).toBe(1);
+		component.setToolResultImages("read-1", images);
+		expect(visibleMutations).toBe(1);
 	});
 });

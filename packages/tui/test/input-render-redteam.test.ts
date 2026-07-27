@@ -1,7 +1,8 @@
 // MUST be first: pins terminal-capability env before @gajae-code/tui evaluates.
 import "./render-goldens-env";
 import { describe, expect, it } from "bun:test";
-import { type Component, Editor, Text, TUI } from "@gajae-code/tui";
+import { type Component, Editor, type MouseEvent, Text, TUI } from "@gajae-code/tui";
+import type { Terminal, TerminalAppearance } from "@gajae-code/tui/terminal";
 import { defaultEditorTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -28,6 +29,109 @@ class MutableTranscript implements Component {
 	}
 }
 
+class FocusProbe implements Component {
+	input: string[] = [];
+	mouse: string[] = [];
+	focused = false;
+
+	constructor(readonly label: string) {}
+
+	invalidate(): void {}
+
+	render(): string[] {
+		return [this.label];
+	}
+
+	handleInput(data: string): void {
+		this.input.push(data);
+	}
+
+	handleMouse(event: MouseEvent): void {
+		this.mouse.push(event.kind);
+	}
+}
+
+class FaultingVirtualTerminal implements Terminal {
+	#available = true;
+	#writeFailureAt: number | undefined;
+	#writes = 0;
+
+	constructor(readonly terminal: VirtualTerminal) {}
+
+	setWriteFailureAt(writeFailureAt: number | undefined): void {
+		this.#writeFailureAt = writeFailureAt;
+		if (writeFailureAt === undefined) this.#available = true;
+	}
+
+	get writeCount(): number {
+		return this.#writes;
+	}
+
+	start(onInput: (data: string) => void, onResize: () => void): void {
+		this.terminal.start(onInput, onResize);
+	}
+
+	stop(): void {
+		this.terminal.stop();
+	}
+
+	drainInput(maxMs?: number, idleMs?: number): Promise<void> {
+		return this.terminal.drainInput(maxMs, idleMs);
+	}
+
+	write(data: string): void {
+		if (!this.#available || (this.#writeFailureAt !== undefined && this.#writes + 1 >= this.#writeFailureAt)) {
+			this.#available = false;
+			throw Object.assign(new Error("deterministic repaint failure"), { code: "EIO" });
+		}
+		this.#writes += 1;
+		this.terminal.write(data);
+	}
+
+	get available(): boolean {
+		return this.#available;
+	}
+
+	get columns(): number {
+		return this.terminal.columns;
+	}
+	get rows(): number {
+		return this.terminal.rows;
+	}
+	get kittyProtocolActive(): boolean {
+		return this.terminal.kittyProtocolActive;
+	}
+	get appearance(): TerminalAppearance | undefined {
+		return this.terminal.appearance;
+	}
+	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void {
+		this.terminal.onAppearanceChange(callback);
+	}
+	moveBy(lines: number): void {
+		this.write(lines > 0 ? `\x1b[${lines}B` : `\x1b[${-lines}A`);
+	}
+	hideCursor(): void {
+		this.write("\x1b[?25l");
+	}
+	showCursor(): void {
+		this.write("\x1b[?25h");
+	}
+	clearLine(): void {
+		this.write("\x1b[K");
+	}
+	clearFromCursor(): void {
+		this.write("\x1b[J");
+	}
+	clearScreen(): void {
+		this.write("\x1b[H\x1b[0J");
+	}
+	setTitle(title: string): void {
+		this.write(`\x1b]0;${title}\x07`);
+	}
+	setProgress(active: boolean): void {
+		this.write(active ? "\x1b]9;4;3\x07" : "\x1b]9;4;0;\x07");
+	}
+}
 interface Harness {
 	term: VirtualTerminal;
 	tui: TUI;
@@ -233,6 +337,49 @@ describe("keyboard input priority scheduler red-team", () => {
 			tui.stop();
 			if (previousIme === undefined) delete Bun.env.GJC_TUI_IME_CURSOR;
 			else Bun.env.GJC_TUI_IME_CURSOR = previousIme;
+		}
+	}, 30000);
+	it("isolates disposed focus from input while a failed repaint leaves its old pixels visible", async () => {
+		for (const removal of ["removeChild", "clear"] as const) {
+			const pixels = new VirtualTerminal(30, 4);
+			const term = new FaultingVirtualTerminal(pixels);
+			const tui = new TUI(term);
+			const disposed = new FocusProbe(`stale-${removal}`);
+			const safe = new FocusProbe(`safe-${removal}`);
+			tui.addChild(disposed);
+			if (removal === "removeChild") tui.addChild(safe);
+			tui.setFocus(disposed);
+			try {
+				tui.start();
+				await pixels.waitForRender();
+				expect(pixels.getViewport().join("\n")).toContain(disposed.label);
+
+				if (removal === "removeChild") tui.removeChild(disposed);
+				else tui.clear();
+				const failureAt = term.writeCount + 1;
+				term.setWriteFailureAt(failureAt);
+				tui.requestRender(true, `disposed.${removal}.repaint`);
+				await macro0();
+				expect(term.available).toBe(false);
+				expect(pixels.getViewport().join("\n")).toContain(disposed.label);
+
+				pixels.sendInput("orphan-key");
+				pixels.sendInput("\x1b[<0;1;1M");
+				expect(disposed.input).toEqual([]);
+				expect(disposed.mouse).toEqual([]);
+
+				term.setWriteFailureAt(undefined);
+				if (removal === "clear") tui.addChild(safe);
+				tui.start();
+				await pixels.waitForRender();
+				tui.setFocus(safe);
+				pixels.sendInput("safe-key");
+				pixels.sendInput("\x1b[<0;1;1M");
+				expect(safe.input).toEqual(["safe-key"]);
+				expect(safe.mouse).toEqual(["click"]);
+			} finally {
+				tui.stop();
+			}
 		}
 	}, 30000);
 });

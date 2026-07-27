@@ -114,6 +114,20 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(reconcile).toHaveBeenCalledTimes(1);
 	});
 
+	it("reports output revision changes while chrome-only editor reflow reports no output mutation", async () => {
+		await mode.init();
+		const report = vi.spyOn(mode.ui, "setViewportOutputSource");
+
+		mode.recordVisibleTranscriptMutation();
+		expect(report).toHaveBeenCalledTimes(1);
+		expect(report.mock.calls[0]?.[0]).toMatchObject({ revision: 1n });
+
+		report.mockClear();
+		mode.editor.setText("draft that changes editor chrome only");
+		mode.updateEditorChrome();
+		expect(report).not.toHaveBeenCalled();
+	});
+
 	it("renders an idle extension custom message through the real rebuild boundary", async () => {
 		let actions: ExtensionActions | undefined;
 		const extensionRunner = {
@@ -604,6 +618,19 @@ describe("InteractiveMode.setEditorComponent", () => {
 			);
 			expect(lines.join("\n")).not.toContain("Type your message...");
 		}
+	});
+
+	it("keeps the focused composer visible at constrained terminal height", async () => {
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+		forceTerminalSize(mode, 48, 3);
+		await mode.init();
+		mode.editor.focused = true;
+		mode.editor.setText("keep this focused draft visible");
+
+		const rendered = mode.ui.render(48).map(stripRenderControls);
+		expect(rendered.join("\n")).toContain("keep this focused draft visible");
+		expect(rendered.some(line => line.trimEnd().startsWith("╭"))).toBe(true);
+		expect(rendered.some(line => line.trimEnd().endsWith("╯"))).toBe(true);
 	});
 
 	it("keeps the default prompt prefix while reflecting shell modes in border color", () => {

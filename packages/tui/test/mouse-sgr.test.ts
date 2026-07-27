@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isSgrMouseSequence, StdinBuffer } from "../src/stdin-buffer";
-import { type Component, parseSgrMouseEvent, TUI } from "../src/tui";
+import { type Component, DEFAULT_WHEEL_LINES, parseSgrMouseEvent, TUI } from "../src/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
 describe("SGR mouse input", () => {
@@ -281,6 +281,82 @@ describe("SGR mouse input", () => {
 
 		expect(copied).toEqual(["表"]);
 		expect(copied[0]).not.toContain("\x1b");
+		tui.stop();
+	});
+	test("does not start or extend manual selection into pinned chrome", async () => {
+		const terminal = new VirtualTerminal(30, 5);
+		const copied: string[] = [];
+		const tui = new TUI(terminal, undefined, {
+			enableMouse: true,
+			copySelection: text => {
+				copied.push(text);
+			},
+		});
+		tui.addChild({
+			render: () => Array.from({ length: 10 }, (_value, index) => `line-${index}`),
+			invalidate: () => {},
+		});
+		const status: Component = { render: () => ["status"], invalidate: () => {} };
+		const editor: Component = { render: () => ["editor"], invalidate: () => {} };
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.start();
+		await terminal.waitForRender();
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await terminal.flush();
+
+		terminal.sendInput("\x1b[<0;1;4M");
+		terminal.sendInput("\x1b[<32;3;5M");
+		terminal.sendInput("\x1b[<0;3;5m");
+		await terminal.waitForRender();
+		expect(copied).toEqual([]);
+
+		terminal.clearWriteLog();
+		terminal.sendInput("\x1b[<0;1;4M");
+		terminal.sendInput("\x1b[<32;3;2M");
+		terminal.sendInput("\x1b[<0;3;2m");
+		await terminal.waitForRender();
+		expect(terminal.getWriteLog().join("")).not.toContain("\x1b[7m");
+		expect(copied).toEqual([]);
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;3;2M");
+		terminal.sendInput("\x1b[<32;3;5M");
+		terminal.sendInput("\x1b[<0;3;5m");
+		await terminal.waitForRender();
+		expect(copied).toHaveLength(1);
+		expect(copied[0]).not.toContain("status");
+		expect(copied[0]).not.toContain("editor");
+		tui.stop();
+	});
+	test("wheel notches scroll a few lines instead of a full page", async () => {
+		const terminal = new VirtualTerminal(30, 5);
+		const tui = new TUI(terminal, undefined, { enableMouse: true });
+		tui.addChild({
+			render: () => Array.from({ length: 12 }, (_value, index) => `line-${index}`),
+			invalidate: () => {},
+		});
+		tui.start();
+		await terminal.waitForRender();
+		expect(terminal.getViewport().map(line => line.trimEnd())).toEqual([
+			"line-7",
+			"line-8",
+			"line-9",
+			"line-10",
+			"line-11",
+		]);
+
+		terminal.sendInput("\x1b[<64;10;2M");
+		await terminal.flush();
+		expect(terminal.getViewport().map(line => line.trimEnd())).toEqual([
+			"line-4",
+			"line-5",
+			"line-6",
+			"line-7",
+			"line-8",
+		]);
+		expect(DEFAULT_WHEEL_LINES).toBe(3);
 		tui.stop();
 	});
 });

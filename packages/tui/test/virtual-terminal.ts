@@ -208,6 +208,60 @@ export class VirtualTerminal implements Terminal {
 	}
 
 	/**
+	 * Reconstruct the currently visible xterm buffer cells as ANSI. This deliberately
+	 * reads cells rather than replaying writes, so differential renders, erases, and
+	 * inverse colors are represented by their effective terminal state.
+	 */
+	getViewportAnsi(): string {
+		const buffer = this.xterm.buffer.active;
+		const paletteCode = (value: number, background: boolean): string => {
+			if (value < 8) return String((background ? 40 : 30) + value);
+			if (value < 16) return String((background ? 100 : 90) + value - 8);
+			return `${background ? 48 : 38};5;${value}`;
+		};
+		const rows: string[] = [];
+		for (let row = 0; row < this.xterm.rows; row += 1) {
+			const line = buffer.getLine(buffer.viewportY + row);
+			let current = "";
+			let output = "";
+			for (let column = 0; column < this.xterm.cols; column += 1) {
+				const cell = line?.getCell(column);
+				if (cell?.getWidth() === 0) continue;
+				const codes: string[] = [];
+				if (cell) {
+					if (cell.isBold()) codes.push("1");
+					if (cell.isDim()) codes.push("2");
+					if (cell.isItalic()) codes.push("3");
+					if (cell.isUnderline()) codes.push("4");
+					if (cell.isBlink()) codes.push("5");
+					if (cell.isInverse()) codes.push("7");
+					if (cell.isInvisible()) codes.push("8");
+					if (cell.isStrikethrough()) codes.push("9");
+					if (cell.isOverline()) codes.push("53");
+					for (const [background, rgb, palette, value] of [
+						[false, cell.isFgRGB(), cell.isFgPalette(), cell.getFgColor()],
+						[true, cell.isBgRGB(), cell.isBgPalette(), cell.getBgColor()],
+					] as const) {
+						if (rgb)
+							codes.push(
+								`${background ? 48 : 38};2;${(value >> 16) & 255};${(value >> 8) & 255};${value & 255}`,
+							);
+						else if (palette) codes.push(paletteCode(value, background));
+					}
+				}
+				const next = codes.join(";");
+				if (next !== current) {
+					output += next ? `\x1b[0m\x1b[${next}m` : "\x1b[0m";
+					current = next;
+				}
+				output += cell?.getChars() || " ";
+			}
+			rows.push(`${output}${current ? "\x1b[0m" : ""}`);
+		}
+		return `${rows.join("\n")}\n`;
+	}
+
+	/**
 	 * Get the entire scroll buffer
 	 */
 	getScrollBuffer(): string[] {

@@ -122,11 +122,15 @@ By default `#doRender` reuses the previous normalized off-screen prefix and only
 
 Set `PI_TUI_VIRTUAL_VIEWPORT=0` (or `false`) to opt out and restore the legacy path that normalizes/truncates and diffs the full rendered transcript every frame (`O(total lines)`). The fast path compares the off-screen raw prefix by raw value equality per line, which short-circuits to a fast reference check when components return stable string instances for unchanged lines; reused entries are deterministic normalizations of identical raw lines. Any width change, off-screen edit, forced render (`requestRender(true)`), or first frame transparently falls back to the full path. `PI_TUI_METRICS` exposes `lineCounts` gauges (`rendered`, `normalized`, `measured`, `diffed`, and `offscreenScan`) to observe the bound.
 
-### Manual transcript paging
+### Manual transcript scrolling and sticky composer
 
-`CustomEditor` routes `PageUp` and `PageDown` to `TUI.scrollViewportPages()` when autocomplete is not active. The TUI records semantic anchors for eligible transcript rows so a manually selected viewport can survive streaming updates, content contraction, and width-dependent reflow.
+`CustomEditor` routes `PageUp` and `PageDown` to `TUI.scrollViewportPages()` when autocomplete is not active. Page keys move by the visible transcript lane height minus one; SGR mouse-wheel input moves by `DEFAULT_WHEEL_LINES` (three rows). The TUI records semantic anchors for eligible transcript rows so a manually selected viewport can survive streaming updates, content contraction, and width-dependent reflow.
 
-Some rendered pages contain no semantic rows—for example, a page made entirely of tool output, transient panels, synthetic status content, or pinned chrome. Paging into such a page switches manual viewport ownership to the numeric row offset instead of rejecting the keypress. Paging back to eligible transcript content establishes a fresh semantic anchor. Ordinary composer input still calls `followLiveViewport()` and returns to the current output.
+While manual ownership is active, `statusLine` and every following direct child (hooks, editor, pet floor) remain fixed at the bottom. The transcript scrolls only in the remaining rows. If semantic output changes while the user is reviewing history, the TUI shows `New output — type to follow`; reflow and transient chrome changes do not trigger it. Ordinary composer input and paste preserve the existing policy: focus stays on the editor, then `followLiveViewport()` returns to current output before processing the input.
+
+Some rendered pages contain no semantic rows—for example, a page made entirely of tool output or transient panels. Paging into such a page switches manual viewport ownership to the numeric transcript offset instead of rejecting the keypress. Paging back to eligible transcript content establishes a fresh semantic anchor. Pinned chrome and the notice are outside transcript selection/copy coordinates. Under constrained height, the notice and decorative pet/low-priority rows are dropped before the focused editor and status content.
+
+Manual-era output remains authoritative in the application transcript but is not retroactively replayed into native terminal/tmux scrollback when following live. Later ordinary live output may naturally move current tail rows into host history.
 
 ## Resize handling
 

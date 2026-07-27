@@ -28,6 +28,8 @@ class StaticComponent implements Component {
 
 class DetachingTerminal implements Terminal {
 	#writes: string[] = [];
+	#attempts: string[] = [];
+
 	#available = true;
 	#writeFailureAt: number | undefined;
 	#hideCursorFails = false;
@@ -38,6 +40,10 @@ class DetachingTerminal implements Terminal {
 
 	get writes(): string[] {
 		return [...this.#writes];
+	}
+
+	get attempts(): string[] {
+		return [...this.#attempts];
 	}
 
 	setHideCursorFails(fails: boolean): void {
@@ -56,6 +62,8 @@ class DetachingTerminal implements Terminal {
 	async drainInput(_maxMs?: number, _idleMs?: number): Promise<void> {}
 
 	write(data: string): void {
+		this.#attempts.push(data);
+
 		if (!this.#available) {
 			throw Object.assign(new Error("pty is gone"), { code: "EIO" });
 		}
@@ -409,5 +417,98 @@ describe("terminal detach handling", () => {
 		expect(delivered).toHaveBeenCalledTimes(1);
 		expect(terminal.writes).toContain("pet-cleanup");
 		tui.stop();
+	});
+	it("commits neither frame nor frontier when the render-buffer write fails before an IME cursor write", async () => {
+		const previousIme = Bun.env.GJC_TUI_IME_CURSOR;
+		Bun.env.GJC_TUI_IME_CURSOR = "1";
+		const terminal = new DetachingTerminal();
+		const tui = new TUI(terminal, false);
+		const transcript = new StaticComponent("before");
+		const component = new StaticComponent(`${CURSOR_MARKER}draft`);
+		tui.addChild(transcript);
+		tui.addChild(component);
+		try {
+			tui.start();
+			await settle();
+			const committedWrites = terminal.writes.length;
+			transcript.setLine("after");
+			terminal.setWriteFailureAt(committedWrites + 1);
+			tui.requestRender(true, "failure.render-buffer");
+			await settle();
+
+			expect(terminal.attempts.at(-1)).toContain("after");
+			expect(terminal.writes).toHaveLength(committedWrites);
+			expect(tui.terminalAvailable).toBe(false);
+			const attemptsAfterFailure = terminal.attempts.length;
+			tui.requestRender(true, "failure.no-retry");
+			await settle();
+			expect(terminal.attempts).toHaveLength(attemptsAfterFailure);
+			// Recover the same TUI only after its transport is writable again; a new
+			// instance would not prove that the failed frame was discarded.
+			tui.stop();
+			terminal.setWriteFailureAt(undefined);
+			transcript.setLine("fresh-render-baseline");
+			component.setLine(`${CURSOR_MARKER}fresh-cursor-baseline`);
+			const recoveryStart = terminal.writes.length;
+			tui.start();
+			await settle();
+			const recoveryFrame = terminal.writes.slice(recoveryStart).join("");
+			expect(recoveryFrame).toContain("fresh-render-baseline");
+			expect(recoveryFrame).toContain("fresh-cursor-baseline");
+			expect(recoveryFrame).not.toContain("after");
+			expect(recoveryFrame).not.toContain("draft");
+		} finally {
+			tui.stop();
+			if (previousIme === undefined) delete Bun.env.GJC_TUI_IME_CURSOR;
+			else Bun.env.GJC_TUI_IME_CURSOR = previousIme;
+		}
+	});
+
+	it("commits the painted frame before a subsequent IME cursor write fails", async () => {
+		const previousIme = Bun.env.GJC_TUI_IME_CURSOR;
+		Bun.env.GJC_TUI_IME_CURSOR = "1";
+		const terminal = new DetachingTerminal();
+		const tui = new TUI(terminal, false);
+		const transcript = new StaticComponent("before");
+		const component = new StaticComponent(`${CURSOR_MARKER}draft`);
+		tui.addChild(transcript);
+		tui.addChild(component);
+		try {
+			tui.start();
+			await settle();
+			const committedWrites = terminal.writes.length;
+			transcript.setLine("after");
+			terminal.setWriteFailureAt(committedWrites + 2);
+			tui.requestRender(true, "failure.cursor");
+			await settle();
+
+			const paintIndex = terminal.attempts.findIndex(write => write.includes("after"));
+			expect(paintIndex).toBeGreaterThanOrEqual(0);
+			const paint = terminal.attempts[paintIndex]!;
+			const cursor = terminal.attempts[paintIndex + 1];
+			expect(cursor).toContain("\x1b[");
+			expect(terminal.writes).toContain(paint);
+			expect(tui.terminalAvailable).toBe(false);
+			const attemptsAfterFailure = terminal.attempts.length;
+			tui.requestRender(true, "failure.no-retry");
+			await settle();
+			expect(terminal.attempts).toHaveLength(attemptsAfterFailure);
+			tui.stop();
+			terminal.setWriteFailureAt(undefined);
+			transcript.setLine("fresh-cursor-recovery");
+			component.setLine(`${CURSOR_MARKER}fresh-cursor-baseline`);
+			const recoveryStart = terminal.writes.length;
+			tui.start();
+			await settle();
+			const recoveryFrame = terminal.writes.slice(recoveryStart).join("");
+			expect(recoveryFrame).toContain("fresh-cursor-recovery");
+			expect(recoveryFrame).toContain("fresh-cursor-baseline");
+			expect(recoveryFrame).not.toContain("after");
+			expect(recoveryFrame).not.toContain("draft");
+		} finally {
+			tui.stop();
+			if (previousIme === undefined) delete Bun.env.GJC_TUI_IME_CURSOR;
+			else Bun.env.GJC_TUI_IME_CURSOR = previousIme;
+		}
 	});
 });

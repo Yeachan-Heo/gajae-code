@@ -248,6 +248,8 @@ export interface InteractiveModeContext {
 	getAssistantViewportAnchorId?(message: AssistantMessage): string;
 	findLastAssistantMessage(): AssistantMessage | undefined;
 	extractAssistantText(message: AssistantMessage): string;
+	/** Records one semantic visible-transcript mutation for the sticky viewport. */
+	recordVisibleTranscriptMutation?(): void;
 	updateEditorTopBorder(): void;
 	updateEditorBorderColor(): void;
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void;

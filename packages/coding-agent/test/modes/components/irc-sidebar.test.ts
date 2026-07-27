@@ -411,3 +411,41 @@ describe("IrcSplitViewComponent", () => {
 		expect(second).toContain("\x1b[32m\x1b[4malice\x1b[24m\x1b[0m");
 	});
 });
+
+it("keeps a short anchored transcript visible after manual sidebar-history navigation in a pinned TUI frame", async () => {
+	const transcript = new Container();
+	const transcriptRow = new Text("short transcript remains visible", 0, 0);
+	transcript.addChild(transcriptRow);
+	transcript.setViewportAnchorSource(transcriptRow, { id: "short-transcript" });
+	const ledger = new IrcObservationLedger();
+	for (let index = 0; index < 40; index++) addRecord(ledger, `long sidebar history ${index}`, `history-${index}`);
+	const split = new IrcSplitViewComponent(transcript, ledger, sidebarTheme);
+	split.setVisible(true);
+	const status = new Text("status: pinned", 0, 0);
+	const editor = new Text("> editor: pinned", 0, 0);
+	const terminal = new VirtualTerminal(80, 10, { isProcessTerminal: true });
+	const tui = new TUI(terminal);
+	try {
+		tui.addChild(split);
+		tui.setViewportAnchorComponent(split);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.setViewportOutputSource({ identity: "irc-subagent-view", revision: 0n });
+		tui.start();
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("short transcript remains visible");
+
+		expect(tui.scrollViewportBy(-3, { pin: "stable" })).toBe(true);
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("status: pinned");
+		expect(terminal.getViewport().join("\n")).toContain("> editor: pinned");
+
+		tui.scrollViewportBy(10_000, { pin: "edge" });
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("short transcript remains visible");
+	} finally {
+		tui.stop();
+	}
+});

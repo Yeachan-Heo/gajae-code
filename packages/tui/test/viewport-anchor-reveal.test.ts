@@ -29,23 +29,73 @@ describe("TUI viewport anchor reveal", () => {
 		const term = new VirtualTerminal(30, 7);
 		const tui = new TUI(term);
 		const transcript = createTranscript();
+		const status = new Text("status", 0, 0);
+		const editor = new Text("editor", 0, 0);
 		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editor);
 		tui.setViewportAnchorComponent(transcript);
+		tui.setBottomPinnedComponent(status);
 		try {
 			tui.start();
 			await settle(term);
 
 			expect(tui.revealViewportAnchor("entry-10", "top")).toBe(true);
 			await settle(term);
-			expect(visible(term)[0]).toBe("entry-10");
+			expect(visible(term)).toEqual([
+				"entry-10",
+				"entry-11",
+				"entry-12",
+				"entry-13",
+				"entry-14",
+				"status",
+				"editor",
+			]);
 
 			expect(tui.revealViewportAnchor("entry-15", "center")).toBe(true);
 			await settle(term);
-			expect(visible(term)[Math.floor(term.rows / 2)]).toBe("entry-15");
+			expect(visible(term)).toEqual([
+				"entry-13",
+				"entry-14",
+				"entry-15",
+				"entry-16",
+				"entry-17",
+				"status",
+				"editor",
+			]);
 
 			expect(tui.revealViewportAnchor("entry-20", "bottom")).toBe(true);
 			await settle(term);
-			expect(visible(term)[term.rows - 1]).toBe("entry-20");
+			expect(visible(term)).toEqual([
+				"entry-16",
+				"entry-17",
+				"entry-18",
+				"entry-19",
+				"entry-20",
+				"status",
+				"editor",
+			]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("returns false when pinned chrome leaves no transcript lane", async () => {
+		const term = new VirtualTerminal(30, 2);
+		const tui = new TUI(term);
+		const transcript = createTranscript();
+		const status = new Text("status", 0, 0);
+		const editor = new Text("editor", 0, 0);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setViewportAnchorComponent(transcript);
+		tui.setBottomPinnedComponent(status);
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["status", "editor"]);
+			expect(tui.revealViewportAnchor("entry-10", "center")).toBe(false);
 		} finally {
 			tui.stop();
 		}

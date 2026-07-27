@@ -261,3 +261,50 @@ record both manifest counts as 108 plus CJK review results.
 
 No raw third-party design corpus, screenshot, or reference asset is stored by
 this workflow.
+
+## Sticky transcript viewport contract
+
+Live mode remains in natural terminal flow. Entering manual history makes the
+application-owned transcript lane scrollable while the status line and every
+later direct composer child are a fixed suffix at the bottom. PageUp/PageDown
+move by the transcript capacity; the wheel remains three rows. A focused editor
+keeps focus, and ordinary editor input or paste follows live before processing
+that input.
+
+Manual output has one bounded boolean indication, exactly **`New output — type
+to follow`**. It is not a count. New visible agent/tool/extension output may set
+it while manual; reflow, transient chrome, reconciliation, and user input may
+not. Following clears it only after a successful live repaint. Manual-era output
+is authoritative in the application transcript but is never retroactively
+replayed into native host scrollback; subsequent ordinary live output follows
+normal host behavior.
+
+The transcript is the only selectable coordinate space. Pinned status/composer
+chrome, notices, blank rows, and overlays never enter selection or copied text;
+CJK selection clamping remains directional and grapheme/cell aware. Under
+constrained height the notice drops first, then decorative pet and low-priority
+hooks. Focused editor/cursor, status, and normal hooks outrank those rows; zero
+transcript capacity is valid and must not corrupt cursor geometry.
+
+At narrow widths use ANSI-aware terminal-cell measurement. ASCII/no-color keeps
+textual state without SGR. Korean, Japanese, Chinese, and mixed CJK/Latin prose
+must wrap at semantic phrase boundaries, never through an action/status label or
+short identifier; a semantic CJK break is a visual-QA failure.
+
+### Sticky viewport deterministic visual QA
+
+`test/fixtures/tui/sticky-viewport-showcase.ts` is a fixed-clock, no-network,
+first-party harness that starts the production `TUI` over a `VirtualTerminal`.
+It constructs transcript, status, hooks, and the real composer as children,
+then drives the live/manual viewport path before capturing the terminal frame.
+Capture with `bun packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts
+--out .gjc/qa/sticky-viewport-<run>` and verify with the paired `--root` script.
+The immutable matrix has exactly 20 keys: `live-overflow`, `manual-history`,
+`manual-new-output`, `multiline-editor-hooks-pet`, `capacity-many`,
+`capacity-one`, `capacity-zero`, and `selection-boundary` at both 80x24 and
+120x36 Unicode/color; plus `manual-new-output/80x24/ascii-no-color`,
+`capacity-zero/48x10/ascii-no-color`,
+`multiline-editor-hooks-pet/48x10/unicode-color`, and
+`narrow-cjk/48x10/unicode-color`. Do not add or replace a manual-follow case.
+
+Each key has only `terminal.txt`, ANSI-preserving `terminal-ansi.txt`, `terminal.html`, and `metadata.json`; the manifest records SHA-256 and byte length. Per-key metadata binds immutable font/render assumptions and the ANSI-aware wrapping/truncation policy. `VirtualTerminal` reconstructs ANSI from visible xterm cells, including cell padding, palette/RGB colors, attributes, and inverse video; plain text is always the stripped reconstruction. The verifier owns an independent literal 20-key oracle and fails closed unless stripped ANSI equals text, `terminal.html` equals the exported canonical `ansiToHtml(terminal-ansi.txt)` byte-for-byte (including its complete document envelope and global CSS), HTML independently preserves the ANSI style-run text, every retained row has the exact `Bun.stringWidth` cell width (including trailing spaces), and `ansi_mode` agrees with required Unicode color SGR or ASCII/no-color output. Every metadata entry has exact CJK phrase-boundary metadata: the narrow-CJK key has only the three canonical boundaries in order and every other key has `[]`. Manual captures prove successful production wheel and PageUp paths and retain observable historical transcript-row evidence. It validates exact payload paths (no duplicates or traversal), immutable source/output revisions, state/status/suffix order, notice cardinality, capacity, actual mouse-copied transcript-only selection, composer, CJK, and provenance invariants. `review-input.json` binds the exact manifest digest, capture author/executor identity, acceptance/design versions, required artifacts, narrow-CJK boundaries, and deterministic host matrix. `--require-independent-review` requires an attestation with an exact root key set; exact per-key result and artifact-check key sets; exact defect `{ description, accepted }` keys with a trimmed, nonblank description; canonical trimmed reviewer identity distinct from both bound identities; the independent-terminal-reviewer role; fixture revision; expected and observed counts of 20; exact checked keys; accepted per-key artifact-check/notes results; accepted artifact/CJK/host decisions; bound digest; and final `accept`. Any malformed, incomplete, or extra attestation content fails closed.

@@ -3,7 +3,7 @@ import { Container, Text } from "@gajae-code/tui";
 import { InternalUrlRouter } from "../../internal-urls";
 import { getLanguageFromPath, theme } from "../../modes/theme/theme";
 import { splitPathAndSel } from "../../tools/path-utils";
-import { PREVIEW_LIMITS, shortenPath } from "../../tools/render-utils";
+import { PREVIEW_LIMITS, replaceTabs, shortenPath } from "../../tools/render-utils";
 import { renderCodeCell } from "../../tui";
 import type { ToolExecutionHandle } from "./tool-execution";
 
@@ -53,9 +53,16 @@ type ReadToolResultDetails = {
 	conflictCount?: number;
 };
 
-type ReadToolGroupOptions = {
-	showContentPreview?: boolean;
-};
+type ReadToolVisibleProjection = ReadonlyArray<{
+	path: string;
+	status: ReadEntry["status"];
+	correctedFrom?: string;
+	conflictCount?: number;
+	preview?: {
+		lines: readonly string[];
+		hiddenLineCount: number;
+	};
+}>;
 
 function getSuffixResolution(details: ReadToolResultDetails | undefined): ReadToolSuffixResolution | undefined {
 	if (typeof details?.suffixResolution?.from !== "string" || typeof details.suffixResolution.to !== "string") {
@@ -82,13 +89,16 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	#expanded = false;
 	#manuallyExpanded: boolean | undefined;
 	#showContentPreview: boolean;
+	#visibleTranscriptChanged = false;
+	#lastVisibleProjection: ReadToolVisibleProjection = [];
 
-	constructor(options: ReadToolGroupOptions = {}) {
+	constructor(options: { showContentPreview?: boolean } = {}) {
 		super();
 		this.#showContentPreview = options.showContentPreview ?? false;
 		this.#text = new Text("", 0, 0);
 		this.addChild(this.#text);
 		this.#updateDisplay();
+		this.#lastVisibleProjection = this.#visibleProjection();
 	}
 
 	updateArgs(args: ReadRenderArgs, toolCallId?: string): void {
@@ -102,7 +112,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		};
 		entry.path = rawPath;
 		this.#entries.set(toolCallId, entry);
-		this.#updateDisplay();
+		this.#updateDisplayAndNotify();
 	}
 
 	updateResult(
@@ -126,23 +136,20 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			typeof details?.conflictCount === "number" && details.conflictCount > 0 ? details.conflictCount : undefined;
 		entry.conflictCount = conflictCount;
 		entry.status = result.isError ? "error" : suffixResolution ? "warning" : "success";
-		// Store the text content for preview/expanded display
 		const textContent = result.content?.find(c => c.type === "text")?.text;
-		if (textContent !== undefined) {
-			entry.contentText = textContent;
-		}
-		this.#updateDisplay();
+		entry.contentText = textContent;
+		this.#updateDisplayAndNotify();
 	}
 
 	setArgsComplete(_toolCallId?: string): void {
-		this.#updateDisplay();
+		this.#updateDisplayAndNotify();
 	}
 
 	/** Applies automatic expansion unless this renderer instance has an explicit fold choice. */
 	setExpanded(expanded: boolean): void {
 		if (this.#manuallyExpanded !== undefined) return;
 		this.#expanded = expanded;
-		this.#updateDisplay();
+		this.#updateDisplayAndNotify();
 	}
 
 	/**
@@ -152,11 +159,72 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	setManuallyExpanded(expanded: boolean): void {
 		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
-		this.#updateDisplay();
+		this.#updateDisplayAndNotify();
 	}
 
 	getComponent(): Component {
 		return this;
+	}
+
+	consumeVisibleTranscriptChange(): boolean {
+		const changed = this.#visibleTranscriptChanged;
+		this.#visibleTranscriptChanged = false;
+		return changed;
+	}
+
+	#visibleProjection(): ReadToolVisibleProjection {
+		return [...this.#entries.values()].map(entry => {
+			if (!this.#shouldRenderPreview(entry)) {
+				return {
+					path: entry.path,
+					status: entry.status,
+					correctedFrom: entry.correctedFrom,
+					conflictCount: entry.conflictCount,
+				};
+			}
+			const lines = replaceTabs(entry.contentText ?? "")
+				.split(/\r?\n/)
+				.map(line => line.slice(line.lastIndexOf("\r") + 1));
+			const visibleLineCount = this.#expanded ? lines.length : Math.min(lines.length, COLLAPSED_PREVIEW_LINES);
+			return {
+				path: entry.path,
+				status: entry.status,
+				correctedFrom: entry.correctedFrom,
+				preview: {
+					lines: lines.slice(0, visibleLineCount),
+					hiddenLineCount: lines.length - visibleLineCount,
+				},
+			};
+		});
+	}
+
+	#sameVisibleProjection(left: ReadToolVisibleProjection, right: ReadToolVisibleProjection): boolean {
+		if (left.length !== right.length) return false;
+		return left.every((entry, index) => {
+			const other = right[index];
+			if (
+				!other ||
+				entry.path !== other.path ||
+				entry.status !== other.status ||
+				entry.correctedFrom !== other.correctedFrom ||
+				(!entry.preview && entry.conflictCount !== other.conflictCount)
+			)
+				return false;
+			if (!entry.preview || !other.preview) return entry.preview === other.preview;
+			return (
+				entry.preview.hiddenLineCount === other.preview.hiddenLineCount &&
+				entry.preview.lines.length === other.preview.lines.length &&
+				entry.preview.lines.every((line, lineIndex) => line === other.preview!.lines[lineIndex])
+			);
+		});
+	}
+
+	#updateDisplayAndNotify(): void {
+		this.#updateDisplay();
+		const after = this.#visibleProjection();
+		if (this.#sameVisibleProjection(after, this.#lastVisibleProjection)) return;
+		this.#lastVisibleProjection = after;
+		this.#visibleTranscriptChanged = true;
 	}
 
 	#updateDisplay(): void {

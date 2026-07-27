@@ -1,6 +1,12 @@
 # Changelog
 
 ## [Unreleased]
+
+### Changed
+
+- Mouse wheel scrolling now moves the session viewport by exactly three lines (`DEFAULT_WHEEL_LINES = 3`) instead of a full page. PageUp/PageDown keep page-sized steps with edge pinning.
+- Manual transcript scrolling now keeps a valid registered status/composer boundary fixed at the bottom independently of output-source registration. Output sources control only the exact semantic new-output notice; transcript selection excludes pinned chrome, short transcript lanes emit blanks instead of duplicating suffix rows, and constrained heights retain the focused suffix component before decorative rows.
+
 ### Fixed
 
 - `waitForRenderCommit` / generation-scoped render tokens resolve only after a successful buffer write (or fail open on stopped/unavailable terminals), enabling awaitable progress frames for interactive resume without hanging (#2914).

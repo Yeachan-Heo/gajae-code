@@ -23,6 +23,8 @@
 
 ### Changed
 
+- When GJC owns mouse input (`mouse.enabled: true`), mouse-wheel scrolling moves the session viewport by three rows per notch instead of a full page. PageUp/PageDown keep page-sized transcript-lane steps.
+- While reviewing transcript history, the status line and composer now stay fixed at the bottom. Semantic assistant/tool output shows `New output — type to follow`, and ordinary typing or paste returns to live output before editing without changing editor focus.
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - Model preset landing now shows explicit `Enter: apply` and `d: set as default` hints; pressing `d` applies the highlighted profile as the default while Enter keeps the session-only apply path (#3161).
 
