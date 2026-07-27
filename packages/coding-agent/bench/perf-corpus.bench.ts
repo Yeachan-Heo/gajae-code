@@ -111,14 +111,19 @@ export function gitWorktreeFingerprint(repositoryRoot: string): { dirty: boolean
 	};
 }
 
-function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerprint: string } {
+export function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerprint: string } {
 	const environmentSha = process.env.GITHUB_SHA?.trim();
 	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
 	let sha = "";
 	let dirty = true;
 	let worktreeFingerprint = "unavailable";
-	const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
-	if (revision.exitCode === 0) {
+	let revision: Bun.SyncSubprocess<"pipe", "pipe"> | null = null;
+	try {
+		revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+	} catch {
+		// Exported source bundles may provide GITHUB_SHA without shipping Git.
+	}
+	if (revision?.exitCode === 0) {
 		sha = new TextDecoder().decode(revision.stdout).trim();
 		const worktree = gitWorktreeFingerprint(repositoryRoot);
 		worktreeFingerprint = worktree.fingerprint;
@@ -153,6 +158,19 @@ function memorySample(startedAt: number): MemoryUsageSample {
 		arrayBuffersBytes: usage.arrayBuffers,
 		activeResourceCount: process.getActiveResourcesInfo().length,
 	};
+}
+interface MemoryHighWaterSamples {
+	rss: MemoryUsageSample;
+	heap: MemoryUsageSample;
+	external: MemoryUsageSample;
+	arrayBuffers: MemoryUsageSample;
+}
+
+export function updateMemoryHighWaterSamples(peaks: MemoryHighWaterSamples, sample: MemoryUsageSample): void {
+	if (sample.rssBytes > peaks.rss.rssBytes) peaks.rss = sample;
+	if (sample.heapUsedBytes > peaks.heap.heapUsedBytes) peaks.heap = sample;
+	if (sample.externalBytes > peaks.external.externalBytes) peaks.external = sample;
+	if (sample.arrayBuffersBytes > peaks.arrayBuffers.arrayBuffersBytes) peaks.arrayBuffers = sample;
 }
 
 export { calculateMemorySlope };
@@ -223,21 +241,24 @@ export function buildMemoryFixture(
 	const startedAt = performance.now();
 	const cpuStart = process.cpuUsage();
 	const samples = [baselineSample];
-	let highWaterSample = baselineSample;
+	const highWaterSamples = {
+		rss: baselineSample,
+		heap: baselineSample,
+		external: baselineSample,
+		arrayBuffers: baselineSample,
+	};
 	let operations = 0;
 	let iterations = 0;
 	const chunkSize = profile === "soak" ? 1 : Math.max(1, Math.ceil(minimumIterations / 20));
 	const sampleIntervalMs = profile === "soak" ? 50 : 0;
-	const captureHighWater = () => {
+	const highWaterIntervalMs = profile === "soak" ? 10 : 0;
+	let lastHighWaterSampleAt = Number.NEGATIVE_INFINITY;
+	const captureHighWater = (force = false) => {
+		const now = performance.now();
+		if (!force && now - lastHighWaterSampleAt < highWaterIntervalMs) return;
+		lastHighWaterSampleAt = now;
 		const sample = memorySample(startedAt);
-		if (
-			sample.rssBytes > highWaterSample.rssBytes ||
-			sample.heapUsedBytes > highWaterSample.heapUsedBytes ||
-			sample.externalBytes > highWaterSample.externalBytes ||
-			sample.arrayBuffersBytes > highWaterSample.arrayBuffersBytes
-		) {
-			highWaterSample = sample;
-		}
+		updateMemoryHighWaterSamples(highWaterSamples, sample);
 	};
 	while (iterations < minimumIterations || performance.now() - startedAt < targetDurationMs) {
 		operations += workload.run(chunkSize, captureHighWater);
@@ -245,10 +266,10 @@ export function buildMemoryFixture(
 		const elapsedSinceLastSample = performance.now() - startedAt - (samples.at(-1)?.elapsedMs ?? 0);
 		if (elapsedSinceLastSample >= sampleIntervalMs) samples.push(memorySample(startedAt));
 	}
-	if (highWaterSample !== baselineSample) {
-		samples.push(highWaterSample);
-		samples.sort((left, right) => left.elapsedMs - right.elapsedMs);
+	for (const sample of new Set(Object.values(highWaterSamples))) {
+		if (sample !== baselineSample && !samples.includes(sample)) samples.push(sample);
 	}
+	samples.sort((left, right) => left.elapsedMs - right.elapsedMs);
 	const elapsedMs = performance.now() - startedAt;
 	if ((samples.at(-1)?.elapsedMs ?? 0) < elapsedMs) samples.push(memorySample(startedAt));
 	const cpu = process.cpuUsage(cpuStart);

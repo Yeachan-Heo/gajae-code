@@ -4,7 +4,7 @@ export interface MemoryWorkload {
 	id: string;
 	surface: MemorySurface;
 	tags: string[];
-	run(iterations: number, sampleHighWater?: () => void): number;
+	run(iterations: number, sampleHighWater?: (force?: boolean) => void): number;
 	teardown(): void;
 }
 

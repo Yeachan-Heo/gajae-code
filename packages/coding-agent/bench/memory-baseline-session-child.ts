@@ -3,7 +3,7 @@ import { buildMemoryFixture } from "./perf-corpus.bench";
 import type { MemoryWorkload } from "./memory-baseline-workloads";
 import type { MemoryWorkloadProfile } from "./perf-corpus-schema";
 
-function createSessionWorkload(): MemoryWorkload {
+export function createSessionWorkload(): MemoryWorkload {
 	let manager = SessionManager.inMemory();
 	let entryCount = 0;
 	return {
@@ -21,6 +21,7 @@ function createSessionWorkload(): MemoryWorkload {
 				sampleHighWater?.();
 				if (entryCount % 128 === 0) {
 					manager.getEntries();
+					sampleHighWater?.(true);
 					manager = SessionManager.inMemory();
 				}
 			}
@@ -33,6 +34,8 @@ function createSessionWorkload(): MemoryWorkload {
 	};
 }
 
-const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
-const durationTargetMs = Number(process.env.GJC_MEMORY_DURATION_MS) || 0;
-process.stdout.write(`${JSON.stringify(buildMemoryFixture(createSessionWorkload(), profile, durationTargetMs))}\n`);
+if (import.meta.main) {
+	const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
+	const durationTargetMs = Number(process.env.GJC_MEMORY_DURATION_MS) || 0;
+	process.stdout.write(`${JSON.stringify(buildMemoryFixture(createSessionWorkload(), profile, durationTargetMs))}\n`);
+}

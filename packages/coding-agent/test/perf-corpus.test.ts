@@ -2,13 +2,16 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createSessionWorkload } from "../bench/memory-baseline-session-child";
 import { createTuiWorkload } from "../bench/memory-baseline-tui-child";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
 import {
 	calculateMemorySlope,
 	gitWorktreeFingerprint,
 	normalizeProcessTreeRss,
+	resolveGitProvenance,
 	runPerfCorpusBenchmark,
+	updateMemoryHighWaterSamples,
 } from "../bench/perf-corpus.bench";
 import {
 	type HotspotClassification,
@@ -90,6 +93,24 @@ describe("perf corpus schema + runner", () => {
 		try {
 			expect(runPerfCorpusBenchmark().gitSha).toBe(expectedSha);
 		} finally {
+			if (previousGitSha === undefined) delete process.env.GITHUB_SHA;
+			else process.env.GITHUB_SHA = previousGitSha;
+		}
+	});
+	test("falls back to GITHUB_SHA when Git is unavailable", () => {
+		const previousGitSha = process.env.GITHUB_SHA;
+		const spawnSync = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
+			throw new Error("git unavailable");
+		});
+		process.env.GITHUB_SHA = "c".repeat(40);
+		try {
+			expect(resolveGitProvenance()).toEqual({
+				sha: "c".repeat(40),
+				dirty: true,
+				worktreeFingerprint: "unavailable",
+			});
+		} finally {
+			spawnSync.mockRestore();
 			if (previousGitSha === undefined) delete process.env.GITHUB_SHA;
 			else process.env.GITHUB_SHA = previousGitSha;
 		}
@@ -322,12 +343,54 @@ describe("perf corpus schema + runner", () => {
 		);
 	});
 
-	test("exposes workload high-water callbacks before teardown", () => {
+	test("preserves independent per-metric high-water samples", () => {
+		const sample = (
+			elapsedMs: number,
+			rssBytes: number,
+			heapUsedBytes: number,
+			externalBytes: number,
+			arrayBuffersBytes: number,
+		): MemoryUsageSample => ({
+			elapsedMs,
+			rssBytes,
+			heapUsedBytes,
+			heapTotalBytes: Math.max(heapUsedBytes, 1_000),
+			externalBytes,
+			arrayBuffersBytes,
+			activeResourceCount: 0,
+		});
+		const baseline = sample(0, 100, 100, 100, 50);
+		const peaks = { rss: baseline, heap: baseline, external: baseline, arrayBuffers: baseline };
+		const rssPeak = sample(1, 900, 110, 110, 55);
+		const heapPeak = sample(2, 800, 700, 120, 60);
+		const externalPeak = sample(3, 700, 600, 500, 70);
+		const arrayBufferPeak = sample(4, 600, 500, 450, 400);
+
+		for (const candidate of [rssPeak, heapPeak, externalPeak, arrayBufferPeak]) {
+			updateMemoryHighWaterSamples(peaks, candidate);
+		}
+
+		expect(peaks).toEqual({
+			rss: rssPeak,
+			heap: heapPeak,
+			external: externalPeak,
+			arrayBuffers: arrayBufferPeak,
+		});
+	});
+	test("forces TUI high-water callbacks before teardown", () => {
 		const workload = createTuiWorkload();
-		let samples = 0;
-		workload.run(3, () => samples++);
-		expect(samples).toBe(3);
+		const forceValues: Array<boolean | undefined> = [];
+		workload.run(3, force => forceValues.push(force));
+		expect(forceValues).toEqual([true, true, true]);
 		expect(workload.currentIndex()).toBe(3);
+		workload.teardown();
+	});
+	test("forces a session sample after entry materialization", () => {
+		const workload = createSessionWorkload();
+		const forceValues: Array<boolean | undefined> = [];
+		workload.run(128, force => forceValues.push(force));
+		expect(forceValues).toHaveLength(129);
+		expect(forceValues.at(-1)).toBe(true);
 		workload.teardown();
 	});
 
