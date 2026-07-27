@@ -318,6 +318,7 @@ export class ProcessTerminal implements Terminal {
 		// When the terminal reports a change, we re-query OSC 11 to get the
 		// actual background color (following Neovim convention) with 100ms debounce.
 		this.#safeWrite("\x1b[?2031h");
+		this.#stdinBuffer?.noteProbeIssued();
 
 		// Start periodic OSC 11 re-query for terminals without Mode 2031
 		// (Warp, Alacritty, WezTerm, iTerm2). Self-disables once Mode 2031 fires.
@@ -562,6 +563,7 @@ export class ProcessTerminal implements Terminal {
 		this.#pendingDa1Sentinels++;
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
+		this.#stdinBuffer?.noteProbeIssued();
 	}
 	/**
 	 * Parse an OSC 11 background color response and compute BT.601 luminance.
@@ -631,6 +633,7 @@ export class ProcessTerminal implements Terminal {
 			return;
 		}
 		this.#safeWrite("\x1b[?u");
+		this.#stdinBuffer?.noteProbeIssued();
 		// Windows Terminal and conhost do not implement the Kitty keyboard
 		// protocol, so the query above never activates it there. They do honor the
 		// modifyOtherKeys fallback below — but that mode breaks Windows CJK/Hangul

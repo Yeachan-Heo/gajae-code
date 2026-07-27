@@ -5,7 +5,7 @@
  * MIT License - Copyright (c) 2025 opentui
  */
 
-import { beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { StdinBuffer } from "@gajae-code/tui/stdin-buffer";
 
 describe("StdinBuffer", () => {
@@ -583,6 +583,114 @@ describe("StdinBuffer", () => {
 			processInput(Buffer.from([0xc1]));
 			expect(emittedSequences).toEqual(["\x1bA"]);
 			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+	});
+	describe("Capability-probe reply fragments", () => {
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it("holds an incomplete OSC prefix instead of flushing its fragments", () => {
+			vi.useFakeTimers();
+			processInput("\x1b]11;rgb:00");
+			vi.advanceTimersByTime(100);
+			expect(emittedSequences).toEqual([]);
+
+			processInput("00/0000/0000\x07");
+			expect(emittedSequences).toEqual(["\x1b]11;rgb:0000/0000/0000\x07"]);
+		});
+
+		it("holds an incomplete CSI prefix instead of flushing its fragments", () => {
+			vi.useFakeTimers();
+			processInput("\x1b[?62");
+			vi.advanceTimersByTime(100);
+			expect(emittedSequences).toEqual([]);
+
+			processInput(";22;52c");
+			expect(emittedSequences).toEqual(["\x1b[?62;22;52c"]);
+		});
+
+		it("reassembles a reply delivered one byte at a time", () => {
+			vi.useFakeTimers();
+			buffer.noteProbeIssued();
+			for (const char of "\x1b]11;rgb:1c1c/1c1c/1c1c\x07") {
+				processInput(char);
+				vi.advanceTimersByTime(15);
+			}
+
+			expect(emittedSequences).toEqual(["\x1b]11;rgb:1c1c/1c1c/1c1c\x07"]);
+		});
+
+		it("flushes a held prefix once the bounded hold elapses", () => {
+			vi.useFakeTimers();
+			processInput("\x1b]11;rgb:00");
+			vi.advanceTimersByTime(400);
+			expect(emittedSequences).toEqual([]);
+
+			vi.advanceTimersByTime(200);
+			expect(emittedSequences).toEqual(["\x1b]11;rgb:00"]);
+		});
+
+		it("flushes a lone ESC promptly when no probe reply is expected", () => {
+			vi.useFakeTimers();
+			processInput("\x1b");
+			vi.advanceTimersByTime(20);
+
+			expect(emittedSequences).toEqual(["\x1b"]);
+		});
+
+		it("holds a lone ESC briefly while a probe reply is expected", () => {
+			vi.useFakeTimers();
+			buffer.noteProbeIssued();
+			processInput("\x1b");
+			vi.advanceTimersByTime(20);
+			expect(emittedSequences).toEqual([]);
+
+			vi.advanceTimersByTime(200);
+			expect(emittedSequences).toEqual(["\x1b"]);
+		});
+
+		it("resolves a held ESC immediately when the next key arrives", () => {
+			vi.useFakeTimers();
+			buffer.noteProbeIssued();
+			processInput("\x1b");
+			vi.advanceTimersByTime(20);
+			processInput("a");
+
+			expect(emittedSequences).toEqual(["\x1ba"]);
+		});
+
+		it("still quarantines an SGR mouse prefix", () => {
+			vi.useFakeTimers();
+			processInput("\x1b[<35;20");
+			vi.advanceTimersByTime(20);
+			processInput(";5M");
+			vi.advanceTimersByTime(20);
+
+			expect(emittedSequences).toEqual([]);
+		});
+		it("cuts an unterminated sequence when a new escape arrives", () => {
+			vi.useFakeTimers();
+			processInput("\x1b]11;rgb:ff");
+			vi.advanceTimersByTime(50);
+			processInput("\x1b[A");
+
+			expect(emittedSequences).toEqual(["\x1b]11;rgb:ff", "\x1b[A"]);
+		});
+
+		it("keeps ESC \\ as the string terminator of an OSC reply", () => {
+			vi.useFakeTimers();
+			processInput("\x1b]11;rgb:1c1c/1c1c/1c1c");
+			vi.advanceTimersByTime(50);
+			processInput("\x1b\\");
+
+			expect(emittedSequences).toEqual(["\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\"]);
+		});
+
+		it("still emits a Meta escape pair (ESC ESC) as one sequence", () => {
+			processInput("\x1b\x1b");
+
+			expect(emittedSequences).toEqual(["\x1b\x1b"]);
 		});
 	});
 });

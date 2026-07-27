@@ -401,4 +401,22 @@ describe("ProcessTerminal raw-Buffer stdin (issue #454)", () => {
 
 		terminal.stop();
 	});
+	it("does not leak a fragmented OSC 11 + DA1 reply into the input handler", () => {
+		const { terminal, received } = setupTerminal();
+
+		// The reply is split across stdin reads with a gap larger than the
+		// StdinBuffer completion timeout, which previously flushed the partial
+		// sequence and typed its remaining bytes into the editor.
+		vi.useFakeTimers();
+		process.stdin.emit("data", Buffer.from("\x1b]11;rgb:00", "utf8"));
+		vi.advanceTimersByTime(50);
+		process.stdin.emit("data", Buffer.from("00/0000/0000\x07\x1b[?62", "utf8"));
+		vi.advanceTimersByTime(50);
+		process.stdin.emit("data", Buffer.from(";22;52c", "utf8"));
+
+		expect(received).toEqual([]);
+		expect(terminal.appearance).toBe("dark");
+
+		terminal.stop();
+	});
 });

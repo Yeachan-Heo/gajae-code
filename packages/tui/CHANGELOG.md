@@ -3,6 +3,8 @@
 ## [Unreleased]
 ### Fixed
 
+- Fragmented terminal capability-probe replies (OSC 11 background color, DA1, Kitty flags, Mode 2031 DSR) are no longer flushed into the input stream as individual characters when the reply is split across stdin reads, which typed sequences such as `^[]11;rgb:0000/0000/0000^G^[[?62;22;52c` into the composer. Incomplete OSC/CSI prefixes are now held at the stdin decoding boundary until they complete (bounded), and an ESC arriving mid-sequence cuts the unterminated sequence instead of swallowing the key that follows it (#3264).
+
 - `waitForRenderCommit` / generation-scoped render tokens resolve only after a successful buffer write (or fail open on stopped/unavailable terminals), enabling awaitable progress frames for interactive resume without hanging (#2914).
 
 ### Fixed
