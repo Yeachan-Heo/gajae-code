@@ -237,23 +237,18 @@ const SOURCE_CLASS_VALUES: readonly PerfCorpusFixtureResult["sourceClass"][] = [
 ];
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const LOGICAL_BUN_EXECUTABLE = "bun";
-
-function isLogicalRunnerScriptArgument(value: string): boolean {
-	if (!/^(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+\.ts$/.test(value)) return false;
-	return value.split("/").every(segment => segment !== "." && segment !== "..");
-}
-
-function isLogicalRunnerArgument(value: string): boolean {
-	return /^--?[A-Za-z0-9][A-Za-z0-9-]*$/.test(value) || isLogicalRunnerScriptArgument(value);
-}
+const LOGICAL_RUNNER_SCRIPT = "packages/coding-agent/bench/perf-corpus.bench.ts";
+const LOGICAL_RUNNER_FLAGS = new Set(["--smol", "--expose-gc"]);
 
 function isLogicalRunnerArgv(value: unknown): value is string[] {
 	if (!Array.isArray(value) || value.length <= 1 || value[0] !== LOGICAL_BUN_EXECUTABLE) return false;
 	const argumentsAfterExecutable = value.slice(1);
 	return (
 		argumentsAfterExecutable.every(
-			argument => typeof argument === "string" && argument.length > 0 && isLogicalRunnerArgument(argument),
-		) && argumentsAfterExecutable.filter(isLogicalRunnerScriptArgument).length === 1
+			argument =>
+				typeof argument === "string" &&
+				(argument === LOGICAL_RUNNER_SCRIPT || LOGICAL_RUNNER_FLAGS.has(argument)),
+		) && argumentsAfterExecutable.filter(argument => argument === LOGICAL_RUNNER_SCRIPT).length === 1
 	);
 }
 const REPORT_FIELDS = [

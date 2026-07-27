@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 import json
 import math
 import os
-import re
 import stat
 from pathlib import Path
 from statistics import NormalDist
@@ -275,24 +274,20 @@ def _validate_private_field_names(value: Any, label: str, *, privacy_attestation
             _validate_private_field_names(nested, f"{label}[{index}]", privacy_attestation=privacy_attestation)
 
 
-def _is_logical_runner_script_argument(value: str) -> bool:
-    if not re.fullmatch(r"(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+\.ts", value):
-        return False
-    return all(segment not in (".", "..") for segment in value.split("/"))
-
-
-def _is_logical_runner_argument(value: str) -> bool:
-    return re.fullmatch(r"--?[A-Za-z0-9][A-Za-z0-9-]*", value) is not None or _is_logical_runner_script_argument(value)
-
-
 def _validate_logical_runner_argv(value: Any, label: str) -> list[str]:
     argv = _expect_list(value, label)
+    logical_runner_script = "packages/coding-agent/bench/perf-corpus.bench.ts"
+    logical_runner_flags = frozenset(("--smol", "--expose-gc"))
     arguments_after_executable = argv[1:]
     if (
         len(argv) <= 1
         or argv[0] != LOGICAL_BUN_EXECUTABLE
-        or any(not isinstance(item, str) or not item or not _is_logical_runner_argument(item) for item in arguments_after_executable)
-        or sum(_is_logical_runner_script_argument(item) for item in arguments_after_executable) != 1
+        or any(
+            not isinstance(item, str)
+            or (item != logical_runner_script and item not in logical_runner_flags)
+            for item in arguments_after_executable
+        )
+        or sum(item == logical_runner_script for item in arguments_after_executable) != 1
     ):
         raise EvidenceError(f"{label} must begin with bun and contain only logical repository-relative values")
     return argv

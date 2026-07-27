@@ -199,7 +199,6 @@ export function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeF
 }
 
 function reproductionInvocation(
-	repositoryRoot: string,
 	profile: MemoryWorkloadProfile,
 	durationTargetMs: number,
 	iterationsTarget: number,
@@ -211,13 +210,15 @@ function reproductionInvocation(
 		GJC_MEMORY_SURFACE_ORDER: memorySurfaceOrder.join(","),
 	};
 	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
-	const scriptPath = process.argv[1];
-	if (!scriptPath) throw new Error("benchmark script path unavailable");
-	const relativeScriptPath = path.relative(repositoryRoot, scriptPath);
-	if (relativeScriptPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeScriptPath)) {
-		throw new Error("benchmark script must be inside the repository");
+	const allowedFlags = new Set(["--smol", "--expose-gc"]);
+	if (process.execArgv.some(argument => !allowedFlags.has(argument)) || process.argv.length > 2) {
+		throw new Error("benchmark runner invocation is outside the frozen public contract");
 	}
-	const argv = ["bun", ...process.execArgv, relativeScriptPath.split(path.sep).join("/"), ...process.argv.slice(2)];
+	const argv = [
+		"bun",
+		...process.execArgv,
+		"packages/coding-agent/bench/perf-corpus.bench.ts",
+	];
 	return { command: argv.join(" "), argv, environment };
 }
 const MEMORY_CHILD_ARGUMENT = "--gjc-memory-child";
@@ -611,7 +612,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 		throw new Error("benchmark checkout provenance changed while workloads were running");
 	}
 	const git = initialGit;
-	const invocation = reproductionInvocation(repositoryRoot, profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
+	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
 	const runner: PerfCorpusReport["runner"] = {
 		command: invocation.command,
 		runtimeCommand: invocation.command,

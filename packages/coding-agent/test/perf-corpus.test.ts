@@ -43,15 +43,7 @@ const memoryControlKeys = [
 ] as const;
 let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
 function expectedPublicRunnerArgv(): string[] {
-	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
-	const scriptPath = process.argv[1];
-	if (!scriptPath) throw new Error("test runner script path unavailable");
-	return [
-		"bun",
-		...process.execArgv,
-		path.relative(repositoryRoot, scriptPath).split(path.sep).join("/"),
-		...process.argv.slice(2),
-	];
+	return ["bun", ...process.execArgv, "packages/coding-agent/bench/perf-corpus.bench.ts"];
 }
 
 beforeEach(() => {
@@ -233,8 +225,29 @@ describe("perf corpus schema + runner", () => {
 			"label(/private/tmp/perf-corpus.bench.ts)",
 			"label[/private/tmp/perf-corpus.bench.ts]",
 			"label|/private/tmp/perf-corpus.bench.ts",
+			"packages/coding-agent/bench/perf-corpus.bench.ts\n",
+			"packages/coding-agent/bench/perf-corpus.bench.ts\r",
+			"packages/coding-agent/bench/perf-corpus.bench.ts\u2028",
+			"packages/coding-agent/bench/perf-corpus.bench.ts\u2029",
 		]) {
 			const argv = ["bun", scriptPath];
+			const runner = {
+				...report.runner,
+				command: argv.join(" "),
+				runtimeCommand: argv.join(" "),
+				argv,
+				runtimeControlIdentity: "",
+			};
+			runner.runtimeControlIdentity = memoryRuntimeControlIdentity(runner);
+			expect(validatePerfCorpusReport({ ...report, runner }).errors).toContain(
+				"runner.argv must begin with bun and contain only logical repository-relative values",
+			);
+		}
+		for (const argv of [
+			["bun", "--eval", "packages/coding-agent/bench/perf-corpus.bench.ts"],
+			["bun", "--evil", "packages/coding-agent/bench/perf-corpus.bench.ts"],
+			["bun", "packages/coding-agent/bench/memory-baseline-session-child.ts"],
+		]) {
 			const runner = {
 				...report.runner,
 				command: argv.join(" "),

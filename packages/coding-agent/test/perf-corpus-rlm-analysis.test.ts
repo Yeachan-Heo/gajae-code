@@ -880,7 +880,17 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(result.diagnostics.validationErrors.some(error => error.filename === "short-01.json")).toBe(false);
 	});
 
-	const privateRunnerCases: readonly (readonly [string, (runner: PerfCorpusReport["runner"]) => void, string])[] = [
+	type PrivateRunnerCase = readonly [string, (runner: PerfCorpusReport["runner"]) => void, string];
+	const invalidRunnerArgvCase = (name: string, argv: string[]): PrivateRunnerCase => [
+		name,
+		runner => {
+			runner.argv = argv;
+			runner.command = runner.argv.join(" ");
+			runner.runtimeCommand = runner.command;
+		},
+		"runner.argv must begin with bun and contain only logical repository-relative values",
+	];
+	const privateRunnerCases: readonly PrivateRunnerCase[] = [
 		[
 			"command",
 			runner => {
@@ -939,24 +949,28 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			},
 			"runner.argv must begin with bun and contain only logical repository-relative values",
 		],
-		...[
-			["home argv", "~/private/perf-corpus.bench.ts"],
-			["drive argv", "C:/private/perf-corpus.bench.ts"],
-			["parenthesized absolute argv", "label(/private/tmp/perf-corpus.bench.ts)"],
-			["bracketed absolute argv", "label[/private/tmp/perf-corpus.bench.ts]"],
-			["punctuation absolute argv", "label|/private/tmp/perf-corpus.bench.ts"],
-		].map(
-			([name, scriptPath]) =>
-				[
-					name,
-					(runner: PerfCorpusReport["runner"]) => {
-						runner.argv = ["bun", scriptPath];
-						runner.command = runner.argv.join(" ");
-						runner.runtimeCommand = runner.command;
-					},
-					"runner.argv must begin with bun and contain only logical repository-relative values",
-				] as const,
-		),
+		invalidRunnerArgvCase("home argv", ["bun", "~/private/perf-corpus.bench.ts"]),
+		invalidRunnerArgvCase("drive argv", ["bun", "C:/private/perf-corpus.bench.ts"]),
+		invalidRunnerArgvCase("parenthesized absolute argv", ["bun", "label(/private/tmp/perf-corpus.bench.ts)"]),
+		invalidRunnerArgvCase("bracketed absolute argv", ["bun", "label[/private/tmp/perf-corpus.bench.ts]"]),
+		invalidRunnerArgvCase("punctuation absolute argv", ["bun", "label|/private/tmp/perf-corpus.bench.ts"]),
+		...["\n", "\r", "\u2028", "\u2029"].flatMap(terminator => [
+			invalidRunnerArgvCase(`script terminator ${terminator.codePointAt(0)!.toString(16)}`, [
+				"bun",
+				`packages/coding-agent/bench/perf-corpus.bench.ts${terminator}`,
+			]),
+			invalidRunnerArgvCase(`flag terminator ${terminator.codePointAt(0)!.toString(16)}`, [
+				"bun",
+				`--smol${terminator}`,
+				"packages/coding-agent/bench/perf-corpus.bench.ts",
+			]),
+		]),
+		invalidRunnerArgvCase("eval flag", ["bun", "--eval", "packages/coding-agent/bench/perf-corpus.bench.ts"]),
+		invalidRunnerArgvCase("unknown flag", ["bun", "--evil", "packages/coding-agent/bench/perf-corpus.bench.ts"]),
+		invalidRunnerArgvCase("alternate script", [
+			"bun",
+			"packages/coding-agent/bench/memory-baseline-session-child.ts",
+		]),
 	];
 
 	test.each(
