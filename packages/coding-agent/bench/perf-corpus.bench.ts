@@ -109,7 +109,12 @@ function memorySlope(samples: MemoryUsageSample[], key: "rssBytes" | "heapUsedBy
 }
 function processTreeRssBytes(): number | null {
 	if (process.platform === "win32") return null;
-	const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,rss="]);
+	let result: Bun.SyncSubprocess<"pipe", "pipe">;
+	try {
+		result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,rss="]);
+	} catch {
+		return null;
+	}
 	if (result.exitCode !== 0) return null;
 	const rows = new TextDecoder().decode(result.stdout).trim().split("\n");
 	const parents = new Map<number, number>();
@@ -150,10 +155,11 @@ function buildMemoryFixture(
 	const minimumIterations = workloadIterations(profile);
 	workload.teardown();
 	gc?.();
+	const baselineSample = { ...memorySample(performance.now()), elapsedMs: 0 };
 	const processTreeBaselineRssBytes = processTreeRssBytes();
 	const startedAt = performance.now();
 	const cpuStart = process.cpuUsage();
-	const samples = [memorySample(startedAt)];
+	const samples = [baselineSample];
 	let operations = 0;
 	let iterations = 0;
 	const chunkSize = profile === "soak" ? 5_000 : Math.max(1, Math.ceil(minimumIterations / 4));
@@ -349,6 +355,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			ci: process.env.CI === "true",
 			profile,
 			durationTargetMs,
+			memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
 		},
 		fixtures,
 		hotspotClassifications: [...V1_V3_RECLASSIFICATION],

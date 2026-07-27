@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
 import {
 	type HotspotClassification,
@@ -50,6 +50,7 @@ describe("perf corpus schema + runner", () => {
 		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
 		expect(new Set(baselines.map(baseline => baseline.surface))).toEqual(new Set(REQUIRED_MEMORY_SURFACES));
 		expect(report.runner.profile).toBe("short");
+		expect(report.runner.memoryIsolation).toBe("in-process");
 		for (const baseline of baselines) {
 			expect(baseline.samples.length).toBeGreaterThanOrEqual(2);
 			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(baseline.samples.at(-1)?.elapsedMs ?? 0);
@@ -74,6 +75,7 @@ describe("perf corpus schema + runner", () => {
 		const report = runPerfCorpusBenchmark({ isolatedMemory: true });
 		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
 		expect(baselines).toHaveLength(REQUIRED_MEMORY_SURFACES.length);
+		expect(report.runner.memoryIsolation).toBe("process-per-surface");
 		expect(baselines.every(baseline => baseline.samples[0]!.rssBytes > 0)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 	});
@@ -127,6 +129,56 @@ describe("perf corpus schema + runner", () => {
 		expect(validatePerfCorpusReport(incomplete).errors).toContain(
 			`fixture ${fixture.fixtureId}: memoryBaseline sample 0.heapUsedBytes invalid`,
 		);
+	});
+	test("rejects malformed memory scalar fields and isolation metadata", () => {
+		const report = runPerfCorpusBenchmark();
+		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
+		const fixture = report.fixtures[fixtureIndex];
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const malformedBaseline = {
+			...fixture.memoryBaseline,
+			surface: "bogus",
+			profile: "bogus",
+			operations: null,
+			operationsPerSecond: Number.POSITIVE_INFINITY,
+			rssSlopeBytesPerSecond: Number.NaN,
+			processTreeSampler: "bogus",
+		} as unknown as typeof fixture.memoryBaseline;
+		const malformed = {
+			...report,
+			runner: { ...report.runner, memoryIsolation: "bogus" },
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex ? { ...candidate, memoryBaseline: malformedBaseline } : candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		const errors = validatePerfCorpusReport(malformed).errors;
+		expect(errors).toContain("runner.memoryIsolation invalid");
+		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.surface invalid`);
+		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.profile invalid`);
+		expect(errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.operations must be a non-negative integer`,
+		);
+		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond not finite`);
+		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond invalid`);
+		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.processTreeSampler invalid`);
+	});
+
+	test("treats a missing process-table sampler as unavailable", () => {
+		const spawnSyncSpy = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
+			throw new Error("ENOENT");
+		});
+		try {
+			const report = runPerfCorpusBenchmark();
+			for (const fixture of report.fixtures) {
+				if (!fixture.memoryBaseline) continue;
+				expect(fixture.memoryBaseline.processTreeSampler).toBe("unavailable");
+				expect(fixture.memoryBaseline.processTreeBaselineRssBytes).toBeNull();
+				expect(fixture.memoryBaseline.processTreePostTeardownRssBytes).toBeNull();
+			}
+			expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
+		} finally {
+			spawnSyncSpy.mockRestore();
+		}
 	});
 	test("does not claim post-GC return metrics when GC is unavailable", () => {
 		const report = runPerfCorpusBenchmark();

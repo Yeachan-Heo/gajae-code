@@ -166,6 +166,7 @@ export interface PerfCorpusReport {
 		ci?: boolean;
 		profile?: MemoryWorkloadProfile;
 		durationTargetMs?: number;
+		memoryIsolation: "in-process" | "process-per-surface";
 	};
 	fixtures: PerfCorpusFixtureResult[];
 	hotspotClassifications: HotspotClassification[];
@@ -184,6 +185,9 @@ export const REQUIRED_MEMORY_SURFACES: readonly MemorySurface[] = [
 	"tui",
 	"shared-native",
 ];
+const MEMORY_WORKLOAD_PROFILES: readonly MemoryWorkloadProfile[] = ["short", "soak"];
+const PROCESS_TREE_SAMPLERS: readonly MemoryBaselineMetric["processTreeSampler"][] = ["ps", "unavailable"];
+const MEMORY_ISOLATION_MODES: readonly PerfCorpusReport["runner"]["memoryIsolation"][] = ["in-process", "process-per-surface"];
 
 const HOTSPOT_STATUS_VALUES: readonly HotspotStatus[] = [
 	"CPU-self-time confirmed",
@@ -247,6 +251,18 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (report.schema !== PERF_CORPUS_SCHEMA) {
 		errors.push(`invalid schema "${report.schema}", expected "${PERF_CORPUS_SCHEMA}"`);
 	}
+	if (!(MEMORY_ISOLATION_MODES as readonly string[]).includes(report.runner.memoryIsolation)) {
+		errors.push("runner.memoryIsolation invalid");
+	}
+	if (report.runner.profile !== undefined && !(MEMORY_WORKLOAD_PROFILES as readonly string[]).includes(report.runner.profile)) {
+		errors.push("runner.profile invalid");
+	}
+	if (
+		report.runner.durationTargetMs !== undefined &&
+		(!Number.isFinite(report.runner.durationTargetMs) || report.runner.durationTargetMs < 0)
+	) {
+		errors.push("runner.durationTargetMs invalid");
+	}
 	// Anchor CPU-self-time claims to ACTUAL captured profiler evidence: collect the
 	// real artifact paths and sample symbols present in fixtures. A claim must name
 	// one of these, so one unrelated profiler artifact cannot license an unrelated
@@ -280,11 +296,28 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		}
 		const baseline = fixture.memoryBaseline;
 		if (baseline) {
+			if (!(REQUIRED_MEMORY_SURFACES as readonly string[]).includes(baseline.surface)) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.surface invalid`);
+			}
+			if (!(MEMORY_WORKLOAD_PROFILES as readonly string[]).includes(baseline.profile)) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.profile invalid`);
+			}
 			if (!Number.isInteger(baseline.iterations) || baseline.iterations <= 0) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.iterations must be a positive integer`);
 			}
+			if (!Number.isInteger(baseline.operations) || baseline.operations < 0) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operations must be a non-negative integer`);
+			}
 			if (!Number.isFinite(baseline.operationsPerSecond) || baseline.operationsPerSecond < 0) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond not finite`);
+			}
+			for (const [name, value] of [
+				["rssSlopeBytesPerSecond", baseline.rssSlopeBytesPerSecond],
+				["heapSlopeBytesPerSecond", baseline.heapSlopeBytesPerSecond],
+			] as const) {
+				if (value !== null && !Number.isFinite(value)) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
+				}
 			}
 			for (const [name, value] of [
 				["processTreeBaselineRssBytes", baseline.processTreeBaselineRssBytes],
@@ -294,21 +327,38 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
 				}
 			}
+			if (!(PROCESS_TREE_SAMPLERS as readonly string[]).includes(baseline.processTreeSampler)) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.processTreeSampler invalid`);
+			}
 			if (
 				baseline.processTreeSampler === "ps" &&
 				(baseline.processTreeBaselineRssBytes === null || baseline.processTreePostTeardownRssBytes === null)
 			) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline ps sampler requires process-tree RSS`);
 			}
-			if (baseline.samples.length < 2) {
+			if (
+				baseline.processTreeSampler === "unavailable" &&
+				(baseline.processTreeBaselineRssBytes !== null || baseline.processTreePostTeardownRssBytes !== null)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: unavailable sampler requires null process-tree RSS`);
+			}
+			if (!Array.isArray(baseline.samples) || baseline.samples.length < 2) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline requires at least two samples`);
 			}
-			for (const [index, sample] of [...baseline.samples, baseline.postTeardown].entries()) {
+			const samples = Array.isArray(baseline.samples) ? baseline.samples : [];
+			for (const [index, sample] of [...samples, baseline.postTeardown].entries()) {
+				if (typeof sample !== "object" || sample === null) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index} invalid`);
+					continue;
+				}
 				for (const name of MEMORY_USAGE_SAMPLE_FIELDS) {
 					const value = sample[name];
 					if (!Object.hasOwn(sample, name) || !Number.isFinite(value) || value < 0) {
 						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.${name} invalid`);
 					}
+				}
+				if (Object.hasOwn(sample, "activeResourceCount") && !Number.isInteger(sample.activeResourceCount)) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
 				}
 			}
 		}
