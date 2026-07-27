@@ -377,11 +377,11 @@ describe("perf corpus schema + runner", () => {
 			arrayBuffers: arrayBufferPeak,
 		});
 	});
-	test("forces TUI high-water callbacks before teardown", () => {
+	test("requests throttled TUI high-water callbacks before teardown", () => {
 		const workload = createTuiWorkload();
 		const forceValues: Array<boolean | undefined> = [];
 		workload.run(3, force => forceValues.push(force));
-		expect(forceValues).toEqual([true, true, true]);
+		expect(forceValues).toEqual([undefined, undefined, undefined]);
 		expect(workload.currentIndex()).toBe(3);
 		workload.teardown();
 	});
