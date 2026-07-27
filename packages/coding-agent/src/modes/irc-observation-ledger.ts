@@ -90,8 +90,7 @@ export class IrcObservationLedger {
 	}
 
 	#retireCurrentSessionIdentities(): void {
-		for (const observationId of this.#records.keys()) {
-			const identity = tombstoneIdentity(observationId);
+		for (const identity of this.#seenObservationIdentities) {
 			this.#retiredSessionIdentities.delete(identity);
 			this.#retiredSessionIdentities.add(identity);
 			while (this.#retiredSessionIdentities.size > IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES) {
