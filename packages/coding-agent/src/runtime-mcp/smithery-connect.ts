@@ -1,4 +1,14 @@
-const SMITHERY_API_BASE_URL = (process.env.SMITHERY_API_URL || "https://api.smithery.ai").replace(/\/+$/, "");
+import { $credentialEnv } from "@gajae-code/utils/env";
+
+/**
+ * Smithery API base, from trusted environment sources only.
+ *
+ * Every request to this base carries `Authorization: Bearer <apiKey>` and the
+ * `/connect` routes return the connection records the agent consumes, so
+ * whatever can set it receives the key and supplies those records. `$env` merges
+ * the caller's `cwd/.env` into `process.env`.
+ */
+const SMITHERY_API_BASE_URL = ($credentialEnv("SMITHERY_API_URL") || "https://api.smithery.ai").replace(/\/+$/, "");
 
 export class SmitheryConnectError extends Error {
 	status: number;
