@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import { type EditPathMutationOptions, withEditPathMutation } from "../edit/path-mutation-lock";
 import {
+	ensureGjcTeamAuthorityState,
 	gjcTeamTaskAuthorityDigest,
 	isCanonicalPersistedGjcTeamTaskClaim,
 	readCanonicalGjcTeamTasksFromDir,
@@ -38,6 +39,7 @@ interface ValidatedWriteTarget {
 	canonicalPath: string;
 	identityKey: string;
 	identityLockPath?: string;
+	kind: "directory" | "file" | "missing";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,12 +56,20 @@ async function resolveValidatedWriteTarget(absolutePath: string): Promise<Valida
 				canonicalPath,
 				identityKey,
 				identityLockPath: path.join(os.tmpdir(), "gjc-edit-identities", identityKey),
+				kind: "file",
+			};
+		}
+		if (stat.isDirectory()) {
+			return {
+				canonicalPath,
+				identityKey: `path:${pathKey(canonicalPath)}`,
+				kind: "directory",
 			};
 		}
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
-	return { canonicalPath, identityKey: `path:${pathKey(canonicalPath)}` };
+	return { canonicalPath, identityKey: `path:${pathKey(canonicalPath)}`, kind: "missing" };
 }
 
 async function validateTeamWriteScope(
@@ -74,6 +84,15 @@ async function validateTeamWriteScope(
 	if (!stateRoot || !teamName || !workerId) return target;
 
 	const teamDir = path.join(stateRoot, teamName);
+	try {
+		await ensureGjcTeamAuthorityState(teamDir, true);
+	} catch (error) {
+		if (!(error instanceof Error) || !error.message.startsWith("task_authority_")) throw error;
+		throw new ToolError(`Team authority validation failed: ${error.message}`);
+	}
+	if (target.kind === "directory") {
+		throw new ToolError(`Team write scope forbids directory mutations: ${absolutePath}`);
+	}
 	const configFile = Bun.file(path.join(teamDir, "config.json"));
 	let config: unknown;
 	try {
@@ -84,6 +103,7 @@ async function validateTeamWriteScope(
 	if (
 		!isRecord(config) ||
 		config.team_name !== teamName ||
+		config.authority_schema_version !== 1 ||
 		!Array.isArray(config.task_ids) ||
 		!config.task_ids.every(taskId => typeof taskId === "string" && /^[A-Za-z0-9._-]+$/u.test(taskId)) ||
 		!isRecord(config.task_authorities) ||
@@ -138,7 +158,11 @@ async function validateTeamWriteScope(
 	const allowed = new Map<string, string>();
 	for (const task of scopedTasks) {
 		for (const writePath of task.write_paths ?? []) {
-			allowed.set((await resolveValidatedWriteTarget(path.join(canonicalRoot, writePath))).identityKey, writePath);
+			const allowedTarget = await resolveValidatedWriteTarget(path.join(canonicalRoot, writePath));
+			if (allowedTarget.kind === "directory") {
+				throw new ToolError(`Team write scope forbids directory write_path declarations: ${writePath}`);
+			}
+			allowed.set(allowedTarget.identityKey, writePath);
 		}
 	}
 	if (!allowed.has(target.identityKey)) {
@@ -155,6 +179,10 @@ export async function enforceTeamWriteScope(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
 	await validateTeamWriteScope(session, absolutePath, env);
+}
+
+export function isTeamWriteScopeActive(env: NodeJS.ProcessEnv = process.env): boolean {
+	return Boolean(env.GJC_TEAM_STATE_ROOT?.trim() && env.GJC_TEAM_NAME?.trim() && env.GJC_TEAM_WORKER_ID?.trim());
 }
 
 export async function withTeamWriteScopeMutation<T>(

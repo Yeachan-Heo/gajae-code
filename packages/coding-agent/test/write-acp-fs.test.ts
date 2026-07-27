@@ -27,59 +27,36 @@ describe("write tool ACP fs routing", () => {
 
 	beforeEach(async () => {
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-acp-fs-test-"));
+		await Settings.init({ inMemory: true, cwd: tmpDir });
 	});
 
 	afterEach(async () => {
 		await fs.rm(tmpDir, { recursive: true, force: true });
 	});
 
-	it("routes plain text writes through an atomic create-only bridge", async () => {
+	it("routes plain text writes through the standard ACP bridge", async () => {
 		const filePath = path.join(tmpDir, "output.txt");
 
 		const bridge: ClientBridge = {
-			capabilities: { createTextFile: true },
-			createTextFile: async () => undefined,
+			capabilities: { writeTextFile: true },
+			writeTextFile: async () => undefined,
 		};
 
-		const bridgeSpy = spyOn(bridge, "createTextFile");
-		const bunWriteSpy = spyOn(Bun, "write");
+		const bridgeSpy = spyOn(bridge, "writeTextFile");
 
-		try {
-			const session = createSession(tmpDir, bridge);
-			const tool = new WriteTool(session);
+		const session = createSession(tmpDir, bridge);
+		const tool = new WriteTool(session);
 
-			await tool.execute("call-1", { path: filePath, content: FILE_CONTENT });
+		await tool.execute("call-1", { path: filePath, content: FILE_CONTENT });
 
-			// Bridge was called with the exact path and content
-			expect(bridgeSpy).toHaveBeenCalledTimes(1);
-			expect(bridgeSpy).toHaveBeenCalledWith({ path: filePath, content: FILE_CONTENT });
-			// Disk write must not have been called — bridge is the destination
-			expect(bunWriteSpy).not.toHaveBeenCalled();
-		} finally {
-			bunWriteSpy.mockRestore();
-		}
-	});
-
-	it("maps a client-side create conflict without touching local disk", async () => {
-		const filePath = path.join(tmpDir, "existing.txt");
-		const bridge: ClientBridge = {
-			capabilities: { createTextFile: true },
-			createTextFile: async () => {
-				throw Object.assign(new Error("already exists"), { code: "EEXIST" });
-			},
-		};
-		const bridgeSpy = spyOn(bridge, "createTextFile");
-
-		const tool = new WriteTool(createSession(tmpDir, bridge));
-		await expect(tool.execute("call-existing", { path: filePath, content: FILE_CONTENT })).rejects.toThrow(
-			/already exists/i,
-		);
 		expect(bridgeSpy).toHaveBeenCalledTimes(1);
+		expect(bridgeSpy).toHaveBeenCalledWith({ path: filePath, content: FILE_CONTENT });
 		expect(await Bun.file(filePath).exists()).toBe(false);
 	});
 
-	it("fails closed when the client cannot prove the path is absent", async () => {
-		const filePath = path.join(tmpDir, "unknown.txt");
+	it("forwards existing-file overwrites through the standard ACP bridge", async () => {
+		const filePath = path.join(tmpDir, "existing.txt");
+		await fs.writeFile(filePath, "existing content\n", "utf8");
 		const bridge: ClientBridge = {
 			capabilities: { writeTextFile: true },
 			writeTextFile: async () => undefined,
@@ -87,9 +64,9 @@ describe("write tool ACP fs routing", () => {
 		const bridgeSpy = spyOn(bridge, "writeTextFile");
 
 		const tool = new WriteTool(createSession(tmpDir, bridge));
-		await expect(tool.execute("call-unknown", { path: filePath, content: FILE_CONTENT })).rejects.toThrow(
-			/cannot guarantee atomic create-only writes/i,
-		);
-		expect(bridgeSpy).not.toHaveBeenCalled();
+		await tool.execute("call-existing", { path: filePath, content: FILE_CONTENT });
+		expect(bridgeSpy).toHaveBeenCalledTimes(1);
+		expect(bridgeSpy).toHaveBeenCalledWith({ path: filePath, content: FILE_CONTENT });
+		expect(await fs.readFile(filePath, "utf8")).toBe("existing content\n");
 	});
 });

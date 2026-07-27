@@ -21,6 +21,7 @@ import hashlineDescription from "../prompts/tools/hashline.md" with { type: "tex
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
 import type { ToolSession } from "../tools";
+import { isTeamWriteScopeActive } from "../tools/team-write-scope";
 import { VimTool, vimSchema } from "../tools/vim";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
 import type { VimToolDetails } from "../vim/types";
@@ -406,7 +407,8 @@ export class EditTool implements AgentTool<TInput> {
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolResultDetails, TInput>> {
 		const modeDefinition = this.#getModeDefinition();
-		return modeDefinition.execute(this, params, signal, getLspBatchRequest(context?.toolCall), onUpdate);
+		const batchRequest = isTeamWriteScopeActive() ? undefined : getLspBatchRequest(context?.toolCall);
+		return modeDefinition.execute(this, params, signal, batchRequest, onUpdate);
 	}
 
 	#getModeDefinition(): EditModeDefinition {

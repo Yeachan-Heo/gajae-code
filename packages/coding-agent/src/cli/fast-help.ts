@@ -92,7 +92,7 @@ Available Tools (default-enabled unless noted):
   read          - Read file contents
   bash          - Execute bash commands
   edit          - Edit files with find/replace
-  write         - Create new files
+  write         - Write files (creates/overwrites)
   grep          - Search file contents
   find          - Find files by glob pattern
   lsp           - Language server protocol (code intelligence)

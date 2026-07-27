@@ -36,6 +36,7 @@ import type {
 	GjcTeamNotificationDeliveryState,
 	GjcTeamNotificationSummary,
 	GjcTeamPaneAttemptResult,
+	GjcTeamPendingTaskAuthority,
 	GjcTeamTask,
 	GjcTeamTaskClaim,
 	GjcTeamTaskMetadataInput,
@@ -184,8 +185,10 @@ export interface GjcTeamConfig {
 	leader: GjcTeamLeader;
 	leader_cwd: string;
 	team_state_root: string;
+	authority_schema_version?: 1;
 	task_ids?: string[];
 	task_authorities?: Record<string, string>;
+	pending_task_authority?: GjcTeamPendingTaskAuthority;
 	workers: GjcTeamWorker[];
 	created_at: string;
 	updated_at: string;

@@ -34,10 +34,13 @@ import {
 	startGjcTeam,
 	transitionGjcTeamTask,
 	translateGjcWorkerLaunchArgsForCli,
+	updateGjcTeamTask,
 } from "../../src/gjc-runtime/team-runtime";
 import {
+	__setGjcTeamAuthorityTestSeamsForTests,
 	type GjcTeamTaskMutationCapability,
 	GjcTeamTaskStore,
+	gjcTeamTaskAuthorityDigest,
 	withGjcTeamTaskMutation,
 } from "../../src/gjc-runtime/team-store";
 import { workerMemoryGuardLedgerPath } from "../../src/gjc-runtime/team-worker-memory-guard";
@@ -254,6 +257,7 @@ function artifactCompletionEvidence(summary = "Completed by artifact review") {
 
 afterEach(async () => {
 	__setGjcTeamRuntimeTestSeamsForTests(undefined);
+	__setGjcTeamAuthorityTestSeamsForTests(undefined);
 	if (cleanupRoot) {
 		for (const session of [
 			"gjc-worktree-team",
@@ -2572,7 +2576,7 @@ describe("native gjc team runtime", () => {
 		await fs.writeFile(taskPath, JSON.stringify(forgedAuthorizedTask));
 		await expect(
 			enforceTeamWriteScope({ cwd: cleanupRoot }, path.join(cleanupRoot, "real", "other.ts"), workerEnv),
-		).rejects.toThrow(/must claim a task before writing files/);
+		).rejects.toThrow(/Team authority validation failed: task_authority_mismatch:task-1/);
 		await fs.writeFile(taskPath, canonicalTaskText);
 		const malformedTask: unknown = Bun.JSON5.parse(canonicalTaskText);
 		if (!isRecord(malformedTask)) throw new Error("invalid test task fixture");
@@ -2580,7 +2584,7 @@ describe("native gjc team runtime", () => {
 		await fs.writeFile(taskPath, JSON.stringify(malformedTask));
 		await expect(
 			enforceTeamWriteScope({ cwd: cleanupRoot }, path.join(cleanupRoot, "real", "file.ts"), workerEnv),
-		).rejects.toThrow(/must claim a task before writing files/);
+		).rejects.toThrow(/Team authority validation failed: task_authority_missing_projection:task-1/);
 		await fs.writeFile(taskPath, canonicalTaskText);
 		const forgedTask: unknown = Bun.JSON5.parse(canonicalTaskText);
 		if (!isRecord(forgedTask)) throw new Error("invalid forged task fixture");
@@ -2686,7 +2690,7 @@ describe("native gjc team runtime", () => {
 				GJC_TEAM_STATE_ROOT: path.dirname(snapshot.state_dir),
 				GJC_TEAM_WORKER_ID: "worker-2",
 			}),
-		).rejects.toThrow(/must claim a task before writing files/);
+		).rejects.toThrow(/Team authority validation failed: task_authority_mismatch:task-1/);
 	});
 
 	it("rejects forged activation of a preassigned task claim", async () => {
@@ -2738,7 +2742,7 @@ describe("native gjc team runtime", () => {
 				GJC_TEAM_STATE_ROOT: path.dirname(snapshot.state_dir),
 				GJC_TEAM_WORKER_ID: "worker-1",
 			}),
-		).rejects.toThrow(/must claim a task before writing files/);
+		).rejects.toThrow(/Team authority validation failed: task_authority_missing_projection:task-1/);
 	});
 
 	it("rejects forged claim-eligibility metadata", async () => {
@@ -4274,8 +4278,20 @@ describe("stalled worker continuation protocol", () => {
 		const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
 		if (!task.claim) throw new Error("expected claimed task");
 		const claim = { ...task.claim, leased_until: leasedUntil };
-		await Bun.write(path.join(fixture.stateDir, "tasks", "task-1.json"), `${JSON.stringify({ ...task, claim })}\n`);
+		const updatedTask = { ...task, claim };
+		await Bun.write(path.join(fixture.stateDir, "tasks", "task-1.json"), `${JSON.stringify(updatedTask)}\n`);
 		await Bun.write(path.join(fixture.stateDir, "claims", "task-1.json"), `${JSON.stringify(claim)}\n`);
+		const config = await readTeamConfig(fixture.stateDir);
+		await Bun.write(
+			path.join(fixture.stateDir, "config.json"),
+			`${JSON.stringify({
+				...config,
+				task_authorities: {
+					...config.task_authorities,
+					"task-1": gjcTeamTaskAuthorityDigest(updatedTask),
+				},
+			})}\n`,
+		);
 	}
 	it("treats a missing claims directory as zero canonical claims before the first claim", async () => {
 		cleanupRoot = await createGitRepo();
@@ -5363,5 +5379,126 @@ describe("stalled worker continuation protocol", () => {
 		release();
 		await Promise.all([monitor, gc]);
 		expect(gcFinished).toBe(true);
+	});
+
+	it("migrates active legacy team authority before enforcing worker writes", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-authority-migration-"));
+		const env = { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" };
+		const teamName = "legacy-authority-team";
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Continue a legacy claimed task",
+			teamName,
+			cwd: cleanupRoot,
+			dryRun: true,
+			env,
+		});
+		await updateGjcTeamTask(teamName, "task-1", { write_paths: ["owned.ts"] }, cleanupRoot, env);
+		const claim = await claimGjcTeamTask(teamName, "worker-1", cleanupRoot, env, "task-1");
+		expect(claim.ok).toBe(true);
+
+		const stateDir = teamStateDir(cleanupRoot, teamName);
+		const configPath = path.join(stateDir, "config.json");
+		const config = await readTeamConfig(stateDir);
+		const legacyConfig = { ...config } as Record<string, unknown>;
+		delete legacyConfig.authority_schema_version;
+		delete legacyConfig.task_ids;
+		delete legacyConfig.task_authorities;
+		delete legacyConfig.pending_task_authority;
+		await Bun.write(configPath, JSON.stringify(legacyConfig, null, 2));
+
+		await expect(
+			enforceTeamWriteScope({ cwd: cleanupRoot }, path.join(cleanupRoot, "owned.ts"), {
+				...env,
+				GJC_TEAM_STATE_ROOT: teamStateRoot(cleanupRoot, TEST_SESSION_ID),
+				GJC_TEAM_NAME: teamName,
+				GJC_TEAM_WORKER_ID: "worker-1",
+			}),
+		).rejects.toThrow(/Team authority validation failed: task_authority_downgrade_detected/);
+		await expect(
+			updateGjcTeamTask(teamName, "task-1", { description: "Reject downgrade" }, cleanupRoot, env),
+		).rejects.toThrow(/task_authority_downgrade_detected/);
+
+		const manifestPath = path.join(stateDir, "manifest.v2.json");
+		const legacyManifest = (await Bun.file(manifestPath).json()) as Record<string, unknown>;
+		delete legacyManifest.authority_schema_version;
+		delete legacyManifest.task_ids;
+		delete legacyManifest.task_authorities;
+		await Bun.write(manifestPath, JSON.stringify(legacyManifest, null, 2));
+
+		await enforceTeamWriteScope({ cwd: cleanupRoot }, path.join(cleanupRoot, "owned.ts"), {
+			...env,
+			GJC_TEAM_STATE_ROOT: teamStateRoot(cleanupRoot, TEST_SESSION_ID),
+			GJC_TEAM_NAME: teamName,
+			GJC_TEAM_WORKER_ID: "worker-1",
+		});
+		const migrated = await readTeamConfig(stateDir);
+		expect(migrated.authority_schema_version).toBe(1);
+		expect(migrated.task_ids).toEqual(["task-1"]);
+		expect(migrated.task_authorities?.["task-1"]).toMatch(/^[a-f0-9]{64}$/);
+	});
+
+	for (const seam of ["afterAuthorityPrepare", "afterTaskProjectionWrite"] as const) {
+		it(`recovers an interrupted task authority commit at ${seam}`, async () => {
+			cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-authority-recovery-"));
+			const env = { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" };
+			const teamName =
+				seam === "afterAuthorityPrepare" ? "authority-recovery-prepare" : "authority-recovery-projection";
+			await startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Recover interrupted authority",
+				teamName,
+				cwd: cleanupRoot,
+				dryRun: true,
+				env,
+			});
+
+			__setGjcTeamAuthorityTestSeamsForTests({
+				[seam]: () => {
+					throw new Error(`injected-${seam}`);
+				},
+			});
+			await expect(
+				updateGjcTeamTask(teamName, "task-1", { description: `committed-${seam}` }, cleanupRoot, env),
+			).rejects.toThrow(`injected-${seam}`);
+			__setGjcTeamAuthorityTestSeamsForTests(undefined);
+
+			const recovered = await updateGjcTeamTask(
+				teamName,
+				"task-1",
+				{ subject: "Recovered authority update" },
+				cleanupRoot,
+				env,
+			);
+			expect(recovered.description).toBe(`committed-${seam}`);
+			expect(recovered.subject).toBe("Recovered authority update");
+			const recoveredConfig = (await readTeamConfig(teamStateDir(cleanupRoot, teamName))) as GjcTeamConfig & {
+				pending_task_authority?: unknown;
+			};
+			expect(recoveredConfig.pending_task_authority).toBeUndefined();
+		});
+	}
+
+	it("rejects existing directories as exact team write paths", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-directory-scope-"));
+		const env = { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" };
+		const teamName = "directory-scope-team";
+		await fs.mkdir(path.join(cleanupRoot, "feature"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Reject recursive ownership",
+			teamName,
+			cwd: cleanupRoot,
+			dryRun: true,
+			env,
+		});
+		await updateGjcTeamTask(teamName, "task-1", { write_paths: ["feature"] }, cleanupRoot, env);
+
+		const claim = await claimGjcTeamTask(teamName, "worker-1", cleanupRoot, env, "task-1");
+		expect(claim.ok).toBe(false);
+		expect(claim.reason).toBe("write_scope_directory_forbidden:task-1:feature");
 	});
 });

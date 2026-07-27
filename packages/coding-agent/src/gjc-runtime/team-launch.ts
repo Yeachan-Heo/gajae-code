@@ -12,8 +12,8 @@ import type {
 	GjcTeamWorkerLifecycle,
 	GjcTeamWorktreeMode,
 } from "./team-runtime";
+import { gjcTeamTaskAuthorityDigest, withGjcTeamMutationFence } from "./team-store";
 import { createInitialGjcTeamWorkerMemoryGuardLedger, workerMemoryGuardLedgerPath } from "./team-worker-memory-guard";
-import { gjcTeamTaskAuthorityDigest } from "./team-store";
 
 /** Launch-specific option wiring kept separate from runtime dispatch. */
 export function withTeamLaunchTransport(
@@ -272,6 +272,7 @@ export async function startGjcTeamLaunch(
 		},
 		leader_cwd: cwd,
 		team_state_root: stateRoot,
+		authority_schema_version: 1,
 		task_ids: initialTasks.map(task => task.id).sort(),
 		task_authorities: Object.fromEntries(initialTasks.map(task => [task.id, gjcTeamTaskAuthorityDigest(task)])),
 		workers: workersWithAssignments,
@@ -279,6 +280,7 @@ export async function startGjcTeamLaunch(
 		updated_at: createdAt,
 	};
 	await initializeStateDirs(runtime, dir, config.workers, platform);
+	for (const task of initialTasks) await runtime.writeTask(dir, task);
 	await runtime.writeJson(path.join(dir, "config.json"), config);
 	await runtime.writeJson(path.join(dir, "manifest.v2.json"), {
 		version: 2,
@@ -292,6 +294,7 @@ export async function startGjcTeamLaunch(
 		worker_cli_plan: config.worker_cli_plan,
 		tmux_command: config.tmux_command,
 		leader: config.leader,
+		authority_schema_version: config.authority_schema_version,
 		task_ids: config.task_ids,
 		task_authorities: config.task_authorities,
 		workers: config.workers,
@@ -301,7 +304,6 @@ export async function startGjcTeamLaunch(
 		updated_at: createdAt,
 	});
 	await runtime.writePhase(dir, "starting");
-	for (const task of initialTasks) await runtime.writeTask(dir, task);
 	await runtime.appendEvent(dir, {
 		type: "team_started",
 		message: options.dryRun
@@ -338,12 +340,17 @@ export async function startGjcTeamLaunch(
 		await runtime.rollbackCreatedWorktrees(config.workers);
 		throw error;
 	}
-	const runningConfig = {
-		...config,
-		workers: tmuxWorkers.map(worker => ({ ...worker, status: "idle" as const, last_heartbeat: runtime.now() })),
-		updated_at: runtime.now(),
-	};
-	await runtime.writeJson(path.join(dir, "config.json"), runningConfig);
+	const runningConfig = await withGjcTeamMutationFence(dir, async () => {
+		const configPath = path.join(dir, "config.json");
+		const latestConfig = (await Bun.file(configPath).json()) as GjcTeamConfig;
+		const updatedConfig: GjcTeamConfig = {
+			...latestConfig,
+			workers: tmuxWorkers.map(worker => ({ ...worker, status: "idle" as const, last_heartbeat: runtime.now() })),
+			updated_at: runtime.now(),
+		};
+		await runtime.writeJson(configPath, updatedConfig);
+		return updatedConfig;
+	});
 	await runtime.writeWorkerLifecycleForConfig(dir, runningConfig, "starting", worker => ({
 		pane_id: worker.pane_id,
 		started_at: runningConfig.created_at,

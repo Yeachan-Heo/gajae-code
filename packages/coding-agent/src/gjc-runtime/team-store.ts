@@ -1,15 +1,10 @@
 /** File-backed team task store, claims, leases, and completion evidence. */
 import { createHash, randomUUID } from "node:crypto";
+import type * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { sessionIdFromDirName } from "./session-layout";
-import {
-	createJsonNoClobber,
-	deleteIfOwned,
-	removeFileAudited,
-	withWorkflowStateLock,
-	writeJsonAtomic,
-} from "./state-writer";
+import { removeFileAudited, withWorkflowStateLock, writeJsonAtomic } from "./state-writer";
 import type { GjcTeamConfig, GjcTeamMailboxMessage } from "./team-runtime";
 
 export type GjcTeamNotificationDeliveryState =
@@ -111,6 +106,11 @@ export interface GjcTeamTask {
 	created_at: string;
 	updated_at: string;
 	completed_at?: string;
+}
+export interface GjcTeamPendingTaskAuthority {
+	previous_digest: string | null;
+	next_digest: string;
+	task: GjcTeamTask;
 }
 export type GjcTeamTaskMetadataInput = Partial<
 	Pick<GjcTeamTask, "owner" | "lane" | "required_role" | "allowed_roles" | "depends_on" | "blocked_by" | "write_paths">
@@ -569,39 +569,322 @@ export async function readCanonicalGjcTeamTasksFromDir(dir: string): Promise<Gjc
 		throw error;
 	}
 }
+
+type GjcTeamAuthorityTestSeams = {
+	afterAuthorityPrepare?: () => void | Promise<void>;
+	afterTaskProjectionWrite?: () => void | Promise<void>;
+};
+
+let authorityTestSeams: GjcTeamAuthorityTestSeams | undefined;
+
+/** @internal */
+export function __setGjcTeamAuthorityTestSeamsForTests(seams: GjcTeamAuthorityTestSeams | undefined): void {
+	authorityTestSeams = seams;
+}
+
+async function readStrictCanonicalGjcTeamTasksFromDir(dir: string): Promise<GjcTeamTask[]> {
+	let entries: nodeFs.Dirent[];
+	try {
+		entries = await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true });
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw error;
+	}
+	const taskEntries = entries.filter(
+		entry => entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json"),
+	);
+	const tasks: GjcTeamTask[] = [];
+	for (const entry of taskEntries) {
+		const fileId = path.basename(entry.name, ".json");
+		const record = await readJson<unknown>(path.join(dir, "tasks", entry.name));
+		if (!isCanonicalPersistedGjcTeamTask(record, fileId)) {
+			throw new Error(`task_authority_invalid_task:${fileId}`);
+		}
+		tasks.push(normalizeGjcTeamTask(record));
+	}
+	return tasks.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+async function assertCanonicalLegacyClaims(dir: string, tasks: readonly GjcTeamTask[]): Promise<void> {
+	let entries: nodeFs.Dirent[];
+	try {
+		entries = await fs.readdir(path.join(dir, "claims"), { withFileTypes: true });
+	} catch (error) {
+		if (isEnoent(error)) {
+			if (tasks.some(task => task.claim !== undefined)) throw new Error("task_authority_missing_claims");
+			return;
+		}
+		throw error;
+	}
+	const claimEntries = entries.filter(entry => entry.isFile() && entry.name.endsWith(".json"));
+	const tasksById = new Map(tasks.map(task => [task.id, task]));
+	for (const entry of claimEntries) {
+		const taskId = path.basename(entry.name, ".json");
+		const claim = await readJson<unknown>(path.join(dir, "claims", entry.name));
+		const taskClaim = tasksById.get(taskId)?.claim;
+		if (
+			!isCanonicalPersistedGjcTeamTaskClaim(claim) ||
+			!taskClaim ||
+			claim.owner !== taskClaim.owner ||
+			claim.token !== taskClaim.token ||
+			claim.leased_until !== taskClaim.leased_until
+		) {
+			throw new Error(`task_authority_invalid_claim:${taskId}`);
+		}
+	}
+	for (const task of tasks) {
+		if (task.claim && !claimEntries.some(entry => path.basename(entry.name, ".json") === task.id)) {
+			throw new Error(`task_authority_missing_claim:${task.id}`);
+		}
+	}
+}
+
+async function reconcileClaimProjections(dir: string, tasks: readonly GjcTeamTask[]): Promise<void> {
+	await fs.mkdir(path.join(dir, "claims"), { recursive: true });
+	const claimsByTask = new Map(
+		tasks
+			.filter((task): task is GjcTeamTask & { claim: GjcTeamTaskClaim } => task.claim !== undefined)
+			.map(task => [task.id, task.claim]),
+	);
+	const entries = await fs.readdir(path.join(dir, "claims"), { withFileTypes: true });
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const taskId = path.basename(entry.name, ".json");
+		if (claimsByTask.has(taskId)) continue;
+		await removeFileAudited(
+			path.join(dir, "claims", entry.name),
+			writerOptions(path.join(dir, "claims", entry.name), "prune", "authority-reconcile"),
+		);
+	}
+	for (const [taskId, claim] of claimsByTask) {
+		await writeJson(claimPath(dir, taskId), claim);
+	}
+}
+
+async function writeClaimProjection(dir: string, task: GjcTeamTask): Promise<void> {
+	if (task.claim) {
+		await writeJson(claimPath(dir, task.id), task.claim);
+		return;
+	}
+	try {
+		await removeFileAudited(
+			claimPath(dir, task.id),
+			writerOptions(claimPath(dir, task.id), "prune", "authority-projection"),
+		);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+}
+
+function canonicalPendingTaskAuthority(value: unknown): GjcTeamPendingTaskAuthority | undefined {
+	if (
+		!isRecord(value) ||
+		!hasExactKeys(value, new Set(["previous_digest", "next_digest", "task"])) ||
+		(value.previous_digest !== null &&
+			(typeof value.previous_digest !== "string" || !/^[a-f0-9]{64}$/u.test(value.previous_digest))) ||
+		typeof value.next_digest !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(value.next_digest) ||
+		!isCanonicalPersistedGjcTeamTask(value.task)
+	) {
+		return undefined;
+	}
+	const task = normalizeGjcTeamTask(value.task);
+	if (gjcTeamTaskAuthorityDigest(task) !== value.next_digest) return undefined;
+	return {
+		previous_digest: value.previous_digest,
+		next_digest: value.next_digest,
+		task,
+	};
+}
+
+function configWithoutPendingAuthority(config: Record<string, unknown>): Record<string, unknown> {
+	const next = { ...config };
+	delete next.pending_task_authority;
+	return next;
+}
+
+function readCanonicalAuthorityInventory(config: Record<string, unknown>): {
+	taskIds: string[];
+	taskAuthorities: Record<string, string>;
+} {
+	if (
+		config.authority_schema_version !== 1 ||
+		!Array.isArray(config.task_ids) ||
+		!config.task_ids.every(taskId => typeof taskId === "string" && isSafePersistedId(taskId)) ||
+		new Set(config.task_ids).size !== config.task_ids.length ||
+		!isRecord(config.task_authorities) ||
+		!Object.values(config.task_authorities).every(
+			digest => typeof digest === "string" && /^[a-f0-9]{64}$/u.test(digest),
+		)
+	) {
+		throw new Error("task_authority_invalid_inventory");
+	}
+	const taskIds = [...config.task_ids].sort();
+	if (JSON.stringify(taskIds) !== JSON.stringify(config.task_ids)) {
+		throw new Error("task_authority_unsorted_inventory");
+	}
+	const taskAuthorities = Object.fromEntries(
+		Object.entries(config.task_authorities).map(([taskId, digest]) => [taskId, String(digest)]),
+	);
+	if (JSON.stringify(Object.keys(taskAuthorities).sort()) !== JSON.stringify(taskIds)) {
+		throw new Error("task_authority_inventory_mismatch");
+	}
+	return { taskIds, taskAuthorities };
+}
+
+function assertAuthorityInventoryMatchesTasks(
+	inventory: { taskIds: string[]; taskAuthorities: Record<string, string> },
+	tasks: readonly GjcTeamTask[],
+): void {
+	const tasksById = new Map(tasks.map(task => [task.id, task]));
+	for (const taskId of inventory.taskIds) {
+		const task = tasksById.get(taskId);
+		if (!task) throw new Error(`task_authority_missing_projection:${taskId}`);
+		if (inventory.taskAuthorities[task.id] !== gjcTeamTaskAuthorityDigest(task)) {
+			throw new Error(`task_authority_mismatch:${task.id}`);
+		}
+	}
+}
+
+async function finalizePendingTaskAuthority(
+	dir: string,
+	config: Record<string, unknown>,
+	pending: GjcTeamPendingTaskAuthority,
+): Promise<void> {
+	const inventory = readCanonicalAuthorityInventory(config);
+	const taskIds = [...new Set([...inventory.taskIds, pending.task.id])].sort();
+	await writeJson(path.join(dir, "config.json"), {
+		...configWithoutPendingAuthority(config),
+		authority_schema_version: 1,
+		task_ids: taskIds,
+		task_authorities: {
+			...inventory.taskAuthorities,
+			[pending.task.id]: pending.next_digest,
+		},
+		updated_at: new Date().toISOString(),
+	});
+}
+
+async function ensureGjcTeamAuthorityStateUnlocked(dir: string, allowLegacyMigration = false): Promise<void> {
+	const configPath = path.join(dir, "config.json");
+	const config = await readJson<unknown>(configPath);
+	if (config === null) return;
+	if (!isRecord(config)) throw new Error("task_authority_invalid_config");
+
+	if (config.pending_task_authority !== undefined) {
+		const pending = canonicalPendingTaskAuthority(config.pending_task_authority);
+		if (!pending) throw new Error("task_authority_invalid_pending_transaction");
+		const inventory = readCanonicalAuthorityInventory(config);
+		const persistedDigest = inventory.taskAuthorities[pending.task.id] ?? null;
+		if (persistedDigest !== pending.previous_digest && persistedDigest !== pending.next_digest) {
+			throw new Error(`task_authority_pending_preimage_mismatch:${pending.task.id}`);
+		}
+		const tasks = await readCanonicalGjcTeamTasksFromDir(dir);
+		const tasksById = new Map(tasks.map(task => [task.id, task]));
+		for (const taskId of inventory.taskIds) {
+			if (taskId === pending.task.id) continue;
+			const task = tasksById.get(taskId);
+			if (!task) throw new Error(`task_authority_missing_projection:${taskId}`);
+			if (inventory.taskAuthorities[taskId] !== gjcTeamTaskAuthorityDigest(task)) {
+				throw new Error(`task_authority_mismatch:${taskId}`);
+			}
+		}
+		const pendingProjection = tasksById.get(pending.task.id);
+		if (pendingProjection) {
+			const digest = gjcTeamTaskAuthorityDigest(pendingProjection);
+			if (digest !== pending.previous_digest && digest !== pending.next_digest) {
+				throw new Error(`task_authority_pending_projection_mismatch:${pending.task.id}`);
+			}
+		}
+		await writeJson(taskPath(dir, pending.task.id), pending.task);
+		await reconcileClaimProjections(
+			dir,
+			[...tasks.filter(task => task.id !== pending.task.id), pending.task].sort((left, right) =>
+				left.id.localeCompare(right.id),
+			),
+		);
+		await finalizePendingTaskAuthority(dir, config, pending);
+		return;
+	}
+
+	if (config.authority_schema_version === undefined) {
+		if (!allowLegacyMigration) throw new Error("task_authority_migration_required");
+		const tasks = await readStrictCanonicalGjcTeamTasksFromDir(dir);
+		await assertCanonicalLegacyClaims(dir, tasks);
+		const hasInventory = config.task_ids !== undefined || config.task_authorities !== undefined;
+		if (hasInventory) {
+			const inventory = readCanonicalAuthorityInventory({ ...config, authority_schema_version: 1 });
+			assertAuthorityInventoryMatchesTasks(inventory, tasks);
+			await writeJson(configPath, {
+				...config,
+				authority_schema_version: 1,
+				updated_at: new Date().toISOString(),
+			});
+			return;
+		}
+		const manifest = await readJson<unknown>(path.join(dir, "manifest.v2.json"));
+		if (
+			isRecord(manifest) &&
+			(manifest.authority_schema_version === 1 ||
+				manifest.task_ids !== undefined ||
+				manifest.task_authorities !== undefined)
+		) {
+			throw new Error("task_authority_downgrade_detected");
+		}
+		await writeJson(configPath, {
+			...config,
+			authority_schema_version: 1,
+			task_ids: tasks.map(task => task.id),
+			task_authorities: Object.fromEntries(tasks.map(task => [task.id, gjcTeamTaskAuthorityDigest(task)])),
+			updated_at: new Date().toISOString(),
+		});
+		return;
+	}
+	const tasks = await readCanonicalGjcTeamTasksFromDir(dir);
+	const inventory = readCanonicalAuthorityInventory(config);
+	assertAuthorityInventoryMatchesTasks(inventory, tasks);
+}
+
+export async function ensureGjcTeamAuthorityState(dir: string, allowLegacyMigration = false): Promise<void> {
+	await withGjcTeamMutationFence(dir, () => ensureGjcTeamAuthorityStateUnlocked(dir, allowLegacyMigration));
+}
+
 async function writeGjcTeamTaskToDir(dir: string, task: GjcTeamTask, previousTask?: GjcTeamTask): Promise<void> {
 	const normalized = normalizeGjcTeamTask(task);
 	const configPath = path.join(dir, "config.json");
+	await ensureGjcTeamAuthorityStateUnlocked(dir);
 	const config = await readJson<unknown>(configPath);
 	if (!isRecord(config)) {
 		await writeJson(taskPath(dir, task.id), normalized);
 		return;
 	}
-	const taskIds = Array.isArray(config.task_ids)
-		? config.task_ids.filter((taskId): taskId is string => typeof taskId === "string")
-		: [];
-	const taskAuthorities = isRecord(config.task_authorities) ? config.task_authorities : {};
-	const persistedAuthority = taskAuthorities[normalized.id];
+	const inventory = readCanonicalAuthorityInventory(config);
+	const persistedAuthority = inventory.taskAuthorities[normalized.id];
 	if (
 		persistedAuthority !== undefined &&
-		(typeof persistedAuthority !== "string" ||
-			persistedAuthority !== gjcTeamTaskAuthorityDigest(previousTask ?? normalized))
+		persistedAuthority !== gjcTeamTaskAuthorityDigest(previousTask ?? normalized)
 	) {
 		throw new Error(`task_authority_mismatch:${normalized.id}`);
 	}
 	if (previousTask && persistedAuthority === undefined) {
 		throw new Error(`task_authority_missing:${normalized.id}`);
 	}
-	await writeJson(taskPath(dir, task.id), normalized);
-	await writeJson(configPath, {
+	const pending: GjcTeamPendingTaskAuthority = {
+		previous_digest: persistedAuthority ?? null,
+		next_digest: gjcTeamTaskAuthorityDigest(normalized),
+		task: normalized,
+	};
+	const preparedConfig = {
 		...config,
-		task_ids: [...new Set([...taskIds, normalized.id])].sort(),
-		task_authorities: {
-			...taskAuthorities,
-			[normalized.id]: gjcTeamTaskAuthorityDigest(normalized),
-		},
+		pending_task_authority: pending,
 		updated_at: new Date().toISOString(),
-	});
+	};
+	await writeJson(configPath, preparedConfig);
+	await authorityTestSeams?.afterAuthorityPrepare?.();
+	await writeJson(taskPath(dir, task.id), normalized);
+	await writeClaimProjection(dir, normalized);
+	await authorityTestSeams?.afterTaskProjectionWrite?.();
+	await finalizePendingTaskAuthority(dir, preparedConfig, pending);
 }
 
 function eligibility(task: GjcTeamTask, worker: GjcTeamTaskWorker, tasks: GjcTeamTask[]): string | null {
@@ -685,6 +968,17 @@ async function canonicalWritePathKey(root: string, writePath: string): Promise<s
 	return writePathKey(path.relative(canonicalRoot, canonicalPath).split(path.sep).join("/"));
 }
 
+async function isDirectoryWritePath(root: string, writePath: string): Promise<boolean> {
+	const canonicalRoot = await fs.realpath(root);
+	const canonicalPath = await resolvePotentialRealPath(path.join(canonicalRoot, writePath));
+	try {
+		return (await fs.stat(canonicalPath)).isDirectory();
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
 async function findActiveWriteScopeConflict(
 	dir: string,
 	task: GjcTeamTask,
@@ -692,6 +986,13 @@ async function findActiveWriteScopeConflict(
 ): Promise<string | null> {
 	const config = await readJson<unknown>(path.join(dir, "config.json"));
 	const root = isRecord(config) && typeof config.leader_cwd === "string" ? config.leader_cwd : undefined;
+	if (root) {
+		for (const writePath of task.write_paths ?? []) {
+			if (await isDirectoryWritePath(root, writePath)) {
+				return `write_scope_directory_forbidden:${task.id}:${writePath}`;
+			}
+		}
+	}
 	const writePaths = new Map(
 		await Promise.all(
 			(task.write_paths ?? []).map(
@@ -824,12 +1125,31 @@ export class GjcTeamTaskStore {
 			return pending;
 		};
 		const capability = Object.freeze<GjcTeamTaskMutationCapability>({
-			create: (subject, description, options) => track(() => this.#createUnlocked(subject, description, options)),
-			update: (id, updates) => track(() => this.#updateUnlocked(id, updates)),
-			claim: (worker, id) => track(() => this.#claimUnlocked(worker, id)),
+			create: (subject, description, options) =>
+				track(async () => {
+					await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+					return this.#createUnlocked(subject, description, options);
+				}),
+			update: (id, updates) =>
+				track(async () => {
+					await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+					return this.#updateUnlocked(id, updates);
+				}),
+			claim: (worker, id) =>
+				track(async () => {
+					await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+					return this.#claimUnlocked(worker, id);
+				}),
 			transition: (id, status, token, workerId, evidenceInput) =>
-				track(() => this.#transitionUnlocked(id, status, token, workerId, evidenceInput)),
-			release: (id, token, workerId) => track(() => this.#releaseUnlocked(id, token, workerId)),
+				track(async () => {
+					await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+					return this.#transitionUnlocked(id, status, token, workerId, evidenceInput);
+				}),
+			release: (id, token, workerId) =>
+				track(async () => {
+					await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+					return this.#releaseUnlocked(id, token, workerId);
+				}),
 			writeRecovered: task =>
 				track(async () => {
 					const previousTask = (await this.list()).find(candidate => candidate.id === task.id);
@@ -838,7 +1158,7 @@ export class GjcTeamTaskStore {
 						return true;
 					} catch (error) {
 						const reason = error instanceof Error ? error.message : String(error);
-						if (!reason.startsWith("task_authority_mismatch:") && !reason.startsWith("task_authority_missing:")) {
+						if (!reason.startsWith("task_authority_")) {
 							throw error;
 						}
 						await this.appendEvent({
@@ -884,7 +1204,10 @@ export class GjcTeamTaskStore {
 		return task;
 	}
 	async create(subject: string, description: string, options: GjcTeamTaskMetadataInput) {
-		return withGjcTeamMutationFence(this.dir, () => this.#createUnlocked(subject, description, options));
+		return withGjcTeamMutationFence(this.dir, async () => {
+			await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+			return this.#createUnlocked(subject, description, options);
+		});
 	}
 	async #createUnlocked(subject: string, description: string, options: GjcTeamTaskMetadataInput) {
 		const task: GjcTeamTask = {
@@ -923,7 +1246,10 @@ export class GjcTeamTaskStore {
 			>
 		>,
 	) {
-		return withGjcTeamMutationFence(this.dir, () => this.#updateUnlocked(id, updates));
+		return withGjcTeamMutationFence(this.dir, async () => {
+			await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+			return this.#updateUnlocked(id, updates);
+		});
 	}
 	async #updateUnlocked(
 		id: string,
@@ -966,7 +1292,10 @@ export class GjcTeamTaskStore {
 		return updated;
 	}
 	async claim(worker: GjcTeamTaskWorker, id?: string): Promise<GjcTeamApiClaimResult> {
-		return withGjcTeamMutationFence(this.dir, () => this.#claimUnlocked(worker, id));
+		return withGjcTeamMutationFence(this.dir, async () => {
+			await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+			return this.#claimUnlocked(worker, id);
+		});
 	}
 	async #claimUnlocked(worker: GjcTeamTaskWorker, id?: string): Promise<GjcTeamApiClaimResult> {
 		const tasks = await this.list();
@@ -1000,26 +1329,11 @@ export class GjcTeamTaskStore {
 			token: randomUUID(),
 			leased_until: new Date(Date.now() + 30 * 60_000).toISOString(),
 		};
-		try {
-			await createJsonNoClobber(
-				claimPath(this.dir, task.id),
-				claim,
-				writerOptions(claimPath(this.dir, task.id), "state", "claim"),
-			);
-		} catch (error) {
-			if (isRecord(error) && error.code === "EEXIST")
-				return { ok: false, reason: `task_already_claimed:${task.id}` };
-			throw error;
-		}
 		const current = await this.read(task.id);
 		const currentTasks = await this.list();
 		const currentReason = eligibility(current, worker, currentTasks);
 		const currentConflict = await findActiveWriteScopeConflict(this.dir, current, currentTasks);
 		if (currentReason || currentConflict || current.status !== "pending") {
-			await deleteIfOwned(claimPath(this.dir, task.id), {
-				...writerOptions(claimPath(this.dir, task.id), "prune", "rollback"),
-				predicate: current => (current as GjcTeamTaskClaim).token === claim.token,
-			});
 			return {
 				ok: false,
 				reason: currentReason ?? currentConflict ?? `task_not_pending:${task.id}`,
@@ -1034,15 +1348,7 @@ export class GjcTeamTaskStore {
 			version: current.version + 1,
 			updated_at: now(),
 		};
-		try {
-			await writeGjcTeamTaskToDir(this.dir, updated, current);
-		} catch (error) {
-			await deleteIfOwned(claimPath(this.dir, task.id), {
-				...writerOptions(claimPath(this.dir, task.id), "prune", "rollback"),
-				predicate: current => (current as GjcTeamTaskClaim).token === claim.token,
-			});
-			throw error;
-		}
+		await writeGjcTeamTaskToDir(this.dir, updated, current);
 		await this.appendEvent({
 			type: "task_claimed",
 			task_id: updated.id,
@@ -1057,9 +1363,10 @@ export class GjcTeamTaskStore {
 		};
 	}
 	async transition(id: string, status: GjcTeamTaskStatus, token?: string, workerId?: string, evidenceInput?: unknown) {
-		return withGjcTeamMutationFence(this.dir, () =>
-			this.#transitionUnlocked(id, status, token, workerId, evidenceInput),
-		);
+		return withGjcTeamMutationFence(this.dir, async () => {
+			await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+			return this.#transitionUnlocked(id, status, token, workerId, evidenceInput);
+		});
 	}
 	async #transitionUnlocked(
 		id: string,
@@ -1090,8 +1397,6 @@ export class GjcTeamTaskStore {
 			...(evidence ? { completion_evidence: evidence } : {}),
 		};
 		await writeGjcTeamTaskToDir(this.dir, updated, task);
-		if (terminal)
-			await removeFileAudited(claimPath(this.dir, id), writerOptions(claimPath(this.dir, id), "prune", "terminal"));
 		const data: Record<string, unknown> = { status };
 		if (evidence)
 			data.completion_evidence = {
@@ -1109,7 +1414,10 @@ export class GjcTeamTaskStore {
 		return updated;
 	}
 	async release(id: string, token: string, workerId: string) {
-		return withGjcTeamMutationFence(this.dir, () => this.#releaseUnlocked(id, token, workerId));
+		return withGjcTeamMutationFence(this.dir, async () => {
+			await ensureGjcTeamAuthorityStateUnlocked(this.dir, true);
+			return this.#releaseUnlocked(id, token, workerId);
+		});
 	}
 	async #releaseUnlocked(id: string, token: string, workerId: string) {
 		const task = await this.read(id);
@@ -1124,10 +1432,6 @@ export class GjcTeamTaskStore {
 			updated_at: now(),
 		};
 		await writeGjcTeamTaskToDir(this.dir, updated, task);
-		await deleteIfOwned(claimPath(this.dir, id), {
-			...writerOptions(claimPath(this.dir, id), "prune", "release"),
-			predicate: current => (current as GjcTeamTaskClaim).token === token,
-		});
 		await this.appendEvent({
 			type: "task_claim_released",
 			task_id: id,

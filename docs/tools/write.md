@@ -1,6 +1,6 @@
 # write
 
-> Create a new plain file, or write an archive entry or SQLite row.
+> Create or overwrite a file, archive entry, or SQLite row.
 
 ## Source
 - Entry: `packages/coding-agent/src/tools/write.ts`
@@ -9,7 +9,7 @@
   - `packages/coding-agent/src/tools/archive-reader.ts` — parse `archive.ext:entry` selectors.
   - `packages/coding-agent/src/tools/sqlite-reader.ts` — detect SQLite paths and perform row insert/update/delete.
   - `packages/coding-agent/src/lsp/index.ts` — format-on-write and diagnostics writethrough.
-  - `packages/coding-agent/src/edit/path-mutation-lock.ts` — serialize same-path creation attempts.
+  - `packages/coding-agent/src/tools/auto-generated-guard.ts` — block overwriting generated files.
   - `packages/coding-agent/src/tools/fs-cache-invalidation.ts` — invalidate shared FS scan caches after writes.
   - `packages/coding-agent/src/tools/plan-mode-guard.ts` — resolve paths and enforce plan-mode write policy.
 
@@ -44,7 +44,7 @@ Single-shot result.
   - Archive write: `Successfully wrote <bytes> bytes to <relative-archive-path>:<entry-path>`.
   - SQLite write: one of `Inserted row into <table>`, `Updated row '<key>' in <table>`, `No row updated ...`, `Deleted row ...`, `No row deleted ...`.
 - If hashline prefixes were copied from `read` output and stripped first, the first text block gets an extra note.
-- Plain file creation does not return LSP diagnostics because reopening the path would weaken atomic no-clobber guarantees.
+- Plain file writes may also return `details.diagnostics` plus `details.meta.diagnostics` when LSP diagnostics-on-write is enabled.
 - SQLite writes use `toolResult(...).sourcePath(...)`, so `details.meta.sourcePath` points at the database file.
 - Archive writes return empty `details`.
 
@@ -64,19 +64,17 @@ Single-shot result.
    - Non-empty `content` is parsed with `Bun.JSON5.parse()`, must be a JSON object, and is routed to insert/update helpers from `packages/coding-agent/src/tools/sqlite-reader.ts`.
    - `invalidateFsScanAfterWrite()` runs on the DB path and the connection is closed in `finally`.
 6. Otherwise the tool treats `path` as a plain filesystem file.
-   - `enforcePlanModeWrite(..., { op: "create" })` runs before lock or filesystem mutation.
-   - The path mutation lock serializes cooperating same-path creators, and local files are opened with exclusive-create semantics.
-   - Existing files are rejected with guidance to use `edit`; whole-file overwrite is not supported for plain paths.
-   - Client-routed writes require an atomic `createTextFile` capability. Legacy write-only bridges, including ACP clients that expose only `fs/write_text_file`, fail closed because they cannot guarantee no-clobber behavior.
-   - Local creation writes the requested content through the exclusive file handle and does not reopen the path for formatter or diagnostics writeback.
+   - `enforcePlanModeWrite(..., { op: "create" })` runs before path resolution.
+   - Existing files are checked by `assertEditableFile()` to block overwriting detected generated files.
+   - The session’s writethrough callback writes content. With LSP enabled and `lsp.formatOnWrite` / `lsp.diagnosticsOnWrite` settings on, `createLspWritethrough()` may format content, sync it through LSP servers, save it, and collect diagnostics. Otherwise `writethroughNoop()` writes directly with `Bun.write()` or `file.write()`.
    - `invalidateFsScanAfterWrite()` runs on the file path.
 7. The tool returns a text result and optional diagnostics metadata.
 
 ## Modes / Variants
 ### Plain file path
 - Target is any path that does not resolve as an archive selector and does not resolve as an existing-or-new SQLite selector.
-- Existing files are rejected; use `edit` for modifications.
-- Parent directories are created before the exclusive file create.
+- Existing files are overwritten.
+- `write.ts` does not call `fs.mkdir()` on this path; parent-directory creation is only implemented in the archive branch.
 
 Example:
 
@@ -134,9 +132,9 @@ content: ""
 
 ## Side Effects
 - Filesystem
-  - Creates new plain files without overwriting existing paths.
+  - Creates or overwrites plain files.
   - Rewrites entire archive files when writing an archive entry.
-  - Creates parent directories for archive files and new plain files.
+  - Creates parent directories for archive files only.
   - Mutates existing SQLite databases; never creates a new SQLite DB.
 - Subprocesses / native bindings
   - Uses Bun SQLite bindings via `bun:sqlite`.
@@ -151,6 +149,7 @@ content: ""
 
 ## Limits & Caps
 - `WriteTool` itself exposes no byte cap beyond storing `content` in memory and, for archives, rebuilding the archive in memory.
+- Generated-file detection reads at most `CHECK_BYTE_COUNT = 1024` bytes and `HEADER_LINE_LIMIT = 40` header lines from an existing file in `packages/coding-agent/src/tools/auto-generated-guard.ts`.
 - SQLite writes set `PRAGMA busy_timeout = 3000`.
 - LSP writethrough uses a `5_000` ms operation timeout in `runLspWritethrough()` and may schedule a deferred diagnostics fetch with `AbortSignal.timeout(25_000)` in `scheduleDeferredDiagnosticsFetch()`.
 
@@ -165,10 +164,9 @@ content: ""
   - `SQLite row writes require a non-empty row key`
 - Missing SQLite DBs surface as `SQLite database '<path>' not found`.
 - SQLite content errors are model-visible `ToolError`s, including invalid JSON5, non-object payloads, unknown columns, non-scalar values, empty update objects, composite primary keys, and `WITHOUT ROWID` tables.
-- Existing plain files are rejected with `File already exists`; use `edit` for modifications.
-- Client-routed plain-file creation fails closed unless the bridge provides atomic create-only semantics.
+- Existing plain files may be rejected by `assertEditableFile()` when they look generated.
 - Archive read/write failures and unexpected SQLite exceptions are wrapped in `ToolError(error.message)`.
-- Plain file creation preserves the exact requested content; run explicit diagnostics or formatting afterward when needed.
+- If no LSP server matches or LSP formatting/diagnostics times out, file writes still fall back to writing content; diagnostics may be omitted.
 
 ## Notes
 - Archive path detection runs before SQLite detection. A path that matches an archive selector is never treated as SQLite.

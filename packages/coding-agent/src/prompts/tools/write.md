@@ -1,7 +1,8 @@
-Creates a new file at the specified path.
+Creates or overwrites file at specified path.
 
 <conditions>
 - Creating new files explicitly required by task
+- Replacing entire file contents when editing would be more complex
 </conditions>
 
 <instruction>
@@ -13,8 +14,7 @@ Creates a new file at the specified path.
 </instruction>
 
 <critical>
-- You MUST use Edit tool for modifying existing files
-- Existing regular files are never overwritten by this tool
+- You SHOULD use Edit tool for modifying existing files (more precise, preserves formatting)
 - You NEVER create documentation files (*.md, README) unless explicitly requested
 - You NEVER use emojis unless requested
 </critical>

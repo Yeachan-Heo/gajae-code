@@ -17,6 +17,7 @@ import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { parseArchivePathCandidates } from "./archive-reader";
+import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
 	expandContentTokens,
@@ -48,7 +49,7 @@ import {
 	updateRowByKey,
 	updateRowByRowId,
 } from "./sqlite-reader";
-import { enforceTeamWriteScope, withTeamWriteScopeMutation } from "./team-write-scope";
+import { enforceTeamWriteScope, isTeamWriteScopeActive, withTeamWriteScopeMutation } from "./team-write-scope";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -180,7 +181,7 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
 /**
  * Write tool implementation.
  *
- * Creates files with optional LSP formatting and diagnostics.
+ * Creates or overwrites files with optional LSP formatting and diagnostics.
  */
 export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails> {
 	readonly name = "write";
@@ -191,7 +192,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly strict = true;
 	readonly concurrency = "exclusive";
 	readonly loadMode = "discoverable";
-	readonly summary = "Write content to a new file";
+	readonly summary = "Write content to a file (creates or overwrites)";
 
 	readonly #writethrough: WritethroughCallback;
 
@@ -473,7 +474,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const originalText = await Bun.file(absolutePath).text();
 		const newContent = spliceConflict(originalText, entry, expanded);
 
-		const batchRequest = getLspBatchRequest(context?.toolCall);
+		const batchRequest = isTeamWriteScopeActive() ? undefined : getLspBatchRequest(context?.toolCall);
 		const diagnostics = await this.#writethrough(absolutePath, newContent, signal, undefined, batchRequest);
 		invalidateFsScanAfterWrite(absolutePath);
 		this.session.fileReadCache?.invalidate(absolutePath);
@@ -571,7 +572,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			byFile.set(mutationPath, bucket);
 		}
 
-		const batchRequest = getLspBatchRequest(context?.toolCall);
+		const batchRequest = isTeamWriteScopeActive() ? undefined : getLspBatchRequest(context?.toolCall);
 		const allDiagnostics: FileDiagnosticsResult[] = [];
 		const succeededFiles: { displayPath: string; count: number }[] = [];
 		const failedFiles: { displayPath: string; count: number; error: string }[] = [];
@@ -656,28 +657,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		};
 	}
 
-	#routeCreateThroughBridge(absolutePath: string, content: string): Promise<void> | undefined {
+	#routeWriteThroughBridge(absolutePath: string, content: string): Promise<void> | undefined {
 		const bridge = this.session.getClientBridge?.();
-		if (!bridge?.capabilities.createTextFile || !bridge.createTextFile) return undefined;
-		return bridge.createTextFile({ path: absolutePath, content });
-	}
-
-	async #createLocalFileExclusive(absolutePath: string, content: string): Promise<void> {
-		await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-		let file: fs.FileHandle;
-		try {
-			file = await fs.open(absolutePath, "wx");
-		} catch (error) {
-			if (isRecord(error) && error.code === "EEXIST") {
-				throw new ToolError(`File already exists: ${absolutePath}. Use the edit tool to modify existing files.`);
-			}
-			throw error;
-		}
-		try {
-			await file.writeFile(content, "utf8");
-		} finally {
-			await file.close();
-		}
+		if (!bridge?.capabilities.writeTextFile || !bridge.writeTextFile) return undefined;
+		return bridge.writeTextFile({ path: absolutePath, content });
 	}
 
 	async execute(
@@ -792,22 +775,21 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return sqliteResult;
 			}
 
-			const absolutePath = resolvePlanPath(this.session, path);
-			const bridgeCapabilities = this.session.getClientBridge?.()?.capabilities;
-			const useBridge = bridgeCapabilities?.createTextFile === true;
 			enforcePlanModeWrite(this.session, path, { op: "create" });
-			if (bridgeCapabilities?.writeTextFile && !useBridge) {
-				throw new ToolError("Client bridge cannot guarantee atomic create-only writes.");
-			}
+			const absolutePath = resolvePlanPath(this.session, path);
+			const batchRequest = isTeamWriteScopeActive() ? undefined : getLspBatchRequest(context?.toolCall);
+
 			return withTeamWriteScopeMutation(
 				this.session,
 				[absolutePath],
 				async ([canonicalPath]) => {
 					const mutationPath = canonicalPath!;
-					// Try ACP bridge first — no disk write when client handles it
-					if (useBridge) {
-						const bridgePromise = this.#routeCreateThroughBridge(mutationPath, cleanContent);
-						if (!bridgePromise) throw new ToolError("Client bridge createTextFile capability is unavailable.");
+					if (await fs.exists(mutationPath)) {
+						await assertEditableFile(mutationPath, path);
+					}
+
+					const bridgePromise = this.#routeWriteThroughBridge(mutationPath, cleanContent);
+					if (bridgePromise !== undefined) {
 						try {
 							await bridgePromise;
 						} catch (error) {
@@ -819,10 +801,19 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						if (stripped) {
 							resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 						}
-						return { content: [{ type: "text" as const, text: resultText }], details: {} };
+						return {
+							content: [{ type: "text" as const, text: resultText }],
+							details: {},
+						};
 					}
 
-					await this.#createLocalFileExclusive(mutationPath, cleanContent);
+					const diagnostics = await this.#writethrough(
+						mutationPath,
+						cleanContent,
+						signal,
+						undefined,
+						batchRequest,
+					);
 					invalidateFsScanAfterWrite(mutationPath);
 
 					const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
@@ -830,12 +821,24 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					if (stripped) {
 						resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 					}
+					if (!diagnostics) {
+						return {
+							content: [{ type: "text" as const, text: resultText }],
+							details: {},
+						};
+					}
+
 					return {
 						content: [{ type: "text" as const, text: resultText }],
-						details: {},
+						details: {
+							diagnostics,
+							meta: outputMeta()
+								.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
+								.get(),
+						},
 					};
 				},
-				{ crossProcess: !useBridge },
+				{ crossProcess: true },
 			);
 		});
 	}
