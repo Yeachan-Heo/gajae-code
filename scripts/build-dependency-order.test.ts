@@ -47,8 +47,21 @@ async function readWorkspaceBuildGraph(): Promise<WorkspaceBuildGraph> {
 		}
 	}
 
+	// Bun schedules a package as a node whenever it has a `prebuild`, `build`, or
+	// `postbuild` script for the invoked `build` run (matching filter_run.zig's
+	// [pre_script_name, script_name, post_script_name] scan) -- not only when
+	// `build` itself is present. A future package with only lifecycle hooks
+	// (or an intentionally empty `build` script) must still be scheduled here.
 	const scheduledPackageNames = new Set(
-		manifests.filter(manifest => manifest.name && manifest.scripts?.build).map(manifest => manifest.name as string),
+		manifests
+			.filter(
+				manifest =>
+					manifest.name &&
+					(manifest.scripts?.build !== undefined ||
+						manifest.scripts?.prebuild !== undefined ||
+						manifest.scripts?.postbuild !== undefined),
+			)
+			.map(manifest => manifest.name as string),
 	);
 
 	const edges = new Map<string, string[]>();
