@@ -97,18 +97,26 @@ function resolveGitProvenance(): { sha: string; dirty: boolean } {
 	return { sha, dirty };
 }
 
-function reproductionCommand(
+function reproductionInvocation(
 	profile: MemoryWorkloadProfile,
 	durationTargetMs: number,
 	iterationsTarget: number,
 	isolatedMemory: boolean,
-): string {
-	if (!isolatedMemory) return "runPerfCorpusBenchmark({ isolatedMemory: false })";
-	const settings =
-		profile === "soak"
-			? `GJC_MEMORY_PROFILE=soak GJC_MEMORY_DURATION_MS=${durationTargetMs} GJC_MEMORY_ITERATIONS=${iterationsTarget} `
-			: `GJC_MEMORY_PROFILE=short GJC_MEMORY_ITERATIONS=${iterationsTarget} `;
-	return `${settings}bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts`;
+): { command: string; argv: string[]; environment: Record<string, string> } {
+	if (!isolatedMemory) {
+		return {
+			command: "runPerfCorpusBenchmark({ isolatedMemory: false })",
+			argv: ["runPerfCorpusBenchmark"],
+			environment: {},
+		};
+	}
+	const argv = ["bun", "--smol", "--expose-gc", "packages/coding-agent/bench/perf-corpus.bench.ts"];
+	const environment: Record<string, string> = {
+		GJC_MEMORY_PROFILE: profile,
+		GJC_MEMORY_ITERATIONS: String(iterationsTarget),
+	};
+	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
+	return { command: argv.join(" "), argv, environment };
 }
 function memorySample(startedAt: number): MemoryUsageSample {
 	const usage = process.memoryUsage();
@@ -388,13 +396,16 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
 	const git = resolveGitProvenance();
+	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, options.isolatedMemory === true);
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
 		generatedAt: new Date().toISOString(),
 		gitSha: git.sha,
 		gitDirty: git.dirty,
 		runner: {
-			command: reproductionCommand(profile, durationTargetMs, iterationsTarget, options.isolatedMemory === true),
+			command: invocation.command,
+			argv: invocation.argv,
+			environment: invocation.environment,
 			platform: process.platform,
 			arch: process.arch,
 			bunVersion: process.versions.bun,

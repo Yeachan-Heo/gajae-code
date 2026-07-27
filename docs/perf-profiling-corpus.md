@@ -43,7 +43,7 @@ A v1–v3 win is **never** called "confirmed" from current-only coverage. `valid
 - `rssMemory: { baselineBytes, peakBytes?, growthBytes, returnBytes, ... }`
 - `byteParity: { renderedGolden?, persistedJsonlGolden?, providerPayloadGolden?, materializedSessionGolden? }`
 - `memoryBaseline?: { surface, profile, iterations, operations, operationsPerSecond, samples, postTeardown, rssSlopeBytesPerSecond, heapSlopeBytesPerSecond, processTreeBaselineRssBytes, processTreePostTeardownRssBytes, processTreeSampler }`
-- `runner: { command, platform, arch, bunVersion?, ci?, profile, durationTargetMs?, memoryIsolation, iterationsTarget, gcExposed }` pins the resolved invocation, workload controls, isolation, and GC availability.
+- `runner: { command, argv, environment, platform, arch, bunVersion?, ci?, profile, durationTargetMs?, memoryIsolation, iterationsTarget, gcExposed }` pins platform-neutral structured invocation data, workload controls, isolation, and GC availability.
 - `gitSha` is the full checked-out `HEAD` when Git is available, with `GITHUB_SHA` used only as a fallback; `gitDirty` explicitly marks tracked or untracked worktree changes so local evidence cannot silently masquerade as a clean commit.
 - Every detailed sample separates `rssBytes`, `heapUsedBytes`, `heapTotalBytes`, `externalBytes`, `arrayBuffersBytes`, and `activeResourceCount`.
 

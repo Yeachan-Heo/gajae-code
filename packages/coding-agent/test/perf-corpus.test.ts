@@ -26,6 +26,8 @@ describe("perf corpus schema + runner", () => {
 		expect(report.schema).toBe(PERF_CORPUS_SCHEMA);
 		expect(report.gitSha).toMatch(/^[0-9a-f]{40}$/);
 		expect(report.runner.command).toBe("runPerfCorpusBenchmark({ isolatedMemory: false })");
+		expect(report.runner.argv).toEqual(["runPerfCorpusBenchmark"]);
+		expect(report.runner.environment).toEqual({});
 		expect(report.runner.iterationsTarget).toBeGreaterThan(0);
 		expect(typeof report.runner.gcExposed).toBe("boolean");
 		expect(typeof report.gitDirty).toBe("boolean");
@@ -100,8 +102,16 @@ describe("perf corpus schema + runner", () => {
 		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
 		expect(baselines).toHaveLength(REQUIRED_MEMORY_SURFACES.length);
 		expect(report.runner.memoryIsolation).toBe("process-per-surface");
-		expect(report.runner.command).toContain("GJC_MEMORY_ITERATIONS=");
-		expect(report.runner.command).toContain("--smol --expose-gc");
+		expect(report.runner.argv).toEqual([
+			"bun",
+			"--smol",
+			"--expose-gc",
+			"packages/coding-agent/bench/perf-corpus.bench.ts",
+		]);
+		expect(report.runner.environment).toEqual({
+			GJC_MEMORY_PROFILE: "short",
+			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
+		});
 		expect(report.runner.gcExposed).toBe(true);
 		expect(baselines.every(baseline => baseline.samples[0]!.rssBytes > 0)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
@@ -259,6 +269,17 @@ describe("perf corpus schema + runner", () => {
 			runner: { ...report.runner, profile: undefined },
 		} as unknown as PerfCorpusReport;
 		expect(validatePerfCorpusReport(missingRunnerProfile).errors).toContain("runner.profile invalid");
+		const mismatchedEnvironment = {
+			...report,
+			runner: {
+				...report.runner,
+				memoryIsolation: "process-per-surface" as const,
+				environment: { GJC_MEMORY_PROFILE: "soak", GJC_MEMORY_ITERATIONS: "1" },
+			},
+		};
+		expect(validatePerfCorpusReport(mismatchedEnvironment).errors).toContain(
+			"runner.environment does not match memory controls",
+		);
 		const gcUnavailableWithReturns = {
 			...report,
 			runner: { ...report.runner, gcExposed: false },

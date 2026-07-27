@@ -161,6 +161,8 @@ export interface PerfCorpusReport {
 	gitDirty: boolean;
 	runner: {
 		command: string;
+		argv: string[];
+		environment: Record<string, string>;
 		platform: NodeJS.Platform;
 		arch: string;
 		bunVersion?: string;
@@ -263,6 +265,20 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (typeof report.runner.command !== "string" || report.runner.command.trim().length === 0) {
 		errors.push("runner.command must record the resolved invocation");
 	}
+	if (
+		!Array.isArray(report.runner.argv) ||
+		report.runner.argv.length === 0 ||
+		report.runner.argv.some(value => typeof value !== "string" || value.length === 0)
+	) {
+		errors.push("runner.argv invalid");
+	}
+	if (
+		typeof report.runner.environment !== "object" ||
+		report.runner.environment === null ||
+		Object.values(report.runner.environment).some(value => typeof value !== "string")
+	) {
+		errors.push("runner.environment invalid");
+	}
 	if (!Number.isInteger(report.runner.iterationsTarget) || report.runner.iterationsTarget <= 0) {
 		errors.push("runner.iterationsTarget invalid");
 	}
@@ -280,6 +296,19 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		(!Number.isFinite(report.runner.durationTargetMs) || report.runner.durationTargetMs < 0)
 	) {
 		errors.push("runner.durationTargetMs invalid");
+	}
+	if (report.runner.memoryIsolation === "process-per-surface") {
+		if (
+			typeof report.runner.environment !== "object" ||
+			report.runner.environment === null ||
+			report.runner.environment.GJC_MEMORY_PROFILE !== report.runner.profile ||
+			report.runner.environment.GJC_MEMORY_ITERATIONS !== String(report.runner.iterationsTarget) ||
+			(report.runner.profile === "soak"
+				? report.runner.environment.GJC_MEMORY_DURATION_MS !== String(report.runner.durationTargetMs)
+				: report.runner.environment.GJC_MEMORY_DURATION_MS !== undefined)
+		) {
+			errors.push("runner.environment does not match memory controls");
+		}
 	}
 	// Anchor CPU-self-time claims to ACTUAL captured profiler evidence: collect the
 	// real artifact paths and sample symbols present in fixtures. A claim must name
