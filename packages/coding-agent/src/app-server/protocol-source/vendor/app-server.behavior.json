@@ -1,0 +1,85 @@
+{
+	"wireProtocol": {
+		"jsonrpcField": "omitted",
+		"malformedJson": "dropped+logged no-response",
+		"idTypes": [
+			"string",
+			"integer"
+		]
+	},
+	"errorEnvelopes": {
+		"notInitialized": {
+			"id": 1,
+			"error": {
+				"code": -32600,
+				"message": "Not initialized"
+			}
+		},
+		"alreadyInitialized": {
+			"id": "initialize-2",
+			"error": {
+				"code": -32600,
+				"message": "Already initialized"
+			}
+		},
+		"overloaded": {
+			"id": 1,
+			"error": {
+				"code": -32001,
+				"message": "Server overloaded; retry later."
+			}
+		},
+		"invalidRequest": {
+			"id": 1,
+			"error": {
+				"code": -32600,
+				"message": "Invalid request"
+			}
+		},
+		"methodNotFound": {
+			"id": 1,
+			"error": {
+				"code": -32601,
+				"message": "Method not found"
+			}
+		},
+		"invalidParams": {
+			"id": 1,
+			"error": {
+				"code": -32602,
+				"message": "Invalid params"
+			}
+		},
+		"internalError": {
+			"id": 1,
+			"error": {
+				"code": -32603,
+				"message": "Internal error"
+			}
+		},
+		"notSupported": {
+			"id": 1,
+			"error": {
+				"code": -32081,
+				"message": "Not supported"
+			}
+		}
+	},
+	"cli": {
+		"AppServerWebsocketAuthArgs": [
+			"--ws-auth capability-token|signed-bearer-token",
+			"--ws-token-file XOR --ws-token-sha256",
+			"--ws-shared-secret-file",
+			"--ws-issuer",
+			"--ws-audience",
+			"--ws-max-clock-skew-seconds"
+		],
+		"authorization": "Authorization-header-only",
+		"frameCap": {
+			"stdio": "GJC-only -32600 id null",
+			"websocket": "close 1009",
+			"unix": "close 1009"
+		},
+		"listenOff": "GJC standalone override: starts without a transport or probes."
+	}
+}

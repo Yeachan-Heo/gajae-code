@@ -1,0 +1,7819 @@
+{
+	"schemaVersion": 1,
+	"authorityLevel": "method-and-field-shapes",
+	"derivation": "rust-source-derived",
+	"directions": {
+		"clientRequests": [
+			{
+				"method": "account/login/cancel",
+				"stability": "stable",
+				"params_type": "v2::CancelLoginAccountParams",
+				"result_type": "v2::CancelLoginAccountResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "CancelLoginAccountStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/login/start",
+				"stability": "stable",
+				"params_type": "v2::LoginAccountParams",
+				"result_type": "v2::LoginAccountResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"LoginAccountParams (enum payload shape is not flattened)"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": [
+						"LoginAccountResponse (enum payload shape is not flattened)"
+					]
+				}
+			},
+			{
+				"method": "account/logout",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::LogoutAccountResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/rateLimitResetCredit/consume",
+				"stability": "stable",
+				"params_type": "v2::ConsumeAccountRateLimitResetCreditParams",
+				"result_type": "v2::ConsumeAccountRateLimitResetCreditResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "idempotencyKey",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "creditId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "outcome",
+							"rustType": "ConsumeAccountRateLimitResetCreditOutcome",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/rateLimits/read",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::GetAccountRateLimitsResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "rateLimits",
+							"rustType": "RateLimitSnapshot",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "rateLimitsByLimitId",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "rateLimitResetCredits",
+							"rustType": "Option<RateLimitResetCreditsSummary>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/read",
+				"stability": "stable",
+				"params_type": "v2::GetAccountParams",
+				"result_type": "v2::GetAccountResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "refreshToken",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "account",
+							"rustType": "Option<Account>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "requiresOpenaiAuth",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/sendAddCreditsNudgeEmail",
+				"stability": "stable",
+				"params_type": "v2::SendAddCreditsNudgeEmailParams",
+				"result_type": "v2::SendAddCreditsNudgeEmailResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "creditType",
+							"rustType": "AddCreditsNudgeCreditType",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "AddCreditsNudgeEmailStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/usage/read",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::GetAccountTokenUsageResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "summary",
+							"rustType": "AccountTokenUsageSummary",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "dailyUsageBuckets",
+							"rustType": "Option<Vec<AccountTokenUsageDailyBucket>>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/workspaceMessages/read",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::GetWorkspaceMessagesResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "featureEnabled",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "messages",
+							"rustType": "Vec<WorkspaceMessage>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "app/installed",
+				"stability": "stable",
+				"params_type": "v2::AppsInstalledParams",
+				"result_type": "v2::AppsInstalledResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"AppsInstalledParams"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": [
+						"AppsInstalledResponse"
+					]
+				}
+			},
+			{
+				"method": "app/list",
+				"stability": "stable",
+				"params_type": "v2::AppsListParams",
+				"result_type": "v2::AppsListResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"AppsListParams"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": [
+						"AppsListResponse"
+					]
+				}
+			},
+			{
+				"method": "app/read",
+				"stability": "stable",
+				"params_type": "v2::AppsReadParams",
+				"result_type": "v2::AppsReadResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"AppsReadParams"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": [
+						"AppsReadResponse"
+					]
+				}
+			},
+			{
+				"method": "collaborationMode/list",
+				"stability": "stable",
+				"params_type": "v2::CollaborationModeListParams",
+				"result_type": "v2::CollaborationModeListResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "command/exec",
+				"stability": "stable",
+				"params_type": "v2::CommandExecParams",
+				"result_type": "v2::CommandExecResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "command",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "processId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "tty",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "streamStdin",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "streamStdoutStderr",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "outputBytesCap",
+							"rustType": "Option<usize>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "disableOutputCap",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "disableTimeout",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "timeoutMs",
+							"rustType": "Option<i64>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<PathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "env",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "size",
+							"rustType": "Option<CommandExecTerminalSize>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sandboxPolicy",
+							"rustType": "Option<SandboxPolicy>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "permissionProfile",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "exitCode",
+							"rustType": "i32",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stdout",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stderr",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "command/exec/resize",
+				"stability": "stable",
+				"params_type": "v2::CommandExecResizeParams",
+				"result_type": "v2::CommandExecResizeResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "processId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "size",
+							"rustType": "CommandExecTerminalSize",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "command/exec/terminate",
+				"stability": "stable",
+				"params_type": "v2::CommandExecTerminateParams",
+				"result_type": "v2::CommandExecTerminateResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "processId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "command/exec/write",
+				"stability": "stable",
+				"params_type": "v2::CommandExecWriteParams",
+				"result_type": "v2::CommandExecWriteResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "processId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "deltaBase64",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "closeStdin",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "config/batchWrite",
+				"stability": "stable",
+				"params_type": "v2::ConfigBatchWriteParams",
+				"result_type": "v2::ConfigWriteResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "edits",
+							"rustType": "Vec<ConfigEdit>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "filePath",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "expectedVersion",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reloadUserConfig",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "WriteStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "version",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "filePath",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "overriddenMetadata",
+							"rustType": "Option<OverriddenMetadata>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "config/mcpServer/reload",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::McpServerRefreshResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "config/read",
+				"stability": "stable",
+				"params_type": "v2::ConfigReadParams",
+				"result_type": "v2::ConfigReadResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "includeLayers",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "config",
+							"rustType": "Config",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "origins",
+							"rustType": "HashMap<String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "layers",
+							"rustType": "Option<Vec<ConfigLayer>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "config/value/write",
+				"stability": "stable",
+				"params_type": "v2::ConfigValueWriteParams",
+				"result_type": "v2::ConfigWriteResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "keyPath",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "value",
+							"rustType": "JsonValue",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "mergeStrategy",
+							"rustType": "MergeStrategy",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "filePath",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "expectedVersion",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "WriteStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "version",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "filePath",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "overriddenMetadata",
+							"rustType": "Option<OverriddenMetadata>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "configRequirements/read",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::ConfigRequirementsReadResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "requirements",
+							"rustType": "Option<ConfigRequirements>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "environment/add",
+				"stability": "stable",
+				"params_type": "v2::EnvironmentAddParams",
+				"result_type": "v2::EnvironmentAddResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "execServerUrl",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "connectTimeoutMs",
+							"rustType": "Option<u64>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "environment/info",
+				"stability": "stable",
+				"params_type": "v2::EnvironmentInfoParams",
+				"result_type": "v2::EnvironmentInfoResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "shell",
+							"rustType": "EnvironmentShellInfo",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<PathUri>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"PathUri"
+					]
+				}
+			},
+			{
+				"method": "environment/status",
+				"stability": "stable",
+				"params_type": "v2::EnvironmentStatusParams",
+				"result_type": "v2::EnvironmentStatusResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "EnvironmentStatusKind",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "error",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "experimentalFeature/enablement/set",
+				"stability": "stable",
+				"params_type": "v2::ExperimentalFeatureEnablementSetParams",
+				"result_type": "v2::ExperimentalFeatureEnablementSetResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "enablement",
+							"rustType": "BTreeMap<String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "enablement",
+							"rustType": "BTreeMap<String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "experimentalFeature/list",
+				"stability": "stable",
+				"params_type": "v2::ExperimentalFeatureListParams",
+				"result_type": "v2::ExperimentalFeatureListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<ExperimentalFeature>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "externalAgentConfig/detect",
+				"stability": "stable",
+				"params_type": "v2::ExternalAgentConfigDetectParams",
+				"result_type": "v2::ExternalAgentConfigDetectResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "includeHome",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "cwds",
+							"rustType": "Option<Vec<PathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "maxSessionAgeDays",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "maxSessions",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "source",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "migrationSource",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "items",
+							"rustType": "Vec<ExternalAgentConfigMigrationItem>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "externalAgentConfig/import",
+				"stability": "stable",
+				"params_type": "v2::ExternalAgentConfigImportParams",
+				"result_type": "v2::ExternalAgentConfigImportResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "migrationItems",
+							"rustType": "Vec<ExternalAgentConfigMigrationItem>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "source",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "providerId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "migrationSource",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "importId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "externalAgentConfig/import/readHistories",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::ExternalAgentConfigImportHistoriesReadResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<ExternalAgentConfigImportHistory>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "connectors",
+							"rustType": "Vec<ExternalAgentImportedConnectorCandidate>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "externalAgentConfig/import/recordHistory",
+				"stability": "stable",
+				"params_type": "v2::ExternalAgentConfigImportHistoryRecordParams",
+				"result_type": "v2::ExternalAgentConfigImportHistoryRecordResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "providerId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemTypeResults",
+							"rustType": "Vec<ExternalAgentConfigImportTypeResult>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "importId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "feedback/upload",
+				"stability": "stable",
+				"params_type": "v2::FeedbackUploadParams",
+				"result_type": "v2::FeedbackUploadResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "classification",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "includeLogs",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "extraLogFiles",
+							"rustType": "Option<Vec<PathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "tags",
+							"rustType": "Option<BTreeMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/copy",
+				"stability": "stable",
+				"params_type": "v2::FsCopyParams",
+				"result_type": "v2::FsCopyResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "sourcePath",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "destinationPath",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "recursive",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/createDirectory",
+				"stability": "stable",
+				"params_type": "v2::FsCreateDirectoryParams",
+				"result_type": "v2::FsCreateDirectoryResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "recursive",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/getMetadata",
+				"stability": "stable",
+				"params_type": "v2::FsGetMetadataParams",
+				"result_type": "v2::FsGetMetadataResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "isDirectory",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "isFile",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "isSymlink",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "createdAtMs",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "modifiedAtMs",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/readDirectory",
+				"stability": "stable",
+				"params_type": "v2::FsReadDirectoryParams",
+				"result_type": "v2::FsReadDirectoryResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "entries",
+							"rustType": "Vec<FsReadDirectoryEntry>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/readFile",
+				"stability": "stable",
+				"params_type": "v2::FsReadFileParams",
+				"result_type": "v2::FsReadFileResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "dataBase64",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/remove",
+				"stability": "stable",
+				"params_type": "v2::FsRemoveParams",
+				"result_type": "v2::FsRemoveResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "recursive",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "force",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/unwatch",
+				"stability": "stable",
+				"params_type": "v2::FsUnwatchParams",
+				"result_type": "v2::FsUnwatchResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "watchId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/watch",
+				"stability": "stable",
+				"params_type": "v2::FsWatchParams",
+				"result_type": "v2::FsWatchResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "watchId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "fs/writeFile",
+				"stability": "stable",
+				"params_type": "v2::FsWriteFileParams",
+				"result_type": "v2::FsWriteFileResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "path",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "dataBase64",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fuzzyFileSearch",
+				"stability": "stable",
+				"params_type": "FuzzyFileSearchParams",
+				"result_type": "FuzzyFileSearchResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "files",
+							"rustType": "Vec<FuzzyFileSearchResult>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fuzzyFileSearch/sessionStart",
+				"stability": "experimental",
+				"params_type": "FuzzyFileSearchSessionStartParams",
+				"result_type": "FuzzyFileSearchSessionStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "sessionId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "roots",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fuzzyFileSearch/sessionStop",
+				"stability": "experimental",
+				"params_type": "FuzzyFileSearchSessionStopParams",
+				"result_type": "FuzzyFileSearchSessionStopResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "sessionId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fuzzyFileSearch/sessionUpdate",
+				"stability": "experimental",
+				"params_type": "FuzzyFileSearchSessionUpdateParams",
+				"result_type": "FuzzyFileSearchSessionUpdateResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "sessionId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "query",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "getAuthStatus",
+				"stability": "stable",
+				"params_type": "v1::GetAuthStatusParams",
+				"result_type": "v1::GetAuthStatusResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "includeToken",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "refreshToken",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "authMethod",
+							"rustType": "Option<AuthMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "authToken",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "requiresOpenaiAuth",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "getConversationSummary",
+				"stability": "stable",
+				"params_type": "v1::GetConversationSummaryParams",
+				"result_type": "v1::GetConversationSummaryResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"GetConversationSummaryParams (enum payload shape is not flattened)"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "gitDiffToRemote",
+				"stability": "stable",
+				"params_type": "v1::GitDiffToRemoteParams",
+				"result_type": "v1::GitDiffToRemoteResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cwd",
+							"rustType": "PathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "sha",
+							"rustType": "GitSha",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "diff",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"GitSha"
+					]
+				}
+			},
+			{
+				"method": "hooks/list",
+				"stability": "stable",
+				"params_type": "v2::HooksListParams",
+				"result_type": "v2::HooksListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cwds",
+							"rustType": "Vec<PathBuf>",
+							"optional": false,
+							"skipSerializingIf": "Vec::is_empty"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<HooksListEntry>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "initialize",
+				"stability": "stable",
+				"params_type": "v1::InitializeParams",
+				"result_type": "v1::InitializeResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "clientInfo",
+							"rustType": "ClientInfo",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "capabilities",
+							"rustType": "Option<InitializeCapabilities>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "userAgent",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "codexHome",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "platformFamily",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "platformOs",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "marketplace/add",
+				"stability": "stable",
+				"params_type": "v2::MarketplaceAddParams",
+				"result_type": "v2::MarketplaceAddResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "source",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "refName",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sparsePaths",
+							"rustType": "Option<Vec<String>>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "marketplaceName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "installedRoot",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "alreadyAdded",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "marketplace/remove",
+				"stability": "stable",
+				"params_type": "v2::MarketplaceRemoveParams",
+				"result_type": "v2::MarketplaceRemoveResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "marketplaceName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "marketplaceName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "installedRoot",
+							"rustType": "Option<AbsolutePathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "marketplace/upgrade",
+				"stability": "stable",
+				"params_type": "v2::MarketplaceUpgradeParams",
+				"result_type": "v2::MarketplaceUpgradeResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "marketplaceName",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "selectedMarketplaces",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "upgradedRoots",
+							"rustType": "Vec<AbsolutePathBuf>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "errors",
+							"rustType": "Vec<MarketplaceUpgradeErrorInfo>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "mcpServer/oauth/login",
+				"stability": "stable",
+				"params_type": "v2::McpServerOauthLoginParams",
+				"result_type": "v2::McpServerOauthLoginResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "name",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "scopes",
+							"rustType": "Option<Vec<String>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "timeoutSecs",
+							"rustType": "Option<i64>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "authorizationUrl",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "mcpServer/resource/read",
+				"stability": "stable",
+				"params_type": "v2::McpResourceReadParams",
+				"result_type": "v2::McpResourceReadResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "server",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "uri",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "contents",
+							"rustType": "Vec<McpResourceContent>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"McpResourceContent"
+					]
+				}
+			},
+			{
+				"method": "mcpServer/tool/call",
+				"stability": "stable",
+				"params_type": "v2::McpServerToolCallParams",
+				"result_type": "v2::McpServerToolCallResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "server",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "tool",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "arguments",
+							"rustType": "Option<JsonValue>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "_meta",
+							"rustType": "Option<JsonValue>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "content",
+							"rustType": "Vec<JsonValue>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "structuredContent",
+							"rustType": "Option<JsonValue>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "isError",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "_meta",
+							"rustType": "Option<JsonValue>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				}
+			},
+			{
+				"method": "mcpServerStatus/list",
+				"stability": "stable",
+				"params_type": "v2::ListMcpServerStatusParams",
+				"result_type": "v2::ListMcpServerStatusResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "detail",
+							"rustType": "Option<McpServerStatusDetail>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<McpServerStatus>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "memory/reset",
+				"stability": "experimental",
+				"params_type": "Option<()>",
+				"result_type": "v2::MemoryResetResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "mock/experimentalMethod",
+				"stability": "stable",
+				"params_type": "v2::MockExperimentalMethodParams",
+				"result_type": "v2::MockExperimentalMethodResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "value",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "echoed",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "model/list",
+				"stability": "stable",
+				"params_type": "v2::ModelListParams",
+				"result_type": "v2::ModelListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "includeHidden",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<Model>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "modelProvider/capabilities/read",
+				"stability": "stable",
+				"params_type": "v2::ModelProviderCapabilitiesReadParams",
+				"result_type": "v2::ModelProviderCapabilitiesReadResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "namespaceTools",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "imageGeneration",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "webSearch",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "permissionProfile/list",
+				"stability": "stable",
+				"params_type": "v2::PermissionProfileListParams",
+				"result_type": "v2::PermissionProfileListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<PermissionProfileSummary>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/install",
+				"stability": "stable",
+				"params_type": "v2::PluginInstallParams",
+				"result_type": "v2::PluginInstallResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "marketplacePath",
+							"rustType": "Option<AbsolutePathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "remoteMarketplaceName",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "pluginName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "authPolicy",
+							"rustType": "PluginAuthPolicy",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "appsNeedingAuth",
+							"rustType": "Vec<AppSummary>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AppSummary"
+					]
+				}
+			},
+			{
+				"method": "plugin/installed",
+				"stability": "stable",
+				"params_type": "v2::PluginInstalledParams",
+				"result_type": "v2::PluginInstalledResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cwds",
+							"rustType": "Option<Vec<AbsolutePathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "installSuggestionPluginNames",
+							"rustType": "Option<Vec<String>>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "marketplaces",
+							"rustType": "Vec<PluginMarketplaceEntry>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "marketplaceLoadErrors",
+							"rustType": "Vec<MarketplaceLoadErrorInfo>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/list",
+				"stability": "stable",
+				"params_type": "v2::PluginListParams",
+				"result_type": "v2::PluginListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cwds",
+							"rustType": "Option<Vec<AbsolutePathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "marketplaceKinds",
+							"rustType": "Option<Vec<PluginListMarketplaceKind>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "forceRefetch",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "marketplaces",
+							"rustType": "Vec<PluginMarketplaceEntry>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "marketplaceLoadErrors",
+							"rustType": "Vec<MarketplaceLoadErrorInfo>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "featuredPluginIds",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/read",
+				"stability": "stable",
+				"params_type": "v2::PluginReadParams",
+				"result_type": "v2::PluginReadResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "marketplacePath",
+							"rustType": "Option<AbsolutePathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "remoteMarketplaceName",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "pluginName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "plugin",
+							"rustType": "PluginDetail",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/share/checkout",
+				"stability": "stable",
+				"params_type": "v2::PluginShareCheckoutParams",
+				"result_type": "v2::PluginShareCheckoutResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "remotePluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "remotePluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "pluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "pluginName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "pluginPath",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "marketplaceName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "marketplacePath",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "remoteVersion",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "plugin/share/delete",
+				"stability": "stable",
+				"params_type": "v2::PluginShareDeleteParams",
+				"result_type": "v2::PluginShareDeleteResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "remotePluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/share/list",
+				"stability": "stable",
+				"params_type": "v2::PluginShareListParams",
+				"result_type": "v2::PluginShareListResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<PluginShareListItem>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/share/save",
+				"stability": "stable",
+				"params_type": "v2::PluginShareSaveParams",
+				"result_type": "v2::PluginShareSaveResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "pluginPath",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "remotePluginId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "discoverability",
+							"rustType": "Option<PluginShareDiscoverability>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "shareTargets",
+							"rustType": "Option<Vec<PluginShareTarget>>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "remotePluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "shareUrl",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/share/updateTargets",
+				"stability": "stable",
+				"params_type": "v2::PluginShareUpdateTargetsParams",
+				"result_type": "v2::PluginShareUpdateTargetsResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "remotePluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "discoverability",
+							"rustType": "PluginShareUpdateDiscoverability",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "shareTargets",
+							"rustType": "Vec<PluginShareTarget>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "principals",
+							"rustType": "Vec<PluginSharePrincipal>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "discoverability",
+							"rustType": "PluginShareDiscoverability",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/skill/read",
+				"stability": "stable",
+				"params_type": "v2::PluginSkillReadParams",
+				"result_type": "v2::PluginSkillReadResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "remoteMarketplaceName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "remotePluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "skillName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "contents",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "plugin/uninstall",
+				"stability": "stable",
+				"params_type": "v2::PluginUninstallParams",
+				"result_type": "v2::PluginUninstallResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "pluginId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "process/kill",
+				"stability": "stable",
+				"params_type": "v2::ProcessKillParams",
+				"result_type": "v2::ProcessKillResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "processHandle",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "process/resizePty",
+				"stability": "stable",
+				"params_type": "v2::ProcessResizePtyParams",
+				"result_type": "v2::ProcessResizePtyResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "processHandle",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "size",
+							"rustType": "ProcessTerminalSize",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "process/spawn",
+				"stability": "stable",
+				"params_type": "v2::ProcessSpawnParams",
+				"result_type": "v2::ProcessSpawnResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "command",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "processHandle",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "tty",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "streamStdin",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "streamStdoutStderr",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "outputBytesCap",
+							"rustType": "Option<Option<usize>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "timeoutMs",
+							"rustType": "Option<Option<i64>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "env",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "size",
+							"rustType": "Option<ProcessTerminalSize>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "process/writeStdin",
+				"stability": "stable",
+				"params_type": "v2::ProcessWriteStdinParams",
+				"result_type": "v2::ProcessWriteStdinResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "processHandle",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "deltaBase64",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "closeStdin",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "remoteControl/client/list",
+				"stability": "experimental",
+				"params_type": "v2::RemoteControlClientsListParams",
+				"result_type": "v2::RemoteControlClientsListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "order",
+							"rustType": "Option<RemoteControlClientsListOrder>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<RemoteControlClient>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "remoteControl/client/revoke",
+				"stability": "experimental",
+				"params_type": "v2::RemoteControlClientsRevokeParams",
+				"result_type": "v2::RemoteControlClientsRevokeResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "clientId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "remoteControl/disable",
+				"stability": "experimental",
+				"params_type": "v2::NullableRemoteControlDisableParams",
+				"result_type": "v2::RemoteControlDisableResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"NullableRemoteControlDisableParams"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "RemoteControlConnectionStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serverName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "installationId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "remoteControl/enable",
+				"stability": "experimental",
+				"params_type": "v2::NullableRemoteControlEnableParams",
+				"result_type": "v2::RemoteControlEnableResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"NullableRemoteControlEnableParams"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "RemoteControlConnectionStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serverName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "installationId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "remoteControl/pairing/start",
+				"stability": "experimental",
+				"params_type": "v2::RemoteControlPairingStartParams",
+				"result_type": "v2::RemoteControlPairingStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "manualCode",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "pairingCode",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "manualPairingCode",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "expiresAt",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "remoteControl/pairing/status",
+				"stability": "experimental",
+				"params_type": "v2::RemoteControlPairingStatusParams",
+				"result_type": "v2::RemoteControlPairingStatusResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "pairingCode",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "manualPairingCode",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "claimed",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "remoteControl/status/read",
+				"stability": "experimental",
+				"params_type": "Option<()>",
+				"result_type": "v2::RemoteControlStatusReadResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "RemoteControlConnectionStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serverName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "installationId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "review/start",
+				"stability": "stable",
+				"params_type": "v2::ReviewStartParams",
+				"result_type": "v2::ReviewStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "target",
+							"rustType": "ReviewTarget",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "delivery",
+							"rustType": "Option<ReviewDelivery>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "turn",
+							"rustType": "Turn",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reviewThreadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "skills/config/write",
+				"stability": "stable",
+				"params_type": "v2::SkillsConfigWriteParams",
+				"result_type": "v2::SkillsConfigWriteResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "effectiveEnabled",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "skills/extraRoots/set",
+				"stability": "stable",
+				"params_type": "v2::SkillsExtraRootsSetParams",
+				"result_type": "v2::SkillsExtraRootsSetResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "extraRoots",
+							"rustType": "Vec<AbsolutePathBuf>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "skills/list",
+				"stability": "stable",
+				"params_type": "v2::SkillsListParams",
+				"result_type": "v2::SkillsListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cwds",
+							"rustType": "Vec<PathBuf>",
+							"optional": false,
+							"skipSerializingIf": "Vec::is_empty"
+						},
+						{
+							"name": "forceReload",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<SkillsListEntry>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/approveGuardianDeniedAction",
+				"stability": "stable",
+				"params_type": "v2::ThreadApproveGuardianDeniedActionParams",
+				"result_type": "v2::ThreadApproveGuardianDeniedActionResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "event",
+							"rustType": "JsonValue",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/archive",
+				"stability": "stable",
+				"params_type": "v2::ThreadArchiveParams",
+				"result_type": "v2::ThreadArchiveResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/backgroundTerminals/clean",
+				"stability": "experimental",
+				"params_type": "v2::ThreadBackgroundTerminalsCleanParams",
+				"result_type": "v2::ThreadBackgroundTerminalsCleanResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/backgroundTerminals/list",
+				"stability": "experimental",
+				"params_type": "v2::ThreadBackgroundTerminalsListParams",
+				"result_type": "v2::ThreadBackgroundTerminalsListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<ThreadBackgroundTerminal>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/backgroundTerminals/terminate",
+				"stability": "experimental",
+				"params_type": "v2::ThreadBackgroundTerminalsTerminateParams",
+				"result_type": "v2::ThreadBackgroundTerminalsTerminateResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "processId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "terminated",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/compact/start",
+				"stability": "stable",
+				"params_type": "v2::ThreadCompactStartParams",
+				"result_type": "v2::ThreadCompactStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/decrement_elicitation",
+				"stability": "stable",
+				"params_type": "v2::ThreadDecrementElicitationParams",
+				"result_type": "v2::ThreadDecrementElicitationResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "count",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "paused",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/delete",
+				"stability": "stable",
+				"params_type": "v2::ThreadDeleteParams",
+				"result_type": "v2::ThreadDeleteResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/fork",
+				"stability": "stable",
+				"params_type": "v2::ThreadForkParams",
+				"result_type": "v2::ThreadForkResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"ThreadForkParams"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "lastTurnId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "beforeTurnId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "path",
+							"rustType": "Option<PathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "model",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "modelProvider",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serviceTier",
+							"rustType": "Option<Option<String>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "runtimeWorkspaceRoots",
+							"rustType": "Option<Vec<AbsolutePathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalPolicy",
+							"rustType": "Option<AskForApproval>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalsReviewer",
+							"rustType": "Option<ApprovalsReviewer>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sandbox",
+							"rustType": "Option<SandboxMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "permissions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "config",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "baseInstructions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "developerInstructions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "ephemeral",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "threadSource",
+							"rustType": "Option<ThreadSource>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "excludeTurns",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "deferGoalContinuation",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf",
+						"ApprovalsReviewer"
+					]
+				}
+			},
+			{
+				"method": "thread/goal/clear",
+				"stability": "stable",
+				"params_type": "v2::ThreadGoalClearParams",
+				"result_type": "v2::ThreadGoalClearResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "cleared",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/goal/get",
+				"stability": "stable",
+				"params_type": "v2::ThreadGoalGetParams",
+				"result_type": "v2::ThreadGoalGetResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "goal",
+							"rustType": "Option<ThreadGoal>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/goal/set",
+				"stability": "stable",
+				"params_type": "v2::ThreadGoalSetParams",
+				"result_type": "v2::ThreadGoalSetResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "goal",
+							"rustType": "ThreadGoal",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/increment_elicitation",
+				"stability": "stable",
+				"params_type": "v2::ThreadIncrementElicitationParams",
+				"result_type": "v2::ThreadIncrementElicitationResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "count",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "paused",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/inject_items",
+				"stability": "stable",
+				"params_type": "v2::ThreadInjectItemsParams",
+				"result_type": "v2::ThreadInjectItemsResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "items",
+							"rustType": "Vec<JsonValue>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/items/list",
+				"stability": "experimental",
+				"params_type": "v2::ThreadItemsListParams",
+				"result_type": "v2::ThreadItemsListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sortDirection",
+							"rustType": "Option<SortDirection>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<ThreadItemEntry>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "backwardsCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/list",
+				"stability": "stable",
+				"params_type": "v2::ThreadListParams",
+				"result_type": "v2::ThreadListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sortKey",
+							"rustType": "Option<ThreadSortKey>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sortDirection",
+							"rustType": "Option<SortDirection>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "modelProviders",
+							"rustType": "Option<Vec<String>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sourceKinds",
+							"rustType": "Option<Vec<ThreadSourceKind>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "archived",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "isPinned",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<ThreadListCwdFilter>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "useStateDbOnly",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "searchTerm",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "parentThreadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "ancestorThreadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<Thread>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "backwardsCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/loaded/list",
+				"stability": "stable",
+				"params_type": "v2::ThreadLoadedListParams",
+				"result_type": "v2::ThreadLoadedListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/memoryMode/set",
+				"stability": "experimental",
+				"params_type": "v2::ThreadMemoryModeSetParams",
+				"result_type": "v2::ThreadMemoryModeSetResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "mode",
+							"rustType": "ThreadMemoryMode",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/metadata/update",
+				"stability": "stable",
+				"params_type": "v2::ThreadMetadataUpdateParams",
+				"result_type": "v2::ThreadMetadataUpdateResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "gitInfo",
+							"rustType": "Option<ThreadMetadataGitInfoUpdateParams>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "isPinned",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "thread",
+							"rustType": "Thread",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/name/set",
+				"stability": "stable",
+				"params_type": "v2::ThreadSetNameParams",
+				"result_type": "v2::ThreadSetNameResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "name",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/read",
+				"stability": "stable",
+				"params_type": "v2::ThreadReadParams",
+				"result_type": "v2::ThreadReadResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "includeTurns",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "thread",
+							"rustType": "Thread",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/appendAudio",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeAppendAudioParams",
+				"result_type": "v2::ThreadRealtimeAppendAudioResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "audio",
+							"rustType": "ThreadRealtimeAudioChunk",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/appendSpeech",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeAppendSpeechParams",
+				"result_type": "v2::ThreadRealtimeAppendSpeechResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "text",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/appendText",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeAppendTextParams",
+				"result_type": "v2::ThreadRealtimeAppendTextResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "text",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "role",
+							"rustType": "ConversationTextRole",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"ConversationTextRole"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/listVoices",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeListVoicesParams",
+				"result_type": "v2::ThreadRealtimeListVoicesResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "voices",
+							"rustType": "RealtimeVoicesList",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"RealtimeVoicesList"
+					]
+				}
+			},
+			{
+				"method": "thread/realtime/start",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeStartParams",
+				"result_type": "v2::ThreadRealtimeStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "clientManagedHandoffs",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "flushTranscriptTailOnSessionEnd",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "codexResponsesAsItems",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "codexResponseItemPrefix",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "codexResponseHandoffMode",
+							"rustType": "Option<CodexResponseHandoffMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "codexResponseHandoffChannelPrefixes",
+							"rustType": "Option<BTreeMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "model",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "outputModality",
+							"rustType": "RealtimeOutputModality",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "includeStartupContext",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "initialItems",
+							"rustType": "Option<Vec<ThreadRealtimeInitialItem>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "prompt",
+							"rustType": "Option<Option<String>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "realtimeSessionId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "transport",
+							"rustType": "Option<ThreadRealtimeStartTransport>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "version",
+							"rustType": "Option<RealtimeConversationVersion>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "voice",
+							"rustType": "Option<RealtimeVoice>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"CodexResponseHandoffMode",
+						"RealtimeConversationVersion",
+						"RealtimeOutputModality",
+						"RealtimeVoice"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/stop",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeStopParams",
+				"result_type": "v2::ThreadRealtimeStopResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/resume",
+				"stability": "stable",
+				"params_type": "v2::ThreadResumeParams",
+				"result_type": "v2::ThreadResumeResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"ThreadResumeParams"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "history",
+							"rustType": "Option<Vec<ResponseItem>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "path",
+							"rustType": "Option<PathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "model",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "modelProvider",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serviceTier",
+							"rustType": "Option<Option<String>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "runtimeWorkspaceRoots",
+							"rustType": "Option<Vec<AbsolutePathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalPolicy",
+							"rustType": "Option<AskForApproval>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalsReviewer",
+							"rustType": "Option<ApprovalsReviewer>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sandbox",
+							"rustType": "Option<SandboxMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "permissions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "config",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "baseInstructions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "developerInstructions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "personality",
+							"rustType": "Option<Personality>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "excludeTurns",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "initialTurnsPage",
+							"rustType": "Option<ThreadResumeInitialTurnsPageParams>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf",
+						"ApprovalsReviewer",
+						"Personality",
+						"ResponseItem"
+					]
+				}
+			},
+			{
+				"method": "thread/rollback",
+				"stability": "stable",
+				"params_type": "v2::ThreadRollbackParams",
+				"result_type": "v2::ThreadRollbackResponse",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"ThreadRollbackParams"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "numTurns",
+							"rustType": "u32",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/search",
+				"stability": "experimental",
+				"params_type": "v2::ThreadSearchParams",
+				"result_type": "v2::ThreadSearchResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sortKey",
+							"rustType": "Option<ThreadSortKey>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sortDirection",
+							"rustType": "Option<SortDirection>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sourceKinds",
+							"rustType": "Option<Vec<ThreadSourceKind>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "archived",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "searchTerm",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<ThreadSearchResult>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "backwardsCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/searchOccurrences",
+				"stability": "experimental",
+				"params_type": "v2::ThreadSearchOccurrencesParams",
+				"result_type": "v2::ThreadSearchOccurrencesResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "searchTerm",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<ThreadSearchOccurrence>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/settings/update",
+				"stability": "experimental",
+				"params_type": "v2::ThreadSettingsUpdateParams",
+				"result_type": "v2::ThreadSettingsUpdateResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/shellCommand",
+				"stability": "stable",
+				"params_type": "v2::ThreadShellCommandParams",
+				"result_type": "v2::ThreadShellCommandResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "command",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/start",
+				"stability": "stable",
+				"params_type": "v2::ThreadStartParams",
+				"result_type": "v2::ThreadStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "model",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "modelProvider",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "allowProviderModelFallback",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						},
+						{
+							"name": "serviceTier",
+							"rustType": "Option<Option<String>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "runtimeWorkspaceRoots",
+							"rustType": "Option<Vec<AbsolutePathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalPolicy",
+							"rustType": "Option<AskForApproval>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalsReviewer",
+							"rustType": "Option<ApprovalsReviewer>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sandbox",
+							"rustType": "Option<SandboxMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "permissions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "config",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serviceName",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "baseInstructions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "developerInstructions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "personality",
+							"rustType": "Option<Personality>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "multiAgentMode",
+							"rustType": "Option<MultiAgentMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "ephemeral",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "historyMode",
+							"rustType": "Option<ThreadHistoryMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sessionStartSource",
+							"rustType": "Option<ThreadStartSource>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadSource",
+							"rustType": "Option<ThreadSource>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environments",
+							"rustType": "Option<Vec<TurnEnvironmentParams>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "dynamicTools",
+							"rustType": "Option<Vec<DynamicToolSpec>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "selectedCapabilityRoots",
+							"rustType": "Option<Vec<SelectedCapabilityRoot>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "mockExperimentalField",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "experimentalRawEvents",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": "std::ops::Not::not"
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf",
+						"ApprovalsReviewer",
+						"DynamicToolSpec",
+						"MultiAgentMode",
+						"Personality",
+						"SelectedCapabilityRoot"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "thread",
+							"rustType": "Thread",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "model",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "modelProvider",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serviceTier",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "runtimeWorkspaceRoots",
+							"rustType": "Vec<AbsolutePathBuf>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "instructionSources",
+							"rustType": "Vec<LegacyAppPathString>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalPolicy",
+							"rustType": "AskForApproval",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalsReviewer",
+							"rustType": "ApprovalsReviewer",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sandbox",
+							"rustType": "SandboxPolicy",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "activePermissionProfile",
+							"rustType": "Option<ActivePermissionProfile>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reasoningEffort",
+							"rustType": "Option<ReasoningEffort>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "multiAgentMode",
+							"rustType": "MultiAgentMode",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf",
+						"ApprovalsReviewer",
+						"LegacyAppPathString",
+						"MultiAgentMode",
+						"ReasoningEffort"
+					]
+				}
+			},
+			{
+				"method": "thread/turns/list",
+				"stability": "experimental",
+				"params_type": "v2::ThreadTurnsListParams",
+				"result_type": "v2::ThreadTurnsListResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "limit",
+							"rustType": "Option<u32>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sortDirection",
+							"rustType": "Option<SortDirection>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemsView",
+							"rustType": "Option<TurnItemsView>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "data",
+							"rustType": "Vec<Turn>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "nextCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "backwardsCursor",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/unarchive",
+				"stability": "stable",
+				"params_type": "v2::ThreadUnarchiveParams",
+				"result_type": "v2::ThreadUnarchiveResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "thread",
+							"rustType": "Thread",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/unsubscribe",
+				"stability": "stable",
+				"params_type": "v2::ThreadUnsubscribeParams",
+				"result_type": "v2::ThreadUnsubscribeResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "ThreadUnsubscribeStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "turn/interrupt",
+				"stability": "stable",
+				"params_type": "v2::TurnInterruptParams",
+				"result_type": "v2::TurnInterruptResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "turn/start",
+				"stability": "stable",
+				"params_type": "v2::TurnStartParams",
+				"result_type": "v2::TurnStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "clientUserMessageId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "input",
+							"rustType": "Vec<UserInput>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "responsesapiClientMetadata",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "additionalContext",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environments",
+							"rustType": "Option<Vec<TurnEnvironmentParams>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<PathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "runtimeWorkspaceRoots",
+							"rustType": "Option<Vec<AbsolutePathBuf>>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalPolicy",
+							"rustType": "Option<AskForApproval>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalsReviewer",
+							"rustType": "Option<ApprovalsReviewer>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sandboxPolicy",
+							"rustType": "Option<SandboxPolicy>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "permissions",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "model",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serviceTier",
+							"rustType": "Option<Option<String>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "effort",
+							"rustType": "Option<ReasoningEffort>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "summary",
+							"rustType": "Option<ReasoningSummary>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "personality",
+							"rustType": "Option<Personality>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "outputSchema",
+							"rustType": "Option<JsonValue>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "collaborationMode",
+							"rustType": "Option<CollaborationMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "multiAgentMode",
+							"rustType": "Option<MultiAgentMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf",
+						"ApprovalsReviewer",
+						"CollaborationMode",
+						"JsonValue",
+						"MultiAgentMode",
+						"Personality",
+						"ReasoningEffort",
+						"ReasoningSummary"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "turn",
+							"rustType": "Turn",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "turn/steer",
+				"stability": "stable",
+				"params_type": "v2::TurnSteerParams",
+				"result_type": "v2::TurnSteerResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "clientUserMessageId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "input",
+							"rustType": "Vec<UserInput>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "responsesapiClientMetadata",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "additionalContext",
+							"rustType": "Option<HashMap<String",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "expectedTurnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "windowsSandbox/readiness",
+				"stability": "stable",
+				"params_type": "Option<()>",
+				"result_type": "v2::WindowsSandboxReadinessResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "WindowsSandboxReadiness",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "windowsSandbox/setupStart",
+				"stability": "stable",
+				"params_type": "v2::WindowsSandboxSetupStartParams",
+				"result_type": "v2::WindowsSandboxSetupStartResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "mode",
+							"rustType": "WindowsSandboxSetupMode",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<AbsolutePathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "started",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			}
+		],
+		"clientNotifications": [
+			{
+				"method": "initialized",
+				"stability": "stable",
+				"params_type": "None",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				}
+			}
+		],
+		"serverRequests": [
+			{
+				"method": "account/chatgptAuthTokens/refresh",
+				"stability": "stable",
+				"params_type": "v2::ChatgptAuthTokensRefreshParams",
+				"result_type": "v2::ChatgptAuthTokensRefreshResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "reason",
+							"rustType": "ChatgptAuthTokensRefreshReason",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "previousAccountId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "accessToken",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "chatgptAccountId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "chatgptPlanType",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "applyPatchApproval",
+				"stability": "stable",
+				"params_type": "v1::ApplyPatchApprovalParams",
+				"result_type": "v1::ApplyPatchApprovalResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "conversationId",
+							"rustType": "ThreadId",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "callId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "fileChanges",
+							"rustType": "HashMap<PathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "grantRoot",
+							"rustType": "Option<PathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"ThreadId"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "decision",
+							"rustType": "ReviewDecision",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"ReviewDecision"
+					]
+				}
+			},
+			{
+				"method": "attestation/generate",
+				"stability": "stable",
+				"params_type": "v2::AttestationGenerateParams",
+				"result_type": "v2::AttestationGenerateResponse",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "token",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "currentTime/read",
+				"stability": "stable",
+				"params_type": "v2::CurrentTimeReadParams",
+				"result_type": "v2::CurrentTimeReadResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "currentTimeAt",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "execCommandApproval",
+				"stability": "stable",
+				"params_type": "v1::ExecCommandApprovalParams",
+				"result_type": "v1::ExecCommandApprovalResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "conversationId",
+							"rustType": "ThreadId",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "callId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "command",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "PathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "parsedCmd",
+							"rustType": "Vec<ParsedCommand>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"ParsedCommand",
+						"ThreadId"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "decision",
+							"rustType": "ReviewDecision",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"ReviewDecision"
+					]
+				}
+			},
+			{
+				"method": "item/commandExecution/requestApproval",
+				"stability": "stable",
+				"params_type": "v2::CommandExecutionRequestApprovalParams",
+				"result_type": "v2::CommandExecutionRequestApprovalResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "startedAtMs",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "approvalId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "environmentId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "networkApprovalContext",
+							"rustType": "Option<NetworkApprovalContext>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "command",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "cwd",
+							"rustType": "Option<LegacyAppPathString>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "commandActions",
+							"rustType": "Option<Vec<CommandAction>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "additionalPermissions",
+							"rustType": "Option<AdditionalPermissionProfile>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "proposedExecpolicyAmendment",
+							"rustType": "Option<ExecPolicyAmendment>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "proposedNetworkPolicyAmendments",
+							"rustType": "Option<Vec<NetworkPolicyAmendment>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "availableDecisions",
+							"rustType": "Option<Vec<CommandExecutionApprovalDecision>>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": [
+						"LegacyAppPathString"
+					]
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/fileChange/requestApproval",
+				"stability": "stable",
+				"params_type": "v2::FileChangeRequestApprovalParams",
+				"result_type": "v2::FileChangeRequestApprovalResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "startedAtMs",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "grantRoot",
+							"rustType": "Option<PathBuf>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "decision",
+							"rustType": "FileChangeApprovalDecision",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/permissions/requestApproval",
+				"stability": "stable",
+				"params_type": "v2::PermissionsRequestApprovalParams",
+				"result_type": "v2::PermissionsRequestApprovalResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "startedAtMs",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "cwd",
+							"rustType": "AbsolutePathBuf",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "permissions",
+							"rustType": "RequestPermissionProfile",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "permissions",
+							"rustType": "GrantedPermissionProfile",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "scope",
+							"rustType": "PermissionGrantScope",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "strictAutoReview",
+							"rustType": "Option<bool>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/tool/call",
+				"stability": "stable",
+				"params_type": "v2::DynamicToolCallParams",
+				"result_type": "v2::DynamicToolCallResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "callId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "namespace",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "tool",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "arguments",
+							"rustType": "JsonValue",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "contentItems",
+							"rustType": "Vec<DynamicToolCallOutputContentItem>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "success",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/tool/requestUserInput",
+				"stability": "stable",
+				"params_type": "v2::ToolRequestUserInputParams",
+				"result_type": "v2::ToolRequestUserInputResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "thread_id",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turn_id",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "item_id",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "questions",
+							"rustType": "Vec<ToolRequestUserInputQuestion>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "auto_resolution_ms",
+							"rustType": "Option<u64>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [
+						{
+							"name": "answers",
+							"rustType": "HashMap<String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "mcpServer/elicitation/request",
+				"stability": "stable",
+				"params_type": "v2::McpServerElicitationRequestParams",
+				"result_type": "v2::McpServerElicitationRequestResponse",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serverName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "request",
+							"rustType": "McpServerElicitationRequest",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				},
+				"result": {
+					"fields": [],
+					"unresolved": []
+				}
+			}
+		],
+		"serverNotifications": [
+			{
+				"method": "account/login/completed",
+				"stability": "stable",
+				"params_type": "v2::AccountLoginCompletedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "account/rateLimits/updated",
+				"stability": "stable",
+				"params_type": "v2::AccountRateLimitsUpdatedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"AccountRateLimitsUpdatedNotification"
+					]
+				}
+			},
+			{
+				"method": "account/updated",
+				"stability": "stable",
+				"params_type": "v2::AccountUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "authMode",
+							"rustType": "Option<AuthMode>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "planType",
+							"rustType": "Option<PlanType>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"PlanType"
+					]
+				}
+			},
+			{
+				"method": "app/list/updated",
+				"stability": "stable",
+				"params_type": "v2::AppListUpdatedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"AppListUpdatedNotification"
+					]
+				}
+			},
+			{
+				"method": "command/exec/outputDelta",
+				"stability": "stable",
+				"params_type": "v2::CommandExecOutputDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "processId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stream",
+							"rustType": "CommandExecOutputStream",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "deltaBase64",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "capReached",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "configWarning",
+				"stability": "stable",
+				"params_type": "v2::ConfigWarningNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "summary",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "details",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "path",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						},
+						{
+							"name": "range",
+							"rustType": "Option<TextRange>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "deprecationNotice",
+				"stability": "stable",
+				"params_type": "v2::DeprecationNoticeNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "summary",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "details",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "error",
+				"stability": "stable",
+				"params_type": "v2::ErrorNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "error",
+							"rustType": "TurnError",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "willRetry",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "externalAgentConfig/import/completed",
+				"stability": "stable",
+				"params_type": "v2::ExternalAgentConfigImportCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "importId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemTypeResults",
+							"rustType": "Vec<ExternalAgentConfigImportTypeResult>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "externalAgentConfig/import/progress",
+				"stability": "stable",
+				"params_type": "v2::ExternalAgentConfigImportProgressNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "importId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemTypeResults",
+							"rustType": "Vec<ExternalAgentConfigImportTypeResult>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fs/changed",
+				"stability": "stable",
+				"params_type": "v2::FsChangedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "watchId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "changedPaths",
+							"rustType": "Vec<AbsolutePathBuf>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"AbsolutePathBuf"
+					]
+				}
+			},
+			{
+				"method": "fuzzyFileSearch/sessionCompleted",
+				"stability": "stable",
+				"params_type": "FuzzyFileSearchSessionCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "sessionId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "fuzzyFileSearch/sessionUpdated",
+				"stability": "stable",
+				"params_type": "FuzzyFileSearchSessionUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "sessionId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "query",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "files",
+							"rustType": "Vec<FuzzyFileSearchResult>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "guardianWarning",
+				"stability": "stable",
+				"params_type": "v2::GuardianWarningNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "message",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "hook/completed",
+				"stability": "stable",
+				"params_type": "v2::HookCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "run",
+							"rustType": "HookRunSummary",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "hook/started",
+				"stability": "stable",
+				"params_type": "v2::HookStartedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/agentMessage/delta",
+				"stability": "stable",
+				"params_type": "v2::AgentMessageDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "delta",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/autoApprovalReview/completed",
+				"stability": "stable",
+				"params_type": "v2::ItemGuardianApprovalReviewCompletedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"ItemGuardianApprovalReviewCompletedNotification"
+					]
+				}
+			},
+			{
+				"method": "item/autoApprovalReview/started",
+				"stability": "stable",
+				"params_type": "v2::ItemGuardianApprovalReviewStartedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"ItemGuardianApprovalReviewStartedNotification"
+					]
+				}
+			},
+			{
+				"method": "item/commandExecution/outputDelta",
+				"stability": "stable",
+				"params_type": "v2::CommandExecutionOutputDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "delta",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/commandExecution/terminalInteraction",
+				"stability": "stable",
+				"params_type": "v2::TerminalInteractionNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "processId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stdin",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/completed",
+				"stability": "stable",
+				"params_type": "v2::ItemCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "startedAtMs",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reviewId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "targetItemId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "review",
+							"rustType": "GuardianApprovalReview",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "action",
+							"rustType": "GuardianApprovalReviewAction",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/fileChange/outputDelta",
+				"stability": "stable",
+				"params_type": "v2::FileChangeOutputDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "delta",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/fileChange/patchUpdated",
+				"stability": "stable",
+				"params_type": "v2::FileChangePatchUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "changes",
+							"rustType": "Vec<FileUpdateChange>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/mcpToolCall/progress",
+				"stability": "stable",
+				"params_type": "v2::McpToolCallProgressNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "message",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/plan/delta",
+				"stability": "stable",
+				"params_type": "v2::PlanDeltaNotification",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"PlanDeltaNotification"
+					]
+				}
+			},
+			{
+				"method": "item/reasoning/summaryPartAdded",
+				"stability": "stable",
+				"params_type": "v2::ReasoningSummaryPartAddedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "summaryIndex",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/reasoning/summaryTextDelta",
+				"stability": "stable",
+				"params_type": "v2::ReasoningSummaryTextDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "delta",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/reasoning/textDelta",
+				"stability": "stable",
+				"params_type": "v2::ReasoningTextDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "itemId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "delta",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "contentIndex",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "item/started",
+				"stability": "stable",
+				"params_type": "v2::ItemStartedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "item",
+							"rustType": "ThreadItem",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "startedAtMs",
+							"rustType": "i64",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "mcpServer/oauthLogin/completed",
+				"stability": "stable",
+				"params_type": "v2::McpServerOauthLoginCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "name",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "success",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "error",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "mcpServer/startupStatus/updated",
+				"stability": "stable",
+				"params_type": "v2::McpServerStatusUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "name",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "status",
+							"rustType": "McpServerStartupState",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "error",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "failureReason",
+							"rustType": "Option<McpServerStartupFailureReason>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "model/rerouted",
+				"stability": "stable",
+				"params_type": "v2::ModelReroutedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "fromModel",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "toModel",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "ModelRerouteReason",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "model/safetyBuffering/updated",
+				"stability": "stable",
+				"params_type": "v2::ModelSafetyBufferingUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "model",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "useCases",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reasons",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "showBufferingUi",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "fasterModel",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "model/verification",
+				"stability": "stable",
+				"params_type": "v2::ModelVerificationNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "verifications",
+							"rustType": "Vec<ModelVerification>",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "process/exited",
+				"stability": "experimental",
+				"params_type": "v2::ProcessExitedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "processHandle",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "exitCode",
+							"rustType": "i32",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stdout",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stdoutCapReached",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stderr",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stderrCapReached",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "process/outputDelta",
+				"stability": "experimental",
+				"params_type": "v2::ProcessOutputDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "processHandle",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "stream",
+							"rustType": "ProcessOutputStream",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "deltaBase64",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "capReached",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "rawResponse/completed",
+				"stability": "stable",
+				"params_type": "v2::RawResponseCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "responseId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "usage",
+							"rustType": "Option<TokenUsageBreakdown>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "rawResponseItem/completed",
+				"stability": "stable",
+				"params_type": "v2::RawResponseItemCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "item",
+							"rustType": "ResponseItem",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"ResponseItem"
+					]
+				}
+			},
+			{
+				"method": "remoteControl/status/changed",
+				"stability": "stable",
+				"params_type": "v2::RemoteControlStatusChangedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "status",
+							"rustType": "RemoteControlConnectionStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "serverName",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "installationId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "serverRequest/resolved",
+				"stability": "stable",
+				"params_type": "v2::ServerRequestResolvedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "requestId",
+							"rustType": "RequestId",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"RequestId"
+					]
+				}
+			},
+			{
+				"method": "skills/changed",
+				"stability": "stable",
+				"params_type": "v2::SkillsChangedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/archived",
+				"stability": "stable",
+				"params_type": "v2::ThreadArchivedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/closed",
+				"stability": "stable",
+				"params_type": "v2::ThreadClosedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/compacted",
+				"stability": "stable",
+				"params_type": "v2::ContextCompactedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/deleted",
+				"stability": "stable",
+				"params_type": "v2::ThreadDeletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/environment/connected",
+				"stability": "experimental",
+				"params_type": "v2::EnvironmentConnectionNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/environment/disconnected",
+				"stability": "experimental",
+				"params_type": "v2::EnvironmentConnectionNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "environmentId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/goal/cleared",
+				"stability": "stable",
+				"params_type": "v2::ThreadGoalClearedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/goal/updated",
+				"stability": "stable",
+				"params_type": "v2::ThreadGoalUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "goal",
+							"rustType": "ThreadGoal",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/name/updated",
+				"stability": "stable",
+				"params_type": "v2::ThreadNameUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadName",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": "Option::is_none"
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/closed",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeClosedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "reason",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/error",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeErrorNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "message",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/itemAdded",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeItemAddedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "item",
+							"rustType": "JsonValue",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				}
+			},
+			{
+				"method": "thread/realtime/outputAudio/delta",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeOutputAudioDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "audio",
+							"rustType": "ThreadRealtimeAudioChunk",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/sdp",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeSdpNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "sdp",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/started",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeStartedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "realtimeSessionId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "version",
+							"rustType": "RealtimeConversationVersion",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"RealtimeConversationVersion"
+					]
+				}
+			},
+			{
+				"method": "thread/realtime/transcript/delta",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeTranscriptDeltaNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "role",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "delta",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/realtime/transcript/done",
+				"stability": "experimental",
+				"params_type": "v2::ThreadRealtimeTranscriptDoneNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "role",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "text",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/settings/updated",
+				"stability": "experimental",
+				"params_type": "v2::ThreadSettingsUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "threadSettings",
+							"rustType": "ThreadSettings",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/started",
+				"stability": "stable",
+				"params_type": "v2::ThreadStartedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/status/changed",
+				"stability": "stable",
+				"params_type": "v2::ThreadStatusChangedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "status",
+							"rustType": "ThreadStatus",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/tokenUsage/updated",
+				"stability": "stable",
+				"params_type": "v2::ThreadTokenUsageUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "tokenUsage",
+							"rustType": "ThreadTokenUsage",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "thread/unarchived",
+				"stability": "stable",
+				"params_type": "v2::ThreadUnarchivedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "turn/completed",
+				"stability": "stable",
+				"params_type": "v2::TurnCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turn",
+							"rustType": "Turn",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "turn/diff/updated",
+				"stability": "stable",
+				"params_type": "v2::TurnDiffUpdatedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": [
+						"TurnDiffUpdatedNotification"
+					]
+				}
+			},
+			{
+				"method": "turn/moderationMetadata",
+				"stability": "experimental",
+				"params_type": "v2::TurnModerationMetadataNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "metadata",
+							"rustType": "JsonValue",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": [
+						"JsonValue"
+					]
+				}
+			},
+			{
+				"method": "turn/plan/updated",
+				"stability": "stable",
+				"params_type": "v2::TurnPlanUpdatedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "turnId",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "diff",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "turn/started",
+				"stability": "stable",
+				"params_type": "v2::TurnStartedNotification",
+				"params": {
+					"fields": [],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "warning",
+				"stability": "stable",
+				"params_type": "v2::WarningNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "threadId",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "message",
+							"rustType": "String",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "windows/worldWritableWarning",
+				"stability": "stable",
+				"params_type": "v2::WindowsWorldWritableWarningNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "samplePaths",
+							"rustType": "Vec<String>",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "extraCount",
+							"rustType": "usize",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "failedScan",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			},
+			{
+				"method": "windowsSandbox/setupCompleted",
+				"stability": "stable",
+				"params_type": "v2::WindowsSandboxSetupCompletedNotification",
+				"params": {
+					"fields": [
+						{
+							"name": "mode",
+							"rustType": "WindowsSandboxSetupMode",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "success",
+							"rustType": "bool",
+							"optional": false,
+							"skipSerializingIf": null
+						},
+						{
+							"name": "error",
+							"rustType": "Option<String>",
+							"optional": true,
+							"skipSerializingIf": null
+						}
+					],
+					"unresolved": []
+				}
+			}
+		]
+	}
+}

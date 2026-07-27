@@ -1,0 +1,107 @@
+#!/usr/bin/env bun
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+const repoRoot = path.resolve(import.meta.dir, "..");
+const protocolRoot = path.join(repoRoot, "packages/coding-agent/src/app-server/protocol-source");
+const vendorRoot = path.join(protocolRoot, "vendor");
+export const pinnedCommit = "81da9deb065d7adb283816b19b40f89bcc484276";
+const protocolBaseUrl = `https://raw.githubusercontent.com/openai/codex/${pinnedCommit}/codex-rs/app-server-protocol/src/protocol`;
+const readmeUrl = `https://raw.githubusercontent.com/openai/codex/${pinnedCommit}/codex-rs/app-server/README.md`;
+const sourceUrl = `${protocolBaseUrl}/common.rs`;
+
+type Stability = "stable" | "experimental";
+export type Direction = "clientRequests" | "clientNotifications" | "serverRequests" | "serverNotifications";
+export type Field = { name: string; rustType: string; optional: boolean; skipSerializingIf: string | null };
+export type Shape = { fields: Field[]; unresolved: string[] };
+type Descriptor = { method: string; stability: Stability; params_type: string; result_type?: string; params: Shape; result?: Shape };
+export type Bundle = { schemaVersion: 1; authorityLevel: "method-and-field-shapes" | "method-catalog"; derivation: "rust-source-derived" | "readme-derived"; directions: Record<Direction, Descriptor[]> };
+
+const sha256 = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
+const stableJson = (value: unknown) => `${JSON.stringify(value, null, "\t")}\n`;
+const typeName = (method: string, suffix: "Params" | "Result") => `${method.replace(/[^A-Za-z0-9]+(.)/g, (_match, character: string) => character.toUpperCase()).replace(/^[^A-Za-z_]/, "Method")}${suffix}`;
+const rustType = (value: string) => value.replace(/\s+/g, " ").trim();
+const camelCaseVariant = (variant: string) => `${variant[0]?.toLowerCase() ?? ""}${variant.slice(1)}`;
+const entryPrefix = "((?:(?:\\s*#\\[[^\\]]+\\]\\s*)|(?:\\s*\\/\\/\\/?[^\\n]*\\n))*)";
+export const readmeMinimumMethodCount = 10;
+export const rustFailureDiagnostic = (error: unknown) => String(error).replace(/\s+/g, " ").slice(0, 1_000);
+const emptyShape = (): Shape => ({ fields: [], unresolved: [] });
+
+function renamedWire(attributes: string): string | undefined { return attributes.match(/#\[(?:serde|ts|strum)\s*\(\s*(?:rename|serialize)\s*=\s*"([^"]+)"/)?.[1]; }
+function descriptorStability(attributes: string): Stability { return /#\[experimental(?:\(|\])/.test(attributes) ? "experimental" : "stable"; }
+function methodName(variant: string, wire: string | undefined, attributes: string): string { return wire ?? renamedWire(attributes) ?? camelCaseVariant(variant); }
+function macroInvocation(source: string, marker: string): string {
+	const first = source.indexOf(marker); const second = first < 0 ? -1 : source.indexOf(marker, first + marker.length); const start = second < 0 ? first : second;
+	if (start < 0) throw new Error(`Pinned Rust parser drift: missing ${marker}`);
+	const opening = source.indexOf("{", start); let depth = 0;
+	for (let index = opening; index < source.length; index++) { if (source[index] === "{") depth++; if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1); }
+	throw new Error(`Pinned Rust parser drift: unterminated ${marker}`);
+}
+function assertPlausibleReadmeFallback(bundle: Bundle) { const count = Object.values(bundle.directions).flat().length; if (count < readmeMinimumMethodCount) throw new Error(`README fallback parser drift: expected at least ${readmeMinimumMethodCount} methods, found ${count}`); }
+
+export async function fetchPinnedText(url: string, fetcher: typeof fetch = fetch): Promise<string> {
+	let response: Response; try { response = await fetcher(url); } catch (error) { throw new Error(`Failed to fetch pinned Codex source ${url}`, { cause: error }); }
+	if (!response.ok) throw new Error(`Pinned Codex source ${url} returned HTTP ${response.status} ${response.statusText}`); return response.text();
+}
+
+export function descriptorsFromReadme(readme: string): Bundle {
+	const requests: Descriptor[] = []; const notifications: Descriptor[] = [];
+	for (const match of readme.matchAll(/^- `([^`]+)`\s+—\s+([^\n]+)/gm)) { const method = match[1]; const description = match[2]; if (!method.includes("/") && method !== "initialize") continue; const stability: Stability = /experimental|beta|under development|deprecated/i.test(description) ? "experimental" : "stable"; const descriptor = { method, stability, params_type: typeName(method, "Params"), params: emptyShape() }; if (/notification emitted|notification is emitted|notification sent|emits .*notification/i.test(description)) notifications.push(descriptor); else requests.push({ ...descriptor, result_type: typeName(method, "Result"), result: emptyShape() }); }
+	requests.push({ method: "initialize", stability: "stable", params_type: typeName("initialize", "Params"), result_type: typeName("initialize", "Result"), params: emptyShape(), result: emptyShape() });
+	const unique = (entries: Descriptor[]) => [...new Map(entries.map(entry => [entry.method, entry])).values()].sort((a, b) => a.method.localeCompare(b.method));
+	const bundle: Bundle = { schemaVersion: 1, authorityLevel: "method-catalog", derivation: "readme-derived", directions: { clientRequests: unique(requests), clientNotifications: [{ method: "initialized", stability: "stable", params_type: "None", params: emptyShape() }], serverRequests: [], serverNotifications: unique(notifications) } }; assertPlausibleReadmeFallback(bundle); return bundle;
+}
+export function descriptorsFromRustSource(source: string): Bundle {
+	const sections: [string, Direction, boolean][] = [["client_request_definitions!", "clientRequests", true], ["server_request_definitions!", "serverRequests", true], ["server_notification_definitions!", "serverNotifications", false], ["client_notification_definitions!", "clientNotifications", false]];
+	const directions = { clientRequests: [], clientNotifications: [], serverRequests: [], serverNotifications: [] } as Record<Direction, Descriptor[]>;
+	for (const [marker, direction, hasResult] of sections) { const section = macroInvocation(source, marker); const entries = hasResult ? section.matchAll(new RegExp(`${entryPrefix}(\\w+)\\s*(?:=>\\s*"([^"]+)")?\\s*\\{\\s*params:\\s*(?:#\\[[^\\]]+\\]\\s*)*([^,]+),[\\s\\S]*?response:\\s*([^,]+),`, "g")) : section.matchAll(new RegExp(`${entryPrefix}(\\w+)\\s*(?:=>\\s*"([^"]+)")?\\s*\\(\\s*([^\\)]+)\\s*\\)`, "g"));
+		for (const match of entries) { const [, attributes, variant, wire, paramsType, resultType] = match; if (!variant || !paramsType || (hasResult && !resultType)) continue; directions[direction].push({ method: methodName(variant, wire, attributes), stability: descriptorStability(attributes), params_type: rustType(paramsType), ...(hasResult ? { result_type: rustType(resultType) } : {}), params: emptyShape(), ...(hasResult ? { result: emptyShape() } : {}) }); }
+		if (direction === "clientNotifications" && directions[direction].length === 0 && /\bInitialized\s*,/.test(section)) directions[direction].push({ method: "initialized", stability: "stable", params_type: "None", params: emptyShape() }); if (!directions[direction].length) throw new Error(`Pinned Rust parser drift: no ${direction} entries parsed`); directions[direction].sort((a, b) => a.method.localeCompare(b.method));
+	}
+	return { schemaVersion: 1, authorityLevel: "method-catalog", derivation: "rust-source-derived", directions };
+}
+
+function matchingBlock(source: string, start: number): string { const opening = source.indexOf("{", start); let depth = 0; for (let index = opening; index < source.length; index++) { if (source[index] === "{") depth++; if (source[index] === "}" && --depth === 0) return source.slice(opening + 1, index); } return ""; }
+type Definition = { attributes: string; body: string; kind: "struct" | "enum" };
+function definitions(sources: Record<string, string>): Map<string, Definition> { const found = new Map<string, Definition>(); for (const source of Object.values(sources)) for (const match of source.matchAll(/((?:\s*#\[[\s\S]*?\]\s*)*)pub\s+(struct|enum)\s+(\w+)[^{]*\{/g)) found.set(match[3], { attributes: match[1], kind: match[2] as "struct" | "enum", body: matchingBlock(source, match.index ?? 0) }); return found; }
+function serdeName(attributes: string, field: string, renameAll: string | undefined): string { const explicit = attributes.match(/#\[serde\s*\([^\]]*rename\s*=\s*"([^"]+)"/)?.[1]; if (explicit) return explicit; if (renameAll === "camelCase") return field.replace(/_([a-z])/g, (_match, character: string) => character.toUpperCase()); if (renameAll === "kebab-case") return field.replace(/_/g, "-"); if (renameAll === "snake_case") return field; return field; }
+function refs(type: string): string[] { return [...type.matchAll(/(?:v[12]::)?([A-Z][A-Za-z0-9_]*)/g)].map(match => match[1]).filter(name => !["Option", "Vec", "HashMap", "BTreeMap", "String", "PathBuf", "Value"].includes(name)); }
+function shapeFor(type: string, definitionsByName: Map<string, Definition>): Shape {
+	if (/^(?:Option<)?\(\)(?:>)?$/.test(type) || type === "None") return emptyShape(); const name = type.match(/(?:v[12]::)?([A-Za-z0-9_]+)$/)?.[1]; const definition = name ? definitionsByName.get(name) : undefined; if (!definition) return { fields: [], unresolved: [...new Set(refs(type))] };
+	if (definition.kind === "enum") return { fields: [], unresolved: [`${name} (enum payload shape is not flattened)`] };
+	const renameAll = definition.attributes.match(/#\[serde\s*\([^\]]*rename_all\s*=\s*"([^"]+)"/)?.[1]; const fields: Field[] = []; const unresolved: string[] = [];
+	for (const match of definition.body.matchAll(/((?:\s*#\[[\s\S]*?\]\s*)*)pub\s+(\w+)\s*:\s*([^,\n]+),/g)) { const attributes = match[1]; const rawType = rustType(match[3]); fields.push({ name: serdeName(attributes, match[2], renameAll), rustType: rawType, optional: /^Option\s*</.test(rawType), skipSerializingIf: attributes.match(/skip_serializing_if\s*=\s*"([^"]+)"/)?.[1] ?? null }); for (const ref of refs(rawType)) if (!definitionsByName.has(ref)) unresolved.push(ref); }
+	return { fields, unresolved: [...new Set(unresolved)].sort() };
+}
+export function addFieldShapes(bundle: Bundle, sources: Record<string, string>): Bundle { const index = definitions(sources); for (const entry of Object.values(bundle.directions).flat()) { entry.params = shapeFor(entry.params_type, index); if (entry.result_type) entry.result = shapeFor(entry.result_type, index); } return { ...bundle, authorityLevel: "method-and-field-shapes" }; }
+export async function resolveBundleFromSources(allowReadmeDerivation: boolean, fetchRustSource: () => Promise<string>, fetchReadme: () => Promise<string>): Promise<{ bundle: Bundle; rustSourceFailure: string | null }> { try { return { bundle: descriptorsFromRustSource(await fetchRustSource()), rustSourceFailure: null }; } catch (error) { if (!allowReadmeDerivation) throw error; return { bundle: descriptorsFromReadme(await fetchReadme()), rustSourceFailure: rustFailureDiagnostic(error) }; } }
+
+const rustToTypeScript = (type: string) => /^Option\s*</.test(type) ? rustToTypeScript(type.replace(/^Option\s*<|>$/g, "")) : /^(?:String|PathBuf|AbsolutePathBuf)$/.test(type) ? "string" : /^(?:bool)$/.test(type) ? "boolean" : /^(?:u|i)\d+$/.test(type) ? "number" : "unknown";
+function interfaceFor(name: string, shape: Shape): string { return `export interface ${name} {\n${shape.fields.map(field => `\t${JSON.stringify(field.name)}${field.optional ? "?" : ""}: ${rustToTypeScript(field.rustType)};`).join("\n")}\n}`; }
+function validatorFor(method: string, shape: Shape): string { const required = shape.fields.filter(field => !field.optional).map(field => JSON.stringify(field.name)); return `\t${JSON.stringify(method)}: (value): value is Record<string, unknown> => isObject(value) && [${required.join(", ")}].every(key => Object.hasOwn(value, key)),`; }
+export function renderGeneratedFiles(bundle: Bundle): Record<string, string> {
+	const entries = Object.values(bundle.directions).flat(); const unresolved = Object.fromEntries(entries.map(entry => [entry.method, { params: entry.params.unresolved, ...(entry.result ? { result: entry.result.unresolved } : {}) }])); const types = `// GENERATED CODE — DO NOT EDIT. Field shapes captured from pinned Rust sources. Source: vendor/app-server.schema.bundle.json.\n\nexport type AppServerParams = Record<string, unknown>;\nexport type AppServerResult = Record<string, unknown>;\nexport const unresolvedTypeReferences = ${JSON.stringify(unresolved, null, "\t")} as const;\n\n${entries.map(entry => `${interfaceFor(typeName(entry.method, "Params"), entry.params)}${entry.result ? `\n${interfaceFor(typeName(entry.method, "Result"), entry.result)}` : ""}`).join("\n\n")}\n`;
+	const validators = `// GENERATED CODE — DO NOT EDIT. Required field validation from pinned Rust source shapes. Source: vendor/app-server.schema.bundle.json.\n\nexport type StructuralValidator = (value: unknown) => value is Record<string, unknown>;\nconst isObject: StructuralValidator = (value): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);\nexport const validators: Record<string, StructuralValidator> = {\n${entries.sort((a, b) => a.method.localeCompare(b.method)).map(entry => validatorFor(entry.method, entry.params)).join("\n")}\n};\nexport const isKnownMethod = (method: string): method is keyof typeof validators => Object.hasOwn(validators, method);\n`;
+	const block = (name: Direction) => `export const ${name} = [\n${bundle.directions[name].map(entry => `\t{ method: ${JSON.stringify(entry.method)}, stability: ${JSON.stringify(entry.stability)}, params_type: ${JSON.stringify(entry.params_type)}${entry.result_type ? `, result_type: ${JSON.stringify(entry.result_type)}` : ""} },`).join("\n")}\n] as const;`;
+	const catalogs = `// GENERATED CODE — DO NOT EDIT. Method catalog with pinned Rust type references. Source: vendor/app-server.schema.bundle.json.\n\nexport type CatalogEntry = { method: string; stability: "stable" | "experimental"; params_type: string; result_type?: string };\n\n${(["clientRequests", "clientNotifications", "serverRequests", "serverNotifications"] as Direction[]).map(block).join("\n\n")}\n`;
+	const manifestEntries = bundle.directions.clientRequests.map(entry => ({ method: entry.method, stability: entry.stability })); const manifest = `// GENERATED CODE — DO NOT EDIT. Support defaults to planned; exceptions are hand-authored in support-manifest.overrides.ts. Source: vendor/app-server.schema.bundle.json.\n\nimport { supportManifestOverrides, type SupportManifestOverride } from "./support-manifest.overrides";\n\nexport type SupportStatus = "implemented" | "not_supported" | "planned";\nexport type SupportManifestRow = { method: string; stability: "stable" | "experimental"; support: SupportStatus; gjcSeam: string | null; gjcBackendPath: string | null; semanticGaps: readonly string[]; translationNotes: readonly string[]; owner: string | null; testIds: readonly string[]; reason: string };\nconst generatedMethods = ${JSON.stringify(manifestEntries, null, "\t")} as const;\nexport const supportManifest: readonly SupportManifestRow[] = generatedMethods.map(entry => {\n\tconst override: SupportManifestOverride | undefined = supportManifestOverrides[entry.method];\n\treturn override ? { method: entry.method, stability: entry.stability, ...override } : { method: entry.method, stability: entry.stability, support: "planned", gjcSeam: null, gjcBackendPath: null, semanticGaps: [], translationNotes: ["No GJC app-server router exists yet."], owner: null, testIds: [], reason: "No GJC app-server router exists yet." };\n});\n`;
+	const generatedBehavior = `// GENERATED CODE — DO NOT EDIT. Source: vendor/app-server.behavior.json.\n\nimport behavior from "../vendor/app-server.behavior.json" with { type: "json" };\n\nexport type GoldenErrorEnvelope = { id: string | number; error: { code: number; message: string } };\nexport const goldenErrorEnvelopes = behavior.errorEnvelopes as Record<string, GoldenErrorEnvelope>;\nexport const websocketAuthArgs = behavior.cli.AppServerWebsocketAuthArgs as readonly string[];\nexport const malformedJsonPolicy = behavior.wireProtocol.malformedJson;\n`;
+	return { "types.generated.ts": types, "validators.generated.ts": validators, "catalogs.generated.ts": catalogs, "support-manifest.generated.ts": manifest, "behavior/generated-behavior.ts": generatedBehavior };
+}
+export async function generateFromVendor(): Promise<Record<Direction, number>> { const bundle = JSON.parse(await fs.readFile(path.join(vendorRoot, "app-server.schema.bundle.json"), "utf8")) as Bundle; await Promise.all(Object.entries(renderGeneratedFiles(bundle)).map(([relative, content]) => fs.writeFile(path.join(protocolRoot, relative), content))); return Object.fromEntries(Object.entries(bundle.directions).map(([direction, entries]) => [direction, entries.length])) as Record<Direction, number>; }
+function behavior() { return { wireProtocol: { jsonrpcField: "omitted", malformedJson: "dropped+logged no-response", idTypes: ["string", "integer"] }, errorEnvelopes: { notInitialized: { id: 1, error: { code: -32600, message: "Not initialized" } }, alreadyInitialized: { id: "initialize-2", error: { code: -32600, message: "Already initialized" } }, overloaded: { id: 1, error: { code: -32001, message: "Server overloaded; retry later." } }, invalidRequest: { id: 1, error: { code: -32600, message: "Invalid request" } }, methodNotFound: { id: 1, error: { code: -32601, message: "Method not found" } }, invalidParams: { id: 1, error: { code: -32602, message: "Invalid params" } }, internalError: { id: 1, error: { code: -32603, message: "Internal error" } }, notSupported: { id: 1, error: { code: -32081, message: "Not supported" } } }, cli: { AppServerWebsocketAuthArgs: ["--ws-auth capability-token|signed-bearer-token", "--ws-token-file XOR --ws-token-sha256", "--ws-shared-secret-file", "--ws-issuer", "--ws-audience", "--ws-max-clock-skew-seconds"], authorization: "Authorization-header-only", frameCap: { stdio: "GJC-only -32600 id null", websocket: "close 1009", unix: "close 1009" }, listenOff: "GJC standalone override: starts without a transport or probes." } }; }
+async function protocolSources(): Promise<Record<string, string>> { const v2Modules = ["account", "apps", "attestation", "collaboration_mode", "command_exec", "config", "current_time", "environment", "experimental_feature", "feedback", "fs", "hook", "item", "mcp", "model", "notification", "permissions", "plugin", "process", "realtime", "remote_control", "review", "shared", "thread", "thread_data", "turn", "windows_sandbox"]; const paths = ["common.rs", "v1.rs", ...v2Modules.map(name => `v2/${name}.rs`)]; return Object.fromEntries(await Promise.all(paths.map(async sourcePath => [sourcePath, await fetchPinnedText(`${protocolBaseUrl}/${sourcePath}`)] as const))); }
+if (import.meta.main) {
+	const { bundle: unresolvedBundle, rustSourceFailure } = await resolveBundleFromSources(process.argv.includes("--allow-readme-derivation"), () => fetchPinnedText(sourceUrl), () => fetchPinnedText(readmeUrl));
+	const sources = unresolvedBundle.derivation === "rust-source-derived" ? await protocolSources() : {};
+	const resolvedBundle = unresolvedBundle.derivation === "rust-source-derived" ? addFieldShapes(unresolvedBundle, sources) : unresolvedBundle;
+	const behaviorJson = stableJson(behavior());
+	const bundleJson = stableJson(resolvedBundle);
+	const priorMeta = await fs.readFile(path.join(vendorRoot, "app-server.meta.json"), "utf8").then(text => JSON.parse(text) as { fetchedAt?: unknown }).catch(() => ({}));
+	const meta = { upstreamCommit: pinnedCommit, fetchedAt: typeof priorMeta.fetchedAt === "string" ? priorMeta.fetchedAt : new Date().toISOString(), authorityLevel: resolvedBundle.authorityLevel, derivation: resolvedBundle.derivation, nonAuthoritative: resolvedBundle.derivation === "readme-derived", rustSourceFailure, checksums: { "app-server.schema.bundle.json": sha256(bundleJson), "app-server.behavior.json": sha256(behaviorJson) }, sourceFiles: Object.fromEntries(Object.entries(sources).map(([file, text]) => [`codex-rs/app-server-protocol/src/protocol/${file}`, sha256(text)])), directionCounts: Object.fromEntries(Object.entries(resolvedBundle.directions).map(([direction, entries]) => [direction, entries.length])), gjcOverrides: ["stdio-oversize -32600 GJC-only", "--listen off standalone override", "GJC-only error codes (no upstream golden): -32010 notFound, -32011 conflict, -32012 cancelled, -32013 idempotencyConflict, -32014 audienceForbidden, -32015 audienceSelectorRequired, -32016 busy — pinned in transport/errors.ts GJC_ONLY_ENVELOPES, distinct from vendored golden envelopes -32600/-32601/-32602/-32603/-32001/-32081"] };
+	await fs.mkdir(vendorRoot, { recursive: true });
+	await Promise.all([fs.writeFile(path.join(vendorRoot, "app-server.schema.bundle.json"), bundleJson), fs.writeFile(path.join(vendorRoot, "app-server.behavior.json"), behaviorJson), fs.writeFile(path.join(vendorRoot, "app-server.meta.json"), stableJson(meta))]);
+	const counts = await generateFromVendor();
+	console.log(`Synced ${pinnedCommit}: ${Object.entries(counts).map(([name, count]) => `${name}=${count}`).join(", ")}; ${resolvedBundle.derivation}; ${resolvedBundle.authorityLevel}`);
+}

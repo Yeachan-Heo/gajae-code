@@ -1,0 +1,54 @@
+{
+	"upstreamCommit": "81da9deb065d7adb283816b19b40f89bcc484276",
+	"fetchedAt": "2026-07-25T02:52:16.216Z",
+	"authorityLevel": "method-and-field-shapes",
+	"derivation": "rust-source-derived",
+	"nonAuthoritative": false,
+	"rustSourceFailure": null,
+	"checksums": {
+		"app-server.schema.bundle.json": "03401da7bfa77726c63cad79a21b159066c59f5105ee61c69e5ff2cebe91b749",
+		"app-server.behavior.json": "8a180c03436f47f47e2b00d32ca49b02af7e8fa5e4179a1a0f8b4594150dd5a7"
+	},
+	"sourceFiles": {
+		"codex-rs/app-server-protocol/src/protocol/common.rs": "78b895d789d65fe676b83b961f354d6a797d1b9c005f1bf42577f5311c47a2ec",
+		"codex-rs/app-server-protocol/src/protocol/v1.rs": "bec8dfc4beb1460fca9483b6224d436605bf1fd7b0796fc7e72b6cb1a43f5fe7",
+		"codex-rs/app-server-protocol/src/protocol/v2/account.rs": "895f9fbb0fdc1a06e9bcd4aed72cff997466383a98c26850d4ff8f5fec53a541",
+		"codex-rs/app-server-protocol/src/protocol/v2/apps.rs": "07f7484d743d80a6bf9d1ac65ac4d3457bd403d059f92d4f1c522066ae68b65e",
+		"codex-rs/app-server-protocol/src/protocol/v2/attestation.rs": "4cbea60ddeef79183753dc677070f0676182caeca07608fb172e9730f2402d11",
+		"codex-rs/app-server-protocol/src/protocol/v2/collaboration_mode.rs": "dedf6d069ed91cc848a2b8c046aeecc9b17fd315346b22b3714678f34b831152",
+		"codex-rs/app-server-protocol/src/protocol/v2/command_exec.rs": "40699a627e455b13b0197672168b1207a5dc62d8da0e8e8f9b4c2125ee2b37b4",
+		"codex-rs/app-server-protocol/src/protocol/v2/config.rs": "21d924739173b78b6cb01916edd651f1182fddf32d9fdc93615dbe2e6889e040",
+		"codex-rs/app-server-protocol/src/protocol/v2/current_time.rs": "d0981596484ac69eed448b5c778d80f25bad26a2e317dabfaeb5aeac8ffcaffa",
+		"codex-rs/app-server-protocol/src/protocol/v2/environment.rs": "01bf3e21e873903e5d5c643c136d785ea025757516c82b53ff2cd4df06198697",
+		"codex-rs/app-server-protocol/src/protocol/v2/experimental_feature.rs": "f966f766d793ac089e474c2717f2c73ad7290639206a54d70ce16f06023c1c0a",
+		"codex-rs/app-server-protocol/src/protocol/v2/feedback.rs": "8d61a2c714aedc39cf2938bd10c75026e92cfcf29998d444be21b27f04c71512",
+		"codex-rs/app-server-protocol/src/protocol/v2/fs.rs": "bbde77b83f9858247d595198c5c88d0725b3c10a0099cf2ac502b980a7cf1fc1",
+		"codex-rs/app-server-protocol/src/protocol/v2/hook.rs": "d9a9a6584f4151c8d54043fb36b84973b4d49373ea9dc0bbceb10ccef4d9bcab",
+		"codex-rs/app-server-protocol/src/protocol/v2/item.rs": "eb40a448ddfd31dc7c08478290684c039548d01cb399612d3d70abb2bec57588",
+		"codex-rs/app-server-protocol/src/protocol/v2/mcp.rs": "7d8df4ce829023ab872038468422cf284fb7954fddf9b78911c0662faa4c78e7",
+		"codex-rs/app-server-protocol/src/protocol/v2/model.rs": "712af94d9b25a05b5db410f9e8ee03e9e1049339f5e736904a9d3d59d170fb57",
+		"codex-rs/app-server-protocol/src/protocol/v2/notification.rs": "29658aa57d75ee8038f136cb5806a760daee066a32fe89444c4a6004039bed7a",
+		"codex-rs/app-server-protocol/src/protocol/v2/permissions.rs": "7668743548ed0e059ec42bd568843b888dee47b1041194f3daae89cc2d48296b",
+		"codex-rs/app-server-protocol/src/protocol/v2/plugin.rs": "afea59ae08f98fa26b50ec2ef701dd70edf2de56fba496d37349c91f324544be",
+		"codex-rs/app-server-protocol/src/protocol/v2/process.rs": "d4e6104e9ee2bb734a572144e2d918dcbb31c143854b6a5abe7a0807d5ad9030",
+		"codex-rs/app-server-protocol/src/protocol/v2/realtime.rs": "d9abbea9c7bc2708a48a0fabbc28098a96362465ef8ac808cbc32db493a421de",
+		"codex-rs/app-server-protocol/src/protocol/v2/remote_control.rs": "b1014d52cb5eef3c33cbd10634624e82cd142dfc8ea8984c9791ae72a683f6cb",
+		"codex-rs/app-server-protocol/src/protocol/v2/review.rs": "ff430956304fedfd4d52c2560ace65959498482f1b5ca49df48b10b0b8bcf587",
+		"codex-rs/app-server-protocol/src/protocol/v2/shared.rs": "0afce5961d297d205cfe75ce50b83bf5cc55947b565ca78ea7bbcce7bf7cd6ed",
+		"codex-rs/app-server-protocol/src/protocol/v2/thread.rs": "6abc5592f914be6711b9adf8f3e83843ddff0cf072d4a26db1487ecfb71a4d29",
+		"codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs": "663277adbad499f198823b6ad4b460274764a44ee822ad52785bb56ab26d7ece",
+		"codex-rs/app-server-protocol/src/protocol/v2/turn.rs": "b4f18d8f2014adcb3e562f925d76229d7e506c12834c62784f76e06dafbcf467",
+		"codex-rs/app-server-protocol/src/protocol/v2/windows_sandbox.rs": "37d804ea4d5d0ae4a026d7be7d031feb7a910c7194de59240f2cf3b89c9062a6"
+	},
+	"directionCounts": {
+		"clientRequests": 130,
+		"clientNotifications": 1,
+		"serverRequests": 11,
+		"serverNotifications": 72
+	},
+	"gjcOverrides": [
+		"stdio-oversize -32600 GJC-only",
+		"--listen off standalone override",
+		"GJC-only error codes (no upstream golden): -32010 notFound, -32011 conflict, -32012 cancelled, -32013 idempotencyConflict, -32014 audienceForbidden, -32015 audienceSelectorRequired, -32016 busy — pinned in transport/errors.ts GJC_ONLY_ENVELOPES, distinct from vendored golden envelopes -32600/-32601/-32602/-32603/-32001/-32081"
+	]
+}
