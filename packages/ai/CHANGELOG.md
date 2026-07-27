@@ -5,6 +5,11 @@
 ### Added
 
 - Added first-class support for **BizRouter**, an OpenAI-compatible Korean enterprise LLM gateway. Registers the `bizrouter` provider descriptor, `/login` entry (API-key paste validated against `https://api.bizrouter.ai/v1/models`), `BIZROUTER_API_KEY` environment resolution, and bundled `models.json` seed models. Models are discovered dynamically from `GET /v1/models` (base URL `https://api.bizrouter.ai/v1`).
+### Fixed
+
+- Anthropic subscription OAuth requests now use the current Claude Code compatibility attribution (`2.1.219`, `sdk-cli`) instead of the stale `2.1.63` CLI fingerprint that Anthropic can misclassify as extra usage.
+
+## [0.11.11] - 2026-07-26
 
 ### Fixed
 

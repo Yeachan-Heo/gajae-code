@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { claudeCodeVersion } from "../providers/anthropic";
 import type {
 	CredentialRankingStrategy,
 	UsageAmount,
@@ -31,7 +32,7 @@ const CLAUDE_HEADERS = {
 	"anthropic-beta":
 		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
 	"content-type": "application/json",
-	"user-agent": "claude-cli/2.1.63 (external, cli)",
+	"user-agent": `claude-cli/${claudeCodeVersion} (external, cli)`,
 	connection: "keep-alive",
 } as const;
 
