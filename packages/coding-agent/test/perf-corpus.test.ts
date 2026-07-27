@@ -457,6 +457,35 @@ describe("perf corpus schema + runner", () => {
 			`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond does not match slope samples`,
 		);
 	});
+	test("rejects slope evidence fabricated outside recorded samples", () => {
+		const report = runPerfCorpusBenchmark();
+		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
+		const fixture = report.fixtures[fixtureIndex];
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = fixture.memoryBaseline;
+		const fabricatedSlopeSamples = baseline.slopeSamples.map((sample, index) =>
+			index === 0 ? { ...sample, activeResourceCount: sample.activeResourceCount + 1 } : sample,
+		);
+		const tampered: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								slopeSamples: fabricatedSlopeSamples,
+								rssSlopeBytesPerSecond: calculateMemorySlope(fabricatedSlopeSamples, "rssBytes"),
+								heapSlopeBytesPerSecond: calculateMemorySlope(fabricatedSlopeSamples, "heapUsedBytes"),
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(tampered).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline slope samples must match recorded samples`,
+		);
+	});
 	test("keeps independently retained peaks out of slope evidence", () => {
 		const report = runPerfCorpusBenchmark();
 		for (const fixture of report.fixtures) {
@@ -607,6 +636,7 @@ describe("perf corpus schema + runner", () => {
 							memoryBaseline: {
 								...validBaseline,
 								samples: oversizedSamples,
+								slopeSamples: [firstSample, firstSample],
 								rssSlopeBytesPerSecond: null,
 								heapSlopeBytesPerSecond: null,
 							},

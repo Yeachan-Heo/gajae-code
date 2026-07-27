@@ -270,6 +270,9 @@ function isValidMemoryUsageSample(value: unknown): value is MemoryUsageSample {
 		name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && Number(sample[name]) >= 0,
 	);
 }
+function memoryUsageSamplesEqual(left: MemoryUsageSample, right: MemoryUsageSample): boolean {
+	return MEMORY_USAGE_SAMPLE_FIELDS.every(name => left[name] === right[name]);
+}
 
 
 /**
@@ -511,9 +514,16 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					}
 				}
 			}
+			const slopeSamplesMatchSamples =
+				samplesAreValid &&
+				slopeSamplesAreValid &&
+				slopeSamples.every(slopeSample => samples.some(sample => memoryUsageSamplesEqual(sample, slopeSample)));
+			if (!slopeSamplesMatchSamples) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline slope samples must match recorded samples`);
+			}
 			if (
 				report.runner.profile === "soak" &&
-				slopeSamplesAreValid &&
+				slopeSamplesMatchSamples &&
 				(slopeSamples.at(-1)?.elapsedMs ?? 0) < (report.runner.durationTargetMs ?? 0)
 			) {
 				errors.push(`fixture ${fixture.fixtureId}: soak samples shorter than runner duration target`);
@@ -526,7 +536,7 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				if (value !== null && !Number.isFinite(value)) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
 				}
-				if (!slopeSamplesAreValid) continue;
+				if (!slopeSamplesMatchSamples) continue;
 				const expected = calculateMemorySlope(slopeSamples, key);
 				if (
 					(value === null) !== (expected === null) ||
