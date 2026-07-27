@@ -12,6 +12,7 @@ const STORE_HEADINGS: Record<GcStore, string> = {
 	file_locks: "Config file-locks",
 	tmux_sessions: "Tmux sessions",
 	registry_entries: "Harness-root registry entries",
+	local_roots: "Session local roots",
 };
 
 function actionLabel(record: GcRecord): string {
