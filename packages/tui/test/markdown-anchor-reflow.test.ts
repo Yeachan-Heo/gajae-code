@@ -244,7 +244,7 @@ describe("TUI holds a Markdown viewport anchor across resize reflow (#2031)", ()
 			tui.start();
 			await settle(term);
 			expect(visible(term).some(line => line.includes("ANCHORXYZ"))).toBe(true);
-			expect(tui.scrollViewportPages(1)).toBe(true);
+			expect(tui.scrollViewportBy(-1, { pin: "stable" })).toBe(true);
 			await term.flush();
 			const targetScreenRow = visible(term).findIndex(line => line.includes("ANCHORXYZ"));
 			expect(targetScreenRow).toBeGreaterThanOrEqual(0);
@@ -253,6 +253,7 @@ describe("TUI holds a Markdown viewport anchor across resize reflow (#2031)", ()
 				await settle(term);
 				expect(visible(term)[targetScreenRow], `width=${width}`).toContain("ANCHORXYZ");
 			}
+			expect(tui.followLiveViewport()).toBe(true);
 		} finally {
 			tui.stop();
 		}
