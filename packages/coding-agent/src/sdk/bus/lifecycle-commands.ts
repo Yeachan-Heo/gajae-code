@@ -270,7 +270,10 @@ function isSafePath(value: string): boolean {
 	// relative are both allowed (full-trust chat), but not injection shapes.
 	if (value.length === 0 || value.length > 4096) return false;
 	if (/[\n\r\0]/.test(value)) return false;
-	return !/[;&|`$(){}<>*?!\\"']/.test(value);
+	// Backslash is a shell escape on POSIX but the native path separator on
+	// Windows; allow it there so absolute Windows paths validate correctly.
+	const metachars = process.platform === "win32" ? /[;&|`$(){}<>*?!"']/ : /[;&|`$(){}<>*?!\\"']/;
+	return !metachars.test(value);
 }
 
 function isSafeBranch(value: string): boolean {
