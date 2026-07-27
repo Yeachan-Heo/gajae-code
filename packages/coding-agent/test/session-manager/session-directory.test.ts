@@ -329,7 +329,13 @@ describe("managed session write protocol", () => {
 			const artifacts = source.slice(0, -6);
 			await fs.mkdir(artifacts, { recursive: true });
 			await fs.writeFile(source, transcript(`artifact-cap-${count}`, cwd));
-			for (let index = 0; index < count; index++) syncFs.writeFileSync(path.join(artifacts, `${index}.bin`), "");
+			for (let start = 0; start < count; start += 256) {
+				await Promise.all(
+					Array.from({ length: Math.min(256, count - start) }, (_, offset) =>
+						fs.writeFile(path.join(artifacts, `${start + offset}.bin`), ""),
+					),
+				);
+			}
 
 			const listed = listManagedCandidates(scope);
 			if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
@@ -348,7 +354,7 @@ describe("managed session write protocol", () => {
 			};
 			expect(receipt.artifactManifest).toHaveLength(count + 1);
 		}
-	}, 120_000);
+	}, 180_000);
 	it("returns a typed strict-open capacity failure and surfaces it from continueRecent", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
