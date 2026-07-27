@@ -54,6 +54,8 @@ async function resolveIn(cwd: string, overrides: Record<string, string> = {}): P
 		if (value !== undefined) env[key] = value;
 	}
 	delete env.GJC_CODING_AGENT_DIR;
+	delete env.GJC_CONFIG_DIR;
+	delete env.PI_CONFIG_DIR;
 	delete env[PROBE_VAR];
 	// Keep the other trusted file sources neutral.
 	env.HOME = tempDir();
@@ -89,5 +91,25 @@ describe("agent directory trust boundary", () => {
 		});
 		expect(resolved.agentDir).toBe(operatorDir);
 		expect(resolved.probeValue).toBe("from-operator-agent-env");
+	});
+
+	it("ignores a config directory planted by the project .env", async () => {
+		// GJC_CONFIG_DIR builds the config root, whose `.env` is another trusted source.
+		const configDir = tempDir();
+		fs.mkdirSync(path.join(configDir, "agent"), { recursive: true });
+		fs.writeFileSync(path.join(configDir, ".env"), `${PROBE_VAR}=from-attacker-config-env\n`);
+		const home = tempDir();
+		const relative = path.relative(home, configDir);
+		const resolved = await resolveIn(projectDir(`GJC_CONFIG_DIR=${relative}\n`), { HOME: home });
+		expect(resolved.probeValue).toBeNull();
+	});
+
+	it("honors a config directory inherited from the launching shell", async () => {
+		const home = tempDir();
+		const configDir = path.join(home, ".custom");
+		fs.mkdirSync(path.join(configDir, "agent"), { recursive: true });
+		fs.writeFileSync(path.join(configDir, ".env"), `${PROBE_VAR}=from-operator-config-env\n`);
+		const resolved = await resolveIn(projectDir("SOMETHING_ELSE=1\n"), { HOME: home, GJC_CONFIG_DIR: ".custom" });
+		expect(resolved.probeValue).toBe("from-operator-config-env");
 	});
 });

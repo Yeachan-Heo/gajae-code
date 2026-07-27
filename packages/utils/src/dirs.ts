@@ -149,8 +149,29 @@ export function setProjectDir(dir: string): void {
 }
 
 /** Get the config directory name relative to home (e.g. ".gjc" or PI_CONFIG_DIR override). */
+/**
+ * Config-directory name, rejected when it comes from the caller's project `.env`.
+ *
+ * The name is joined with the home directory to build the config root, and that
+ * root plus the agent directory beneath it supply two of the `.env` files
+ * `$credentialEnv` treats as trusted. Bun loads `cwd/.env` into `process.env`
+ * before any module runs, so a repository could otherwise point the config root
+ * at a directory it ships and have its own `.env` treated as trusted —
+ * recovering every endpoint and credential redirect the boundary rejects.
+ *
+ * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
+ * it applies the same conservative ambiguity rule directly, matching how
+ * `GJC_CODING_AGENT_DIR` is treated.
+ */
+function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
+	const value = process.env[name];
+	if (!value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
+	return value;
+}
+
 export function getConfigDirName(): string {
-	return process.env.GJC_CONFIG_DIR ?? process.env.PI_CONFIG_DIR ?? CONFIG_DIR_NAME;
+	return trustedConfigDirName("GJC_CONFIG_DIR") ?? trustedConfigDirName("PI_CONFIG_DIR") ?? CONFIG_DIR_NAME;
 }
 
 /** Get the config agent directory name relative to home (e.g. ".gjc/agent" or PI_CONFIG_DIR + "/agent"). */
