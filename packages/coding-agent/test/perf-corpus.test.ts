@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { createTuiWorkload } from "../bench/memory-baseline-tui-child";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
 import {
-	buildMemoryFixture,
 	calculateMemorySlope,
 	gitWorktreeFingerprint,
 	normalizeProcessTreeRss,
@@ -323,11 +322,13 @@ describe("perf corpus schema + runner", () => {
 		);
 	});
 
-	test("records workload high-water callbacks before teardown", () => {
-		const workload = createMemoryBaselineWorkloads()[0];
-		if (!workload) throw new Error("memory workload unavailable");
-		const fixture = buildMemoryFixture(workload, "short", 0);
-		expect(fixture.memoryBaseline?.samples.length).toBeGreaterThan((fixture.memoryBaseline?.iterations ?? 0) + 1);
+	test("exposes workload high-water callbacks before teardown", () => {
+		const workload = createTuiWorkload();
+		let samples = 0;
+		workload.run(3, () => samples++);
+		expect(samples).toBe(3);
+		expect(workload.currentIndex()).toBe(3);
+		workload.teardown();
 	});
 
 	test("rejects an empty corpus instead of skipping required memory surfaces", () => {

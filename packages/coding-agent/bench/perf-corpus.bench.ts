@@ -223,15 +223,31 @@ export function buildMemoryFixture(
 	const startedAt = performance.now();
 	const cpuStart = process.cpuUsage();
 	const samples = [baselineSample];
+	let highWaterSample = baselineSample;
 	let operations = 0;
 	let iterations = 0;
 	const chunkSize = profile === "soak" ? 1 : Math.max(1, Math.ceil(minimumIterations / 20));
 	const sampleIntervalMs = profile === "soak" ? 50 : 0;
+	const captureHighWater = () => {
+		const sample = memorySample(startedAt);
+		if (
+			sample.rssBytes > highWaterSample.rssBytes ||
+			sample.heapUsedBytes > highWaterSample.heapUsedBytes ||
+			sample.externalBytes > highWaterSample.externalBytes ||
+			sample.arrayBuffersBytes > highWaterSample.arrayBuffersBytes
+		) {
+			highWaterSample = sample;
+		}
+	};
 	while (iterations < minimumIterations || performance.now() - startedAt < targetDurationMs) {
-		operations += workload.run(chunkSize, () => samples.push(memorySample(startedAt)));
+		operations += workload.run(chunkSize, captureHighWater);
 		iterations += chunkSize;
 		const elapsedSinceLastSample = performance.now() - startedAt - (samples.at(-1)?.elapsedMs ?? 0);
 		if (elapsedSinceLastSample >= sampleIntervalMs) samples.push(memorySample(startedAt));
+	}
+	if (highWaterSample !== baselineSample) {
+		samples.push(highWaterSample);
+		samples.sort((left, right) => left.elapsedMs - right.elapsedMs);
 	}
 	const elapsedMs = performance.now() - startedAt;
 	if ((samples.at(-1)?.elapsedMs ?? 0) < elapsedMs) samples.push(memorySample(startedAt));
@@ -242,7 +258,7 @@ export function buildMemoryFixture(
 	const processTreePostTeardownRssBytes = processTreeRssBytes();
 	const processTree = normalizeProcessTreeRss(processTreeBaselineRssBytes, processTreePostTeardownRssBytes);
 	const baselineBytes = samples[0]?.rssBytes ?? null;
-	const peakBytes = Math.max(...samples.map(sample => sample.rssBytes));
+	const peakBytes = samples.reduce((peak, sample) => Math.max(peak, sample.rssBytes), 0);
 	const fixtureClass =
 		workload.surface === "cli"
 			? "startup-session-load"
