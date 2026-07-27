@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
 import * as os from "node:os";
+import { createTuiWorkload } from "../bench/memory-baseline-tui-child";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
 import { calculateMemorySlope, normalizeProcessTreeRss, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
 import {
@@ -28,7 +29,10 @@ describe("perf corpus schema + runner", () => {
 		expect(report.gitSha).toMatch(/^[0-9a-f]{40}$/);
 		expect(report.runner.command).toBe("runPerfCorpusBenchmark({ isolatedMemory: false })");
 		expect(report.runner.argv).toEqual(["runPerfCorpusBenchmark"]);
-		expect(report.runner.environment).toEqual({});
+		expect(report.runner.environment).toEqual({
+			GJC_MEMORY_PROFILE: "short",
+			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
+		});
 		expect(report.runner.iterationsTarget).toBeGreaterThan(0);
 		expect(typeof report.runner.gcExposed).toBe("boolean");
 		expect(typeof report.gitDirty).toBe("boolean");
@@ -181,6 +185,30 @@ describe("perf corpus schema + runner", () => {
 			`fixture ${fixture.fixtureId}: memoryBaseline sample 0.heapUsedBytes invalid`,
 		);
 	});
+	test("rejects non-object memory samples without throwing", () => {
+		const report = runPerfCorpusBenchmark();
+		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
+		const fixture = report.fixtures[fixtureIndex];
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = fixture.memoryBaseline;
+		const malformed = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								samples: [baseline.samples[0], null],
+							},
+						}
+					: candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		expect(() => validatePerfCorpusReport(malformed)).not.toThrow();
+		expect(validatePerfCorpusReport(malformed).ok).toBe(false);
+	});
+
 	test("rejects an empty corpus instead of skipping required memory surfaces", () => {
 		const report = runPerfCorpusBenchmark();
 		const empty = { ...report, fixtures: [] };
@@ -251,6 +279,13 @@ describe("perf corpus schema + runner", () => {
 		expect(workload.run(1)).toBe(4_224);
 		workload.teardown();
 		expect(workload.run(1)).toBe(4_096);
+	});
+	test("preserves TUI workload indices across sampling chunks", () => {
+		const workload = createTuiWorkload();
+		expect(workload.run(1)).toBe(3);
+		expect(workload.run(1)).toBe(3);
+		workload.teardown();
+		expect(workload.run(1)).toBe(3);
 	});
 	test("rejects malformed memory scalar fields and isolation metadata", () => {
 		const report = runPerfCorpusBenchmark();

@@ -107,19 +107,19 @@ function reproductionInvocation(
 	iterationsTarget: number,
 	isolatedMemory: boolean,
 ): { command: string; argv: string[]; environment: Record<string, string> } {
-	if (!isolatedMemory) {
-		return {
-			command: "runPerfCorpusBenchmark({ isolatedMemory: false })",
-			argv: ["runPerfCorpusBenchmark"],
-			environment: {},
-		};
-	}
-	const argv = ["bun", "--smol", "--expose-gc", "packages/coding-agent/bench/perf-corpus.bench.ts"];
 	const environment: Record<string, string> = {
 		GJC_MEMORY_PROFILE: profile,
 		GJC_MEMORY_ITERATIONS: String(iterationsTarget),
 	};
 	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
+	if (!isolatedMemory) {
+		return {
+			command: "runPerfCorpusBenchmark({ isolatedMemory: false })",
+			argv: ["runPerfCorpusBenchmark"],
+			environment,
+		};
+	}
+	const argv = ["bun", "--smol", "--expose-gc", "packages/coding-agent/bench/perf-corpus.bench.ts"];
 	return { command: argv.join(" "), argv, environment };
 }
 function memorySample(startedAt: number): MemoryUsageSample {

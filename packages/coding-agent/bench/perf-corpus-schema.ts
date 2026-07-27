@@ -318,18 +318,16 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	) {
 		errors.push("runner.durationTargetMs invalid");
 	}
-	if (report.runner.memoryIsolation === "process-per-surface") {
-		if (
-			typeof report.runner.environment !== "object" ||
-			report.runner.environment === null ||
-			report.runner.environment.GJC_MEMORY_PROFILE !== report.runner.profile ||
-			report.runner.environment.GJC_MEMORY_ITERATIONS !== String(report.runner.iterationsTarget) ||
-			(report.runner.profile === "soak"
-				? report.runner.environment.GJC_MEMORY_DURATION_MS !== String(report.runner.durationTargetMs)
-				: report.runner.environment.GJC_MEMORY_DURATION_MS !== undefined)
-		) {
-			errors.push("runner.environment does not match memory controls");
-		}
+	if (
+		typeof report.runner.environment !== "object" ||
+		report.runner.environment === null ||
+		report.runner.environment.GJC_MEMORY_PROFILE !== report.runner.profile ||
+		report.runner.environment.GJC_MEMORY_ITERATIONS !== String(report.runner.iterationsTarget) ||
+		(report.runner.profile === "soak"
+			? report.runner.environment.GJC_MEMORY_DURATION_MS !== String(report.runner.durationTargetMs)
+			: report.runner.environment.GJC_MEMORY_DURATION_MS !== undefined)
+	) {
+		errors.push("runner.environment does not match memory controls");
 	}
 	// Anchor CPU-self-time claims to ACTUAL captured profiler evidence: collect the
 	// real artifact paths and sample symbols present in fixtures. A claim must name
@@ -427,17 +425,19 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
 				}
 			}
-			for (let index = 1; index < samples.length; index++) {
-				if (samples[index].elapsedMs < samples[index - 1].elapsedMs) {
-					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline samples must be chronological`);
-					break;
-				}
-			}
 			const samplesAreValid = samples.every(sample =>
 				typeof sample === "object" &&
 				sample !== null &&
 				MEMORY_USAGE_SAMPLE_FIELDS.every(name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && sample[name] >= 0),
 			);
+			if (samplesAreValid) {
+				for (let index = 1; index < samples.length; index++) {
+					if (samples[index].elapsedMs < samples[index - 1].elapsedMs) {
+						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline samples must be chronological`);
+						break;
+					}
+				}
+			}
 			for (const [name, key] of [
 				["rssSlopeBytesPerSecond", "rssBytes"],
 				["heapSlopeBytesPerSecond", "heapUsedBytes"],
