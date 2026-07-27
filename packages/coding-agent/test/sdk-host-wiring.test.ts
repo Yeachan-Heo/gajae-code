@@ -2269,6 +2269,110 @@ test("SDK host abort-and-prompt cancels a never-resolving preflight before repla
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+test("SDK host turn.abort discards an accepted prompt that never reaches agent_start", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-unstarted-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-unstarted-${Date.now()}`;
+	const sessionContext = { ...context(cwd, sessionId), abort: () => {} };
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (id: string, operation: string, input: Record<string, unknown> = {}) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id);
+	};
+
+	expect(await request("accepted-before-abort", "turn.prompt", { text: "will not start" })).toMatchObject({
+		ok: true,
+		result: { accepted: true },
+	});
+	expect(await request("abort-unstarted", "turn.abort")).toMatchObject({ ok: true, result: { aborted: true } });
+	expect(await request("prompt-after-abort", "turn.prompt", { text: "must be admitted" })).toMatchObject({
+		ok: true,
+		result: { accepted: true },
+	});
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("SDK host turn.abort_and_prompt drains an accepted unstarted prompt before its replacement", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-unstarted-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-unstarted-${Date.now()}`;
+	const sessionContext = { ...context(cwd, sessionId), abort: () => {} };
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "accepted-before-abort-and-prompt",
+			operation: "turn.prompt",
+			input: { text: "will not start" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "accepted-before-abort-and-prompt"),
+		"accepted prompt response",
+	);
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-and-prompt-after-unstarted",
+			operation: "turn.abort_and_prompt",
+			input: { text: "replacement must be admitted" },
+		}),
+	);
+	await Promise.race([
+		waitFor(
+			() =>
+				frames.some(frame => frame.type === "control_response" && frame.id === "abort-and-prompt-after-unstarted"),
+			"abort-and-prompt replacement response",
+		),
+		Bun.sleep(750).then(() => {
+			throw new Error("abort_and_prompt replacement response did not arrive within 750ms.");
+		}),
+	]);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "abort-and-prompt-after-unstarted"),
+	).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
 
 test("SDK host waits for asynchronous abort unwind before delivering an abort-and-prompt replacement", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-"));
