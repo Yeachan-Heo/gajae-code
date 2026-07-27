@@ -2612,6 +2612,84 @@ function positiveEnvMs(value: string | undefined): number | undefined {
 }
 
 /**
+ * The launcher a host watches for liveness. A pid alone is not identity: pids are
+ * reused, and a recycled one would keep an orphaned host alive forever. The
+ * initiator records the incarnation it observed, and the host compares against it.
+ */
+export interface LauncherIdentity {
+	pid: number;
+	incarnation: string;
+}
+
+/**
+ * Read the launcher identity out of a lifecycle request. Only the per-request value
+ * is trusted: a detached broker can carry a stale ambient `GJC_SDK_CLIENT_PID` from
+ * an unrelated client, which would point the host at the wrong process.
+ */
+export function parseLauncherIdentity(lifecycleRequest: string | undefined): LauncherIdentity | undefined {
+	try {
+		const request = JSON.parse(lifecycleRequest ?? "") as {
+			launcherIdentity?: { pid?: unknown; incarnation?: unknown };
+		};
+		const identity = request.launcherIdentity;
+		return typeof identity?.pid === "number" &&
+			Number.isSafeInteger(identity.pid) &&
+			identity.pid > 0 &&
+			isProcessIncarnation(identity.incarnation)
+			? { pid: identity.pid, incarnation: identity.incarnation }
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export interface LauncherProbe {
+	signal: (pid: number) => void;
+	incarnation: (pid: number) => string | undefined;
+}
+
+/**
+ * Whether the launching client is still the process the host was told to watch.
+ *
+ * Fail-open on purpose: an unknown identity reports alive, so an unidentifiable
+ * launcher leaks a host rather than risking the reclamation of a live session.
+ */
+export function isLauncherAlive(identity: LauncherIdentity | undefined, probe: LauncherProbe): boolean {
+	if (!identity) return true;
+	try {
+		probe.signal(identity.pid);
+	} catch (error) {
+		// EPERM means the pid exists but belongs to another user.
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+	return probe.incarnation(identity.pid) === identity.incarnation;
+}
+
+export interface ReclaimInputs {
+	launcherAlive: boolean;
+	negotiatedConnections: number;
+	handshakingConnections: number;
+	busy: boolean;
+	pendingPrompts: number;
+	unusedSince: number | undefined;
+	now: number;
+	idleReapMs: number;
+}
+
+/**
+ * A host is reclaimable only when every ownership signal is clear. `handshaking`
+ * counts a client that has connected but not yet negotiated capabilities, so a
+ * reconnect in progress is not mistaken for an idle host at the grace boundary.
+ */
+export function shouldReclaimHost(inputs: ReclaimInputs): boolean {
+	if (inputs.launcherAlive) return false;
+	if (inputs.negotiatedConnections > 0 || inputs.handshakingConnections > 0) return false;
+	if (inputs.busy || inputs.pendingPrompts > 0) return false;
+	if (inputs.unusedSince === undefined) return false;
+	return inputs.now - inputs.unusedSince >= inputs.idleReapMs;
+}
+
+/**
  * A broker-spawned session host outlives its client so the client can reconnect.
  * Reclaim one only after this long with no live client and no work in flight, so a
  * crashed or force-quit client cannot leak the process forever.
@@ -3424,31 +3502,12 @@ export function createNotificationsExtension(
 		 * exits. Unknown identity deliberately fails open; leaking is safer than
 		 * reclaiming a host that may still belong to a live client.
 		 */
-		const launcherIdentity = (() => {
-			try {
-				const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST ?? "") as {
-					launcherIdentity?: { pid?: unknown; incarnation?: unknown };
-				};
-				const identity = request.launcherIdentity;
-				return typeof identity?.pid === "number" &&
-					Number.isSafeInteger(identity.pid) &&
-					identity.pid > 0 &&
-					isProcessIncarnation(identity.incarnation)
-					? { pid: identity.pid, incarnation: identity.incarnation }
-					: undefined;
-			} catch {
-				return undefined;
-			}
-		})();
-		const launcherAlive = (): boolean => {
-			if (!launcherIdentity) return true;
-			try {
-				process.kill(launcherIdentity.pid, 0);
-			} catch (error) {
-				return (error as NodeJS.ErrnoException).code === "EPERM";
-			}
-			return processIncarnation(launcherIdentity.pid) === launcherIdentity.incarnation;
+		const launcherIdentity = parseLauncherIdentity(process.env.GJC_SDK_LIFECYCLE_REQUEST);
+		const launcherProbe: LauncherProbe = {
+			signal: pid => process.kill(pid, 0),
+			incarnation: pid => processIncarnation(pid),
 		};
+		const launcherAlive = (): boolean => isLauncherAlive(launcherIdentity, launcherProbe);
 		const hostInUse = () => hostCapCache.size > 0 || handshakingConnections.size > 0;
 		const noteHostInUse = () => {
 			if (unusedSince !== undefined) unusedSince = undefined;
@@ -4673,12 +4732,25 @@ export function createNotificationsExtension(
 					// A live launcher, a live connection, or a turn in flight all mean the host
 					// is still wanted. A reattached client keeps it alive even once the process
 					// that originally launched it is gone.
-					if (launcherAlive() || hostInUse() || runtime.busy || runtime.pendingPromptCorrelations.length > 0) {
+					const alive = launcherAlive();
+					if (alive || hostInUse() || runtime.busy || runtime.pendingPromptCorrelations.length > 0) {
 						unusedSince = undefined;
 						return;
 					}
 					unusedSince ??= Date.now();
-					if (Date.now() - unusedSince < SESSION_HOST_IDLE_REAP_MS) return;
+					if (
+						!shouldReclaimHost({
+							launcherAlive: alive,
+							negotiatedConnections: hostCapCache.size,
+							handshakingConnections: handshakingConnections.size,
+							busy: runtime.busy,
+							pendingPrompts: runtime.pendingPromptCorrelations.length,
+							unusedSince,
+							now: Date.now(),
+							idleReapMs: SESSION_HOST_IDLE_REAP_MS,
+						})
+					)
+						return;
 					logger.info(
 						`sdk: reclaiming session host ${id} after ${Math.round(SESSION_HOST_IDLE_REAP_MS / 60_000)}m with no client connection.`,
 					);
