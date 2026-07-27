@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "workloads": [
+    {
+      "name": "sticky-suffix-10000-rows-height-1",
+      "hard": {
+        "largeFlatFrameSliceCalls": 0,
+        "pinnedSuffixOverflowFrames": 1,
+        "pinnedSuffixSelectedRows": 1
+      },
+      "advisory": {
+        "renderCount": 1
+      }
+    },
+    {
+      "name": "sticky-suffix-10000-rows-height-3",
+      "hard": {
+        "largeFlatFrameSliceCalls": 0,
+        "pinnedSuffixOverflowFrames": 1,
+        "pinnedSuffixSelectedRows": 3
+      },
+      "advisory": {
+        "renderCount": 1
+      }
+    },
+    {
+      "name": "sticky-suffix-10000-rows-height-10",
+      "hard": {
+        "largeFlatFrameSliceCalls": 0,
+        "pinnedSuffixOverflowFrames": 1,
+        "pinnedSuffixSelectedRows": 10
+      },
+      "advisory": {
+        "renderCount": 1
+      }
+    },
+    {
+      "name": "sticky-suffix-100000-rows-height-1",
+      "hard": {
+        "largeFlatFrameSliceCalls": 0,
+        "pinnedSuffixOverflowFrames": 1,
+        "pinnedSuffixSelectedRows": 1
+      },
+      "advisory": {
+        "renderCount": 1
+      }
+    },
+    {
+      "name": "sticky-suffix-100000-rows-height-3",
+      "hard": {
+        "largeFlatFrameSliceCalls": 0,
+        "pinnedSuffixOverflowFrames": 1,
+        "pinnedSuffixSelectedRows": 3
+      },
+      "advisory": {
+        "renderCount": 1
+      }
+    },
+    {
+      "name": "sticky-suffix-100000-rows-height-10",
+      "hard": {
+        "largeFlatFrameSliceCalls": 0,
+        "pinnedSuffixOverflowFrames": 1,
+        "pinnedSuffixSelectedRows": 10
+      },
+      "advisory": {
+        "renderCount": 1
+      }
+    },
+    {
+      "name": "equal-output-source-1000",
+      "hard": {
+        "equalNoops": 1000,
+        "renderRequests": 0
+      },
+      "advisory": {}
+    },
+    {
+      "name": "irc-sidebar-near-cap-cache",
+      "hard": {
+        "ledgerEpochAdvances": 10000,
+        "unchangedProjectionMisses": 1,
+        "unchangedProjectionHits": 99,
+        "unchangedStyledMisses": 1,
+        "unchangedStyledHits": 99,
+        "unchangedWrapCalls": 682,
+        "mutationProjectionMisses": 2,
+        "mutationStyledMisses": 2,
+        "mutationWrapCalls": 1364
+      },
+      "advisory": {}
+    }
+  ],
+  "advisory": {
+    "timingAndMemoryOnly": true,
+    "wallMs": 676.496458,
+    "cpuUserMicros": 709817,
+    "cpuSystemMicros": 34741,
+    "rssBytes": 756973568
+  }
+}
