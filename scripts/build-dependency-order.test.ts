@@ -4,15 +4,17 @@ import * as path from "node:path";
 
 // Bun's workspace-script scheduler (src/cli/filter_run.zig, `runScriptsWithFilter`)
 // orders `bun run --workspaces`/`bun run --filter '*'` scripts by each package's
-// regular `dependencies` graph, restricted to packages that declare the invoked
-// script (here: `build`). If a dependency cycle exists among those scripted
-// packages, Bun's own scheduler detects it and disables ordering for *every*
-// scripted package in the run, not just the cyclic ones -- silently turning every
+// regular `dependencies` graph, restricted to packages scheduled for the
+// invoked script (here: `build`, scheduled by any of `prebuild`/`build`/
+// `postbuild` being present -- Bun scans all three per package). If a
+// dependency cycle exists among those scheduled packages, Bun's own
+// scheduler detects it and disables ordering for *every* scheduled package
+// in the run, not just the cyclic ones -- silently turning every
 // `bun run build` invocation into an unordered race.
 //
 // This regression protects that invariant directly: the `@gajae-code/*`
 // workspace dependency graph, restricted to packages scheduled for a `build`
-// run (any of `prebuild`/`build`/`postbuild` present),
+// run (any of `prebuild`/`build`/`postbuild` present)
 // must stay acyclic. It intentionally does not invoke Bun or assert anything
 // about CLI flag spelling (`--workspaces` vs `--filter`), since both route
 // through the same scheduler and neither guards this invariant on its own.
