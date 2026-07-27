@@ -325,7 +325,7 @@ export class TelegramAdoptionIntentStore {
 		try {
 			await this.#fsImpl.writeFile(temporary, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
 			await this.#fsImpl.chmod(temporary, 0o600);
-			const handle = await this.#fsImpl.open(temporary, "r");
+			const handle = await this.#fsImpl.open(temporary, "r+");
 			try {
 				await syncRequired(handle);
 			} finally {
