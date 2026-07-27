@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- An empty `--agent-dir` no longer makes the notification daemons write into the current working directory. Every daemon path is built as `path.join(agentDir, "notifications")`, which silently yields a relative path when the first segment is empty, so the daemon's lock, ownership, state, heartbeat and topic files landed in whatever repository the user was in. The daemon entry points now treat an empty value as absent, matching the truthy check `parseSdkInternalArgv` already applies to the broker.
 - Align managed fallback abort-after-exhaustion expectations with #3257 ownership release: a subscriber abort at terminal `message_end` no longer expects a second `requestRunTerminal(cancelled)` because the logical-run owner is already cleared.
 - Python eval timeout annotations now prefer the caller-configured `timeoutMs` over remaining wall-clock budget so async setup cannot flake second formatting in CI.
 - Overflow maintenance now stops cleanly when no-op compaction would replay the same oversized request; the runtime status explains that `/clear` preserves the current session ID before retrying.

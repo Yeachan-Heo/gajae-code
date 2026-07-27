@@ -41,8 +41,12 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and Bot API cooldown structural fixes (#2956, #2960, #3048).
  * Generation 30 adds opt-in tool activity delivery, closed lifecycle phases,
  * and capability-versioned mixed-host compatibility.
+ * Generation 31 stops an empty `--agent-dir` from resolving daemon paths
+ * relative to the caller's cwd, so a daemon started that way no longer writes
+ * its lock, ownership, state, heartbeat and topic files into the working
+ * directory.
  */
-export const DAEMON_GENERATION = 30;
+export const DAEMON_GENERATION = 31;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers

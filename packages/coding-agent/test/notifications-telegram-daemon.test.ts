@@ -2896,11 +2896,13 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 30 adds capability-versioned tool activity", () => {
+	test("keeps wire protocol 3 while generation 31 fixes empty-agent-dir path resolution", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generation 29 adds structural serving safeguards; generation 30 adds
-		// capability-versioned tool activity without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(30);
+		// capability-versioned tool activity; generation 31 stops an empty
+		// `--agent-dir` from resolving daemon paths relative to the caller's cwd.
+		// None of them change the wire protocol.
+		expect(DAEMON_GENERATION).toBe(31);
 	});
 	test.each([
 		"1",
