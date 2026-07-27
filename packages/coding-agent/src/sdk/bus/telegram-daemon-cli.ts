@@ -50,9 +50,26 @@ export interface RunDaemonInternalDeps {
 const OWNER_WATCHDOG_INTERVAL_MS = 5_000;
 const OWNER_STALL_MS = 3 * HEARTBEAT_TTL_MS;
 
+/**
+ * Value for `name`, treating an empty value as absent.
+ *
+ * The spawn sites pass `--agent-dir` unconditionally
+ * (`telegram-daemon.ts:2910`, `chat-daemon-control.ts:393`,
+ * `broker/ensure.ts:248`), so an empty agent dir arrives as `--agent-dir ""`.
+ * `??` would accept that, and every daemon path is built with
+ * `path.join(agentDir, "notifications")`, which silently yields a *relative*
+ * path when the first segment is empty — the daemon's lock, ownership, state,
+ * heartbeat and topic files then land in the current working directory, i.e.
+ * inside whatever repository the user happened to be in.
+ *
+ * `parseSdkInternalArgv` (`commands/sdk.ts:516`) already rejects an empty
+ * `--agent-dir` with a truthy check; this is the same guard for the daemon
+ * entry points.
+ */
 function argValue(argv: string[], name: string): string | undefined {
 	const i = argv.indexOf(name);
-	return i >= 0 ? argv[i + 1] : undefined;
+	const value = i >= 0 ? argv[i + 1] : undefined;
+	return value ? value : undefined;
 }
 const DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT = 1;
 let daemonCompatibilityDiagnosticCount = 0;
@@ -199,7 +216,9 @@ export function createDaemonControlHooks(settings: Settings) {
 }
 
 export async function runDaemonSmoke(opts: { agentDir?: string } = {}): Promise<void> {
-	const agentDir = opts.agentDir ?? fs.mkdtempSync(path.join(process.cwd(), ".telegram-daemon-smoke-"));
+	// `??` would accept an empty dir and skip the temp dir entirely, writing the
+	// smoke artifacts into the current working directory.
+	const agentDir = opts.agentDir || fs.mkdtempSync(path.join(process.cwd(), ".telegram-daemon-smoke-"));
 	const settings = createLightweightDaemonSettings({ agentDir, rawConfig: {} });
 	const paths = daemonPaths(agentDir);
 	await fs.promises.mkdir(paths.dir, { recursive: true, mode: 0o700 });
