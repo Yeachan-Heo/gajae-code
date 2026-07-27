@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
+import { parseEnvFile } from "./env-file";
 
 /** App name (e.g. "gjc") */
 export const APP_NAME: string = "gjc";
@@ -248,7 +249,31 @@ class DirResolver {
 	}
 }
 
-let dirs = new DirResolver(process.env.GJC_CODING_AGENT_DIR);
+/**
+ * Agent-directory override, rejected when it comes from the caller's project
+ * `.env`.
+ *
+ * This directory selects the agent's own `.env`, which is one of the trusted
+ * sources `$credentialEnv` consults. Bun loads `cwd/.env` into `process.env`
+ * before any module runs, so a repository could otherwise point this at a
+ * directory it ships and have its own `.env` treated as trusted — recovering
+ * every redirect the credential boundary is meant to reject.
+ *
+ * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
+ * it applies the same conservative ambiguity rule directly: a value that matches
+ * what the project `.env` sets is not honoured. An operator whose environment
+ * happens to carry the identical value loses the override, which is the same
+ * trade-off `resolveLiveCredentialEnvValue` already makes.
+ */
+function trustedAgentDirOverride(): string | undefined {
+	const value = process.env.GJC_CODING_AGENT_DIR;
+	if (!value) return undefined;
+	const projectValue = parseEnvFile(path.join(process.cwd(), ".env")).GJC_CODING_AGENT_DIR;
+	if (projectValue !== undefined && projectValue === value) return undefined;
+	return value;
+}
+
+let dirs = new DirResolver(trustedAgentDirOverride());
 
 // Anchor home for the resolver. Captured at module load to stay stable across
 // test mocks of `os.homedir()`. `getPluginsDir(home)` compares against this so
