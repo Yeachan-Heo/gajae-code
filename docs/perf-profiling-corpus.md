@@ -33,7 +33,7 @@ Optimization **status vocabulary** for a hotspot:
 
 A v1–v3 win is **never** called "confirmed" from current-only coverage. `validatePerfCorpusReport()` enforces this: a `CPU-self-time confirmed` classification is rejected unless the report carries profiler self-time evidence.
 
-## Schema (gjc.perf-corpus/1)
+## Schema (gjc.perf-corpus/2)
 
 `PerfCorpusReport` keeps the evidence classes as **separate named fields** per fixture:
 
@@ -43,7 +43,8 @@ A v1–v3 win is **never** called "confirmed" from current-only coverage. `valid
 - `rssMemory: { baselineBytes, peakBytes?, growthBytes, returnBytes, ... }`
 - `byteParity: { renderedGolden?, persistedJsonlGolden?, providerPayloadGolden?, materializedSessionGolden? }`
 - `memoryBaseline?: { surface, profile, iterations, operations, operationsPerSecond, samples, postTeardown, rssSlopeBytesPerSecond, heapSlopeBytesPerSecond, processTreeBaselineRssBytes, processTreePostTeardownRssBytes, processTreeSampler }`
-- `runner.memoryIsolation: "in-process" | "process-per-surface"` distinguishes focused programmatic results from acceptance-equivalent isolated artifacts.
+- `runner: { command, platform, arch, bunVersion?, ci?, profile?, durationTargetMs?, memoryIsolation, iterationsTarget, gcExposed }` pins the resolved invocation, workload controls, isolation, and GC availability.
+- `gitSha` is the full source commit, resolved from `GITHUB_SHA` or local Git.
 - Every detailed sample separates `rssBytes`, `heapUsedBytes`, `heapTotalBytes`, `externalBytes`, `arrayBuffersBytes`, and `activeResourceCount`.
 
 `hotspotClassifications: HotspotClassification[]` carry `{ hotspotId, status, evidenceClass, artifactRefs, notes }`. The current v1–v3 reclassification lives in `V1_V3_RECLASSIFICATION`; no entry is `CPU-self-time confirmed` because no profiler artifacts have been captured yet.
@@ -97,7 +98,7 @@ Held thresholds (`HELD_PERF_THRESHOLDS`) name candidates that need variance char
 ## Memory baseline protocol
 
 Detailed memory fixtures cover seven explicit surfaces: CLI startup/configuration, AgentSession-style message/context lifecycle, blob/external buffers, worker generations, Telegram reconnect/queue settlement, TUI render/dispose churn, and shared/native transfer boundaries. The fixtures are synthetic lifecycle proxies: they establish a reproducible allocation and teardown envelope but do not by themselves prove a production leak. A production optimization claim still requires a workload adapter that exercises the implicated owner and a same-host before/after artifact.
-The command-line runner executes each memory surface in a fresh Bun subprocess and records `runner.memoryIsolation: "process-per-surface"` so allocator high-water state from one fixture cannot contaminate the next surface's baseline. Programmatic `runPerfCorpusBenchmark()` defaults to in-process fixtures and records `"in-process"` for focused contract tests; pass `{ isolatedMemory: true }` for acceptance-equivalent evidence. Process-tree RSS snapshots exclude the `ps` sampler process and degrade to `"unavailable"` when the executable is absent. The local baseline sample is captured before process-table parsing. Baseline samples are collected after optional forced GC, and post-teardown return fields remain `null` when GC is unavailable.
+The command-line runner executes each memory surface in a fresh Bun subprocess and records `runner.memoryIsolation: "process-per-surface"` so allocator high-water state from one fixture cannot contaminate the next surface's baseline. Programmatic `runPerfCorpusBenchmark()` defaults to in-process fixtures and records `"in-process"` for focused contract tests; pass `{ isolatedMemory: true }` for acceptance-equivalent evidence. Process-tree RSS snapshots exclude the `ps` sampler process and degrade to `"unavailable"` when the executable is absent. The process-tree baseline is captured after GC, followed by another GC that clears sampler allocations before the local baseline and workload begin. Soak workloads use single-iteration batches so approximately 50 ms sampling cannot be hidden behind a large synchronous chunk. Post-teardown return fields remain `null` when GC is unavailable.
 
 Use the `short` profile for deterministic contract and shape checks; its bounded iteration window intentionally reports `null` slopes when less than 250 ms is observed. Use `soak` for repeated sampling and slope characterization. For decision evidence:
 The soak default runs each surface for at least one second and samples at approximately 50 ms intervals. `GJC_MEMORY_DURATION_MS` accepts 250–60000 ms and `GJC_MEMORY_ITERATIONS` accepts 1–10000000; record overrides with the artifact.

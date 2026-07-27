@@ -23,6 +23,10 @@ describe("perf corpus schema + runner", () => {
 	test("runner emits the schema with separated evidence fields and >=3 required fixture classes", () => {
 		const report = runPerfCorpusBenchmark();
 		expect(report.schema).toBe(PERF_CORPUS_SCHEMA);
+		expect(report.gitSha).toMatch(/^[0-9a-f]{40}$/);
+		expect(report.runner.command).toBe("runPerfCorpusBenchmark({ isolatedMemory: false })");
+		expect(report.runner.iterationsTarget).toBeGreaterThan(0);
+		expect(typeof report.runner.gcExposed).toBe("boolean");
 		const classes = new Set(report.fixtures.map(f => f.fixtureClass));
 		for (const required of REQUIRED_FIXTURE_CLASSES) {
 			expect(classes.has(required)).toBe(true);
@@ -81,6 +85,9 @@ describe("perf corpus schema + runner", () => {
 		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
 		expect(baselines).toHaveLength(REQUIRED_MEMORY_SURFACES.length);
 		expect(report.runner.memoryIsolation).toBe("process-per-surface");
+		expect(report.runner.command).toContain("GJC_MEMORY_ITERATIONS=");
+		expect(report.runner.command).toContain("--smol --expose-gc");
+		expect(report.runner.gcExposed).toBe(true);
 		expect(baselines.every(baseline => baseline.samples[0]!.rssBytes > 0)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 	});
@@ -179,6 +186,7 @@ describe("perf corpus schema + runner", () => {
 		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
 		const fixture = report.fixtures[fixtureIndex];
 		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const validBaseline = fixture.memoryBaseline;
 		const malformedBaseline = {
 			...fixture.memoryBaseline,
 			surface: "bogus",
@@ -205,9 +213,29 @@ describe("perf corpus schema + runner", () => {
 		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond not finite`);
 		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond invalid`);
 		expect(errors).toContain(`fixture ${fixture.fixtureId}: memoryBaseline.processTreeSampler invalid`);
+		const profileMismatch = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: { ...validBaseline, profile: "soak" as const },
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(profileMismatch).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.profile must match runner.profile`,
+		);
+		const legacySchema = { ...report, schema: "gjc.perf-corpus/1" } as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(legacySchema).errors).toContain(
+			'invalid schema "gjc.perf-corpus/1", expected "gjc.perf-corpus/2"',
+		);
 	});
 
 	test("treats a missing process-table sampler as unavailable", () => {
+		const previousGitSha = process.env.GITHUB_SHA;
+		process.env.GITHUB_SHA = "a".repeat(40);
 		const spawnSyncSpy = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
 			throw new Error("ENOENT");
 		});
@@ -222,6 +250,8 @@ describe("perf corpus schema + runner", () => {
 			expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 		} finally {
 			spawnSyncSpy.mockRestore();
+			if (previousGitSha === undefined) delete process.env.GITHUB_SHA;
+			else process.env.GITHUB_SHA = previousGitSha;
 		}
 	});
 	test("does not claim post-GC return metrics when GC is unavailable", () => {

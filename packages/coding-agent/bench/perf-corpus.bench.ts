@@ -81,6 +81,34 @@ function measureRss(work: () => void): RssMemoryMetric {
 		heapReturnBytes,
 	};
 }
+function resolveGitSha(): string {
+	const environmentSha = process.env.GITHUB_SHA?.trim();
+	if (environmentSha) return environmentSha;
+	try {
+		const result = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+		if (result.exitCode === 0) {
+			const sha = new TextDecoder().decode(result.stdout).trim();
+			if (sha) return sha;
+		}
+	} catch {
+		// Validation below rejects missing provenance with an actionable error.
+	}
+	return "";
+}
+
+function reproductionCommand(
+	profile: MemoryWorkloadProfile,
+	durationTargetMs: number,
+	iterationsTarget: number,
+	isolatedMemory: boolean,
+): string {
+	if (!isolatedMemory) return "runPerfCorpusBenchmark({ isolatedMemory: false })";
+	const settings =
+		profile === "soak"
+			? `GJC_MEMORY_PROFILE=soak GJC_MEMORY_DURATION_MS=${durationTargetMs} GJC_MEMORY_ITERATIONS=${iterationsTarget} `
+			: `GJC_MEMORY_PROFILE=short GJC_MEMORY_ITERATIONS=${iterationsTarget} `;
+	return `${settings}bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts`;
+}
 function memorySample(startedAt: number): MemoryUsageSample {
 	const usage = process.memoryUsage();
 	return {
@@ -155,14 +183,15 @@ function buildMemoryFixture(
 	const minimumIterations = workloadIterations(profile);
 	workload.teardown();
 	gc?.();
-	const baselineSample = { ...memorySample(performance.now()), elapsedMs: 0 };
 	const processTreeBaselineRssBytes = processTreeRssBytes();
+	gc?.();
+	const baselineSample = { ...memorySample(performance.now()), elapsedMs: 0 };
 	const startedAt = performance.now();
 	const cpuStart = process.cpuUsage();
 	const samples = [baselineSample];
 	let operations = 0;
 	let iterations = 0;
-	const chunkSize = profile === "soak" ? 5_000 : Math.max(1, Math.ceil(minimumIterations / 4));
+	const chunkSize = profile === "soak" ? 1 : Math.max(1, Math.ceil(minimumIterations / 20));
 	const sampleIntervalMs = profile === "soak" ? 50 : 0;
 	while (iterations < minimumIterations || performance.now() - startedAt < targetDurationMs) {
 		operations += workload.run(chunkSize);
@@ -335,6 +364,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 				? configuredDurationMs
 				: 1_000
 			: 0;
+	const iterationsTarget = workloadIterations(profile);
 	const fixtures: PerfCorpusFixtureResult[] = [
 		buildFixture("startup-load", "startup-session-load", ["startup", "session-load"], startupWorkload, 0x51ed),
 		buildFixture("streaming-ttft", "streaming-ttft", ["streaming", "ttft"], streamingWorkload, 0x9e37),
@@ -346,9 +376,9 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
 		generatedAt: new Date().toISOString(),
-		gitSha: process.env.GITHUB_SHA,
+		gitSha: resolveGitSha(),
 		runner: {
-			command: "bun packages/coding-agent/bench/perf-corpus.bench.ts",
+			command: reproductionCommand(profile, durationTargetMs, iterationsTarget, options.isolatedMemory === true),
 			platform: process.platform,
 			arch: process.arch,
 			bunVersion: process.versions.bun,
@@ -356,6 +386,8 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			profile,
 			durationTargetMs,
 			memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
+			iterationsTarget,
+			gcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
 		},
 		fixtures,
 		hotspotClassifications: [...V1_V3_RECLASSIFICATION],

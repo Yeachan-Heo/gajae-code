@@ -155,9 +155,9 @@ export interface ThresholdLedgerReference {
 }
 
 export interface PerfCorpusReport {
-	schema: "gjc.perf-corpus/1";
+	schema: "gjc.perf-corpus/2";
 	generatedAt: string;
-	gitSha?: string;
+	gitSha: string;
 	runner: {
 		command: string;
 		platform: NodeJS.Platform;
@@ -167,13 +167,15 @@ export interface PerfCorpusReport {
 		profile?: MemoryWorkloadProfile;
 		durationTargetMs?: number;
 		memoryIsolation: "in-process" | "process-per-surface";
+		iterationsTarget: number;
+		gcExposed: boolean;
 	};
 	fixtures: PerfCorpusFixtureResult[];
 	hotspotClassifications: HotspotClassification[];
 	thresholdLedger?: ThresholdLedgerReference[];
 }
 
-export const PERF_CORPUS_SCHEMA = "gjc.perf-corpus/1" as const;
+export const PERF_CORPUS_SCHEMA = "gjc.perf-corpus/2" as const;
 
 export const REQUIRED_FIXTURE_CLASSES: readonly FixtureClass[] = ["startup-session-load", "streaming-ttft", "large-transcript"];
 export const REQUIRED_MEMORY_SURFACES: readonly MemorySurface[] = [
@@ -251,6 +253,18 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (report.schema !== PERF_CORPUS_SCHEMA) {
 		errors.push(`invalid schema "${report.schema}", expected "${PERF_CORPUS_SCHEMA}"`);
 	}
+	if (!/^[0-9a-f]{40}$/i.test(report.gitSha)) {
+		errors.push("gitSha must be a full 40-character commit SHA");
+	}
+	if (typeof report.runner.command !== "string" || report.runner.command.trim().length === 0) {
+		errors.push("runner.command must record the resolved invocation");
+	}
+	if (!Number.isInteger(report.runner.iterationsTarget) || report.runner.iterationsTarget <= 0) {
+		errors.push("runner.iterationsTarget invalid");
+	}
+	if (typeof report.runner.gcExposed !== "boolean") {
+		errors.push("runner.gcExposed invalid");
+	}
 	if (!(MEMORY_ISOLATION_MODES as readonly string[]).includes(report.runner.memoryIsolation)) {
 		errors.push("runner.memoryIsolation invalid");
 	}
@@ -301,6 +315,9 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			}
 			if (!(MEMORY_WORKLOAD_PROFILES as readonly string[]).includes(baseline.profile)) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.profile invalid`);
+			}
+			if (report.runner.profile !== undefined && baseline.profile !== report.runner.profile) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.profile must match runner.profile`);
 			}
 			if (!Number.isInteger(baseline.iterations) || baseline.iterations <= 0) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.iterations must be a positive integer`);
