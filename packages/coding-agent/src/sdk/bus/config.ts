@@ -553,6 +553,8 @@ export interface RedactableAction {
 	workflowGateId?: string;
 	question?: string;
 	options?: string[];
+	/** Selected zero-based option positions for transport-specific multi-select rendering. */
+	selectedOptionIndices?: number[];
 	summary?: string;
 	/** Optional zero-based recommendation into the authoritative raw options. */
 	recommendedIndex?: number;

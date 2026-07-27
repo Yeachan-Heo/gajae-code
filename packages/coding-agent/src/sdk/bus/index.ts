@@ -646,7 +646,31 @@ export class PresentationArbiter {
 	) {}
 
 	retain(presentation: UnattendedGatePresentation): void {
-		const alreadyPresent = this.presentations.has(presentation.gateId);
+		const existing = this.presentations.get(presentation.gateId);
+		if (
+			existing &&
+			this.active?.gateId === presentation.gateId &&
+			(existing.options.length !== presentation.options.length ||
+				existing.options.some((option, index) => presentation.options[index] !== option))
+		) {
+			const active = this.active;
+			let status: RetireStatus;
+			try {
+				status = parseRetireStatus(this.server.retireIfUnclaimed(active).status);
+			} catch (error) {
+				logger.warn(`interactive presentation replay retirement failed: ${String(error)}`);
+				return;
+			}
+			if (!isTerminalProof(status)) return;
+			this.routes.delete(active.actionId);
+			this.active = undefined;
+		}
+		const alreadyPresent = existing !== undefined;
+		if (existing?.multi && presentation.multi) {
+			presentation.selectedOptions = existing.selectedOptions.filter(option =>
+				presentation.options.includes(option),
+			);
+		}
 		if (!alreadyPresent) this.queue.push(presentation.gateId);
 		this.presentations.set(presentation.gateId, presentation);
 		// A fresh durable replay is explicit production recovery after transient N-API exhaustion.
@@ -775,6 +799,13 @@ export class PresentationArbiter {
 									? `(${presentation.selectedOptions.length} selected) ${presentation.question}`
 									: presentation.question,
 							options: presentation.options,
+							...(presentation.multi
+								? {
+										selectedOptionIndices: presentation.options.flatMap((option, index) =>
+											presentation.selectedOptions.includes(option) ? [index] : [],
+										),
+									}
+								: {}),
 							...(presentation.recommendedIndex === undefined
 								? {}
 								: { recommendedIndex: presentation.recommendedIndex }),
@@ -3479,7 +3510,6 @@ export function createNotificationsExtension(
 		if (lifecycleRequired && !lifecycleAgentDir)
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
 
-		const gateOptions = new Map<string, string[]>();
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const tag = sessionTag(id);
@@ -4713,7 +4743,7 @@ export function createNotificationsExtension(
 					} else if (presentation?.multi && typeof rawAnswer === "string") {
 						answer = { selected: presentation.selectedOptions, other: true, custom: rawAnswer };
 					} else {
-						const mapped = mapAnswerToGate(reply.answerJson, gateOptions.get(gateId) ?? []);
+						const mapped = mapAnswerToGate(reply.answerJson, presentation?.options ?? []);
 						if (!mapped.ok) {
 							// A numeric selector outside options is invalid (issue #2030): close the
 							// exact claim/receipt and reissue the interaction — never a success ack.
@@ -5109,7 +5139,6 @@ export function createNotificationsExtension(
 				activeRuntime.disposeGateTerminalController = () => {};
 				activeRuntime.disposeAckRecoveryParticipant = () => {};
 				activeRuntime.workflowGate = undefined;
-				gateOptions.clear();
 				if (typeof gate?.onGateEmitted !== "function" || typeof gate.resolveGateFromNotification !== "function") {
 					return;
 				}
@@ -5134,7 +5163,6 @@ export function createNotificationsExtension(
 					const rawGateOptions = g.options ?? [];
 					const options = rawGateOptions.map(o => String((o as { label?: unknown }).label ?? ""));
 					const recommendedIndex = recommendedIndexFromGateOptions(rawGateOptions);
-					gateOptions.set(g.gate_id, options);
 					const promptCtx = g.context as { prompt?: unknown; title?: unknown } | undefined;
 					const question =
 						(typeof promptCtx?.prompt === "string" && promptCtx.prompt) ||
