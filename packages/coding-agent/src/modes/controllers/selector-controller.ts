@@ -1153,6 +1153,12 @@ export class SelectorController {
 		);
 		if (scope === undefined) return;
 		const persistDefault = scope.trim().toLowerCase() === "default";
+		if (persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
+			this.ctx.showError(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			return;
+		}
 
 		const imageProvider = normalized as
 			| "auto"

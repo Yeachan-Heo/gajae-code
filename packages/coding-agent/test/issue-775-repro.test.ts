@@ -243,23 +243,27 @@ describe("issue #775: per-model defaultLevel", () => {
 			commit.mockRestore();
 		}
 	});
-	it("applies committed thinking visibility after an intervening model change", async () => {
+	it("applies committed thinking visibility across a persistent default-model selection", async () => {
 		const settings = Settings.isolated({ hideThinkingBlock: false });
 		await createSession(getSonnet(), settings);
 		session.setThinkingVisibility("hidden");
 		const commitStarted = Promise.withResolvers<void>();
 		const releaseCommit = Promise.withResolvers<void>();
 		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		let commitCount = 0;
 		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
-			commitStarted.resolve();
-			await releaseCommit.promise;
+			commitCount++;
+			if (commitCount === 1) {
+				commitStarted.resolve();
+				await releaseCommit.promise;
+			}
 			return commitAtomicBatch(changes);
 		});
 
 		try {
 			const persistentControl = session.setThinkingVisibilityForControl("visible", true);
 			await commitStarted.promise;
-			await session.setModel(getOpus());
+			await session.setDefaultModelSelection(getOpus(), Effort.High);
 			expect(session.getThinkingVisibility()).toBe("hidden");
 
 			releaseCommit.resolve();

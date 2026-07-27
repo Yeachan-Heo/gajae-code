@@ -2755,7 +2755,6 @@ export class AgentSession {
 		this.#thinkingLevelLiveMutationRevision++;
 		this.#pendingThinkingLevelControlSuccess = undefined;
 		this.#pendingThinkingLevelControlFailure = undefined;
-		this.#thinkingVisibilityLiveMutationRevision++;
 		this.#pendingThinkingVisibilityControlSuccess = undefined;
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
@@ -9434,7 +9433,6 @@ export class AgentSession {
 		this.#thinkingLevelLiveMutationRevision++;
 		this.#pendingThinkingLevelControlSuccess = undefined;
 		this.#pendingThinkingLevelControlFailure = undefined;
-		this.#thinkingVisibilityLiveMutationRevision++;
 		this.#pendingThinkingVisibilityControlSuccess = undefined;
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = inheritedThinkingLevel;
@@ -9875,7 +9873,6 @@ export class AgentSession {
 		this.#thinkingLevelLiveMutationRevision++;
 		this.#pendingThinkingLevelControlSuccess = undefined;
 		this.#pendingThinkingLevelControlFailure = undefined;
-		this.#thinkingVisibilityLiveMutationRevision++;
 		this.#pendingThinkingVisibilityControlSuccess = undefined;
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = thinkingLevel;
@@ -15135,7 +15132,6 @@ export class AgentSession {
 				this.#thinkingLevelLiveMutationRevision++;
 				this.#pendingThinkingLevelControlSuccess = undefined;
 				this.#pendingThinkingLevelControlFailure = undefined;
-				this.#thinkingVisibilityLiveMutationRevision++;
 				this.#pendingThinkingVisibilityControlSuccess = undefined;
 				this.#pendingThinkingVisibilityControlFailure = undefined;
 				this.#thinkingLevel = nextThinkingLevel;
@@ -15213,7 +15209,6 @@ export class AgentSession {
 				this.#thinkingLevelLiveMutationRevision++;
 				this.#pendingThinkingLevelControlSuccess = undefined;
 				this.#pendingThinkingLevelControlFailure = undefined;
-				this.#thinkingVisibilityLiveMutationRevision++;
 				this.#pendingThinkingVisibilityControlSuccess = undefined;
 				this.#pendingThinkingVisibilityControlFailure = undefined;
 				this.#thinkingLevel = previousThinkingLevel;
