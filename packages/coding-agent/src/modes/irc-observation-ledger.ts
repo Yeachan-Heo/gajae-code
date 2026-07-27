@@ -60,6 +60,7 @@ export class IrcObservationLedger {
 	#nextSequence = 0;
 	#seenObservationIdentities = new Set<string>();
 	#identityCapacityExhausted = false;
+	#retiredSessionIdentities = new Set<string>();
 	#evictedObservationIds = new Set<string>();
 	#mutationEpoch = 0;
 
@@ -74,13 +75,31 @@ export class IrcObservationLedger {
 
 	#rememberObservationIdentity(observationId: string): boolean {
 		const identity = tombstoneIdentity(observationId);
-		if (this.#seenObservationIdentities.has(identity) || this.#identityCapacityExhausted) return false;
+		if (
+			this.#seenObservationIdentities.has(identity) ||
+			this.#retiredSessionIdentities.has(identity) ||
+			this.#identityCapacityExhausted
+		)
+			return false;
 		if (this.#seenObservationIdentities.size >= IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES) {
 			this.#identityCapacityExhausted = true;
 			return false;
 		}
 		this.#seenObservationIdentities.add(identity);
 		return true;
+	}
+
+	#retireCurrentSessionIdentities(): void {
+		for (const observationId of this.#records.keys()) {
+			const identity = tombstoneIdentity(observationId);
+			this.#retiredSessionIdentities.delete(identity);
+			this.#retiredSessionIdentities.add(identity);
+			while (this.#retiredSessionIdentities.size > IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES) {
+				const oldest = this.#retiredSessionIdentities.values().next().value;
+				if (oldest === undefined) break;
+				this.#retiredSessionIdentities.delete(oldest);
+			}
+		}
 	}
 
 	#evict(observationId: string): void {
@@ -146,8 +165,10 @@ export class IrcObservationLedger {
 		return observationIds;
 	}
 
-	reset(): void {
+	reset(options?: { retireCurrentSessionIdentities?: boolean }): void {
 		const retainedRecordsChanged = this.#records.size > 0;
+		if (options?.retireCurrentSessionIdentities) this.#retireCurrentSessionIdentities();
+		else this.#retiredSessionIdentities.clear();
 		if (retainedRecordsChanged) {
 			for (const observationId of this.#records.keys()) {
 				this.#evictedObservationIds.add(observationId);

@@ -48,7 +48,7 @@ function createForkContext(fork: () => Promise<boolean>) {
 	ctx.resetRenderedIrcInlineComponents = () => helpers.resetRenderedIrcInlineComponents();
 	let controller: EventController;
 	ctx.resetIrcSidebarSession = () => {
-		ledger.reset();
+		ledger.reset({ retireCurrentSessionIdentities: true });
 		controller.resetIrcObservations();
 		sidebarRequestedVisible = false;
 		helpers.resetIrcSidebarHint();

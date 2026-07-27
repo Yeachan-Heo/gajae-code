@@ -2232,7 +2232,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sidebarVisible = this.#ircSplitView.effectiveSidebarVisible(this.ui.terminal.columns);
 		const rightWidth = computeIrcSplitWidths(this.ui.terminal.columns).rightWidth;
 		const beforeToken = sidebarVisible ? getIrcSidebarSemanticToken(this.ircLedger, rightWidth) : "";
-		this.ircLedger.reset();
+		this.ircLedger.reset({ retireCurrentSessionIdentities: true });
 		this.#ircSplitView.resetSource();
 		const afterToken = sidebarVisible ? getIrcSidebarSemanticToken(this.ircLedger, rightWidth) : "";
 		this.#eventController.resetIrcObservations();
