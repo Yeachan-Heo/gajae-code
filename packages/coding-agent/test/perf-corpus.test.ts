@@ -42,6 +42,17 @@ const memoryControlKeys = [
 	"GJC_MEMORY_SURFACE_ORDER",
 ] as const;
 let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
+function expectedPublicRunnerArgv(): string[] {
+	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+	const scriptPath = process.argv[1];
+	if (!scriptPath) throw new Error("test runner script path unavailable");
+	return [
+		"bun",
+		...process.execArgv,
+		path.relative(repositoryRoot, scriptPath).split(path.sep).join("/"),
+		...process.argv.slice(2),
+	];
+}
 
 beforeEach(() => {
 	originalMemoryControls = new Map(memoryControlKeys.map(key => [key, process.env[key]]));
@@ -60,14 +71,14 @@ describe("perf corpus schema + runner", () => {
 		const report = runPerfCorpusBenchmark();
 		expect(report.schema).toBe(PERF_CORPUS_SCHEMA);
 		expect(report.gitSha).toMatch(/^[0-9a-f]{40}$/);
-		const expectedParentArgv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+		const expectedParentArgv = expectedPublicRunnerArgv();
 		expect(report.runner.command).toBe(expectedParentArgv.join(" "));
 		expect(report.runner.argv).toEqual(expectedParentArgv);
 		expect(report.runner.runtimeCommand).toBe(report.runner.command);
 		expect(report.runner.runtimeControlIdentity).toBe(memoryRuntimeControlIdentity(report.runner));
 		expect(report.runner.runnerPid).toBe(process.pid);
 		expect(report.runner.bunVersion).toBe(process.versions.bun);
-		expect(path.isAbsolute(report.runner.bunExecutable)).toBe(true);
+		expect(report.runner.bunExecutable).toBe("bun");
 		expect(report.runner.bunExecutableSha256).toMatch(/^[0-9a-f]{64}$/);
 		expect(report.runner.worktreeFingerprint).toMatch(/^[0-9a-f]{64}$/);
 		expect(report.runner.closureDigest).toMatch(/^[0-9a-f]{64}$/);
@@ -170,12 +181,12 @@ describe("perf corpus schema + runner", () => {
 			await fs.rm(repository, { recursive: true, force: true });
 		}
 	});
-	test("binds the exact Bun executable and canonical tracked closure manifest", () => {
+	test("binds the public Bun identity, exact executable bytes, and canonical tracked closure manifest", () => {
 		const repositoryRoot = path.resolve(import.meta.dir, "../../..");
 		const provenance = resolveMeasurementRuntimeProvenance(repositoryRoot);
 		const report = runPerfCorpusBenchmark();
 		expect(report.runner.bunVersion).toBe(provenance.bunVersion);
-		expect(report.runner.bunExecutable).toBe(provenance.bunExecutable);
+		expect(report.runner.bunExecutable).toBe("bun");
 		expect(report.runner.bunExecutableSha256).toBe(provenance.bunExecutableSha256);
 		expect(report.runner.closureDigest).toBe(provenance.closureDigest);
 		expect(report.runner.closureManifest).toEqual(provenance.closureManifest);
@@ -212,6 +223,23 @@ describe("perf corpus schema + runner", () => {
 		expect(validatePerfCorpusReport(changedCommand).errors).toContain(
 			"runner.runtimeCommand must exactly match runner.command",
 		);
+		for (const scriptPath of [
+			"packages/../private/perf-corpus.bench.ts",
+			"packages\\coding-agent\\bench\\perf-corpus.bench.ts",
+		]) {
+			const argv = ["bun", scriptPath];
+			const runner = {
+				...report.runner,
+				command: argv.join(" "),
+				runtimeCommand: argv.join(" "),
+				argv,
+				runtimeControlIdentity: "",
+			};
+			runner.runtimeControlIdentity = memoryRuntimeControlIdentity(runner);
+			expect(validatePerfCorpusReport({ ...report, runner }).errors).toContain(
+				"runner.argv must begin with bun and contain only logical repository-relative values",
+			);
+		}
 	});
 
 	test("rejects unexpected and provider/private fields across the report taxonomy", () => {
@@ -369,7 +397,7 @@ describe("perf corpus schema + runner", () => {
 		expect(baselines.map(baseline => baseline.surface)).toEqual(customOrder);
 		expect(report.runner.memoryIsolation).toBe("process-per-surface");
 		expect(report.runner.memorySurfaceOrder).toEqual(customOrder);
-		expect(report.runner.argv).toEqual([process.execPath, ...process.execArgv, ...process.argv.slice(1)]);
+		expect(report.runner.argv).toEqual(expectedPublicRunnerArgv());
 		expect(report.runner.memoryChildExecArgv).toEqual(["--smol", "--expose-gc"]);
 		expect(report.runner.environment).toEqual({
 			GJC_MEMORY_PROFILE: "short",

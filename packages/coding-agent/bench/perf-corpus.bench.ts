@@ -199,6 +199,7 @@ export function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeF
 }
 
 function reproductionInvocation(
+	repositoryRoot: string,
 	profile: MemoryWorkloadProfile,
 	durationTargetMs: number,
 	iterationsTarget: number,
@@ -210,7 +211,13 @@ function reproductionInvocation(
 		GJC_MEMORY_SURFACE_ORDER: memorySurfaceOrder.join(","),
 	};
 	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
-	const argv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+	const scriptPath = process.argv[1];
+	if (!scriptPath) throw new Error("benchmark script path unavailable");
+	const relativeScriptPath = path.relative(repositoryRoot, scriptPath);
+	if (relativeScriptPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeScriptPath)) {
+		throw new Error("benchmark script must be inside the repository");
+	}
+	const argv = ["bun", ...process.execArgv, relativeScriptPath.split(path.sep).join("/"), ...process.argv.slice(2)];
 	return { command: argv.join(" "), argv, environment };
 }
 const MEMORY_CHILD_ARGUMENT = "--gjc-memory-child";
@@ -604,7 +611,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 		throw new Error("benchmark checkout provenance changed while workloads were running");
 	}
 	const git = initialGit;
-	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
+	const invocation = reproductionInvocation(repositoryRoot, profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
 	const runner: PerfCorpusReport["runner"] = {
 		command: invocation.command,
 		runtimeCommand: invocation.command,
@@ -614,7 +621,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 		platform: process.platform,
 		arch: process.arch,
 		bunVersion: initialRuntime.bunVersion,
-		bunExecutable: initialRuntime.bunExecutable,
+		bunExecutable: "bun",
 		bunExecutableSha256: initialRuntime.bunExecutableSha256,
 		worktreeFingerprint: git.worktreeFingerprint,
 		closureDigest: initialRuntime.closureDigest,

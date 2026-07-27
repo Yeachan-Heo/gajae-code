@@ -122,6 +122,7 @@ BASELINE_FIELDS = {
 }
 CAPTURE_SEMANTICS_ID = "gjc.memory-baseline.capture/3"
 BUN_VERSION = "1.3.14"
+LOGICAL_BUN_EXECUTABLE = "bun"
 RESULT_JSON = "perf-corpus-rlm-result.json"
 RESULT_MARKDOWN = "perf-corpus-rlm-result.md"
 NORMAL = NormalDist()
@@ -271,6 +272,37 @@ def _validate_private_field_names(value: Any, label: str, *, privacy_attestation
     elif isinstance(value, list):
         for index, nested in enumerate(value):
             _validate_private_field_names(nested, f"{label}[{index}]", privacy_attestation=privacy_attestation)
+
+
+def _contains_host_private_path(value: str) -> bool:
+    if "\\" in value:
+        return True
+    for part in value.split():
+        for token in part.split("="):
+            normalized = token.strip("\"'")
+            if (
+                normalized.startswith("/")
+                or normalized.startswith("~/")
+                or (len(normalized) >= 3 and normalized[0].isalpha() and normalized[1] == ":" and normalized[2] == "/")
+                or ".." in normalized.split("/")
+            ):
+                return True
+    return False
+
+
+def _validate_logical_runner_argv(value: Any, label: str) -> list[str]:
+    argv = _expect_list(value, label)
+    if (
+        len(argv) <= 1
+        or any(not isinstance(item, str) or not item or _contains_host_private_path(item) for item in argv)
+        or argv[0] != LOGICAL_BUN_EXECUTABLE
+        or not any(
+            not item.startswith("-") and "/" in item and item.endswith(".ts")
+            for item in argv[1:]
+        )
+    ):
+        raise EvidenceError(f"{label} must begin with bun and contain only logical repository-relative values")
+    return argv
 
 
 def _protocol_digest(prereg: dict[str, Any]) -> str:
@@ -838,18 +870,20 @@ def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any
     if runner.get("memoryChildGcExposed") is not True or runner.get("memoryChildExecArgv") != ["--smol", "--expose-gc"]:
         raise EvidenceError(f"{filename}: isolated child controls drift")
     command = _expect_string(runner.get("command"), f"{filename}.runner.command")
+    if _contains_host_private_path(command):
+        raise EvidenceError(f"{filename}: runner.command contains a host-private path")
     if runner.get("runtimeCommand") != command:
         raise EvidenceError(f"{filename}: runtimeCommand must equal command")
-    argv = _expect_list(runner.get("argv"), f"{filename}.runner.argv")
-    if not argv or any(not isinstance(item, str) or not item for item in argv):
-        raise EvidenceError(f"{filename}: runner.argv is invalid")
+    argv = _validate_logical_runner_argv(runner.get("argv"), f"{filename}.runner.argv")
+    if command != " ".join(argv):
+        raise EvidenceError(f"{filename}: runner.command must exactly match the logical runner.argv")
     platform = _expect_string(runner.get("platform"), f"{filename}.runner.platform")
     arch = _expect_string(runner.get("arch"), f"{filename}.runner.arch")
     if runner.get("bunVersion") != BUN_VERSION:
         raise EvidenceError(f"{filename}: Bun version drift")
     bun_executable = _expect_string(runner.get("bunExecutable"), f"{filename}.runner.bunExecutable")
-    if not os.path.isabs(bun_executable) or os.path.normpath(bun_executable) != bun_executable:
-        raise EvidenceError(f"{filename}: bunExecutable must be a canonical absolute path")
+    if bun_executable != LOGICAL_BUN_EXECUTABLE:
+        raise EvidenceError(f'{filename}: bunExecutable must be the logical identifier "bun"')
     _expect_sha256(runner.get("bunExecutableSha256"), f"{filename}.runner.bunExecutableSha256")
     worktree_fingerprint = _expect_sha256(runner.get("worktreeFingerprint"), f"{filename}.runner.worktreeFingerprint")
     runner_pid = _expect_integer(runner.get("runnerPid"), f"{filename}.runner.runnerPid", positive=True)

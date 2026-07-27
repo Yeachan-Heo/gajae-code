@@ -236,6 +236,33 @@ const SOURCE_CLASS_VALUES: readonly PerfCorpusFixtureResult["sourceClass"][] = [
 	"dogfood-redacted",
 ];
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const LOGICAL_BUN_EXECUTABLE = "bun";
+
+function containsHostPrivatePath(value: string): boolean {
+	if (value.includes("\\")) return true;
+	for (const token of value.split(/\s+/).flatMap(part => part.split("="))) {
+		const normalized = token.replace(/^["']|["']$/g, "");
+		if (
+			normalized.startsWith("/") ||
+			normalized.startsWith("~/") ||
+			/^[A-Za-z]:\//.test(normalized) ||
+			normalized.split("/").includes("..")
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function isLogicalRunnerArgv(value: unknown): value is string[] {
+	return (
+		Array.isArray(value) &&
+		value.length > 1 &&
+		value.every(argument => typeof argument === "string" && argument.length > 0 && !containsHostPrivatePath(argument)) &&
+		value[0] === LOGICAL_BUN_EXECUTABLE &&
+		value.slice(1).some(argument => !argument.startsWith("-") && argument.includes("/") && argument.endsWith(".ts"))
+	);
+}
 const REPORT_FIELDS = [
 	"schema",
 	"generatedAt",
@@ -534,8 +561,8 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (typeof report.runner.bunVersion !== "string" || report.runner.bunVersion.trim().length === 0) {
 		errors.push("runner.bunVersion invalid");
 	}
-	if (typeof report.runner.bunExecutable !== "string" || !report.runner.bunExecutable.startsWith("/")) {
-		errors.push("runner.bunExecutable must be an absolute canonical path");
+	if (report.runner.bunExecutable !== LOGICAL_BUN_EXECUTABLE) {
+		errors.push('runner.bunExecutable must be the logical identifier "bun"');
 	}
 	if (!SHA256_PATTERN.test(report.runner.bunExecutableSha256)) {
 		errors.push("runner.bunExecutableSha256 invalid");
@@ -557,15 +584,16 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (report.runner.runtimeControlIdentity !== memoryRuntimeControlIdentity(report.runner)) {
 		errors.push("runner.runtimeControlIdentity does not match runtime controls");
 	}
-	if (typeof report.runner.command !== "string" || report.runner.command.trim().length === 0) {
-		errors.push("runner.command must record the resolved invocation");
+	if (!isLogicalRunnerArgv(report.runner.argv)) {
+		errors.push("runner.argv must begin with bun and contain only logical repository-relative values");
 	}
 	if (
+		typeof report.runner.command !== "string" ||
+		containsHostPrivatePath(report.runner.command) ||
 		!Array.isArray(report.runner.argv) ||
-		report.runner.argv.length === 0 ||
-		report.runner.argv.some(value => typeof value !== "string" || value.length === 0)
+		report.runner.command !== report.runner.argv.join(" ")
 	) {
-		errors.push("runner.argv invalid");
+		errors.push("runner.command must exactly match the logical runner.argv");
 	}
 	if (
 		typeof report.runner.environment !== "object" ||

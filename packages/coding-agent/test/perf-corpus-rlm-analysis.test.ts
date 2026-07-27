@@ -488,7 +488,7 @@ function reportFor(
 		platform: "darwin",
 		arch: "arm64",
 		bunVersion: "1.3.14",
-		bunExecutable: "/usr/local/bin/bun",
+		bunExecutable: "bun",
 		bunExecutableSha256: "b".repeat(64),
 		worktreeFingerprint: "c".repeat(64),
 		closureDigest: sha256(`${closureManifest.join("\n")}\n`),
@@ -841,8 +841,11 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 
 		const replayReport = structuredClone(report);
 		replayReport.gitDirty = false;
-		replayReport.runner.bunExecutable = "/usr/local/bin/bun";
-		replayReport.runner.runtimeControlIdentity = memoryRuntimeControlIdentity(replayReport.runner);
+		expect(replayReport.runner.bunExecutable).toBe("bun");
+		expect(replayReport.runner.argv[0]).toBe("bun");
+		expect(replayReport.runner.command).toBe(replayReport.runner.argv.join(" "));
+		expect(JSON.stringify(replayReport)).not.toContain(path.resolve(import.meta.dir, "../../.."));
+		expect(JSON.stringify(replayReport)).not.toContain(process.execPath);
 		await writeCorpus(input);
 		await fs.writeFile(path.join(input, "short-01.json"), `${JSON.stringify(replayReport)}\n`);
 		for (const entry of await fs.readdir(input)) {
@@ -875,6 +878,76 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		const result = await readResult(output);
 		expect(result.admission.short.admittedBlocks).toBeGreaterThanOrEqual(1);
 		expect(result.diagnostics.validationErrors.some(error => error.filename === "short-01.json")).toBe(false);
+	});
+
+	const privateRunnerCases: readonly [string, (runner: PerfCorpusReport["runner"]) => void, string][] = [
+		[
+			"command",
+			runner => {
+				runner.command = "bun /private/tmp/checkout/packages/coding-agent/bench/perf-corpus.bench.ts";
+				runner.runtimeCommand = runner.command;
+			},
+			"runner.command contains a host-private path",
+		],
+		[
+			"argv",
+			runner => {
+				runner.argv = ["bun", "/private/tmp/checkout/packages/coding-agent/bench/perf-corpus.bench.ts"];
+			},
+			"runner.argv must begin with bun and contain only logical repository-relative values",
+		],
+		[
+			"bunExecutable",
+			runner => {
+				runner.bunExecutable = "/private/tmp/runtime/bin/bun";
+			},
+			'bunExecutable must be the logical identifier "bun"',
+		],
+		[
+			"traversal argv",
+			runner => {
+				runner.argv = ["bun", "packages/../private/perf-corpus.bench.ts"];
+				runner.command = runner.argv.join(" ");
+				runner.runtimeCommand = runner.command;
+			},
+			"runner.command contains a host-private path",
+		],
+		[
+			"backslash argv",
+			runner => {
+				runner.argv = ["bun", "packages\\coding-agent\\bench\\perf-corpus.bench.ts"];
+				runner.command = runner.argv.join(" ");
+				runner.runtimeCommand = runner.command;
+			},
+			"runner.command contains a host-private path",
+		],
+	];
+
+	test.each(
+		privateRunnerCases,
+	)("rejects a host-private runner %s before admission", async (name, mutate, expectedMessage) => {
+		const input = path.join(temporaryRoot, `private-runner-${name}-input`);
+		const output = path.join(temporaryRoot, `private-runner-${name}-output`);
+		await writeCorpus(input, () => 100_000, ["short-01"]);
+		let runtimeControlIdentity = "";
+		await mutateReport(input, "short-01.json", report => {
+			mutate(report.runner);
+			report.runner.runtimeControlIdentity = memoryRuntimeControlIdentity(report.runner);
+			runtimeControlIdentity = report.runner.runtimeControlIdentity;
+		});
+		await mutateLedger(input, ledger => {
+			const attempt = (ledger.attempts as JsonObject[]).find(item => item.reportFilename === "short-01.json");
+			if (!attempt) throw new Error("short-01 ledger attempt unavailable");
+			attempt.runtimeControlIdentity = runtimeControlIdentity;
+		});
+
+		expect(invoke(input, output).exitCode).toBe(0);
+		const result = await readResult(output);
+		expect(result.diagnostics.validationErrors).toContainEqual(
+			expect.objectContaining({ filename: "short-01.json", message: expect.stringContaining(expectedMessage) }),
+		);
+		expect(result.admission.short.invalidBlocks).toBe(1);
+		expect(result.admissionTraceability.some(item => item.attemptId === "short-01")).toBe(false);
 	});
 
 	test("fails closed when Git checkout provenance is unavailable", () => {
@@ -911,7 +984,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(result.cohort?.sharedRunnerProvenance).toMatchObject({
 			runtimeCommand: "bun packages/coding-agent/bench/perf-corpus.bench.ts",
 			bunVersion: "1.3.14",
-			bunExecutable: "/usr/local/bin/bun",
+			bunExecutable: "bun",
 			bunExecutableSha256: "b".repeat(64),
 			worktreeFingerprint: "c".repeat(64),
 		});
