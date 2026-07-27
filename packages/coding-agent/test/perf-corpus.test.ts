@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
-import { runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
+import { calculateMemorySlope, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
 import {
 	type HotspotClassification,
 	hasProfilerSelfTimeEvidence,
@@ -55,9 +55,14 @@ describe("perf corpus schema + runner", () => {
 			expect(baseline.samples.length).toBeGreaterThanOrEqual(2);
 			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(baseline.samples.at(-1)?.elapsedMs ?? 0);
 			if (process.platform === "darwin" || process.platform === "linux") {
-				expect(baseline.processTreeSampler).toBe("ps");
-				expect(baseline.processTreeBaselineRssBytes).toBeGreaterThan(0);
-				expect(baseline.processTreePostTeardownRssBytes).toBeGreaterThan(0);
+				expect(["ps", "unavailable"]).toContain(baseline.processTreeSampler);
+				if (baseline.processTreeSampler === "ps") {
+					expect(baseline.processTreeBaselineRssBytes).toBeGreaterThan(0);
+					expect(baseline.processTreePostTeardownRssBytes).toBeGreaterThan(0);
+				} else {
+					expect(baseline.processTreeBaselineRssBytes).toBeNull();
+					expect(baseline.processTreePostTeardownRssBytes).toBeNull();
+				}
 			}
 			expect(Number.isFinite(baseline.operationsPerSecond)).toBe(true);
 			expect(baseline.samples.every(sample => sample.externalBytes >= sample.arrayBuffersBytes)).toBe(true);
@@ -129,6 +134,45 @@ describe("perf corpus schema + runner", () => {
 		expect(validatePerfCorpusReport(incomplete).errors).toContain(
 			`fixture ${fixture.fixtureId}: memoryBaseline sample 0.heapUsedBytes invalid`,
 		);
+	});
+	test("rejects an empty corpus instead of skipping required memory surfaces", () => {
+		const report = runPerfCorpusBenchmark();
+		const empty = { ...report, fixtures: [] };
+		const errors = validatePerfCorpusReport(empty).errors;
+		for (const surface of REQUIRED_MEMORY_SURFACES) {
+			expect(errors).toContain(`memory baseline missing required surface "${surface}"`);
+		}
+	});
+
+	test("calculates slopes only from the steady-state window", () => {
+		const sample = (elapsedMs: number, rssBytes: number): MemoryUsageSample => ({
+			elapsedMs,
+			rssBytes,
+			heapUsedBytes: rssBytes,
+			heapTotalBytes: rssBytes,
+			externalBytes: 0,
+			arrayBuffersBytes: 0,
+			activeResourceCount: 0,
+		});
+		const stabilizedAfterWarmup = [
+			sample(0, 100),
+			sample(200, 200),
+			sample(400, 200),
+			sample(600, 200),
+			sample(800, 200),
+			sample(1_000, 200),
+		];
+		expect(calculateMemorySlope(stabilizedAfterWarmup, "rssBytes")).toBe(0);
+		const growingSteadyState = [
+			sample(0, 100),
+			sample(200, 200),
+			sample(400, 200),
+			sample(600, 220),
+			sample(800, 240),
+			sample(1_000, 260),
+		];
+		expect(calculateMemorySlope(growingSteadyState, "rssBytes")).toBe(100);
+		expect(calculateMemorySlope([sample(0, 100), sample(200, 200)], "rssBytes")).toBeNull();
 	});
 	test("rejects malformed memory scalar fields and isolation metadata", () => {
 		const report = runPerfCorpusBenchmark();

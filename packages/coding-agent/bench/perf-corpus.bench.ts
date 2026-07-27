@@ -94,7 +94,7 @@ function memorySample(startedAt: number): MemoryUsageSample {
 	};
 }
 
-function memorySlope(samples: MemoryUsageSample[], key: "rssBytes" | "heapUsedBytes"): number | null {
+export function calculateMemorySlope(samples: MemoryUsageSample[], key: "rssBytes" | "heapUsedBytes"): number | null {
 	const first = samples[0];
 	const last = samples.at(-1);
 	if (!first || !last) return null;
@@ -226,8 +226,8 @@ function buildMemoryFixture(
 			operationsPerSecond: operations / Math.max(elapsedMs / 1_000, 1e-6),
 			samples,
 			postTeardown,
-			rssSlopeBytesPerSecond: memorySlope(samples, "rssBytes"),
-			heapSlopeBytesPerSecond: memorySlope(samples, "heapUsedBytes"),
+			rssSlopeBytesPerSecond: calculateMemorySlope(samples, "rssBytes"),
+			heapSlopeBytesPerSecond: calculateMemorySlope(samples, "heapUsedBytes"),
 			processTreeBaselineRssBytes,
 			processTreePostTeardownRssBytes,
 			processTreeSampler:

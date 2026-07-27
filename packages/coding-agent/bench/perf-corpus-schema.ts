@@ -366,10 +366,8 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	const measuredSurfaces = new Set(
 		report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline.surface] : [])),
 	);
-	if (measuredSurfaces.size > 0) {
-		for (const surface of REQUIRED_MEMORY_SURFACES) {
-			if (!measuredSurfaces.has(surface)) errors.push(`memory baseline missing required surface "${surface}"`);
-		}
+	for (const surface of REQUIRED_MEMORY_SURFACES) {
+		if (!measuredSurfaces.has(surface)) errors.push(`memory baseline missing required surface "${surface}"`);
 	}
 	for (const classification of report.hotspotClassifications) {
 		errors.push(...validateHotspotClassification(classification));
