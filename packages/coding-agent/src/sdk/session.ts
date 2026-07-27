@@ -21,6 +21,7 @@ import {
 	type ToolResultMessage,
 } from "@gajae-code/ai";
 import {
+	codexToolWireName,
 	getOpenAICodexTransportDetails,
 	prewarmOpenAICodexResponses,
 } from "@gajae-code/ai/providers/openai-codex-responses";
@@ -2188,7 +2189,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const previousPromptMetadataModel = promptMetadataModel;
 				promptMetadataModel = candidateModel;
 				try {
-					return buildSystemPromptToolMetadata(tools);
+					const activeModel = candidateModel ?? agent?.state.model ?? model;
+					// Codex renames reserved tool names on the wire; the prompt must
+					// refer to the tools by the names the model actually receives.
+					const overrides =
+						activeModel?.api === "openai-codex-responses"
+							? Object.fromEntries(
+									Array.from(tools.keys())
+										.filter(name => codexToolWireName(name) !== name)
+										.map(name => [name, { wireName: codexToolWireName(name) }]),
+								)
+							: {};
+					return buildSystemPromptToolMetadata(tools, overrides);
 				} finally {
 					promptMetadataModel = previousPromptMetadataModel;
 				}

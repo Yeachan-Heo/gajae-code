@@ -276,6 +276,50 @@ describe("openai-codex streaming", () => {
 		]);
 	});
 
+	it("maps reserved tool wire names back to canonical tool names", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sse = `${[
+			`data: ${JSON.stringify({
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "computer_tool",
+					arguments: "",
+				},
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.function_call_arguments.done",
+				item_id: "fc_1",
+				arguments: '{"action":"screenshot"}',
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "computer_tool",
+					arguments: '{"action":"screenshot"}',
+				},
+			})}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed" } })}`,
+		].join("\n\n")}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), { apiKey: token }).result();
+
+		const toolCalls = result.content.filter(block => block.type === "toolCall");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0]).toMatchObject({ name: "computer", arguments: { action: "screenshot" } });
+	});
+
 	it.each([
 		[false, 2],
 		[true, 1],

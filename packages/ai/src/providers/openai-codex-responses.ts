@@ -133,6 +133,31 @@ const CODEX_WEBSOCKET_FATAL_PATTERNS = ["websocket error:", "websocket closed be
 /** Max total time to spend retrying 429s with server-provided delays (5 minutes). */
 const CODEX_RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
 
+/**
+ * Tool names the Codex backend reserves for its own namespaces. Sending a
+ * function tool under one of these names is rejected with
+ * `Function 'computer.computer' not allowed in namespace 'computer'`.
+ * These are renamed on the wire and mapped back on receive so the internal
+ * tool name stays canonical everywhere else in the harness.
+ */
+const CODEX_RESERVED_TOOL_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
+	["browser", "browser_tool"],
+	["computer", "computer_tool"],
+]);
+const CODEX_CANONICAL_TOOL_NAMES: ReadonlyMap<string, string> = new Map(
+	Array.from(CODEX_RESERVED_TOOL_WIRE_NAMES, ([canonical, wire]) => [wire, canonical]),
+);
+
+/** Maps a canonical tool name to the name Codex accepts on the wire. */
+export function codexToolWireName(name: string): string {
+	return CODEX_RESERVED_TOOL_WIRE_NAMES.get(name) ?? name;
+}
+
+/** Maps a Codex wire tool name back to the canonical harness tool name. */
+export function codexToolCanonicalName(wireName: string): string {
+	return CODEX_CANONICAL_TOOL_NAMES.get(wireName) ?? wireName;
+}
+
 const CODEX_PROGRESS_EVENT_TYPES = new Set([
 	"response.created",
 	"response.output_item.added",
@@ -477,7 +502,7 @@ export function normalizeCodexToolChoice(
 			: undefined;
 		return customTool
 			? { type: "custom", name: customTool.customWireName ?? customTool.name }
-			: { type: "function", name };
+			: { type: "function", name: codexToolWireName(name) };
 	};
 	if (choice.type === "function") {
 		if ("function" in choice && choice.function?.name) {
@@ -1100,7 +1125,7 @@ function createOutputBlockForItem(item: CodexEventItem): CodexOutputBlock | null
 		return {
 			type: "toolCall",
 			id: encodeResponsesToolCallId(item.call_id, item.id),
-			name: item.name,
+			name: codexToolCanonicalName(item.name),
 			arguments: {},
 			partialJson: item.arguments || "",
 		};
@@ -1358,7 +1383,7 @@ function handleOutputItemDone(
 		const toolCall: ToolCall = {
 			type: "toolCall",
 			id,
-			name: item.name,
+			name: codexToolCanonicalName(item.name),
 			arguments: parseStreamingJson(item.arguments || "{}"),
 		};
 		runtime.canSafelyReplayWebsocketOverSse = false;
@@ -2700,6 +2725,13 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				true,
 				customCallIds,
 			);
+			for (const item of outputItems) {
+				// Reconstructed (non-raw) history carries canonical tool names; the
+				// wire form has to match the renamed `tools` entries.
+				if (item.type === "function_call" && typeof item.name === "string") {
+					item.name = codexToolWireName(item.name);
+				}
+			}
 			if (outputItems.length > 0) {
 				messages.push(...outputItems);
 			}
@@ -2786,7 +2818,7 @@ export function convertOpenAICodexResponsesTools(
 		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(baseParameters, strict);
 		return {
 			type: "function",
-			name: tool.name,
+			name: codexToolWireName(tool.name),
 			description: tool.description || "",
 			parameters,
 			...(effectiveStrict && { strict: true }),
