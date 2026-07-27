@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { type EventFrame, SessionEventStream } from "./events";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
@@ -72,6 +73,15 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 const CAP_GATED_FRAME_KINDS = new Set(["tool_activity", "reasoning_summary"]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
+export const PROMPT_REPLAY_TOKEN_CAPACITY = 128;
+const PROMPT_AUDIENCE_RECOVERY_TTL_MS = 5 * 60_000;
+
+type PendingAudienceClaim = {
+	connectionId: string;
+	replayToken: string;
+	expiresAt: number;
+	response?: SdkFrame;
+};
 
 /** Safe, identifier-free explanations for every refused activation status. */
 const ACTIVATION_MESSAGES: Record<
@@ -181,6 +191,9 @@ export class SessionSdkHost {
 	#readyGeneration?: number;
 	/** Serializes activation attempts so a concurrent pair cannot both publish. */
 	#activation: Promise<SessionActivationOutcome> = Promise.resolve("not_prepared");
+	#replayTokens = new Map<string, string>();
+	#replayTokenOwners = new Map<string, string>();
+	#pendingAudienceClaims = new Map<string, PendingAudienceClaim>();
 
 	constructor(options: SessionSdkHostOptions) {
 		this.#options = options;
@@ -218,6 +231,80 @@ export class SessionSdkHost {
 	/** Adds an event to the resumable event ring. Transport delivery is owned by bus wiring. */
 	emitEvent(frame: SdkFrame): EventFrame {
 		return this.events.emit(frame);
+	}
+
+	/** Mints the opaque capability required to replay events scoped to a requester reference. */
+	issueReplayToken(requesterRef: string): string {
+		const existing = this.#replayTokens.get(requesterRef);
+		if (existing) return existing;
+		this.#evictExpiredAudienceClaims();
+		if (!this.#evictReplayTokens()) throw Object.assign(new Error("Replay token capacity is temporarily exhausted."), { code: "busy" });
+		const token = randomBytes(32).toString("base64url");
+		this.#replayTokens.set(requesterRef, token);
+		return token;
+	}
+	#evictReplayTokens(exceptRequesterRef?: string): boolean {
+		this.#evictExpiredAudienceClaims();
+		while (this.#replayTokens.size >= PROMPT_REPLAY_TOKEN_CAPACITY) {
+			const candidate = [...this.#replayTokens.keys()].find(
+				requesterRef => requesterRef !== exceptRequesterRef && !this.#pendingAudienceClaims.has(requesterRef),
+			);
+			if (candidate === undefined) return false;
+			this.#replayTokens.delete(candidate);
+			this.#replayTokenOwners.delete(candidate);
+		}
+		return true;
+	}
+	#evictExpiredAudienceClaims(now = Date.now()): void {
+		for (const [requesterRef, claim] of this.#pendingAudienceClaims)
+			if (claim.expiresAt <= now) this.#pendingAudienceClaims.delete(requesterRef);
+	}
+	#claimPromptAudience(connectionId: string, requesterRef: string): string | undefined {
+		this.#evictExpiredAudienceClaims();
+		const existing = this.#pendingAudienceClaims.get(requesterRef);
+		if (existing) return existing.connectionId === connectionId ? existing.replayToken : undefined;
+		if (this.#pendingAudienceClaims.size >= PROMPT_REPLAY_TOKEN_CAPACITY) return undefined;
+		const replayToken = randomBytes(32).toString("base64url");
+		this.#pendingAudienceClaims.set(requesterRef, {
+			connectionId,
+			replayToken,
+			expiresAt: Date.now() + PROMPT_AUDIENCE_RECOVERY_TTL_MS,
+		});
+		return replayToken;
+	}
+	#authorizePromptAudience(connectionId: string, requesterRef: string, replayToken: string | undefined): string | undefined {
+		this.#evictExpiredAudienceClaims();
+		const token = this.#replayTokens.get(requesterRef);
+		if (token) {
+			if (replayToken !== token && this.#replayTokenOwners.get(requesterRef) !== connectionId) return undefined;
+			const existingClaim = this.#pendingAudienceClaims.get(requesterRef);
+			if (existingClaim && existingClaim.connectionId !== connectionId) return undefined;
+			if (!existingClaim && this.#pendingAudienceClaims.size >= PROMPT_REPLAY_TOKEN_CAPACITY) return undefined;
+			this.#pendingAudienceClaims.set(requesterRef, {
+				connectionId,
+				replayToken: token,
+				expiresAt: Date.now() + PROMPT_AUDIENCE_RECOVERY_TTL_MS,
+			});
+			this.#replayTokenOwners.set(requesterRef, connectionId);
+			return token;
+		}
+		return this.#claimPromptAudience(connectionId, requesterRef);
+	}
+	#releasePromptAudienceClaim(connectionId: string, requesterRef: string): void {
+		if (this.#pendingAudienceClaims.get(requesterRef)?.connectionId === connectionId)
+			this.#pendingAudienceClaims.delete(requesterRef);
+	}
+	#bindReplayToken(connectionId: string, requesterRef: string, replayToken: string): void {
+		const existingReplayToken = this.#replayTokens.get(requesterRef);
+		if (existingReplayToken === undefined) {
+			if (!this.#evictReplayTokens(requesterRef))
+				throw Object.assign(new Error("Replay token capacity is temporarily exhausted."), { code: "busy" });
+			this.#replayTokens.set(requesterRef, replayToken);
+		} else if (existingReplayToken !== replayToken) {
+			throw Object.assign(new Error("Replay token binding does not match the authorized token."), { code: "audience_forbidden" });
+		}
+		this.#replayTokenOwners.set(requesterRef, connectionId);
+		this.#releasePromptAudienceClaim(connectionId, requesterRef);
 	}
 
 	async start(): Promise<"started" | "already"> {
@@ -376,9 +463,33 @@ export class SessionSdkHost {
 						});
 						break;
 					}
-					const result = await this.#options.control?.(connectionId, frame);
-					if (result !== undefined) {
-						const response = { type: "control_response", ...(result as SdkFrame) };
+					const audiencePrompt =
+						frame.operation === "turn.prompt" ||
+						frame.operation === "turn.follow_up" ||
+						frame.operation === "turn.abort_and_prompt";
+					const clientRef =
+						frame.operation === "turn.prompt" && record(frame.input)
+							? optionalString(record(frame.input)!, "clientRef")?.trim()
+							: undefined;
+					const requesterRef = audiencePrompt ? clientRef || connectionId : undefined;
+					const issuedReplayToken =
+						requesterRef === undefined
+							? undefined
+							: this.#authorizePromptAudience(connectionId, requesterRef, optionalString(frame, "replayToken"));
+					if (requesterRef !== undefined && issuedReplayToken === undefined) {
+						await this.#send(connectionId, {
+							type: "control_response",
+							id: typeof frame.id === "string" ? frame.id : "",
+							ok: false,
+							error: { code: "audience_forbidden", message: "A matching replay token is required for this requesterRef." },
+						});
+						break;
+					}
+					const recovered = requesterRef ? this.#pendingAudienceClaims.get(requesterRef)?.response : undefined;
+					if (recovered) {
+						const response = { ...recovered, id: typeof frame.id === "string" ? frame.id : "" };
+						// Replayed responses still run the tool-activity opt-in hook, so a consumer
+						// that gates on beforeControlResponse observes the recovered terminal too.
 						let terminalSent = false;
 						const sendTerminal = async (): Promise<void> => {
 							if (terminalSent) return;
@@ -387,7 +498,47 @@ export class SessionSdkHost {
 						};
 						await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
 						await sendTerminal();
+						if (issuedReplayToken) this.#bindReplayToken(connectionId, requesterRef!, issuedReplayToken);
 						await this.#options.afterControlResponse?.(connectionId, frame, response);
+						break;
+					}
+					let result: unknown;
+					try {
+						result = await this.#options.control?.(connectionId, frame);
+					} catch (error) {
+						if (requesterRef) this.#releasePromptAudienceClaim(connectionId, requesterRef);
+						throw error;
+					}
+					if (result !== undefined) {
+						const successfulAcknowledgement = (result as { ok?: unknown }).ok === true;
+						const response = {
+							type: "control_response",
+							...(result as SdkFrame),
+							...(requesterRef && successfulAcknowledgement ? { replayToken: issuedReplayToken } : {}),
+						};
+						if (requesterRef && successfulAcknowledgement) {
+							const claim = this.#pendingAudienceClaims.get(requesterRef);
+							if (claim?.connectionId === connectionId) claim.response = response;
+						}
+						let terminalSent = false;
+						const sendTerminal = async (): Promise<void> => {
+							if (terminalSent) return;
+							terminalSent = true;
+							await this.#send(connectionId, response);
+						};
+						try {
+							await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
+							await sendTerminal();
+						} catch (error) {
+							if (requesterRef && !successfulAcknowledgement) this.#releasePromptAudienceClaim(connectionId, requesterRef);
+							throw error;
+						}
+						if (requesterRef && successfulAcknowledgement && issuedReplayToken)
+							this.#bindReplayToken(connectionId, requesterRef, issuedReplayToken);
+						else if (requesterRef) this.#releasePromptAudienceClaim(connectionId, requesterRef);
+						await this.#options.afterControlResponse?.(connectionId, frame, response);
+					} else if (requesterRef) {
+						this.#releasePromptAudienceClaim(connectionId, requesterRef);
 					}
 					break;
 				}
@@ -432,10 +583,39 @@ export class SessionSdkHost {
 					const sinceGeneration = rawGeneration;
 					const sinceSeq = rawSeq;
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
+					const requesterRef = optionalString(frame, "requesterRef");
+					const replayToken = optionalString(frame, "replayToken");
+					this.#evictExpiredAudienceClaims();
+					// Rejections still carry the caller's own cursor: the native transport validator
+					// (crates/gjc-sdk/src/server.rs) drops any event_replay_result without numeric
+					// generation/lastSeq, and echoing the request cursor advances nothing.
+					const rejectionCursor = { events: [], generation: sinceGeneration, lastSeq: sinceSeq };
+					const storedReplayToken = requesterRef ? this.#replayTokens.get(requesterRef) : undefined;
+					const pendingClaim = requesterRef ? this.#pendingAudienceClaims.get(requesterRef) : undefined;
+					const hasPendingRecovery =
+						pendingClaim !== undefined &&
+						pendingClaim.expiresAt > Date.now() &&
+						pendingClaim.connectionId === connectionId &&
+						pendingClaim.replayToken === replayToken;
+					if (requesterRef && (storedReplayToken === undefined || storedReplayToken !== replayToken) && !hasPendingRecovery) {
+						await this.#send(connectionId, {
+							type: "event_replay_result",
+							id,
+							ok: false,
+							error: { code: "audience_forbidden", message: "A matching replay token is required for this requesterRef." },
+							...rejectionCursor,
+						});
+						break;
+					}
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
-					const events = replay.events.filter(
-						event => !CAP_GATED_FRAME_KINDS.has(String(event.kind)) || capabilities.has(TOOL_ACTIVITY_CAPABILITY),
-					);
+					const events = replay.events.filter(event => {
+						const audience = event.audience as { requesterRef?: unknown } | undefined;
+						return (
+							(typeof audience?.requesterRef !== "string" || audience.requesterRef === requesterRef) &&
+							(!CAP_GATED_FRAME_KINDS.has(String(event.kind)) || capabilities.has(TOOL_ACTIVITY_CAPABILITY))
+						);
+					});
+					// A rejected scoped replay echoes its own cursor so it cannot skip audience-scoped events.
 					await this.#send(connectionId, {
 						type: "event_replay_result",
 						id,

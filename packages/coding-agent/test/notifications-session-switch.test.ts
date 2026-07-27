@@ -354,7 +354,7 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 			type: "control_request",
 			id: "terminal-failure-request",
 			operation: "turn.prompt",
-			input: { text: "will fail after acknowledgement" },
+			input: { text: "will fail after acknowledgement", clientRef: "terminal-failure-requester" },
 		}),
 	);
 	await waitFor(
@@ -364,9 +364,19 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 	);
 	const response = frames.find(
 		frame => frame.type === "control_response" && frame.id === "terminal-failure-request",
-	) as { result?: { commandId?: string; turnId?: string } };
+	) as { result?: { commandId?: string; turnId?: string }; replayToken?: string };
 	expect(response.result).toMatchObject({ accepted: true });
-	ws.send(JSON.stringify({ type: "event_replay", id: "terminal-failure-events", sinceGeneration: 1, sinceSeq: 0 }));
+	expect(response.replayToken).toEqual(expect.any(String));
+	ws.send(
+		JSON.stringify({
+			type: "event_replay",
+			id: "terminal-failure-events",
+			sinceGeneration: 1,
+			sinceSeq: 0,
+			requesterRef: "terminal-failure-requester",
+			replayToken: response.replayToken,
+		}),
+	);
 	await waitFor(
 		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "terminal-failure-events"),
 		4000,

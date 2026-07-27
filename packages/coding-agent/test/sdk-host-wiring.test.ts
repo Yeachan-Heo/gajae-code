@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, spyOn, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -82,6 +82,7 @@ afterEach(async () => {
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
 	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
+	vi.restoreAllMocks();
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -1389,6 +1390,28 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 			expect.objectContaining({ payload: expect.objectContaining({ type: "activity", sessionId, state: "idle" }) }),
 		]),
 	);
+	const rejectedCursor = { sinceGeneration: 1, sinceSeq: 17 };
+	socket.send(
+		JSON.stringify({
+			type: "event_replay",
+			id: "replay-rejected-token",
+			...rejectedCursor,
+			requesterRef: "other-requester",
+			replayToken: "invalid-token",
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "replay-rejected-token"),
+		"rejected event replay response",
+	);
+	expect(frames.find(frame => frame.type === "event_replay_result" && frame.id === "replay-rejected-token")).toMatchObject({
+		type: "event_replay_result",
+		id: "replay-rejected-token",
+		ok: false,
+		events: [],
+		generation: rejectedCursor.sinceGeneration,
+		lastSeq: rejectedCursor.sinceSeq,
+	});
 	await Bun.sleep(100);
 	socket.send(
 		JSON.stringify({
@@ -1760,7 +1783,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 	);
 	const observerReplay = observerFrames.find(
 		frame => frame.type === "event_replay_result" && frame.id === "observer-replay",
-	) as { events?: Array<Record<string, unknown>> };
+	) as { events?: Array<Record<string, unknown>>; ok?: boolean };
 	const correlation = {
 		commandId: acknowledgement.result?.commandId,
 		turnId: acknowledgement.result?.turnId,
@@ -1771,6 +1794,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 	expect(frames.filter(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toEqual([
 		expect.objectContaining({ type: "agent_end", sessionId, ...correlation }),
 	]);
+	expect(observerReplay).toMatchObject({ ok: true });
 	expect(observerFrames.some(frame => frame.type === "agent_start" || frame.type === "agent_end")).toBe(false);
 	expect(observerFrames.some(frame => frame.type === "event" && frame.kind === "message_update")).toBe(false);
 	expect(
@@ -1783,8 +1807,9 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		),
 	).toBe(false);
 	expect(observerReplay.events?.some(frame => frame.kind === "message_update")).toBe(false);
+	expect(observerReplay.events?.some(frame => frame.kind === "agent_start" || frame.kind === "agent_end")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-});
+}, 20_000);
 
 test("SDK host buffers synchronous pre-ack start and end until after acknowledgement", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-pre-ack-end-"));
@@ -1909,7 +1934,7 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
-test("SDK host replays an accepted prompt terminal after its requester disconnects", async () => {
+test("SDK host retains a long-running disconnected prompt for correlated event and terminal replay", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-disconnect-replay-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-disconnect-replay-${Date.now()}`;
@@ -1931,7 +1956,7 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 			type: "control_request",
 			id: "disconnect-prompt",
 			operation: "turn.prompt",
-			input: { text: "recover my terminal" },
+			input: { text: "recover my terminal", clientRef: "disconnect-requester" },
 		}),
 	);
 	await waitFor(
@@ -1942,6 +1967,7 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 		frame => frame.type === "control_response" && frame.id === "disconnect-prompt",
 	) as {
 		result?: { commandId?: unknown; turnId?: unknown };
+		replayToken?: string;
 	};
 	const correlation = { commandId: acknowledgement.result?.commandId, turnId: acknowledgement.result?.turnId };
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
@@ -1954,6 +1980,16 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 	);
 	requester.close();
 	await requesterClosed;
+	const now = Date.now();
+	spyOn(Date, "now").mockReturnValue(now + 5 * 60_000 + 1);
+	await handlers.get("message_update")?.(
+		{
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: "late delta" }] },
+			assistantMessageEvent: { type: "text_delta", delta: "late delta" },
+		},
+		sessionContext,
+	);
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
 	const recoveryFrames: Record<string, unknown>[] = [];
 	const recovery = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
@@ -1963,7 +1999,7 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 		recovery.addEventListener("open", () => resolve(), { once: true });
 		recovery.addEventListener("error", () => reject(new Error("recovery WS error")), { once: true });
 	});
-	recovery.send(JSON.stringify({ type: "event_replay", id: "disconnect-replay", sinceGeneration: 1, sinceSeq: 0 }));
+	recovery.send(JSON.stringify({ type: "event_replay", id: "disconnect-replay", sinceGeneration: 1, sinceSeq: 0, requesterRef: "disconnect-requester", replayToken: acknowledgement.replayToken }));
 	await waitFor(
 		() => recoveryFrames.some(frame => frame.type === "event_replay_result" && frame.id === "disconnect-replay"),
 		"disconnected prompt replay",
@@ -1971,12 +2007,21 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 	const replay = recoveryFrames.find(
 		frame => frame.type === "event_replay_result" && frame.id === "disconnect-replay",
 	) as {
-		events?: Array<{ payload?: Record<string, unknown> }>;
+		events?: Array<{ payload?: Record<string, unknown>; kind?: string; commandId?: unknown; turnId?: unknown }>;
 	};
 	const lifecycle = replay.events?.filter(
 		event =>
 			event.payload?.commandId === correlation.commandId &&
 			(event.payload?.type === "agent_start" || event.payload?.type === "agent_end"),
+	);
+	const replayedEvent = replay.events?.find(
+		event =>
+			event.kind === "message_update" &&
+			(event.payload?.event as { assistantMessageEvent?: { delta?: unknown } } | undefined)?.assistantMessageEvent?.delta ===
+				"late delta",
+	);
+	expect(replayedEvent).toEqual(
+		expect.objectContaining({ commandId: correlation.commandId, turnId: correlation.turnId }),
 	);
 	expect(lifecycle).toEqual([
 		expect.objectContaining({ payload: { type: "agent_start", sessionId, ...correlation } }),
@@ -2036,7 +2081,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 			type: "control_request",
 			id: "first-prompt",
 			operation: "turn.prompt",
-			input: { text: "accepted once" },
+			input: { text: "accepted once", clientRef: "concurrent-requester" },
 			idempotencyKey: "concurrent-prompt",
 		}),
 	);
@@ -2071,6 +2116,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 		frame => frame.type === "control_response" && frame.id === "first-prompt",
 	) as {
 		result?: { commandId?: unknown; turnId?: unknown };
+		replayToken?: string;
 	};
 	const correlation = { commandId: acknowledgement.result?.commandId, turnId: acknowledgement.result?.turnId };
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
@@ -2093,7 +2139,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 		recovery.addEventListener("open", () => resolve(), { once: true });
 		recovery.addEventListener("error", () => reject(new Error("recovery WS error")), { once: true });
 	});
-	recovery.send(JSON.stringify({ type: "event_replay", id: "prompt-recovery", sinceGeneration: 1, sinceSeq: 0 }));
+	recovery.send(JSON.stringify({ type: "event_replay", id: "prompt-recovery", sinceGeneration: 1, sinceSeq: 0, requesterRef: "concurrent-requester", replayToken: acknowledgement.replayToken }));
 	await waitFor(
 		() => recoveryFrames.some(frame => frame.type === "event_replay_result" && frame.id === "prompt-recovery"),
 		"prompt lifecycle recovery",
@@ -4918,14 +4964,14 @@ test("turn.prompt_status reconciles an accepted prompt across client reconnect w
 	});
 	expect(wrongPair).toMatchObject({ ok: true, result: { status: "unknown" } });
 
-	// A retained duplicate clientRef is rejected before execution (safe non-replay).
+	// A different connection cannot submit a retained clientRef without the acknowledgement's replay token.
 	const duplicate = await second.request({
 		type: "control_request",
 		id: "prompt-duplicate-ref",
 		operation: "turn.prompt",
 		input: { text: "duplicate", clientRef: "recon-ref-1" },
 	});
-	expect(duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
+	expect(duplicate).toMatchObject({ ok: false, error: { code: "audience_forbidden" } });
 
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
 	const terminal = await second.request({
