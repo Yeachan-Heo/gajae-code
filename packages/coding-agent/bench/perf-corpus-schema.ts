@@ -71,6 +71,41 @@ export interface RssMemoryMetric {
 	heapBaselineBytes?: number | null;
 	heapReturnBytes?: number | null;
 }
+export type MemorySurface =
+	| "cli"
+	| "agent-session"
+	| "blob-store"
+	| "worker"
+	| "telegram-daemon"
+	| "tui"
+	| "shared-native";
+
+export type MemoryWorkloadProfile = "short" | "soak";
+
+export interface MemoryUsageSample {
+	elapsedMs: number;
+	rssBytes: number;
+	heapUsedBytes: number;
+	heapTotalBytes: number;
+	externalBytes: number;
+	arrayBuffersBytes: number;
+	activeResourceCount: number;
+}
+
+export interface MemoryBaselineMetric {
+	surface: MemorySurface;
+	profile: MemoryWorkloadProfile;
+	iterations: number;
+	operations: number;
+	operationsPerSecond: number;
+	samples: MemoryUsageSample[];
+	postTeardown: MemoryUsageSample;
+	rssSlopeBytesPerSecond: number | null;
+	heapSlopeBytesPerSecond: number | null;
+	processTreeBaselineRssBytes: number | null;
+	processTreePostTeardownRssBytes: number | null;
+	processTreeSampler: "ps" | "unavailable";
+}
 
 export interface ByteParityMetric {
 	renderedGolden?: ParityVerdict;
@@ -94,6 +129,7 @@ export interface PerfCorpusFixtureResult {
 	profilerSelfTime: ProfilerSelfTime;
 	rssMemory: RssMemoryMetric;
 	byteParity: ByteParityMetric;
+	memoryBaseline?: MemoryBaselineMetric;
 }
 
 export interface HotspotClassification {
@@ -119,6 +155,8 @@ export interface PerfCorpusReport {
 		arch: string;
 		bunVersion?: string;
 		ci?: boolean;
+		profile?: MemoryWorkloadProfile;
+		durationTargetMs?: number;
 	};
 	fixtures: PerfCorpusFixtureResult[];
 	hotspotClassifications: HotspotClassification[];
@@ -128,6 +166,15 @@ export interface PerfCorpusReport {
 export const PERF_CORPUS_SCHEMA = "gjc.perf-corpus/1" as const;
 
 export const REQUIRED_FIXTURE_CLASSES: readonly FixtureClass[] = ["startup-session-load", "streaming-ttft", "large-transcript"];
+export const REQUIRED_MEMORY_SURFACES: readonly MemorySurface[] = [
+	"cli",
+	"agent-session",
+	"blob-store",
+	"worker",
+	"telegram-daemon",
+	"tui",
+	"shared-native",
+];
 
 const HOTSPOT_STATUS_VALUES: readonly HotspotStatus[] = [
 	"CPU-self-time confirmed",
@@ -221,6 +268,47 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		}
 		if (!Number.isFinite(fixture.rssMemory.growthBytes)) {
 			errors.push(`fixture ${fixture.fixtureId}: rssMemory.growthBytes not finite`);
+		}
+		const baseline = fixture.memoryBaseline;
+		if (baseline) {
+			if (!Number.isInteger(baseline.iterations) || baseline.iterations <= 0) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.iterations must be a positive integer`);
+			}
+			if (!Number.isFinite(baseline.operationsPerSecond) || baseline.operationsPerSecond < 0) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond not finite`);
+			}
+			for (const [name, value] of [
+				["processTreeBaselineRssBytes", baseline.processTreeBaselineRssBytes],
+				["processTreePostTeardownRssBytes", baseline.processTreePostTeardownRssBytes],
+			] as const) {
+				if (value !== null && (!Number.isFinite(value) || value < 0)) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
+				}
+			}
+			if (
+				baseline.processTreeSampler === "ps" &&
+				(baseline.processTreeBaselineRssBytes === null || baseline.processTreePostTeardownRssBytes === null)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline ps sampler requires process-tree RSS`);
+			}
+			if (baseline.samples.length < 2) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline requires at least two samples`);
+			}
+			for (const [index, sample] of [...baseline.samples, baseline.postTeardown].entries()) {
+				for (const [name, value] of Object.entries(sample)) {
+					if (!Number.isFinite(value) || value < 0) {
+						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.${name} invalid`);
+					}
+				}
+			}
+		}
+	}
+	const measuredSurfaces = new Set(
+		report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline.surface] : [])),
+	);
+	if (measuredSurfaces.size > 0) {
+		for (const surface of REQUIRED_MEMORY_SURFACES) {
+			if (!measuredSurfaces.has(surface)) errors.push(`memory baseline missing required surface "${surface}"`);
 		}
 	}
 	for (const classification of report.hotspotClassifications) {

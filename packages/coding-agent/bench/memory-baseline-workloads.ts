@@ -1,0 +1,138 @@
+import { Container, Text } from "@gajae-code/tui";
+import { SessionManager } from "../src/session/session-manager";
+import type { MemorySurface, MemoryWorkloadProfile } from "./perf-corpus-schema";
+
+export interface MemoryWorkload {
+	id: string;
+	surface: MemorySurface;
+	tags: string[];
+	run(iterations: number): number;
+	teardown(): void;
+}
+
+interface MutableWorkloadState {
+	arrays: Uint8Array[];
+	maps: Map<string, string>[];
+	strings: string[];
+}
+
+function statefulWorkload(
+	id: string,
+	surface: MemorySurface,
+	tags: string[],
+	step: (state: MutableWorkloadState, index: number) => number,
+): MemoryWorkload {
+	const state: MutableWorkloadState = { arrays: [], maps: [], strings: [] };
+	return {
+		id,
+		surface,
+		tags,
+		run(iterations) {
+			let operations = 0;
+			for (let index = 0; index < iterations; index++) operations += step(state, index);
+			return operations;
+		},
+		teardown() {
+			state.arrays.length = 0;
+			state.maps.length = 0;
+			state.strings.length = 0;
+		},
+	};
+}
+
+function sessionLifecycleWorkload(): MemoryWorkload {
+	let manager = SessionManager.inMemory();
+	let entryCount = 0;
+	return {
+		id: "agent-session-lifecycle",
+		surface: "agent-session",
+		tags: ["messages", "materialization", "clear"],
+		run(iterations) {
+			for (let index = 0; index < iterations; index++) {
+				manager.appendMessage({
+					role: "user",
+					content: `message-${entryCount}:${"x".repeat(512 + (entryCount % 32))}`,
+					timestamp: entryCount,
+				});
+				entryCount++;
+				if (entryCount % 128 === 0) {
+					manager.getEntries();
+					manager = SessionManager.inMemory();
+				}
+			}
+			return iterations;
+		},
+		teardown() {
+			manager = SessionManager.inMemory();
+			entryCount = 0;
+		},
+	};
+}
+
+function tuiLifecycleWorkload(): MemoryWorkload {
+	return {
+		id: "tui-component-churn",
+		surface: "tui",
+		tags: ["mount", "render", "dispose"],
+		run(iterations) {
+			let renderedLines = 0;
+			for (let index = 0; index < iterations; index++) {
+				const container = new Container();
+				container.addChild(new Text(`header-${index}`, 0, 0));
+				container.addChild(new Text(`body-${index}:${"─".repeat(40)}`, 0, 0));
+				container.addChild(new Text(`footer-${index}`, 0, 0));
+				renderedLines += container.render(80).length;
+				container.dispose();
+			}
+			return renderedLines;
+		},
+		teardown() {},
+	};
+}
+
+export function workloadIterations(profile: MemoryWorkloadProfile): number {
+	const configured = Number(process.env.GJC_MEMORY_ITERATIONS);
+	if (Number.isSafeInteger(configured) && configured > 0 && configured <= 10_000_000) return configured;
+	return profile === "soak" ? 100_000 : 200;
+}
+
+export function createMemoryBaselineWorkloads(): MemoryWorkload[] {
+	return [
+		statefulWorkload("cli-startup", "cli", ["argv", "configuration", "startup"], (state, index) => {
+			const options = new Map<string, string>();
+			for (let option = 0; option < 16; option++) options.set(`--option-${option}`, `${index}-${option}`);
+			state.maps.push(options);
+			if (state.maps.length > 8) state.maps.shift();
+			return options.size;
+		}),
+		sessionLifecycleWorkload(),
+		statefulWorkload("blob-external-buffers", "blob-store", ["external", "array-buffer", "teardown"], (state, index) => {
+			state.arrays.push(new Uint8Array(8_192 + (index % 8) * 1_024));
+			if (state.arrays.length > 32) state.arrays.shift();
+			return 1;
+		}),
+		statefulWorkload("worker-generation", "worker", ["generation", "heartbeat", "replacement"], (state, index) => {
+			const generation = new Map<string, string>();
+			generation.set("worker", `worker-${index % 8}`);
+			generation.set("generation", `${index}`);
+			generation.set("heartbeat", `${index * 1000}`);
+			state.maps.push(generation);
+			if (state.maps.length > 16) state.maps.shift();
+			return generation.size;
+		}),
+		statefulWorkload("telegram-reconnect-queue", "telegram-daemon", ["queue", "reconnect", "settlement"], (state, index) => {
+			state.strings.push(JSON.stringify({ generation: index % 4, updateId: index, text: `notice-${index}` }));
+			if (state.strings.length > 64) state.strings.shift();
+			return 1;
+		}),
+		tuiLifecycleWorkload(),
+		statefulWorkload("shared-native-boundary", "shared-native", ["copy", "transfer", "external"], (state, index) => {
+			const source = new Uint8Array(4_096 + (index % 16) * 128);
+			const copy = source.slice();
+			Bun.hash.xxHash64(copy);
+			state.arrays.push(copy);
+			if (state.arrays.length > 24) state.arrays.shift();
+			return copy.byteLength;
+		}),
+	];
+}

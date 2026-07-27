@@ -8,6 +8,7 @@ Implementation:
 - Runner: `packages/coding-agent/bench/perf-corpus.bench.ts`
 - Threshold/evidence ledger: `packages/coding-agent/bench/perf-threshold.ledger.ts`
 - Tests: `packages/coding-agent/test/perf-corpus.test.ts`
+- Deterministic memory surface workloads: `packages/coding-agent/bench/memory-baseline-workloads.ts`
 
 ## Evidence taxonomy
 
@@ -41,6 +42,8 @@ A v1–v3 win is **never** called "confirmed" from current-only coverage. `valid
 - `profilerSelfTime: { profiler, artifactPath?, samples? }`
 - `rssMemory: { baselineBytes, peakBytes?, growthBytes, returnBytes, ... }`
 - `byteParity: { renderedGolden?, persistedJsonlGolden?, providerPayloadGolden?, materializedSessionGolden? }`
+- `memoryBaseline?: { surface, profile, iterations, operations, operationsPerSecond, samples, postTeardown, rssSlopeBytesPerSecond, heapSlopeBytesPerSecond, processTreeBaselineRssBytes, processTreePostTeardownRssBytes, processTreeSampler }`
+- Every detailed sample separates `rssBytes`, `heapUsedBytes`, `heapTotalBytes`, `externalBytes`, `arrayBuffersBytes`, and `activeResourceCount`.
 
 `hotspotClassifications: HotspotClassification[]` carry `{ hotspotId, status, evidenceClass, artifactRefs, notes }`. The current v1–v3 reclassification lives in `V1_V3_RECLASSIFICATION`; no entry is `CPU-self-time confirmed` because no profiler artifacts have been captured yet.
 
@@ -58,6 +61,17 @@ bun packages/coding-agent/bench/perf-corpus.bench.ts
 
 # Run the corpus schema/classification/ledger tests
 bun test packages/coding-agent/test/perf-corpus.test.ts
+```
+
+```bash
+# Emit the detailed short memory profile with explicit GC return samples
+bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts
+
+# Opt into the longer bounded soak profile
+GJC_MEMORY_PROFILE=soak bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts
+
+# Override the per-surface duration (250–60000 ms) and minimum iterations
+GJC_MEMORY_PROFILE=soak GJC_MEMORY_DURATION_MS=10000 GJC_MEMORY_ITERATIONS=100000 bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts
 ```
 
 ## Profiler-artifact expectations
@@ -78,6 +92,23 @@ Wall-clock and RSS thresholds are noisy. Promotion is gradual:
 3. **Enforced** — a hard CI gate, allowed only with `varianceCharacterized: true`, passed before/after `benchmarkEvidence`, and human approval. `validatePerfThresholdLedger()` rejects enforced thresholds lacking this evidence.
 
 Held thresholds (`HELD_PERF_THRESHOLDS`) name candidates that need variance characterization before enforcement.
+
+## Memory baseline protocol
+
+Detailed memory fixtures cover seven explicit surfaces: CLI startup/configuration, AgentSession-style message/context lifecycle, blob/external buffers, worker generations, Telegram reconnect/queue settlement, TUI render/dispose churn, and shared/native transfer boundaries. The fixtures are synthetic lifecycle proxies: they establish a reproducible allocation and teardown envelope but do not by themselves prove a production leak. A production optimization claim still requires a workload adapter that exercises the implicated owner and a same-host before/after artifact.
+The command-line runner executes each memory surface in a fresh Bun subprocess so allocator high-water state from one fixture cannot contaminate the next surface's baseline. Programmatic `runPerfCorpusBenchmark()` defaults to in-process fixtures for focused contract tests; pass `{ isolatedMemory: true }` for acceptance-equivalent evidence.
+
+Use the `short` profile for deterministic contract checks. Use `soak` for repeated sampling and slope characterization. For decision evidence:
+The soak default runs each surface for at least one second and samples at approximately 50 ms intervals. `GJC_MEMORY_DURATION_MS` accepts 250–60000 ms and `GJC_MEMORY_ITERATIONS` accepts 1–10000000; record overrides with the artifact.
+
+1. Pin the source SHA, Bun version, platform/architecture, profile, fixture inputs, and command.
+2. Run at least five short repetitions and three independent soak repetitions on an otherwise idle runner.
+3. Exclude warm-up from slope decisions and report the raw samples, median, p95, variance/confidence interval, peak, and post-teardown values.
+4. Interpret heap, external/array-buffer, RSS, and process-tree evidence separately. A high post-GC RSS with a returned heap may be allocator high-water residency, not a reachability leak.
+5. Do not enforce a numeric threshold until variance is characterized and recorded in the threshold ledger. A claimed optimization needs either a statistically supported improvement on the same workload or removal of a reproducible unbounded slope.
+6. Treat active handles and post-teardown residue as lifecycle signals, not byte-parity proof. Behavior, transcript/blob integrity, throughput, and latency remain independent gates.
+
+The default fixtures contain no user or provider data. Raw private transcripts remain prohibited.
 
 ## Memory retention & fail-closed materialization
 

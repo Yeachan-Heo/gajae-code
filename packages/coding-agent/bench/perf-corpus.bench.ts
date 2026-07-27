@@ -11,12 +11,17 @@
  */
 
 import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
+import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
+	type MemoryUsageSample,
+	type MemoryWorkloadProfile,
+	type MemorySurface,
 	type PerfCorpusFixtureResult,
 	type PerfCorpusReport,
 	PERF_CORPUS_SCHEMA,
 	type ProcessCpuUsageMetric,
 	type RssMemoryMetric,
+	REQUIRED_MEMORY_SURFACES,
 	V1_V3_RECLASSIFICATION,
 	validatePerfCorpusReport,
 	type WallClockPhaseMetric,
@@ -76,6 +81,178 @@ function measureRss(work: () => void): RssMemoryMetric {
 		heapReturnBytes,
 	};
 }
+function memorySample(startedAt: number): MemoryUsageSample {
+	const usage = process.memoryUsage();
+	return {
+		elapsedMs: performance.now() - startedAt,
+		rssBytes: usage.rss,
+		heapUsedBytes: usage.heapUsed,
+		heapTotalBytes: usage.heapTotal,
+		externalBytes: usage.external,
+		arrayBuffersBytes: usage.arrayBuffers,
+		activeResourceCount: process.getActiveResourcesInfo().length,
+	};
+}
+
+function memorySlope(samples: MemoryUsageSample[], key: "rssBytes" | "heapUsedBytes"): number | null {
+	const first = samples[0];
+	const last = samples.at(-1);
+	if (!first || !last || last.elapsedMs - first.elapsedMs < 250) return null;
+	return ((last[key] - first[key]) * 1_000) / (last.elapsedMs - first.elapsedMs);
+}
+function processTreeRssBytes(): number | null {
+	if (process.platform === "win32") return null;
+	const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,rss="]);
+	if (result.exitCode !== 0) return null;
+	const rows = new TextDecoder().decode(result.stdout).trim().split("\n");
+	const parents = new Map<number, number>();
+	const rssByPid = new Map<number, number>();
+	for (const row of rows) {
+		const [pidText, parentText, rssText] = row.trim().split(/\s+/);
+		const pid = Number(pidText);
+		const parent = Number(parentText);
+		const rssKiB = Number(rssText);
+		if (!Number.isInteger(pid) || !Number.isInteger(parent) || !Number.isFinite(rssKiB)) continue;
+		parents.set(pid, parent);
+		rssByPid.set(pid, rssKiB * 1_024);
+	}
+	const descendants = new Set([process.pid]);
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const [pid, parent] of parents) {
+			if (descendants.has(parent) && !descendants.has(pid)) {
+				descendants.add(pid);
+				changed = true;
+			}
+		}
+	}
+	let total = 0;
+	for (const pid of descendants) total += rssByPid.get(pid) ?? 0;
+	return total > 0 ? total : null;
+}
+
+function buildMemoryFixture(
+	workload: MemoryWorkload,
+	profile: MemoryWorkloadProfile,
+	targetDurationMs: number,
+): PerfCorpusFixtureResult {
+	const gc = (globalThis as { gc?: () => void }).gc;
+	const minimumIterations = workloadIterations(profile);
+	workload.teardown();
+	const processTreeBaselineRssBytes = processTreeRssBytes();
+	gc?.();
+	const startedAt = performance.now();
+	const cpuStart = process.cpuUsage();
+	const samples = [memorySample(startedAt)];
+	let operations = 0;
+	let iterations = 0;
+	const chunkSize = profile === "soak" ? 5_000 : Math.max(1, Math.ceil(minimumIterations / 4));
+	const sampleIntervalMs = profile === "soak" ? 50 : 0;
+	while (iterations < minimumIterations || performance.now() - startedAt < targetDurationMs) {
+		operations += workload.run(chunkSize);
+		iterations += chunkSize;
+		const elapsedSinceLastSample = performance.now() - startedAt - (samples.at(-1)?.elapsedMs ?? 0);
+		if (elapsedSinceLastSample >= sampleIntervalMs) samples.push(memorySample(startedAt));
+	}
+	const elapsedMs = performance.now() - startedAt;
+	if ((samples.at(-1)?.elapsedMs ?? 0) < elapsedMs) samples.push(memorySample(startedAt));
+	const cpu = process.cpuUsage(cpuStart);
+	workload.teardown();
+	gc?.();
+	const postTeardown = memorySample(startedAt);
+	const processTreePostTeardownRssBytes = processTreeRssBytes();
+	const baselineBytes = samples[0]?.rssBytes ?? null;
+	const peakBytes = Math.max(...samples.map(sample => sample.rssBytes));
+	const fixtureClass =
+		workload.surface === "cli"
+			? "startup-session-load"
+			: workload.surface === "agent-session" || workload.surface === "blob-store"
+				? "large-transcript"
+				: "high-output-tool";
+	return {
+		fixtureId: `memory-${workload.id}`,
+		fixtureClass,
+		sourceClass: "synthetic",
+		workloadTags: ["memory-baseline", workload.surface, ...workload.tags],
+		privacy: {
+			rawPrivateTranscriptCommitted: false,
+			redactionNotes: "synthetic or deterministic production lifecycle workload; no user, provider, or transcript data",
+		},
+		wallClockPhase: { run: { elapsedMs, advisoryOnly: true } },
+		processCpuUsage: {
+			run: {
+				userMicros: cpu.user,
+				systemMicros: cpu.system,
+				elapsedMs,
+				cpuFraction: (cpu.user + cpu.system) / 1_000 / Math.max(elapsedMs, 1e-6),
+			},
+		},
+		profilerSelfTime: { profiler: "none" },
+		rssMemory: {
+			baselineBytes,
+			peakBytes,
+			growthBytes: peakBytes - (baselineBytes ?? peakBytes),
+			returnBytes: postTeardown.rssBytes,
+			heapBaselineBytes: samples[0]?.heapUsedBytes ?? null,
+			heapReturnBytes: postTeardown.heapUsedBytes,
+		},
+		byteParity: {
+			renderedGolden: "not-run",
+			persistedJsonlGolden: "not-run",
+			providerPayloadGolden: "not-run",
+			materializedSessionGolden: "not-run",
+		},
+		memoryBaseline: {
+			surface: workload.surface,
+			profile,
+			iterations,
+			operations,
+			operationsPerSecond: operations / Math.max(elapsedMs / 1_000, 1e-6),
+			samples,
+			postTeardown,
+			rssSlopeBytesPerSecond: memorySlope(samples, "rssBytes"),
+			heapSlopeBytesPerSecond: memorySlope(samples, "heapUsedBytes"),
+			processTreeBaselineRssBytes,
+			processTreePostTeardownRssBytes,
+			processTreeSampler:
+				processTreeBaselineRssBytes === null || processTreePostTeardownRssBytes === null ? "unavailable" : "ps",
+		},
+	};
+}
+
+function buildMemoryFixtures(
+	profile: MemoryWorkloadProfile,
+	targetDurationMs: number,
+): PerfCorpusFixtureResult[] {
+	return createMemoryBaselineWorkloads().map(workload => buildMemoryFixture(workload, profile, targetDurationMs));
+}
+
+function isMemorySurface(value: string | undefined): value is MemorySurface {
+	return value !== undefined && (REQUIRED_MEMORY_SURFACES as readonly string[]).includes(value);
+}
+
+function buildIsolatedMemoryFixtures(
+	profile: MemoryWorkloadProfile,
+	targetDurationMs: number,
+): PerfCorpusFixtureResult[] {
+	return REQUIRED_MEMORY_SURFACES.map(surface => {
+		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", import.meta.path], {
+			env: {
+				...process.env,
+				GJC_MEMORY_CHILD_SURFACE: surface,
+				GJC_MEMORY_PROFILE: profile,
+				GJC_MEMORY_DURATION_MS: String(targetDurationMs),
+			},
+		});
+		if (result.exitCode !== 0) {
+			throw new Error(
+				`memory baseline child failed for ${surface}: ${new TextDecoder().decode(result.stderr).trim()}`,
+			);
+		}
+		return JSON.parse(new TextDecoder().decode(result.stdout)) as PerfCorpusFixtureResult;
+	});
+}
 
 /** Synthetic startup/session-load workload: allocate + index a small session. */
 function startupWorkload(rand: () => number): void {
@@ -134,11 +311,22 @@ function buildFixture(
 	};
 }
 
-export function runPerfCorpusBenchmark(): PerfCorpusReport {
+export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+	const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
+	const configuredDurationMs = Number(process.env.GJC_MEMORY_DURATION_MS);
+	const durationTargetMs =
+		profile === "soak"
+			? Number.isSafeInteger(configuredDurationMs) && configuredDurationMs >= 250 && configuredDurationMs <= 60_000
+				? configuredDurationMs
+				: 1_000
+			: 0;
 	const fixtures: PerfCorpusFixtureResult[] = [
 		buildFixture("startup-load", "startup-session-load", ["startup", "session-load"], startupWorkload, 0x51ed),
 		buildFixture("streaming-ttft", "streaming-ttft", ["streaming", "ttft"], streamingWorkload, 0x9e37),
 		buildFixture("large-transcript", "large-transcript", ["transcript", "scroll"], largeTranscriptWorkload, 0xc0de),
+		...(options.isolatedMemory
+			? buildIsolatedMemoryFixtures(profile, durationTargetMs)
+			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
@@ -150,6 +338,8 @@ export function runPerfCorpusBenchmark(): PerfCorpusReport {
 			arch: process.arch,
 			bunVersion: process.versions.bun,
 			ci: process.env.CI === "true",
+			profile,
+			durationTargetMs,
 		},
 		fixtures,
 		hotspotClassifications: [...V1_V3_RECLASSIFICATION],
@@ -163,6 +353,15 @@ export function runPerfCorpusBenchmark(): PerfCorpusReport {
 }
 
 if (import.meta.main) {
-	const report = runPerfCorpusBenchmark();
-	process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+	const childSurface = process.env.GJC_MEMORY_CHILD_SURFACE;
+	if (isMemorySurface(childSurface)) {
+		const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
+		const durationTargetMs = Number(process.env.GJC_MEMORY_DURATION_MS) || 0;
+		const workload = createMemoryBaselineWorkloads().find(candidate => candidate.surface === childSurface);
+		if (!workload) throw new Error(`memory baseline workload unavailable for ${childSurface}`);
+		process.stdout.write(`${JSON.stringify(buildMemoryFixture(workload, profile, durationTargetMs))}\n`);
+	} else {
+		const report = runPerfCorpusBenchmark({ isolatedMemory: true });
+		process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+	}
 }

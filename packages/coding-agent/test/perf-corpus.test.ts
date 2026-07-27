@@ -7,6 +7,7 @@ import {
 	PERF_CORPUS_SCHEMA,
 	type PerfCorpusReport,
 	REQUIRED_FIXTURE_CLASSES,
+	REQUIRED_MEMORY_SURFACES,
 	V1_V3_RECLASSIFICATION,
 	validateHotspotClassification,
 	validatePerfCorpusReport,
@@ -41,6 +42,64 @@ describe("perf corpus schema + runner", () => {
 			}
 			expect(Number.isFinite(fixture.rssMemory.growthBytes)).toBe(true);
 		}
+	});
+
+	test("emits detailed memory baselines for every required product surface", () => {
+		const report = runPerfCorpusBenchmark();
+		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
+		expect(new Set(baselines.map(baseline => baseline.surface))).toEqual(new Set(REQUIRED_MEMORY_SURFACES));
+		expect(report.runner.profile).toBe("short");
+		for (const baseline of baselines) {
+			expect(baseline.samples.length).toBeGreaterThanOrEqual(2);
+			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(baseline.samples.at(-1)?.elapsedMs ?? 0);
+			if (process.platform === "darwin" || process.platform === "linux") {
+				expect(baseline.processTreeSampler).toBe("ps");
+				expect(baseline.processTreeBaselineRssBytes).toBeGreaterThan(0);
+				expect(baseline.processTreePostTeardownRssBytes).toBeGreaterThan(0);
+			}
+			expect(Number.isFinite(baseline.operationsPerSecond)).toBe(true);
+			expect(baseline.samples.every(sample => sample.externalBytes >= sample.arrayBuffersBytes)).toBe(true);
+		}
+	});
+
+	test("isolates each memory surface in a fresh Bun process", () => {
+		const report = runPerfCorpusBenchmark({ isolatedMemory: true });
+		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
+		expect(baselines).toHaveLength(REQUIRED_MEMORY_SURFACES.length);
+		expect(baselines.every(baseline => baseline.samples[0]!.rssBytes > 0)).toBe(true);
+		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
+	});
+
+	test("fails closed when a required surface or detailed sample is invalid", () => {
+		const report = runPerfCorpusBenchmark();
+		const withoutTui: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.filter(fixture => fixture.memoryBaseline?.surface !== "tui"),
+		};
+		expect(validatePerfCorpusReport(withoutTui).errors).toContain('memory baseline missing required surface "tui"');
+
+		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
+		const fixture = report.fixtures[fixtureIndex];
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = fixture.memoryBaseline;
+		const tampered: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								samples: [{ ...baseline.samples[0]!, rssBytes: Number.NaN }],
+							},
+						}
+					: candidate,
+			),
+		};
+		const validation = validatePerfCorpusReport(tampered);
+		expect(validation.ok).toBe(false);
+		expect(validation.errors.some(error => error.includes("requires at least two samples"))).toBe(true);
+		expect(validation.errors.some(error => error.includes(".rssBytes invalid"))).toBe(true);
 	});
 
 	test("the base runner attaches no profiler, so no hotspot is CPU-self-time confirmed", () => {
