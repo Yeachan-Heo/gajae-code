@@ -525,7 +525,7 @@ export const SETTINGS_SCHEMA = {
 
 	"theme.light": {
 		type: "string",
-		default: "blue-crab-light",
+		default: "red-claw-light",
 		ui: {
 			tab: "appearance",
 			label: "Light Theme",

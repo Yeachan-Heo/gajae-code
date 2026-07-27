@@ -144,7 +144,7 @@
 
 ### Changed
 
-- The `theme.light` slot now defaults to `blue-crab-light` instead of `blue-crab`. `blue-crab` is a dark-classified deep-ocean palette, so light-appearance terminals previously got a dark theme; the light slot now resolves to a true light theme out of the box. Legacy flat `theme: "light"` configs migrate to `blue-crab-light`, while explicit `theme.light` choices (including `blue-crab`) are preserved.
+- The `theme.light` slot now defaults to `red-claw-light` instead of `blue-crab`. `blue-crab` is a dark-classified deep-ocean palette, so light-appearance terminals previously got a dark theme; the light slot now resolves to a true light theme that carries the same red-claw brand identity as the dark default. Legacy flat `theme: "light"` configs migrate to `red-claw-light`, while explicit `theme.light` choices (including `blue-crab` and `blue-crab-light`) are preserved.
 
 ## [0.11.7] - 2026-07-22
 ### Added

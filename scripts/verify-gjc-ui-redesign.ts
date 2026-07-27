@@ -117,9 +117,9 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 			? settings.slice(lightThemeStart, symbolPresetStart)
 			: "";
 	const settingsDarkDefault = darkThemeBlock.includes('default: "red-claw"');
-	const settingsLightDefault = lightThemeBlock.includes('default: "blue-crab-light"');
+	const settingsLightDefault = lightThemeBlock.includes('default: "red-claw-light"');
 	const runtimeDarkDefault = themeRuntime.includes('var autoDarkTheme: string = "red-claw";');
-	const runtimeLightDefault = themeRuntime.includes('var autoLightTheme: string = "blue-crab-light";');
+	const runtimeLightDefault = themeRuntime.includes('var autoLightTheme: string = "red-claw-light";');
 
 	return {
 		name: "crustacean theme defaults and semantic token split",
@@ -133,9 +133,9 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 			semanticFindings.length === 0,
 		details: [
 			`settings default red-claw: ${settingsDarkDefault}`,
-			`settings default blue-crab-light: ${settingsLightDefault}`,
+			`settings default red-claw-light: ${settingsLightDefault}`,
 			`runtime autoDarkTheme red-claw: ${runtimeDarkDefault}`,
-			`runtime autoLightTheme blue-crab-light: ${runtimeLightDefault}`,
+			`runtime autoLightTheme red-claw-light: ${runtimeLightDefault}`,
 			`expected built-in themes (${expectedBuiltIns.join(", ")}): ${retainedBuiltIns}`,
 			`brand mappings valid: ${brandMappingsValid}`,
 			`semantic collisions: ${semanticFindings.join("; ") || "<none>"}`,
@@ -226,18 +226,18 @@ async function verifyDocsBranding(): Promise<GateResult> {
 		name: "public docs current GJC crustacean theme direction",
 		passed:
 			rootReadme.includes("default dark TUI identity is the GJC red-claw theme") &&
-			rootReadme.includes("light-appearance terminals default to the bundled blue-crab-light theme") &&
+			rootReadme.includes("light-appearance terminals default to the bundled red-claw-light theme") &&
 			packageReadme.includes("defaults to the bundled `red-claw`") &&
-			packageReadme.includes("bundled `blue-crab-light` theme") &&
+			packageReadme.includes("bundled `red-claw-light` theme") &&
 			themeDoc.includes('theme.dark = "red-claw"') &&
-			themeDoc.includes('theme.light = "blue-crab-light"'),
+			themeDoc.includes('theme.light = "red-claw-light"'),
 		details: [
 			`README GJC red-claw default: ${rootReadme.includes("default dark TUI identity is the GJC red-claw theme")}`,
-			`README blue-crab-light light default: ${rootReadme.includes("light-appearance terminals default to the bundled blue-crab-light theme")}`,
+			`README red-claw-light light default: ${rootReadme.includes("light-appearance terminals default to the bundled red-claw-light theme")}`,
 			`package README default red-claw: ${packageReadme.includes("defaults to the bundled `red-claw`")}`,
-			`package README default blue-crab-light: ${packageReadme.includes("bundled `blue-crab-light` theme")}`,
+			`package README default red-claw-light: ${packageReadme.includes("bundled `red-claw-light` theme")}`,
 			`theme docs default red-claw: ${themeDoc.includes('theme.dark = "red-claw"')}`,
-			`theme docs default blue-crab-light: ${themeDoc.includes('theme.light = "blue-crab-light"')}`,
+			`theme docs default red-claw-light: ${themeDoc.includes('theme.light = "red-claw-light"')}`,
 		],
 	};
 }
