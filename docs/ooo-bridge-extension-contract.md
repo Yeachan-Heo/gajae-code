@@ -62,6 +62,6 @@ For native discovery, install one of:
 
 The loader scans one level under each `extensions` directory. Complex packages should use a package manifest instead of relying on recursive discovery.
 
-`GJC_CONFIG_DIR` selects the project config directory name. `GJC_CODING_AGENT_DIR` selects the user agent directory name under `$HOME`. The native provider resolves those locations before loading extension modules, skills, rules, hooks, and related capabilities.
+`GJC_CONFIG_DIR` selects the **home-relative** config directory name: the config root is `<home>/<GJC_CONFIG_DIR>`, defaulting to `~/.gjc`. It does not select a project directory. `GJC_CODING_AGENT_DIR` overrides the agent directory **path** rather than naming one under `$HOME`; it is resolved with `path.resolve`, so an absolute value is used as-is and a relative value is resolved against the current working directory. The native provider resolves those locations before loading extension modules, skills, rules, hooks, and related capabilities.
 
 Hooks are not the input bridge surface: `packages/coding-agent/src/capability/hook.ts` defines pre/post tool hooks only.
