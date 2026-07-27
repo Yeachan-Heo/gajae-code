@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import {
 	type Component,
 	padding,
@@ -21,6 +22,46 @@ const IRC_SIDEBAR_MAX_RENDER_SOURCE_UTF8_BYTES = 64 * 1_024;
 const IRC_SIDEBAR_OLDER_MESSAGES_ELISION = "… older IRC messages elided …";
 const IRC_SIDEBAR_MESSAGE_ELISION = "  … message elided …";
 
+export const __ircSidebarPerfCounters = {
+	enabled: false,
+	projectionMemoHits: 0,
+	projectionMemoMisses: 0,
+	recordsVisited: 0,
+	sourceBytes: 0,
+	rows: 0,
+	styledCacheHits: 0,
+	styledCacheMisses: 0,
+	wrapCalls: 0,
+	snapshot() {
+		return {
+			projectionMemoHits: this.projectionMemoHits,
+			projectionMemoMisses: this.projectionMemoMisses,
+			recordsVisited: this.recordsVisited,
+			sourceBytes: this.sourceBytes,
+			rows: this.rows,
+			styledCacheHits: this.styledCacheHits,
+			styledCacheMisses: this.styledCacheMisses,
+			wrapCalls: this.wrapCalls,
+		};
+	},
+	enable(): void {
+		this.enabled = true;
+	},
+	disable(): void {
+		this.enabled = false;
+	},
+	reset(): void {
+		this.projectionMemoHits = 0;
+		this.projectionMemoMisses = 0;
+		this.recordsVisited = 0;
+		this.sourceBytes = 0;
+		this.rows = 0;
+		this.styledCacheHits = 0;
+		this.styledCacheMisses = 0;
+		this.wrapCalls = 0;
+	},
+};
+
 /** Computes transcript/sidebar widths while preserving at least half the terminal for the transcript. */
 export function computeIrcSplitWidths(width: number): {
 	leftWidth: number;
@@ -34,12 +75,7 @@ export function computeIrcSplitWidths(width: number): {
 		0,
 		Math.min(preferredSidebar, normalizedWidth - IRC_SEPARATOR_WIDTH - transcriptFloor),
 	);
-
-	// The sidebar yields entirely rather than rendering below its readable minimum.
-	if (sidebarWidth < IRC_SIDEBAR_MIN_WIDTH) {
-		return { leftWidth: normalizedWidth, separatorWidth: 0, rightWidth: 0 };
-	}
-
+	if (sidebarWidth < IRC_SIDEBAR_MIN_WIDTH) return { leftWidth: normalizedWidth, separatorWidth: 0, rightWidth: 0 };
 	return {
 		leftWidth: normalizedWidth - IRC_SEPARATOR_WIDTH - sidebarWidth,
 		separatorWidth: IRC_SEPARATOR_WIDTH,
@@ -47,52 +83,99 @@ export function computeIrcSplitWidths(width: number): {
 	};
 }
 
-function styleSender(componentTheme: IrcSidebarTheme, sender: string): string {
-	return componentTheme.fg("accent", componentTheme.bold(sender));
+type SemanticLine = Readonly<{
+	kind: "header" | "body" | "elision" | "blank";
+	text: string;
+	sender?: string;
+	recipient?: string;
+	time?: string;
+}>;
+export type IrcSidebarSemanticProjection = Readonly<{ token: string; lines: readonly SemanticLine[] }>;
+const projectionMemo = new WeakMap<
+	IrcObservationLedger,
+	{ epoch: number; width: number; projection: IrcSidebarSemanticProjection }
+>();
+
+function semanticProjectionToken(lines: readonly SemanticLine[]): string {
+	const hash = crypto.createHash("sha256");
+	const length = Buffer.allocUnsafe(4);
+	const writeField = (value: string | undefined): void => {
+		length.writeUInt32BE(value === undefined ? 0xffffffff : Buffer.byteLength(value, "utf8"));
+		hash.update(length);
+		if (value !== undefined) hash.update(value, "utf8");
+	};
+
+	hash.update("gjc:irc:sidebar-semantic-projection:v1\0");
+	length.writeUInt32BE(lines.length);
+	hash.update(length);
+	for (const line of lines) {
+		writeField(line.kind);
+		writeField(line.text);
+		writeField(line.sender);
+		writeField(line.recipient);
+		writeField(line.time);
+	}
+	return hash.digest("hex");
 }
 
-function renderSidebarRecord(
+function projectRecord(
 	record: IrcObservationRecord,
 	width: number,
-	componentTheme: IrcSidebarTheme,
 	maxRows: number,
 	maxSourceUtf8Bytes: number,
-): { lines: string[]; sourceUtf8Bytes: number; truncated: boolean } {
+): { lines: SemanticLine[]; sourceUtf8Bytes: number; truncated: boolean } {
 	const bodyWidth = Math.max(1, width - 2);
 	const sourceLimit = Math.min(maxSourceUtf8Bytes, Math.max(0, maxRows - 1) * bodyWidth);
 	const clipped = projectIrcText(record.text, sourceLimit);
 	const block = formatIrcMessageBlock({ ...record, text: clipped.text });
-	const sender = styleSender(componentTheme, block.sender);
-	const time = componentTheme.fg("dim", block.time);
-	const lines = [truncateToWidth(`${sender} → ${block.recipient} · ${time}`, width)];
+	const lines: SemanticLine[] = [
+		{
+			kind: "header",
+			text: `${block.sender} → ${block.recipient} · ${block.time}`,
+			sender: block.sender,
+			recipient: block.recipient,
+			time: block.time,
+		},
+	];
 	let truncated = clipped.truncated;
-
 	body: for (const bodyLine of block.bodyLines) {
+		if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.wrapCalls++;
 		for (const wrappedLine of wrapTextWithAnsi(bodyLine, bodyWidth)) {
 			if (lines.length >= maxRows) {
 				truncated = true;
 				break body;
 			}
-			lines.push(truncateToWidth(`  ${wrappedLine}`, width));
+			lines.push({ kind: "body", text: `  ${wrappedLine}` });
 		}
 	}
 	if (truncated && maxRows > 1) {
-		const marker = componentTheme.fg("dim", IRC_SIDEBAR_MESSAGE_ELISION);
-		if (lines.length >= maxRows) lines[maxRows - 1] = truncateToWidth(marker, width);
-		else lines.push(truncateToWidth(marker, width));
+		const marker: SemanticLine = { kind: "elision", text: IRC_SIDEBAR_MESSAGE_ELISION };
+		if (lines.length >= maxRows) lines[maxRows - 1] = marker;
+		else lines.push(marker);
 	}
 	return { lines, sourceUtf8Bytes: clipped.utf8Bytes, truncated };
 }
 
-function renderSidebarRecords(ledger: IrcObservationLedger, width: number, componentTheme: IrcSidebarTheme): string[] {
-	if (width <= 0) return [];
-
-	const records = ledger.getSidebarRecords();
-	const newestFirstBlocks: string[][] = [];
+/** The authoritative bounded, display-neutral IRC sidebar projection. */
+export function getIrcSidebarSemanticProjection(
+	ledger: IrcObservationLedger,
+	width: number,
+): IrcSidebarSemanticProjection {
+	if (width <= 0) return { token: "", lines: [] };
+	const memo = projectionMemo.get(ledger);
+	const cachedProjection = memo?.epoch === ledger.mutationEpoch && memo.width === width ? memo.projection : undefined;
+	if (cachedProjection) {
+		if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.projectionMemoHits++;
+		return cachedProjection;
+	}
+	if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.projectionMemoMisses++;
+	const newestFirstBlocks: SemanticLine[][] = [];
 	let renderedRows = 0;
 	let renderedSourceUtf8Bytes = 0;
 	let omittedOlderRecords = false;
+	const records = ledger.getSidebarRecords();
 	for (let index = records.length - 1; index >= 0; index--) {
+		if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.recordsVisited++;
 		const separatorRows = newestFirstBlocks.length > 0 ? 1 : 0;
 		const availableRows = IRC_SIDEBAR_MAX_RENDER_ROWS - renderedRows - separatorRows - 2;
 		const availableSourceUtf8Bytes = IRC_SIDEBAR_MAX_RENDER_SOURCE_UTF8_BYTES - renderedSourceUtf8Bytes;
@@ -101,32 +184,32 @@ function renderSidebarRecords(ledger: IrcObservationLedger, width: number, compo
 			omittedOlderRecords = true;
 			break;
 		}
-
-		const rendered = renderSidebarRecord(
-			records[index],
-			width,
-			componentTheme,
-			availableRows,
-			availableSourceUtf8Bytes,
-		);
-		newestFirstBlocks.push(rendered.lines);
-		renderedRows += separatorRows + rendered.lines.length;
-		renderedSourceUtf8Bytes += rendered.sourceUtf8Bytes;
-		if (rendered.truncated) {
+		const projected = projectRecord(records[index], width, availableRows, availableSourceUtf8Bytes);
+		newestFirstBlocks.push(projected.lines);
+		renderedRows += separatorRows + projected.lines.length;
+		renderedSourceUtf8Bytes += projected.sourceUtf8Bytes;
+		if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.sourceBytes += projected.sourceUtf8Bytes;
+		if (projected.truncated) {
 			omittedOlderRecords = index > 0;
 			break;
 		}
 	}
-
-	const lines: string[] = [];
-	if (omittedOlderRecords) {
-		lines.push(truncateToWidth(componentTheme.fg("dim", IRC_SIDEBAR_OLDER_MESSAGES_ELISION), width));
-	}
+	const lines: SemanticLine[] = omittedOlderRecords
+		? [{ kind: "elision", text: IRC_SIDEBAR_OLDER_MESSAGES_ELISION }]
+		: [];
 	for (const block of newestFirstBlocks.reverse()) {
-		if (lines.length > 0) lines.push("");
+		if (lines.length > 0) lines.push({ kind: "blank", text: "" });
 		lines.push(...block);
 	}
-	return lines.slice(0, IRC_SIDEBAR_MAX_RENDER_ROWS);
+	const bounded = lines.slice(0, IRC_SIDEBAR_MAX_RENDER_ROWS);
+	if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.rows += bounded.length;
+	const projection = { token: semanticProjectionToken(bounded), lines: bounded };
+	projectionMemo.set(ledger, { epoch: ledger.mutationEpoch, width, projection });
+	return projection;
+}
+
+export function getIrcSidebarSemanticToken(ledger: IrcObservationLedger, width: number): string {
+	return getIrcSidebarSemanticProjection(ledger, width).token;
 }
 
 export interface IrcSidebarTheme {
@@ -134,64 +217,96 @@ export interface IrcSidebarTheme {
 	bold(text: string): string;
 	readonly boxSharp: { readonly vertical: string };
 }
-
 export type IrcSidebarThemeSource = IrcSidebarTheme | (() => IrcSidebarTheme);
 
 /** Read-only IRC history alongside the active transcript. */
 export class IrcSplitViewComponent implements ViewportAnchorProvider {
 	#visible = false;
+	#themeGeneration = 0;
+	#styledMemo:
+		| { token: string; width: number; themeGeneration: number; theme: IrcSidebarTheme; lines: string[] }
+		| undefined;
 
 	constructor(
 		private readonly leftPane: Component,
 		private readonly ledger: IrcObservationLedger,
 		private readonly componentTheme: IrcSidebarThemeSource,
 	) {}
-
 	get visible(): boolean {
 		return this.#visible;
 	}
-
 	effectiveSidebarVisible(width = process.stdout.columns ?? 0): boolean {
 		return this.#visible && computeIrcSplitWidths(width).rightWidth > 0;
 	}
-
 	setVisible(visible: boolean): void {
-		if (this.#visible === visible) return;
-		this.#visible = visible;
-		this.invalidate();
+		if (this.#visible !== visible) {
+			this.#visible = visible;
+			this.invalidate();
+		}
 	}
-
+	invalidateTheme(): void {
+		this.#themeGeneration++;
+		this.#styledMemo = undefined;
+	}
+	resetSource(): void {
+		projectionMemo.delete(this.ledger);
+		this.#styledMemo = undefined;
+	}
 	render(width: number): string[] {
 		return this.renderWithViewportAnchors(width).lines;
 	}
-
+	#renderSidebar(width: number, componentTheme: IrcSidebarTheme): string[] {
+		const projection = getIrcSidebarSemanticProjection(this.ledger, width);
+		const cached = this.#styledMemo;
+		if (
+			cached?.token === projection.token &&
+			cached.width === width &&
+			cached.themeGeneration === this.#themeGeneration &&
+			cached.theme === componentTheme
+		) {
+			if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.styledCacheHits++;
+			return cached.lines;
+		}
+		if (__ircSidebarPerfCounters.enabled) __ircSidebarPerfCounters.styledCacheMisses++;
+		const lines = projection.lines.map(line => {
+			if (line.kind === "header")
+				return truncateToWidth(
+					`${componentTheme.fg("accent", componentTheme.bold(line.sender!))} → ${line.recipient} · ${componentTheme.fg("dim", line.time!)}`,
+					width,
+				);
+			return truncateToWidth(line.kind === "elision" ? componentTheme.fg("dim", line.text) : line.text, width);
+		});
+		this.#styledMemo = {
+			token: projection.token,
+			width,
+			themeGeneration: this.#themeGeneration,
+			theme: componentTheme,
+			lines,
+		};
+		return lines;
+	}
 	renderWithViewportAnchors(width: number): ViewportAnchorRender {
 		if (!this.#visible) return renderComponentWithViewportAnchors(this.leftPane, width);
-
 		const componentTheme = typeof this.componentTheme === "function" ? this.componentTheme() : this.componentTheme;
 		const { leftWidth, separatorWidth, rightWidth } = computeIrcSplitWidths(width);
 		if (rightWidth === 0) return renderComponentWithViewportAnchors(this.leftPane, width);
-
-		const separatorText = componentTheme.fg("dim", ` ${componentTheme.boxSharp.vertical} `);
-		const separator = separatorWidth > 0 ? separatorText : "";
+		const separator = separatorWidth > 0 ? componentTheme.fg("dim", ` ${componentTheme.boxSharp.vertical} `) : "";
 		const leftRender = withTerminalGraphicsFallback(
 			() => renderComponentWithViewportAnchors(this.leftPane, leftWidth),
 			{ allowCursorNeutralImages: true },
 		);
-		const rightLines = renderSidebarRecords(this.ledger, rightWidth, componentTheme);
+		const rightLines = this.#renderSidebar(rightWidth, componentTheme);
 		const lineCount = Math.max(leftRender.lines.length, rightLines.length);
 		const lines: string[] = [];
 		const anchors: ViewportAnchorRender["anchors"] = [];
-
 		const leftOffset = lineCount - leftRender.lines.length;
 		const rightOffset = lineCount - rightLines.length;
 		for (let index = 0; index < lineCount; index++) {
 			const leftIndex = index - leftOffset;
 			const leftRaw = leftRender.lines[leftIndex] ?? "";
 			const right = truncateToWidth(rightLines[index - rightOffset] ?? "", rightWidth);
-			if (TERMINAL.isImageLine(leftRaw)) {
-				lines.push(leftRaw + padding(leftWidth) + separator + right);
-			} else {
+			if (TERMINAL.isImageLine(leftRaw)) lines.push(leftRaw + padding(leftWidth) + separator + right);
+			else {
 				const left = truncateToWidth(leftRaw, leftWidth);
 				lines.push(left + padding(Math.max(0, leftWidth - visibleWidth(left))) + separator + right);
 			}
@@ -199,7 +314,6 @@ export class IrcSplitViewComponent implements ViewportAnchorProvider {
 		}
 		return { lines, anchors };
 	}
-
 	invalidate(): void {
 		this.leftPane.invalidate?.();
 	}

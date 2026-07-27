@@ -4,9 +4,26 @@ import type { ParsedIrcMessage } from "./utils/irc-message";
 
 type InlineMode = "persistent" | "ephemeral";
 
-const MAX_RECORDS = 10_000;
-const MAX_RETAINED_UTF8_BYTES = 16 * 1024 * 1024;
-const MAX_SEEN_IDENTITIES = 100_000;
+export const IRC_OBSERVATION_LEDGER_MAX_RECORDS = 10_000;
+export const IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES = 16 * 1024 * 1024;
+export const IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES = 100_000;
+
+export const __ircLedgerPerfCounters = {
+	enabled: false,
+	epochAdvances: 0,
+	snapshot() {
+		return { epochAdvances: this.epochAdvances };
+	},
+	enable(): void {
+		this.enabled = true;
+	},
+	disable(): void {
+		this.enabled = false;
+	},
+	reset(): void {
+		this.epochAdvances = 0;
+	},
+};
 
 export type IrcObservationRecord = Readonly<
 	ParsedIrcMessage & {
@@ -22,7 +39,7 @@ function measureRetainedUtf8Bytes(message: ParsedIrcMessage): number {
 	let bytes = 4;
 	for (const value of [message.observationId, message.from, message.to, message.text, message.kind]) {
 		bytes += Buffer.byteLength(value, "utf8");
-		if (bytes > MAX_RETAINED_UTF8_BYTES) return bytes;
+		if (bytes > IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES) return bytes;
 	}
 	return bytes;
 }
@@ -44,11 +61,21 @@ export class IrcObservationLedger {
 	#seenObservationIdentities = new Set<string>();
 	#identityCapacityExhausted = false;
 	#evictedObservationIds = new Set<string>();
+	#mutationEpoch = 0;
+
+	get mutationEpoch(): number {
+		return this.#mutationEpoch;
+	}
+
+	#advanceMutationEpoch(): void {
+		this.#mutationEpoch++;
+		if (__ircLedgerPerfCounters.enabled) __ircLedgerPerfCounters.epochAdvances++;
+	}
 
 	#rememberObservationIdentity(observationId: string): boolean {
 		const identity = tombstoneIdentity(observationId);
 		if (this.#seenObservationIdentities.has(identity) || this.#identityCapacityExhausted) return false;
-		if (this.#seenObservationIdentities.size >= MAX_SEEN_IDENTITIES) {
+		if (this.#seenObservationIdentities.size >= IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES) {
 			this.#identityCapacityExhausted = true;
 			return false;
 		}
@@ -65,7 +92,10 @@ export class IrcObservationLedger {
 	}
 
 	#enforceBounds(): void {
-		while (this.#records.size > MAX_RECORDS || this.#retainedUtf8Bytes > MAX_RETAINED_UTF8_BYTES) {
+		while (
+			this.#records.size > IRC_OBSERVATION_LEDGER_MAX_RECORDS ||
+			this.#retainedUtf8Bytes > IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES
+		) {
 			const oldestObservationId = this.#records.keys().next().value;
 			if (oldestObservationId === undefined) return;
 			this.#evict(oldestObservationId);
@@ -76,10 +106,9 @@ export class IrcObservationLedger {
 	observe(message: ParsedIrcMessage, panelVisibleAtObservation: boolean): IrcObservationRecord | undefined {
 		const existing = this.#records.get(message.observationId);
 		if (existing) return existing;
-		if (!this.#rememberObservationIdentity(message.observationId)) return undefined;
-
 		const estimatedBytes = measureRetainedUtf8Bytes(message);
-		if (estimatedBytes > MAX_RETAINED_UTF8_BYTES) return undefined;
+		if (estimatedBytes > IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES) return undefined;
+		if (!this.#rememberObservationIdentity(message.observationId)) return undefined;
 
 		const observedAt = Date.now();
 		const mode: InlineMode = panelVisibleAtObservation ? "ephemeral" : "persistent";
@@ -94,6 +123,7 @@ export class IrcObservationLedger {
 		this.#records.set(record.observationId, record);
 		this.#retainedUtf8Bytes += estimatedBytes;
 		this.#enforceBounds();
+		this.#advanceMutationEpoch();
 		return this.#records.get(record.observationId);
 	}
 
@@ -117,11 +147,17 @@ export class IrcObservationLedger {
 	}
 
 	reset(): void {
-		for (const observationId of this.#records.keys()) {
-			this.#evictedObservationIds.add(observationId);
+		const retainedRecordsChanged = this.#records.size > 0;
+		if (retainedRecordsChanged) {
+			for (const observationId of this.#records.keys()) {
+				this.#evictedObservationIds.add(observationId);
+			}
+			this.#records.clear();
+			this.#retainedUtf8Bytes = 0;
 		}
-		this.#records.clear();
-		this.#retainedUtf8Bytes = 0;
 		this.#nextSequence = 0;
+		this.#seenObservationIdentities.clear();
+		this.#identityCapacityExhausted = false;
+		if (retainedRecordsChanged) this.#advanceMutationEpoch();
 	}
 }

@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
 	computeIrcSplitWidths,
+	getIrcSidebarSemanticToken,
 	IRC_SIDEBAR_MAX_RENDER_ROWS,
 	type IrcSidebarTheme,
 	IrcSplitViewComponent,
 } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
-import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
+import {
+	IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES,
+	IrcObservationLedger,
+} from "@gajae-code/coding-agent/modes/irc-observation-ledger";
 import {
 	type Component,
 	Container,
@@ -74,6 +78,53 @@ function image(): Image {
 	);
 }
 
+describe("IrcObservationLedger sidebar contracts", () => {
+	it("does not consume an identity when its payload is rejected", () => {
+		const ledger = new IrcObservationLedger();
+		const observationId = "rejected-then-accepted";
+		expect(
+			ledger.observe(
+				{
+					observationId,
+					kind: "incoming",
+					from: "alice",
+					to: "bob",
+					text: "x".repeat(IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES),
+					timestamp: 1,
+				},
+				false,
+			),
+		).toBeUndefined();
+		expect(
+			ledger.observe(
+				{ observationId, kind: "incoming", from: "alice", to: "bob", text: "accepted", timestamp: 2 },
+				false,
+			),
+		).toBeDefined();
+	});
+
+	it("reset releases deduplication state without changing an empty projection epoch", () => {
+		const ledger = new IrcObservationLedger();
+		addRecord(ledger, "first", "reset-identity");
+		ledger.reset();
+		const emptyEpoch = ledger.mutationEpoch;
+		ledger.reset();
+		expect(ledger.mutationEpoch).toBe(emptyEpoch);
+		expect(
+			ledger.observe(
+				{
+					observationId: "reset-identity",
+					kind: "incoming",
+					from: "alice",
+					to: "bob",
+					text: "second",
+					timestamp: 2,
+				},
+				false,
+			),
+		).toBeDefined();
+	});
+});
 describe("computeIrcSplitWidths", () => {
 	it("keeps exact split invariants for every width from 1 through 500", () => {
 		for (let width = 1; width <= 500; width++) {
@@ -409,6 +460,43 @@ describe("IrcSplitViewComponent", () => {
 		};
 		const second = split.render(80).join("\n");
 		expect(second).toContain("\x1b[32m\x1b[4malice\x1b[24m\x1b[0m");
+	});
+
+	it("renders ledger mutations without retaining stale sidebar output", () => {
+		const ledger = new IrcObservationLedger();
+		addRecord(ledger, "first entry", "first");
+		const split = new IrcSplitViewComponent(new TestPane("left"), ledger, sidebarTheme);
+		split.setVisible(true);
+
+		expect(Bun.stripANSI(split.render(80).join("\n"))).toContain("first entry");
+		addRecord(ledger, "second entry", "second");
+		const rendered = Bun.stripANSI(split.render(80).join("\n"));
+		expect(rendered).toContain("first entry");
+		expect(rendered).toContain("second entry");
+	});
+
+	it("clears sidebar output after a ledger reset", () => {
+		const ledger = new IrcObservationLedger();
+		addRecord(ledger, "reset entry", "reset");
+		const split = new IrcSplitViewComponent(new TestPane("left"), ledger, sidebarTheme);
+		split.setVisible(true);
+		expect(Bun.stripANSI(split.render(80).join("\n"))).toContain("reset entry");
+
+		ledger.reset();
+		expect(Bun.stripANSI(split.render(80).join("\n"))).not.toContain("reset entry");
+	});
+
+	it("hashes semantic tokens compactly while preserving and changing them with projected semantics", () => {
+		const ledger = new IrcObservationLedger();
+		const width = computeIrcSplitWidths(80).rightWidth;
+		addRecord(ledger, "visible token", "visible");
+		const initial = getIrcSidebarSemanticToken(ledger, width);
+		expect(initial).toMatch(/^[a-f0-9]{64}$/);
+
+		addRecord(ledger, "ignored duplicate", "visible");
+		expect(getIrcSidebarSemanticToken(ledger, width)).toBe(initial);
+		addRecord(ledger, "changed token", "changed");
+		expect(getIrcSidebarSemanticToken(ledger, width)).not.toBe(initial);
 	});
 });
 
