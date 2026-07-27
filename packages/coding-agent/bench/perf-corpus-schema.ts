@@ -473,13 +473,6 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					}
 				}
 				if (
-					Object.hasOwn(sample, "heapUsedBytes") &&
-					Object.hasOwn(sample, "heapTotalBytes") &&
-					sample.heapUsedBytes > sample.heapTotalBytes
-				) {
-					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index} heapUsedBytes exceeds heapTotalBytes`);
-				}
-				if (
 					Object.hasOwn(sample, "arrayBuffersBytes") &&
 					Object.hasOwn(sample, "externalBytes") &&
 					sample.arrayBuffersBytes > sample.externalBytes

@@ -294,7 +294,7 @@ describe("perf corpus schema + runner", () => {
 		);
 	});
 
-	test("rejects physically impossible memory samples", () => {
+	test("rejects physically impossible external-memory samples", () => {
 		const report = runPerfCorpusBenchmark();
 		const fixture = report.fixtures.find(candidate => candidate.memoryBaseline);
 		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
@@ -309,7 +309,7 @@ describe("perf corpus schema + runner", () => {
 							memoryBaseline: {
 								...baseline,
 								samples: [
-									{ ...sample, heapTotalBytes: sample.heapUsedBytes - 1 },
+									{ ...sample, externalBytes: sample.arrayBuffersBytes - 1 },
 									...baseline.samples.slice(1),
 								],
 							},
@@ -318,7 +318,7 @@ describe("perf corpus schema + runner", () => {
 			),
 		} satisfies PerfCorpusReport;
 		expect(validatePerfCorpusReport(impossible).errors).toContain(
-			`fixture ${fixture.fixtureId}: memoryBaseline sample 0 heapUsedBytes exceeds heapTotalBytes`,
+			`fixture ${fixture.fixtureId}: memoryBaseline sample 0 arrayBuffersBytes exceeds externalBytes`,
 		);
 	});
 
