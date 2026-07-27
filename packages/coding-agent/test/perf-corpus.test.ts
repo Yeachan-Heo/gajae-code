@@ -41,14 +41,16 @@ describe("perf corpus schema + runner", () => {
 		const report = runPerfCorpusBenchmark();
 		expect(report.schema).toBe(PERF_CORPUS_SCHEMA);
 		expect(report.gitSha).toMatch(/^[0-9a-f]{40}$/);
-		expect(report.runner.command).toBe("runPerfCorpusBenchmark({ isolatedMemory: false })");
-		expect(report.runner.argv).toEqual(["runPerfCorpusBenchmark"]);
+		const expectedParentArgv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+		expect(report.runner.command).toBe(expectedParentArgv.join(" "));
+		expect(report.runner.argv).toEqual(expectedParentArgv);
 		expect(report.runner.environment).toEqual({
 			GJC_MEMORY_PROFILE: "short",
 			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
 		});
 		expect(report.runner.iterationsTarget).toBeGreaterThan(0);
 		expect(typeof report.runner.gcExposed).toBe("boolean");
+		expect(report.runner.memoryChildExecArgv).toEqual([]);
 		expect(typeof report.gitDirty).toBe("boolean");
 		const classes = new Set(report.fixtures.map(f => f.fixtureClass));
 		for (const required of REQUIRED_FIXTURE_CLASSES) {
@@ -133,12 +135,8 @@ describe("perf corpus schema + runner", () => {
 		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
 		expect(baselines).toHaveLength(REQUIRED_MEMORY_SURFACES.length);
 		expect(report.runner.memoryIsolation).toBe("process-per-surface");
-		expect(report.runner.argv).toEqual([
-			"bun",
-			"--smol",
-			"--expose-gc",
-			"packages/coding-agent/bench/perf-corpus.bench.ts",
-		]);
+		expect(report.runner.argv).toEqual([process.execPath, ...process.execArgv, ...process.argv.slice(1)]);
+		expect(report.runner.memoryChildExecArgv).toEqual(["--smol", "--expose-gc"]);
 		expect(report.runner.environment).toEqual({
 			GJC_MEMORY_PROFILE: "short",
 			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
@@ -234,6 +232,23 @@ describe("perf corpus schema + runner", () => {
 		} as unknown as PerfCorpusReport;
 		expect(() => validatePerfCorpusReport(malformedTeardown)).not.toThrow();
 		expect(validatePerfCorpusReport(malformedTeardown).ok).toBe(false);
+		const earlyTeardown = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								postTeardown: { ...baseline.postTeardown, elapsedMs: 0 },
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(earlyTeardown).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline postTeardown predates workload samples`,
+		);
 	});
 
 	test("rejects an empty corpus instead of skipping required memory surfaces", () => {
@@ -393,6 +408,11 @@ describe("perf corpus schema + runner", () => {
 			runner: { ...report.runner, memoryChildGcExposed: undefined },
 		} as unknown as PerfCorpusReport;
 		expect(validatePerfCorpusReport(missingMemoryChildGc).errors).toContain("runner.memoryChildGcExposed invalid");
+		const missingMemoryChildArgv = {
+			...report,
+			runner: { ...report.runner, memoryChildExecArgv: ["--smol"] },
+		};
+		expect(validatePerfCorpusReport(missingMemoryChildArgv).errors).toContain("runner.memoryChildExecArgv invalid");
 		const insufficientIterations = {
 			...report,
 			fixtures: report.fixtures.map((candidate, index) =>
@@ -415,6 +435,23 @@ describe("perf corpus schema + runner", () => {
 		};
 		expect(validatePerfCorpusReport(inconsistentSummary).errors).toContain(
 			`fixture ${fixture.fixtureId}: rssMemory.growthBytes does not match detailed samples`,
+		);
+		const inconsistentThroughput = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: {
+								...validBaseline,
+								operationsPerSecond: validBaseline.operationsPerSecond + 1,
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(inconsistentThroughput).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond does not match operations`,
 		);
 		const mismatchedEnvironment = {
 			...report,

@@ -84,42 +84,38 @@ function measureRss(work: () => void): RssMemoryMetric {
 		heapReturnBytes,
 	};
 }
-function resolveGitProvenance(): { sha: string; dirty: boolean } {
+function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerprint: string } {
 	const environmentSha = process.env.GITHUB_SHA?.trim();
 	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
 	let sha = "";
 	let dirty = true;
+	let worktreeFingerprint = "unavailable";
 	try {
 		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
 		if (revision.exitCode === 0) sha = new TextDecoder().decode(revision.stdout).trim();
 		const status = Bun.spawnSync(["git", "status", "--porcelain"], { cwd: repositoryRoot });
-		if (status.exitCode === 0) dirty = new TextDecoder().decode(status.stdout).trim().length > 0;
+		if (status.exitCode === 0) {
+			worktreeFingerprint = new TextDecoder().decode(status.stdout);
+			dirty = worktreeFingerprint.trim().length > 0;
+		}
 	} catch {
 		// The report records conservative dirty provenance when Git is unavailable.
 	}
 	if (!sha) sha = environmentSha ?? "";
-	return { sha, dirty };
+	return { sha, dirty, worktreeFingerprint };
 }
 
 function reproductionInvocation(
 	profile: MemoryWorkloadProfile,
 	durationTargetMs: number,
 	iterationsTarget: number,
-	isolatedMemory: boolean,
 ): { command: string; argv: string[]; environment: Record<string, string> } {
 	const environment: Record<string, string> = {
 		GJC_MEMORY_PROFILE: profile,
 		GJC_MEMORY_ITERATIONS: String(iterationsTarget),
 	};
 	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
-	if (!isolatedMemory) {
-		return {
-			command: "runPerfCorpusBenchmark({ isolatedMemory: false })",
-			argv: ["runPerfCorpusBenchmark"],
-			environment,
-		};
-	}
-	const argv = ["bun", "--smol", "--expose-gc", "packages/coding-agent/bench/perf-corpus.bench.ts"];
+	const argv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
 	return { command: argv.join(" "), argv, environment };
 }
 function memorySample(startedAt: number): MemoryUsageSample {
@@ -399,11 +395,15 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
 	const finalGit = resolveGitProvenance();
-	if (initialGit.sha !== finalGit.sha || initialGit.dirty !== finalGit.dirty) {
+	if (
+		initialGit.sha !== finalGit.sha ||
+		initialGit.dirty !== finalGit.dirty ||
+		initialGit.worktreeFingerprint !== finalGit.worktreeFingerprint
+	) {
 		throw new Error("benchmark checkout provenance changed while workloads were running");
 	}
 	const git = initialGit;
-	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, options.isolatedMemory === true);
+	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget);
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
 		generatedAt: new Date().toISOString(),
@@ -423,6 +423,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			iterationsTarget,
 			gcExposed: typeof globalThis.gc === "function",
 			memoryChildGcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
+			memoryChildExecArgv: options.isolatedMemory ? ["--smol", "--expose-gc"] : [],
 		},
 		fixtures,
 		hotspotClassifications: [...V1_V3_RECLASSIFICATION],

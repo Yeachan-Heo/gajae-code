@@ -173,6 +173,7 @@ export interface PerfCorpusReport {
 		iterationsTarget: number;
 		gcExposed: boolean;
 		memoryChildGcExposed: boolean;
+		memoryChildExecArgv: string[];
 	};
 	fixtures: PerfCorpusFixtureResult[];
 	hotspotClassifications: HotspotClassification[];
@@ -314,6 +315,15 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (typeof report.runner.memoryChildGcExposed !== "boolean") {
 		errors.push("runner.memoryChildGcExposed invalid");
 	}
+	if (
+		!Array.isArray(report.runner.memoryChildExecArgv) ||
+		report.runner.memoryChildExecArgv.some(value => typeof value !== "string" || value.length === 0) ||
+		(report.runner.memoryIsolation === "process-per-surface"
+			? report.runner.memoryChildExecArgv.join("\0") !== ["--smol", "--expose-gc"].join("\0")
+			: report.runner.memoryChildExecArgv.length !== 0)
+	) {
+		errors.push("runner.memoryChildExecArgv invalid");
+	}
 	if (!(MEMORY_ISOLATION_MODES as readonly string[]).includes(report.runner.memoryIsolation)) {
 		errors.push("runner.memoryIsolation invalid");
 	}
@@ -400,6 +410,22 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			if (!Number.isFinite(baseline.operationsPerSecond) || baseline.operationsPerSecond < 0) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond not finite`);
 			}
+			const runElapsedMs = fixture.wallClockPhase.run?.elapsedMs;
+			if (
+				Number.isInteger(baseline.operations) &&
+				baseline.operations >= 0 &&
+				Number.isFinite(runElapsedMs) &&
+				runElapsedMs !== undefined
+			) {
+				const expectedThroughput = baseline.operations / Math.max(runElapsedMs / 1_000, 1e-6);
+				if (
+					!Number.isFinite(baseline.operationsPerSecond) ||
+					Math.abs(baseline.operationsPerSecond - expectedThroughput) >
+						Math.max(1e-9, Math.abs(expectedThroughput) * 1e-12)
+				) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond does not match operations`);
+				}
+			}
 			for (const [name, value] of [
 				["processTreeBaselineRssBytes", baseline.processTreeBaselineRssBytes],
 				["processTreePostTeardownRssBytes", baseline.processTreePostTeardownRssBytes],
@@ -468,7 +494,16 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match samples`);
 				}
 			}
-			if (samplesAreValid && samples.length > 0 && isValidMemoryUsageSample(baseline.postTeardown)) {
+			const postTeardownIsValid = isValidMemoryUsageSample(baseline.postTeardown);
+			if (
+				samplesAreValid &&
+				samples.length > 0 &&
+				postTeardownIsValid &&
+				baseline.postTeardown.elapsedMs < (samples.at(-1)?.elapsedMs ?? 0)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline postTeardown predates workload samples`);
+			}
+			if (samplesAreValid && samples.length > 0 && postTeardownIsValid) {
 				const firstSample = samples[0];
 				const peakRssBytes = Math.max(...samples.map(sample => sample.rssBytes));
 				const childGcExposed =
