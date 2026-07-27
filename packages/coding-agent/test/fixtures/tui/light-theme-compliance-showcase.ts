@@ -795,23 +795,41 @@ function cjkLanguageFor(sceneId: LightThemeComplianceSceneId): LightThemeComplia
 	}
 }
 
+function truecolorTo256Index(red: number, green: number, blue: number): number {
+	if (red === green && green === blue) {
+		return red < 8 ? 16 : red > 248 ? 231 : Math.round(((red - 8) / 247) * 24) + 232;
+	}
+	return 16 + 36 * Math.round((red / 255) * 5) + 6 * Math.round((green / 255) * 5) + Math.round((blue / 255) * 5);
+}
+
+/**
+ * Rewrite every truecolor selector inside an SGR sequence to its 256-color equivalent.
+ *
+ * Truecolor selectors are not always a whole sequence: the native ANSI-aware wrapper carries
+ * style state across wrapped lines by re-emitting it as one merged sequence (for example
+ * `ESC[3;38;2;51;50;52m` for italic + fg). Parameters are therefore walked in order so
+ * non-color parameters survive untouched.
+ */
 function downsampleTruecolorAnsiTo256(ansi: string): string {
-	return ansi.replace(
-		/\x1b\[(38|48);2;(\d+);(\d+);(\d+)m/g,
-		(_match: string, layer: string, redRaw: string, greenRaw: string, blueRaw: string): string => {
-			const red = Number(redRaw);
-			const green = Number(greenRaw);
-			const blue = Number(blueRaw);
-			let index: number;
-			if (red === green && green === blue) {
-				index = red < 8 ? 16 : red > 248 ? 231 : Math.round(((red - 8) / 247) * 24) + 232;
-			} else {
-				index =
-					16 + 36 * Math.round((red / 255) * 5) + 6 * Math.round((green / 255) * 5) + Math.round((blue / 255) * 5);
+	return ansi.replace(/\x1b\[([0-9;]*)m/g, (match: string, rawParams: string): string => {
+		if (!rawParams.includes(";2;")) return match;
+		const params = rawParams.split(";");
+		const downsampled: string[] = [];
+		for (let i = 0; i < params.length; i++) {
+			const param = params[i];
+			const isColorLayer = param === "38" || param === "48";
+			if (!isColorLayer || params[i + 1] !== "2" || i + 4 >= params.length) {
+				downsampled.push(param);
+				continue;
 			}
-			return `\x1b[${layer};5;${index}m`;
-		},
-	);
+			const red = Number(params[i + 2]);
+			const green = Number(params[i + 3]);
+			const blue = Number(params[i + 4]);
+			downsampled.push(param, "5", String(truecolorTo256Index(red, green, blue)));
+			i += 4;
+		}
+		return `\x1b[${downsampled.join(";")}m`;
+	});
 }
 
 function finalizeRender(
