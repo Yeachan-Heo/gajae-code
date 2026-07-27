@@ -158,13 +158,14 @@ export interface PerfCorpusReport {
 	schema: "gjc.perf-corpus/2";
 	generatedAt: string;
 	gitSha: string;
+	gitDirty: boolean;
 	runner: {
 		command: string;
 		platform: NodeJS.Platform;
 		arch: string;
 		bunVersion?: string;
 		ci?: boolean;
-		profile?: MemoryWorkloadProfile;
+		profile: MemoryWorkloadProfile;
 		durationTargetMs?: number;
 		memoryIsolation: "in-process" | "process-per-surface";
 		iterationsTarget: number;
@@ -256,6 +257,9 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (!/^[0-9a-f]{40}$/i.test(report.gitSha)) {
 		errors.push("gitSha must be a full 40-character commit SHA");
 	}
+	if (typeof report.gitDirty !== "boolean") {
+		errors.push("gitDirty invalid");
+	}
 	if (typeof report.runner.command !== "string" || report.runner.command.trim().length === 0) {
 		errors.push("runner.command must record the resolved invocation");
 	}
@@ -268,7 +272,7 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (!(MEMORY_ISOLATION_MODES as readonly string[]).includes(report.runner.memoryIsolation)) {
 		errors.push("runner.memoryIsolation invalid");
 	}
-	if (report.runner.profile !== undefined && !(MEMORY_WORKLOAD_PROFILES as readonly string[]).includes(report.runner.profile)) {
+	if (!(MEMORY_WORKLOAD_PROFILES as readonly string[]).includes(report.runner.profile)) {
 		errors.push("runner.profile invalid");
 	}
 	if (
@@ -316,7 +320,7 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			if (!(MEMORY_WORKLOAD_PROFILES as readonly string[]).includes(baseline.profile)) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.profile invalid`);
 			}
-			if (report.runner.profile !== undefined && baseline.profile !== report.runner.profile) {
+			if (baseline.profile !== report.runner.profile) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.profile must match runner.profile`);
 			}
 			if (!Number.isInteger(baseline.iterations) || baseline.iterations <= 0) {
@@ -377,6 +381,18 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				if (Object.hasOwn(sample, "activeResourceCount") && !Number.isInteger(sample.activeResourceCount)) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
 				}
+			}
+			if (
+				report.runner.gcExposed &&
+				(fixture.rssMemory.returnBytes === null || fixture.rssMemory.heapReturnBytes === null)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: gcExposed requires post-GC return metrics`);
+			}
+			if (
+				!report.runner.gcExposed &&
+				(fixture.rssMemory.returnBytes !== null || fixture.rssMemory.heapReturnBytes !== null)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: unavailable GC requires null return metrics`);
 			}
 		}
 	}

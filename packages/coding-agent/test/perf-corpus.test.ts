@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
+import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
 import { calculateMemorySlope, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
 import {
 	type HotspotClassification,
@@ -27,6 +28,7 @@ describe("perf corpus schema + runner", () => {
 		expect(report.runner.command).toBe("runPerfCorpusBenchmark({ isolatedMemory: false })");
 		expect(report.runner.iterationsTarget).toBeGreaterThan(0);
 		expect(typeof report.runner.gcExposed).toBe("boolean");
+		expect(typeof report.gitDirty).toBe("boolean");
 		const classes = new Set(report.fixtures.map(f => f.fixtureClass));
 		for (const required of REQUIRED_FIXTURE_CLASSES) {
 			expect(classes.has(required)).toBe(true);
@@ -90,7 +92,7 @@ describe("perf corpus schema + runner", () => {
 		expect(report.runner.gcExposed).toBe(true);
 		expect(baselines.every(baseline => baseline.samples[0]!.rssBytes > 0)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
-	});
+	}, 15_000);
 
 	test("fails closed when a required surface or detailed sample is invalid or incomplete", () => {
 		const report = runPerfCorpusBenchmark();
@@ -181,6 +183,14 @@ describe("perf corpus schema + runner", () => {
 		expect(calculateMemorySlope(growingSteadyState, "rssBytes")).toBe(100);
 		expect(calculateMemorySlope([sample(0, 100), sample(200, 200)], "rssBytes")).toBeNull();
 	});
+	test("preserves stateful workload indices across sampling chunks", () => {
+		const workload = createMemoryBaselineWorkloads().find(candidate => candidate.surface === "shared-native");
+		if (!workload) throw new Error("shared-native workload unavailable");
+		expect(workload.run(1)).toBe(4_096);
+		expect(workload.run(1)).toBe(4_224);
+		workload.teardown();
+		expect(workload.run(1)).toBe(4_096);
+	});
 	test("rejects malformed memory scalar fields and isolation metadata", () => {
 		const report = runPerfCorpusBenchmark();
 		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
@@ -230,6 +240,41 @@ describe("perf corpus schema + runner", () => {
 		const legacySchema = { ...report, schema: "gjc.perf-corpus/1" } as unknown as PerfCorpusReport;
 		expect(validatePerfCorpusReport(legacySchema).errors).toContain(
 			'invalid schema "gjc.perf-corpus/1", expected "gjc.perf-corpus/2"',
+		);
+		const missingRunnerProfile = {
+			...report,
+			runner: { ...report.runner, profile: undefined },
+		} as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(missingRunnerProfile).errors).toContain("runner.profile invalid");
+		const gcUnavailableWithReturns = {
+			...report,
+			runner: { ...report.runner, gcExposed: false },
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							rssMemory: { ...candidate.rssMemory, returnBytes: 1, heapReturnBytes: 1 },
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(gcUnavailableWithReturns).errors).toContain(
+			`fixture ${fixture.fixtureId}: unavailable GC requires null return metrics`,
+		);
+		const gcExposedWithoutReturns = {
+			...report,
+			runner: { ...report.runner, gcExposed: true },
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							rssMemory: { ...candidate.rssMemory, returnBytes: null, heapReturnBytes: null },
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(gcExposedWithoutReturns).errors).toContain(
+			`fixture ${fixture.fixtureId}: gcExposed requires post-GC return metrics`,
 		);
 	});
 

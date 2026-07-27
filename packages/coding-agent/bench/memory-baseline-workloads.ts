@@ -23,19 +23,21 @@ function statefulWorkload(
 	step: (state: MutableWorkloadState, index: number) => number,
 ): MemoryWorkload {
 	const state: MutableWorkloadState = { arrays: [], maps: [], strings: [] };
+	let nextIndex = 0;
 	return {
 		id,
 		surface,
 		tags,
 		run(iterations) {
 			let operations = 0;
-			for (let index = 0; index < iterations; index++) operations += step(state, index);
+			for (let offset = 0; offset < iterations; offset++) operations += step(state, nextIndex++);
 			return operations;
 		},
 		teardown() {
 			state.arrays.length = 0;
 			state.maps.length = 0;
 			state.strings.length = 0;
+			nextIndex = 0;
 		},
 	};
 }

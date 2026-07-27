@@ -81,19 +81,21 @@ function measureRss(work: () => void): RssMemoryMetric {
 		heapReturnBytes,
 	};
 }
-function resolveGitSha(): string {
+function resolveGitProvenance(): { sha: string; dirty: boolean } {
 	const environmentSha = process.env.GITHUB_SHA?.trim();
-	if (environmentSha) return environmentSha;
+	let sha = environmentSha ?? "";
+	let dirty = true;
 	try {
-		const result = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-		if (result.exitCode === 0) {
-			const sha = new TextDecoder().decode(result.stdout).trim();
-			if (sha) return sha;
+		if (!sha) {
+			const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+			if (revision.exitCode === 0) sha = new TextDecoder().decode(revision.stdout).trim();
 		}
+		const status = Bun.spawnSync(["git", "status", "--porcelain"]);
+		if (status.exitCode === 0) dirty = new TextDecoder().decode(status.stdout).trim().length > 0;
 	} catch {
-		// Validation below rejects missing provenance with an actionable error.
+		// The report records conservative dirty provenance and validation rejects a missing SHA.
 	}
-	return "";
+	return { sha, dirty };
 }
 
 function reproductionCommand(
@@ -373,10 +375,12 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			? buildIsolatedMemoryFixtures(profile, durationTargetMs)
 			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
+	const git = resolveGitProvenance();
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
 		generatedAt: new Date().toISOString(),
-		gitSha: resolveGitSha(),
+		gitSha: git.sha,
+		gitDirty: git.dirty,
 		runner: {
 			command: reproductionCommand(profile, durationTargetMs, iterationsTarget, options.isolatedMemory === true),
 			platform: process.platform,
