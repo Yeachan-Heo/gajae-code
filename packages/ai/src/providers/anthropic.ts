@@ -11,6 +11,7 @@ import type {
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages";
 import {
+	$credentialEnv,
 	$env,
 	extractHttpStatusFromError,
 	isEnoent,
@@ -817,10 +818,12 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 	// calls api.z.ai directly (no zcode.z.ai gateway, no captcha). Pin the base so dynamic
 	// discovery / stale bundled catalogs / model cache can't redirect it elsewhere.
 	if (model.provider === "glm-zcode") {
-		return normalizeAnthropicBaseUrl(process.env.ZCODE_PLAN_ANTHROPIC_BASE_URL) ?? "https://api.z.ai/api/anthropic";
+		return (
+			normalizeAnthropicBaseUrl($credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")) ?? "https://api.z.ai/api/anthropic"
+		);
 	}
 	if (model.provider === "anthropic" && isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeAnthropicBaseUrl($env.FOUNDRY_BASE_URL);
+		const foundryBaseUrl = normalizeAnthropicBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));
 		if (foundryBaseUrl) {
 			return foundryBaseUrl;
 		}
