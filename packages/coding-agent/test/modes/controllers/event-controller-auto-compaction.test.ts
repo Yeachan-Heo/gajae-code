@@ -186,6 +186,47 @@ describe("EventController auto-compaction overflow status", () => {
 		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: true });
 	});
 
+	it("shows a skipped overflow reason as status instead of warning", async () => {
+		const fixture = await runEndEvent({
+			type: "auto_compaction_end",
+			action: "context-full",
+			result: undefined,
+			aborted: false,
+			willRetry: false,
+			skipped: true,
+			errorMessage:
+				"Context overflow recovery skipped: nothing eligible to compact. Run /clear to preserve this session ID, or switch to a larger-context model before retrying.",
+		});
+
+		expect(fixture.loaderStop).toHaveBeenCalledTimes(1);
+		expect(fixture.ctx.autoCompactionLoader).toBeUndefined();
+		expect(fixture.showStatus).toHaveBeenCalledWith(
+			"Context overflow recovery skipped: nothing eligible to compact. Run /clear to preserve this session ID, or switch to a larger-context model before retrying.",
+		);
+		expect(fixture.showWarning).not.toHaveBeenCalled();
+		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+	});
+
+	it("keeps an oversized unchanged maintenance skip as a warning", async () => {
+		const errorMessage =
+			"Auto-compaction skipped: previous unchanged maintenance request exceeded the model context window; change or reduce the conversation before retrying maintenance.";
+		const fixture = await runEndEvent({
+			type: "auto_compaction_end",
+			action: "context-full",
+			result: undefined,
+			aborted: false,
+			willRetry: false,
+			skipped: true,
+			errorMessage,
+		});
+
+		expect(fixture.loaderStop).toHaveBeenCalledTimes(1);
+		expect(fixture.ctx.autoCompactionLoader).toBeUndefined();
+		expect(fixture.showStatus).not.toHaveBeenCalled();
+		expect(fixture.showWarning).toHaveBeenCalledWith(errorMessage);
+		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+	});
+
 	it("clears the loader before showing disabled non-resumable overflow recovery status", async () => {
 		const fixture = await runEndEvent({
 			type: "auto_compaction_end",

@@ -380,10 +380,14 @@ describe("AgentSession managed fallback attempt transaction", () => {
 
 		const agentEnds = events.filter(event => event.type === "agent_end");
 		expect(agentEnds).toHaveLength(1);
-		expect(terminalSpy).toHaveBeenCalledTimes(2);
-		expect(terminalSpy.mock.calls).toEqual([
-			[terminalSpy.mock.calls[0]![0], expect.objectContaining({ stopReason: "exhausted" })],
-			[terminalSpy.mock.calls[0]![0], expect.objectContaining({ stopReason: "cancelled" })],
+		// PR #3257 clears managed ownership before terminal observers run, so a
+		// subscriber abort at message_end no longer sees a live logical-run owner
+		// and must not issue a second requestRunTerminal(cancelled). Exhausted
+		// completion remains the sole terminalization.
+		expect(terminalSpy).toHaveBeenCalledTimes(1);
+		expect(terminalSpy.mock.calls[0]).toEqual([
+			terminalSpy.mock.calls[0]![0],
+			expect.objectContaining({ stopReason: "exhausted" }),
 		]);
 		expect(agentEnds[0]).toMatchObject({
 			messages: [

@@ -1153,6 +1153,12 @@ export class SelectorController {
 		);
 		if (scope === undefined) return;
 		const persistDefault = scope.trim().toLowerCase() === "default";
+		if (persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
+			this.ctx.showError(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			return;
+		}
 
 		const imageProvider = normalized as
 			| "auto"
@@ -1226,13 +1232,18 @@ export class SelectorController {
 			const selector = new ThinkingSelectorComponent(
 				this.ctx.session.thinkingLevel,
 				availableLevels,
-				selection => {
-					done();
-
+				async selection => {
 					const { level, persistDefault } = selection;
 					const configuredDefault = this.ctx.settings.get("defaultThinkingLevel");
 					const levelToApply = level === ThinkingLevel.Inherit ? configuredDefault : level;
-					this.ctx.session.setThinkingLevel(levelToApply, persistDefault);
+					try {
+						await this.ctx.session.setThinkingLevelForControl(level, persistDefault);
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						return;
+					}
+					done();
+
 					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
 					const requestedLabel =
 						level === ThinkingLevel.Inherit ? `${level} (configured default: ${configuredDefault})` : level;
@@ -1272,6 +1283,7 @@ export class SelectorController {
 					},
 					{
 						onChange: (id, value) => this.handleSettingChange(id, value),
+						onError: message => this.ctx.showError(message),
 						onThemePreview: themeName => {
 							return previewTheme(themeName).then(result => {
 								if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
@@ -1291,6 +1303,7 @@ export class SelectorController {
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
 						},
+						onPetCommit: mode => this.ctx.commitPetPreviewMode(mode as PetMode),
 						onStatusLinePreview: previewSettings => {
 							// Update status line with preview settings
 							this.ctx.statusLine.updateSettings({
@@ -1334,24 +1347,40 @@ export class SelectorController {
 		getAvailableThemes().then(availableThemes => {
 			const initialTheme = getCurrentThemeName() ?? "red-claw";
 			this.showSelector(done => {
+				const restoreAndClose = () => {
+					void restoreThemePreview(initialTheme).then(result => {
+						if (!result.success && result.error) {
+							this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
+						}
+						this.#refreshThemeUi();
+					});
+					done();
+				};
 				const selector = new ThemeSelectorComponent(
 					initialTheme,
 					availableThemes,
 					themeName => {
-						const settingPath = getDetectedThemeSettingsPath();
-						settings.set(settingPath, themeName);
+						if (!settings.canWriteDurableConfig()) {
+							this.ctx.showError(
+								"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+							);
+							restoreAndClose();
+							return;
+						}
+						try {
+							settings.set(getDetectedThemeSettingsPath(), themeName);
+						} catch (error) {
+							if (!settings.canWriteDurableConfig()) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+								restoreAndClose();
+								return;
+							}
+							throw error;
+						}
 						this.#refreshThemeUi();
 						done();
 					},
-					() => {
-						void restoreThemePreview(initialTheme).then(result => {
-							if (!result.success && result.error) {
-								this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
-							}
-							this.#refreshThemeUi();
-						});
-						done();
-					},
+					restoreAndClose,
 					themeName => {
 						void previewTheme(themeName).then(result => {
 							if (!result.success && result.error) {
@@ -1375,8 +1404,9 @@ export class SelectorController {
 			const selector = new PetSelectorComponent(
 				initial,
 				mode => {
-					this.ctx.setPetMode(mode);
-					done();
+					if (this.ctx.setPetMode(mode)) {
+						done();
+					}
 				},
 				() => {
 					this.ctx.previewPetMode(initial);

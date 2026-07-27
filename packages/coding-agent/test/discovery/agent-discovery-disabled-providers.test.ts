@@ -2,11 +2,18 @@
  * Regression test for #1075:
  * discoverAgents() must skip GJC plugin roots when the plugin provider is disabled.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { disableProvider, enableProvider } from "../../src/capability";
+import {
+	disableProvider,
+	enableProvider,
+	getDisabledProviders,
+	initializeWithSettings,
+	isProviderEnabled,
+	setDisabledProviders,
+} from "../../src/capability";
 import { clearCache as clearFsCache } from "../../src/capability/fs";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import { clearClaudePluginRootsCache } from "../../src/discovery/helpers";
@@ -78,5 +85,25 @@ describe("discoverAgents — claude-plugins disabled provider", () => {
 		clearClaudePluginRootsCache();
 		const { agents } = await discoverAgents(tempHome, tempHome, settings);
 		expect(agents.map(a => a.name)).not.toContain("simplifier");
+	});
+	test("rejects provider toggles before mutating state when initialized settings are read-only", () => {
+		const writableSettings = Settings.isolated();
+		const readOnlySettings = Settings.isolated({ disabledProviders: ["already-disabled"] });
+		const canWrite = vi.spyOn(readOnlySettings, "canWriteDurableConfig").mockReturnValue(false);
+		initializeWithSettings(readOnlySettings);
+
+		try {
+			expect(() => disableProvider("new-provider")).toThrow("Repair config.yml");
+			expect(isProviderEnabled("new-provider")).toBe(true);
+
+			expect(() => enableProvider("already-disabled")).toThrow("Repair config.yml");
+			expect(isProviderEnabled("already-disabled")).toBe(false);
+
+			expect(() => setDisabledProviders(["replacement"])).toThrow("Repair config.yml");
+			expect(getDisabledProviders()).toEqual(["already-disabled"]);
+		} finally {
+			canWrite.mockRestore();
+			initializeWithSettings(writableSettings);
+		}
 	});
 });

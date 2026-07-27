@@ -198,7 +198,10 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
-			const resultContent = [...extractDiffToolCallContent(event.result), ...extractToolCallContent(event.result)];
+			const resultContent = [
+				...extractDiffToolCallContent(event.result, options.cwd),
+				...extractToolCallContent(event.result),
+			];
 			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
@@ -207,8 +210,9 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				rawOutput: event.result,
 			};
 			if (event.isError) {
+				// Failure is carried by `status`; `kind` stays the tool's real category so
+				// clients keep the icon/treatment established by the initial `tool_call`.
 				update.title = `Failed: ${buildToolTitle(event.toolName, args, undefined)}`;
-				update.kind = "other";
 			}
 			if (content.length > 0) {
 				update.content = content;
@@ -713,7 +717,7 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 }
 
 /** Emit a `diff` ToolCallContent for each per-file edit result that carries oldText/newText. */
-function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
+function extractDiffToolCallContent(result: unknown, cwd?: string): ToolCallContent[] {
 	if (typeof result !== "object" || result === null) return [];
 	const details = (result as { details?: unknown }).details;
 	if (typeof details !== "object" || details === null) return [];
@@ -721,13 +725,13 @@ function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
 	const perFile = (details as { perFileResults?: unknown }).perFileResults;
 	const entries: unknown[] = Array.isArray(perFile) ? perFile : [details];
 	for (const entry of entries) {
-		const block = buildDiffContent(entry);
+		const block = buildDiffContent(entry, cwd);
 		if (block) blocks.push(block);
 	}
 	return blocks;
 }
 
-function buildDiffContent(entry: unknown): ToolCallContent | undefined {
+function buildDiffContent(entry: unknown, cwd?: string): ToolCallContent | undefined {
 	if (typeof entry !== "object" || entry === null) return undefined;
 	const candidate = entry as { path?: unknown; oldText?: unknown; newText?: unknown; isError?: unknown };
 	if (candidate.isError === true) return undefined;
@@ -738,7 +742,8 @@ function buildDiffContent(entry: unknown): ToolCallContent | undefined {
 	if (oldText === undefined && newText === undefined) return undefined;
 	return {
 		type: "diff",
-		path,
+		// `Diff.path` is specified as an absolute path, same as ToolCallLocation.
+		path: toAcpLocationPath(path, cwd),
 		oldText: oldText ?? null,
 		newText: newText ?? "",
 	};
@@ -859,7 +864,9 @@ function toToolCallContent(value: unknown): ToolCallContent | undefined {
 				resourceLinkContent.mimeType = mimeType;
 			}
 			const size = extractNumberProperty<ResourceLinkLikeContent>(value, "size");
-			if (size !== undefined) {
+			// `ResourceLink.size` is a byte count typed as int64; drop fractional, negative,
+			// or non-representable values rather than emitting a block clients must reject.
+			if (size !== undefined && Number.isSafeInteger(size) && size >= 0) {
 				resourceLinkContent.size = size;
 			}
 			return {

@@ -351,15 +351,23 @@ function parseEncodedContainer(value: unknown): unknown {
 function isRoundZeroRecoveryCandidate(value: unknown): boolean {
 	const root = parseEncodedContainer(value);
 	if (typeof root !== "object" || root === null || !Object.hasOwn(root, "questions")) return false;
-	const questionsValue = parseEncodedContainer((root as Record<string, unknown>).questions);
+	const rawQuestions = (root as Record<string, unknown>).questions;
+	const questionsValue = parseEncodedContainer(rawQuestions);
 	if (!Array.isArray(questionsValue)) return questionsValue === null;
+	const rootEncoded = typeof value === "string" || typeof rawQuestions === "string";
 	return questionsValue.some(rawQuestion => {
 		const question = parseEncodedContainer(rawQuestion);
 		if (typeof question !== "object" || question === null || !Object.hasOwn(question, "deepInterview")) return false;
-		const deepInterview = parseEncodedContainer((question as Record<string, unknown>).deepInterview);
+		const rawDeepInterview = (question as Record<string, unknown>).deepInterview;
+		const deepInterview = parseEncodedContainer(rawDeepInterview);
 		if (typeof deepInterview !== "object" || deepInterview === null) return false;
 		const metadata = deepInterview as Record<string, unknown>;
-		return Object.hasOwn(metadata, "intent_contract") || Object.hasOwn(metadata, "intent_review");
+		const hasContract = Object.hasOwn(metadata, "intent_contract");
+		const hasReview = Object.hasOwn(metadata, "intent_review");
+		// A JSON-string container is terminal only for the retired contract+review
+		// pair; canonical single-sided asks stay eligible for generic JSON coercion.
+		const encoded = rootEncoded || typeof rawQuestion === "string" || typeof rawDeepInterview === "string";
+		return encoded ? hasContract && hasReview : hasContract || hasReview;
 	});
 }
 

@@ -31,6 +31,8 @@ import {
 } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue, selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
+import { getProviderAuthHealth } from "../../config/provider-auth-health";
+import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
@@ -542,10 +544,22 @@ export class ModelSelectorComponent extends Container {
 		this.#applyTabFilter();
 	}
 
+	#resolveProviderAuthState(providerId: string): ProviderAuthState {
+		const health = getProviderAuthHealth(this.#modelRegistry.authStorage, providerId);
+		if (health) return health;
+		return this.#modelRegistry.hasConfiguredProviderAuth(providerId) ? "configured" : "none";
+	}
+
 	#sortModels(models: ModelItem[]): void {
-		// Sort: default-tagged model first, then MRU, then alphabetical
+		// Sort: default-tagged model first, then MRU, then provider ranking
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
+		const providerAuthStateById = new Map<string, ProviderAuthState>();
+		for (const item of models) {
+			if (!providerAuthStateById.has(item.provider)) {
+				providerAuthStateById.set(item.provider, this.#resolveProviderAuthState(item.provider));
+			}
+		}
 
 		const modelRank = (item: ModelItem) => computeModelRank(item.model, this.#roles);
 
@@ -566,7 +580,18 @@ export class ModelSelectorComponent extends Container {
 			if (aMru !== bMru) return aMru - bMru;
 
 			// By provider, then recency within provider
-			const providerCmp = a.provider.localeCompare(b.provider);
+			const providerCmp = compareRankedProviders(
+				{
+					id: a.provider,
+					label: a.provider,
+					authState: providerAuthStateById.get(a.provider) ?? "none",
+				},
+				{
+					id: b.provider,
+					label: b.provider,
+					authState: providerAuthStateById.get(b.provider) ?? "none",
+				},
+			);
 			if (providerCmp !== 0) return providerCmp;
 
 			// Priority field (lower = better, e.g. OpenAI code backend priority values)
@@ -608,6 +633,12 @@ export class ModelSelectorComponent extends Container {
 	#sortCanonicalModels(models: CanonicalModelItem[]): void {
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
+		const providerAuthStateById = new Map<string, ProviderAuthState>();
+		for (const item of models) {
+			if (!providerAuthStateById.has(item.model.provider)) {
+				providerAuthStateById.set(item.model.provider, this.#resolveProviderAuthState(item.model.provider));
+			}
+		}
 
 		const modelRank = (item: CanonicalModelItem) => computeModelRank(item.model, this.#roles);
 
@@ -620,7 +651,18 @@ export class ModelSelectorComponent extends Container {
 			const bMru = mruIndex.get(`${b.model.provider}/${b.model.id}`) ?? Number.MAX_SAFE_INTEGER;
 			if (aMru !== bMru) return aMru - bMru;
 
-			const providerCmp = a.model.provider.localeCompare(b.model.provider);
+			const providerCmp = compareRankedProviders(
+				{
+					id: a.model.provider,
+					label: a.model.provider,
+					authState: providerAuthStateById.get(a.model.provider) ?? "none",
+				},
+				{
+					id: b.model.provider,
+					label: b.model.provider,
+					authState: providerAuthStateById.get(b.model.provider) ?? "none",
+				},
+			);
 			if (providerCmp !== 0) return providerCmp;
 
 			return a.id.localeCompare(b.id);
@@ -735,8 +777,23 @@ export class ModelSelectorComponent extends Container {
 		for (const provider of this.#modelRegistry.getDiscoverableProviders()) {
 			providerSet.add(provider);
 		}
+		const providerAuthStateById = new Map<string, ProviderAuthState>();
+		for (const provider of providerSet) {
+			providerAuthStateById.set(provider, this.#resolveProviderAuthState(provider));
+		}
 		const sortedProviderIds = Array.from(providerSet).sort((left, right) =>
-			formatProviderTabLabel(left).localeCompare(formatProviderTabLabel(right)),
+			compareRankedProviders(
+				{
+					id: left,
+					label: formatProviderTabLabel(left),
+					authState: providerAuthStateById.get(left) ?? "none",
+				},
+				{
+					id: right,
+					label: formatProviderTabLabel(right),
+					authState: providerAuthStateById.get(right) ?? "none",
+				},
+			),
 		);
 		this.#providers = [...STATIC_PROVIDER_TABS, ...sortedProviderIds.map(createProviderTab)];
 		const activeIndex = this.#providers.findIndex(tab => tab.id === activeTabId);

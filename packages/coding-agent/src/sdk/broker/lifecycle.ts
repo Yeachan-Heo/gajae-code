@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
-import { resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
 	isModelProfileError,
@@ -706,12 +706,31 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 	});
 }
 
+/**
+ * Operator override for the session-host command, resolved from trusted
+ * environment sources only.
+ *
+ * The result is spawned directly, so whatever can set it chooses which binary
+ * the broker runs. `$env` merges the caller's `cwd/.env` into `process.env`, so
+ * reading it there would let repository content replace the session host;
+ * resolve it the same way provider credentials are (launching shell plus
+ * GJC/user-owned `.env` files, never the project `.env`).
+ */
+function sdkSessionCommandOverride(): { file: string; args: string[] } | undefined {
+	const configured = $credentialEnv("GJC_SDK_SESSION_COMMAND");
+	if (!configured) return undefined;
+	const [file, ...args] = configured.trim().split(/\s+/);
+	return file ? { file, args } : undefined;
+}
+
+/** Test seam: the session-host command override as resolved from trusted env. */
+export function sdkSessionCommandOverrideForTest(): { file: string; args: string[] } | undefined {
+	return sdkSessionCommandOverride();
+}
+
 function command(broker: Broker): LifecycleCommand {
-	const configured = process.env.GJC_SDK_SESSION_COMMAND;
-	if (configured) {
-		const [file, ...args] = configured.trim().split(/\s+/);
-		if (file) return { file, args };
-	}
+	const configured = sdkSessionCommandOverride();
+	if (configured) return configured;
 	return lifecycleCommandResolversForTest.get(broker)?.() ?? resolveSdkInternalSpawnCommand("session-host-internal");
 }
 

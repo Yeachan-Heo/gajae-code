@@ -1196,6 +1196,9 @@ export class Agent {
 	 */
 	requestRunTerminal(logicalRunId: ManagedLogicalRunId, request: RunTerminalRequest): boolean {
 		if (this.#terminalizedLogicalRunIds.has(logicalRunId)) return false;
+		if (this.#managedLogicalRunOwner === logicalRunId) {
+			this.#managedLogicalRunOwner = undefined;
+		}
 		this.#finalizeRun(
 			logicalRunId,
 			{

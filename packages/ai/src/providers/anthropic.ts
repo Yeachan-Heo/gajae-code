@@ -11,6 +11,7 @@ import type {
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages";
 import {
+	$credentialEnv,
 	$env,
 	extractHttpStatusFromError,
 	isEnoent,
@@ -490,7 +491,8 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Anthropic Code headers and tool prefixing.
-export const claudeCodeVersion = "2.1.63";
+export const claudeCodeVersion = "2.1.219";
+export const claudeCodeEntrypoint = "sdk-cli";
 export const claudeToolPrefix: string = "proxy_";
 export const claudeCodeSystemInstruction = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
@@ -566,7 +568,7 @@ function createClaudeBillingHeader(payload: unknown): string {
 	const buildHash = Array.from(randomBytes, byte => byte.toString(16).padStart(2, "0"))
 		.join("")
 		.slice(0, 3);
-	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${claudeCodeVersion}.${buildHash}; cc_entrypoint=cli; cch=${cch};`;
+	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${claudeCodeVersion}.${buildHash}; cc_entrypoint=${claudeCodeEntrypoint}; cch=${cch};`;
 }
 
 const CLAUDE_CLOAKING_USER_ID_REGEX =
@@ -816,10 +818,12 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 	// calls api.z.ai directly (no zcode.z.ai gateway, no captcha). Pin the base so dynamic
 	// discovery / stale bundled catalogs / model cache can't redirect it elsewhere.
 	if (model.provider === "glm-zcode") {
-		return normalizeAnthropicBaseUrl(process.env.ZCODE_PLAN_ANTHROPIC_BASE_URL) ?? "https://api.z.ai/api/anthropic";
+		return (
+			normalizeAnthropicBaseUrl($credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")) ?? "https://api.z.ai/api/anthropic"
+		);
 	}
 	if (model.provider === "anthropic" && isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeAnthropicBaseUrl($env.FOUNDRY_BASE_URL);
+		const foundryBaseUrl = normalizeAnthropicBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));
 		if (foundryBaseUrl) {
 			return foundryBaseUrl;
 		}

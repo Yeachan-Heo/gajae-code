@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	collectGcReport,
 	computeExitCode,
+	GC_STORES,
 	type GcContext,
 	type GcPidProbe,
 	type GcRecord,
@@ -253,19 +254,14 @@ describe("runGjcGcCommand", () => {
 		}
 	});
 
-	test("--json emits a report with all five store arrays", async () => {
+	test("--json emits a report with an array for every known store", async () => {
 		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
 		expect(result.status).toBe(0);
 		const parsed = JSON.parse(result.stdout);
 		expect(parsed.dry_run).toBe(true);
 		expect(parsed.operation).toBe("dry_run");
-		expect(Object.keys(parsed.stores).sort()).toEqual([
-			"file_locks",
-			"harness_leases",
-			"registry_entries",
-			"team_workers",
-			"tmux_sessions",
-		]);
+		// Derived from GC_STORES so adding a store cannot silently drop its array.
+		expect(Object.keys(parsed.stores).sort()).toEqual([...GC_STORES].sort());
 	});
 
 	test("default text mode reports dry run", async () => {

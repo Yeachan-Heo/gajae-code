@@ -34,7 +34,7 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | ------------------------------- | ------------------------------------------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `ANTHROPIC_OAUTH_TOKEN`         | Anthropic API auth                               | Using Anthropic with OAuth token auth                          | Takes precedence over `ANTHROPIC_API_KEY` for provider auth resolution                              |
 | `ANTHROPIC_API_KEY`             | Anthropic API auth                               | Using Anthropic without OAuth token                            | Fallback after `ANTHROPIC_OAUTH_TOKEN`                                                              |
-| `ANTHROPIC_FOUNDRY_API_KEY`     | Anthropic via Azure Foundry / enterprise gateway | `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` enabled                              | Takes precedence over `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when Foundry mode is enabled  |
+| `ANTHROPIC_FOUNDRY_API_KEY`     | Anthropic via Azure Foundry / enterprise gateway | `CLAUDE_CODE_USE_FOUNDRY` enabled                              | Takes precedence over `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when Foundry mode is enabled  |
 | `OPENAI_API_KEY`                | OpenAI auth                                      | Using OpenAI-family providers without explicit apiKey argument | Used by OpenAI Completions/Responses providers                                                      |
 | `GEMINI_API_KEY`                | Google Gemini auth                               | Using `google` provider models                                 | Primary key for Gemini provider mapping                                                             |
 | `GOOGLE_API_KEY`                | Gemini image tool auth fallback                  | Using `gemini_image` tool without `GEMINI_API_KEY`             | Used by coding-agent image tool fallback path                                                       |
@@ -113,27 +113,27 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 
 ### Anthropic Foundry Gateway (Azure / enterprise proxy)
 
-When `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry mode:
+When `CLAUDE_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry mode:
 
 - Base URL resolves from `FOUNDRY_BASE_URL` (fallback remains model/default base URL if unset).
 - API key resolution for provider `anthropic` becomes:
   `ANTHROPIC_FOUNDRY_API_KEY` → `ANTHROPIC_OAUTH_TOKEN` → `ANTHROPIC_API_KEY`.
 - `ANTHROPIC_CUSTOM_HEADERS` is parsed as comma/newline-separated `key: value` pairs and merged into request headers.
 - TLS client/server material can be injected from env values:
-  `NODE_EXTRA_CA_CERTS`, `ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`.
+  `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`.
   Each accepts either:
   - a filesystem path to PEM content, or
   - inline PEM (including escaped `\n` sequences).
 
 | Variable                    | Value type                                     | Behavior                                                                      |
 | --------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------- |
-| `ANTHROPIC_MODEL_CODE_USE_FOUNDRY`   | Boolean-like string (`1`, `true`, `yes`, `on`) | Enables Foundry mode for Anthropic provider                                   |
+| `CLAUDE_CODE_USE_FOUNDRY`   | Boolean-like string (`1`, `true`, `yes`, `on`) | Enables Foundry mode for Anthropic provider                                   |
 | `FOUNDRY_BASE_URL`          | URL string                                     | Anthropic endpoint base URL in Foundry mode                                   |
 | `ANTHROPIC_FOUNDRY_API_KEY` | Token string                                   | Used for `Authorization: Bearer <token>`                                      |
 | `ANTHROPIC_CUSTOM_HEADERS`  | Header list string                             | Extra headers; format `header-a: value, header-b: value` or newline-separated |
 | `NODE_EXTRA_CA_CERTS`       | PEM path or inline PEM                         | Extra CA chain for server certificate validation                              |
-| `ANTHROPIC_MODEL_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
-| `ANTHROPIC_MODEL_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
+| `CLAUDE_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
+| `CLAUDE_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
 
 ### Amazon Bedrock
 
@@ -394,7 +394,7 @@ SearXNG also reads the equivalent `searxng.endpoint`, `searxng.token`, `searxng.
 Anthropic web search uses `findAnthropicAuth()` from `packages/ai/src/utils/anthropic-auth.ts` in this order:
 
 1. `ANTHROPIC_SEARCH_API_KEY` (+ optional `ANTHROPIC_SEARCH_BASE_URL`)
-2. `ANTHROPIC_FOUNDRY_API_KEY` when `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled
+2. `ANTHROPIC_FOUNDRY_API_KEY` when `CLAUDE_CODE_USE_FOUNDRY` is enabled
 3. Anthropic OAuth credentials from `agent.db` (must not expire within 5-minute buffer)
 4. Anthropic API-key credentials from `agent.db`
 5. Generic Anthropic env fallback: provider key (`ANTHROPIC_FOUNDRY_API_KEY` in Foundry mode, otherwise `ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`) + optional `ANTHROPIC_BASE_URL` (`FOUNDRY_BASE_URL` when Foundry mode is enabled)
@@ -487,15 +487,17 @@ These are consumed via `@gajae-code/utils/dirs` and affect where coding-agent st
 | Variable                   | Behavior                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------ |
 | `GJC_BASH_NO_CI`            | Suppresses automatic `CI=true` injection into spawned shell env                |
-| `ANTHROPIC_MODEL_BASH_NO_CI`        | Legacy alias fallback for `GJC_BASH_NO_CI`                                      |
+| `PI_BASH_NO_CI`             | Legacy alias fallback for `GJC_BASH_NO_CI`                                     |
+| `CLAUDE_BASH_NO_CI`         | Legacy alias fallback for `GJC_BASH_NO_CI`                                     |
 | `GJC_BASH_NO_LOGIN`         | Disables login-shell mode; shell args become `['-c']` instead of `['-l','-c']` |
-| `ANTHROPIC_MODEL_BASH_NO_LOGIN`     | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                   |
-| `GJC_SHELL_PREFIX`          | Optional command prefix wrapper                                                |
-| `ANTHROPIC_MODEL_CODE_SHELL_PREFIX` | Legacy alias fallback for `GJC_SHELL_PREFIX`                                    |
+| `PI_BASH_NO_LOGIN`          | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
+| `CLAUDE_BASH_NO_LOGIN`      | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
+| `PI_SHELL_PREFIX`           | Optional command prefix wrapper                                                |
+| `CLAUDE_CODE_SHELL_PREFIX`  | Legacy alias fallback for `PI_SHELL_PREFIX`                                    |
 | `VISUAL`                   | Preferred external editor command                                              |
 | `EDITOR`                   | Fallback external editor command                                               |
 
-Current implementation: `GJC_BASH_NO_LOGIN`/`ANTHROPIC_MODEL_BASH_NO_LOGIN` are active; when either is set, `getShellArgs()` returns `['-c']`.
+Current implementation: `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` are resolved first, then the `PI_*` and `CLAUDE_*` aliases above. Both are boolean-like: only `1`/`Y`/`TRUE`/`YES`/`ON` (case-insensitive) enable them, so an explicit `GJC_BASH_NO_LOGIN=0` keeps the login shell even when a legacy alias is truthy. The shell prefix is read from `PI_SHELL_PREFIX`/`CLAUDE_CODE_SHELL_PREFIX` only; `GJC_SHELL_PREFIX` is not currently honored.
 
 ---
 
@@ -589,6 +591,6 @@ Treat these as secrets; do not log or commit them:
 - Provider/API keys and OAuth/bearer credentials (all `*_API_KEY`, `*_TOKEN`, OAuth access/refresh tokens)
 - Cloud credentials (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS` path may expose service-account material)
 - Search/provider auth vars (`EXA_API_KEY`, `BRAVE_API_KEY`, `PERPLEXITY_API_KEY`, Anthropic search keys)
-- Foundry mTLS material (`ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
+- Foundry mTLS material (`CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
 
 Python runtime also explicitly strips many common key vars before spawning kernel subprocesses (`packages/coding-agent/src/eval/py/runtime.ts`).

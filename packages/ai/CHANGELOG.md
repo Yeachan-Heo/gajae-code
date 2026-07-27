@@ -5,11 +5,24 @@
 ### Added
 
 - Added first-class support for **BizRouter**, an OpenAI-compatible Korean enterprise LLM gateway. Registers the `bizrouter` provider descriptor, `/login` entry (API-key paste validated against `https://api.bizrouter.ai/v1/models`), `BIZROUTER_API_KEY` environment resolution, and bundled `models.json` seed models. Models are discovered dynamically from `GET /v1/models` (base URL `https://api.bizrouter.ai/v1`).
+### Fixed
+
+- Anthropic subscription OAuth requests now use the current Claude Code compatibility attribution (`2.1.219`, `sdk-cli`) instead of the stale `2.1.63` CLI fingerprint that Anthropic can misclassify as extra usage.
+- Connection failures now name the transport code and the target URL. Bun reports DNS and socket failures as a bare `Error` whose message is a standalone hint ("Was there a typo in the url or port?", "Unable to connect. Is the computer able to access the url?") and keeps the actionable facts on `code` and `path`, but only `message` reached the assistant message. A provider outage, a local DNS failure, and a mistyped custom base URL therefore all rendered as the same context-free sentence with no host in it. Such failures now read `... (transport=FailedToOpenSocket url=https://chatgpt.com/backend-api/codex/responses)`; the URL is reduced to origin and path so a key carried in the query string is not surfaced.
+
+### Documentation
+
+- `docs/environment-variables.md` now names the Anthropic Foundry gateway variables that are actually read: `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_CLIENT_CERT`, and `CLAUDE_CODE_CLIENT_KEY`. The page advertised `ANTHROPIC_MODEL_CODE_*` spellings that no code path reads, so an operator following it could not enable Foundry mode at all, and the mTLS client material was silently ignored.
+
+## [0.11.11] - 2026-07-26
 
 ### Fixed
 
+- The Kimi usage endpoint base (`KIMI_CODE_BASE_URL`) is now resolved from trusted environment sources only. That base becomes the URL the usage request sends `Authorization: Bearer <accessToken>` to, so reading it through the merged view that includes the caller's `cwd/.env` let a repository collect the user's Kimi access token. An explicit caller-supplied base URL still takes precedence, and shell / user-level configuration is unchanged.
 - Anthropic `ping` keepalives no longer reset stream progress, so responses that stop producing content now reach the idle timeout instead of hanging indefinitely.
+- The Anthropic endpoint decision is now resolved from trusted environment sources only: `ANTHROPIC_BASE_URL`, `FOUNDRY_BASE_URL`, `ZCODE_PLAN_ANTHROPIC_BASE_URL`, and the `CLAUDE_CODE_USE_FOUNDRY` mode switch. `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` that redirected authenticated Anthropic requests — the resolved base URL becomes `${baseUrl}/v1/messages` while the headers carry the API key or OAuth token. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); shell and user-level configuration is unchanged.
 - The documented `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` environment variable now takes effect: the stream-watchdog idle-timeout helpers resolve it GJC-first before the legacy `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` / `PI_STREAM_IDLE_TIMEOUT_MS` aliases (previously only the `PI_`-prefixed names were read, so setting the documented GJC name was a silent no-op).
+- The documented OpenAI-code provider knobs now take effect: `GJC_OPENAI_CODE_DEBUG`, `GJC_OPENAI_CODE_WEBSOCKET`, `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS`, `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`, and `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS` are resolved GJC-first ahead of the legacy `PI_CODEX_*` names. The Codex → OpenAI-code rename had updated the documentation but not the reads, so every documented name was a silent no-op.
 
 ## [0.11.10] - 2026-07-25
 

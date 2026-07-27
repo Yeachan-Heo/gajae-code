@@ -36,7 +36,7 @@ const DEFAULT_INSTRUCTIONS =
 	"You are a helpful assistant with web search capabilities. Search the web to answer the user's question accurately and cite your sources.";
 
 function getConfiguredModel(): string | undefined {
-	const configuredModel = $env.PI_CODEX_WEB_SEARCH_MODEL?.trim();
+	const configuredModel = ($env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL ?? $env.PI_CODEX_WEB_SEARCH_MODEL)?.trim();
 	return configuredModel ? configuredModel : undefined;
 }
 

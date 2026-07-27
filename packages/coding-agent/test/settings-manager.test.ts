@@ -4,7 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { getCustomThemesDir, getProjectAgentDir, logger, Snowflake } from "@gajae-code/utils";
+import {
+	getCustomThemesDir,
+	getDefaultTabWidth,
+	getProjectAgentDir,
+	logger,
+	Snowflake,
+	setDefaultTabWidth,
+} from "@gajae-code/utils";
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
@@ -476,6 +483,71 @@ describe("Settings", () => {
 			await settings.flushOrThrow();
 			expect((await readSettings()).notifications).toEqual({ redact: true });
 		});
+		it("fails closed after an atomic read failure", async () => {
+			for (const commit of [
+				(settings: Settings) =>
+					settings.commitAtomicBatch([{ path: "theme.dark", op: "set" as const, value: "red-claw" }]),
+				(settings: Settings) =>
+					settings.commitAtomicBatchWithCurrent(() => [
+						{ path: "theme.dark", op: "set" as const, value: "red-claw" },
+					]),
+			]) {
+				await writeSettings({ theme: { dark: "blue-crab" } });
+				const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+				await Bun.write(getConfigPath(), "notifications: [");
+
+				const failure = await commit(settings).catch(error => error);
+				expect(failure).toBeInstanceOf(Error);
+				expect(settings.canWriteDurableConfig()).toBe(false);
+				expect(settings.getSchemaReport()).toMatchObject({
+					valid: false,
+					issues: [{ path: "config.yml", kind: "invalid" }],
+				});
+				expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+				await expect(
+					settings.commitAtomicBatch([{ path: "theme.dark", op: "set", value: "red-claw" }]),
+				).rejects.toThrow("Repair config.yml");
+				settings.getStorage()?.close();
+			}
+		});
+		it("keeps atomic failure recovery ahead of causally dependent queued work", async () => {
+			for (const commit of [
+				(settings: Settings) =>
+					settings.commitAtomicBatch([{ path: "notifications.enabled", op: "set" as const, value: true }]),
+				(settings: Settings) =>
+					settings.commitAtomicBatchWithCurrent(() => [
+						{ path: "notifications.enabled", op: "set" as const, value: true },
+					]),
+			]) {
+				await writeSettings({ theme: { dark: "blue-crab" } });
+				const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+				await Bun.write(getConfigPath(), "malformed-root\n");
+
+				const firstSettled = Promise.withResolvers<void>();
+				const first = commit(settings);
+				void first.finally(() => firstSettled.resolve()).catch(() => undefined);
+				const later = settings.commitAtomicBatchWithCurrent(async () => {
+					await firstSettled.promise;
+					return [];
+				});
+				const bounded = await Promise.race([
+					Promise.allSettled([first, later]),
+					Bun.sleep(2_000).then(() => "timeout" as const),
+				]);
+
+				expect(bounded).not.toBe("timeout");
+				expect(bounded).toMatchObject([
+					{
+						status: "rejected",
+						reason: {
+							message: "Cannot atomically repair notification settings while config.yml has a malformed root.",
+						},
+					},
+					{ status: "fulfilled" },
+				]);
+				settings.getStorage()?.close();
+			}
+		});
 
 		it("exposes an ordinary set and hook before disk completion without reentrant flush deadlock", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -567,5 +639,189 @@ describe("Settings", () => {
 		const migration = schema?.properties?.session?.properties?.directoryMigration;
 		expect(migration?.default).toBe("copy-retain");
 		expect(migration?.enum).toEqual(["copy-retain", "disabled"]);
+	});
+	it("clears recovered diagnostics and notification validation after an empty-file repair", async () => {
+		const malformed = "notifications: [";
+		await Bun.write(getConfigPath(), malformed);
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.set("theme.dark", "red-claw")).toThrow("Repair config.yml");
+			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flush();
+
+			expect(settings.canWriteDurableConfig()).toBe(true);
+			expect(settings.getSchemaReport()).toEqual({ issues: [], valid: true });
+			expect(settings.getNotificationSettingsSnapshot()).toMatchObject({ enabled: false });
+			settings.set("notifications.redact", true);
+			expect(settings.get("notifications.redact")).toBe(true);
+			await settings.flushOrThrow();
+			expect(await readSettings()).toMatchObject({ notifications: { redact: true } });
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("publishes repaired durable setting changes through hooks and listeners", async () => {
+		await Bun.write(getConfigPath(), "display: [");
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		const changedPaths: string[] = [];
+		const unsubscribe = settings.onChanged(settingPath => changedPaths.push(settingPath));
+		try {
+			setDefaultTabWidth(3);
+			await Bun.write(getConfigPath(), "display:\n  tabWidth: 7\n");
+			await settings.flush();
+
+			expect(settings.get("display.tabWidth")).toBe(7);
+			expect(getDefaultTabWidth()).toBe(7);
+			expect(changedPaths).toEqual(["display.tabWidth"]);
+		} finally {
+			unsubscribe();
+			setDefaultTabWidth(4);
+			settings.getStorage()?.close();
+		}
+	});
+
+	it("persists a retained dirty patch on the first flush after YAML repair", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await settings.flush();
+
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flushOrThrow();
+
+			expect(settings.canWriteDurableConfig()).toBe(true);
+			expect((await readSettings()).theme).toEqual({ dark: "blue-crab" });
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("enters syntax recovery after a debounced save encounters malformed YAML", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await Bun.sleep(300);
+
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => settings.set("theme.light", "blue-crab")).toThrow("Repair config.yml");
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("preserves fail-closed notifications while replaying dirty patches after external syntax corruption", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("notifications.redact", true);
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "notifications: [");
+			await settings.flush();
+
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flushOrThrow();
+
+			expect(await readSettings()).toMatchObject({
+				notifications: { redact: true },
+				theme: { dark: "blue-crab" },
+			});
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("retains fail-closed recovery state when a durable refresh read fails", async () => {
+		const malformed = "notifications: [";
+		await Bun.write(getConfigPath(), malformed);
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			fs.rmSync(getConfigPath());
+			fs.mkdirSync(getConfigPath());
+
+			await expect(settings.flush()).rejects.toThrow();
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => settings.set("notifications.redact", true)).toThrow("Repair config.yml");
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("serializes failed-save recovery behind a later reserved save", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		let queuedNewestSave = false;
+		const warning = vi.spyOn(logger, "warn").mockImplementation(message => {
+			if (message !== "Settings: background save failed" || queuedNewestSave) return;
+			queuedNewestSave = true;
+			fs.writeFileSync(getConfigPath(), YAML.stringify({ theme: { dark: "red-claw" } }, null, 2));
+			settings.set("theme.dark", "red-claw");
+		});
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await expect(settings.flushOrThrow()).rejects.toThrow();
+
+			expect(queuedNewestSave).toBe(true);
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect((await readSettings()).theme).toEqual({ dark: "red-claw" });
+		} finally {
+			warning.mockRestore();
+			settings.getStorage()?.close();
+		}
+	});
+
+	it("keeps malformed global recovery and notification state in cwd clones", async () => {
+		const malformed = "notifications: [";
+		const clonedCwd = path.join(testDir, "cloned-project");
+		fs.mkdirSync(clonedCwd, { recursive: true });
+		await Bun.write(getConfigPath(), malformed);
+		const source = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			const cloned = await source.cloneForCwd(clonedCwd);
+			expect(cloned.canWriteDurableConfig()).toBe(false);
+			expect(cloned.getSchemaReport()).toEqual(source.getSchemaReport());
+			expect(() => source.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => cloned.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => cloned.set("notifications.redact", true)).toThrow("Repair config.yml");
+			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+		} finally {
+			source.getStorage()?.close();
+		}
+	});
+	it("keeps the source as the sole owner of retained patches in recovered cwd clones", async () => {
+		const clonedCwd = path.join(testDir, "cloned-project");
+		fs.mkdirSync(clonedCwd, { recursive: true });
+		const source = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			source.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await Bun.sleep(300);
+
+			const cloned = await source.cloneForCwd(clonedCwd);
+			expect(cloned.canWriteDurableConfig()).toBe(false);
+			expect(cloned.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await source.flushOrThrow();
+			expect((await readSettings()).theme).toEqual({ dark: "blue-crab" });
+
+			await Bun.write(getConfigPath(), YAML.stringify({ theme: { dark: "red-claw" } }, null, 2));
+			await cloned.flushOrThrow();
+			expect((await readSettings()).theme).toEqual({ dark: "red-claw" });
+		} finally {
+			source.getStorage()?.close();
+		}
 	});
 });

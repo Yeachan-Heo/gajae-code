@@ -3481,4 +3481,29 @@ describe("AskTool Round-0 intent recovery", () => {
 			deepInterview: { intent_review: expect.any(Object) },
 		});
 	});
+
+	it("coerces JSON-string containers for single-sided deep-interview asks", () => {
+		const contractOnly = roundZeroPair();
+		Reflect.deleteProperty(contractOnly.questions[0].deepInterview, "intent_review");
+		const encodedQuestions = { questions: JSON.stringify(contractOnly.questions) } as unknown as Record<
+			string,
+			unknown
+		>;
+		expect(validateAsk(encodedQuestions).questions[0]).toMatchObject({
+			deepInterview: { intent_contract: expect.any(Object) },
+		});
+
+		const postRoundReview = roundZeroPair();
+		Reflect.deleteProperty(postRoundReview.questions[0].deepInterview, "intent_contract");
+		postRoundReview.questions[0].deepInterview.round = 1;
+		postRoundReview.questions[0].deepInterview.component = "locked-intent";
+		postRoundReview.questions[0].deepInterview.dimension = "constraints";
+		const encodedReview = { questions: JSON.stringify(postRoundReview.questions) } as unknown as Record<
+			string,
+			unknown
+		>;
+		expect(validateAsk(encodedReview, "post-topology").questions[0]).toMatchObject({
+			deepInterview: { intent_review: expect.any(Object) },
+		});
+	});
 });

@@ -84,6 +84,31 @@ describe("generateFileMentionMessages path resolution", () => {
 	});
 });
 
+describe("resolveReadPath macOS screenshot recovery", () => {
+	const NNBSP = "\u202f";
+
+	test("recovers the narrow no-break space before AM/PM for any following separator", async () => {
+		const cwd = await createTempDir();
+		const cases = [
+			`Screenshot 2026-07-26 at 11.23.30${NNBSP}PM.png`,
+			`Screenshot 2026-07-26 at 11.23.31${NNBSP}PM-1785075812409.png`,
+			`Screenshot 2026-07-26 at 11.23.32${NNBSP}AM_2.png`,
+		];
+		for (const name of cases) {
+			await Bun.write(path.join(cwd, name), "x");
+			// The model normalizes NNBSP to a plain space before the tool sees the path.
+			const typed = path.join(cwd, name.replace(NNBSP, " "));
+			expect(resolveReadPath(typed, cwd)).toBe(path.join(cwd, name));
+		}
+	});
+
+	test("leaves a plain-space path alone when AM/PM is part of a longer word", async () => {
+		const cwd = await createTempDir();
+		const typed = path.join(cwd, "a PMX.png");
+		expect(resolveReadPath(typed, cwd)).toBe(typed);
+	});
+});
+
 describe("generateFileMentionMessages duplicate suppression + inline cap (Finding 5)", () => {
 	function files(messages: Awaited<ReturnType<typeof generateFileMentionMessages>>) {
 		const m = messages[0];

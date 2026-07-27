@@ -976,11 +976,21 @@ function redactSecrets(input: string): string {
 		/(?:sk|pk|rk|tok|key|secret|token|password)[-_A-Za-z0-9]{12,}/g,
 		/[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
 		/(?:AKIA|ASIA)[A-Z0-9]{16}/g,
+		// GitHub tokens carry no keyword the first pattern recognizes, so without
+		// this they reached MEMORY.md and memory_summary.md verbatim — and the
+		// summary is injected into every later session. Same shapes the
+		// contribution-prep scrubber already covers.
+		/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g,
 	];
 	for (const pattern of patterns) {
 		out = out.replace(pattern, "[REDACTED]");
 	}
 	return out;
+}
+
+/** Secret scrubbing applied to every phase-2 consolidation output. Test seam. */
+export function redactMemorySecretsForTesting(input: string): string {
+	return redactSecrets(input);
 }
 
 function sanitizeSkillName(name: string): string {

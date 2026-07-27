@@ -58,6 +58,7 @@ function createSelector(
 		options.modelRegistry ??
 		({
 			getAll: () => [model],
+			hasConfiguredProviderAuth: () => false,
 			getDiscoverableProviders: () => [],
 			getCanonicalModels: () => [],
 			resolveCanonicalModel: () => undefined,
@@ -382,6 +383,7 @@ describe("ModelSelector canonical model selection", () => {
 		const selectorValue = `${model.provider}/${model.id}`;
 		const modelRegistry = {
 			getAll: () => [model],
+			hasConfiguredProviderAuth: () => false,
 			getDiscoverableProviders: () => [],
 			getCanonicalModels: () => [
 				{
@@ -430,6 +432,7 @@ describe("ModelSelector canonical model selection", () => {
 		});
 		const modelRegistry = {
 			getAll: () => availableModels,
+			hasConfiguredProviderAuth: () => false,
 			refresh: vi.fn(async () => {}),
 			refreshProvider,
 			getError: () => undefined,
@@ -741,6 +744,7 @@ function createFastSelector(args: {
 	const isFastForSubagentProvider = args.isFastForSubagentProvider ?? isFastForProvider;
 	const modelRegistry = {
 		getAll: () => models,
+		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,

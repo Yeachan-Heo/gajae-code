@@ -41,6 +41,7 @@ function createControllerContext() {
 			getAvailable: () => [selectedModel],
 			refresh: vi.fn(async () => {}),
 			getAll: () => [selectedModel],
+			hasConfiguredProviderAuth: () => false,
 			getError: () => undefined,
 			getCanonicalModels: () => [],
 			getDiscoverableProviders: () => [],

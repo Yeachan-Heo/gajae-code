@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
+import * as compactionModule from "@gajae-code/agent-core/compaction";
 import { type AssistantMessage, getBundledModel, type Model, stream as streamModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -151,7 +152,7 @@ function successfulStream(model: Model, content = "Recovered"): AssistantMessage
 	});
 }
 
-describe("AgentSession managed fallback upstream request counts", () => {
+describe("AgentSession fallback upstream request counts", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
@@ -177,8 +178,13 @@ describe("AgentSession managed fallback upstream request counts", () => {
 	function createSession(
 		maxAttempts: number,
 		streamFn: AgentOptions["streamFn"],
-		models?: { primary: Model; fallback: Model },
+		modelsOrSettings: { primary: Model; fallback: Model } | Record<string, unknown> = {},
 	): { primary: Model; fallback: Model } {
+		const models =
+			"primary" in modelsOrSettings && "fallback" in modelsOrSettings
+				? (modelsOrSettings as { primary: Model; fallback: Model })
+				: undefined;
+		const settingsOverrides = models ? {} : modelsOrSettings;
 		const primary = models?.primary ?? getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = models?.fallback ?? getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
@@ -191,6 +197,7 @@ describe("AgentSession managed fallback upstream request counts", () => {
 			"compaction.enabled": false,
 			"fallback.maxAttempts": maxAttempts,
 			"retry.baseDelayMs": 10,
+			...settingsOverrides,
 		});
 		settings.setModelRole("default", selector(primary));
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
@@ -293,6 +300,60 @@ describe("AgentSession managed fallback upstream request counts", () => {
 			else Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = originalTimeout;
 		}
 	});
+
+	function createPlainSession(
+		streamFn: AgentOptions["streamFn"],
+		settingsOverrides: Record<string, unknown> = {},
+	): Model {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary) throw new Error("Expected bundled test model");
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 10,
+			...settingsOverrides,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain("default", [selector(primary)], "test");
+		return primary;
+	}
+
+	function seedCompactableHistory(primary: Model): void {
+		for (let index = 0; index < 4; index++) {
+			const user = {
+				role: "user" as const,
+				content: `seed request ${index} `.repeat(40),
+				timestamp: Date.now() + index * 2,
+			};
+			const assistant: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: `seed response ${index} `.repeat(40) }],
+				api: primary.api,
+				provider: primary.provider,
+				model: primary.id,
+				usage: {
+					input: 20_000,
+					output: 200,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 20_200,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now() + index * 2 + 1,
+			};
+			session!.agent.appendMessage(user);
+			session!.sessionManager.appendMessage(user);
+			session!.agent.appendMessage(assistant);
+			session!.sessionManager.appendMessage(assistant);
+		}
+	}
+
 	it("N=1 sends one managed request to each chain entry without a hidden replay", async () => {
 		const calls: StreamCall[] = [];
 		const { primary, fallback } = createSession(1, (model, _context, options) => {
@@ -398,25 +459,294 @@ describe("AgentSession managed fallback upstream request counts", () => {
 		);
 	});
 
-	it("bounds repeated overflow maintenance within one logical run", async () => {
+	it("terminalizes overflow maintenance when compaction would be a no-op", async () => {
 		const calls: string[] = [];
 		const events: AgentSessionEvent[] = [];
-		const { primary, fallback } = createSession(1, model => {
-			calls.push(selector(model));
-			return typedOpaqueOverflowStream(model);
+		let managedOwnerAtTerminalEvent: number | undefined;
+		const { primary, fallback } = createSession(
+			1,
+			model => {
+				calls.push(selector(model));
+				return typedOpaqueOverflowStream(model);
+			},
+			{
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 1,
+			},
+		);
+		const prepareSpy = vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
+		session!.subscribe(event => {
+			events.push(event);
+			if (
+				event.type === "auto_compaction_end" &&
+				event.skipped &&
+				!event.willRetry &&
+				event.errorMessage?.includes("nothing eligible to compact")
+			) {
+				managedOwnerAtTerminalEvent = session!.agent.currentManagedLogicalRunId;
+			}
 		});
-		session!.subscribe(event => events.push(event));
 
 		await session!.prompt("Stop after bounded overflow maintenance");
 		await session!.waitForIdle();
 
-		expect(calls).toEqual([selector(primary), selector(primary)]);
+		expect(prepareSpy).toHaveBeenCalled();
+		expect(calls).toEqual([selector(primary)]);
 		expect(calls).not.toContain(selector(fallback));
+		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(1);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "auto_compaction_end",
+				action: "context-full",
+				aborted: false,
+				skipped: true,
+				willRetry: false,
+				errorMessage: expect.stringContaining("nothing eligible to compact"),
+			}),
+		);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(managedOwnerAtTerminalEvent).toBeUndefined();
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorStatus: 400,
+		});
+		expect(
+			session!.messages.filter(message => message.role === "assistant" && message.stopReason === "error"),
+		).toHaveLength(1);
+	});
+
+	it("resumes a successor queued while managed no-op maintenance is starting", async () => {
+		const calls: string[] = [];
+		const events: AgentSessionEvent[] = [];
+		let requestCount = 0;
+		let queuedPrompt: Promise<void> | undefined;
+		const successorTerminal = Promise.withResolvers<void>();
+		const { primary } = createSession(
+			1,
+			model => {
+				calls.push(selector(model));
+				requestCount += 1;
+				return requestCount === 1
+					? typedOpaqueOverflowStream(model)
+					: successfulStream(model, "Queued successor completed");
+			},
+			{
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 1,
+			},
+		);
+		const prepareSpy = vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
+		session!.subscribe(event => {
+			events.push(event);
+			if (
+				event.type === "agent_end" &&
+				event.messages.some(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(
+							content => content.type === "text" && content.text === "Queued successor completed",
+						),
+				)
+			) {
+				successorTerminal.resolve();
+			}
+			if (
+				!queuedPrompt &&
+				event.type === "auto_compaction_start" &&
+				event.reason === "overflow" &&
+				event.action === "context-full"
+			) {
+				queuedPrompt = session!.prompt("Run after terminal overflow", {
+					skipCompactionCheck: true,
+					streamingBehavior: "steer",
+				});
+			}
+		});
+
+		await session!.prompt("Terminal overflow before queued successor");
+		expect(queuedPrompt).toBeDefined();
+		await queuedPrompt;
+		await Promise.race([
+			successorTerminal.promise,
+			Bun.sleep(1_000).then(() => {
+				throw new Error(
+					`Queued successor did not reach terminal lifecycle: calls=${JSON.stringify(calls)}, events=${JSON.stringify(
+						events.map(event => event.type),
+					)}, owner=${String(session!.agent.currentManagedLogicalRunId)}`,
+				);
+			}),
+		]);
+		await session!.waitForIdle();
+
+		expect(prepareSpy).toHaveBeenCalled();
+		expect(calls).toEqual([selector(primary), selector(primary)]);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Queued successor completed" }],
+			stopReason: "stop",
+		});
+	});
+
+	it("preserves the terminal overflow assistant after plain no-op maintenance", async () => {
+		const calls: StreamCall[] = [];
+		const events: AgentSessionEvent[] = [];
+		const primary = createPlainSession(
+			(model, _context, options) => {
+				calls.push({
+					selector: selector(model),
+					fallbackManaged: options?.fallbackManaged,
+					fallbackAttempt: options?.fallbackAttempt,
+				});
+				return typedOpaqueOverflowStream(model);
+			},
+			{
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 1,
+			},
+		);
+		const prepareSpy = vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Preserve the terminal plain overflow");
+		await session!.waitForIdle();
+
+		expect(prepareSpy).toHaveBeenCalled();
+		expect(calls).toEqual([{ selector: selector(primary), fallbackManaged: undefined, fallbackAttempt: undefined }]);
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "auto_compaction_end",
+				action: "context-full",
+				aborted: false,
+				skipped: true,
+				willRetry: false,
+				errorMessage: expect.stringContaining("nothing eligible to compact"),
+			}),
+		);
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			stopReason: "error",
+			errorStatus: 400,
 		});
+		expect(
+			session!.sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "error",
+				),
+		).toHaveLength(1);
+	});
+
+	it("settles plain overflow before terminal observers mutate live state", async () => {
+		const calls: StreamCall[] = [];
+		const primary = createPlainSession(
+			(model, _context, options) => {
+				calls.push({
+					selector: selector(model),
+					fallbackManaged: options?.fallbackManaged,
+					fallbackAttempt: options?.fallbackAttempt,
+				});
+				return typedOpaqueOverflowStream(model);
+			},
+			{
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 1,
+			},
+		);
+		const prepareSpy = vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
+		let resetAtTerminalEvent = false;
+		session!.subscribe(event => {
+			if (
+				event.type === "auto_compaction_end" &&
+				event.skipped &&
+				!event.willRetry &&
+				event.errorMessage?.includes("nothing eligible to compact")
+			) {
+				resetAtTerminalEvent = true;
+				session!.agent.reset();
+			}
+		});
+
+		await session!.prompt("Clear while observing terminal plain overflow");
+		await session!.waitForIdle();
+
+		expect(prepareSpy).toHaveBeenCalled();
+		expect(calls).toEqual([{ selector: selector(primary), fallbackManaged: undefined, fallbackAttempt: undefined }]);
+		expect(resetAtTerminalEvent).toBeTrue();
+		expect(session!.messages).toEqual([]);
+		expect(
+			session!.sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "error",
+				),
+		).toHaveLength(1);
+	});
+
+	it("preserves successful overflow compaction and retry on the same model", async () => {
+		const calls: string[] = [];
+		const events: AgentSessionEvent[] = [];
+		let primaryCalls = 0;
+		const { primary, fallback } = createSession(
+			1,
+			model => {
+				calls.push(selector(model));
+				if (selector(model) !== selector(primary)) return successfulStream(model);
+				primaryCalls += 1;
+				return primaryCalls === 1
+					? typedOpaqueOverflowStream(model)
+					: successfulStream(model, "Recovered after compaction");
+			},
+			{
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 1,
+			},
+		);
+		seedCompactableHistory(primary);
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "Compacted summary",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+			preserveData: undefined,
+		}));
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Recover after real overflow compaction");
+		await session!.waitForIdle();
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(calls).toEqual([selector(primary), selector(primary)]);
+		expect(calls).not.toContain(selector(fallback));
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "auto_compaction_end",
+				action: "context-full",
+				aborted: false,
+				willRetry: true,
+				result: expect.objectContaining({ summary: "Compacted summary" }),
+			}),
+		);
+		expect(events.filter(event => event.type === "agent_end")).toEqual([
+			expect.objectContaining({ stopReason: "completed" }),
+		]);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Recovered after compaction" }],
+		});
+		expect(
+			session!.messages.filter(message => message.role === "assistant" && message.stopReason === "error"),
+		).toHaveLength(0);
 	});
 	it("preserves a prior fallback charge across overflow maintenance", async () => {
 		const calls: string[] = [];

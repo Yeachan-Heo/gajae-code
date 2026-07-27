@@ -1,6 +1,8 @@
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProviderInfo } from "@gajae-code/ai/utils/oauth/types";
 import { Container, matchesKey, Spacer, TruncatedText } from "@gajae-code/tui";
+import { recordProviderAuthHealth } from "../../config/provider-auth-health";
+import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import { theme } from "../../modes/theme/theme";
 import { matchesSelectCancel } from "../../modes/utils/keybinding-matchers";
 import type { AuthStorage } from "../../session/auth-storage";
@@ -14,6 +16,7 @@ const OAUTH_SELECTOR_MAX_VISIBLE = 10;
 export class OAuthSelectorComponent extends Container {
 	#listContainer: Container;
 	#allProviders: OAuthProviderInfo[] = [];
+	#sortedProviders: OAuthProviderInfo[] = [];
 	#selectedIndex: number = 0;
 	#mode: "login" | "logout";
 	#authStorage: AuthStorage;
@@ -91,7 +94,7 @@ export class OAuthSelectorComponent extends Container {
 			}
 			this.#authState.set(provider.id, "checking");
 			pending += 1;
-			void this.#validateProvider(provider.id, generation);
+			void this.#validateProvider(provider.id, generation, this.#authStorage.getGeneration());
 		}
 
 		if (pending > 0) {
@@ -101,7 +104,7 @@ export class OAuthSelectorComponent extends Container {
 		}
 	}
 
-	async #validateProvider(providerId: string, generation: number): Promise<void> {
+	async #validateProvider(providerId: string, generation: number, authGeneration: number): Promise<void> {
 		if (!this.#validateAuthCallback) return;
 		let isValid = false;
 		try {
@@ -112,6 +115,11 @@ export class OAuthSelectorComponent extends Container {
 
 		if (generation !== this.#validationGeneration) return;
 		this.#authState.set(providerId, isValid ? "valid" : "invalid");
+		// Only record the ordering hint when the credentials validated are still the
+		// current ones; a result from a superseded generation must not describe them.
+		if (authGeneration === this.#authStorage.getGeneration()) {
+			recordProviderAuthHealth(this.#authStorage, providerId, isValid ? "valid" : "invalid");
+		}
 		if (![...this.#authState.values()].includes("checking")) {
 			this.#stopSpinner();
 		}
@@ -138,6 +146,10 @@ export class OAuthSelectorComponent extends Container {
 		}
 	}
 
+	#getProviderAuthState(providerId: string): ProviderAuthState {
+		return this.#authState.get(providerId) ?? "none";
+	}
+
 	#getStatusIndicator(providerId: string): string {
 		const state = this.#authState.get(providerId);
 		if (state === "checking") {
@@ -154,9 +166,25 @@ export class OAuthSelectorComponent extends Container {
 		return this.#authStorage.hasAuth(providerId) ? theme.fg("success", ` ${theme.status.success} logged in`) : "";
 	}
 	#updateList(): void {
+		const selectedProviderId = this.#sortedProviders[this.#selectedIndex]?.id;
+		const rankedProviders = this.#allProviders.map(provider => ({
+			provider,
+			id: provider.id,
+			label: provider.name,
+			authState: this.#getProviderAuthState(provider.id),
+		}));
+		rankedProviders.sort(compareRankedProviders);
+		this.#sortedProviders = rankedProviders.map(({ provider }) => provider);
+		if (selectedProviderId !== undefined) {
+			const selectedIndex = this.#sortedProviders.findIndex(provider => provider.id === selectedProviderId);
+			if (selectedIndex >= 0) this.#selectedIndex = selectedIndex;
+		}
+		if (this.#selectedIndex >= this.#sortedProviders.length) {
+			this.#selectedIndex = Math.max(0, this.#sortedProviders.length - 1);
+		}
 		this.#listContainer.clear();
 
-		const total = this.#allProviders.length;
+		const total = this.#sortedProviders.length;
 		const maxVisible = OAUTH_SELECTOR_MAX_VISIBLE;
 		const startIndex =
 			total <= maxVisible
@@ -165,7 +193,7 @@ export class OAuthSelectorComponent extends Container {
 		const endIndex = Math.min(startIndex + maxVisible, total);
 
 		for (let i = startIndex; i < endIndex; i++) {
-			const provider = this.#allProviders[i];
+			const provider = this.#sortedProviders[i];
 			if (!provider) continue;
 			const isSelected = i === this.#selectedIndex;
 			const isAvailable = provider.available;
@@ -218,23 +246,25 @@ export class OAuthSelectorComponent extends Container {
 	handleInput(keyData: string): void {
 		// Up arrow
 		if (matchesKey(keyData, "up")) {
-			if (this.#allProviders.length > 0) {
-				this.#selectedIndex = this.#selectedIndex === 0 ? this.#allProviders.length - 1 : this.#selectedIndex - 1;
+			if (this.#sortedProviders.length > 0) {
+				this.#selectedIndex =
+					this.#selectedIndex === 0 ? this.#sortedProviders.length - 1 : this.#selectedIndex - 1;
 			}
 			this.#statusMessage = undefined;
 			this.#updateList();
 		}
 		// Down arrow
 		else if (matchesKey(keyData, "down")) {
-			if (this.#allProviders.length > 0) {
-				this.#selectedIndex = this.#selectedIndex === this.#allProviders.length - 1 ? 0 : this.#selectedIndex + 1;
+			if (this.#sortedProviders.length > 0) {
+				this.#selectedIndex =
+					this.#selectedIndex === this.#sortedProviders.length - 1 ? 0 : this.#selectedIndex + 1;
 			}
 			this.#statusMessage = undefined;
 			this.#updateList();
 		}
 		// Page up - jump up by one visible page
 		else if (matchesKey(keyData, "pageUp")) {
-			if (this.#allProviders.length > 0) {
+			if (this.#sortedProviders.length > 0) {
 				this.#selectedIndex = Math.max(0, this.#selectedIndex - OAUTH_SELECTOR_MAX_VISIBLE);
 			}
 			this.#statusMessage = undefined;
@@ -242,9 +272,9 @@ export class OAuthSelectorComponent extends Container {
 		}
 		// Page down - jump down by one visible page
 		else if (matchesKey(keyData, "pageDown")) {
-			if (this.#allProviders.length > 0) {
+			if (this.#sortedProviders.length > 0) {
 				this.#selectedIndex = Math.min(
-					this.#allProviders.length - 1,
+					this.#sortedProviders.length - 1,
 					this.#selectedIndex + OAUTH_SELECTOR_MAX_VISIBLE,
 				);
 			}
@@ -253,7 +283,7 @@ export class OAuthSelectorComponent extends Container {
 		}
 		// Enter
 		else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
-			const selectedProvider = this.#allProviders[this.#selectedIndex];
+			const selectedProvider = this.#sortedProviders[this.#selectedIndex];
 			if (selectedProvider?.available) {
 				this.#statusMessage = undefined;
 				this.stopValidation();

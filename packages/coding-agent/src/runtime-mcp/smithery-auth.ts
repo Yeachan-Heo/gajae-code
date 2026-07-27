@@ -2,9 +2,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger } from "@gajae-code/utils";
 import { getAgentDir } from "@gajae-code/utils/dirs";
+import { $credentialEnv } from "@gajae-code/utils/env";
 
 const SMITHERY_AUTH_FILENAME = "smithery.json";
-const SMITHERY_URL = process.env.SMITHERY_URL || "https://smithery.ai";
+/**
+ * Smithery web origin, from trusted environment sources only.
+ *
+ * This origin serves the CLI auth session and the verification URL the user is
+ * sent to, so whatever can set it can drive the login flow. `$env` merges the
+ * caller's `cwd/.env` into `process.env`, so reading it there would let
+ * repository content redirect that flow.
+ */
+const SMITHERY_URL = $credentialEnv("SMITHERY_URL") || "https://smithery.ai";
 
 type SmitheryCliAuthSession = {
 	sessionId: string;
@@ -29,6 +38,11 @@ function normalizeApiKey(value: string | undefined): string | undefined {
 	if (!value) return undefined;
 	const trimmed = value.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Test seam: the Smithery origin and env API key as resolved from trusted env. */
+export function resolveSmitheryEnvForTest(): { url: string; apiKey: string | undefined } {
+	return { url: SMITHERY_URL, apiKey: normalizeApiKey($credentialEnv("SMITHERY_API_KEY")) };
 }
 
 export function getSmitheryLoginUrl(): string {
@@ -62,7 +76,8 @@ export async function pollSmitheryCliAuthSession(
 }
 
 export async function getSmitheryApiKey(): Promise<string | undefined> {
-	const envKey = normalizeApiKey(process.env.SMITHERY_API_KEY);
+	// Trusted sources only: this key authenticates every Smithery API call.
+	const envKey = normalizeApiKey($credentialEnv("SMITHERY_API_KEY"));
 	if (envKey) return envKey;
 
 	const authPath = getSmitheryAuthPath();

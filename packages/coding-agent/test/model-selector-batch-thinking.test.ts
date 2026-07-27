@@ -40,6 +40,7 @@ function createSelector(
 ): ModelSelectorComponent {
 	const modelRegistry = {
 		getAll: () => [model],
+		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,

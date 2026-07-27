@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { getAgentDbPath, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { type ModelsConfig, ModelsConfigSchema } from "../config/models-config-schema";
+import { compareRankedProviders, famousProviderIndex } from "../config/provider-ranking";
 import { AuthStorage } from "../session/auth-storage";
 import providerPresets from "./provider-presets.json";
 
@@ -81,11 +82,25 @@ export function findProviderPreset(value: string | undefined): ProviderPreset | 
 	return PROVIDER_PRESETS.find(preset => preset.id === normalized || preset.aliases.includes(normalized));
 }
 
+function providerPresetRankingId(preset: ProviderPreset): string {
+	return (
+		[preset.providerId, preset.id, ...preset.aliases].find(id => famousProviderIndex(id) !== undefined) ?? preset.id
+	);
+}
+
 export function formatProviderPresetList(): string {
-	return PROVIDER_PRESETS.map(preset => {
-		const aliases = preset.aliases.length > 0 ? ` (aliases: ${preset.aliases.join(", ")})` : "";
-		return `${preset.id}${aliases}: ${preset.description}`;
-	}).join("\n");
+	return [...PROVIDER_PRESETS]
+		.sort((left, right) =>
+			compareRankedProviders(
+				{ id: providerPresetRankingId(left), label: left.name, authState: "none" },
+				{ id: providerPresetRankingId(right), label: right.name, authState: "none" },
+			),
+		)
+		.map(preset => {
+			const aliases = preset.aliases.length > 0 ? ` (aliases: ${preset.aliases.join(", ")})` : "";
+			return `${preset.id}${aliases}: ${preset.description}`;
+		})
+		.join("\n");
 }
 
 export function parseModelList(values: readonly string[]): string[] {

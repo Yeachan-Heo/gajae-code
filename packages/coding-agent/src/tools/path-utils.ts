@@ -33,7 +33,11 @@ function normalizeUnicodeSpaces(str: string): string {
 }
 
 function tryMacOSScreenshotPath(filePath: string): string {
-	return filePath.replace(/ (AM|PM)\./g, `${NARROW_NO_BREAK_SPACE}$1.`);
+	// macOS writes a narrow no-break space before AM/PM, but the model normalizes it
+	// to a plain space. The original name is not always `…PM.png`: attachment paths
+	// append a timestamp (`…PM-1785075812409.png`), so match any non-alphanumeric
+	// separator or end of segment rather than a literal dot.
+	return filePath.replace(/ (AM|PM)(?=[^A-Za-z0-9/]|$)/g, `${NARROW_NO_BREAK_SPACE}$1`);
 }
 
 function tryNFDVariant(filePath: string): string {

@@ -1,8 +1,9 @@
 /**
  * Centralized path helpers for gajae-code config directories.
  *
- * Uses PI_CONFIG_DIR (default ".gjc") for the config root and
- * PI_CODING_AGENT_DIR to override the agent directory.
+ * Uses GJC_CONFIG_DIR (legacy alias PI_CONFIG_DIR, default ".gjc") for the
+ * config root and GJC_CODING_AGENT_DIR (legacy alias PI_CODING_AGENT_DIR) to
+ * override the agent directory.
  *
  * On Linux, if XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME environment
  * variables are set, paths are redirected to XDG-compliant locations under
@@ -15,6 +16,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
+import { parseEnvFile } from "./env-file";
 
 /** App name (e.g. "gjc") */
 export const APP_NAME: string = "gjc";
@@ -148,8 +150,29 @@ export function setProjectDir(dir: string): void {
 }
 
 /** Get the config directory name relative to home (e.g. ".gjc" or PI_CONFIG_DIR override). */
+/**
+ * Config-directory name, rejected when it comes from the caller's project `.env`.
+ *
+ * The name is joined with the home directory to build the config root, and that
+ * root plus the agent directory beneath it supply two of the `.env` files
+ * `$credentialEnv` treats as trusted. Bun loads `cwd/.env` into `process.env`
+ * before any module runs, so a repository could otherwise point the config root
+ * at a directory it ships and have its own `.env` treated as trusted —
+ * recovering every endpoint and credential redirect the boundary rejects.
+ *
+ * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
+ * it applies the same conservative ambiguity rule directly, matching how
+ * `GJC_CODING_AGENT_DIR` is treated.
+ */
+function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
+	const value = process.env[name];
+	if (!value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
+	return value;
+}
+
 export function getConfigDirName(): string {
-	return process.env.GJC_CONFIG_DIR ?? process.env.PI_CONFIG_DIR ?? CONFIG_DIR_NAME;
+	return trustedConfigDirName("GJC_CONFIG_DIR") ?? trustedConfigDirName("PI_CONFIG_DIR") ?? CONFIG_DIR_NAME;
 }
 
 /** Get the config agent directory name relative to home (e.g. ".gjc/agent" or PI_CONFIG_DIR + "/agent"). */
@@ -248,7 +271,43 @@ class DirResolver {
 	}
 }
 
-let dirs = new DirResolver(process.env.GJC_CODING_AGENT_DIR);
+/**
+ * Agent-directory override, rejected when it comes from the caller's project
+ * `.env`.
+ *
+ * This directory selects the agent's own `.env`, which is one of the trusted
+ * sources `$credentialEnv` consults. Bun loads `cwd/.env` into `process.env`
+ * before any module runs, so a repository could otherwise point this at a
+ * directory it ships and have its own `.env` treated as trusted — recovering
+ * every redirect the credential boundary is meant to reject.
+ *
+ * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
+ * it applies the same conservative ambiguity rule directly: a value that matches
+ * what the project `.env` sets is not honoured. An operator whose environment
+ * happens to carry the identical value loses the override, which is the same
+ * trade-off `resolveLiveCredentialEnvValue` already makes.
+ */
+function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
+	const value = process.env[name];
+	if (!value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
+	return value;
+}
+
+/**
+ * Both spellings are honoured, mirroring `getConfigDirName`.
+ *
+ * `PI_CODING_AGENT_DIR` is the legacy alias this module's own header documents,
+ * and parts of the product already resolve it (`gc-runtime.ts:370`,
+ * `deep-interview-runtime.ts:384`). Reading only the `GJC_` spelling here split
+ * the agent directory in two: `gjc gc` operated on the aliased directory while
+ * everything reaching `getAgentDir()` stayed on the default.
+ */
+function trustedAgentDirOverride(): string | undefined {
+	return trustedAgentDirOverrideFor("GJC_CODING_AGENT_DIR") ?? trustedAgentDirOverrideFor("PI_CODING_AGENT_DIR");
+}
+
+let dirs = new DirResolver(trustedAgentDirOverride());
 
 // Anchor home for the resolver. Captured at module load to stay stable across
 // test mocks of `os.homedir()`. `getPluginsDir(home)` compares against this so

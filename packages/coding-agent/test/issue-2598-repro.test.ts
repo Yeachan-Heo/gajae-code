@@ -49,7 +49,14 @@ const forbiddenRuntimePaths = /(?:^|\/)(?:path-utils|render-utils)(?:\.ts)?$|(?:
 function runtimeImportSpecifiers(source: string): string[] {
 	const specifiers = new Set<string>();
 	const staticImport = /^\s*import\s+(?!type\b)(?:[\s\S]*?\s+from\s+)?["']([^"']+)["'];?/gm;
-	const reExport = /^\s*export\s+(?!type\b)[\s\S]*?\s+from\s+["']([^"']+)["'];?/gm;
+	// Match real re-export syntax only (`export * from`, `export * as ns from`,
+	// `export { … } from`). A bare `[\s\S]*?` after `export` lets a plain
+	// `export function`/`export const` scan forward for the next ` from "…"`,
+	// which can land inside a later comment or string and invent an import edge
+	// that does not exist (e.g. utils/src/env.ts documents `import { $env } from
+	// "@gajae-code/utils"` in prose).
+	const reExport =
+		/^\s*export\s+(?!type\b)(?:\*(?:\s+as\s+[A-Za-z_$][\w$]*)?|\{[\s\S]*?\})\s+from\s+["']([^"']+)["'];?/gm;
 	const dynamicImport = /\bimport\(\s*["']([^"']+)["']\s*\)/g;
 	for (const pattern of [staticImport, reExport, dynamicImport]) {
 		for (const match of source.matchAll(pattern)) specifiers.add(match[1]);

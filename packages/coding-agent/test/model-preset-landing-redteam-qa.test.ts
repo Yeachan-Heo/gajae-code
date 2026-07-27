@@ -128,6 +128,7 @@ function createRegistry(
 			...builtinCodexModels,
 			...builtinComboModels,
 		],
+		hasConfiguredProviderAuth: (provider: string) => authenticatedProviders.includes(provider),
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,

@@ -16,8 +16,24 @@ import {
 const THREAD_ID = 901;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
+/**
+ * Polls until `predicate` holds.
+ *
+ * These cases drive a real daemon, a real WebSocket, and a stubbed bot whose
+ * calls one test deliberately holds open to exercise a duplicate-delivery race,
+ * so time spent here tracks how contended the runner is rather than whether the
+ * behaviour under test is correct. The previous 8s budget passed locally but
+ * expired on loaded CI shards: an 8,185ms failure was observed waiting for
+ * "ephemeral turn", well inside that test's own 30s budget.
+ *
+ * The budget is not raised to near the test timeout because a single test
+ * chains up to six of these waits, and an over-long per-wait deadline would let
+ * the enclosing 30s test expire first with a less useful error. Every caller
+ * still asserts its exact post-condition after waiting, so a real regression
+ * fails on the assertion rather than on the clock.
+ */
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 8_000;
+	const deadline = Date.now() + 12_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await sleep(20);

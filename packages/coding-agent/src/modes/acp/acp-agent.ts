@@ -25,6 +25,7 @@ import {
 	PROTOCOL_VERSION,
 	type PromptRequest,
 	type PromptResponse,
+	RequestError,
 	type ResumeSessionRequest,
 	type ResumeSessionResponse,
 	type SessionInfo,
@@ -532,6 +533,34 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 	return { text: text.join("\n"), images };
 }
 
+/**
+ * `AcpSdkAdapterError.code` is an internal string, but the SDK only derives a
+ * JSON-RPC code from a `RequestError`. Everything else collapses to an opaque
+ * `-32603 Internal error`, which hides the reason and defeats client-side
+ * recovery (an ACP client cannot see that it must authenticate). Map the codes
+ * that have a defined ACP/JSON-RPC counterpart onto a real `RequestError`.
+ */
+export function acpRequestFailure(error: unknown): unknown {
+	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+	if (typeof code !== "string") return error;
+	const message = error instanceof Error ? error.message : code;
+	switch (code) {
+		case "authentication_failed":
+			return RequestError.authRequired({ code, details: message }, message);
+		case "not_found":
+			return RequestError.resourceNotFound(message);
+		case "invalid_input":
+		case "unsupported":
+		case "unsupported_content":
+			return RequestError.invalidParams({ code, details: message }, message);
+		default:
+			// The remaining internal codes (conflict, unavailable, busy, …) have no ACP
+			// counterpart and stay -32603. Keep the discriminator in `data` so a client can
+			// branch on retry/reconnect instead of parsing an English message.
+			return RequestError.internalError({ code, details: message }, message);
+	}
+}
+
 /** Registers a permission provider only when the ACP client requires prompts. */
 export function acpProviderRegistrations(
 	capabilities: ClientCapabilities | undefined,
@@ -988,6 +1017,16 @@ export class AcpAgent implements Agent {
 	}
 
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
+		// An unrecognized extension method is a protocol failure, not an application
+		// result: it must reach the client as JSON-RPC -32601 rather than a resolved
+		// payload. Recognized `_gjc/*` methods keep their `{ok:false}` result contract.
+		if (
+			method !== "session/set_model" &&
+			method !== "_gjc/sdk/global" &&
+			method !== "_gjc/sdk/control" &&
+			method !== "_gjc/sdk/query"
+		)
+			throw RequestError.methodNotFound(method);
 		try {
 			if (method === "session/set_model") {
 				const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
@@ -1001,13 +1040,10 @@ export class AcpAgent implements Agent {
 				const result = await (await this.#brokerAdapter()).handle(method, params);
 				return object(result) ?? {};
 			}
-			if (method === "_gjc/sdk/control" || method === "_gjc/sdk/query") {
-				const id = typeof params.sessionId === "string" ? params.sessionId : undefined;
-				if (!id) throw new AcpSdkAdapterError("invalid_input", "sessionId is required.");
-				const result = await this.#adapter(id).handle(method, params);
-				return object(result) ?? {};
-			}
-			throw new AcpSdkAdapterError("method_not_found", `Unknown ACP ext method: ${method}`);
+			const id = typeof params.sessionId === "string" ? params.sessionId : undefined;
+			if (!id) throw new AcpSdkAdapterError("invalid_input", "sessionId is required.");
+			const result = await this.#adapter(id).handle(method, params);
+			return object(result) ?? {};
 		} catch (error) {
 			const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal";
 			const message = error instanceof Error ? error.message : String(error);

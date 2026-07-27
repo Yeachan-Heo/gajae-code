@@ -11,6 +11,7 @@ type CapturedRequest = {
 };
 
 const originalCodexSearchModel = process.env.PI_CODEX_WEB_SEARCH_MODEL;
+const originalDocumentedCodexSearchModel = process.env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL;
 
 function makeSseResponse(model: string): string {
 	return [
@@ -219,6 +220,11 @@ describe("searchCodex model selection", () => {
 		} else {
 			process.env.PI_CODEX_WEB_SEARCH_MODEL = originalCodexSearchModel;
 		}
+		if (originalDocumentedCodexSearchModel === undefined) {
+			delete process.env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL;
+		} else {
+			process.env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL = originalDocumentedCodexSearchModel;
+		}
 	});
 
 	it("uses the built-in default model when PI_CODEX_WEB_SEARCH_MODEL is unset", async () => {
@@ -288,6 +294,28 @@ describe("searchCodex model selection", () => {
 		const result = await searchCodex(makeSearchParams("overridden codex model"));
 
 		expect(capturedRequest).not.toBeNull();
+		expect(capturedRequest?.body?.model).toBe("gpt-5.4-mini");
+		expect(result.model).toBe("gpt-5.4-mini");
+	});
+
+	it("uses the documented GJC_OPENAI_CODE_WEB_SEARCH_MODEL when provided", async () => {
+		process.env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL = "gpt-5.4-mini";
+		using _hook = mockCodexFetch("gpt-5.4-mini");
+
+		const result = await searchCodex(makeSearchParams("documented codex model override"));
+
+		expect(capturedRequest).not.toBeNull();
+		expect(capturedRequest?.body?.model).toBe("gpt-5.4-mini");
+		expect(result.model).toBe("gpt-5.4-mini");
+	});
+
+	it("resolves GJC-first: GJC_OPENAI_CODE_WEB_SEARCH_MODEL wins over legacy PI_CODEX_WEB_SEARCH_MODEL", async () => {
+		process.env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL = "gpt-5.4-mini";
+		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.4";
+		using _hook = mockCodexFetch("gpt-5.4-mini");
+
+		const result = await searchCodex(makeSearchParams("gjc-first codex model"));
+
 		expect(capturedRequest?.body?.model).toBe("gpt-5.4-mini");
 		expect(result.model).toBe("gpt-5.4-mini");
 	});

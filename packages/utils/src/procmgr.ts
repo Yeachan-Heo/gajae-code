@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@gajae-code/natives";
 import type { Subprocess } from "bun";
-import { $env, filterProcessEnv } from "./env";
+import { $pickCredentialEnv, $pickflag, filterProcessEnv } from "./env";
 import { $which } from "./which";
 
 export interface ShellConfig {
@@ -41,9 +41,13 @@ function isExecutable(path: string): boolean {
 
 /**
  * Build the spawn environment (cached).
+ *
+ * `CI=true` is injected unless the documented `GJC_BASH_NO_CI` (or its legacy
+ * `PI_BASH_NO_CI` / `CLAUDE_BASH_NO_CI` aliases) is set to a canonical truthy
+ * flag value.
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
-	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
+	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
 	const inherited = filterProcessEnv(Bun.env);
 	delete inherited.GJC_SESSION_FILE;
 	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
@@ -60,18 +64,30 @@ function buildSpawnEnv(shell: string): Record<string, string> {
 
 /**
  * Get shell args, optionally including login shell flag.
- * Supports PI_BASH_NO_LOGIN and ANTHROPIC_MODEL_BASH_NO_LOGIN to skip -l.
+ *
+ * Honors the documented `GJC_BASH_NO_LOGIN` first, with `PI_BASH_NO_LOGIN` and
+ * `CLAUDE_BASH_NO_LOGIN` as legacy aliases. Boolean-like values follow the
+ * canonical flag contract (`1`/`Y`/`TRUE`/`YES`/`ON`, case-insensitive), so an
+ * explicit `GJC_BASH_NO_LOGIN=0` keeps the login shell even when a legacy alias
+ * is set to a truthy value.
  */
 function getShellArgs(): string[] {
-	const noLogin = $env.PI_BASH_NO_LOGIN || $env.CLAUDE_BASH_NO_LOGIN;
+	const noLogin = $pickflag("GJC_BASH_NO_LOGIN", "PI_BASH_NO_LOGIN", "CLAUDE_BASH_NO_LOGIN");
 	return noLogin ? ["-c"] : ["-l", "-c"];
 }
 
 /**
  * Get shell prefix for wrapping commands (profilers, strace, etc.).
+ *
+ * Resolved from trusted sources only. The prefix is interpolated ahead of every
+ * bash command (`${prefix} ${command}`) and executed through the shell, so it is
+ * an arbitrary-command-execution surface. `$env` merges the caller's
+ * `cwd/.env`, which means repository content could otherwise set it; resolution
+ * therefore goes through the non-project resolver (launching shell plus
+ * GJC/user-owned `.env` files), matching how provider credentials are resolved.
  */
 function getShellPrefix(): string | undefined {
-	return $env.PI_SHELL_PREFIX || $env.CLAUDE_CODE_SHELL_PREFIX;
+	return $pickCredentialEnv("PI_SHELL_PREFIX", "CLAUDE_CODE_SHELL_PREFIX");
 }
 
 /**
@@ -185,6 +201,15 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 	}
 	cachedShellConfig = buildConfig("sh");
 	return cachedShellConfig;
+}
+
+/**
+ * Clear the memoized shell configuration so the next {@link getShellConfig}
+ * call re-resolves the shell and re-reads the environment (shell selection and
+ * the bash CI/login flags). Primarily for tests that vary those inputs.
+ */
+export function resetShellConfigCache(): void {
+	cachedShellConfig = null;
 }
 
 /**

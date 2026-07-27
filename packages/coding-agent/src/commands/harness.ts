@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { $credentialEnv } from "@gajae-code/utils/env";
 import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
@@ -565,20 +566,42 @@ function ownerIsolationPlatform(): NodeJS.Platform {
 		: "linux";
 }
 
+/**
+ * Operator override for the process-start probe command, resolved from trusted
+ * environment sources only.
+ *
+ * The result is spawned, so whatever can set it chooses which binary runs.
+ * `$env` merges the caller's `cwd/.env` into `process.env`, so reading it there
+ * would let repository content pick the command; resolve it the same way
+ * provider credentials are (launching shell plus GJC/user-owned `.env` files,
+ * never the project `.env`). A malformed override stays fatal rather than
+ * silently falling back to `ps`, matching the previous behavior.
+ */
+type ProcessStartCommandOverride = { kind: "none" } | { kind: "invalid" } | { kind: "command"; command: string[] };
+
+function processStartCommandOverride(): ProcessStartCommandOverride {
+	const configured = $credentialEnv("GJC_HARNESS_PROCESS_START_COMMAND");
+	if (!configured) return { kind: "none" };
+	try {
+		const parsed = JSON.parse(configured) as unknown;
+		if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some(value => typeof value !== "string" || !value))
+			return { kind: "invalid" };
+		return { kind: "command", command: parsed as string[] };
+	} catch {
+		return { kind: "invalid" };
+	}
+}
+
+/** Test seam: the process-start command override as resolved from trusted env. */
+export function processStartCommandOverrideForTest(): ProcessStartCommandOverride {
+	return processStartCommandOverride();
+}
+
 function portableProcessStartTime(pid: number): string | null {
 	if (process.platform === "linux") return null;
-	const configured = process.env.GJC_HARNESS_PROCESS_START_COMMAND;
-	let command: string[] = ["ps", "-o", "lstart=", "-p"];
-	if (configured) {
-		try {
-			const parsed = JSON.parse(configured) as unknown;
-			if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some(value => typeof value !== "string" || !value))
-				return null;
-			command = parsed;
-		} catch {
-			return null;
-		}
-	}
+	const override = processStartCommandOverride();
+	if (override.kind === "invalid") return null;
+	const command: string[] = override.kind === "command" ? override.command : ["ps", "-o", "lstart=", "-p"];
 	const result = Bun.spawnSync([...command, String(pid)], {
 		stdout: "pipe",
 		stderr: "ignore",

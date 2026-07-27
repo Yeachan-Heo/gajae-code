@@ -8,7 +8,7 @@
  * `authStorage.getApiKey("anthropic", sessionId)` first, then pass the result
  * through {@link buildAnthropicAuthConfig} for header/URL shaping.
  */
-import { $env } from "@gajae-code/utils";
+import { $credentialEnv } from "@gajae-code/utils";
 import {
 	buildAnthropicHeaders as buildProviderAnthropicHeaders,
 	normalizeAnthropicBaseUrl,
@@ -29,12 +29,20 @@ function normalizeBaseUrl(baseUrl: string | undefined): string | undefined {
 	return trimmed ? trimmed.replace(/\/+$/, "") : undefined;
 }
 
+/**
+ * Resolve the Anthropic base URL from the environment.
+ *
+ * Trusted sources only: the result becomes the request URL that carries the
+ * Anthropic API key / OAuth token, so whatever can set it can redirect
+ * authenticated traffic. `$env` merges the caller's `cwd/.env`, so reading it
+ * there would let repository content choose where credentials are sent.
+ */
 export function resolveAnthropicBaseUrlFromEnv(): string | undefined {
 	if (isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeBaseUrl($env.FOUNDRY_BASE_URL);
+		const foundryBaseUrl = normalizeBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));
 		if (foundryBaseUrl) return foundryBaseUrl;
 	}
-	const anthropicBaseUrl = normalizeBaseUrl($env.ANTHROPIC_BASE_URL);
+	const anthropicBaseUrl = normalizeBaseUrl($credentialEnv("ANTHROPIC_BASE_URL"));
 	return anthropicBaseUrl || undefined;
 }
 

@@ -54,6 +54,7 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 		getError: () => undefined,
 		getAvailable: () => [defaultModel, alternateModel],
 		getAll: () => [defaultModel, alternateModel],
+		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,

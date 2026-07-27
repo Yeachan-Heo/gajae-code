@@ -280,6 +280,53 @@ describe("managed attempt transaction", () => {
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
 	});
 
+	it("clears managed ownership before terminal observers run", async () => {
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: async () => {
+				throw Object.assign(new Error(""), {
+					transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+				});
+			},
+		});
+		let ownerBeforeTerminal: number | undefined;
+		let ownerAtMessageEnd: number | undefined;
+		let ownerAtAgentEnd: number | undefined;
+		agent.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				ownerAtMessageEnd = agent.currentManagedLogicalRunId;
+			}
+			if (event.type === "agent_end") {
+				ownerAtAgentEnd = agent.currentManagedLogicalRunId;
+			}
+		});
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				if (outcome.type !== "context_overflow_discarded") {
+					throw new Error(`Expected discarded overflow, received ${outcome.type}`);
+				}
+				return {
+					type: "maintenance",
+					continuation: ownership => {
+						ownerBeforeTerminal = agent.currentManagedLogicalRunId;
+						agent.requestRunTerminal(ownership.logicalRunId, {
+							stopReason: "error",
+							messages: [outcome.message],
+						});
+					},
+				};
+			},
+		});
+
+		expect(ownerBeforeTerminal).toBeDefined();
+		expect(ownerAtMessageEnd).toBeUndefined();
+		expect(ownerAtAgentEnd).toBeUndefined();
+		expect(agent.currentManagedLogicalRunId).toBeUndefined();
+	});
+
 	it("discards retryable managed failures before any assistant lifecycle escapes", async () => {
 		const mock = createMockModel();
 		const streamFn = async () => {

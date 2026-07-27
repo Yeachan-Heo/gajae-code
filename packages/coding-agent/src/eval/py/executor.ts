@@ -514,8 +514,11 @@ async function executeWithKernel(
 		});
 
 		if (result.cancelled) {
+			// Prefer the caller-configured timeout for the user-facing annotation.
+			// Remaining wall-clock budget can shrink after async setup (Settings.init,
+			// kernel start) and would otherwise flake Math.round() second formatting.
 			const annotation = result.timedOut
-				? formatKernelTimeoutAnnotation(executionTimeoutMs, result.kernelKilled ?? false)
+				? formatKernelTimeoutAnnotation(options?.timeoutMs ?? executionTimeoutMs, result.kernelKilled ?? false)
 				: undefined;
 			let crashNotice: string | null = null;
 			if (result.kernelKilled) {
@@ -569,7 +572,9 @@ async function executeWithKernel(
 				cancelled: true,
 				displayOutputs,
 				stdinRequested: false,
-				...(await sink.dump(timedOut ? formatTimeoutAnnotation(executionTimeoutMs) : undefined)),
+				...(await sink.dump(
+					timedOut ? formatTimeoutAnnotation(options?.timeoutMs ?? executionTimeoutMs) : undefined,
+				)),
 			};
 		}
 		const error = err instanceof Error ? err : new Error(String(err));

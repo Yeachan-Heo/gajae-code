@@ -2044,9 +2044,24 @@ export class InputController {
 	}
 
 	toggleThinkingBlockVisibility(): void {
-		this.ctx.hideThinkingBlock = !this.ctx.hideThinkingBlock;
-		settings.set("hideThinkingBlock", this.ctx.hideThinkingBlock);
-		this.ctx.session.agent.hideThinkingSummary = this.ctx.hideThinkingBlock;
+		if (!settings.canWriteDurableConfig()) {
+			this.ctx.showError(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			return;
+		}
+		const hideThinkingBlock = !this.ctx.hideThinkingBlock;
+		try {
+			settings.set("hideThinkingBlock", hideThinkingBlock);
+		} catch (error) {
+			if (!settings.canWriteDurableConfig()) {
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+				return;
+			}
+			throw error;
+		}
+		this.ctx.hideThinkingBlock = hideThinkingBlock;
+		this.ctx.session.setThinkingVisibility(hideThinkingBlock ? "hidden" : "visible");
 
 		// Rebuild chat from session messages
 		// Detach the live streaming component before the disposing clear() so the

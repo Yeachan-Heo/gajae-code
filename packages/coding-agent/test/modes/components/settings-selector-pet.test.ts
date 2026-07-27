@@ -121,4 +121,26 @@ describe("SettingsSelectorComponent pet capability", () => {
 		expect(onChange).not.toHaveBeenCalled();
 		expect(settings.get("pet.mode")).toBe("off");
 	});
+	it("rejects read-only pet commits before the shared policy can mutate widget state", () => {
+		const canWrite = vi.spyOn(Settings.instance, "canWriteDurableConfig").mockReturnValue(false);
+		const onChange = vi.fn();
+		const onError = vi.fn();
+		const onPetCommit = vi.fn(() => true);
+		try {
+			const component = makeComponent(true, { onChange, onError, onPetCommit });
+
+			openPetSetting(component);
+			component.handleInput("\x1b[B");
+			component.handleInput("\n");
+
+			expect(onError).toHaveBeenCalledWith(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			expect(onPetCommit).not.toHaveBeenCalled();
+			expect(onChange).not.toHaveBeenCalled();
+			expect(settings.get("pet.mode")).toBe("off");
+		} finally {
+			canWrite.mockRestore();
+		}
+	});
 });

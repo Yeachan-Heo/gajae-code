@@ -235,18 +235,16 @@ function getSavedUsageMode(): UsageMode {
 	return segmentOptions.usage?.mode === "remaining" ? "remaining" : "used";
 }
 
-function setSavedUsageMode(mode: string): StatusLineSegmentOptions {
+function getUsageModeSettings(mode: string): StatusLineSegmentOptions {
 	const normalizedMode: UsageMode = mode === "remaining" ? "remaining" : "used";
 	const segmentOptions = settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
-	const nextOptions: StatusLineSegmentOptions = {
+	return {
 		...segmentOptions,
 		usage: {
 			...(segmentOptions.usage ?? {}),
 			mode: normalizedMode,
 		},
 	};
-	settings.set("statusLine.segmentOptions", nextOptions as Record<string, unknown>);
-	return nextOptions;
 }
 
 function statusSegmentLabel(id: StatusLineSegmentId): string {
@@ -613,14 +611,17 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	#save(): void {
-		settings.set("statusLine.preset", "custom");
-		settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
-		settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
-		settings.set("statusLine.separator", this.#draft.separator);
-		settings.set(
-			"statusLine.segmentOptions",
-			cloneSegmentOptions(this.#draft.segmentOptions) as Record<string, unknown>,
-		);
+		const saved = commitInteractiveSettings(this.callbacks, () => {
+			settings.set("statusLine.preset", "custom");
+			settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
+			settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
+			settings.set("statusLine.separator", this.#draft.separator);
+			settings.set(
+				"statusLine.segmentOptions",
+				cloneSegmentOptions(this.#draft.segmentOptions) as Record<string, unknown>,
+			);
+		});
+		if (!saved) return;
 		this.callbacks.onChange("statusLine.preset", "custom");
 		this.callbacks.onChange("statusLine.leftSegments", [...this.#draft.leftSegments]);
 		this.callbacks.onChange("statusLine.rightSegments", [...this.#draft.rightSegments]);
@@ -707,8 +708,28 @@ export interface SettingsCallbacks {
 	getStatusLinePreview?: (width?: number) => string;
 	/** Called when plugins change */
 	onPluginsChanged?: () => void;
+	/** Called when an interactive setting cannot be committed. */
+	onError?: (message: string) => void;
 	/** Called when settings panel is closed */
 	onCancel: () => void;
+}
+function commitInteractiveSettings(callbacks: SettingsCallbacks, commit: () => void): boolean {
+	if (!settings.canWriteDurableConfig()) {
+		callbacks.onError?.(
+			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+		);
+		return false;
+	}
+	try {
+		commit();
+		return true;
+	} catch (error) {
+		if (!settings.canWriteDurableConfig()) {
+			callbacks.onError?.(error instanceof Error ? error.message : String(error));
+			return false;
+		}
+		throw error;
+	}
 }
 
 /**
@@ -994,11 +1015,18 @@ export class SettingsSelectorComponent extends Container {
 					// The shared pet commit policy rechecks capability immediately
 					// before mutation and persists only on acceptance; the settings
 					// surface must not persist ahead of that result.
-					const accepted = this.callbacks.onPetCommit?.(value) ?? false;
+					let accepted = false;
+					if (
+						!commitInteractiveSettings(this.callbacks, () => {
+							accepted = this.callbacks.onPetCommit?.(value) ?? false;
+						})
+					) {
+						return;
+					}
 					done(accepted ? value : undefined);
 					return;
 				}
-				this.#setSettingValue(def.path, value);
+				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
 				this.callbacks.onChange(def.path, value);
 				done(value);
 			},
@@ -1031,7 +1059,7 @@ export class SettingsSelectorComponent extends Container {
 			value => {
 				// Empty string clears the setting; undefined-typed string settings
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
-				this.#setSettingValue(def.path, value);
+				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
 				this.callbacks.onChange(def.path, value);
 				wrappedDone(value);
 			},
@@ -1089,7 +1117,15 @@ export class SettingsSelectorComponent extends Container {
 			getSettingsListTheme(),
 			(id, newValue) => {
 				if (id === STATUS_LINE_USAGE_MODE_ID) {
-					const segmentOptions = setSavedUsageMode(newValue);
+					const segmentOptions = getUsageModeSettings(newValue);
+					if (
+						!commitInteractiveSettings(this.callbacks, () => {
+							settings.set("statusLine.segmentOptions", segmentOptions as Record<string, unknown>);
+						})
+					) {
+						this.#refreshCurrentTabItems(defs);
+						return;
+					}
 					this.callbacks.onChange("statusLine.segmentOptions", segmentOptions);
 					if (tabId === "appearance") {
 						this.#triggerStatusLinePreview();
@@ -1105,14 +1141,20 @@ export class SettingsSelectorComponent extends Container {
 
 				if (def.type === "boolean") {
 					const boolValue = newValue === "true";
-					settings.set(path, boolValue as never);
+					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, boolValue as never))) {
+						this.#refreshCurrentTabItems(defs);
+						return;
+					}
 					this.callbacks.onChange(path, boolValue);
 
 					if (tabId === "appearance") {
 						this.#triggerStatusLinePreview();
 					}
 				} else if (def.type === "enum") {
-					settings.set(path, newValue as never);
+					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, newValue as never))) {
+						this.#refreshCurrentTabItems(defs);
+						return;
+					}
 					this.callbacks.onChange(path, newValue);
 				}
 				// Submenu/text types already persisted the value inside their own

@@ -19,7 +19,13 @@ import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 
 import { buildGcReportText } from "./gc-render";
 
-export type GcStore = "harness_leases" | "team_workers" | "file_locks" | "tmux_sessions" | "registry_entries";
+export type GcStore =
+	| "harness_leases"
+	| "team_workers"
+	| "file_locks"
+	| "tmux_sessions"
+	| "registry_entries"
+	| "local_roots";
 
 export const GC_STORES: readonly GcStore[] = [
 	"harness_leases",
@@ -27,6 +33,7 @@ export const GC_STORES: readonly GcStore[] = [
 	"file_locks",
 	"tmux_sessions",
 	"registry_entries",
+	"local_roots",
 ] as const;
 
 /** Why a probed pid is kept instead of treated as dead. */
@@ -452,11 +459,13 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		{ fileLocksGcAdapter },
 		{ teamWorkersGcAdapter },
 		{ tmuxSessionsGcAdapter },
+		{ localRootsGcAdapter },
 	] = await Promise.all([
 		import("../harness-control-plane/gc-adapter"),
 		import("../config/file-lock-gc"),
 		import("./team-gc"),
 		import("./tmux-gc"),
+		import("../internal-urls/local-root-gc"),
 	]);
 	return [
 		harnessLeasesGcAdapter,
@@ -464,5 +473,6 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		fileLocksGcAdapter,
 		tmuxSessionsGcAdapter,
 		registryEntriesGcAdapter,
+		localRootsGcAdapter,
 	];
 }

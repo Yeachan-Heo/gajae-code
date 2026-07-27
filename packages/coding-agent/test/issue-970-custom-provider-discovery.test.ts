@@ -34,6 +34,7 @@ async function createSelector(state: ProviderDiscoveryState): Promise<ModelSelec
 		getError: () => undefined,
 		getAvailable: () => [],
 		getAll: () => [],
+		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [state.provider],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,

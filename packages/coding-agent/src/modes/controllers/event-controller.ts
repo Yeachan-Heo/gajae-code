@@ -966,6 +966,12 @@ export class EventController {
 			} else if (event.willRetry && !isHandoffAction) {
 				this.ctx.showStatus("Context overflow maintenance completed");
 			}
+		} else if (
+			event.skipped &&
+			event.errorMessage?.startsWith("Context overflow recovery skipped: nothing eligible to compact.") &&
+			!isHandoffAction
+		) {
+			this.ctx.showStatus(event.errorMessage);
 		} else if (event.errorMessage) {
 			this.ctx.showWarning(event.errorMessage);
 		} else if (isHandoffAction) {

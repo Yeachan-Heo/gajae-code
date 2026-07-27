@@ -2507,6 +2507,13 @@ export class ModelRegistry {
 		return this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider);
 	}
 
+	/**
+	 * Check whether auth is configured for a provider.
+	 */
+	hasConfiguredProviderAuth(provider: string): boolean {
+		return this.#keylessProviders.has(provider) || this.authStorage.hasAuth(provider);
+	}
+
 	getDiscoverableProviders(): string[] {
 		const disabledProviders = getDisabledProviderIdsFromSettings();
 		return this.#discoveryManager.providers

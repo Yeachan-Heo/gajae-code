@@ -48,6 +48,7 @@ function createRegistry(options: { profiles?: ModelProfileDefinition[]; missingC
 		getError: () => undefined,
 		getAvailable: () => [defaultModel, alternateModel, flatModel],
 		getAll: () => [defaultModel, alternateModel, flatModel],
+		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,

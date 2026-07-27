@@ -885,7 +885,6 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					toolCallId: "replay-tool-1",
 					status: "failed",
 					title: "Failed: read: missing.ts",
-					kind: "other",
 					content: [{ type: "content", content: { type: "text", text: "File not found" } }],
 				}),
 			}),

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getPuppeteerDir } from "@gajae-code/utils/dirs";
+import { $credentialEnv } from "@gajae-code/utils/env";
 import * as logger from "@gajae-code/utils/logger";
 import { $which } from "@gajae-code/utils/which";
 import * as browsers from "@puppeteer/browsers";
@@ -81,6 +82,42 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 }
 
 /**
+ * Browser launch overrides resolved from trusted environment sources only.
+ *
+ * These choose the browser binary and route/verify its traffic, so whatever can
+ * set them controls what runs and who sees the session. `$env` merges the
+ * caller's `cwd/.env` into `process.env`, so reading them directly would let
+ * repository content pick the executable, point every request at an attacker's
+ * proxy, or disable certificate validation. Resolve them the same way provider
+ * credentials are: launching shell plus GJC/user-owned `.env` files, never the
+ * project `.env`.
+ */
+function trustedBrowserEnv(name: string): string | undefined {
+	return $credentialEnv(name);
+}
+
+/** Boolean-like trusted browser env knob (`true`/`1`/`yes`/`on`). */
+function browserLaunchFlagEnabled(name: string): boolean {
+	const value = trustedBrowserEnv(name)?.toLowerCase();
+	return value === "true" || value === "1" || value === "yes" || value === "on";
+}
+
+/** Test seam: the browser launch overrides as resolved from trusted env. */
+export function resolveBrowserEnvOverridesForTest(): {
+	executablePath: string | undefined;
+	proxy: string | undefined;
+	proxyBypassLoopback: boolean;
+	ignoreCertErrors: boolean;
+} {
+	return {
+		executablePath: trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH"),
+		proxy: trustedBrowserEnv("PUPPETEER_PROXY"),
+		proxyBypassLoopback: browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK"),
+		ignoreCertErrors: browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS"),
+	};
+}
+
+/**
  * Lazily download Chromium on first browser launch via @puppeteer/browsers.
  * Skipped when a system Chromium (NixOS) or PUPPETEER_EXECUTABLE_PATH is set.
  * The browser is cached under ~/.gjc/puppeteer (getPuppeteerDir).
@@ -89,7 +126,7 @@ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const sysChrome = resolveSystemChromium();
 	if (sysChrome) return sysChrome;
-	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+	const envPath = trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH");
 	if (envPath) return envPath;
 	if (chromiumExecutablePromise) return chromiumExecutablePromise;
 
@@ -272,13 +309,12 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		// Isolated copy only (caller guarantees). Never point this at a live profile.
 		launchArgs.push(`--user-data-dir=${opts.profileWarmupDir}`);
 	}
-	const proxy = process.env.PUPPETEER_PROXY;
+	const proxy = trustedBrowserEnv("PUPPETEER_PROXY");
 	if (proxy) {
 		launchArgs.push(`--proxy-server=${proxy}`);
 		// Chrome (since v72) bypasses proxies for localhost by default. When PUPPETEER_PROXY_BYPASS_LOOPBACK
 		// is true, add <-loopback> so traffic to localhost reaches the proxy (e.g. for mitmdump/auth capture).
-		const bypassLoopback = process.env.PUPPETEER_PROXY_BYPASS_LOOPBACK?.toLowerCase();
-		if (bypassLoopback === "true" || bypassLoopback === "1" || bypassLoopback === "yes" || bypassLoopback === "on") {
+		if (browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK")) {
 			launchArgs.push("--proxy-bypass-list=<-loopback>");
 		}
 	}
@@ -287,8 +323,7 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	if (opts.geo?.locale) {
 		launchArgs.push(`--lang=${opts.geo.locale}`);
 	}
-	const ignoreCert = process.env.PUPPETEER_PROXY_IGNORE_CERT_ERRORS?.toLowerCase();
-	if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
+	if (browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS")) {
 		launchArgs.push("--ignore-certificate-errors");
 	}
 	const launchEnv = opts.geo?.timezone ? { ...process.env, TZ: opts.geo.timezone } : undefined;

@@ -357,6 +357,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("emits a diff ToolCallContent for each per-file edit result", () => {
+		const cwd = "/repo";
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -376,6 +377,7 @@ describe("ACP event mapper", () => {
 				},
 			} as AgentSessionEvent,
 			"session-1",
+			{ cwd },
 		);
 
 		expect(updates).toHaveLength(1);
@@ -388,13 +390,18 @@ describe("ACP event mapper", () => {
 		expect(update.sessionUpdate).toBe("tool_call_update");
 		const diffBlocks = update.content?.filter(block => block.type === "diff") ?? [];
 		expect(diffBlocks).toEqual([
-			{ type: "diff", path: "foo.ts", oldText: "before\n", newText: "after\n" },
-			{ type: "diff", path: "bar.ts", oldText: null, newText: "created\n" },
+			{ type: "diff", path: path.resolve(cwd, "foo.ts"), oldText: "before\n", newText: "after\n" },
+			{ type: "diff", path: path.resolve(cwd, "bar.ts"), oldText: null, newText: "created\n" },
 		]);
-		expect(update.locations).toEqual([{ path: "foo.ts" }, { path: "bar.ts" }, { path: "skipped.ts" }]);
+		expect(update.locations).toEqual([
+			{ path: path.resolve(cwd, "foo.ts") },
+			{ path: path.resolve(cwd, "bar.ts") },
+			{ path: path.resolve(cwd, "skipped.ts") },
+		]);
 	});
 
 	it("emits a diff ToolCallContent for single-file edit details", () => {
+		const cwd = "/repo";
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -412,6 +419,7 @@ describe("ACP event mapper", () => {
 				},
 			} as AgentSessionEvent,
 			"session-1",
+			{ cwd },
 		);
 
 		expect(updates).toHaveLength(1);
@@ -423,9 +431,37 @@ describe("ACP event mapper", () => {
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
 		expect(update.content?.filter(block => block.type === "diff")).toEqual([
-			{ type: "diff", path: "single.ts", oldText: "before\n", newText: "after\n" },
+			{ type: "diff", path: path.resolve(cwd, "single.ts"), oldText: "before\n", newText: "after\n" },
 		]);
-		expect(update.locations).toEqual([{ path: "single.ts" }]);
+		expect(update.locations).toEqual([{ path: path.resolve(cwd, "single.ts") }]);
+	});
+
+	it("resolves edit diff paths against cwd without sandboxing traversal", () => {
+		const cwd = "/repo";
+		const paths = ["nested/file.ts", path.resolve("/outside.ts"), "../outside.ts"];
+
+		for (const diffPath of paths) {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: `tc-diff-${diffPath}`,
+					toolName: "edit",
+					isError: false,
+					result: {
+						details: { path: diffPath, oldText: "before\n", newText: "after\n" },
+					},
+				} as AgentSessionEvent,
+				"session-1",
+				{ cwd },
+			);
+			const update = updates[0]!.update as {
+				content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
+			};
+
+			expect(update.content?.filter(block => block.type === "diff")).toEqual([
+				{ type: "diff", path: path.resolve(cwd, diffPath), oldText: "before\n", newText: "after\n" },
+			]);
+		}
 	});
 
 	it("emits locations on tool_execution_update from args", () => {
@@ -607,9 +643,10 @@ describe("ACP event mapper", () => {
 			toolCallId: "tc-read-final",
 			status: "failed",
 			title: "Failed: read: missing.ts",
-			kind: "other",
 			locations: [{ path: path.resolve("/repo", "missing.ts") }],
 		});
+		// Failure is carried by `status`; the initial tool_call `kind` stays authoritative.
+		expect(updates[0]!.update).not.toHaveProperty("kind");
 	});
 
 	it("keeps terminal content alongside readable error and message fields", () => {
@@ -675,6 +712,58 @@ describe("ACP event mapper", () => {
 		};
 
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "hello from stdout" } }]);
+	});
+	it("keeps only valid int64 ResourceLink sizes", () => {
+		const cases = [
+			{ size: 0, keepsSize: true },
+			{ size: 42, keepsSize: true },
+			{ size: Number.MAX_SAFE_INTEGER, keepsSize: true },
+			{ size: -1, keepsSize: false },
+			{ size: 1.5, keepsSize: false },
+			{ size: Number.NaN, keepsSize: false },
+			{ size: Number.POSITIVE_INFINITY, keepsSize: false },
+			{ size: Number.MAX_SAFE_INTEGER + 1, keepsSize: false },
+		];
+
+		for (const { size, keepsSize } of cases) {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: `tc-resource-link-${size}`,
+					toolName: "read",
+					isError: false,
+					result: {
+						content: [
+							{
+								type: "resource_link",
+								uri: "file:///repo/file.txt",
+								name: "file.txt",
+								size,
+							},
+						],
+					},
+				} as AgentSessionEvent,
+				"session-1",
+			);
+			const update = updates[0]!.update as {
+				content?: Array<{
+					type: string;
+					content?: { type: string; uri?: string; name?: string; size?: number };
+				}>;
+			};
+			const resourceLink = update.content?.find(block => block.content?.type === "resource_link")?.content;
+
+			expect(resourceLink).toMatchObject({
+				type: "resource_link",
+				uri: "file:///repo/file.txt",
+				name: "file.txt",
+			});
+			if (keepsSize) {
+				expect(resourceLink?.size).toBe(size);
+			} else {
+				expect(resourceLink).not.toHaveProperty("size");
+			}
+		}
 	});
 
 	it("embeds only terminal content from direct terminalId", () => {
