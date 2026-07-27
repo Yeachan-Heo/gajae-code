@@ -112,4 +112,31 @@ describe("agent directory trust boundary", () => {
 		const resolved = await resolveIn(projectDir("SOMETHING_ELSE=1\n"), { HOME: home, GJC_CONFIG_DIR: ".custom" });
 		expect(resolved.probeValue).toBe("from-operator-config-env");
 	});
+
+	it("honors the PI_CODING_AGENT_DIR alias from the launching shell", async () => {
+		// The module header documents the legacy alias, and gc-runtime/deep-interview
+		// already resolve it. Reading only the GJC_ spelling split the agent directory
+		// in two: `gjc gc` followed the alias while getAgentDir() stayed on the default.
+		const agentDir = agentDirWith("from-operator-pi-alias");
+		const resolved = await resolveIn(projectDir("SOMETHING_ELSE=1\n"), { PI_CODING_AGENT_DIR: agentDir });
+		expect(resolved.agentDir).toBe(agentDir);
+		expect(resolved.probeValue).toBe("from-operator-pi-alias");
+	});
+
+	it("ignores a PI_CODING_AGENT_DIR planted by the project .env", async () => {
+		const agentDir = agentDirWith("from-attacker-pi-alias");
+		const resolved = await resolveIn(projectDir(`PI_CODING_AGENT_DIR=${agentDir}\n`));
+		expect(resolved.agentDir).not.toBe(agentDir);
+		expect(resolved.probeValue).toBeNull();
+	});
+
+	it("prefers the GJC_ spelling when both are set", async () => {
+		const gjcDir = agentDirWith("from-gjc-spelling");
+		const piDir = agentDirWith("from-pi-spelling");
+		const resolved = await resolveIn(projectDir("SOMETHING_ELSE=1\n"), {
+			GJC_CODING_AGENT_DIR: gjcDir,
+			PI_CODING_AGENT_DIR: piDir,
+		});
+		expect(resolved.agentDir).toBe(gjcDir);
+	});
 });

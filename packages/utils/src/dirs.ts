@@ -1,8 +1,9 @@
 /**
  * Centralized path helpers for gajae-code config directories.
  *
- * Uses PI_CONFIG_DIR (default ".gjc") for the config root and
- * PI_CODING_AGENT_DIR to override the agent directory.
+ * Uses GJC_CONFIG_DIR (legacy alias PI_CONFIG_DIR, default ".gjc") for the
+ * config root and GJC_CODING_AGENT_DIR (legacy alias PI_CODING_AGENT_DIR) to
+ * override the agent directory.
  *
  * On Linux, if XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME environment
  * variables are set, paths are redirected to XDG-compliant locations under
@@ -286,12 +287,24 @@ class DirResolver {
  * happens to carry the identical value loses the override, which is the same
  * trade-off `resolveLiveCredentialEnvValue` already makes.
  */
-function trustedAgentDirOverride(): string | undefined {
-	const value = process.env.GJC_CODING_AGENT_DIR;
+function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
+	const value = process.env[name];
 	if (!value) return undefined;
-	const projectValue = parseEnvFile(path.join(process.cwd(), ".env")).GJC_CODING_AGENT_DIR;
-	if (projectValue !== undefined && projectValue === value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
 	return value;
+}
+
+/**
+ * Both spellings are honoured, mirroring `getConfigDirName`.
+ *
+ * `PI_CODING_AGENT_DIR` is the legacy alias this module's own header documents,
+ * and parts of the product already resolve it (`gc-runtime.ts:370`,
+ * `deep-interview-runtime.ts:384`). Reading only the `GJC_` spelling here split
+ * the agent directory in two: `gjc gc` operated on the aliased directory while
+ * everything reaching `getAgentDir()` stayed on the default.
+ */
+function trustedAgentDirOverride(): string | undefined {
+	return trustedAgentDirOverrideFor("GJC_CODING_AGENT_DIR") ?? trustedAgentDirOverrideFor("PI_CODING_AGENT_DIR");
 }
 
 let dirs = new DirResolver(trustedAgentDirOverride());
