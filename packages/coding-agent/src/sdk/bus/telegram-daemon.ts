@@ -8753,18 +8753,32 @@ export class TelegramNotificationDaemon {
 							(control as { enabled?: unknown }).enabled === true,
 					)
 				: [];
+			const options: string[] = Array.isArray(msg.options)
+				? msg.options.filter((option: unknown): option is string => typeof option === "string")
+				: [];
+			const multiSelect = Array.isArray(msg.selectedOptionIndices);
+			const selectedOptionIndices = new Set(
+				multiSelect
+					? msg.selectedOptionIndices.filter(
+							(index: unknown): index is number =>
+								Number.isInteger(index) && Number(index) >= 0 && Number(index) < options.length,
+						)
+					: [],
+			);
+			const displayOptions = options.map((option, index) =>
+				multiSelect ? `${selectedOptionIndices.has(index) ? "☑" : "☐"} ${option}` : option,
+			);
 			const rendered = buildActionMessage({
 				kind: msg.kind ?? "ask",
 				id: msg.id,
 				question: msg.question,
-				options: msg.options,
+				options: displayOptions,
 				recommendedIndex: msg.recommendedIndex,
 				controls,
 				summary: msg.summary,
 			});
-			const options = Array.isArray(msg.options) ? msg.options : [];
 			const inline_keyboard = [
-				...buildCompactChoiceGrid(options, (i: number) =>
+				...buildCompactChoiceGrid(displayOptions, (i: number) =>
 					this.aliasTable.put({ sessionId: logicalSessionId, actionId: msg.id, answer: i }),
 				),
 				...controls.map(control => [
@@ -8819,7 +8833,7 @@ export class TelegramNotificationDaemon {
 						markdown: buildActionMarkdown({
 							kind,
 							question: msg.question,
-							options: msg.options,
+							options: displayOptions,
 							recommendedIndex: msg.recommendedIndex,
 							summary: msg.summary,
 						}),

@@ -4093,10 +4093,23 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	expect(publications[0]).toMatchObject({ options: ["one", "two"], recommendedIndex: 1 });
 	arbiter.complete("ordinary");
 	expect(publications.map(action => action.workflowGateId)).toEqual([undefined, "workflow-first"]);
+	expect(publications[1]).toMatchObject({
+		options: ["one", "two"],
+		selectedOptionIndices: [],
+		recommendedIndex: 0,
+	});
 	const firstActionId = publications[1]!.id as string;
 	expect(arbiter.toggle(firstActionId, "one")).toBe(true);
 	expect(publications).toHaveLength(3);
-	expect(publications[2]).toMatchObject({ options: ["one", "two"], recommendedIndex: 0 });
+	expect(publications[2]).toMatchObject({
+		question: "(1 selected) workflow-first",
+		options: ["one", "two"],
+		selectedOptionIndices: [0],
+		recommendedIndex: 0,
+	});
+	const replayedActionId = publications[2]!.id as string;
+	arbiter.retain(gate("workflow-first", true, 0));
+	expect(arbiter.presentationFor(replayedActionId)?.selectedOptions).toEqual(["one"]);
 	arbiter.retain(gate("workflow-second"));
 	const queued = arbiter.prepareDirectControl("workflow-second");
 	expect(queued).toEqual({ status: "queued", ordinal: 1 });
@@ -4112,6 +4125,84 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	arbiter.finishDirectControl("workflow-second", uncertain as { status: "retired"; ordinal: number }, "unknown");
 	await Promise.resolve();
 	expect(publications).toHaveLength(4);
+});
+
+test("PresentationArbiter retires and republishes an active replay whose option snapshot changed", () => {
+	const publications: Array<Record<string, unknown>> = [];
+	const retired: string[] = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as Record<string, unknown>;
+				publications.push(action);
+				return { actionId: action.id as string, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed(lease: { actionId: string }) {
+				retired.push(lease.actionId);
+				return { status: "retired" as const };
+			},
+		} as never,
+		() => false,
+		"test",
+	);
+	const presentation = (options: string[]) => ({
+		gateId: "workflow",
+		workflowGateId: "workflow",
+		sessionId: "session",
+		question: "Pick",
+		options,
+		controls: [],
+		multi: true,
+		allowEmpty: false,
+		selectedOptions: [],
+	});
+
+	arbiter.retain(presentation(["one", "two"]));
+	const firstActionId = publications[0]!.id as string;
+	expect(arbiter.toggle(firstActionId, "one")).toBe(true);
+	const selectedActionId = publications[1]!.id as string;
+	arbiter.retain(presentation(["two", "three"]));
+
+	expect(retired).toContain(selectedActionId);
+	expect(publications).toHaveLength(3);
+	expect(publications[2]).toMatchObject({
+		options: ["two", "three"],
+		selectedOptionIndices: [],
+	});
+});
+
+test("PresentationArbiter keeps the routed option snapshot when replay retirement lacks terminal proof", () => {
+	const publications: Array<Record<string, unknown>> = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as Record<string, unknown>;
+				publications.push(action);
+				return { actionId: action.id as string, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "claimed" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	const presentation = (options: string[]) => ({
+		gateId: "workflow",
+		workflowGateId: "workflow",
+		sessionId: "session",
+		question: "Pick",
+		options,
+		controls: [],
+		multi: false,
+		allowEmpty: false,
+		selectedOptions: [],
+	});
+
+	arbiter.retain(presentation(["one", "two"]));
+	const actionId = publications[0]!.id as string;
+	arbiter.retain(presentation(["two", "three"]));
+
+	expect(publications).toHaveLength(1);
+	expect(arbiter.presentationFor(actionId)?.options).toEqual(["one", "two"]);
 });
 
 test("PresentationArbiter terminalizes a queued direct control with explicit non-published proof", () => {
