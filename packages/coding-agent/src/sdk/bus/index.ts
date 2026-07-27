@@ -58,6 +58,7 @@ import type {
 import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
+import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
 import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
@@ -2610,12 +2611,6 @@ function positiveEnvMs(value: string | undefined): number | undefined {
 	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-/** Read a positive integer process id, ignoring junk values. */
-function positivePid(value: string | undefined): number | undefined {
-	const parsed = Number(value);
-	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
-}
-
 /**
  * A broker-spawned session host outlives its client so the client can reconnect.
  * Reclaim one only after this long with no live client and no work in flight, so a
@@ -3421,29 +3416,45 @@ export function createNotificationsExtension(
 		};
 
 		const hostCapCache = new Map<string, ReadonlySet<string>>();
+		const handshakingConnections = new Set<string>();
 		let idleReaperTimer: ReturnType<typeof setInterval> | undefined;
 		let unusedSince: number | undefined = lifecycleRequired ? Date.now() : undefined;
 		/**
-		 * Connection-close callbacks do not arrive when a client is killed rather than
-		 * closed, so a stale capability entry cannot prove a peer is alive. The launching
-		 * client's pid is the authoritative signal for THAT client, but a later client can
-		 * reattach to this same host, so a live connection always wins.
+		 * A PID alone is not an identity: it can be reused after the initiating client
+		 * exits. Unknown identity deliberately fails open; leaking is safer than
+		 * reclaiming a host that may still belong to a live client.
 		 */
-		const clientPid = positivePid(process.env.GJC_SDK_CLIENT_PID);
-		const launcherAlive = (): boolean => {
-			if (clientPid === undefined) return true;
+		const launcherIdentity = (() => {
 			try {
-				process.kill(clientPid, 0);
-				return true;
+				const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST ?? "") as {
+					launcherIdentity?: { pid?: unknown; incarnation?: unknown };
+				};
+				const identity = request.launcherIdentity;
+				return typeof identity?.pid === "number" &&
+					Number.isSafeInteger(identity.pid) &&
+					identity.pid > 0 &&
+					isProcessIncarnation(identity.incarnation)
+					? { pid: identity.pid, incarnation: identity.incarnation }
+					: undefined;
+			} catch {
+				return undefined;
+			}
+		})();
+		const launcherAlive = (): boolean => {
+			if (!launcherIdentity) return true;
+			try {
+				process.kill(launcherIdentity.pid, 0);
 			} catch (error) {
 				return (error as NodeJS.ErrnoException).code === "EPERM";
 			}
+			return processIncarnation(launcherIdentity.pid) === launcherIdentity.incarnation;
 		};
+		const hostInUse = () => hostCapCache.size > 0 || handshakingConnections.size > 0;
 		const noteHostInUse = () => {
 			if (unusedSince !== undefined) unusedSince = undefined;
 		};
 		const noteHostMaybeUnused = () => {
-			if (lifecycleRequired && hostCapCache.size === 0) unusedSince ??= Date.now();
+			if (lifecycleRequired && !hostInUse()) unusedSince ??= Date.now();
 		};
 
 		const configOverrides = new Map<string, unknown>();
@@ -4087,6 +4098,10 @@ export function createNotificationsExtension(
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err || !inbound) return;
+				if (inbound.connectionId) {
+					handshakingConnections.add(inbound.connectionId);
+					noteHostInUse();
+				}
 				try {
 					const frame = JSON.parse(inbound.json) as unknown;
 					if (!frame || typeof frame !== "object") return;
@@ -4129,13 +4144,17 @@ export function createNotificationsExtension(
 				);
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
-				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
+				if (connectionId) {
+					handshakingConnections.delete(connectionId);
+					hostCapCache.set(connectionId, new Set(capabilities));
+				}
 				noteHostInUse();
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
+				handshakingConnections.delete(connectionId);
 				for (const submission of promptSubmissions.values())
 					if (submission.connectionId === connectionId) abandonPrompt(submission);
 				noteHostMaybeUnused();
@@ -4654,12 +4673,7 @@ export function createNotificationsExtension(
 					// A live launcher, a live connection, or a turn in flight all mean the host
 					// is still wanted. A reattached client keeps it alive even once the process
 					// that originally launched it is gone.
-					if (
-						launcherAlive() ||
-						hostCapCache.size > 0 ||
-						runtime.busy ||
-						runtime.pendingPromptCorrelations.length > 0
-					) {
+					if (launcherAlive() || hostInUse() || runtime.busy || runtime.pendingPromptCorrelations.length > 0) {
 						unusedSince = undefined;
 						return;
 					}

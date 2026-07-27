@@ -48,6 +48,7 @@ import type {
 	LifecycleWorktreeIntent,
 } from "./lifecycle-ledger";
 import {
+	isProcessIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
 	parseDarwinProcessIncarnation,
@@ -223,6 +224,12 @@ export interface SessionLifecycleLaunchRequest {
 	semanticReadyDeadlineAt: number;
 	terminationStartDeadlineAt: number;
 	lifecycleCleanupDeadlineAt: number;
+	/** Identity captured by the initiating client; absent identity deliberately disables host reaping. */
+	launcherIdentity?: { pid: number; incarnation: string };
+}
+function positivePid(value: string | undefined): number | undefined {
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionLifecycleTranscriptIdentity {
@@ -348,6 +355,10 @@ export function readSessionLifecycleLaunchRequest(
 		(request.sessionPath !== undefined &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
 		(request.sessionIdentity !== undefined && !isSessionLifecycleTranscriptIdentity(request.sessionIdentity)) ||
+		(request.launcherIdentity !== undefined &&
+			(!Number.isSafeInteger(request.launcherIdentity.pid) ||
+				request.launcherIdentity.pid <= 0 ||
+				!isProcessIncarnation(request.launcherIdentity.incarnation))) ||
 		(request.effectMarker !== undefined &&
 			(typeof request.effectMarker !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(request.effectMarker))) ||
 		(request.modelPreset !== undefined && (typeof request.modelPreset !== "string" || !request.modelPreset)) ||
@@ -2866,7 +2877,12 @@ async function executeLifecycleResponse(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
-
+		const clientPid = positivePid(process.env.GJC_SDK_CLIENT_PID);
+		const clientIncarnation = process.env.GJC_SDK_CLIENT_INCARNATION;
+		const launcherIdentity =
+			clientPid !== undefined && isProcessIncarnation(clientIncarnation)
+				? { pid: clientPid, incarnation: clientIncarnation }
+				: undefined;
 		const request: SessionLifecycleLaunchRequest = {
 			operation,
 			sessionId: launch.id,
@@ -2878,6 +2894,7 @@ async function executeLifecycleResponse(
 			semanticReadyDeadlineAt: deadlines.semanticReadyDeadlineAt,
 			terminationStartDeadlineAt: deadlines.terminationStartDeadlineAt,
 			lifecycleCleanupDeadlineAt: deadlines.lifecycleCleanupDeadlineAt,
+			...(launcherIdentity ? { launcherIdentity } : {}),
 			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
 			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
 			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
@@ -2904,12 +2921,12 @@ async function executeLifecycleResponse(
 					GJC_STATE_ROOT: launch.root,
 					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
 					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
-					// The host reclaims itself when its client is gone; forward the tuning knob
-					// and the client's pid, since a killed client sends no connection-close.
+					// The host reads the request identity rather than inheriting this ambient
+					// value, which prevents a detached broker's stale environment from being
+					// mistaken for the requesting client.
 					...(process.env.GJC_SDK_HOST_IDLE_REAP_MS
 						? { GJC_SDK_HOST_IDLE_REAP_MS: process.env.GJC_SDK_HOST_IDLE_REAP_MS }
 						: {}),
-					...(process.env.GJC_SDK_CLIENT_PID ? { GJC_SDK_CLIENT_PID: process.env.GJC_SDK_CLIENT_PID } : {}),
 				},
 			});
 			child = spawned;

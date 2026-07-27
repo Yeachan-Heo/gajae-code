@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
@@ -394,7 +395,7 @@ export async function runSessionHost(
 	const { session, capability, rollback } = created;
 	let sessionDisposal: Promise<void> | undefined;
 	const disposeSession = (): Promise<void> => {
-		sessionDisposal ??= session.dispose().catch(() => {});
+		sessionDisposal ??= session.dispose();
 		return sessionDisposal;
 	};
 	let disposal: Promise<LifecycleTranscriptEvidence | undefined> | undefined;
@@ -438,12 +439,24 @@ export async function runSessionHost(
 	};
 	const stop = () => {
 		if (capability.result?.status === "started") {
-			void disposeSession().finally(() => process.exit(0));
+			void disposeSession().then(
+				() => process.exit(0),
+				error => {
+					logger.error(`sdk lifecycle host disposal failed: ${String(error)}`);
+					process.exit(1);
+				},
+			);
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
 		capability.cancel();
-		void failAfterRollback(failure).finally(() => process.exit(0));
+		void failAfterRollback(failure).then(
+			() => process.exit(0),
+			error => {
+				logger.error(`sdk lifecycle host shutdown failed: ${String(error)}`);
+				process.exit(1);
+			},
+		);
 	};
 	const cutoffFailure = (): SdkStartupFailure => capability.normalizeFailure("startup", "pending");
 	const throwIfCutoff = (): void => {
