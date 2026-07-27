@@ -91,6 +91,24 @@ export interface MemoryUsageSample {
 	arrayBuffersBytes: number;
 	activeResourceCount: number;
 }
+export type MemoryExtremumDomain = "rssBytes" | "heapUsedBytes" | "externalBytes" | "arrayBuffersBytes";
+
+export interface MemoryObservedExtremum {
+	valueBytes: number;
+	elapsedMs: number;
+}
+
+export type MemoryObservedExtrema = Record<MemoryExtremumDomain, MemoryObservedExtremum>;
+
+export interface MemorySamplingMetadata {
+	periodicCadenceTargetMs: number;
+	highWaterCadenceTargetMs: number;
+	periodicDeadlinesMissed: number;
+	highWaterCallbacks: number;
+	highWaterProbes: number;
+	forcedHighWaterProbes: number;
+	throttledHighWaterCallbacks: number;
+}
 const MEMORY_USAGE_SAMPLE_FIELDS = [
 	"elapsedMs",
 	"rssBytes",
@@ -107,7 +125,9 @@ export interface MemoryBaselineMetric {
 	iterations: number;
 	operations: number;
 	operationsPerSecond: number;
-	samples: MemoryUsageSample[];
+	periodicSamples: MemoryUsageSample[];
+	observedExtrema: MemoryObservedExtrema;
+	sampling: MemorySamplingMetadata;
 	postTeardown: MemoryUsageSample;
 	rssSlopeBytesPerSecond: number | null;
 	heapSlopeBytesPerSecond: number | null;
@@ -155,7 +175,7 @@ export interface ThresholdLedgerReference {
 }
 
 export interface PerfCorpusReport {
-	schema: "gjc.perf-corpus/2";
+	schema: "gjc.perf-corpus/3";
 	generatedAt: string;
 	gitSha: string;
 	gitDirty: boolean;
@@ -180,7 +200,7 @@ export interface PerfCorpusReport {
 	thresholdLedger?: ThresholdLedgerReference[];
 }
 
-export const PERF_CORPUS_SCHEMA = "gjc.perf-corpus/2" as const;
+export const PERF_CORPUS_SCHEMA = "gjc.perf-corpus/3" as const;
 
 export const REQUIRED_FIXTURE_CLASSES: readonly FixtureClass[] = ["startup-session-load", "streaming-ttft", "large-transcript"];
 export const REQUIRED_MEMORY_SURFACES: readonly MemorySurface[] = [
@@ -195,6 +215,12 @@ export const REQUIRED_MEMORY_SURFACES: readonly MemorySurface[] = [
 const MEMORY_WORKLOAD_PROFILES: readonly MemoryWorkloadProfile[] = ["short", "soak"];
 const PROCESS_TREE_SAMPLERS: readonly MemoryBaselineMetric["processTreeSampler"][] = ["ps", "unavailable"];
 const MEMORY_ISOLATION_MODES: readonly PerfCorpusReport["runner"]["memoryIsolation"][] = ["in-process", "process-per-surface"];
+const MEMORY_EXTREMUM_DOMAINS: readonly MemoryExtremumDomain[] = [
+	"rssBytes",
+	"heapUsedBytes",
+	"externalBytes",
+	"arrayBuffersBytes",
+];
 
 const HOTSPOT_STATUS_VALUES: readonly HotspotStatus[] = [
 	"CPU-self-time confirmed",
@@ -262,11 +288,21 @@ export function calculateMemorySlope(
 	if (!steadyStateFirst || !steadyStateLast || steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs < 250) return null;
 	return ((steadyStateLast[key] - steadyStateFirst[key]) * 1_000) / (steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs);
 }
+function isValidMemoryByteValue(value: unknown): value is number {
+	return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
 function isValidMemoryUsageSample(value: unknown): value is MemoryUsageSample {
 	if (typeof value !== "object" || value === null) return false;
 	const sample = value as Record<string, unknown>;
-	return MEMORY_USAGE_SAMPLE_FIELDS.every(
-		name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && Number(sample[name]) >= 0,
+	return (
+		MEMORY_USAGE_SAMPLE_FIELDS.every(name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && Number(sample[name]) >= 0) &&
+		isValidMemoryByteValue(sample.rssBytes) &&
+		isValidMemoryByteValue(sample.heapUsedBytes) &&
+		isValidMemoryByteValue(sample.heapTotalBytes) &&
+		isValidMemoryByteValue(sample.externalBytes) &&
+		isValidMemoryByteValue(sample.arrayBuffersBytes) &&
+		Number.isSafeInteger(sample.activeResourceCount)
 	);
 }
 
@@ -280,8 +316,11 @@ function isValidMemoryUsageSample(value: unknown): value is MemoryUsageSample {
  */
 export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolean; errors: string[] } {
 	const errors: string[] = [];
-	if (report.schema !== PERF_CORPUS_SCHEMA) {
-		errors.push(`invalid schema "${report.schema}", expected "${PERF_CORPUS_SCHEMA}"`);
+	const schema = (report as { schema?: unknown }).schema;
+	if (schema === "gjc.perf-corpus/2") {
+		errors.push(`schema "${schema}" is incompatible with the v3 validator; expected "${PERF_CORPUS_SCHEMA}"`);
+	} else if (schema !== PERF_CORPUS_SCHEMA) {
+		errors.push(`invalid schema "${String(schema)}", expected "${PERF_CORPUS_SCHEMA}"`);
 	}
 	if (!/^[0-9a-f]{40}$/i.test(report.gitSha)) {
 		errors.push("gitSha must be a full 40-character commit SHA");
@@ -457,11 +496,28 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			) {
 				errors.push(`fixture ${fixture.fixtureId}: unavailable sampler requires null process-tree RSS`);
 			}
-			if (!Array.isArray(baseline.samples) || baseline.samples.length < 2) {
-				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline requires at least two samples`);
+			if (Object.hasOwn(baseline, "samples")) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.samples is not allowed in schema v3`);
 			}
-			const samples = Array.isArray(baseline.samples) ? baseline.samples : [];
-			for (const [index, sample] of [...samples, baseline.postTeardown].entries()) {
+			if (!Array.isArray(baseline.periodicSamples) || baseline.periodicSamples.length < 2) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline requires at least two periodicSamples`);
+			}
+			const periodicSamples = Array.isArray(baseline.periodicSamples) ? baseline.periodicSamples : [];
+			const lastPeriodicElapsedMs =
+				periodicSamples.length > 0 && isValidMemoryUsageSample(periodicSamples.at(-1))
+					? (periodicSamples.at(-1)?.elapsedMs ?? 0)
+					: 0;
+			const shortChunkSize = Math.max(1, Math.ceil(report.runner.iterationsTarget / 20));
+			const maximumPeriodicSamples =
+				baseline.profile === "soak"
+					? Math.floor(lastPeriodicElapsedMs / 50) + 3
+					: Math.ceil(Math.max(0, baseline.iterations) / shortChunkSize) + 2;
+			const periodicCountIsBounded = periodicSamples.length <= maximumPeriodicSamples;
+			if (!periodicCountIsBounded) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.periodicSamples exceeds cadence bound`);
+			}
+			const samplesToValidate = periodicCountIsBounded ? periodicSamples : [];
+			for (const [index, sample] of [...samplesToValidate, baseline.postTeardown].entries()) {
 				if (typeof sample !== "object" || sample === null) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index} invalid`);
 					continue;
@@ -472,6 +528,17 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.${name} invalid`);
 					}
 				}
+				for (const name of [
+					"rssBytes",
+					"heapUsedBytes",
+					"heapTotalBytes",
+					"externalBytes",
+					"arrayBuffersBytes",
+				] as const) {
+					if (Object.hasOwn(sample, name) && !isValidMemoryByteValue(sample[name])) {
+						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.${name} must be a safe integer`);
+					}
+				}
 				if (
 					Object.hasOwn(sample, "arrayBuffersBytes") &&
 					Object.hasOwn(sample, "externalBytes") &&
@@ -479,25 +546,144 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index} arrayBuffersBytes exceeds externalBytes`);
 				}
-				if (Object.hasOwn(sample, "activeResourceCount") && !Number.isInteger(sample.activeResourceCount)) {
+				if (Object.hasOwn(sample, "activeResourceCount") && !Number.isSafeInteger(sample.activeResourceCount)) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
 				}
 			}
-			const samplesAreValid = samples.every(isValidMemoryUsageSample);
+			const samplesAreValid = periodicCountIsBounded && periodicSamples.every(isValidMemoryUsageSample);
 			if (samplesAreValid) {
-				for (let index = 1; index < samples.length; index++) {
-					if (samples[index].elapsedMs < samples[index - 1].elapsedMs) {
-						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline samples must be chronological`);
+				for (let index = 1; index < periodicSamples.length; index++) {
+					if (periodicSamples[index].elapsedMs < periodicSamples[index - 1].elapsedMs) {
+						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.periodicSamples must be chronological`);
 						break;
 					}
 				}
 			}
+			if (samplesAreValid && periodicSamples.length > 0 && periodicSamples[0].elapsedMs !== 0) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.periodicSamples must start at elapsedMs 0`);
+			}
+			if (
+				samplesAreValid &&
+				Number.isFinite(runElapsedMs) &&
+				runElapsedMs !== periodicSamples.at(-1)?.elapsedMs
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline final periodicSample must match run duration`);
+			}
 			if (
 				report.runner.profile === "soak" &&
 				samplesAreValid &&
-				(samples.at(-1)?.elapsedMs ?? 0) < (report.runner.durationTargetMs ?? 0)
+				(periodicSamples.at(-1)?.elapsedMs ?? 0) < (report.runner.durationTargetMs ?? 0)
 			) {
-				errors.push(`fixture ${fixture.fixtureId}: soak samples shorter than runner duration target`);
+				errors.push(`fixture ${fixture.fixtureId}: soak periodicSamples shorter than runner duration target`);
+			}
+			const observedExtremaValue: unknown = baseline.observedExtrema;
+			const observedExtrema =
+				typeof observedExtremaValue === "object" && observedExtremaValue !== null && !Array.isArray(observedExtremaValue)
+					? (observedExtremaValue as Partial<MemoryObservedExtrema>)
+					: {};
+			const observedExtremaKeys = Object.keys(observedExtrema);
+			let extremaAreValid =
+				observedExtremaKeys.length === MEMORY_EXTREMUM_DOMAINS.length &&
+				observedExtremaKeys.every(key => (MEMORY_EXTREMUM_DOMAINS as readonly string[]).includes(key));
+			if (!extremaAreValid) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.observedExtrema must contain exactly four memory domains`);
+			}
+			for (const domain of MEMORY_EXTREMUM_DOMAINS) {
+				const extremum = observedExtrema[domain];
+				if (
+					typeof extremum !== "object" ||
+					extremum === null ||
+					Array.isArray(extremum) ||
+					Object.keys(extremum).length !== 2 ||
+					!Object.hasOwn(extremum, "valueBytes") ||
+					!Object.hasOwn(extremum, "elapsedMs") ||
+					!isValidMemoryByteValue(extremum.valueBytes) ||
+					!Number.isFinite(extremum.elapsedMs) ||
+					extremum.elapsedMs < 0
+				) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.observedExtrema.${domain} invalid`);
+					extremaAreValid = false;
+					continue;
+				}
+				if (samplesAreValid && extremum.elapsedMs > lastPeriodicElapsedMs) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.observedExtrema.${domain} outside measurement lifecycle`);
+					extremaAreValid = false;
+				}
+				if (
+					samplesAreValid &&
+					periodicSamples.some(sample => sample[domain] > extremum.valueBytes)
+				) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.observedExtrema.${domain} below periodic observation`);
+					extremaAreValid = false;
+				}
+			}
+			const externalExtremum = observedExtrema.externalBytes;
+			const arrayBuffersExtremum = observedExtrema.arrayBuffersBytes;
+			if (
+				extremaAreValid &&
+				externalExtremum &&
+				arrayBuffersExtremum &&
+				arrayBuffersExtremum.valueBytes > externalExtremum.valueBytes
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline observed arrayBuffersBytes exceeds externalBytes`);
+				extremaAreValid = false;
+			}
+			const samplingValue: unknown = baseline.sampling;
+			const sampling =
+				typeof samplingValue === "object" && samplingValue !== null && !Array.isArray(samplingValue)
+					? (samplingValue as Partial<MemorySamplingMetadata>)
+					: {};
+			const samplingFields = [
+				"periodicCadenceTargetMs",
+				"highWaterCadenceTargetMs",
+				"periodicDeadlinesMissed",
+				"highWaterCallbacks",
+				"highWaterProbes",
+				"forcedHighWaterProbes",
+				"throttledHighWaterCallbacks",
+			] as const satisfies readonly (keyof MemorySamplingMetadata)[];
+			if (
+				Object.keys(sampling).length !== samplingFields.length ||
+				!samplingFields.every(name => Number.isSafeInteger(sampling[name]) && Number(sampling[name]) >= 0)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.sampling invalid`);
+			}
+			const expectedPeriodicCadenceMs = baseline.profile === "soak" ? 50 : 0;
+			const expectedHighWaterCadenceMs = baseline.profile === "soak" ? 10 : 0;
+			if (
+				sampling.periodicCadenceTargetMs !== expectedPeriodicCadenceMs ||
+				sampling.highWaterCadenceTargetMs !== expectedHighWaterCadenceMs
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.sampling cadence does not match profile`);
+			}
+			if (
+				typeof sampling.highWaterCallbacks === "number" &&
+				typeof sampling.highWaterProbes === "number" &&
+				typeof sampling.throttledHighWaterCallbacks === "number" &&
+				sampling.highWaterCallbacks !== sampling.highWaterProbes + sampling.throttledHighWaterCallbacks
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.sampling callback counts inconsistent`);
+			}
+			if (
+				typeof sampling.forcedHighWaterProbes === "number" &&
+				typeof sampling.highWaterProbes === "number" &&
+				sampling.forcedHighWaterProbes > sampling.highWaterProbes
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.sampling forced probes exceed probes`);
+			}
+			if (
+				baseline.profile === "short" &&
+				(sampling.periodicDeadlinesMissed !== 0 || sampling.throttledHighWaterCallbacks !== 0)
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.sampling short profile cannot report throttling`);
+			}
+			if (
+				baseline.profile === "soak" &&
+				typeof sampling.highWaterProbes === "number" &&
+				typeof sampling.forcedHighWaterProbes === "number" &&
+				sampling.highWaterProbes - sampling.forcedHighWaterProbes > Math.floor(lastPeriodicElapsedMs / 10) + 1
+			) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.sampling high-water probes exceed cadence bound`);
 			}
 			for (const [name, key] of [
 				["rssSlopeBytesPerSecond", "rssBytes"],
@@ -508,42 +694,43 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
 				}
 				if (!samplesAreValid) continue;
-				const expected = calculateMemorySlope(samples, key);
+				const expected = calculateMemorySlope(periodicSamples, key);
 				if (
 					(value === null) !== (expected === null) ||
 					(value !== null && expected !== null && Math.abs(value - expected) > Math.max(1e-9, Math.abs(expected) * 1e-12))
 				) {
-					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match samples`);
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match periodicSamples`);
 				}
 			}
 			const postTeardownIsValid = isValidMemoryUsageSample(baseline.postTeardown);
 			if (
 				samplesAreValid &&
-				samples.length > 0 &&
+				periodicSamples.length > 0 &&
 				postTeardownIsValid &&
-				baseline.postTeardown.elapsedMs < (samples.at(-1)?.elapsedMs ?? 0)
+				baseline.postTeardown.elapsedMs < (periodicSamples.at(-1)?.elapsedMs ?? 0)
 			) {
-				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline postTeardown predates workload samples`);
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline postTeardown predates periodicSamples`);
 			}
-			if (samplesAreValid && samples.length > 0 && postTeardownIsValid) {
-				const firstSample = samples[0];
-				let peakRssBytes = firstSample.rssBytes;
-				for (const sample of samples) peakRssBytes = Math.max(peakRssBytes, sample.rssBytes);
-				const childGcExposed =
-					report.runner.memoryIsolation === "process-per-surface"
-						? report.runner.memoryChildGcExposed
-						: report.runner.gcExposed;
-				const expectedSummary = {
-					baselineBytes: firstSample.rssBytes,
-					peakBytes: peakRssBytes,
-					growthBytes: peakRssBytes - firstSample.rssBytes,
-					returnBytes: childGcExposed ? baseline.postTeardown.rssBytes : null,
-					heapBaselineBytes: firstSample.heapUsedBytes,
-					heapReturnBytes: childGcExposed ? baseline.postTeardown.heapUsedBytes : null,
-				};
-				for (const [name, expected] of Object.entries(expectedSummary)) {
-					if (fixture.rssMemory[name as keyof typeof expectedSummary] !== expected) {
-						errors.push(`fixture ${fixture.fixtureId}: rssMemory.${name} does not match detailed samples`);
+			if (samplesAreValid && periodicSamples.length > 0 && postTeardownIsValid && extremaAreValid) {
+				const firstSample = periodicSamples[0];
+				const rssExtremum = observedExtrema.rssBytes;
+				if (rssExtremum) {
+					const childGcExposed =
+						report.runner.memoryIsolation === "process-per-surface"
+							? report.runner.memoryChildGcExposed
+							: report.runner.gcExposed;
+					const expectedSummary = {
+						baselineBytes: firstSample.rssBytes,
+						peakBytes: rssExtremum.valueBytes,
+						growthBytes: rssExtremum.valueBytes - firstSample.rssBytes,
+						returnBytes: childGcExposed ? baseline.postTeardown.rssBytes : null,
+						heapBaselineBytes: firstSample.heapUsedBytes,
+						heapReturnBytes: childGcExposed ? baseline.postTeardown.heapUsedBytes : null,
+					};
+					for (const [name, expected] of Object.entries(expectedSummary)) {
+						if (fixture.rssMemory[name as keyof typeof expectedSummary] !== expected) {
+							errors.push(`fixture ${fixture.fixtureId}: rssMemory.${name} does not match periodic/extrema evidence`);
+						}
 					}
 				}
 			}

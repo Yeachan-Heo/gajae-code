@@ -17,6 +17,7 @@ import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations 
 import {
 	calculateMemorySlope,
 	type MemoryUsageSample,
+	type MemoryObservedExtrema,
 	type MemoryWorkloadProfile,
 	type MemorySurface,
 	type PerfCorpusFixtureResult,
@@ -159,18 +160,28 @@ function memorySample(startedAt: number): MemoryUsageSample {
 		activeResourceCount: process.getActiveResourcesInfo().length,
 	};
 }
-interface MemoryHighWaterSamples {
-	rss: MemoryUsageSample;
-	heap: MemoryUsageSample;
-	external: MemoryUsageSample;
-	arrayBuffers: MemoryUsageSample;
+function createMemoryObservedExtrema(sample: MemoryUsageSample): MemoryObservedExtrema {
+	return {
+		rssBytes: { valueBytes: sample.rssBytes, elapsedMs: sample.elapsedMs },
+		heapUsedBytes: { valueBytes: sample.heapUsedBytes, elapsedMs: sample.elapsedMs },
+		externalBytes: { valueBytes: sample.externalBytes, elapsedMs: sample.elapsedMs },
+		arrayBuffersBytes: { valueBytes: sample.arrayBuffersBytes, elapsedMs: sample.elapsedMs },
+	};
 }
 
-export function updateMemoryHighWaterSamples(peaks: MemoryHighWaterSamples, sample: MemoryUsageSample): void {
-	if (sample.rssBytes > peaks.rss.rssBytes) peaks.rss = sample;
-	if (sample.heapUsedBytes > peaks.heap.heapUsedBytes) peaks.heap = sample;
-	if (sample.externalBytes > peaks.external.externalBytes) peaks.external = sample;
-	if (sample.arrayBuffersBytes > peaks.arrayBuffers.arrayBuffersBytes) peaks.arrayBuffers = sample;
+export function updateMemoryObservedExtrema(extrema: MemoryObservedExtrema, sample: MemoryUsageSample): void {
+	if (sample.rssBytes > extrema.rssBytes.valueBytes) {
+		extrema.rssBytes = { valueBytes: sample.rssBytes, elapsedMs: sample.elapsedMs };
+	}
+	if (sample.heapUsedBytes > extrema.heapUsedBytes.valueBytes) {
+		extrema.heapUsedBytes = { valueBytes: sample.heapUsedBytes, elapsedMs: sample.elapsedMs };
+	}
+	if (sample.externalBytes > extrema.externalBytes.valueBytes) {
+		extrema.externalBytes = { valueBytes: sample.externalBytes, elapsedMs: sample.elapsedMs };
+	}
+	if (sample.arrayBuffersBytes > extrema.arrayBuffersBytes.valueBytes) {
+		extrema.arrayBuffersBytes = { valueBytes: sample.arrayBuffersBytes, elapsedMs: sample.elapsedMs };
+	}
 }
 
 export { calculateMemorySlope };
@@ -240,46 +251,63 @@ export function buildMemoryFixture(
 	const baselineSample = { ...memorySample(performance.now()), elapsedMs: 0 };
 	const startedAt = performance.now();
 	const cpuStart = process.cpuUsage();
-	const samples = [baselineSample];
-	const highWaterSamples = {
-		rss: baselineSample,
-		heap: baselineSample,
-		external: baselineSample,
-		arrayBuffers: baselineSample,
-	};
+	const periodicSamples = [baselineSample];
+	const observedExtrema = createMemoryObservedExtrema(baselineSample);
 	let operations = 0;
 	let iterations = 0;
 	const chunkSize = profile === "soak" ? 1 : Math.max(1, Math.ceil(minimumIterations / 20));
-	const sampleIntervalMs = profile === "soak" ? 50 : 0;
-	const highWaterIntervalMs = profile === "soak" ? 10 : 0;
+	const periodicCadenceTargetMs = profile === "soak" ? 50 : 0;
+	const highWaterCadenceTargetMs = profile === "soak" ? 10 : 0;
+	let nextPeriodicDeadlineMs = periodicCadenceTargetMs;
+	let periodicDeadlinesMissed = 0;
+	let highWaterCallbacks = 0;
+	let highWaterProbes = 0;
+	let forcedHighWaterProbes = 0;
+	let throttledHighWaterCallbacks = 0;
 	let lastHighWaterSampleAt = Number.NEGATIVE_INFINITY;
-	const captureHighWater = (force = false) => {
-		const now = performance.now();
-		if (!force && now - lastHighWaterSampleAt < highWaterIntervalMs) return;
-		lastHighWaterSampleAt = now;
+	const capturePeriodic = () => {
 		const sample = memorySample(startedAt);
-		updateMemoryHighWaterSamples(highWaterSamples, sample);
+		periodicSamples.push(sample);
+		updateMemoryObservedExtrema(observedExtrema, sample);
+	};
+	const captureHighWater = (force = false) => {
+		highWaterCallbacks++;
+		const now = performance.now();
+		if (!force && now - lastHighWaterSampleAt < highWaterCadenceTargetMs) {
+			throttledHighWaterCallbacks++;
+			return;
+		}
+		lastHighWaterSampleAt = now;
+		highWaterProbes++;
+		if (force) forcedHighWaterProbes++;
+		updateMemoryObservedExtrema(observedExtrema, memorySample(startedAt));
 	};
 	while (iterations < minimumIterations || performance.now() - startedAt < targetDurationMs) {
 		operations += workload.run(chunkSize, captureHighWater);
 		iterations += chunkSize;
-		const elapsedSinceLastSample = performance.now() - startedAt - (samples.at(-1)?.elapsedMs ?? 0);
-		if (elapsedSinceLastSample >= sampleIntervalMs) samples.push(memorySample(startedAt));
+		if (periodicCadenceTargetMs === 0) {
+			capturePeriodic();
+			continue;
+		}
+		const elapsedMs = performance.now() - startedAt;
+		if (elapsedMs >= nextPeriodicDeadlineMs) {
+			const deadlinesReached = Math.floor((elapsedMs - nextPeriodicDeadlineMs) / periodicCadenceTargetMs) + 1;
+			periodicDeadlinesMissed += deadlinesReached - 1;
+			nextPeriodicDeadlineMs += deadlinesReached * periodicCadenceTargetMs;
+			capturePeriodic();
+		}
 	}
-	for (const sample of new Set(Object.values(highWaterSamples))) {
-		if (sample !== baselineSample && !samples.includes(sample)) samples.push(sample);
-	}
-	samples.sort((left, right) => left.elapsedMs - right.elapsedMs);
-	const elapsedMs = performance.now() - startedAt;
-	if ((samples.at(-1)?.elapsedMs ?? 0) < elapsedMs) samples.push(memorySample(startedAt));
+	const loopCompletedElapsedMs = performance.now() - startedAt;
+	if ((periodicSamples.at(-1)?.elapsedMs ?? 0) < loopCompletedElapsedMs) capturePeriodic();
+	const elapsedMs = periodicSamples.at(-1)?.elapsedMs ?? loopCompletedElapsedMs;
 	const cpu = process.cpuUsage(cpuStart);
 	workload.teardown();
 	gc?.();
 	const postTeardown = memorySample(startedAt);
 	const processTreePostTeardownRssBytes = processTreeRssBytes();
 	const processTree = normalizeProcessTreeRss(processTreeBaselineRssBytes, processTreePostTeardownRssBytes);
-	const baselineBytes = samples[0]?.rssBytes ?? null;
-	const peakBytes = samples.reduce((peak, sample) => Math.max(peak, sample.rssBytes), 0);
+	const baselineBytes = periodicSamples[0]?.rssBytes ?? null;
+	const peakBytes = observedExtrema.rssBytes.valueBytes;
 	const fixtureClass =
 		workload.surface === "cli"
 			? "startup-session-load"
@@ -310,7 +338,7 @@ export function buildMemoryFixture(
 			peakBytes,
 			growthBytes: peakBytes - (baselineBytes ?? peakBytes),
 			returnBytes: gc ? postTeardown.rssBytes : null,
-			heapBaselineBytes: samples[0]?.heapUsedBytes ?? null,
+			heapBaselineBytes: periodicSamples[0]?.heapUsedBytes ?? null,
 			heapReturnBytes: gc ? postTeardown.heapUsedBytes : null,
 		},
 		byteParity: {
@@ -325,10 +353,20 @@ export function buildMemoryFixture(
 			iterations,
 			operations,
 			operationsPerSecond: operations / Math.max(elapsedMs / 1_000, 1e-6),
-			samples,
+			periodicSamples,
+			observedExtrema,
+			sampling: {
+				periodicCadenceTargetMs,
+				highWaterCadenceTargetMs,
+				periodicDeadlinesMissed,
+				highWaterCallbacks,
+				highWaterProbes,
+				forcedHighWaterProbes,
+				throttledHighWaterCallbacks,
+			},
 			postTeardown,
-			rssSlopeBytesPerSecond: calculateMemorySlope(samples, "rssBytes"),
-			heapSlopeBytesPerSecond: calculateMemorySlope(samples, "heapUsedBytes"),
+			rssSlopeBytesPerSecond: calculateMemorySlope(periodicSamples, "rssBytes"),
+			heapSlopeBytesPerSecond: calculateMemorySlope(periodicSamples, "heapUsedBytes"),
 			processTreeBaselineRssBytes: processTree.baselineBytes,
 			processTreePostTeardownRssBytes: processTree.postTeardownBytes,
 			processTreeSampler: processTree.sampler,

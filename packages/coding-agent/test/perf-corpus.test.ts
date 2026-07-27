@@ -11,7 +11,7 @@ import {
 	normalizeProcessTreeRss,
 	resolveGitProvenance,
 	runPerfCorpusBenchmark,
-	updateMemoryHighWaterSamples,
+	updateMemoryObservedExtrema,
 } from "../bench/perf-corpus.bench";
 import {
 	type HotspotClassification,
@@ -166,8 +166,33 @@ describe("perf corpus schema + runner", () => {
 		expect(report.runner.profile).toBe("short");
 		expect(report.runner.memoryIsolation).toBe("in-process");
 		for (const baseline of baselines) {
-			expect(baseline.samples.length).toBeGreaterThanOrEqual(2);
-			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(baseline.samples.at(-1)?.elapsedMs ?? 0);
+			expect(baseline.periodicSamples.length).toBeGreaterThanOrEqual(2);
+			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(
+				baseline.periodicSamples.at(-1)?.elapsedMs ?? 0,
+			);
+			const fixture = report.fixtures.find(candidate => candidate.memoryBaseline === baseline);
+			if (!fixture) throw new Error(`fixture unavailable for ${baseline.surface}`);
+			const finalPeriodic = baseline.periodicSamples.at(-1);
+			if (!finalPeriodic) throw new Error(`final periodic sample unavailable for ${baseline.surface}`);
+			expect(fixture.wallClockPhase.run?.elapsedMs).toBe(finalPeriodic.elapsedMs);
+			expect(Object.keys(baseline.observedExtrema).sort()).toEqual(
+				["rssBytes", "heapUsedBytes", "externalBytes", "arrayBuffersBytes"].sort(),
+			);
+			for (const domain of ["rssBytes", "heapUsedBytes", "externalBytes", "arrayBuffersBytes"] as const) {
+				const extremum = baseline.observedExtrema[domain];
+				expect(extremum.elapsedMs).toBeLessThanOrEqual(finalPeriodic.elapsedMs);
+				const periodicMaximum = Math.max(...baseline.periodicSamples.map(sample => sample[domain]));
+				expect(extremum.valueBytes).toBeGreaterThanOrEqual(periodicMaximum);
+			}
+			expect(fixture.rssMemory.peakBytes).toBe(baseline.observedExtrema.rssBytes.valueBytes);
+			expect(fixture.rssMemory.growthBytes).toBe(
+				baseline.observedExtrema.rssBytes.valueBytes - baseline.periodicSamples[0]!.rssBytes,
+			);
+			expect(baseline.sampling.periodicCadenceTargetMs).toBe(0);
+			expect(baseline.sampling.highWaterCadenceTargetMs).toBe(0);
+			expect(baseline.sampling.highWaterCallbacks).toBe(
+				baseline.sampling.highWaterProbes + baseline.sampling.throttledHighWaterCallbacks,
+			);
 			if (process.platform === "darwin" || process.platform === "linux") {
 				expect(["ps", "unavailable"]).toContain(baseline.processTreeSampler);
 				if (baseline.processTreeSampler === "ps") {
@@ -179,7 +204,7 @@ describe("perf corpus schema + runner", () => {
 				}
 			}
 			expect(Number.isFinite(baseline.operationsPerSecond)).toBe(true);
-			expect(baseline.samples.every(sample => sample.externalBytes >= sample.arrayBuffersBytes)).toBe(true);
+			expect(baseline.periodicSamples.every(sample => sample.externalBytes >= sample.arrayBuffersBytes)).toBe(true);
 			expect(baseline.rssSlopeBytesPerSecond === null || Number.isFinite(baseline.rssSlopeBytesPerSecond)).toBe(
 				true,
 			);
@@ -203,7 +228,7 @@ describe("perf corpus schema + runner", () => {
 		});
 		expect(report.runner.gcExposed).toBe(typeof globalThis.gc === "function");
 		expect(report.runner.memoryChildGcExposed).toBe(true);
-		expect(baselines.every(baseline => baseline.samples[0]!.rssBytes > 0)).toBe(true);
+		expect(baselines.every(baseline => baseline.periodicSamples[0]!.rssBytes > 0)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 	}, 15_000);
 
@@ -227,7 +252,7 @@ describe("perf corpus schema + runner", () => {
 							...candidate,
 							memoryBaseline: {
 								...baseline,
-								samples: [{ ...baseline.samples[0]!, rssBytes: Number.NaN }],
+								periodicSamples: [{ ...baseline.periodicSamples[0]!, rssBytes: Number.NaN }],
 							},
 						}
 					: candidate,
@@ -235,9 +260,9 @@ describe("perf corpus schema + runner", () => {
 		};
 		const validation = validatePerfCorpusReport(tampered);
 		expect(validation.ok).toBe(false);
-		expect(validation.errors.some(error => error.includes("requires at least two samples"))).toBe(true);
+		expect(validation.errors.some(error => error.includes("requires at least two periodicSamples"))).toBe(true);
 		expect(validation.errors.some(error => error.includes(".rssBytes invalid"))).toBe(true);
-		const incompleteSample: Partial<MemoryUsageSample> = { ...baseline.samples[0] };
+		const incompleteSample: Partial<MemoryUsageSample> = { ...baseline.periodicSamples[0] };
 		delete incompleteSample.heapUsedBytes;
 		const incomplete: PerfCorpusReport = {
 			...report,
@@ -247,7 +272,7 @@ describe("perf corpus schema + runner", () => {
 							...candidate,
 							memoryBaseline: {
 								...baseline,
-								samples: [incompleteSample as MemoryUsageSample, baseline.samples[1]!],
+								periodicSamples: [incompleteSample as MemoryUsageSample, baseline.periodicSamples[1]!],
 							},
 						}
 					: candidate,
@@ -271,7 +296,7 @@ describe("perf corpus schema + runner", () => {
 							...candidate,
 							memoryBaseline: {
 								...baseline,
-								samples: [baseline.samples[0], null],
+								periodicSamples: [baseline.periodicSamples[0], null],
 							},
 						}
 					: candidate,
@@ -294,7 +319,7 @@ describe("perf corpus schema + runner", () => {
 		const malformedTeardownResult = validatePerfCorpusReport(malformedTeardown);
 		expect(malformedTeardownResult.ok).toBe(false);
 		expect(malformedTeardownResult.errors).toContain(
-			`fixture ${fixture.fixtureId}: memoryBaseline sample ${baseline.samples.length} invalid`,
+			`fixture ${fixture.fixtureId}: memoryBaseline sample ${baseline.periodicSamples.length} invalid`,
 		);
 		const earlyTeardown = {
 			...report,
@@ -311,16 +336,46 @@ describe("perf corpus schema + runner", () => {
 			),
 		};
 		expect(validatePerfCorpusReport(earlyTeardown).errors).toContain(
-			`fixture ${fixture.fixtureId}: memoryBaseline postTeardown predates workload samples`,
+			`fixture ${fixture.fixtureId}: memoryBaseline postTeardown predates periodicSamples`,
 		);
 	});
 
-	test("rejects physically impossible external-memory samples", () => {
+	test("accepts Bun heap accounting while rejecting impossible external memory fields", () => {
 		const report = runPerfCorpusBenchmark();
 		const fixture = report.fixtures.find(candidate => candidate.memoryBaseline);
 		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
 		const baseline = fixture.memoryBaseline;
-		const sample = baseline.samples[0];
+		const sampleIndex = baseline.periodicSamples.length - 1;
+		const sample = baseline.periodicSamples[sampleIndex];
+		const bunSample = { ...sample, heapUsedBytes: sample.heapTotalBytes + 1 };
+		const periodicSamples = baseline.periodicSamples.map((candidate, index) =>
+			index === sampleIndex ? bunSample : candidate,
+		);
+		const observedExtrema = {
+			rssBytes: { ...baseline.observedExtrema.rssBytes },
+			heapUsedBytes: { ...baseline.observedExtrema.heapUsedBytes },
+			externalBytes: { ...baseline.observedExtrema.externalBytes },
+			arrayBuffersBytes: { ...baseline.observedExtrema.arrayBuffersBytes },
+		};
+		updateMemoryObservedExtrema(observedExtrema, bunSample);
+		const bunCounterexample = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								periodicSamples,
+								observedExtrema,
+								heapSlopeBytesPerSecond: calculateMemorySlope(periodicSamples, "heapUsedBytes"),
+							},
+						}
+					: candidate,
+			),
+		} satisfies PerfCorpusReport;
+		expect(validatePerfCorpusReport(bunCounterexample)).toEqual({ ok: true, errors: [] });
+
 		const impossible = {
 			...report,
 			fixtures: report.fixtures.map(candidate =>
@@ -329,21 +384,137 @@ describe("perf corpus schema + runner", () => {
 							...candidate,
 							memoryBaseline: {
 								...baseline,
-								samples: [
-									{ ...sample, externalBytes: sample.arrayBuffersBytes - 1 },
-									...baseline.samples.slice(1),
-								],
+								periodicSamples: baseline.periodicSamples.map((candidate, index) =>
+									index === sampleIndex
+										? { ...candidate, externalBytes: candidate.arrayBuffersBytes - 1 }
+										: candidate,
+								),
 							},
 						}
 					: candidate,
 			),
 		} satisfies PerfCorpusReport;
-		expect(validatePerfCorpusReport(impossible).errors).toContain(
-			`fixture ${fixture.fixtureId}: memoryBaseline sample 0 arrayBuffersBytes exceeds externalBytes`,
+		const impossibleResult = validatePerfCorpusReport(impossible);
+		expect(impossibleResult.ok).toBe(false);
+		expect(impossibleResult.errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline sample ${sampleIndex} arrayBuffersBytes exceeds externalBytes`,
 		);
 	});
 
-	test("preserves independent per-metric high-water samples", () => {
+	test("rejects malformed, tampered, and out-of-lifecycle observed extrema", () => {
+		const report = runPerfCorpusBenchmark();
+		const fixture = report.fixtures.find(candidate => candidate.memoryBaseline);
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = fixture.memoryBaseline;
+		const finalElapsedMs = baseline.periodicSamples.at(-1)?.elapsedMs ?? 0;
+		const malformedShape = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								observedExtrema: {
+									...baseline.observedExtrema,
+									bogusBytes: { valueBytes: 1, elapsedMs: 0 },
+								},
+							},
+						}
+					: candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(malformedShape).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.observedExtrema must contain exactly four memory domains`,
+		);
+		const mixedChannels = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								samples: baseline.periodicSamples,
+							},
+						}
+					: candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(mixedChannels).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.samples is not allowed in schema v3`,
+		);
+
+		const lateExtremum: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								observedExtrema: {
+									...baseline.observedExtrema,
+									heapUsedBytes: {
+										...baseline.observedExtrema.heapUsedBytes,
+										elapsedMs: finalElapsedMs + 1,
+									},
+								},
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(lateExtremum).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.observedExtrema.heapUsedBytes outside measurement lifecycle`,
+		);
+
+		const belowPeriodic: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								observedExtrema: {
+									...baseline.observedExtrema,
+									externalBytes: { valueBytes: 0, elapsedMs: 0 },
+								},
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(belowPeriodic).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.observedExtrema.externalBytes below periodic observation`,
+		);
+
+		const tamperedRss: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								observedExtrema: {
+									...baseline.observedExtrema,
+									rssBytes: {
+										valueBytes: baseline.observedExtrema.rssBytes.valueBytes + 1,
+										elapsedMs: baseline.observedExtrema.rssBytes.elapsedMs,
+									},
+								},
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(tamperedRss).errors).toContain(
+			`fixture ${fixture.fixtureId}: rssMemory.peakBytes does not match periodic/extrema evidence`,
+		);
+	});
+	test("keeps independent observed extrema without contaminating periodic slopes and retains earliest ties", () => {
 		const sample = (
 			elapsedMs: number,
 			rssBytes: number,
@@ -359,23 +530,36 @@ describe("perf corpus schema + runner", () => {
 			arrayBuffersBytes,
 			activeResourceCount: 0,
 		});
-		const baseline = sample(0, 100, 100, 100, 50);
-		const peaks = { rss: baseline, heap: baseline, external: baseline, arrayBuffers: baseline };
-		const rssPeak = sample(1, 900, 110, 110, 55);
-		const heapPeak = sample(2, 800, 700, 120, 60);
-		const externalPeak = sample(3, 700, 600, 500, 70);
-		const arrayBufferPeak = sample(4, 600, 500, 450, 400);
-
-		for (const candidate of [rssPeak, heapPeak, externalPeak, arrayBufferPeak]) {
-			updateMemoryHighWaterSamples(peaks, candidate);
+		const periodicSamples = [
+			sample(0, 100, 100, 100, 50),
+			sample(500, 150, 150, 110, 55),
+			sample(1_000, 200, 200, 120, 60),
+		];
+		const extrema = {
+			rssBytes: { valueBytes: 100, elapsedMs: 0 },
+			heapUsedBytes: { valueBytes: 100, elapsedMs: 0 },
+			externalBytes: { valueBytes: 100, elapsedMs: 0 },
+			arrayBuffersBytes: { valueBytes: 50, elapsedMs: 0 },
+		};
+		const slopeBeforeExtrema = calculateMemorySlope(periodicSamples, "rssBytes");
+		for (const candidate of [
+			sample(100, 900, 110, 110, 55),
+			sample(200, 800, 700, 120, 60),
+			sample(300, 700, 600, 500, 70),
+			sample(400, 600, 500, 450, 400),
+			sample(450, 900, 700, 500, 400),
+		]) {
+			updateMemoryObservedExtrema(extrema, candidate);
 		}
 
-		expect(peaks).toEqual({
-			rss: rssPeak,
-			heap: heapPeak,
-			external: externalPeak,
-			arrayBuffers: arrayBufferPeak,
+		expect(extrema).toEqual({
+			rssBytes: { valueBytes: 900, elapsedMs: 100 },
+			heapUsedBytes: { valueBytes: 700, elapsedMs: 200 },
+			externalBytes: { valueBytes: 500, elapsedMs: 300 },
+			arrayBuffersBytes: { valueBytes: 400, elapsedMs: 400 },
 		});
+		expect(periodicSamples).toHaveLength(3);
+		expect(calculateMemorySlope(periodicSamples, "rssBytes")).toBe(slopeBeforeExtrema);
 	});
 	test("requests throttled TUI high-water callbacks before teardown", () => {
 		const workload = createTuiWorkload();
@@ -454,7 +638,7 @@ describe("perf corpus schema + runner", () => {
 			),
 		};
 		expect(validatePerfCorpusReport(tampered).errors).toContain(
-			`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond does not match samples`,
+			`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond does not match periodicSamples`,
 		);
 	});
 	test("preserves stateful workload indices across sampling chunks", () => {
@@ -521,9 +705,9 @@ describe("perf corpus schema + runner", () => {
 		expect(validatePerfCorpusReport(profileMismatch).errors).toContain(
 			`fixture ${fixture.fixtureId}: memoryBaseline.profile must match runner.profile`,
 		);
-		const legacySchema = { ...report, schema: "gjc.perf-corpus/1" } as unknown as PerfCorpusReport;
-		expect(validatePerfCorpusReport(legacySchema).errors).toContain(
-			'invalid schema "gjc.perf-corpus/1", expected "gjc.perf-corpus/2"',
+		const v2Schema = { ...report, schema: "gjc.perf-corpus/2" } as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(v2Schema).errors).toContain(
+			'schema "gjc.perf-corpus/2" is incompatible with the v3 validator; expected "gjc.perf-corpus/3"',
 		);
 		const missingRunnerProfile = {
 			...report,
@@ -577,9 +761,9 @@ describe("perf corpus schema + runner", () => {
 			),
 		};
 		expect(validatePerfCorpusReport(inconsistentSummary).errors).toContain(
-			`fixture ${fixture.fixtureId}: rssMemory.growthBytes does not match detailed samples`,
+			`fixture ${fixture.fixtureId}: rssMemory.growthBytes does not match periodic/extrema evidence`,
 		);
-		const firstSample = validBaseline.samples[0];
+		const firstSample = validBaseline.periodicSamples[0];
 		const oversizedSamples = Array.from({ length: 1_000_000 }, () => firstSample);
 		oversizedSamples[543_210] = { ...firstSample, rssBytes: firstSample.rssBytes + 1 };
 		const oversizedPersistedReport = {
@@ -596,7 +780,7 @@ describe("perf corpus schema + runner", () => {
 							},
 							memoryBaseline: {
 								...validBaseline,
-								samples: oversizedSamples,
+								periodicSamples: oversizedSamples,
 								rssSlopeBytesPerSecond: null,
 								heapSlopeBytesPerSecond: null,
 							},
@@ -604,7 +788,9 @@ describe("perf corpus schema + runner", () => {
 					: candidate,
 			),
 		};
-		expect(validatePerfCorpusReport(oversizedPersistedReport)).toEqual({ ok: true, errors: [] });
+		expect(validatePerfCorpusReport(oversizedPersistedReport).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.periodicSamples exceeds cadence bound`,
+		);
 		const inconsistentThroughput = {
 			...report,
 			fixtures: report.fixtures.map((candidate, index) =>
