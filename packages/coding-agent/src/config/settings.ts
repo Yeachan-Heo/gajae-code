@@ -535,7 +535,6 @@ export class Settings implements NotificationSettingsReader {
 	canWriteDurableConfig(): boolean {
 		return !this.#persist || !this.#hasRecoveredConfigSyntax;
 	}
-	}
 
 	/**
 	 * Set a setting value (sync).
