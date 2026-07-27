@@ -10273,6 +10273,14 @@ export class AgentSession {
 		}
 
 		if (
+			mutationRevision === this.#thinkingLevelMutationRevision &&
+			this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision
+		) {
+			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+			this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+			return;
+		}
+		if (
 			mutationRevision !== this.#thinkingLevelMutationRevision ||
 			this.#reasoningControlContextGeneration !== expectedContextGeneration ||
 			this.sessionManager.getSessionId() !== expectedSessionId ||

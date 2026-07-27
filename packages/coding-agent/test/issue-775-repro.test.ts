@@ -213,6 +213,34 @@ describe("issue #775: per-model defaultLevel", () => {
 			commit.mockRestore();
 		}
 	});
+	it("applies committed thinking effort after a context-only clear", async () => {
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Low });
+		await createSession(getSonnet(), settings);
+		const commitStarted = Promise.withResolvers<void>();
+		const releaseCommit = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			commitStarted.resolve();
+			await releaseCommit.promise;
+			return commitAtomicBatch(changes);
+		});
+
+		try {
+			const persistentControl = session.setThinkingLevelForControl(Effort.Medium, true);
+			await commitStarted.promise;
+			await session.clearContext();
+			expect(session.thinkingLevel).toBe(Effort.Low);
+
+			releaseCommit.resolve();
+			await persistentControl;
+
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.Medium);
+			expect(session.thinkingLevel).toBe(Effort.Medium);
+			expect(session.getThinkingScopeForControl()).toBe("global config");
+		} finally {
+			commit.mockRestore();
+		}
+	});
 
 	it("keeps a newer session thinking visibility when a global control commit finishes", async () => {
 		const settings = Settings.isolated({ hideThinkingBlock: false });
