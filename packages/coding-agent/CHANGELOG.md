@@ -3,6 +3,8 @@
 ## [Unreleased]
 ### Fixed
 
+- Align managed fallback abort-after-exhaustion expectations with #3257 ownership release: a subscriber abort at terminal `message_end` no longer expects a second `requestRunTerminal(cancelled)` because the logical-run owner is already cleared.
+- Python eval timeout annotations now prefer the caller-configured `timeoutMs` over remaining wall-clock budget so async setup cannot flake second formatting in CI.
 - Overflow maintenance now stops cleanly when no-op compaction would replay the same oversized request; the runtime status explains that `/clear` preserves the current session ID before retrying.
 - The `ask` tool no longer rejects a JSON-string-encoded single-sided Round 0 payload before coercion; only the retired contract+review pair stays terminal, so a provider that serializes `questions` as a string no longer drives the model into an unbounded retry loop.
 - Browser launch overrides (`PUPPETEER_EXECUTABLE_PATH`, `PUPPETEER_PROXY`, `PUPPETEER_PROXY_BYPASS_LOOPBACK`, `PUPPETEER_PROXY_IGNORE_CERT_ERRORS`) are now resolved from trusted environment sources only. `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` that chose the browser binary, routed every request through its own proxy, and disabled certificate validation. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); shell-level configuration is unchanged.
