@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import {
+	appendTransportFailureContext,
 	finalizeErrorMessage,
 	formatModelUnavailableGuidance,
 	isModelUnavailableError,
@@ -163,5 +164,100 @@ describe("HTTP 400 error message safety (issue #438)", () => {
 		expect(guidance).toContain("not available");
 		expect(guidance).toContain("gjc --list-models");
 		expect(guidance).not.toContain("''");
+	});
+});
+
+describe("transport failure context", () => {
+	function bunTransportError(message: string, code: string, path?: string): Error {
+		return Object.assign(new Error(message), path === undefined ? { code } : { code, path });
+	}
+
+	function codexDump(): RawHttpRequestDump {
+		return {
+			provider: "openai-codex",
+			api: "openai-responses",
+			model: "gpt-5.6-sol",
+			method: "POST",
+			url: "https://chatgpt.com/backend-api/codex/responses",
+		};
+	}
+
+	it("names the host and the failure code for a Bun DNS failure", async () => {
+		const error = bunTransportError(
+			"Was there a typo in the url or port?",
+			"FailedToOpenSocket",
+			"https://chatgpt.com/backend-api/codex/responses",
+		);
+
+		const message = await finalizeErrorMessage(error, codexDump());
+
+		expect(message).toContain("Was there a typo in the url or port?");
+		expect(message).toContain("transport=FailedToOpenSocket");
+		expect(message).toContain("url=https://chatgpt.com/backend-api/codex/responses");
+	});
+
+	it("falls back to the request dump URL when the error carries no path", () => {
+		const error = bunTransportError(
+			"Unable to connect. Is the computer able to access the url?",
+			"ConnectionRefused",
+		);
+
+		const message = appendTransportFailureContext(error.message, error, codexDump());
+
+		expect(message).toContain("transport=ConnectionRefused");
+		expect(message).toContain("url=https://chatgpt.com/backend-api/codex/responses");
+	});
+
+	it("keeps query strings out of the surfaced URL", () => {
+		const error = bunTransportError(
+			"Unable to connect. Is the computer able to access the url?",
+			"ENOTFOUND",
+			"https://generativelanguage.googleapis.com/v1beta/models/gemini:streamGenerateContent?key=synthetic-secret",
+		);
+
+		const message = appendTransportFailureContext(error.message, error, undefined);
+
+		expect(message).toContain(
+			"url=https://generativelanguage.googleapis.com/v1beta/models/gemini:streamGenerateContent",
+		);
+		expect(message).not.toContain("synthetic-secret");
+	});
+
+	it("reads the transport failure through a wrapped cause", () => {
+		const error = Object.assign(new Error("fetch failed"), {
+			cause: bunTransportError(
+				"connect ECONNREFUSED 127.0.0.1:11434",
+				"ECONNREFUSED",
+				"http://127.0.0.1:11434/api/chat",
+			),
+		});
+
+		const message = appendTransportFailureContext(error.message, error, undefined);
+
+		expect(message).toContain("transport=ECONNREFUSED");
+		expect(message).toContain("url=http://127.0.0.1:11434/api/chat");
+	});
+
+	it("leaves errors that reached an HTTP status untouched", () => {
+		const error = Object.assign(new Error("500 upstream failure"), { status: 500, code: "ConnectionReset" });
+
+		expect(appendTransportFailureContext(error.message, error, codexDump())).toBe("500 upstream failure");
+	});
+
+	it("leaves aborts untouched so the abort display path keeps matching", () => {
+		const error = Object.assign(new Error("Request was aborted."), { name: "AbortError", code: "ABORT_ERR" });
+
+		expect(appendTransportFailureContext(error.message, error, codexDump())).toBe("Request was aborted.");
+	});
+
+	it("does not append the same context twice", () => {
+		const error = bunTransportError(
+			"Was there a typo in the url or port?",
+			"FailedToOpenSocket",
+			"https://chatgpt.com/x",
+		);
+		const once = appendTransportFailureContext(error.message, error, undefined);
+
+		expect(appendTransportFailureContext(once, error, undefined)).toBe(once);
 	});
 });

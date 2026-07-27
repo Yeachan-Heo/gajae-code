@@ -8,6 +8,7 @@
 ### Fixed
 
 - Anthropic subscription OAuth requests now use the current Claude Code compatibility attribution (`2.1.219`, `sdk-cli`) instead of the stale `2.1.63` CLI fingerprint that Anthropic can misclassify as extra usage.
+- Connection failures now name the transport code and the target URL. Bun reports DNS and socket failures as a bare `Error` whose message is a standalone hint ("Was there a typo in the url or port?", "Unable to connect. Is the computer able to access the url?") and keeps the actionable facts on `code` and `path`, but only `message` reached the assistant message. A provider outage, a local DNS failure, and a mistyped custom base URL therefore all rendered as the same context-free sentence with no host in it. Such failures now read `... (transport=FailedToOpenSocket url=https://chatgpt.com/backend-api/codex/responses)`; the URL is reduced to origin and path so a key carried in the query string is not surfaced.
 
 ### Documentation
 

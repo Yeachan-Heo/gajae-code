@@ -27,6 +27,34 @@ type ErrorWithStatus = {
 const SENSITIVE_HEADERS = ["authorization", "x-api-key", "api-key", "cookie", "set-cookie", "proxy-authorization"];
 
 /**
+ * Connection-level failure codes, meaning the request never reached the
+ * provider and no HTTP status exists. Bun reports the first group for `fetch`;
+ * the `E*`/`UND_ERR_*` group comes from Node-style DNS and socket errors.
+ *
+ * Deliberately excludes aborts and TLS/certificate codes: an abort is a
+ * user/watchdog outcome with its own display path, and its message must keep
+ * matching the abort normalizers in `modes/utils/abort-message`.
+ */
+const TRANSPORT_FAILURE_CODES: ReadonlySet<string> = new Set([
+	"ConnectionClosed",
+	"ConnectionRefused",
+	"ConnectionReset",
+	"ConnectionTimeout",
+	"FailedToOpenSocket",
+	"HTTP2Unsupported",
+	"EAI_AGAIN",
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"EHOSTUNREACH",
+	"ENETUNREACH",
+	"ENOTFOUND",
+	"EPIPE",
+	"ETIMEDOUT",
+	"UND_ERR_CONNECT_TIMEOUT",
+	"UND_ERR_SOCKET",
+]);
+
+/**
  * Privacy note appended next to a saved raw HTTP request dump. The dump is
  * sanitized (secrets/thinking redacted) but can still contain prompt content
  * and request metadata, so we explicitly discourage pasting it into public
@@ -88,6 +116,54 @@ export async function appendRawHttpRequestDumpFor400(
 	}
 }
 
+/** Origin and path of `value`, dropping query, fragment, and credentials so a
+ *  key carried in the request URL (Google `?key=`, signed URLs) never lands in
+ *  a user-visible error string. */
+function redactRequestUrl(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.trim().length === 0) return undefined;
+	try {
+		const url = new URL(value);
+		return `${url.origin}${url.pathname}`;
+	} catch {
+		return undefined;
+	}
+}
+
+function findTransportFailure(error: unknown, depth: number): { code: string; url?: string } | undefined {
+	if (!error || typeof error !== "object" || depth > 2) return undefined;
+	const info = error as { code?: unknown; path?: unknown; url?: unknown; cause?: unknown };
+	if (typeof info.code === "string" && TRANSPORT_FAILURE_CODES.has(info.code)) {
+		return { code: info.code, url: redactRequestUrl(info.path) ?? redactRequestUrl(info.url) };
+	}
+	return findTransportFailure(info.cause, depth + 1);
+}
+
+/**
+ * Name the failed connection when the request never produced an HTTP status.
+ *
+ * Bun raises DNS and socket failures as a bare `Error` whose message is a
+ * standalone hint ("Was there a typo in the url or port?", "Unable to connect.
+ * Is the computer able to access the url?") while the actionable facts live on
+ * `code` and `path`. Those properties are dropped when only `message` reaches
+ * the assistant message, so a provider outage, a local DNS failure, and a
+ * mistyped custom base URL all render as the same context-free sentence.
+ * Appending the code and the target URL tells the user which host failed and
+ * whether the fault is theirs.
+ */
+export function appendTransportFailureContext(
+	message: string,
+	error: unknown,
+	rawRequestDump: RawHttpRequestDump | undefined,
+): string {
+	if (extractHttpStatusFromError(error) !== undefined) return message;
+	const failure = findTransportFailure(error, 0);
+	if (!failure) return message;
+
+	const url = failure.url ?? redactRequestUrl(rawRequestDump?.url);
+	const context = url ? `transport=${failure.code} url=${url}` : `transport=${failure.code}`;
+	return message.includes(context) ? message : `${message} (${context})`;
+}
+
 export async function finalizeErrorMessage(
 	error: unknown,
 	rawRequestDump: RawHttpRequestDump | undefined,
@@ -105,6 +181,7 @@ export async function finalizeErrorMessage(
 	if (isModelUnavailableError(message, error)) {
 		message = `${message}\n\n${formatModelUnavailableGuidance(rawRequestDump)}`;
 	}
+	message = appendTransportFailureContext(message, error, rawRequestDump);
 	return appendRawHttpRequestDumpFor400(message, error, rawRequestDump);
 }
 
