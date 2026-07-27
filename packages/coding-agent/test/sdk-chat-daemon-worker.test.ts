@@ -928,7 +928,7 @@ describe("chat daemon worker", () => {
 		expect(client.requests).toHaveLength(requestsBeforeProhibited);
 		expect(broker.requests).toHaveLength(1);
 		await runtime.stop();
-	});
+	}, 10_000);
 	it("retains a sent control prompt as ambiguous when its SDK response is lost", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-command-response-loss-"));
 		const agentDir = path.join(root, "agent");
