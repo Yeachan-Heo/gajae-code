@@ -261,6 +261,14 @@ export function calculateMemorySlope(
 	if (!steadyStateFirst || !steadyStateLast || steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs < 250) return null;
 	return ((steadyStateLast[key] - steadyStateFirst[key]) * 1_000) / (steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs);
 }
+function isValidMemoryUsageSample(value: unknown): value is MemoryUsageSample {
+	if (typeof value !== "object" || value === null) return false;
+	const sample = value as Record<string, unknown>;
+	return MEMORY_USAGE_SAMPLE_FIELDS.every(
+		name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && Number(sample[name]) >= 0,
+	);
+}
+
 
 /**
  * Validate a whole report. Beyond per-classification rules, a hotspot may not
@@ -317,6 +325,15 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		(!Number.isFinite(report.runner.durationTargetMs) || report.runner.durationTargetMs < 0)
 	) {
 		errors.push("runner.durationTargetMs invalid");
+	}
+	if (
+		(report.runner.profile === "soak" &&
+			(!Number.isSafeInteger(report.runner.durationTargetMs) ||
+				(report.runner.durationTargetMs ?? 0) < 250 ||
+				(report.runner.durationTargetMs ?? 0) > 60_000)) ||
+		(report.runner.profile === "short" && report.runner.durationTargetMs !== 0)
+	) {
+		errors.push("runner.durationTargetMs does not match profile bounds");
 	}
 	if (
 		typeof report.runner.environment !== "object" ||
@@ -425,11 +442,7 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
 				}
 			}
-			const samplesAreValid = samples.every(sample =>
-				typeof sample === "object" &&
-				sample !== null &&
-				MEMORY_USAGE_SAMPLE_FIELDS.every(name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && sample[name] >= 0),
-			);
+			const samplesAreValid = samples.every(isValidMemoryUsageSample);
 			if (samplesAreValid) {
 				for (let index = 1; index < samples.length; index++) {
 					if (samples[index].elapsedMs < samples[index - 1].elapsedMs) {
@@ -455,7 +468,7 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match samples`);
 				}
 			}
-			if (samplesAreValid && samples.length > 0) {
+			if (samplesAreValid && samples.length > 0 && isValidMemoryUsageSample(baseline.postTeardown)) {
 				const firstSample = samples[0];
 				const peakRssBytes = Math.max(...samples.map(sample => sample.rssBytes));
 				const childGcExposed =

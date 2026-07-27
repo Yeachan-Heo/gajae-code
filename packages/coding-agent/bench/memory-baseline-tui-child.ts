@@ -3,7 +3,11 @@ import { buildMemoryFixture } from "./perf-corpus.bench";
 import type { MemoryWorkload } from "./memory-baseline-workloads";
 import type { MemoryWorkloadProfile } from "./perf-corpus-schema";
 
-export function createTuiWorkload(): MemoryWorkload {
+export interface TuiMemoryWorkload extends MemoryWorkload {
+	currentIndex(): number;
+}
+
+export function createTuiWorkload(): TuiMemoryWorkload {
 	let nextIndex = 0;
 	return {
 		id: "tui-component-churn",
@@ -21,6 +25,9 @@ export function createTuiWorkload(): MemoryWorkload {
 				container.dispose();
 			}
 			return renderedLines;
+		},
+		currentIndex() {
+			return nextIndex;
 		},
 		teardown() {
 			nextIndex = 0;

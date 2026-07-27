@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import * as os from "node:os";
 import { createTuiWorkload } from "../bench/memory-baseline-tui-child";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
@@ -21,6 +21,20 @@ import {
 	HELD_PERF_THRESHOLDS,
 	validatePerfThresholdLedger,
 } from "../bench/perf-threshold.ledger";
+
+const memoryControlKeys = ["GJC_MEMORY_PROFILE", "GJC_MEMORY_ITERATIONS", "GJC_MEMORY_DURATION_MS"] as const;
+const originalMemoryControls = new Map(memoryControlKeys.map(key => [key, process.env[key]]));
+
+beforeAll(() => {
+	for (const key of memoryControlKeys) delete process.env[key];
+});
+
+afterAll(() => {
+	for (const [key, value] of originalMemoryControls) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+});
 
 describe("perf corpus schema + runner", () => {
 	test("runner emits the schema with separated evidence fields and >=3 required fixture classes", () => {
@@ -207,6 +221,19 @@ describe("perf corpus schema + runner", () => {
 		} as unknown as PerfCorpusReport;
 		expect(() => validatePerfCorpusReport(malformed)).not.toThrow();
 		expect(validatePerfCorpusReport(malformed).ok).toBe(false);
+		const malformedTeardown = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: { ...baseline, postTeardown: null },
+						}
+					: candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		expect(() => validatePerfCorpusReport(malformedTeardown)).not.toThrow();
+		expect(validatePerfCorpusReport(malformedTeardown).ok).toBe(false);
 	});
 
 	test("rejects an empty corpus instead of skipping required memory surfaces", () => {
@@ -282,10 +309,13 @@ describe("perf corpus schema + runner", () => {
 	});
 	test("preserves TUI workload indices across sampling chunks", () => {
 		const workload = createTuiWorkload();
+		expect(workload.currentIndex()).toBe(0);
 		expect(workload.run(1)).toBe(3);
+		expect(workload.currentIndex()).toBe(1);
 		expect(workload.run(1)).toBe(3);
+		expect(workload.currentIndex()).toBe(2);
 		workload.teardown();
-		expect(workload.run(1)).toBe(3);
+		expect(workload.currentIndex()).toBe(0);
 	});
 	test("rejects malformed memory scalar fields and isolation metadata", () => {
 		const report = runPerfCorpusBenchmark();
@@ -342,6 +372,22 @@ describe("perf corpus schema + runner", () => {
 			runner: { ...report.runner, profile: undefined },
 		} as unknown as PerfCorpusReport;
 		expect(validatePerfCorpusReport(missingRunnerProfile).errors).toContain("runner.profile invalid");
+		const invalidSoakDuration = {
+			...report,
+			runner: {
+				...report.runner,
+				profile: "soak" as const,
+				durationTargetMs: 0,
+				environment: {
+					GJC_MEMORY_PROFILE: "soak",
+					GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
+					GJC_MEMORY_DURATION_MS: "0",
+				},
+			},
+		};
+		expect(validatePerfCorpusReport(invalidSoakDuration).errors).toContain(
+			"runner.durationTargetMs does not match profile bounds",
+		);
 		const missingMemoryChildGc = {
 			...report,
 			runner: { ...report.runner, memoryChildGcExposed: undefined },
