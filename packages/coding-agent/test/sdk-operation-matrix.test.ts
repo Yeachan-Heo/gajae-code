@@ -91,7 +91,7 @@ describe("SDK operation matrix", () => {
 		const registryById = new Map(OPERATIONS.map(operation => [operation.id, operation]));
 		const inventoryIds = registryInventory.map(row => row.sourceId.replace("registry:", ""));
 		expect(new Set(inventoryIds)).toEqual(new Set(registryById.keys()));
-		expect(registryInventory).toHaveLength(95);
+		expect(registryInventory).toHaveLength(97);
 
 		for (const row of registryInventory) {
 			const id = row.sourceId.startsWith("registry:") ? row.sourceId.slice("registry:".length) : row.sourceId;
@@ -108,7 +108,7 @@ describe("SDK operation matrix", () => {
 	});
 
 	it("keeps control errors, query continuity, counts, and the stage-05 adapter partition explicit", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(55);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(7);
 		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(29);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);

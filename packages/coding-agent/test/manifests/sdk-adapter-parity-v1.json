@@ -5199,7 +5199,7 @@
 			"adapterTestId": "AD-T-C53",
 			"sdkId": "model.profile.set",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C53",
 			"argv": [
@@ -5209,13 +5209,13 @@
 				"--test-name-pattern",
 				"^AD-T-C53:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C53",
 			"sdkId": "model.profile.set",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C53",
 			"argv": [
@@ -5225,13 +5225,13 @@
 				"--test-name-pattern",
 				"^AD-D-C53:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C53",
 			"sdkId": "model.profile.set",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C53",
 			"argv": [
@@ -5241,7 +5241,7 @@
 				"--test-name-pattern",
 				"^AD-S-C53:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C53",
@@ -5288,6 +5288,198 @@
 				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C53:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-T-C54",
+			"sdkId": "projection.append",
+			"adapter": "telegram",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-C54",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-C54:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-D-C54",
+			"sdkId": "projection.append",
+			"adapter": "discord",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-C54",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-C54:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-S-C54",
+			"sdkId": "projection.append",
+			"adapter": "slack",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-C54",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-C54:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-M-C54",
+			"sdkId": "projection.append",
+			"adapter": "mcp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-M-C54",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-M-C54:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-A-C54",
+			"sdkId": "projection.append",
+			"adapter": "acp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-A-C54",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-A-C54:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-L-C54",
+			"sdkId": "projection.append",
+			"adapter": "daemonCli",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-L-C54",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-L-C54:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-T-C55",
+			"sdkId": "projection.read",
+			"adapter": "telegram",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-C55",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-C55:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-D-C55",
+			"sdkId": "projection.read",
+			"adapter": "discord",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-C55",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-C55:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-S-C55",
+			"sdkId": "projection.read",
+			"adapter": "slack",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-C55",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-C55:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-M-C55",
+			"sdkId": "projection.read",
+			"adapter": "mcp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-M-C55",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-M-C55:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-A-C55",
+			"sdkId": "projection.read",
+			"adapter": "acp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-A-C55",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-A-C55:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-L-C55",
+			"sdkId": "projection.read",
+			"adapter": "daemonCli",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-L-C55",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-L-C55:"
 			],
 			"expected": "forwarded"
 		},

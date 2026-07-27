@@ -62,6 +62,8 @@ export interface ControlSurface {
 	retryLast(): Promise<ControlValue> | ControlValue;
 	retryNow(): Promise<ControlValue> | ControlValue;
 	backgroundBash(): Promise<ControlValue> | ControlValue;
+	appendProjection(envelope: ControlValue): Promise<ControlValue> | ControlValue;
+	readProjection(afterRevision?: number): Promise<ControlValue> | ControlValue;
 	/** Returns the current revision for a registry revision resource. */
 	/** Installed per-session registry rows. Dispatch rejects other rows before invoking a surface method. */
 	installedOperations?: ReadonlySet<string>;

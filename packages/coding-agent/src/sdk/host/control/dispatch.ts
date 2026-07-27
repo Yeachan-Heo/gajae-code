@@ -3,6 +3,7 @@ import {
 	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
+import { validateAppServerProjectionAfterRevision, validateAppServerProjectionEnvelope } from "../../../session/app-server-projection";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
 
@@ -66,6 +67,7 @@ const SHARED_ERROR_CODES = new Set([
 	"cursor_expired",
 	"event_gap",
 	"unavailable",
+	"projection_corrupt",
 	"internal",
 ]);
 const IDEMPOTENCY_TTL_MS = 15 * 60 * 1_000;
@@ -122,6 +124,14 @@ function inputHash(input: unknown): string {
 	return createHash("sha256")
 		.update(JSON.stringify(canonicalize(input)))
 		.digest("hex");
+}
+
+function projectionEnvelope(input: ControlInput): ControlInput {
+	return validateAppServerProjectionEnvelope(input.envelope) as unknown as ControlInput;
+}
+
+function projectionAfterRevision(input: ControlInput): number | undefined {
+	return validateAppServerProjectionAfterRevision(input.afterRevision);
 }
 
 function text(input: ControlInput, key = "text"): string {
@@ -254,6 +264,10 @@ function invoke(
 			return surface.retryNow();
 		case "bash.background":
 			return surface.backgroundBash();
+		case "projection.append":
+			return surface.appendProjection(projectionEnvelope(input));
+		case "projection.read":
+			return surface.readProjection(projectionAfterRevision(input));
 		default:
 			throw new Error("unknown operation");
 	}

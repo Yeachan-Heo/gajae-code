@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ADAPTERS, OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const packageRoot = path.join(repoRoot, "packages", "coding-agent");
@@ -333,7 +334,7 @@ describe("test manifest runner", () => {
 		expect(result.exitCode, output(result)).toBe(0);
 		expect(output(result)).toContain(`manifest command receipts complete: ${manifest.commands.length}`);
 		expect(output(result)).toContain(
-			"manifest row receipts complete: 576 (telegram=96, discord=96, slack=96, mcp=96, acp=96, daemonCli=96)",
+			`manifest row receipts complete: ${ADAPTERS.length * (OPERATIONS.length + 1)} (${ADAPTERS.map(adapter => `${adapter}=${OPERATIONS.length + 1}`).join(", ")})`,
 		);
 		const invocations = (await Bun.file(fake.log).text()).trim().split("\n");
 		expect(invocations).toHaveLength(manifest.commands.length + manifest.rows.length);

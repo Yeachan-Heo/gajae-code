@@ -56,6 +56,8 @@ const methodByOperation: Record<string, string> = {
 	"retry.last": "retryLast",
 	"retry.now": "retryNow",
 	"bash.background": "backgroundBash",
+	"projection.append": "appendProjection",
+	"projection.read": "readProjection",
 };
 
 function request(row: (typeof OPERATIONS)[number]): ControlRequest {
@@ -89,6 +91,8 @@ function request(row: (typeof OPERATIONS)[number]): ControlRequest {
 			before: "before",
 			after: "after",
 			path: "/tmp",
+			envelope: { schemaVersion: 1, recordKind: "turn", sourceKey: "source", payload: {} },
+			afterRevision: 0,
 		},
 		confirm: row.sdkId === "context.clear" || row.sdkId === "session.delete",
 	};
@@ -212,6 +216,32 @@ test("rejects unknown operations, malformed input, and missing destructive confi
 	const response = await dispatchControl(surface, clear, { id: "clear", operation: clear.sdkId, input: {} });
 	expect(response.error).toMatchObject({ code: "invalid_input" });
 	expect(response.error?.message).toContain("confirm");
+});
+
+test("dispatch projection validation shares the persistence envelope contract", async () => {
+	const append = OPERATIONS.find(row => row.sdkId === "projection.append")!;
+	const read = OPERATIONS.find(row => row.sdkId === "projection.read")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		appendProjection: (...args: unknown[]) => calls.push(args),
+		readProjection: (...args: unknown[]) => calls.push(args),
+	} as unknown as ControlSurface;
+	const validEnvelope = { schemaVersion: 1, recordKind: "turn", sourceKey: "source", payload: { value: 1 } };
+	expect((await dispatchControl(surface, append, { ...request(append), input: { envelope: validEnvelope } })).ok).toBe(true);
+	expect((await dispatchControl(surface, append, { ...request(append), input: { envelope: { ...validEnvelope, extra: true } } })).error?.code).toBe("invalid_input");
+	expect((await dispatchControl(surface, read, { ...request(read), input: { afterRevision: 2 } })).ok).toBe(true);
+	expect(calls).toEqual([[validEnvelope], [2]]);
+});
+
+test("dispatch preserves projection corruption errors", async () => {
+	const read = OPERATIONS.find(row => row.sdkId === "projection.read")!;
+	const surface = {
+		readProjection: () => {
+			throw Object.assign(new Error("Persisted app-server projection is corrupt."), { code: "projection_corrupt" });
+		},
+	} as unknown as ControlSurface;
+	const response = await dispatchControl(surface, read, { ...request(read), input: {} });
+	expect(response.error).toEqual({ code: "projection_corrupt", message: "Persisted app-server projection is corrupt." });
 });
 
 test("returns the current revision on an optimistic concurrency conflict", async () => {

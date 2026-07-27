@@ -474,6 +474,9 @@ export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
  * Does NOT participate in LLM context (ignored by buildSessionContext).
  * For injecting content into context, see CustomMessageEntry.
  */
+/** Reserved for app-server projection records written only by the owning child session host. */
+export const APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE = "gjc.app-server.projection";
+
 export interface CustomEntry<T = unknown> extends SessionEntryBase {
 	type: "custom";
 	customType: string;
@@ -8680,6 +8683,17 @@ export class SessionManager {
 
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
+		if (customType === APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE)
+			throw new Error(`${APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE} is reserved for app-server projections.`);
+		return this.#appendCustomEntry(customType, data);
+	}
+
+	/** Append a trusted app-server projection entry. Not available to extension callers. */
+	appendAppServerProjectionEntry(data: unknown): string {
+		return this.#appendCustomEntry(APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE, data);
+	}
+
+	#appendCustomEntry(customType: string, data?: unknown): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
