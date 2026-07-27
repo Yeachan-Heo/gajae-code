@@ -244,6 +244,23 @@ export function validateHotspotClassification(c: HotspotClassification): string[
 	return errors;
 }
 
+export function calculateMemorySlope(
+	samples: MemoryUsageSample[],
+	key: "rssBytes" | "heapUsedBytes",
+): number | null {
+	const first = samples[0];
+	const last = samples.at(-1);
+	if (!first || !last) return null;
+	const observedDurationMs = last.elapsedMs - first.elapsedMs;
+	if (observedDurationMs < 250) return null;
+	const warmupCutoffMs = first.elapsedMs + Math.min(250, observedDurationMs / 4);
+	const steadyStateSamples = samples.filter(sample => sample.elapsedMs >= warmupCutoffMs);
+	const steadyStateFirst = steadyStateSamples[0];
+	const steadyStateLast = steadyStateSamples.at(-1);
+	if (!steadyStateFirst || !steadyStateLast || steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs < 250) return null;
+	return ((steadyStateLast[key] - steadyStateFirst[key]) * 1_000) / (steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs);
+}
+
 /**
  * Validate a whole report. Beyond per-classification rules, a hotspot may not
  * be `CPU-self-time confirmed` unless the report actually carries profiler
@@ -362,14 +379,6 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond not finite`);
 			}
 			for (const [name, value] of [
-				["rssSlopeBytesPerSecond", baseline.rssSlopeBytesPerSecond],
-				["heapSlopeBytesPerSecond", baseline.heapSlopeBytesPerSecond],
-			] as const) {
-				if (value !== null && !Number.isFinite(value)) {
-					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
-				}
-			}
-			for (const [name, value] of [
 				["processTreeBaselineRssBytes", baseline.processTreeBaselineRssBytes],
 				["processTreePostTeardownRssBytes", baseline.processTreePostTeardownRssBytes],
 			] as const) {
@@ -409,6 +418,34 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				}
 				if (Object.hasOwn(sample, "activeResourceCount") && !Number.isInteger(sample.activeResourceCount)) {
 					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.activeResourceCount must be an integer`);
+				}
+			}
+			for (let index = 1; index < samples.length; index++) {
+				if (samples[index].elapsedMs < samples[index - 1].elapsedMs) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline samples must be chronological`);
+					break;
+				}
+			}
+			const samplesAreValid = samples.every(sample =>
+				typeof sample === "object" &&
+				sample !== null &&
+				MEMORY_USAGE_SAMPLE_FIELDS.every(name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && sample[name] >= 0),
+			);
+			for (const [name, key] of [
+				["rssSlopeBytesPerSecond", "rssBytes"],
+				["heapSlopeBytesPerSecond", "heapUsedBytes"],
+			] as const) {
+				const value = baseline[name];
+				if (value !== null && !Number.isFinite(value)) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} invalid`);
+				}
+				if (!samplesAreValid) continue;
+				const expected = calculateMemorySlope(samples, key);
+				if (
+					(value === null) !== (expected === null) ||
+					(value !== null && expected !== null && Math.abs(value - expected) > Math.max(1e-9, Math.abs(expected) * 1e-12))
+				) {
+					errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.${name} does not match samples`);
 				}
 			}
 			if (

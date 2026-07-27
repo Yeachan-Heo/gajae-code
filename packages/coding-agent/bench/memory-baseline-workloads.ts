@@ -1,5 +1,3 @@
-import { Container, Text } from "@gajae-code/tui";
-import { SessionManager } from "../src/session/session-manager";
 import type { MemorySurface, MemoryWorkloadProfile } from "./perf-corpus-schema";
 
 export interface MemoryWorkload {
@@ -42,54 +40,20 @@ function statefulWorkload(
 	};
 }
 
-function sessionLifecycleWorkload(): MemoryWorkload {
-	let manager = SessionManager.inMemory();
-	let entryCount = 0;
-	return {
-		id: "agent-session-lifecycle",
-		surface: "agent-session",
-		tags: ["messages", "materialization", "clear"],
-		run(iterations) {
-			for (let index = 0; index < iterations; index++) {
-				manager.appendMessage({
-					role: "user",
-					content: `message-${entryCount}:${"x".repeat(512 + (entryCount % 32))}`,
-					timestamp: entryCount,
-				});
-				entryCount++;
-				if (entryCount % 128 === 0) {
-					manager.getEntries();
-					manager = SessionManager.inMemory();
-				}
-			}
-			return iterations;
-		},
-		teardown() {
-			manager = SessionManager.inMemory();
-			entryCount = 0;
-		},
-	};
+function sessionLifecycleProxyWorkload(): MemoryWorkload {
+	return statefulWorkload("agent-session-lifecycle", "agent-session", ["messages", "materialization", "clear"], (state, index) => {
+		state.strings.push(`message-${index}:${"x".repeat(512 + (index % 32))}`);
+		if (state.strings.length >= 128) state.strings.length = 0;
+		return 1;
+	});
 }
 
-function tuiLifecycleWorkload(): MemoryWorkload {
-	return {
-		id: "tui-component-churn",
-		surface: "tui",
-		tags: ["mount", "render", "dispose"],
-		run(iterations) {
-			let renderedLines = 0;
-			for (let index = 0; index < iterations; index++) {
-				const container = new Container();
-				container.addChild(new Text(`header-${index}`, 0, 0));
-				container.addChild(new Text(`body-${index}:${"─".repeat(40)}`, 0, 0));
-				container.addChild(new Text(`footer-${index}`, 0, 0));
-				renderedLines += container.render(80).length;
-				container.dispose();
-			}
-			return renderedLines;
-		},
-		teardown() {},
-	};
+function tuiLifecycleProxyWorkload(): MemoryWorkload {
+	return statefulWorkload("tui-component-churn", "tui", ["mount", "render", "dispose"], (state, index) => {
+		state.strings.push(`header-${index}\nbody-${index}:${"─".repeat(40)}\nfooter-${index}`);
+		if (state.strings.length > 8) state.strings.shift();
+		return 3;
+	});
 }
 
 export function workloadIterations(profile: MemoryWorkloadProfile): number {
@@ -107,7 +71,7 @@ export function createMemoryBaselineWorkloads(): MemoryWorkload[] {
 			if (state.maps.length > 8) state.maps.shift();
 			return options.size;
 		}),
-		sessionLifecycleWorkload(),
+		sessionLifecycleProxyWorkload(),
 		statefulWorkload("blob-external-buffers", "blob-store", ["external", "array-buffer", "teardown"], (state, index) => {
 			state.arrays.push(new Uint8Array(8_192 + (index % 8) * 1_024));
 			if (state.arrays.length > 32) state.arrays.shift();
@@ -127,7 +91,7 @@ export function createMemoryBaselineWorkloads(): MemoryWorkload[] {
 			if (state.strings.length > 64) state.strings.shift();
 			return 1;
 		}),
-		tuiLifecycleWorkload(),
+		tuiLifecycleProxyWorkload(),
 		statefulWorkload("shared-native-boundary", "shared-native", ["copy", "transfer", "external"], (state, index) => {
 			const source = new Uint8Array(4_096 + (index % 16) * 128);
 			const copy = source.slice();

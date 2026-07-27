@@ -10,9 +10,11 @@
  * Run: `bun packages/coding-agent/bench/perf-corpus.bench.ts`
  */
 
+import * as path from "node:path";
 import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
 import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
+	calculateMemorySlope,
 	type MemoryUsageSample,
 	type MemoryWorkloadProfile,
 	type MemorySurface,
@@ -83,12 +85,13 @@ function measureRss(work: () => void): RssMemoryMetric {
 }
 function resolveGitProvenance(): { sha: string; dirty: boolean } {
 	const environmentSha = process.env.GITHUB_SHA?.trim();
+	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
 	let sha = "";
 	let dirty = true;
 	try {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
 		if (revision.exitCode === 0) sha = new TextDecoder().decode(revision.stdout).trim();
-		const status = Bun.spawnSync(["git", "status", "--porcelain"]);
+		const status = Bun.spawnSync(["git", "status", "--porcelain"], { cwd: repositoryRoot });
 		if (status.exitCode === 0) dirty = new TextDecoder().decode(status.stdout).trim().length > 0;
 	} catch {
 		// The report records conservative dirty provenance when Git is unavailable.
@@ -131,19 +134,7 @@ function memorySample(startedAt: number): MemoryUsageSample {
 	};
 }
 
-export function calculateMemorySlope(samples: MemoryUsageSample[], key: "rssBytes" | "heapUsedBytes"): number | null {
-	const first = samples[0];
-	const last = samples.at(-1);
-	if (!first || !last) return null;
-	const observedDurationMs = last.elapsedMs - first.elapsedMs;
-	if (observedDurationMs < 250) return null;
-	const warmupCutoffMs = first.elapsedMs + Math.min(250, observedDurationMs / 4);
-	const steadyStateSamples = samples.filter(sample => sample.elapsedMs >= warmupCutoffMs);
-	const steadyStateFirst = steadyStateSamples[0];
-	const steadyStateLast = steadyStateSamples.at(-1);
-	if (!steadyStateFirst || !steadyStateLast || steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs < 250) return null;
-	return ((steadyStateLast[key] - steadyStateFirst[key]) * 1_000) / (steadyStateLast.elapsedMs - steadyStateFirst.elapsedMs);
-}
+export { calculateMemorySlope };
 function processTreeRssBytes(): number | null {
 	if (process.platform === "win32") return null;
 	let result: Bun.SyncSubprocess<"pipe", "pipe">;
@@ -196,7 +187,7 @@ export function normalizeProcessTreeRss(
 	return { baselineBytes, postTeardownBytes, sampler: "ps" };
 }
 
-function buildMemoryFixture(
+export function buildMemoryFixture(
 	workload: MemoryWorkload,
 	profile: MemoryWorkloadProfile,
 	targetDurationMs: number,
@@ -298,12 +289,22 @@ function isMemorySurface(value: string | undefined): value is MemorySurface {
 	return value !== undefined && (REQUIRED_MEMORY_SURFACES as readonly string[]).includes(value);
 }
 
+function isolatedMemoryEntry(surface: MemorySurface): string {
+	if (surface === "agent-session") {
+		return new URL("./memory-baseline-session-child.ts", import.meta.url).pathname;
+	}
+	if (surface === "tui") {
+		return new URL("./memory-baseline-tui-child.ts", import.meta.url).pathname;
+	}
+	return import.meta.path;
+}
+
 function buildIsolatedMemoryFixtures(
 	profile: MemoryWorkloadProfile,
 	targetDurationMs: number,
 ): PerfCorpusFixtureResult[] {
 	return REQUIRED_MEMORY_SURFACES.map(surface => {
-		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", import.meta.path], {
+		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface)], {
 			env: {
 				...process.env,
 				GJC_MEMORY_CHILD_SURFACE: surface,

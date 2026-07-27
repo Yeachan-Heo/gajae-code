@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
+import * as os from "node:os";
 import { createMemoryBaselineWorkloads } from "../bench/memory-baseline-workloads";
 import { calculateMemorySlope, normalizeProcessTreeRss, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
 import {
@@ -63,6 +64,18 @@ describe("perf corpus schema + runner", () => {
 		} finally {
 			if (previousGitSha === undefined) delete process.env.GITHUB_SHA;
 			else process.env.GITHUB_SHA = previousGitSha;
+		}
+	});
+	test("resolves provenance from the benchmark checkout instead of the caller cwd", () => {
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
+		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
+		const previousCwd = process.cwd();
+		try {
+			process.chdir(os.tmpdir());
+			expect(runPerfCorpusBenchmark().gitSha).toBe(expectedSha);
+		} finally {
+			process.chdir(previousCwd);
 		}
 	});
 
@@ -205,6 +218,30 @@ describe("perf corpus schema + runner", () => {
 		];
 		expect(calculateMemorySlope(growingSteadyState, "rssBytes")).toBe(100);
 		expect(calculateMemorySlope([sample(0, 100), sample(200, 200)], "rssBytes")).toBeNull();
+	});
+	test("rejects reported slopes that do not match the raw samples", () => {
+		const report = runPerfCorpusBenchmark();
+		const fixtureIndex = report.fixtures.findIndex(fixture => fixture.memoryBaseline);
+		const fixture = report.fixtures[fixtureIndex];
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = fixture.memoryBaseline;
+		const tampered: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								rssSlopeBytesPerSecond: (baseline.rssSlopeBytesPerSecond ?? 0) + 1,
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(tampered).errors).toContain(
+			`fixture ${fixture.fixtureId}: memoryBaseline.rssSlopeBytesPerSecond does not match samples`,
+		);
 	});
 	test("preserves stateful workload indices across sampling chunks", () => {
 		const workload = createMemoryBaselineWorkloads().find(candidate => candidate.surface === "shared-native");
