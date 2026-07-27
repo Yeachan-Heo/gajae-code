@@ -23,6 +23,7 @@ import type { AgentSessionEvent } from "../../session/agent-session";
 import { type CustomMessage, isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import { transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
+import { computeIrcSplitWidths, getIrcSidebarSemanticToken } from "../components/irc-sidebar";
 import type { IrcObservationRecord } from "../irc-observation-ledger";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
@@ -36,7 +37,14 @@ type AgentSessionEventKind = AgentSessionEvent["type"];
 
 /** Test-only performance counters for advisory baseline tests. */
 export const __eventControllerPerfCounters = {
+	enabled: false,
 	messageUpdateContentVisits: 0,
+	enable(): void {
+		this.enabled = true;
+	},
+	disable(): void {
+		this.enabled = false;
+	},
 	reset(): void {
 		this.messageUpdateContentVisits = 0;
 	},
@@ -300,8 +308,12 @@ export class EventController {
 		const parsed = parseIrcMessage(message);
 		if (!parsed) return;
 		const arrival = this.ctx.captureIrcArrivalSnapshot();
+		const rightWidth = arrival.panelVisible
+			? computeIrcSplitWidths(this.ctx.ui.terminal?.columns ?? 0).rightWidth
+			: 0;
+		const beforeToken = rightWidth > 0 ? getIrcSidebarSemanticToken(this.ctx.ircLedger, rightWidth) : "";
 		const record = this.ctx.ircLedger.observe(parsed, arrival.panelVisible);
-		this.#cleanupEvictedIrcObservations();
+		const evictedInlineRemoved = this.#cleanupIrcObservationIds(this.ctx.ircLedger.drainEvictedObservationIds());
 		if (!record) return;
 		const signature = `irc:${record.observationId}`;
 		if (this.#renderedCustomMessages.has(signature)) return;
@@ -311,7 +323,10 @@ export class EventController {
 		this.#renderedIrcComponents.set(record.observationId, components);
 		this.#scheduleIrcExpiry(record, components);
 		this.ctx.ui.requestRender();
-		if (components.length > 0) this.#recordVisibleTranscriptMutation();
+		const afterToken = rightWidth > 0 ? getIrcSidebarSemanticToken(this.ctx.ircLedger, rightWidth) : "";
+		if (components.length > 0 || evictedInlineRemoved || (rightWidth > 0 && beforeToken !== afterToken)) {
+			this.#recordVisibleTranscriptMutation();
+		}
 	}
 
 	#cleanupIrcObservationIds(observationIds: readonly string[]): boolean {
@@ -469,15 +484,10 @@ export class EventController {
 		this.#cleanupEvictedIrcObservations();
 		const projectedObservationIds = new Set(inlineProjection.map(record => record.observationId));
 		for (const [observationId, components] of componentsByObservationId) {
-			const record = this.ctx.ircLedger.getRecord(observationId);
-			if (
-				!projectedObservationIds.has(observationId) ||
-				(record?.mode === "ephemeral" && record.expiresAt! - now <= 0)
-			) {
+			if (!projectedObservationIds.has(observationId)) {
 				for (const component of components) {
 					this.ctx.chatContainer.removeChild(component);
 				}
-				this.#renderedIrcComponents.delete(observationId);
 				componentsByObservationId.delete(observationId);
 			}
 		}
@@ -508,14 +518,12 @@ export class EventController {
 		}
 		const remainingMs = record.expiresAt! - Date.now();
 		if (remainingMs <= 0) {
-			if (this.#cleanupExpiredIrcInlineComponents(record.observationId)) this.#recordVisibleTranscriptMutation();
+			if (this.#cleanupExpiredIrcInlineComponents(record.observationId)) this.#observeVisibleTranscriptMutation();
 			return false;
 		}
 		const timer = setTimeout(() => {
 			this.#ircExpiryTimers.delete(record.observationId);
-			if (this.#cleanupExpiredIrcInlineComponents(record.observationId)) {
-				this.ctx.recordVisibleTranscriptMutation?.();
-			}
+			if (this.#cleanupExpiredIrcInlineComponents(record.observationId)) this.#observeVisibleTranscriptMutation();
 			this.ctx.ui.requestRender();
 		}, remainingMs);
 		timer.unref?.();
@@ -592,7 +600,7 @@ export class EventController {
 			}
 
 			for (const content of contentsToProcess) {
-				__eventControllerPerfCounters.messageUpdateContentVisits += 1;
+				if (__eventControllerPerfCounters.enabled) __eventControllerPerfCounters.messageUpdateContentVisits += 1;
 				if (content.type !== "toolCall") continue;
 				if (content.name === "read") {
 					if (!readArgsHaveTarget(content.arguments)) continue;

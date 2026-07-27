@@ -61,7 +61,7 @@ import { GajaePetWidget, type PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import { IrcSplitViewComponent } from "./components/irc-sidebar";
+import { computeIrcSplitWidths, getIrcSidebarSemanticToken, IrcSplitViewComponent } from "./components/irc-sidebar";
 import {
 	getPetUnavailableWarning,
 	isPetAvailable,
@@ -907,6 +907,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Set up theme file watcher
 		onThemeChange(() => {
 			clearRenderCache();
+			this.#ircSplitView.invalidateTheme();
 			configureDefaultComposerChrome(this.editor);
 			this.editor.setPlaceholder(this.#getComposerPlaceholder());
 			this.ui.invalidate();
@@ -2214,12 +2215,18 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	resetIrcSidebarSession(): void {
+		const sidebarVisible = this.#ircSplitView.effectiveSidebarVisible(this.ui.terminal.columns);
+		const rightWidth = computeIrcSplitWidths(this.ui.terminal.columns).rightWidth;
+		const beforeToken = sidebarVisible ? getIrcSidebarSemanticToken(this.ircLedger, rightWidth) : "";
 		this.ircLedger.reset();
+		this.#ircSplitView.resetSource();
+		const afterToken = sidebarVisible ? getIrcSidebarSemanticToken(this.ircLedger, rightWidth) : "";
 		this.#eventController.resetIrcObservations();
 		this.#ircSidebarRequestedVisible = false;
 		this.#ircSplitView.setVisible(false);
 		this.#uiHelpers.resetIrcSidebarHint();
 		this.#syncIrcSidebarAvailabilityFromSettings();
+		if (sidebarVisible && beforeToken !== afterToken) this.recordVisibleTranscriptMutation();
 	}
 
 	#invalidateIrcSidebarRender(): void {

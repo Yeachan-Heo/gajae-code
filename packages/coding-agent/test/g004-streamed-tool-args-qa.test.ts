@@ -252,14 +252,15 @@ describe("G004 streamed tool args QA", () => {
 		}
 	});
 
-	it("COALESCE-SKIP recomputes edit preview for same-length changed content via args identity version", async () => {
-		let previewRuns = 0;
+	it("COALESCE-SKIP recomputes and renders same-length changed edit previews", async () => {
 		const editModule = await import("../src/edit/index");
 		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).hashline;
 		const originalCompute = strategy.computeDiffPreview;
-		strategy.computeDiffPreview = async (...args: any[]) => {
-			previewRuns += 1;
-			return originalCompute.apply(strategy, args);
+		const pending: Array<{ resolve: (value: unknown) => void }> = [];
+		strategy.computeDiffPreview = () => {
+			const deferred = Promise.withResolvers<unknown>();
+			pending.push({ resolve: deferred.resolve });
+			return deferred.promise;
 		};
 		const component = new ToolExecutionComponent(
 			"edit",
@@ -268,12 +269,23 @@ describe("G004 streamed tool args QA", () => {
 			{ name: "edit", label: "Edit", mode: "hashline" } as any,
 			ui,
 		);
+		const settleRenderedPreview = async (expected: string): Promise<void> => {
+			for (let attempt = 0; attempt < 20; attempt++) {
+				await Promise.resolve();
+				if (rendered(component).includes(expected)) return;
+			}
+			throw new Error(`Preview did not render ${expected}`);
+		};
 		try {
-			await new Promise(resolve => setTimeout(resolve, 20));
-			const before = previewRuns;
+			expect(pending).toHaveLength(1);
+			pending[0].resolve([{ path: "preview-one.txt", diff: "+preview-one" }]);
+			await settleRenderedPreview("preview-one");
+
 			component.updateArgs(makeArgs("edit", 2, true));
-			await new Promise(resolve => setTimeout(resolve, 50));
-			expect(previewRuns).toBeGreaterThan(before);
+			expect(pending).toHaveLength(2);
+			pending[1].resolve([{ path: "preview-two.txt", diff: "+preview-two" }]);
+			await settleRenderedPreview("preview-two");
+			expect(rendered(component)).not.toContain("preview-one");
 		} finally {
 			strategy.computeDiffPreview = originalCompute;
 			component.dispose();
@@ -302,32 +314,40 @@ describe("G004 streamed tool args QA", () => {
 	});
 
 	it("FALLBACK routes message_update without contentIndex to all changed tool calls", async () => {
+		const countersWereEnabled = __eventControllerPerfCounters.enabled;
+		__eventControllerPerfCounters.enable();
 		__eventControllerPerfCounters.reset();
-		const message = assistantMessage([
-			{
-				type: "toolCall",
-				id: "a",
-				name: "bash",
-				arguments: { command: "echo a" },
-				partialJson: '{"command":"echo a',
-			},
-			{
-				type: "toolCall",
-				id: "b",
-				name: "eval",
-				arguments: { language: "javascript", code: "1+1" },
-				partialJson: '{"language":"javascript"',
-			},
-		]);
-		const ctx = makeCtx();
-		ctx.streamingMessage = message;
-		await new EventController(ctx).handleEvent({ type: "message_update", message } as any);
-		expect(ctx.pendingTools.has("a")).toBe(true);
-		expect(ctx.pendingTools.has("b")).toBe(true);
-		expect(__eventControllerPerfCounters.messageUpdateContentVisits).toBe(2);
-		ctx.pendingTools.forEach((component: any) => {
-			component.dispose?.();
-		});
+		try {
+			const message = assistantMessage([
+				{
+					type: "toolCall",
+					id: "a",
+					name: "bash",
+					arguments: { command: "echo a" },
+					partialJson: '{"command":"echo a',
+				},
+				{
+					type: "toolCall",
+					id: "b",
+					name: "eval",
+					arguments: { language: "javascript", code: "1+1" },
+					partialJson: '{"language":"javascript"',
+				},
+			]);
+			const ctx = makeCtx();
+			ctx.streamingMessage = message;
+			await new EventController(ctx).handleEvent({ type: "message_update", message } as any);
+			expect(ctx.pendingTools.has("a")).toBe(true);
+			expect(ctx.pendingTools.has("b")).toBe(true);
+			expect(__eventControllerPerfCounters.messageUpdateContentVisits).toBe(2);
+			ctx.pendingTools.forEach((component: any) => {
+				component.dispose?.();
+			});
+		} finally {
+			__eventControllerPerfCounters.reset();
+			if (countersWereEnabled) __eventControllerPerfCounters.enable();
+			else __eventControllerPerfCounters.disable();
+		}
 	});
 
 	it("INTENT-CACHE recomputes only for changed tool args and preserves cached intent", async () => {
