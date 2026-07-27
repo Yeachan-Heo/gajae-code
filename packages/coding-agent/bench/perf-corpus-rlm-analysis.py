@@ -127,6 +127,29 @@ RESULT_MARKDOWN = "perf-corpus-rlm-result.md"
 NORMAL = NormalDist()
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 CANONICAL_RESAMPLES = 10_000
+ATTEMPT_LEDGER_SCHEMA = "gjc.perf-corpus-attempt-ledger/1"
+RAW_MANIFEST_SCHEMA = "gjc.perf-corpus-raw-manifest/1"
+ATTEMPT_LEDGER_FILENAME = "perf-corpus-attempt-ledger.json"
+RAW_MANIFEST_FILENAME = "perf-corpus-raw-manifest.json"
+FIXTURE_CLASSES = ("startup-session-load", "streaming-ttft", "large-transcript", "high-output-tool", "edit-diff")
+EVIDENCE_CLASSES = (
+    "wall-clock-proxy",
+    "process-cpu-usage",
+    "profiler-self-time",
+    "rss-memory",
+    "byte-parity",
+    "ledger-approved-threshold",
+)
+HOTSPOT_STATUSES = (
+    "CPU-self-time confirmed",
+    "fallback-toggle-confirmed",
+    "covered-current",
+    "not-visible",
+    "needs-trace-coverage",
+)
+PROFILERS = ("bun", "node", "clinic", "instruments", "perf", "other", "none")
+PARITY_VERDICTS = ("pass", "fail", "not-run")
+EXPECTED_PREREGISTRATION_POLICY_SHA256 = "49a4c6a575e0bf5829c90fc4646c8a3b2430bb5d1b7f6cdc5019266eca4b1acf"
 
 
 class EvidenceError(Exception):
@@ -176,7 +199,7 @@ def _load_json_bytes(raw: bytes, label: str, maximum_bytes: int, maximum_depth: 
     return value
 
 
-def _load_json_file(path: Path, maximum_bytes: int, maximum_depth: int) -> Any:
+def _read_file_bytes(path: Path, maximum_bytes: int) -> tuple[bytes, os.stat_result]:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise EvidenceError(f"path is not a regular non-symlink file: {path.name}")
@@ -209,7 +232,51 @@ def _load_json_file(path: Path, maximum_bytes: int, maximum_depth: int) -> Any:
         or len(raw) != before.st_size
     ):
         raise EvidenceError(f"file changed while reading: {path.name}")
-    return _load_json_bytes(bytes(raw), path.name, maximum_bytes, maximum_depth)
+    return bytes(raw), before
+
+
+def _canonical_digest(value: Any) -> str:
+    return _sha256_bytes(
+        json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _validate_seal(container: dict[str, Any], label: str) -> None:
+    seal = _expect_dict(_required(container, "seal", label), f"{label}.seal")
+    _expect_exact_keys(seal, {"algorithm", "digest"}, f"{label}.seal")
+    if seal.get("algorithm") != "sha256-canonical-json":
+        raise EvidenceError(f"{label}.seal algorithm drift")
+    digest = _expect_sha256(seal.get("digest"), f"{label}.seal.digest")
+    payload = {key: value for key, value in container.items() if key != "seal"}
+    if digest != _canonical_digest(payload):
+        raise EvidenceError(f"{label}.seal digest mismatch")
+
+
+def _validate_private_field_names(value: Any, label: str, *, privacy_attestation: bool = False) -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized = key.lower()
+            permitted_attestation = privacy_attestation and key in {"rawPrivateTranscriptCommitted", "redactionNotes"}
+            permitted_schema_field = key == "providerPayloadGolden"
+            if not permitted_attestation and not permitted_schema_field and any(
+                forbidden in normalized
+                for forbidden in ("provider", "private", "transcript", "secret", "credential", "token", "username")
+            ):
+                raise EvidenceError(f"{label}.{key} is a forbidden private/provider field")
+            _validate_private_field_names(
+                nested,
+                f"{label}.{key}",
+                privacy_attestation=privacy_attestation or key == "privacy",
+            )
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _validate_private_field_names(nested, f"{label}[{index}]", privacy_attestation=privacy_attestation)
+
+
+def _protocol_digest(prereg: dict[str, Any]) -> str:
+    contract = _expect_dict(prereg.get("sealedInputContract"), "preregistration.sealedInputContract")
+    fields = _validate_string_array(contract.get("protocolDigestFields"), "sealedInputContract.protocolDigestFields")
+    return _canonical_digest({field: _required(prereg, field, "preregistration") for field in fields})
 
 
 def _sha256_bytes(raw: bytes) -> str:
@@ -274,6 +341,13 @@ def _expect_sha256(value: Any, label: str) -> str:
     normalized = _expect_string(value, label)
     if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
         raise EvidenceError(f"{label} must be lowercase SHA-256")
+    return normalized
+
+
+def _expect_git_oid(value: Any, label: str) -> str:
+    normalized = _expect_string(value, label)
+    if len(normalized) != 40 or any(character not in "0123456789abcdef" for character in normalized):
+        raise EvidenceError(f"{label} must be a lowercase 40-character Git object ID")
     return normalized
 
 
@@ -633,9 +707,112 @@ def _validate_baseline(
     }
 
 
+def _validate_string_array(value: Any, label: str) -> list[str]:
+    items = _expect_list(value, label)
+    for index, item in enumerate(items):
+        _expect_string(item, f"{label}[{index}]")
+    return items
+
+
+def _validate_report_containers(report: dict[str, Any], filename: str) -> None:
+    classifications = _expect_list(report.get("hotspotClassifications"), f"{filename}.hotspotClassifications")
+    for index, value in enumerate(classifications):
+        label = f"{filename}.hotspotClassifications[{index}]"
+        item = _expect_dict(value, label)
+        _expect_exact_keys(item, {"hotspotId", "status", "evidenceClass", "artifactRefs", "notes"}, label)
+        _expect_string(item.get("hotspotId"), f"{label}.hotspotId")
+        if item.get("status") not in HOTSPOT_STATUSES:
+            raise EvidenceError(f"{label}.status is invalid")
+        if item.get("evidenceClass") not in EVIDENCE_CLASSES:
+            raise EvidenceError(f"{label}.evidenceClass is invalid")
+        _validate_string_array(item.get("artifactRefs"), f"{label}.artifactRefs")
+        _expect_string(item.get("notes"), f"{label}.notes")
+        if item["status"] == "CPU-self-time confirmed" and item["evidenceClass"] != "profiler-self-time":
+            raise EvidenceError(f"{label} CPU confirmation requires profiler-self-time evidence")
+    thresholds = _expect_list(report.get("thresholdLedger"), f"{filename}.thresholdLedger")
+    for index, value in enumerate(thresholds):
+        label = f"{filename}.thresholdLedger[{index}]"
+        item = _expect_dict(value, label)
+        _expect_exact_keys(item, {"name", "advisoryOrEnforced"}, label)
+        _expect_string(item.get("name"), f"{label}.name")
+        if item.get("advisoryOrEnforced") not in ("advisory", "enforced"):
+            raise EvidenceError(f"{label}.advisoryOrEnforced is invalid")
+
+
+def _validate_fixture_containers(fixture: dict[str, Any], label: str) -> None:
+    _expect_string(fixture.get("fixtureId"), f"{label}.fixtureId")
+    if fixture.get("fixtureClass") not in FIXTURE_CLASSES:
+        raise EvidenceError(f"{label}.fixtureClass is invalid")
+    tags = _validate_string_array(fixture.get("workloadTags"), f"{label}.workloadTags")
+    if len(tags) != len(set(tags)):
+        raise EvidenceError(f"{label}.workloadTags must be unique")
+    privacy = _expect_dict(fixture.get("privacy"), f"{label}.privacy")
+    _expect_exact_keys(privacy, {"rawPrivateTranscriptCommitted", "redactionNotes"}, f"{label}.privacy")
+    if privacy.get("rawPrivateTranscriptCommitted") is not False:
+        raise EvidenceError(f"{label}: raw private transcript content is forbidden")
+    _expect_string(privacy.get("redactionNotes"), f"{label}.privacy.redactionNotes")
+    wall_clock = _expect_dict(fixture.get("wallClockPhase"), f"{label}.wallClockPhase")
+    for phase, raw_metric in wall_clock.items():
+        _expect_string(phase, f"{label}.wallClockPhase key")
+        metric_label = f"{label}.wallClockPhase.{phase}"
+        metric = _expect_dict(raw_metric, metric_label)
+        allowed = {"elapsedMs", "startMs", "p50Ms", "p95Ms", "advisoryOnly"}
+        if not {"elapsedMs", "advisoryOnly"} <= set(metric) or not set(metric) <= allowed:
+            raise EvidenceError(f"{metric_label} fields are invalid")
+        for field in set(metric) - {"advisoryOnly"}:
+            _expect_number(metric[field], f"{metric_label}.{field}", nonnegative=True)
+        _expect_bool(metric.get("advisoryOnly"), f"{metric_label}.advisoryOnly")
+    process_cpu = _expect_dict(fixture.get("processCpuUsage"), f"{label}.processCpuUsage")
+    for phase, raw_metric in process_cpu.items():
+        _expect_string(phase, f"{label}.processCpuUsage key")
+        metric_label = f"{label}.processCpuUsage.{phase}"
+        metric = _expect_dict(raw_metric, metric_label)
+        allowed = {"userMicros", "systemMicros", "elapsedMs", "cpuFraction"}
+        if not {"userMicros", "systemMicros", "elapsedMs"} <= set(metric) or not set(metric) <= allowed:
+            raise EvidenceError(f"{metric_label} fields are invalid")
+        for field in metric:
+            _expect_number(metric[field], f"{metric_label}.{field}", nonnegative=True)
+    profiler = _expect_dict(fixture.get("profilerSelfTime"), f"{label}.profilerSelfTime")
+    if not {"profiler"} <= set(profiler) or not set(profiler) <= {"profiler", "artifactPath", "samples"}:
+        raise EvidenceError(f"{label}.profilerSelfTime fields are invalid")
+    if profiler.get("profiler") not in PROFILERS:
+        raise EvidenceError(f"{label}.profilerSelfTime.profiler is invalid")
+    if "artifactPath" in profiler:
+        _expect_string(profiler["artifactPath"], f"{label}.profilerSelfTime.artifactPath")
+    if "samples" in profiler:
+        for index, raw_sample in enumerate(_expect_list(profiler["samples"], f"{label}.profilerSelfTime.samples")):
+            sample_label = f"{label}.profilerSelfTime.samples[{index}]"
+            item = _expect_dict(raw_sample, sample_label)
+            if not {"symbol", "selfTimeMs"} <= set(item) or not set(item) <= {"symbol", "selfTimeMs", "totalTimeMs", "package"}:
+                raise EvidenceError(f"{sample_label} fields are invalid")
+            _expect_string(item.get("symbol"), f"{sample_label}.symbol")
+            _expect_number(item.get("selfTimeMs"), f"{sample_label}.selfTimeMs", nonnegative=True)
+            if "totalTimeMs" in item:
+                _expect_number(item["totalTimeMs"], f"{sample_label}.totalTimeMs", nonnegative=True)
+            if "package" in item:
+                _expect_string(item["package"], f"{sample_label}.package")
+    rss = _expect_dict(fixture.get("rssMemory"), f"{label}.rssMemory")
+    if not {"baselineBytes", "growthBytes", "returnBytes"} <= set(rss) or not set(rss) <= {
+        "baselineBytes", "peakBytes", "growthBytes", "returnBytes", "heapBaselineBytes", "heapReturnBytes"
+    }:
+        raise EvidenceError(f"{label}.rssMemory fields are invalid")
+    for field, raw in rss.items():
+        if raw is not None:
+            if field == "growthBytes":
+                _expect_integer(raw, f"{label}.rssMemory.{field}")
+            else:
+                _expect_integer(raw, f"{label}.rssMemory.{field}", nonnegative=True)
+    parity = _expect_dict(fixture.get("byteParity"), f"{label}.byteParity")
+    if not set(parity) <= {"renderedGolden", "persistedJsonlGolden", "providerPayloadGolden", "materializedSessionGolden"}:
+        raise EvidenceError(f"{label}.byteParity fields are invalid")
+    for field, verdict in parity.items():
+        if verdict not in PARITY_VERDICTS:
+            raise EvidenceError(f"{label}.byteParity.{field} is invalid")
+
 def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any], expected_git_sha: str) -> dict[str, Any]:
     filename = schedule["expectedFilename"]
     report = _expect_dict(value, filename)
+    _validate_private_field_names(report, filename)
     _expect_exact_keys(report, REPORT_FIELDS, filename)
     if report.get("schema") != REPORT_SCHEMA:
         raise EvidenceError(f"{filename}: schema must be {REPORT_SCHEMA}")
@@ -739,8 +916,7 @@ def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any
     expected_closure_digest = _sha256_bytes(("\n".join(closure_manifest) + "\n").encode("utf-8"))
     if runner.get("closureDigest") != expected_closure_digest:
         raise EvidenceError(f"{filename}: closureDigest mismatch")
-    _expect_list(report.get("hotspotClassifications"), f"{filename}.hotspotClassifications")
-    _expect_list(report.get("thresholdLedger"), f"{filename}.thresholdLedger")
+    _validate_report_containers(report, filename)
     fixtures = _expect_list(report.get("fixtures"), f"{filename}.fixtures")
     baselines: dict[str, dict[str, Any]] = {}
     observed_order: list[str] = []
@@ -753,14 +929,7 @@ def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any
         _expect_exact_keys(fixture, expected_fixture_fields, fixture_label)
         if fixture.get("sourceClass") != "synthetic":
             raise EvidenceError(f"{fixture_label}.sourceClass must be synthetic")
-        tags = _expect_list(fixture.get("workloadTags"), f"{fixture_label}.workloadTags")
-        if any(not isinstance(tag, str) or not tag for tag in tags):
-            raise EvidenceError(f"{fixture_label}.workloadTags is invalid")
-        privacy = _expect_dict(fixture.get("privacy"), f"{fixture_label}.privacy")
-        _expect_exact_keys(privacy, {"rawPrivateTranscriptCommitted", "redactionNotes"}, f"{fixture_label}.privacy")
-        if privacy.get("rawPrivateTranscriptCommitted") is not False:
-            raise EvidenceError(f"{fixture_label}: raw private transcript content is forbidden")
-        _expect_string(privacy.get("redactionNotes"), f"{fixture_label}.privacy.redactionNotes")
+        _validate_fixture_containers(fixture, fixture_label)
         if baseline_value is None:
             continue
         validated = _validate_baseline(
@@ -838,6 +1007,27 @@ def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any
 
 def _validate_preregistration(value: Any) -> dict[str, Any]:
     prereg = _expect_dict(value, "preregistration")
+    _expect_exact_keys(
+        prereg,
+        {
+            "schema",
+            "analysisSchema",
+            "reportSchema",
+            "frozenBeforeOutcomes",
+            "digestBinding",
+            "cohort",
+            "bounds",
+            "analysis",
+            "exclusions",
+            "captureControls",
+            "sealedInputContract",
+            "trustedCodePolicy",
+            "limitations",
+        },
+        "preregistration",
+    )
+    if _canonical_digest(prereg) != EXPECTED_PREREGISTRATION_POLICY_SHA256:
+        raise EvidenceError("authenticated preregistration policy drift")
     if prereg.get("schema") != PREREG_SCHEMA or prereg.get("analysisSchema") != ANALYSIS_SCHEMA or prereg.get("reportSchema") != REPORT_SCHEMA:
         raise EvidenceError("preregistration schema binding is invalid")
     if prereg.get("frozenBeforeOutcomes") is not True:
@@ -860,7 +1050,7 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
         raise EvidenceError("preregistration trusted-code policy drift")
     bounds = _expect_dict(prereg.get("bounds"), "preregistration.bounds")
     expected_bounds = {
-        "maximumInputFiles": 37,
+        "maximumInputFiles": 39,
         "maximumBytesPerFile": 8_388_608,
         "maximumTotalInputBytes": 134_217_728,
         "maximumJsonDepth": 40,
@@ -915,7 +1105,8 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
         permutation.get("performedBeforeOutcomes") is not True
         or permutation.get("seed") != 0x3279B4E7
         or permutation.get("seedExpression") != "0x3279B4E7"
-        or "cyclic rotations" not in str(permutation.get("algorithm", ""))
+        or permutation.get("algorithm")
+        != "Sort the seven UTF-8 surface names by raw SHA-256 of '0x3279B4E7:<profile>:<surface>' to obtain a seeded base row, then use cyclic rotations. Soak slots 1-21 are three complete seven-row Latin cycles; slots 22-24 are fixed rotations 1, 3, and 5. Short slots use the first five rotations. An invalid attempt does not advance the admission slot, so its replacement reuses the same row."
     ):
         raise EvidenceError("preregistration counterbalancing algorithm drift")
     admission_rows = _expect_dict(controls.get("admissionRows"), "preregistration.captureControls.admissionRows")
@@ -970,22 +1161,40 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
     bootstrap = _expect_dict(action.get("bootstrap"), "preregistration.analysis.actionFamily.bootstrap")
     p95_receipt = _expect_dict(analysis.get("p95MethodReceipt"), "preregistration.analysis.p95MethodReceipt")
     if (
-        action.get("eligibleSurfaces") != list(ELIGIBLE_SURFACES)
+        cohort.get("allMembersRequired") is not True
+        or cohort.get("gitDirtyRequired") is not False
+        or cohort.get("memoryIsolation") != "process-per-surface"
+        or cohort.get("sameGitShaPlatformAndArchRequired") is not True
+        or cohort.get("independentReportBlocks") is not True
+        or action.get("name") != "sustained-heap-growth"
+        or action.get("eligibleSurfaces") != list(ELIGIBLE_SURFACES)
         or action.get("eligibleProfile") != "soak"
         or action.get("primaryEstimator") != "report-endpoint-heapSlopeBytesPerSecond"
         or action.get("sensitivityEstimator") != "per-report-steady-state-Theil-Sen-heapUsedBytes-slope"
+        or action.get("aggregation") != "median-across-all-independent-report-blocks"
         or action.get("minimumPositiveSignsPerEstimatorPerSurface") != 18
         or action.get("minimumBcaLowerBoundBytesPerSecond") != 1_048_576 / 30
+        or action.get("minimumBcaLowerBoundExpression") != "1048576/30"
+        or action.get("noMultiplicityExpansion") is not True
+        or "conjunctive" not in str(action.get("decision", ""))
         or bootstrap.get("method") != "two-sided-95-percent-BCa"
         or bootstrap.get("resamples") != 10000
         or bootstrap.get("resampleOverrideAllowed") is not False
+        or bootstrap.get("unit") != "whole-report-block"
+        or bootstrap.get("jointSurfaceResampling") is not True
         or bootstrap.get("seed") != 0x3279B4E7
         or bootstrap.get("seedExpression") != "0x3279B4E7"
+        or bootstrap.get("indexGenerator") != "sha256(seed:replicate:draw)-modulo-block-count"
+        or bootstrap.get("quantile") != "Hyndman-Fan-type-7"
+        or bootstrap.get("biasTies") != "half-weight"
         or analysis.get("p95Claim") != "omitted-impossible-with-24-independent-blocks"
+        or p95_receipt.get("method") != "two-sided-distribution-free-exact-order-statistic-interval"
+        or p95_receipt.get("populationQuantile") != 0.95
+        or p95_receipt.get("confidenceLevel") != 0.95
         or p95_receipt.get("independentBlockCount") != 24
         or p95_receipt.get("finiteUpperEndpointAvailable") is not False
     ):
-        raise EvidenceError("preregistered action family or p95 method receipt drift")
+        raise EvidenceError("preregistered decision policy drift")
     return prereg
 
 
@@ -1043,6 +1252,10 @@ def _run_level_points(reports: Sequence[dict[str, Any]], surface: str) -> list[d
                 "admissionNumber": report["admissionNumber"],
                 "capturedAtSeconds": report["capturedAtSeconds"],
                 "surfaceOrdinal": validated["ordinal"],
+                "thermalState": report["captureTelemetry"]["telemetryBefore"]["thermalState"]["value"],
+                "memoryPressure": report["captureTelemetry"]["telemetryBefore"]["memoryPressure"]["value"],
+                "loadAverage1m": report["captureTelemetry"]["telemetryBefore"]["loadAverage1m"]["value"],
+                "freeMemoryBytes": report["captureTelemetry"]["telemetryBefore"]["freeMemoryBytes"]["value"],
                 "endpointHeapSlopeBytesPerSecond": baseline["heapSlopeBytesPerSecond"],
                 "theilSenHeapSlopeBytesPerSecond": validated["theilSenHeapSlopeBytesPerSecond"],
                 "endpointRssSlopeBytesPerSecond": baseline["rssSlopeBytesPerSecond"],
@@ -1083,19 +1296,37 @@ def _estimator_sensitivities(reports: Sequence[dict[str, Any]], surface: str, es
         },
         "latinSquareBlocks": latin_blocks,
         "telemetry": {
-            "availability": "NOT_CAPTURED_IN_REPORT_SCHEMA",
-            "correlations": {},
-            "reason": "No thermal, load, pressure, power, or free-memory telemetry fields are present in schema-v3 report bytes.",
+            "availability": "SUPPORTED_BY_SEALED_ATTEMPT_LEDGER",
+            "thermalStates": sorted({str(point["thermalState"]) for point in points}),
+            "memoryPressureStates": sorted({str(point["memoryPressure"]) for point in points}),
+            "descriptiveSpearmanNoPValue": {
+                "loadAverage1m": _spearman([float(point["loadAverage1m"]) for point in points], values),
+                "freeMemoryBytes": _spearman([float(point["freeMemoryBytes"]) for point in points], values),
+            },
         },
     }
 
 
 
 
+def _admission_traceability(reports: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "ledgerSequence": report["ledgerSequence"],
+            "attemptId": report["attemptId"],
+            "admissionSlotId": report["blockId"],
+            "profile": report["profile"],
+            "filename": report["filename"],
+            "sha256": report["rawReportSha256"],
+        }
+        for report in sorted(reports, key=lambda item: item["ledgerSequence"])
+    ]
+
+
 def _sufficient_result(
     reports: Sequence[dict[str, Any]],
     prereg: dict[str, Any],
-    hashes: dict[str, str],
+    hashes: dict[str, Any],
     attempts: dict[str, int],
     invalid: dict[str, int],
     attempt_findings: Sequence[dict[str, Any]],
@@ -1185,6 +1416,7 @@ def _sufficient_result(
         "actionDecision": "ACTION" if all_pass else "NO_ACTION",
         "actionFamily": "sustained-heap-growth",
         "hashBindings": hashes,
+        "admissionTraceability": _admission_traceability(reports),
         "admission": admission,
         "cohort": {
             "reportSchema": REPORT_SCHEMA,
@@ -1284,11 +1516,12 @@ def _finding_from_error(error: EvidenceError, schedule: dict[str, Any] | None = 
 
 def _insufficient_result(
     findings: Sequence[dict[str, Any]],
-    hashes: dict[str, str],
+    hashes: dict[str, Any],
     prereg: dict[str, Any] | None = None,
     attempts: dict[str, int] | None = None,
     admitted: dict[str, int] | None = None,
     invalid: dict[str, int] | None = None,
+    reports: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     attempts = attempts or {"short": 0, "soak": 0}
     admitted = admitted or {"short": 0, "soak": 0}
@@ -1328,6 +1561,7 @@ def _insufficient_result(
         "actionDecision": "NOT_EVALUATED",
         "actionFamily": "sustained-heap-growth",
         "hashBindings": hashes,
+        "admissionTraceability": _admission_traceability(reports),
         "admission": admission,
         "diagnostics": {
             "validationErrors": list(findings),
@@ -1355,6 +1589,26 @@ def _markdown(result: dict[str, Any]) -> str:
         "- Tail-percentile claim: omitted",
         "",
     ]
+    bindings = result["hashBindings"]
+    lines.extend(
+        [
+            "## Sealed input bindings",
+            "",
+            f"- Authenticated attempt ledger SHA-256: `{bindings['attemptLedgerSha256']}`",
+            f"- Authenticated raw manifest SHA-256: `{bindings['rawManifestSha256']}`",
+            "",
+            "### Admitted raw report traceability",
+            "",
+            "| Ledger sequence | Attempt | Admission slot | Profile | Filename | SHA-256 |",
+            "| ---: | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for item in result["admissionTraceability"]:
+        lines.append(
+            f"| {item['ledgerSequence']} | {item['attemptId']} | {item['admissionSlotId']} | "
+            f"{item['profile']} | {item['filename']} | `{item['sha256']}` |"
+        )
+    lines.append("")
     if result["evidenceStatus"] == "SUFFICIENT_EVIDENCE":
         lines.extend([
             "## Admission",
@@ -1381,6 +1635,280 @@ def _markdown(result: dict[str, Any]) -> str:
         lines.append(f"- {limitation}")
     return "\n".join(lines) + "\n"
 
+
+def _validate_sealed_inputs(
+    input_dir: Path,
+    prereg: dict[str, Any],
+    expected_bindings: dict[str, str],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, bytes], dict[str, Any]]:
+    contract = prereg["sealedInputContract"]
+    ledger_raw, ledger_info = _read_file_bytes(input_dir / ATTEMPT_LEDGER_FILENAME, contract["maximumLedgerBytes"])
+    manifest_raw, _ = _read_file_bytes(input_dir / RAW_MANIFEST_FILENAME, contract["maximumManifestBytes"])
+    ledger_digest = _sha256_bytes(ledger_raw)
+    manifest_digest = _sha256_bytes(manifest_raw)
+    if ledger_digest != expected_bindings["attemptLedgerSha256"]:
+        raise EvidenceError("attempt ledger SHA-256 mismatch for supplied bytes")
+    if manifest_digest != expected_bindings["rawManifestSha256"]:
+        raise EvidenceError("raw manifest SHA-256 mismatch for supplied bytes")
+    ledger = _expect_dict(
+        _load_json_bytes(
+            ledger_raw,
+            ATTEMPT_LEDGER_FILENAME,
+            contract["maximumLedgerBytes"],
+            prereg["bounds"]["maximumJsonDepth"],
+        ),
+        ATTEMPT_LEDGER_FILENAME,
+    )
+    manifest = _expect_dict(
+        _load_json_bytes(
+            manifest_raw,
+            RAW_MANIFEST_FILENAME,
+            contract["maximumManifestBytes"],
+            prereg["bounds"]["maximumJsonDepth"],
+        ),
+        RAW_MANIFEST_FILENAME,
+    )
+    _expect_exact_keys(ledger, set(contract["ledgerFields"]), ATTEMPT_LEDGER_FILENAME)
+    if (
+        ledger.get("schema") != ATTEMPT_LEDGER_SCHEMA
+        or ledger.get("version") != contract["attemptLedgerVersion"]
+        or ledger.get("complete") is not True
+    ):
+        raise EvidenceError("attempt ledger schema/version/complete drift")
+    _validate_seal(ledger, ATTEMPT_LEDGER_FILENAME)
+    _expect_sha256(ledger.get("captureId"), f"{ATTEMPT_LEDGER_FILENAME}.captureId")
+    _expect_git_oid(ledger.get("measurementGitSha"), f"{ATTEMPT_LEDGER_FILENAME}.measurementGitSha")
+    _expect_git_oid(ledger.get("measurementTreeSha"), f"{ATTEMPT_LEDGER_FILENAME}.measurementTreeSha")
+    for field in (
+        "closureDigest",
+        "worktreeFingerprint",
+        "runtimeControlIdentity",
+        "scheduleDigest",
+        "protocolDigest",
+    ):
+        _expect_sha256(ledger.get(field), f"{ATTEMPT_LEDGER_FILENAME}.{field}")
+    identity_fields = {
+        "captureId": "expectedCaptureId",
+        "measurementGitSha": "expectedGitSha",
+        "measurementTreeSha": "expectedTreeSha",
+        "closureDigest": "expectedClosureDigest",
+        "worktreeFingerprint": "expectedWorktreeFingerprint",
+        "runtimeControlIdentity": "expectedRuntimeControlIdentity",
+        "scheduleDigest": "expectedScheduleDigest",
+        "protocolDigest": "expectedProtocolDigest",
+    }
+    for field, expected_field in identity_fields.items():
+        if ledger.get(field) != expected_bindings[expected_field]:
+            raise EvidenceError(f"attempt ledger authenticated binding mismatch: {field}")
+    derived_schedule_digest = _canonical_digest(prereg["captureControls"]["schedule"])
+    if ledger["scheduleDigest"] != derived_schedule_digest:
+        raise EvidenceError("attempt ledger frozen schedule digest mismatch")
+    if ledger["protocolDigest"] != _protocol_digest(prereg):
+        raise EvidenceError("attempt ledger frozen protocol digest mismatch")
+
+    host = _expect_dict(ledger.get("host"), f"{ATTEMPT_LEDGER_FILENAME}.host")
+    _expect_exact_keys(host, set(contract["hostFields"]), f"{ATTEMPT_LEDGER_FILENAME}.host")
+    _expect_sha256(host.get("hostId"), f"{ATTEMPT_LEDGER_FILENAME}.host.hostId")
+    _expect_string(host.get("platform"), f"{ATTEMPT_LEDGER_FILENAME}.host.platform")
+    _expect_string(host.get("arch"), f"{ATTEMPT_LEDGER_FILENAME}.host.arch")
+    if host.get("powerSource") != contract["requiredPowerSource"] or host.get("powerMode") != contract["requiredPowerMode"]:
+        raise EvidenceError("attempt ledger fixed host power state drift")
+
+    def validate_telemetry(value: Any, label: str, minimum_time: float, maximum_time: float) -> tuple[float, int]:
+        telemetry = _expect_dict(value, label)
+        _expect_exact_keys(telemetry, set(contract["telemetryFields"]), label)
+        observed_time = _timestamp_seconds(telemetry.get("timestamp"), f"{label}.timestamp")
+        if observed_time < minimum_time or observed_time > maximum_time:
+            raise EvidenceError(f"{label}.timestamp is outside the attempt boundary")
+        validated: dict[str, float | int | str] = {}
+        for field in ("thermalState", "memoryPressure", "loadAverage1m", "freeMemoryBytes"):
+            metric_label = f"{label}.{field}"
+            metric = _expect_dict(telemetry.get(field), metric_label)
+            _expect_exact_keys(metric, set(contract["telemetryValueFields"]), metric_label)
+            if metric.get("availability") not in contract["telemetryAvailabilityValues"]:
+                raise EvidenceError(f"{metric_label}.availability is invalid")
+            if metric.get("availability") != contract["requiredTelemetryAvailability"]:
+                raise EvidenceError(f"{metric_label} required telemetry is unavailable")
+            validated[field] = metric.get("value")
+        if validated["thermalState"] not in contract["allowedThermalStates"]:
+            raise EvidenceError(f"{label}.thermalState is critical or outside the frozen control")
+        if validated["memoryPressure"] not in contract["allowedMemoryPressureStates"]:
+            raise EvidenceError(f"{label}.memoryPressure is critical or outside the frozen control")
+        load = _expect_number(validated["loadAverage1m"], f"{label}.loadAverage1m.value", nonnegative=True)
+        if load > contract["maximumLoadAverage1m"]:
+            raise EvidenceError(f"{label}.loadAverage1m exceeds bound")
+        free_memory = _expect_integer(validated["freeMemoryBytes"], f"{label}.freeMemoryBytes.value", positive=True)
+        if not contract["minimumFreeMemoryBytes"] <= free_memory <= contract["maximumFreeMemoryBytes"]:
+            raise EvidenceError(f"{label}.freeMemoryBytes exceeds bound")
+        return load, free_memory
+
+    attempts = _expect_list(ledger.get("attempts"), f"{ATTEMPT_LEDGER_FILENAME}.attempts")
+    if not attempts or len(attempts) > 37:
+        raise EvidenceError("attempt ledger attempt count is outside frozen bounds")
+    schedule_by_id = {
+        item["attemptId"]: (index, item)
+        for index, item in enumerate(prereg["captureControls"]["schedule"])
+    }
+    previous_schedule_index = -1
+    previous_end = 0.0
+    first_load: float | None = None
+    first_free_memory: int | None = None
+    validated_attempts: list[dict[str, Any]] = []
+    filenames: set[str] = set()
+    for index, raw_attempt in enumerate(attempts):
+        label = f"{ATTEMPT_LEDGER_FILENAME}.attempts[{index}]"
+        attempt = _expect_dict(raw_attempt, label)
+        _expect_exact_keys(attempt, set(contract["attemptFields"]), label)
+        if _expect_integer(attempt.get("sequence"), f"{label}.sequence", positive=True) != index + 1:
+            raise EvidenceError("attempt ledger global sequence drift")
+        attempt_id = _expect_string(attempt.get("attemptId"), f"{label}.attemptId")
+        if attempt_id not in schedule_by_id:
+            raise EvidenceError(f"{label}.attemptId is outside frozen allocation")
+        schedule_index, scheduled = schedule_by_id[attempt_id]
+        if schedule_index <= previous_schedule_index:
+            raise EvidenceError("attempt ledger global chronological interleaving drift")
+        previous_schedule_index = schedule_index
+        for field in ("profile", "attemptNumber"):
+            if attempt.get(field) != scheduled[field]:
+                raise EvidenceError(f"{label}.{field} allocation drift")
+        if attempt.get("reportFilename") != scheduled["expectedFilename"] or attempt["reportFilename"] in filenames:
+            raise EvidenceError(f"{label}.reportFilename allocation or uniqueness drift")
+        filenames.add(attempt["reportFilename"])
+        slot_id = _expect_string(attempt.get("admissionSlotId"), f"{label}.admissionSlotId")
+        rows = prereg["captureControls"]["admissionRows"][scheduled["profile"]]
+        matching_rows = [row for row in rows if row["slotId"] == slot_id]
+        if len(matching_rows) != 1 or attempt.get("expectedSurfaceOrder") != matching_rows[0]["surfaceOrder"]:
+            raise EvidenceError(f"{label} replacement slot/expected surface order drift")
+        actual_order = _validate_string_array(attempt.get("actualSurfaceOrder"), f"{label}.actualSurfaceOrder")
+        if len(actual_order) != len(SURFACES) or set(actual_order) != set(SURFACES):
+            raise EvidenceError(f"{label}.actualSurfaceOrder must be the exact seven-surface permutation")
+
+        started = _timestamp_seconds(attempt.get("startedAt"), f"{label}.startedAt")
+        ended = _timestamp_seconds(attempt.get("endedAt"), f"{label}.endedAt")
+        if ended <= started:
+            raise EvidenceError(f"{label} has an overlapping or non-positive interval")
+        if attempt.get("sequential") is not True:
+            raise EvidenceError(f"{label}.sequential must be true")
+        cooldown = _expect_number(
+            attempt.get("cooldownAfterPreviousSeconds"),
+            f"{label}.cooldownAfterPreviousSeconds",
+            nonnegative=True,
+        )
+        if index == 0:
+            if cooldown != 0:
+                raise EvidenceError("first attempt cooldown must be zero")
+        else:
+            actual_cooldown = started - previous_end
+            if (
+                started < previous_end
+                or actual_cooldown < contract["minimumCooldownSeconds"]
+                or abs(cooldown - actual_cooldown) > 0.001
+            ):
+                raise EvidenceError(f"{label} overlaps or violates sequential 60-second cooldown")
+        previous_end = ended
+        for field in ("hostId", "platform", "arch", "powerSource", "powerMode"):
+            if attempt.get(field) != host[field]:
+                raise EvidenceError(f"{label}.{field} fixed host/power state drift")
+        before_load, before_free = validate_telemetry(attempt.get("telemetryBefore"), f"{label}.telemetryBefore", started, ended)
+        after_load, after_free = validate_telemetry(attempt.get("telemetryAfter"), f"{label}.telemetryAfter", started, ended)
+        for load, free_memory in ((before_load, before_free), (after_load, after_free)):
+            if first_load is None:
+                first_load = load
+                first_free_memory = free_memory
+            else:
+                if abs(load - first_load) > contract["maximumLoadAverage1mDrift"]:
+                    raise EvidenceError(f"{label}.loadAverage1m telemetry drift")
+                if first_free_memory is None:
+                    raise EvidenceError("attempt ledger free-memory reference is missing")
+                if abs(free_memory - first_free_memory) / first_free_memory > contract["maximumFreeMemoryFractionDrift"]:
+                    raise EvidenceError(f"{label}.freeMemoryBytes telemetry drift")
+        if attempt.get("interrupted") is not False:
+            raise EvidenceError(f"{label}.interrupted must be false")
+        if attempt.get("parentClosed") is not True or attempt.get("childrenClosed") is not True:
+            raise EvidenceError(f"{label} parent/children process closure failed")
+        _expect_integer(attempt.get("reportSizeBytes"), f"{label}.reportSizeBytes", positive=True)
+        _expect_sha256(attempt.get("reportSha256"), f"{label}.reportSha256")
+        _expect_git_oid(attempt.get("measurementGitSha"), f"{label}.measurementGitSha")
+        _expect_git_oid(attempt.get("measurementTreeSha"), f"{label}.measurementTreeSha")
+        for field in ("closureDigest", "worktreeFingerprint", "runtimeControlIdentity"):
+            _expect_sha256(attempt.get(field), f"{label}.{field}")
+        for field, expected_field in (
+            ("measurementGitSha", "expectedGitSha"),
+            ("measurementTreeSha", "expectedTreeSha"),
+            ("closureDigest", "expectedClosureDigest"),
+            ("worktreeFingerprint", "expectedWorktreeFingerprint"),
+        ):
+            if attempt[field] != expected_bindings[expected_field]:
+                raise EvidenceError(f"{label} authenticated M/tree/C/fingerprint binding drift: {field}")
+        validated_attempts.append(attempt)
+
+    sealed_at = _timestamp_seconds(ledger.get("sealedAt"), f"{ATTEMPT_LEDGER_FILENAME}.sealedAt")
+    if sealed_at < previous_end:
+        raise EvidenceError("attempt ledger was sealed before the final attempt ended")
+
+    _expect_exact_keys(manifest, set(contract["manifestFields"]), RAW_MANIFEST_FILENAME)
+    if (
+        manifest.get("schema") != RAW_MANIFEST_SCHEMA
+        or manifest.get("version") != contract["rawManifestVersion"]
+        or manifest.get("complete") is not True
+    ):
+        raise EvidenceError("raw manifest schema/version/complete drift")
+    _validate_seal(manifest, RAW_MANIFEST_FILENAME)
+    if manifest.get("sealedAt") != ledger.get("sealedAt"):
+        raise EvidenceError("raw manifest sealed timestamp mismatch")
+    for field, expected_field in identity_fields.items():
+        if manifest.get(field) != expected_bindings[expected_field]:
+            raise EvidenceError(f"raw manifest authenticated binding mismatch: {field}")
+    manifest_ledger = _expect_dict(manifest.get("ledger"), f"{RAW_MANIFEST_FILENAME}.ledger")
+    _expect_exact_keys(manifest_ledger, set(contract["manifestLedgerFields"]), f"{RAW_MANIFEST_FILENAME}.ledger")
+    if manifest_ledger != {
+        "filename": ATTEMPT_LEDGER_FILENAME,
+        "sizeBytes": ledger_info.st_size,
+        "sha256": ledger_digest,
+    }:
+        raise EvidenceError("raw manifest attempt-ledger binding mismatch")
+    manifest_reports = _expect_list(manifest.get("reports"), f"{RAW_MANIFEST_FILENAME}.reports")
+    if len(manifest_reports) != len(validated_attempts):
+        raise EvidenceError("raw manifest is incomplete for attempt ledger")
+    bindings: dict[str, dict[str, Any]] = {}
+    ordered_report_hashes: list[dict[str, Any]] = []
+    authenticated_report_bytes: dict[str, bytes] = {}
+    for index, (raw_entry, attempt) in enumerate(zip(manifest_reports, validated_attempts)):
+        label = f"{RAW_MANIFEST_FILENAME}.reports[{index}]"
+        entry = _expect_dict(raw_entry, label)
+        _expect_exact_keys(entry, set(contract["manifestReportFields"]), label)
+        expected = {
+            "sequence": index + 1,
+            "attemptId": attempt["attemptId"],
+            "filename": attempt["reportFilename"],
+            "sizeBytes": attempt["reportSizeBytes"],
+            "sha256": attempt["reportSha256"],
+        }
+        if entry != expected:
+            raise EvidenceError(f"{label} report binding mismatch")
+        if entry["filename"] in bindings:
+            raise EvidenceError(f"{label} duplicate report filename")
+        bindings[entry["filename"]] = entry
+        ordered_report_hashes.append(
+            {
+                "sequence": entry["sequence"],
+                "attemptId": entry["attemptId"],
+                "admissionSlotId": attempt["admissionSlotId"],
+                "profile": attempt["profile"],
+                "filename": entry["filename"],
+                "sha256": entry["sha256"],
+            }
+        )
+    for filename, binding in bindings.items():
+        report_raw, _ = _read_file_bytes(input_dir / filename, prereg["bounds"]["maximumBytesPerFile"])
+        if len(report_raw) != binding["sizeBytes"] or _sha256_bytes(report_raw) != binding["sha256"]:
+            raise EvidenceError(f"{filename}: report filename/size/SHA-256 binding mismatch")
+        authenticated_report_bytes[filename] = report_raw
+    return validated_attempts, bindings, authenticated_report_bytes, {
+        "attemptLedgerSha256": ledger_digest,
+        "rawManifestSha256": manifest_digest,
+        "orderedReportHashes": ordered_report_hashes,
+    }
 
 def _safe_directory(path: Path, *, create: bool = False) -> Path:
     if path.exists() or path.is_symlink():
@@ -1428,18 +1956,45 @@ def run_analysis(
     output_dir: str | os.PathLike[str],
     preregistration_bytes: bytes,
     expected_git_sha: str,
+    expected_tree_sha: str,
+    expected_closure_digest: str,
+    expected_worktree_fingerprint: str,
+    expected_runtime_control_identity: str,
+    expected_capture_id: str,
+    expected_schedule_digest: str,
+    expected_protocol_digest: str,
     authenticated_driver_sha256: str,
     authenticated_preregistration_sha256: str,
     authenticated_template_sha256: str,
+    authenticated_attempt_ledger_sha256: str,
+    authenticated_raw_manifest_sha256: str,
 ) -> dict[str, Any]:
-    if not isinstance(expected_git_sha, str) or len(expected_git_sha) != 40 or any(character not in "0123456789abcdefABCDEF" for character in expected_git_sha):
-        raise EvidenceError("expected git SHA must be 40 hexadecimal characters")
-    for expected, label in (
+    for expected, label in ((expected_git_sha, "git SHA"), (expected_tree_sha, "tree SHA")):
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 40
+            or any(character not in "0123456789abcdefABCDEF" for character in expected)
+        ):
+            raise EvidenceError(f"expected {label} must be 40 hexadecimal characters")
+    digest_inputs = (
+        (expected_closure_digest, "closure digest"),
+        (expected_worktree_fingerprint, "worktree fingerprint"),
+        (expected_runtime_control_identity, "runtime control identity"),
+        (expected_capture_id, "capture ID"),
+        (expected_schedule_digest, "schedule digest"),
+        (expected_protocol_digest, "protocol digest"),
         (authenticated_driver_sha256, "driver"),
         (authenticated_preregistration_sha256, "preregistration"),
         (authenticated_template_sha256, "template"),
-    ):
-        if not isinstance(expected, str) or len(expected) != 64 or any(character not in "0123456789abcdefABCDEF" for character in expected):
+        (authenticated_attempt_ledger_sha256, "attempt ledger"),
+        (authenticated_raw_manifest_sha256, "raw manifest"),
+    )
+    for expected, label in digest_inputs:
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in expected)
+        ):
             raise EvidenceError(f"authenticated {label} SHA-256 is invalid")
     if _sha256_bytes(preregistration_bytes) != authenticated_preregistration_sha256.lower():
         raise EvidenceError("preregistration SHA-256 mismatch for supplied bytes")
@@ -1449,16 +2004,51 @@ def run_analysis(
     output_real = _safe_directory(Path(output_dir), create=True)
     if input_real == output_real or input_real in output_real.parents or output_real in input_real.parents:
         raise EvidenceError("input and output directories must be disjoint")
-    hashes = {
+    expected_bindings = {
+        "expectedGitSha": expected_git_sha.lower(),
+        "expectedTreeSha": expected_tree_sha.lower(),
+        "expectedClosureDigest": expected_closure_digest.lower(),
+        "expectedWorktreeFingerprint": expected_worktree_fingerprint.lower(),
+        "expectedRuntimeControlIdentity": expected_runtime_control_identity.lower(),
+        "expectedCaptureId": expected_capture_id.lower(),
+        "expectedScheduleDigest": expected_schedule_digest.lower(),
+        "expectedProtocolDigest": expected_protocol_digest.lower(),
+        "attemptLedgerSha256": authenticated_attempt_ledger_sha256.lower(),
+        "rawManifestSha256": authenticated_raw_manifest_sha256.lower(),
+    }
+    hashes: dict[str, Any] = {
         "driverSha256": authenticated_driver_sha256.lower(),
         "preregistrationSha256": authenticated_preregistration_sha256.lower(),
         "templateSha256": authenticated_template_sha256.lower(),
-        "expectedGitSha": expected_git_sha.lower(),
+        **expected_bindings,
     }
     bounds = prereg["bounds"]
-    schedule_items = prereg["captureControls"]["schedule"]
+    try:
+        ledger_attempts, raw_bindings, authenticated_report_bytes, sealed_hashes = _validate_sealed_inputs(
+            input_real,
+            prereg,
+            expected_bindings,
+        )
+        hashes.update(sealed_hashes)
+    except (EvidenceError, FileNotFoundError) as error:
+        finding = _finding(
+            "SEALED_INPUT_INVALID",
+            "PROTOCOL",
+            str(error) if isinstance(error, EvidenceError) else f"missing sealed input: {Path(error.filename).name}",
+        )
+        result = _insufficient_result([finding], hashes, prereg)
+        json_path, markdown_path = _write_canonical(output_real, result, bounds["maximumMarkdownBytes"])
+        return {"result": result, "resultJsonPath": str(json_path), "resultMarkdownPath": str(markdown_path)}
+    frozen_schedule = prereg["captureControls"]["schedule"]
+    schedule_by_id = {item["attemptId"]: item for item in frozen_schedule}
+    schedule_items = [schedule_by_id[item["attemptId"]] for item in ledger_attempts]
+    ledger_by_filename = {item["reportFilename"]: item for item in ledger_attempts}
     admission_rows = prereg["captureControls"]["admissionRows"]
-    expected_names = {item["expectedFilename"] for item in schedule_items}
+    expected_names = {
+        ATTEMPT_LEDGER_FILENAME,
+        RAW_MANIFEST_FILENAME,
+        *(item["expectedFilename"] for item in schedule_items),
+    }
     attempts = {"short": 0, "soak": 0}
     admitted = {"short": 0, "soak": 0}
     invalid = {"short": 0, "soak": 0}
@@ -1572,12 +2162,40 @@ def run_analysis(
                 invalid[profile] += 1
                 continue
             try:
-                report_value = _load_json_file(
-                    input_real / filename,
+                ledger_attempt = ledger_by_filename[filename]
+                binding = raw_bindings[filename]
+                if ledger_attempt["admissionSlotId"] != row["slotId"]:
+                    raise EvidenceError(f"{filename}: admission slot replacement progression drift")
+                report_raw = authenticated_report_bytes[filename]
+                report_digest = binding["sha256"]
+                report_value = _load_json_bytes(
+                    report_raw,
+                    filename,
                     bounds["maximumBytesPerFile"],
                     bounds["maximumJsonDepth"],
                 )
-                reports.append(_validate_report(report_value, schedule, prereg, expected_git_sha.lower()))
+                report_mapping = _expect_dict(report_value, filename)
+                report_runner = _expect_dict(report_mapping.get("runner"), f"{filename}.runner")
+                if report_runner.get("memorySurfaceOrder") != ledger_attempt["actualSurfaceOrder"]:
+                    raise EvidenceError(f"{filename}: ledger actual surface order binding mismatch")
+                for field in ("platform", "arch"):
+                    if report_runner.get(field) != ledger_attempt[field]:
+                        raise EvidenceError(f"{filename}: report/ledger host {field} binding mismatch")
+                for report_field, ledger_field in (
+                    ("closureDigest", "closureDigest"),
+                    ("worktreeFingerprint", "worktreeFingerprint"),
+                    ("runtimeControlIdentity", "runtimeControlIdentity"),
+                ):
+                    if report_runner.get(report_field) != ledger_attempt[ledger_field]:
+                        raise EvidenceError(f"{filename}: report/ledger {report_field} binding mismatch")
+                validated_report = _validate_report(report_value, schedule, prereg, expected_git_sha.lower())
+                validated_report["ledgerSequence"] = ledger_attempt["sequence"]
+                validated_report["rawReportSha256"] = report_digest
+                validated_report["captureTelemetry"] = {
+                    "telemetryBefore": ledger_attempt["telemetryBefore"],
+                    "telemetryAfter": ledger_attempt["telemetryAfter"],
+                }
+                reports.append(validated_report)
                 admitted[profile] += 1
             except EvidenceError as error:
                 attempt_findings.append(_finding_from_error(error, schedule))
@@ -1617,12 +2235,12 @@ def run_analysis(
             )
     all_findings = [*global_findings, *attempt_findings]
     if global_findings:
-        result = _insufficient_result(all_findings, hashes, prereg, attempts, admitted, invalid)
+        result = _insufficient_result(all_findings, hashes, prereg, attempts, admitted, invalid, reports)
     else:
         try:
             result = _sufficient_result(reports, prereg, hashes, attempts, invalid, attempt_findings)
         except EvidenceError as error:
             all_findings.append(_finding_from_error(error))
-            result = _insufficient_result(all_findings, hashes, prereg, attempts, admitted, invalid)
+            result = _insufficient_result(all_findings, hashes, prereg, attempts, admitted, invalid, reports)
     json_path, markdown_path = _write_canonical(output_real, result, bounds["maximumMarkdownBytes"])
     return {"result": result, "resultJsonPath": str(json_path), "resultMarkdownPath": str(markdown_path)}

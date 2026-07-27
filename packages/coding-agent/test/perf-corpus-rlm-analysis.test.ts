@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { resolveGitProvenance, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
 import {
 	MEMORY_CAPTURE_SEMANTICS_ID,
+	type MemoryBaselineMetric,
 	type MemorySurface,
 	memoryRuntimeControlIdentity,
 	type PerfCorpusReport,
@@ -17,13 +18,22 @@ const preregistrationPath = path.resolve(import.meta.dir, "../bench/perf-corpus-
 const templatePath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-template.ipynb");
 const bundleDirectory = path.dirname(driverPath);
 const gitSha = "0123456789abcdef0123456789abcdef01234567";
-const expectedTemplateSha256 = "5030ffd69aceb1a849f4153b78a6a7f1b3bb937776024745d7bbb510df7f62b6";
+const expectedTemplateSha256 = "dab587637aa4202c97348dbe2f856df95827598bc8abd87079af8b6e91884d36";
 const decoder = new TextDecoder();
 let temporaryRoot = "";
 let preregistration: Preregistration;
 let driverSha256 = "";
 let preregistrationSha256 = "";
 let authenticatedLauncher: AuthenticatedLauncher;
+const treeSha = "d".repeat(40);
+const worktreeFingerprint = "c".repeat(64);
+const captureRuntimeControlIdentity = "e".repeat(64);
+const captureId = "f".repeat(64);
+const hostId = "1".repeat(64);
+let expectedClosureDigest = "";
+let expectedScheduleDigest = "";
+let expectedProtocolDigest = "";
+const sealedDigestsByDirectory = new Map<string, { attemptLedgerSha256: string; rawManifestSha256: string }>();
 
 interface ScheduleItem {
 	attemptId: string;
@@ -62,11 +72,15 @@ interface Preregistration {
 		admissionRows: Record<"short" | "soak", AdmissionRow[]>;
 		schedule: ScheduleItem[];
 	};
+	sealedInputContract: {
+		protocolDigestFields: string[];
+	};
 }
 
 type SlopePlan = number | { steadyDeltas: number[] };
 
-type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+type JsonObject = { [key: string]: JsonValue };
+type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
 
 interface MemorySample {
 	elapsedMs: number;
@@ -106,6 +120,8 @@ interface SyntheticReportMutationSurface {
 		privacy: Record<string, JsonValue>;
 		memoryBaseline: SyntheticMemoryBaseline;
 	}>;
+	hotspotClassifications: JsonObject[];
+	thresholdLedger: JsonObject[];
 	depthProbe?: JsonValue;
 }
 
@@ -144,7 +160,32 @@ interface ValidationResult {
 		driverSha256: string;
 		preregistrationSha256: string;
 		templateSha256: string;
+		expectedTreeSha: string;
+		expectedClosureDigest: string;
+		expectedWorktreeFingerprint: string;
+		expectedRuntimeControlIdentity: string;
+		expectedCaptureId: string;
+		expectedScheduleDigest: string;
+		expectedProtocolDigest: string;
+		attemptLedgerSha256: string;
+		rawManifestSha256: string;
+		orderedReportHashes: Array<{
+			sequence: number;
+			attemptId: string;
+			admissionSlotId: string;
+			profile: string;
+			filename: string;
+			sha256: string;
+		}>;
 	};
+	admissionTraceability: Array<{
+		ledgerSequence: number;
+		attemptId: string;
+		admissionSlotId: string;
+		profile: string;
+		filename: string;
+		sha256: string;
+	}>;
 	admission: Record<"short" | "soak", AdmissionSummary>;
 	claimPolicy: {
 		p95: {
@@ -182,6 +223,103 @@ interface AuthenticatedLauncher {
 
 function sha256(bytes: Uint8Array | string): string {
 	return createHash("sha256").update(bytes).digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+		const encoded = JSON.stringify(value);
+		if (encoded === undefined) throw new Error("canonical JSON primitive is unsupported");
+		return encoded;
+	}
+	if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(",")}]`;
+	if (typeof value !== "object") throw new Error("canonical JSON value is unsupported");
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+
+function canonicalDigest(value: unknown): string {
+	return sha256(canonicalJson(value));
+}
+
+function sealedObject(payload: Record<string, JsonValue>): Record<string, JsonValue> {
+	return {
+		...payload,
+		seal: {
+			algorithm: "sha256-canonical-json",
+			digest: canonicalDigest(payload),
+		},
+	};
+}
+
+function payloadWithoutSeal(value: JsonObject): JsonObject {
+	return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "seal")) as JsonObject;
+}
+
+async function writeSealedJson(target: string, payload: JsonObject): Promise<Uint8Array> {
+	const raw = new TextEncoder().encode(`${JSON.stringify(sealedObject(payload))}\n`);
+	await fs.writeFile(target, raw);
+	return raw;
+}
+
+async function resealCorpus(directory: string): Promise<void> {
+	const ledgerPath = path.join(directory, "perf-corpus-attempt-ledger.json");
+	const manifestPath = path.join(directory, "perf-corpus-raw-manifest.json");
+	const ledger = JSON.parse(await fs.readFile(ledgerPath, "utf8")) as JsonObject;
+	const attempts = ledger.attempts as JsonObject[];
+	const reportEntries: JsonObject[] = [];
+	for (const [index, attempt] of attempts.entries()) {
+		const filename = attempt.reportFilename as string;
+		const raw = await fs.readFile(path.join(directory, filename));
+		let report: JsonObject | null = null;
+		try {
+			report = JSON.parse(raw.toString("utf8")) as JsonObject;
+		} catch {
+			// Preserve the sealed attempt controls for deliberately malformed raw bytes.
+		}
+		attempt.reportSizeBytes = raw.byteLength;
+		attempt.reportSha256 = sha256(raw);
+		if (report !== null) {
+			const runner = report.runner as JsonObject;
+			attempt.actualSurfaceOrder = runner.memorySurfaceOrder!;
+			attempt.runtimeControlIdentity = runner.runtimeControlIdentity!;
+		}
+		reportEntries.push({
+			sequence: index + 1,
+			attemptId: attempt.attemptId!,
+			filename,
+			sizeBytes: raw.byteLength,
+			sha256: sha256(raw),
+		});
+	}
+	const ledgerRaw = await writeSealedJson(ledgerPath, payloadWithoutSeal(ledger));
+	const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as JsonObject;
+	for (const field of [
+		"sealedAt",
+		"captureId",
+		"measurementGitSha",
+		"measurementTreeSha",
+		"closureDigest",
+		"worktreeFingerprint",
+		"runtimeControlIdentity",
+		"scheduleDigest",
+		"protocolDigest",
+	]) {
+		manifest[field] = ledger[field]!;
+	}
+	manifest.ledger = {
+		filename: "perf-corpus-attempt-ledger.json",
+		sizeBytes: ledgerRaw.byteLength,
+		sha256: sha256(ledgerRaw),
+	};
+	manifest.reports = reportEntries;
+	const manifestRaw = await writeSealedJson(manifestPath, payloadWithoutSeal(manifest));
+	sealedDigestsByDirectory.set(path.resolve(directory), {
+		attemptLedgerSha256: sha256(ledgerRaw),
+		rawManifestSha256: sha256(manifestRaw),
+	});
 }
 
 function authenticateTemplateBytes(templateBytes: Uint8Array): AuthenticatedLauncher {
@@ -230,12 +368,12 @@ function endpointSlope(periodicSamples: MemorySample[], key: "rssBytes" | "heapU
 }
 
 function baseline(
-	surface: string,
+	surface: MemorySurface,
 	profile: "short" | "soak",
 	iterationsTarget: number,
 	plan: SlopePlan,
 	ordinal: number,
-) {
+): MemoryBaselineMetric {
 	const initialHeap = 100_000_000;
 	const periodicSamples =
 		typeof plan === "number"
@@ -297,9 +435,9 @@ function reportFor(
 	schedule: ScheduledReport,
 	blockIndex: number,
 	slopeFor: (surface: string, blockIndex: number) => SlopePlan,
-) {
+): PerfCorpusReport {
 	const profileConfig = preregistration.cohort.profiles[schedule.profile];
-	const fixtures = schedule.surfaceOrder.map((surface, ordinal) => {
+	const fixtures: PerfCorpusReport["fixtures"] = schedule.surfaceOrder.map((surface, ordinal) => {
 		const memoryBaseline = baseline(
 			surface,
 			schedule.profile,
@@ -387,31 +525,131 @@ async function writeCorpus(
 	await fs.mkdir(directory, { recursive: true });
 	const invalidSet = new Set(invalidAttemptIds);
 	const admitted = { short: 0, soak: 0 };
-	const reports: Array<{ schedule: ScheduledReport; blockIndex: number }> = [];
+	const reports: Array<{ schedule: ScheduledReport; blockIndex: number; report: PerfCorpusReport }> = [];
 	for (const [blockIndex, attempt] of preregistration.captureControls.schedule.entries()) {
 		const profileConfig = preregistration.cohort.profiles[attempt.profile];
 		if (admitted[attempt.profile] >= profileConfig.requiredAdmittedBlocks) continue;
 		const invalid = invalidSet.has(attempt.attemptId);
 		const row = preregistration.captureControls.admissionRows[attempt.profile][admitted[attempt.profile]]!;
-		reports.push({
-			schedule: {
-				...attempt,
-				admissionNumber: admitted[attempt.profile] + 1,
-				slotId: row.slotId,
-				surfaceOrder: row.surfaceOrder,
-			},
-			blockIndex,
-		});
+		const schedule = {
+			...attempt,
+			admissionNumber: admitted[attempt.profile] + 1,
+			slotId: row.slotId,
+			surfaceOrder: row.surfaceOrder,
+		};
+		reports.push({ schedule, blockIndex, report: reportFor(schedule, blockIndex, slopeFor) });
 		if (!invalid) admitted[attempt.profile]++;
 	}
-	await Promise.all(
-		reports.map(async ({ schedule, blockIndex }) => {
-			await fs.writeFile(
-				path.join(directory, schedule.expectedFilename),
-				`${JSON.stringify(reportFor(schedule, blockIndex, slopeFor))}\n`,
-			);
-		}),
-	);
+	for (const { schedule, report } of reports) {
+		await fs.writeFile(path.join(directory, schedule.expectedFilename), `${JSON.stringify(report)}\n`);
+	}
+	const scheduleDigest = expectedScheduleDigest;
+	const protocolDigest = expectedProtocolDigest;
+	let cursorMs = Date.UTC(2026, 6, 27, 0, 0, 0);
+	const attempts: JsonObject[] = [];
+	for (const [index, { schedule, report }] of reports.entries()) {
+		const durationMs = Math.max(preregistration.cohort.profiles[schedule.profile].durationTargetMs, 1_000);
+		const startedAt = new Date(cursorMs).toISOString();
+		const endedAt = new Date(cursorMs + durationMs).toISOString();
+		const reportRaw = await fs.readFile(path.join(directory, schedule.expectedFilename));
+		attempts.push({
+			sequence: index + 1,
+			attemptId: schedule.attemptId,
+			attemptNumber: schedule.attemptNumber,
+			admissionSlotId: schedule.slotId,
+			profile: schedule.profile,
+			expectedSurfaceOrder: schedule.surfaceOrder,
+			actualSurfaceOrder: [...report.runner.memorySurfaceOrder],
+			startedAt,
+			endedAt,
+			cooldownAfterPreviousSeconds: index === 0 ? 0 : 60,
+			hostId,
+			platform: "darwin",
+			arch: "arm64",
+			powerSource: "AC",
+			powerMode: "performance",
+			sequential: true,
+			interrupted: false,
+			parentClosed: true,
+			childrenClosed: true,
+			reportFilename: schedule.expectedFilename,
+			reportSizeBytes: reportRaw.byteLength,
+			reportSha256: sha256(reportRaw),
+			measurementGitSha: gitSha,
+			measurementTreeSha: treeSha,
+			closureDigest: report.runner.closureDigest,
+			worktreeFingerprint: report.runner.worktreeFingerprint,
+			runtimeControlIdentity: report.runner.runtimeControlIdentity,
+			telemetryBefore: telemetry(startedAt),
+			telemetryAfter: telemetry(endedAt),
+		});
+		cursorMs += durationMs + 60_000;
+	}
+	const sealedAt = new Date(cursorMs).toISOString();
+	const ledgerPayload: JsonObject = {
+		schema: "gjc.perf-corpus-attempt-ledger/1",
+		version: 1,
+		complete: true,
+		sealedAt,
+		captureId,
+		measurementGitSha: gitSha,
+		measurementTreeSha: treeSha,
+		closureDigest: expectedClosureDigest,
+		worktreeFingerprint,
+		runtimeControlIdentity: captureRuntimeControlIdentity,
+		scheduleDigest,
+		protocolDigest,
+		host: {
+			hostId,
+			platform: "darwin",
+			arch: "arm64",
+			powerSource: "AC",
+			powerMode: "performance",
+		},
+		attempts,
+	};
+	const ledgerRaw = await writeSealedJson(path.join(directory, "perf-corpus-attempt-ledger.json"), ledgerPayload);
+	const manifestPayload: JsonObject = {
+		schema: "gjc.perf-corpus-raw-manifest/1",
+		version: 1,
+		complete: true,
+		sealedAt,
+		captureId,
+		measurementGitSha: gitSha,
+		measurementTreeSha: treeSha,
+		closureDigest: expectedClosureDigest,
+		worktreeFingerprint,
+		runtimeControlIdentity: captureRuntimeControlIdentity,
+		scheduleDigest,
+		protocolDigest,
+		ledger: {
+			filename: "perf-corpus-attempt-ledger.json",
+			sizeBytes: ledgerRaw.byteLength,
+			sha256: sha256(ledgerRaw),
+		},
+		reports: attempts.map(attempt => ({
+			sequence: attempt.sequence!,
+			attemptId: attempt.attemptId!,
+			filename: attempt.reportFilename!,
+			sizeBytes: attempt.reportSizeBytes!,
+			sha256: attempt.reportSha256!,
+		})),
+	};
+	const manifestRaw = await writeSealedJson(path.join(directory, "perf-corpus-raw-manifest.json"), manifestPayload);
+	sealedDigestsByDirectory.set(path.resolve(directory), {
+		attemptLedgerSha256: sha256(ledgerRaw),
+		rawManifestSha256: sha256(manifestRaw),
+	});
+}
+
+function telemetry(timestamp: string): JsonObject {
+	return {
+		timestamp,
+		thermalState: { availability: "supported", value: "nominal" },
+		memoryPressure: { availability: "supported", value: "normal" },
+		loadAverage1m: { availability: "supported", value: 1 },
+		freeMemoryBytes: { availability: "supported", value: 16 * 1024 * 1024 * 1024 },
+	};
 }
 
 async function mutateReport(
@@ -423,6 +661,28 @@ async function mutateReport(
 	const report = JSON.parse(await fs.readFile(target, "utf8")) as SyntheticReportMutationSurface;
 	mutate(report);
 	await fs.writeFile(target, `${JSON.stringify(report)}\n`);
+	await resealCorpus(directory);
+}
+
+async function mutateLedger(directory: string, mutate: (ledger: JsonObject) => void): Promise<void> {
+	const target = path.join(directory, "perf-corpus-attempt-ledger.json");
+	const ledger = JSON.parse(await fs.readFile(target, "utf8")) as JsonObject;
+	mutate(ledger);
+	await writeSealedJson(target, payloadWithoutSeal(ledger));
+	await resealCorpus(directory);
+}
+
+async function mutateManifest(directory: string, mutate: (manifest: JsonObject) => void): Promise<void> {
+	const target = path.join(directory, "perf-corpus-raw-manifest.json");
+	const manifest = JSON.parse(await fs.readFile(target, "utf8")) as JsonObject;
+	mutate(manifest);
+	const raw = await writeSealedJson(target, payloadWithoutSeal(manifest));
+	const current = sealedDigestsByDirectory.get(path.resolve(directory));
+	if (!current) throw new Error("sealed corpus digest fixture is missing");
+	sealedDigestsByDirectory.set(path.resolve(directory), {
+		attemptLedgerSha256: current.attemptLedgerSha256,
+		rawManifestSha256: sha256(raw),
+	});
 }
 
 function invoke(
@@ -436,9 +696,18 @@ function invoke(
 		pythonPath?: string;
 		readOnlyAttestation?: string;
 		expectedGitSha?: string;
+		expectedTreeSha?: string;
+		expectedClosureDigest?: string;
+		expectedWorktreeFingerprint?: string;
+		expectedRuntimeControlIdentity?: string;
+		expectedCaptureId?: string;
+		expectedScheduleDigest?: string;
+		expectedProtocolDigest?: string;
 	} = {},
 ) {
 	const launcher = authenticatedLauncher;
+	const sealedDigests = sealedDigestsByDirectory.get(path.resolve(inputDirectory));
+	if (!sealedDigests) throw new Error(`sealed digests are unavailable for ${inputDirectory}`);
 	chmodSync(inputDirectory, 0o555);
 	let result: Bun.SyncSubprocess<"pipe", "pipe">;
 	try {
@@ -462,9 +731,20 @@ function invoke(
 					GJC_PERF_CORPUS_INPUT_DIR: inputDirectory,
 					GJC_PERF_CORPUS_OUTPUT_DIR: outputDirectory,
 					GJC_PERF_CORPUS_EXPECTED_GIT_SHA: options.expectedGitSha ?? gitSha,
+					GJC_PERF_CORPUS_EXPECTED_TREE_SHA: options.expectedTreeSha ?? treeSha,
+					GJC_PERF_CORPUS_EXPECTED_CLOSURE_DIGEST: options.expectedClosureDigest ?? expectedClosureDigest,
+					GJC_PERF_CORPUS_EXPECTED_WORKTREE_FINGERPRINT:
+						options.expectedWorktreeFingerprint ?? worktreeFingerprint,
+					GJC_PERF_CORPUS_EXPECTED_RUNTIME_CONTROL_IDENTITY:
+						options.expectedRuntimeControlIdentity ?? captureRuntimeControlIdentity,
+					GJC_PERF_CORPUS_EXPECTED_CAPTURE_ID: options.expectedCaptureId ?? captureId,
+					GJC_PERF_CORPUS_EXPECTED_SCHEDULE_DIGEST: options.expectedScheduleDigest ?? expectedScheduleDigest,
+					GJC_PERF_CORPUS_EXPECTED_PROTOCOL_DIGEST: options.expectedProtocolDigest ?? expectedProtocolDigest,
 					GJC_PERF_CORPUS_TEMPLATE_SHA256: launcher.templateSha256,
 					GJC_PERF_CORPUS_DRIVER_SHA256: options.driverDigest ?? driverSha256,
 					GJC_PERF_CORPUS_PREREGISTRATION_SHA256: options.preregistrationDigest ?? preregistrationSha256,
+					GJC_PERF_CORPUS_ATTEMPT_LEDGER_SHA256: sealedDigests.attemptLedgerSha256,
+					GJC_PERF_CORPUS_RAW_MANIFEST_SHA256: sealedDigests.rawManifestSha256,
 					GJC_PERF_CORPUS_INPUT_MOUNT_READ_ONLY: options.readOnlyAttestation ?? launcher.immutableMountAttestation,
 				},
 			},
@@ -507,6 +787,14 @@ beforeAll(async () => {
 	driverSha256 = sha256(driverBytes);
 	preregistrationSha256 = sha256(preregistrationBytes);
 	preregistration = JSON.parse(preregistrationBytes.toString("utf8"));
+	expectedClosureDigest = sha256(`packages/coding-agent/bench/perf-corpus.bench.ts:${"a".repeat(64)}\n`);
+	expectedScheduleDigest = canonicalDigest(preregistration.captureControls.schedule);
+	const preregistrationRecord = preregistration as unknown as JsonObject;
+	expectedProtocolDigest = canonicalDigest(
+		Object.fromEntries(
+			preregistration.sealedInputContract.protocolDigestFields.map(field => [field, preregistrationRecord[field]]),
+		),
+	);
 	authenticatedLauncher = launcher;
 });
 
@@ -553,15 +841,39 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 
 		const replayReport = structuredClone(report);
 		replayReport.gitDirty = false;
-		await fs.mkdir(input);
+		replayReport.runner.bunExecutable = "/usr/local/bin/bun";
+		replayReport.runner.runtimeControlIdentity = memoryRuntimeControlIdentity(replayReport.runner);
+		await writeCorpus(input);
 		await fs.writeFile(path.join(input, "short-01.json"), `${JSON.stringify(replayReport)}\n`);
-		expect(invoke(input, output, { expectedGitSha: report.gitSha }).exitCode).toBe(3);
-		const result = await readResult(output);
-		expect(result.admission.short).toMatchObject({
-			attemptsObserved: 1,
-			admittedBlocks: 1,
-			invalidBlocks: 0,
+		for (const entry of await fs.readdir(input)) {
+			if (entry.endsWith(".json") && entry !== "short-01.json" && !entry.startsWith("perf-corpus-")) {
+				await fs.unlink(path.join(input, entry));
+			}
+		}
+		await mutateLedger(input, ledger => {
+			ledger.attempts = (ledger.attempts as JsonObject[]).filter(
+				attempt => attempt.reportFilename === "short-01.json",
+			);
+			ledger.measurementGitSha = report.gitSha;
+			ledger.closureDigest = report.runner.closureDigest;
+			ledger.worktreeFingerprint = report.runner.worktreeFingerprint;
+			for (const attempt of ledger.attempts as JsonObject[]) {
+				attempt.sequence = 1;
+				attempt.cooldownAfterPreviousSeconds = 0;
+				attempt.measurementGitSha = report.gitSha;
+				attempt.closureDigest = report.runner.closureDigest;
+				attempt.worktreeFingerprint = report.runner.worktreeFingerprint;
+			}
 		});
+		expect(
+			invoke(input, output, {
+				expectedGitSha: report.gitSha,
+				expectedClosureDigest: report.runner.closureDigest,
+				expectedWorktreeFingerprint: report.runner.worktreeFingerprint,
+			}).exitCode,
+		).toBe(3);
+		const result = await readResult(output);
+		expect(result.admission.short.admittedBlocks).toBeGreaterThanOrEqual(1);
 		expect(result.diagnostics.validationErrors.some(error => error.filename === "short-01.json")).toBe(false);
 	});
 
@@ -603,6 +915,14 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			bunExecutableSha256: "b".repeat(64),
 			worktreeFingerprint: "c".repeat(64),
 		});
+		const sealedDigests = sealedDigestsByDirectory.get(path.resolve(input));
+		expect(sealedDigests).toBeDefined();
+		expect(result.hashBindings).toMatchObject(sealedDigests!);
+		expect(result.hashBindings.orderedReportHashes).toHaveLength(29);
+		expect(result.admissionTraceability).toHaveLength(29);
+		expect(result.admissionTraceability.map(item => item.sha256)).toEqual(
+			result.hashBindings.orderedReportHashes.map(item => item.sha256),
+		);
 		expect(result.admission.short).toMatchObject({
 			admittedBlocks: 5,
 			invalidBlocks: 0,
@@ -620,6 +940,226 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			finiteUpperEndpointAvailable: false,
 			empiricalP95Emitted: false,
 		});
+	});
+
+	test("rejects reversed chronology, overlap, and cooldown below 60 seconds in the sealed ledger", async () => {
+		for (const [name, mutate] of [
+			[
+				"reversed-order",
+				(ledger: JsonObject) => {
+					ledger.attempts = [...(ledger.attempts as JsonObject[])].reverse();
+				},
+			],
+			[
+				"overlap",
+				(ledger: JsonObject) => {
+					const attempts = ledger.attempts as JsonObject[];
+					attempts[1]!.startedAt = attempts[0]!.startedAt!;
+					attempts[1]!.cooldownAfterPreviousSeconds = 0;
+				},
+			],
+			[
+				"short-cooldown",
+				(ledger: JsonObject) => {
+					const attempts = ledger.attempts as JsonObject[];
+					const priorEnd = Date.parse(attempts[0]!.endedAt as string);
+					const startedAt = new Date(priorEnd + 59_000).toISOString();
+					const endedAt = new Date(priorEnd + 60_000).toISOString();
+					attempts[1]!.startedAt = startedAt;
+					attempts[1]!.endedAt = endedAt;
+					attempts[1]!.cooldownAfterPreviousSeconds = 59;
+					attempts[1]!.telemetryBefore = telemetry(startedAt);
+					attempts[1]!.telemetryAfter = telemetry(endedAt);
+				},
+			],
+		] as const) {
+			const input = path.join(temporaryRoot, `sealed-${name}-input`);
+			const output = path.join(temporaryRoot, `sealed-${name}-output`);
+			await writeCorpus(input);
+			await mutateLedger(input, mutate);
+			expect(invoke(input, output).exitCode).toBe(3);
+			expect(validationCodes(await readResult(output))).toContain("SEALED_INPUT_INVALID");
+		}
+	});
+
+	test("rejects host, power, telemetry, interruption, and process-closure drift", async () => {
+		for (const [name, mutate] of [
+			["host", (ledger: JsonObject) => ((ledger.host as JsonObject).hostId = "2".repeat(64))],
+			["power", (ledger: JsonObject) => ((ledger.host as JsonObject).powerSource = "battery")],
+			[
+				"telemetry",
+				(ledger: JsonObject) => {
+					const attempt = (ledger.attempts as JsonObject[])[1]!;
+					const before = attempt.telemetryBefore as JsonObject;
+					(before.loadAverage1m as JsonObject).value = 3;
+				},
+			],
+			[
+				"thermal-critical",
+				(ledger: JsonObject) => {
+					const attempt = (ledger.attempts as JsonObject[])[0]!;
+					const before = attempt.telemetryBefore as JsonObject;
+					(before.thermalState as JsonObject).value = "critical";
+				},
+			],
+			[
+				"telemetry-unavailable",
+				(ledger: JsonObject) => {
+					const attempt = (ledger.attempts as JsonObject[])[0]!;
+					const before = attempt.telemetryBefore as JsonObject;
+					(before.memoryPressure as JsonObject).availability = "unavailable";
+					(before.memoryPressure as JsonObject).value = null;
+				},
+			],
+			["interruption", (ledger: JsonObject) => ((ledger.attempts as JsonObject[])[0]!.interrupted = true)],
+			["process-leak", (ledger: JsonObject) => ((ledger.attempts as JsonObject[])[0]!.childrenClosed = false)],
+		] as const) {
+			const input = path.join(temporaryRoot, `control-${name}-input`);
+			const output = path.join(temporaryRoot, `control-${name}-output`);
+			await writeCorpus(input);
+			await mutateLedger(input, mutate);
+			expect(invoke(input, output).exitCode).toBe(3);
+			expect(validationCodes(await readResult(output))).toContain("SEALED_INPUT_INVALID");
+		}
+	});
+
+	test("rejects raw report byte mismatch as a sealed-input failure and missing or extra manifest entries", async () => {
+		const reportInput = path.join(temporaryRoot, "report-binding-input");
+		const reportOutput = path.join(temporaryRoot, "report-binding-output");
+		await writeCorpus(reportInput);
+		await fs.appendFile(path.join(reportInput, "soak-01.json"), " ");
+		expect(invoke(reportInput, reportOutput).exitCode).toBe(3);
+		expect(validationCodes(await readResult(reportOutput))).toContain("SEALED_INPUT_INVALID");
+
+		for (const [name, mutate] of [
+			["missing", (manifest: JsonObject) => (manifest.reports as JsonObject[]).pop()],
+			[
+				"extra",
+				(manifest: JsonObject) =>
+					(manifest.reports as JsonObject[]).push({
+						sequence: 999,
+						attemptId: "soak-30",
+						filename: "soak-30.json",
+						sizeBytes: 1,
+						sha256: "0".repeat(64),
+					}),
+			],
+		] as const) {
+			const input = path.join(temporaryRoot, `manifest-${name}-input`);
+			const output = path.join(temporaryRoot, `manifest-${name}-output`);
+			await writeCorpus(input);
+			await mutateManifest(input, mutate);
+			expect(invoke(input, output).exitCode).toBe(3);
+			expect(validationCodes(await readResult(output))).toContain("SEALED_INPUT_INVALID");
+		}
+	});
+
+	test("does not let a valid frozen replacement mask an earlier sealed report byte mismatch", async () => {
+		const input = path.join(temporaryRoot, "tampered-replacement-input");
+		const output = path.join(temporaryRoot, "tampered-replacement-output");
+		await writeCorpus(input, () => 100_000, ["short-01"]);
+		await mutateReport(input, "short-01.json", report => {
+			report.gitDirty = true;
+		});
+		await fs.appendFile(path.join(input, "short-01.json"), " ");
+
+		expect(await pathExists(path.join(input, "short-02.json"))).toBe(true);
+		expect(invoke(input, output).exitCode).toBe(3);
+		const result = await readResult(output);
+		expect(result.diagnostics.validationErrors).toEqual([
+			expect.objectContaining({
+				code: "SEALED_INPUT_INVALID",
+				message: "short-01.json: report filename/size/SHA-256 binding mismatch",
+			}),
+		]);
+		expect(result.admission.short).toMatchObject({
+			attemptsObserved: 0,
+			admittedBlocks: 0,
+			invalidBlocks: 0,
+		});
+		expect(result.admissionTraceability).toEqual([]);
+	});
+
+	test("rejects authenticated M/tree/C/fingerprint/control binding drift", async () => {
+		for (const [name, options] of [
+			["measurement", { expectedGitSha: "a".repeat(40) }],
+			["tree", { expectedTreeSha: "a".repeat(40) }],
+			["closure", { expectedClosureDigest: "a".repeat(64) }],
+			["fingerprint", { expectedWorktreeFingerprint: "a".repeat(64) }],
+			["control", { expectedRuntimeControlIdentity: "a".repeat(64) }],
+		] as const) {
+			const input = path.join(temporaryRoot, `binding-${name}-input`);
+			const output = path.join(temporaryRoot, `binding-${name}-output`);
+			await writeCorpus(input);
+			expect(invoke(input, output, options).exitCode).toBe(3);
+			expect(validationCodes(await readResult(output))).toContain("SEALED_INPUT_INVALID");
+		}
+	});
+
+	test("rejects nested private/provider fields and authenticated preregistration policy drift", async () => {
+		const privateInput = path.join(temporaryRoot, "nested-private-input");
+		const privateOutput = path.join(temporaryRoot, "nested-private-output");
+		await writeCorpus(privateInput, () => 100_000, ["short-01"]);
+		await mutateReport(privateInput, "short-01.json", report => {
+			report.fixtures[0]!.privacy.providerPayload = "forbidden";
+		});
+		expect(invoke(privateInput, privateOutput).exitCode).toBe(0);
+		const privateResult = await readResult(privateOutput);
+		expect(privateResult.diagnostics.validationErrors).toContainEqual(
+			expect.objectContaining({ code: "PRIVACY_TAXONOMY_INVALID", filename: "short-01.json" }),
+		);
+
+		const policyInput = path.join(temporaryRoot, "policy-drift-input");
+		const policyOutput = path.join(temporaryRoot, "policy-drift-output");
+		const policyBundle = path.join(temporaryRoot, "policy-drift-bundle");
+		await writeCorpus(policyInput);
+		await fs.mkdir(policyBundle);
+		const policy = JSON.parse(await fs.readFile(preregistrationPath, "utf8")) as JsonObject;
+		const analysis = policy.analysis as JsonObject;
+		const actionFamily = analysis.actionFamily as JsonObject;
+		const bootstrap = actionFamily.bootstrap as JsonObject;
+		bootstrap.resamples = 9_999;
+		const policyBytes = `${JSON.stringify(policy, null, 2)}\n`;
+		await Promise.all([
+			fs.copyFile(driverPath, path.join(policyBundle, path.basename(driverPath))),
+			fs.writeFile(path.join(policyBundle, path.basename(preregistrationPath)), policyBytes),
+		]);
+		const policyInvocation = invoke(policyInput, policyOutput, {
+			bundleDir: policyBundle,
+			preregistrationDigest: sha256(policyBytes),
+		});
+		expect(policyInvocation.exitCode).not.toBe(0);
+		expect(policyInvocation.stderr).toContain("authenticated preregistration policy drift");
+		expect(await pathExists(policyOutput)).toBe(false);
+	});
+
+	test("rejects malformed nested hotspot and threshold-ledger containers", async () => {
+		const input = path.join(temporaryRoot, "nested-container-input");
+		const output = path.join(temporaryRoot, "nested-container-output");
+		await writeCorpus(input, () => 100_000, ["short-01", "short-02"]);
+		await mutateReport(input, "short-01.json", report => {
+			report.hotspotClassifications = [
+				{
+					hotspotId: "M01",
+					status: "covered-current",
+					evidenceClass: "rss-memory",
+					artifactRefs: [],
+					notes: "synthetic",
+					unexpected: true,
+				},
+			];
+		});
+		await mutateReport(input, "short-02.json", report => {
+			report.thresholdLedger = [{ name: "memory", advisoryOrEnforced: 1 }];
+		});
+		expect(invoke(input, output).exitCode).toBe(0);
+		const result = await readResult(output);
+		expect(result.diagnostics.validationErrors).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ filename: "short-01.json", code: "REPORT_VALIDATION_FAILED" }),
+				expect.objectContaining({ filename: "short-02.json", code: "REPORT_VALIDATION_FAILED" }),
+			]),
+		);
 	});
 
 	test("reuses each fixed admission slot after an invalid preallocated attempt", async () => {
@@ -674,15 +1214,13 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(result.evidenceStatus).toBe("INSUFFICIENT_EVIDENCE");
 		expect(result.actionDecision).toBe("NOT_EVALUATED");
 		expect(result.admission.soak).toMatchObject({
-			attemptsObserved: 23,
-			admittedBlocks: 23,
+			attemptsObserved: 0,
+			admittedBlocks: 0,
 			invalidBlocks: 0,
-			notEvaluatedBlocks: 1,
+			notEvaluatedBlocks: 24,
 			excludedBlocks: 0,
 		});
-		expect(result.diagnostics.validationErrors).toContainEqual(
-			expect.objectContaining({ code: "MISSING_SCHEDULED_BLOCK", filename: "soak-24.json" }),
-		);
+		expect(validationCodes(result)).toContain("SEALED_INPUT_INVALID");
 		expect(result.claimPolicy.p95).toMatchObject({
 			status: "OMITTED_IMPOSSIBLE",
 			finiteUpperEndpointAvailable: false,
@@ -738,27 +1276,32 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(result.diagnostics.validationErrors).toContainEqual(
 			expect.objectContaining({
 				code: "PROVENANCE_DRIFT",
-				message: expect.stringContaining("runner provenance drift across admitted reports: worktreeFingerprint"),
+				message: expect.stringContaining("report/ledger worktreeFingerprint binding mismatch"),
 			}),
 		);
 	});
 
 	test("enforces fixed JSON depth and per-file byte bounds", async () => {
-		const input = path.join(temporaryRoot, "json-bounds-input");
-		const output = path.join(temporaryRoot, "json-bounds-output");
-		await writeCorpus(input, () => 100_000, ["short-02", "short-03"]);
-		await mutateReport(input, "short-02.json", report => {
+		const depthInput = path.join(temporaryRoot, "json-depth-input");
+		const depthOutput = path.join(temporaryRoot, "json-depth-output");
+		await writeCorpus(depthInput, () => 100_000, ["short-02"]);
+		await mutateReport(depthInput, "short-02.json", report => {
 			let nested: JsonValue = "leaf";
 			for (let index = 0; index < 45; index++) nested = { nested };
 			report.depthProbe = nested;
 		});
-		await fs.writeFile(path.join(input, "short-03.json"), Buffer.alloc(8_388_609, 0x20));
-		expect(invoke(input, output).exitCode).toBe(0);
-		const result = await readResult(output);
-		expect(validationCodes(result)).toEqual(
-			expect.arrayContaining(["JSON_DEPTH_BOUND_EXCEEDED", "BYTE_BOUND_EXCEEDED"]),
-		);
-		expect(result.admission.short).toMatchObject({ admittedBlocks: 5, invalidBlocks: 2, notEvaluatedBlocks: 0 });
+		expect(invoke(depthInput, depthOutput).exitCode).toBe(0);
+		const depthResult = await readResult(depthOutput);
+		expect(validationCodes(depthResult)).toContain("JSON_DEPTH_BOUND_EXCEEDED");
+		expect(depthResult.admission.short).toMatchObject({ admittedBlocks: 5, invalidBlocks: 1, notEvaluatedBlocks: 0 });
+
+		const byteInput = path.join(temporaryRoot, "json-byte-input");
+		const byteOutput = path.join(temporaryRoot, "json-byte-output");
+		await writeCorpus(byteInput, () => 100_000, ["short-03"]);
+		await fs.writeFile(path.join(byteInput, "short-03.json"), Buffer.alloc(8_388_609, 0x20));
+		await resealCorpus(byteInput);
+		expect(invoke(byteInput, byteOutput).exitCode).toBe(3);
+		expect(validationCodes(await readResult(byteOutput))).toContain("SEALED_INPUT_INVALID");
 	});
 
 	test("rejects fixed sample-count and elapsed-duration bounds before estimator pair work", async () => {
@@ -1025,6 +1568,6 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		await fs.writeFile(path.join(input, "notes.txt"), "never interpret this content");
 		expect(invoke(input, output).exitCode).toBe(3);
 		const result = await readResult(output);
-		expect(validationCodes(result)).toEqual(expect.arrayContaining(["UNSAFE_INPUT_ENTRY", "UNEXPECTED_INPUT_ENTRY"]));
+		expect(validationCodes(result)).toContain("SEALED_INPUT_INVALID");
 	});
 });

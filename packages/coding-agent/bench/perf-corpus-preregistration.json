@@ -48,7 +48,7 @@
     ]
   },
   "bounds": {
-    "maximumInputFiles": 37,
+    "maximumInputFiles": 39,
     "maximumBytesPerFile": 8388608,
     "maximumTotalInputBytes": 134217728,
     "maximumJsonDepth": 40,
@@ -208,6 +208,159 @@
       { "attemptId": "soak-29", "profile": "soak", "attemptNumber": 29, "expectedFilename": "soak-29.json" },
       { "attemptId": "soak-30", "profile": "soak", "attemptNumber": 30, "expectedFilename": "soak-30.json" }
     ]
+  },
+  "sealedInputContract": {
+    "attemptLedgerFilename": "perf-corpus-attempt-ledger.json",
+    "attemptLedgerSchema": "gjc.perf-corpus-attempt-ledger/1",
+    "attemptLedgerVersion": 1,
+    "rawManifestFilename": "perf-corpus-raw-manifest.json",
+    "rawManifestSchema": "gjc.perf-corpus-raw-manifest/1",
+    "rawManifestVersion": 1,
+    "requiredExternalBindings": [
+      "expectedGitSha",
+      "expectedTreeSha",
+      "expectedClosureDigest",
+      "expectedWorktreeFingerprint",
+      "expectedRuntimeControlIdentity",
+      "expectedCaptureId",
+      "expectedScheduleDigest",
+      "expectedProtocolDigest",
+      "attemptLedgerSha256",
+      "rawManifestSha256"
+    ],
+    "maximumLedgerBytes": 1048576,
+    "maximumManifestBytes": 1048576,
+    "minimumCooldownSeconds": 60,
+    "sequentialNonOverlapRequired": true,
+    "requiredPowerSource": "AC",
+    "requiredPowerMode": "performance",
+    "telemetryAvailabilityValues": [
+      "supported",
+      "unavailable"
+    ],
+    "requiredTelemetryAvailability": "supported",
+    "allowedThermalStates": [
+      "nominal"
+    ],
+    "allowedMemoryPressureStates": [
+      "normal"
+    ],
+    "maximumLoadAverage1m": 4,
+    "maximumLoadAverage1mDrift": 1,
+    "minimumFreeMemoryBytes": 4294967296,
+    "maximumFreeMemoryBytes": 1099511627776,
+    "maximumFreeMemoryFractionDrift": 0.25,
+    "protocolDigestFields": [
+      "cohort",
+      "bounds",
+      "analysis",
+      "exclusions",
+      "captureControls",
+      "sealedInputContract",
+      "trustedCodePolicy"
+    ],
+    "ledgerFields": [
+      "schema",
+      "version",
+      "complete",
+      "sealedAt",
+      "captureId",
+      "measurementGitSha",
+      "measurementTreeSha",
+      "closureDigest",
+      "worktreeFingerprint",
+      "runtimeControlIdentity",
+      "scheduleDigest",
+      "protocolDigest",
+      "host",
+      "attempts",
+      "seal"
+    ],
+    "hostFields": [
+      "hostId",
+      "platform",
+      "arch",
+      "powerSource",
+      "powerMode"
+    ],
+    "attemptFields": [
+      "sequence",
+      "attemptId",
+      "attemptNumber",
+      "admissionSlotId",
+      "profile",
+      "expectedSurfaceOrder",
+      "actualSurfaceOrder",
+      "startedAt",
+      "endedAt",
+      "cooldownAfterPreviousSeconds",
+      "hostId",
+      "platform",
+      "arch",
+      "powerSource",
+      "powerMode",
+      "sequential",
+      "interrupted",
+      "parentClosed",
+      "childrenClosed",
+      "reportFilename",
+      "reportSizeBytes",
+      "reportSha256",
+      "measurementGitSha",
+      "measurementTreeSha",
+      "closureDigest",
+      "worktreeFingerprint",
+      "runtimeControlIdentity",
+      "telemetryBefore",
+      "telemetryAfter"
+    ],
+    "telemetryFields": [
+      "timestamp",
+      "thermalState",
+      "memoryPressure",
+      "loadAverage1m",
+      "freeMemoryBytes"
+    ],
+    "telemetryValueFields": [
+      "availability",
+      "value"
+    ],
+    "manifestFields": [
+      "schema",
+      "version",
+      "complete",
+      "sealedAt",
+      "captureId",
+      "measurementGitSha",
+      "measurementTreeSha",
+      "closureDigest",
+      "worktreeFingerprint",
+      "runtimeControlIdentity",
+      "scheduleDigest",
+      "protocolDigest",
+      "ledger",
+      "reports",
+      "seal"
+    ],
+    "manifestLedgerFields": [
+      "filename",
+      "sizeBytes",
+      "sha256"
+    ],
+    "manifestReportFields": [
+      "sequence",
+      "attemptId",
+      "filename",
+      "sizeBytes",
+      "sha256"
+    ],
+    "sealFields": [
+      "algorithm",
+      "digest"
+    ],
+    "sealAlgorithm": "sha256-canonical-json",
+    "completeRequired": true,
+    "privacy": "hostId and captureId are opaque lowercase SHA-256 values; usernames, private paths, environment values, provider payloads, transcripts, secrets, credentials, tokens, and private metadata are forbidden"
   },
   "trustedCodePolicy": {
     "artifactRole": "data-only",
