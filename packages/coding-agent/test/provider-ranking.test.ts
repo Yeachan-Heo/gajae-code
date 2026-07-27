@@ -112,6 +112,7 @@ describe("famous provider list", () => {
 			"xiaomi-token-plan-ams",
 			"xiaomi-token-plan-cn",
 			"opengateway",
+			"bizrouter",
 			"github-copilot",
 			"cursor",
 		];
