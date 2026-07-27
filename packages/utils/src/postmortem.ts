@@ -229,9 +229,15 @@ function redactCrashSecrets(text: string): string {
 	redacted = redacted.replace(/\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "«redacted-auth»");
 	redacted = redacted.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "«redacted-jwt»");
 	redacted = redacted.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");
+	// `gh[opsur]_` covers the classic PAT/OAuth/server/user/refresh prefixes;
+	// fine-grained PATs use an entirely different `github_pat_` prefix and would
+	// otherwise survive into a log the module keeps indefinitely.
 	redacted = redacted.replace(/\bgh[opsur]_[A-Za-z0-9]{16,}\b/g, "«redacted-github-token»");
+	redacted = redacted.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "«redacted-github-token»");
 	redacted = redacted.replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, "«redacted-slack-token»");
-	redacted = redacted.replace(/\bAKIA[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	// AKIA is the long-term access key id; ASIA is the temporary/STS one, which is
+	// the shape that actually shows up in a crashed request.
+	redacted = redacted.replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
 	redacted = redacted.replace(
 		/(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|secret[_-]?key|password|passwd|authorization)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
 		"$1«redacted»",
