@@ -1285,6 +1285,7 @@ describe("telegram daemon", () => {
 			ensureTelegramDaemonRunningDetailed(
 				{ settings: s, cwd, sessionId: "session" },
 				{
+					platform: "linux",
 					now: () => now,
 					pidAlive: pid => pid === 999,
 					pidIncarnation: () => "linux:100",
@@ -4809,6 +4810,7 @@ describe("telegram daemon", () => {
 			ensureTelegramDaemonRunningDetailed(
 				{ settings: s, cwd: agentDir, sessionId: "reconciled" },
 				{
+					platform: "linux",
 					pid: 4242,
 					now: () => now,
 					pidAlive: pid => (pid === 111 ? staleProbes++ === 0 : pid === 4243),
