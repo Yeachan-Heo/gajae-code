@@ -2901,7 +2901,13 @@ describe("telegram daemon", () => {
 		// Generation 30 adds capability-versioned tool activity; generation 31
 		// rolls out lifecycle cleanup; generation 32 adds sound-policy
 		// configuration and delivery without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(32);
+		expect(DAEMON_GENERATION).toBe(33);
+	});
+	test("keeps wire protocol 3 while generation 33 adds replay-safe multi-select state", () => {
+		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
+		// Generation 32 adds sound-policy configuration and delivery; generation
+		// 33 adds action-bound multi-select state without changing the wire protocol.
+		expect(DAEMON_GENERATION).toBe(33);
 	});
 	test.each([
 		"1",
