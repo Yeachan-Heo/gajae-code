@@ -516,6 +516,31 @@ describe("perf corpus schema + runner", () => {
 		expect(validatePerfCorpusReport(inconsistentSummary).errors).toContain(
 			`fixture ${fixture.fixtureId}: rssMemory.growthBytes does not match detailed samples`,
 		);
+		const firstSample = validBaseline.samples[0];
+		const oversizedSamples = Array.from({ length: 200_000 }, () => ({ ...firstSample }));
+		const oversizedPersistedReport = {
+			...report,
+			fixtures: report.fixtures.map((candidate, index) =>
+				index === fixtureIndex
+					? {
+							...candidate,
+							rssMemory: {
+								...candidate.rssMemory,
+								baselineBytes: firstSample.rssBytes,
+								peakBytes: firstSample.rssBytes,
+								growthBytes: 0,
+							},
+							memoryBaseline: {
+								...validBaseline,
+								samples: oversizedSamples,
+								rssSlopeBytesPerSecond: null,
+								heapSlopeBytesPerSecond: null,
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(oversizedPersistedReport)).toEqual({ ok: true, errors: [] });
 		const inconsistentThroughput = {
 			...report,
 			fixtures: report.fixtures.map((candidate, index) =>

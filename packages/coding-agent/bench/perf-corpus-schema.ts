@@ -527,7 +527,8 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			}
 			if (samplesAreValid && samples.length > 0 && postTeardownIsValid) {
 				const firstSample = samples[0];
-				const peakRssBytes = Math.max(...samples.map(sample => sample.rssBytes));
+				let peakRssBytes = firstSample.rssBytes;
+				for (const sample of samples) peakRssBytes = Math.max(peakRssBytes, sample.rssBytes);
 				const childGcExposed =
 					report.runner.memoryIsolation === "process-per-surface"
 						? report.runner.memoryChildGcExposed
