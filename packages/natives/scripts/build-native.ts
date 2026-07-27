@@ -250,12 +250,6 @@ const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
 console.log(`Building pi-natives for ${targetPlatform}-${targetArch}${variantSuffix}${profileSuffix}…`);
 
-await fs.mkdir(nativeDir, { recursive: true });
-await cleanupStaleTemps(nativeDir);
-await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
-const buildOutputDir = await fs.mkdtemp(buildOutputDirPrefix);
-napiArgs[10] = buildOutputDir;
-
 // Resolve napi bin directly: `bunx @napi-rs/cli` can pick up the wrong bin on
 // systems where `cli` exists on PATH (e.g. Mono's /usr/bin/cli on Ubuntu).
 const napiBin = Bun.which("napi", {
@@ -275,6 +269,12 @@ if (!cargoPathResolution) {
 	);
 }
 Bun.env.PATH = cargoPathResolution.pathValue;
+
+await fs.mkdir(nativeDir, { recursive: true });
+await cleanupStaleTemps(nativeDir);
+await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
+const buildOutputDir = await fs.mkdtemp(buildOutputDirPrefix);
+napiArgs[10] = buildOutputDir;
 
 try {
 	const buildResult = await $`${napiBin} ${napiArgs}`.nothrow();

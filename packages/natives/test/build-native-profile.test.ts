@@ -39,6 +39,16 @@ function parseTomlSections(source: string): Record<string, TomlSection> {
 	return sections;
 }
 
+async function listNativeBuildDirs(): Promise<string[]> {
+	const buildRoot = path.join(repoRoot, "packages/natives/native/.build");
+	try {
+		return (await fs.readdir(buildRoot)).sort();
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw err;
+	}
+}
+
 describe("native build Cargo profiles", () => {
 	it("defines an unwind-safe dist profile that only inherits size settings from release", async () => {
 		const cargoToml = await Bun.file(path.join(repoRoot, "Cargo.toml")).text();
@@ -116,6 +126,38 @@ exit 1
 				} else {
 					Bun.env.CARGO_HOME = previousCargoHome;
 				}
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+});
+
+describe("native build failure cleanup", () => {
+	it.skipIf(process.platform === "win32")(
+		"does not create a native .build directory when Cargo is unavailable",
+		async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-missing-cargo-"));
+			const before = await listNativeBuildDirs();
+
+			try {
+				const proc = Bun.spawn({
+					cmd: [process.execPath, path.join(repoRoot, "packages/natives/scripts/build-native.ts")],
+					cwd: repoRoot,
+					env: {
+						...process.env,
+						CARGO_HOME: path.join(tempDir, "cargo-home"),
+						HOME: path.join(tempDir, "home"),
+						PATH: "/usr/bin:/bin",
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+
+				const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+				expect(exitCode).not.toBe(0);
+				expect(stderr).toContain("Could not locate Cargo for native addon build");
+				expect(await listNativeBuildDirs()).toEqual(before);
+			} finally {
 				await fs.rm(tempDir, { recursive: true, force: true });
 			}
 		},
