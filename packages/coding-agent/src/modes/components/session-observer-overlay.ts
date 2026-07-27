@@ -1,10 +1,11 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import type { ToolResultMessage } from "@gajae-code/ai";
 import { matchesKey } from "@gajae-code/tui";
 import { formatDuration, formatNumber } from "@gajae-code/utils";
 import type { KeyId } from "../../config/keybindings";
 import { isSilentAbort } from "../../session/messages";
-import type { SessionMessageEntry } from "../../session/session-manager";
+import type { FileEntry, SessionMessageEntry } from "../../session/session-manager";
 import { parseSessionEntries } from "../../session/session-manager";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { theme } from "../theme/theme";
@@ -15,13 +16,26 @@ import {
 } from "./tool-transcript-format";
 import { type TranscriptViewerEntry, TranscriptViewerOverlay } from "./transcript-viewer-overlay";
 
+const FATAL_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+type FileIdentity = { dev: bigint; ino: bigint };
+type StableSnapshot = { identity: FileIdentity; size: number; prefix: Buffer; tail: Buffer };
+type ObserverCache = {
+	path: string;
+	identity: FileIdentity;
+	completeOffset: number;
+	prefixDigest: string;
+	entries: SessionMessageEntry[];
+	model?: string;
+};
+
 /** Session-observer adapter. The shared viewer owns navigation and fold state. */
 export class SessionObserverOverlayComponent extends TranscriptViewerOverlay {
 	#registry: SessionObserverRegistry;
 	#onDone: () => void;
 	#observeKeys: readonly KeyId[];
 	#selectedSessionId?: string;
-	#cache?: { path: string; bytesRead: number; entries: SessionMessageEntry[]; model?: string };
+	#cache?: ObserverCache;
 
 	constructor(registry: SessionObserverRegistry, onDone: () => void, observeKeys: KeyId[]) {
 		// The option closures run during the base constructor's initial refresh,
@@ -126,32 +140,81 @@ export class SessionObserverOverlayComponent extends TranscriptViewerOverlay {
 		return stats.length ? [theme.fg("dim", stats.join(theme.sep.dot))] : [];
 	}
 	#load(filePath: string): SessionMessageEntry[] {
-		if (this.#cache?.path !== filePath) this.#cache = undefined;
-		const fromByte = this.#cache?.bytesRead ?? 0;
-		const result = readFileIncremental(filePath, fromByte);
-		if (!result) return this.#cache?.entries ?? [];
-		if (result.newSize < fromByte) {
+		if (this.#cache && this.#cache.path !== filePath) {
 			this.#cache = undefined;
-			return this.#load(filePath);
+			this.resetSourceState();
 		}
-		if (!this.#cache) this.#cache = { path: filePath, bytesRead: 0, entries: [] };
-		if (result.text) {
-			const lastNewline = result.text.lastIndexOf("\n");
-			if (lastNewline >= 0) {
-				const complete = result.text.slice(0, lastNewline + 1);
-				for (const entry of parseSessionEntries(complete)) {
-					if (entry.type === "message") {
-						this.#cache.entries.push(entry);
-						if (!this.#cache.model && entry.message.role === "assistant") this.#cache.model = entry.message.model;
-					} else if (entry.type === "model_change") this.#cache.model = entry.model;
-				}
-				this.#cache.bytesRead = fromByte + Buffer.byteLength(complete, "utf-8");
+
+		const cache = this.#cache;
+		const snapshot = readStableSnapshot(filePath, cache?.completeOffset ?? 0);
+		if (!snapshot) {
+			// An unreadable source is never allowed to keep presenting a prior file as current.
+			if (cache) this.#clearSource();
+			return [];
+		}
+
+		const canAppend =
+			cache &&
+			sameIdentity(cache.identity, snapshot.identity) &&
+			snapshot.size >= cache.completeOffset &&
+			digest(snapshot.prefix) === cache.prefixDigest;
+		if (canAppend) return this.#appendStable(cache, snapshot);
+
+		// A changed fd identity, changed committed bytes, or a shrink is a replacement.
+		// Validate the entire candidate before it replaces the visible transcript.
+		const replacement = readStableSnapshot(filePath, 0);
+		if (!replacement) {
+			this.#clearSource();
+			return [];
+		}
+		const candidate = cacheEntries(filePath, replacement);
+		if (!candidate) {
+			this.#clearSource();
+			return [];
+		}
+		this.#cache = candidate;
+		if (cache) this.resetSourceState();
+		return candidate.entries;
+	}
+	#appendStable(cache: ObserverCache, snapshot: StableSnapshot): SessionMessageEntry[] {
+		const complete = completePrefix(snapshot.tail);
+		if (!complete) {
+			if (!isValidUtf8Prefix(snapshot.tail)) {
+				this.#clearSource();
+				return [];
 			}
+			return cache.entries;
 		}
-		return this.#cache.entries;
+		const remainder = snapshot.tail.subarray(complete.bytes.length);
+		if (!isValidUtf8Prefix(remainder)) {
+			this.#clearSource();
+			return [];
+		}
+		const parsed = parseCompleteEntries(complete.bytes);
+		if (!parsed) {
+			this.#clearSource();
+			return [];
+		}
+		const entries = [...cache.entries, ...parsed.entries];
+		this.#cache = {
+			...cache,
+			completeOffset: cache.completeOffset + complete.bytes.length,
+			prefixDigest: digest(Buffer.concat([snapshot.prefix, complete.bytes])),
+			entries,
+			model: parsed.model ?? cache.model,
+		};
+		return entries;
+	}
+	#clearSource(): void {
+		if (this.#cache) this.resetSourceState();
+		this.#cache = undefined;
 	}
 }
 
+/**
+ * This deliberately remains the eager full-history projection. PR2 owns projection
+ * virtualization/incrementalization; source acquisition above only controls snapshot safety.
+ */
 export function entriesFromMessages(entries: readonly SessionMessageEntry[]): TranscriptViewerEntry[] {
 	const results = new Map<string, ToolResultMessage>();
 	for (const entry of entries)
@@ -259,19 +322,111 @@ function truncateThinking(text: string, expanded: boolean): string {
 	return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
-function readFileIncremental(filePath: string, fromByte: number): { text: string; newSize: number } | null {
+function readStableSnapshot(filePath: string, completeOffset: number): StableSnapshot | null {
+	let fd: number | undefined;
 	try {
-		const stat = fs.statSync(filePath);
-		if (stat.size <= fromByte) return { text: "", newSize: stat.size };
-		const buffer = Buffer.alloc(stat.size - fromByte);
-		const fd = fs.openSync(filePath, "r");
-		try {
-			fs.readSync(fd, buffer, 0, buffer.length, fromByte);
-		} finally {
-			fs.closeSync(fd);
-		}
-		return { text: buffer.toString("utf-8"), newSize: stat.size };
+		fd = fs.openSync(filePath, "r");
+		const before = fs.fstatSync(fd, { bigint: true });
+		if (before.size > BigInt(Number.MAX_SAFE_INTEGER) || completeOffset > Number(before.size)) return null;
+		const size = Number(before.size);
+		const prefix = readExactly(fd, 0, completeOffset);
+		const tail = readExactly(fd, completeOffset, size - completeOffset);
+		const after = fs.fstatSync(fd, { bigint: true });
+		if (
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeNs !== after.mtimeNs ||
+			before.ctimeNs !== after.ctimeNs
+		)
+			return null;
+		return { identity: { dev: before.dev, ino: before.ino }, size, prefix, tail };
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
+function readExactly(fd: number, position: number, length: number): Buffer {
+	const buffer = Buffer.alloc(length);
+	let offset = 0;
+	while (offset < length) {
+		const bytesRead = fs.readSync(fd, buffer, offset, length - offset, position + offset);
+		if (bytesRead === 0) throw new Error("Short session file read");
+		offset += bytesRead;
+	}
+	return buffer;
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function digest(bytes: Buffer): string {
+	return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+function completePrefix(bytes: Buffer): { bytes: Buffer } | undefined {
+	const newline = bytes.lastIndexOf(0x0a);
+	return newline < 0 ? undefined : { bytes: bytes.subarray(0, newline + 1) };
+}
+
+function parseCompleteEntries(bytes: Buffer): { entries: SessionMessageEntry[]; model?: string } | null {
+	try {
+		const text = FATAL_UTF8_DECODER.decode(bytes);
+		for (const line of text.split("\n")) if (line.trim()) JSON.parse(line);
+		const parsed = parseSessionEntries(text);
+		return {
+			entries: parsed.filter((entry): entry is SessionMessageEntry => entry.type === "message"),
+			model: modelFromEntries(parsed),
+		};
 	} catch {
 		return null;
 	}
+}
+
+function modelFromEntries(entries: readonly FileEntry[]): string | undefined {
+	let model: string | undefined;
+	for (const entry of entries) {
+		if (entry.type === "model_change") model = entry.model;
+		else if (entry.type === "message" && entry.message.role === "assistant" && entry.message.model)
+			model = entry.message.model;
+	}
+	return model;
+}
+
+function isValidUtf8Prefix(bytes: Buffer): boolean {
+	try {
+		new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: true });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function cacheEntries(filePath: string, snapshot: StableSnapshot): ObserverCache | null {
+	const complete = completePrefix(snapshot.tail);
+	if (!complete) {
+		if (!isValidUtf8Prefix(snapshot.tail)) return null;
+		return {
+			path: filePath,
+			identity: snapshot.identity,
+			completeOffset: 0,
+			prefixDigest: digest(Buffer.alloc(0)),
+			entries: [],
+		};
+	}
+	const remainder = snapshot.tail.subarray(complete.bytes.length);
+	if (!isValidUtf8Prefix(remainder)) return null;
+	const parsed = parseCompleteEntries(complete.bytes);
+	if (!parsed) return null;
+	return {
+		path: filePath,
+		identity: snapshot.identity,
+		completeOffset: complete.bytes.length,
+		prefixDigest: digest(complete.bytes),
+		entries: parsed.entries,
+		model: parsed.model,
+	};
 }
