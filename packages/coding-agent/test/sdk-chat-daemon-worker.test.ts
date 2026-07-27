@@ -780,6 +780,12 @@ describe("chat daemon worker", () => {
 		await waitForConversation(conversation => conversation?.pendingActionId === undefined);
 		await restartedRuntime.stop();
 	});
+	// Wider timeout than bun:test's 5000ms default: this exercises a full
+	// durable SessionIndex + ChatDaemonRuntime lifecycle with three concurrent
+	// request waiters and occasionally exceeds 5s under CI shard contention
+	// (observed timeout in dev CI run 30291963270, shard 2); reproduced
+	// deterministically passing in 1.3-6.4s locally with no polling/race in
+	// the waiter mechanism, so this raises budget rather than masking a hang.
 	it("replays Slack control, query, and global commands with their durable receipt keys", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-command-keys-"));
 		const agentDir = path.join(root, "agent");
@@ -928,7 +934,7 @@ describe("chat daemon worker", () => {
 		expect(client.requests).toHaveLength(requestsBeforeProhibited);
 		expect(broker.requests).toHaveLength(1);
 		await runtime.stop();
-	});
+	}, 20000);
 	it("retains a sent control prompt as ambiguous when its SDK response is lost", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-command-response-loss-"));
 		const agentDir = path.join(root, "agent");

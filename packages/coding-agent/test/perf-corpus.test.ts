@@ -32,6 +32,11 @@ import {
 	validatePerfThresholdLedger,
 } from "../bench/perf-threshold.ledger";
 
+// Mirrors resolveGitProvenance()'s repository-root resolution so precondition
+// checks below never depend on the ambient process cwd (CI shard tasks run
+// `bun test` with cwd pinned to a package subdirectory, not the repo root).
+const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+
 const memoryControlKeys = ["GJC_MEMORY_PROFILE", "GJC_MEMORY_ITERATIONS", "GJC_MEMORY_DURATION_MS"] as const;
 let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
 
@@ -85,8 +90,10 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 	test("prefers checked-out HEAD over workflow SHA provenance", () => {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+		if (revision.exitCode !== 0) {
+			throw new Error(`git revision unavailable: ${new TextDecoder().decode(revision.stderr)}`);
+		}
 		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
 		const previousGitSha = process.env.GITHUB_SHA;
 		process.env.GITHUB_SHA = "b".repeat(40);
@@ -116,8 +123,10 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 	test("resolves provenance from the benchmark checkout instead of the caller cwd", () => {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+		if (revision.exitCode !== 0) {
+			throw new Error(`git revision unavailable: ${new TextDecoder().decode(revision.stderr)}`);
+		}
 		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
 		const previousCwd = process.cwd();
 		try {
