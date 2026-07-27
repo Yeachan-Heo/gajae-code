@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Native addon builds now prepend the active `rustup` toolchain's Cargo directory before invoking `napi`, so non-interactive shells without `~/.cargo/bin` on `PATH` no longer fail with opaque `cargo metadata failed to run` errors.
 
 ## [0.11.11] - 2026-07-26
 ### Added
