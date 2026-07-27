@@ -13,6 +13,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -1031,6 +1032,10 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	#replaceGlobalWithDurable(current: RawSettings): void {
+		const previous = new Map<SettingPath, unknown>();
+		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			previous.set(settingPath, structuredClone(this.get(settingPath)));
+		}
 		this.#global = current;
 		for (const patch of this.#pendingPatchesInGenerationOrder()) {
 			applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
@@ -1040,6 +1045,14 @@ export class Settings implements NotificationSettingsReader {
 		}
 		this.#rebuildMerged();
 		this.#recomputeNotificationValidationFromRaw();
+		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			const previousValue = previous.get(settingPath);
+			const nextValue = this.get(settingPath);
+			if (isDeepStrictEqual(previousValue, nextValue)) continue;
+			const hook = SETTING_HOOKS[settingPath];
+			if (hook) hook(nextValue, previousValue);
+			for (const listener of this.#changeListeners) listener(settingPath);
+		}
 	}
 	/**
 	 * Set an agent model override while keeping any live runtime override aligned.

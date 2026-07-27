@@ -4,7 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { getCustomThemesDir, getProjectAgentDir, logger, Snowflake } from "@gajae-code/utils";
+import {
+	getCustomThemesDir,
+	getDefaultTabWidth,
+	getProjectAgentDir,
+	logger,
+	Snowflake,
+	setDefaultTabWidth,
+} from "@gajae-code/utils";
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
@@ -654,6 +661,25 @@ describe("Settings", () => {
 			await settings.flushOrThrow();
 			expect(await readSettings()).toMatchObject({ notifications: { redact: true } });
 		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("publishes repaired durable setting changes through hooks and listeners", async () => {
+		await Bun.write(getConfigPath(), "display: [");
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		const changedPaths: string[] = [];
+		const unsubscribe = settings.onChanged(settingPath => changedPaths.push(settingPath));
+		try {
+			setDefaultTabWidth(3);
+			await Bun.write(getConfigPath(), "display:\n  tabWidth: 7\n");
+			await settings.flush();
+
+			expect(settings.get("display.tabWidth")).toBe(7);
+			expect(getDefaultTabWidth()).toBe(7);
+			expect(changedPaths).toEqual(["display.tabWidth"]);
+		} finally {
+			unsubscribe();
+			setDefaultTabWidth(4);
 			settings.getStorage()?.close();
 		}
 	});

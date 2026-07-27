@@ -1226,19 +1226,18 @@ export class SelectorController {
 			const selector = new ThinkingSelectorComponent(
 				this.ctx.session.thinkingLevel,
 				availableLevels,
-				selection => {
-					if (selection.persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
-						this.ctx.showError(
-							"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
-						);
+				async selection => {
+					const { level, persistDefault } = selection;
+					const configuredDefault = this.ctx.settings.get("defaultThinkingLevel");
+					const levelToApply = level === ThinkingLevel.Inherit ? configuredDefault : level;
+					try {
+						await this.ctx.session.setThinkingLevelForControl(level, persistDefault);
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
 						return;
 					}
 					done();
 
-					const { level, persistDefault } = selection;
-					const configuredDefault = this.ctx.settings.get("defaultThinkingLevel");
-					const levelToApply = level === ThinkingLevel.Inherit ? configuredDefault : level;
-					this.ctx.session.setThinkingLevel(levelToApply, persistDefault);
 					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
 					const requestedLabel =
 						level === ThinkingLevel.Inherit ? `${level} (configured default: ${configuredDefault})` : level;

@@ -10388,6 +10388,13 @@ export class AgentSession {
 			}
 			throw new Error("Unable to persist reasoning settings.");
 		}
+		if (
+			mutationRevision === this.#thinkingVisibilityMutationRevision &&
+			this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision
+		) {
+			this.setThinkingVisibility(visibility);
+			return;
+		}
 
 		if (
 			mutationRevision !== this.#thinkingVisibilityMutationRevision ||

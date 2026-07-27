@@ -81,7 +81,7 @@ describe("ThinkingSelectorComponent", () => {
 });
 
 describe("SelectorController effort selector", () => {
-	it("applies inherit through the configured default and refreshes chrome", () => {
+	it("applies inherit through the configured default and refreshes chrome", async () => {
 		const editorContainer = {
 			children: [] as unknown[],
 			clear() {
@@ -97,9 +97,9 @@ describe("SelectorController effort selector", () => {
 		const session = {
 			thinkingLevel: ThinkingLevel.Inherit as ThinkingLevel | undefined,
 			getAvailableThinkingLevels: () => [ThinkingLevel.Low, ThinkingLevel.High],
-			setThinkingLevel(level: ThinkingLevel | undefined, persist?: boolean) {
+			async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean) {
 				thinkingLevelCalls.push({ level, persist });
-				this.thinkingLevel = level;
+				this.thinkingLevel = level === ThinkingLevel.Inherit ? settings.get("defaultThinkingLevel") : level;
 			},
 		};
 		const ctx = {
@@ -130,8 +130,9 @@ describe("SelectorController effort selector", () => {
 		expect(thinkingLevelCalls).toEqual([]);
 
 		selector.handleInput("\n");
+		await Bun.sleep(0);
 
-		expect(thinkingLevelCalls).toEqual([{ level: ThinkingLevel.High, persist: false }]);
+		expect(thinkingLevelCalls).toEqual([{ level: ThinkingLevel.Inherit, persist: false }]);
 		expect(statuses[0]).toContain("configured default: high");
 		expect(statuses[0]).toContain("Effective effort: high");
 		expect(ctx.statusLine.invalidate).toHaveBeenCalled();
@@ -141,7 +142,7 @@ describe("SelectorController effort selector", () => {
 		expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);
 	});
 
-	it("can persist the selected effort as the default", () => {
+	it("can persist the selected effort as the default", async () => {
 		const editorContainer = {
 			children: [] as unknown[],
 			clear() {
@@ -157,7 +158,7 @@ describe("SelectorController effort selector", () => {
 		const session = {
 			thinkingLevel: ThinkingLevel.Off as ThinkingLevel | undefined,
 			getAvailableThinkingLevels: () => [ThinkingLevel.Low, ThinkingLevel.High],
-			setThinkingLevel(level: ThinkingLevel | undefined, persist?: boolean) {
+			async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean) {
 				thinkingLevelCalls.push({ level, persist });
 				this.thinkingLevel = level;
 			},
@@ -190,6 +191,7 @@ describe("SelectorController effort selector", () => {
 		selector.handleInput("\n");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
+		await Bun.sleep(0);
 
 		expect(thinkingLevelCalls).toEqual([{ level: ThinkingLevel.Low, persist: true }]);
 		expect(notifyConfigChanged).toHaveBeenCalled();
@@ -210,7 +212,7 @@ describe("SelectorController effort selector", () => {
 		const session = {
 			thinkingLevel: ThinkingLevel.Off as ThinkingLevel | undefined,
 			getAvailableThinkingLevels: () => [ThinkingLevel.Low],
-			setThinkingLevel: vi.fn(),
+			setThinkingLevelForControl: vi.fn(),
 		};
 		const ctx = {
 			editorContainer,
@@ -232,12 +234,12 @@ describe("SelectorController effort selector", () => {
 		}
 		selector.handleInput("\x1b");
 
-		expect(session.setThinkingLevel).not.toHaveBeenCalled();
+		expect(session.setThinkingLevelForControl).not.toHaveBeenCalled();
 		expect(ctx.ui.requestRender).toHaveBeenCalled();
 		expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);
 	});
 
-	it("rejects persisted effort changes before mutating live session state during recovery", () => {
+	it("surfaces atomic persisted effort failures without reporting success", async () => {
 		const editorContainer = {
 			children: [] as unknown[],
 			clear() {
@@ -248,11 +250,13 @@ describe("SelectorController effort selector", () => {
 			},
 		};
 		const settings = Settings.isolated({ defaultThinkingLevel: ThinkingLevel.High });
-		const canWrite = vi.spyOn(settings, "canWriteDurableConfig").mockReturnValue(false);
+		const atomicFailure = new Error("Repair config.yml before changing reasoning settings.");
 		const session = {
 			thinkingLevel: ThinkingLevel.Off as ThinkingLevel | undefined,
 			getAvailableThinkingLevels: () => [ThinkingLevel.Low],
-			setThinkingLevel: vi.fn(),
+			setThinkingLevelForControl: vi.fn(async () => {
+				throw atomicFailure;
+			}),
 		};
 		const showError = vi.fn();
 		const ctx = {
@@ -279,14 +283,14 @@ describe("SelectorController effort selector", () => {
 			selector.handleInput("\n");
 			selector.handleInput("\x1b[B");
 			selector.handleInput("\n");
+			await Bun.sleep(0);
 
-			expect(session.setThinkingLevel).not.toHaveBeenCalled();
-			expect(showError).toHaveBeenCalledWith(
-				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
-			);
+			expect(session.setThinkingLevelForControl).toHaveBeenCalledWith(ThinkingLevel.Low, true);
+			expect(showError).toHaveBeenCalledWith(atomicFailure.message);
+			expect(ctx.showStatus).not.toHaveBeenCalled();
 			expect(editorContainer.children[0]).toBe(selector);
 		} finally {
-			canWrite.mockRestore();
+			settings.getStorage()?.close();
 		}
 	});
 });
