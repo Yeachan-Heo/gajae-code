@@ -16,6 +16,7 @@ import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
 import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
 	calculateMemorySlope,
+	isExactMemorySurfaceOrder,
 	type MemoryUsageSample,
 	type MemoryObservedExtrema,
 	type MemoryWorkloadProfile,
@@ -138,10 +139,12 @@ function reproductionInvocation(
 	profile: MemoryWorkloadProfile,
 	durationTargetMs: number,
 	iterationsTarget: number,
+	memorySurfaceOrder: readonly MemorySurface[],
 ): { command: string; argv: string[]; environment: Record<string, string> } {
 	const environment: Record<string, string> = {
 		GJC_MEMORY_PROFILE: profile,
 		GJC_MEMORY_ITERATIONS: String(iterationsTarget),
+		GJC_MEMORY_SURFACE_ORDER: memorySurfaceOrder.join(","),
 	};
 	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
 	const argv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
@@ -384,6 +387,18 @@ function buildMemoryFixtures(
 function isMemorySurface(value: string | undefined): value is MemorySurface {
 	return value !== undefined && (REQUIRED_MEMORY_SURFACES as readonly string[]).includes(value);
 }
+function resolveMemorySurfaceOrder(isolatedMemory: boolean): MemorySurface[] {
+	if (!isolatedMemory) return [...REQUIRED_MEMORY_SURFACES];
+	const configured = process.env.GJC_MEMORY_SURFACE_ORDER;
+	if (configured === undefined) return [...REQUIRED_MEMORY_SURFACES];
+	const order = configured.split(",");
+	if (!isExactMemorySurfaceOrder(order)) {
+		throw new Error(
+			`GJC_MEMORY_SURFACE_ORDER must be an exact comma-separated permutation of: ${REQUIRED_MEMORY_SURFACES.join(",")}`,
+		);
+	}
+	return order;
+}
 
 function isolatedMemoryEntry(surface: MemorySurface): string {
 	if (surface === "agent-session") {
@@ -398,8 +413,9 @@ function isolatedMemoryEntry(surface: MemorySurface): string {
 function buildIsolatedMemoryFixtures(
 	profile: MemoryWorkloadProfile,
 	targetDurationMs: number,
+	memorySurfaceOrder: readonly MemorySurface[],
 ): PerfCorpusFixtureResult[] {
-	return REQUIRED_MEMORY_SURFACES.map(surface => {
+	return memorySurfaceOrder.map(surface => {
 		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface), MEMORY_CHILD_ARGUMENT], {
 			env: {
 				...process.env,
@@ -484,13 +500,14 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 				: 1_000
 			: 0;
 	const iterationsTarget = workloadIterations(profile);
+	const memorySurfaceOrder = resolveMemorySurfaceOrder(options.isolatedMemory === true);
 	const initialGit = resolveGitProvenance();
 	const fixtures: PerfCorpusFixtureResult[] = [
 		buildFixture("startup-load", "startup-session-load", ["startup", "session-load"], startupWorkload, 0x51ed),
 		buildFixture("streaming-ttft", "streaming-ttft", ["streaming", "ttft"], streamingWorkload, 0x9e37),
 		buildFixture("large-transcript", "large-transcript", ["transcript", "scroll"], largeTranscriptWorkload, 0xc0de),
 		...(options.isolatedMemory
-			? buildIsolatedMemoryFixtures(profile, durationTargetMs)
+			? buildIsolatedMemoryFixtures(profile, durationTargetMs, memorySurfaceOrder)
 			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
 	const finalGit = resolveGitProvenance();
@@ -502,7 +519,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 		throw new Error("benchmark checkout provenance changed while workloads were running");
 	}
 	const git = initialGit;
-	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget);
+	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
 		generatedAt: new Date().toISOString(),
@@ -519,6 +536,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			profile,
 			durationTargetMs,
 			memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
+			memorySurfaceOrder,
 			iterationsTarget,
 			gcExposed: typeof globalThis.gc === "function",
 			memoryChildGcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",

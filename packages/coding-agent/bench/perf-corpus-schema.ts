@@ -190,6 +190,7 @@ export interface PerfCorpusReport {
 		profile: MemoryWorkloadProfile;
 		durationTargetMs?: number;
 		memoryIsolation: "in-process" | "process-per-surface";
+		memorySurfaceOrder: MemorySurface[];
 		iterationsTarget: number;
 		gcExposed: boolean;
 		memoryChildGcExposed: boolean;
@@ -215,6 +216,18 @@ export const REQUIRED_MEMORY_SURFACES: readonly MemorySurface[] = [
 const MEMORY_WORKLOAD_PROFILES: readonly MemoryWorkloadProfile[] = ["short", "soak"];
 const PROCESS_TREE_SAMPLERS: readonly MemoryBaselineMetric["processTreeSampler"][] = ["ps", "unavailable"];
 const MEMORY_ISOLATION_MODES: readonly PerfCorpusReport["runner"]["memoryIsolation"][] = ["in-process", "process-per-surface"];
+export function isExactMemorySurfaceOrder(value: unknown): value is MemorySurface[] {
+	return (
+		Array.isArray(value) &&
+		value.length === REQUIRED_MEMORY_SURFACES.length &&
+		value.every(
+			surface =>
+				typeof surface === "string" && (REQUIRED_MEMORY_SURFACES as readonly string[]).includes(surface),
+		) &&
+		new Set(value).size === REQUIRED_MEMORY_SURFACES.length
+	);
+}
+
 const MEMORY_EXTREMUM_DOMAINS: readonly MemoryExtremumDomain[] = [
 	"rssBytes",
 	"heapUsedBytes",
@@ -366,6 +379,10 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	if (!(MEMORY_ISOLATION_MODES as readonly string[]).includes(report.runner.memoryIsolation)) {
 		errors.push("runner.memoryIsolation invalid");
 	}
+	const memorySurfaceOrderValid = isExactMemorySurfaceOrder(report.runner.memorySurfaceOrder);
+	if (!memorySurfaceOrderValid) {
+		errors.push("runner.memorySurfaceOrder must be an exact permutation of required memory surfaces");
+	}
 	if (!(MEMORY_WORKLOAD_PROFILES as readonly string[]).includes(report.runner.profile)) {
 		errors.push("runner.profile invalid");
 	}
@@ -391,7 +408,9 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		report.runner.environment.GJC_MEMORY_ITERATIONS !== String(report.runner.iterationsTarget) ||
 		(report.runner.profile === "soak"
 			? report.runner.environment.GJC_MEMORY_DURATION_MS !== String(report.runner.durationTargetMs)
-			: report.runner.environment.GJC_MEMORY_DURATION_MS !== undefined)
+			: report.runner.environment.GJC_MEMORY_DURATION_MS !== undefined) ||
+		(memorySurfaceOrderValid &&
+			report.runner.environment.GJC_MEMORY_SURFACE_ORDER !== report.runner.memorySurfaceOrder.join(","))
 	) {
 		errors.push("runner.environment does not match memory controls");
 	}
@@ -752,11 +771,20 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			}
 		}
 	}
-	const measuredSurfaces = new Set(
-		report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline.surface] : [])),
+	const measuredSurfaceOrder = report.fixtures.flatMap(fixture =>
+		fixture.memoryBaseline ? [fixture.memoryBaseline.surface] : [],
 	);
+	const measuredSurfaces = new Set(measuredSurfaceOrder);
 	for (const surface of REQUIRED_MEMORY_SURFACES) {
 		if (!measuredSurfaces.has(surface)) errors.push(`memory baseline missing required surface "${surface}"`);
+	}
+	if (
+		report.runner.memoryIsolation === "process-per-surface" &&
+		memorySurfaceOrderValid &&
+		(measuredSurfaceOrder.length !== report.runner.memorySurfaceOrder.length ||
+			measuredSurfaceOrder.some((surface, index) => surface !== report.runner.memorySurfaceOrder[index]))
+	) {
+		errors.push("memory baseline order must match runner.memorySurfaceOrder for process-per-surface");
 	}
 	for (const classification of report.hotspotClassifications) {
 		errors.push(...validateHotspotClassification(classification));

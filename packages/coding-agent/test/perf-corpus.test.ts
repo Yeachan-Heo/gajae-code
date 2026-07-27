@@ -32,7 +32,12 @@ import {
 	validatePerfThresholdLedger,
 } from "../bench/perf-threshold.ledger";
 
-const memoryControlKeys = ["GJC_MEMORY_PROFILE", "GJC_MEMORY_ITERATIONS", "GJC_MEMORY_DURATION_MS"] as const;
+const memoryControlKeys = [
+	"GJC_MEMORY_PROFILE",
+	"GJC_MEMORY_ITERATIONS",
+	"GJC_MEMORY_DURATION_MS",
+	"GJC_MEMORY_SURFACE_ORDER",
+] as const;
 let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
 
 beforeEach(() => {
@@ -58,10 +63,12 @@ describe("perf corpus schema + runner", () => {
 		expect(report.runner.environment).toEqual({
 			GJC_MEMORY_PROFILE: "short",
 			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
+			GJC_MEMORY_SURFACE_ORDER: REQUIRED_MEMORY_SURFACES.join(","),
 		});
 		expect(report.runner.iterationsTarget).toBeGreaterThan(0);
 		expect(typeof report.runner.gcExposed).toBe("boolean");
 		expect(report.runner.memoryChildExecArgv).toEqual([]);
+		expect(report.runner.memorySurfaceOrder).toEqual([...REQUIRED_MEMORY_SURFACES]);
 		expect(typeof report.gitDirty).toBe("boolean");
 		const classes = new Set(report.fixtures.map(f => f.fixtureClass));
 		for (const required of REQUIRED_FIXTURE_CLASSES) {
@@ -165,6 +172,7 @@ describe("perf corpus schema + runner", () => {
 		expect(new Set(baselines.map(baseline => baseline.surface))).toEqual(new Set(REQUIRED_MEMORY_SURFACES));
 		expect(report.runner.profile).toBe("short");
 		expect(report.runner.memoryIsolation).toBe("in-process");
+		expect(report.runner.memorySurfaceOrder).toEqual([...REQUIRED_MEMORY_SURFACES]);
 		for (const baseline of baselines) {
 			expect(baseline.periodicSamples.length).toBeGreaterThanOrEqual(2);
 			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(
@@ -215,22 +223,65 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 
-	test("isolates each memory surface in a fresh Bun process", () => {
+	test("uses the canonical memory surface order for isolated runs without an explicit order", () => {
+		expect(process.env.GJC_MEMORY_SURFACE_ORDER).toBeUndefined();
+		const report = runPerfCorpusBenchmark({ isolatedMemory: true });
+		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
+		expect(baselines.map(baseline => baseline.surface)).toEqual([...REQUIRED_MEMORY_SURFACES]);
+		expect(report.runner.memorySurfaceOrder).toEqual([...REQUIRED_MEMORY_SURFACES]);
+		expect(report.runner.environment.GJC_MEMORY_SURFACE_ORDER).toBe(REQUIRED_MEMORY_SURFACES.join(","));
+	}, 15_000);
+
+	test("isolates each memory surface in a fresh Bun process using the preregistered order", () => {
+		const customOrder = [...REQUIRED_MEMORY_SURFACES].reverse();
+		process.env.GJC_MEMORY_SURFACE_ORDER = customOrder.join(",");
 		const report = runPerfCorpusBenchmark({ isolatedMemory: true });
 		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
 		expect(baselines).toHaveLength(REQUIRED_MEMORY_SURFACES.length);
+		expect(baselines.map(baseline => baseline.surface)).toEqual(customOrder);
 		expect(report.runner.memoryIsolation).toBe("process-per-surface");
+		expect(report.runner.memorySurfaceOrder).toEqual(customOrder);
 		expect(report.runner.argv).toEqual([process.execPath, ...process.execArgv, ...process.argv.slice(1)]);
 		expect(report.runner.memoryChildExecArgv).toEqual(["--smol", "--expose-gc"]);
 		expect(report.runner.environment).toEqual({
 			GJC_MEMORY_PROFILE: "short",
 			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
+			GJC_MEMORY_SURFACE_ORDER: customOrder.join(","),
 		});
 		expect(report.runner.gcExposed).toBe(typeof globalThis.gc === "function");
 		expect(report.runner.memoryChildGcExposed).toBe(true);
 		expect(baselines.every(baseline => baseline.periodicSamples[0]!.rssBytes > 0)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
+
+		const fixtureOrderMismatch = {
+			...report,
+			fixtures: [
+				...report.fixtures.filter(fixture => !fixture.memoryBaseline),
+				...report.fixtures.filter(fixture => fixture.memoryBaseline).reverse(),
+			],
+		};
+		expect(validatePerfCorpusReport(fixtureOrderMismatch).errors).toContain(
+			"memory baseline order must match runner.memorySurfaceOrder for process-per-surface",
+		);
 	}, 15_000);
+
+	test("rejects malformed explicit process-per-surface orders without normalization", () => {
+		const canonicalOrder = REQUIRED_MEMORY_SURFACES.join(",");
+		const malformedOrders = [
+			"",
+			"cli",
+			`${canonicalOrder},`,
+			canonicalOrder.replace("shared-native", "cli"),
+			canonicalOrder.replace("shared-native", "unknown"),
+			canonicalOrder.replace("agent-session", " agent-session"),
+		];
+		for (const malformedOrder of malformedOrders) {
+			process.env.GJC_MEMORY_SURFACE_ORDER = malformedOrder;
+			expect(() => runPerfCorpusBenchmark({ isolatedMemory: true })).toThrow(
+				"GJC_MEMORY_SURFACE_ORDER must be an exact comma-separated permutation",
+			);
+		}
+	});
 
 	test("fails closed when a required surface or detailed sample is invalid or incomplete", () => {
 		const report = runPerfCorpusBenchmark();
@@ -807,6 +858,32 @@ describe("perf corpus schema + runner", () => {
 		};
 		expect(validatePerfCorpusReport(inconsistentThroughput).errors).toContain(
 			`fixture ${fixture.fixtureId}: memoryBaseline.operationsPerSecond does not match operations`,
+		);
+		const invalidSurfaceOrder = {
+			...report,
+			runner: {
+				...report.runner,
+				memorySurfaceOrder: [
+					...REQUIRED_MEMORY_SURFACES.slice(0, -1),
+					"cli",
+				] as PerfCorpusReport["runner"]["memorySurfaceOrder"],
+			},
+		};
+		expect(validatePerfCorpusReport(invalidSurfaceOrder).errors).toContain(
+			"runner.memorySurfaceOrder must be an exact permutation of required memory surfaces",
+		);
+		const mismatchedSurfaceEnvironment = {
+			...report,
+			runner: {
+				...report.runner,
+				environment: {
+					...report.runner.environment,
+					GJC_MEMORY_SURFACE_ORDER: [...REQUIRED_MEMORY_SURFACES].reverse().join(","),
+				},
+			},
+		};
+		expect(validatePerfCorpusReport(mismatchedSurfaceEnvironment).errors).toContain(
+			"runner.environment does not match memory controls",
 		);
 		const mismatchedEnvironment = {
 			...report,
