@@ -238,35 +238,22 @@ const SOURCE_CLASS_VALUES: readonly PerfCorpusFixtureResult["sourceClass"][] = [
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const LOGICAL_BUN_EXECUTABLE = "bun";
 
-function containsHostPrivatePath(value: string): boolean {
-	if (
-		value.includes("\\") ||
-		/(?:^|[\s,;:=])\/\S/.test(value) ||
-		/(?:^|[\s,;:=])[A-Za-z]:\//.test(value)
-	) {
-		return true;
-	}
-	for (const token of value.split(/\s+/).flatMap(part => part.split("="))) {
-		const normalized = token.replace(/^["']|["']$/g, "");
-		if (
-			normalized.startsWith("/") ||
-			normalized.startsWith("~/") ||
-			/^[A-Za-z]:\//.test(normalized) ||
-			normalized.split("/").includes("..")
-		) {
-			return true;
-		}
-	}
-	return false;
+function isLogicalRunnerScriptArgument(value: string): boolean {
+	if (!/^(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+\.ts$/.test(value)) return false;
+	return value.split("/").every(segment => segment !== "." && segment !== "..");
+}
+
+function isLogicalRunnerArgument(value: string): boolean {
+	return /^--?[A-Za-z0-9][A-Za-z0-9-]*$/.test(value) || isLogicalRunnerScriptArgument(value);
 }
 
 function isLogicalRunnerArgv(value: unknown): value is string[] {
+	if (!Array.isArray(value) || value.length <= 1 || value[0] !== LOGICAL_BUN_EXECUTABLE) return false;
+	const argumentsAfterExecutable = value.slice(1);
 	return (
-		Array.isArray(value) &&
-		value.length > 1 &&
-		value.every(argument => typeof argument === "string" && argument.length > 0 && !containsHostPrivatePath(argument)) &&
-		value[0] === LOGICAL_BUN_EXECUTABLE &&
-		value.slice(1).some(argument => !argument.startsWith("-") && argument.includes("/") && argument.endsWith(".ts"))
+		argumentsAfterExecutable.every(
+			argument => typeof argument === "string" && argument.length > 0 && isLogicalRunnerArgument(argument),
+		) && argumentsAfterExecutable.filter(isLogicalRunnerScriptArgument).length === 1
 	);
 }
 const REPORT_FIELDS = [
@@ -595,7 +582,6 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	}
 	if (
 		typeof report.runner.command !== "string" ||
-		containsHostPrivatePath(report.runner.command) ||
 		!Array.isArray(report.runner.argv) ||
 		report.runner.command !== report.runner.argv.join(" ")
 	) {

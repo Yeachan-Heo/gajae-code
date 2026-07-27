@@ -880,14 +880,14 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(result.diagnostics.validationErrors.some(error => error.filename === "short-01.json")).toBe(false);
 	});
 
-	const privateRunnerCases: readonly [string, (runner: PerfCorpusReport["runner"]) => void, string][] = [
+	const privateRunnerCases: readonly (readonly [string, (runner: PerfCorpusReport["runner"]) => void, string])[] = [
 		[
 			"command",
 			runner => {
 				runner.command = "bun /private/tmp/checkout/packages/coding-agent/bench/perf-corpus.bench.ts";
 				runner.runtimeCommand = runner.command;
 			},
-			"runner.command contains a host-private path",
+			"runner.command must exactly match the logical runner.argv",
 		],
 		[
 			"argv",
@@ -910,7 +910,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 				runner.command = runner.argv.join(" ");
 				runner.runtimeCommand = runner.command;
 			},
-			"runner.command contains a host-private path",
+			"runner.argv must begin with bun and contain only logical repository-relative values",
 		],
 		[
 			"backslash argv",
@@ -919,7 +919,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 				runner.command = runner.argv.join(" ");
 				runner.runtimeCommand = runner.command;
 			},
-			"runner.command contains a host-private path",
+			"runner.argv must begin with bun and contain only logical repository-relative values",
 		],
 		[
 			"file URI argv",
@@ -928,7 +928,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 				runner.command = runner.argv.join(" ");
 				runner.runtimeCommand = runner.command;
 			},
-			"runner.command contains a host-private path",
+			"runner.argv must begin with bun and contain only logical repository-relative values",
 		],
 		[
 			"embedded absolute argv",
@@ -937,8 +937,26 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 				runner.command = runner.argv.join(" ");
 				runner.runtimeCommand = runner.command;
 			},
-			"runner.command contains a host-private path",
+			"runner.argv must begin with bun and contain only logical repository-relative values",
 		],
+		...[
+			["home argv", "~/private/perf-corpus.bench.ts"],
+			["drive argv", "C:/private/perf-corpus.bench.ts"],
+			["parenthesized absolute argv", "label(/private/tmp/perf-corpus.bench.ts)"],
+			["bracketed absolute argv", "label[/private/tmp/perf-corpus.bench.ts]"],
+			["punctuation absolute argv", "label|/private/tmp/perf-corpus.bench.ts"],
+		].map(
+			([name, scriptPath]) =>
+				[
+					name,
+					(runner: PerfCorpusReport["runner"]) => {
+						runner.argv = ["bun", scriptPath];
+						runner.command = runner.argv.join(" ");
+						runner.runtimeCommand = runner.command;
+					},
+					"runner.argv must begin with bun and contain only logical repository-relative values",
+				] as const,
+		),
 	];
 
 	test.each(

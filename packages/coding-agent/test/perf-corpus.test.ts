@@ -228,6 +228,11 @@ describe("perf corpus schema + runner", () => {
 			"packages\\coding-agent\\bench\\perf-corpus.bench.ts",
 			"file:///private/tmp/perf-corpus.bench.ts",
 			"label,/private/tmp/perf-corpus.bench.ts",
+			"~/private/perf-corpus.bench.ts",
+			"C:/private/perf-corpus.bench.ts",
+			"label(/private/tmp/perf-corpus.bench.ts)",
+			"label[/private/tmp/perf-corpus.bench.ts]",
+			"label|/private/tmp/perf-corpus.bench.ts",
 		]) {
 			const argv = ["bun", scriptPath];
 			const runner = {
