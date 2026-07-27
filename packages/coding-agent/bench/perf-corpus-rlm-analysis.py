@@ -10,6 +10,7 @@ the network.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -24,6 +25,15 @@ PREREG_SCHEMA = "gjc.perf-corpus-preregistration/1"
 SURFACES = ("cli", "agent-session", "blob-store", "worker", "telegram-daemon", "tui", "shared-native")
 ELIGIBLE_SURFACES = ("agent-session", "tui")
 EXTREMA_DOMAINS = ("rssBytes", "heapUsedBytes", "externalBytes", "arrayBuffersBytes")
+SHARED_RUNNER_PROVENANCE_FIELDS = (
+    "runtimeCommand",
+    "closureDigest",
+    "closureManifest",
+    "bunVersion",
+    "bunExecutable",
+    "bunExecutableSha256",
+    "worktreeFingerprint",
+)
 SAMPLE_FIELDS = (
     "elapsedMs",
     "rssBytes",
@@ -42,6 +52,76 @@ SAMPLING_FIELDS = (
     "forcedHighWaterProbes",
     "throttledHighWaterCallbacks",
 )
+REPORT_FIELDS = {
+    "schema",
+    "generatedAt",
+    "gitSha",
+    "gitDirty",
+    "runner",
+    "fixtures",
+    "hotspotClassifications",
+    "thresholdLedger",
+}
+RUNNER_FIELDS = {
+    "command",
+    "argv",
+    "environment",
+    "platform",
+    "arch",
+    "bunVersion",
+    "bunExecutable",
+    "bunExecutableSha256",
+    "ci",
+    "profile",
+    "durationTargetMs",
+    "memoryIsolation",
+    "memorySurfaceOrder",
+    "iterationsTarget",
+    "gcExposed",
+    "memoryChildGcExposed",
+    "memoryChildExecArgv",
+    "runnerPid",
+    "runtimeCommand",
+    "runtimeControlIdentity",
+    "closureDigest",
+    "closureManifest",
+    "worktreeFingerprint",
+}
+FIXTURE_FIELDS = {
+    "fixtureId",
+    "fixtureClass",
+    "sourceClass",
+    "workloadTags",
+    "privacy",
+    "wallClockPhase",
+    "processCpuUsage",
+    "profilerSelfTime",
+    "rssMemory",
+    "byteParity",
+    "memoryBaseline",
+}
+BASELINE_FIELDS = {
+    "surface",
+    "profile",
+    "iterations",
+    "operations",
+    "operationsPerSecond",
+    "periodicSamples",
+    "observedExtrema",
+    "sampling",
+    "postTeardown",
+    "rssSlopeBytesPerSecond",
+    "heapSlopeBytesPerSecond",
+    "processTreeBaselineRssBytes",
+    "processTreePostTeardownRssBytes",
+    "processTreeSampler",
+    "ordinal",
+    "childPid",
+    "parentPid",
+    "captureSemanticsId",
+}
+CAPTURE_SEMANTICS_ID = "gjc.memory-baseline.capture/3"
+BUN_VERSION = "1.3.14"
 RESULT_JSON = "perf-corpus-rlm-result.json"
 RESULT_MARKDOWN = "perf-corpus-rlm-result.md"
 NORMAL = NormalDist()
@@ -183,6 +263,31 @@ def _required(mapping: dict[str, Any], key: str, label: str) -> Any:
     if key not in mapping:
         raise EvidenceError(f"{label}.{key} is required")
     return mapping[key]
+def _expect_exact_keys(mapping: dict[str, Any], expected: set[str], label: str) -> None:
+    if set(mapping) != expected:
+        missing = sorted(expected - set(mapping))
+        unexpected = sorted(set(mapping) - expected)
+        raise EvidenceError(f"{label} fields are invalid; missing={missing}, unexpected={unexpected}")
+
+
+def _expect_sha256(value: Any, label: str) -> str:
+    normalized = _expect_string(value, label)
+    if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+        raise EvidenceError(f"{label} must be lowercase SHA-256")
+    return normalized
+
+
+def _timestamp_seconds(value: Any, label: str) -> float:
+    raw = _expect_string(value, label)
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise EvidenceError(f"{label} must be an ISO-8601 timestamp") from error
+    if parsed.tzinfo is None:
+        raise EvidenceError(f"{label} must include a timezone")
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
 
 
 def _median(values: Sequence[float]) -> float:
@@ -193,22 +298,75 @@ def _median(values: Sequence[float]) -> float:
     if len(ordered) % 2:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) / 2.0
+def _rank(values: Sequence[float]) -> list[float]:
+    ordered = sorted(range(len(values)), key=lambda index: values[index])
+    ranks = [0.0] * len(values)
+    cursor = 0
+    while cursor < len(ordered):
+        end = cursor + 1
+        while end < len(ordered) and values[ordered[end]] == values[ordered[cursor]]:
+            end += 1
+        rank = (cursor + end - 1) / 2.0 + 1.0
+        for position in range(cursor, end):
+            ranks[ordered[position]] = rank
+        cursor = end
+    return ranks
 
 
-def _summary(values: Sequence[float]) -> dict[str, float | int]:
-    if not values:
-        raise EvidenceError("descriptive summary requires at least one value")
+def _spearman(left: Sequence[float], right: Sequence[float]) -> dict[str, Any]:
+    if len(left) != len(right) or len(left) < 2:
+        return {"coefficient": None, "pointCount": len(left), "reason": "fewer-than-two-paired-points"}
+    left_ranks = _rank(left)
+    right_ranks = _rank(right)
+    left_mean = sum(left_ranks) / len(left_ranks)
+    right_mean = sum(right_ranks) / len(right_ranks)
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left_ranks, right_ranks))
+    left_scale = sum((value - left_mean) ** 2 for value in left_ranks)
+    right_scale = sum((value - right_mean) ** 2 for value in right_ranks)
+    if left_scale == 0 or right_scale == 0:
+        return {"coefficient": None, "pointCount": len(left), "reason": "constant-rank-input"}
     return {
-        "count": len(values),
-        "minimum": min(values),
-        "median": _median(values),
-        "maximum": max(values),
+        "coefficient": numerator / math.sqrt(left_scale * right_scale),
+        "pointCount": len(left),
+        "reason": None,
     }
 
 
-def _optional_summary(values: Sequence[float]) -> dict[str, float | int | None]:
+
+
+def _summary(values: Sequence[float]) -> dict[str, Any]:
     if not values:
-        return {"count": 0, "minimum": None, "median": None, "maximum": None}
+        raise EvidenceError("descriptive summary requires at least one value")
+    points = [float(value) for value in values]
+    median = _median(points)
+    first_quartile = _quantile_type7(points, 0.25)
+    third_quartile = _quantile_type7(points, 0.75)
+    return {
+        "count": len(points),
+        "minimum": min(points),
+        "median": median,
+        "medianAbsoluteDeviation": _median([abs(value - median) for value in points]),
+        "firstQuartile": first_quartile,
+        "thirdQuartile": third_quartile,
+        "interquartileRange": third_quartile - first_quartile,
+        "maximum": max(points),
+        "points": points,
+    }
+
+
+def _optional_summary(values: Sequence[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "minimum": None,
+            "median": None,
+            "medianAbsoluteDeviation": None,
+            "firstQuartile": None,
+            "thirdQuartile": None,
+            "interquartileRange": None,
+            "maximum": None,
+            "points": [],
+        }
     return _summary(values)
 
 
@@ -274,7 +432,7 @@ def _unit_only_bca_reference(values: Sequence[float]) -> dict[str, float | int]:
     if len(values) < 3 or len(values) > 64:
         raise EvidenceError("unit-only BCa requires between 3 and 64 values")
     normalized = [_expect_number(value, f"unitValues[{index}]") for index, value in enumerate(values)]
-    return _bca_interval(normalized, 20260727)
+    return _bca_interval(normalized, 0x3279B4E7)
 
 def _derived_slope(numerator: float, elapsed_ms: float, label: str) -> float:
     if not math.isfinite(numerator) or not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
@@ -329,13 +487,14 @@ def _theil_sen(
     if not slopes:
         return None
     result = _median(slopes)
-    if not math.isfinite(result) or (minimum_absolute_slope > 0 and abs(result) < minimum_absolute_slope):
-        raise EvidenceError("Theil-Sen heap slope is zero, near-zero, or non-finite")
+    if not math.isfinite(result):
+        raise EvidenceError("Theil-Sen heap slope is non-finite")
     return result
 
 
 def _validate_sample(value: Any, label: str) -> dict[str, Any]:
     sample = _expect_dict(value, label)
+    _expect_exact_keys(sample, set(SAMPLE_FIELDS), label)
     for field in SAMPLE_FIELDS:
         raw = _required(sample, field, label)
         if field == "activeResourceCount":
@@ -358,6 +517,14 @@ def _validate_baseline(
     bounds: dict[str, Any],
 ) -> dict[str, Any]:
     baseline = _expect_dict(value, label)
+    _expect_exact_keys(baseline, BASELINE_FIELDS, label)
+    ordinal = _expect_integer(_required(baseline, "ordinal", label), f"{label}.ordinal", nonnegative=True)
+    child_pid = _expect_integer(_required(baseline, "childPid", label), f"{label}.childPid", positive=True)
+    parent_pid = _expect_integer(_required(baseline, "parentPid", label), f"{label}.parentPid", positive=True)
+    if parent_pid != runner["runnerPid"] or child_pid == parent_pid:
+        raise EvidenceError(f"{label} process identity does not match isolated runner")
+    if baseline.get("captureSemanticsId") != CAPTURE_SEMANTICS_ID:
+        raise EvidenceError(f"{label}.captureSemanticsId drift")
     if baseline.get("profile") != profile:
         raise EvidenceError(f"{label}.profile does not match runner profile")
     surface = baseline.get("surface")
@@ -455,47 +622,64 @@ def _validate_baseline(
         endpoint_heap = baseline["heapSlopeBytesPerSecond"]
         if endpoint_heap is None or theil_sen is None:
             raise EvidenceError(f"{label} does not support both preregistered heap-slope estimators")
-        if not math.isfinite(float(endpoint_heap)) or abs(float(endpoint_heap)) < bounds["minimumAbsoluteActionSlopeBytesPerSecond"]:
-            raise EvidenceError(f"{label}.heapSlopeBytesPerSecond is zero, near-zero, or non-finite")
-    return {"baseline": baseline, "samples": samples, "theilSenHeapSlopeBytesPerSecond": theil_sen}
+        if not math.isfinite(float(endpoint_heap)):
+            raise EvidenceError(f"{label}.heapSlopeBytesPerSecond is non-finite")
+    return {
+        "baseline": baseline,
+        "samples": samples,
+        "ordinal": ordinal,
+        "childPid": child_pid,
+        "theilSenHeapSlopeBytesPerSecond": theil_sen,
+    }
 
 
 def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any], expected_git_sha: str) -> dict[str, Any]:
-    report = _expect_dict(value, schedule["expectedFilename"])
+    filename = schedule["expectedFilename"]
+    report = _expect_dict(value, filename)
+    _expect_exact_keys(report, REPORT_FIELDS, filename)
     if report.get("schema") != REPORT_SCHEMA:
-        raise EvidenceError(f"{schedule['expectedFilename']}: schema must be {REPORT_SCHEMA}")
+        raise EvidenceError(f"{filename}: schema must be {REPORT_SCHEMA}")
     if report.get("gitSha") != expected_git_sha or not isinstance(report.get("gitSha"), str):
-        raise EvidenceError(f"{schedule['expectedFilename']}: gitSha mismatch")
-    if _expect_bool(report.get("gitDirty"), f"{schedule['expectedFilename']}.gitDirty"):
-        raise EvidenceError(f"{schedule['expectedFilename']}: gitDirty must be false")
-    _expect_string(report.get("generatedAt"), f"{schedule['expectedFilename']}.generatedAt")
-    runner = _expect_dict(report.get("runner"), f"{schedule['expectedFilename']}.runner")
+        raise EvidenceError(f"{filename}: gitSha mismatch")
+    if _expect_bool(report.get("gitDirty"), f"{filename}.gitDirty"):
+        raise EvidenceError(f"{filename}: gitDirty must be false")
+    captured_at = _timestamp_seconds(report.get("generatedAt"), f"{filename}.generatedAt")
+    runner = _expect_dict(report.get("runner"), f"{filename}.runner")
+    _expect_exact_keys(runner, RUNNER_FIELDS, f"{filename}.runner")
     profile = schedule["profile"]
     profile_config = prereg["cohort"]["profiles"][profile]
     if runner.get("profile") != profile:
-        raise EvidenceError(f"{schedule['expectedFilename']}: profile mismatch")
+        raise EvidenceError(f"{filename}: profile mismatch")
     if runner.get("durationTargetMs") != profile_config["durationTargetMs"]:
-        raise EvidenceError(f"{schedule['expectedFilename']}: duration target drift")
+        raise EvidenceError(f"{filename}: duration target drift")
     if runner.get("iterationsTarget") != profile_config["iterationsTarget"]:
-        raise EvidenceError(f"{schedule['expectedFilename']}: iterations target drift")
+        raise EvidenceError(f"{filename}: iterations target drift")
     if runner.get("memoryIsolation") != prereg["cohort"]["memoryIsolation"]:
-        raise EvidenceError(f"{schedule['expectedFilename']}: memory isolation drift")
-    for field in ("gcExposed", "memoryChildGcExposed"):
-        _expect_bool(runner.get(field), f"{schedule['expectedFilename']}.runner.{field}")
+        raise EvidenceError(f"{filename}: memory isolation drift")
+    for field in ("gcExposed", "memoryChildGcExposed", "ci"):
+        _expect_bool(runner.get(field), f"{filename}.runner.{field}")
     if runner.get("memoryChildGcExposed") is not True or runner.get("memoryChildExecArgv") != ["--smol", "--expose-gc"]:
-        raise EvidenceError(f"{schedule['expectedFilename']}: isolated child controls drift")
-    _expect_string(runner.get("command"), f"{schedule['expectedFilename']}.runner.command")
-    argv = _expect_list(runner.get("argv"), f"{schedule['expectedFilename']}.runner.argv")
+        raise EvidenceError(f"{filename}: isolated child controls drift")
+    command = _expect_string(runner.get("command"), f"{filename}.runner.command")
+    if runner.get("runtimeCommand") != command:
+        raise EvidenceError(f"{filename}: runtimeCommand must equal command")
+    argv = _expect_list(runner.get("argv"), f"{filename}.runner.argv")
     if not argv or any(not isinstance(item, str) or not item for item in argv):
-        raise EvidenceError(f"{schedule['expectedFilename']}: runner.argv is invalid")
-    platform = _expect_string(runner.get("platform"), f"{schedule['expectedFilename']}.runner.platform")
-    arch = _expect_string(runner.get("arch"), f"{schedule['expectedFilename']}.runner.arch")
+        raise EvidenceError(f"{filename}: runner.argv is invalid")
+    platform = _expect_string(runner.get("platform"), f"{filename}.runner.platform")
+    arch = _expect_string(runner.get("arch"), f"{filename}.runner.arch")
+    if runner.get("bunVersion") != BUN_VERSION:
+        raise EvidenceError(f"{filename}: Bun version drift")
+    bun_executable = _expect_string(runner.get("bunExecutable"), f"{filename}.runner.bunExecutable")
+    if not os.path.isabs(bun_executable) or os.path.normpath(bun_executable) != bun_executable:
+        raise EvidenceError(f"{filename}: bunExecutable must be a canonical absolute path")
+    _expect_sha256(runner.get("bunExecutableSha256"), f"{filename}.runner.bunExecutableSha256")
+    worktree_fingerprint = _expect_sha256(runner.get("worktreeFingerprint"), f"{filename}.runner.worktreeFingerprint")
+    runner_pid = _expect_integer(runner.get("runnerPid"), f"{filename}.runner.runnerPid", positive=True)
     expected_order = schedule["surfaceOrder"]
     if runner.get("memorySurfaceOrder") != expected_order:
-        raise EvidenceError(f"{schedule['expectedFilename']}: preregistered memory surface order mismatch")
-    environment = _expect_dict(runner.get("environment"), f"{schedule['expectedFilename']}.runner.environment")
-    if any(not isinstance(key, str) or not isinstance(item, str) for key, item in environment.items()):
-        raise EvidenceError(f"{schedule['expectedFilename']}: runner.environment is invalid")
+        raise EvidenceError(f"{filename}: preregistered memory surface order mismatch")
+    environment = _expect_dict(runner.get("environment"), f"{filename}.runner.environment")
     expected_controls = {
         "GJC_MEMORY_PROFILE": profile,
         "GJC_MEMORY_ITERATIONS": str(profile_config["iterationsTarget"]),
@@ -503,29 +687,95 @@ def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any
     }
     if profile == "soak":
         expected_controls["GJC_MEMORY_DURATION_MS"] = str(profile_config["durationTargetMs"])
-    elif "GJC_MEMORY_DURATION_MS" in environment:
-        raise EvidenceError(f"{schedule['expectedFilename']}: short duration environment control is forbidden")
-    for key, expected in expected_controls.items():
-        if environment.get(key) != expected:
-            raise EvidenceError(f"{schedule['expectedFilename']}: environment control {key} drift")
-    _expect_list(report.get("hotspotClassifications"), f"{schedule['expectedFilename']}.hotspotClassifications")
-    fixtures = _expect_list(report.get("fixtures"), f"{schedule['expectedFilename']}.fixtures")
+    if environment != expected_controls:
+        raise EvidenceError(f"{filename}: runner.environment exact controls drift")
+    identity_source = {
+        "runtimeCommand": command,
+        "argv": argv,
+        "environment": environment,
+        "platform": platform,
+        "arch": arch,
+        "bunVersion": runner["bunVersion"],
+        "bunExecutable": bun_executable,
+        "bunExecutableSha256": runner["bunExecutableSha256"],
+        "worktreeFingerprint": worktree_fingerprint,
+        "closureDigest": runner["closureDigest"],
+        "closureManifest": runner["closureManifest"],
+        "profile": profile,
+        "durationTargetMs": profile_config["durationTargetMs"],
+        "memoryIsolation": prereg["cohort"]["memoryIsolation"],
+        "memorySurfaceOrder": expected_order,
+        "iterationsTarget": profile_config["iterationsTarget"],
+        "gcExposed": runner["gcExposed"],
+        "memoryChildGcExposed": runner["memoryChildGcExposed"],
+        "memoryChildExecArgv": runner["memoryChildExecArgv"],
+        "runnerPid": runner_pid,
+        "captureSemanticsId": CAPTURE_SEMANTICS_ID,
+    }
+    expected_identity = _sha256_bytes(
+        json.dumps(identity_source, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    )
+    if runner.get("runtimeControlIdentity") != expected_identity:
+        raise EvidenceError(f"{filename}: runtimeControlIdentity mismatch")
+    closure_manifest = _expect_list(runner.get("closureManifest"), f"{filename}.runner.closureManifest")
+    if not closure_manifest or any(not isinstance(item, str) or not item for item in closure_manifest):
+        raise EvidenceError(f"{filename}: closureManifest must be a non-empty string array")
+    if closure_manifest != sorted(set(closure_manifest)):
+        raise EvidenceError(f"{filename}: closureManifest must be sorted and unique")
+    for index, item in enumerate(closure_manifest):
+        try:
+            member_path, digest = item.rsplit(":", 1)
+        except ValueError as error:
+            raise EvidenceError(f"{filename}: closureManifest[{index}] is invalid") from error
+        segments = member_path.split("/")
+        if (
+            not member_path
+            or member_path.startswith("/")
+            or "\\" in member_path
+            or any(segment in ("", ".", "..") for segment in segments)
+        ):
+            raise EvidenceError(f"{filename}: closureManifest[{index}] path is invalid")
+        _expect_sha256(digest, f"{filename}.runner.closureManifest[{index}] digest")
+    expected_closure_digest = _sha256_bytes(("\n".join(closure_manifest) + "\n").encode("utf-8"))
+    if runner.get("closureDigest") != expected_closure_digest:
+        raise EvidenceError(f"{filename}: closureDigest mismatch")
+    _expect_list(report.get("hotspotClassifications"), f"{filename}.hotspotClassifications")
+    _expect_list(report.get("thresholdLedger"), f"{filename}.thresholdLedger")
+    fixtures = _expect_list(report.get("fixtures"), f"{filename}.fixtures")
     baselines: dict[str, dict[str, Any]] = {}
     observed_order: list[str] = []
+    child_pids: set[int] = set()
     for index, fixture_value in enumerate(fixtures):
-        fixture = _expect_dict(fixture_value, f"{schedule['expectedFilename']}.fixtures[{index}]")
+        fixture_label = f"{filename}.fixtures[{index}]"
+        fixture = _expect_dict(fixture_value, fixture_label)
         baseline_value = fixture.get("memoryBaseline")
+        expected_fixture_fields = FIXTURE_FIELDS if baseline_value is not None else FIXTURE_FIELDS - {"memoryBaseline"}
+        _expect_exact_keys(fixture, expected_fixture_fields, fixture_label)
+        if fixture.get("sourceClass") != "synthetic":
+            raise EvidenceError(f"{fixture_label}.sourceClass must be synthetic")
+        tags = _expect_list(fixture.get("workloadTags"), f"{fixture_label}.workloadTags")
+        if any(not isinstance(tag, str) or not tag for tag in tags):
+            raise EvidenceError(f"{fixture_label}.workloadTags is invalid")
+        privacy = _expect_dict(fixture.get("privacy"), f"{fixture_label}.privacy")
+        _expect_exact_keys(privacy, {"rawPrivateTranscriptCommitted", "redactionNotes"}, f"{fixture_label}.privacy")
+        if privacy.get("rawPrivateTranscriptCommitted") is not False:
+            raise EvidenceError(f"{fixture_label}: raw private transcript content is forbidden")
+        _expect_string(privacy.get("redactionNotes"), f"{fixture_label}.privacy.redactionNotes")
         if baseline_value is None:
             continue
         validated = _validate_baseline(
             baseline_value,
-            f"{schedule['expectedFilename']}.fixtures[{index}].memoryBaseline",
+            f"{fixture_label}.memoryBaseline",
             profile,
             runner,
             profile_config,
             prereg["bounds"],
         )
-        fixture_label = f"{schedule['expectedFilename']}.fixtures[{index}]"
+        if validated["ordinal"] != len(observed_order):
+            raise EvidenceError(f"{fixture_label}: memory baseline ordinal does not match surface order")
+        if validated["childPid"] in child_pids:
+            raise EvidenceError(f"{filename}: isolated child PIDs must be distinct")
+        child_pids.add(validated["childPid"])
         _expect_string(fixture.get("fixtureId"), f"{fixture_label}.fixtureId")
         wall_clock = _expect_dict(fixture.get("wallClockPhase"), f"{fixture_label}.wallClockPhase")
         run_metric = _expect_dict(wall_clock.get("run"), f"{fixture_label}.wallClockPhase.run")
@@ -545,23 +795,42 @@ def _validate_report(value: Any, schedule: dict[str, Any], prereg: dict[str, Any
             "heapBaselineBytes": validated["samples"][0]["heapUsedBytes"],
             "heapReturnBytes": measured["postTeardown"]["heapUsedBytes"],
         }
-        if any(rss_memory.get(field) != expected for field, expected in expected_rss_summary.items()):
+        if set(rss_memory) != set(expected_rss_summary) or any(
+            rss_memory[field] != expected for field, expected in expected_rss_summary.items()
+        ):
             raise EvidenceError(f"{fixture_label}: rssMemory summary does not match periodic/extrema evidence")
-        surface = validated["baseline"]["surface"]
+        surface = measured["surface"]
         if surface in baselines:
-            raise EvidenceError(f"{schedule['expectedFilename']}: duplicate memory surface {surface}")
+            raise EvidenceError(f"{filename}: duplicate memory surface {surface}")
         baselines[surface] = validated
         observed_order.append(surface)
     if set(baselines) != set(SURFACES) or len(baselines) != len(SURFACES):
-        raise EvidenceError(f"{schedule['expectedFilename']}: exactly seven required memory surfaces are required")
+        raise EvidenceError(f"{filename}: exactly seven required memory surfaces are required")
     if observed_order != expected_order:
-        raise EvidenceError(f"{schedule['expectedFilename']}: fixture order does not match preregistered order")
+        raise EvidenceError(f"{filename}: fixture order does not match preregistered order")
     return {
-        "blockId": schedule["blockId"],
-        "filename": schedule["expectedFilename"],
+        "blockId": schedule["slotId"],
+        "attemptId": schedule["attemptId"],
+        "attemptNumber": schedule["attemptNumber"],
+        "admissionNumber": schedule["admissionNumber"],
+        "filename": filename,
         "profile": profile,
         "platform": platform,
         "arch": arch,
+        "capturedAtSeconds": captured_at,
+        "runnerProvenance": {
+            key: runner[key]
+            for key in (
+                "runtimeCommand",
+                "closureDigest",
+                "closureManifest",
+                "bunVersion",
+                "bunExecutable",
+                "bunExecutableSha256",
+                "worktreeFingerprint",
+            )
+        },
+        "runnerPid": runner_pid,
         "baselines": baselines,
         "observedOrder": observed_order,
     }
@@ -591,28 +860,31 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
         raise EvidenceError("preregistration trusted-code policy drift")
     bounds = _expect_dict(prereg.get("bounds"), "preregistration.bounds")
     expected_bounds = {
-        "maximumInputFiles": 29,
+        "maximumInputFiles": 37,
         "maximumBytesPerFile": 8_388_608,
         "maximumTotalInputBytes": 134_217_728,
         "maximumJsonDepth": 40,
         "maximumMarkdownBytes": 65_536,
         "minimumElapsedDeltaMs": 0.001,
-        "minimumAbsoluteActionSlopeBytesPerSecond": 1e-9,
-        "maximumTheilSenPairsPerBaseline": 253,
+        "minimumAbsoluteActionSlopeBytesPerSecond": 0,
+        "maximumTheilSenPairsPerBaseline": 181_503,
     }
+    if set(bounds) != set(expected_bounds):
+        raise EvidenceError("preregistration bounds fields drift")
     for field, expected in expected_bounds.items():
         raw = bounds.get(field)
         if isinstance(expected, int):
-            _expect_integer(raw, f"preregistration.bounds.{field}", positive=True)
+            _expect_integer(raw, f"preregistration.bounds.{field}", nonnegative=True)
         else:
             _expect_number(raw, f"preregistration.bounds.{field}", nonnegative=True)
         if raw != expected:
             raise EvidenceError(f"preregistration bound drift: {field}")
-    profiles = _expect_dict(_expect_dict(prereg.get("cohort"), "preregistration.cohort").get("profiles"), "preregistration.cohort.profiles")
+    cohort = _expect_dict(prereg.get("cohort"), "preregistration.cohort")
+    profiles = _expect_dict(cohort.get("profiles"), "preregistration.cohort.profiles")
     expected_profiles = {
         "short": {
             "requiredAdmittedBlocks": 5,
-            "attemptCap": 5,
+            "attemptCap": 7,
             "durationTargetMs": 0,
             "iterationsTarget": 200,
             "maximumPeriodicSamples": 22,
@@ -620,50 +892,83 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
         },
         "soak": {
             "requiredAdmittedBlocks": 24,
-            "attemptCap": 24,
-            "durationTargetMs": 1000,
+            "attemptCap": 30,
+            "durationTargetMs": 30_000,
             "iterationsTarget": 100000,
-            "maximumPeriodicSamples": 23,
+            "maximumPeriodicSamples": 603,
             "elapsedDurationToleranceMs": 250,
         },
     }
+    if set(profiles) != set(expected_profiles):
+        raise EvidenceError("preregistration profile set drift")
     for profile, expected in expected_profiles.items():
         config = _expect_dict(profiles.get(profile), f"preregistration.cohort.profiles.{profile}")
-        if any(config.get(field) != expected_value for field, expected_value in expected.items()):
+        if config != expected:
             raise EvidenceError(f"preregistration {profile} count/cap/control drift")
+    if cohort.get("sharedRunnerProvenanceFields") != list(SHARED_RUNNER_PROVENANCE_FIELDS):
+        raise EvidenceError("preregistration shared runner provenance fields drift")
     controls = _expect_dict(prereg.get("captureControls"), "preregistration.captureControls")
     if controls.get("requiredSurfaces") != list(SURFACES):
         raise EvidenceError("preregistration required surface drift")
+    permutation = _expect_dict(controls.get("permutationGeneration"), "preregistration.captureControls.permutationGeneration")
+    if (
+        permutation.get("performedBeforeOutcomes") is not True
+        or permutation.get("seed") != 0x3279B4E7
+        or permutation.get("seedExpression") != "0x3279B4E7"
+        or "cyclic rotations" not in str(permutation.get("algorithm", ""))
+    ):
+        raise EvidenceError("preregistration counterbalancing algorithm drift")
+    admission_rows = _expect_dict(controls.get("admissionRows"), "preregistration.captureControls.admissionRows")
+    base_rows = {
+        "short": ["tui", "telegram-daemon", "shared-native", "blob-store", "agent-session", "worker", "cli"],
+        "soak": ["blob-store", "shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon"],
+    }
+    rotation_indexes = {
+        "short": list(range(5)),
+        "soak": [index % 7 for index in range(21)] + [1, 3, 5],
+    }
+    for profile in ("short", "soak"):
+        rows = _expect_list(admission_rows.get(profile), f"preregistration.captureControls.admissionRows.{profile}")
+        expected_count = expected_profiles[profile]["requiredAdmittedBlocks"]
+        if len(rows) != expected_count:
+            raise EvidenceError(f"preregistration {profile} admission-row count mismatch")
+        for index, raw in enumerate(rows):
+            item = _expect_dict(raw, f"admissionRows.{profile}[{index}]")
+            _expect_exact_keys(item, {"slotId", "surfaceOrder"}, f"admissionRows.{profile}[{index}]")
+            base = base_rows[profile]
+            rotation = rotation_indexes[profile][index]
+            expected_order = base[rotation:] + base[:rotation]
+            if item.get("slotId") != f"{profile}-slot-{index + 1:02d}" or item.get("surfaceOrder") != expected_order:
+                raise EvidenceError(f"preregistration {profile} admission-row {index + 1} drift")
     schedule = _expect_list(controls.get("schedule"), "preregistration.captureControls.schedule")
-    if len(schedule) != 29:
-        raise EvidenceError("preregistration schedule must contain 29 blocks")
+    if len(schedule) != 37:
+        raise EvidenceError("preregistration schedule must contain 37 frozen attempt allocations")
+    expected_schedule: list[tuple[str, int]] = []
+    short_after_soak = {2: 1, 6: 2, 10: 3, 14: 4, 18: 5, 22: 6, 26: 7}
+    for soak_attempt in range(1, 31):
+        expected_schedule.append(("soak", soak_attempt))
+        if soak_attempt in short_after_soak:
+            expected_schedule.append(("short", short_after_soak[soak_attempt]))
     filenames: set[str] = set()
-    block_ids: set[str] = set()
     for index, raw in enumerate(schedule):
         item = _expect_dict(raw, f"preregistration.captureControls.schedule[{index}]")
-        block_id = _expect_string(item.get("blockId"), f"schedule[{index}].blockId")
-        filename = _expect_string(item.get("expectedFilename"), f"schedule[{index}].expectedFilename")
-        profile = item.get("profile")
-        order = item.get("surfaceOrder")
+        _expect_exact_keys(item, {"attemptId", "profile", "attemptNumber", "expectedFilename"}, f"schedule[{index}]")
+        profile, attempt_number = expected_schedule[index]
+        attempt_id = f"{profile}-{attempt_number:02d}"
         if (
-            profile not in expected_profiles
-            or filename != f"{block_id}.json"
-            or not isinstance(order, list)
-            or len(order) != 7
-            or any(not isinstance(surface, str) for surface in order)
-            or set(order) != set(SURFACES)
+            item.get("profile") != profile
+            or item.get("attemptNumber") != attempt_number
+            or item.get("attemptId") != attempt_id
+            or item.get("expectedFilename") != f"{attempt_id}.json"
         ):
-            raise EvidenceError(f"preregistration schedule[{index}] is invalid")
-        if filename in filenames or block_id in block_ids:
-            raise EvidenceError("preregistration schedule identifiers must be unique")
-        filenames.add(filename)
-        block_ids.add(block_id)
-    for profile, expected in expected_profiles.items():
-        if sum(item["profile"] == profile for item in schedule) != expected["requiredAdmittedBlocks"]:
-            raise EvidenceError(f"preregistration schedule {profile} count mismatch")
+            raise EvidenceError(f"preregistration schedule[{index}] allocation/interleave drift")
+        if item["expectedFilename"] in filenames:
+            raise EvidenceError("preregistration schedule filenames must be unique")
+        filenames.add(item["expectedFilename"])
     analysis = _expect_dict(prereg.get("analysis"), "preregistration.analysis")
     action = _expect_dict(analysis.get("actionFamily"), "preregistration.analysis.actionFamily")
     bootstrap = _expect_dict(action.get("bootstrap"), "preregistration.analysis.actionFamily.bootstrap")
+    p95_receipt = _expect_dict(analysis.get("p95MethodReceipt"), "preregistration.analysis.p95MethodReceipt")
     if (
         action.get("eligibleSurfaces") != list(ELIGIBLE_SURFACES)
         or action.get("eligibleProfile") != "soak"
@@ -674,10 +979,13 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
         or bootstrap.get("method") != "two-sided-95-percent-BCa"
         or bootstrap.get("resamples") != 10000
         or bootstrap.get("resampleOverrideAllowed") is not False
-        or bootstrap.get("seed") != 20260727
-        or analysis.get("p95Claim") != "omitted"
+        or bootstrap.get("seed") != 0x3279B4E7
+        or bootstrap.get("seedExpression") != "0x3279B4E7"
+        or analysis.get("p95Claim") != "omitted-impossible-with-24-independent-blocks"
+        or p95_receipt.get("independentBlockCount") != 24
+        or p95_receipt.get("finiteUpperEndpointAvailable") is not False
     ):
-        raise EvidenceError("preregistered action family drift")
+        raise EvidenceError("preregistered action family or p95 method receipt drift")
     return prereg
 
 
@@ -722,15 +1030,92 @@ def _surface_descriptives(reports: Sequence[dict[str, Any]], surface: str) -> di
     for field in SAMPLING_FIELDS:
         result["sampling"][field] = _summary([float(item["sampling"][field]) for item in baselines])
     return result
+def _run_level_points(reports: Sequence[dict[str, Any]], surface: str) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for report in reports:
+        validated = report["baselines"][surface]
+        baseline = validated["baseline"]
+        points.append(
+            {
+                "blockId": report["blockId"],
+                "attemptId": report["attemptId"],
+                "attemptNumber": report["attemptNumber"],
+                "admissionNumber": report["admissionNumber"],
+                "capturedAtSeconds": report["capturedAtSeconds"],
+                "surfaceOrdinal": validated["ordinal"],
+                "endpointHeapSlopeBytesPerSecond": baseline["heapSlopeBytesPerSecond"],
+                "theilSenHeapSlopeBytesPerSecond": validated["theilSenHeapSlopeBytesPerSecond"],
+                "endpointRssSlopeBytesPerSecond": baseline["rssSlopeBytesPerSecond"],
+                "operationsPerSecond": baseline["operationsPerSecond"],
+            }
+        )
+    return points
 
 
-def _sufficient_result(reports: Sequence[dict[str, Any]], prereg: dict[str, Any], hashes: dict[str, str]) -> dict[str, Any]:
+def _estimator_sensitivities(reports: Sequence[dict[str, Any]], surface: str, estimator: str) -> dict[str, Any]:
+    points = _run_level_points(reports, surface)
+    values = [float(point[estimator]) for point in points]
+    first_count = len(values) // 3
+    last_start = len(values) - first_count
+    latin_blocks = []
+    for block_number, (start, end) in enumerate(((0, 7), (7, 14), (14, 21), (21, 24)), start=1):
+        block_values = values[start:end]
+        latin_blocks.append(
+            {
+                "block": block_number,
+                "admissionRange": [start + 1, end],
+                "completeLatinCycle": block_number <= 3,
+                "summary": _optional_summary(block_values),
+            }
+        )
+    return {
+        "descriptiveSpearmanNoPValue": {
+            "attemptNumber": _spearman([float(point["attemptNumber"]) for point in points], values),
+            "admissionNumber": _spearman([float(point["admissionNumber"]) for point in points], values),
+            "captureTime": _spearman([float(point["capturedAtSeconds"]) for point in points], values),
+            "surfaceOrdinal": _spearman([float(point["surfaceOrdinal"]) for point in points], values),
+        },
+        "firstLastThird": {
+            "firstAdmissionRange": [1, first_count],
+            "lastAdmissionRange": [last_start + 1, len(values)],
+            "first": _optional_summary(values[:first_count]),
+            "last": _optional_summary(values[last_start:]),
+        },
+        "latinSquareBlocks": latin_blocks,
+        "telemetry": {
+            "availability": "NOT_CAPTURED_IN_REPORT_SCHEMA",
+            "correlations": {},
+            "reason": "No thermal, load, pressure, power, or free-memory telemetry fields are present in schema-v3 report bytes.",
+        },
+    }
+
+
+
+
+def _sufficient_result(
+    reports: Sequence[dict[str, Any]],
+    prereg: dict[str, Any],
+    hashes: dict[str, str],
+    attempts: dict[str, int],
+    invalid: dict[str, int],
+    attempt_findings: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
     by_profile = {profile: [report for report in reports if report["profile"] == profile] for profile in ("short", "soak")}
     platforms = sorted({f"{report['platform']}/{report['arch']}" for report in reports})
     if len(platforms) != 1:
         raise EvidenceError("platform or architecture drift across admitted reports")
+    shared_provenance_fields = prereg["cohort"]["sharedRunnerProvenanceFields"]
+    provenance_reference = reports[0]["runnerProvenance"]
+    for report in reports[1:]:
+        for field in shared_provenance_fields:
+            if report["runnerProvenance"][field] != provenance_reference[field]:
+                raise EvidenceError(f"runner provenance drift across admitted reports: {field}")
     descriptive = {
         profile: {surface: _surface_descriptives(by_profile[profile], surface) for surface in SURFACES}
+        for profile in ("short", "soak")
+    }
+    run_level_points = {
+        profile: {surface: _run_level_points(by_profile[profile], surface) for surface in SURFACES}
         for profile in ("short", "soak")
     }
     action_config = prereg["analysis"]["actionFamily"]
@@ -740,6 +1125,7 @@ def _sufficient_result(reports: Sequence[dict[str, Any]], prereg: dict[str, Any]
     sign_minimum = action_config["minimumPositiveSignsPerEstimatorPerSurface"]
     lower_minimum = action_config["minimumBcaLowerBoundBytesPerSecond"]
     action_surfaces: dict[str, Any] = {}
+    drift: dict[str, Any] = {}
     all_pass = True
     for surface in ELIGIBLE_SURFACES:
         endpoint = [float(report["baselines"][surface]["baseline"]["heapSlopeBytesPerSecond"]) for report in by_profile["soak"]]
@@ -751,28 +1137,48 @@ def _sufficient_result(reports: Sequence[dict[str, Any]], prereg: dict[str, Any]
         all_pass = all_pass and passed
         action_surfaces[surface] = {
             "reportCount": len(endpoint),
+            "primarySummaryBytesPerSecond": _summary(endpoint),
             "primaryMedianBytesPerSecond": _median(endpoint),
             "primaryBca": interval,
             "endpointPositiveSigns": endpoint_positive,
+            "theilSenSummaryBytesPerSecond": _summary(sensitivity),
             "theilSenMedianBytesPerSecond": _median(sensitivity),
             "theilSenPositiveSigns": sensitivity_positive,
             "minimumPositiveSignsRequired": sign_minimum,
             "minimumBcaLowerBoundBytesPerSecond": lower_minimum,
             "surfacePass": passed,
         }
+        drift[surface] = {
+            "endpointHeapSlopeBytesPerSecond": _estimator_sensitivities(
+                by_profile["soak"], surface, "endpointHeapSlopeBytesPerSecond"
+            ),
+            "theilSenHeapSlopeBytesPerSecond": _estimator_sensitivities(
+                by_profile["soak"], surface, "theilSenHeapSlopeBytesPerSecond"
+            ),
+        }
     admission = {}
     for profile in ("short", "soak"):
         config = prereg["cohort"]["profiles"][profile]
         admission[profile] = {
-            "attemptsObserved": len(by_profile[profile]),
+            "attemptsObserved": attempts[profile],
             "attemptCap": config["attemptCap"],
             "requiredAdmittedBlocks": config["requiredAdmittedBlocks"],
             "admittedBlocks": len(by_profile[profile]),
-            "invalidBlocks": 0,
+            "invalidBlocks": invalid[profile],
             "notEvaluatedBlocks": 0,
+            "unusedPreallocatedAttempts": config["attemptCap"] - attempts[profile],
             "excludedBlocks": 0,
-            "allMembersAdmitted": True,
+            "allMembersAdmitted": len(by_profile[profile]) == config["requiredAdmittedBlocks"],
         }
+    p95_receipt = dict(prereg["analysis"]["p95MethodReceipt"])
+    p95_receipt.update(
+        {
+            "status": "OMITTED_IMPOSSIBLE",
+            "maximumFiniteUpperCoverage": 1.0 - 0.95**24,
+            "empiricalP95Emitted": False,
+            "modeledP95Emitted": False,
+        }
+    )
     return {
         "schema": ANALYSIS_SCHEMA,
         "evidenceStatus": "SUFFICIENT_EVIDENCE",
@@ -787,17 +1193,22 @@ def _sufficient_result(reports: Sequence[dict[str, Any]], prereg: dict[str, Any]
             "gitDirty": False,
             "platformArch": platforms[0],
             "allMembersRequired": True,
+            "sharedRunnerProvenance": provenance_reference,
         },
         "diagnostics": {
-            "schemaDrift": [],
-            "provenanceDrift": [],
-            "profileControlDrift": [],
-            "surfaceSetDrift": [],
-            "surfaceOrderDrift": [],
+            "validationErrors": list(attempt_findings),
+            "schemaDrift": [item for item in attempt_findings if item["category"] == "STRUCTURE"],
+            "provenanceDrift": [item for item in attempt_findings if item["category"] == "PROVENANCE"],
+            "profileControlDrift": [item for item in attempt_findings if item["code"] == "PROFILE_CONTROL_DRIFT"],
+            "surfaceSetDrift": [item for item in attempt_findings if item["code"] == "SURFACE_SET_DRIFT"],
+            "surfaceOrderDrift": [item for item in attempt_findings if item["code"] == "SURFACE_ORDER_DRIFT"],
             "platformDrift": [],
             "validatedBlockOrder": [report["blockId"] for report in reports],
+            "validatedAttemptOrder": [report["attemptId"] for report in reports],
+            "driftOrderTimeTelemetrySensitivities": drift,
         },
         "descriptiveByProfileAndSurface": descriptive,
+        "runLevelPointsByProfileAndSurface": run_level_points,
         "actionAnalysis": {
             "profile": "soak",
             "metric": "heapSlopeBytesPerSecond",
@@ -808,7 +1219,7 @@ def _sufficient_result(reports: Sequence[dict[str, Any]], prereg: dict[str, Any]
             "allConjunctiveConditionsPass": all_pass,
         },
         "claimPolicy": {
-            "p95": "OMITTED",
+            "p95": p95_receipt,
             "otherSurfaces": "DESCRIPTIVE_ONLY",
             "teardownAndExtrema": "DESCRIPTIVE_ONLY",
         },
@@ -826,7 +1237,10 @@ def _finding(
     if schedule is not None:
         result.update(
             {
-                "blockId": schedule["blockId"],
+                "blockId": schedule.get("slotId"),
+                "attemptId": schedule.get("attemptId"),
+                "attemptNumber": schedule.get("attemptNumber"),
+                "admissionNumber": schedule.get("admissionNumber"),
                 "filename": schedule["expectedFilename"],
                 "profile": schedule["profile"],
             }
@@ -851,13 +1265,15 @@ def _finding_from_error(error: EvidenceError, schedule: dict[str, Any] | None = 
         code, category = "TIMESTAMP_SEPARATION_INVALID", "STRUCTURE"
     elif "slope" in lowered:
         code, category = "DERIVED_SLOPE_INVALID", "ESTIMATOR"
-    elif "git" in lowered:
+    elif "raw private" in lowered or "privacy" in lowered or "sourceclass" in lowered:
+        code, category = "PRIVACY_TAXONOMY_INVALID", "PRIVACY"
+    elif any(term in lowered for term in ("git", "runtimecommand", "runtimecontrolidentity", "closure", "bun ", "bunexecutable", "worktree", "process identity", "child pid", "parent pid")):
         code, category = "PROVENANCE_DRIFT", "PROVENANCE"
-    elif "order" in lowered:
+    elif "order" in lowered or "ordinal" in lowered:
         code, category = "SURFACE_ORDER_DRIFT", "CONTROL"
     elif "seven required memory surfaces" in lowered:
         code, category = "SURFACE_SET_DRIFT", "CONTROL"
-    elif "profile" in lowered or "duration" in lowered or "iterations" in lowered or "environment control" in lowered:
+    elif "profile" in lowered or "duration" in lowered or "iterations" in lowered or "environment" in lowered:
         code, category = "PROFILE_CONTROL_DRIFT", "CONTROL"
     elif "platform" in lowered or "architecture" in lowered:
         code, category = "PLATFORM_DRIFT", "PROVENANCE"
@@ -880,19 +1296,32 @@ def _insufficient_result(
     limitations = prereg.get("limitations", []) if prereg else []
     admission: dict[str, Any] = {}
     for profile, required in (("short", 5), ("soak", 24)):
-        not_evaluated = required - admitted[profile] - invalid[profile]
-        if not_evaluated < 0:
-            raise EvidenceError(f"{profile} admission accounting is inconsistent")
+        not_evaluated = max(required - admitted[profile] - invalid[profile], 0)
+        attempt_cap = prereg["cohort"]["profiles"][profile]["attemptCap"] if prereg else (7 if profile == "short" else 30)
         admission[profile] = {
             "attemptsObserved": attempts[profile],
-            "attemptCap": required,
+            "attemptCap": attempt_cap,
             "requiredAdmittedBlocks": required,
             "admittedBlocks": admitted[profile],
             "invalidBlocks": invalid[profile],
             "notEvaluatedBlocks": not_evaluated,
+            "unusedPreallocatedAttempts": attempt_cap - attempts[profile],
             "excludedBlocks": 0,
-            "allMembersAdmitted": admitted[profile] == required and invalid[profile] == 0 and not_evaluated == 0,
+            "allMembersAdmitted": admitted[profile] == required,
         }
+    p95_receipt = dict(prereg["analysis"]["p95MethodReceipt"]) if prereg else {
+        "method": "two-sided-distribution-free-exact-order-statistic-interval",
+        "independentBlockCount": 24,
+        "finiteUpperEndpointAvailable": False,
+    }
+    p95_receipt.update(
+        {
+            "status": "OMITTED_IMPOSSIBLE",
+            "maximumFiniteUpperCoverage": 1.0 - 0.95**24,
+            "empiricalP95Emitted": False,
+            "modeledP95Emitted": False,
+        }
+    )
     return {
         "schema": ANALYSIS_SCHEMA,
         "evidenceStatus": "INSUFFICIENT_EVIDENCE",
@@ -909,8 +1338,9 @@ def _insufficient_result(
             "surfaceOrderDrift": [item for item in findings if item["code"] == "SURFACE_ORDER_DRIFT"],
             "platformDrift": [item for item in findings if item["code"] == "PLATFORM_DRIFT"],
             "resourceBounds": [item for item in findings if item["category"] == "RESOURCE_BOUND"],
+            "privacyDrift": [item for item in findings if item["category"] == "PRIVACY"],
         },
-        "claimPolicy": {"p95": "OMITTED", "otherSurfaces": "DESCRIPTIVE_ONLY", "teardownAndExtrema": "DESCRIPTIVE_ONLY"},
+        "claimPolicy": {"p95": p95_receipt, "otherSurfaces": "DESCRIPTIVE_ONLY", "teardownAndExtrema": "DESCRIPTIVE_ONLY"},
         "limitations": limitations,
     }
 
@@ -935,7 +1365,7 @@ def _markdown(result: dict[str, Any]) -> str:
         for profile in ("short", "soak"):
             item = result["admission"][profile]
             lines.append(f"| {profile} | {item['admittedBlocks']} / {item['requiredAdmittedBlocks']} | {item['attemptsObserved']} / {item['attemptCap']} |")
-        lines.extend(["", "## Preregistered action rule", "", "| Surface | Endpoint median (B/s) | BCa lower (B/s) | Endpoint + | Theil–Sen + | Pass |", "| --- | ---: | ---: | ---: | ---: | --- |"]) 
+        lines.extend(["", "## Preregistered action rule", "", "| Surface | Endpoint median (B/s) | BCa lower (B/s) | Endpoint + | Theil–Sen + | Pass |", "| --- | ---: | ---: | ---: | ---: | --- |"])
         for surface in ELIGIBLE_SURFACES:
             item = result["actionAnalysis"]["surfaces"][surface]
             lines.append(f"| {surface} | {item['primaryMedianBytesPerSecond']:.6f} | {item['primaryBca']['lower']:.6f} | {item['endpointPositiveSigns']} | {item['theilSenPositiveSigns']} | {str(item['surfacePass']).lower()} |")
@@ -1027,12 +1457,13 @@ def run_analysis(
     }
     bounds = prereg["bounds"]
     schedule_items = prereg["captureControls"]["schedule"]
+    admission_rows = prereg["captureControls"]["admissionRows"]
     expected_names = {item["expectedFilename"] for item in schedule_items}
     attempts = {"short": 0, "soak": 0}
     admitted = {"short": 0, "soak": 0}
     invalid = {"short": 0, "soak": 0}
-    invalid_names: set[str] = set()
-    findings: list[dict[str, Any]] = []
+    global_findings: list[dict[str, Any]] = []
+    attempt_findings: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
 
     scanned_entries: list[os.DirEntry[str]] = []
@@ -1044,21 +1475,29 @@ def run_analysis(
                 break
             scanned_entries.append(entry)
     if entry_count_exceeded:
-        findings.append(_finding("INPUT_FILE_COUNT_BOUND_EXCEEDED", "RESOURCE_BOUND", "input directory exceeds file-count bound"))
+        global_findings.append(
+            _finding("INPUT_FILE_COUNT_BOUND_EXCEEDED", "RESOURCE_BOUND", "input directory exceeds file-count bound")
+        )
     scanned_total_size = 0
+    present_names: set[str] = set()
+    entry_info: dict[str, os.stat_result] = {}
     for entry in sorted(scanned_entries, key=lambda item: item.name):
         try:
-            scanned_total_size += entry.stat(follow_symlinks=False).st_size
+            info = entry.stat(follow_symlinks=False)
+            scanned_total_size += info.st_size
+            entry_info[entry.name] = info
         except OSError as error:
-            findings.append(
+            global_findings.append(
                 _finding(
                     "INPUT_METADATA_UNAVAILABLE",
                     "STRUCTURE",
                     f"cannot stat input directory entry {entry.name}: {error.strerror}",
                 )
             )
+            continue
+        present_names.add(entry.name)
         if entry.name not in expected_names or not entry.name.endswith(".json"):
-            findings.append(
+            global_findings.append(
                 _finding(
                     "UNEXPECTED_INPUT_ENTRY",
                     "STRUCTURE",
@@ -1066,77 +1505,124 @@ def run_analysis(
                 )
             )
 
-    total_scheduled_size = 0
-    safe_schedules: list[dict[str, Any]] = []
-    for schedule in schedule_items:
-        filename = schedule["expectedFilename"]
-        path = input_real / filename
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            findings.append(
+    for profile in ("short", "soak"):
+        present_numbers = sorted(
+            item["attemptNumber"]
+            for item in schedule_items
+            if item["profile"] == profile and item["expectedFilename"] in present_names
+        )
+        if present_numbers and present_numbers != list(range(1, present_numbers[-1] + 1)):
+            global_findings.append(
                 _finding(
-                    "MISSING_SCHEDULED_BLOCK",
-                    "STRUCTURE",
-                    f"missing scheduled input: {filename}",
-                    schedule,
+                    "MISSING_ATTEMPT_ALLOCATION",
+                    "PROTOCOL",
+                    f"{profile} attempt files must be a contiguous prefix of the frozen allocation",
                 )
             )
-            continue
-        attempts[schedule["profile"]] += 1
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            findings.append(
-                _finding(
-                    "UNSAFE_INPUT_ENTRY",
-                    "STRUCTURE",
-                    f"input entry is not a regular non-symlink file: {filename}",
-                    schedule,
-                )
-            )
-            invalid[schedule["profile"]] += 1
-            invalid_names.add(filename)
-            continue
-        total_scheduled_size += info.st_size
-        if info.st_size > bounds["maximumBytesPerFile"]:
-            findings.append(
-                _finding(
-                    "BYTE_BOUND_EXCEEDED",
-                    "RESOURCE_BOUND",
-                    f"file exceeds byte bound: {filename}",
-                    schedule,
-                )
-            )
-            invalid[schedule["profile"]] += 1
-            invalid_names.add(filename)
-            continue
-        safe_schedules.append(schedule)
 
-    total_bound_exceeded = max(total_scheduled_size, scanned_total_size) > bounds["maximumTotalInputBytes"]
-    if total_bound_exceeded:
-        findings.append(_finding("TOTAL_INPUT_BYTE_BOUND_EXCEEDED", "RESOURCE_BOUND", "input directory exceeds total-byte bound"))
+    if scanned_total_size > bounds["maximumTotalInputBytes"]:
+        global_findings.append(
+            _finding("TOTAL_INPUT_BYTE_BOUND_EXCEEDED", "RESOURCE_BOUND", "input directory exceeds total-byte bound")
+        )
     else:
-        for schedule in safe_schedules:
+        for frozen_item in schedule_items:
+            filename = frozen_item["expectedFilename"]
+            if filename not in present_names:
+                continue
+            profile = frozen_item["profile"]
+            attempts[profile] += 1
+            if admitted[profile] >= prereg["cohort"]["profiles"][profile]["requiredAdmittedBlocks"]:
+                global_findings.append(
+                    _finding(
+                        "POST_TARGET_ATTEMPT",
+                        "PROTOCOL",
+                        f"{filename} was captured after the {profile} admission target was reached",
+                        frozen_item,
+                    )
+                )
+                continue
+            row = admission_rows[profile][admitted[profile]]
+            schedule = {
+                **frozen_item,
+                "slotId": row["slotId"],
+                "admissionNumber": admitted[profile] + 1,
+                "surfaceOrder": row["surfaceOrder"],
+            }
+            info = entry_info[filename]
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                attempt_findings.append(
+                    _finding(
+                        "UNSAFE_INPUT_ENTRY",
+                        "STRUCTURE",
+                        f"input entry is not a regular non-symlink file: {filename}",
+                        schedule,
+                    )
+                )
+                invalid[profile] += 1
+                continue
+            if info.st_size > bounds["maximumBytesPerFile"]:
+                attempt_findings.append(
+                    _finding(
+                        "BYTE_BOUND_EXCEEDED",
+                        "RESOURCE_BOUND",
+                        f"file exceeds byte bound: {filename}",
+                        schedule,
+                    )
+                )
+                invalid[profile] += 1
+                continue
             try:
                 report_value = _load_json_file(
-                    input_real / schedule["expectedFilename"],
+                    input_real / filename,
                     bounds["maximumBytesPerFile"],
                     bounds["maximumJsonDepth"],
                 )
                 reports.append(_validate_report(report_value, schedule, prereg, expected_git_sha.lower()))
-                admitted[schedule["profile"]] += 1
+                admitted[profile] += 1
             except EvidenceError as error:
-                findings.append(_finding_from_error(error, schedule))
-                if schedule["expectedFilename"] not in invalid_names:
-                    invalid[schedule["profile"]] += 1
-                    invalid_names.add(schedule["expectedFilename"])
+                attempt_findings.append(_finding_from_error(error, schedule))
+                invalid[profile] += 1
 
-    if findings:
-        result = _insufficient_result(findings, hashes, prereg, attempts, admitted, invalid)
+    for profile in ("short", "soak"):
+        required = prereg["cohort"]["profiles"][profile]["requiredAdmittedBlocks"]
+        if admitted[profile] != required:
+            missing_item = next(
+                (
+                    item
+                    for item in schedule_items
+                    if item["profile"] == profile and item["expectedFilename"] not in present_names
+                ),
+                None,
+            )
+            if missing_item is not None:
+                row = admission_rows[profile][admitted[profile]]
+                global_findings.append(
+                    _finding(
+                        "MISSING_SCHEDULED_BLOCK",
+                        "PROTOCOL",
+                        f"{missing_item['expectedFilename']} is the next frozen attempt required for {row['slotId']}",
+                        {
+                            **missing_item,
+                            "slotId": row["slotId"],
+                            "admissionNumber": admitted[profile] + 1,
+                        },
+                    )
+                )
+            global_findings.append(
+                _finding(
+                    "ADMISSION_TARGET_NOT_MET",
+                    "PROTOCOL",
+                    f"{profile} admitted {admitted[profile]} of {required} required blocks in {attempts[profile]} attempts",
+                )
+            )
+    all_findings = [*global_findings, *attempt_findings]
+    if global_findings:
+        result = _insufficient_result(all_findings, hashes, prereg, attempts, admitted, invalid)
     else:
         try:
-            result = _sufficient_result(reports, prereg, hashes)
+            result = _sufficient_result(reports, prereg, hashes, attempts, invalid, attempt_findings)
         except EvidenceError as error:
-            findings.append(_finding_from_error(error))
-            result = _insufficient_result(findings, hashes, prereg, attempts, admitted, invalid)
+            all_findings.append(_finding_from_error(error))
+            result = _insufficient_result(all_findings, hashes, prereg, attempts, admitted, invalid)
     json_path, markdown_path = _write_canonical(output_real, result, bounds["maximumMarkdownBytes"])
     return {"result": result, "resultJsonPath": str(json_path), "resultMarkdownPath": str(markdown_path)}

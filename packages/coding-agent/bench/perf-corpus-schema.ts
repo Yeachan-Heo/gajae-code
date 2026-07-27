@@ -100,6 +100,8 @@ export interface MemoryObservedExtremum {
 
 export type MemoryObservedExtrema = Record<MemoryExtremumDomain, MemoryObservedExtremum>;
 
+export const MEMORY_CAPTURE_SEMANTICS_ID = "gjc.memory-baseline.capture/3" as const;
+
 export interface MemorySamplingMetadata {
 	periodicCadenceTargetMs: number;
 	highWaterCadenceTargetMs: number;
@@ -121,6 +123,10 @@ const MEMORY_USAGE_SAMPLE_FIELDS = [
 
 export interface MemoryBaselineMetric {
 	surface: MemorySurface;
+	ordinal: number;
+	childPid: number;
+	parentPid: number;
+	captureSemanticsId: typeof MEMORY_CAPTURE_SEMANTICS_ID;
 	profile: MemoryWorkloadProfile;
 	iterations: number;
 	operations: number;
@@ -181,11 +187,18 @@ export interface PerfCorpusReport {
 	gitDirty: boolean;
 	runner: {
 		command: string;
+		runtimeCommand: string;
+		runtimeControlIdentity: string;
 		argv: string[];
 		environment: Record<string, string>;
 		platform: NodeJS.Platform;
 		arch: string;
-		bunVersion?: string;
+		bunVersion: string;
+		bunExecutable: string;
+		bunExecutableSha256: string;
+		worktreeFingerprint: string;
+		closureDigest: string;
+		closureManifest: readonly string[];
 		ci?: boolean;
 		profile: MemoryWorkloadProfile;
 		durationTargetMs?: number;
@@ -195,6 +208,7 @@ export interface PerfCorpusReport {
 		gcExposed: boolean;
 		memoryChildGcExposed: boolean;
 		memoryChildExecArgv: string[];
+		runnerPid: number;
 	};
 	fixtures: PerfCorpusFixtureResult[];
 	hotspotClassifications: HotspotClassification[];
@@ -216,6 +230,171 @@ export const REQUIRED_MEMORY_SURFACES: readonly MemorySurface[] = [
 const MEMORY_WORKLOAD_PROFILES: readonly MemoryWorkloadProfile[] = ["short", "soak"];
 const PROCESS_TREE_SAMPLERS: readonly MemoryBaselineMetric["processTreeSampler"][] = ["ps", "unavailable"];
 const MEMORY_ISOLATION_MODES: readonly PerfCorpusReport["runner"]["memoryIsolation"][] = ["in-process", "process-per-surface"];
+const SOURCE_CLASS_VALUES: readonly PerfCorpusFixtureResult["sourceClass"][] = [
+	"synthetic",
+	"sanitized-real",
+	"dogfood-redacted",
+];
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const REPORT_FIELDS = [
+	"schema",
+	"generatedAt",
+	"gitSha",
+	"gitDirty",
+	"runner",
+	"fixtures",
+	"hotspotClassifications",
+	"thresholdLedger",
+] as const;
+const RUNNER_FIELDS = [
+	"command",
+	"runtimeCommand",
+	"runtimeControlIdentity",
+	"argv",
+	"environment",
+	"platform",
+	"arch",
+	"bunVersion",
+	"bunExecutable",
+	"bunExecutableSha256",
+	"worktreeFingerprint",
+	"closureDigest",
+	"closureManifest",
+	"ci",
+	"profile",
+	"durationTargetMs",
+	"memoryIsolation",
+	"memorySurfaceOrder",
+	"iterationsTarget",
+	"gcExposed",
+	"memoryChildGcExposed",
+	"memoryChildExecArgv",
+	"runnerPid",
+] as const;
+const FIXTURE_FIELDS = [
+	"fixtureId",
+	"fixtureClass",
+	"sourceClass",
+	"workloadTags",
+	"privacy",
+	"wallClockPhase",
+	"processCpuUsage",
+	"profilerSelfTime",
+	"rssMemory",
+	"byteParity",
+	"memoryBaseline",
+] as const;
+const PRIVACY_FIELDS = ["rawPrivateTranscriptCommitted", "redactionNotes"] as const;
+const WALL_CLOCK_FIELDS = ["elapsedMs", "startMs", "p50Ms", "p95Ms", "advisoryOnly"] as const;
+const PROCESS_CPU_FIELDS = ["userMicros", "systemMicros", "elapsedMs", "cpuFraction"] as const;
+const PROFILER_FIELDS = ["profiler", "artifactPath", "samples"] as const;
+const PROFILER_SAMPLE_FIELDS = ["symbol", "selfTimeMs", "totalTimeMs", "package"] as const;
+const RSS_MEMORY_FIELDS = [
+	"baselineBytes",
+	"peakBytes",
+	"growthBytes",
+	"returnBytes",
+	"heapBaselineBytes",
+	"heapReturnBytes",
+] as const;
+const BYTE_PARITY_FIELDS = [
+	"renderedGolden",
+	"persistedJsonlGolden",
+	"providerPayloadGolden",
+	"materializedSessionGolden",
+] as const;
+const MEMORY_BASELINE_FIELDS = [
+	"surface",
+	"ordinal",
+	"childPid",
+	"parentPid",
+	"captureSemanticsId",
+	"profile",
+	"iterations",
+	"operations",
+	"operationsPerSecond",
+	"periodicSamples",
+	"observedExtrema",
+	"sampling",
+	"postTeardown",
+	"rssSlopeBytesPerSecond",
+	"heapSlopeBytesPerSecond",
+	"processTreeBaselineRssBytes",
+	"processTreePostTeardownRssBytes",
+	"processTreeSampler",
+] as const;
+const HOTSPOT_CLASSIFICATION_FIELDS = ["hotspotId", "status", "evidenceClass", "artifactRefs", "notes"] as const;
+const THRESHOLD_LEDGER_FIELDS = ["name", "advisoryOrEnforced"] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rejectUnexpectedKeys(
+	value: unknown,
+	allowed: readonly string[],
+	context: string,
+	errors: string[],
+): value is Record<string, unknown> {
+	if (!isRecord(value)) {
+		errors.push(`${context} must be an object`);
+		return false;
+	}
+	for (const key of Object.keys(value)) {
+		if (!allowed.includes(key)) errors.push(`${context}.${key} is not allowed`);
+	}
+	return true;
+}
+
+function sha256(value: string): string {
+	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
+}
+
+export function memoryRuntimeControlIdentity(runner: PerfCorpusReport["runner"]): string {
+	const controls = {
+		runtimeCommand: runner.runtimeCommand,
+		argv: runner.argv,
+		environment: runner.environment,
+		platform: runner.platform,
+		arch: runner.arch,
+		bunVersion: runner.bunVersion,
+		bunExecutable: runner.bunExecutable,
+		bunExecutableSha256: runner.bunExecutableSha256,
+		worktreeFingerprint: runner.worktreeFingerprint,
+		closureDigest: runner.closureDigest,
+		closureManifest: runner.closureManifest,
+		profile: runner.profile,
+		durationTargetMs: runner.durationTargetMs,
+		memoryIsolation: runner.memoryIsolation,
+		memorySurfaceOrder: runner.memorySurfaceOrder,
+		iterationsTarget: runner.iterationsTarget,
+		gcExposed: runner.gcExposed,
+		memoryChildGcExposed: runner.memoryChildGcExposed,
+		memoryChildExecArgv: runner.memoryChildExecArgv,
+		runnerPid: runner.runnerPid,
+		captureSemanticsId: MEMORY_CAPTURE_SEMANTICS_ID,
+	};
+	return sha256(JSON.stringify(controls));
+}
+
+function isValidClosureManifest(value: unknown): value is readonly string[] {
+	if (!Array.isArray(value) || value.length === 0 || value.some(entry => typeof entry !== "string")) return false;
+	const entries = value as string[];
+	if (new Set(entries).size !== entries.length) return false;
+	if (entries.some((entry, index) => index > 0 && entries[index - 1] >= entry)) return false;
+	return entries.every(entry => {
+		const separator = entry.lastIndexOf(":");
+		if (separator <= 0) return false;
+		const relativePath = entry.slice(0, separator);
+		const digest = entry.slice(separator + 1);
+		return (
+			!relativePath.startsWith("/") &&
+			!relativePath.includes("\\") &&
+			!relativePath.split("/").includes("..") &&
+			SHA256_PATTERN.test(digest)
+		);
+	});
+}
 export function isExactMemorySurfaceOrder(value: unknown): value is MemorySurface[] {
 	return (
 		Array.isArray(value) &&
@@ -306,16 +485,16 @@ function isValidMemoryByteValue(value: unknown): value is number {
 }
 
 function isValidMemoryUsageSample(value: unknown): value is MemoryUsageSample {
-	if (typeof value !== "object" || value === null) return false;
-	const sample = value as Record<string, unknown>;
+	if (!isRecord(value)) return false;
 	return (
-		MEMORY_USAGE_SAMPLE_FIELDS.every(name => Object.hasOwn(sample, name) && Number.isFinite(sample[name]) && Number(sample[name]) >= 0) &&
-		isValidMemoryByteValue(sample.rssBytes) &&
-		isValidMemoryByteValue(sample.heapUsedBytes) &&
-		isValidMemoryByteValue(sample.heapTotalBytes) &&
-		isValidMemoryByteValue(sample.externalBytes) &&
-		isValidMemoryByteValue(sample.arrayBuffersBytes) &&
-		Number.isSafeInteger(sample.activeResourceCount)
+		Object.keys(value).length === MEMORY_USAGE_SAMPLE_FIELDS.length &&
+		MEMORY_USAGE_SAMPLE_FIELDS.every(name => Object.hasOwn(value, name) && Number.isFinite(value[name]) && Number(value[name]) >= 0) &&
+		isValidMemoryByteValue(value.rssBytes) &&
+		isValidMemoryByteValue(value.heapUsedBytes) &&
+		isValidMemoryByteValue(value.heapTotalBytes) &&
+		isValidMemoryByteValue(value.externalBytes) &&
+		isValidMemoryByteValue(value.arrayBuffersBytes) &&
+		Number.isSafeInteger(value.activeResourceCount)
 	);
 }
 
@@ -329,6 +508,8 @@ function isValidMemoryUsageSample(value: unknown): value is MemoryUsageSample {
  */
 export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolean; errors: string[] } {
 	const errors: string[] = [];
+	rejectUnexpectedKeys(report, REPORT_FIELDS, "report", errors);
+	rejectUnexpectedKeys(report.runner, RUNNER_FIELDS, "runner", errors);
 	const schema = (report as { schema?: unknown }).schema;
 	if (schema === "gjc.perf-corpus/2") {
 		errors.push(`schema "${schema}" is incompatible with the v3 validator; expected "${PERF_CORPUS_SCHEMA}"`);
@@ -340,6 +521,41 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	}
 	if (typeof report.gitDirty !== "boolean") {
 		errors.push("gitDirty invalid");
+	}
+	if (typeof report.generatedAt !== "string" || !Number.isFinite(Date.parse(report.generatedAt))) {
+		errors.push("generatedAt invalid");
+	}
+	if (!Number.isSafeInteger(report.runner.runnerPid) || report.runner.runnerPid <= 0) {
+		errors.push("runner.runnerPid invalid");
+	}
+	if (typeof report.runner.runtimeCommand !== "string" || report.runner.runtimeCommand !== report.runner.command) {
+		errors.push("runner.runtimeCommand must exactly match runner.command");
+	}
+	if (typeof report.runner.bunVersion !== "string" || report.runner.bunVersion.trim().length === 0) {
+		errors.push("runner.bunVersion invalid");
+	}
+	if (typeof report.runner.bunExecutable !== "string" || !report.runner.bunExecutable.startsWith("/")) {
+		errors.push("runner.bunExecutable must be an absolute canonical path");
+	}
+	if (!SHA256_PATTERN.test(report.runner.bunExecutableSha256)) {
+		errors.push("runner.bunExecutableSha256 invalid");
+	}
+	if (!SHA256_PATTERN.test(report.runner.worktreeFingerprint)) {
+		errors.push("runner.worktreeFingerprint invalid");
+	}
+	if (!isValidClosureManifest(report.runner.closureManifest)) {
+		errors.push("runner.closureManifest invalid");
+	} else {
+		const expectedClosureDigest = sha256(`${report.runner.closureManifest.join("\n")}\n`);
+		if (report.runner.closureDigest !== expectedClosureDigest) {
+			errors.push("runner.closureDigest does not match closureManifest");
+		}
+	}
+	if (!SHA256_PATTERN.test(report.runner.closureDigest)) {
+		errors.push("runner.closureDigest invalid");
+	}
+	if (report.runner.runtimeControlIdentity !== memoryRuntimeControlIdentity(report.runner)) {
+		errors.push("runner.runtimeControlIdentity does not match runtime controls");
 	}
 	if (typeof report.runner.command !== "string" || report.runner.command.trim().length === 0) {
 		errors.push("runner.command must record the resolved invocation");
@@ -357,6 +573,18 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		Object.values(report.runner.environment).some(value => typeof value !== "string")
 	) {
 		errors.push("runner.environment invalid");
+	}
+	const expectedEnvironmentKeys = [
+		"GJC_MEMORY_ITERATIONS",
+		"GJC_MEMORY_PROFILE",
+		"GJC_MEMORY_SURFACE_ORDER",
+		...(report.runner.profile === "soak" ? ["GJC_MEMORY_DURATION_MS"] : []),
+	].sort();
+	if (
+		isRecord(report.runner.environment) &&
+		Object.keys(report.runner.environment).sort().join("\0") !== expectedEnvironmentKeys.join("\0")
+	) {
+		errors.push("runner.environment contains unexpected capture controls");
 	}
 	if (!Number.isInteger(report.runner.iterationsTarget) || report.runner.iterationsTarget <= 0) {
 		errors.push("runner.iterationsTarget invalid");
@@ -431,13 +659,31 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		for (const sample of profiler.samples ?? []) knownProfilerSymbols.add(sample.symbol);
 	}
 	for (const fixture of report.fixtures) {
+		rejectUnexpectedKeys(fixture, FIXTURE_FIELDS, `fixture ${fixture.fixtureId}`, errors);
+		rejectUnexpectedKeys(fixture.privacy, PRIVACY_FIELDS, `fixture ${fixture.fixtureId}.privacy`, errors);
+		rejectUnexpectedKeys(fixture.profilerSelfTime, PROFILER_FIELDS, `fixture ${fixture.fixtureId}.profilerSelfTime`, errors);
+		rejectUnexpectedKeys(fixture.rssMemory, RSS_MEMORY_FIELDS, `fixture ${fixture.fixtureId}.rssMemory`, errors);
+		rejectUnexpectedKeys(fixture.byteParity, BYTE_PARITY_FIELDS, `fixture ${fixture.fixtureId}.byteParity`, errors);
+		if (!(SOURCE_CLASS_VALUES as readonly string[]).includes(fixture.sourceClass)) {
+			errors.push(`fixture ${fixture.fixtureId}: sourceClass invalid`);
+		}
+		for (const [index, sample] of (fixture.profilerSelfTime.samples ?? []).entries()) {
+			rejectUnexpectedKeys(
+				sample,
+				PROFILER_SAMPLE_FIELDS,
+				`fixture ${fixture.fixtureId}.profilerSelfTime.samples.${index}`,
+				errors,
+			);
+		}
 		if (fixture.privacy.rawPrivateTranscriptCommitted !== false) {
 			errors.push(`fixture ${fixture.fixtureId}: rawPrivateTranscriptCommitted must be false`);
 		}
 		for (const [phase, metric] of Object.entries(fixture.wallClockPhase)) {
+			rejectUnexpectedKeys(metric, WALL_CLOCK_FIELDS, `fixture ${fixture.fixtureId}.wallClockPhase.${phase}`, errors);
 			if (!Number.isFinite(metric.elapsedMs)) errors.push(`fixture ${fixture.fixtureId}: wallClockPhase.${phase}.elapsedMs not finite`);
 		}
 		for (const [phase, metric] of Object.entries(fixture.processCpuUsage)) {
+			rejectUnexpectedKeys(metric, PROCESS_CPU_FIELDS, `fixture ${fixture.fixtureId}.processCpuUsage.${phase}`, errors);
 			if (!Number.isFinite(metric.userMicros) || !Number.isFinite(metric.systemMicros)) {
 				errors.push(`fixture ${fixture.fixtureId}: processCpuUsage.${phase} not finite`);
 			}
@@ -447,6 +693,19 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 		}
 		const baseline = fixture.memoryBaseline;
 		if (baseline) {
+			rejectUnexpectedKeys(baseline, MEMORY_BASELINE_FIELDS, `fixture ${fixture.fixtureId}.memoryBaseline`, errors);
+			if (!Number.isSafeInteger(baseline.ordinal) || baseline.ordinal < 0) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.ordinal invalid`);
+			}
+			if (!Number.isSafeInteger(baseline.childPid) || baseline.childPid <= 0) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.childPid invalid`);
+			}
+			if (!Number.isSafeInteger(baseline.parentPid) || baseline.parentPid <= 0) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.parentPid invalid`);
+			}
+			if (baseline.captureSemanticsId !== MEMORY_CAPTURE_SEMANTICS_ID) {
+				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.captureSemanticsId invalid`);
+			}
 			if (!(REQUIRED_MEMORY_SURFACES as readonly string[]).includes(baseline.surface)) {
 				errors.push(`fixture ${fixture.fixtureId}: memoryBaseline.surface invalid`);
 			}
@@ -547,6 +806,12 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 						errors.push(`fixture ${fixture.fixtureId}: memoryBaseline sample ${index}.${name} invalid`);
 					}
 				}
+				rejectUnexpectedKeys(
+					sample,
+					MEMORY_USAGE_SAMPLE_FIELDS,
+					`fixture ${fixture.fixtureId}.memoryBaseline sample ${index}`,
+					errors,
+				);
 				for (const name of [
 					"rssBytes",
 					"heapUsedBytes",
@@ -771,9 +1036,10 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 			}
 		}
 	}
-	const measuredSurfaceOrder = report.fixtures.flatMap(fixture =>
-		fixture.memoryBaseline ? [fixture.memoryBaseline.surface] : [],
+	const measuredBaselines = report.fixtures.flatMap(fixture =>
+		fixture.memoryBaseline ? [fixture.memoryBaseline] : [],
 	);
+	const measuredSurfaceOrder = measuredBaselines.map(baseline => baseline.surface);
 	const measuredSurfaces = new Set(measuredSurfaceOrder);
 	for (const surface of REQUIRED_MEMORY_SURFACES) {
 		if (!measuredSurfaces.has(surface)) errors.push(`memory baseline missing required surface "${surface}"`);
@@ -786,7 +1052,39 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 	) {
 		errors.push("memory baseline order must match runner.memorySurfaceOrder for process-per-surface");
 	}
+	if (
+		memorySurfaceOrderValid &&
+		measuredBaselines.some(
+			(baseline, index) =>
+				baseline.ordinal !== index || baseline.surface !== report.runner.memorySurfaceOrder[index],
+		)
+	) {
+		errors.push("memory baseline ordinal/surface identity must match runner.memorySurfaceOrder");
+	}
+	if (new Set(measuredBaselines.map(baseline => baseline.parentPid)).size !== 1) {
+		errors.push("memory baseline surfaces must have exactly one parent PID");
+	}
+	if (report.runner.memoryIsolation === "process-per-surface") {
+		if (
+			measuredBaselines.some(
+				baseline => baseline.parentPid !== report.runner.runnerPid || baseline.childPid === report.runner.runnerPid,
+			)
+		) {
+			errors.push("isolated memory baseline process tree does not match runner PID");
+		}
+		if (new Set(measuredBaselines.map(baseline => baseline.childPid)).size !== measuredBaselines.length) {
+			errors.push("isolated memory baseline child PIDs must be distinct");
+		}
+	} else if (measuredBaselines.some(baseline => baseline.childPid !== report.runner.runnerPid)) {
+		errors.push("in-process memory baseline child PID must equal runner PID");
+	}
 	for (const classification of report.hotspotClassifications) {
+		rejectUnexpectedKeys(
+			classification,
+			HOTSPOT_CLASSIFICATION_FIELDS,
+			`hotspot ${classification.hotspotId}`,
+			errors,
+		);
 		errors.push(...validateHotspotClassification(classification));
 		if (classification.status === "CPU-self-time confirmed") {
 			const anchored = classification.artifactRefs.some(ref => knownProfilerArtifacts.has(ref) || knownProfilerSymbols.has(ref));
@@ -796,6 +1094,9 @@ export function validatePerfCorpusReport(report: PerfCorpusReport): { ok: boolea
 				);
 			}
 		}
+	}
+	for (const [index, threshold] of (report.thresholdLedger ?? []).entries()) {
+		rejectUnexpectedKeys(threshold, THRESHOLD_LEDGER_FIELDS, `thresholdLedger.${index}`, errors);
 	}
 	return { ok: errors.length === 0, errors };
 }

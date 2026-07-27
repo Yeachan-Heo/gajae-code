@@ -20,7 +20,7 @@
     "profiles": {
       "short": {
         "requiredAdmittedBlocks": 5,
-        "attemptCap": 5,
+        "attemptCap": 7,
         "durationTargetMs": 0,
         "iterationsTarget": 200,
         "maximumPeriodicSamples": 22,
@@ -28,31 +28,45 @@
       },
       "soak": {
         "requiredAdmittedBlocks": 24,
-        "attemptCap": 24,
-        "durationTargetMs": 1000,
+        "attemptCap": 30,
+        "durationTargetMs": 30000,
         "iterationsTarget": 100000,
-        "maximumPeriodicSamples": 23,
+        "maximumPeriodicSamples": 603,
         "elapsedDurationToleranceMs": 250
       }
     },
     "sameGitShaPlatformAndArchRequired": true,
-    "independentReportBlocks": true
+    "independentReportBlocks": true,
+    "sharedRunnerProvenanceFields": [
+      "runtimeCommand",
+      "closureDigest",
+      "closureManifest",
+      "bunVersion",
+      "bunExecutable",
+      "bunExecutableSha256",
+      "worktreeFingerprint"
+    ]
   },
   "bounds": {
-    "maximumInputFiles": 29,
+    "maximumInputFiles": 37,
     "maximumBytesPerFile": 8388608,
     "maximumTotalInputBytes": 134217728,
     "maximumJsonDepth": 40,
     "maximumMarkdownBytes": 65536,
     "minimumElapsedDeltaMs": 0.001,
-    "minimumAbsoluteActionSlopeBytesPerSecond": 1e-9,
-    "maximumTheilSenPairsPerBaseline": 253
+    "minimumAbsoluteActionSlopeBytesPerSecond": 0,
+    "maximumTheilSenPairsPerBaseline": 181503
   },
   "analysis": {
     "descriptiveStatistics": [
       "minimum",
       "median",
-      "maximum"
+      "medianAbsoluteDeviation",
+      "firstQuartile",
+      "thirdQuartile",
+      "interquartileRange",
+      "maximum",
+      "allRunLevelPoints"
     ],
     "actionFamily": {
       "name": "sustained-heap-growth",
@@ -70,7 +84,8 @@
         "resampleOverrideAllowed": false,
         "unit": "whole-report-block",
         "jointSurfaceResampling": true,
-        "seed": 20260727,
+        "seed": 846836967,
+        "seedExpression": "0x3279B4E7",
         "indexGenerator": "sha256(seed:replicate:draw)-modulo-block-count",
         "quantile": "Hyndman-Fan-type-7",
         "biasTies": "half-weight"
@@ -78,27 +93,37 @@
       "minimumPositiveSignsPerEstimatorPerSurface": 18,
       "minimumBcaLowerBoundBytesPerSecond": 34952.53333333333,
       "minimumBcaLowerBoundExpression": "1048576/30",
-      "decision": "Action only when both eligible surfaces independently meet the endpoint BCa lower bound and both endpoint and Theil-Sen estimators have at least 18 positive report signs. All conditions are conjunctive.",
+      "decision": "Action only when both eligible surfaces independently meet the endpoint BCa lower bound and both endpoint and Theil-Sen estimators have at least 18 positive report signs. Zero is valid non-positive evidence. All conditions are conjunctive.",
       "noMultiplicityExpansion": true
     },
-    "p95Claim": "omitted",
+    "p95Claim": "omitted-impossible-with-24-independent-blocks",
+    "p95MethodReceipt": {
+      "method": "two-sided-distribution-free-exact-order-statistic-interval",
+      "populationQuantile": 0.95,
+      "confidenceLevel": 0.95,
+      "independentBlockCount": 24,
+      "finiteUpperEndpointAvailable": false,
+      "maximumFiniteUpperCoverageExpression": "1 - 0.95^24",
+      "reason": "With 24 independent blocks, even the sample maximum covers the population p95 from above with probability only 1 - 0.95^24, below 95%; no finite two-sided exact 95% upper endpoint is available. No empirical or modeled p95 is emitted."
+    },
     "otherSurfaces": "descriptive-only",
     "teardownAndObservedExtrema": "descriptive-only",
-    "insufficientEvidenceRule": "Emit INSUFFICIENT_EVIDENCE with actionDecision NOT_EVALUATED unless every scheduled file is present, no other directory entry exists, exact profile counts are admitted, and every report passes structure, provenance, fixed resource bounds, control, seven-surface, and order validation. Validate every bounded scheduled member and report admitted, invalid, and not-evaluated counts without treating any member as excluded or replacing it after its scheduled attempt cap."
+    "insufficientEvidenceRule": "Emit INSUFFICIENT_EVIDENCE with actionDecision NOT_EVALUATED unless 5 valid short and 24 valid soak reports are admitted within the frozen 7/30 attempt allocations. Invalid attempts consume their profile cap and remain in diagnostics; only the next frozen allocation may replace an invalid attempt, reusing the unfilled admission-slot surface order. Stop each profile at its admitted target and reject post-target or out-of-allocation attempts."
   },
   "exclusions": {
     "postOutcomeExclusionsAllowed": false,
-    "invalidStructure": "fail-cohort-as-INSUFFICIENT_EVIDENCE",
-    "missingScheduledBlock": "fail-cohort-as-INSUFFICIENT_EVIDENCE",
+    "invalidStructure": "consume-attempt-and-use-next-frozen-allocation-if-available",
+    "missingAttemptAllocation": "fail-closed-when-a-later-allocation-for-that-profile-exists",
     "extraOrUnexpectedFile": "fail-cohort-as-INSUFFICIENT_EVIDENCE",
-    "dirtyOrMismatchedGit": "fail-cohort-as-INSUFFICIENT_EVIDENCE",
-    "orderOrControlDrift": "fail-cohort-as-INSUFFICIENT_EVIDENCE"
+    "dirtyOrMismatchedGit": "invalid-attempt",
+    "orderOrControlDrift": "invalid-attempt"
   },
   "captureControls": {
     "permutationGeneration": {
       "performedBeforeOutcomes": true,
-      "algorithm": "For each block, sort the seven UTF-8 surface names by the raw SHA-256 digest of '20260727:<profile>:<two-digit-index>:<surface>'.",
-      "seed": 20260727
+      "algorithm": "Sort the seven UTF-8 surface names by raw SHA-256 of '0x3279B4E7:<profile>:<surface>' to obtain a seeded base row, then use cyclic rotations. Soak slots 1-21 are three complete seven-row Latin cycles; slots 22-24 are fixed rotations 1, 3, and 5. Short slots use the first five rotations. An invalid attempt does not advance the admission slot, so its replacement reuses the same row.",
+      "seed": 846836967,
+      "seedExpression": "0x3279B4E7"
     },
     "requiredSurfaces": [
       "cli",
@@ -109,36 +134,79 @@
       "tui",
       "shared-native"
     ],
+    "admissionRows": {
+      "short": [
+        { "slotId": "short-slot-01", "surfaceOrder": ["tui", "telegram-daemon", "shared-native", "blob-store", "agent-session", "worker", "cli"] },
+        { "slotId": "short-slot-02", "surfaceOrder": ["telegram-daemon", "shared-native", "blob-store", "agent-session", "worker", "cli", "tui"] },
+        { "slotId": "short-slot-03", "surfaceOrder": ["shared-native", "blob-store", "agent-session", "worker", "cli", "tui", "telegram-daemon"] },
+        { "slotId": "short-slot-04", "surfaceOrder": ["blob-store", "agent-session", "worker", "cli", "tui", "telegram-daemon", "shared-native"] },
+        { "slotId": "short-slot-05", "surfaceOrder": ["agent-session", "worker", "cli", "tui", "telegram-daemon", "shared-native", "blob-store"] }
+      ],
+      "soak": [
+        { "slotId": "soak-slot-01", "surfaceOrder": ["blob-store", "shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon"] },
+        { "slotId": "soak-slot-02", "surfaceOrder": ["shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon", "blob-store"] },
+        { "slotId": "soak-slot-03", "surfaceOrder": ["worker", "agent-session", "tui", "cli", "telegram-daemon", "blob-store", "shared-native"] },
+        { "slotId": "soak-slot-04", "surfaceOrder": ["agent-session", "tui", "cli", "telegram-daemon", "blob-store", "shared-native", "worker"] },
+        { "slotId": "soak-slot-05", "surfaceOrder": ["tui", "cli", "telegram-daemon", "blob-store", "shared-native", "worker", "agent-session"] },
+        { "slotId": "soak-slot-06", "surfaceOrder": ["cli", "telegram-daemon", "blob-store", "shared-native", "worker", "agent-session", "tui"] },
+        { "slotId": "soak-slot-07", "surfaceOrder": ["telegram-daemon", "blob-store", "shared-native", "worker", "agent-session", "tui", "cli"] },
+        { "slotId": "soak-slot-08", "surfaceOrder": ["blob-store", "shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon"] },
+        { "slotId": "soak-slot-09", "surfaceOrder": ["shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon", "blob-store"] },
+        { "slotId": "soak-slot-10", "surfaceOrder": ["worker", "agent-session", "tui", "cli", "telegram-daemon", "blob-store", "shared-native"] },
+        { "slotId": "soak-slot-11", "surfaceOrder": ["agent-session", "tui", "cli", "telegram-daemon", "blob-store", "shared-native", "worker"] },
+        { "slotId": "soak-slot-12", "surfaceOrder": ["tui", "cli", "telegram-daemon", "blob-store", "shared-native", "worker", "agent-session"] },
+        { "slotId": "soak-slot-13", "surfaceOrder": ["cli", "telegram-daemon", "blob-store", "shared-native", "worker", "agent-session", "tui"] },
+        { "slotId": "soak-slot-14", "surfaceOrder": ["telegram-daemon", "blob-store", "shared-native", "worker", "agent-session", "tui", "cli"] },
+        { "slotId": "soak-slot-15", "surfaceOrder": ["blob-store", "shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon"] },
+        { "slotId": "soak-slot-16", "surfaceOrder": ["shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon", "blob-store"] },
+        { "slotId": "soak-slot-17", "surfaceOrder": ["worker", "agent-session", "tui", "cli", "telegram-daemon", "blob-store", "shared-native"] },
+        { "slotId": "soak-slot-18", "surfaceOrder": ["agent-session", "tui", "cli", "telegram-daemon", "blob-store", "shared-native", "worker"] },
+        { "slotId": "soak-slot-19", "surfaceOrder": ["tui", "cli", "telegram-daemon", "blob-store", "shared-native", "worker", "agent-session"] },
+        { "slotId": "soak-slot-20", "surfaceOrder": ["cli", "telegram-daemon", "blob-store", "shared-native", "worker", "agent-session", "tui"] },
+        { "slotId": "soak-slot-21", "surfaceOrder": ["telegram-daemon", "blob-store", "shared-native", "worker", "agent-session", "tui", "cli"] },
+        { "slotId": "soak-slot-22", "surfaceOrder": ["shared-native", "worker", "agent-session", "tui", "cli", "telegram-daemon", "blob-store"] },
+        { "slotId": "soak-slot-23", "surfaceOrder": ["agent-session", "tui", "cli", "telegram-daemon", "blob-store", "shared-native", "worker"] },
+        { "slotId": "soak-slot-24", "surfaceOrder": ["cli", "telegram-daemon", "blob-store", "shared-native", "worker", "agent-session", "tui"] }
+      ]
+    },
     "schedule": [
-      { "blockId": "short-01", "profile": "short", "expectedFilename": "short-01.json", "surfaceOrder": ["tui", "worker", "shared-native", "cli", "agent-session", "telegram-daemon", "blob-store"] },
-      { "blockId": "short-02", "profile": "short", "expectedFilename": "short-02.json", "surfaceOrder": ["worker", "agent-session", "tui", "telegram-daemon", "shared-native", "blob-store", "cli"] },
-      { "blockId": "short-03", "profile": "short", "expectedFilename": "short-03.json", "surfaceOrder": ["telegram-daemon", "blob-store", "shared-native", "agent-session", "tui", "worker", "cli"] },
-      { "blockId": "short-04", "profile": "short", "expectedFilename": "short-04.json", "surfaceOrder": ["agent-session", "tui", "worker", "cli", "telegram-daemon", "shared-native", "blob-store"] },
-      { "blockId": "short-05", "profile": "short", "expectedFilename": "short-05.json", "surfaceOrder": ["tui", "cli", "blob-store", "telegram-daemon", "worker", "agent-session", "shared-native"] },
-      { "blockId": "soak-01", "profile": "soak", "expectedFilename": "soak-01.json", "surfaceOrder": ["agent-session", "telegram-daemon", "tui", "shared-native", "cli", "worker", "blob-store"] },
-      { "blockId": "soak-02", "profile": "soak", "expectedFilename": "soak-02.json", "surfaceOrder": ["worker", "tui", "cli", "telegram-daemon", "shared-native", "blob-store", "agent-session"] },
-      { "blockId": "soak-03", "profile": "soak", "expectedFilename": "soak-03.json", "surfaceOrder": ["agent-session", "telegram-daemon", "shared-native", "worker", "cli", "tui", "blob-store"] },
-      { "blockId": "soak-04", "profile": "soak", "expectedFilename": "soak-04.json", "surfaceOrder": ["shared-native", "telegram-daemon", "blob-store", "tui", "cli", "agent-session", "worker"] },
-      { "blockId": "soak-05", "profile": "soak", "expectedFilename": "soak-05.json", "surfaceOrder": ["telegram-daemon", "blob-store", "worker", "tui", "agent-session", "cli", "shared-native"] },
-      { "blockId": "soak-06", "profile": "soak", "expectedFilename": "soak-06.json", "surfaceOrder": ["tui", "blob-store", "shared-native", "cli", "telegram-daemon", "worker", "agent-session"] },
-      { "blockId": "soak-07", "profile": "soak", "expectedFilename": "soak-07.json", "surfaceOrder": ["tui", "telegram-daemon", "blob-store", "shared-native", "cli", "worker", "agent-session"] },
-      { "blockId": "soak-08", "profile": "soak", "expectedFilename": "soak-08.json", "surfaceOrder": ["blob-store", "tui", "agent-session", "worker", "cli", "shared-native", "telegram-daemon"] },
-      { "blockId": "soak-09", "profile": "soak", "expectedFilename": "soak-09.json", "surfaceOrder": ["worker", "blob-store", "shared-native", "tui", "telegram-daemon", "agent-session", "cli"] },
-      { "blockId": "soak-10", "profile": "soak", "expectedFilename": "soak-10.json", "surfaceOrder": ["agent-session", "cli", "telegram-daemon", "worker", "blob-store", "tui", "shared-native"] },
-      { "blockId": "soak-11", "profile": "soak", "expectedFilename": "soak-11.json", "surfaceOrder": ["cli", "shared-native", "worker", "tui", "telegram-daemon", "agent-session", "blob-store"] },
-      { "blockId": "soak-12", "profile": "soak", "expectedFilename": "soak-12.json", "surfaceOrder": ["tui", "cli", "blob-store", "shared-native", "agent-session", "telegram-daemon", "worker"] },
-      { "blockId": "soak-13", "profile": "soak", "expectedFilename": "soak-13.json", "surfaceOrder": ["blob-store", "agent-session", "tui", "telegram-daemon", "cli", "shared-native", "worker"] },
-      { "blockId": "soak-14", "profile": "soak", "expectedFilename": "soak-14.json", "surfaceOrder": ["shared-native", "blob-store", "telegram-daemon", "worker", "agent-session", "tui", "cli"] },
-      { "blockId": "soak-15", "profile": "soak", "expectedFilename": "soak-15.json", "surfaceOrder": ["cli", "worker", "agent-session", "telegram-daemon", "tui", "blob-store", "shared-native"] },
-      { "blockId": "soak-16", "profile": "soak", "expectedFilename": "soak-16.json", "surfaceOrder": ["shared-native", "blob-store", "cli", "tui", "agent-session", "worker", "telegram-daemon"] },
-      { "blockId": "soak-17", "profile": "soak", "expectedFilename": "soak-17.json", "surfaceOrder": ["shared-native", "agent-session", "telegram-daemon", "worker", "cli", "tui", "blob-store"] },
-      { "blockId": "soak-18", "profile": "soak", "expectedFilename": "soak-18.json", "surfaceOrder": ["worker", "agent-session", "shared-native", "tui", "blob-store", "telegram-daemon", "cli"] },
-      { "blockId": "soak-19", "profile": "soak", "expectedFilename": "soak-19.json", "surfaceOrder": ["agent-session", "shared-native", "blob-store", "worker", "cli", "telegram-daemon", "tui"] },
-      { "blockId": "soak-20", "profile": "soak", "expectedFilename": "soak-20.json", "surfaceOrder": ["worker", "agent-session", "shared-native", "tui", "blob-store", "cli", "telegram-daemon"] },
-      { "blockId": "soak-21", "profile": "soak", "expectedFilename": "soak-21.json", "surfaceOrder": ["blob-store", "telegram-daemon", "worker", "shared-native", "agent-session", "cli", "tui"] },
-      { "blockId": "soak-22", "profile": "soak", "expectedFilename": "soak-22.json", "surfaceOrder": ["shared-native", "worker", "blob-store", "telegram-daemon", "tui", "agent-session", "cli"] },
-      { "blockId": "soak-23", "profile": "soak", "expectedFilename": "soak-23.json", "surfaceOrder": ["agent-session", "shared-native", "blob-store", "telegram-daemon", "cli", "tui", "worker"] },
-      { "blockId": "soak-24", "profile": "soak", "expectedFilename": "soak-24.json", "surfaceOrder": ["shared-native", "telegram-daemon", "worker", "cli", "blob-store", "tui", "agent-session"] }
+      { "attemptId": "soak-01", "profile": "soak", "attemptNumber": 1, "expectedFilename": "soak-01.json" },
+      { "attemptId": "soak-02", "profile": "soak", "attemptNumber": 2, "expectedFilename": "soak-02.json" },
+      { "attemptId": "short-01", "profile": "short", "attemptNumber": 1, "expectedFilename": "short-01.json" },
+      { "attemptId": "soak-03", "profile": "soak", "attemptNumber": 3, "expectedFilename": "soak-03.json" },
+      { "attemptId": "soak-04", "profile": "soak", "attemptNumber": 4, "expectedFilename": "soak-04.json" },
+      { "attemptId": "soak-05", "profile": "soak", "attemptNumber": 5, "expectedFilename": "soak-05.json" },
+      { "attemptId": "soak-06", "profile": "soak", "attemptNumber": 6, "expectedFilename": "soak-06.json" },
+      { "attemptId": "short-02", "profile": "short", "attemptNumber": 2, "expectedFilename": "short-02.json" },
+      { "attemptId": "soak-07", "profile": "soak", "attemptNumber": 7, "expectedFilename": "soak-07.json" },
+      { "attemptId": "soak-08", "profile": "soak", "attemptNumber": 8, "expectedFilename": "soak-08.json" },
+      { "attemptId": "soak-09", "profile": "soak", "attemptNumber": 9, "expectedFilename": "soak-09.json" },
+      { "attemptId": "soak-10", "profile": "soak", "attemptNumber": 10, "expectedFilename": "soak-10.json" },
+      { "attemptId": "short-03", "profile": "short", "attemptNumber": 3, "expectedFilename": "short-03.json" },
+      { "attemptId": "soak-11", "profile": "soak", "attemptNumber": 11, "expectedFilename": "soak-11.json" },
+      { "attemptId": "soak-12", "profile": "soak", "attemptNumber": 12, "expectedFilename": "soak-12.json" },
+      { "attemptId": "soak-13", "profile": "soak", "attemptNumber": 13, "expectedFilename": "soak-13.json" },
+      { "attemptId": "soak-14", "profile": "soak", "attemptNumber": 14, "expectedFilename": "soak-14.json" },
+      { "attemptId": "short-04", "profile": "short", "attemptNumber": 4, "expectedFilename": "short-04.json" },
+      { "attemptId": "soak-15", "profile": "soak", "attemptNumber": 15, "expectedFilename": "soak-15.json" },
+      { "attemptId": "soak-16", "profile": "soak", "attemptNumber": 16, "expectedFilename": "soak-16.json" },
+      { "attemptId": "soak-17", "profile": "soak", "attemptNumber": 17, "expectedFilename": "soak-17.json" },
+      { "attemptId": "soak-18", "profile": "soak", "attemptNumber": 18, "expectedFilename": "soak-18.json" },
+      { "attemptId": "short-05", "profile": "short", "attemptNumber": 5, "expectedFilename": "short-05.json" },
+      { "attemptId": "soak-19", "profile": "soak", "attemptNumber": 19, "expectedFilename": "soak-19.json" },
+      { "attemptId": "soak-20", "profile": "soak", "attemptNumber": 20, "expectedFilename": "soak-20.json" },
+      { "attemptId": "soak-21", "profile": "soak", "attemptNumber": 21, "expectedFilename": "soak-21.json" },
+      { "attemptId": "soak-22", "profile": "soak", "attemptNumber": 22, "expectedFilename": "soak-22.json" },
+      { "attemptId": "short-06", "profile": "short", "attemptNumber": 6, "expectedFilename": "short-06.json" },
+      { "attemptId": "soak-23", "profile": "soak", "attemptNumber": 23, "expectedFilename": "soak-23.json" },
+      { "attemptId": "soak-24", "profile": "soak", "attemptNumber": 24, "expectedFilename": "soak-24.json" },
+      { "attemptId": "soak-25", "profile": "soak", "attemptNumber": 25, "expectedFilename": "soak-25.json" },
+      { "attemptId": "soak-26", "profile": "soak", "attemptNumber": 26, "expectedFilename": "soak-26.json" },
+      { "attemptId": "short-07", "profile": "short", "attemptNumber": 7, "expectedFilename": "short-07.json" },
+      { "attemptId": "soak-27", "profile": "soak", "attemptNumber": 27, "expectedFilename": "soak-27.json" },
+      { "attemptId": "soak-28", "profile": "soak", "attemptNumber": 28, "expectedFilename": "soak-28.json" },
+      { "attemptId": "soak-29", "profile": "soak", "attemptNumber": 29, "expectedFilename": "soak-29.json" },
+      { "attemptId": "soak-30", "profile": "soak", "attemptNumber": 30, "expectedFilename": "soak-30.json" }
     ]
   },
   "trustedCodePolicy": {
@@ -159,6 +227,6 @@
     "Endpoint and Theil-Sen slopes measure retained heap proxies and do not identify allocation sites or causal leaks.",
     "Observed extrema and teardown values are descriptive and do not enter the action rule.",
     "Results are platform-, architecture-, runtime-, checkout-, and capture-control-specific and are not generalized across platforms.",
-    "No p95 claim is preregistered or emitted."
+    "With 24 independent blocks no finite two-sided distribution-free exact 95% upper endpoint exists for population p95; no p95 value, interval, or gate is emitted."
   ]
 }

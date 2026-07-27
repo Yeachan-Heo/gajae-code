@@ -10,13 +10,16 @@
  * Run: `bun packages/coding-agent/bench/perf-corpus.bench.ts`
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
 import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
 import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
 	calculateMemorySlope,
+	memoryRuntimeControlIdentity,
 	isExactMemorySurfaceOrder,
+	MEMORY_CAPTURE_SEMANTICS_ID,
 	type MemoryUsageSample,
 	type MemoryObservedExtrema,
 	type MemoryWorkloadProfile,
@@ -31,6 +34,69 @@ import {
 	validatePerfCorpusReport,
 	type WallClockPhaseMetric,
 } from "./perf-corpus-schema";
+
+export interface MeasurementRuntimeProvenance {
+	bunVersion: string;
+	bunExecutable: string;
+	bunExecutableSha256: string;
+	closureDigest: string;
+	closureManifest: readonly string[];
+}
+
+const MEASUREMENT_CLOSURE_SELECTORS: readonly string[] = [
+	"bun.lock",
+	"Cargo.lock",
+	"Cargo.toml",
+	"package.json",
+	"packages/agent/package.json",
+	"packages/agent/src",
+	"packages/ai/package.json",
+	"packages/ai/src",
+	"packages/coding-agent/package.json",
+	"packages/coding-agent/bench",
+	"packages/coding-agent/src",
+	"packages/natives/package.json",
+	"packages/natives/native",
+	"packages/tui/package.json",
+	"packages/tui/src",
+	"packages/utils/package.json",
+	"packages/utils/src",
+];
+
+function sha256Bytes(value: Uint8Array | string): string {
+	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
+}
+
+export function resolveMeasurementRuntimeProvenance(repositoryRoot: string): MeasurementRuntimeProvenance {
+	const bunVersion = process.versions.bun;
+	if (!bunVersion) throw new Error("Bun version unavailable");
+	const bunExecutable = fs.realpathSync(process.execPath);
+	const trackedClosure = Bun.spawnSync(
+		["git", "ls-files", "-z", "--error-unmatch", "--", ...MEASUREMENT_CLOSURE_SELECTORS],
+		{ cwd: repositoryRoot },
+	);
+	if (trackedClosure.exitCode !== 0) {
+		throw new Error("measurement closure contains an untracked or missing source");
+	}
+	const closurePaths = new TextDecoder()
+		.decode(trackedClosure.stdout)
+		.split("\0")
+		.filter(Boolean);
+	const uniqueClosurePaths = [...new Set(closurePaths)].sort();
+	const closureManifest = uniqueClosurePaths
+		.map(relativePath => {
+			const sourcePath = path.join(repositoryRoot, relativePath);
+			return `${relativePath}:${sha256Bytes(fs.readFileSync(sourcePath))}`;
+		})
+		.sort();
+	return {
+		bunVersion,
+		bunExecutable,
+		bunExecutableSha256: sha256Bytes(fs.readFileSync(bunExecutable)),
+		closureDigest: sha256Bytes(`${closureManifest.join("\n")}\n`),
+		closureManifest,
+	};
+}
 
 /** Deterministic PRNG (mulberry32) so fixtures are identical on every run. */
 function mulberry32(seed: number): () => number {
@@ -114,25 +180,22 @@ export function gitWorktreeFingerprint(repositoryRoot: string): { dirty: boolean
 }
 
 export function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerprint: string } {
-	const environmentSha = process.env.GITHUB_SHA?.trim();
 	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
-	let sha = "";
-	let dirty = true;
-	let worktreeFingerprint = "unavailable";
-	let revision: Bun.SyncSubprocess<"pipe", "pipe"> | null = null;
+	let revision: Bun.SyncSubprocess<"pipe", "pipe">;
 	try {
 		revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
-	} catch {
-		// Exported source bundles may provide GITHUB_SHA without shipping Git.
+	} catch (error) {
+		throw new Error("git HEAD provenance unavailable", { cause: error });
 	}
-	if (revision?.exitCode === 0) {
-		sha = new TextDecoder().decode(revision.stdout).trim();
-		const worktree = gitWorktreeFingerprint(repositoryRoot);
-		worktreeFingerprint = worktree.fingerprint;
-		dirty = worktree.dirty;
+	if (revision.exitCode !== 0) {
+		throw new Error("git HEAD provenance unavailable");
 	}
-	if (!sha) sha = environmentSha ?? "";
-	return { sha, dirty, worktreeFingerprint };
+	const sha = new TextDecoder().decode(revision.stdout).trim();
+	if (!/^[0-9a-f]{40}$/i.test(sha)) {
+		throw new Error("git HEAD provenance is not a full commit SHA");
+	}
+	const worktree = gitWorktreeFingerprint(repositoryRoot);
+	return { sha, dirty: worktree.dirty, worktreeFingerprint: worktree.fingerprint };
 }
 
 function reproductionInvocation(
@@ -238,6 +301,16 @@ export function normalizeProcessTreeRss(
 		return { baselineBytes: null, postTeardownBytes: null, sampler: "unavailable" };
 	}
 	return { baselineBytes, postTeardownBytes, sampler: "ps" };
+}
+
+function surfaceOrdinal(surface: MemorySurface): number {
+	const configured = process.argv.includes(MEMORY_CHILD_ARGUMENT)
+		? Number(process.env.GJC_MEMORY_SURFACE_ORDINAL)
+		: Number.NaN;
+	if (Number.isSafeInteger(configured) && configured >= 0 && configured < REQUIRED_MEMORY_SURFACES.length) {
+		return configured;
+	}
+	return REQUIRED_MEMORY_SURFACES.indexOf(surface);
 }
 
 export function buildMemoryFixture(
@@ -352,6 +425,10 @@ export function buildMemoryFixture(
 		},
 		memoryBaseline: {
 			surface: workload.surface,
+			ordinal: surfaceOrdinal(workload.surface),
+			childPid: process.pid,
+			parentPid: process.ppid,
+			captureSemanticsId: MEMORY_CAPTURE_SEMANTICS_ID,
 			profile,
 			iterations,
 			operations,
@@ -415,13 +492,14 @@ function buildIsolatedMemoryFixtures(
 	targetDurationMs: number,
 	memorySurfaceOrder: readonly MemorySurface[],
 ): PerfCorpusFixtureResult[] {
-	return memorySurfaceOrder.map(surface => {
+	return memorySurfaceOrder.map((surface, ordinal) => {
 		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface), MEMORY_CHILD_ARGUMENT], {
 			env: {
 				...process.env,
 				GJC_MEMORY_CHILD_SURFACE: surface,
 				GJC_MEMORY_PROFILE: profile,
 				GJC_MEMORY_DURATION_MS: String(targetDurationMs),
+				GJC_MEMORY_SURFACE_ORDINAL: String(ordinal),
 			},
 		});
 		if (result.exitCode !== 0) {
@@ -502,6 +580,8 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 	const iterationsTarget = workloadIterations(profile);
 	const memorySurfaceOrder = resolveMemorySurfaceOrder(options.isolatedMemory === true);
 	const initialGit = resolveGitProvenance();
+	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+	const initialRuntime = resolveMeasurementRuntimeProvenance(repositoryRoot);
 	const fixtures: PerfCorpusFixtureResult[] = [
 		buildFixture("startup-load", "startup-session-load", ["startup", "session-load"], startupWorkload, 0x51ed),
 		buildFixture("streaming-ttft", "streaming-ttft", ["streaming", "ttft"], streamingWorkload, 0x9e37),
@@ -511,37 +591,52 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
 	const finalGit = resolveGitProvenance();
+	const finalRuntime = resolveMeasurementRuntimeProvenance(repositoryRoot);
 	if (
 		initialGit.sha !== finalGit.sha ||
 		initialGit.dirty !== finalGit.dirty ||
-		initialGit.worktreeFingerprint !== finalGit.worktreeFingerprint
+		initialGit.worktreeFingerprint !== finalGit.worktreeFingerprint ||
+		initialRuntime.bunVersion !== finalRuntime.bunVersion ||
+		initialRuntime.bunExecutable !== finalRuntime.bunExecutable ||
+		initialRuntime.bunExecutableSha256 !== finalRuntime.bunExecutableSha256 ||
+		initialRuntime.closureDigest !== finalRuntime.closureDigest
 	) {
 		throw new Error("benchmark checkout provenance changed while workloads were running");
 	}
 	const git = initialGit;
 	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
+	const runner: PerfCorpusReport["runner"] = {
+		command: invocation.command,
+		runtimeCommand: invocation.command,
+		runtimeControlIdentity: "",
+		argv: invocation.argv,
+		environment: invocation.environment,
+		platform: process.platform,
+		arch: process.arch,
+		bunVersion: initialRuntime.bunVersion,
+		bunExecutable: initialRuntime.bunExecutable,
+		bunExecutableSha256: initialRuntime.bunExecutableSha256,
+		worktreeFingerprint: git.worktreeFingerprint,
+		closureDigest: initialRuntime.closureDigest,
+		closureManifest: initialRuntime.closureManifest,
+		ci: process.env.CI === "true",
+		profile,
+		durationTargetMs,
+		memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
+		memorySurfaceOrder,
+		iterationsTarget,
+		gcExposed: typeof globalThis.gc === "function",
+		memoryChildGcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
+		memoryChildExecArgv: options.isolatedMemory ? ["--smol", "--expose-gc"] : [],
+		runnerPid: process.pid,
+	};
+	runner.runtimeControlIdentity = memoryRuntimeControlIdentity(runner);
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
 		generatedAt: new Date().toISOString(),
 		gitSha: git.sha,
 		gitDirty: git.dirty,
-		runner: {
-			command: invocation.command,
-			argv: invocation.argv,
-			environment: invocation.environment,
-			platform: process.platform,
-			arch: process.arch,
-			bunVersion: process.versions.bun,
-			ci: process.env.CI === "true",
-			profile,
-			durationTargetMs,
-			memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
-			memorySurfaceOrder,
-			iterationsTarget,
-			gcExposed: typeof globalThis.gc === "function",
-			memoryChildGcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
-			memoryChildExecArgv: options.isolatedMemory ? ["--smol", "--expose-gc"] : [],
-		},
+		runner,
 		fixtures,
 		hotspotClassifications: [...V1_V3_RECLASSIFICATION],
 		thresholdLedger: APPLIED_PERF_THRESHOLDS.map(t => ({ name: t.name, advisoryOrEnforced: t.advisoryOrEnforced })),

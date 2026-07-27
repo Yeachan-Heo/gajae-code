@@ -1,16 +1,23 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveGitProvenance, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
+import {
+	MEMORY_CAPTURE_SEMANTICS_ID,
+	type MemorySurface,
+	memoryRuntimeControlIdentity,
+	type PerfCorpusReport,
+} from "../bench/perf-corpus-schema";
 
 const driverPath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-analysis.py");
 const preregistrationPath = path.resolve(import.meta.dir, "../bench/perf-corpus-preregistration.json");
 const templatePath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-template.ipynb");
 const bundleDirectory = path.dirname(driverPath);
 const gitSha = "0123456789abcdef0123456789abcdef01234567";
-const expectedTemplateSha256 = "8599b3be29c688105e3bf85c492016d943e44f762d69409fb48b000f0e1c9df9";
+const expectedTemplateSha256 = "5030ffd69aceb1a849f4153b78a6a7f1b3bb937776024745d7bbb510df7f62b6";
 const decoder = new TextDecoder();
 let temporaryRoot = "";
 let preregistration: Preregistration;
@@ -19,10 +26,21 @@ let preregistrationSha256 = "";
 let authenticatedLauncher: AuthenticatedLauncher;
 
 interface ScheduleItem {
-	blockId: string;
+	attemptId: string;
 	profile: "short" | "soak";
+	attemptNumber: number;
 	expectedFilename: string;
-	surfaceOrder: string[];
+}
+
+interface AdmissionRow {
+	slotId: string;
+	surfaceOrder: MemorySurface[];
+}
+
+interface ScheduledReport extends ScheduleItem {
+	admissionNumber: number;
+	slotId: string;
+	surfaceOrder: MemorySurface[];
 }
 
 interface Preregistration {
@@ -30,14 +48,20 @@ interface Preregistration {
 		profiles: Record<
 			"short" | "soak",
 			{
+				requiredAdmittedBlocks: number;
+				attemptCap: number;
 				durationTargetMs: number;
 				iterationsTarget: number;
 				maximumPeriodicSamples: number;
 				elapsedDurationToleranceMs: number;
 			}
 		>;
+		sharedRunnerProvenanceFields: string[];
 	};
-	captureControls: { schedule: ScheduleItem[] };
+	captureControls: {
+		admissionRows: Record<"short" | "soak", AdmissionRow[]>;
+		schedule: ScheduleItem[];
+	};
 }
 
 type SlopePlan = number | { steadyDeltas: number[] };
@@ -68,13 +92,18 @@ interface SyntheticMemoryBaseline {
 	processTreeBaselineRssBytes: number | null;
 	processTreePostTeardownRssBytes: number | null;
 	processTreeSampler: "ps" | "unavailable";
+	ordinal: number;
+	childPid: number;
+	parentPid: number;
+	captureSemanticsId: string;
 }
 
 interface SyntheticReportMutationSurface {
-	runner: {
-		memorySurfaceOrder: string[];
-	};
+	gitDirty: boolean;
+	runner: PerfCorpusReport["runner"];
 	fixtures: Array<{
+		sourceClass: string;
+		privacy: Record<string, JsonValue>;
 		memoryBaseline: SyntheticMemoryBaseline;
 	}>;
 	depthProbe?: JsonValue;
@@ -84,6 +113,8 @@ interface ValidationError {
 	code: string;
 	filename?: string;
 	message?: string;
+	blockId?: string;
+	attemptId?: string;
 }
 
 interface AdmissionSummary {
@@ -116,11 +147,22 @@ interface ValidationResult {
 	};
 	admission: Record<"short" | "soak", AdmissionSummary>;
 	claimPolicy: {
-		p95: string;
+		p95: {
+			status: string;
+			finiteUpperEndpointAvailable: boolean;
+			empiricalP95Emitted: boolean;
+		};
+	};
+	cohort?: {
+		sharedRunnerProvenance: Record<string, JsonValue>;
 	};
 	diagnostics: {
 		validationErrors: ValidationError[];
+		driftOrderTimeTelemetrySensitivities?: Record<string, JsonValue>;
+		validatedAttemptOrder?: string[];
 	};
+	runLevelPointsByProfileAndSurface?: Record<string, Record<string, JsonValue[]>>;
+	descriptiveByProfileAndSurface?: Record<string, Record<string, Record<string, JsonValue>>>;
 }
 
 interface NotebookCell {
@@ -187,16 +229,28 @@ function endpointSlope(periodicSamples: MemorySample[], key: "rssBytes" | "heapU
 	return ((steady.at(-1)![key] - steady[0]![key]) * 1000) / (steady.at(-1)!.elapsedMs - steady[0]!.elapsedMs);
 }
 
-function baseline(surface: string, profile: "short" | "soak", iterationsTarget: number, plan: SlopePlan) {
+function baseline(
+	surface: string,
+	profile: "short" | "soak",
+	iterationsTarget: number,
+	plan: SlopePlan,
+	ordinal: number,
+) {
 	const initialHeap = 100_000_000;
 	const periodicSamples =
 		typeof plan === "number"
-			? [0, 250, 500, 750, 1000].map(elapsedMs =>
-					sample(elapsedMs, initialHeap + Math.round((plan * elapsedMs) / 1000)),
-				)
+			? [0, 1, 2, 3, 4].map(index => {
+					const elapsedMs = index * (profile === "soak" ? 7_500 : 250);
+					return sample(elapsedMs, initialHeap + Math.round((plan * elapsedMs) / 1000));
+				})
 			: [
 					sample(0, initialHeap),
-					...plan.steadyDeltas.map((delta, index) => sample((index + 1) * 250, initialHeap + delta)),
+					...plan.steadyDeltas.map((delta, index) =>
+						sample(
+							(index + 1) * (profile === "soak" ? 30_000 / plan.steadyDeltas.length : 250),
+							initialHeap + delta,
+						),
+					),
 				];
 	const finalElapsed = periodicSamples.at(-1)!.elapsedMs;
 	const heapMaximum = Math.max(...periodicSamples.map(item => item.heapUsedBytes));
@@ -232,21 +286,26 @@ function baseline(surface: string, profile: "short" | "soak", iterationsTarget: 
 		processTreeBaselineRssBytes: null as number | null,
 		processTreePostTeardownRssBytes: null as number | null,
 		processTreeSampler: "unavailable",
+		ordinal,
+		childPid: 10_000 + ordinal,
+		parentPid: 9_000,
+		captureSemanticsId: MEMORY_CAPTURE_SEMANTICS_ID,
 	};
 }
 
 function reportFor(
-	schedule: ScheduleItem,
+	schedule: ScheduledReport,
 	blockIndex: number,
 	slopeFor: (surface: string, blockIndex: number) => SlopePlan,
 ) {
 	const profileConfig = preregistration.cohort.profiles[schedule.profile];
-	const fixtures = schedule.surfaceOrder.map(surface => {
+	const fixtures = schedule.surfaceOrder.map((surface, ordinal) => {
 		const memoryBaseline = baseline(
 			surface,
 			schedule.profile,
 			profileConfig.iterationsTarget,
 			slopeFor(surface, blockIndex),
+			ordinal,
 		);
 		const runElapsedMs = memoryBaseline.periodicSamples.at(-1)!.elapsedMs;
 		return {
@@ -254,7 +313,10 @@ function reportFor(
 			fixtureClass: "large-transcript",
 			sourceClass: "synthetic",
 			workloadTags: ["memory", surface],
-			privacy: { rawPrivateTranscriptCommitted: false },
+			privacy: {
+				rawPrivateTranscriptCommitted: false,
+				redactionNotes: "fully synthetic memory lifecycle fixture; no private or provider content",
+			},
 			wallClockPhase: { run: { elapsedMs: runElapsedMs, advisoryOnly: true } },
 			processCpuUsage: { run: { userMicros: 1, systemMicros: 1, elapsedMs: runElapsedMs } },
 			profilerSelfTime: { profiler: "none" },
@@ -276,42 +338,77 @@ function reportFor(
 		GJC_MEMORY_SURFACE_ORDER: schedule.surfaceOrder.join(","),
 	};
 	if (schedule.profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(profileConfig.durationTargetMs);
+	const command = "bun packages/coding-agent/bench/perf-corpus.bench.ts";
+	const argv = ["bun", "packages/coding-agent/bench/perf-corpus.bench.ts"];
+	const closureManifest = [`packages/coding-agent/bench/perf-corpus.bench.ts:${"a".repeat(64)}`];
+	const runner: PerfCorpusReport["runner"] = {
+		command,
+		runtimeCommand: command,
+		runtimeControlIdentity: "",
+		argv,
+		environment,
+		platform: "darwin",
+		arch: "arm64",
+		bunVersion: "1.3.14",
+		bunExecutable: "/usr/local/bin/bun",
+		bunExecutableSha256: "b".repeat(64),
+		worktreeFingerprint: "c".repeat(64),
+		closureDigest: sha256(`${closureManifest.join("\n")}\n`),
+		closureManifest,
+		ci: false,
+		profile: schedule.profile,
+		durationTargetMs: profileConfig.durationTargetMs,
+		memoryIsolation: "process-per-surface",
+		memorySurfaceOrder: schedule.surfaceOrder,
+		iterationsTarget: profileConfig.iterationsTarget,
+		gcExposed: false,
+		memoryChildGcExposed: true,
+		memoryChildExecArgv: ["--smol", "--expose-gc"],
+		runnerPid: 9_000,
+	};
+	runner.runtimeControlIdentity = memoryRuntimeControlIdentity(runner);
 	return {
 		schema: "gjc.perf-corpus/3",
-		generatedAt: "2026-07-27T00:00:00.000Z",
+		generatedAt: new Date(Date.UTC(2026, 6, 27, 0, 0, blockIndex)).toISOString(),
 		gitSha,
 		gitDirty: false,
-		runner: {
-			command: "bun packages/coding-agent/bench/perf-corpus.bench.ts",
-			argv: ["bun", "packages/coding-agent/bench/perf-corpus.bench.ts"],
-			environment,
-			platform: "darwin",
-			arch: "arm64",
-			bunVersion: "1.3.0",
-			profile: schedule.profile,
-			durationTargetMs: profileConfig.durationTargetMs,
-			memoryIsolation: "process-per-surface",
-			iterationsTarget: profileConfig.iterationsTarget,
-			gcExposed: false,
-			memoryChildGcExposed: true,
-			memoryChildExecArgv: ["--smol", "--expose-gc"],
-			memorySurfaceOrder: schedule.surfaceOrder,
-		},
+		runner,
 		fixtures,
 		hotspotClassifications: [],
+		thresholdLedger: [],
 	};
 }
 
 async function writeCorpus(
 	directory: string,
 	slopeFor: (surface: string, blockIndex: number) => SlopePlan = () => 100_000,
+	invalidAttemptIds: readonly string[] = [],
 ): Promise<void> {
 	await fs.mkdir(directory, { recursive: true });
+	const invalidSet = new Set(invalidAttemptIds);
+	const admitted = { short: 0, soak: 0 };
+	const reports: Array<{ schedule: ScheduledReport; blockIndex: number }> = [];
+	for (const [blockIndex, attempt] of preregistration.captureControls.schedule.entries()) {
+		const profileConfig = preregistration.cohort.profiles[attempt.profile];
+		if (admitted[attempt.profile] >= profileConfig.requiredAdmittedBlocks) continue;
+		const invalid = invalidSet.has(attempt.attemptId);
+		const row = preregistration.captureControls.admissionRows[attempt.profile][admitted[attempt.profile]]!;
+		reports.push({
+			schedule: {
+				...attempt,
+				admissionNumber: admitted[attempt.profile] + 1,
+				slotId: row.slotId,
+				surfaceOrder: row.surfaceOrder,
+			},
+			blockIndex,
+		});
+		if (!invalid) admitted[attempt.profile]++;
+	}
 	await Promise.all(
-		preregistration.captureControls.schedule.map(async (schedule, index) => {
+		reports.map(async ({ schedule, blockIndex }) => {
 			await fs.writeFile(
 				path.join(directory, schedule.expectedFilename),
-				`${JSON.stringify(reportFor(schedule, index, slopeFor))}\n`,
+				`${JSON.stringify(reportFor(schedule, blockIndex, slopeFor))}\n`,
 			);
 		}),
 	);
@@ -338,6 +435,7 @@ function invoke(
 		preregistrationDigest?: string;
 		pythonPath?: string;
 		readOnlyAttestation?: string;
+		expectedGitSha?: string;
 	} = {},
 ) {
 	const launcher = authenticatedLauncher;
@@ -363,7 +461,7 @@ function invoke(
 					GJC_PERF_CORPUS_BUNDLE_DIR: options.bundleDir ?? bundleDirectory,
 					GJC_PERF_CORPUS_INPUT_DIR: inputDirectory,
 					GJC_PERF_CORPUS_OUTPUT_DIR: outputDirectory,
-					GJC_PERF_CORPUS_EXPECTED_GIT_SHA: gitSha,
+					GJC_PERF_CORPUS_EXPECTED_GIT_SHA: options.expectedGitSha ?? gitSha,
 					GJC_PERF_CORPUS_TEMPLATE_SHA256: launcher.templateSha256,
 					GJC_PERF_CORPUS_DRIVER_SHA256: options.driverDigest ?? driverSha256,
 					GJC_PERF_CORPUS_PREREGISTRATION_SHA256: options.preregistrationDigest ?? preregistrationSha256,
@@ -417,6 +515,66 @@ afterAll(async () => {
 });
 
 describe("trusted perf-corpus RLM analysis driver", () => {
+	test("admits the real producer provenance contract through Python replay", async () => {
+		const input = path.join(temporaryRoot, "producer-contract-input");
+		const output = path.join(temporaryRoot, "producer-contract-output");
+		const surfaceOrder = preregistration.captureControls.admissionRows.short[0]!.surfaceOrder;
+		const previousEnvironment = {
+			profile: process.env.GJC_MEMORY_PROFILE,
+			duration: process.env.GJC_MEMORY_DURATION_MS,
+			iterations: process.env.GJC_MEMORY_ITERATIONS,
+			surfaceOrder: process.env.GJC_MEMORY_SURFACE_ORDER,
+		};
+		let report: PerfCorpusReport;
+		try {
+			process.env.GJC_MEMORY_PROFILE = "short";
+			delete process.env.GJC_MEMORY_DURATION_MS;
+			process.env.GJC_MEMORY_ITERATIONS = String(preregistration.cohort.profiles.short.iterationsTarget);
+			process.env.GJC_MEMORY_SURFACE_ORDER = surfaceOrder.join(",");
+			report = runPerfCorpusBenchmark({ isolatedMemory: true });
+		} finally {
+			if (previousEnvironment.profile === undefined) delete process.env.GJC_MEMORY_PROFILE;
+			else process.env.GJC_MEMORY_PROFILE = previousEnvironment.profile;
+			if (previousEnvironment.duration === undefined) delete process.env.GJC_MEMORY_DURATION_MS;
+			else process.env.GJC_MEMORY_DURATION_MS = previousEnvironment.duration;
+			if (previousEnvironment.iterations === undefined) delete process.env.GJC_MEMORY_ITERATIONS;
+			else process.env.GJC_MEMORY_ITERATIONS = previousEnvironment.iterations;
+			if (previousEnvironment.surfaceOrder === undefined) delete process.env.GJC_MEMORY_SURFACE_ORDER;
+			else process.env.GJC_MEMORY_SURFACE_ORDER = previousEnvironment.surfaceOrder;
+		}
+
+		const baselines = report.fixtures.flatMap(fixture =>
+			fixture.memoryBaseline === undefined ? [] : [fixture.memoryBaseline],
+		);
+		expect(baselines).toHaveLength(surfaceOrder.length);
+		expect(baselines.every(baseline => baseline.captureSemanticsId === MEMORY_CAPTURE_SEMANTICS_ID)).toBe(true);
+		expect(report.runner.closureDigest).toBe(sha256(`${report.runner.closureManifest.join("\n")}\n`));
+		expect(report.runner.runtimeControlIdentity).toBe(memoryRuntimeControlIdentity(report.runner));
+
+		const replayReport = structuredClone(report);
+		replayReport.gitDirty = false;
+		await fs.mkdir(input);
+		await fs.writeFile(path.join(input, "short-01.json"), `${JSON.stringify(replayReport)}\n`);
+		expect(invoke(input, output, { expectedGitSha: report.gitSha }).exitCode).toBe(3);
+		const result = await readResult(output);
+		expect(result.admission.short).toMatchObject({
+			attemptsObserved: 1,
+			admittedBlocks: 1,
+			invalidBlocks: 0,
+		});
+		expect(result.diagnostics.validationErrors.some(error => error.filename === "short-01.json")).toBe(false);
+	});
+
+	test("fails closed when Git checkout provenance is unavailable", () => {
+		const spawnSync = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
+			throw new Error("git unavailable");
+		});
+		try {
+			expect(() => resolveGitProvenance()).toThrow("git HEAD provenance unavailable");
+		} finally {
+			spawnSync.mockRestore();
+		}
+	});
 	test("emits byte-identical canonical 10,000-resample results for the sealed all-positive cohort", async () => {
 		const input = path.join(temporaryRoot, "deterministic-input");
 		const firstOutput = path.join(temporaryRoot, "deterministic-output-a");
@@ -438,6 +596,13 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			preregistrationSha256,
 			templateSha256: expectedTemplateSha256,
 		});
+		expect(result.cohort?.sharedRunnerProvenance).toMatchObject({
+			runtimeCommand: "bun packages/coding-agent/bench/perf-corpus.bench.ts",
+			bunVersion: "1.3.14",
+			bunExecutable: "/usr/local/bin/bun",
+			bunExecutableSha256: "b".repeat(64),
+			worktreeFingerprint: "c".repeat(64),
+		});
 		expect(result.admission.short).toMatchObject({
 			admittedBlocks: 5,
 			invalidBlocks: 0,
@@ -450,7 +615,53 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			notEvaluatedBlocks: 0,
 			excludedBlocks: 0,
 		});
-		expect(result.claimPolicy.p95).toBe("OMITTED");
+		expect(result.claimPolicy.p95).toMatchObject({
+			status: "OMITTED_IMPOSSIBLE",
+			finiteUpperEndpointAvailable: false,
+			empiricalP95Emitted: false,
+		});
+	});
+
+	test("reuses each fixed admission slot after an invalid preallocated attempt", async () => {
+		const input = path.join(temporaryRoot, "replacement-input");
+		const output = path.join(temporaryRoot, "replacement-output");
+		await writeCorpus(input, () => 100_000, ["short-01", "soak-01"]);
+		await Promise.all(
+			["short-01.json", "soak-01.json"].map(filename =>
+				mutateReport(input, filename, report => {
+					report.gitDirty = true;
+				}),
+			),
+		);
+		expect(invoke(input, output).exitCode).toBe(0);
+		const result = await readResult(output);
+		expect(result.admission.short).toMatchObject({
+			attemptsObserved: 6,
+			admittedBlocks: 5,
+			invalidBlocks: 1,
+			notEvaluatedBlocks: 0,
+		});
+		expect(result.admission.soak).toMatchObject({
+			attemptsObserved: 25,
+			admittedBlocks: 24,
+			invalidBlocks: 1,
+			notEvaluatedBlocks: 0,
+		});
+		expect(result.diagnostics.validationErrors).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ attemptId: "short-01", blockId: "short-slot-01" }),
+				expect.objectContaining({ attemptId: "soak-01", blockId: "soak-slot-01" }),
+			]),
+		);
+		expect(result.diagnostics.validatedAttemptOrder).toEqual(
+			expect.arrayContaining(["short-02", "short-06", "soak-02", "soak-25"]),
+		);
+		expect(result.runLevelPointsByProfileAndSurface?.short.cli).toEqual(
+			expect.arrayContaining([expect.objectContaining({ attemptId: "short-02", blockId: "short-slot-01" })]),
+		);
+		expect(result.runLevelPointsByProfileAndSurface?.soak.cli).toEqual(
+			expect.arrayContaining([expect.objectContaining({ attemptId: "soak-02", blockId: "soak-slot-01" })]),
+		);
 	});
 
 	test("defaults insufficient evidence to NOT_EVALUATED with truthful missing-member accounting", async () => {
@@ -472,13 +683,17 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(result.diagnostics.validationErrors).toContainEqual(
 			expect.objectContaining({ code: "MISSING_SCHEDULED_BLOCK", filename: "soak-24.json" }),
 		);
-		expect(result.claimPolicy.p95).toBe("OMITTED");
+		expect(result.claimPolicy.p95).toMatchObject({
+			status: "OMITTED_IMPOSSIBLE",
+			finiteUpperEndpointAvailable: false,
+			empiricalP95Emitted: false,
+		});
 	});
 
 	test("collects structured errors from early and late invalid blocks without fabricating exclusions", async () => {
 		const input = path.join(temporaryRoot, "multi-invalid-input");
 		const output = path.join(temporaryRoot, "multi-invalid-output");
-		await writeCorpus(input);
+		await writeCorpus(input, () => 100_000, ["short-01", "soak-24"]);
 		const early = path.join(input, "short-01.json");
 		const raw = await fs.readFile(early, "utf8");
 		await fs.writeFile(
@@ -488,7 +703,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		await mutateReport(input, "soak-24.json", report => {
 			report.runner.memorySurfaceOrder = [...report.runner.memorySurfaceOrder].reverse();
 		});
-		expect(invoke(input, output).exitCode).toBe(3);
+		expect(invoke(input, output).exitCode).toBe(0);
 		const result = await readResult(output);
 		expect(result.diagnostics.validationErrors).toEqual(
 			expect.arrayContaining([
@@ -497,50 +712,68 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			]),
 		);
 		expect(result.admission.short).toMatchObject({
-			admittedBlocks: 4,
+			admittedBlocks: 5,
 			invalidBlocks: 1,
 			notEvaluatedBlocks: 0,
 			excludedBlocks: 0,
 		});
 		expect(result.admission.soak).toMatchObject({
-			admittedBlocks: 23,
+			admittedBlocks: 24,
 			invalidBlocks: 1,
 			notEvaluatedBlocks: 0,
 			excludedBlocks: 0,
 		});
 	});
 
+	test("fails closed when an individually valid shared runner provenance field drifts", async () => {
+		const input = path.join(temporaryRoot, "shared-provenance-input");
+		const output = path.join(temporaryRoot, "shared-provenance-output");
+		await writeCorpus(input);
+		await mutateReport(input, "soak-24.json", report => {
+			report.runner.worktreeFingerprint = "d".repeat(64);
+			report.runner.runtimeControlIdentity = memoryRuntimeControlIdentity(report.runner);
+		});
+		expect(invoke(input, output).exitCode).toBe(3);
+		const result = await readResult(output);
+		expect(result.diagnostics.validationErrors).toContainEqual(
+			expect.objectContaining({
+				code: "PROVENANCE_DRIFT",
+				message: expect.stringContaining("runner provenance drift across admitted reports: worktreeFingerprint"),
+			}),
+		);
+	});
+
 	test("enforces fixed JSON depth and per-file byte bounds", async () => {
 		const input = path.join(temporaryRoot, "json-bounds-input");
 		const output = path.join(temporaryRoot, "json-bounds-output");
-		await writeCorpus(input);
+		await writeCorpus(input, () => 100_000, ["short-02", "short-03"]);
 		await mutateReport(input, "short-02.json", report => {
 			let nested: JsonValue = "leaf";
 			for (let index = 0; index < 45; index++) nested = { nested };
 			report.depthProbe = nested;
 		});
 		await fs.writeFile(path.join(input, "short-03.json"), Buffer.alloc(8_388_609, 0x20));
-		expect(invoke(input, output).exitCode).toBe(3);
+		expect(invoke(input, output).exitCode).toBe(0);
 		const result = await readResult(output);
 		expect(validationCodes(result)).toEqual(
 			expect.arrayContaining(["JSON_DEPTH_BOUND_EXCEEDED", "BYTE_BOUND_EXCEEDED"]),
 		);
-		expect(result.admission.short).toMatchObject({ admittedBlocks: 3, invalidBlocks: 2, notEvaluatedBlocks: 0 });
+		expect(result.admission.short).toMatchObject({ admittedBlocks: 5, invalidBlocks: 2, notEvaluatedBlocks: 0 });
 	});
 
 	test("rejects fixed sample-count and elapsed-duration bounds before estimator pair work", async () => {
 		const input = path.join(temporaryRoot, "sample-bounds-input");
 		const output = path.join(temporaryRoot, "sample-bounds-output");
-		await writeCorpus(input);
+		await writeCorpus(input, () => 100_000, ["short-01", "soak-24"]);
 		await mutateReport(input, "short-01.json", report => {
 			report.fixtures[0].memoryBaseline.periodicSamples = Array.from({ length: 23 }, (_, index) =>
 				sample(index * 250, 100_000_000 + index),
 			);
 		});
 		await mutateReport(input, "soak-24.json", report => {
-			report.fixtures[0].memoryBaseline.periodicSamples.at(-1)!.elapsedMs = 1250.001;
+			report.fixtures[0].memoryBaseline.periodicSamples.at(-1)!.elapsedMs = 30_250.001;
 		});
-		expect(invoke(input, output).exitCode).toBe(3);
+		expect(invoke(input, output).exitCode).toBe(0);
 		const result = await readResult(output);
 		expect(result.diagnostics.validationErrors).toEqual(
 			expect.arrayContaining([
@@ -550,12 +783,12 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		);
 	});
 
-	test("rejects extreme duration, near-equal timestamps, and zero action slopes", async () => {
+	test("accepts zero action slopes while rejecting extreme duration and near-equal timestamps", async () => {
 		const input = path.join(temporaryRoot, "numeric-edge-input");
 		const output = path.join(temporaryRoot, "numeric-edge-output");
-		await writeCorpus(input);
+		await writeCorpus(input, () => 100_000, ["soak-01", "soak-24"]);
 		await mutateReport(input, "soak-01.json", report => {
-			report.fixtures[0].memoryBaseline.periodicSamples[2].elapsedMs = 250.0001;
+			report.fixtures[0].memoryBaseline.periodicSamples[2].elapsedMs = 7_500.0001;
 		});
 		await mutateReport(input, "soak-02.json", report => {
 			const measured = report.fixtures[0].memoryBaseline;
@@ -566,12 +799,11 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		await mutateReport(input, "soak-24.json", report => {
 			report.fixtures[0].memoryBaseline.periodicSamples.at(-1)!.elapsedMs = 1e300;
 		});
-		expect(invoke(input, output).exitCode).toBe(3);
+		expect(invoke(input, output).exitCode).toBe(0);
 		const result = await readResult(output);
 		expect(result.diagnostics.validationErrors).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ code: "TIMESTAMP_SEPARATION_INVALID", filename: "soak-01.json" }),
-				expect.objectContaining({ code: "DERIVED_SLOPE_INVALID", filename: "soak-02.json" }),
 				expect.objectContaining({ code: "ELAPSED_DURATION_BOUND_EXCEEDED", filename: "soak-24.json" }),
 			]),
 		);
@@ -625,7 +857,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		const result = JSON.parse(decoder.decode(invocation.stdout));
 		expect(result).toMatchObject({
 			resamples: 10_000,
-			seed: 20260727,
+			seed: 0x3279b4e7,
 			lower: boundary,
 			upper: boundary,
 			biasCorrection: 0,
@@ -756,7 +988,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 
 		const invalidInput = path.join(temporaryRoot, "sampler-invalid-input");
 		const invalidOutput = path.join(temporaryRoot, "sampler-invalid-output");
-		await writeCorpus(invalidInput);
+		await writeCorpus(invalidInput, () => 100_000, ["short-01", "soak-24"]);
 		await mutateReport(invalidInput, "short-01.json", report => {
 			report.fixtures[0].memoryBaseline.processTreeSampler = "ps";
 		});
@@ -765,7 +997,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			measured.processTreeBaselineRssBytes = 1;
 			measured.processTreePostTeardownRssBytes = 1;
 		});
-		expect(invoke(invalidInput, invalidOutput).exitCode).toBe(3);
+		expect(invoke(invalidInput, invalidOutput).exitCode).toBe(0);
 		const result = await readResult(invalidOutput);
 		expect(result.diagnostics.validationErrors).toEqual(
 			expect.arrayContaining([
@@ -784,7 +1016,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 	test("rejects symlinks and unexpected entries without reading them", async () => {
 		const input = path.join(temporaryRoot, "unsafe-input");
 		const output = path.join(temporaryRoot, "unsafe-output");
-		await writeCorpus(input);
+		await writeCorpus(input, () => 100_000, ["short-01", "short-02"]);
 		const target = path.join(input, "short-01.json");
 		const replacement = path.join(temporaryRoot, "outside-report.json");
 		await fs.rename(target, replacement);

@@ -22,7 +22,7 @@ export function createTuiWorkload(): TuiMemoryWorkload {
 				container.addChild(new Text(`body-${index}:${"─".repeat(40)}`, 0, 0));
 				container.addChild(new Text(`footer-${index}`, 0, 0));
 				renderedLines += container.render(80).length;
-				sampleHighWater?.();
+				sampleHighWater?.(true);
 				container.dispose();
 			}
 			return renderedLines;

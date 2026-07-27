@@ -10,6 +10,7 @@ import {
 	gitWorktreeFingerprint,
 	normalizeProcessTreeRss,
 	resolveGitProvenance,
+	resolveMeasurementRuntimeProvenance,
 	runPerfCorpusBenchmark,
 	updateMemoryObservedExtrema,
 } from "../bench/perf-corpus.bench";
@@ -17,7 +18,9 @@ import {
 	type HotspotClassification,
 	hasProfilerSelfTimeEvidence,
 	isHotspotStatus,
+	MEMORY_CAPTURE_SEMANTICS_ID,
 	type MemoryUsageSample,
+	memoryRuntimeControlIdentity,
 	PERF_CORPUS_SCHEMA,
 	type PerfCorpusReport,
 	REQUIRED_FIXTURE_CLASSES,
@@ -60,6 +63,16 @@ describe("perf corpus schema + runner", () => {
 		const expectedParentArgv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
 		expect(report.runner.command).toBe(expectedParentArgv.join(" "));
 		expect(report.runner.argv).toEqual(expectedParentArgv);
+		expect(report.runner.runtimeCommand).toBe(report.runner.command);
+		expect(report.runner.runtimeControlIdentity).toBe(memoryRuntimeControlIdentity(report.runner));
+		expect(report.runner.runnerPid).toBe(process.pid);
+		expect(report.runner.bunVersion).toBe(process.versions.bun);
+		expect(path.isAbsolute(report.runner.bunExecutable)).toBe(true);
+		expect(report.runner.bunExecutableSha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(report.runner.worktreeFingerprint).toMatch(/^[0-9a-f]{64}$/);
+		expect(report.runner.closureDigest).toMatch(/^[0-9a-f]{64}$/);
+		expect(report.runner.closureManifest.length).toBeGreaterThan(0);
+		expect(report.runner.closureManifest).toEqual([...report.runner.closureManifest].sort());
 		expect(report.runner.environment).toEqual({
 			GJC_MEMORY_PROFILE: "short",
 			GJC_MEMORY_ITERATIONS: String(report.runner.iterationsTarget),
@@ -104,22 +117,14 @@ describe("perf corpus schema + runner", () => {
 			else process.env.GITHUB_SHA = previousGitSha;
 		}
 	});
-	test("falls back to GITHUB_SHA when Git is unavailable", () => {
-		const previousGitSha = process.env.GITHUB_SHA;
+	test("fails closed when Git is unavailable", () => {
 		const spawnSync = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
 			throw new Error("git unavailable");
 		});
-		process.env.GITHUB_SHA = "c".repeat(40);
 		try {
-			expect(resolveGitProvenance()).toEqual({
-				sha: "c".repeat(40),
-				dirty: true,
-				worktreeFingerprint: "unavailable",
-			});
+			expect(() => resolveGitProvenance()).toThrow("git HEAD provenance unavailable");
 		} finally {
 			spawnSync.mockRestore();
-			if (previousGitSha === undefined) delete process.env.GITHUB_SHA;
-			else process.env.GITHUB_SHA = previousGitSha;
 		}
 	});
 	test("resolves provenance from the benchmark checkout instead of the caller cwd", () => {
@@ -165,6 +170,125 @@ describe("perf corpus schema + runner", () => {
 			await fs.rm(repository, { recursive: true, force: true });
 		}
 	});
+	test("binds the exact Bun executable and canonical tracked closure manifest", () => {
+		const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+		const provenance = resolveMeasurementRuntimeProvenance(repositoryRoot);
+		const report = runPerfCorpusBenchmark();
+		expect(report.runner.bunVersion).toBe(provenance.bunVersion);
+		expect(report.runner.bunExecutable).toBe(provenance.bunExecutable);
+		expect(report.runner.bunExecutableSha256).toBe(provenance.bunExecutableSha256);
+		expect(report.runner.closureDigest).toBe(provenance.closureDigest);
+		expect(report.runner.closureManifest).toEqual(provenance.closureManifest);
+	});
+
+	test("rejects tampered provenance identities and non-canonical closure manifests", () => {
+		const report = runPerfCorpusBenchmark();
+		const tamperedClosure = {
+			...report,
+			runner: { ...report.runner, closureDigest: "0".repeat(64) },
+		};
+		expect(validatePerfCorpusReport(tamperedClosure).errors).toContain(
+			"runner.closureDigest does not match closureManifest",
+		);
+		const tamperedRuntime = {
+			...report,
+			runner: { ...report.runner, bunExecutableSha256: "0".repeat(64) },
+		};
+		expect(validatePerfCorpusReport(tamperedRuntime).errors).toContain(
+			"runner.runtimeControlIdentity does not match runtime controls",
+		);
+		const privateManifest = {
+			...report,
+			runner: {
+				...report.runner,
+				closureManifest: [`/private/source.ts:${"a".repeat(64)}`, ...report.runner.closureManifest],
+			},
+		};
+		expect(validatePerfCorpusReport(privateManifest).errors).toContain("runner.closureManifest invalid");
+		const changedCommand = {
+			...report,
+			runner: { ...report.runner, runtimeCommand: "bun unexpected.ts" },
+		};
+		expect(validatePerfCorpusReport(changedCommand).errors).toContain(
+			"runner.runtimeCommand must exactly match runner.command",
+		);
+	});
+
+	test("rejects unexpected and provider/private fields across the report taxonomy", () => {
+		const report = runPerfCorpusBenchmark();
+		const topLevel = { ...report, provider: "private" } as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(topLevel).errors).toContain("report.provider is not allowed");
+
+		const fixture = report.fixtures[0];
+		if (!fixture) throw new Error("fixture unavailable");
+		const fixturePrivate = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							provider: { payload: "private" },
+							privacy: { ...candidate.privacy, privateTranscript: "private" },
+							sourceClass: "provider-private",
+						}
+					: candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		const privateErrors = validatePerfCorpusReport(fixturePrivate).errors;
+		expect(privateErrors).toContain(`fixture ${fixture.fixtureId}.provider is not allowed`);
+		expect(privateErrors).toContain(`fixture ${fixture.fixtureId}.privacy.privateTranscript is not allowed`);
+		expect(privateErrors).toContain(`fixture ${fixture.fixtureId}: sourceClass invalid`);
+
+		const unexpectedEnvironment = {
+			...report,
+			runner: {
+				...report.runner,
+				environment: { ...report.runner.environment, PROVIDER_API_KEY: "private" },
+			},
+		};
+		expect(validatePerfCorpusReport(unexpectedEnvironment).errors).toContain(
+			"runner.environment contains unexpected capture controls",
+		);
+
+		const baselineFixture = report.fixtures.find(candidate => candidate.memoryBaseline);
+		if (!baselineFixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = baselineFixture.memoryBaseline;
+		const unexpectedSample = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === baselineFixture
+					? {
+							...candidate,
+							memoryBaseline: {
+								...baseline,
+								periodicSamples: [
+									{ ...baseline.periodicSamples[0], providerResponse: "private" },
+									...baseline.periodicSamples.slice(1),
+								],
+							},
+						}
+					: candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(unexpectedSample).errors).toContain(
+			`fixture ${baselineFixture.fixtureId}.memoryBaseline sample 0.providerResponse is not allowed`,
+		);
+
+		const wrongCaptureSemantics = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === baselineFixture
+					? {
+							...candidate,
+							memoryBaseline: { ...baseline, captureSemanticsId: "unstable" },
+						}
+					: candidate,
+			),
+		} as unknown as PerfCorpusReport;
+		expect(validatePerfCorpusReport(wrongCaptureSemantics).errors).toContain(
+			`fixture ${baselineFixture.fixtureId}: memoryBaseline.captureSemanticsId invalid`,
+		);
+	});
 
 	test("emits detailed memory baselines for every required product surface", () => {
 		const report = runPerfCorpusBenchmark();
@@ -174,6 +298,10 @@ describe("perf corpus schema + runner", () => {
 		expect(report.runner.memoryIsolation).toBe("in-process");
 		expect(report.runner.memorySurfaceOrder).toEqual([...REQUIRED_MEMORY_SURFACES]);
 		for (const baseline of baselines) {
+			expect(baseline.ordinal).toBe(report.runner.memorySurfaceOrder.indexOf(baseline.surface));
+			expect(baseline.childPid).toBe(report.runner.runnerPid);
+			expect(baseline.parentPid).toBe(process.ppid);
+			expect(baseline.captureSemanticsId).toBe(MEMORY_CAPTURE_SEMANTICS_ID);
 			expect(baseline.periodicSamples.length).toBeGreaterThanOrEqual(2);
 			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(
 				baseline.periodicSamples.at(-1)?.elapsedMs ?? 0,
@@ -251,6 +379,10 @@ describe("perf corpus schema + runner", () => {
 		expect(report.runner.gcExposed).toBe(typeof globalThis.gc === "function");
 		expect(report.runner.memoryChildGcExposed).toBe(true);
 		expect(baselines.every(baseline => baseline.periodicSamples[0]!.rssBytes > 0)).toBe(true);
+		expect(new Set(baselines.map(baseline => baseline.childPid)).size).toBe(REQUIRED_MEMORY_SURFACES.length);
+		expect(new Set(baselines.map(baseline => baseline.parentPid))).toEqual(new Set([report.runner.runnerPid]));
+		expect(baselines.map(baseline => baseline.ordinal)).toEqual(customOrder.map((_, index) => index));
+		expect(baselines.every(baseline => baseline.childPid !== report.runner.runnerPid)).toBe(true);
 		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
 
 		const fixtureOrderMismatch = {
@@ -262,6 +394,53 @@ describe("perf corpus schema + runner", () => {
 		};
 		expect(validatePerfCorpusReport(fixtureOrderMismatch).errors).toContain(
 			"memory baseline order must match runner.memorySurfaceOrder for process-per-surface",
+		);
+
+		const firstChildPid = baselines[0]?.childPid;
+		if (!firstChildPid) throw new Error("isolated child PID unavailable");
+		const duplicateChildPid: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate.memoryBaseline?.ordinal === 1
+					? {
+							...candidate,
+							memoryBaseline: { ...candidate.memoryBaseline, childPid: firstChildPid },
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(duplicateChildPid).errors).toContain(
+			"isolated memory baseline child PIDs must be distinct",
+		);
+
+		const wrongParent: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate.memoryBaseline?.ordinal === 0
+					? {
+							...candidate,
+							memoryBaseline: { ...candidate.memoryBaseline, parentPid: report.runner.runnerPid + 1 },
+						}
+					: candidate,
+			),
+		};
+		const wrongParentErrors = validatePerfCorpusReport(wrongParent).errors;
+		expect(wrongParentErrors).toContain("memory baseline surfaces must have exactly one parent PID");
+		expect(wrongParentErrors).toContain("isolated memory baseline process tree does not match runner PID");
+
+		const wrongOrdinal: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate.memoryBaseline?.ordinal === 0
+					? {
+							...candidate,
+							memoryBaseline: { ...candidate.memoryBaseline, ordinal: 1 },
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(wrongOrdinal).errors).toContain(
+			"memory baseline ordinal/surface identity must match runner.memorySurfaceOrder",
 		);
 	}, 15_000);
 
@@ -612,11 +791,11 @@ describe("perf corpus schema + runner", () => {
 		expect(periodicSamples).toHaveLength(3);
 		expect(calculateMemorySlope(periodicSamples, "rssBytes")).toBe(slopeBeforeExtrema);
 	});
-	test("requests throttled TUI high-water callbacks before teardown", () => {
+	test("forces a TUI high-water callback after every render and before teardown", () => {
 		const workload = createTuiWorkload();
 		const forceValues: Array<boolean | undefined> = [];
 		workload.run(3, force => forceValues.push(force));
-		expect(forceValues).toEqual([undefined, undefined, undefined]);
+		expect(forceValues).toEqual([true, true, true]);
 		expect(workload.currentIndex()).toBe(3);
 		workload.teardown();
 	});
@@ -638,7 +817,7 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 
-	test("calculates slopes only from the steady-state window", () => {
+	test("admits zero and near-zero negative slopes as non-positive steady-state evidence", () => {
 		const sample = (elapsedMs: number, rssBytes: number): MemoryUsageSample => ({
 			elapsedMs,
 			rssBytes,
@@ -657,6 +836,8 @@ describe("perf corpus schema + runner", () => {
 			sample(1_000, 200),
 		];
 		expect(calculateMemorySlope(stabilizedAfterWarmup, "rssBytes")).toBe(0);
+		const nearZeroDecline = [sample(0, 200), sample(250, 200), sample(1_000_250, 199)];
+		expect(calculateMemorySlope(nearZeroDecline, "rssBytes")).toBeCloseTo(-0.001, 12);
 		const growingSteadyState = [
 			sample(0, 100),
 			sample(200, 200),
@@ -667,6 +848,53 @@ describe("perf corpus schema + runner", () => {
 		];
 		expect(calculateMemorySlope(growingSteadyState, "rssBytes")).toBe(100);
 		expect(calculateMemorySlope([sample(0, 100), sample(200, 200)], "rssBytes")).toBeNull();
+	});
+	test("validates serialized zero/near-zero slopes as non-positive evidence", () => {
+		const report = runPerfCorpusBenchmark();
+		const fixture = report.fixtures.find(candidate => candidate.memoryBaseline);
+		if (!fixture?.memoryBaseline) throw new Error("memory baseline fixture unavailable");
+		const baseline = fixture.memoryBaseline;
+		const first = baseline.periodicSamples[0];
+		if (!first) throw new Error("baseline sample unavailable");
+		const durationMs = 1_000_250;
+		const finalIndex = baseline.periodicSamples.length - 1;
+		const periodicSamples = baseline.periodicSamples.map((sample, index) => ({
+			...sample,
+			elapsedMs: index === finalIndex ? durationMs : (durationMs * index) / finalIndex,
+			rssBytes: index === finalIndex ? first.rssBytes - 1 : first.rssBytes,
+			heapUsedBytes: index === finalIndex ? first.heapUsedBytes - 1 : first.heapUsedBytes,
+		}));
+		const rssSlopeBytesPerSecond = calculateMemorySlope(periodicSamples, "rssBytes");
+		const heapSlopeBytesPerSecond = calculateMemorySlope(periodicSamples, "heapUsedBytes");
+		if (rssSlopeBytesPerSecond === null || heapSlopeBytesPerSecond === null) {
+			throw new Error("near-zero slope unavailable");
+		}
+		expect(rssSlopeBytesPerSecond).toBeLessThanOrEqual(0);
+		expect(heapSlopeBytesPerSecond).toBeLessThanOrEqual(0);
+		expect(Math.abs(rssSlopeBytesPerSecond)).toBeLessThan(1);
+		const serializedEvidence: PerfCorpusReport = {
+			...report,
+			fixtures: report.fixtures.map(candidate =>
+				candidate === fixture
+					? {
+							...candidate,
+							wallClockPhase: {
+								...candidate.wallClockPhase,
+								run: { ...candidate.wallClockPhase.run!, elapsedMs: durationMs },
+							},
+							memoryBaseline: {
+								...baseline,
+								operationsPerSecond: baseline.operations / (durationMs / 1_000),
+								periodicSamples,
+								postTeardown: { ...baseline.postTeardown, elapsedMs: durationMs },
+								rssSlopeBytesPerSecond,
+								heapSlopeBytesPerSecond,
+							},
+						}
+					: candidate,
+			),
+		};
+		expect(validatePerfCorpusReport(serializedEvidence)).toEqual({ ok: true, errors: [] });
 	});
 	test("rejects reported slopes that do not match the raw samples", () => {
 		const report = runPerfCorpusBenchmark();
