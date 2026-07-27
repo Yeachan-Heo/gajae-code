@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Memory consolidation redacts GitHub tokens. The scrubber covered AWS ids, JWTs and keyword-prefixed keys, but GitHub tokens carry none of those keywords, so they reached `MEMORY.md` and `memory_summary.md` verbatim — and the summary is injected into every later session. Now covers the same three prefixes the contribution-prep scrubber already handled.
 - Align managed fallback abort-after-exhaustion expectations with #3257 ownership release: a subscriber abort at terminal `message_end` no longer expects a second `requestRunTerminal(cancelled)` because the logical-run owner is already cleared.
 - Python eval timeout annotations now prefer the caller-configured `timeoutMs` over remaining wall-clock budget so async setup cannot flake second formatting in CI.
 - Overflow maintenance now stops cleanly when no-op compaction would replay the same oversized request; the runtime status explains that `/clear` preserves the current session ID before retrying.
