@@ -1,7 +1,7 @@
 # Changelog
 
 ## [Unreleased]
-### Fixed
+### Resume fixes
 
 - Interactive `/resume` no longer awaits ordinary notification-endpoint rotation after predecessor fencing when the transition is stamped `interactive_selector_resume`; lifecycle/SDK identity-control paths still await readiness and use a fail-closed control-drain orchestration that sends terminal control outcomes only after successor readiness, while uncertain predecessor stop no longer starts the successor (#2914).
 - Interactive TUI `/resume` commits a status-container progress lease before inspect/migration/switch work and clears it on every exit path, with generation-scoped render-commit wait that fails open when the terminal is stopped or unavailable (#2914).
@@ -10,9 +10,6 @@
 ### Added
 
 - Deterministic tests for session_switch await policy (selector defer vs default/branch await), control-drain ordering, host pre-response readiness gating, and resume progress lease-before-switch behavior (#2914).
-
-### Added
-
 - Added cross-platform memory-pressure observability with effective host/cgroup limits, configurable GC and restart advisory thresholds, typed Linux process probes, and a Windows Job Object native probe; unsupported lifecycle actions remain advisory-only.
 - Added versioned memory-guard checkpoints with strict transcript/blob validation and fail-closed cross-process writer/TTY ownership claims for future graceful restart activation.
 - Ralplan consensus planning now enforces a finite planner/revision iteration budget at the native write path (default 5, configurable via `gjc.ralplan.maxIterations`). Opening another planner/revision pass past the cap fails closed with exit code 3 and an operator-visible `PLANNING-STUCK` marker instead of silent unbounded re-review; `final`/post-interview escalation remains allowed without auto-implementation. The cap also floors against on-disk `stage-*-{planner,revision}.md` artifacts so a wiped, truncated, or malformed `index.jsonl` cannot fail open after prior openers (#3165).
@@ -24,11 +21,13 @@
 ### Changed
 
 - When GJC owns mouse input (`mouse.enabled: true`), mouse-wheel scrolling moves the session viewport by three rows per notch instead of a full page. PageUp/PageDown keep page-sized transcript-lane steps.
-- While reviewing transcript history, the status line and composer now stay fixed at the bottom. Semantic assistant/tool output shows `New output — type to follow`, and ordinary typing or paste returns to live output before editing without changing editor focus.
+- While reviewing transcript history, the status line and composer stay fixed at the bottom. Semantic assistant/tool output and visible capped-sidebar changes show `New output — type to follow`; duplicate, elided, hidden, geometry-only, and theme-only changes do not. Ordinary typing or paste returns to live output before editing without changing editor focus.
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - Model preset landing now shows explicit `Enter: apply` and `d: set as default` hints; pressing `d` applies the highlighted profile as the default while Enter keeps the session-only apply path (#3161).
 
 ### Fixed
+
+- Session Observer now reads stable source snapshots, publishes only complete JSONL appends, validates replacement candidates, and clears stale transcript/model/tool content on source replacement, truncation, deletion, unreadability, or malformed candidates. Its transcript projection remains eager full-history work; this does not add virtualization or bounded full-history memory.
 - Session-manager fork/moveTo failure-injection tests now use a platform-aware hermetic seam: retained `RecoveryFsRoot` prototype spies on Linux and the direct native/fs fallbacks off Linux, with a required hit counter so a dead injection fails closed (#3209).
 - The #3216 win32 cleanup-producer regression no longer hardcodes divergent directory size `4096`; it injects `nativeRoot.size + 1` so the test stays hermetic when Linux directory size is already `4096` (post-merge Dev CI red on `79f0de870`).
 

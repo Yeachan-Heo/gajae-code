@@ -6,14 +6,14 @@
 
 - Mouse wheel scrolling now moves the session viewport by exactly three lines (`DEFAULT_WHEEL_LINES = 3`) instead of a full page. PageUp/PageDown keep page-sized steps with edge pinning.
 - Manual transcript scrolling now keeps a valid registered status/composer boundary fixed at the bottom independently of output-source registration. Output sources control only the exact semantic new-output notice; transcript selection excludes pinned chrome, short transcript lanes emit blanks instead of duplicating suffix rows, and constrained heights retain the focused suffix component before decorative rows.
+- Manual viewport revisions now advance for semantic changes in a visible capped sidebar even without an inline component; duplicate, elided, hidden, geometry-only, and theme-only changes do not raise a false new-output notice. Equal output-source updates do not render, and constrained pinned suffixes avoid copying transcript-length prefixes.
+- A downward manual scroll (wheel or `PageDown`) that reaches the true transcript bottom now transitions through the existing live-follow transaction instead of repainting another manual frame, so wheel and PageDown automatically return to live output at the bottom. A partial downward movement retains manual ownership and the notice; upward movement never follows. The transition preserves editor focus, pinned chrome, notice clearing, and fatal terminal transaction semantics, clears manual anchor state through the existing transaction, and does not replay manual-era output into native/host scrollback.
 
 ### Fixed
 
 - `waitForRenderCommit` / generation-scoped render tokens resolve only after a successful buffer write (or fail open on stopped/unavailable terminals), enabling awaitable progress frames for interactive resume without hanging (#2914).
-
-### Fixed
-
 - Streaming layout contraction followed by regrowth no longer re-admits an already committed logical row into native terminal scrollback, preventing occasional duplicated assistant lines after Markdown reflow.
+- Repeated clearing of an already-clear viewport output source is now a render-request no-op, matching identical non-null source updates.
 
 ## [0.11.10] - 2026-07-25
 

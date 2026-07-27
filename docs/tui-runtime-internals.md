@@ -132,6 +132,16 @@ Some rendered pages contain no semantic rows—for example, a page made entirely
 
 Manual-era output remains authoritative in the application transcript but is not retroactively replayed into native terminal/tmux scrollback when following live. Later ordinary live output may naturally move current tail rows into host history.
 
+When a downward movement (wheel or `PageDown`) in `scrollViewportBy` clamps to the true maximum transcript top for the current effective manual capacity, the TUI transitions through the existing `followLiveViewport()` transaction instead of painting another manual frame. This makes the bottom reachable through both discrete wheel steps and full-page jumps: a partial downward movement that does not reach the bottom retains manual ownership and the new-output notice, and upward movement never follows. The transition reuses the same live-follow path that ordinary composer input triggers, so focus, pinned chrome, manual-anchor clearing, notice clearing, and fatal terminal transaction semantics remain consistent. Manual-era output is never replayed into native/host scrollback on the transition; the next new semantic output appends through the live frontier exactly once.
+
+### PR1 semantic revision and observer safety
+
+A visible, capped IRC sidebar contributes its semantic projection to the manual-viewport new-output revision even when it produces no inline transcript component. The revision advances only for actual semantic output: duplicate, elided, hidden, geometry-only, and theme-only changes do not show the notice. Re-submitting an equal output source is a no-render operation. When the pinned suffix is constrained, the renderer selects its suffix rows without copying the full transcript-length prefix.
+
+`Session Observer` reads only stable source snapshots. It retains an incomplete append until a complete JSONL line is available, validates replacement candidates before publishing them, and clears cached transcript/model/tool content when the source is replaced, truncated, deleted, unreadable, or malformed. This is source-acquisition safety only: the observer still eagerly rebuilds full-history transcript projections, so its memory and refresh work remain `O(total observed history)`. PR1 does not add projection virtualization or bounded full-history memory.
+
+`PI_TUI_METRICS` structural counters are opt-in deterministic evidence. Timing and RSS samples are advisory observations, not release thresholds.
+
 ## Resize handling
 
 Resize events are event-driven from `ProcessTerminal` to `TUI.requestResizeRender()`.
