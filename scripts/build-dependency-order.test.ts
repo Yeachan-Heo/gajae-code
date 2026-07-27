@@ -11,7 +11,8 @@ import * as path from "node:path";
 // `bun run build` invocation into an unordered race.
 //
 // This regression protects that invariant directly: the `@gajae-code/*`
-// workspace dependency graph, restricted to packages with a `build` script,
+// workspace dependency graph, restricted to packages scheduled for a `build`
+// run (any of `prebuild`/`build`/`postbuild` present),
 // must stay acyclic. It intentionally does not invoke Bun or assert anything
 // about CLI flag spelling (`--workspaces` vs `--filter`), since both route
 // through the same scheduler and neither guards this invariant on its own.
@@ -26,7 +27,7 @@ interface WorkspacePackageManifest {
 }
 
 interface WorkspaceBuildGraph {
-	/** Packages with a `build` script -- the only nodes Bun's scheduler creates for a `build` run. */
+	/** Packages scheduled for a `build` run (any of `prebuild`/`build`/`postbuild` present) -- the only nodes Bun's scheduler creates for that run. */
 	scheduledPackageNames: Set<string>;
 	/** consumer package name -> producer package names (regular `dependencies` only, restricted to scheduled packages). */
 	edges: Map<string, string[]>;
@@ -107,7 +108,7 @@ function findCycle(edges: Map<string, string[]>): string[] | null {
 }
 
 describe("workspace build dependency graph stays acyclic", () => {
-	test("no dependency cycle among build-script-bearing @gajae-code/* packages", async () => {
+	test("no dependency cycle among build-lifecycle-scheduled @gajae-code/* packages", async () => {
 		const { scheduledPackageNames, edges } = await readWorkspaceBuildGraph();
 
 		// Sanity: the graph must actually contain the packages this regression
@@ -119,7 +120,7 @@ describe("workspace build dependency graph stays acyclic", () => {
 		const cycle = findCycle(edges);
 		if (cycle) {
 			throw new Error(
-				`Dependency cycle detected among build-script-bearing @gajae-code/* packages: ${cycle.join(" -> ")}. ` +
+				`Dependency cycle detected among build-lifecycle-scheduled @gajae-code/* packages: ${cycle.join(" -> ")}. ` +
 					"Bun's workspace-script scheduler disables build ordering for every scheduled package " +
 					"in a run when any cycle exists among them, which silently turns `bun run build` into an " +
 					"unordered race (see packages/coding-agent's build shelling into `bun --cwd=../natives run " +
