@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
+import type { ProviderConfigInput } from "../config/model-registry";
 import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
@@ -28,6 +29,35 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
+
+export async function registerTestModelProvider(
+	session: { modelRegistry: { registerProvider: (name: string, config: ProviderConfigInput) => void } },
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+	const modulePath = env.GJC_TEST_MODEL_PROVIDER;
+	if (!modulePath || env.GJC_TEST_MODEL_PROVIDER_AUTHORITY !== "1") return;
+	const provider = (await import(modulePath)) as {
+		providerName?: unknown;
+		api?: unknown;
+		streamSimple?: unknown;
+		models?: unknown;
+	};
+	if (
+		typeof provider.providerName !== "string" ||
+		!provider.providerName ||
+		typeof provider.api !== "string" ||
+		typeof provider.streamSimple !== "function" ||
+		!Array.isArray(provider.models)
+	)
+		throw new Error("GJC_TEST_MODEL_PROVIDER must export providerName, api, streamSimple, and models.");
+	session.modelRegistry.registerProvider(provider.providerName, {
+		api: provider.api as ProviderConfigInput["api"],
+		streamSimple: provider.streamSimple as ProviderConfigInput["streamSimple"],
+		// Deep-copy so registry-side mutation can never corrupt the imported module's live exports.
+		models: structuredClone(provider.models) as ProviderConfigInput["models"],
+	});
+}
+
 import { runSdkServe } from "../sdk/transport/serve-cli";
 import {
 	type CapturedSessionTranscriptSnapshot,
@@ -510,6 +540,8 @@ export async function runSessionHost(
 	};
 
 	try {
+		await beforeCutoff(registerTestModelProvider(session));
+		throwIfCutoff();
 		const modelProfileStartup =
 			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
 				? new Promise<void>(() => {})
