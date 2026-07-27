@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- The Kimi OAuth host (`KIMI_CODE_OAUTH_HOST` / `KIMI_OAUTH_HOST`) is now resolved from trusted environment sources only. That host receives the device-authorization request, the authorization-code exchange, and the refresh call that carries the existing refresh token, so reading it through the merged view that includes the caller's `cwd/.env` let a repository redirect the login flow and collect the user's Kimi credentials. Resolution now uses the non-project resolver; shell and user-level configuration is unchanged.
 - Anthropic `ping` keepalives no longer reset stream progress, so responses that stop producing content now reach the idle timeout instead of hanging indefinitely.
 - The documented `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` environment variable now takes effect: the stream-watchdog idle-timeout helpers resolve it GJC-first before the legacy `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` / `PI_STREAM_IDLE_TIMEOUT_MS` aliases (previously only the `PI_`-prefixed names were read, so setting the documented GJC name was a silent no-op).
 - The documented OpenAI-code provider knobs now take effect: `GJC_OPENAI_CODE_DEBUG`, `GJC_OPENAI_CODE_WEBSOCKET`, `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS`, `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`, and `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS` are resolved GJC-first ahead of the legacy `PI_CODEX_*` names. The Codex → OpenAI-code rename had updated the documentation but not the reads, so every documented name was a silent no-op.
