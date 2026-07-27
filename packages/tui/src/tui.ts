@@ -1009,7 +1009,7 @@ export class TUI extends Container {
 		// acquire manual ownership and freeze the next semantic output. Manual owners
 		// that reach the same boundary transition through the existing live transaction.
 		if (direction > 0 && targetViewportTop === maxViewportTop) {
-			if (this.#manualViewportTop === undefined && currentViewportTop === maxViewportTop) return false;
+			if (this.#manualViewportTop === undefined && currentViewportTop === maxViewportTop) return true;
 			if (this.#manualViewportTop !== undefined) return this.followLiveViewport();
 		}
 		if (frame !== null) {
@@ -1135,8 +1135,9 @@ export class TUI extends Container {
 				this.#paintedManualOutputNotice = false;
 				this.#lastCursorPosition = liveCursorPosition;
 				this.#previousLines = liveLines;
-				this.#scrollbackResumeViewportTop = undefined;
-				this.#nativeScrollbackViewportTop = liveViewportTop;
+				if (this.#scrollbackResumeViewportTop === undefined) {
+					this.#nativeScrollbackViewportTop = liveViewportTop;
+				}
 			},
 			true,
 		);

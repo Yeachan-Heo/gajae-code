@@ -850,7 +850,7 @@ describe("TUI manual viewport paging", () => {
 					mode === "wheel"
 						? tui.scrollViewportBy(DEFAULT_WHEEL_LINES, { pin: "stable" })
 						: tui.scrollViewportPages(1);
-				expect(moved).toBe(false);
+				expect(moved).toBe(true);
 
 				content.replace(Array.from({ length: 13 }, (_value, index) => `line-${index}`));
 				tui.setViewportOutputSource({ identity: `live-bottom-${mode}`, revision: 1n });
