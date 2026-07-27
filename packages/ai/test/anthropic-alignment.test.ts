@@ -9,6 +9,7 @@ import {
 	buildAnthropicClientOptions,
 	buildAnthropicHeaders,
 	buildAnthropicSystemBlocks,
+	claudeCodeEntrypoint,
 	claudeCodeVersion,
 	generateClaudeCloakingUserId,
 	isClaudeCloakingUserId,
@@ -115,6 +116,13 @@ describe("Anthropic request fingerprint alignment", () => {
 			extraInstructions: ["Use citations when possible"],
 			cacheControl: { type: "ephemeral" },
 		});
+
+		const billingHeader = blocks?.[0]?.text;
+		expect(billingHeader).toMatch(
+			new RegExp(
+				`^x-anthropic-billing-header: cc_version=${claudeCodeVersion}\\.[0-9a-f]{3}; cc_entrypoint=${claudeCodeEntrypoint}; cch=[0-9a-f]{5};$`,
+			),
+		);
 
 		expect(blocks).toBeDefined();
 		// Earlier blocks must NOT carry cache_control; a single trailing breakpoint covers them all.

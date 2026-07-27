@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Anthropic subscription OAuth requests now use the current Claude Code compatibility attribution (`2.1.219`, `sdk-cli`) instead of the stale `2.1.63` CLI fingerprint that Anthropic can misclassify as extra usage.
+
 ## [0.11.11] - 2026-07-26
 
 ### Fixed
