@@ -517,7 +517,8 @@ describe("perf corpus schema + runner", () => {
 			`fixture ${fixture.fixtureId}: rssMemory.growthBytes does not match detailed samples`,
 		);
 		const firstSample = validBaseline.samples[0];
-		const oversizedSamples = Array.from({ length: 200_000 }, () => ({ ...firstSample }));
+		const oversizedSamples = Array.from({ length: 1_000_000 }, () => firstSample);
+		oversizedSamples[543_210] = { ...firstSample, rssBytes: firstSample.rssBytes + 1 };
 		const oversizedPersistedReport = {
 			...report,
 			fixtures: report.fixtures.map((candidate, index) =>
@@ -527,8 +528,8 @@ describe("perf corpus schema + runner", () => {
 							rssMemory: {
 								...candidate.rssMemory,
 								baselineBytes: firstSample.rssBytes,
-								peakBytes: firstSample.rssBytes,
-								growthBytes: 0,
+								peakBytes: firstSample.rssBytes + 1,
+								growthBytes: 1,
 							},
 							memoryBaseline: {
 								...validBaseline,
