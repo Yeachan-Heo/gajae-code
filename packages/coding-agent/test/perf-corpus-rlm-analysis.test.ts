@@ -921,6 +921,24 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			},
 			"runner.command contains a host-private path",
 		],
+		[
+			"file URI argv",
+			runner => {
+				runner.argv = ["bun", "file:///private/tmp/perf-corpus.bench.ts"];
+				runner.command = runner.argv.join(" ");
+				runner.runtimeCommand = runner.command;
+			},
+			"runner.command contains a host-private path",
+		],
+		[
+			"embedded absolute argv",
+			runner => {
+				runner.argv = ["bun", "label,/private/tmp/perf-corpus.bench.ts"];
+				runner.command = runner.argv.join(" ");
+				runner.runtimeCommand = runner.command;
+			},
+			"runner.command contains a host-private path",
+		],
 	];
 
 	test.each(

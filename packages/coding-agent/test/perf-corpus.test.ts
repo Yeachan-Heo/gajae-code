@@ -226,6 +226,8 @@ describe("perf corpus schema + runner", () => {
 		for (const scriptPath of [
 			"packages/../private/perf-corpus.bench.ts",
 			"packages\\coding-agent\\bench\\perf-corpus.bench.ts",
+			"file:///private/tmp/perf-corpus.bench.ts",
+			"label,/private/tmp/perf-corpus.bench.ts",
 		]) {
 			const argv = ["bun", scriptPath];
 			const runner = {

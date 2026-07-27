@@ -239,7 +239,13 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const LOGICAL_BUN_EXECUTABLE = "bun";
 
 function containsHostPrivatePath(value: string): boolean {
-	if (value.includes("\\")) return true;
+	if (
+		value.includes("\\") ||
+		/(?:^|[\s,;:=])\/\S/.test(value) ||
+		/(?:^|[\s,;:=])[A-Za-z]:\//.test(value)
+	) {
+		return true;
+	}
 	for (const token of value.split(/\s+/).flatMap(part => part.split("="))) {
 		const normalized = token.replace(/^["']|["']$/g, "");
 		if (

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+import re
 import stat
 from pathlib import Path
 from statistics import NormalDist
@@ -275,7 +276,11 @@ def _validate_private_field_names(value: Any, label: str, *, privacy_attestation
 
 
 def _contains_host_private_path(value: str) -> bool:
-    if "\\" in value:
+    if (
+        "\\" in value
+        or re.search(r"(?:^|[\s,;:=])/\S", value)
+        or re.search(r"(?:^|[\s,;:=])[A-Za-z]:/", value)
+    ):
         return True
     for part in value.split():
         for token in part.split("="):
