@@ -236,6 +236,17 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					return;
 				}
 				if (frame.type === "query_request") {
+					if (frame.query === "runtime.capabilities") {
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id: frame.id,
+								ok: true,
+								result: { promptTerminalOutcomeVersion: 1 },
+							}),
+						);
+						return;
+					}
 					if (frame.query === "context.get") {
 						socket.send(
 							JSON.stringify({
@@ -356,6 +367,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 									commandId: "prompt-command",
 									turnId: "prompt-turn",
 									finalText: "fast",
+									outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 								}),
 							);
 						}
@@ -664,8 +676,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			.filter(update => update.update.sessionUpdate === "agent_message_chunk")
 			.map(update => (update.update as { content: { text: string } }).content.text),
 	).toEqual(["first", "second"]);
+	// Activity is advisory rendering state; only the correlated normalized terminal settles.
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
 	expect(await bounded(firstPrompt, "first prompt completion")).toEqual({ stopReason: "end_turn" });
 	await waitFor(
 		() =>
@@ -704,6 +726,15 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(cancelledSettled).toBe(false);
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+		}),
+	);
 	expect(await bounded(cancelledPrompt, "cancelled prompt completion")).toEqual({ stopReason: "cancelled" });
 	expect(
 		updates.filter(update => {
@@ -725,15 +756,33 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	).rejects.toThrow("SDK did not acknowledge cancellation");
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
 	expect(await bounded(abortFailurePrompt, "abort-failure prompt completion")).toEqual({ stopReason: "end_turn" });
 	abortAcknowledged = true;
 	promptDeliveredWhileBusy = true;
 	const steeringPrompt = agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "steer me" }] });
 	await waitFor(() => promptInputs.length === 4, "steering prompt delivery");
 	promptDeliveredWhileBusy = false;
-	// The host sent busy before the acknowledgement. The first valid idle after
-	// that boundary must finish the steering prompt without a second busy frame.
+	// The host sent busy before the acknowledgement. Idle no longer completes a
+	// prompt; the correlated normalized terminal is the only settlement authority.
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
 	expect(await bounded(steeringPrompt, "steering prompt completion")).toEqual({ stopReason: "end_turn" });
 
 	completeNextPromptBeforeAck = true;
@@ -1110,7 +1159,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	await expect(
 		frameFailureAgent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "closed" }] }),
-	).rejects.toThrow("Unsupported ACP session");
+	).rejects.toThrow("Unknown session, not found");
 	frameFailureAbort.abort();
 
 	brokerSessions = [];
@@ -1155,6 +1204,15 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await waitFor(() => promptInputs.length === 8, "restored-session follow-up prompt delivery");
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
 	expect(await bounded(followupPrompt, "restored-session follow-up prompt completion")).toEqual({
 		stopReason: "end_turn",
 	});

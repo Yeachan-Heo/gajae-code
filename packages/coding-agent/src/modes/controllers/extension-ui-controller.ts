@@ -417,6 +417,7 @@ export class ExtensionUiController {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
 			abort: () => this.ctx.session.abort(),
+			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			getPendingMessageCounts: () => this.ctx.session.pendingMessageCounts,
 			getTranscript: () => this.ctx.session.getTranscript(),
@@ -468,6 +469,7 @@ export class ExtensionUiController {
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
+			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -716,6 +718,7 @@ export class ExtensionUiController {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
 			abort: () => this.ctx.session.abort(),
+			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			getPendingMessageCounts: () => this.ctx.session.pendingMessageCounts,
 			getTranscript: () => this.ctx.session.getTranscript(),
@@ -764,6 +767,7 @@ export class ExtensionUiController {
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
+			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {

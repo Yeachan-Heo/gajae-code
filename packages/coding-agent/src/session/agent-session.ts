@@ -37,6 +37,7 @@ import {
 	type ManagedAttemptOutcome,
 	type MidRunMaintenanceOutcome,
 	resolveTelemetry,
+	type RunSettlementProof,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
@@ -4003,8 +4004,12 @@ export class AgentSession {
 	}
 
 	#trackPostPromptTask(task: Promise<void>): void {
+		const resourceRunId = this.agent.activeResourceRunId;
 		this.#postPromptTasks.add(task);
 		this.#ensurePostPromptTasksPromise();
+		if (resourceRunId) {
+			this.agent.resourceLedger.track(resourceRunId, "post_prompt", "agent-session", task);
+		}
 		void task
 			.catch(() => {})
 			.finally(() => {
@@ -6515,6 +6520,11 @@ export class AgentSession {
 	 */
 	get hasPostPromptWork(): boolean {
 		return this.#postPromptTasks.size > 0;
+	}
+
+	/** Stable resource ownership identifier for the active prompt run. */
+	get activePromptHandle(): string | undefined {
+		return this.agent.activeResourceRunId;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -9059,6 +9069,26 @@ export class AgentSession {
 	}): Promise<void> {
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
+	}
+	/**
+	 * Abort a specific active prompt and prove whether its tracked resources settled.
+	 */
+	async abortPromptAndWait(handle: string, options: { graceMs: number }): Promise<RunSettlementProof> {
+		// Only the abort trigger is gated on active ownership; settlement is always proven
+		// from the ledger, because a run can go inactive while its resources still run.
+		if (handle === this.agent.activeResourceRunId)
+			// Awaiting the abort unboundedly would let a provider or tool that ignores
+			// cancellation defer the grace forever, so the proof races the fixed grace
+			// independently of abort completion.
+			void this.abort({ timeoutMs: options.graceMs }).catch(() => {});
+
+		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
+		if (proof.status === "unfenced") {
+			// Detach the unsettled resources so they can never re-enter this run; their real
+			// promises still release them inside the ledger.
+			this.agent.resourceLedger.quarantine(handle);
+		}
+		return proof;
 	}
 
 	/** Atomically interrupt the active run and make text the next prompt. */

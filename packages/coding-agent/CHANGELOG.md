@@ -27,6 +27,8 @@
 - Interactive TUI `/resume` commits a status-container progress lease before inspect/migration/switch work and clears it on every exit path, with generation-scoped render-commit wait that fails open when the terminal is stopped or unavailable (#2914).
 - Interactive `/resume` progress lease fails open when `statusContainer` or UI lacks child-mutation/render-commit surface, preserving headless/minimal controller contexts without weakening full TUI progress-before-switch (#3234 post-merge).
 - The documented `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` environment variable now overrides the OpenAI-code web-search model; it is resolved GJC-first ahead of the legacy `PI_CODEX_WEB_SEARCH_MODEL` name (previously only the legacy name was read, so the documented name was a silent no-op).
+- ACP prompt completion no longer hangs clients: terminal prompt outcomes are now projected through ACP after the SDK finalizes them.
+- Prompt terminalization now exposes exactly one normalized outcome per accepted prompt, preserving the terminal reason or controlled failure code across SDK and ACP clients.
 
 ### Added
 

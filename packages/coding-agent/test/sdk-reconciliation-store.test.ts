@@ -55,14 +55,17 @@ describe("reconciliation-store", () => {
 			},
 		];
 		const settled = settleProcessRestart(input, now);
+		// Prompts must always end with one normalized outcome; only skills keep the
+		// legacy outcome-less `process_restart` settlement.
 		expect(settled[0]?.status).toBe("failed");
-		expect(settled[0]?.error?.code).toBe("process_restart");
+		expect(settled[0]?.error?.code).toBe("prompt_failed");
+		expect(settled[0]?.outcome).toMatchObject({ kind: "failed", code: "prompt_failed" });
 		expect(settled[1]?.status).toBe("failed");
 		expect(settled[1]?.error?.code).toBe("process_restart");
 		expect(settled[2]?.status).toBe("terminal_ok");
 	});
 
-	test("transact persists and reload settles non-terminal as process_restart", async () => {
+	test("transact persists and reload settles a non-terminal prompt with its normalized outcome", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-store-"));
 		const sessionFile = path.join(root, "sess.jsonl");
 		await fs.writeFile(sessionFile, "");
@@ -86,12 +89,12 @@ describe("reconciliation-store", () => {
 		const loaded = await reopened.load();
 		expect(loaded).toHaveLength(1);
 		expect(loaded[0]?.status).toBe("failed");
-		expect(loaded[0]?.error?.code).toBe("process_restart");
+		expect(loaded[0]?.error?.code).toBe("prompt_failed");
 		// sticky after settle
 		const again = createReconciliationStore({ sessionFile, sessionId: "sess1", now: () => 10_000 });
 		const loaded2 = await again.load();
 		expect(loaded2[0]?.status).toBe("failed");
-		expect(loaded2[0]?.error?.code).toBe("process_restart");
+		expect(loaded2[0]?.error?.code).toBe("prompt_failed");
 
 		await again.delete();
 		await expect(fs.stat(store.path!)).rejects.toMatchObject({ code: "ENOENT" });

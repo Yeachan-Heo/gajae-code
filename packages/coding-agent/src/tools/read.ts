@@ -1419,6 +1419,21 @@ interface ResolvedSqliteReadPath {
  * Reads files with support for images, converted documents (via markit), and text.
  * Directories return a formatted listing with modification times.
  */
+/**
+ * A client-authority denial is a decision, not a transport failure: falling back to
+ * disk would bypass the permission the client just refused. Availability failures
+ * still fall back so an unreachable bridge cannot break local reads.
+ */
+function isClientAuthorityDenial(error: unknown): boolean {
+	const code =
+		typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+	// ACP clients surface refusals as an application error; -32001 is the reserved
+	// client-authority denial code and -32603 covers hosts without a dedicated code.
+	if (code === "permission_denied" || code === "forbidden" || code === -32001 || code === -32603) return true;
+	const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+	return /permission denied|not permitted|access denied|forbidden/i.test(message);
+}
+
 export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly name = "read";
 	readonly label = "Read";
@@ -1991,6 +2006,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 				return { outputText: "", contentLineCount: 0, columnTruncated: 0, bridgeResult };
 			} catch (error) {
+				if (isClientAuthorityDenial(error)) throw error;
 				logger.warn("ACP fs readTextFile failed; falling back to disk", { path: absolutePath, error });
 			}
 		}
@@ -2893,6 +2909,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							}
 							return bridgeResult;
 						} catch (error) {
+							if (isClientAuthorityDenial(error)) throw error;
 							logger.warn("ACP fs readTextFile failed; falling back to disk", { path: absolutePath, error });
 						}
 					}

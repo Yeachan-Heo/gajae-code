@@ -284,12 +284,35 @@ Malformed reasoning descriptors are not client-recoverable catalog data. The
 query returns the SDK's safe `internal` error rather than exposing a partially
 formed row or descriptor details.
 
-## Prompt acceptance and reconciliation (Q26)
+## Prompt acceptance, termination, and reconciliation (Q26)
+
+`runtime.capabilities.promptTerminalOutcomeVersion` is `1` when this contract is available. Its normalized TypeScript terminal outcome is:
+
+```ts
+type SdkPromptTerminalOutcome =
+	| {
+			kind: "stopped";
+			reason: "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
+			provenance: "agent" | "client_cancel";
+	  }
+	| {
+			kind: "failed";
+			code: "prompt_failed" | "prompt_deadline_exceeded";
+			message: string;
+			provenance: "agent_failed" | "deadline";
+	  };
+```
 
 `turn.prompt` returns `{ accepted: true, commandId, turnId, clientRef? }` only after
-its asynchronous preflight accepts the prompt. This acknowledgement is not a
-process-durable terminal result. The authoritative public reconciliation query is
-`Q26` / `turn.prompt_status`, scoped to the same live session runtime.
+its asynchronous preflight accepts the prompt. That receipt is a durable,
+**non-terminal pending claim**, not a process-durable terminal result. The SDK
+later finalizes that claim with exactly one `SdkPromptTerminalOutcome`; cleanup
+may follow only after the claim is durable.
+
+The authoritative public reconciliation query is `Q26` /
+`turn.prompt_status`, scoped to the same live session runtime. Its `outcome`
+field is exposed only after finalization. A pending claim is never represented
+or exposed as a terminal outcome.
 
 Callers that must recover from a lost acknowledgement should assign one fresh
 `clientRef` (a trimmed, non-empty string of at most 128 characters) to each logical
@@ -309,20 +332,27 @@ or:
 
 The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
 `unknown`. Known records include `acceptedAt`; in-flight and terminal records add
-`startedAt` and/or `terminalAt`; failed records add a bounded sanitized
-`error.code` and `error.message`. Cursors, partial generated-ID pairs, mixed
-selectors, and extra selector fields are rejected.
+`startedAt` and/or `terminalAt`; finalized records include `outcome`; failed records
+also include a bounded sanitized `error.code` and `error.message`. Cursors, partial
+generated-ID pairs, mixed selectors, and extra selector fields are rejected.
+
+Correlated `agent_end` and `agent_failed` frames carry the same finalized
+`outcome`. Clients must correlate those frames and Q26 by the prompt identifiers,
+not infer terminality from stream activity or an earlier pending claim.
 
 Reconciliation state survives client disconnect/reconnect. With the session-private
 durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also
 survive **GJC session-process restart** for the same session identity within
-capacity/TTL, subject to crash-consistent fsync. Active records that were not
-terminal at death are settled as `failed` with `error.code = process_restart`
-(reconciliation incomplete — not proof of agent failure). Eviction or absence still
-returns honest `unknown`; that means the prior outcome is unknowable, not that
-execution did not occur. Active records are capped at 128 per kind and are never aged
-into terminal. Terminal records are retained for 15 minutes, capped at 256 per kind,
-and evicted oldest-terminal first.
+capacity/TTL, subject to crash-consistent fsync. A non-terminal prompt record at
+restart finalizes its pending outcome; if that claim is absent, it finalizes as
+`{ kind: "failed", code: "prompt_failed", ... }`. This prompt-specific recovery
+does not apply to skill records: active `skill.invoke` records retain
+`error.code = process_restart` because their reconciliation is incomplete, not
+proof of a skill failure. Eviction or absence still returns honest `unknown`; that
+means the prior outcome is unknowable, not that execution did not occur. Active
+records are capped at 128 per kind and are never aged into terminal. Terminal
+records are retained for 15 minutes, capped at 256 per kind, and evicted
+oldest-terminal first.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
@@ -330,14 +360,26 @@ does not replay a response or produce `idempotency_conflict`. A retained duplica
 reuse a `clientRef` as a retry mechanism: after eviction the same value can identify
 a new prompt while the old outcome remains unknown.
 
+`turn.abort` returns a typed disposition. A caller that does not own the target
+receives `resource_gone`; it must not treat that result as cancellation of another
+prompt.
+
+`sdk.promptDeadlineMs` defaults to `1_800_000`. It accepts only safe integers in
+`[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting
+when the prompt is durably accepted. Terminalization then has a fixed `10_000` ms
+grace period, which is not configurable. A controlled terminal failure reaches ACP
+as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
+`prompt_deadline_exceeded`.
+
 ## Skill invoke reconciliation (Q28)
 
 `skill.invoke` accepts optional `clientRef` and returns an early accepted receipt
 `{ accepted: true, commandId, turnId, clientRef?, name, path, lineCount?, args? }` after
 durable/preflight accept (SDK control path), not after skill completion. Query prior
 status with `Q28` / `skill.invoke_status` using the same selectors as Q26. Kind-scoped
-indexes mean prompt and skill `clientRef` values never collide. Same capacity/TTL and
-process_restart settlement rules as prompt reconciliation apply.
+indexes mean prompt and skill `clientRef` values never collide. Skill records use the
+same capacity/TTL limits, but an active skill record at restart settles with
+`error.code = process_restart`.
 
 ## Model profile discovery and validation (Q27)
 

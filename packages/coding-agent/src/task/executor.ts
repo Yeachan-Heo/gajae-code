@@ -1802,6 +1802,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						getModel: () => session.model,
 						isIdle: () => !session.isStreaming,
 						abort: () => session.abort(),
+						abortPromptAndWait: (handle, options) => session.abortPromptAndWait(handle, options),
 						hasPendingMessages: () => session.queuedMessageCount > 0,
 						getPendingMessageCounts: () => session.pendingMessageCounts,
 						getTranscript: () => session.getTranscript(),

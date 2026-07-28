@@ -99,6 +99,17 @@ describe("ACP production cancellation completion", () => {
 						return;
 					}
 					if (frame.type === "query_request") {
+						if (frame.query === "runtime.capabilities") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result: { promptTerminalOutcomeVersion: 1 },
+								}),
+							);
+							return;
+						}
 						const items =
 							frame.query === "config.list/get"
 								? [{ mode: "default", model: "openai/gpt", thinking: "medium" }]
@@ -196,8 +207,18 @@ describe("ACP production cancellation completion", () => {
 			});
 		await bounded(firstDelivered.promise, "first prompt delivery");
 		await bounded(acp.cancel({ sessionId: created.sessionId }), "first cancel acknowledgement");
+		// Activity is advisory only; the authoritative normalized terminal settles the prompt.
 		promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 		promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+		promptSocket!.send(
+			JSON.stringify({
+				type: "agent_end",
+				sessionId: created.sessionId,
+				commandId: "prompt-command",
+				turnId: "prompt-turn",
+				outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+			}),
+		);
 		expect(await bounded(firstPrompt, "first prompt completion")).toEqual({ stopReason: "cancelled" });
 		expect(firstResolutions).toBe(1);
 
@@ -221,6 +242,15 @@ describe("ACP production cancellation completion", () => {
 		).rejects.toThrow("SDK did not acknowledge cancellation");
 		promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 		promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+		promptSocket!.send(
+			JSON.stringify({
+				type: "agent_end",
+				sessionId: created.sessionId,
+				commandId: "prompt-command",
+				turnId: "prompt-turn",
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			}),
+		);
 		expect(await bounded(secondPrompt, "second prompt completion")).toEqual({ stopReason: "end_turn" });
 		expect(secondResolutions).toBe(1);
 

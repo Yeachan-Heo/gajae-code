@@ -1,0 +1,162 @@
+{
+  "command": [
+    "bun",
+    "/Users/probe/.cache/gjc/acpx/47dc1c56b20da3c248a4a1b5c5106f52e65e6594/conformance/runner/run.ts",
+    "--profile",
+    "/Users/probe/.cache/gjc/acpx/47dc1c56b20da3c248a4a1b5c5106f52e65e6594/conformance/profiles/acp-core-v1.json",
+    "--cases-dir",
+    "/Users/probe/.cache/gjc/acpx/47dc1c56b20da3c248a4a1b5c5106f52e65e6594/conformance/cases",
+    "--agent-command",
+    "bun /Users/probe/git/probepark/gajae-code/packages/coding-agent/scripts/acp-conformance-agent.ts",
+    "--format",
+    "json",
+    "--report",
+    "/var/folders/yx/36gb7cy13hqbgxkbll48m0cr0000gn/T/gjc-acpx-ea8e0daa-0b68-47df-84dd-206ffee71592.json",
+    "--cwd",
+    "/Users/probe/acp-013-final"
+  ],
+  "cwd": "/Users/probe/acp-013-final",
+  "gjc": {
+    "commit": "69faa20d38d39f0b08ae4694c81946b7cfd631eb",
+    "dirty": true
+  },
+  "acpx": {
+    "version": "0.13.0",
+    "gitHead": "47dc1c56b20da3c248a4a1b5c5106f52e65e6594"
+  },
+  "profile": "acp-core-v1",
+  "agentCommand": "bun /Users/probe/git/probepark/gajae-code/packages/coding-agent/scripts/acp-conformance-agent.ts",
+  "matrix": [
+    {
+      "id": "acp.v1.initialize.handshake",
+      "title": "Initialize handshake succeeds",
+      "passed": true,
+      "durationMs": 764
+    },
+    {
+      "id": "acp.v1.session.new.basic",
+      "title": "Session creation returns a session id",
+      "passed": true,
+      "durationMs": 2552
+    },
+    {
+      "id": "acp.v1.session.prompt.single_turn",
+      "title": "Prompt request starts and completes one turn",
+      "passed": true,
+      "durationMs": 2616
+    },
+    {
+      "id": "acp.v1.session.update.termination",
+      "title": "Update stream references session and terminates cleanly",
+      "passed": true,
+      "durationMs": 2654
+    },
+    {
+      "id": "acp.v1.session.cancel.in_flight",
+      "title": "Cancel terminates active turn",
+      "passed": true,
+      "durationMs": 2767
+    },
+    {
+      "id": "acp.v1.session.cancel.idle",
+      "title": "Cancel on idle session is acknowledged",
+      "passed": true,
+      "durationMs": 2690
+    },
+    {
+      "id": "acp.v1.session.prompt.multi_turn",
+      "title": "Multi-turn prompt flow remains stable",
+      "passed": true,
+      "durationMs": 2646
+    },
+    {
+      "id": "acp.v1.errors.invalid_params",
+      "title": "Invalid params produce explicit protocol error",
+      "passed": true,
+      "durationMs": 757
+    },
+    {
+      "id": "acp.v1.errors.invalid_prompt_session_type",
+      "title": "Prompt rejects invalid session id type",
+      "passed": true,
+      "durationMs": 765
+    },
+    {
+      "id": "acp.v1.errors.permission_denied",
+      "title": "Permission denial is explicit and machine-readable",
+      "passed": true,
+      "durationMs": 2826
+    },
+    {
+      "id": "acp.v1.errors.permission_denied.write",
+      "title": "Permission denial for write is explicit",
+      "passed": true,
+      "durationMs": 2754
+    },
+    {
+      "id": "acp.v1.errors.unknown_session",
+      "title": "Unknown session id fails explicitly",
+      "passed": true,
+      "durationMs": 778
+    },
+    {
+      "id": "acp.v1.session.prompt.echo_empty",
+      "title": "Echo without payload still completes",
+      "passed": true,
+      "durationMs": 2697
+    },
+    {
+      "id": "acp.v1.session.prompt.unrecognized",
+      "title": "Unrecognized prompt is surfaced in updates",
+      "passed": true,
+      "durationMs": 2707
+    },
+    {
+      "id": "acp.v1.errors.invalid_params.cwd_null",
+      "title": "Null cwd is rejected",
+      "passed": true,
+      "durationMs": 788
+    },
+    {
+      "id": "acp.v1.session.prompt.structured_blocks",
+      "title": "Structured prompt blocks are preserved",
+      "passed": true,
+      "durationMs": 2713
+    },
+    {
+      "id": "acp.v1.permissions.read.approved",
+      "title": "Read operation succeeds in approve-all mode",
+      "passed": true,
+      "durationMs": 2721
+    },
+    {
+      "id": "acp.v1.permissions.write.approved",
+      "title": "Write operation succeeds in approve-all mode",
+      "passed": true,
+      "durationMs": 2720
+    },
+    {
+      "id": "acp.v1.session.prompt.background_completion",
+      "title": "Background prompt can be awaited",
+      "passed": true,
+      "durationMs": 2705
+    },
+    {
+      "id": "acp.v1.session.cancel.followup_prompt",
+      "title": "Session remains usable after cancellation",
+      "passed": true,
+      "durationMs": 2881
+    },
+    {
+      "id": "acp.v1.session.prompt.post_success_drain",
+      "title": "Late post-success tool updates remain observable",
+      "passed": true,
+      "durationMs": 2892
+    }
+  ],
+  "totals": {
+    "cases": 21,
+    "passed": 21,
+    "failed": 0
+  }
+}

@@ -181,6 +181,9 @@ export class ExtensionRunner {
 	#isIdleFn: () => boolean = () => true;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void = () => {};
+	#abortPromptAndWaitFn: NonNullable<ExtensionContextActions["abortPromptAndWait"]> = async () => {
+		throw new Error("abortPromptAndWait binding is unavailable");
+	};
 	#hasPendingMessagesFn: () => boolean = () => false;
 	#getPendingMessageCountsFn: () => { steering: number; followUp: number; nextTurn: number } = () => ({
 		steering: 0,
@@ -214,6 +217,7 @@ export class ExtensionRunner {
 	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
 	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
+	#setSdkClientBridgeFn: ExtensionContextActions["setSdkClientBridge"] = undefined;
 
 	#invokeSkillFn: ExtensionContextActions["invokeSkill"] = undefined;
 	#setPlanModeFn: ExtensionContextActions["setPlanMode"] = undefined;
@@ -298,6 +302,11 @@ export class ExtensionRunner {
 		this.#getModel = contextActions.getModel;
 		this.#isIdleFn = contextActions.isIdle;
 		this.#abortFn = contextActions.abort;
+		this.#abortPromptAndWaitFn =
+			contextActions.abortPromptAndWait ??
+			(async () => {
+				throw new Error("abortPromptAndWait binding is unavailable");
+			});
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#getPendingMessageCountsFn =
 			contextActions.getPendingMessageCounts ?? (() => ({ steering: 0, followUp: 0, nextTurn: 0 }));
@@ -331,6 +340,7 @@ export class ExtensionRunner {
 		this.#getJobsFn = contextActions.getJobs;
 		this.#sdkControlFn = contextActions.sdkControl;
 		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
+		this.#setSdkClientBridgeFn = contextActions.setSdkClientBridge;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -553,6 +563,7 @@ export class ExtensionRunner {
 			},
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
+			abortPromptAndWait: (handle, options) => this.#abortPromptAndWaitFn(handle, options),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			getPendingMessageCounts: () => this.#getPendingMessageCountsFn(),
 			getTranscript: () => this.#getTranscriptFn(),
@@ -582,6 +593,7 @@ export class ExtensionRunner {
 			getJobs: () => this.#getJobsFn?.(),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
+			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),
 			sdkBindings: () => [
 				...(this.#cycleModelFn ? ["cycleModel"] : []),
 				...(this.#setModelProfileFn ? ["setModelProfile"] : []),

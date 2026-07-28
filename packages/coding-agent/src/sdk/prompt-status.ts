@@ -17,8 +17,10 @@
  *   prior outcome unknown — callers MUST NOT reuse a clientRef as a retry
  *   mechanism and MUST treat `unknown` as uncertainty, not proof of
  *   non-execution.
- * - The durability floor is the live session process: after restart or
- *   retained-record eviction, a lookup honestly reports `unknown`.
+ * - Prompt records survive process restart: an active prompt is finalized from its
+ *   durable pending outcome, or as `prompt_failed` when it has none. Only skill
+ *   records settle as `process_restart`, and a lookup reports `unknown` only after
+ *   retained-record TTL/capacity eviction.
  * - Q26 tracks prompts accepted through the SDK control surface (which always
  *   carries a requesting connection); submissions without a delivery owner are
  *   outside the reconciliation contract and hold no reservation.
@@ -38,8 +40,17 @@ export interface TurnPromptInput {
 	clientRef?: string;
 }
 
-/** Terminal outcome is preserved exactly; active records never age into terminal. */
+/**
+ * Terminal outcome is preserved exactly; active records never age into terminal. A
+ * prompt that is active at process restart is finalized from its durable pending
+ * outcome (or `prompt_failed` when it has none), so it never reports as unknown.
+ */
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
+export type SdkPromptStopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
+export type SdkPromptFailureCode = "prompt_failed" | "prompt_deadline_exceeded";
+export type SdkPromptTerminalOutcome =
+	| { kind: "stopped"; reason: SdkPromptStopReason; provenance: "agent" | "client_cancel" }
+	| { kind: "failed"; code: SdkPromptFailureCode; message: string; provenance: "agent_failed" | "deadline" };
 
 /** Exactly one selector per lookup. */
 export type TurnPromptStatusSelector = { clientRef: string } | { commandId: string; turnId: string };
@@ -67,6 +78,7 @@ export interface TurnPromptReconciliationTerminalOk extends TurnPromptReconcilia
 	startedAt?: number;
 	/** Epoch milliseconds of the terminal transition. */
 	terminalAt: number;
+	outcome?: SdkPromptTerminalOutcome;
 }
 
 export interface TurnPromptReconciliationFailed extends TurnPromptReconciliationIdentity {
@@ -75,6 +87,7 @@ export interface TurnPromptReconciliationFailed extends TurnPromptReconciliation
 	terminalAt: number;
 	/** Bounded, sanitized failure detail (code safe-token ≤64, message ≤512). */
 	error: { code: string; message: string };
+	outcome?: SdkPromptTerminalOutcome;
 }
 
 export interface TurnPromptReconciliationUnknown {

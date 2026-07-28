@@ -1831,24 +1831,58 @@ async function streamAssistantResponse(
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			const fallbackAttempt = config.fallbackManaged ? config.nextFallbackAttempt?.(config.model) : undefined;
-			const response = await streamFunction(config.model, llmContext, {
-				...config,
-				fallbackAttempt,
-				apiKey: resolvedApiKey,
-				authCredentialType,
-				metadata: resolvedMetadata,
-				sessionId: config.providerSessionId ?? config.sessionId,
-				toolChoice: effectiveToolChoice,
-				reasoning: effectiveReasoning,
-				temperature: effectiveTemperature,
-				signal: requestSignal,
-				onResponse: captureOnResponse,
-			});
+			const responsePromise = Promise.resolve().then(() =>
+				streamFunction(config.model, llmContext, {
+					...config,
+					fallbackAttempt,
+					apiKey: resolvedApiKey,
+					authCredentialType,
+					metadata: resolvedMetadata,
+					sessionId: config.providerSessionId ?? config.sessionId,
+					toolChoice: effectiveToolChoice,
+					reasoning: effectiveReasoning,
+					temperature: effectiveTemperature,
+					signal: requestSignal,
+					onResponse: captureOnResponse,
+				}),
+			);
+			if (config.resourceLedger && config.resourceRunId) {
+				config.resourceLedger.track(
+					config.resourceRunId,
+					"provider_factory",
+					`${config.model.provider}/${config.model.id}`,
+					responsePromise,
+				);
+			}
+			const response = await responsePromise;
 
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;
 
 			const responseIterator = response[Symbol.asyncIterator]();
+			const { promise: iteratorSettled, resolve: settleIterator } = Promise.withResolvers<void>();
+			let iteratorClosed = false;
+			const closeIterator = (): void => {
+				if (iteratorClosed) return;
+				iteratorClosed = true;
+
+				void Promise.resolve(responseIterator.return?.()).then(
+					() => settleIterator(),
+					() => settleIterator(),
+				);
+			};
+			if (config.resourceLedger && config.resourceRunId) {
+				// The lease covers the iterator AND the trailing `response.result()`: a
+				// hanging result must never look like settled provider work.
+				config.resourceLedger.track(
+					config.resourceRunId,
+					"provider_iterator",
+					`${config.model.provider}/${config.model.id}`,
+					iteratorSettled.then(async () => {
+						await Promise.allSettled([Promise.resolve(response.result())]);
+					}),
+				);
+			}
 
 			// Set up a single abort race: register the abort listener once for the whole
 			// stream and reuse the same race promise for every iterator.next() instead of
@@ -1857,6 +1891,7 @@ async function streamAssistantResponse(
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
+					closeIterator();
 					const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
 					await finishChat(aborted);
 					return aborted;
@@ -1874,7 +1909,7 @@ async function streamAssistantResponse(
 					if (abortRacePromise) {
 						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
 						if (result === ABORTED) {
-							responseIterator.return?.()?.catch(() => {});
+							closeIterator();
 							const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
 							await finishChat(aborted);
 							return aborted;
@@ -1888,7 +1923,11 @@ async function streamAssistantResponse(
 						await finishChat(aborted);
 						return aborted;
 					}
-					if (next.done) break;
+					if (next.done) {
+						iteratorClosed = true;
+						settleIterator();
+						break;
+					}
 
 					const event = next.value;
 
@@ -1955,6 +1994,7 @@ async function streamAssistantResponse(
 				}
 			} finally {
 				detachAbortListener?.();
+				closeIterator();
 			}
 
 			const trailing = config.fallbackManaged
@@ -2261,7 +2301,7 @@ async function executeToolCalls(
 							toolCalls: toolCallInfos,
 						})
 					: undefined;
-				const rawResult = await tool.execute(
+				const execution = tool.execute(
 					toolCall.id,
 					transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs,
 					tool.nonAbortable ? undefined : toolSignal,
@@ -2276,6 +2316,10 @@ async function executeToolCalls(
 					},
 					toolContext,
 				);
+				if (config.resourceLedger && config.resourceRunId) {
+					config.resourceLedger.track(config.resourceRunId, "tool", `${toolCall.name}:${toolCall.id}`, execution);
+				}
+				const rawResult = await execution;
 				const coerced = coerceToolResult(rawResult);
 				result = coerced.result;
 				if (coerced.malformed || result.isError) isError = true;

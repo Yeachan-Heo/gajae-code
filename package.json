@@ -85,6 +85,7 @@
     "install:dev": "bun install && bun --cwd=packages/coding-agent link && bun --cwd=packages/ai link && bun run dev:link && bun packages/coding-agent/src/cli.ts setup defaults",
     "install:defaults": "bun packages/coding-agent/src/cli.ts setup defaults",
     "dev": "bun --cwd=packages/coding-agent src/cli.ts",
+    "conformance:run": "bun packages/coding-agent/scripts/run-acp-conformance.ts",
     "dev:link": "bun scripts/dev-link.ts",
     "dev:doctor": "bun scripts/dev-link.ts --check",
     "stats": "bun --cwd=packages/coding-agent src/cli.ts stats",

@@ -1863,7 +1863,14 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 	);
 	expect(lifecycle).toEqual([
 		expect.objectContaining({ payload: { type: "agent_start", sessionId, ...correlation } }),
-		expect.objectContaining({ payload: { type: "agent_end", sessionId, ...correlation } }),
+		expect.objectContaining({
+			payload: {
+				type: "agent_end",
+				sessionId,
+				...correlation,
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		}),
 	]);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
@@ -1986,7 +1993,14 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 	);
 	expect(replayedLifecycle).toEqual([
 		expect.objectContaining({ payload: { type: "agent_start", sessionId, ...correlation } }),
-		expect.objectContaining({ payload: { type: "agent_end", sessionId, ...correlation } }),
+		expect.objectContaining({
+			payload: {
+				type: "agent_end",
+				sessionId,
+				...correlation,
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		}),
 	]);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });

@@ -275,6 +275,13 @@ export const SETTINGS_SCHEMA = {
 		values: ["copy-retain", "disabled"] as const,
 		default: "copy-retain",
 	},
+	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
+	"sdk.promptDeadlineMs": {
+		type: "number",
+		default: 1_800_000,
+		description: "SDK-owned prompt deadline; ACP has no separate timeout.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },

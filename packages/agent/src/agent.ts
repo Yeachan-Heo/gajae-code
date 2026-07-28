@@ -25,6 +25,7 @@ import { agentLoop, agentLoopContinue } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { HarmonyAuditEvent } from "./harmony-leak";
 import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
+import { createRunResourceLedger } from "./run-resource-ledger";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -38,6 +39,7 @@ import type {
 	ManagedAttemptDecision,
 	ManagedAttemptOutcome,
 	ManagedLogicalRunId,
+	RunResourceLedger,
 	RunTerminalRequest,
 	StreamFn,
 	ToolCallContext,
@@ -361,6 +363,7 @@ export class Agent {
 	#resolveRunningPrompt?: () => void;
 	#runSequence = 0;
 	#activeRunId?: number;
+	#activeResourceRunId?: string;
 	#continuationGeneration = 0;
 	#activeFallbackManaged = false;
 	#kimiApiFormat?: "openai" | "anthropic";
@@ -388,6 +391,7 @@ export class Agent {
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
 	#terminalizedLogicalRunIds = new Set<ManagedLogicalRunId>();
 	#managedLogicalRunOwner?: ManagedLogicalRunId;
+	readonly resourceLedger: RunResourceLedger = createRunResourceLedger();
 
 	streamFn: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
@@ -1152,12 +1156,14 @@ export class Agent {
 		this.#state.pendingToolCalls = new Set<string>();
 		this.#abortController = undefined;
 		this.#cursorToolResultBuffer = [];
+		this.resourceLedger.quarantine(this.#activeResourceRunId ?? String(managedLogicalRunId ?? runId));
 		this.#managedLogicalRunOwner = undefined;
 
 		const resolve = this.#resolveRunningPrompt;
 		this.#runningPrompt = undefined;
 		this.#resolveRunningPrompt = undefined;
 		this.#activeRunId = undefined;
+		this.#activeResourceRunId = undefined;
 		resolve?.();
 		if (this.#activeFallbackManaged) {
 			this.requestRunTerminal(managedLogicalRunId ?? runId, { stopReason: "cancelled" });
@@ -1174,6 +1180,10 @@ export class Agent {
 	/** The active per-attempt run identifier. */
 	get activeRunId(): number | undefined {
 		return this.#activeRunId;
+	}
+	/** Stable resource ownership identifier for the active prompt run. */
+	get activeResourceRunId(): string | undefined {
+		return this.#activeResourceRunId;
 	}
 
 	/**
@@ -1342,11 +1352,12 @@ export class Agent {
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
-		options?.onRunAccepted?.();
 
 		const fallbackManaged = options?.fallbackManaged === true;
 		const managedLogicalRunOwner = fallbackManaged ? (this.#managedLogicalRunOwner ?? runId) : undefined;
 		const startsManagedLogicalRun = fallbackManaged && this.#managedLogicalRunOwner === undefined;
+		this.#activeResourceRunId = String(managedLogicalRunOwner ?? runId);
+		options?.onRunAccepted?.();
 		if (startsManagedLogicalRun) {
 			this.#managedLogicalRunOwner = managedLogicalRunOwner;
 			this.#emit({ type: "agent_start" });
@@ -1358,6 +1369,7 @@ export class Agent {
 			this.#state.isStreaming = false;
 			this.#abortController = undefined;
 			this.#activeRunId = undefined;
+			this.#activeResourceRunId = undefined;
 			this.#runningPrompt = undefined;
 			this.#resolveRunningPrompt = undefined;
 			resolve();
@@ -1454,6 +1466,8 @@ export class Agent {
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
 			signal: abortController.signal,
+			resourceLedger: this.resourceLedger,
+			resourceRunId: this.#activeResourceRunId,
 			getApiKey: this.getApiKey,
 			getAuthCredentialType: this.getAuthCredentialType,
 			getToolContext: this.#getToolContext,
@@ -1700,6 +1714,7 @@ export class Agent {
 				this.#state.pendingToolCalls = new Set<string>();
 				this.#abortController = undefined;
 				this.#activeRunId = undefined;
+				this.#activeResourceRunId = undefined;
 				this.#activeFallbackManaged = false;
 				this.#resolveRunningPrompt?.();
 				this.#runningPrompt = undefined;
