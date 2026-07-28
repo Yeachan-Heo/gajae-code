@@ -671,11 +671,11 @@ export class TUI extends Container {
 	#widthSettleTimer: NodeJS.Timeout | undefined;
 	#widthSettleRepairPending = false;
 	#lastObservedWidth = 0;
-	// Trailing debounce for the settled width repair. Tunable for tests and
-	// hosts: GJC_TUI_WIDTH_SETTLE_MS / PI_TUI_WIDTH_SETTLE_MS; 0 disables the
-	// settled repair entirely (deterministic replay harnesses need this — a
-	// wall-clock-timed full replay lands at nondeterministic logical positions).
-	readonly #widthSettleMs = TUI.#readWidthSettleMs();
+	// Trailing debounce for the settled width repair. Instance-local: taken from
+	// options.widthSettleMs when provided (deterministic harnesses pass 0 to
+	// disable), otherwise from GJC_TUI_WIDTH_SETTLE_MS / PI_TUI_WIDTH_SETTLE_MS,
+	// otherwise 1000. Sampled once at construction.
+	#widthSettleMs: number = TUI.#readWidthSettleMs();
 	static readonly #WIDTH_SETTLE_MS = 1000;
 
 	static #readWidthSettleMs(): number {
@@ -787,12 +787,22 @@ export class TUI extends Container {
 		private readonly options: {
 			enableMouse?: boolean;
 			copySelection?: (text: string) => void | Promise<void>;
+			/**
+			 * Trailing debounce for the settled width repair, in ms. `0` disables the
+			 * settled repair (deterministic harnesses need this — a wall-clock-timed
+			 * full replay lands at nondeterministic logical positions). Defaults to
+			 * `GJC_TUI_WIDTH_SETTLE_MS` / `PI_TUI_WIDTH_SETTLE_MS`, then 1000.
+			 */
+			widthSettleMs?: number;
 		} = {},
 	) {
 		super();
 		this.terminal = terminal;
 		if (showHardwareCursor !== undefined) {
 			this.#showHardwareCursor = showHardwareCursor;
+		}
+		if (options.widthSettleMs !== undefined && Number.isFinite(options.widthSettleMs) && options.widthSettleMs >= 0) {
+			this.#widthSettleMs = options.widthSettleMs;
 		}
 		this.#imeCursorActive = !this.#showHardwareCursor && this.#useImeBlockCursor;
 		this.#unsubscribeTabWidthChange = onDefaultTabWidthChange(() => {
