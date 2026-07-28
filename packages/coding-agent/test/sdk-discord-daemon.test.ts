@@ -729,10 +729,15 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "recovered" }),
 			).rejects.toThrow("rate limited");
 			provider.failPost = false;
+			// Lease recovery backs off as `min(1_000, 25 * 2 ** min(failures, 5))`,
+			// so a single transient failure can schedule the retry a full second
+			// out — the previous 20 * 25ms = 500ms budget was under-provisioned
+			// against the daemon's own worst case and lost the race on loaded CI
+			// runners. Allow for several such delays instead.
 			for (
-				let attempt = 0;
-				attempt < 20 && !provider.messages.some(message => message.content === "recovered");
-				attempt++
+				let waited = 0;
+				waited < 10_000 && !provider.messages.some(message => message.content === "recovered");
+				waited += 25
 			)
 				await Bun.sleep(25);
 			expect(provider.messages).toContainEqual(expect.objectContaining({ content: "recovered" }));
