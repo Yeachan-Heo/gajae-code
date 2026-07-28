@@ -577,3 +577,73 @@ describe("write resolves conflicts via conflict://N", () => {
 		expect(after).toBe("// extra line\n// another extra\nline 1\nnewApi(x)\nline N\n");
 	});
 });
+
+// Conflict surfacing must not depend on which end of the file truncation kept.
+// PR #3348 flipped the bare-read default from `head` to `last` while the scan
+// lived only on the head render path, so every conflict silently disappeared
+// from bare reads. Pin all three directions explicitly.
+describe("conflict surfacing is truncation-direction independent", () => {
+	let tempDir: string;
+
+	beforeAll(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+	});
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "conflict-dir-"));
+	});
+
+	afterEach(async () => {
+		await fs.rm(tempDir, { recursive: true, force: true });
+	});
+
+	for (const truncation of ["head", "last", "both"] as const) {
+		it(`registers and warns for an explicit \`${truncation}\` read`, async () => {
+			await Bun.write(path.join(tempDir, "foo.ts"), TWO_WAY);
+			const session = createTestSession(tempDir);
+			const read = await getTool(session, "read");
+
+			const result = await read.execute(`read-${truncation}`, { path: "foo.ts", truncation });
+			const text = getText(result);
+
+			expect(text).toContain("⚠");
+			expect(text).toContain("1 unresolved conflict detected");
+			expect(session.conflictHistory?.get(1)).toBeDefined();
+		});
+	}
+
+	it("registers on a bare read under the configured default direction", async () => {
+		await Bun.write(path.join(tempDir, "foo.ts"), TWO_WAY);
+		const session = createTestSession(tempDir);
+		const read = await getTool(session, "read");
+
+		const text = getText(await read.execute("read-bare", { path: "foo.ts" }));
+
+		expect(text).toContain("⚠");
+		expect(session.conflictHistory?.get(1)).toBeDefined();
+	});
+
+	it("keeps true source line numbers for a conflict kept by a truncated tail window", async () => {
+		// The padding must exceed `read.receiptBudgetLines` (default 50) or the
+		// `last` read fits whole, nothing is dropped, and the line-number
+		// assertion below would pass even if tail rebasing were broken. At 80
+		// padding lines the window genuinely starts mid-file, so the recorded
+		// start line can only be right if origins are rebased to real file
+		// coordinates rather than window-relative ones.
+		const padding = Array.from({ length: 80 }, (_, index) => `pad ${index + 1}`);
+		await Bun.write(path.join(tempDir, "padded.ts"), [...padding, ...TWO_WAY.split("\n")].join("\n"));
+		const session = createTestSession(tempDir);
+		const read = await getTool(session, "read");
+
+		const text = getText(await read.execute("read-padded", { path: "padded.ts", truncation: "last" }));
+
+		// Prove the window actually truncated: the first padding line is gone.
+		expect(text).not.toContain("pad 1\n");
+		expect(text).toContain("⚠");
+		const entry = session.conflictHistory?.get(1);
+		expect(entry).toBeDefined();
+		// The marker block starts on file line 82 (80 padding lines + "line 1").
+		expect(entry?.startLine).toBe(82);
+	});
+});

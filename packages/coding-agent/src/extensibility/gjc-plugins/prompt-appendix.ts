@@ -23,7 +23,11 @@ function sanitizeBody(text: string): string {
 	// Strip control chars (except tab/newline), then XML-escape &, <, > so a
 	// malicious body can NEVER emit a closing delimiter or fake <system>/
 	// <developer>/<gjc-subskill> tag that escapes the lower-authority block.
-	const stripped = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
+	//
+	// The set spans C0, DEL, and C1. Carriage return can rewrite a rendered line,
+	// and U+009B is a single-byte CSI that introduces an escape sequence without
+	// any preceding ESC, so omitting either leaves the same injection open.
+	const stripped = text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 	return stripped.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 

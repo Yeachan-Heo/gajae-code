@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { bindPluginMcpToPublicNetwork } from "../../runtime-mcp/plugin-network-boundary";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
+import { bundleIdentity } from "./lifecycle-reconciliation";
 import { loadEffectiveGjcPluginRegistry, registryPathForScope } from "./registry";
 import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
 import type { GjcPluginRegistryEntry, GjcPluginScope } from "./types";
@@ -105,6 +106,7 @@ async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<S
 		const snapshot = await snapshotExistingFile(abs);
 		if (!snapshot) {
 			return {
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId: `plugin:${entry.name}`,
 				code: "runtime_mismatch",
@@ -113,6 +115,7 @@ async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<S
 		}
 		if ((await hashFile(snapshot)) !== file.sha256) {
 			return {
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId: `plugin:${entry.name}`,
 				code: "runtime_mismatch",
@@ -186,12 +189,16 @@ export async function loadAlwaysOnPluginTools(input: {
 	);
 
 	// Map declared (path -> name) for every active always-on tool surface.
-	const declared = new Map<string, { name: string; plugin: string }>();
+	const declared = new Map<string, { name: string; plugin: string; scope: GjcPluginScope }>();
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const t of entry.surfaces.tools) {
 			if (disabled.has(t.extensionId)) continue;
-			declared.set(path.join(entry.pluginRoot, t.relativePath), { name: t.name, plugin: entry.name });
+			declared.set(path.join(entry.pluginRoot, t.relativePath), {
+				name: t.name,
+				plugin: entry.name,
+				scope: entry.scope,
+			});
 		}
 	}
 	if (declared.size === 0) return { tools: [], quarantine };
@@ -218,6 +225,7 @@ export async function loadAlwaysOnPluginTools(input: {
 		// Manifest is authoritative: exactly the one declared name must come back.
 		if (returned.length !== 1 || returned[0] !== info.name) {
 			quarantine.push({
+				identity: bundleIdentity(info.scope, info.plugin),
 				plugin: info.plugin,
 				surfaceId: `tool:${info.name}`,
 				code: "runtime_mismatch",
@@ -228,6 +236,7 @@ export async function loadAlwaysOnPluginTools(input: {
 		if (seenNames.has(info.name)) {
 			// Defense in depth: never overwrite a reserved/earlier name.
 			quarantine.push({
+				identity: bundleIdentity(info.scope, info.plugin),
 				plugin: info.plugin,
 				surfaceId: `tool:${info.name}`,
 				code: "session_collision",
@@ -335,6 +344,7 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 				}
 			} catch (error) {
 				quarantine.push({
+					identity: bundleIdentity(entry.scope, entry.name),
 					plugin: entry.name,
 					surfaceId: m.extensionId,
 					code: "security_policy",

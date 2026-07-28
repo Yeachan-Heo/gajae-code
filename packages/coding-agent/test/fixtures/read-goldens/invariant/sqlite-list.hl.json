@@ -1,0 +1,11 @@
+{
+  "text": "users (4 rows)",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/app.sqlite"
+    }
+  }
+}

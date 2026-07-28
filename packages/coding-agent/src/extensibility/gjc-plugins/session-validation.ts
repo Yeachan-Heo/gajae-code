@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { GjcPluginLoadErrorCode, GjcPluginRegistryEntry } from "./types";
+import { bundleIdentity, identityKey } from "./lifecycle-reconciliation";
+import type { GjcBundleIdentity, GjcPluginLoadErrorCode, GjcPluginRegistryEntry } from "./types";
 
 /**
  * Session-start validation: the registry is the collision authority. Capability
@@ -22,6 +23,8 @@ export interface SessionCapabilityEvidence {
 }
 
 export interface SessionQuarantine {
+	/** Scope-qualified canonical target this finding belongs to. */
+	identity: GjcBundleIdentity;
 	plugin: string;
 	surfaceId: string;
 	code: GjcPluginLoadErrorCode;
@@ -52,6 +55,7 @@ export async function verifyEntryHashes(entry: GjcPluginRegistryEntry): Promise<
 			buf = await fs.readFile(abs);
 		} catch {
 			return {
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId: `plugin:${entry.name}`,
 				code: "runtime_mismatch",
@@ -60,6 +64,7 @@ export async function verifyEntryHashes(entry: GjcPluginRegistryEntry): Promise<
 		}
 		if (sha256(buf) !== file.sha256) {
 			return {
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId: `plugin:${entry.name}`,
 				code: "runtime_mismatch",
@@ -103,7 +108,7 @@ export function validateSessionBundles(
 	preQuarantined: readonly SessionQuarantine[] = [],
 ): SessionValidationResult {
 	const quarantine: SessionQuarantine[] = [...preQuarantined];
-	const quarantinedPlugins = new Set(preQuarantined.map(q => q.plugin));
+	const quarantinedPlugins = new Set(preQuarantined.map(q => identityKey(q.identity)));
 
 	const seenTools = new Set<string>(evidence.toolNames ?? []);
 	const seenMcps = new Set<string>(evidence.mcpNames ?? []);
@@ -113,12 +118,13 @@ export function validateSessionBundles(
 	const active: GjcPluginRegistryEntry[] = [];
 	for (const entry of entries) {
 		if (!entry.enabled) continue; // user-disabled, not an error
-		if (quarantinedPlugins.has(entry.name)) continue;
+		if (quarantinedPlugins.has(identityKey(bundleIdentity(entry.scope, entry.name)))) continue;
 		const surfaces = activeSurfaceIds(entry);
 		let collided = false;
 		const recordCollision = (surfaceId: string, what: string): void => {
 			collided = true;
 			quarantine.push({
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId,
 				code: "session_collision",

@@ -18,6 +18,10 @@ import type { ImageContent, MessageAttribution } from "@gajae-code/ai";
 import { getConfigRootDir, isEnoent } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import type { CustomMessage } from "../session/messages";
+import { type GhResult, type RunGh, runGhDefault } from "../utils/gh";
+
+export type { GhResult, RunGh };
+export { runGhDefault };
 
 export const STAR_REMINDER_REPO = "Yeachan-Heo/gajae-code";
 export const STAR_REMINDER_CUSTOM_TYPE = "star-reminder";
@@ -33,15 +37,6 @@ export interface StarReminderState {
 }
 
 export type StarCheckStatus = "starred" | "unstarred" | "unavailable";
-
-export interface GhResult {
-	exitCode: number;
-	stdout: string;
-	stderr: string;
-	timedOut?: boolean;
-}
-
-export type RunGh = (args: string[], options?: { timeoutMs?: number }) => Promise<GhResult>;
 
 export interface StarReminderDeps {
 	statePath?: string;
@@ -185,39 +180,6 @@ export async function recordDeclinedAfterNo(deps?: StarReminderDeps): Promise<St
 		if (current.starred) return current;
 		return { ...current, declined: true };
 	}, deps);
-}
-
-// --------------------------------------------------------------------------
-// gh helpers
-// --------------------------------------------------------------------------
-
-/** Default `gh` runner. Returns an unavailable-style result instead of throwing. */
-export async function runGhDefault(args: string[], options?: { timeoutMs?: number }): Promise<GhResult> {
-	const ghPath = Bun.which("gh");
-	if (!ghPath) {
-		return { exitCode: -1, stdout: "", stderr: "gh not found", timedOut: false };
-	}
-	const timeoutMs = options?.timeoutMs ?? GH_TIMEOUT_MS;
-	let timedOut = false;
-	try {
-		const proc = Bun.spawn([ghPath, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
-		const timer = setTimeout(() => {
-			timedOut = true;
-			proc.kill();
-		}, timeoutMs);
-		try {
-			const [stdout, stderr] = await Promise.all([
-				new Response(proc.stdout).text(),
-				new Response(proc.stderr).text(),
-			]);
-			const exitCode = await proc.exited;
-			return { exitCode, stdout, stderr, timedOut };
-		} finally {
-			clearTimeout(timer);
-		}
-	} catch (err) {
-		return { exitCode: -1, stdout: "", stderr: err instanceof Error ? err.message : String(err), timedOut };
-	}
 }
 
 function resolveRunGh(deps?: StarReminderDeps): RunGh {

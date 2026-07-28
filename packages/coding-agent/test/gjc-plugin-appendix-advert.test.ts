@@ -3,12 +3,15 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	applyGjcBundleUpdate,
 	buildAgentSubskillAdvertisement,
 	buildSubskillAdvertisement,
+	bundleIdentity,
 	type GjcPluginRegistryEntry,
-	installGjcPluginBundle,
+	installGjcBundle,
 	loadEffectiveGjcPluginRegistry,
 	type NormalizedGjcPluginSurfaces,
+	previewGjcBundleUpdate,
 	renderPluginAppendices,
 } from "../src/extensibility/gjc-plugins";
 import { buildSystemPrompt } from "../src/system-prompt";
@@ -48,7 +51,7 @@ describe("plugin prompt appendices", () => {
 	test("renders lower-authority system + agent appendix blocks from an installed bundle", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		await installGjcBundle({ cwd }, "project", sixSurface);
 		const effective = await loadEffectiveGjcPluginRegistry(cwd);
 		const rendered = await renderPluginAppendices(effective);
 		expect(rendered.system).toContain("<gjc-plugin-system-appendix");
@@ -61,13 +64,18 @@ describe("plugin prompt appendices", () => {
 	test("digest changes when appendix content changes", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx2-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const source = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-mod-"));
+		tempDirs.push(source);
+		await fs.cp(sixSurface, source, { recursive: true });
+		const ctx = { cwd };
+		const identity = bundleIdentity("project", "valid-six-surface-bundle");
+		await installGjcBundle(ctx, "project", source);
 		const before = (await renderPluginAppendices(await loadEffectiveGjcPluginRegistry(cwd))).digest;
-		const modified = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-mod-"));
-		tempDirs.push(modified);
-		await fs.cp(sixSurface, modified, { recursive: true });
-		await fs.appendFile(path.join(modified, "prompts", "system-appendix.md"), "\nNew clause.\n");
-		await installGjcPluginBundle(modified, { scope: "project", cwd, force: true });
+		await fs.appendFile(path.join(source, "prompts", "system-appendix.md"), "\nNew clause.\n");
+		const preview = await previewGjcBundleUpdate(ctx, identity);
+		expect(preview.ok).toBe(true);
+		if (!preview.ok) throw new Error(preview.error.code);
+		await applyGjcBundleUpdate(ctx, preview.value.token);
 		const after = (await renderPluginAppendices(await loadEffectiveGjcPluginRegistry(cwd))).digest;
 		expect(after).not.toBe(before);
 	});

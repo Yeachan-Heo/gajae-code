@@ -561,7 +561,7 @@ function renderAgentProgress(
 	const description = progress.description?.trim();
 	const displayId = formatTaskId(progress.id);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
-	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}`;
+	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}${progress.fastMode && theme.icon.fast ? ` ${theme.icon.fast}` : ""}`;
 
 	// A provider recovery loop is operationally distinct from normal agent work.
 	if (progress.retryState && progress.status === "running") {
@@ -593,6 +593,10 @@ function renderAgentProgress(
 				truncateToWidth(replaceTabs(formatModelSubstitutionWarning(progress.modelSubstitutionWarning)), 90),
 			)}`,
 		);
+	}
+	if (progress.setupFailure && progress.status !== "running") {
+		const summary = `Setup failure: ${truncateToWidth(replaceTabs(progress.setupFailure.summary), 80)}`;
+		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("error", summary)}`);
 	}
 
 	// Current tool (if running) or most recent completed tool
@@ -862,7 +866,7 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 	const description = result.description?.trim();
 	const displayId = formatTaskId(result.id);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
-	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)} ${formatBadge(
+	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}${result.fastMode && theme.icon.fast ? ` ${theme.icon.fast}` : ""} ${formatBadge(
 		statusText,
 		iconColor,
 		theme,

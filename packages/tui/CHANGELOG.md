@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-28
+
 ### Changed
 
 - Mouse wheel scrolling now moves the session viewport by exactly three lines (`DEFAULT_WHEEL_LINES = 3`) instead of a full page. PageUp/PageDown keep page-sized steps with edge pinning.
@@ -11,11 +13,14 @@
 
 ### Fixed
 
+- Slash-command autocomplete no longer treats the final segment of a nested filesystem path or URL as a command token, preventing accepted skill suggestions from rewriting literal paths.
+
+- Terminal capability-probe replies no longer leak into the prompt as text (`^[]11;rgb:0000/0000/0000^G^[[?62;22;52c` appearing in the editor after a long-running foreground command). Three separate paths fed them to the input handler: replies whose pending-query counters had already been reset (`stop()`/`start()` around an editor handoff, Ctrl+Z, or a session resume) failed the `#pendingDa1Sentinels`/`#osc11Pending` gates and were forwarded; a reply split across stdin reads with a gap larger than `StdinBuffer`'s 10ms completion timeout was flushed as individual characters; and an unterminated sequence kept absorbing the following ESC. Probe replies are now consumed by shape, incomplete probe-reply prefixes are held at the stdin decoding boundary (bounded by 500ms/256 bytes, and only 150ms for a bare ESC inside a probe window), an ESC cuts the sequence in progress unless it is an OSC/DCS/APC string terminator, and an unsolicited reply is dropped by an explicit backstop. A dropped or mangled reply can no longer latch `#osc11Pending` either: a 1s watchdog and a 64-byte reassembly cap resolve the query cycle instead of swallowing keystrokes. DA1 and XTSMGRAPHICS replies stay owned by the sixel probe and are dropped in `Tui` once that probe has finished, so an orphaned device report is no longer typed into the focused component.
+
 - `waitForRenderCommit` / generation-scoped render tokens resolve only after a successful buffer write (or fail open on stopped/unavailable terminals), enabling awaitable progress frames for interactive resume without hanging (#2914).
 - Streaming layout contraction followed by regrowth no longer re-admits an already committed logical row into native terminal scrollback, preventing occasional duplicated assistant lines after Markdown reflow.
 - Repeated clearing of an already-clear viewport output source is now a render-request no-op, matching identical non-null source updates.
-
-## [0.11.11] - 2026-07-26
+- A terminal width change now ends in one forced full redraw 1000ms after the last observed resize event, repairing stale bands left by lines wrapped at the old column count — across the full transcript, including scrollback history, on every host. Interim resize frames keep their cheap per-host path; the debounce is what makes the one full replay safe, so drag-resizing still does not replay the transcript per `SIGWINCH`. While the user is reading scrollback (manual viewport), the repair is deferred and runs when they return to live output. Height-only changes are unaffected (#3360, #3361).
 
 ## [0.11.7] - 2026-07-22
 ### Fixed

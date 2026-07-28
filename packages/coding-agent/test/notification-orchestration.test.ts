@@ -42,6 +42,7 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 		telegram: {
 			botToken: "stored-telegram-token",
 			chatId: "stored-chat",
+			sound: "important",
 			rich: { enabled: true },
 			richDraft: { enabled: false },
 			toolActivity: { enabled: true },

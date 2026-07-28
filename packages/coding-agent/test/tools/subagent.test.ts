@@ -3,8 +3,19 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "../../src/async";
+import { kNoAuth } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import { getThemeByName } from "../../src/modes/theme/theme";
+import * as sdkModule from "../../src/sdk";
+import type { AgentSession, PromptOptions } from "../../src/session/agent-session";
+import { subagentRunOutcomeFromSingleResult } from "../../src/task";
+import { runSubprocess } from "../../src/task/executor";
+import { buildTaskReceipt } from "../../src/task/receipt";
+import type { AgentDefinition } from "../../src/task/types";
+import { createSetupFailureSummary, type SingleResult } from "../../src/task/types";
 import { capCodePointsAndBytes, SubagentTool, type ToolSession } from "../../src/tools";
+import type { SubagentToolDetails } from "../../src/tools/subagent";
+import { subagentBodyCacheTestHooks, subagentToolRenderer } from "../../src/tools/subagent-render";
 
 function createSession(agentId = "0-Main"): ToolSession {
 	return {
@@ -149,6 +160,297 @@ describe("SubagentTool", () => {
 		expect(getText(result)).toContain("subagent result");
 		expect(manager.hasPendingDeliveries()).toBe(false);
 		await manager.dispose({ timeoutMs: 100 });
+	});
+	it("retains a bounded, redacted executor setup failure in async subagent receipts", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const secret = "TOP_SECRET_DO_NOT_LEAK";
+		const setupFailure = createSetupFailureSummary(
+			new Error(
+				`Agent session initialization failed: token=${secret} at /tmp/${secret}/session.jsonl ${"x".repeat(400)}`,
+			),
+		);
+		const singleResult = {
+			aborted: false,
+			exitCode: 1,
+			setupFailure,
+		} satisfies Pick<SingleResult, "aborted" | "exitCode" | "setupFailure">;
+		const jobId = manager.register(
+			"task",
+			"launching subagent",
+			async () => subagentRunOutcomeFromSingleResult("Subagent failed.", singleResult),
+			{
+				id: "job-setup-failure",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-SetupFailure", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+
+		await manager.getJob(jobId)?.promise;
+		const result = await tool.execute("subagent-setup-failure", { action: "inspect", ids: ["0-SetupFailure"] });
+		const snapshot = result.details?.subagents[0];
+
+		expect(snapshot?.status).toBe("failed");
+		expect(snapshot?.setupFailureSummary).toContain("Agent session initialization failed");
+		expect(snapshot?.setupFailureSummary).toContain("token=[redacted]");
+		expect(snapshot?.setupFailureSummary).not.toContain(secret);
+		expect(snapshot?.setupFailureSummary).not.toContain("/tmp/");
+		expect(snapshot?.setupFailureSummary?.length ?? 0).toBeLessThanOrEqual(280);
+		expect(getText(result)).toContain(`Setup failure: ${snapshot?.setupFailureSummary}`);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+	it("renders setup failures and invalidates the static body cache when the cause changes", async () => {
+		const theme = await getThemeByName("red-claw");
+		if (!theme) throw new Error("Expected test theme");
+		const details = (setupFailureSummary: string): SubagentToolDetails => ({
+			subagents: [
+				{
+					id: "0-SetupFailure",
+					jobId: "job-setup-failure",
+					status: "failed",
+					label: "launching subagent",
+					agent: "executor",
+					agentSource: "bundled",
+					durationMs: 1,
+					setupFailureSummary,
+				},
+			],
+		});
+		const render = (value: SubagentToolDetails) =>
+			Bun.stripANSI(
+				subagentToolRenderer
+					.renderResult(
+						{ content: [{ type: "text", text: "" }], details: value },
+						{ expanded: true, isPartial: false },
+						theme,
+					)
+					.render(160)
+					.join("\n"),
+			);
+
+		subagentBodyCacheTestHooks.reset();
+		expect(render(details("Session setup rejected."))).toContain("Setup failure: Session setup rejected.");
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		expect(render(details("Session setup rejected after credentials refresh."))).toContain(
+			"Setup failure: Session setup rejected after credentials refresh.",
+		);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
+	});
+	it("marks requests only after the real prompt preflight accepts in every run mode", async () => {
+		const agent: AgentDefinition = { name: "executor", description: "test", systemPrompt: "test", source: "bundled" };
+		const modes = ["initial", "resume", "message"] as const;
+		const run = async (runMode: (typeof modes)[number], accept: boolean) => {
+			const promptOptions: PromptOptions[] = [];
+			const session = {
+				agent: { state: { systemPrompt: ["test"] } },
+				sessionManager: { appendSessionInit: () => {} },
+				extensionRunner: undefined,
+				get messages() {
+					return [];
+				},
+				getActiveToolNames: () => ["read", "yield"],
+				setActiveToolsByName: async () => {},
+				setConfiguredModelChain: () => {},
+				seedDefaultFallbackResolution: () => {},
+				subscribe: () => () => {},
+				prompt: async (_text: string, options?: PromptOptions) => {
+					if (options) promptOptions.push(options);
+					if (accept) await options?.onPreflightAcceptCommit?.();
+					throw new Error(
+						accept ? "request failed after acceptance" : "preflight rejected: token=preflight-secret",
+					);
+				},
+				waitForIdle: async () => {},
+				getLastAssistantMessage: () => undefined,
+				abort: async () => {},
+				dispose: async () => {},
+			} as unknown as AgentSession;
+			const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as never);
+			try {
+				const result = await runSubprocess({
+					cwd: "/tmp",
+					agent,
+					task: "do work",
+					index: 0,
+					id: `0-${runMode}-${accept ? "accepted" : "rejected"}`,
+					settings: Settings.isolated(),
+					modelRegistry: {
+						refresh: async () => {},
+						getAvailable: () => [],
+						getApiKey: async () => kNoAuth,
+					} as never,
+					enableLsp: false,
+					runMode,
+					resumeMessage: "continue",
+				});
+				expect(promptOptions).toHaveLength(1);
+				expect(promptOptions[0]?.onPreflightAccepted).toBeFunction();
+				expect(promptOptions[0]?.onPreflightAcceptCommit).toBeFunction();
+				return result;
+			} finally {
+				spy.mockRestore();
+			}
+		};
+
+		for (const mode of modes) {
+			const rejected = await run(mode, false);
+			expect(rejected.setupFailure?.summary).toContain("preflight rejected: token=[redacted]");
+			const accepted = await run(mode, true);
+			expect(accepted.setupFailure).toBeUndefined();
+		}
+	});
+	it("redacts complete authorization header values and query credentials", () => {
+		const secrets = [
+			"bearer-secret",
+			"basic-secret",
+			"arbitrary-secret",
+			"query-token",
+			"query-key",
+			"#GJC1_opaque_secret#",
+		];
+		const summary = createSetupFailureSummary(
+			new Error(
+				[
+					"Request failed",
+					"Authorization: Bearer bearer-secret",
+					"Authorization: Basic basic-secret",
+					"Authorization: Digest arbitrary-secret",
+					"GET /callback?access_token=query-token&api_key=query-key",
+					"token=[redacted]",
+					"credential=#GJC1_opaque_secret#",
+					"status=401",
+				].join("\n"),
+			),
+		).summary;
+
+		expect(summary).toBe(
+			"Request failed Authorization: [redacted] Authorization: [redacted] Authorization: [redacted] GET /callback?access_token=[redacted]&api_key=[redacted] token=[redacted] credential=[redacted] status=401",
+		);
+		for (const secret of secrets) expect(summary).not.toContain(secret);
+	});
+	it("redacts cookies, URL credentials, compound keys, and Unicode-obfuscated secrets within byte bounds", () => {
+		const secrets = ["cookie-secret", "url-secret", "client-secret", "unicode-secret"];
+		const summary = createSetupFailureSummary(
+			new Error(
+				`Cookie: session=cookie-secret; theme=dark\nGET https://user:url-secret@example.test/path clientSecret=client-secret to\u200bken=unicode-secret cache_key=ordinary ${"🧪".repeat(400)}`,
+			),
+		).summary;
+
+		expect(summary).toContain("Cookie: [redacted]");
+		expect(summary).toContain("https://[redacted]@example.test/path");
+		expect(summary).toContain("clientSecret=[redacted]");
+		expect(summary).toContain("token=[redacted]");
+		expect(summary).toContain("cache_key=ordinary");
+		expect(Buffer.byteLength(summary, "utf8")).toBeLessThanOrEqual(1_024);
+		expect(Array.from(summary).length).toBeLessThanOrEqual(281);
+		for (const secret of secrets) expect(summary).not.toContain(secret);
+	});
+	it("redacts underscore-delimited credential names and local paths without hiding prose", () => {
+		const secrets = ["github-token-secret", "openai-api-key-secret", "backup-token-secret"];
+		const summary = createSetupFailureSummary(
+			new Error(
+				[
+					"GITHUB_TOKEN=github-token-secret",
+					"OPENAI_API_KEY=openai-api-key-secret",
+					"GITHUB_TOKEN_BACKUP=backup-token-secret",
+					"failed opening /var/folders/zz/T/gjc/openai-api-key-secret/session.jsonl",
+					"and /opt/gjc/openai-api-key-secret/config.json",
+					"plain prose keeps / callback, 1/2, and /single",
+					"GET /callback?access_token=query-token&api_key=query-key",
+				].join("\n"),
+			),
+		).summary;
+
+		expect(summary).toBe(
+			"GITHUB_TOKEN=[redacted] OPENAI_API_KEY=[redacted] GITHUB_TOKEN_BACKUP=[redacted] failed opening <path>/session.jsonl and <path>/config.json plain prose keeps / callback, 1/2, and /single GET /callback?access_token=[redacted]&api_key=[redacted]",
+		);
+		for (const secret of secrets) expect(summary).not.toContain(secret);
+	});
+	it("redacts sensitive path basenames, local file URIs, and control-fragmented credential values", () => {
+		const pathSecret = "ghp_PATH_SECRET_DO_NOT_LEAK";
+		const valueSecret = "SECRET_SUFFIX_DO_NOT_LEAK";
+		const summary = createSetupFailureSummary(
+			new Error(
+				[
+					`wrote /Users/alice/${pathSecret}`,
+					`at file:///Users/alice/.config/${valueSecret}`,
+					`and file://localhost/private/${valueSecret}`,
+					"ordinary /Users/alice/project/config.json and file:///Users/alice/project/report.txt",
+					`token=prefix\u001b[31m${valueSecret}`,
+					`api_key=prefix\u0000${valueSecret}`,
+				].join("\n"),
+			),
+		).summary;
+
+		expect(summary).toContain("wrote <path>/[redacted]");
+		expect(summary).toContain("file://<path>/[redacted]");
+		expect(summary).toContain("ordinary <path>/config.json and file://<path>/report.txt");
+		expect(summary).toContain("token=[redacted]");
+		expect(summary).toContain("api_key=[redacted]");
+		expect(summary).not.toContain(pathSecret);
+		expect(summary).not.toContain("alice");
+		expect(summary).not.toContain(valueSecret);
+		expect(summary).not.toContain("prefix");
+	});
+	it("redacts spaced API-key labels, high-confidence provider tokens, Windows paths, and secret basenames", () => {
+		const providerToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+		const summary = createSetupFailureSummary(
+			new Error(
+				`API key: api-key-secret provider ${providerToken} paths C:\\Users\\Alice\\secrets.json and C:\\work\\report.txt ordinary prose remains visible`,
+			),
+		).summary;
+
+		expect(summary).toBe(
+			"API key: [redacted] provider [redacted] paths <path>/[redacted] and <path>/report.txt ordinary prose remains visible",
+		);
+		expect(summary).not.toContain("api-key-secret");
+		expect(summary).not.toContain(providerToken);
+	});
+	it("prioritizes a setup failure in receipt delivery over a model substitution warning", () => {
+		const receipt = buildTaskReceipt({
+			index: 0,
+			id: "0-SetupFailure",
+			agent: "executor",
+			agentSource: "bundled",
+			task: "start",
+			exitCode: 1,
+			output: "",
+			stderr: "",
+			truncated: false,
+			durationMs: 0,
+			tokens: 0,
+			setupFailure: { summary: "Credential bootstrap rejected." },
+			modelSubstitutionWarning: {
+				requested: "openai-codex/gpt-5.3-codex",
+				effective: "openai-codex/gpt-5.5",
+				reason: "auth_unavailable",
+			},
+		} satisfies SingleResult);
+
+		expect(receipt.preview).toBe("Task failed during setup: Credential bootstrap rejected.");
+	});
+	it("maps initial and resumed producer failures identically without exposing post-request causes", () => {
+		const setupFailure = createSetupFailureSummary(new Error("Session initialization failed: token=secret"));
+		const preRequestFailure = {
+			aborted: false,
+			exitCode: 1,
+			setupFailure,
+		} satisfies Pick<SingleResult, "aborted" | "exitCode" | "setupFailure">;
+
+		const initial = subagentRunOutcomeFromSingleResult("Subagent failed.", preRequestFailure);
+		const resumed = subagentRunOutcomeFromSingleResult("Subagent failed.", preRequestFailure);
+		const postRequest = subagentRunOutcomeFromSingleResult("Subagent failed.", {
+			aborted: false,
+			exitCode: 1,
+		});
+
+		expect(initial).toEqual({
+			kind: "failed",
+			text: "Subagent failed.",
+			setupFailureSummary: "Session initialization failed: token=[redacted]",
+		});
+		expect(resumed).toEqual(initial);
+		expect(postRequest).toEqual({ kind: "failed", text: "Subagent failed." });
 	});
 
 	it("consumes a watched completion before unwatch can redeliver it", async () => {

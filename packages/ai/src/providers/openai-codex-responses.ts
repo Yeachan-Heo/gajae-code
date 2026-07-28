@@ -48,9 +48,13 @@ import {
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
 } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { transportFailureFacts } from "../utils/fallback-transport";
+import { STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
-import { getOpenAIStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
+import {
+	getOpenAIStreamIdleTimeoutMs,
+	getStreamFirstEventTimeoutMs,
+	iterateWithIdleTimeout,
+} from "../utils/idle-iterator";
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import {
@@ -103,7 +107,6 @@ const CODEX_MAX_RETRIES = 5;
 const CODEX_RETRY_DELAY_MS = 500;
 const CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS = 10000;
 const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
-const CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS = 15000;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
 const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_found", "codex_previous_response_stale"]);
@@ -274,6 +277,7 @@ async function retryCodexInitialTransportWithoutToolChoice(
 
 interface CodexRequestSetup {
 	requestSignal: AbortSignal;
+	firstEventTimeoutMs: number | undefined;
 	wrapCodexSseStream: (source: AsyncGenerator<Record<string, unknown>>) => AsyncGenerator<Record<string, unknown>>;
 	requestAbortController: AbortController;
 }
@@ -355,16 +359,6 @@ function getCodexWebSocketIdleTimeoutMs(overrideMs?: number): number {
 	);
 }
 
-function getCodexWebSocketFirstEventTimeoutMs(idleTimeoutMs: number, overrideMs?: number): number {
-	return (
-		overrideMs ??
-		parseCodexPositiveInteger(
-			$env.PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS,
-			Math.min(CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS, idleTimeoutMs),
-		)
-	);
-}
-
 function createCodexProviderSessionState(): CodexProviderSessionState {
 	const state: CodexProviderSessionState = {
 		webSocketSessions: new Map(),
@@ -391,8 +385,12 @@ function getCodexProviderSessionState(
 	return created;
 }
 
-function createCodexWebSocketTransportError(message: string): Error {
-	return new Error(`${CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX}: ${message}`);
+function createCodexWebSocketTransportError(message: string, providerCode?: string): Error & { providerCode?: string } {
+	const error = new Error(`${CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX}: ${message}`) as Error & {
+		providerCode?: string;
+	};
+	error.providerCode = providerCode;
+	return error;
 }
 
 function isCodexWebSocketFatalError(error: Error): boolean {
@@ -403,6 +401,13 @@ function isCodexWebSocketFatalError(error: Error): boolean {
 function isCodexWebSocketTransportError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	return error.message.startsWith(CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX);
+}
+
+function isCodexFirstEventTimeout(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		(error as { providerCode?: unknown }).providerCode === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE
+	);
 }
 
 function isCodexWebSocketRetryableStreamError(error: unknown): boolean {
@@ -607,17 +612,22 @@ function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): C
 	const requestSignal = options?.signal
 		? AbortSignal.any([options.signal, requestAbortController.signal])
 		: requestAbortController.signal;
+	const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
+	const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 	const wrapCodexSseStream = (
 		source: AsyncGenerator<Record<string, unknown>>,
 	): AsyncGenerator<Record<string, unknown>> =>
 		iterateWithIdleTimeout(source, {
-			idleTimeoutMs: options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(),
+			idleTimeoutMs,
+			firstItemTimeoutMs: firstEventTimeoutMs,
+			firstItemErrorMessage: "OpenAI Codex SSE stream timed out while waiting for the first event",
 			errorMessage: "OpenAI Codex SSE stream stalled while waiting for the next event",
 			onIdle: () => requestAbortController.abort(),
+			onFirstItemTimeout: () => requestAbortController.abort(),
 			abortSignal: options?.signal,
 			isProgressItem: isCodexStreamProgressEvent,
 		});
-	return { requestAbortController, requestSignal, wrapCodexSseStream };
+	return { requestAbortController, requestSignal, firstEventTimeoutMs, wrapCodexSseStream };
 }
 
 async function buildCodexRequestContext(
@@ -838,6 +848,7 @@ async function openCodexWebSocketTransport(
 		websocketState,
 		requestSetup.requestSignal,
 		options,
+		requestSetup.firstEventTimeoutMs,
 	);
 	return { eventStream, requestBodyForState, transport: "websocket" };
 }
@@ -1478,7 +1489,7 @@ async function recoverCodexStreamError(
 	runtime: CodexStreamRuntime,
 	error: unknown,
 ): Promise<boolean> {
-	if (context.options?.fallbackManaged) return false;
+	if (isCodexFirstEventTimeout(error)) return false;
 	if (await tryRetryWithoutForcedToolChoice(context, runtime, error)) {
 		return true;
 	}
@@ -2196,7 +2207,6 @@ function headersToRecord(headers: Headers): Record<string, string> {
 
 interface CodexWebSocketConnectionOptions {
 	idleTimeoutMs: number;
-	firstEventTimeoutMs: number;
 	onHandshakeHeaders?: (headers: Headers) => void;
 }
 
@@ -2204,7 +2214,6 @@ class CodexWebSocketConnection {
 	#url: string;
 	#headers: Record<string, string>;
 	#idleTimeoutMs: number;
-	#firstEventTimeoutMs: number;
 	#onHandshakeHeaders?: (headers: Headers) => void;
 	#socket: Bun.WebSocket | null = null;
 	#queue: Array<Record<string, unknown> | Error | null> = [];
@@ -2216,7 +2225,6 @@ class CodexWebSocketConnection {
 		this.#url = url;
 		this.#headers = headers;
 		this.#idleTimeoutMs = options.idleTimeoutMs;
-		this.#firstEventTimeoutMs = options.firstEventTimeoutMs;
 		this.#onHandshakeHeaders = options.onHandshakeHeaders;
 	}
 
@@ -2346,6 +2354,7 @@ class CodexWebSocketConnection {
 	async *streamRequest(
 		request: Record<string, unknown>,
 		signal?: AbortSignal,
+		firstEventTimeoutMs?: number,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw createCodexWebSocketTransportError("websocket connection is unavailable");
@@ -2368,11 +2377,11 @@ class CodexWebSocketConnection {
 
 		try {
 			this.#socket.send(JSON.stringify(request));
-			let sawFirstEvent = false;
+			let sawFirstProgress = false;
 			let lastProgressAt = Date.now();
 			while (true) {
-				let timeoutMs = this.#firstEventTimeoutMs;
-				if (sawFirstEvent) {
+				let timeoutMs = firstEventTimeoutMs;
+				if (sawFirstProgress) {
 					timeoutMs = this.#idleTimeoutMs - (Date.now() - lastProgressAt);
 					if (timeoutMs <= 0) {
 						throw createCodexWebSocketTransportError("idle timeout waiting for websocket");
@@ -2380,7 +2389,8 @@ class CodexWebSocketConnection {
 				}
 				const next = await this.#nextMessage(
 					timeoutMs,
-					sawFirstEvent ? "idle timeout waiting for websocket" : "timeout waiting for first websocket event",
+					sawFirstProgress ? "idle timeout waiting for websocket" : "timeout waiting for first websocket event",
+					sawFirstProgress ? undefined : STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 				);
 				if (next instanceof Error) {
 					throw next;
@@ -2388,8 +2398,8 @@ class CodexWebSocketConnection {
 				if (next === null) {
 					throw createCodexWebSocketTransportError("websocket closed before response completion");
 				}
-				sawFirstEvent = true;
 				if (isCodexStreamProgressEvent(next)) {
+					sawFirstProgress = true;
 					lastProgressAt = Date.now();
 				}
 				yield next;
@@ -2425,13 +2435,17 @@ class CodexWebSocketConnection {
 		if (waiter) waiter();
 	}
 
-	async #nextMessage(timeoutMs: number, timeoutReason: string): Promise<Record<string, unknown> | Error | null> {
+	async #nextMessage(
+		timeoutMs: number | undefined,
+		timeoutReason: string,
+		providerCode?: string,
+	): Promise<Record<string, unknown> | Error | null> {
 		while (this.#queue.length === 0) {
 			const { promise, resolve } = Promise.withResolvers<void>();
 			this.#waiters.push(resolve);
 			let timedOut = false;
 			let timeout: NodeJS.Timeout | undefined;
-			if (timeoutMs > 0) {
+			if (timeoutMs !== undefined && timeoutMs > 0) {
 				timeout = setTimeout(() => {
 					timedOut = true;
 					const waiterIndex = this.#waiters.indexOf(resolve);
@@ -2444,7 +2458,7 @@ class CodexWebSocketConnection {
 			await promise;
 			if (timeout) clearTimeout(timeout);
 			if (timedOut && this.#queue.length === 0) {
-				return createCodexWebSocketTransportError(timeoutReason);
+				return createCodexWebSocketTransportError(timeoutReason, providerCode);
 			}
 		}
 		return this.#queue.shift() ?? null;
@@ -2473,7 +2487,6 @@ async function getOrCreateCodexWebSocketConnection(
 	const idleTimeoutMs = getCodexWebSocketIdleTimeoutMs(options?.streamIdleTimeoutMs);
 	state.connection = new CodexWebSocketConnection(url, headerRecord, {
 		idleTimeoutMs,
-		firstEventTimeoutMs: getCodexWebSocketFirstEventTimeoutMs(idleTimeoutMs, options?.streamFirstEventTimeoutMs),
 		onHandshakeHeaders: handshakeHeaders => {
 			updateCodexSessionMetadataFromHeaders(state, handshakeHeaders);
 		},
@@ -2544,9 +2557,10 @@ async function openCodexWebSocketEventStream(
 	state: CodexWebSocketSessionState,
 	signal?: AbortSignal,
 	options?: Pick<OpenAICodexResponsesOptions, "streamFirstEventTimeoutMs" | "streamIdleTimeoutMs">,
+	firstEventTimeoutMs?: number,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const connection = await getOrCreateCodexWebSocketConnection(state, url, headers, signal, options);
-	return connection.streamRequest(request, signal);
+	return connection.streamRequest(request, signal, firstEventTimeoutMs);
 }
 
 function createCodexHeaders(

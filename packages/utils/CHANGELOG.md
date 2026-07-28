@@ -2,12 +2,15 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-28
+
 ## [0.11.11] - 2026-07-26
 
 ### Fixed
 
 - `getAgentDir()` honors the legacy `PI_CODING_AGENT_DIR` alias, mirroring `getConfigDirName()`. Parts of the product already resolved the alias (`gc-runtime.ts:370`, `deep-interview-runtime.ts:384`) while `dirs.ts` read only the `GJC_` spelling, so setting it moved `gjc gc` to the aliased directory while everything reaching `getAgentDir()` stayed on the default. The alias goes through the same project-`.env` trust guard.
 - A `GJC_CODING_AGENT_DIR` or `GJC_CONFIG_DIR` / `PI_CONFIG_DIR` planted by the caller's project `.env` no longer selects the agent or config directory. Bun loads `cwd/.env` into `process.env` before any module runs, so a repository could point the agent directory at one it ships and have that directory's `.env` treated as a trusted credential source — recovering every endpoint and credential redirect the trust boundary rejects. Both directories supply `.env` files that `$credentialEnv` treats as trusted, so either name was enough to make a repository's own `.env` trusted. An override is now ignored when it matches what the project `.env` sets; an operator setting either from their shell is unaffected. The `.env` parsing primitives moved to a leaf `env-file` module so `dirs` can use them without a cycle; their public surface is unchanged.
+- A configured config-directory name (`GJC_CONFIG_DIR` / `PI_CONFIG_DIR`) can no longer escape the home-relative root it is documented to stay under. The name is joined with `<home>` to locate user-level `mcp.json`, `SYSTEM.md`, skills, agents and installed plugins; `path.join` neutralizes a leading separator but not `..` segments, so an escaping value pointed that discovery outside the config root entirely. Escaping values now fall back to the default name.
 - Strict CLI commands now reject unexpected positional arguments with usage guidance instead of silently ignoring typos or unsupported trailing input; non-strict passthrough commands and variadic arguments retain their existing behavior (#3173).
 - Integer CLI flags now reject trailing characters, decimals, exponent notation, surrounding whitespace, and values outside JavaScript's safe-integer range instead of silently truncating or rounding them (#3172).
 - The documented `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` environment variables now take effect for the spawn shell configuration, resolved GJC-first ahead of the legacy `PI_*` / `CLAUDE_*` aliases (previously only the legacy names were read, so the documented names were silent no-ops). Both now follow the canonical boolean-flag contract (`1`/`Y`/`TRUE`/`YES`/`ON`, case-insensitive) instead of any-non-empty-string, so `GJC_BASH_NO_CI=0` no longer suppresses `CI=true`. Adds `resetShellConfigCache()` for deterministic shell-config testing, and corrects `docs/environment-variables.md`, which advertised non-functional `ANTHROPIC_MODEL_*` aliases.

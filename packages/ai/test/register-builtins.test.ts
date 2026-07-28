@@ -136,6 +136,7 @@ describe("register-builtins lazy streams", () => {
 		expect(providerSignal?.aborted).toBe(true);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider stream stalled while waiting for the next event");
+		expect(result.transportFailure).toBeUndefined();
 	});
 
 	it("preserves caller aborts while forwarding lazy provider streams", async () => {
@@ -312,6 +313,10 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		const result = await stream.result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider stream timed out while waiting for the first event");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+		});
 	});
 
 	it("unrelated providers still time out at the 120s shared default", async () => {

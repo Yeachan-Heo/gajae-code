@@ -71,7 +71,7 @@ Native helper layer exposed through N-API.
 
 - `packages/natives/package.json` exports `native/index.js` and generated TypeScript definitions.
 - `packages/natives/native/loader-state.js` resolves platform/CPU-specific native binaries and validates package/native version alignment.
-- `crates/pi-natives/src/lib.rs` is the N-API root for appearance, AST search/editing, clipboard, filesystem scan/cache, grep/glob, syntax highlighting, HTML-to-Markdown, keyboard parsing, process/PTY/shell support, SIXEL, code summarization, token counting, text measurement/wrapping/truncation, workspace scanning, power assertions, and isolation helpers.
+- `crates/pi-natives/src/lib.rs` is the N-API root for appearance, AST search/editing, clipboard, filesystem scan/cache, grep/glob, syntax highlighting, HTML-to-Markdown, keyboard parsing, process/PTY/shell support, SIXEL, code summarization, text measurement/wrapping/truncation, workspace scanning, power assertions, and isolation helpers.
 - `crates/pi-shell/src/lib.rs` exposes brush-based shell execution primitives used by the native shell adapter.
 - `crates/pi-shell/src/shell.rs` implements persistent and one-shot shell execution, streaming, environment handling, cancellation, and output minimizer telemetry.
 - `crates/pi-shell/src/fixup.rs` performs conservative AST-based bash command fixups.

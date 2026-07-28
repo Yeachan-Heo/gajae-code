@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "kind": "pr-merge-lane-retirement-receipt",
+  "generatedAt": "2026-07-28",
+  "status": "terminal",
+  "lane": "tui/product exact-head merge batch (PRs #3392, #3401, #3404) + receipt + adjacent issue closure",
+  "doctrine": "owner-directed serialized merge of independently reviewed, exact-head-green, non-overlapping PRs; dev red/pending is not a repo-wide freeze; scheduler/transport-cancelled CI runs are not product failures",
+  "mergedByThisLane": [
+    {
+      "pr": 3392,
+      "title": "fix(tui): stop terminal probe replies leaking into the prompt",
+      "mergeCommitSha": "cb43a2ad4f4d9bfd3261f4ed71eaee5c5d6b64cf",
+      "preMergeVerdict": "exact-head green, mergeStateStatus CLEAN",
+      "resolvesIssue": 3264,
+      "supersedesPr": 3266
+    },
+    {
+      "pr": 3401,
+      "title": "fix(tui): isolate status-line gh lookup stdin",
+      "mergeCommitSha": "382e4a7d5b350c0af5fc05395e4c0a20f2df925f",
+      "preMergeVerdict": "exact-head green, mergeStateStatus CLEAN",
+      "resolvesIssue": 3354
+    },
+    {
+      "pr": 3404,
+      "title": "perf(coding-agent): cache transcript viewer layouts",
+      "mergeCommitSha": "5d735aaee0f4aa35b3953082d1bf98b62128b363",
+      "preMergeVerdict": "exact-head green, mergeStateStatus CLEAN"
+    },
+    {
+      "pr": 3416,
+      "title": "chore(artifacts): record pr3392/3401/3404 merge batch receipt",
+      "mergeCommitSha": "ffebffe905dae5a49252fbb00ea6e14f33bf900d",
+      "preMergeVerdict": "exact-head green after rebase-onto-current-dev correction (see pr3392-3401-3404-merge-batch-receipt.json); stale-base Telegram-guard false positive resolved by rebase, no generation bump, no guard mutation"
+    }
+  ],
+  "mergedByOtherOwners_confirmedInScopeReferenced": [
+    {
+      "pr": 3415,
+      "title": "fix(skill-state): stop heredoc document bodies from false-blocking spec persistence during planning phases",
+      "mergeCommitSha": "0d202ee79405b93eaad759881bcef452d8636eb9",
+      "note": "landed by a different active lane between this lane's polls; not merged by this lane, recorded for batch continuity only"
+    },
+    {
+      "pr": 3418,
+      "title": "feat(session): add resume model behavior control (repair of #3293)",
+      "mergeCommitSha": "dae17134cb3e411294d83f10ca70158bee804db1",
+      "note": "landed by a different active lane; repairs/repackages #3293"
+    },
+    {
+      "pr": 3344,
+      "title": "fix(session): restore disk offloading for managed-session resident data (RAM/CPU bloat in long sessions)",
+      "mergeCommitSha": "8347ee379183343adf0afca6d4cdf6f54ace0530",
+      "note": "landed by a different active lane; not touched by this lane"
+    }
+  ],
+  "issuesClosed": [
+    {
+      "issue": 3264,
+      "title": "tui: fragmented OSC 11 / DA1 probe replies are typed into the input box",
+      "resolvedBy": "cb43a2ad4f4d9bfd3261f4ed71eaee5c5d6b64cf (#3392)",
+      "stateReason": "completed",
+      "commentUrl": "https://github.com/Yeachan-Heo/gajae-code/issues/3264#issuecomment-5106356099"
+    },
+    {
+      "issue": 3354,
+      "title": "Status-line gh pr view inherits stdin and steals TUI keystrokes on non-default branches",
+      "resolvedBy": "382e4a7d5b350c0af5fc05395e4c0a20f2df925f (#3401)",
+      "stateReason": "completed",
+      "commentUrl": "https://github.com/Yeachan-Heo/gajae-code/issues/3354#issuecomment-5106356599"
+    }
+  ],
+  "supersededPrs": [
+    {
+      "pr": 3266,
+      "title": "fix(tui): hold fragmented capability-probe replies instead of typing them into the composer",
+      "action": "closed unmerged, comment posted with merge SHA evidence",
+      "evidence": "diff of pr3266:packages/tui/src/terminal.ts is a strict byte-identical subset of pr3392's diff to the same file"
+    }
+  ],
+  "prsAlreadyClosedNoActionNeeded": [
+    {
+      "pr": 3293,
+      "title": "feat(session): add session.resumeModelBehavior to control resume model restore",
+      "state": "closed (merged: true) prior to this lane's involvement",
+      "note": "already merged, not open — no supersession action required; #3418 is its repair/repackage, also merged"
+    }
+  ],
+  "ciObservations": [
+    {
+      "runId": 30372952312,
+      "headSha": "ffebffe905dae5a49252fbb00ea6e14f33bf900d",
+      "conclusion": "cancelled",
+      "classification": "concurrency-cascade cancellation — superseded by a rapid subsequent push (#3415) under the dev-ref concurrency group; native-build and matrix jobs show conclusion=cancelled (not failure); evidence-producer/umbrella job fail-closed only because upstream results included cancelled, per its documented fail-closed design",
+      "attributionToThisLanesDiff": "none — receipt-only JSON diff cannot affect build/test outcomes; plan job confirmed baseline matrix scheduling unrelated to file content"
+    },
+    {
+      "runId": 30373979454,
+      "headSha": "34cd145c03089028d0505eeb7514fc5effe449dc",
+      "conclusion": "cancelled",
+      "jobCount": 0,
+      "classification": "scheduler/transport cancellation (zero jobs ever scheduled) — not a product/code failure, per owner directive",
+      "attributionToThisLanesDiff": "none — this head was produced by other owners' merges after this lane's #3416 landed"
+    }
+  ],
+  "outstandingOwnership": "dev-CI lane owns restoring a fresh exact-head terminal Dev CI proof on current dev tip; this lane does not poll further per explicit instruction to stop polling unrelated Dev CI",
+  "laneStatus": "retired",
+  "blockers": []
+}

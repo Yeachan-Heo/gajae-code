@@ -74,6 +74,7 @@ const BASE_CFG: NotificationConfig = {
 	redact: false,
 	verbosity: "lean",
 	sessionScope: "all",
+	sound: "all",
 	rich: {
 		enabled: true,
 	},
@@ -116,6 +117,7 @@ const MALFORMED_NOTIFICATION_LEAVES: ReadonlyArray<readonly [SettingPath, unknow
 	["notifications.telegram.richDraft.enabled", "invalid"],
 	["notifications.telegram.toolActivity.enabled", "invalid"],
 	["notifications.telegram.streaming.enabled", "invalid"],
+	["notifications.telegram.sound", "invalid"],
 	["notifications.telegram.topics.nameTemplate", 42],
 	["notifications.discord.botToken", 42],
 	["notifications.discord.applicationId", 42],
@@ -179,6 +181,7 @@ describe("notifications config", () => {
 			"notifications.telegram.chatId": "chat-1",
 			"notifications.telegram.btw.enabled": true,
 			"notifications.telegram.streaming.enabled": false,
+			"notifications.telegram.sound": "none",
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.applicationId": "discord-app",
 			"notifications.discord.guildId": "discord-guild",
@@ -212,6 +215,7 @@ describe("notifications config", () => {
 			redact: true,
 			verbosity: "lean",
 			sessionScope: "all",
+			sound: "none",
 			btw: {
 				enabled: true,
 			},
@@ -1176,14 +1180,16 @@ describe("notifications config", () => {
 			},
 		};
 
-		expect(isDiscordConfigured(discord)).toBe(true);
-		expect(isDiscordConfigured({ ...discord, discord: { ...discord.discord, guildId: " " } })).toBe(false);
-		expect(isDiscordConfigured({ ...discord, discord: { ...discord.discord, parentChannelId: undefined } })).toBe(
+		expect(isDiscordConfigured({ enabled: true, discord: discord.discord })).toBe(true);
+		expect(isDiscordConfigured({ enabled: false, discord: discord.discord })).toBe(false);
+		expect(isDiscordConfigured({ enabled: true, discord: { ...discord.discord, guildId: " " } })).toBe(false);
+		expect(isDiscordConfigured({ enabled: true, discord: { ...discord.discord, parentChannelId: undefined } })).toBe(
 			false,
 		);
-		expect(isSlackConfigured(slack)).toBe(true);
-		expect(isSlackConfigured({ ...slack, slack: { ...slack.slack, appToken: "\t" } })).toBe(false);
-		expect(isSlackConfigured({ ...slack, slack: { ...slack.slack, workspaceId: undefined } })).toBe(false);
+		expect(isSlackConfigured({ enabled: true, slack: slack.slack })).toBe(true);
+		expect(isSlackConfigured({ enabled: false, slack: slack.slack })).toBe(false);
+		expect(isSlackConfigured({ enabled: true, slack: { ...slack.slack, appToken: "\t" } })).toBe(false);
+		expect(isSlackConfigured({ enabled: true, slack: { ...slack.slack, workspaceId: undefined } })).toBe(false);
 		expect(isGloballyConfigured(discord)).toBe(true);
 		expect(isGloballyConfigured(slack)).toBe(true);
 		expect(isGloballyConfigured({ ...discord, enabled: false })).toBe(false);

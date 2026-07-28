@@ -36,6 +36,7 @@ import {
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
 	type MidRunMaintenanceOutcome,
+	type RunSettlementProof,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -105,6 +106,7 @@ import {
 	classifyFallbackTrigger,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
+	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -162,12 +164,15 @@ export interface ForkContextSeedOptions {
 import { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	extractRetryHint,
+	hasFsCode,
+	isEacces,
 	isEnoent,
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
+
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
@@ -242,6 +247,7 @@ import {
 	resolveSubskillActivationForSkillInvocation,
 } from "../extensibility/gjc-plugins";
 import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injection";
+import type { GjcRuntimeSnapshotProvider } from "../extensibility/gjc-plugins/runtime-quarantine";
 import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
@@ -272,6 +278,7 @@ import {
 	registerCoordinatorRuntimeStateFinalizer,
 } from "../gjc-runtime/session-state-sidecar";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
+import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heartbeat";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -506,6 +513,11 @@ export interface AgentSessionConfig {
 	workerIntegrationRequest?: (signal: AbortSignal) => Promise<void>;
 	/** Bound terminal worker-integration settlement for embedded hosts and deterministic lifecycle tests. */
 	workerIntegrationTimeoutMs?: number;
+	/**
+	 * Override the runtime-owned `gjc team` worker heartbeat reporter. Defaults to a
+	 * reporter derived from the team worker environment, or none outside a worker pane.
+	 */
+	teamWorkerHeartbeatReporter?: GjcTeamWorkerHeartbeatReporter;
 
 	/** Loaded skills (already discovered by SDK) */
 	skills?: Skill[];
@@ -1698,6 +1710,7 @@ export class AgentSession {
 	#resetRetryReplaySafety(): void {
 		this.#retryReplayEpoch++;
 		this.#retryReplayUnsafeEpoch = undefined;
+		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		if (
 			this.#extensionRunner?.hasHandlers("context") ||
 			this.#extensionRunner?.hasHandlers("before_provider_request") ||
@@ -1731,6 +1744,7 @@ export class AgentSession {
 	// Retry state
 	#retryAbortController: AbortController | undefined = undefined;
 	#retryNowRequested = false;
+	#firstEventTimeoutRetryStartedAt: number | undefined;
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
@@ -1795,6 +1809,10 @@ export class AgentSession {
 	#turnIndex = 0;
 	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler;
 	#workerIntegrationRequestedForTurn = false;
+	/** Runtime-owned team worker heartbeat; `undefined` outside a `gjc team` worker pane. */
+	#teamWorkerHeartbeat: GjcTeamWorkerHeartbeatReporter | undefined;
+	#teamWorkerTurnsInFlight = 0;
+	#unregisterTeamWorkerAsyncJobChange: (() => void) | undefined;
 	// First-party internal before-agent-start contributors (not user hooks).
 	#beforeAgentStartContributors: BeforeAgentStartContributor[] = [];
 
@@ -2149,6 +2167,8 @@ export class AgentSession {
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
+			// Runtime-owned worker liveness follows Agent turns and background jobs
+			// in #refreshTeamWorkerHeartbeat(), including internally dispatched turns.
 		}
 	}
 
@@ -2205,6 +2225,15 @@ export class AgentSession {
 		this.#flushPendingAgentEnd();
 	}
 
+	#retainDeferredAgentEndAfterContinuationBusy(
+		hold: symbol | undefined,
+		pending: AgentSessionEvent | undefined,
+	): void {
+		if (!hold || !pending) return;
+		this.#pendingAgentEndEmit = pending;
+		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+	}
+
 	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
 		if (!hold) return;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
@@ -2255,8 +2284,20 @@ export class AgentSession {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
+			this.#refreshTeamWorkerHeartbeat();
 			this.#flushPendingBackgroundExchanges();
 			this.#flushPendingAgentEnd();
+		}
+	}
+
+	#refreshTeamWorkerHeartbeat(): void {
+		const hasOwnedBackgroundJob =
+			this.#agentId !== undefined &&
+			(this.#ownedAsyncJobManager?.getRunningJobs({ ownerId: this.#agentId }).length ?? 0) > 0;
+		if (this.#teamWorkerTurnsInFlight > 0 || hasOwnedBackgroundJob) {
+			this.#teamWorkerHeartbeat?.start();
+		} else {
+			this.#teamWorkerHeartbeat?.stop();
 		}
 	}
 
@@ -2311,6 +2352,14 @@ export class AgentSession {
 				}),
 			config.workerIntegrationTimeoutMs,
 		);
+		// One publisher per worker process: subagent sessions share this process and its
+		// team env, so letting each create a reporter would run N timers writing the same
+		// record. The top-level session owns the pane's liveness.
+		this.#teamWorkerHeartbeat =
+			config.teamWorkerHeartbeatReporter ??
+			((config.taskDepth ?? 0) === 0
+				? GjcTeamWorkerHeartbeatReporter.forProcess(() => this.sessionManager.getCwd())
+				: undefined);
 		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
 		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
@@ -2472,6 +2521,9 @@ export class AgentSession {
 		this.#ttsrManager = config.ttsrManager;
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
+		this.#unregisterTeamWorkerAsyncJobChange = this.#ownedAsyncJobManager?.onChange(() => {
+			this.#refreshTeamWorkerHeartbeat();
+		});
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
@@ -2566,7 +2618,24 @@ export class AgentSession {
 
 	/** Advance the tool-choice queue and return the next directive for the upcoming LLM call. */
 	nextToolChoice(): ToolChoice | undefined {
-		return this.#toolChoiceQueue.nextToolChoice();
+		const choice = this.#toolChoiceQueue.nextToolChoice();
+		if (!choice || typeof choice === "string") return choice;
+
+		const toolName = choice.type === "tool" ? choice.name : "function" in choice ? choice.function.name : choice.name;
+		const activeTool = this.agent.state.tools.find(
+			tool => tool.name === toolName || tool.customWireName === toolName,
+		);
+		if (!activeTool) {
+			this.#toolChoiceQueue.degradeInFlight(`Tool "${toolName}" is no longer active.`);
+			return undefined;
+		}
+
+		const refreshed = buildNamedToolChoiceResult(activeTool.name, this.model);
+		if (!refreshed.exactNamed || !refreshed.choice) {
+			this.#toolChoiceQueue.degradeInFlight(refreshed.resolved?.reason ?? "Named tool choice is unavailable.");
+			return undefined;
+		}
+		return refreshed.choice;
 	}
 
 	/**
@@ -3196,19 +3265,26 @@ export class AgentSession {
 		return queued;
 	}
 
-	#trackAgentEvent = async (event: AgentEvent): Promise<void> => {
+	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		const activePromptHandle = this.activePromptHandle;
 		const agentEndHandled = event.type === "agent_end" ? Promise.withResolvers<void>() : undefined;
 		if (agentEndHandled) this.#agentEndHandlingPromise = agentEndHandled.promise;
 		this.#agentEventHandlersInFlight++;
-		try {
-			await this.#handleAgentEvent(event);
-		} catch (error) {
-			logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
-		} finally {
-			this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
-			this.#flushPendingAgentEnd();
-			agentEndHandled?.resolve();
+		const handler = (async (): Promise<void> => {
+			try {
+				await this.#handleAgentEvent(event, activePromptHandle);
+			} catch (error) {
+				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
+			} finally {
+				this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
+				this.#flushPendingAgentEnd();
+				agentEndHandled?.resolve();
+			}
+		})();
+		if (activePromptHandle) {
+			this.agent.resourceLedger.track(activePromptHandle, "post_prompt", "agent-session-event", handler);
 		}
+		return handler;
 	};
 
 	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
@@ -3227,6 +3303,18 @@ export class AgentSession {
 			this.#closedExtensionTurnGeneration = undefined;
 		} else if (event.type === "turn_end") {
 			this.#closedExtensionTurnGeneration = this.#extensionTurnGeneration;
+		}
+		if (event.type === "turn_start") {
+			this.#teamWorkerTurnsInFlight++;
+			this.#refreshTeamWorkerHeartbeat();
+		} else if (event.type === "turn_end") {
+			this.#teamWorkerTurnsInFlight = Math.max(0, this.#teamWorkerTurnsInFlight - 1);
+			this.#refreshTeamWorkerHeartbeat();
+		} else if (event.type === "agent_end") {
+			// Failed Agent runs can emit agent_end without turn_end. Reset rather than
+			// leaking a positive count that would report an idle/failed worker forever.
+			this.#teamWorkerTurnsInFlight = 0;
+			this.#refreshTeamWorkerHeartbeat();
 		}
 		if (event.type === "message_update") {
 			// Fast path: message_update maps to no sidecar state, so we must not
@@ -3347,7 +3435,7 @@ export class AgentSession {
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+	#handleAgentEvent = async (event: AgentEvent, activePromptHandle?: string): Promise<void> => {
 		if (this.#extensionRunner?.hasHandlers(event.type)) this.#markRetryReplayUnsafe();
 		if (
 			event.type === "tool_execution_start" ||
@@ -3696,9 +3784,10 @@ export class AgentSession {
 											this.#ttsrAbortPending = false;
 											this.#resolveTtsrResume();
 										},
+										resourceRunId: activePromptHandle,
 									});
 								},
-								{ delayMs: 50 },
+								{ delayMs: 50, resourceRunId: activePromptHandle },
 							);
 							return;
 						}
@@ -3857,7 +3946,11 @@ export class AgentSession {
 					maintenanceGeneration !== undefined &&
 					this.#promptGeneration === maintenanceGeneration
 				) {
-					this.#scheduleAgentContinue({ generation: maintenanceGeneration, skipCompactionCheck: true });
+					this.#scheduleAgentContinue({
+						generation: maintenanceGeneration,
+						skipCompactionCheck: true,
+						resourceRunId: activePromptHandle,
+					});
 				}
 				return;
 			}
@@ -3937,8 +4030,11 @@ export class AgentSession {
 			}
 			this.#resolveRetry();
 
-			const compactionTask = this.#checkCompaction(msg);
-			this.#trackPostPromptTask(compactionTask.then(() => undefined));
+			const compactionTask = this.#checkCompaction(msg, true, undefined, activePromptHandle);
+			this.#trackPostPromptTask(
+				compactionTask.then(() => undefined),
+				activePromptHandle,
+			);
 			await compactionTask;
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
 			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
@@ -4002,9 +4098,12 @@ export class AgentSession {
 		this.#postPromptTasksPromise = undefined;
 	}
 
-	#trackPostPromptTask(task: Promise<void>): void {
+	#trackPostPromptTask(task: Promise<void>, resourceRunId = this.activePromptHandle): void {
 		this.#postPromptTasks.add(task);
 		this.#ensurePostPromptTasksPromise();
+		if (resourceRunId) {
+			this.agent.resourceLedger.track(resourceRunId, "post_prompt", "agent-session", task);
+		}
 		void task
 			.catch(() => {})
 			.finally(() => {
@@ -4017,7 +4116,7 @@ export class AgentSession {
 
 	#schedulePostPromptTask(
 		task: (signal: AbortSignal) => Promise<void>,
-		options?: { delayMs?: number; generation?: number; onSkip?: () => void },
+		options?: { delayMs?: number; generation?: number; onSkip?: () => void; resourceRunId?: string },
 	): Promise<void> {
 		const delayMs = options?.delayMs ?? 0;
 		const signal = this.#postPromptTasksAbortController.signal;
@@ -4040,8 +4139,12 @@ export class AgentSession {
 			}
 			await task(signal);
 		})();
-		this.#trackPostPromptTask(scheduled);
+		this.#trackPostPromptTask(scheduled, options?.resourceRunId);
 		return scheduled;
+	}
+
+	#isAgentBusyError(error: unknown): error is AgentBusyError {
+		return error instanceof AgentBusyError;
 	}
 
 	#scheduleAgentContinue(options?: {
@@ -4052,7 +4155,9 @@ export class AgentSession {
 		shouldContinue?: () => boolean;
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
 		allowDuringCancelAndSubmit?: boolean;
+		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
+		resourceRunId?: string;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -4075,81 +4180,92 @@ export class AgentSession {
 		};
 		const scheduledGeneration = options?.generation;
 		const signal = this.#postPromptTasksAbortController.signal;
-		return this.#schedulePostPromptTask(
-			async () => {
-				const canContinue = (): boolean => {
-					if (signal.aborted || this.#isDisposed) {
-						skip("aborted_signal");
-						return false;
-					}
-					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-						skip("generation_changed");
-						return false;
-					}
-					if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
-						skip("queue_drained");
-						return false;
-					}
-					if (options?.shouldContinue && !options.shouldContinue()) {
-						skip("queue_drained");
-						return false;
-					}
-					return true;
-				};
-				if (!canContinue()) return;
-				try {
-					if (!options?.skipCompactionCheck) {
-						await this.#checkEstimatedContextBeforePrompt();
-						if (!canContinue()) return;
-					}
-					if (signal.aborted) {
-						skip("aborted_signal");
-						return;
-					}
-					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-						skip("generation_changed");
-						return;
-					}
-					if (options?.shouldContinue && !options.shouldContinue()) {
-						skip("queue_drained");
-						return;
-					}
-					// A continuation scheduled before a handoff engaged must not start a
-					// turn against the session being handed off (or the restored
-					// predecessor). rearmIdle / normal delivery resumes after the fence.
-					if (this.#handoffTransitionActive) {
-						skip("handoff_in_progress");
-						return;
-					}
-					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
-					const startsQueuedSuccessor =
-						this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
+		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> =>
+			this.#schedulePostPromptTask(
+				async () => {
+					const canContinue = (): boolean => {
+						if (signal.aborted || this.#isDisposed) {
+							skip("aborted_signal");
+							return false;
+						}
+						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+							skip("generation_changed");
+							return false;
+						}
+						if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
+							skip("queue_drained");
+							return false;
+						}
+						if (options?.shouldContinue && !options.shouldContinue()) {
+							skip("queue_drained");
+							return false;
+						}
+						return true;
+					};
+					if (!canContinue()) return;
 					try {
-						await this.agent.continue({
-							...this.#managedFallbackPromptOptions(),
-							// Reset only after continue() has claimed the queued turn. Skipped or stale
-							// continuations retain predecessor accounting, and resetAttemptBudget keeps
-							// the sticky fallback cursor unchanged.
-							onRunAccepted: startsQueuedSuccessor
-								? () => {
-										this.#defaultFallbackChain().resetAttemptBudget();
-										this.#overflowMaintenanceAttempts = 0;
-									}
-								: undefined,
-						});
+						if (!options?.skipCompactionCheck) {
+							await this.#checkEstimatedContextBeforePrompt();
+							if (!canContinue()) return;
+						}
+						if (signal.aborted) {
+							skip("aborted_signal");
+							return;
+						}
+						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+							skip("generation_changed");
+							return;
+						}
+						if (options?.shouldContinue && !options.shouldContinue()) {
+							skip("queue_drained");
+							return;
+						}
+						// A continuation scheduled before a handoff engaged must not start a
+						// turn against the session being handed off (or the restored
+						// predecessor). rearmIdle / normal delivery resumes after the fence.
+						if (this.#handoffTransitionActive) {
+							skip("handoff_in_progress");
+							return;
+						}
+						const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+						const startsQueuedSuccessor =
+							this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
+						try {
+							await this.agent.continue({
+								...this.#managedFallbackPromptOptions(),
+								// Reset only after continue() has claimed the queued turn. Skipped or stale
+								// continuations retain predecessor accounting, and resetAttemptBudget keeps
+								// the sticky fallback cursor unchanged.
+								onRunAccepted: startsQueuedSuccessor
+									? () => {
+											this.#defaultFallbackChain().resetAttemptBudget();
+											this.#overflowMaintenanceAttempts = 0;
+										}
+									: undefined,
+							});
+						} catch (error) {
+							if (options?.rescheduleOnBusy && this.#isAgentBusyError(error) && !terminalized && canContinue()) {
+								this.#retainDeferredAgentEndAfterContinuationBusy(predecessorAgentEndHold, predecessorAgentEnd);
+								logger.debug("agent.continue busy after scheduling; rescheduling", {
+									error: error.message,
+								});
+								void scheduleAttempt(100);
+								return;
+							}
+							this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+							throw error;
+						}
 					} catch (error) {
-						this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
-						throw error;
+						fail(error);
 					}
-				} catch (error) {
-					fail(error);
-				}
-			},
-			{
-				delayMs: options?.delayMs,
-				onSkip: () => skip("aborted_signal"),
-			},
-		);
+				},
+				{
+					delayMs,
+					onSkip: () => skip("aborted_signal"),
+					resourceRunId: options?.resourceRunId,
+				},
+			);
+		return scheduleAttempt();
 	}
 
 	#logCompactionContinuationSkipped(
@@ -4165,7 +4281,7 @@ export class AgentSession {
 	): void {
 		logger.warn("Auto-compaction continuation failed", {
 			source,
-			reason: error instanceof Error && error.name === "AgentBusyError" ? "queue_drained" : "not_resumable_tail",
+			reason: "not_resumable_tail",
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
@@ -4193,14 +4309,15 @@ export class AgentSession {
 		return compactionSettings.autoContinue === false ? "auto_continue_disabled_non_resumable_tail" : undefined;
 	}
 
-	#scheduleOverflowRetryContinuation(generation: number): boolean {
+	#scheduleOverflowRetryContinuation(generation: number, resourceRunId?: string): boolean {
 		this.#stripOverflowFailedTurnForRetry();
 		if (this.#isResumableAgentTail()) {
 			this.#scheduleAgentContinue({
 				delayMs: 100,
 				generation,
 				suppressPredecessorAgentEnd: true,
-
+				resourceRunId,
+				rescheduleOnBusy: true,
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
 				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 			});
@@ -4237,9 +4354,11 @@ export class AgentSession {
 		};
 		const scheduledGeneration = generation;
 		const signal = this.#postPromptTasksAbortController.signal;
-		this.#trackPostPromptTask(
-			(async () => {
+		const scheduleAttempt = (delayMs = 0) => {
+			const attempt = (async () => {
+				let rescheduled = false;
 				try {
+					if (delayMs > 0) await scheduler.wait(delayMs, { signal });
 					await Promise.resolve();
 					if (signal.aborted) {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
@@ -4251,12 +4370,28 @@ export class AgentSession {
 					}
 					await continuePrompt();
 				} catch (error) {
+					if (signal.aborted) {
+						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+						return;
+					}
+					if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
+						logger.debug("Auto-compaction continuation busy; rescheduling", {
+							source: "auto_continue_prompt",
+							reason: "queue_drained",
+							error: error.message,
+						});
+						rescheduled = true;
+						scheduleAttempt(100);
+						return;
+					}
 					this.#logCompactionContinuationError("auto_continue_prompt", error);
 				} finally {
-					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+					if (!rescheduled) this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 				}
-			})(),
-		);
+			})();
+			this.#trackPostPromptTask(attempt);
+		};
+		scheduleAttempt();
 	}
 
 	async #cancelPostPromptTasks(): Promise<void> {
@@ -4747,6 +4882,19 @@ export class AgentSession {
 				prepared?.managedLegacyLocalMigrationSource ?? this.sessionManager.getManagedLegacyLocalMigrationSource(),
 			getSessionId: () => prepared?.sessionId ?? this.sessionManager.getSessionId(),
 		};
+	}
+
+	/** Defer local:// provisioning when a read-only session load cannot create its artifact root. */
+	async #initializeLocalRootForLoadedSession(): Promise<void> {
+		try {
+			await initializeLocalRoot(this.#localProtocolOptions());
+		} catch (error) {
+			if (!isEacces(error) && !hasFsCode(error, "EPERM") && !hasFsCode(error, "EROFS")) throw error;
+			logger.debug("Deferred local root initialization for read-only session load", {
+				sessionFile: this.sessionManager.getSessionFile(),
+				error: String(error),
+			});
+		}
 	}
 
 	#maybeAbortStreamingEdit(event: AgentEvent, generation: number): void {
@@ -5334,6 +5482,9 @@ export class AgentSession {
 		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
 		await disposeVmContextsByOwner(this.#evalKernelOwnerId);
 		this.#releasePowerAssertion();
+		this.#unregisterTeamWorkerAsyncJobChange?.();
+		this.#unregisterTeamWorkerAsyncJobChange = undefined;
+		this.#teamWorkerHeartbeat?.dispose();
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
@@ -5378,6 +5529,9 @@ export class AgentSession {
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		this.#unregisterResourceGc?.();
 		this.#unregisterResourceGc = undefined;
+		this.#unregisterTeamWorkerAsyncJobChange?.();
+		this.#unregisterTeamWorkerAsyncJobChange = undefined;
+		this.#teamWorkerHeartbeat?.dispose();
 		const work = Promise.allSettled([
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).
@@ -6515,6 +6669,11 @@ export class AgentSession {
 	 */
 	get hasPostPromptWork(): boolean {
 		return this.#postPromptTasks.size > 0;
+	}
+
+	/** Stable resource ownership identifier for the active prompt run. */
+	get activePromptHandle(): string | undefined {
+		return this.agent.activeResourceRunId;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -8087,6 +8246,7 @@ export class AgentSession {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
 			model: this.model ?? undefined,
+			getActivePromptHandle: () => this.activePromptHandle,
 			isIdle: () => !this.isStreaming,
 			abort: () => {
 				void this.abort();
@@ -9060,6 +9220,26 @@ export class AgentSession {
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
 	}
+	/**
+	 * Abort a specific active prompt and prove whether its tracked resources settled.
+	 */
+	async abortPromptAndWait(handle: string, options: { graceMs: number }): Promise<RunSettlementProof> {
+		// Only the abort trigger is gated on active ownership; settlement is always proven
+		// from the ledger, because a run can go inactive while its resources still run.
+		if (handle === this.agent.activeResourceRunId)
+			// Awaiting the abort unboundedly would let a provider or tool that ignores
+			// cancellation defer the grace forever, so the proof races the fixed grace
+			// independently of abort completion.
+			void this.abort({ timeoutMs: options.graceMs }).catch(() => {});
+
+		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
+		if (proof.status === "unfenced") {
+			// Detach the unsettled resources so they can never re-enter this run; their real
+			// promises still release them inside the ledger.
+			this.agent.resourceLedger.quarantine(handle);
+		}
+		return proof;
+	}
 
 	/** Atomically interrupt the active run and make text the next prompt. */
 	async cancelAndSubmit(text: string, options?: { queuedEntryId?: string }): Promise<CancelAndSubmitOutcome> {
@@ -9712,6 +9892,16 @@ export class AgentSession {
 	 */
 	getSessionDefaultModelSelector(): string | undefined {
 		return getSessionContextForInternalRead(this.sessionManager).models.default;
+	}
+	/**
+	 * Resolve the model that `modelRoles.default` currently points to, independent
+	 * of whatever model this session's log last recorded. Used by the TUI resume
+	 * flow's `session.resumeModelBehavior: "ask"` prompt to offer the currently
+	 * configured default as an alternative to the session's saved model.
+	 */
+	resolveConfiguredDefaultModel(): Model | undefined {
+		const availableModels = this.#modelRegistry.getAvailable();
+		return this.#resolveRoleModelFull("default", availableModels, undefined).model;
 	}
 
 	/**
@@ -10604,6 +10794,16 @@ export class AgentSession {
 		return getSupportedEfforts(this.model);
 	}
 
+	/**
+	 * Runtime evidence published for the current GJC bundle activation
+	 * generation, set once by `createAgentSession` after every producer has run.
+	 * Undefined until that publication happens, so consumers report runtime
+	 * status as unavailable rather than falsely clear.
+	 */
+	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+	/** Activation generation a published snapshot must match to be merged. */
+	gjcActivationGeneration?: number;
+
 	// =========================================================================
 	// Message Queue Mode Management
 	// =========================================================================
@@ -11305,6 +11505,7 @@ export class AgentSession {
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck = true,
 		onTerminalOverflowNoop?: () => void,
+		resourceRunId?: string,
 	): Promise<boolean> {
 		// Safety stops are terminal and must not trigger context maintenance.
 		if (
@@ -11351,7 +11552,12 @@ export class AgentSession {
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (promoted) {
 				// Retry on the promoted (larger) model without compacting
-				this.#scheduleAgentContinue({ delayMs: 100, generation, suppressPredecessorAgentEnd: true });
+				this.#scheduleAgentContinue({
+					delayMs: 100,
+					generation,
+					suppressPredecessorAgentEnd: true,
+					resourceRunId,
+				});
 
 				return true;
 			}
@@ -11367,10 +11573,11 @@ export class AgentSession {
 							this.agent.appendMessage(assistantMessage);
 						}
 					},
+					resourceRunId,
 				});
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
-			return this.#scheduleOverflowRetryContinuation(generation);
+			return this.#scheduleOverflowRetryContinuation(generation, resourceRunId);
 		}
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return false;
@@ -12682,6 +12889,7 @@ export class AgentSession {
 			force?: boolean;
 			signal?: AbortSignal;
 			beforeTerminalOverflowNoop?: () => void;
+			resourceRunId?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		const compactionSettings = this.settings.getGroup("compaction");
@@ -12703,7 +12911,7 @@ export class AgentSession {
 					if (signal.aborted) return;
 					await this.#runAutoCompaction(reason, willRetry, true, options);
 				},
-				{ generation },
+				{ generation, resourceRunId: options?.resourceRunId },
 			);
 			return { kind: "skipped" };
 		}
@@ -12848,6 +13056,7 @@ export class AgentSession {
 							delayMs: 100,
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
+							rescheduleOnBusy: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						});
@@ -12865,6 +13074,7 @@ export class AgentSession {
 						suppressPredecessorAgentEnd: true,
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
+						rescheduleOnBusy: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
@@ -13109,6 +13319,7 @@ export class AgentSession {
 					generation,
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
+					rescheduleOnBusy: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
@@ -13221,6 +13432,10 @@ export class AgentSession {
 			}
 		}
 		return false;
+	}
+
+	#isTypedFirstEventTimeout(message: AssistantMessage): boolean {
+		return message.transportFailure?.providerCode?.toLowerCase() === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
 	}
 
 	#isTerminalProviderFirstEventTimeout(message: AssistantMessage): boolean {
@@ -13348,6 +13563,7 @@ export class AgentSession {
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
+		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
 		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
@@ -13388,10 +13604,8 @@ export class AgentSession {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) {
 			return "terminal";
 		}
-		// A first-event timeout on ollama-cloud (the ollama-chat API) must not
-		// join the unbounded transient class: each continuation retry re-issues
-		// the full request to a remote, billable backend, so an unbounded loop
-		// can silently spike usage (#713). Bound it to retry.maxRetries instead.
+		// Legacy providers that have not yet stamped the typed timeout fact retain
+		// their existing bounded ollama-cloud behavior.
 		if (this.#isFirstEventTimeoutErrorMessage(err) && this.#shouldFailClosedOnFirstEventTimeout(message)) {
 			return "first_event_timeout";
 		}
@@ -13766,12 +13980,24 @@ export class AgentSession {
 		// user opt-out.
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
+		if (classification === "first_event_timeout") {
+			this.#firstEventTimeoutRetryStartedAt ??= Date.now();
+		}
+		// First-event timeouts are replay-safe only before any model progress,
+		// abort, or extension/provider lifecycle participation.
+		if (
+			classification === "first_event_timeout" &&
+			(!this.#hasCleanRetryReplaySafety || assistantMessageHasVisibleOrToolContent(message))
+		) {
+			return false;
+		}
 		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures.
 		if (!managedFallback && !legacyRetryConfigured) {
 			if (
-				hasBareDefaultRetryDisqualifyingFacts(message) ||
-				(classification !== "transient" && classification !== "first_event_timeout") ||
-				!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? "") ||
+				(!this.#isTypedFirstEventTimeout(message) &&
+					(hasBareDefaultRetryDisqualifyingFacts(message) ||
+						(classification !== "transient" && classification !== "first_event_timeout") ||
+						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
 				!this.#hasCleanRetryReplaySafety
 			) {
 				return false;
@@ -13806,6 +14032,10 @@ export class AgentSession {
 				this.#defaultFallbackExhaustedLastTurn = true;
 				controller.resetSticky();
 				return managedOutcome ? this.#managedFallbackExhaustionDecision(message, errorMessage) : false;
+			}
+			if (classification === "first_event_timeout") {
+				const elapsedMs = Date.now() - (this.#firstEventTimeoutRetryStartedAt ?? Date.now());
+				message.errorMessage = `First-event stream timeout exhausted after ${attemptsUsed} attempts; waited ${elapsedMs}ms total: ${message.errorMessage ?? "Unknown error"}`;
 			}
 			return false;
 		}
@@ -13870,7 +14100,12 @@ export class AgentSession {
 			await this.#emitSessionEvent({
 				type: "auto_retry_start",
 				attempt: this.#retryAttempt,
-				maxAttempts: managedFallback ? controller.maxAttempts : retrySettings.maxRetries,
+				maxAttempts:
+					classification === "first_event_timeout"
+						? retrySettings.maxRetries + 1
+						: managedFallback
+							? controller.maxAttempts
+							: retrySettings.maxRetries,
 				delayMs,
 				errorMessage,
 				unbounded: managedFallback ? false : legacyUnbounded,
@@ -13878,9 +14113,19 @@ export class AgentSession {
 
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-				this.agent.replaceMessages(messages.slice(0, -1));
+				let end = messages.length - 1;
+				// A wedged turn can leave more than one assistant tail behind (e.g. the
+				// agent loop's invalid_prompt repair resend commits its own rejected
+				// message). agent.continue() refuses ANY assistant tail, so strip the
+				// whole trailing run of failed attempts, not just the last one.
+				while (end > 0) {
+					const previous = messages[end - 1];
+					if (previous.role !== "assistant") break;
+					if (previous.stopReason !== "error" && previous.stopReason !== "aborted") break;
+					end--;
+				}
+				this.agent.replaceMessages(messages.slice(0, end));
 			}
-
 			try {
 				await scheduler.wait(delayMs, { signal: retryAbortController.signal });
 			} catch {
@@ -15119,7 +15364,7 @@ export class AgentSession {
 				// workflow-gate emitter, and hooks cannot resolve against an ungated
 				// root. The manager-rotation window itself is tracked in #3138
 				// (#2797 / #2925).
-				if (switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
+				if (switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 
@@ -15141,9 +15386,13 @@ export class AgentSession {
 					this.#rebindProviderSessionState(new Map());
 				}
 
+				const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
 				const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
+				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
 				const defaultEntries =
-					configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
+					resumeModelBehavior === "useCurrentDefault"
+						? settingsDefaultEntries
+						: (configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []));
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -15200,7 +15449,7 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
-				if (!switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
+				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
 				if (switchingToDifferentSession) {
 					// The local:// migration gate for this successor already ran above,

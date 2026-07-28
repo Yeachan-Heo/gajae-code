@@ -857,7 +857,8 @@ function buildHudForMode(
 					: typeof payload.mode === "string"
 						? (payload.mode as string)
 						: undefined;
-			const verdict = typeof payload.verdict === "string" ? (payload.verdict as string) : undefined;
+			const rawVerdict = payload.last_review_verdict ?? payload.verdict;
+			const verdict = typeof rawVerdict === "string" ? rawVerdict : undefined;
 			const iteration = typeof payload.iteration === "number" ? (payload.iteration as number) : undefined;
 			const pendingApproval = payload.pending_approval === true || stage === "final";
 			return buildRalplanHudSummary({

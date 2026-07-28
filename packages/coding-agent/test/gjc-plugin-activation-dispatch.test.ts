@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	GjcPluginLoadError,
 	readActiveSubskillsForParent,
@@ -12,6 +13,8 @@ import { applyHandoffToActiveState, syncSkillActiveState } from "../src/skill-st
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const tempRoots: string[] = [];
+const originalAgentDir = getAgentDir();
+let agentDir: string;
 
 async function tempProjectWithFixture(fixtureName: string): Promise<string> {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-activation-"));
@@ -35,10 +38,17 @@ async function tempProjectWithFixtures(fixtureNames: string[]): Promise<string> 
 	return cwd;
 }
 
+beforeEach(async () => {
+	agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-activation-agent-"));
+	setAgentDir(agentDir);
+});
+
 afterEach(async () => {
+	setAgentDir(originalAgentDir);
 	for (const root of tempRoots.splice(0)) {
 		await fs.rm(root, { recursive: true, force: true });
 	}
+	await fs.rm(agentDir, { recursive: true, force: true });
 });
 
 describe("GJC sub-skill activation dispatch", () => {

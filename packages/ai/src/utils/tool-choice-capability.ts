@@ -175,7 +175,8 @@ export function isForcedToolChoiceUnsupportedError(error: unknown, sentForcedToo
 			message,
 		) ||
 		/forces?\s+tool\s+use.*?(not\s+compatible|incompatible|not\s+supported)/is.test(message) ||
-		/does\s+not\s+support\s+forced\s+tool[_\s-]?choices?/is.test(message)
+		/does\s+not\s+support\s+forced\s+tool[_\s-]?choices?/is.test(message) ||
+		/tool[_\s-]?choices?\s+['"`][^'"`\r\n]+['"`]\s+not\s+found\s+in\s+['"`]tools['"`]\s+parameter\b/is.test(message)
 	);
 }
 

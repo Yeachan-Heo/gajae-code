@@ -1,3 +1,4 @@
+import { $credentialEnv } from "@gajae-code/utils";
 import type {
 	CredentialRankingStrategy,
 	UsageFetchContext,
@@ -64,8 +65,18 @@ function isUnsafeGrokBaseUrlOverride(baseUrl?: string): boolean {
 }
 
 function resolveAccessToken(params: UsageFetchParams): string | undefined {
-	const token = params.credential.accessToken ?? params.credential.apiKey ?? process.env.GROK_CLI_OAUTH_TOKEN;
+	// Trusted sources only for the env fallback: this token authenticates the
+	// billing/usage call, so whatever can set it decides which account is queried
+	// with it. `$env` merges the caller's `cwd/.env` into `process.env`, so
+	// reading it there would let repository content supply the credential.
+	// Stored credentials keep precedence.
+	const token = params.credential.accessToken ?? params.credential.apiKey ?? $credentialEnv("GROK_CLI_OAUTH_TOKEN");
 	return token?.trim() || undefined;
+}
+
+/** Test seam: the usage access token as resolved from a credential plus trusted env. */
+export function resolveGrokAccessTokenForTest(params: UsageFetchParams): string | undefined {
+	return resolveAccessToken(params);
 }
 
 function buildMonthlyUsageLimit(usage: BillingUsage, nowMs: number): UsageLimit {

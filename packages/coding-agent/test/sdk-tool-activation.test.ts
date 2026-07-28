@@ -118,6 +118,42 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("keeps task delegation available when task.eager is enabled with all-tool discovery", async () => {
+		const { session } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({ "tools.discoveryMode": "all", "task.eager": true }),
+		);
+
+		try {
+			expect(session.getActiveToolNames()).toContain("task");
+			expect(session.systemPrompt.join("\n")).toContain("<delegation>");
+			expect(session.systemPrompt.join("\n")).toContain("Delegate by default for multi-file changes");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("routes non-eager task delegation through tool discovery before claiming execution", async () => {
+		const { session } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({ "tools.discoveryMode": "all", "task.eager": false }),
+		);
+
+		try {
+			expect(session.getActiveToolNames()).toContain("search_tool_bm25");
+			expect(session.getActiveToolNames()).not.toContain("task");
+			expect(session.getDiscoverableTools().map(tool => tool.name)).toContain("task");
+			expect(session.systemPrompt.join("\n")).toContain(
+				"search for `subagent delegation` before saying agents are running",
+			);
+
+			expect(await session.activateDiscoveredTools(["task"])).toEqual(["task"]);
+			expect(session.getActiveToolNames()).toContain("task");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("persists activated built-ins when MCP discovery is disabled", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const { session } = await createMinimalSession(

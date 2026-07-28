@@ -56,11 +56,13 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	createSetupFailureSummary,
 	hasCompleteUsageCostBreakdown,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type ModelSubstitutionWarning,
 	type ReviewFinding,
+	type SetupFailureSummary,
 	type SingleResult,
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -241,6 +243,8 @@ export interface ExecutorOptions {
 	 * subagents, and a main-model fast-mode auto-disable does not clobber it.
 	 */
 	inheritedServiceTier?: ServiceTier;
+	/** Resolve whether the effective subagent tier grants fast mode for the selected provider. */
+	isFastForSubagentProvider?: (provider?: string) => boolean;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -873,6 +877,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let sessionEventOrdinal = 0;
 	let retryStartOrdinal = 0;
 	const seenAssistantMessages = new WeakSet<AgentMessage>();
+	let llmRequestStarted = false;
 	const seenAssistantMessageIdentities = new Set<string>();
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
@@ -965,7 +970,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				task,
 				assignment,
 				progress: progressSnapshot,
-				sessionFile: null,
+				sessionFile: sessionFile ?? undefined,
 			});
 		}
 		lastProgressEmitMs = Date.now();
@@ -1380,6 +1385,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		error?: string;
 		aborted?: boolean;
 		abortReason?: string;
+		setupFailure?: SetupFailureSummary;
 		durationMs: number;
 	}> => {
 		const sessionAbortController = new AbortController();
@@ -1387,6 +1393,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let error: string | undefined;
 		let aborted = false;
 		let abortReasonText: string | undefined;
+		let setupFailure: SetupFailureSummary | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
 				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
@@ -1463,6 +1470,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				resolvedModelString = formatModelString(model);
 				activeProviderModelString = resolvedModelString;
 			}
+			progress.fastMode = model ? (options.isFastForSubagentProvider?.(model.provider) ?? false) : false;
 			if (authFallbackUsed && model && requestedModel) {
 				modelSubstitutionWarning = {
 					requested: formatModelString(requestedModel),
@@ -1706,7 +1714,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					agentSource: agent.source,
 					description: options.description,
 					status: "started",
-					sessionFile: null,
+					sessionFile: sessionFile ?? undefined,
 					index,
 				});
 			}
@@ -1801,7 +1809,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					{
 						getModel: () => session.model,
 						isIdle: () => !session.isStreaming,
+						getActivePromptHandle: () => session.activePromptHandle,
 						abort: () => session.abort(),
+						abortPromptAndWait: (handle, options) => session.abortPromptAndWait(handle, options),
 						hasPendingMessages: () => session.queuedMessageCount > 0,
 						getPendingMessageCounts: () => session.pendingMessageCounts,
 						getTranscript: () => session.getTranscript(),
@@ -1905,16 +1915,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 			const runMode = options.runMode ?? "initial";
+			const markLlmRequestStarted = () => {
+				llmRequestStarted = true;
+			};
+			const promptOptions = {
+				attribution: "agent" as const,
+				// A prompt is an LLM request only after AgentSession accepts its
+				// preflight fence. Rejections remain setup failures.
+				onPreflightAccepted: markLlmRequestStarted,
+				onPreflightAcceptCommit: markLlmRequestStarted,
+			};
 			if (runMode === "message") {
-				await awaitAbortable(session.prompt(options.resumeMessage ?? "", { attribution: "agent" }));
+				await awaitAbortable(session.prompt(options.resumeMessage ?? "", promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			} else if (runMode === "resume") {
-				await awaitAbortable(
-					session.prompt("Continue from the paused subagent session state.", { attribution: "agent" }),
-				);
+				await awaitAbortable(session.prompt("Continue from the paused subagent session state.", promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			} else {
-				await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+				await awaitAbortable(session.prompt(task, promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			}
 
@@ -1991,6 +2009,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			exitCode = 1;
 			if (!abortSignal.aborted) {
 				error = err instanceof Error ? err.stack || err.message : String(err);
+				if (!llmRequestStarted) setupFailure = createSetupFailureSummary(err);
 			}
 		} finally {
 			if (abortSignal.aborted) {
@@ -2026,6 +2045,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			error,
 			aborted,
 			abortReason: aborted ? abortReasonText : undefined,
+			setupFailure,
 			durationMs: Date.now() - startTime,
 		};
 	};
@@ -2130,6 +2150,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? yieldAbortReason
 				: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : resolveAbortReasonText()))
 		: undefined;
+	progress.setupFailure = done.setupFailure;
 	progress.status = paused ? "paused" : wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
 
@@ -2141,7 +2162,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			agentSource: agent.source,
 			description: options.description,
 			status: progress.status as "completed" | "failed" | "aborted" | "paused",
-			sessionFile: null,
+			sessionFile: sessionFile ?? undefined,
 			index,
 		});
 	}
@@ -2165,7 +2186,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		contextWindow: progress.contextWindow,
 		modelOverride,
 		modelSubstitutionWarning,
+		fastMode: progress.fastMode,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
+		setupFailure: done.setupFailure,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
 		paused,

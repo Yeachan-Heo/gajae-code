@@ -1,12 +1,20 @@
 # Changelog
 
 ## [Unreleased]
+- Agent session configuration can carry an explicit first-event stream timeout while preserving provider defaults when the setting is absent.
+
+### Fixed
+
+- The `invalid_prompt` circuit breaker no longer replays the rejected turn on its repaired resend. The streaming path commits the failed assistant message to the context before the breaker runs, so the one repaired resend re-sent that errored turn as if the model had spoken it — re-triggering `Request blocked (code=invalid_prompt)` and leaving a second assistant tail that no continuation can resume from. The breaker now repairs and resends only the history that preceded the rejection.
+
+## [0.12.0] - 2026-07-28
 
 ## [0.11.11] - 2026-07-26
 
 ### Fixed
 
 - Managed runs now release their logical-run ownership before terminal observers are notified, so terminal overflow recovery cannot leave a stale owner behind.
+- The OpenAI remote-compaction endpoint is now resolved from trusted environment sources only. `OPENAI_BASE_URL` was read through the merged view that includes the caller's `cwd/.env`, so a repository could redirect compaction requests that carry the OpenAI credential; it now uses the non-project resolver, leaving shell and user-level configuration unchanged.
 - Repeated malformed tool calls now get one tool-free recovery response, preventing argument-validation loops from ending without an answer while leaving ordinary execution-error retries unchanged. The recovery turn commits its assistant to the durable context, forces `toolChoice: "none"` alongside an empty tool list without consuming a queued tool choice, and never executes a tool call it did not advertise. Its recovery prompt is request-only, so append-only tool prefixes stay stable and the durable message log is unchanged.
 - Argument-validation loops now reach a deterministic terminal state. If a model keeps emitting only malformed tool calls after the one-shot recovery turn, the run stops with an explanatory error instead of calling the provider indefinitely. The bound counts consecutive all-malformed turns rather than repeated argument signatures, so a model rotating invalid argument shapes is bounded too; any healthy tool turn resets it.
 

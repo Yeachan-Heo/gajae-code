@@ -94,6 +94,7 @@ import {
 	createAliasTable,
 	readEndpoint,
 	routeInboundUpdate,
+	telegramDisableNotification,
 } from "./telegram-reference";
 import { decideThreadedInbound, type InboundAttachment } from "./threaded-inbound";
 import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
@@ -3529,12 +3530,14 @@ export class TelegramBotTransport implements BotApi {
 				mime?: string;
 				caption?: string;
 				parse_mode?: string;
+				disable_notification?: boolean;
 			};
 			const form = new FormData();
 			form.set("chat_id", String(b.chat_id));
 			if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
 			if (b.caption) form.set("caption", b.caption);
 			if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
+			if (b.disable_notification === true) form.set("disable_notification", "true");
 			form.set("photo", new Blob([Buffer.from(b.photo, "base64")], { type: b.mime ?? "image/png" }), "image");
 			const res = await fetchWithRetry(
 				fetchImpl,
@@ -3555,12 +3558,14 @@ export class TelegramBotTransport implements BotApi {
 				fileName?: string;
 				caption?: string;
 				parse_mode?: string;
+				disable_notification?: boolean;
 			};
 			const form = new FormData();
 			form.set("chat_id", String(b.chat_id));
 			if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
 			if (b.caption) form.set("caption", b.caption);
 			if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
+			if (b.disable_notification === true) form.set("disable_notification", "true");
 			form.set(
 				"document",
 				new Blob([Buffer.from(b.document, "base64")], { type: b.mime ?? "application/octet-stream" }),
@@ -3848,6 +3853,8 @@ export interface TelegramDaemonOptions {
 	richDraft?: { enabled: boolean };
 	/** Tool start/completion messages (off by default; explicit opt-in only). */
 	toolActivity?: { enabled: boolean };
+	/** Controls which Telegram sends play an audible notification. Defaults to all. */
+	sound?: "all" | "important" | "none";
 	/**
 	 * Per-session Telegram forum-topic naming. `nameTemplate` supports the
 	 * `{repo}`, `{branch}`, and `{title}` placeholders; unset preserves the
@@ -4524,6 +4531,9 @@ export class TelegramNotificationDaemon {
 						chat_id: this.opts.chatId,
 						...(threadId !== undefined ? { message_thread_id: threadId } : {}),
 						text,
+						...(telegramDisableNotification(this.opts.sound, "finalized") === true
+							? { disable_notification: true }
+							: {}),
 					})
 					.catch(() => undefined);
 			}
@@ -4536,6 +4546,9 @@ export class TelegramNotificationDaemon {
 						...(threadId !== undefined ? { message_thread_id: threadId } : {}),
 						text,
 						parse_mode: TELEGRAM_PARSE_MODE,
+						...(telegramDisableNotification(this.opts.sound, "finalized") === true
+							? { disable_notification: true }
+							: {}),
 					})
 					.catch(() => undefined);
 			}
@@ -5649,6 +5662,9 @@ export class TelegramNotificationDaemon {
 				reply_parameters: { message_id: input.messageId },
 				text: input.text,
 				...(input.parseMode ? { parse_mode: input.parseMode } : {}),
+				...(telegramDisableNotification(this.opts.sound, "finalized") === true
+					? { disable_notification: true }
+					: {}),
 			},
 			{
 				noRetry: true,
@@ -7345,6 +7361,9 @@ export class TelegramNotificationDaemon {
 							chat_id: this.opts.chatId,
 							...(topicLease ? { message_thread_id: Number(topicLease.topicId) } : {}),
 							text: "Selected!",
+							...(telegramDisableNotification(this.opts.sound, item.lane) === true
+								? { disable_notification: true }
+								: {}),
 						},
 						{ signal: controller.signal, noRetry: true },
 					);
@@ -7448,7 +7467,13 @@ export class TelegramNotificationDaemon {
 						if (draftId !== undefined) {
 							await deliverDraft(
 								this.botApi,
-								{ chat_id: this.opts.chatId, ...threadField },
+								{
+									chat_id: this.opts.chatId,
+									...threadField,
+									...(telegramDisableNotification(this.opts.sound, "live") === true
+										? { disable_notification: true }
+										: {}),
+								},
 								draftId,
 								send.richDraftMarkdown!,
 								logger,
@@ -7463,6 +7488,7 @@ export class TelegramNotificationDaemon {
 					disposition = "rejected";
 					continue;
 				}
+				const disableNotification = telegramDisableNotification(this.opts.sound, send.lane);
 				if (send.method === "sendPhoto" && send.photoBase64) {
 					// Real photo upload (the default botApi multiparts base64 -> file).
 					await itemBotApi.call("sendPhoto", {
@@ -7472,6 +7498,7 @@ export class TelegramNotificationDaemon {
 						mime: send.mime,
 						caption: send.text,
 						parse_mode: TELEGRAM_PARSE_MODE,
+						...(disableNotification === true ? { disable_notification: true } : {}),
 					});
 				} else if (send.method === "sendDocument" && send.documentBase64) {
 					await itemBotApi.call("sendDocument", {
@@ -7482,11 +7509,11 @@ export class TelegramNotificationDaemon {
 						fileName: send.fileName,
 						caption: send.text,
 						parse_mode: TELEGRAM_PARSE_MODE,
+						...(disableNotification === true ? { disable_notification: true } : {}),
 					});
 				} else if (send.text) {
 					// Rich pre-branch: promote stable non-editable finalized text to a fresh
-					// sendRichMessage when enabled. Off/miss falls through to the unchanged
-					// upstream edit/send path, so off behavior is byte-identical.
+					// sendRichMessage when enabled. Off/miss falls through to the HTML path.
 					if (
 						shouldPromoteRich({
 							enabled: this.opts.rich?.enabled !== false,
@@ -7509,6 +7536,7 @@ export class TelegramNotificationDaemon {
 								...threadField,
 								text: chunks[0]!,
 								parse_mode: TELEGRAM_PARSE_MODE,
+								...(disableNotification === true ? { disable_notification: true } : {}),
 							});
 							for (let i = 1; i < chunks.length; i++) {
 								this.submitPool({
@@ -7535,7 +7563,11 @@ export class TelegramNotificationDaemon {
 						};
 						const richMessageId = await deliverRichWithFallback(
 							itemBotApi,
-							{ chat_id: this.opts.chatId, ...threadField },
+							{
+								chat_id: this.opts.chatId,
+								...threadField,
+								...(disableNotification === true ? { disable_notification: true } : {}),
+							},
 							send,
 							AbortSignal.any([this.#deliveryAbort.signal, AbortSignal.timeout(30_000)]),
 							sendHtmlFallback,
@@ -7589,6 +7621,7 @@ export class TelegramNotificationDaemon {
 									...threadField,
 									text: chunks[0]!,
 									parse_mode: TELEGRAM_PARSE_MODE,
+									...(disableNotification === true ? { disable_notification: true } : {}),
 								})) as { result?: { message_id?: number } };
 								firstMessageId = res?.result?.message_id;
 							}
@@ -7605,6 +7638,7 @@ export class TelegramNotificationDaemon {
 								...threadField,
 								text: chunks[0]!,
 								parse_mode: TELEGRAM_PARSE_MODE,
+								...(disableNotification === true ? { disable_notification: true } : {}),
 							})) as { result?: { message_id?: number } };
 							firstMessageId = res?.result?.message_id;
 						}
@@ -7906,6 +7940,9 @@ export class TelegramNotificationDaemon {
 				chat_id: this.opts.chatId,
 				text: "Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.",
 				parse_mode: TELEGRAM_PARSE_MODE,
+				...(telegramDisableNotification(this.opts.sound, "finalized") === true
+					? { disable_notification: true }
+					: {}),
 			});
 		} catch {
 			// Best-effort nudge; never block delivery.
@@ -8083,6 +8120,7 @@ export class TelegramNotificationDaemon {
 				text: rendered.text,
 				parse_mode: TELEGRAM_PARSE_MODE,
 				reply_markup: { inline_keyboard },
+				...(telegramDisableNotification(this.opts.sound, "ask") === true ? { disable_notification: true } : {}),
 			});
 			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
@@ -8393,6 +8431,9 @@ export class TelegramNotificationDaemon {
 								...(index === 0 ? { reply_parameters: { message_id: pending.messageId } } : {}),
 								text,
 								parse_mode: TELEGRAM_PARSE_MODE,
+								...(telegramDisableNotification(this.opts.sound, "finalized") === true
+									? { disable_notification: true }
+									: {}),
 							},
 						});
 						if (outcome === "accepted") {
@@ -8411,6 +8452,9 @@ export class TelegramNotificationDaemon {
 						message_thread_id: Number(pending.threadId),
 						reply_parameters: { message_id: pending.messageId },
 						rich_message: { markdown, skip_entity_detection: true },
+						...(telegramDisableNotification(this.opts.sound, "finalized") === true
+							? { disable_notification: true }
+							: {}),
 					});
 					if (outcome === "accepted") {
 						deliveryOutcome = "accepted";
@@ -8734,6 +8778,7 @@ export class TelegramNotificationDaemon {
 					},
 				]),
 			];
+			const kind = msg.kind === "idle" ? "idle" : "ask";
 			// HTML delivery: one sendMessage per chunk, keyboard on the last chunk;
 			// returns the last chunk's message_id (the reply-routable message).
 			const sendHtmlChunks = async (): Promise<number | undefined> => {
@@ -8747,13 +8792,15 @@ export class TelegramNotificationDaemon {
 						...threadField,
 						text: chunks[i]!,
 						parse_mode: TELEGRAM_PARSE_MODE,
+						...(telegramDisableNotification(this.opts.sound, kind, i === chunks.length - 1) === true
+							? { disable_notification: true }
+							: {}),
 						...(i === chunks.length - 1 && inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
 					})) as { result?: { message_id?: number } } | undefined;
 					if (result === undefined) return undefined;
 				}
 				return result?.result?.message_id;
 			};
-			const kind = msg.kind === "idle" ? "idle" : "ask";
 			if (this.opts.rich?.enabled !== false) {
 				// Rich (default on): promote to sendRichMessage with a top-level
 				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.
@@ -8761,7 +8808,13 @@ export class TelegramNotificationDaemon {
 				if (!this.#leaseTokenAllows(socketLease) || (topicLease && !this.topicLeaseIsCurrent(topicLease))) return;
 				const outcome = await deliverRichActionWithFallback(
 					this.botApi,
-					{ chat_id: this.opts.chatId, ...threadField },
+					{
+						chat_id: this.opts.chatId,
+						...threadField,
+						...(telegramDisableNotification(this.opts.sound, kind) === true
+							? { disable_notification: true }
+							: {}),
+					},
 					{
 						markdown: buildActionMarkdown({
 							kind,
@@ -8780,10 +8833,9 @@ export class TelegramNotificationDaemon {
 				if (kind === "ask" && outcome.messageId !== undefined)
 					this.messageRoutes.set(String(outcome.messageId), { sessionId: logicalSessionId, actionId: msg.id });
 			} else {
-				// Off: byte-identical to the pre-rich HTML path.
+				// Rich disabled: deliver through the HTML chunk path.
 				const messageId = await sendHtmlChunks();
-				// Only asks are reply-routable; idle pings register no route (parity
-				// with the rich branch and correct even in the byte-identical off path).
+				// Only asks are reply-routable; idle pings register no route.
 				if (kind === "ask" && messageId !== undefined)
 					this.messageRoutes.set(String(messageId), { sessionId: logicalSessionId, actionId: msg.id });
 			}
@@ -8889,6 +8941,9 @@ export class TelegramNotificationDaemon {
 				chat_id: this.opts.chatId,
 				text,
 				parse_mode: TELEGRAM_PARSE_MODE,
+				...(telegramDisableNotification(this.opts.sound, "finalized") === true
+					? { disable_notification: true }
+					: {}),
 			});
 		} catch {
 			// Best-effort stale guidance must not reject a callback.
@@ -8902,6 +8957,7 @@ export class TelegramNotificationDaemon {
 			chat_id: this.opts.chatId,
 			text: "This button is stale after notification daemon restart. Please answer locally in the GJC session or wait for a fresh notification.",
 			parse_mode: TELEGRAM_PARSE_MODE,
+			...(telegramDisableNotification(this.opts.sound, "finalized") === true ? { disable_notification: true } : {}),
 		});
 	}
 
@@ -9038,6 +9094,9 @@ export class TelegramNotificationDaemon {
 							...threadField,
 							text: body,
 							parse_mode: TELEGRAM_PARSE_MODE,
+							...(telegramDisableNotification(this.opts.sound, "finalized") === true
+								? { disable_notification: true }
+								: {}),
 						});
 					} catch {
 						// Best-effort confirmation; never block on the notice.
@@ -9234,6 +9293,9 @@ export class TelegramNotificationDaemon {
 								chat_id: this.opts.chatId,
 								message_thread_id: Number(inbound.threadId),
 								text: "Session control unavailable: this local GJC session is disconnected.",
+								...(telegramDisableNotification(this.opts.sound, "finalized") === true
+									? { disable_notification: true }
+									: {}),
 							});
 						} catch {
 							logger.warn("notifications: unavailable-control notice delivery failed");
@@ -9408,6 +9470,9 @@ export class TelegramNotificationDaemon {
 									message_thread_id: Number(inbound.threadId),
 									text: body,
 									parse_mode: TELEGRAM_PARSE_MODE,
+									...(telegramDisableNotification(this.opts.sound, "finalized") === true
+										? { disable_notification: true }
+										: {}),
 								});
 							} catch {
 								// Best-effort control feedback; never convert to user input.

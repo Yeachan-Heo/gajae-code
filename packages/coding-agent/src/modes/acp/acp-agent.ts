@@ -47,6 +47,7 @@ import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
+import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -66,26 +67,21 @@ const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
 export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
+/** Bounded retention of settled prompt correlations so late duplicates stay closed. */
+const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 
 type JsonObject = Record<string, unknown>;
-/**
- * ACP prompt completion is tied to lifecycle activity observed after dispatch.
- * A fast host may stream and finish a turn before acknowledging `turn.prompt`,
- * so pre-ack activity is retained but cannot resolve the waiter until the
- * acknowledgement supplies its command/turn correlation.
- */
 interface PromptWaiter {
-	cancelRequested: boolean;
 	acknowledged: boolean;
-	activityObserved: boolean;
-	/** The prompt was accepted while the host was already busy, so its next valid idle ends the steer. */
-	steeringAtAcknowledgement: boolean;
 	/** Highest inbound frame sequence already observed when the prompt was acknowledged. */
 	boundary: number;
 	correlation: PromptCorrelation;
 	messageProgress?: { textEmitted: boolean; thoughtEmitted: boolean };
 	emittedAssistantText: string;
-	pendingTerminal?: PromptCorrelation;
+	settled: boolean;
+	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
+	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
+	deferredFrames: JsonObject[];
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -110,6 +106,9 @@ type SessionRecord = {
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
 	/** Actionable model-profile authentication failure detected before prompt dispatch. */
+	connectionId?: string;
+	/** Bounded set of correlations already settled; they stay closed for publication. */
+	settledPromptCorrelations: PromptCorrelation[];
 	authFailure?: string;
 	activePrompt?: PromptWaiter;
 };
@@ -257,31 +256,97 @@ function correlationFrom(...values: unknown[]): PromptCorrelation {
 	return correlation;
 }
 
-function correlationsConflict(expected: PromptCorrelation, actual: PromptCorrelation): boolean {
-	return (
-		(expected.commandId !== undefined && actual.commandId !== undefined && expected.commandId !== actual.commandId) ||
-		(expected.turnId !== undefined && actual.turnId !== undefined && expected.turnId !== actual.turnId)
-	);
+function hasCorrelation(correlation: PromptCorrelation): boolean {
+	return correlation.commandId !== undefined || correlation.turnId !== undefined;
 }
-
 function correlationsMatch(expected: PromptCorrelation, actual: PromptCorrelation): boolean {
 	return (
-		(expected.commandId !== undefined && expected.commandId === actual.commandId) ||
-		(expected.turnId !== undefined && expected.turnId === actual.turnId)
+		hasCorrelation(actual) &&
+		(expected.commandId === undefined || expected.commandId === actual.commandId) &&
+		(expected.turnId === undefined || expected.turnId === actual.turnId)
 	);
 }
 
-function isPromptActivity(eventType: string): boolean {
-	return [
-		"agent_start",
-		"turn_start",
-		"message_start",
-		"message_update",
-		"message_end",
-		"tool_execution_start",
-		"tool_execution_update",
-		"tool_execution_end",
-	].includes(eventType);
+function hasCompleteCorrelation(correlation: PromptCorrelation): correlation is { commandId: string; turnId: string } {
+	return (
+		typeof correlation.commandId === "string" &&
+		correlation.commandId.trim().length > 0 &&
+		typeof correlation.turnId === "string" &&
+		correlation.turnId.trim().length > 0
+	);
+}
+
+function correlationsExactlyMatch(expected: PromptCorrelation, actual: PromptCorrelation): boolean {
+	return (
+		hasCompleteCorrelation(expected) &&
+		hasCompleteCorrelation(actual) &&
+		expected.commandId === actual.commandId &&
+		expected.turnId === actual.turnId
+	);
+}
+
+function promptAcknowledgement(value: unknown): PromptCorrelation | undefined {
+	const candidate = object(value);
+	if (
+		!candidate ||
+		candidate.ok === false ||
+		candidate.error !== undefined ||
+		(candidate.accepted !== undefined && candidate.accepted !== true)
+	)
+		return undefined;
+	const payload = object(candidate.result) ?? candidate;
+	if (payload.accepted !== true) return undefined;
+	if (typeof payload.commandId !== "string" || payload.commandId.trim().length === 0) return undefined;
+	if (typeof payload.turnId !== "string" || payload.turnId.trim().length === 0) return undefined;
+	return { commandId: payload.commandId, turnId: payload.turnId };
+}
+function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefined {
+	const correlation: PromptCorrelation = {};
+	let malformed = false;
+	for (const value of values) {
+		const candidate = object(value);
+		if (!candidate) continue;
+		for (const [field, aliases] of [
+			["commandId", ["commandId", "command_id"]],
+			["turnId", ["turnId", "turn_id"]],
+		] as const) {
+			for (const alias of aliases) {
+				if (!Object.hasOwn(candidate, alias)) continue;
+				const identity = candidate[alias];
+				if (typeof identity !== "string" || identity.trim().length === 0) {
+					malformed = true;
+					continue;
+				}
+				const previous = correlation[field];
+				if (previous !== undefined && previous !== identity) malformed = true;
+				correlation[field] = identity;
+			}
+		}
+	}
+	return malformed ? undefined : correlation;
+}
+
+function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
+	const outcome = object(event.outcome);
+	if (!outcome) return undefined;
+	if (
+		outcome.kind === "stopped" &&
+		(outcome.reason === "end_turn" ||
+			outcome.reason === "max_tokens" ||
+			outcome.reason === "max_turn_requests" ||
+			outcome.reason === "refusal" ||
+			outcome.reason === "cancelled") &&
+		(outcome.provenance === "agent" || outcome.provenance === "client_cancel")
+	)
+		return outcome as SdkPromptTerminalOutcome;
+	if (
+		outcome.kind === "failed" &&
+		(outcome.code === "prompt_failed" || outcome.code === "prompt_deadline_exceeded") &&
+		typeof outcome.message === "string" &&
+		(outcome.provenance === "agent_failed" || outcome.provenance === "deadline")
+	)
+		return outcome as SdkPromptTerminalOutcome;
+	return undefined;
 }
 
 export type TranscriptReplayBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -322,11 +387,9 @@ type ReceivedSdkEvent = {
  * without treating notification-specific frames as agent lifecycle truth.
  */
 function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
-	if (frame.type === "activity") {
-		const type = frame.state === "busy" ? "agent_start" : frame.state === "idle" ? "agent_end" : undefined;
-		return type ? { event: { type, ...correlationFrom(frame) } } : undefined;
-	}
-	if (frame.type === "agent_start" || frame.type === "agent_end") return { event: frame };
+	if (frame.type === "activity") return undefined;
+	if (frame.type === "agent_start" || frame.type === "agent_end" || frame.type === "agent_failed")
+		return { event: frame };
 	if (frame.type !== "event") return undefined;
 	const payload = object(frame.payload);
 	if (!payload) return undefined;
@@ -547,8 +610,10 @@ export function acpRequestFailure(error: unknown): unknown {
 	switch (code) {
 		case "authentication_failed":
 			return RequestError.authRequired({ code, details: message }, message);
-		case "not_found":
-			return RequestError.resourceNotFound(message);
+		// `not_found` stays -32603 with its discriminator in `data`: ACP's
+		// `resourceNotFound` (-32002) is a URI-addressed resource error, and an unknown
+		// session id is not a resource URI. Pinned ACP core-v1 conformance also requires
+		// -32603/-32000 for a prompt against an unknown session.
 		case "invalid_input":
 		case "unsupported":
 		case "unsupported_content":
@@ -567,15 +632,57 @@ export function acpProviderRegistrations(
 	env: NodeJS.ProcessEnv = process.env,
 ): AcpProviderRegistration[] {
 	return [
+		// `fs.readTextFile` and `fs.writeTextFile` are independently optional, so the
+		// advertised methods travel with the lease instead of being inferred as both.
 		...(capabilities?.fs?.readTextFile || capabilities?.fs?.writeTextFile
-			? [{ capability: "fs", definitions: [] }]
+			? [
+					{
+						capability: "fs",
+						definitions: [
+							...(capabilities.fs.readTextFile ? [{ name: "fs.readTextFile" }] : []),
+							...(capabilities.fs.writeTextFile ? [{ name: "fs.writeTextFile" }] : []),
+						],
+					},
+				]
 			: []),
 		...(capabilities?.terminal ? [{ capability: "terminal", definitions: [] }] : []),
 		...(resolveAcpPermissionMode(capabilities, env) === "prompt"
 			? [{ capability: "permission", definitions: [] }]
 			: []),
-		{ capability: "ui", definitions: [] },
+		...(capabilities?.elicitation?.form ? [{ capability: "ui", definitions: [] }] : []),
 	];
+}
+
+export function createAcpReverseConnection(connection: AgentSideConnection, sessionId: string): AcpReverseConnection {
+	const methods: Record<string, string> = {
+		request: "session/request_permission",
+		"permission.request": "session/request_permission",
+		"fs.readTextFile": "fs/read_text_file",
+		"fs.writeTextFile": "fs/write_text_file",
+		"terminal.create": "terminal/create",
+		"ui.elicit": "elicitation/create",
+	};
+	return {
+		request: async (
+			method: string,
+			params: JsonObject,
+			options?: { cancellationSignal?: AbortSignal },
+		): Promise<unknown> => {
+			const name = methods[method];
+			if (!name)
+				throw new AcpSdkAdapterError("acp_reverse_unavailable", `ACP reverse method is unavailable: ${method}`);
+			const rawRequest = (connection as unknown as Record<string, unknown>).request;
+			if (typeof rawRequest !== "function")
+				throw new AcpSdkAdapterError("acp_reverse_unavailable", "ACP reverse request surface is unavailable.");
+			return await (
+				rawRequest as (
+					method: string,
+					input: JsonObject,
+					options?: { cancellationSignal?: AbortSignal },
+				) => Promise<unknown>
+			).call(connection, name, { ...params, sessionId }, options);
+		},
+	};
 }
 
 /** Maps ACP permission handling to the session's canonical SDK policy. */
@@ -595,82 +702,6 @@ export async function applyAcpStartupOptions(
 ): Promise<void> {
 	if (options?.modelId) await adapter.setModel(options.modelId);
 	if (options?.thinkingLevel) await adapter.control("thinking.set", { level: options.thinkingLevel });
-}
-
-/** ACP form elicitation uses the client-facing reverse surface without owning a session runtime. */
-export function createAcpExtensionUiContext(
-	connection: AgentSideConnection,
-	getSessionId: () => string,
-	capabilities: ClientCapabilities | undefined,
-): {
-	select: (
-		message: string,
-		options: string[],
-		dialog?: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void },
-	) => Promise<string | undefined>;
-	confirm: (
-		message: string,
-		detail?: string,
-		dialog?: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void },
-	) => Promise<boolean>;
-	input: (
-		message: string,
-		placeholder?: string,
-		dialog?: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void },
-	) => Promise<string | undefined>;
-} {
-	const elicit = async (
-		kind: "select" | "confirm" | "input",
-		message: string,
-		options: string[] | undefined,
-		dialog: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void } | undefined,
-	): Promise<unknown> => {
-		if (!capabilities?.elicitation?.form || dialog?.signal?.aborted) return undefined;
-		const request = (
-			connection as unknown as { unstable_createElicitation(input: JsonObject): Promise<JsonObject> }
-		).unstable_createElicitation({
-			sessionId: getSessionId(),
-			message,
-			requestedSchema: {
-				type: "object",
-				properties: {
-					value:
-						kind === "confirm" ? { type: "boolean" } : { type: "string", ...(options ? { enum: options } : {}) },
-				},
-				required: ["value"],
-			},
-		});
-		let timer: NodeJS.Timeout | undefined;
-		const timeout =
-			dialog?.timeout === undefined
-				? undefined
-				: new Promise<undefined>(resolve => {
-						timer = setTimeout(() => {
-							dialog.onTimeout?.();
-							resolve(undefined);
-						}, dialog.timeout);
-					});
-		try {
-			const response = timeout ? await Promise.race([request, timeout]) : await request;
-			return object(object(response)?.content)?.value;
-		} catch {
-			return undefined;
-		} finally {
-			if (timer) clearTimeout(timer);
-		}
-	};
-	return {
-		select: async (message, options, dialog) => {
-			const value = await elicit("select", message, options, dialog);
-			return typeof value === "string" && options.includes(value) ? value : undefined;
-		},
-		confirm: async (message, detail, dialog) =>
-			(await elicit("confirm", detail ? `${message}\n\n${detail}` : message, undefined, dialog)) === true,
-		input: async (message, placeholder, dialog) => {
-			const value = await elicit("input", placeholder ? `${message}\n\n${placeholder}` : message, undefined, dialog);
-			return typeof value === "string" ? value : undefined;
-		},
-	};
 }
 
 /**
@@ -962,20 +993,19 @@ export class AcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
-		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${params.sessionId}`);
+		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 		const payload = acpPromptPayload(params.prompt);
 		let waiter!: PromptWaiter;
 		const response = new Promise<PromptResponse>((resolve, reject) => {
 			waiter = {
-				cancelRequested: false,
 				acknowledged: false,
-				activityObserved: false,
-				steeringAtAcknowledgement: record.busy,
 				boundary: record.inboundSequence,
 				correlation: {},
 				emittedAssistantText: "",
+				settled: false,
+				deferredFrames: [],
 				resolve,
 				reject,
 			};
@@ -986,14 +1016,29 @@ export class AcpAgent implements Agent {
 				text: payload.text,
 				...(payload.images.length ? { images: payload.images } : {}),
 			});
-			waiter.steeringAtAcknowledgement = record.busy;
-			// Capture the ingress boundary after the command acknowledgement. Frames
-			// queued before this point are stale with respect to this ACP prompt.
+			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
+			if (!acknowledgementCorrelation)
+				throw new AcpSdkAdapterError(
+					"invalid_prompt_acknowledgement",
+					"SDK prompt acknowledgement must accept the prompt and include commandId and turnId.",
+				);
+			// Retain the acknowledgement ingress boundary with its complete correlation.
 			waiter.boundary = record.inboundSequence;
-			waiter.correlation = correlationFrom(acknowledgement);
+			waiter.correlation = acknowledgementCorrelation;
 			waiter.acknowledged = true;
+			// Frames held while ownership was unknown belong to this prompt only when the
+			// acknowledgement proves their complete correlation matches exactly.
+			const deferred = waiter.deferredFrames.splice(0);
+			for (const deferredFrame of deferred)
+				if (correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame)))
+					record.frameTail = record.frameTail.then(
+						async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
+					);
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
+			waiter.deferredFrames.length = 0;
+			waiter.terminal = undefined;
+			waiter.settled = true;
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
 			throw error;
 		}
@@ -1002,8 +1047,7 @@ export class AcpAgent implements Agent {
 
 	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#sessions.get(params.sessionId);
-		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${params.sessionId}`);
-		const waiter = record.activePrompt;
+		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		const acknowledgement = await record.adapter.cancel();
 		const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
 		if (result?.aborted !== true)
@@ -1011,9 +1055,6 @@ export class AcpAgent implements Agent {
 				"abort_unacknowledged",
 				"SDK did not acknowledge cancellation of the active prompt.",
 			);
-		// Do not retroactively mark a waiter that already settled while the abort
-		// request was in flight. A cancelled response means the abort itself won.
-		if (waiter && record.activePrompt === waiter) waiter.cancelRequested = true;
 	}
 
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
@@ -1110,8 +1151,9 @@ export class AcpAgent implements Agent {
 		if (attached) {
 			if (path.resolve(attached.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
-			if (mcpServers.length > 0)
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
+			// ACP clients replay their declared MCP servers when reconnecting. The live
+			// session host remains authoritative for its immutable configuration, so
+			// attachment must not reinterpret the replay as a mutation request.
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -1149,8 +1191,8 @@ export class AcpAgent implements Agent {
 		const indexed = await this.#scopedBrokerSession(id, cwd);
 		this.#assertSessionEpoch(id, epoch);
 		if (indexed?.live) {
-			if (mcpServers.length > 0)
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
+			// A reconnect may repeat the client's MCP declaration. Attaching to the
+			// existing endpoint preserves the live host's immutable configuration.
 			const result = await this.#brokerEndpoint(id, indexed.endpointGeneration);
 			this.#assertSessionEpoch(id, epoch);
 			await this.#attach(id, cwd, endpoint(result), epoch);
@@ -1229,6 +1271,19 @@ export class AcpAgent implements Agent {
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
 			});
+			let capabilities: JsonObject | undefined;
+			try {
+				const response = object(await adapter.query("runtime.capabilities"));
+				const result = object(response?.result) ?? response;
+				// Q18 is a paged query surface: the capability object arrives as the single
+				// page item, so fall back to the envelope only for direct-result hosts.
+				capabilities = object(pageItems(result)[0]) ?? result;
+			} catch {}
+			if (capabilities?.promptTerminalOutcomeVersion !== 1)
+				throw new AcpSdkAdapterError(
+					"unavailable",
+					"This ACP client requires a newer GJC SDK session; restart the session.",
+				);
 			this.#assertSessionEpoch(id, epoch);
 			const record: SessionRecord = {
 				cwd,
@@ -1237,7 +1292,9 @@ export class AcpAgent implements Agent {
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
 				frameTail: Promise.resolve(),
+				settledPromptCorrelations: [],
 				inboundSequence: 0,
+				connectionId: adapter.connectionId,
 				busy: false,
 				toolArgs: new Map(),
 			};
@@ -1414,7 +1471,7 @@ export class AcpAgent implements Agent {
 
 	#adapter(id: string): AcpSdkAdapter {
 		const record = this.#sessions.get(id);
-		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${id}`);
+		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${id}`);
 		return record.adapter;
 	}
 
@@ -1434,29 +1491,18 @@ export class AcpAgent implements Agent {
 	}
 
 	#reverseConnection(sessionId: string): AcpReverseConnection {
-		const methods: Record<string, string> = {
-			"fs.readTextFile": "readTextFile",
-			"fs.writeTextFile": "writeTextFile",
-			"terminal.create": "createTerminal",
-			"permission.request": "requestPermission",
-			"ui.elicit": "unstable_createElicitation",
-		};
-		return {
-			request: async (method: string, params: JsonObject): Promise<unknown> => {
-				const name = methods[method] ?? method;
-				const target = (this.#connection as unknown as Record<string, unknown>)[name];
-				if (typeof target !== "function")
-					throw new AcpSdkAdapterError("acp_reverse_unavailable", `ACP reverse method is unavailable: ${method}`);
-				const request = method === "permission.request" ? { ...params, sessionId } : params;
-				return await (target as (input: JsonObject) => Promise<unknown>)(request);
-			},
-		};
+		return createAcpReverseConnection(this.#connection, sessionId);
 	}
 
 	#observeSessionActivity(record: SessionRecord, frame: JsonObject): void {
+		if (frame.type === "activity") {
+			if (frame.state === "busy") record.busy = true;
+			else if (frame.state === "idle") record.busy = false;
+			return;
+		}
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") record.busy = true;
-		else if (event?.type === "agent_end") record.busy = false;
+		else if (event?.type === "agent_end" || event?.type === "agent_failed") record.busy = false;
 	}
 
 	#frameProcessingFailure(error: unknown): AcpSdkAdapterError {
@@ -1468,22 +1514,72 @@ export class AcpAgent implements Agent {
 	#enqueueSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
-		// Sequence and busy state are captured at ingress, before queued work begins.
-		// A frame received before acknowledgement stays before that prompt's boundary.
+		// Ingress ordering is recorded before queued work begins.
 		this.#observeSessionActivity(record, frame);
-		const sequence = ++record.inboundSequence;
-		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame, sequence));
+		++record.inboundSequence;
+		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
 		record.frameTail = task.catch(
 			async error => await this.#failSession(id, adapter, this.#frameProcessingFailure(error)),
 		);
 	}
 
-	async #handleSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject, sequence: number): Promise<void> {
+	async #handleSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): Promise<void> {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		if ((frame.type === "hello" || frame.type === "server_hello") && typeof frame.connectionId === "string") {
+			const reconnected = record.connectionId !== undefined && record.connectionId !== frame.connectionId;
+			record.connectionId = frame.connectionId;
+			if (reconnected) {
+				const waiter = record.activePrompt;
+				if (waiter && !waiter.settled && !waiter.terminal) {
+					record.activePrompt = undefined;
+					waiter.settled = true;
+					if (hasCorrelation(waiter.correlation)) {
+						record.settledPromptCorrelations.push(waiter.correlation);
+						while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+							record.settledPromptCorrelations.shift();
+					}
+					waiter.reject(
+						new AcpSdkAdapterError(
+							"connection_closed",
+							"The prompt owner connection was lost before completion.",
+						),
+					);
+				}
+			}
+			return;
+		}
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
+		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
+		const correlation = (isTerminal ? strictCorrelationFrom(frame, event) : correlationFrom(frame, event)) ?? {};
+		const activePrompt = record.activePrompt;
+		const outcome = isTerminal ? terminalOutcome(event) : undefined;
+		if (isTerminal) {
+			// Terminal ownership requires a complete identity. Unowned, partial, and
+			// duplicate terminals are never allowed to publish or query anything.
+			if (!hasCompleteCorrelation(correlation) || !activePrompt || activePrompt.settled) return;
+			if (!activePrompt.acknowledged) {
+				// Hold the entire frame until the prompt acknowledgement proves ownership.
+				activePrompt.deferredFrames.push(frame);
+				return;
+			}
+			if (!correlationsExactlyMatch(activePrompt.correlation, correlation) || activePrompt.terminal) return;
+			if (!outcome) {
+				const detail =
+					typeof (event as { error?: { message?: unknown } }).error?.message === "string"
+						? (event as { error: { message: string } }).error.message
+						: "the prompt terminal omitted a valid normalized outcome";
+				this.#rejectPrompt(
+					record,
+					activePrompt,
+					new AcpSdkAdapterError("connection_closed", `ACP prompt terminal was invalid: ${detail}`),
+				);
+				return;
+			}
+			activePrompt.terminal = { outcome, correlation };
+		}
 		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
 		if (
 			toolCallId &&
@@ -1492,31 +1588,21 @@ export class AcpAgent implements Agent {
 		) {
 			record.toolArgs.set(toolCallId, event.args);
 		}
-		const correlation = correlationFrom(frame, event);
-		const activePrompt = record.activePrompt;
-		// Prompt ownership is updated before publishing client notifications, but a
-		// terminal waiter is resolved only after acknowledgement and publication
-		// succeed. Fast hosts may emit the whole turn before acknowledging the
-		// control request; retaining that activity prevents an idle ACP prompt from
-		// remaining open forever.
-		if (
-			activePrompt &&
-			sequence > activePrompt.boundary &&
-			!correlationsConflict(activePrompt.correlation, correlation)
-		) {
-			if (isPromptActivity(String(event.type))) {
-				activePrompt.activityObserved = true;
-			} else if (event.type === "agent_end") {
-				if (
-					correlationsMatch(activePrompt.correlation, correlation) ||
-					correlation.commandId !== undefined ||
-					correlation.turnId !== undefined ||
-					activePrompt.activityObserved ||
-					activePrompt.steeringAtAcknowledgement
-				)
-					activePrompt.pendingTerminal = correlation;
+		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
+			correlationsMatch(settled, correlation),
+		);
+		if (settledCorrelation) {
+			// Frames for an already-settled correlation stay closed until an active prompt
+			// acknowledges the exact same identity.
+			if (activePrompt && !activePrompt.settled && !activePrompt.acknowledged) {
+				activePrompt.deferredFrames.push(frame);
+				return;
 			}
+			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
 		}
+		// After a correlated settlement with no active prompt, correlationless wire frames
+		// have no prompt to belong to and must not publish further updates.
+		if (!record.activePrompt && record.settledPromptCorrelations.length > 0 && !hasCorrelation(correlation)) return;
 		if (wirePayload) {
 			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
 				cwd: record.cwd,
@@ -1582,21 +1668,47 @@ export class AcpAgent implements Agent {
 				}
 			}
 			await this.#emitEndOfTurnUpdates(id, adapter);
+		} else if (event.type === "agent_failed") {
+			await this.#emitEndOfTurnUpdates(id, adapter);
 		}
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
 	}
 
-	#settlePrompt(record: SessionRecord, waiter: PromptWaiter): void {
-		if (record.activePrompt !== waiter || !waiter.acknowledged || !waiter.pendingTerminal) return;
-		if (correlationsConflict(waiter.correlation, waiter.pendingTerminal)) return;
-		if (
-			!correlationsMatch(waiter.correlation, waiter.pendingTerminal) &&
-			!waiter.activityObserved &&
-			!waiter.steeringAtAcknowledgement
-		)
-			return;
+	#rejectPrompt(record: SessionRecord, waiter: PromptWaiter, error: AcpSdkAdapterError): void {
+		if (record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
-		waiter.resolve({ stopReason: waiter.cancelRequested ? "cancelled" : "end_turn" });
+		waiter.settled = true;
+		waiter.deferredFrames.length = 0;
+		waiter.terminal = undefined;
+		if (hasCompleteCorrelation(waiter.correlation)) {
+			record.settledPromptCorrelations.push(waiter.correlation);
+			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+				record.settledPromptCorrelations.shift();
+		}
+		waiter.reject(error);
+	}
+
+	#settlePrompt(record: SessionRecord, waiter: PromptWaiter): void {
+		if (record.activePrompt !== waiter || waiter.settled || !waiter.acknowledged || !waiter.terminal) return;
+		// A terminal captured before acknowledgement is only this prompt's terminal when the
+		// eventual acknowledgement correlates with it; otherwise it belonged to an earlier prompt.
+		if (!correlationsExactlyMatch(waiter.correlation, waiter.terminal.correlation)) {
+			waiter.terminal = undefined;
+			return;
+		}
+		record.activePrompt = undefined;
+		waiter.settled = true;
+		if (hasCorrelation(waiter.correlation)) {
+			record.settledPromptCorrelations.push(waiter.correlation);
+			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+				record.settledPromptCorrelations.shift();
+		}
+		const { outcome } = waiter.terminal;
+		if (outcome.kind === "stopped") {
+			waiter.resolve({ stopReason: outcome.reason });
+			return;
+		}
+		waiter.reject(new AcpSdkAdapterError(outcome.code, outcome.message));
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter): Promise<void> {
@@ -1670,7 +1782,7 @@ export class AcpAgent implements Agent {
 		rejectUnavailableStartupPreset = false,
 	): Promise<Pick<NewSessionResponse, "configOptions" | "modes">> {
 		const record = this.#sessions.get(id);
-		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${id}`);
+		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${id}`);
 		const modelPreset = this.#startupOptions?.modelPreset;
 		const [config, modelCatalog] = await Promise.all([
 			record.adapter.query("config.list/get"),

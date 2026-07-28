@@ -5,6 +5,7 @@ import {
 	type GjcPluginAppendixManifestEntry,
 	type GjcPluginHookManifestEntry,
 	GjcPluginLoadError,
+	type GjcPluginLoadErrorCode,
 	type GjcPluginManifest,
 	type GjcPluginMcpManifestEntry,
 	type GjcPluginMcpTransport,
@@ -51,6 +52,67 @@ function requireNonEmptyString(value: unknown, field: string, filePath: string):
 		);
 	}
 	return value;
+}
+
+/**
+ * A bundle name is echoed by the CLI, rendered in Settings, and used to derive
+ * a directory segment, so it is constrained at the parse boundary rather than
+ * sanitized at every display site. Anything outside this set — control or ANSI
+ * sequences, path separators, whitespace, or credential-looking text — is
+ * rejected before it can ever be stored.
+ */
+function manifestSafeName(
+	value: unknown,
+	field: string,
+	manifestPath: string,
+	code: GjcPluginLoadErrorCode = "invalid_manifest",
+): string {
+	const name =
+		code === "invalid_frontmatter"
+			? requireNonEmptyString(value, field, manifestPath)
+			: manifestString(value, field, manifestPath);
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(name)) {
+		throw new GjcPluginLoadError(
+			code,
+			`GJC plugin ${field} must be 1-128 characters of letters, digits, dot, underscore, or hyphen (${manifestPath})`,
+		);
+	}
+	return name;
+}
+
+/**
+ * Free-form prose that is rendered into prompts or UI. It is not constrained to
+ * the identifier grammar, but control and ANSI characters are rejected so a
+ * manifest cannot inject escape sequences into a rendered surface.
+ */
+function manifestSafeProse(
+	value: unknown,
+	field: string,
+	manifestPath: string,
+	code: GjcPluginLoadErrorCode = "invalid_manifest",
+): string {
+	const text = requireNonEmptyString(value, field, manifestPath);
+	// C0, DEL, and the C1 block: a single-byte CSI (U+009B) is an escape
+	// introducer on its own, so rejecting only C0 leaves the same injection open.
+	if (/[\u0000-\u001f\u007f-\u009f]/.test(text)) {
+		throw new GjcPluginLoadError(code, `GJC plugin ${field} must not contain control characters (${manifestPath})`);
+	}
+	return text;
+}
+
+/**
+ * A version string is rendered next to the bundle name everywhere the bundle
+ * appears, so it is constrained to printable version-like characters.
+ */
+function manifestSafeVersion(value: unknown, manifestPath: string): string {
+	const version = manifestString(value, "version", manifestPath);
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,63}$/.test(version)) {
+		throw new GjcPluginLoadError(
+			"invalid_manifest",
+			`GJC plugin version must be 1-64 characters of letters, digits, dot, plus, underscore, or hyphen (${manifestPath})`,
+		);
+	}
+	return version;
 }
 
 function manifestString(value: unknown, field: string, manifestPath: string): string {
@@ -109,12 +171,12 @@ function parseTools(value: unknown, manifestPath: string): GjcPluginToolManifest
 				`Invalid GJC plugin manifest at ${manifestPath}: tools[${index}] must be a string or object`,
 			);
 		}
-		const name = manifestString(entry.name, `tools[${index}].name`, manifestPath);
+		const name = manifestSafeName(entry.name, `tools[${index}].name`, manifestPath);
 		const path = manifestString(entry.path, `tools[${index}].path`, manifestPath);
 		const description =
 			entry.description === undefined
 				? undefined
-				: manifestString(entry.description, `tools[${index}].description`, manifestPath);
+				: manifestSafeProse(entry.description, `tools[${index}].description`, manifestPath);
 		const sha256 =
 			entry.sha256 === undefined ? undefined : manifestString(entry.sha256, `tools[${index}].sha256`, manifestPath);
 		return { name, path, description, sha256, surface: "always-on" };
@@ -130,11 +192,15 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 				`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}] must be an object`,
 			);
 		}
-		const name = manifestString(entry.name, `hooks[${index}].name`, manifestPath);
-		const event = manifestString(entry.event, `hooks[${index}].event`, manifestPath);
+		const name = manifestSafeName(entry.name, `hooks[${index}].name`, manifestPath);
+		// event/target become part of the hook surface ID
+		// (`hook:<event>:<phase>:<target>:<name>`), which is rendered and printed.
+		const event = manifestSafeName(entry.event, `hooks[${index}].event`, manifestPath);
 		const path = manifestString(entry.path, `hooks[${index}].path`, manifestPath);
 		const target =
-			entry.target === undefined ? undefined : manifestString(entry.target, `hooks[${index}].target`, manifestPath);
+			entry.target === undefined
+				? undefined
+				: manifestSafeName(entry.target, `hooks[${index}].target`, manifestPath);
 		let phase: "before" | "after" | undefined;
 		if (entry.phase !== undefined) {
 			if (entry.phase !== "before" && entry.phase !== "after") {
@@ -160,7 +226,7 @@ function parseMcps(value: unknown, manifestPath: string): GjcPluginMcpManifestEn
 				`Invalid GJC plugin manifest at ${manifestPath}: mcps[${index}] must be an object`,
 			);
 		}
-		const name = manifestString(entry.name, `mcps[${index}].name`, manifestPath);
+		const name = manifestSafeName(entry.name, `mcps[${index}].name`, manifestPath);
 		const transport = entry.transport;
 		if (typeof transport !== "string" || !MCP_TRANSPORTS.includes(transport as GjcPluginMcpTransport)) {
 			throw new GjcPluginLoadError(
@@ -207,7 +273,7 @@ function parseAppendixEntry(entry: unknown, field: string, manifestPath: string)
 			`Invalid GJC plugin manifest at ${manifestPath}: ${field} must be an object`,
 		);
 	}
-	const name = manifestString(entry.name, `${field}.name`, manifestPath);
+	const name = manifestSafeName(entry.name, `${field}.name`, manifestPath);
 	const path = entry.path === undefined ? undefined : manifestString(entry.path, `${field}.path`, manifestPath);
 	// Content may be empty/whitespace here; the compiler enforces non-empty and
 	// maps emptiness to invalid_appendix (not invalid_manifest).
@@ -282,8 +348,8 @@ export function parseManifest(raw: unknown, manifestPath: string): GjcPluginMani
 		);
 	}
 
-	const name = manifestString(raw.name, "name", manifestPath);
-	const version = manifestString(raw.version, "version", manifestPath);
+	const name = manifestSafeName(raw.name, "name", manifestPath);
+	const version = manifestSafeVersion(raw.version, manifestPath);
 
 	return {
 		name,
@@ -300,10 +366,16 @@ export function parseManifest(raw: unknown, manifestPath: string): GjcPluginMani
 
 export function parseSubskillFrontmatter(fm: Record<string, unknown>, filePath: string): SubskillFrontmatter {
 	return {
-		name: requireNonEmptyString(fm.name, "name", filePath),
+		// Name and activation_arg become part of the surface ID
+		// (`subskill:<parent>:<phase>:<arg>`) and are rendered, so they share the
+		// identifier grammar. binds_to and phase are separately checked against
+		// the known parent/phase sets. The description is prose and may not be
+		// constrained to that grammar, but must not carry control characters into
+		// a rendered prompt.
+		name: manifestSafeName(fm.name, "name", filePath, "invalid_frontmatter"),
 		binds_to: requireNonEmptyString(fm.binds_to, "binds_to", filePath),
 		phase: requireNonEmptyString(fm.phase, "phase", filePath),
-		activation_arg: requireNonEmptyString(fm.activation_arg, "activation_arg", filePath),
-		description: requireNonEmptyString(fm.description, "description", filePath),
+		activation_arg: manifestSafeName(fm.activation_arg, "activation_arg", filePath, "invalid_frontmatter"),
+		description: manifestSafeProse(fm.description, "description", filePath, "invalid_frontmatter"),
 	};
 }

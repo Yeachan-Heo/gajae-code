@@ -32,6 +32,8 @@ export interface AsyncJob {
 	promise: Promise<void>;
 	resultText?: string;
 	errorText?: string;
+	/** Safe, bounded cause when session setup failed before the LLM began work. */
+	setupFailureSummary?: string;
 	metadata?: AsyncJobMetadata;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "0-Main",
@@ -69,9 +71,12 @@ export interface AsyncJobMetadata {
  * non-terminal and non-delivering: the run suspended at a safe boundary and the
  * subagent can be resumed from its persisted sessionFile. `completed` always
  * wins a race with a late pause because the run returns it once it has actually
- * finished.
+ * finished. A `failed` outcome retains a safe setup diagnostic for receipt rendering.
  */
-export type SubagentRunOutcome = { kind: "completed"; text: string } | { kind: "paused"; note?: string };
+export type SubagentRunOutcome =
+	| { kind: "completed"; text: string }
+	| { kind: "failed"; text: string; setupFailureSummary?: string }
+	| { kind: "paused"; note?: string };
 
 /** Canonical lifecycle of a subagent across pause/resume cycles. */
 export type SubagentLifecycle = "running" | "paused" | "queued" | "completed" | "failed" | "cancelled";
@@ -499,7 +504,7 @@ export class AsyncJobManager {
 					typeof result === "string" ? { kind: "completed", text: result } : result;
 
 				if (job.status === "cancelled") {
-					job.resultText = outcome.kind === "completed" ? outcome.text : outcome.note;
+					job.resultText = outcome.kind === "paused" ? outcome.note : outcome.text;
 					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
 					this.#markRecordTerminal(id, "cancelled");
@@ -514,6 +519,18 @@ export class AsyncJobManager {
 					this.#freezeEndTime(job);
 					if (outcome.note) job.resultText = outcome.note;
 					this.#markRecordPaused(id);
+					this.#drainResumeQueue();
+					return;
+				}
+				if (outcome.kind === "failed") {
+					job.status = "failed";
+					job.setupFailureSummary = outcome.setupFailureSummary;
+					this.#freezeEndTime(job);
+					job.errorText = outcome.text;
+					this.#enqueueDelivery(id, outcome.text);
+					this.#runLifecycle(id, "terminal", job);
+					this.#scheduleEviction(id);
+					this.#markRecordTerminal(id, "failed");
 					this.#drainResumeQueue();
 					return;
 				}

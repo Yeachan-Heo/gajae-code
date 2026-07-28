@@ -130,7 +130,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("runs-on: windows-latest");
 		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
 		expect(windowsJob).toContain("Windows session-path canonicalization regression");
-		expect(windowsJob).toContain("bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
+		// The `./` prefix is load-bearing on Windows: without it Bun treats the argument
+		// as a name filter rather than a path, matches nothing, and exits 1. Pinned here
+		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));

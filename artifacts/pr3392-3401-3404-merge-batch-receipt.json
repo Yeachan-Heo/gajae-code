@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "kind": "pr-merge-batch-receipt",
+  "generatedAt": "2026-07-28",
+  "status": "terminal",
+  "doctrine": "owner-directed serialized merge of independently reviewed, exact-head-green, non-overlapping PRs; dev red/pending is not a repo-wide freeze",
+  "batch": [
+    {
+      "pr": 3392,
+      "title": "fix(tui): stop terminal probe replies leaking into the prompt",
+      "headSha": "0e2a8f14bef2a09bb4836ceb1611e788e2651ace",
+      "preMergeVerdict": "exact-head green: all required checks SUCCESS/SKIPPED, mergeStateStatus CLEAN",
+      "mergeMethod": "squash",
+      "mergeCommitSha": "cb43a2ad4f4d9bfd3261f4ed71eaee5c5d6b64cf",
+      "postMergeCiFailuresAttributed": [],
+      "supersedes": {
+        "pr": 3266,
+        "title": "fix(tui): hold fragmented capability-probe replies instead of typing them into the composer",
+        "action": "closed unmerged as superseded",
+        "evidence": "diff of pr3266:packages/tui/src/terminal.ts is a strict byte-identical subset of pr3392's diff to the same file (all noteProbeIssued() hunks match); pr3392 additionally adds the OSC-11 query watchdog, unbounded-reassembly-buffer cap, and PROBE_REPLY_PATTERNS/isUnsolicitedProbeReply()"
+      }
+    },
+    {
+      "pr": 3401,
+      "title": "fix(tui): isolate status-line gh lookup stdin",
+      "headSha": "24b085718a2513d41fb5faafd300a71f2bf1dfb0",
+      "preMergeVerdict": "exact-head green: all required checks SUCCESS/SKIPPED, mergeStateStatus CLEAN",
+      "mergeMethod": "squash",
+      "mergeCommitSha": "382e4a7d5b350c0af5fc05395e4c0a20f2df925f",
+      "postMergeCiFailuresAttributed": []
+    },
+    {
+      "pr": 3404,
+      "title": "perf(coding-agent): cache transcript viewer layouts",
+      "headSha": "2f2173c8b8b78f5c34d34a39e9305a491fc6ce5a",
+      "preMergeVerdict": "exact-head green: all required checks SUCCESS/SKIPPED, mergeStateStatus CLEAN",
+      "mergeMethod": "squash",
+      "mergeCommitSha": "5d735aaee0f4aa35b3953082d1bf98b62128b363",
+      "postMergeCiFailuresAttributed": []
+    }
+  ],
+  "nonOverlapCheck": "packages/tui/src/terminal.ts (#3392) vs packages/tui status-line gh lookup (#3401) vs packages/coding-agent transcript viewer + packages/stats (#3404) — disjoint file sets, serialized merge, no conflicts",
+  "unrelatedBlockerObserved": {
+    "commit": "c97da89c1afadcf20fc949307f2996aaeffecfca",
+    "pr": 3406,
+    "failingCheck": "Affected path validation / test:@gajae-code/coding-agent:shard-2-of-8",
+    "failingTest": "team worker memory guard wiring > selects the hottest Linux worker, checkpoints it, and syncs config and manifest on replacement",
+    "cause": "5000ms test timeout, reran green on rerun (CI runner contention flake, not a code regression)",
+    "relationToBatch": "none — no file overlap with #3392/#3401/#3404; other owners advanced dev past this commit before it needed to block this lane",
+    "action": "held merges only while this was current dev head; resumed independent merging once updated doctrine confirmed red/pending dev does not block non-overlapping exact-head-green PRs"
+  },
+  "devHeadSequence": [
+    { "afterMerge": 3392, "devHead": "cb43a2ad4f4d9bfd3261f4ed71eaee5c5d6b64cf" },
+    { "afterMerge": 3401, "devHead": "382e4a7d5b350c0af5fc05395e4c0a20f2df925f" },
+    { "afterMerge": 3404, "devHead": "5d735aaee0f4aa35b3953082d1bf98b62128b363" }
+  ],
+  "devHeadAtReceiptTime": "75def0287e6ca741b753e57e7a369c640c9e508f",
+  "devHeadAtReceiptTimeNote": "advanced past all three batch merges by other owners (e.g. #3352); CI on this later head still in flight at receipt time, unrelated to this batch's merges",
+  "issuesTouched": [
+    { "issue": 3402, "action": "none — unrelated open issue (fast-mode indicator UI), out of scope for this batch" }
+  ],
+  "outstanding": [],
+  "blockers": []
+}

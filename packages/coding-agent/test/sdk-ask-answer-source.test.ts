@@ -91,4 +91,105 @@ describe("createAgentSession wires getAskAnswerSource into built-in AskTool", ()
 			await session.dispose?.();
 		}
 	}, 20_000);
+
+	it("answers a headless SDK ask through the registered remote source", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-headless-ask-source-"));
+		tempDirs.push(tempDir);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(tempDir),
+			settings: Settings.isolated(),
+			hasUI: false,
+		});
+		session.setWorkflowGateEmitter(undefined);
+		const disposeSource = registerAskAnswerSource(session.sessionId, {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: async () => ({
+				source: "remote" as const,
+				interaction: { kind: "value" as const, value: "yes" },
+				settle: async settlement =>
+					settlement.kind === "commit"
+						? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 1 } }
+						: { kind: "resolved_without_commit" as const },
+			}),
+		});
+
+		try {
+			const askTool = session.getToolByName("ask");
+			expect(askTool).toBeDefined();
+
+			let aborted = false;
+			const context = {
+				hasUI: false,
+				abort: () => {
+					aborted = true;
+				},
+			} as unknown as AgentToolContext;
+
+			const result = await askTool!.execute(
+				"call-headless-ask",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(aborted).toBe(false);
+			expect(result.content[0]?.type).toBe("text");
+			if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("yes");
+
+			disposeSource();
+			const disposeDecline = registerAskAnswerSource(session.sessionId, {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: async () => undefined,
+			});
+			await expect(
+				askTool!.execute(
+					"call-headless-decline",
+					{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }] }] },
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow("cancelled by the remote client");
+			disposeDecline();
+
+			const order: string[] = [];
+			let disposeReplacement: (() => void) | undefined;
+			const disposeInitial = registerAskAnswerSource(session.sessionId, {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: async () => {
+					order.push("first");
+					disposeReplacement = registerAskAnswerSource(session.sessionId, {
+						awaitAnswer: async () => undefined,
+						awaitAnswerRequest: async () => {
+							order.push("second");
+							return "no";
+						},
+					});
+					return "yes";
+				},
+			});
+			await askTool!.execute(
+				"call-headless-source-refresh",
+				{
+					questions: [
+						{ id: "first", question: "First?", options: [{ label: "yes" }] },
+						{ id: "second", question: "Second?", options: [{ label: "no" }] },
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+			expect(order).toEqual(["first", "second"]);
+			disposeReplacement?.();
+			disposeInitial();
+		} finally {
+			disposeSource();
+			await session.dispose?.();
+		}
+	}, 20_000);
 });

@@ -13,7 +13,7 @@ const originalAgentDir = getAgentDir();
 let tempDir: TempDir | null = null;
 
 beforeEach(() => {
-	tempDir = TempDir.createSync("@pi-stats-priority-");
+	tempDir = TempDir.createSync(path.join(os.homedir(), "pi-stats-priority-"));
 	const configDir = path.relative(os.homedir(), tempDir.join("config"));
 	process.env.PI_CONFIG_DIR = configDir;
 	setAgentDir(path.join(os.homedir(), configDir, "agent"));

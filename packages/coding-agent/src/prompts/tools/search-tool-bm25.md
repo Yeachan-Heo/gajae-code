@@ -12,6 +12,11 @@ Behavior:
 - Repeated searches add to the active tool set; they do not remove earlier selections
 - Newly activated tools become available before the next model call in the same overall turn
 
+Follow-through:
+- Activation only changes the active tool set; it does not execute a discovered tool or complete its work.
+- If the task still needs a newly activated capability, call that tool in the next model turn. Do not claim that a browser action, web search, integration, or subagent ran until its tool result is present.
+- If discovery was the only requested action, report availability as availability, not as completed work.
+
 Not for repository/file/code search. Tool discovery only.
 
 Returns JSON with:

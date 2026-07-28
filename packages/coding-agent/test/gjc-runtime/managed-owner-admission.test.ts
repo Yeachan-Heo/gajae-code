@@ -15,7 +15,20 @@ const admissionModule = path.join(
 	"gjc-runtime",
 	"managed-owner-admission.ts",
 );
+const managedOwnerEnvironmentKeys = [
+	"GJC_TMUX_OWNER_STATE_DIR",
+	"GJC_COORDINATOR_SESSION_ID",
+	"GJC_TMUX_OWNER_GENERATION",
+	"GJC_MANAGED_OWNER_RUN_ID",
+	"GJC_MANAGED_OWNER_INCARNATION",
+	"GJC_MANAGED_OWNER_CHILD_TOKEN",
+] as const;
 
+function managedOwnerEnvironment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	for (const name of managedOwnerEnvironmentKeys) delete env[name];
+	return { ...env, ...overrides };
+}
 async function admit(stateDir: string, token?: string): Promise<{ admitted: boolean; exitCode: number; root: string }> {
 	const script = `import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); console.log(JSON.stringify({ admitted: admission.kind !== "blocked", exitCode: process.exitCode ?? 0 }));`;
 	const child = Bun.spawn({
@@ -121,6 +134,33 @@ async function writeRecoveryEvidence(cwd: string): Promise<string> {
 }
 
 describe("managed owner admission", () => {
+	it("treats a coordinator session ID alone as fresh while rejecting partial owner metadata", async () => {
+		const script = `import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); console.log(JSON.stringify({ kind: admission.kind }));`;
+		const fresh = Bun.spawn({
+			cmd: [process.execPath, "-e", script],
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: managedOwnerEnvironment({ GJC_COORDINATOR_SESSION_ID: "ordinary-coordinator-session" }),
+		});
+		const [freshStdout, freshExitCode] = await Promise.all([new Response(fresh.stdout).text(), fresh.exited]);
+		expect(freshExitCode).toBe(0);
+		expect(JSON.parse(freshStdout)).toEqual({ kind: "fresh" });
+
+		const partial = Bun.spawn({
+			cmd: [process.execPath, "-e", script],
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: managedOwnerEnvironment({
+				GJC_COORDINATOR_SESSION_ID: "ordinary-coordinator-session",
+				GJC_TMUX_OWNER_GENERATION: "partial-generation",
+			}),
+		});
+		const [partialStderr, partialExitCode] = await Promise.all([new Response(partial.stderr).text(), partial.exited]);
+		expect(partialExitCode).not.toBe(0);
+		expect(partialStderr).toContain("managed_owner_admission_metadata_invalid");
+	});
 	it("admits only the exact token binding for the current session and generation", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-"));
 		try {

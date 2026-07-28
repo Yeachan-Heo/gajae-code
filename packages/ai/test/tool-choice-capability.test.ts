@@ -169,6 +169,15 @@ describe("isForcedToolChoiceUnsupportedError", () => {
 		).toBe(true);
 	});
 
+	it("matches named tool choices rejected by the provider tool list", () => {
+		expect(
+			isForcedToolChoiceUnsupportedError(
+				statusError(400, "Tool choice 'todo_write' not found in 'tools' parameter."),
+				true,
+			),
+		).toBe(true);
+	});
+
 	it("rejects non-400 errors", () => {
 		expect(
 			isForcedToolChoiceUnsupportedError(

@@ -1,0 +1,11 @@
+{
+  "text": ".\n  - alpha.txt\n  - nested/\n    - beta.txt",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/local-tree"
+    }
+  }
+}

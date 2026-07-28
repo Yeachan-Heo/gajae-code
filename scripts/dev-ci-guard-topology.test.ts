@@ -173,4 +173,32 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(checkoutStep(guard.steps).with?.["fetch-depth"]).toBe(0);
 		expect(authorityFetch).not.toContain("--depth");
 	});
+	// Regression for the shared Windows CI blocker seen on PRs #3423/#3422/#3325 and
+	// the #3424/#3425/#3426/#3428 burst: `bun test <path>` only treats the argument as
+	// a path when it resolves; otherwise Bun silently degrades it to a *name filter*,
+	// matches zero files, and exits 1 with
+	//   note: To treat the "<path>" filter as a path, run "bun test ./<path>"
+	// On Windows runners the bare relative form failed to resolve, so
+	// `resident-cache-win32-gate.windows.test.ts` (added by #3344, 1439fd109) turned
+	// every affected PR red for a reason unrelated to its own diff. The `./` prefix
+	// forces unambiguous path interpretation on every platform.
+	//
+	// This pins the invariant for all workflow test invocations, not just the one that
+	// broke, so the next added Windows step cannot reintroduce the same class of
+	// failure. A bare-path invocation is also silently *wrong* rather than loud: a
+	// filter that matches nothing can pass locally on Linux and fail only on Windows.
+	test("every workflow bun test invocation addresses files by explicit relative path", async () => {
+		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
+		const offenders: string[] = [];
+		for (const rawLine of source.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (!line.startsWith("bun test ")) continue;
+			const [firstArg] = line.slice("bun test ".length).trim().split(/\s+/);
+			if (!firstArg || firstArg.startsWith("-")) continue; // whole-suite or flag-only run
+			if (firstArg.startsWith("./") || firstArg.startsWith("$")) continue;
+			offenders.push(line);
+		}
+		expect(offenders).toEqual([]);
+	});
+
 });

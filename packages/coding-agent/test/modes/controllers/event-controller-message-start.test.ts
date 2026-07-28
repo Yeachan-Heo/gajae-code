@@ -27,6 +27,7 @@ function createContext(options: {
 	optimisticSignature?: string;
 	locallySubmittedSignatures?: string[];
 	injectedSignatures?: Array<[string, number]>;
+	transcriptViewerOpen?: boolean;
 }) {
 	let currentEditorText = options.editorText;
 	const setText = vi.fn((text: string) => {
@@ -38,6 +39,7 @@ function createContext(options: {
 	};
 	const addMessageToChat = vi.fn();
 	const updatePendingMessagesDisplay = vi.fn();
+	const refreshTranscriptViewer = vi.fn();
 	const ctx = {
 		isInitialized: true,
 		statusLine: { invalidate: vi.fn() },
@@ -56,9 +58,50 @@ function createContext(options: {
 		optimisticUserMessageSignature: options.optimisticSignature,
 		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
 		optimisticInjectedSignatures: new Map<string, number>(options.injectedSignatures ?? []),
+		...(options.transcriptViewerOpen !== undefined
+			? {
+					isTranscriptViewerOpen: () => options.transcriptViewerOpen === true,
+					refreshTranscriptViewer,
+				}
+			: {}),
 	} as unknown as InteractiveModeContext;
-	return { ctx, editor, setText, addMessageToChat, updatePendingMessagesDisplay };
+	return { ctx, editor, setText, addMessageToChat, updatePendingMessagesDisplay, refreshTranscriptViewer };
 }
+
+describe("EventController transcript viewer refresh ownership", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("refreshes the transcript viewer exactly once when it is open after handling message_start", async () => {
+		// After render() stopped refreshing unconditionally, EventController owns the
+		// explicit refresh trigger: a successful event refreshes the viewer exactly
+		// once, and only while it is open.
+		const message = createUserMessage("hello while viewer is open");
+		const { ctx, refreshTranscriptViewer } = createContext({
+			editorText: "draft",
+			transcriptViewerOpen: true,
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message });
+
+		expect(refreshTranscriptViewer).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not refresh the transcript viewer when it is closed during message_start", async () => {
+		const message = createUserMessage("hello while viewer is closed");
+		const { ctx, refreshTranscriptViewer } = createContext({
+			editorText: "draft",
+			transcriptViewerOpen: false,
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message });
+
+		expect(refreshTranscriptViewer).not.toHaveBeenCalled();
+	});
+});
 
 describe("EventController message_start (user role)", () => {
 	afterEach(() => {

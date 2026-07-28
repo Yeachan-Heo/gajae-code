@@ -9,8 +9,8 @@ import {
 	type GjcPluginRegistryEntry,
 	parseManifest,
 	readRegistry,
-	updateRegistry,
 } from "../src/extensibility/gjc-plugins";
+import { updateRegistry } from "../src/extensibility/gjc-plugins/registry";
 
 const tempDirs: string[] = [];
 

@@ -25,7 +25,9 @@
  * Reference: https://docs.searxng.org/dev/search_api.html
  */
 
+import * as path from "node:path";
 import type { AuthStorage } from "@gajae-code/ai";
+import { $credentialEnv, parseEnvFile } from "@gajae-code/utils";
 
 import { settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
@@ -74,6 +76,47 @@ interface SearXNGAuth {
 }
 
 /** Find SearXNG endpoint from settings or environment. */
+/**
+ * SearXNG environment value, from trusted sources only, preserving an
+ * intentionally empty setting.
+ *
+ * These four names decide where search requests go and what credential they
+ * carry, and `$env` merges the caller's `cwd/.env` into `process.env`, so a
+ * repository could otherwise redirect the search and hand over the basic-auth
+ * material.
+ *
+ * `$credentialEnv` is the resolver for that boundary, but it collapses an empty
+ * value to `undefined` — and SearXNG basic auth treats "set but empty" as
+ * meaningful (`alice:` and `:s3cret` are both valid). So an empty value is
+ * recovered explicitly, and only when the project `.env` is not what set it.
+ */
+function trustedSearxngEnv(name: string): string | null {
+	const trusted = $credentialEnv(name);
+	if (trusted !== undefined) return trusted;
+
+	const raw = process.env[name];
+	if (raw === undefined || raw.trim().length > 0) return null;
+	// Empty-but-set. Honour it unless the project `.env` is the source.
+	const projectValue = parseEnvFile(path.join(process.cwd(), ".env"))[name];
+	if (projectValue !== undefined && projectValue.trim().length === 0) return null;
+	return "";
+}
+
+/** Test seam: the SearXNG endpoint and auth material as resolved from trusted env. */
+export function resolveSearxngConfigForTest(): {
+	endpoint: string | null;
+	token: string | null;
+	basicUsername: string | null;
+	basicPassword: string | null;
+} {
+	return {
+		endpoint: findEndpoint(),
+		token: findToken(),
+		basicUsername: findBasicUsername(),
+		basicPassword: findBasicPassword(),
+	};
+}
+
 function findEndpoint(): string | null {
 	try {
 		const endpoint = settings.get("searxng.endpoint");
@@ -81,7 +124,7 @@ function findEndpoint(): string | null {
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_ENDPOINT ?? null;
+	return trustedSearxngEnv("SEARXNG_ENDPOINT");
 }
 
 /** Find SearXNG bearer token from settings or environment. */
@@ -92,7 +135,7 @@ function findToken(): string | null {
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_TOKEN ?? null;
+	return trustedSearxngEnv("SEARXNG_TOKEN");
 }
 
 /** Find SearXNG Basic auth username from settings or environment. */
@@ -103,7 +146,7 @@ function findBasicUsername(): string | null {
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_BASIC_USERNAME ?? null;
+	return trustedSearxngEnv("SEARXNG_BASIC_USERNAME");
 }
 
 /** Find SearXNG Basic auth password from settings or environment. */
@@ -114,7 +157,7 @@ function findBasicPassword(): string | null {
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_BASIC_PASSWORD ?? null;
+	return trustedSearxngEnv("SEARXNG_BASIC_PASSWORD");
 }
 
 /** Build the RFC 7617 Basic auth credential using UTF-8 bytes. */

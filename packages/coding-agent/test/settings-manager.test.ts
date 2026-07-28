@@ -91,7 +91,15 @@ describe("Settings", () => {
 			warning.mockRestore();
 		}
 	});
+	it("distinguishes an absent first-event retry timeout from an explicit zero", () => {
+		const absent = Settings.isolated();
+		expect(absent.get("retry.streamFirstEventTimeoutMs")).toBe(100_000);
+		expect(absent.has("retry.streamFirstEventTimeoutMs")).toBe(false);
 
+		const explicitZero = Settings.isolated({ "retry.streamFirstEventTimeoutMs": 0 });
+		expect(explicitZero.get("retry.streamFirstEventTimeoutMs")).toBe(0);
+		expect(explicitZero.has("retry.streamFirstEventTimeoutMs")).toBe(true);
+	});
 	const writeCustomTheme = async (name: string, userMessageBg: string) => {
 		const themesDir = getCustomThemesDir(agentDir);
 		fs.mkdirSync(themesDir, { recursive: true });

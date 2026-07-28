@@ -62,6 +62,7 @@ import { transportFailureFacts } from "../utils/fallback-transport";
 import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import {
+	FirstEventTimeoutError,
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
@@ -1472,7 +1473,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
-				const firstEventTimeoutAbortError = new Error(
+				const firstEventTimeoutAbortError = new FirstEventTimeoutError(
 					"Anthropic stream timed out while waiting for the first event",
 				);
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
@@ -1781,8 +1782,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					break;
 				} catch (streamError) {
-					const streamFailure = activeAbortTracker.getLocalAbortReason() ?? streamError;
-					if (sawProviderSafetyStop) {
+					const localAbortReason = activeAbortTracker.getLocalAbortReason();
+					const streamFailure = localAbortReason ?? streamError;
+					if (localAbortReason || sawProviderSafetyStop) {
 						throw streamFailure;
 					}
 					if (
@@ -1909,13 +1911,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				delete (block as { index?: number }).index;
 				delete (block as { partialJson?: string }).partialJson;
 			}
-			const firstEventTimeoutError = activeAbortTracker.getLocalAbortReason();
+			const localAbortReason = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.transportFailure = transportFailureFacts(error);
+			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? error);
+			output.transportFailure = transportFailureFacts(localAbortReason ?? error);
 			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
-				output.errorMessage =
-					firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+				output.errorMessage = localAbortReason?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			}
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			output.duration = Date.now() - startTime;

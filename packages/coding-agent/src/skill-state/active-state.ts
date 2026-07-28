@@ -71,8 +71,6 @@ export interface SkillActiveEntry {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	source_state_revision?: number;
-	/** Durable ordering token from the source workflow mode-state, not this cache file's revision. */
-	committed_mode_state_revision?: number;
 }
 
 export interface SkillActiveState {
@@ -116,8 +114,6 @@ export interface SyncSkillActiveStateOptions {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	sourceRevision?: number;
-	/** Durable ordering token from the source workflow mode-state, not this cache file's revision. */
-	committedModeRevision?: number;
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -789,9 +785,6 @@ async function persistActiveEntry(
 		await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
 			cwd,
 			audit: activeStateWriterAudit("write-active-entry", sessionScope),
-			...(typeof entry.committed_mode_state_revision === "number"
-				? { orderingRevision: entry.committed_mode_state_revision }
-				: {}),
 		});
 	}
 }
@@ -870,9 +863,6 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 				? { active_subskills: preservedActiveSubskills }
 				: {}),
 		...(typeof options.sourceRevision === "number" ? { source_state_revision: options.sourceRevision } : {}),
-		...(typeof options.committedModeRevision === "number"
-			? { committed_mode_state_revision: options.committedModeRevision }
-			: {}),
 	};
 	const sessionScope = { sessionId: options.sessionId };
 	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);

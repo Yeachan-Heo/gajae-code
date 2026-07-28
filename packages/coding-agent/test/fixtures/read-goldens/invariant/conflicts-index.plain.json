@@ -1,0 +1,11 @@
+{
+  "text": "⚠ 2 unresolved conflicts in conflicts.txt\n- ours = ours\n- theirs = theirs\nNOTICE: Bulk-resolve with `write({ path: \"conflict://*\", content })`, or address a single block with `write({ path: \"conflict://<N>\", content })`. Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` for a single side).\n`content` shorthand: `@ours` / `@theirs` / `@base` / `@both` lines expand to the recorded sections; `@both` = ours-then-theirs. Non-token lines pass through verbatim.\n\n#1  L2-6\n#2  L8-12",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/conflicts.txt"
+    }
+  }
+}

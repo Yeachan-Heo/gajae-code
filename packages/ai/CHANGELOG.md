@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+- Provider streams now surface first-event watchdog expiry as a typed timeout so callers can apply bounded retry policy without parsing error prose.
+- Codex named-tool requests now recognize provider `Tool choice '<name>' not found in 'tools' parameter` errors as runtime capability failures and retry once without forcing the choice.
+
+## [0.12.0] - 2026-07-28
 
 ### Added
 
@@ -19,12 +23,16 @@
 ### Fixed
 
 - The Kimi usage endpoint base (`KIMI_CODE_BASE_URL`) is now resolved from trusted environment sources only. That base becomes the URL the usage request sends `Authorization: Bearer <accessToken>` to, so reading it through the merged view that includes the caller's `cwd/.env` let a repository collect the user's Kimi access token. An explicit caller-supplied base URL still takes precedence, and shell / user-level configuration is unchanged.
+- The Gemini CLI compatibility version used in the outbound `User-Agent` is refreshed from `0.50.0` to `0.52.0`, matching the current upstream release. The repository ships `check-spoofed-versions` for exactly this, but that check is not wired into CI, so the value had drifted two minor releases behind.
+- The OpenAI and Azure endpoint decisions are now resolved from trusted environment sources only: `OPENAI_BASE_URL` (streaming responses, completions, and the model manager) and `AZURE_OPENAI_BASE_URL`. `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` that redirected authenticated requests; the two provider paths already reached for `$inheritedEnv` but re-admitted the project `.env` through a fallback. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); shell and user-level configuration is unchanged.
+- The OpenAI and Azure endpoint decisions are now resolved from trusted environment sources only: `OPENAI_BASE_URL` (streaming responses, completions, and the model manager), `AZURE_OPENAI_BASE_URL`, and `AZURE_OPENAI_RESOURCE_NAME` (the alternate constructor for the same Azure host). `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` that redirected authenticated requests; the two provider paths already reached for `$inheritedEnv` but re-admitted the project `.env` through a fallback. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); shell and user-level configuration is unchanged.
+- Google credential material is now resolved from trusted environment sources only: the `GOOGLE_APPLICATION_CREDENTIALS` service-account / authorized-user file path used by the ADC loader, and `GOOGLE_CLOUD_API_KEY` used as the Vertex API key. Both were read through the merged view that includes the caller's `cwd/.env`, so a repository could ship a key file and point the agent at it, making it authenticate to Google as an identity the repository chose. `stream.ts` already resolved the same ADC variable through the non-project resolver; the two now agree. An explicit caller-supplied API key still takes precedence.
+- The Grok usage token fallback (`GROK_CLI_OAUTH_TOKEN`) is now resolved from trusted environment sources only. It authenticates the billing/usage call, and reading it through the merged view that includes the caller's `cwd/.env` let a repository decide which account that call ran against. Stored credentials keep precedence, and shell / user-level configuration is unchanged.
+- The Vertex AI location (`GOOGLE_CLOUD_LOCATION`) can no longer redirect authenticated requests off Google. It is interpolated into the request host (`${location}-aiplatform.googleapis.com`), so a value containing `/` terminated the authority component and sent the Google access token to an arbitrary origin — and it was read through the merged view that includes the caller's `cwd/.env`. It now resolves from trusted sources only and must be a region label; `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` moved to the same trusted resolver.
 - Anthropic `ping` keepalives no longer reset stream progress, so responses that stop producing content now reach the idle timeout instead of hanging indefinitely.
 - The Anthropic endpoint decision is now resolved from trusted environment sources only: `ANTHROPIC_BASE_URL`, `FOUNDRY_BASE_URL`, `ZCODE_PLAN_ANTHROPIC_BASE_URL`, and the `CLAUDE_CODE_USE_FOUNDRY` mode switch. `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` that redirected authenticated Anthropic requests — the resolved base URL becomes `${baseUrl}/v1/messages` while the headers carry the API key or OAuth token. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); shell and user-level configuration is unchanged.
 - The documented `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` environment variable now takes effect: the stream-watchdog idle-timeout helpers resolve it GJC-first before the legacy `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` / `PI_STREAM_IDLE_TIMEOUT_MS` aliases (previously only the `PI_`-prefixed names were read, so setting the documented GJC name was a silent no-op).
 - The documented OpenAI-code provider knobs now take effect: `GJC_OPENAI_CODE_DEBUG`, `GJC_OPENAI_CODE_WEBSOCKET`, `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS`, `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`, and `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS` are resolved GJC-first ahead of the legacy `PI_CODEX_*` names. The Codex → OpenAI-code rename had updated the documentation but not the reads, so every documented name was a silent no-op.
-
-## [0.11.10] - 2026-07-25
 
 ## [0.11.9] - 2026-07-24
 ### Fixed

@@ -195,6 +195,16 @@ describe("deliverDraft best-effort delivery", () => {
 		await deliverDraft(bot, { chat_id: "chat-xyz" }, 1, "hi");
 		expect(calls[0]!.body).toEqual({ chat_id: "chat-xyz", draft_id: 1, rich_message: { markdown: "hi" } });
 	});
+	test("body preserves an explicit silent-delivery base", async () => {
+		const { bot, calls } = makeBot(() => ({ ok: true }));
+		await deliverDraft(bot, { chat_id: "chat-xyz", disable_notification: true }, 1, "hi");
+		expect(calls[0]!.body).toEqual({
+			chat_id: "chat-xyz",
+			disable_notification: true,
+			draft_id: 1,
+			rich_message: { markdown: "hi" },
+		});
+	});
 
 	test("null response counts as success: no warn", async () => {
 		const { bot } = makeBot(() => null);
@@ -337,7 +347,12 @@ function draftSession(id = "S"): any {
 
 function makeDraftDaemon(
 	bot: DraftFakeBotApi,
-	opts: { richDraft?: { enabled: boolean }; rich?: { enabled: boolean }; now?: () => number },
+	opts: {
+		richDraft?: { enabled: boolean };
+		rich?: { enabled: boolean };
+		now?: () => number;
+		sound?: "all" | "important" | "none";
+	},
 ): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: draftSettings(tempAgentDir()),
@@ -348,6 +363,7 @@ function makeDraftDaemon(
 		...(opts.rich ? { rich: opts.rich } : {}),
 		...(opts.richDraft ? { richDraft: opts.richDraft } : {}),
 		...(opts.now ? { now: opts.now } : {}),
+		...(opts.sound ? { sound: opts.sound } : {}),
 	});
 }
 
@@ -426,6 +442,21 @@ describe("daemon draft streaming (opt-in, off by default)", () => {
 			rich_message: { markdown: "streaming **preview**" },
 		});
 		expect(findMethod(bot, "sendMessage")!.body.text).toBe(markdownToTelegramHtml("streaming **preview**"));
+	});
+	test.each(["none", "important"] as const)("sound %s silences live HTML and rich drafts", async sound => {
+		const bot = new DraftFakeBotApi();
+		const daemon = makeDraftDaemon(bot, {
+			rich: { enabled: true },
+			richDraft: { enabled: true },
+			sound,
+		});
+		const session = draftSession();
+		await establishTopic(daemon, bot, session);
+
+		await live(daemon, session, "streaming **preview**");
+
+		expect(findMethod(bot, "sendRichMessageDraft")!.body.disable_notification).toBe(true);
+		expect(findMethod(bot, "sendMessage")!.body.disable_notification).toBe(true);
 	});
 
 	test("debounce: rapid live frames are throttled to >=1.5s spacing (fake clock)", async () => {

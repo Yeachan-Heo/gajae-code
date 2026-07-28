@@ -51,8 +51,8 @@ This means the bridge allows exactly one inherited bridge-marked dispatcher leve
 
 The canonical install location is the agent extensions directory discovered by the native GJC provider:
 
-- user-level: `${GJC_CODING_AGENT_DIR:-$HOME/.gjc/agent}/extensions`
-- project-level: `<cwd>/${GJC_CONFIG_DIR:-.gjc}/extensions`
+- user-level: `$HOME/${GJC_CONFIG_DIR:-.gjc}/agent/extensions`
+- project-level: `<cwd>/.gjc/extensions`
 
 For native discovery, install one of:
 
@@ -62,6 +62,8 @@ For native discovery, install one of:
 
 The loader scans one level under each `extensions` directory. Complex packages should use a package manifest instead of relying on recursive discovery.
 
-`GJC_CONFIG_DIR` selects the project config directory name. `GJC_CODING_AGENT_DIR` selects the user agent directory name under `$HOME`. The native provider resolves those locations before loading extension modules, skills, rules, hooks, and related capabilities.
+`GJC_CONFIG_DIR` selects the **home-relative** config directory name: the config root is `<home>/<GJC_CONFIG_DIR>`, defaulting to `~/.gjc`. It does not select a project directory — the project-level path is the constant `.gjc` (`discovery/helpers.ts`, `getProjectAgentDir()`), so `GJC_CONFIG_DIR` never moves it. `GJC_CODING_AGENT_DIR` overrides the agent directory **path** rather than naming one under `$HOME`; it is resolved with `path.resolve`, so an absolute value is used as-is and a relative value is resolved against the current working directory.
+
+Discovery is the exception to that second override. The native provider builds its user-level root from `GJC_CONFIG_DIR` alone (`<home>/<config-dir>/agent`) and never consults `getAgentDir()`, so an operator who sets `GJC_CODING_AGENT_DIR` moves the agent directory for the rest of the product but **not** for extension, skill, rule, or hook discovery.
 
 Hooks are not the input bridge surface: `packages/coding-agent/src/capability/hook.ts` defines pre/post tool hooks only.

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { loadCapability } from "../src/capability";
 import { clearCache as clearFsCache } from "../src/capability/fs";
 import { hookCapability } from "../src/capability/hook";
@@ -27,6 +28,8 @@ const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 let tempHome: string;
 let tempCwd: string;
 let originalHome: string | undefined;
+const originalAgentDir = getAgentDir();
+let agentDir: string;
 
 async function installMixedRootRegistry(): Promise<void> {
 	const pluginPath = path.join(tempHome, "plugin-install", "malicious-mixed-root");
@@ -67,6 +70,8 @@ beforeEach(async () => {
 	originalHome = process.env.HOME;
 	tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-home-"));
 	tempCwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-nosurface-"));
+	agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-nosurface-agent-"));
+	setAgentDir(agentDir);
 	process.env.HOME = tempHome;
 	vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 });
@@ -75,6 +80,7 @@ afterEach(async () => {
 	clearClaudePluginRootsCache();
 	clearFsCache();
 	vi.restoreAllMocks();
+	setAgentDir(originalAgentDir);
 	if (originalHome === undefined) {
 		delete process.env.HOME;
 	} else {
@@ -82,6 +88,7 @@ afterEach(async () => {
 	}
 	await fs.rm(tempHome, { recursive: true, force: true });
 	await fs.rm(tempCwd, { recursive: true, force: true });
+	await fs.rm(agentDir, { recursive: true, force: true });
 });
 
 describe("GJC plugin roots never surface through legacy claude plugin providers", () => {

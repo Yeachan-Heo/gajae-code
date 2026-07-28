@@ -23,9 +23,18 @@ interface RalplanHudState extends WorkflowGateHudState {
 	iteration?: number;
 	iterationFromIndex?: number;
 	stages?: string;
+	architectPasses?: number;
+	criticPasses?: number;
+	reviewPassBudget?: number;
 	verdict?: string;
 	latestSummary?: string;
 	pendingApproval?: boolean;
+	autoHandoff?: {
+		configuredTarget: string;
+		effectiveTarget: string;
+		degradationReason: string | null;
+	};
+	planningStuck?: boolean;
 	updatedAt?: string;
 }
 
@@ -194,13 +203,41 @@ export function deriveDeepInterviewHud(
 export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSummary {
 	const verdict = state.verdict?.toUpperCase();
 	const verdictSeverity =
-		verdict === "BLOCK"
+		verdict === "BLOCK" || verdict === "REJECT"
 			? "blocked"
 			: verdict === "ITERATE" || verdict === "WATCH"
 				? "warning"
-				: verdict === "APPROVE" || verdict === "CLEAR"
+				: verdict === "APPROVE" || verdict === "CLEAR" || verdict === "OKAY"
 					? "success"
 					: undefined;
+	const reviewPassChip = (
+		label: "arch" | "crit",
+		passes: number | undefined,
+		priority: number,
+	): WorkflowHudChip | null => {
+		if (
+			state.pendingApproval ||
+			typeof passes !== "number" ||
+			!Number.isFinite(passes) ||
+			passes <= 0 ||
+			typeof state.reviewPassBudget !== "number" ||
+			!Number.isFinite(state.reviewPassBudget) ||
+			state.reviewPassBudget <= 0
+		) {
+			return null;
+		}
+		return chip(label, `${passes}/${state.reviewPassBudget}`, priority);
+	};
+	const handoffValue = state.autoHandoff
+		? `${state.autoHandoff.configuredTarget}→${state.autoHandoff.effectiveTarget}${
+				state.autoHandoff.degradationReason ? `:${state.autoHandoff.degradationReason}` : ""
+			}`
+		: undefined;
+	const handoffSeverity = state.planningStuck
+		? "blocked"
+		: state.autoHandoff?.degradationReason
+			? "warning"
+			: undefined;
 	return {
 		version: 1,
 		summary: state.latestSummary,
@@ -217,7 +254,10 @@ export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSumma
 				30,
 			),
 			chip("stages", state.stages, 35),
+			reviewPassChip("arch", state.architectPasses, 36),
+			reviewPassChip("crit", state.criticPasses, 38),
 			chip("verdict", verdict, 40, verdictSeverity),
+			chip("handoff", handoffValue, 45, handoffSeverity),
 		]),
 		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
 	};

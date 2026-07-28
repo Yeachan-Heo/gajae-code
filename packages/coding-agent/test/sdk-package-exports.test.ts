@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type {
 	ModelProfileCatalogItem,
 	ModelProfileErrorDetails,
@@ -77,6 +79,32 @@ describe("SDK package exports", () => {
 		expect(exitCode).not.toBe(0);
 		expect(output).toMatch(/error/i);
 		expect(output).toContain(subpath);
+	});
+
+	it("resolves every declared export target to a file that exists", () => {
+		// A removed module can leave its exports entry behind: the package then
+		// advertises a subpath that fails to resolve for consumers, and nothing in
+		// the tree references it, so no import breaks to signal the drift.
+		const packageDir = path.dirname(import.meta.dir); // packages/coding-agent
+		const missing: string[] = [];
+
+		const walk = (value: unknown, label: string): void => {
+			if (value === null) return;
+			if (typeof value === "string") {
+				if (!value.startsWith("./") || value.includes("*")) return;
+				if (!fs.existsSync(path.join(packageDir, value))) missing.push(`${label} -> ${value}`);
+				return;
+			}
+			if (typeof value === "object")
+				for (const [key, nested] of Object.entries(value as Record<string, unknown>))
+					walk(nested, `${label}/${key}`);
+		};
+
+		const manifest = packageJson as unknown as Record<string, unknown>;
+		for (const field of ["exports", "main", "module", "types", "bin"])
+			if (manifest[field] !== undefined) walk(manifest[field], field);
+
+		expect(missing).toEqual([]);
 	});
 
 	it("keeps internal SDK modules off the public package surface", () => {

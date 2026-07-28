@@ -229,6 +229,10 @@ export function extractSlashCommandTokenPrefix(text: string): string | null {
 	const charBeforeSlash = text[slashIndex - 1];
 	if (charBeforeSlash && NON_COMMAND_SLASH_PREFIX_PRECEDERS.has(charBeforeSlash)) return null;
 
+	let tokenStart = slashIndex;
+	while (tokenStart > 0 && !/\s/.test(text[tokenStart - 1] ?? "")) tokenStart -= 1;
+	if (text.slice(tokenStart, slashIndex).includes("/")) return null;
+
 	return token;
 }
 export interface AutocompleteItem {

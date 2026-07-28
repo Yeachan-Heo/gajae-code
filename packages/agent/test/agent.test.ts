@@ -6,6 +6,20 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAssistantMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("preserves first-event timeout options and runtime mutations", () => {
+		const absent = new Agent();
+		expect(absent.streamFirstEventTimeoutMs).toBeUndefined();
+
+		const explicitZero = new Agent({ streamFirstEventTimeoutMs: 0 });
+		expect(explicitZero.streamFirstEventTimeoutMs).toBe(0);
+
+		const positive = new Agent({ streamFirstEventTimeoutMs: 12_345 });
+		expect(positive.streamFirstEventTimeoutMs).toBe(12_345);
+		positive.streamFirstEventTimeoutMs = 0;
+		expect(positive.streamFirstEventTimeoutMs).toBe(0);
+		positive.streamFirstEventTimeoutMs = undefined;
+		expect(positive.streamFirstEventTimeoutMs).toBeUndefined();
+	});
 	it("should support steering message queueing", async () => {
 		const agent = new Agent();
 

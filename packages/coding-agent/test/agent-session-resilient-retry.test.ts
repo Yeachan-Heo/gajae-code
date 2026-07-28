@@ -9,6 +9,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -1037,6 +1038,111 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+	it("forwards only explicit first-event timeout settings to provider stream options", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+
+		for (const testCase of [
+			{ name: "absent", setting: undefined, expected: undefined },
+			{ name: "zero", setting: 0, expected: 0 },
+			{ name: "positive", setting: 12_345, expected: 12_345 },
+		]) {
+			const capturedTimeouts: Array<number | undefined> = [];
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				...(testCase.setting === undefined ? {} : { "retry.streamFirstEventTimeoutMs": testCase.setting }),
+			});
+			const { session: configuredSession } = await createAgentSession({
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				model,
+				modelRegistry,
+				settings,
+				sessionManager: SessionManager.inMemory(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: [],
+				workspaceTree: {
+					rootPath: tempDir.path(),
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				},
+			});
+			session = configuredSession;
+			const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+			configuredSession.agent.streamFn = (streamModel, context, options) => {
+				capturedTimeouts.push(options?.streamFirstEventTimeoutMs);
+				return mock.stream(streamModel, context, options);
+			};
+
+			expect(configuredSession.agent.streamFirstEventTimeoutMs, testCase.name).toBe(testCase.expected);
+			await configuredSession.prompt(`first-event timeout ${testCase.name}`);
+			await configuredSession.waitForIdle();
+			expect(capturedTimeouts, testCase.name).toEqual([testCase.expected]);
+
+			await configuredSession.dispose();
+			session = undefined;
+		}
+	}, 30_000);
+	it("replays typed first-event timeouts only up to retry.maxRetries + 1 total attempts", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "provider message is not used for timeout classification",
+			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 2 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("typed first-event timeout");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(3);
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.every(event => event.maxAttempts === 3 && event.unbounded === false)).toBe(true);
+		expect(lastAssistant(session).errorMessage).toMatch(/exhausted after 3 attempts; waited \d+ms total/);
+	});
+	it("replays a typed first-event timeout before progress and never after progress", async () => {
+		const noProgressModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "provider message is not used for timeout classification",
+			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+			recoveredContent: "recovered",
+			requestedModels: noProgressModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("typed timeout before progress");
+		await session.waitForIdle();
+
+		expect(noProgressModels).toHaveLength(2);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		await session.dispose();
+		session = undefined;
+
+		const progressModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "provider message is not used for timeout classification",
+			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+			partialContent: "already streamed",
+			requestedModels: progressModels,
+		});
+
+		await session.prompt("typed timeout after progress");
+		await session.waitForIdle();
+
+		expect(progressModels).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
 	});
 	it("retries a bare-default watchdog with an empty extension runner", async () => {
 		const requestedModels: string[] = [];

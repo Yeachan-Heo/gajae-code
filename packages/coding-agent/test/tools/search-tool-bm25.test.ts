@@ -53,9 +53,11 @@ describe("SearchToolBm25Tool", () => {
 	];
 
 	it("uses a static description independent of the discoverable catalog", () => {
-		expect(new SearchToolBm25Tool(createSession(tools)).description).toBe(
-			new SearchToolBm25Tool(createSession([])).description,
-		);
+		const description = new SearchToolBm25Tool(createSession(tools)).description;
+		expect(description).toBe(new SearchToolBm25Tool(createSession([])).description);
+		expect(description).toContain("Activation only changes the active tool set");
+		expect(description).toContain("it does not execute a discovered tool");
+		expect(description).toContain("call that tool in the next model turn");
 	});
 
 	it("searches, activates, and preserves ranked activation order", async () => {

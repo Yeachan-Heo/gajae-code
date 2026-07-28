@@ -314,20 +314,42 @@ describe("ultragoal nudge guard", () => {
 	});
 
 	// AC4: default budget is 10 and a project setting takes precedence over the user setting.
+	//
+	// The user-settings half runs in a child process. `GJC_CONFIG_DIR` is a config
+	// root *dirname under home* (PR #3327), not a full path, and `getConfigRootDir()`
+	// joins it onto `os.homedir()` — which an in-process test cannot redirect. Setting
+	// it to an absolute path here silently resolved nothing and the assertion only
+	// passed while the reader still treated the value as a full path.
 	it("AC4: nudge budget default is 10 and project overrides user", async () => {
 		const cwd = await tempDir();
 		const defaultResolved = await resolveUltragoalNudgeBudget(cwd);
 		expect(defaultResolved.budget).toBe(10);
-		const userDir = await tempDir();
-		await fs.mkdir(path.join(userDir, ".gjc"), { recursive: true });
-		await fs.writeFile(
-			path.join(userDir, ".gjc", "settings.json"),
-			JSON.stringify({ "gjc.ultragoal.nudgeBudget": 3 }),
-		);
-		process.env.GJC_CONFIG_DIR = path.join(userDir, ".gjc");
-		expect((await resolveUltragoalNudgeBudget(cwd)).budget).toBe(3);
+
+		const home = await tempDir();
+		await fs.mkdir(path.join(home, ".gjc"), { recursive: true });
+		await fs.writeFile(path.join(home, ".gjc", "settings.json"), JSON.stringify({ "gjc.ultragoal.nudgeBudget": 3 }));
+		const probe = path.join(import.meta.dir, "..", "fixtures", "config-root-settings-probe.ts");
+		const userOnly = Bun.spawn([process.execPath, probe], {
+			cwd,
+			env: { ...process.env, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const userOut = await new Response(userOnly.stdout).text();
+		expect(await userOnly.exited).toBe(0);
+		expect(JSON.parse(userOut.trim()).ultragoal.budget).toBe(3);
+
+		// A project setting still wins over that user setting.
 		await setProjectBudget(cwd, 7);
-		expect((await resolveUltragoalNudgeBudget(cwd)).budget).toBe(7);
+		const projectWins = Bun.spawn([process.execPath, probe], {
+			cwd,
+			env: { ...process.env, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const projectOut = await new Response(projectWins.stdout).text();
+		expect(await projectWins.exited).toBe(0);
+		expect(JSON.parse(projectOut.trim()).ultragoal.budget).toBe(7);
 	});
 
 	// AC4: budget 0 is an opt-out — the writer never appends and reports exhausted.

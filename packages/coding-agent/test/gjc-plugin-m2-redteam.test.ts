@@ -3,7 +3,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { gzipSync } from "node:zlib";
-import { GjcPluginLoadError, installGjcPluginBundle, readRegistry } from "../src/extensibility/gjc-plugins";
+import {
+	applyGjcBundleUpdate,
+	bundleIdentity,
+	installGjcBundle,
+	previewGjcBundleUpdate,
+	readRegistry,
+} from "../src/extensibility/gjc-plugins";
 
 const tempDirs: string[] = [];
 const fixtureRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
@@ -137,7 +143,7 @@ describe("GJC plugin installer M2 red-team", () => {
 		await fs.rm(escapeTarget, { force: true });
 		const tarball = await writeTarball([{ name: "../escape.txt", data: "owned" }]);
 
-		await expect(installGjcPluginBundle(tarball, { scope: "project", cwd })).rejects.toMatchObject({
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
 			code: "security_policy",
 		});
 		expect(await exists(escapeTarget)).toBe(false);
@@ -148,7 +154,7 @@ describe("GJC plugin installer M2 red-team", () => {
 		const cwd = await mkProjectCwd();
 		const tarball = await writeTarball([{ name: "/etc/evil", data: "owned" }], { gzip: true });
 
-		await expect(installGjcPluginBundle(tarball, { scope: "project", cwd })).rejects.toMatchObject({
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
 			code: "security_policy",
 		});
 		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
@@ -158,7 +164,7 @@ describe("GJC plugin installer M2 red-team", () => {
 		const cwd = await mkProjectCwd();
 		const tarball = await writeTarball([{ name: "bundle-link", typeflag: "2", linkname: "../../escape" }]);
 
-		await expect(installGjcPluginBundle(tarball, { scope: "project", cwd })).rejects.toMatchObject({
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
 			code: "security_policy",
 		});
 		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
@@ -171,7 +177,7 @@ describe("GJC plugin installer M2 red-team", () => {
 			{ name: "also-not-a-plugin/nested/file.txt", data: "still no manifest" },
 		]);
 
-		await expect(installGjcPluginBundle(tarball, { scope: "project", cwd })).rejects.toMatchObject({
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
 			code: "missing_file",
 		});
 		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
@@ -181,9 +187,9 @@ describe("GJC plugin installer M2 red-team", () => {
 		const cwd = await mkProjectCwd();
 		const tarball = await validBundleTarball({ prefix: "nested-plugin/", gzip: true });
 
-		const result = await installGjcPluginBundle(tarball, { scope: "project", cwd });
+		const result = await installGjcBundle({ cwd }, "project", tarball);
 
-		expect(result.status).toBe("installed");
+		expect(result).toMatchObject({ ok: true, value: { status: "installed" } });
 		const registry = await readRegistry("project", cwd);
 		expect(registry.plugins.map(plugin => plugin.name)).toEqual(["valid-six-surface-bundle"]);
 		expect(registry.plugins[0]?.source.kind).toBe("tarball");
@@ -200,26 +206,40 @@ describe("GJC plugin installer M2 red-team", () => {
 			JSON.stringify({ kind: "gajae-code-plugin", name: "forbidden-bundle", version: "1.0.0", commands: [] }),
 		);
 
-		await expect(installGjcPluginBundle(bad, { scope: "project", cwd })).rejects.toMatchObject({
+		await expect(installGjcBundle({ cwd }, "project", bad)).rejects.toMatchObject({
 			code: "forbidden_surface",
 		});
 		expect(await listEntries(path.join(cwd, ".gjc", "gjc-plugins"))).toEqual([]);
 		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
 	});
 
-	test("reinstall identical content is unchanged, changed content conflicts, and force updates", async () => {
+	test("reinstall identical content requires upgrade and preview/apply updates", async () => {
 		const cwd = await mkProjectCwd();
+		const ctx = { cwd };
 		const original = await makeBundleCopy("m2-reinstall-bundle");
-		const modified = await makeBundleCopy("m2-reinstall-bundle", async dir => {
-			await fs.appendFile(path.join(dir, "prompts", "system-appendix.md"), "\nChanged content.\n");
-		});
+		const identity = bundleIdentity("project", "m2-reinstall-bundle");
 
-		expect((await installGjcPluginBundle(original, { scope: "project", cwd })).status).toBe("installed");
-		expect((await installGjcPluginBundle(original, { scope: "project", cwd })).status).toBe("unchanged");
-		await expect(installGjcPluginBundle(modified, { scope: "project", cwd })).rejects.toMatchObject({
-			code: "install_conflict",
+		expect(await installGjcBundle(ctx, "project", original)).toMatchObject({
+			ok: true,
+			value: { status: "installed" },
 		});
-		expect((await installGjcPluginBundle(modified, { scope: "project", cwd, force: true })).status).toBe("updated");
+		expect(await installGjcBundle(ctx, "project", original)).toMatchObject({
+			ok: false,
+			error: { code: "already_installed_use_upgrade" },
+		});
+		await fs.appendFile(path.join(original, "prompts", "system-appendix.md"), "\nChanged content.\n");
+		expect(await installGjcBundle(ctx, "project", original)).toMatchObject({
+			ok: false,
+			error: { code: "already_installed_use_upgrade" },
+		});
+		const preview = await previewGjcBundleUpdate(ctx, identity);
+		expect(preview.ok).toBe(true);
+		if (!preview.ok) throw new Error(preview.error.code);
+		expect(preview.value.changed).toBe(true);
+		expect(await applyGjcBundleUpdate(ctx, preview.value.token)).toMatchObject({
+			ok: true,
+			value: { status: "updated" },
+		});
 		const installedPrompt = await fs.readFile(
 			path.join(cwd, ".gjc", "gjc-plugins", "m2-reinstall-bundle", "prompts", "system-appendix.md"),
 			"utf8",
@@ -231,17 +251,15 @@ describe("GJC plugin installer M2 red-team", () => {
 		const cwd = await mkProjectCwd();
 		const bundle = await makeBundleCopy("m2-concurrent-bundle");
 
-		const results = await Promise.allSettled([
-			installGjcPluginBundle(bundle, { scope: "project", cwd }),
-			installGjcPluginBundle(bundle, { scope: "project", cwd }),
+		const results = await Promise.all([
+			installGjcBundle({ cwd }, "project", bundle),
+			installGjcBundle({ cwd }, "project", bundle),
 		]);
-		for (const result of results) {
-			if (result.status === "rejected" && result.reason instanceof GjcPluginLoadError) {
-				expect(result.reason.code).toBe("install_conflict");
-			} else {
-				expect(result.status).toBe("fulfilled");
-			}
-		}
+		expect(results.filter(result => result.ok)).toHaveLength(1);
+		expect(results.find(result => !result.ok)).toMatchObject({
+			ok: false,
+			error: { code: "already_installed_use_upgrade" },
+		});
 
 		const registry = await readRegistry("project", cwd);
 		expect(registry.plugins.map(plugin => plugin.name)).toEqual(["m2-concurrent-bundle"]);

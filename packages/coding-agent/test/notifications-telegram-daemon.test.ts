@@ -2896,11 +2896,12 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 30 adds capability-versioned tool activity", () => {
+	test("keeps wire protocol 3 while generation 32 adds sound-policy configuration and delivery", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 29 adds structural serving safeguards; generation 30 adds
-		// capability-versioned tool activity without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(30);
+		// Generation 30 adds capability-versioned tool activity; generation 31
+		// rolls out lifecycle cleanup; generation 32 adds sound-policy
+		// configuration and delivery without changing the wire protocol.
+		expect(DAEMON_GENERATION).toBe(32);
 	});
 	test.each([
 		"1",
@@ -6055,6 +6056,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "important",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -6082,6 +6084,7 @@ describe("telegram daemon", () => {
 			buttons.every((button: { callback_data: string }) => Buffer.byteLength(button.callback_data, "utf8") <= 64),
 		).toBe(true);
 		expect(buttons.every((button: { callback_data: string }) => button.callback_data.startsWith("m:"))).toBe(true);
+		expect(Object.hasOwn(sent, "disable_notification")).toBe(false);
 	});
 
 	test("model choice callbacks are chat-authorized and forward one session-bound control command", async () => {
@@ -6232,6 +6235,7 @@ describe("telegram daemon", () => {
 			now: () => now,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -6255,6 +6259,9 @@ describe("telegram daemon", () => {
 				call => call.method === "answerCallbackQuery" && call.body.text === "Button is stale. Run /model again.",
 			),
 		).toBe(true);
+		expect(
+			bot.calls.find(c => c.method === "sendMessage" && String(c.body.text).includes("Run /model again"))!.body,
+		).toMatchObject({ disable_notification: true });
 	});
 
 	test("a fresh model menu replaces every prior alias for its logical session", async () => {
@@ -6701,6 +6708,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("A", "ws://a", "ta");
 		await daemon.handleTelegramUpdate({
@@ -6708,6 +6716,9 @@ describe("telegram daemon", () => {
 		});
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))).toBe(true);
+		expect(
+			bot.calls.find(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))!.body,
+		).toMatchObject({ disable_notification: true });
 		await daemon.handleTelegramUpdate({
 			callback_query: { id: "cb2", data: "expired", message: { chat: { id: 42 } } },
 		});
@@ -6756,6 +6767,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -6772,6 +6784,9 @@ describe("telegram daemon", () => {
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 		expect(bot.calls.some(c => c.method === "answerCallbackQuery" && c.body.text === "Button is stale")).toBe(true);
 		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))).toBe(true);
+		expect(
+			bot.calls.find(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))!.body,
+		).toMatchObject({ disable_notification: true });
 
 		bot.calls = [];
 		daemon.sessions.delete("S");
@@ -7092,6 +7107,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
+			sound: "important",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
@@ -7121,6 +7137,7 @@ describe("telegram daemon", () => {
 		const selectedCalls = bot.calls.filter(call => call.method === "sendMessage" && call.body.text === "Selected!");
 		expect(selectedCalls).toHaveLength(1);
 		expect(selectedCalls[0]?.body.parse_mode).toBeUndefined();
+		expect(Object.hasOwn(selectedCalls[0]!.body, "disable_notification")).toBe(false);
 		const results = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).filter(
 			frame => frame.type === "ask_selected_ack_result",
 		);
@@ -7251,6 +7268,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
@@ -7272,7 +7290,7 @@ describe("telegram daemon", () => {
 		});
 
 		const selected = bot.calls.find(call => call.method === "sendMessage" && call.body.text === "Selected!");
-		expect(selected?.body).toEqual({ chat_id: "42", text: "Selected!" });
+		expect(selected?.body).toEqual({ chat_id: "42", text: "Selected!", disable_notification: true });
 		expect(FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame))).toContainEqual({
 			type: "ask_selected_ack_result",
 			requestId: "ack-flat",
@@ -8010,6 +8028,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -8030,6 +8049,7 @@ describe("telegram daemon", () => {
 		expect(bot.calls.filter(call => call.method === "sendMessage").map(call => call.body.text)).toEqual([
 			"Session control unavailable: this local GJC session is disconnected.",
 		]);
+		expect(bot.calls.filter(call => call.method === "sendMessage")[0]?.body.disable_notification).toBe(true);
 	});
 	test.each([
 		"writeFile",
@@ -10183,6 +10203,7 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 		chatId: "42",
 		botApi: bot,
 		rich: { enabled: false },
+		sound: "none",
 	});
 	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
 
@@ -10213,6 +10234,7 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 	// The nudge is sent exactly once with the requested copy.
 	const notices = sends.filter(c => String(c.body.text).includes(THREADED_FALLBACK_NOTICE));
 	expect(notices).toHaveLength(1);
+	expect(notices[0]!.body.disable_notification).toBe(true);
 	// The ask still carries its inline keyboard in flat mode.
 	const ask = sends.find(c => String(c.body.text).includes("Proceed?"));
 	expect(ask).toBeTruthy();
@@ -13084,7 +13106,11 @@ function richSession(id = "S"): any {
 	return { sessionId: id, token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
 }
 
-function makeRichDaemon(bot: FakeBotApi, rich?: { enabled: boolean }): TelegramNotificationDaemon {
+function makeRichDaemon(
+	bot: FakeBotApi,
+	rich?: { enabled: boolean },
+	sound?: "all" | "important" | "none",
+): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: settings(tempAgentDir()),
 		ownerId: "owner",
@@ -13092,6 +13118,7 @@ function makeRichDaemon(bot: FakeBotApi, rich?: { enabled: boolean }): TelegramN
 		chatId: "42",
 		botApi: bot as any,
 		...(rich ? { rich } : {}),
+		...(sound ? { sound } : {}),
 	});
 }
 
@@ -13197,6 +13224,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			mime: "image/png",
 			caption: "shot",
 			parse_mode: "HTML",
+			disable_notification: true,
 		});
 		await transport.call("sendDocument", {
 			chat_id: "42",
@@ -13206,6 +13234,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			fileName: "notes.pdf",
 			caption: "doc",
 			parse_mode: "HTML",
+			disable_notification: true,
 		});
 		// Defaults: no mime -> image/png; no mime/fileName -> octet-stream/"file"; no thread -> field omitted.
 		await transport.call("sendPhoto", { chat_id: "42", photo: Buffer.from("Z").toString("base64") });
@@ -13218,6 +13247,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(photo.get("message_thread_id")).toBe("7");
 		expect(photo.get("caption")).toBe("shot");
 		expect(photo.get("parse_mode")).toBe("HTML");
+		expect(photo.get("disable_notification")).toBe("true");
 		const photoFile = photo.get("photo") as File;
 		expect(photoFile).toBeInstanceOf(Blob);
 		expect(photoFile.name).toBe("image");
@@ -13230,6 +13260,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(doc.get("message_thread_id")).toBe("9");
 		expect(doc.get("caption")).toBe("doc");
 		expect(doc.get("parse_mode")).toBe("HTML");
+		expect(doc.get("disable_notification")).toBe("true");
 		const docFile = doc.get("document") as File;
 		expect(docFile).toBeInstanceOf(Blob);
 		expect(docFile.name).toBe("notes.pdf");
@@ -13238,17 +13269,19 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 
 		const photoDefaults = requests[2].init.body as FormData;
 		expect((photoDefaults.get("photo") as File).type).toBe("image/png");
+		expect(photoDefaults.has("disable_notification")).toBe(false);
 		const docDefaults = requests[3].init.body as FormData;
 		expect(docDefaults.has("message_thread_id")).toBe(false);
 		expect(docDefaults.has("caption")).toBe(false);
 		expect(docDefaults.has("parse_mode")).toBe(false);
+		expect(docDefaults.has("disable_notification")).toBe(false);
 		const docDefaultFile = docDefaults.get("document") as File;
 		expect(docDefaultFile.name).toBe("file");
 		expect(docDefaultFile.type).toBe("application/octet-stream");
 	});
 
-	// (c) off-state fake BotApi: no rich, byte-identical HTML body -----------
-	test("(c) off states never call sendRichMessage and emit a byte-identical HTML body", async () => {
+	// (c) default all policy preserves audible finalized HTML delivery ----------
+	test("(c) default all policy omits disable_notification from finalized HTML delivery", async () => {
 		const raw = "Just plain final answer text";
 		const goldenBody =
 			'{"chat_id":"42","message_thread_id":555,"text":"Just plain final answer text","parse_mode":"HTML"}';
@@ -13262,7 +13295,6 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			expect(countMethod(bot, "sendRichMessage")).toBe(0);
 			expect(countMethod(bot, "sendMessage")).toBe(1);
 			const body = findMethod(bot, "sendMessage")!.body;
-			// Byte-identical to the pre-rich HTML path (field order included).
 			expect(JSON.stringify(body)).toBe(goldenBody);
 			expect(body.text).toBe(markdownToTelegramHtml(raw));
 			expect(body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
@@ -13379,6 +13411,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		const first = bot.calls.filter(c => c.method === "sendMessage");
 		expect(first).toHaveLength(1);
 		expect(first[0]!.body.text).toBe(chunks[0]);
+		expect(Object.hasOwn(first[0]!.body, "disable_notification")).toBe(false);
 		// A follow-up flush drains the requeued continuations (ahead of the newer frame).
 		bot.calls.length = 0;
 		await daemon.handleSessionMessage(session, {
@@ -13390,6 +13423,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		const rest = bot.calls.filter(c => c.method === "sendMessage");
 		expect(rest.map(c => c.body.text)).toEqual([...chunks.slice(1), markdownToTelegramHtml("tail")]);
 		expect(rest.every(c => c.body.message_thread_id === 555 && c.body.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
+		expect(rest.every(c => !Object.hasOwn(c.body, "disable_notification"))).toBe(true);
 	});
 
 	test("(d) sendRichMessage ok:false falls back to a single HTML chunk", async () => {
@@ -13401,6 +13435,8 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(countMethod(bot, "sendRichMessage")).toBe(1);
 		expect(countMethod(bot, "sendMessage")).toBe(1);
 		expect(findMethod(bot, "sendMessage")!.body.text).toBe(markdownToTelegramHtml(raw));
+		expect(Object.hasOwn(findMethod(bot, "sendRichMessage")!.body, "disable_notification")).toBe(false);
+		expect(Object.hasOwn(findMethod(bot, "sendMessage")!.body, "disable_notification")).toBe(false);
 	});
 
 	test("(d) deliverRichWithFallback warns exactly once per explicit rejection and never on success", async () => {
@@ -13630,7 +13666,7 @@ describe("telegram daemon rich overflow boundary (G006)", () => {
 });
 
 describe("telegram daemon action-needed rich delivery (G004)", () => {
-	function makeAskDaemon(bot: FakeBotApi, rich: { enabled: boolean }) {
+	function makeAskDaemon(bot: FakeBotApi, rich: { enabled: boolean }, sound?: "all" | "important" | "none") {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const daemon = new TelegramNotificationDaemon({
@@ -13641,6 +13677,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			botApi: bot as any,
 			WebSocketImpl: FakeWs as any,
 			rich,
+			...(sound ? { sound } : {}),
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		return daemon;
@@ -13748,6 +13785,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		const rich = findMethod(bot, "sendRichMessage")!;
 		expect(rich.body.rich_message.markdown).toContain("Agent idle");
 		expect(rich.body.reply_markup).toBeUndefined();
+		expect(Object.hasOwn(rich.body, "disable_notification")).toBe(false);
 		expect(daemon.messageRoutes.size).toBe(0);
 	});
 
@@ -13767,6 +13805,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		expect(sends).toHaveLength(1);
 		expect(sends[0]!.body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
 		expect(sends[0]!.body.reply_markup.inline_keyboard).toBeTruthy();
+		expect(Object.hasOwn(sends[0]!.body, "disable_notification")).toBe(false);
 		const askEntry = [...daemon.messageRoutes.entries()].find(
 			([, route]) => route.sessionId === "S" && route.actionId === "ask",
 		);
@@ -13790,10 +13829,62 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		expect(countMethod(bot, "sendMessage")).toBe(0);
 		expect(daemon.messageRoutes.size).toBe(0);
 	});
+	test("important sound silences split ask chunks before the keyboard-bearing final chunk", async () => {
+		FakeWs.instances = [];
+		const bot = new RichFakeBotApi();
+		const daemon = makeAskDaemon(bot, { enabled: false }, "important");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "x".repeat(9_000),
+			options: ["Y"],
+		});
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		expect(sends.length).toBeGreaterThan(1);
+		expect(sends.slice(0, -1).every(call => call.body.disable_notification === true)).toBe(true);
+		expect(sends.at(-1)!.body.reply_markup.inline_keyboard).toBeTruthy();
+		expect(Object.hasOwn(sends.at(-1)!.body, "disable_notification")).toBe(false);
+	});
+	test("sound all omits the flag from direct and rich finalized delivery", async () => {
+		const directBot = new RichFakeBotApi();
+		await driveFinalizedTurn(makeRichDaemon(directBot, { enabled: false }, "all"), directBot, richSession(), "final");
+		expect(Object.hasOwn(findMethod(directBot, "sendMessage")!.body, "disable_notification")).toBe(false);
+
+		const richBot = new RichFakeBotApi();
+		await driveFinalizedTurn(makeRichDaemon(richBot, { enabled: true }, "all"), richBot, richSession(), "final");
+		expect(Object.hasOwn(findMethod(richBot, "sendRichMessage")!.body, "disable_notification")).toBe(false);
+	});
+
+	test("sound none silences photo and document delivery", async () => {
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, undefined, "none");
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "image_attachment",
+			sessionId: "S",
+			data: Buffer.from("image").toString("base64"),
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "file_attachment",
+			sessionId: "S",
+			data: Buffer.from("document").toString("base64"),
+			name: "document.txt",
+		});
+		expect(findMethod(bot, "sendPhoto")!.body.disable_notification).toBe(true);
+		expect(findMethod(bot, "sendDocument")!.body.disable_notification).toBe(true);
+	});
 });
 
 describe("telegram daemon /rich toggle (G005)", () => {
-	function richDaemonWithSettings(bot: FakeBotApi, s: Settings, enabled: boolean) {
+	function richDaemonWithSettings(
+		bot: FakeBotApi,
+		s: Settings,
+		enabled: boolean,
+		sound?: "all" | "important" | "none",
+	) {
 		return new TelegramNotificationDaemon({
 			settings: s,
 			ownerId: "owner",
@@ -13801,6 +13892,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 			chatId: "42",
 			botApi: bot as any,
 			rich: { enabled },
+			sound,
 		});
 	}
 
@@ -13808,7 +13900,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const bot = new RichFakeBotApi();
-		const daemon = richDaemonWithSettings(bot, s, true);
+		const daemon = richDaemonWithSettings(bot, s, true, "none");
 
 		await daemon.handleTelegramUpdate({
 			update_id: 501,
@@ -13817,6 +13909,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 		const confirm = bot.calls.find(c => c.method === "sendMessage" && c.body.text === "Rich messages: off");
 		expect(confirm).toBeDefined();
 		expect(confirm!.body.message_thread_id).toBe(555);
+		expect(confirm!.body.disable_notification).toBe(true);
 		expect(s.get("notifications.telegram.rich.enabled")).toBe(false);
 
 		// Runtime is toggled immediately: the next finalized final is HTML, not rich.
@@ -19116,9 +19209,9 @@ test("Telegram Bot API 429 cooldown clamps malformed retry_after values and does
 // ---------------------------------------------------------------------------
 
 describe("PR #3186 blockers", () => {
-	test("serving epoch 3 replaces pre-policy (epoch 1 and 2) daemons via isCurrentCompatibleOwner", () => {
+	test("serving epoch 4 replaces pre-policy (epochs 1 through 3) daemons via isCurrentCompatibleOwner", () => {
 		// Epoch 1: legacy daemon states that never published servingEpoch.
-		expect(SERVING_EPOCH).toBe(3);
+		expect(SERVING_EPOCH).toBe(4);
 		const freshInput = (servingEpoch?: number) => {
 			const state: DaemonState = {
 				pid: 999,
@@ -19146,12 +19239,14 @@ describe("PR #3186 blockers", () => {
 		};
 		// Epoch undefined (epoch 1) — not compatible.
 		expect(isCurrentCompatibleOwner(freshInput(undefined))).toBe(false);
-		// Epoch 2 — not compatible with epoch 3.
+		// Epoch 2 — not compatible with epoch 4.
 		expect(isCurrentCompatibleOwner(freshInput(2))).toBe(false);
-		// Epoch 3 — compatible.
-		expect(isCurrentCompatibleOwner(freshInput(3))).toBe(true);
-		// Future epoch 4 — still compatible (>= check).
+		// Epoch 3 — not compatible with epoch 4.
+		expect(isCurrentCompatibleOwner(freshInput(3))).toBe(false);
+		// Epoch 4 — compatible.
 		expect(isCurrentCompatibleOwner(freshInput(4))).toBe(true);
+		// Future epoch 5 — still compatible (>= check).
+		expect(isCurrentCompatibleOwner(freshInput(5))).toBe(true);
 	});
 
 	test("visible v1 starts are terminated with terminalization on policy transition", async () => {

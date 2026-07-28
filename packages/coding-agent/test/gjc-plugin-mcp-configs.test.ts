@@ -1,23 +1,34 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildPluginMcpConfigs, installGjcPluginBundle } from "../src/extensibility/gjc-plugins";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { buildPluginMcpConfigs, installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { isPluginMcpPublicNetworkBound } from "../src/runtime-mcp/plugin-network-boundary";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
 const tempDirs: string[] = [];
+const originalAgentDir = getAgentDir();
+let agentDir: string;
+
+beforeEach(async () => {
+	agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-configs-agent-"));
+	setAgentDir(agentDir);
+});
 
 afterEach(async () => {
+	setAgentDir(originalAgentDir);
 	for (const d of tempDirs.splice(0)) await fs.rm(d, { recursive: true, force: true });
+	await fs.rm(agentDir, { recursive: true, force: true });
 });
 
 describe("plugin MCP runtime config conversion", () => {
 	test("converts a bundled stdio MCP into a root-confined runtime config", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 		expect(quarantine).toHaveLength(0);
 		const docs = configs.domain_docs;
@@ -51,7 +62,8 @@ describe("plugin MCP runtime config conversion", () => {
 			}),
 		);
 
-		await installGjcPluginBundle(bundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", bundle);
+		expect(r.ok).toBe(true);
 		const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 
 		expect(quarantine).toHaveLength(0);

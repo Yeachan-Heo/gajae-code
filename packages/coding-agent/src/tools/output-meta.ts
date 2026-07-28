@@ -16,7 +16,15 @@ import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
 import { sessionArtifactCapability } from "../session/session-manager";
-import { type OutputSummary, type TruncationResult, truncateMiddle, truncateTail } from "../session/streaming-output";
+import {
+	formatMiddleElisionMarker,
+	type OutputSummary,
+	type ReadWindow,
+	type TruncationResult,
+	truncateMiddle,
+	truncateTail,
+} from "../session/streaming-output";
+
 import { formatBytes, wrapBrackets } from "./render-utils";
 import { renderError } from "./tool-errors";
 
@@ -25,6 +33,9 @@ import { renderError } from "./tool-errors";
  */
 export interface TruncationMeta {
 	direction: "head" | "tail" | "middle";
+	/** Coordinate basis for shown/head/tail ranges. Omitted means file coordinates; "window" is the selected-range coordinate system. */
+	rangeBase?: "file" | "window";
+	noticeOwner?: "body";
 	truncatedBy: "lines" | "bytes" | "middle";
 	totalLines: number;
 	totalBytes: number;
@@ -36,6 +47,8 @@ export interface TruncationMeta {
 	/** Head/tail line ranges shown when direction === "middle". */
 	headRange?: { start: number; end: number };
 	tailRange?: { start: number; end: number };
+	/** Partial source-line preview retained by a directional window. */
+	partialLine?: { line: number; bytes: number; sourceBytes: number };
 	/** Bytes elided from the middle. */
 	elidedBytes?: number;
 	/** Lines elided from the middle. */
@@ -91,12 +104,15 @@ export interface TruncationOptions {
 	startLine?: number;
 	totalFileLines?: number;
 	artifactId?: string;
+	maxBytes?: number;
+	noticeOwner?: "body";
 }
 
 export interface TruncationSummaryOptions {
 	direction: "head" | "tail" | "middle";
 	startLine?: number;
 	totalFileLines?: number;
+	noticeOwner?: "body";
 }
 
 export interface TruncationTextOptions {
@@ -105,6 +121,7 @@ export interface TruncationTextOptions {
 	totalBytes?: number;
 	maxBytes?: number;
 	artifactId?: string;
+	noticeOwner?: "body";
 }
 
 /**
@@ -126,7 +143,7 @@ export class OutputMetaBuilder {
 	truncation(result: TruncationResult, options: TruncationOptions): this {
 		if (!result.truncated) return this;
 
-		const { direction, startLine = 1, totalFileLines, artifactId } = options;
+		const { direction, startLine = 1, totalFileLines, artifactId, noticeOwner, maxBytes } = options;
 		const outputLines = result.outputLines ?? result.totalLines;
 		const outputBytes = result.outputBytes ?? result.totalBytes;
 		const isMiddle = direction === "middle" || result.truncatedBy === "middle";
@@ -137,6 +154,7 @@ export class OutputMetaBuilder {
 				: "bytes";
 
 		const effectiveTotalLines = totalFileLines ?? result.totalLines;
+		const owner = noticeOwner !== undefined ? { noticeOwner } : {};
 
 		if (isMiddle) {
 			const elidedLines = result.elidedLines ?? Math.max(0, effectiveTotalLines - outputLines);
@@ -150,10 +168,12 @@ export class OutputMetaBuilder {
 			this.#meta.truncation = {
 				direction: "middle",
 				truncatedBy: "middle",
+				...owner,
 				totalLines: effectiveTotalLines,
 				totalBytes: result.totalBytes,
 				outputLines,
 				outputBytes,
+				...(maxBytes !== undefined ? { maxBytes } : {}),
 				headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
 				tailRange:
 					tailLines > 0 ? { start: effectiveTotalLines - tailLines + 1, end: effectiveTotalLines } : undefined,
@@ -178,10 +198,12 @@ export class OutputMetaBuilder {
 		this.#meta.truncation = {
 			direction,
 			truncatedBy,
+			...owner,
 			totalLines: effectiveTotalLines,
 			totalBytes: result.totalBytes,
 			outputLines,
 			outputBytes,
+			...(maxBytes !== undefined ? { maxBytes } : {}),
 			shownRange: { start: shownStart, end: shownEnd },
 			artifactId,
 			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
@@ -190,12 +212,124 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
+	/** Add metadata from the actual head/tail windows retained by middle truncation. */
+	truncationWindows(
+		windows: ReadWindow,
+		options: {
+			artifactId?: string;
+			noticeOwner?: "body";
+			maxBytes?: number;
+			rangeBase?: "file" | "window";
+		} = {},
+	): this {
+		if (windows.kind === "full") return this;
+
+		const { artifactId, noticeOwner, rangeBase } = options;
+		const maxBytes = options.maxBytes ?? (windows as ReadWindow & { maxBytes?: number }).maxBytes;
+		const outputLinesOverride = (windows as ReadWindow & { outputLinesOverride?: number }).outputLinesOverride;
+		const outputBytesOverride = (windows as ReadWindow & { outputBytesOverride?: number }).outputBytesOverride;
+		const owner = noticeOwner !== undefined ? { noticeOwner } : {};
+		const rangeBaseMeta = rangeBase !== undefined ? { rangeBase } : {};
+		const hiddenReason = (windows as ReadWindow & { truncatedBy?: "lines" | "bytes" | "middle" }).truncatedBy;
+		const fallbackTruncatedBy: "lines" | "bytes" = hiddenReason === "bytes" ? "bytes" : "lines";
+		const partialTail = windows.tail?.kind === "partial-line" ? windows.tail : undefined;
+		if (partialTail) {
+			const headBytes = windows.head?.bytes ?? 0;
+			const separatorBytes = windows.head ? 1 : 0;
+			const markerBytes =
+				windows.elidedLines > 0
+					? Buffer.byteLength(formatMiddleElisionMarker(windows.elidedLines, windows.elidedBytes), "utf-8") + 1
+					: 0;
+			this.#meta.truncation = {
+				direction: windows.kind === "tail-only" ? "tail" : "middle",
+				truncatedBy: "bytes",
+				...owner,
+				...rangeBaseMeta,
+				totalLines: windows.totalLines,
+				totalBytes: windows.totalBytes,
+				outputLines:
+					outputLinesOverride ??
+					(windows.head
+						? windows.head.lines + partialTail.lines + (windows.elidedLines > 0 ? 1 : 0)
+						: partialTail.lines),
+				outputBytes: outputBytesOverride ?? headBytes + partialTail.bytes + separatorBytes + markerBytes,
+				...(maxBytes !== undefined ? { maxBytes } : {}),
+				partialLine: {
+					line: partialTail.origin.startLine,
+					bytes: partialTail.bytes,
+					sourceBytes: partialTail.sourceLineBytes,
+				},
+				artifactId,
+			};
+			return this;
+		}
+
+		if (windows.kind === "head-only" && windows.head) {
+			const { head } = windows;
+			this.#meta.truncation = {
+				direction: "head",
+				truncatedBy: fallbackTruncatedBy,
+				...owner,
+				...rangeBaseMeta,
+				totalLines: windows.totalLines,
+				totalBytes: windows.totalBytes,
+				outputLines: outputLinesOverride ?? head.lines,
+				outputBytes: outputBytesOverride ?? head.bytes,
+				...(maxBytes !== undefined ? { maxBytes } : {}),
+				shownRange: { start: head.origin.startLine, end: head.origin.endLine },
+				artifactId,
+				nextOffset: head.origin.endLine + 1,
+			};
+			return this;
+		}
+
+		if (windows.kind === "tail-only" && windows.tail) {
+			const { tail } = windows;
+			this.#meta.truncation = {
+				direction: "tail",
+				truncatedBy: fallbackTruncatedBy,
+				...owner,
+				...rangeBaseMeta,
+				totalLines: windows.totalLines,
+				totalBytes: windows.totalBytes,
+				outputLines: outputLinesOverride ?? tail.lines,
+				outputBytes: outputBytesOverride ?? tail.bytes,
+				...(maxBytes !== undefined ? { maxBytes } : {}),
+				shownRange: { start: tail.origin.startLine, end: tail.origin.endLine },
+				artifactId,
+			};
+			return this;
+		}
+
+		const { head, tail } = windows;
+		if (!head || !tail) return this;
+		const marker = formatMiddleElisionMarker(windows.elidedLines, windows.elidedBytes);
+		this.#meta.truncation = {
+			direction: "middle",
+			truncatedBy: "middle",
+			...owner,
+			...rangeBaseMeta,
+			totalLines: windows.totalLines,
+			totalBytes: windows.totalBytes,
+			outputLines: head.lines + tail.lines + 1,
+			outputBytes: head.bytes + tail.bytes + Buffer.byteLength(marker, "utf-8") + 2,
+			...(maxBytes !== undefined ? { maxBytes } : {}),
+			headRange: { start: head.origin.startLine, end: head.origin.endLine },
+			tailRange: { start: tail.origin.startLine, end: tail.origin.endLine },
+			elidedLines: windows.elidedLines,
+			elidedBytes: windows.elidedBytes,
+			artifactId,
+		};
+		return this;
+	}
+
 	/** Add truncation info from OutputSummary. No-op if not truncated. */
 	truncationFromSummary(summary: OutputSummary, options: TruncationSummaryOptions): this {
 		if (!summary.truncated) return this;
 
-		const { direction, startLine = 1, totalFileLines } = options;
+		const { direction, startLine = 1, totalFileLines, noticeOwner } = options;
 		const totalLines = totalFileLines ?? summary.totalLines;
+		const owner = noticeOwner !== undefined ? { noticeOwner } : {};
 
 		// Middle elision: the sink retained head + tail with an elision marker.
 		if (summary.elidedBytes != null && summary.elidedBytes > 0) {
@@ -206,6 +340,7 @@ export class OutputMetaBuilder {
 			this.#meta.truncation = {
 				direction: "middle",
 				truncatedBy: "middle",
+				...owner,
 				totalLines,
 				totalBytes: summary.totalBytes,
 				outputLines: summary.outputLines,
@@ -240,6 +375,7 @@ export class OutputMetaBuilder {
 		this.#meta.truncation = {
 			direction,
 			truncatedBy,
+			...owner,
 			totalLines,
 			totalBytes: summary.totalBytes,
 			outputLines: summary.outputLines,
@@ -285,6 +421,7 @@ export class OutputMetaBuilder {
 		this.#meta.truncation = {
 			direction: options.direction,
 			truncatedBy,
+			...(options.noticeOwner !== undefined ? { noticeOwner: options.noticeOwner } : {}),
 			totalLines,
 			totalBytes,
 			outputLines,
@@ -387,7 +524,25 @@ export function formatFullOutputReference(artifactId: string): string {
 	return `Read artifact://${artifactId} for full output`;
 }
 
+function formatTruncationRangeTotal(truncation: TruncationMeta): string {
+	return truncation.rangeBase === "window"
+		? `the selected ${truncation.totalLines}-line range`
+		: `${truncation.totalLines}`;
+}
+
 export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
+	const rangeTotal = formatTruncationRangeTotal(truncation);
+	if (truncation.partialLine) {
+		let notice = `Showing last ${formatBytes(truncation.partialLine.bytes)} of line ${truncation.partialLine.line} of ${rangeTotal}`;
+		if (truncation.partialLine.sourceBytes > truncation.partialLine.bytes) {
+			notice += ` (line is ${formatBytes(truncation.partialLine.sourceBytes)})`;
+		}
+		if (truncation.artifactId != null) {
+			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+		}
+		return notice;
+	}
+
 	let notice: string;
 
 	if (truncation.direction === "middle") {
@@ -399,9 +554,9 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		const headPart = head ? `lines ${head.start}-${head.end}` : "";
 		const tailPart = tail ? `${tail.start}-${tail.end}` : "";
 		if (headPart && tailPart) {
-			notice = `Showing ${headPart} and ${tailPart} of ${totalLines}; ${elidedLines.toLocaleString()} middle line${elidedLines === 1 ? "" : "s"} (${formatBytes(elidedBytes)}) elided`;
+			notice = `Showing ${headPart} and ${tailPart} of ${rangeTotal}; ${elidedLines.toLocaleString()} middle line${elidedLines === 1 ? "" : "s"} (${formatBytes(elidedBytes)}) elided`;
 		} else {
-			notice = `Showing ${truncation.outputLines} of ${totalLines} lines; middle elided`;
+			notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}; middle elided`;
 		}
 		if (truncation.artifactId != null) {
 			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
@@ -411,9 +566,9 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 
 	const range = truncation.shownRange;
 	if (range && range.end >= range.start) {
-		notice = `Showing lines ${range.start}-${range.end} of ${truncation.totalLines}`;
+		notice = `Showing lines ${range.start}-${range.end} of ${rangeTotal}`;
 	} else {
-		notice = `Showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
+		notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}`;
 	}
 
 	if (truncation.truncatedBy === "bytes") {
@@ -450,7 +605,7 @@ export function formatOutputNotice(meta: OutputMeta | undefined): string {
 	const parts: string[] = [];
 
 	// Truncation notice
-	if (meta.truncation) {
+	if (meta.truncation && meta.truncation.noticeOwner !== "body") {
 		parts.push(formatTruncationMetaNotice(meta.truncation));
 	}
 
@@ -710,6 +865,17 @@ async function spillLargeResultToArtifact(
 	return { ...result, content: newContent, details: newDetails };
 }
 
+const BODY_TRUNCATION_FOOTER_KEY = "__bodyTruncationFooter";
+
+function stripBodyOwnedTruncationFooter(text: string, details: unknown): string {
+	const footer = (details as { [BODY_TRUNCATION_FOOTER_KEY]?: unknown } | undefined)?.[BODY_TRUNCATION_FOOTER_KEY];
+	if (typeof footer !== "string" || footer.length === 0) return text;
+	const trimmedText = text.trimEnd();
+	const trimmedFooter = footer.trim();
+	if (!trimmedText.endsWith(trimmedFooter)) return text;
+	return trimmedText.slice(0, -trimmedFooter.length).trimEnd();
+}
+
 /**
  * Absolute inline-size backstop enforced after {@link spillLargeResultToArtifact}.
  *
@@ -738,7 +904,8 @@ async function enforceInlineResultBackstop(
 	}
 	if (textParts.length === 0) return result;
 
-	const fullText = textParts.length === 1 ? textParts[0] : textParts.join("\n");
+	const renderedText = textParts.length === 1 ? textParts[0] : textParts.join("\n");
+	const fullText = stripBodyOwnedTruncationFooter(renderedText, result.details);
 	const totalBytes = Buffer.byteLength(fullText, "utf-8");
 	if (totalBytes <= maxInlineBytes) return result;
 

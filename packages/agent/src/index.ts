@@ -12,6 +12,7 @@ export * from "./image-placeholder-guard";
 export * from "./proxy";
 // Run-level telemetry collector + aggregators
 export * from "./run-collector";
+export * from "./run-resource-ledger";
 // Telemetry
 export * from "./telemetry";
 // Thinking selectors

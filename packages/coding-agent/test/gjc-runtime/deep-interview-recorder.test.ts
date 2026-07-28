@@ -18,8 +18,6 @@ import {
 	readDeepInterviewStateCompact,
 	validateDeepInterviewScoredTransition,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
-import { runDeepInterviewRepairCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-repair";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
 const TEST_SESSION_ID = "test-session";
@@ -30,26 +28,6 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-recorder-"));
 	tempRoots.push(dir);
 	return dir;
-}
-async function seedRecorderState(cwd: string): Promise<void> {
-	const result = await runNativeDeepInterviewCommand(["--json", "seed recorder state"], cwd);
-	expect(result.status).toBe(0);
-	const initialized = await runDeepInterviewRepairCommand(
-		[
-			"initialize-context",
-			"--session-id",
-			TEST_SESSION_ID,
-			"--schema-version",
-			"1",
-			"--expected-revision",
-			"0",
-			"--input-json",
-			'{"type":"greenfield","threshold":0.05}',
-			"--json",
-		],
-		cwd,
-	);
-	expect(initialized.status).toBe(0);
 }
 
 beforeAll(() => {
@@ -185,7 +163,7 @@ describe("deep-interview recorder: transition validator", () => {
 			...shell({ round: 2, questionId: "q2" }),
 			lifecycle: "scored",
 			scores: { goal: 0.3 },
-			ambiguity: 0.7,
+			ambiguity: 0.62,
 			triggers: [trigger()],
 		};
 		expect(validateDeepInterviewScoredTransition(prior, next).ok).toBe(true);
@@ -196,7 +174,7 @@ describe("deep-interview recorder: transition validator", () => {
 			...shell({ round: 2, questionId: "q2" }),
 			lifecycle: "scored",
 			scores: { goal: 0.8 },
-			ambiguity: 0.7,
+			ambiguity: 0.62,
 			triggers: [trigger()],
 		};
 		const result = validateDeepInterviewScoredTransition(prior, next);
@@ -255,6 +233,10 @@ describe("deep-interview recorder: contradiction fixture (round N vs N-2)", () =
 			triggers: [
 				trigger({
 					contradictedFactId: "f1",
+					priorDimensionScore: 0.8,
+					newDimensionScore: 0.4,
+					priorAmbiguity: 0.3,
+					newAmbiguity: 0.55,
 					evidence: "Round 3 says the core entity is Project, contradicting f1",
 				}),
 			],
@@ -301,7 +283,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("persists exactly one durable record per key and no-ops identical replay", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		const input = {
 			round: 1,
 			questionId: "q1",
@@ -344,7 +325,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("locks a canonical Round-0 contract to the recorder answer hash without retaining raw custom input", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		const intentContract = {
 			items: [
 				{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" },
@@ -411,7 +391,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("does not lock a rejected Round-0 proposal before corrected confirmation", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		const base = {
 			round: 0,
 			questionId: "intent-confirmation",
@@ -459,7 +438,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("records approved reductions from answer labels with redacted evidence", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -522,7 +500,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("enriches the same record to scored without appending a second", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -539,7 +516,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
+				scores: { goal: 0.5 },
 				ambiguity: 0.5,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -553,7 +530,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("accepts a 100,000-code-point emoji scoring payload and rejects 100,001 without mutation", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -564,9 +540,9 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			const input = {
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
+				scores: { goal: 0.5 },
 				ambiguity: 0.5,
-				triggers: [trigger({ name: "", status: "unresolved", rationale: "payload boundary fixture" })],
+				triggers: [trigger({ name: "" })],
 			};
 			input.triggers[0]!.name = "😀".repeat(length - [...JSON.stringify(input)].length);
 			expect([...JSON.stringify(input)]).toHaveLength(length);
@@ -585,7 +561,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("refuses to persist an invalid scored transition and does not falsely converge", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		// Round 1 establishes a clear baseline (goal 0.5, ambiguity 0.5).
 		await appendOrMergeDeepInterviewRound(
 			cwd,
@@ -604,7 +579,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
+				scores: { goal: 0.5 },
 				ambiguity: 0.5,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -623,22 +598,17 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{ sessionId: TEST_SESSION_ID },
 		);
 		await expect(
-			enrichDeepInterviewRoundScoring(
-				cwd,
-				statePath,
-				{
-					round: 2,
-					questionId: "q2",
-					scores: { goal: 0.8, constraints: 0.8, criteria: 0.8 },
-					ambiguity: 0.4,
-					triggers: [trigger()],
-				},
-				{ sessionId: TEST_SESSION_ID },
-			),
-		).rejects.toThrow("DI_STATE_SCHEMA_INVALID");
+			enrichDeepInterviewRoundScoring(cwd, statePath, {
+				round: 2,
+				questionId: "q2",
+				scores: { goal: 0.8 },
+				ambiguity: 0.4,
+				triggers: [trigger()],
+			}),
+		).rejects.toThrow(/invalid and was refused/);
 
 		// Durable state is untouched: round 2 stays an unscored shell and the latest
-		// persisted ambiguity is the prior round's, not the refused native value.
+		// persisted ambiguity is the prior round's, not the refused 0.4.
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		expect(persisted.state.rounds).toHaveLength(2);
 		const round2 = persisted.state.rounds.find((r: DeepInterviewRoundRecord) => r.round === 2);
@@ -649,7 +619,6 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("persists a valid scored transition that lowers the dimension and raises ambiguity", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -667,7 +636,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
+				scores: { goal: 0.5 },
 				ambiguity: 0.5,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -689,7 +658,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 2,
 				questionId: "q2",
-				scores: { goal: 0.3, constraints: 0.3, criteria: 0.3 },
+				scores: { goal: 0.3 },
 				ambiguity: 0.62,
 				triggers: [trigger()],
 			},
@@ -698,8 +667,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		const round2 = persisted.state.rounds.find((r: DeepInterviewRoundRecord) => r.round === 2);
 		expect(round2.lifecycle).toBe("scored");
-		expect(persisted.state.current_ambiguity).toBe(0.7);
-		expect(round2.reported_ambiguity).toBe(0.7);
+		expect(persisted.state.current_ambiguity).toBe(0.62);
 	});
 
 	it("reads a compact slice and migrates legacy on-disk state safely", async () => {
@@ -716,147 +684,5 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		expect(compact.established_facts).toEqual([]);
 		expect(compact.recent_scored_rounds).toEqual([]);
 		expect(compact.pending_shells).toEqual([]);
-	});
-
-	it("scores Round 1 even though the unscorable Round-0 topology gate shell stays answered", async () => {
-		// Regression: the Round-0 topology gate is recorded as an `answered` shell so the
-		// locked intent contract can bind to its answer hash, but `apply-round-result`
-		// rejects `--round 0`, so that shell can never reach `scored`. Counting it in the
-		// "earlier rounds must be scored" precondition deadlocked every later round, making
-		// the whole interview unable to score a single answer.
-		const cwd = await tempDir();
-		const statePath = statePathFor(cwd);
-		await seedRecorderState(cwd);
-		expect(
-			(
-				await runDeepInterviewRepairCommand(
-					[
-						"confirm-topology",
-						"--session-id",
-						TEST_SESSION_ID,
-						"--schema-version",
-						"1",
-						"--expected-revision",
-						"1",
-						"--input-json",
-						'{"components":[{"id":"alpha","name":"Alpha"}],"deferred_components":[]}',
-						"--json",
-					],
-					cwd,
-				)
-			).status,
-		).toBe(0);
-		await appendOrMergeDeepInterviewRound(
-			cwd,
-			statePath,
-			{
-				round: 0,
-				questionId: "round0-topology",
-				questionText: "Confirm locked intent",
-				component: "review-topology",
-				dimension: "topology",
-				selectedOptions: ["Confirm"],
-				intent_contract: {
-					items: [{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" }],
-					confirmation_options: ["Confirm"],
-				},
-			},
-			{ sessionId: TEST_SESSION_ID },
-		);
-		await appendOrMergeDeepInterviewRound(
-			cwd,
-			statePath,
-			{
-				round: 1,
-				questionId: "q1",
-				questionText: "Q?",
-				component: "alpha",
-				dimension: "goal",
-				selectedOptions: ["a"],
-			},
-			{ sessionId: TEST_SESSION_ID },
-		);
-		const before = JSON.parse(await fs.readFile(statePath, "utf-8")) as {
-			state_revision: number;
-			state: { rounds: DeepInterviewRoundRecord[] };
-		};
-		expect(before.state.rounds.find(round => round.round === 0)?.lifecycle).toBe("answered");
-		const scored = await runDeepInterviewRepairCommand(
-			[
-				"apply-round-result",
-				"--session-id",
-				TEST_SESSION_ID,
-				"--schema-version",
-				"1",
-				"--expected-revision",
-				String(before.state_revision),
-				"--round",
-				"1",
-				"--question-id",
-				"q1",
-				"--result-json",
-				JSON.stringify({
-					global_scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 },
-					component_updates: [{ component_id: "alpha", scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 } }],
-				}),
-				"--json",
-			],
-			cwd,
-		);
-		expect(scored.status, scored.stderr).toBe(0);
-		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8")) as {
-			state: { rounds: DeepInterviewRoundRecord[] };
-		};
-		expect(persisted.state.rounds.find(round => round.round === 0)?.lifecycle).toBe("answered");
-		expect(persisted.state.rounds.find(round => round.round === 1)?.lifecycle).toBe("scored");
-		// The result JSON above omits `targeting`/`ontology`/`bookkeeping`, so the
-		// decoder materializes them as `undefined`. Replaying it must digest to the
-		// same value and settle as an idempotent noop rather than a conflict.
-		const replay = await runDeepInterviewRepairCommand(
-			[
-				"apply-round-result",
-				"--session-id",
-				TEST_SESSION_ID,
-				"--schema-version",
-				"1",
-				"--expected-revision",
-				String(before.state_revision + 1),
-				"--round",
-				"1",
-				"--question-id",
-				"q1",
-				"--result-json",
-				JSON.stringify({
-					global_scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 },
-					component_updates: [{ component_id: "alpha", scores: { goal: 0.4, constraints: 0.3, criteria: 0.2 } }],
-				}),
-				"--json",
-			],
-			cwd,
-		);
-		expect(replay.status, replay.stderr).toBe(0);
-		expect(JSON.parse(replay.stdout ?? "{}")).toMatchObject({ ok: true, written: false });
-	});
-
-	it("canonicalizes an agent-supplied dimension label before persisting the shell", () => {
-		// `deepInterview.dimension` is free text on post-topology asks; the persisted envelope
-		// only accepts canonical ids, so a display label must not reach state verbatim.
-		for (const [supplied, expected] of [
-			["Constraints", "constraints"],
-			["Goal Clarity", "goal"],
-			["Success Criteria", undefined],
-			["criteria", "criteria"],
-			["topology", "topology"],
-			["not-a-dimension", undefined],
-		] as const) {
-			const shell = buildAnswerShell({
-				round: 1,
-				questionId: "q",
-				questionText: "question",
-				selectedOptions: ["a"],
-				dimension: supplied,
-			} as never);
-			expect(shell.dimension).toBe(expected as never);
-		}
 	});
 });

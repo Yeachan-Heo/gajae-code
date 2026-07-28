@@ -114,7 +114,11 @@ export interface TruncationResult {
 	elidedLines?: number;
 	lastLinePartial?: boolean;
 	firstLineExceedsLimit?: boolean;
+	lastLineExceedsLimit?: boolean;
 }
+
+/** Direction vocabulary used by callers that select which end of content to retain. */
+export type TruncationDirection = "head" | "last" | "both";
 
 export interface TruncationOptions {
 	/** Maximum number of lines (default: 3000) */
@@ -131,6 +135,8 @@ export interface TruncationOptions {
 	 * window receives `maxLines - maxHeadLines`. Default `floor(maxLines/2)`.
 	 */
 	maxHeadLines?: number;
+	/** Direction to dispatch through truncateContent (head, last, or both). */
+	direction?: TruncationDirection;
 }
 
 /** Result from byte-level truncation helpers. */
@@ -452,6 +458,7 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 					outputBytes: tail.bytes,
 					lastLinePartial: true,
 					firstLineExceedsLimit: false,
+					lastLineExceedsLimit: true,
 				};
 			}
 			break;
@@ -474,6 +481,7 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 					outputBytes: tail.bytes,
 					lastLinePartial: true,
 					firstLineExceedsLimit: false,
+					lastLineExceedsLimit: true,
 				};
 			}
 			break;
@@ -516,14 +524,129 @@ export function formatMiddleElisionMarker(elidedLines: number, elidedBytes: numb
 }
 
 /**
- * Truncate content keeping a head window and a tail window, eliding the middle.
- *
- * The combined output is `<head>\n<marker>\n<tail>` when truncation is needed.
- * `maxHeadBytes` defaults to `floor(maxBytes / 2)`; the tail receives the
- * remainder. Falls back to `truncateTail` / `truncateHead` if either side's
- * budget is empty or the content already fits.
+ * A retained source segment returned by {@link truncateMiddleWindows}.
+ * Line coordinates are 1-indexed and inclusive.
  */
-export function truncateMiddle(content: string, options: TruncationOptions = {}): TruncationResult {
+export type ReadSegment =
+	| {
+			kind: "lines";
+			content: string;
+			lines: number;
+			bytes: number;
+			origin: { startLine: number; endLine: number };
+			lastLinePartial: false;
+	  }
+	| {
+			kind: "partial-line";
+			content: string;
+			lines: 1;
+			bytes: number;
+			origin: { startLine: number; endLine: number };
+			sourceLineBytes: number;
+			lastLinePartial: true;
+	  };
+
+/** The actual windows retained by middle truncation. */
+export interface ReadWindow {
+	kind: "full" | "head-only" | "tail-only" | "middle";
+	head?: ReadSegment;
+	tail?: ReadSegment;
+	// With normalized head/tail line budgets, an overlap cannot occur: a
+	// source that can fit both windows returns `full`, otherwise their kept
+	// line counts sum to less than the source. Retain this defensive value for
+	// custom/future budgets and wire compatibility.
+	overlap: "disjoint" | "adjacent" | "overlapping";
+	elidedLines: number;
+	elidedBytes: number;
+	totalLines: number;
+	totalBytes: number;
+	/** @deprecated Non-enumerable compatibility reason for older consumers. */
+	truncatedBy?: "lines" | "bytes" | "middle";
+}
+
+function outputLineCount(result: TruncationResult): number {
+	return result.outputLines ?? (result.content.length === 0 ? 0 : countNewlines(result.content) + 1);
+}
+
+function outputByteCount(result: TruncationResult): number {
+	return result.outputBytes ?? Buffer.byteLength(result.content, "utf-8");
+}
+
+function lastSourceLineBytes(content: string): number {
+	const lineStart = content.lastIndexOf(NL) + 1;
+	return Buffer.byteLength(content.slice(lineStart), "utf-8");
+}
+
+function makeReadSegment(
+	result: TruncationResult,
+	startLine: number,
+	totalLines: number,
+	sourceContent: string = result.content,
+): ReadSegment | undefined {
+	const lines = outputLineCount(result);
+	if (lines <= 0) return undefined;
+	const bytes = outputByteCount(result);
+	const endLine = Math.min(totalLines, startLine + lines - 1);
+	if (result.lastLinePartial) {
+		const partialLine = endLine;
+		return {
+			kind: "partial-line",
+			content: result.content,
+			lines: 1,
+			bytes,
+			origin: { startLine: partialLine, endLine: partialLine },
+			sourceLineBytes: lastSourceLineBytes(sourceContent),
+			lastLinePartial: true,
+		};
+	}
+	return {
+		kind: "lines",
+		content: result.content,
+		lines,
+		bytes,
+		origin: { startLine, endLine },
+		lastLinePartial: false,
+	};
+}
+
+function withMiddleWindowReason(windows: ReadWindow, truncatedBy: "lines" | "bytes" | "middle"): ReadWindow {
+	Object.defineProperty(windows, "truncatedBy", { value: truncatedBy, enumerable: false });
+	return windows;
+}
+
+function fullReadWindow(
+	content: string,
+	totalLines: number,
+	totalBytes: number,
+	overlap: ReadWindow["overlap"] = "disjoint",
+): ReadWindow {
+	return {
+		kind: "full",
+		head: {
+			kind: "lines",
+			content,
+			lines: totalLines,
+			bytes: totalBytes,
+			origin: { startLine: 1, endLine: totalLines },
+			lastLinePartial: false,
+		},
+		overlap,
+		elidedLines: 0,
+		elidedBytes: 0,
+		totalLines,
+		totalBytes,
+	};
+}
+
+/**
+ * Truncate content while exposing the exact retained head/tail windows.
+ *
+ * The budget split and fallback ordering intentionally mirror truncateMiddle.
+ * The overlap classification is performed before resolving an overlap to a
+ * full window, so callers can distinguish disjoint, adjacent and overlapping
+ * candidate windows even when no marker is needed.
+ */
+export function truncateMiddleWindows(content: string, options: TruncationOptions = {}): ReadWindow {
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
 	const headBytes = options.maxHeadBytes ?? Math.floor(maxBytes / 2);
@@ -533,57 +656,153 @@ export function truncateMiddle(content: string, options: TruncationOptions = {})
 
 	const totalBytes = Buffer.byteLength(content, "utf-8");
 	const totalLines = countNewlines(content) + 1;
+	if (totalBytes <= maxBytes && totalLines <= maxLines) return fullReadWindow(content, totalLines, totalBytes);
 
-	if (totalBytes <= maxBytes && totalLines <= maxLines) {
-		return noTruncResult(content, totalLines, totalBytes);
-	}
+	const oneSided = (kind: "head-only" | "tail-only", result: TruncationResult, startLine: number): ReadWindow => {
+		const lines = outputLineCount(result);
+		const bytes = outputByteCount(result);
+		const segment = makeReadSegment(result, startLine, totalLines, content);
 
-	// Degenerate budgets → fall back to one-sided truncation.
+		const windows: ReadWindow = {
+			kind,
+			...(kind === "head-only" ? (segment ? { head: segment } : {}) : segment ? { tail: segment } : {}),
+			overlap: "disjoint",
+			elidedLines: Math.max(0, totalLines - lines),
+			elidedBytes: Math.max(0, totalBytes - bytes),
+			totalLines,
+			totalBytes,
+		};
+		return withMiddleWindowReason(windows, result.truncatedBy === "lines" ? "lines" : "bytes");
+	};
+
+	// Keep this order identical to truncateMiddle: degenerate budgets are
+	// resolved before either one-sided truncator is called.
 	if (headBytes <= 0 || headLines <= 0) {
-		return truncateTail(content, { maxBytes: tailBytes || maxBytes, maxLines: tailLines || maxLines });
+		const tail = truncateTail(content, { maxBytes: tailBytes || maxBytes, maxLines: tailLines || maxLines });
+		return oneSided("tail-only", tail, totalLines - outputLineCount(tail) + 1);
 	}
 	if (tailBytes <= 0 || tailLines <= 0) {
-		return truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
+		const head = truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
+		return oneSided("head-only", head, 1);
 	}
 
 	const head = truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
 	const tail = truncateTail(content, { maxBytes: tailBytes, maxLines: tailLines });
-
-	const headLinesKept = head.outputLines ?? 0;
-	const tailLinesKept = tail.outputLines ?? 0;
-	const headBytesKept = head.outputBytes ?? Buffer.byteLength(head.content, "utf-8");
-	const tailBytesKept = tail.outputBytes ?? Buffer.byteLength(tail.content, "utf-8");
+	const headLinesKept = outputLineCount(head);
+	const tailLinesKept = outputLineCount(tail);
+	const headBytesKept = outputByteCount(head);
+	const tailBytesKept = outputByteCount(tail);
 
 	// Head unusable (first line exceeds budget) → tail-only.
-	if (headLinesKept === 0 || head.firstLineExceedsLimit) return tail;
+	if (headLinesKept === 0 || head.firstLineExceedsLimit) {
+		return oneSided("tail-only", tail, totalLines - tailLinesKept + 1);
+	}
 	// Tail unusable → head-only.
-	if (tailLinesKept === 0) return head;
-	// Windows overlap → no meaningful elision; return content untruncated.
-	if (headLinesKept + tailLinesKept >= totalLines) {
-		return noTruncResult(content, totalLines, totalBytes);
+	if (tailLinesKept === 0) return oneSided("head-only", head, 1);
+
+	const headEnd = headLinesKept;
+	const tailStart = totalLines - tailLinesKept + 1;
+	const overlap: ReadWindow["overlap"] =
+		headEnd + 1 < tailStart ? "disjoint" : headEnd + 1 === tailStart ? "adjacent" : "overlapping";
+	const tailPartial = tail.lastLinePartial === true;
+
+	// Adjacent/overlapping complete windows cover the whole source. Return one
+	// full segment so renderers never insert a marker for an overlap.
+	if (headLinesKept + tailLinesKept >= totalLines && !tailPartial) {
+		return fullReadWindow(content, totalLines, totalBytes, overlap);
 	}
 
-	const elidedLines = totalLines - headLinesKept - tailLinesKept;
-	// `totalBytes - headBytesKept - tailBytesKept` includes newline separators
-	// between the kept windows and the elided region; close enough for a notice.
-	const elidedBytes = Math.max(0, totalBytes - headBytesKept - tailBytesKept);
-	const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
-	const composed = `${head.content}\n${marker}\n${tail.content}`;
-	const markerBytes = Buffer.byteLength(marker, "utf-8");
+	const headWindow = makeReadSegment(head, 1, totalLines, content);
+	const tailWindow = makeReadSegment(tail, tailStart, totalLines, content);
+	if (!headWindow || !tailWindow) return fullReadWindow(content, totalLines, totalBytes, overlap);
 
-	return {
-		content: composed,
-		truncated: true,
-		truncatedBy: "middle",
-		totalLines,
-		totalBytes,
-		outputLines: headLinesKept + tailLinesKept + 1,
-		outputBytes: headBytesKept + tailBytesKept + markerBytes + 2,
-		elidedLines,
-		elidedBytes,
-		lastLinePartial: tail.lastLinePartial,
-		firstLineExceedsLimit: false,
-	};
+	const partialSourceBytes = tailWindow.kind === "partial-line" ? tailWindow.sourceLineBytes : tailWindow.bytes;
+	const elidedLines = tailPartial
+		? Math.max(0, tailStart - headEnd - 1)
+		: Math.max(0, totalLines - headLinesKept - tailLinesKept);
+	const elidedBytes = tailPartial
+		? Math.max(0, totalBytes - headBytesKept - partialSourceBytes)
+		: Math.max(0, totalBytes - headBytesKept - tailBytesKept);
+	return withMiddleWindowReason(
+		{
+			kind: "middle",
+			head: headWindow,
+			tail: tailWindow,
+			overlap,
+			elidedLines,
+			elidedBytes,
+			totalLines,
+			totalBytes,
+		},
+		"middle",
+	);
+}
+
+/**
+ * Truncate content keeping a head window and a tail window, eliding the middle.
+ * The composed return shape remains field-for-field compatible with the
+ * historical implementation; callers that need coordinates use
+ * truncateMiddleWindows directly.
+ */
+export function truncateMiddle(content: string, options: TruncationOptions = {}): TruncationResult {
+	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+	const headBytes = options.maxHeadBytes ?? Math.floor(maxBytes / 2);
+	const tailBytes = Math.max(0, maxBytes - headBytes);
+	const headLines = options.maxHeadLines ?? Math.max(1, Math.floor(maxLines / 2));
+	const tailLines = Math.max(0, maxLines - headLines);
+	const windows = truncateMiddleWindows(content, options);
+
+	switch (windows.kind) {
+		case "full":
+			return noTruncResult(content, windows.totalLines, windows.totalBytes);
+		case "tail-only":
+			return truncateTail(content, { maxBytes: tailBytes || maxBytes, maxLines: tailLines || maxLines });
+		case "head-only":
+			return truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
+		case "middle": {
+			const head = windows.head;
+			const tail = windows.tail;
+			if (!head || !tail) return noTruncResult(content, windows.totalLines, windows.totalBytes);
+			if (head.lines + tail.lines >= windows.totalLines)
+				return noTruncResult(content, windows.totalLines, windows.totalBytes);
+			const legacyElidedLines = Math.max(0, windows.totalLines - head.lines - tail.lines);
+			const legacyElidedBytes =
+				tail.kind === "partial-line"
+					? Math.max(0, windows.totalBytes - head.bytes - tail.bytes)
+					: windows.elidedBytes;
+			const marker = formatMiddleElisionMarker(legacyElidedLines, legacyElidedBytes);
+			const markerBytes = Buffer.byteLength(marker, "utf-8");
+			return {
+				content: `${head.content}\n${marker}\n${tail.content}`,
+				truncated: true,
+				truncatedBy: "middle",
+				totalLines: windows.totalLines,
+				totalBytes: windows.totalBytes,
+				outputLines: head.lines + tail.lines + 1,
+				outputBytes: head.bytes + tail.bytes + markerBytes + 2,
+				elidedLines: legacyElidedLines,
+				elidedBytes: legacyElidedBytes,
+				lastLinePartial: tail.lastLinePartial,
+				firstLineExceedsLimit: false,
+				...(tail.lastLinePartial ? { lastLineExceedsLimit: true } : {}),
+			};
+		}
+	}
+}
+
+/**
+ * Dispatch truncation using the caller-facing direction vocabulary.
+ */
+export function truncateContent(content: string, options: TruncationOptions = {}): TruncationResult {
+	switch (options.direction) {
+		case "last":
+			return truncateTail(content, options);
+		case "both":
+			return truncateMiddle(content, options);
+		default:
+			return truncateHead(content, options);
+	}
 }
 
 // =============================================================================

@@ -5,7 +5,7 @@
  * Endpoint: POST https://api.kimi.com/coding/v1/search
  */
 import type { AuthStorage } from "@gajae-code/ai";
-import { $env } from "@gajae-code/utils";
+import { $credentialEnv } from "@gajae-code/utils";
 
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -55,8 +55,17 @@ function asTrimmed(value: string | undefined): string | undefined {
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/** Test seam: the Kimi search base URL as resolved from trusted env. */
+export function resolveKimiSearchBaseUrlForTest(): string {
+	return resolveBaseUrl();
+}
+
 function resolveBaseUrl(): string {
-	return asTrimmed($env.MOONSHOT_SEARCH_BASE_URL) ?? asTrimmed($env.KIMI_SEARCH_BASE_URL) ?? KIMI_SEARCH_URL;
+	return (
+		asTrimmed($credentialEnv("MOONSHOT_SEARCH_BASE_URL")) ??
+		asTrimmed($credentialEnv("KIMI_SEARCH_BASE_URL")) ??
+		KIMI_SEARCH_URL
+	);
 }
 
 /** Find Kimi search credentials from environment or AuthStorage. */
@@ -65,7 +74,8 @@ async function findApiKey(
 	sessionId: string | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<string | null> {
-	const envKey = asTrimmed($env.MOONSHOT_SEARCH_API_KEY) ?? asTrimmed($env.KIMI_SEARCH_API_KEY);
+	const envKey =
+		asTrimmed($credentialEnv("MOONSHOT_SEARCH_API_KEY")) ?? asTrimmed($credentialEnv("KIMI_SEARCH_API_KEY"));
 	if (envKey) return envKey;
 
 	return (
@@ -157,8 +167,8 @@ export class KimiProvider extends SearchProvider {
 
 	isAvailable(authStorage: AuthStorage): boolean {
 		return (
-			!!asTrimmed($env.MOONSHOT_SEARCH_API_KEY) ||
-			!!asTrimmed($env.KIMI_SEARCH_API_KEY) ||
+			!!asTrimmed($credentialEnv("MOONSHOT_SEARCH_API_KEY")) ||
+			!!asTrimmed($credentialEnv("KIMI_SEARCH_API_KEY")) ||
 			authStorage.hasAuth("moonshot") ||
 			authStorage.hasAuth("kimi-code")
 		);

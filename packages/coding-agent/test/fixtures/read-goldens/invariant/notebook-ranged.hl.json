@@ -1,0 +1,14 @@
+{
+  "text": "1jo|# %% [markdown] cell:0\n2tt|# Read goldens\n3zy|Notebook fixture\n4qx|# %% [code] cell:1\n5jl|x = 1\n6lh|x + 1\n7vg|# %% [raw] cell:2\n8ez|raw notebook cell",
+  "displayContent": {
+    "text": "# %% [markdown] cell:0\n# Read goldens\nNotebook fixture\n# %% [code] cell:1\nx = 1\nx + 1\n# %% [raw] cell:2\nraw notebook cell",
+    "startLine": 1
+  },
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/notebook.ipynb"
+    }
+  }
+}

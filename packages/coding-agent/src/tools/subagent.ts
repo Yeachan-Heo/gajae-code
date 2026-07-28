@@ -65,6 +65,8 @@ export interface SubagentSnapshot {
 	durationMs: number;
 	resultText?: string;
 	errorText?: string;
+	/** Safe setup failure cause retained from the executor launch path. */
+	setupFailureSummary?: string;
 	resultPreview?: string;
 	outputRef?: string;
 	truncated?: boolean;
@@ -603,6 +605,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			}
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
 			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
+			if (snapshot.setupFailureSummary) lines.push(`Setup failure: ${snapshot.setupFailureSummary}`);
 			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
 			if (snapshot.steerMessage) {
 				lines.push(`Steer (${snapshot.steerState ?? "queued"}):`, "```", snapshot.steerMessage, "```");
@@ -730,6 +733,9 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 						resultPreview: output.preview,
 						truncated: output.truncated,
 					}
+				: {}),
+			...(job.setupFailureSummary
+				? { setupFailureSummary: sanitizeText(job.setupFailureSummary, RECEIPT_PREVIEW_WIDTH) }
 				: {}),
 			...(outputRef ? { outputRef } : {}),
 			...(runningTimeoutGuidance ? { guidance: runningTimeoutGuidance } : {}),

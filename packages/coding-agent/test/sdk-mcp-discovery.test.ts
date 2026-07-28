@@ -9,9 +9,9 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { CustomTool } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 import { createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { logger, Snowflake } from "@gajae-code/utils";
+import { getAgentDir, logger, Snowflake, setAgentDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { installGjcPluginBundle } from "../src/extensibility/gjc-plugins";
+import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { createMCPToolName, type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
 
 function createMcpCustomTool(name: string, serverName: string, mcpToolName: string): CustomTool {
@@ -70,16 +70,20 @@ function createReasoningModel(): Model<"openai-responses"> {
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
 const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
 const validSixSurfacePluginBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
+const originalAgentDir = getAgentDir();
 
 describe("createAgentSession MCP discovery prompt gating", () => {
 	let tempDir: string;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
+	let agentDir: string;
 
 	beforeEach(async () => {
 		MCPManager.resetForTests();
 		tempDir = path.join(os.tmpdir(), `pi-sdk-mcp-discovery-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sdk-mcp-discovery-agent-"));
+		setAgentDir(agentDir);
 		authStorage = await AuthStorage.create(":memory:");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
@@ -125,8 +129,12 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		vi.restoreAllMocks();
 		MCPManager.resetForTests();
 		authStorage.close();
+		setAgentDir(originalAgentDir);
 		if (tempDir && fs.existsSync(tempDir)) {
 			await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
+		}
+		if (agentDir && fs.existsSync(agentDir)) {
+			await fs.promises.rm(agentDir, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
 		}
 	});
 
@@ -555,7 +563,8 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				expectedToolName: "domain_note",
 				mcpTools: [createMcpCustomTool("domain_note", "exact", "domain_note")],
 				prepare: async () => {
-					await installGjcPluginBundle(validSixSurfacePluginBundle, { scope: "project", cwd: tempDir });
+					const r = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+					expect(r.ok).toBe(true);
 				},
 			},
 		];

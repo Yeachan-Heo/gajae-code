@@ -618,6 +618,7 @@ function fixedEditorState(
 		richDraftEnabled: false,
 		toolActivityEnabled: true,
 		streamingEnabled: true,
+		sound: "all",
 	};
 
 	switch (stateId) {

@@ -36,4 +36,15 @@ describe("MemoryBlobStore byte/count LRU bound (W5 / F8)", () => {
 		expect(ref).toBe(`blob:sha256:${hash}`);
 		expect(store.getSync(hash)?.toString()).toBe("hello blob");
 	});
+
+	it("retains canonical blobs beyond the normal LRU count cap", () => {
+		const store = new MemoryBlobStore({ ownership: "canonical" });
+		const count = 4096 + 8;
+		const hashes: string[] = [];
+		for (let index = 0; index < count; index++) {
+			hashes.push(store.putSync(Buffer.from(`canonical-${index}`)).hash);
+		}
+		expect(store.getSync(hashes[0]!)?.toString()).toBe("canonical-0");
+		expect(store.getSync(hashes[hashes.length - 1]!)?.toString()).toBe(`canonical-${count - 1}`);
+	});
 });

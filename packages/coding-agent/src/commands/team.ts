@@ -13,6 +13,7 @@ import {
 	readGjcTeamSnapshot,
 	shutdownGjcTeam,
 	startGjcTeam,
+	UnknownGjcTeamApiOperationError,
 } from "../gjc-runtime/team-runtime";
 import { syncSkillActiveState } from "../skill-state/active-state";
 
@@ -183,7 +184,24 @@ export default class Team extends Command {
 				return;
 			}
 			const input = parseInputFlag(rest);
-			const result = await executeGjcTeamApiOperation(operation, input);
+			let result: unknown;
+			try {
+				result = await executeGjcTeamApiOperation(operation, input);
+			} catch (error) {
+				if (!(error instanceof UnknownGjcTeamApiOperationError)) throw error;
+				process.exitCode = 1;
+				if (json) {
+					writeReceipt({
+						ok: false,
+						error: error.code,
+						operation: error.operation,
+						suggestions: error.suggestions,
+					});
+				} else {
+					process.stderr.write(`${error.message}\n`);
+				}
+				return;
+			}
 			const teamName = String(input.team_name ?? input.teamName ?? "").trim();
 			if (teamName) {
 				try {

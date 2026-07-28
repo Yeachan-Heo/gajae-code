@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
-import * as os from "node:os";
 import * as path from "node:path";
+import { getConfigRootDir } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -19,6 +19,7 @@ import {
 	computeCriticVerdictPlanGeneration,
 	computeUltragoalPlanGeneration,
 	countNonOkayTerminalCriticVerdicts,
+	finalAggregateReceiptMissingCriticOkay,
 	findFreshBatchCloseReceipt,
 	findLedgerReceiptEvent,
 	isCleanPauseCriticVerdictShape,
@@ -490,8 +491,7 @@ export async function resolveUltragoalNudgeBudget(cwd: string): Promise<{ budget
 	const projectPath = path.join(gjcRoot(cwd), "settings.json");
 	const project = await readSettingsNudgeBudget(projectPath);
 	if (project !== null) return { budget: project, source: projectPath };
-	const userDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
-	const userPath = path.join(userDir, "settings.json");
+	const userPath = path.join(getConfigRootDir(), "settings.json");
 	const user = await readSettingsNudgeBudget(userPath);
 	if (user !== null) return { budget: user, source: userPath };
 	return { budget: DEFAULT_ULTRAGOAL_NUDGE_BUDGET, source: "default" };
@@ -3091,8 +3091,13 @@ export async function checkpointUltragoalGoal(input: {
 	// receipt, the replay is a genuine re-verification: it must run the full
 	// quality gate and mint a fresh receipt, otherwise a completed goal with a
 	// context-staled receipt can never be repaired (different evidence is
-	// rejected on complete goals by design). A mutated goal row keeps the
-	// fail-loud tamper handling in the idempotent branch below.
+	// rejected on complete goals by design). A final-aggregate receipt whose
+	// recorded checkpoint gate lacks a clean criticReview OKAY is likewise
+	// repair-eligible: it is not "stale", but the completion guard rejects it
+	// forever (active_missing_critic_verdict), so a no-op replay would leave
+	// the run permanently unable to complete even after the terminal critic
+	// records OKAY. A mutated goal row keeps the fail-loud tamper handling in
+	// the idempotent branch below.
 	const staleCompleteReceiptReplay =
 		input.status === "complete" &&
 		goal.status === "complete" &&
@@ -3100,13 +3105,14 @@ export async function checkpointUltragoalGoal(input: {
 		Boolean(matchingIdempotentEvent) &&
 		(!goal.completionVerification ||
 			(goal.completionVerification.verifiedAt === goal.updatedAt &&
-				validateReceiptFreshBase({
+				(validateReceiptFreshBase({
 					plan,
 					ledger: ledgerBefore,
 					goal,
 					receipt: goal.completionVerification,
 					receiptKind: goal.completionVerification.receiptKind,
-				}) !== null));
+				}) !== null ||
+					finalAggregateReceiptMissingCriticOkay(ledgerBefore, goal.completionVerification))));
 	if (
 		goal.status === input.status &&
 		goal.evidence === evidence &&

@@ -192,6 +192,9 @@ function renderSubagentSnapshotBody(
 	}
 	if (snapshot.description) lines.push(`  ${theme.fg("dim", `Description: ${snapshot.description}`)}`);
 	if (snapshot.outputRef) lines.push(`  ${theme.fg("dim", `Output: ${snapshot.outputRef}`)}`);
+	if (snapshot.setupFailureSummary) {
+		lines.push(`  ${theme.fg("error", `Setup failure: ${snapshot.setupFailureSummary}`)}`);
+	}
 	if (snapshot.assignment) {
 		lines.push(`  ${theme.fg("dim", "Assignment:")}`);
 		for (const al of snapshot.assignment.split("\n")) lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
@@ -312,8 +315,9 @@ export const subagentToolRenderer = {
 					);
 				}
 
-				snapshotSignatures ??= subagents.map(snapshot =>
-					subagentAwaitRenderedStateSignature([snapshot], result.details),
+				snapshotSignatures ??= subagents.map(
+					snapshot =>
+						`${subagentAwaitRenderedStateSignature([snapshot], result.details)}:${snapshot.setupFailureSummary ?? ""}`,
 				);
 				subagents.forEach((snapshot, index) => {
 					// Fresh per-subagent status line (cheap), then a cached or dynamic body.

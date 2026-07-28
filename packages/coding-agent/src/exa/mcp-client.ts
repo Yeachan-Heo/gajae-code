@@ -1,5 +1,5 @@
 import type { TSchema } from "@gajae-code/ai";
-import { $env, logger } from "@gajae-code/utils";
+import { $credentialEnv, logger } from "@gajae-code/utils";
 import type { CustomTool, CustomToolResult } from "../extensibility/custom-tools/types";
 import { callMCP } from "../runtime-mcp/json-rpc";
 import type {
@@ -11,9 +11,18 @@ import type {
 	MCPToolWrapperConfig,
 } from "./types";
 
-/** Find EXA_API_KEY from Bun.env or .env files */
+/**
+ * Find `EXA_API_KEY` from trusted environment sources.
+ *
+ * The key authenticates every Exa MCP call and travels in the request URL, so
+ * whatever can set it decides which account the agent's searches run through —
+ * and therefore who can see those queries. `$env` merges the caller's `cwd/.env`
+ * into `process.env`, so reading it there would let repository content supply
+ * that account. Resolve it the same way provider credentials are: launching
+ * shell plus GJC/user-owned `.env` files, never the project `.env`.
+ */
 export function findApiKey(): string | null {
-	return $env.EXA_API_KEY;
+	return $credentialEnv("EXA_API_KEY") ?? null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

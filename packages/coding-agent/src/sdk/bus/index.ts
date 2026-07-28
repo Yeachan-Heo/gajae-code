@@ -30,7 +30,7 @@ import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
-import { logger, postmortem, VERSION } from "@gajae-code/utils";
+import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
@@ -44,9 +44,11 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import type { ClientBridge } from "../../session/client-bridge";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
+	AskAnswerSource,
 	AskAnswerSourceResult,
 	AskRemoteControl,
 	AskRemoteInteraction,
@@ -63,7 +65,7 @@ import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { projectQ10Models } from "../models.js";
-import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
+import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
 	lifecycleStartupCapabilityForApi,
@@ -944,6 +946,19 @@ interface SessionRuntime {
 	pendingPromptCorrelations: Array<{ commandId: string; turnId: string }>;
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
+	/** Binds the executing Agent run to a correlated prompt so cleanup targets only it. */
+	bindPromptExecutionHandle: (correlation: { commandId: string; turnId: string }, handle: string | undefined) => void;
+	/** Reads the durable non-terminal claim for a correlated prompt, if any. */
+	peekPromptPendingOutcome: (correlation: {
+		commandId: string;
+		turnId: string;
+	}) => SdkPromptTerminalOutcome | undefined;
+	/** Claims, fences, finalizes, and publishes exactly one normalized prompt terminal. */
+	terminalizePrompt: (
+		correlation: { commandId: string; turnId: string },
+		outcome: SdkPromptTerminalOutcome,
+		extra?: { finalText?: string },
+	) => Promise<void>;
 	/** Records a correlated prompt terminal boundary after agent unwind. */
 	/** Atomically claims a correlated prompt terminal boundary after agent unwind. */
 	recordPromptTerminal: (correlation: { commandId: string; turnId: string } | undefined) => boolean;
@@ -964,6 +979,7 @@ interface SessionRuntime {
 					commandId?: string;
 					turnId?: string;
 					finalText?: string;
+					outcome?: SdkPromptTerminalOutcome;
 			  }
 			| {
 					type: "agent_failed";
@@ -971,6 +987,7 @@ interface SessionRuntime {
 					commandId: string;
 					turnId: string;
 					error: { code: string; message: string };
+					outcome?: SdkPromptTerminalOutcome;
 			  },
 	) => void;
 	/** Publishes one canonical agent-wire event to the client that owns the active prompt. */
@@ -1134,6 +1151,7 @@ const defaultConfig: NotificationConfig = {
 	redact: false,
 	verbosity: "lean",
 	sessionScope: "all",
+	sound: "all",
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },
@@ -1143,8 +1161,17 @@ const defaultConfig: NotificationConfig = {
 	btw: { enabled: true },
 };
 
+/**
+ * Whether the notifications control channel is enabled.
+ *
+ * Trusted sources only: enabling it opens the session control/answer channel, so
+ * a repository must not be able to turn it on. `$env` merges the caller's
+ * `cwd/.env` into `process.env`; the sibling resolvers in `config.ts` and
+ * `session-control.ts` already read an injected env record rather than the merged
+ * view, and this direct read was the outlier.
+ */
 export function notificationsEnabled(): boolean {
-	return process.env.GJC_NOTIFICATIONS === "1" || Boolean(process.env.GJC_NOTIFICATIONS_TOKEN);
+	return $credentialEnv("GJC_NOTIFICATIONS") === "1" || Boolean($credentialEnv("GJC_NOTIFICATIONS_TOKEN"));
 }
 
 function streamIntervalMs(): number {
@@ -1617,6 +1644,80 @@ async function requestRecoveredSelectedAck(
 	}
 }
 
+function createSdkUiAskAnswerSource(
+	requestElicitation: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>,
+): AskAnswerSource {
+	const awaitAnswerRequest = async (
+		request: AskAnswerRequest,
+		signal?: AbortSignal,
+	): Promise<AskAnswerSourceResult> => {
+		if (signal?.aborted) return undefined;
+		const choices = new Map<string, AskRemoteInteraction>();
+		const oneOf =
+			request.interaction === "selector"
+				? [
+						...request.options.map((label, index) => {
+							const value = `option:${index}`;
+							choices.set(value, { kind: "value", value: label });
+							return { const: value, title: label };
+						}),
+						...request.controls
+							.filter(control => control.enabled)
+							.map(control => {
+								const value = `control:${control.id}`;
+								choices.set(value, { kind: "control", controlId: control.id });
+								return { const: value, title: control.label };
+							}),
+					]
+				: [];
+		const response = await requestElicitation(
+			{
+				mode: "form",
+				message: request.question,
+				requestedSchema: {
+					type: "object",
+					properties: {
+						value: { type: "string", ...(oneOf.length > 0 ? { oneOf } : {}) },
+					},
+					required: ["value"],
+				},
+			},
+			signal,
+		);
+		if (signal?.aborted || !isRecord(response) || response.action !== "accept") return undefined;
+		const value = isRecord(response.content) ? response.content.value : undefined;
+		if (typeof value !== "string") return undefined;
+		if (request.interaction !== "selector") return value;
+		const interaction = choices.get(value);
+		if (!interaction) return undefined;
+		if (interaction.kind === "value") return interaction.value;
+		let settled: Promise<AskSettlementResult> | undefined;
+		return {
+			source: "remote",
+			interaction,
+			settle(settlement) {
+				if (!settled) {
+					settled = Promise.resolve(
+						settlement.kind === "commit"
+							? { kind: "committed", ack: { status: "failed", reason: "unsupported" } }
+							: settlement.kind === "invalid"
+								? { kind: "invalid_closed" }
+								: { kind: "resolved_without_commit" },
+					);
+				}
+				return settled;
+			},
+		};
+	};
+	return {
+		async awaitAnswer(question, options, signal) {
+			const answer = await awaitAnswerRequest({ question, options, interaction: "selector", controls: [] }, signal);
+			if (!answer || typeof answer === "string") return answer;
+			return answer.interaction.kind === "value" ? answer.interaction.value : undefined;
+		},
+		awaitAnswerRequest,
+	};
+}
 /** Register the interactive `ask` answer source for a session (the ask tool
  * races the local UI against a remote reply). Returns the deregister disposer. */
 function registerInteractiveAnswerSource(
@@ -1947,6 +2048,7 @@ function sdkQuerySurface(
 		getCapabilities: () => ({
 			operations: [...installedOperations(ctx, "control"), ...installedOperations(ctx, "query")],
 			hostTools: getInstalledDefinitions("host_tools") !== undefined,
+			promptTerminalOutcomeVersion: 1,
 		}),
 		getAuthProviders: () => [...new Set(ctx.modelRegistry.getAll().map(model => model.provider))],
 		getTools: () => {
@@ -1990,13 +2092,21 @@ function sdkControlSurface(
 		trackReconciliation?: boolean,
 	) => void | Promise<void> = () => {},
 	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
+	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
 	admitPrompt: (clientRef?: string) => void,
 	releasePromptAdmission: (clientRef?: string) => void,
+	awaitReconciliationReady: () => Promise<void> = async () => {},
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
+	abortOwnedPrompt: (
+		connectionId: string | undefined,
+	) => Promise<{ aborted: true; disposition: "cancelled" | "already_terminal" | "idle" }> = async () => ({
+		aborted: true,
+		disposition: "idle",
+	}),
 	skillRecon?: {
 		admit: (clientRef?: string) => void;
 		release: (clientRef?: string) => void;
@@ -2011,7 +2121,10 @@ function sdkControlSurface(
 		) => Promise<void>;
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	},
-): ControlSurface {
+): ControlSurface & {
+	cancelPendingPreflights(): void;
+	cancelPendingPreflightsForConnection(connectionId: string): void;
+} {
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
@@ -2065,9 +2178,15 @@ function sdkControlSurface(
 			return unavailable(operation, "no typed session seam is installed")();
 		return ctx.sdkControl(operation, input);
 	};
-	const pendingPreflightCancellations = new Set<() => void>();
+	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => void }>();
+	const preflightKey = (connectionId: string | undefined, correlation: { commandId: string; turnId: string }) =>
+		`${connectionId ?? ""}\0${correlation.commandId}\0${correlation.turnId}`;
 	const cancelPendingPreflights = () => {
-		for (const cancel of pendingPreflightCancellations) cancel();
+		for (const { cancel } of pendingPreflightCancellations.values()) cancel();
+	};
+	const cancelPendingPreflightsForConnection = (connectionId: string) => {
+		for (const entry of pendingPreflightCancellations.values())
+			if (entry.connectionId === connectionId) entry.cancel();
 	};
 	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
 	const awaitAbortReady = async () => {
@@ -2092,7 +2211,18 @@ function sdkControlSurface(
 			throw Object.assign(new Error("clientRef must be a non-empty string of at most 128 characters."), {
 				code: "invalid_input",
 			});
-		if (trackReconciliation) admitPrompt(trimmedClientRef);
+		if (trackReconciliation) {
+			// Restart recovery must be committed before a tracked prompt reserves capacity,
+			// otherwise it can admit against pre-hydration state or a lost clientRef.
+			try {
+				await awaitReconciliationReady();
+			} catch {
+				throw Object.assign(new Error("Prompt reconciliation state is unavailable; retry after restart."), {
+					code: "unavailable",
+				});
+			}
+			admitPrompt(trimmedClientRef);
+		}
 		try {
 			if (forceFresh && isSessionBusy()) {
 				throw Object.assign(
@@ -2140,17 +2270,31 @@ function sdkControlSurface(
 				status: "rejected",
 				error: Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
 			});
-		pendingPreflightCancellations.add(cancelPreflight);
+		pendingPreflightCancellations.set(preflightKey(requesterConnectionId, correlation), {
+			connectionId: requesterConnectionId,
+			cancel: cancelPreflight,
+		});
 		const settleAccepted = async () => {
 			if (preflightSettled) return;
 			accepted = true;
-			await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
+			try {
+				await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
+			} catch (error) {
+				// Durable acceptance failed, so the prompt was never accepted: reject the
+				// control preflight and rethrow so the awaiting session does not execute it.
+				accepted = false;
+				onPromptAcceptFailed(correlation);
+				settlePreflight({ status: "rejected", error });
+				throw error;
+			}
 			settlePreflight({ status: "accepted" });
 		};
 		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
 		const onPreflightAcceptCommit = settleAccepted;
 		const onPreflightAccepted = () => {
-			void settleAccepted();
+			// Legacy fire-and-forget hook: the rejection is already reported through the
+			// preflight promise, so swallow it here instead of leaking an unhandled rejection.
+			void settleAccepted().catch(() => {});
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
 		// succeeds. The terminal result records correlation before agent_start can fire.
@@ -2192,24 +2336,35 @@ function sdkControlSurface(
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		} finally {
-			pendingPreflightCancellations.delete(cancelPreflight);
+			pendingPreflightCancellations.delete(preflightKey(requesterConnectionId, correlation));
 		}
 	};
-	const surface: ControlSurface & { cancelPendingPreflights(): void } = {
+	const surface: ControlSurface & {
+		cancelPendingPreflights(): void;
+		cancelPendingPreflightsForConnection(connectionId: string): void;
+	} = {
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
 		steer: text => sendSteer(text),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
-		abort: () => {
-			cancelPendingPreflights();
-			ctx.abort();
-			return { aborted: true };
+		abort: async () => {
+			const requesterConnectionId = controlRequesterContext.getStore();
+			const pendingPreflight = [...pendingPreflightCancellations.values()].some(
+				entry => entry.connectionId === requesterConnectionId,
+			);
+			if (pendingPreflight) {
+				if (requesterConnectionId) cancelPendingPreflightsForConnection(requesterConnectionId);
+				else cancelPendingPreflights();
+				return { aborted: true, disposition: "preflight_cancelled" };
+			}
+			return await abortOwnedPrompt(requesterConnectionId);
 		},
 		abortAndPrompt: async text => {
 			await awaitAbortReady();
 			return await submitPrompt(text, undefined, true, undefined, false, controlRequesterContext.getStore());
 		},
 		cancelPendingPreflights,
+		cancelPendingPreflightsForConnection,
 		answerAsk: (id, answer) => {
 			const pending = pendingInteractive.get(id);
 			if (!pending) throw Object.assign(new Error(`Ask ${id} was not found.`), { code: "resource_gone" });
@@ -2385,7 +2540,16 @@ function sdkControlSurface(
 			const commandId = crypto.randomUUID();
 			const turnId = crypto.randomUUID();
 			const correlation = { commandId, turnId };
-			if (skillRecon) skillRecon.admit(trimmedClientRef);
+			if (skillRecon) {
+				try {
+					await awaitReconciliationReady();
+				} catch {
+					throw Object.assign(new Error("Skill reconciliation state is unavailable; retry after restart."), {
+						code: "unavailable",
+					});
+				}
+				skillRecon.admit(trimmedClientRef);
+			}
 			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
 			let phase: "pending" | "accepted" | "rejected" = "pending";
 			const settleAccept = (value: Record<string, unknown>) => {
@@ -3353,32 +3517,86 @@ export function createNotificationsExtension(
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
+		let disposeUiAnswerSource: (() => void) | undefined;
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
-			if (capability !== "permission") return;
-			ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
-				const result = await host!.reverse.request("permission", "request", {
-					toolCall,
-					options: permissionOptions,
-					aborted: signal?.aborted === true,
-				});
-				if (!result || typeof result !== "object")
+			if (capability === "permission") {
+				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
+					const result = await host!.reverse.request(
+						"permission",
+						"request",
+						{
+							toolCall,
+							options: permissionOptions,
+						},
+						signal,
+					);
+					if (!result || typeof result !== "object")
+						throw new Error("permission provider returned an invalid response");
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					if (response.outcome === "cancelled") return { outcome: "cancelled" };
+					if (response.outcome === "selected" && typeof response.optionId === "string")
+						return {
+							outcome: "selected",
+							optionId: response.optionId,
+							...(typeof response.kind === "string"
+								? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
+								: {}),
+						};
 					throw new Error("permission provider returned an invalid response");
-				const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
-				if (response.outcome === "cancelled") return { outcome: "cancelled" };
-				if (response.outcome === "selected" && typeof response.optionId === "string")
-					return {
-						outcome: "selected",
-						optionId: response.optionId,
-						...(typeof response.kind === "string"
-							? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
-							: {}),
-					};
-				throw new Error("permission provider returned an invalid response");
-			});
+				});
+				return;
+			}
+			if (capability === "ui") {
+				disposeUiAnswerSource?.();
+				disposeUiAnswerSource = registerAskAnswerSource(
+					id,
+					createSdkUiAskAnswerSource(
+						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
+					),
+				);
+				return;
+			}
+			if (capability !== "fs") return;
+			// Only advertise the methods the client actually declared; a read-only client
+			// must keep using the local write path instead of failing against the bridge.
+			const names = new Set(
+				(Array.isArray(definitions) ? definitions : [])
+					.map(definition =>
+						definition && typeof definition === "object" ? (definition as { name?: unknown }).name : undefined,
+					)
+					.filter((name): name is string => typeof name === "string"),
+			);
+			const canRead = names.size === 0 || names.has("fs.readTextFile");
+			const canWrite = names.size === 0 || names.has("fs.writeTextFile");
+			const bridge: ClientBridge = {
+				capabilities: { readTextFile: canRead, writeTextFile: canWrite },
+				deferAgentInitiatedTurns: true,
+				async readTextFile(params) {
+					const result = await host!.reverse.request("fs", "fs.readTextFile", params);
+					if (
+						!result ||
+						typeof result !== "object" ||
+						typeof (result as { content?: unknown }).content !== "string"
+					)
+						throw new Error("fs provider returned an invalid read response");
+					return (result as { content: string }).content;
+				},
+				async writeTextFile(params) {
+					await host!.reverse.request("fs", "fs.writeTextFile", params);
+				},
+			};
+			if (!canRead) delete bridge.readTextFile;
+			if (!canWrite) delete bridge.writeTextFile;
+			ctx.setSdkClientBridge?.(bridge);
 		};
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
+			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
+			if (capability === "ui") {
+				disposeUiAnswerSource?.();
+				disposeUiAnswerSource = undefined;
+			}
 		};
 
 		const hostCapCache = new Map<string, ReadonlySet<string>>();
@@ -3389,6 +3607,8 @@ export function createNotificationsExtension(
 		const PROMPT_SUBMISSION_TTL_MS = 5 * 60_000;
 		const PROMPT_TERMINAL_TOMBSTONE_CAPACITY = 256;
 		const PROMPT_TERMINAL_TOMBSTONE_TTL_MS = 15 * 60_000;
+		// SDK-owned terminalization grace; injectable in tests, never a user setting.
+		const PROMPT_TERMINALIZATION_GRACE_MS = 10_000;
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
 		type PromptLifecycleFrame =
@@ -3398,6 +3618,7 @@ export function createNotificationsExtension(
 					commandId?: string;
 					turnId?: string;
 					finalText?: string;
+					outcome?: SdkPromptTerminalOutcome;
 			  }
 			| {
 					type: "agent_failed";
@@ -3405,6 +3626,7 @@ export function createNotificationsExtension(
 					commandId: string;
 					turnId: string;
 					error: { code: string; message: string };
+					outcome?: SdkPromptTerminalOutcome;
 			  };
 		type PromptSubmission = {
 			acknowledged: boolean;
@@ -3414,11 +3636,22 @@ export function createNotificationsExtension(
 			error: unknown;
 			terminal: boolean;
 			retainCorrelation: boolean;
+			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
+			fatal?: boolean;
 			createdAt: number;
+			deadlineMs: number;
+			deadlineTimer?: Parameters<typeof clearTimeout>[0];
+			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
+			outcome?: SdkPromptTerminalOutcome;
+			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
+			executionHandle?: string;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
-		const promptTerminalTombstones = new Map<string, number>();
+		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
+		const fencedConnections = new Set<string>();
+		let cancelPreflightsForConnection: ((connectionId: string) => void) | undefined;
+		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
 		// Authoritative bounded reconciliation state for Q26 turn.prompt_status
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
@@ -3432,7 +3665,14 @@ export function createNotificationsExtension(
 				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
 				: null;
 		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
-		if (durableStore) void kindReconciliation.hydrateFromStore();
+		// Restart recovery must commit before any prompt is admitted; otherwise a new
+		// admission can race the hydrated full-state replacement.
+		const reconciliationReady: Promise<void> = durableStore
+			? kindReconciliation.hydrateFromStore()
+			: Promise.resolve();
+		// Never let a hydration rejection become an unhandled rejection; tracked prompts
+		// re-await the same promise and fail closed below.
+		void reconciliationReady.catch(() => {});
 		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
 		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
@@ -3452,32 +3692,39 @@ export function createNotificationsExtension(
 			);
 			if (pendingIndex !== -1) pendingPromptCorrelations.splice(pendingIndex, 1);
 		};
-		const addTerminalTombstone = (key: string, now = Date.now()) => {
+		const addTerminalTombstone = (key: string, connectionId: string, now = Date.now()) => {
 			promptTerminalTombstones.delete(key);
-			promptTerminalTombstones.set(key, now + PROMPT_TERMINAL_TOMBSTONE_TTL_MS);
+			promptTerminalTombstones.set(key, { connectionId, expiresAt: now + PROMPT_TERMINAL_TOMBSTONE_TTL_MS });
 			while (promptTerminalTombstones.size > PROMPT_TERMINAL_TOMBSTONE_CAPACITY)
 				promptTerminalTombstones.delete(promptTerminalTombstones.keys().next().value!);
 		};
 		const finalizePrompt = (key: string, correlation: { commandId: string; turnId: string }) => {
+			const submission = promptSubmissions.get(key);
+			if (submission?.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			promptSubmissions.delete(key);
 			removePendingPromptCorrelation(correlation);
-			addTerminalTombstone(key);
+			if (submission) addTerminalTombstone(key, submission.connectionId);
 		};
 		const expirePromptDelivery = (key: string, submission: PromptSubmission) => {
+			if (!submission.terminal) return;
+			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			promptSubmissions.delete(key);
-			if (!submission.terminal && submission.retainCorrelation) return;
+			// A fatal closure is transport-level, not a committed semantic terminal: the
+			// durable record stays authoritative, so it must never leave a tombstone.
+			if (submission.fatal) return;
 			const [commandId, turnId] = key.split(":", 2);
 			if (!commandId || !turnId) return;
 			removePendingPromptCorrelation({ commandId, turnId });
-			addTerminalTombstone(key);
+			addTerminalTombstone(key, submission.connectionId);
 		};
 		const cleanupPromptRecords = (now = Date.now()) => {
 			kindReconciliation.cleanup();
 			reconciliation.cleanup();
-			for (const [key, expiresAt] of promptTerminalTombstones)
-				if (expiresAt <= now) promptTerminalTombstones.delete(key);
+			for (const [key, tombstone] of promptTerminalTombstones)
+				if (tombstone.expiresAt <= now) promptTerminalTombstones.delete(key);
 			for (const [key, submission] of promptSubmissions)
-				if (submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now) expirePromptDelivery(key, submission);
+				if (submission.terminal && submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now)
+					expirePromptDelivery(key, submission);
 		};
 		const abandonPrompt = (submission: PromptSubmission) => {
 			submission.abandoned = true;
@@ -3511,7 +3758,10 @@ export function createNotificationsExtension(
 				logger.warn(`sdk: correlated lifecycle delivery failed: ${String(error)}`);
 				abandonPrompt(submission);
 			}
-			if (submission.terminal) finalizePrompt(key, correlation);
+			if (submission.terminal) {
+				submission.phase = "delivered";
+				finalizePrompt(key, correlation);
+			}
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
 			if (!runtime?.activePromptCorrelation) return;
@@ -3547,6 +3797,7 @@ export function createNotificationsExtension(
 				}
 			}
 			if (submission.terminal) {
+				submission.phase = "delivered";
 				const [commandId, turnId] = key.split(":", 2);
 				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
 			}
@@ -3567,12 +3818,16 @@ export function createNotificationsExtension(
 			// failures that race the durable write still emit correlated terminals.
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
-				const oldest = promptSubmissions.entries().next().value as [string, PromptSubmission] | undefined;
-				if (!oldest) break;
-				expirePromptDelivery(oldest[0], oldest[1]);
+				const oldestTerminal = [...promptSubmissions.entries()].find(([, submission]) => submission.terminal);
+				if (!oldestTerminal)
+					throw Object.assign(
+						new Error("Too many active prompt submissions; reconcile or await terminal state."),
+						{ code: "reconciliation_capacity" },
+					);
+				expirePromptDelivery(oldestTerminal[0], oldestTerminal[1]);
 			}
 			pendingPromptCorrelations.push(correlation);
-			promptSubmissions.set(promptSubmissionKey(correlation), {
+			const submission: PromptSubmission = {
 				acknowledged: false,
 				connectionId: requesterConnectionId,
 				abandoned: false,
@@ -3581,31 +3836,217 @@ export function createNotificationsExtension(
 				terminal: false,
 				retainCorrelation: trackReconciliation,
 				createdAt: Date.now(),
+				deadlineMs: settings?.get("sdk.promptDeadlineMs") ?? 1_800_000,
+				phase: "active",
+				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
+				executionHandle: undefined,
 				bufferedFrames: [],
-			});
+			};
+			promptSubmissions.set(promptSubmissionKey(correlation), submission);
 			if (trackReconciliation) await notePromptReconciliationAccepted(correlation, clientRef);
+			submission.deadlineTimer = setTimeout(() => {
+				void terminalizePrompt(
+					correlation,
+					{
+						kind: "failed",
+						code: "prompt_deadline_exceeded",
+						message: "Prompt deadline exceeded.",
+						provenance: "deadline",
+					},
+					{ fence: true },
+				);
+			}, submission.deadlineMs);
+		};
+		/** Roll back process-local registration when durable acceptance failed. */
+		const discardPromptAcceptance = (correlation: { commandId: string; turnId: string }) => {
+			promptSubmissions.delete(promptSubmissionKey(correlation));
+			removePendingPromptCorrelation(correlation);
 		};
 		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
 			if (!correlation) return false;
-			cleanupPromptRecords();
-			const key = promptSubmissionKey(correlation);
-			if (promptTerminalTombstones.has(key)) return false;
-			const submission = promptSubmissions.get(key);
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal) return false;
 			submission.terminal = true;
+			submission.phase = "publication_closed";
 			return true;
+		};
+		/**
+		 * Fail-closed teardown: the durable claim survives for restart recovery, but the
+		 * waiting client must still reject exactly once, so an infrastructure failure frame
+		 * is delivered before the connection is released.
+		 */
+		const failPromptClosed = (
+			correlation: { commandId: string; turnId: string },
+			submission: PromptSubmission,
+			code: string,
+			message: string,
+		) => {
+			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			if (!submission.terminal) {
+				submission.terminal = true;
+				submission.fatal = true;
+				submission.phase = "publication_closed";
+				// Deliver the transport failure directly to the accepted requester instead of
+				// `emitPromptLifecycle`: this must never enter the resumable semantic event
+				// ring, finalize reconciliation, or tombstone the correlation, because the
+				// durable claim stays authoritative for Q26 and restart recovery.
+				// Delivered regardless of acknowledgement: a pre-ack fatal failure must still
+				// settle the waiting request instead of leaving it pending forever.
+				if (runtime)
+					try {
+						runtime.server.sendTo(
+							submission.connectionId,
+							JSON.stringify({
+								type: "agent_failed",
+								sessionId: runtime.id,
+								...correlation,
+								error: { code, message },
+							}),
+						);
+					} catch (error) {
+						logger.warn(`sdk: fatal prompt closure delivery failed: ${String(error)}`);
+					}
+			}
+			// Fence the endpoint. The native transport exposes no close primitive, so the
+			// connection is marked failed (every later inbound frame from it is refused),
+			// its reverse leases are released, and its deliveries are abandoned. The durable
+			// record stays active for Q26 and restart recovery.
+			cancelPreflightsForConnection?.(submission.connectionId);
+			fencedConnections.add(submission.connectionId);
+			host?.handleDisconnect(submission.connectionId);
+			for (const [key, owned] of promptSubmissions)
+				if (owned.connectionId === submission.connectionId) {
+					abandonPrompt(owned);
+					const [commandId, turnId] = key.split(":", 2);
+					if (commandId && turnId) removePendingPromptCorrelation({ commandId, turnId });
+				}
+			if (
+				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
+				runtime.activePromptCorrelation.turnId === correlation.turnId
+			)
+				runtime.activePromptCorrelation = undefined;
+		};
+		const bindPromptExecutionHandle = (
+			correlation: { commandId: string; turnId: string },
+			handle: string | undefined,
+		) => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (submission) submission.executionHandle = handle;
+		};
+		const terminalizePrompt = async (
+			correlation: { commandId: string; turnId: string },
+			requestedOutcome: SdkPromptTerminalOutcome,
+			// Cleanup-initiated claims (cancel, deadline, owner disconnect) must abort the
+			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
+			// so aborting there would cancel the next turn instead of fencing this one.
+			options: { fence?: boolean } = {},
+			extra?: { finalText?: string; error?: { code: string; message: string } },
+		) => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission || submission.terminal || submission.phase !== "active") return;
+			submission.phase = "outcome_claimed";
+			let winner: SdkPromptTerminalOutcome;
+			try {
+				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome);
+			} catch (error) {
+				// The claim is the durability boundary: without it nothing may be published
+				// and the endpoint must fail closed so the client rejects exactly once. The
+				// last durable record stays active for restart recovery.
+				logger.warn(`sdk: prompt claim persistence failed: ${String(error)}`);
+				failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
+				return;
+			}
+			submission.outcome = winner;
+			submission.phase = "terminalizing";
+			if (options.fence) {
+				const seam = ctx as typeof ctx & {
+					abortPromptAndWait?: (
+						handle: string,
+						options: { graceMs: number },
+					) => Promise<{ status: "settled" } | { status: "unfenced" }>;
+				};
+				// Only the handle captured for this correlation may be fenced; a later run
+				// must never be aborted by an older prompt's cleanup.
+				if (typeof seam.abortPromptAndWait !== "function" || !submission.executionHandle) {
+					failPromptClosed(
+						correlation,
+						submission,
+						"terminal_uncertain",
+						"Prompt resources could not be fenced with an exact run handle.",
+					);
+					return;
+				}
+				let proof: { status: "settled" } | { status: "unfenced" };
+				try {
+					proof = await seam.abortPromptAndWait(submission.executionHandle, {
+						graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
+					});
+				} catch (error) {
+					logger.warn(`sdk: prompt resource fencing failed: ${String(error)}`);
+					failPromptClosed(
+						correlation,
+						submission,
+						"terminal_uncertain",
+						"Prompt resources could not be settled before terminalization.",
+					);
+					return;
+				}
+				if (proof?.status !== "settled") {
+					// No settlement proof: never publish a normal terminal. The durable
+					// pending claim stays active so restart recovery finalizes it.
+					failPromptClosed(
+						correlation,
+						submission,
+						"terminal_uncertain",
+						"Prompt resources did not settle before the terminalization grace expired.",
+					);
+					return;
+				}
+			}
+			try {
+				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error);
+			} catch (error) {
+				// The durable pending claim survives; publishing an unpersisted terminal
+				// would contradict it, so fail the endpoint closed instead.
+				logger.warn(`sdk: prompt terminal persistence failed: ${String(error)}`);
+				failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
+				return;
+			}
+			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			if (!recordPromptTerminal(correlation) || !runtime) return;
+			if (winner.kind === "failed") {
+				emitPromptLifecycle(correlation, {
+					type: "agent_failed",
+					sessionId: runtime.id,
+					...correlation,
+					error: extra?.error ?? { code: winner.code, message: winner.message },
+					outcome: winner,
+				});
+			} else {
+				emitPromptLifecycle(correlation, {
+					type: "agent_end",
+					sessionId: runtime.id,
+					...correlation,
+					...(extra?.finalText ? { finalText: extra.finalText } : {}),
+					outcome: winner,
+				});
+			}
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const sanitized = sanitizePromptFailure(error);
-			void kindReconciliation.noteTransition("prompt", correlation, { type: "agent_failed", error: sanitized });
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission || !runtime || !recordPromptTerminal(correlation)) return;
-			emitPromptLifecycle(correlation, {
-				type: "agent_failed",
-				sessionId: runtime.id,
-				...correlation,
-				error: sanitized,
-			});
+			void terminalizePrompt(
+				correlation,
+				{
+					kind: "failed",
+					code: "prompt_failed",
+					message: sanitized.message,
+					provenance: "agent_failed",
+				},
+				{},
+				// The normalized outcome is the ACP contract; the wire error keeps the
+				// existing sanitized discriminator so SDK clients keep branching on it.
+				{ error: sanitized },
+			);
 		};
 		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
@@ -3662,13 +4103,29 @@ export function createNotificationsExtension(
 			() => runtime?.busy === true || pendingPromptCorrelations.length > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
+			discardPromptAcceptance,
 			() => runtime?.stopping !== true,
 			trackGateResolution,
 			admitPromptSubmission,
 			releasePromptAdmission,
+			() => reconciliationReady,
 			settings,
 			configOverrides,
 			configRevision,
+			async connectionId => {
+				const active = [...promptSubmissions.entries()].find(
+					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
+				);
+				if (!active) return { aborted: true, disposition: "idle" as const };
+				const [commandId, turnId] = active[0].split(":", 2);
+				if (commandId && turnId)
+					await terminalizePrompt(
+						{ commandId, turnId },
+						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+						{ fence: true },
+					);
+				return { aborted: true, disposition: "cancelled" as const };
+			},
 			{
 				admit: (clientRef?: string) => kindReconciliation.admit("skill", clientRef),
 				release: (clientRef?: string) => kindReconciliation.releaseAdmission("skill", clientRef),
@@ -3678,6 +4135,7 @@ export function createNotificationsExtension(
 				lookup: selector => kindReconciliation.lookup("skill", selector),
 			},
 		);
+		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
 			if (
 				frame.type !== "control_response" ||
@@ -3951,6 +4409,9 @@ export function createNotificationsExtension(
 			busy: false,
 			pendingPromptCorrelations,
 			activePromptCorrelation: undefined,
+			bindPromptExecutionHandle,
+			peekPromptPendingOutcome: correlation => kindReconciliation.peekPendingOutcome(correlation),
+			terminalizePrompt: (correlation, outcome, extra) => terminalizePrompt(correlation, outcome, {}, extra),
 			recordPromptTerminal,
 			notePromptReconciliation: (correlation, frame) => {
 				void kindReconciliation.noteTransition("prompt", correlation, frame);
@@ -4013,6 +4474,23 @@ export function createNotificationsExtension(
 		});
 		initializedRuntime.abortEphemeralTurns = () => ephemeralTurns.dispose();
 		initializedRuntime.disableEphemeralTurns = () => ephemeralTurns.disable();
+		const sendEndpointStale = (connectionId: string, frame: Record<string, unknown>) => {
+			const id = typeof frame.id === "string" ? frame.id : undefined;
+			if (!id) return;
+			const error = { code: "endpoint_stale", message: "session endpoint is stale." };
+			const responseType =
+				frame.type === "control_request"
+					? "control_response"
+					: frame.type === "query_request"
+						? "query_response"
+						: frame.type === "global_request"
+							? "global_response"
+							: undefined;
+			if (!responseType) return;
+			try {
+				server.sendTo(connectionId, JSON.stringify({ type: responseType, id, ok: false, error }));
+			} catch {}
+		};
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err || !inbound) return;
@@ -4020,20 +4498,12 @@ export function createNotificationsExtension(
 					const frame = JSON.parse(inbound.json) as unknown;
 					if (!frame || typeof frame !== "object") return;
 					const typedFrame = frame as Record<string, unknown>;
+					if (inbound.connectionId && fencedConnections.has(inbound.connectionId)) {
+						sendEndpointStale(inbound.connectionId, typedFrame);
+						return;
+					}
 					if (initializedRuntime.inboundFenced) {
-						if (typedFrame.type === "control_request" && typeof typedFrame.id === "string") {
-							try {
-								server.sendTo(
-									inbound.connectionId,
-									JSON.stringify({
-										type: "control_response",
-										id: typedFrame.id,
-										ok: false,
-										error: { code: "endpoint_stale", message: "session endpoint is draining." },
-									}),
-								);
-							} catch {}
-						}
+						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
@@ -4062,8 +4532,19 @@ export function createNotificationsExtension(
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
+				controlSurface.cancelPendingPreflightsForConnection(connectionId);
 				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
+				// The socket is gone, so its fence has nothing left to refuse. Dropping the
+				// entry keeps the set bounded by live connections instead of growing forever.
+				fencedConnections.delete(connectionId);
+				// Deliberate deviation from the plan's "claim prompt_failed on old-owner
+				// disconnect": that would break the shipped Q26 reconnect contract, where a
+				// client may drop its socket and reconcile the still-running prompt without
+				// duplicate execution (see test/sdk-host-wiring.test.ts "turn.prompt_status
+				// reconciles an accepted prompt across client reconnect"). A closed socket
+				// therefore only abandons delivery; ACP rejects its own local waiter once and
+				// terminal authority stays with the eventual normalized SDK outcome.
 				for (const submission of promptSubmissions.values())
 					if (submission.connectionId === connectionId) abandonPrompt(submission);
 			});
@@ -5169,6 +5650,7 @@ export function createNotificationsExtension(
 		rt.busy = true;
 		const correlation = rt.pendingPromptCorrelations.shift();
 		rt.activePromptCorrelation = correlation;
+		if (correlation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
 		rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
@@ -5214,15 +5696,45 @@ export function createNotificationsExtension(
 		rt.busy = false;
 		const correlation = rt.activePromptCorrelation;
 		if (correlation) {
-			const terminalAssistant = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).find(
+			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
+				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
+			) as Array<{ stopReason?: unknown; errorKind?: unknown }>;
+			const finalAssistant = assistants[0];
+			const pendingOutcome = rt.peekPromptPendingOutcome(correlation);
+			let outcome: SdkPromptTerminalOutcome;
+			if (pendingOutcome) outcome = pendingOutcome;
+			else if (finalAssistant?.stopReason === "length")
+				outcome = { kind: "stopped", reason: "max_tokens", provenance: "agent" };
+			else if (finalAssistant?.errorKind === "provider_safety_stop")
+				outcome = { kind: "stopped", reason: "refusal", provenance: "agent" };
+			// A missing/normal final assistant with a non-failing loop stop reason is a
+			// normal turn end; only explicit error/aborted assistants or non-completed
+			// loop stop reasons are failures. Text is never parsed.
+			else if (
+				(event.stopReason === undefined || event.stopReason === "completed") &&
+				finalAssistant?.stopReason !== "error" &&
+				finalAssistant?.stopReason !== "aborted"
+			)
+				outcome = { kind: "stopped", reason: "end_turn", provenance: "agent" };
+			else
+				outcome = {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Prompt submission failed.",
+					provenance: "agent_failed",
+				};
+			const successAssistant = assistants.find(
+				message => (message as { stopReason?: unknown }).stopReason === "stop",
+			);
+			const finalText = successAssistant ? acpFinalTextFromMessage(successAssistant).text : "";
+			// The normalized outcome is the ACP contract; existing SDK clients keep the
+			// legacy failure discriminator on the wire and in the reconciliation record.
+			const terminalAssistant = assistants.find(
 				message =>
-					message &&
-					typeof message === "object" &&
-					(message as { role?: unknown }).role === "assistant" &&
-					((message as { stopReason?: unknown }).stopReason === "error" ||
-						(message as { stopReason?: unknown }).stopReason === "aborted"),
+					(message as { stopReason?: unknown }).stopReason === "error" ||
+					(message as { stopReason?: unknown }).stopReason === "aborted",
 			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown } | undefined;
-			const failureCode =
+			const legacyCode =
 				event.stopReason === "cancelled"
 					? "cancelled"
 					: terminalAssistant?.stopReason === "error"
@@ -5230,33 +5742,16 @@ export function createNotificationsExtension(
 						: terminalAssistant?.stopReason === "aborted"
 							? "aborted"
 							: undefined;
-			if (failureCode)
-				rt.emitPromptFailure(correlation, {
-					code: failureCode,
-					message:
-						typeof terminalAssistant?.errorMessage === "string"
-							? terminalAssistant.errorMessage
-							: "Prompt submission failed.",
-				});
-			else {
-				rt.notePromptReconciliation(correlation, { type: "agent_end" });
-				if (rt.recordPromptTerminal(correlation)) {
-					const finalAssistant = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).find(
-						message =>
-							message &&
-							typeof message === "object" &&
-							(message as { role?: unknown }).role === "assistant" &&
-							(message as { stopReason?: unknown }).stopReason === "stop",
-					);
-					const finalText = finalAssistant ? acpFinalTextFromMessage(finalAssistant).text : "";
-					rt.emitPromptLifecycle(correlation, {
-						type: "agent_end",
-						sessionId: id,
-						...correlation,
-						...(finalText ? { finalText } : {}),
-					});
-				}
-			}
+			void rt.terminalizePrompt(correlation, outcome, {
+				...(finalText ? { finalText } : {}),
+				...(outcome.kind === "failed" && legacyCode
+					? {
+							// Only the legacy discriminator is preserved; provider text is never
+							// retained, matching `sanitizePromptFailure`.
+							error: { code: legacyCode, message: "Prompt submission failed." },
+						}
+					: {}),
+			});
 		} else {
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}

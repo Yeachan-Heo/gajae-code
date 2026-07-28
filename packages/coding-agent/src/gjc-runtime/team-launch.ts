@@ -36,6 +36,7 @@ export function buildWorkerCommand(
 	worker: GjcTeamWorker,
 	platform: NodeJS.Platform = process.platform,
 	promptOverride?: string,
+	env: NodeJS.ProcessEnv = process.env,
 ): string {
 	const quote = platform === "win32" ? powershellQuote : shellQuote;
 	const envAssignment = (key: string, value: string): string =>
@@ -74,6 +75,13 @@ export function buildWorkerCommand(
 			"GJC_TEAM_WORKER_MEMORY_GUARD_PATH",
 			workerMemoryGuardLedgerPath(path.join(config.state_root, config.team_name), worker.id),
 		),
+		// The worker derives its heartbeat cadence from the same window the leader
+		// enforces. tmux panes do not inherit the launching shell's environment, so
+		// without this a tightened window would leave workers publishing on the
+		// default cadence and reported stale while they are working.
+		...(env.GJC_TEAM_HEARTBEAT_STALE_MS?.trim()
+			? [envAssignment("GJC_TEAM_HEARTBEAT_STALE_MS", env.GJC_TEAM_HEARTBEAT_STALE_MS.trim())]
+			: []),
 	];
 	const joined = envLines.join(" ");
 	const clearInheritedSession = config.gjc_session_id

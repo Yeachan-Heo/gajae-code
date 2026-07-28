@@ -632,3 +632,55 @@ canonical Darwin captures depend on the recorded installed fonts; theme or
 consumer fixes require a failing inventory row; and every post-review change
 forces recapture/re-review. No third-party corpus, screenshot, font, brand
 guide, prompt pack, or raw reference asset is copied into source control.
+
+## GJC Bundles
+
+GJC Bundles is a directly hosted Settings surface using the existing framed-list
+grammar. A bundle identity is always displayed as its name plus `(user)` or
+`(project)`. Same-name rows in opposite scopes are distinct identities and are
+never merged, selected together, or mutated through one another.
+
+Only safe source presentation is permitted. Never render or retain a raw source
+locator, userinfo, query, fragment, token, authentication material, or a full
+parent path in labels, descriptions, status, confirmation, errors, or evidence.
+
+Persisted enablement is user intent: bundle and eligible-surface enabled or
+disabled state. Effective runtime status is advisory display evidence only and
+never acts as hidden authorization. Deterministic quarantine blocks an enable
+action; disable is always available. Runtime evidence does not alter either
+rule.
+
+Focus, cursor, wrapping, ANSI-aware cell measurement, CJK semantic wrapping,
+and list scrolling follow the existing settings contracts above. Up/Down wrap
+within lists. A non-cancellable bundle mutation visibly locks navigation,
+including Escape and tab changes, until it completes; the lock names its
+reason. Long names and descriptions wrap in allocated content regions without
+hiding scope identity, CJK text breaks only at semantic boundaries, ANSI styles
+do not affect width measurement, and long surface lists scroll while retaining
+the focused row and scroll position.
+
+This Settings surface does not install or uninstall bundles, edit sources, or
+repair quarantine. It supports only list/detail, update review/apply,
+bundle-toggle, and eligible-surface-toggle actions.
+
+### Create-only refusal and source reachability
+
+An already-installed target is refused with `already_installed_use_upgrade`,
+independently of `--force`, and the refusal performs no filesystem mutation:
+it is decided before any registry lock is acquired, because acquiring a lock
+itself creates the scope root.
+
+Refusal is bound to the bundle name declared in the manifest, because that name
+*is* the identity component. When the source is a local directory the name is
+read without resolving, so a deleted-and-recreated or offline-but-present source
+still refuses correctly.
+
+When the source cannot be read at all — a deleted directory, an unreachable git
+remote, a missing tarball — the target's identity is genuinely unknowable before
+resolution, so the operation resolves and reports the source failure instead of
+refusing. Matching on the stored locator was tried and rejected as unsound: one
+locator can resolve to different content over time, the same URI can back two
+differently named bundles, and a stored `uri#ref` differs from a bare `uri`, so
+locator-based refusal would refuse installs that should proceed. Refusing on a
+guess is worse than reporting the real failure, so identity must be readable for
+refusal to apply.

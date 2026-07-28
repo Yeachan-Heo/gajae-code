@@ -19,8 +19,13 @@ Most runtime lookups use `$env` from `@gajae-code/utils` (`packages/utils/src/en
 3. Agent `.env` (`~/.gjc/agent/.env`, respecting `GJC_CONFIG_DIR` / `GJC_CODING_AGENT_DIR`) for keys not already set
 4. Config-root `.env` (`~/.gjc/.env`, respecting `GJC_CONFIG_DIR`) for keys not already set
 5. Home `.env` (`~/.env`) for keys not already set
+6. Login shell rc files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.bash_profile`, `~/.bashrc`) for keys not already set
 
-Additional rule inside each `.env` file: `GJC_*` keys are mirrored to `GJC_*` keys in that parsed file.
+Step 6 does not execute those files. Each is scanned line by line for literal `export NAME=value` or `NAME=value` assignments, and surrounding quotes are stripped. Values that are not literal are dropped rather than resolved: a command substitution such as `export FOO=$(...)` is discarded.
+
+Because the scan is per line and has no notion of shell block structure, it does not reflect whether an assignment would actually run. An assignment nested in an `if` or a function body is read exactly like a top-level one, so a value you guarded behind something like `if [ -n "$CI" ]` in `~/.zshrc` still reaches `$env` unconditionally. Only assignments that do not start their own line — for example one packed after `case ... in` on the same line — are missed.
+
+Keys are used exactly as written. A `PI_`-prefixed key in a `.env` file is not mirrored to its `GJC_` counterpart, or the reverse — where both spellings are accepted it is because the reading code asks for both names.
 
 ---
 
@@ -290,7 +295,7 @@ Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewpor
 | `GJC_TEAM_WORKER_CLI` | Team worker CLI selector; accepted values are `auto` or `gjc` |
 | `GJC_TEAM_WORKER_CLI_MAP` | Comma-separated worker CLI selector map; entries must be `auto` or `gjc` |
 | `GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS` | Default-off stalled-worker continuation for the mutating `gjc team monitor` path; only exact value `1` enables it. A nudge is fenced to a running non-dry-run team, stale heartbeat, live recorded non-leader pane in the recorded tmux target, a proven-absent shutdown authority record, `ready`/`working` lifecycle with a valid non-terminal worker status, one current matching in-progress claim, and a lease that covers the hold. Valid-present or invalid/unreadable shutdown authority vetoes continuation but does not suppress normal stale-claim recovery. It uses at most two immutable journaled attempts (30s, then 120s) and fails closed on restart/unknown outcome. It sends a fixed prompt only to that pane on verified native tmux transport; psmux and native Windows send-keys fallback transports record a skipped outcome and send no continuation input. It does not replay providers, inspect/inject dynamic pane content or cross panes, kill/relaunch/split workers, or alter claims. |
-| `GJC_TEAM_HEARTBEAT_STALE_MS` | Stale-heartbeat threshold in milliseconds. Defaults to `120000`; a non-numeric value falls back to that default, and a non-positive value disables stale-heartbeat detection. |
+| `GJC_TEAM_HEARTBEAT_STALE_MS` | Stale-heartbeat threshold in milliseconds. Defaults to `120000`; a non-numeric value falls back to that default, a positive value below `3` is clamped to `3`, and a non-positive value disables stale-heartbeat detection (and with it the worker's own heartbeat publishing). A GJC worker session publishes a runtime-owned heartbeat every third of this window (minimum 1ms, capped at 30s) while an agent turn or owned background job is active, and `gjc team` exports the configured value into worker panes, which do not inherit the launching shell's environment. |
 
 ### Hermes MCP bridge
 

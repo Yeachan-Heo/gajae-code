@@ -5,9 +5,13 @@ import { createServer } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	applyGjcBundleUpdate,
+	bundleIdentity,
 	GjcPluginLoadError,
-	installGjcPluginBundle,
+	getGjcBundle,
+	installGjcBundle,
 	isGjcPluginBundleSource,
+	previewGjcBundleUpdate,
 	readRegistry,
 } from "../src/extensibility/gjc-plugins";
 
@@ -127,8 +131,11 @@ async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: (
 describe("GJC plugin installer", () => {
 	test("installs a local-path bundle into the project scope", async () => {
 		const cwd = await mkProjectCwd();
-		const result = await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
-		expect(result.status).toBe("installed");
+		const result = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(result.ok).toBe(true);
+		if (!result.ok) throw new Error(result.error.code);
+		expect(result.value.status).toBe("installed");
+		expect(result.value.summary.identity).toEqual(bundleIdentity("project", "valid-six-surface-bundle"));
 
 		const installedDir = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
 		expect(await exists(path.join(installedDir, "gajae-plugin.json"))).toBe(true);
@@ -138,29 +145,56 @@ describe("GJC plugin installer", () => {
 		expect(registry.plugins[0]?.surfaces.tools[0]?.name).toBe("domain_note");
 	});
 
-	test("reinstalling identical content is a no-op", async () => {
+	test("reinstalling identical content requires upgrade and an upgrade is unchanged", async () => {
 		const cwd = await mkProjectCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
-		const second = await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
-		expect(second.status).toBe("unchanged");
+		const ctx = { cwd };
+		const identity = bundleIdentity("project", "valid-six-surface-bundle");
+		const first = await installGjcBundle(ctx, "project", sixSurface);
+		expect(first.ok).toBe(true);
+
+		const before = await getGjcBundle(ctx, identity);
+		expect(before.ok).toBe(true);
+		if (!before.ok) throw new Error(before.error.code);
+		const second = await installGjcBundle(ctx, "project", sixSurface);
+		expect(second).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
+		const after = await getGjcBundle(ctx, identity);
+		expect(after.ok).toBe(true);
+		if (!after.ok) throw new Error(after.error.code);
+		expect(after.value.targetFingerprint).toBe(before.value.targetFingerprint);
+
+		const preview = await previewGjcBundleUpdate(ctx, identity);
+		expect(preview.ok).toBe(true);
+		if (!preview.ok) throw new Error(preview.error.code);
+		expect(preview.value.changed).toBe(false);
+		const applied = await applyGjcBundleUpdate(ctx, preview.value.token);
+		expect(applied).toMatchObject({ ok: true, value: { status: "unchanged" } });
 	});
 
-	test("reinstalling different content requires --force", async () => {
+	test("reinstalling different content requires upgrade and preview/apply updates", async () => {
 		const cwd = await mkProjectCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const ctx = { cwd };
+		const source = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-modsrc-"));
+		tempDirs.push(source);
+		await fs.cp(sixSurface, source, { recursive: true });
+		const identity = bundleIdentity("project", "valid-six-surface-bundle");
+		const first = await installGjcBundle(ctx, "project", source);
+		expect(first.ok).toBe(true);
 
-		// Make a modified copy with the same plugin name but different content.
-		const modified = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-modsrc-"));
-		tempDirs.push(modified);
-		await fs.cp(sixSurface, modified, { recursive: true });
-		await fs.appendFile(path.join(modified, "prompts", "system-appendix.md"), "\nExtra policy line.\n");
+		await fs.appendFile(path.join(source, "prompts", "system-appendix.md"), "\nExtra policy line.\n");
+		const reinstall = await installGjcBundle(ctx, "project", source);
+		expect(reinstall).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
 
-		await expect(installGjcPluginBundle(modified, { scope: "project", cwd })).rejects.toMatchObject({
-			code: "install_conflict",
-		});
-
-		const forced = await installGjcPluginBundle(modified, { scope: "project", cwd, force: true });
-		expect(forced.status).toBe("updated");
+		const preview = await previewGjcBundleUpdate(ctx, identity);
+		expect(preview.ok).toBe(true);
+		if (!preview.ok) throw new Error(preview.error.code);
+		expect(preview.value.changed).toBe(true);
+		const applied = await applyGjcBundleUpdate(ctx, preview.value.token);
+		expect(applied).toMatchObject({ ok: true, value: { status: "updated" } });
+		const summary = await getGjcBundle(ctx, identity);
+		expect(summary.ok).toBe(true);
+		if (!summary.ok) throw new Error(summary.error.code);
+		expect(summary.value.version).toBe(preview.value.candidateVersion);
+		expect(summary.value.manifestHash).toBe(preview.value.candidateManifestHash);
 	});
 
 	test("a bad bundle leaves no files and no registry entry", async () => {
@@ -171,7 +205,7 @@ describe("GJC plugin installer", () => {
 			path.join(bad, "gajae-plugin.json"),
 			JSON.stringify({ kind: "gajae-code-plugin", name: "bad-bundle", version: "1.0.0", agents: [] }),
 		);
-		await expect(installGjcPluginBundle(bad, { scope: "project", cwd })).rejects.toBeInstanceOf(GjcPluginLoadError);
+		await expect(installGjcBundle({ cwd }, "project", bad)).rejects.toBeInstanceOf(GjcPluginLoadError);
 
 		expect(await exists(path.join(cwd, ".gjc", "gjc-plugins", "bad-bundle"))).toBe(false);
 		const registry = await readRegistry("project", cwd);
@@ -186,7 +220,7 @@ describe("GJC plugin installer", () => {
 		const prev = process.env.GJC_TEST_IMPORT_SENTINEL;
 		process.env.GJC_TEST_IMPORT_SENTINEL = sentinel;
 		try {
-			await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+			await installGjcBundle({ cwd }, "project", sixSurface);
 		} finally {
 			if (prev === undefined) delete process.env.GJC_TEST_IMPORT_SENTINEL;
 			else process.env.GJC_TEST_IMPORT_SENTINEL = prev;
@@ -204,8 +238,8 @@ describe("GJC plugin installer", () => {
 			env: { ...process.env, COPYFILE_DISABLE: "1" },
 		});
 		expect(res.status).toBe(0);
-		const result = await installGjcPluginBundle(tarball, { scope: "project", cwd });
-		expect(result.status).toBe("installed");
+		const result = await installGjcBundle({ cwd }, "project", tarball);
+		expect(result).toMatchObject({ ok: true, value: { status: "installed" } });
 		expect(await isGjcPluginBundleSource(tarball)).toBe(true);
 		const registry = await readRegistry("project", cwd);
 		expect(registry.plugins[0]?.source.kind).toBe("tarball");
@@ -224,10 +258,11 @@ describe("GJC plugin installer", () => {
 		});
 		const cwd = await mkProjectCwd();
 		try {
-			const result = await installGjcPluginBundle(served.url, { scope: "project", cwd });
-			expect(result.status).toBe("installed");
-			expect(result.entry.source.kind).toBe("git");
-			expect(result.entry.source.uri).toBe(served.url);
+			const result = await installGjcBundle({ cwd }, "project", served.url);
+			expect(result.ok).toBe(true);
+			if (!result.ok) throw new Error(result.error.code);
+			expect(result.value.status).toBe("installed");
+			expect(result.value.summary.source.kind).toBe("git");
 
 			const installedDir = path.join(cwd, ".gjc", "gjc-plugins", "git-source-bundle");
 			expect(await exists(path.join(installedDir, "gajae-plugin.json"))).toBe(true);
@@ -245,7 +280,7 @@ describe("GJC plugin installer", () => {
 		const cwd = await mkProjectCwd();
 		const rejectingServer = await startRejectingGitServer();
 		try {
-			await expect(installGjcPluginBundle(rejectingServer.url, { scope: "project", cwd })).rejects.toMatchObject({
+			await expect(installGjcBundle({ cwd }, "project", rejectingServer.url)).rejects.toMatchObject({
 				code: "install_conflict",
 				name: "GjcPluginLoadError",
 			});

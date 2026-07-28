@@ -7,6 +7,7 @@ import type { AssistantMessage, Message, ProviderPayload, ProviderSessionState, 
 import { createOpenAIResponsesHistoryPayload } from "@gajae-code/ai/utils";
 import * as asyncModule from "@gajae-code/coding-agent/async";
 import * as settingsModule from "@gajae-code/coding-agent/config/settings";
+import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import * as sdkModule from "@gajae-code/coding-agent/sdk";
 import type { AgentSession, ForkContextSeed } from "@gajae-code/coding-agent/session/agent-session";
@@ -31,6 +32,10 @@ function createUsage(): Usage {
 		totalTokens: 2,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+}
+
+function makeFsError(code: "EACCES" | "EPERM" | "EROFS"): NodeJS.ErrnoException {
+	return Object.assign(new Error(code), { code });
 }
 
 function createUserHistoryPayload(provider = "openai"): ProviderPayload {
@@ -964,6 +969,93 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(session.sessionManager).toBe(currentSessionManager);
 		expect(session.sessionFile).toBe(sessionFile);
 		expectAssistantReplayMetadataSanitized(findRuntimeAssistant(session, "Unreadable assistant snapshot"));
+	});
+
+	it.each([
+		"EACCES",
+		"EPERM",
+		"EROFS",
+	] as const)("publishes a read-only successor and retries local:// setup after %s", async code => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-readonly-local-switch-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const currentSessionManager = SessionManager.create(tempDir, tempDir);
+		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
+		sessions.push(session);
+		authStorages.push(authStorage);
+		const predecessorSessionId = session.sessionId;
+		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
+			sessionManager.appendMessage({ role: "user", content: "read-only successor", timestamp: Date.now() });
+		});
+		const readiness = vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValue(makeFsError(code));
+
+		try {
+			await expect(session.switchSession(sessionFile)).resolves.toBe(true);
+			const successorSessionId = session.sessionManager.getSessionId();
+			expect(successorSessionId).not.toBe(predecessorSessionId);
+			expect(session.sessionId).toBe(successorSessionId);
+			expect(session.agent.sessionId).toBe(successorSessionId);
+			expect(session.sessionFile).toBe(sessionFile);
+
+			await expect(session.reload()).resolves.toBeUndefined();
+			expect(readiness).toHaveBeenCalledTimes(2);
+
+			const localOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				isManagedDestination: () => session.sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			const localMkdir = vi.spyOn(fs, "mkdirSync").mockImplementation((() => {
+				throw makeFsError(code);
+			}) as typeof fs.mkdirSync);
+			try {
+				expect(() => internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions)).toThrow(code);
+			} finally {
+				localMkdir.mockRestore();
+			}
+			const localPath = internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions);
+			fs.writeFileSync(localPath, "retried local root");
+			expect(fs.readFileSync(localPath, "utf8")).toBe("retried local root");
+		} finally {
+			readiness.mockRestore();
+		}
+	});
+
+	it("rolls back an unrelated local-root failure with predecessor authority intact", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-local-switch-rollback-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const currentSessionManager = SessionManager.create(tempDir, tempDir);
+		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
+		sessions.push(session);
+		authStorages.push(authStorage);
+		const predecessor = {
+			sessionId: session.sessionId,
+			sessionFile: session.sessionFile,
+			managerSessionId: currentSessionManager.getSessionId(),
+			managerSessionFile: currentSessionManager.getSessionFile(),
+			agentSessionId: session.agent.sessionId,
+			agentProviderSessionId: session.agent.providerSessionId,
+		};
+		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
+			sessionManager.appendMessage({ role: "user", content: "failed successor", timestamp: Date.now() });
+		});
+		const readiness = vi
+			.spyOn(internalUrls, "initializeLocalRoot")
+			.mockRejectedValueOnce(new Error("unexpected local root initialization failure"));
+
+		try {
+			await expect(session.switchSession(sessionFile)).rejects.toThrow(
+				"unexpected local root initialization failure",
+			);
+			expect(session.sessionId).toBe(predecessor.sessionId);
+			expect(session.sessionFile).toBe(predecessor.sessionFile);
+			expect(currentSessionManager.getSessionId()).toBe(predecessor.managerSessionId);
+			expect(currentSessionManager.getSessionFile()).toBe(predecessor.managerSessionFile);
+			expect(session.agent.sessionId).toBe(predecessor.agentSessionId);
+			expect(session.agent.providerSessionId).toBe(predecessor.agentProviderSessionId);
+		} finally {
+			readiness.mockRestore();
+		}
 	});
 
 	it("clears provider session state and sanitizes loaded assistant metadata when switching sessions", async () => {

@@ -9,12 +9,13 @@ Read files, directories, archives, SQLite databases, images, documents, internal
 ## Parameters
 
 - `path` — required. Local path, internal URI (`agent://`, `artifact://`, `rule://`, `local://`), or URL. Append `:<sel>` for line ranges, raw mode, or special modes (e.g. `src/foo.ts:50-200`, `src/foo.ts:raw`, `db.sqlite:users:42`).
+- `truncation` — optional `head` | `last` | `both`; selects which end of an over-budget result to retain. Configured default: {{TRUNCATION_DEFAULT}} (factory default: `last`); non-file routes such as URLs, directories and converted documents default to `head`. A line-range selector still bounds the selection — this only picks which end of that selection survives the byte/line cap. SQLite row queries page via their own `limit`/`offset` and ignore it.
+
 
 ## Selectors
-
 Append `:<sel>` to `path`. The bare path falls back to the default mode.
 
-- _(none)_ — parseable code → structural summary (signatures kept, bodies elided); other files → read from the start (up to {{DEFAULT_LIMIT}} lines).
+- _(none)_ — parseable code → structural summary (signatures kept, bodies elided); a plain text file → a bounded receipt of about {{RECEIPT_LINES}} lines or {{RECEIPT_KIB}} KiB, whichever is smaller; the configured truncation direction is {{TRUNCATION_DEFAULT}} (factory default: last). Line+hash anchors keep their real file line numbers and a footer names the omitted range. Archive members use the larger {{DEFAULT_MAX_LINES}}-line / 50 KiB budget. Converted documents, notebooks, URLs and directory listings still start from the beginning.
 - `:50` / `:50-` — read from line 50 onward.
 - `:50-200` — lines 50–200 inclusive.
 - `:50+150` — 150 lines starting at line 50.
@@ -39,6 +40,7 @@ Append `:<sel>` to `path`. The bare path falls back to the default mode.
   `[NN lines across MM elided regions; read <path>:raw or a line range like <path>:1-9999 for verbatim content]`
 
   If the elided body is what you actually need, re-issue the **exact selector the footer names**. NEVER guess what's inside `..` / `…` — those markers carry no content.
+- Directional windows identify the retained first/last lines and the omitted range; use the `re-read <path>:1-<total>` or `:raw` hint in the footer to recover the full content.
 
 # Documents & Notebooks
 

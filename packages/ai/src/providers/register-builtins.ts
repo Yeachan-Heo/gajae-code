@@ -10,6 +10,7 @@
  * lazy wrappers below), so this file IS the main streaming path's provider
  * loader: heavy SDKs stay out of the CLI startup parse graph.
  */
+
 import type {
 	Api,
 	AssistantMessage,
@@ -21,6 +22,7 @@ import type {
 } from "../types";
 import { type AbortSourceTracker, createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream as EventStreamImpl } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
 import type { BedrockOptions } from "./amazon-bedrock";
 import type { AnthropicOptions } from "./anthropic";
@@ -261,6 +263,7 @@ function createLazyLoadErrorMessage<TApi extends Api>(
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
 ): AssistantMessage {
+	const transportFailure = transportFailureFacts(error);
 	return {
 		role: "assistant",
 		content: [],
@@ -278,6 +281,7 @@ function createLazyLoadErrorMessage<TApi extends Api>(
 		stopReason,
 		errorMessage:
 			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
+		...(transportFailure ? { transportFailure } : {}),
 		timestamp: Date.now(),
 	};
 }

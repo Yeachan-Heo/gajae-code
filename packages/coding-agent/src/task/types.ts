@@ -283,6 +283,8 @@ export interface AgentProgress {
 	durationMs: number;
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: ModelSubstitutionWarning;
+	/** Whether the resolved subagent model runs under the effective fast service tier. */
+	fastMode?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -313,6 +315,8 @@ export interface AgentProgress {
 		attempt: number;
 		errorMessage: string;
 	};
+	/** Safe diagnostic retained in terminal progress when setup fails before the first LLM request. */
+	setupFailure?: SetupFailureSummary;
 	/**
 	 * Snapshot of the most recent `task` tool call's in-flight `TaskToolDetails`,
 	 * captured from `tool_execution_update`. Lets the parent UI surface live
@@ -321,6 +325,96 @@ export interface AgentProgress {
 	 * `extractedToolData.task` after that.
 	 */
 	inflightTaskDetails?: TaskToolDetails;
+}
+
+/** Bounded diagnostic retained when subagent setup fails before an LLM request starts. */
+export interface SetupFailureSummary {
+	summary: string;
+}
+
+const SETUP_FAILURE_SUMMARY_MAX_CHARS = 280;
+const SETUP_FAILURE_SUMMARY_MAX_BYTES = 1_024;
+const AUTHORIZATION_HEADER_VALUE_PATTERN = /(["']?(?:Proxy-)?Authorization\b["']?\s*:\s*)[^\r\n]*/gi;
+const COOKIE_HEADER_VALUE_PATTERN = /(["']?(?:Set-)?Cookie\b["']?\s*:\s*)[^\r\n]*/gi;
+const URL_CREDENTIAL_PATTERN = /([a-z][a-z0-9+.-]*:\/\/)[^/?#\s:@]+:[^@/?#\s]+@/gi;
+const API_KEY_LABEL_VALUE_PATTERN = /(["']?api\s+key["']?\s*:\s*)(?:"[^"]*"|'[^']*'|[^\s&]+)/gi;
+const SENSITIVE_SETUP_FAILURE_VALUE_PATTERN =
+	/(["']?(?:(?:[A-Za-z][A-Za-z0-9]*[_.-])*?)(?:access[_-]?token|refresh[_-]?token|session[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|private[_-]?key|signing[_-]?key|secret|password|passwd|pwd|authorization|credential|token)(?:[_.-][A-Za-z0-9]+)*["']?)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&]+)/gi;
+const BARE_PROVIDER_TOKEN_PATTERN =
+	/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|AKIA[A-Z0-9]{16})\b/g;
+const LOCAL_ABSOLUTE_PATH_PATTERN = /(^|[\s("'`=])((?:\/(?!\/)[^\s/:?"'`()[\]{},;<>]+){2,})/g;
+const WINDOWS_ABSOLUTE_PATH_PATTERN =
+	/(^|[\s("'`=])([A-Za-z]:\\(?:[^\\/:?"'`()[\]{},;<>\s]+\\)+[^\\/:?"'`()[\]{},;<>\s]+)/g;
+const LOCAL_FILE_URI_PATTERN = /\bfile:\/\/(?:localhost)?(?:\/[^\s/:?"'`()[\]{},;<>]+)+/gi;
+const SENSITIVE_PATH_BASENAME_PATTERN =
+	/(?:^|[_.-])(?:access[_-]?token|refresh[_-]?token|session[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|private[_-]?key|signing[_-]?key|secrets?|password|passwd|pwd|authorization|credential|token)(?:[_.-]|$)|^(?:\.env(?:\..*)?|credentials?(?:\.[A-Za-z0-9_-]+)?|id_(?:rsa|ed25519)|.+\.(?:pem|p12|pfx|key))$|^(?:sk|pk|rk|gh[opsur]|github_pat|xox[baprs])[_-][A-Za-z0-9_-]+$/i;
+
+function redactPathBasename(path: string): string {
+	const basename = path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+	return SENSITIVE_PATH_BASENAME_PATTERN.test(basename) ? "[redacted]" : basename;
+}
+
+function redactLocalAbsolutePath(_match: string, prefix: string, absolutePath: string): string {
+	return `${prefix}<path>/${redactPathBasename(absolutePath)}`;
+}
+
+function redactLocalFileUri(uri: string): string {
+	return `file://<path>/${redactPathBasename(uri)}`;
+}
+
+function normalizeSetupFailureText(value: string): string {
+	return value
+		.normalize("NFKC")
+		.replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001B]*(?:\u0007|\u001B\\))/g, "")
+		.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
+		.replace(/\t/g, " ");
+}
+
+function capSetupFailureSummary(value: string): string {
+	const ellipsis = "…";
+	const ellipsisBytes = Buffer.byteLength(ellipsis, "utf8");
+	const chunks: string[] = [];
+	let chars = 0;
+	let bytes = 0;
+	for (const codePoint of value) {
+		const codePointBytes = Buffer.byteLength(codePoint, "utf8");
+		if (chars + 1 > SETUP_FAILURE_SUMMARY_MAX_CHARS || bytes + codePointBytes > SETUP_FAILURE_SUMMARY_MAX_BYTES) {
+			while (
+				chunks.length > 0 &&
+				(chars + 1 > SETUP_FAILURE_SUMMARY_MAX_CHARS || bytes + ellipsisBytes > SETUP_FAILURE_SUMMARY_MAX_BYTES)
+			) {
+				const removed = chunks.pop()!;
+				chars -= 1;
+				bytes -= Buffer.byteLength(removed, "utf8");
+			}
+			return `${chunks.join("")}${ellipsis}`;
+		}
+		chunks.push(codePoint);
+		chars += 1;
+		bytes += codePointBytes;
+	}
+	return chunks.join("");
+}
+
+/** Create a bounded diagnostic that preserves a setup failure's cause without exposing credentials or local paths. */
+export function createSetupFailureSummary(error: unknown): SetupFailureSummary {
+	const message = normalizeSetupFailureText(error instanceof Error ? error.message : String(error));
+	const summary = message
+		.replace(AUTHORIZATION_HEADER_VALUE_PATTERN, "$1[redacted]")
+		.replace(COOKIE_HEADER_VALUE_PATTERN, "$1[redacted]")
+		.replace(URL_CREDENTIAL_PATTERN, "$1[redacted]@")
+		.replace(API_KEY_LABEL_VALUE_PATTERN, "$1[redacted]")
+		.replace(LOCAL_FILE_URI_PATTERN, redactLocalFileUri)
+		.replace(LOCAL_ABSOLUTE_PATH_PATTERN, redactLocalAbsolutePath)
+		.replace(WINDOWS_ABSOLUTE_PATH_PATTERN, redactLocalAbsolutePath)
+		.replace(SENSITIVE_SETUP_FAILURE_VALUE_PATTERN, "$1$2[redacted]")
+		.replace(BARE_PROVIDER_TOKEN_PATTERN, "[redacted]")
+		.replace(/\s+/g, " ")
+		.trim();
+	return {
+		summary: capSetupFailureSummary(summary) || "Subagent setup failed.",
+	};
 }
 
 /** Result from a single agent execution */
@@ -346,7 +440,11 @@ export interface SingleResult {
 	contextWindow?: number;
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: ModelSubstitutionWarning;
+	/** Whether the resolved subagent model ran under the effective fast service tier. */
+	fastMode?: boolean;
 	error?: string;
+	/** Safe diagnostic for a failure before the subagent sent its first LLM request. */
+	setupFailure?: SetupFailureSummary;
 	aborted?: boolean;
 	abortReason?: string;
 	paused?: boolean;

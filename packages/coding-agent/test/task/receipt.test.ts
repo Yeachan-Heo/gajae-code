@@ -203,7 +203,7 @@ describe("task result receipts", () => {
 	it("sanitizeTaskToolDetails maps raw results to receipts and preserves usage", () => {
 		const raw = {
 			projectAgentsDir: null,
-			results: [makeRaw()],
+			results: [makeRaw({ fastMode: true })],
 			totalDurationMs: 10,
 			usage: CANONICAL_USAGE,
 			outputPaths: ["/tmp/LEAK_SENTINEL_DO_NOT_DIGEST/0-Test.md"],
@@ -211,6 +211,7 @@ describe("task result receipts", () => {
 		const sanitized = sanitizeTaskToolDetails(raw);
 		expect(sanitized.usage).toBe(CANONICAL_USAGE);
 		expect(sanitized.results[0]?.preview).toBe("Task completed; output artifact unavailable.");
+		expect(sanitized.results[0]?.fastMode).toBe(true);
 		expect(sanitized.roiSummary).toEqual({ childCount: 1, totalTokens: 20, lowRoiChildIds: [] });
 		expect(findRawTaskLeakKeys(sanitized)).toEqual([]);
 		expect("outputPaths" in sanitized).toBe(false);

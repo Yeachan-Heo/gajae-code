@@ -201,6 +201,8 @@ sleep 30 && gjc team monitor <team-name>
 ```
 The mutating monitor path also performs bounded liveness recovery: expired task claims, stale heartbeat claims, and missing recorded worker panes are requeued instead of leaving work permanently `in_progress`.
 
+A GJC worker session publishes its own heartbeat while an agent turn or owned background job is active, at a third of the stale window, so a long build or test run is no longer reported stale. A worker that publishes nothing — for example one wedged before it could report — is still recovered on the normal window.
+
 ### Opt-in stalled-worker continuation
 
 `GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS=1` enables a separate, default-off monitor-only nudge for a stalled live worker. It is considered only when the team is running (not dry-run), the worker heartbeat is stale (using `GJC_TEAM_HEARTBEAT_STALE_MS`, default `120000` ms), and all of these checks pass:

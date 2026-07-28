@@ -28,6 +28,29 @@ export type StreamFn = (
 
 /** Stable identifier for a managed logical run, shared by all of its retry attempts. */
 export type ManagedLogicalRunId = number;
+/** A resource owned by a prompt run until its promise settles. */
+export type RunResourceKind = "provider_factory" | "provider_iterator" | "tool" | "post_prompt";
+
+export interface RunResourceEntry {
+	id: string;
+	kind: RunResourceKind;
+	label: string;
+	registeredAt: number;
+}
+
+export type RunSettlementProof = { status: "settled" } | { status: "unfenced"; pending: RunResourceEntry[] };
+
+export interface RunResourceLedger {
+	/** Reserve a run handle before publishing its `agent_start` event. */
+	open(resourceRunId: string): void;
+	track(resourceRunId: string, kind: RunResourceKind, label: string, settled: PromiseLike<unknown>): void;
+	pending(resourceRunId: string): RunResourceEntry[];
+	/** Seal a run after terminal event publication; only sealed empty runs settle. */
+	seal(resourceRunId: string): void;
+	waitForSettlement(resourceRunId: string, options: { graceMs: number }): Promise<RunSettlementProof>;
+	/** Terminally detach a run; its bounded tombstone remains unfenced forever. */
+	quarantine(resourceRunId: string): RunResourceEntry[];
+}
 
 /** Terminal completion requested for a logical run. */
 export interface RunTerminalRequest {
@@ -353,6 +376,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * capture, cost estimator, agent identity).
 	 */
 	telemetry?: AgentTelemetryConfig;
+	/**
+	 * Optional prompt-run resource ownership ledger. Provider and scheduler-level tool
+	 * work is tracked until its owned lifecycle promise settles.
+	 */
+	resourceLedger?: RunResourceLedger;
+	/** Stable resource ownership identifier for this prompt run. */
+	resourceRunId?: string;
 }
 
 /**

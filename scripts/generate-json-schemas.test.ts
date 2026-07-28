@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { JSON_SCHEMA_OUTPUTS, stableJson } from "./generate-json-schemas";
+import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
 
 function acceptsJsonSchemaFixture(schema: unknown, value: unknown): boolean {
 	if (schema === true) return true;
@@ -35,6 +36,19 @@ describe("generated JSON Schemas", () => {
 			const existing = await Bun.file(target).text();
 			expect(existing).toBe(stableJson(output.schema));
 		}
+	});
+
+	it("registers the ralplan per-lane review budget without loosening the object", () => {
+		const setting = SETTINGS_SCHEMA["gjc.ralplan.maxReviewPassesPerLane"];
+		expect(setting.default).toBe(1);
+		expect(setting.validate?.(0)).toBe(false);
+		expect(setting.validate?.(11)).toBe(false);
+		expect(setting.validate?.(1.5)).toBe(false);
+
+		const schema = configSchema() as any;
+		const ralplan = schema.properties.gjc.properties.ralplan;
+		expect(ralplan.properties.maxReviewPassesPerLane).toMatchObject({ type: "number", default: 1 });
+		expect(ralplan.additionalProperties).toBe(false);
 	});
 
 	it("accepts documented Discord and Slack config while rejecting unknown chat properties", () => {

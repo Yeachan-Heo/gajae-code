@@ -22,6 +22,8 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `path` | `string` | Yes | Filesystem path, internal URL, or web URL. May end with a trailing selector such as `:50-100` or `:raw`. |
+| `truncation` | `head` \| `last` \| `both` | No | Which end of over-budget output to retain. Bare local files and archive members use `read.truncation` (factory default: `last`); URLs, converted documents, directories, ranges, internal URLs, and other non-bare routes default to `head`. Explicit values are honored where the route supports truncation. SQLite row/schema/query/raw reads ignore this parameter. |
+
 
 ### Selector grammar
 
@@ -62,7 +64,8 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
 - Directory/archive listings and SQLite table lists also set `details.meta.limits` when list limits trigger.
 
 ## Flow
-1. `ReadTool.execute()` accepts `{ path }`. `file://...` inputs are expanded first with `expandPath()`.
+1. `ReadTool.execute()` accepts `{ path, truncation? }`. `file://...` inputs are expanded first with `expandPath()`.
+   - `gjc read <path> --truncation head|last|both` passes the explicit direction through to the same tool payload.
 2. It tries URL handling first via `parseReadUrlTarget()` from `packages/coding-agent/src/tools/fetch.ts`.
    - Plain URL reads call `executeReadUrl()`.
    - URL reads with line selectors load or refresh the URL cache with `loadReadUrlCacheEntry()` and paginate the cached text locally with `#buildInMemoryTextResult()`.
@@ -98,7 +101,9 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
   - Summary output keeps selected declarations and replaces elided spans with `...`. When at least one span is elided, the text content ends with a footer like `[NN lines across MM elided regions; read <path>:raw or a line range like <path>:1-9999 for verbatim content]` so the agent has a concrete recovery selector instead of a bare marker.
   - When an elided block sits between matching brace lines, `#renderSummary()` may merge them into one anchored line rather than emitting separate opener/closer lines.
 - Explicit selector or summarization miss: streamed text read.
-  - Default open-ended limit is `min(session setting read.defaultLimit, DEFAULT_MAX_LINES)`.
+  - Bare local text uses the receipt budgets (`read.receiptBudgetLines` / `read.receiptBudgetBytes`), whose factory defaults are 50 lines and 10 KiB, and keeps the tail by default (`read.truncation` controls the configured direction). `read.defaultLimit` defaults to 300, but it is a collection/selection limit, not the bare receipt window.
+  - Bare archive members use the shared 3000-line / 50 KiB cap and keep the tail by default.
+  - Converted documents, notebooks, URLs, and directory listings default to head; explicit `truncation` selects another end when that route supports it.
   - Explicit ranges expand by `RANGE_LEADING_CONTEXT_LINES = 1` / `RANGE_TRAILING_CONTEXT_LINES = 3` on the constrained sides only.
   - Non-raw output uses `resolveFileDisplayMode()`:
     - hashline anchors when edit mode is hashline, read is not raw, source is mutable, edit tool exists, and `readHashLines !== false`
@@ -169,7 +174,7 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
 ### Documents
 - `CONVERTIBLE_EXTENSIONS` in `packages/coding-agent/src/tools/read.ts` covers `.pdf`, `.doc`, `.docx`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.rtf`, `.epub`.
 - `convertFileWithMarkit()` converts the file to text/markdown.
-- Converted output is then head-truncated with normal shared limits; there is no line selector support inside the source document before conversion.
+- Converted output uses the normal shared limits and route direction (head by default); there is no line selector support inside the source document before conversion.
 - Conversion failures return a text block like `[Cannot read .pdf file: ...]`.
 
 ### Jupyter notebooks
@@ -224,6 +229,8 @@ Notes: ...
 
 ---
 ```
+- URL truncation keeps the `URL:`/`Content-Type:`/`Method:` (and `Notes:`) preamble intact. `head` retains the historical whole-output byte accounting; explicit `last`/`both` apply the 300-line / 50 KiB cap to the body only and then reattach the preamble.
+- URL truncation metadata (`totalLines` / `totalBytes` and shown counts) describes the body window, not the preamble. The preamble offset is recorded when the output is built; artifact rehydration stores a separate wrapped-coordinate offset so delimiter text is never rediscovered from content.
 
 - `method` records the winning path (`json`, `feed`, `text`, `alternate-markdown`, `md-suffix`, `content-negotiation`, `image`, `markit`, `llms.txt`, `raw`, `raw-html`, `insane`, etc.).
 - URL reads may return an inline image block when the fetched resource is a supported image and survives resizing.
@@ -261,7 +268,8 @@ Notes: ...
 - Shared text truncation defaults from `packages/coding-agent/src/session/streaming-output.ts`:
   - `DEFAULT_MAX_LINES = 3000`
   - `DEFAULT_MAX_BYTES = 50 * 1024`
-- Local text open-ended default line limit: `read.defaultLimit`, clamped to `[1, DEFAULT_MAX_LINES]`.
+- Local bare text uses `read.receiptBudgetLines` / `read.receiptBudgetBytes` (factory defaults: 50 lines / 10 KiB); `read.defaultLimit` defaults to 300 but is not the receipt window size.
+- Bare archive members use `DEFAULT_MAX_LINES = 3000` and `DEFAULT_MAX_BYTES = 50 KiB`; converted documents, notebooks, URLs, and directories default to head.
 - Explicit line ranges add `1` leading and `3` trailing context lines on the constrained sides (`RANGE_LEADING_CONTEXT_LINES` / `RANGE_TRAILING_CONTEXT_LINES`).
 - File streaming chunk size: `8 * 1024` bytes (`READ_CHUNK_SIZE`).
 - Local streamed byte budget for line reads: `max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512)`.
@@ -276,7 +284,7 @@ Notes: ...
   - table list cap `500`
   - render width `120`, column width `40`
   - busy timeout `3000` ms
-- URL read result shown to the model is truncated to `300` lines and `50 KiB` in `executeReadUrl()`; full cached output can be attached as an artifact.
+- URL output caps are 300 lines / 50 KiB. For URL `last` / `both`, those caps describe body bytes/lines only; the preamble is always reattached. URL `head` keeps the historical whole-output accounting for byte-identical compatibility. SQLite row/schema/query/raw reads ignore `truncation` and use their own query/sample limits.
 - Inline fetched URL images:
   - source bytes cap `20 MiB`
   - post-resize inline output cap `300 KiB`

@@ -110,7 +110,13 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -214,21 +220,6 @@
       },
       {
         "appliesToVerbs": [
-          "kickoff"
-        ],
-        "name": "trace",
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
-          "kickoff",
-          "write-spec"
-        ],
-        "name": "json",
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
           "write-spec"
         ],
         "enumValues": [
@@ -271,332 +262,48 @@
       },
       {
         "appliesToVerbs": [
-          "draft create"
+          "write-spec",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write",
+          "clear",
+          "handoff"
         ],
-        "name": "session-id",
+        "name": "json",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "stage",
+          "write"
+        ],
+        "name": "input",
         "required": true,
         "type": "string"
       },
       {
         "appliesToVerbs": [
-          "draft create"
+          "write"
+        ],
+        "name": "reset",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "stage"
         ],
         "enumValues": [
           "initialize-context",
-          "confirm-topology",
-          "record-answer",
-          "apply-round-result"
+          "record-round",
+          "update-facts",
+          "merge-state"
         ],
         "name": "for",
         "required": true,
         "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "draft create"
-        ],
-        "name": "round-key",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft create"
-        ],
-        "name": "round",
-        "type": "number"
-      },
-      {
-        "appliesToVerbs": [
-          "draft create"
-        ],
-        "name": "question-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft create"
-        ],
-        "name": "round-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft create"
-        ],
-        "name": "component-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft create"
-        ],
-        "name": "dimension",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft edit",
-          "draft show",
-          "draft check",
-          "draft rebase",
-          "draft discard",
-          "initialize-context",
-          "confirm-topology",
-          "record-answer",
-          "apply-round-result"
-        ],
-        "name": "draft-id",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft edit",
-          "draft rebase",
-          "draft discard",
-          "initialize-context",
-          "confirm-topology",
-          "record-answer",
-          "apply-round-result"
-        ],
-        "name": "expected-draft-revision",
-        "required": true,
-        "type": "number"
-      },
-      {
-        "appliesToVerbs": [
-          "draft edit"
-        ],
-        "enumValues": [
-          "set",
-          "append",
-          "remove"
-        ],
-        "name": "op",
-        "required": true,
-        "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "draft edit"
-        ],
-        "name": "path",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft edit"
-        ],
-        "name": "value",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft edit"
-        ],
-        "name": "value-file",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "draft edit"
-        ],
-        "name": "null",
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
-          "draft rebase"
-        ],
-        "name": "to-state-revision",
-        "required": true,
-        "type": "number"
-      },
-      {
-        "appliesToVerbs": [
-          "draft create",
-          "draft edit",
-          "draft show",
-          "draft check",
-          "draft rebase",
-          "draft discard",
-          "initialize-context",
-          "confirm-topology",
-          "record-answer",
-          "apply-round-result",
-          "inspect",
-          "sanity-check"
-        ],
-        "name": "json",
-        "required": true,
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
-          "inspect",
-          "sanity-check"
-        ],
-        "name": "session-id",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "initialize-context",
-          "confirm-topology",
-          "record-answer",
-          "apply-round-result"
-        ],
-        "compatibilityOnly": true,
-        "name": "session-id",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "initialize-context",
-          "confirm-topology",
-          "record-answer",
-          "apply-round-result"
-        ],
-        "compatibilityOnly": true,
-        "name": "schema-version",
-        "required": true,
-        "type": "number"
-      },
-      {
-        "appliesToVerbs": [
-          "initialize-context",
-          "confirm-topology",
-          "record-answer",
-          "apply-round-result"
-        ],
-        "compatibilityOnly": true,
-        "name": "expected-revision",
-        "required": true,
-        "type": "number"
-      },
-      {
-        "appliesToVerbs": [
-          "initialize-context",
-          "confirm-topology"
-        ],
-        "compatibilityOnly": true,
-        "name": "input-json",
-        "required": true,
-        "type": "object"
-      },
-      {
-        "appliesToVerbs": [
-          "record-answer",
-          "apply-round-result"
-        ],
-        "compatibilityOnly": true,
-        "name": "round",
-        "required": true,
-        "type": "number"
-      },
-      {
-        "appliesToVerbs": [
-          "record-answer",
-          "apply-round-result"
-        ],
-        "compatibilityOnly": true,
-        "name": "question-id",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "record-answer",
-          "apply-round-result"
-        ],
-        "compatibilityOnly": true,
-        "name": "round-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "record-answer"
-        ],
-        "compatibilityOnly": true,
-        "name": "component-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "record-answer"
-        ],
-        "compatibilityOnly": true,
-        "name": "dimension",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "record-answer"
-        ],
-        "compatibilityOnly": true,
-        "name": "answer-json",
-        "required": true,
-        "type": "object"
-      },
-      {
-        "appliesToVerbs": [
-          "record-answer"
-        ],
-        "compatibilityOnly": true,
-        "name": "question-json",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "apply-round-result"
-        ],
-        "compatibilityOnly": true,
-        "name": "result-json",
-        "required": true,
-        "type": "object"
-      },
-      {
-        "appliesToVerbs": [
-          "inspect"
-        ],
-        "enumValues": [
-          "summary",
-          "recent-scored",
-          "pending",
-          "round",
-          "topology",
-          "facts",
-          "triggers",
-          "floor"
-        ],
-        "name": "selector",
-        "required": true,
-        "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "inspect"
-        ],
-        "name": "round-key",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "inspect"
-        ],
-        "name": "cursor",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "inspect"
-        ],
-        "name": "limit",
-        "type": "number"
       },
       {
         "name": "args",
@@ -643,51 +350,35 @@
         "surface": "command-flag"
       },
       {
-        "name": "draft create",
-        "surface": "draft-action"
-      },
-      {
-        "name": "draft edit",
-        "surface": "draft-action"
-      },
-      {
-        "name": "draft show",
-        "surface": "draft-action"
-      },
-      {
-        "name": "draft check",
-        "surface": "draft-action"
-      },
-      {
-        "name": "draft rebase",
-        "surface": "draft-action"
-      },
-      {
-        "name": "draft discard",
-        "surface": "draft-action"
-      },
-      {
-        "name": "initialize-context",
+        "name": "stage",
         "surface": "command-positional"
       },
       {
-        "name": "confirm-topology",
+        "name": "check",
         "surface": "command-positional"
       },
       {
-        "name": "record-answer",
+        "name": "apply",
         "surface": "command-positional"
       },
       {
-        "name": "apply-round-result",
+        "name": "discard",
         "surface": "command-positional"
       },
       {
-        "name": "inspect",
+        "name": "read",
         "surface": "command-positional"
       },
       {
-        "name": "sanity-check",
+        "name": "write",
+        "surface": "command-positional"
+      },
+      {
+        "name": "clear",
+        "surface": "command-positional"
+      },
+      {
+        "name": "handoff",
         "surface": "command-positional"
       },
       {
@@ -919,7 +610,13 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -1307,7 +1004,13 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -1793,7 +1496,13 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"

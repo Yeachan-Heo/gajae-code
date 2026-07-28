@@ -32,7 +32,7 @@ There is no current `packages/natives/src` TypeScript wrapper layer. Consumers i
 
 Current capability groups in the generated API include:
 
-- **Search/text/code primitives**: `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `astGrep`, `astEdit`, text width/slicing/wrapping/sanitization, syntax highlighting, token counting.
+- **Search/text/code primitives**: `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `astGrep`, `astEdit`, text width/slicing/wrapping/sanitization, syntax highlighting.
 - **Execution/process/terminal primitives**: `executeShell`, `Shell`, `PtySession`, process-tree helpers, key parsing.
 - **System/media/conversion primitives**: clipboard, image resize/encode/SIXEL, HTML-to-Markdown, macOS appearance/power helpers, work profiling, Windows ProjFS overlay helpers.
 

@@ -105,6 +105,23 @@ describe("task renderer: nested live rendering", () => {
 		);
 		return Bun.stripANSI(component.render(160).join("\n"));
 	}
+	it("renders the fast-mode glyph in live and final subagent panels", async () => {
+		const theme = (await getThemeByName("red-claw"))!;
+		const liveText = await render(
+			makeRunningProgress({
+				id: "2-FastLive",
+				description: "Fast live child",
+				fastMode: true,
+			}),
+		);
+		const finalText = await renderResult({
+			...makeCompletedSubResult("3-FastFinal", "Fast final child"),
+			fastMode: true,
+		});
+
+		expect(liveText).toContain(`Fast live child ${theme.icon.fast}`);
+		expect(finalText).toContain(`Fast final child ${theme.icon.fast}`);
+	});
 
 	it("renders completed nested task results stored in extractedToolData.task while parent is in-progress", async () => {
 		const parent = makeRunningProgress({
@@ -296,6 +313,17 @@ describe("task renderer: nested live rendering", () => {
 
 		expect(text).toContain("Requested model substituted: openai-codex/gpt-5.3-codex -> openai-codex/gpt-5.5");
 		expect(text).not.toContain("Model override substituted");
+	});
+	it("renders a terminal setup failure in live progress", async () => {
+		const text = await render(
+			makeRunningProgress({
+				id: "3-SetupFailure",
+				status: "failed",
+				setupFailure: { summary: "Credential bootstrap rejected." },
+			}),
+		);
+
+		expect(text).toContain("Setup failure: Credential bootstrap rejected.");
 	});
 
 	it("renders requested model substitution in final results", async () => {

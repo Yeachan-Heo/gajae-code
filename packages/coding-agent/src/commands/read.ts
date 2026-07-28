@@ -1,7 +1,7 @@
 /**
  * Show what the read tool will return for a given path.
  */
-import { Args, Command } from "@gajae-code/utils/cli";
+import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { type ReadCommandArgs, runReadCommand } from "../cli/read-cli";
 import { initTheme } from "../modes/theme/theme";
 
@@ -15,8 +15,16 @@ export default class Read extends Command {
 		}),
 	};
 
+	static flags = {
+		truncation: Flags.string({
+			options: ["head", "last", "both"],
+			description: "Which end of an over-budget result to keep",
+		}),
+	};
+
 	static examples = [
 		"gjc read src/foo.ts",
+		"gjc read src/foo.ts --truncation head",
 		"gjc read src/foo.ts:50-100",
 		"gjc read src/foo.ts:raw",
 		"gjc read https://example.com",
@@ -25,9 +33,10 @@ export default class Read extends Command {
 	];
 
 	async run(): Promise<void> {
-		const { args } = await this.parse(Read);
+		const { args, flags } = await this.parse(Read);
 		const cmd: ReadCommandArgs = {
 			path: args.path ?? "",
+			truncation: flags.truncation as ReadCommandArgs["truncation"],
 		};
 		await initTheme();
 		await runReadCommand(cmd);

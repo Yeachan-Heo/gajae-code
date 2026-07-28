@@ -106,6 +106,8 @@ export interface SessionStorageWriterOpenOptions {
 export interface ManagedSessionSecurityContext {
 	readonly kind: "managed";
 	readonly agentDir: string;
+	/** Logical profile root for process-local caches; distinct from managed pathname authority. */
+	readonly profileAgentDir: string;
 	readonly sessionsRoot: string;
 	readonly sessionDir: string;
 	readonly rootAuthority: ManagedDirectoryRoot;
@@ -117,12 +119,18 @@ const managedSecurityContexts = new WeakSet<ManagedSessionSecurityContext>();
 /** @internal Create the only accepted managed writer authority object. */
 export function createManagedSessionSecurityContext(input: {
 	agentDir: string;
+	/** Optional for compatibility with existing authority-only callers. */
+	profileAgentDir?: string;
 	sessionsRoot: string;
 	sessionDir: string;
 	rootAuthority: ManagedDirectoryRoot;
 	retainedAuthority?: native.RecoveryFsRoot;
 }): ManagedSessionSecurityContext {
-	const context = Object.freeze({ kind: "managed" as const, ...input });
+	const context = Object.freeze({
+		kind: "managed" as const,
+		...input,
+		profileAgentDir: input.profileAgentDir ?? input.agentDir,
+	});
 	managedSecurityContexts.add(context);
 	return context;
 }

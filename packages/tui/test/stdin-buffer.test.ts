@@ -585,4 +585,50 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences.join("")).not.toContain("\uFFFD");
 		});
 	});
+	describe("Probe Reply Fragments", () => {
+		const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+		it("holds an incomplete probe-reply prefix instead of flushing its fragments", async () => {
+			processInput("\x1b[?62");
+			await sleep(60);
+
+			// Still held: flushing would type "ESC [ ? 6 2" into the editor.
+			expect(emittedSequences).toEqual([]);
+
+			processInput(";22;52c");
+			expect(emittedSequences).toEqual(["\x1b[?62;22;52c"]);
+		});
+
+		it("restarts the hold clock while the fragment keeps growing", async () => {
+			// Regression: the hold start stamp was recorded once and never refreshed,
+			// so every later fragment of a long reply stream expired the hold instantly
+			// and leaked character by character.
+			for (const part of ["\x1b]11;", "rgb:0000", "/0000", "/0000"]) {
+				processInput(part);
+				await sleep(30);
+			}
+			expect(emittedSequences).toEqual([]);
+
+			processInput("\x07");
+			expect(emittedSequences).toEqual(["\x1b]11;rgb:0000/0000/0000\x07"]);
+		});
+
+		it("gives up on a stalled probe fragment instead of swallowing later input", async () => {
+			processInput("\x1b[?62");
+			await sleep(700);
+			processInput("a");
+
+			expect(emittedSequences).toEqual(["\x1b[?62", "a"]);
+		});
+
+		it("cuts an unterminated sequence at the ESC that starts the next one", () => {
+			processInput("\x1b[?62\x1b[A");
+			expect(emittedSequences).toEqual(["\x1b[?62", "\x1b[A"]);
+		});
+
+		it("keeps an OSC string terminator attached to its sequence", () => {
+			processInput("\x1b]11;rgb:0000/0000/0000\x1b\\");
+			expect(emittedSequences).toEqual(["\x1b]11;rgb:0000/0000/0000\x1b\\"]);
+		});
+	});
 });

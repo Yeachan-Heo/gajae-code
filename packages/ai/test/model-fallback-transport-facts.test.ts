@@ -76,6 +76,9 @@ describe("fallback transport facts", () => {
 		).toEqual({ class: "quota", retryAfterMs: 125 });
 		expect(classifyFallbackTrigger({ kind: "transport", status: 401 })).toEqual({ class: "auth" });
 		expect(classifyFallbackTrigger({ kind: "transport", status: 503 })).toEqual({ class: "server" });
+		expect(classifyFallbackTrigger({ kind: "transport", providerCode: "stream_first_event_timeout" })).toEqual({
+			class: "server",
+		});
 	});
 
 	it("normalizes provider transport metadata without parsing error text", () => {

@@ -20,7 +20,13 @@ import {
 	type SessionStorageWriter,
 } from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
-import { getSessionsDir, getTerminalSessionsDir } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getResidentCacheRootDir,
+	getSessionsDir,
+	getTerminalSessionsDir,
+	setAgentDir,
+} from "@gajae-code/utils";
 import { resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
@@ -36,6 +42,15 @@ function makeTempDir(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-readonly-"));
 	tempDirs.push(dir);
 	return dir;
+}
+
+function residentCacheDirs(root: string): string[] {
+	return fs.existsSync(root)
+		? fs
+				.readdirSync(root)
+				.map(name => path.join(root, name))
+				.filter(dir => path.basename(dir).startsWith("i-") && fs.statSync(dir).isDirectory())
+		: [];
 }
 
 class WriteTrackingStorage extends MemorySessionStorage {
@@ -438,28 +453,41 @@ describe("SessionManager read-only resume", () => {
 		const sourcePath = path.join(root, "source.jsonl");
 		const destinationDir = path.join(root, "destination-sessions");
 		const targetCwd = path.join(root, "target");
+		const agentDir = path.join(root, "agent");
+		const cacheRoot = getResidentCacheRootDir(agentDir);
+		const originalAgentDir = getAgentDir();
 		const history = "x".repeat(1025);
+		const renameNoReplacePath = native.renameNoReplacePath;
+		let stagingDisposedBeforePublish = false;
+		const rename = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (String(source).includes(".fork-staging-")) {
+				expect(residentCacheDirs(cacheRoot)).toHaveLength(1);
+				stagingDisposedBeforePublish = true;
+			}
+			return renameNoReplacePath(source, destination);
+		});
+		let manager: SessionManager | undefined;
+		setAgentDir(agentDir);
 		fs.mkdirSync(targetCwd);
 		fs.writeFileSync(sourcePath, sessionText("session-a").replace("resume", history));
 
-		const captured = SessionManager.captureTranscriptStrict(sourcePath);
-		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
-		const forked = await SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir);
-		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
-		const artifactsDir = forked.manager.getArtifactsDir();
-		if (!artifactsDir) throw new Error("Expected strict fork artifacts");
-		const residentCacheDir = path.join(artifactsDir, "resident-cache");
-
 		try {
-			expect(forked.manager.getSessionDir()).toBe(destinationDir);
-			expect(forked.manager.getEntries()).toMatchObject([
-				{ type: "message", message: { role: "user", content: history } },
-			]);
-			expect(fs.readdirSync(residentCacheDir)).toHaveLength(1);
+			const captured = SessionManager.captureTranscriptStrict(sourcePath);
+			if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
+			const forked = await SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir);
+			if (forked.kind !== "forked") throw new Error("Expected strict fork success");
+			manager = forked.manager;
+
+			expect(manager.getSessionDir()).toBe(destinationDir);
+			expect(manager.getEntries()).toMatchObject([{ type: "message", message: { role: "user", content: history } }]);
+			expect(stagingDisposedBeforePublish).toBe(true);
+			expect(residentCacheDirs(cacheRoot)).toHaveLength(1);
 		} finally {
-			await forked.manager.close();
+			await manager?.close();
+			rename.mockRestore();
+			setAgentDir(originalAgentDir);
 		}
-		expect(fs.readdirSync(residentCacheDir)).toEqual([]);
+		expect(residentCacheDirs(cacheRoot)).toEqual([]);
 	});
 	it.skipIf(process.platform !== "linux")(
 		"does not publish a strict fork when staged tree durability fails",

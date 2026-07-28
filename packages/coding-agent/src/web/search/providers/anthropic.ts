@@ -14,7 +14,7 @@ import {
 	buildAnthropicUrl,
 	stripClaudeToolPrefix,
 } from "@gajae-code/ai";
-import { $env } from "@gajae-code/utils";
+import { $credentialEnv, $env } from "@gajae-code/utils";
 import type {
 	AnthropicApiResponse,
 	AnthropicCitation,
@@ -275,8 +275,8 @@ export async function searchAnthropic(
 	params: SearchParams | AnthropicSearchParams,
 	_legacyStorage?: unknown,
 ): Promise<SearchResponse> {
-	const searchApiKey = $env.ANTHROPIC_SEARCH_API_KEY;
-	const searchBaseUrl = $env.ANTHROPIC_SEARCH_BASE_URL;
+	const searchApiKey = $credentialEnv("ANTHROPIC_SEARCH_API_KEY");
+	const searchBaseUrl = $credentialEnv("ANTHROPIC_SEARCH_BASE_URL");
 	let auth: AnthropicAuthConfig | undefined;
 	// When reusing the active model's own credentials (native search over a
 	// proxy), prefer its wire model id and carry its request headers through.
@@ -360,7 +360,7 @@ export class AnthropicProvider extends SearchProvider {
 	readonly label = "Anthropic";
 
 	isAvailable(authStorage: AuthStorage): Promise<boolean> | boolean {
-		return Boolean($env.ANTHROPIC_SEARCH_API_KEY) || authStorage.hasAuth("anthropic");
+		return Boolean($credentialEnv("ANTHROPIC_SEARCH_API_KEY")) || authStorage.hasAuth("anthropic");
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {

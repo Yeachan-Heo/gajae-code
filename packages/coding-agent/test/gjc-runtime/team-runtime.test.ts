@@ -18,6 +18,7 @@ import {
 	monitorGjcTeam,
 	monitorGjcTeamSnapshot,
 	parseTeamLaunchArgs,
+	probeGjcTeamAvailability,
 	pruneTeamWorkerGcRecord,
 	readGjcTeamSnapshot,
 	readGjcTeamTask,
@@ -33,6 +34,7 @@ import {
 	startGjcTeam,
 	transitionGjcTeamTask,
 	translateGjcWorkerLaunchArgsForCli,
+	UnknownGjcTeamApiOperationError,
 } from "../../src/gjc-runtime/team-runtime";
 import {
 	type GjcTeamTaskMutationCapability,
@@ -42,6 +44,21 @@ import {
 import { workerMemoryGuardLedgerPath } from "../../src/gjc-runtime/team-worker-memory-guard";
 import { gjcContinuationReservationDigest, isValidGjcContinuationOutcome } from "../../src/gjc-runtime/team-workers";
 
+const TEAM_CLI = path.resolve(import.meta.dir, "../../src/cli.ts");
+
+async function runTeamApiCli(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const child = Bun.spawn([process.execPath, TEAM_CLI, "team", "api", ...args], {
+		env: { ...process.env, NO_COLOR: "1" },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
+	return { exitCode, stdout, stderr };
+}
 const TEST_SESSION_ID = "test-session";
 let cleanupRoot: string | undefined;
 let previousGjcSessionId: string | undefined;
@@ -1213,6 +1230,40 @@ describe("native gjc team runtime", () => {
 			false,
 		);
 	});
+	it("probes a managed leader without mutating tmux", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+
+		expect(
+			probeGjcTeamAvailability({
+				GJC_TMUX_COMMAND: fakeTmux,
+				TMUX: "/tmp/tmux-501/default,1,0",
+			}),
+		).toEqual({ available: true });
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("show-options");
+		expect(tmuxLog).not.toContain("set-option");
+		expect(tmuxLog).not.toContain("split-window");
+	});
+	it("probes an unmanaged leader without inspecting or changing its ownership tag", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { gjcProfile: false });
+
+		expect(
+			probeGjcTeamAvailability({
+				GJC_TMUX_COMMAND: fakeTmux,
+				TMUX: "/tmp/tmux-501/default,1,0",
+			}),
+		).toEqual({ available: true });
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("show-options");
+		expect(tmuxLog).not.toContain("set-option");
+		expect(tmuxLog).not.toContain("split-window");
+	});
 
 	it("rejects a tmux provider that cannot persist GJC's ownership tag (e.g. psmux)", async () => {
 		cleanupRoot = await createGitRepo();
@@ -2313,6 +2364,44 @@ describe("native gjc team runtime", () => {
 		expect(status.task_counts.in_progress).toBe(1);
 	});
 
+	it("rejects unknown API operations before state lookup with actionable guidance", async () => {
+		const heartbeatError = await executeGjcTeamApiOperation("heartbeat", {}).catch((error: unknown) => error);
+		expect(heartbeatError).toBeInstanceOf(UnknownGjcTeamApiOperationError);
+		expect(heartbeatError).toMatchObject({
+			code: "unknown_team_api_operation",
+			operation: "heartbeat",
+			suggestions: ["read-worker-heartbeat", "update-worker-heartbeat"],
+		});
+		expect((heartbeatError as Error).message).toBe(
+			"unknown_team_api_operation:heartbeat; did you mean read-worker-heartbeat or update-worker-heartbeat?",
+		);
+
+		await expect(executeGjcTeamApiOperation("get-task", {})).rejects.toThrow(
+			"unknown_team_api_operation:get-task; did you mean read-task?",
+		);
+		await expect(executeGjcTeamApiOperation("wat", {})).rejects.toThrow(
+			"unknown_team_api_operation:wat; run gjc team api --help for supported operations",
+		);
+		await expect(executeGjcTeamApiOperation("read-task", {})).rejects.toThrow("missing_team_name");
+
+		const jsonResult = await runTeamApiCli(["heartbeat", "--input", "{}", "--json"]);
+		expect(jsonResult.exitCode).toBe(1);
+		expect(JSON.parse(jsonResult.stdout)).toEqual({
+			ok: false,
+			error: "unknown_team_api_operation",
+			operation: "heartbeat",
+			suggestions: ["read-worker-heartbeat", "update-worker-heartbeat"],
+		});
+		expect(jsonResult.stderr).toBe("");
+		expect(`${jsonResult.stdout}${jsonResult.stderr}`).not.toContain("Uncaught Exception");
+		expect(`${jsonResult.stdout}${jsonResult.stderr}`).not.toContain("gjc-crash.log");
+
+		const textResult = await runTeamApiCli(["get-task", "--input", "{}"]);
+		expect(textResult.exitCode).toBe(1);
+		expect(textResult.stdout).toBe("");
+		expect(textResult.stderr).toBe("unknown_team_api_operation:get-task; did you mean read-task?\n");
+		expect(textResult.stderr).not.toContain("Uncaught Exception");
+	});
 	it("supports GJC team parity behavioral API operations", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
 		await startGjcTeam({

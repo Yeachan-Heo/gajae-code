@@ -1,19 +1,25 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	installGjcPluginBundle,
-	loadAlwaysOnPluginTools,
-	renderSkillAdvertisement,
-} from "../src/extensibility/gjc-plugins";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { installGjcBundle, loadAlwaysOnPluginTools, renderSkillAdvertisement } from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
 const tempDirs: string[] = [];
+const originalAgentDir = getAgentDir();
+let agentDir: string;
+
+beforeEach(async () => {
+	agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-runtime-adapters-agent-"));
+	setAgentDir(agentDir);
+});
 
 afterEach(async () => {
+	setAgentDir(originalAgentDir);
 	for (const d of tempDirs.splice(0)) await fs.rm(d, { recursive: true, force: true });
+	await fs.rm(agentDir, { recursive: true, force: true });
 });
 
 async function mkCwd(): Promise<string> {
@@ -25,7 +31,8 @@ async function mkCwd(): Promise<string> {
 describe("always-on plugin tool runtime activation", () => {
 	test("loads a declared always-on tool from an installed bundle", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const res = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
 		expect(res.tools.map(t => t.name)).toContain("domain_note");
 		expect(res.quarantine).toHaveLength(0);
@@ -40,7 +47,8 @@ describe("always-on plugin tool runtime activation", () => {
 
 	test("refuses to overwrite a reserved tool name", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const res = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: ["domain_note"] });
 		expect(res.tools.map(t => t.name)).not.toContain("domain_note");
 		expect(res.quarantine.some(q => q.code === "session_collision")).toBe(true);
@@ -48,7 +56,8 @@ describe("always-on plugin tool runtime activation", () => {
 
 	test("quarantines on installed-file hash drift", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const installed = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "tools", "domain-note.ts");
 		await fs.appendFile(installed, "\n// tampered after install\n");
 		const res = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
@@ -74,7 +83,8 @@ describe("always-on plugin tool runtime activation", () => {
 				tools: [{ name: "declared_x", path: "tools/t.ts" }],
 			}),
 		);
-		await installGjcPluginBundle(src, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", src);
+		expect(r.ok).toBe(true);
 		const res = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
 		expect(res.tools.map(t => t.name)).not.toContain("actual_y");
 		expect(res.tools.map(t => t.name)).not.toContain("declared_x");
@@ -83,7 +93,8 @@ describe("always-on plugin tool runtime activation", () => {
 
 	test("reuses validated registry hashes across repeated surface calls until files change", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
 		const readFileSpy = spyOn(fs, "readFile");
 		const pluginReadCount = () =>
@@ -105,7 +116,8 @@ describe("always-on plugin tool runtime activation", () => {
 
 	test("file metadata changes force re-hash and drift quarantine", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const installed = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "tools", "domain-note.ts");
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
 		const readFileSpy = spyOn(fs, "readFile");
@@ -128,7 +140,8 @@ describe("always-on plugin tool runtime activation", () => {
 
 	test("same-size tamper with restored mtime still fails closed instead of reusing a forged hash", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const installed = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "tools", "domain-note.ts");
 		const beforeStat = await fs.stat(installed);
 		const primed = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
@@ -148,7 +161,8 @@ describe("always-on plugin tool runtime activation", () => {
 
 	test("registry enablement changes invalidate the validated-registry cache", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const before = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
 		expect(before).toContain('activation_arg="design"');
 

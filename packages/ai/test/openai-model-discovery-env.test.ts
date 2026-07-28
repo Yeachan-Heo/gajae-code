@@ -44,7 +44,7 @@ function runDiscoveryIsolationScript(script: string, env: Record<string, string>
 }
 
 describe("OpenAI model discovery environment precedence", () => {
-	it("uses inherited shell OPENAI_BASE_URL before fallback $env.OPENAI_BASE_URL", () => {
+	it("resolves OPENAI_BASE_URL from the inherited shell environment", () => {
 		const providerModelsUrl = pathToFileURL(
 			path.resolve(import.meta.dir, "../src/provider-models/openai-compat.ts"),
 		).href;
