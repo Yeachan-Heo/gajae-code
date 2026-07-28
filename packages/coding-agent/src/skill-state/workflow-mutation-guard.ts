@@ -814,7 +814,13 @@ function maskHeredocBodiesPass(
 		// the previous dequoted line so split command words (`e\` + `val`)
 		// reassemble for command/shadow detection.
 		if (isContinuationLine && dequotedLines.length > 0) {
-			dequotedLines[dequotedLines.length - 1] += dequoted;
+			let previousDequoted = dequotedLines[dequotedLines.length - 1] ?? "";
+			// A continuation can also split ANSI-C quoting (`$\` + `'eval'`): the
+			// rejoined `$'` still drops its `$` during quote removal.
+			if (previousDequoted.endsWith("$") && line.startsWith("'")) {
+				previousDequoted = previousDequoted.slice(0, -1);
+			}
+			dequotedLines[dequotedLines.length - 1] = previousDequoted + dequoted;
 		} else {
 			dequotedLines.push(dequoted);
 		}
