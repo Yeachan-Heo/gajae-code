@@ -293,4 +293,24 @@ describe("deep-interview staged transitions", () => {
 		const applied = await run(root, ["apply", "--json"]);
 		expect(parse(applied.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_NO_DRAFT" });
 	});
+
+	it("reports a typed session error when no session id is resolvable", async () => {
+		const root = await tempDir();
+		const saved = process.env.GJC_SESSION_ID;
+		delete process.env.GJC_SESSION_ID;
+		try {
+			const staged = await run(root, [
+				"stage",
+				"--for",
+				"initialize-context",
+				"--input",
+				JSON.stringify({ state: { initial_idea: "no session anywhere" } }),
+				"--json",
+			]);
+			expect(staged.status).toBe(2);
+			expect(parse(staged.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_SESSION_REQUIRED" });
+		} finally {
+			process.env.GJC_SESSION_ID = saved;
+		}
+	});
 });

@@ -8,7 +8,12 @@ import {
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
 import { sessionStateDir } from "./session-layout";
-import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
+import {
+	resolveGjcSessionForRead,
+	resolveGjcSessionForWrite,
+	SessionResolutionError,
+	writeSessionActivityMarker,
+} from "./session-resolution";
 import {
 	persistedStateRevision,
 	readExistingStateForMutation,
@@ -53,6 +58,7 @@ const DRAFT_FILE = "deep-interview-draft.json";
 export type DeepInterviewStageErrorCode =
 	| "DI_STAGE_USAGE"
 	| "DI_STAGE_INPUT_INVALID"
+	| "DI_STAGE_SESSION_REQUIRED"
 	| "DI_STAGE_DRAFT_EXISTS"
 	| "DI_STAGE_NO_DRAFT"
 	| "DI_STAGE_DRAFT_CORRUPT"
@@ -533,11 +539,21 @@ export async function runDeepInterviewStageCommand(
 					.join(" ")}\n`;
 		return { status, stdout };
 	} catch (error) {
-		if (error instanceof DeepInterviewStageError) {
+		const staged =
+			error instanceof DeepInterviewStageError
+				? error
+				: error instanceof SessionResolutionError
+					? new DeepInterviewStageError(
+							"DI_STAGE_SESSION_REQUIRED",
+							error.message,
+							"set GJC_SESSION_ID (or include session_id in the staged payload) and retry",
+						)
+					: undefined;
+		if (staged) {
 			const body = json
-				? `${JSON.stringify({ ok: false, code: error.code, message: error.message, ...(error.recovery ? { recovery: error.recovery } : {}) })}\n`
-				: `${error.code}: ${error.message}${error.recovery ? `\nrecovery: ${error.recovery}` : ""}\n`;
-			return { status: error.exitStatus, stderr: body };
+				? `${JSON.stringify({ ok: false, code: staged.code, message: staged.message, ...(staged.recovery ? { recovery: staged.recovery } : {}) })}\n`
+				: `${staged.code}: ${staged.message}${staged.recovery ? `\nrecovery: ${staged.recovery}` : ""}\n`;
+			return { status: staged.exitStatus, stderr: body };
 		}
 		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
