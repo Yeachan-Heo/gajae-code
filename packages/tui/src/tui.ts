@@ -668,6 +668,9 @@ export class TUI extends Container {
 	#renderCommitWaiters = new Map<number, Set<RenderCommitWaiter>>();
 	#lastRenderWriteSucceeded = false;
 	#renderTimer: NodeJS.Timeout | undefined;
+	#widthSettleTimer: NodeJS.Timeout | undefined;
+	#widthSettleBaseline = 0;
+	static readonly #WIDTH_SETTLE_MS = 1000;
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
 	// Input-priority scheduling: an input keystroke must never be starved behind a
@@ -1523,6 +1526,10 @@ export class TUI extends Container {
 			this.#renderTimer = undefined;
 			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
+		if (this.#widthSettleTimer) {
+			clearTimeout(this.#widthSettleTimer);
+			this.#widthSettleTimer = undefined;
+		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.#previousLines.length > 0) {
 			const targetRow = this.#previousLines.length; // Line after the last content
@@ -1583,9 +1590,34 @@ export class TUI extends Container {
 	 * is a no-op otherwise.
 	 */
 	requestResizeRender(): void {
-		const dimensionsChanged =
-			this.#previousWidth !== this.terminal.columns || this.#previousHeight !== this.terminal.rows;
-		this.requestRender(dimensionsChanged && !useViewportRepaintPath(this.terminal), "resize");
+		const widthChanged = this.#previousWidth !== this.terminal.columns;
+		const heightChanged = this.#previousHeight !== this.terminal.rows;
+		if (widthChanged) this.#scheduleWidthSettleRedraw();
+		this.requestRender(heightChanged && !useViewportRepaintPath(this.terminal), "resize");
+	}
+
+	/**
+	 * Width reflow leaves artifacts that a differential render cannot repair: lines
+	 * wrapped at the old column count stay on screen as stale bands. Only a full
+	 * redraw fixes them, but forcing one per SIGWINCH during a drag-resize is a
+	 * replay storm. So width changes arm a trailing timer instead: interim frames
+	 * keep the normal (cheap) render path, and one forced full redraw commits
+	 * #WIDTH_SETTLE_MS after the last width change. Height-only changes are
+	 * unaffected — they reflow nothing and keep their existing behavior.
+	 */
+	#scheduleWidthSettleRedraw(): void {
+		if (this.#widthSettleTimer) {
+			clearTimeout(this.#widthSettleTimer);
+		} else {
+			this.#widthSettleBaseline = this.#previousWidth;
+		}
+		this.#widthSettleTimer = setTimeout(() => {
+			this.#widthSettleTimer = undefined;
+			if (this.#stopped) return;
+			if (this.terminal.columns === this.#widthSettleBaseline) return;
+			this.requestRender(true, "resize.width-settled");
+		}, TUI.#WIDTH_SETTLE_MS);
+		this.#widthSettleTimer.unref?.();
 	}
 
 	requestRender(force = false, source = "unknown"): void {
