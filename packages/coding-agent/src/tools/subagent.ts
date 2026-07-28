@@ -82,6 +82,8 @@ export interface SubagentSnapshot {
 	requestedModel?: string;
 	/** True when the requested model lacked credentials and fell back to the parent model. */
 	modelFellBack?: boolean;
+	/** Whether fast mode is effectively active for the subagent's current model. */
+	fastModeActive?: boolean;
 }
 
 export type SubagentAwaitOutcome = "completed" | "timed_out" | "interrupted";
@@ -695,6 +697,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (record.effectiveModel) fields.effectiveModel = record.effectiveModel;
 		if (record.requestedModel) fields.requestedModel = record.requestedModel;
 		if (record.modelFellBack) fields.modelFellBack = true;
+		if (record.fastModeActive !== undefined) fields.fastModeActive = record.fastModeActive;
 		return fields;
 	}
 
@@ -900,6 +903,7 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 		effectiveModel: snapshot.effectiveModel ?? null,
 		requestedModel: snapshot.requestedModel ?? null,
 		modelFellBack: snapshot.modelFellBack ?? false,
+		fastModeActive: snapshot.fastModeActive ?? null,
 		// durationMs intentionally excluded (time-derived; would defeat idle gating).
 		progress: snapshot.progress ? canonicalizeProgressForSignature(snapshot.progress) : null,
 	};
@@ -927,6 +931,7 @@ function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
 		cost: progress.cost,
 		modelOverride: progress.modelOverride ?? null,
 		modelSubstitutionWarning: progress.modelSubstitutionWarning ?? null,
+		fastModeActive: progress.fastModeActive ?? null,
 		// durationMs intentionally excluded (time-derived).
 		extractedToolData: progress.extractedToolData
 			? canonicalizeExtractedToolDataForSignature(progress.extractedToolData)

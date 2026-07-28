@@ -90,6 +90,22 @@ describe("task renderer: nested live rendering", () => {
 		);
 		return Bun.stripANSI(component.render(160).join("\n"));
 	}
+	async function renderBackgroundProgress(progress: AgentProgress[]): Promise<string> {
+		const theme = (await getThemeByName("red-claw"))!;
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [],
+			totalDurationMs: 1234,
+			progress,
+			async: { state: "completed", jobId: "background-task", type: "task" },
+		};
+		const component = taskToolRenderer.renderResult(
+			{ content: [{ type: "text", text: "Background task complete" }], details },
+			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			theme,
+		);
+		return Bun.stripANSI(component.render(160).join("\n"));
+	}
 
 	async function renderResult(result: TaskResultReceipt): Promise<string> {
 		const theme = (await getThemeByName("red-claw"))!;
@@ -105,6 +121,50 @@ describe("task renderer: nested live rendering", () => {
 		);
 		return Bun.stripANSI(component.render(160).join("\n"));
 	}
+	it("renders the fast indicator for direct foreground task progress and results", async () => {
+		const iconFast = (await getThemeByName("red-claw"))!.icon.fast;
+		const live = await render(
+			makeRunningProgress({
+				id: "foreground-live",
+				description: "Foreground task is running",
+				fastModeActive: true,
+			}),
+		);
+		const terminal = await renderResult({
+			...makeCompletedSubResult("foreground-terminal", "Foreground task completed"),
+			fastModeActive: true,
+		});
+
+		expect(live).toContain(`Foreground task is running ${iconFast}`);
+		expect(terminal).toContain(`Foreground task completed ⟦done⟧ ${iconFast}`);
+	});
+	it("renders one fast glyph for qualifying terminal background progress only", async () => {
+		const iconFast = (await getThemeByName("red-claw"))!.icon.fast;
+		const text = await renderBackgroundProgress([
+			makeRunningProgress({
+				id: "background-fast",
+				description: "Fast terminal background task",
+				status: "completed",
+				fastModeActive: true,
+			}),
+			makeRunningProgress({
+				id: "background-not-fast",
+				description: "Non-fast terminal background task",
+				status: "completed",
+				fastModeActive: false,
+			}),
+			makeRunningProgress({
+				id: "background-unknown",
+				description: "Unknown terminal background task",
+				status: "completed",
+			}),
+		]);
+
+		expect(text.split(iconFast).length - 1).toBe(1);
+		expect(text.split("\n").find(line => line.includes("Fast terminal background task"))).toContain(iconFast);
+		expect(text.split("\n").find(line => line.includes("Non-fast terminal background task"))).not.toContain(iconFast);
+		expect(text.split("\n").find(line => line.includes("Unknown terminal background task"))).not.toContain(iconFast);
+	});
 
 	it("renders completed nested task results stored in extractedToolData.task while parent is in-progress", async () => {
 		const parent = makeRunningProgress({

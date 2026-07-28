@@ -869,6 +869,31 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let lastAssistantModelString: string | undefined;
 	let activeProviderModelString: string | undefined;
 	let effectiveThinkingLevelForWarning: ThinkingLevel | undefined;
+	const syncFastModeActive = (effectiveModel?: string): void => {
+		if (!activeSession) return;
+		const sessionModel = activeSession.model ? formatModelString(activeSession.model) : undefined;
+		const actualModel = effectiveModel ?? sessionModel;
+		const isFastModeActive =
+			typeof activeSession.isFastModeActive === "function"
+				? activeSession.isFastModeActive.bind(activeSession)
+				: undefined;
+		const isFastForProvider =
+			typeof activeSession.isFastForProvider === "function"
+				? activeSession.isFastForProvider.bind(activeSession)
+				: () => false;
+		// AgentSession applies provider `disabledFeatures` before delivering its
+		// event. Its effective predicate is therefore authoritative for both the
+		// configured model and a provider fallback/substitution.
+		progress.fastModeActive = isFastModeActive
+			? isFastModeActive()
+			: isFastForProvider(providerNameFromModel(actualModel));
+		AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
+			requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
+			effectiveModel: actualModel,
+			modelFellBack: modelSubstitutionWarning?.reason === "auth_unavailable",
+			fastModeActive: progress.fastModeActive,
+		});
+	};
 	let lastProviderProgressAtMs: number | undefined;
 	let sessionEventOrdinal = 0;
 	let retryStartOrdinal = 0;
@@ -1314,6 +1339,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							});
 						}
 					}
+					syncFastModeActive(assistantModel);
+					flushProgress = true;
 				}
 				// Extract and accumulate usage (prefer message.usage, fallback to event.usage)
 				const messageUsage = getMessageUsage(event.message) || (event as AgentEvent & { usage?: unknown }).usage;
@@ -1662,6 +1689,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 
 			activeSession = session;
+			syncFastModeActive();
+			scheduleProgress(true);
 			// Each subagent invocation owns a fresh controller; its configured chain
 			// is scoped to this child session and never shares parent sticky state.
 			// Auth-aware resolution can substitute the parent model only after every
@@ -1875,6 +1904,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 				if (event.type === "model_fallback_switched") {
 					activeProviderModelString = event.to;
+					syncFastModeActive(event.to);
+					scheduleProgress(true);
 					forwardSubagentEvent(event);
 					return;
 				}
@@ -2167,6 +2198,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		contextWindow: progress.contextWindow,
 		modelOverride,
 		modelSubstitutionWarning,
+		fastModeActive: progress.fastModeActive,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,

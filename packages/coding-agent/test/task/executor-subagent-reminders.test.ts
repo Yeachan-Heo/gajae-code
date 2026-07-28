@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
+import { AsyncJobManager } from "../../src/async/job-manager";
 import { kNoAuth } from "../../src/config/model-registry";
 
 import { Settings } from "../../src/config/settings";
@@ -62,6 +63,8 @@ function createMockSession(
 			return state.messages;
 		},
 		extensionRunner: undefined,
+		isFastModeActive: () => false,
+		isFastForProvider: () => false,
 		sessionManager: {
 			appendSessionInit: () => {},
 		},
@@ -105,6 +108,7 @@ function mockCreateAgentSession(session: AgentSession) {
 describe("runSubprocess yield reminders", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+		AsyncJobManager.resetForTests();
 	});
 
 	const baseAgent: AgentDefinition = {
@@ -210,6 +214,28 @@ describe("runSubprocess yield reminders", () => {
 				scope: "subagent",
 			}),
 		]);
+	});
+	it("falls back safely when a legacy session omits fast-mode methods", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-legacy-fast",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		delete (session as Partial<AgentSession>).isFastModeActive;
+		delete (session as Partial<AgentSession>).isFastForProvider;
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-legacy-fast-mode", modelRegistry });
+
+		expect(result.exitCode).toBe(0);
+		expect(result.fastModeActive).toBe(false);
 	});
 
 	it("clears provider retry state on the first recovered assistant event", async () => {
@@ -494,6 +520,124 @@ describe("runSubprocess yield reminders", () => {
 
 		const retryStart = progressUpdates.find(update => update.event === "auto_retry_start");
 		expect(retryStart?.progress.retryState?.provider).toBe("fallback");
+		expect(result.exitCode).toBe(0);
+	});
+	it("uses AgentSession's effective fast-mode state after priority is auto-disabled", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		manager.registerSubagentRecord({
+			subagentId: "subagent-fast-mode-off",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		let fastModeActive = true;
+		const session = createMockSession(({ emit }) => {
+			const terminal = {
+				...createAssistantStopMessage("Result submitted."),
+				provider: "test",
+				model: "mock",
+				disabledFeatures: ["priority"],
+			};
+			// AgentSession consumes disabledFeatures before notifying subscribers.
+			fastModeActive = false;
+			emit({ type: "message_end", message: terminal });
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fast-mode-off",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		(session as unknown as { isFastModeActive: () => boolean }).isFastModeActive = () => fastModeActive;
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-fast-mode-off",
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+
+		expect(result.fastModeActive).toBe(false);
+		expect(manager.getSubagentRecord("subagent-fast-mode-off")?.fastModeActive).toBe(false);
+		expect(result.exitCode).toBe(0);
+	});
+	it("uses effective fast mode after a fallback model switch", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		manager.registerSubagentRecord({
+			subagentId: "subagent-fallback-fast-mode",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressUpdates.push({
+				event: currentEvent,
+				progress: structuredClone((payload as { progress: AgentProgress }).progress),
+			});
+		});
+
+		const primaryModel = { ...model, provider: "primary", id: "model" };
+		const session = createMockSession(
+			({ emit }) => {
+				currentEvent = "model_fallback_switched";
+				emit({
+					type: "model_fallback_switched",
+					eventId: "fallback-fast-mode",
+					from: "primary/model",
+					to: "fallback/model",
+					reason: "rate_limit",
+					role: "executor",
+					scope: "subagent",
+					activeIndex: 1,
+					chainLength: 2,
+					attemptsUsed: 1,
+				});
+				currentEvent = "tool_execution_end";
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-fallback-fast-mode",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { provider: "fallback" } },
+					},
+					isError: false,
+				});
+			},
+			{ model: primaryModel },
+		);
+		(session as unknown as { isFastForProvider: (provider?: string) => boolean }).isFastForProvider = provider =>
+			provider === "fallback";
+		(session as unknown as { isFastModeActive: () => boolean }).isFastModeActive = () => false;
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-fast-mode",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+
+		expect(progressUpdates.find(update => update.event === "model_fallback_switched")?.progress.fastModeActive).toBe(
+			false,
+		);
+		expect(result.fastModeActive).toBe(false);
+		expect(manager.getSubagentRecord("subagent-fallback-fast-mode")?.fastModeActive).toBe(false);
 		expect(result.exitCode).toBe(0);
 	});
 

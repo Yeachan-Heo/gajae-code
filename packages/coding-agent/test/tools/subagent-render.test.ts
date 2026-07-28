@@ -335,6 +335,56 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("requested openai-codex/gpt-5.5");
 		expect(out).toContain("fell back");
 	});
+	it("renders one fast glyph for each live subagent row with fast mode active", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-FastA",
+					fastModeActive: true,
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-FastA", currentTool: "read", fastModeActive: true }),
+				}),
+				snapshot({
+					id: "0-FastB",
+					fastModeActive: true,
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-FastB", currentTool: "bash", fastModeActive: true }),
+				}),
+				snapshot({
+					id: "0-Normal",
+					fastModeActive: false,
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-Normal", currentTool: "bash", fastModeActive: false }),
+				}),
+				snapshot({
+					id: "0-Unknown",
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-Unknown", currentTool: "edit" }),
+				}),
+			],
+		});
+
+		expect(out.split(theme.icon.fast).length - 1).toBe(2);
+		for (const id of ["0-FastA", "0-FastB"]) {
+			expect(out.split("\n").find(line => line.includes(id))).toContain(theme.icon.fast);
+		}
+	});
+
+	it("renders one fast glyph for each qualifying terminal subagent row", () => {
+		const out = render({
+			subagents: [
+				snapshot({ id: "0-FastDoneA", status: "completed", fastModeActive: true, resultText: "done" }),
+				snapshot({ id: "0-FastDoneB", status: "completed", fastModeActive: true, resultText: "done" }),
+				snapshot({ id: "0-NormalDone", status: "completed", fastModeActive: false, resultText: "done" }),
+				snapshot({ id: "0-UnknownDone", status: "completed", resultText: "done" }),
+			],
+		});
+
+		expect(out.split(theme.icon.fast).length - 1).toBe(2);
+		for (const id of ["0-FastDoneA", "0-FastDoneB"]) {
+			expect(out.split("\n").find(line => line.includes(id))).toContain(theme.icon.fast);
+		}
+	});
 });
 
 describe("interrupted await receipts", () => {

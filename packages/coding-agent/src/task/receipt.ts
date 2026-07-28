@@ -29,6 +29,8 @@ export interface TaskResultReceipt {
 	contextWindow?: number;
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
+	/** Whether fast mode was effectively active for the subagent's final model. */
+	fastModeActive?: SingleResult["fastModeActive"];
 	usage?: SingleResult["usage"];
 	cost?: number;
 	usageCostBreakdownComplete?: true;
@@ -246,6 +248,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		contextWindow: raw.contextWindow,
 		modelOverride: raw.modelOverride,
 		modelSubstitutionWarning: raw.modelSubstitutionWarning,
+		...(raw.fastModeActive !== undefined ? { fastModeActive: raw.fastModeActive } : {}),
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
 		usageCostBreakdownComplete:

@@ -123,6 +123,35 @@ describe("SubagentTool", () => {
 		expect(getText(result)).not.toContain("job-bash");
 		await manager.dispose({ timeoutMs: 100 });
 	});
+	it("maps manager-owned fast-mode state into snapshots without a global default", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession("0-Main"));
+		for (const subagentId of ["0-FastOn", "0-FastOff", "0-FastUnknown"]) {
+			manager.registerSubagentRecord({
+				subagentId,
+				ownerId: "0-Main",
+				currentJobId: null,
+				historicalJobIds: [],
+				status: "completed",
+				sessionFile: null,
+				resumable: false,
+			});
+		}
+		manager.updateSubagentModel("0-FastOn", { fastModeActive: true });
+		manager.updateSubagentModel("0-FastOff", { fastModeActive: false });
+
+		const result = await tool.execute("subagent-list-fast-mode", { action: "list" });
+		const snapshots = result.details?.subagents ?? [];
+		const active = snapshots.find(snapshot => snapshot.id === "0-FastOn");
+		const inactive = snapshots.find(snapshot => snapshot.id === "0-FastOff");
+		const unknown = snapshots.find(snapshot => snapshot.id === "0-FastUnknown");
+
+		expect(active?.fastModeActive).toBe(true);
+		expect(inactive?.fastModeActive).toBe(false);
+		expect(unknown).toBeDefined();
+		expect("fastModeActive" in unknown!).toBe(false);
+		await manager.dispose({ timeoutMs: 100 });
+	});
 
 	it("await retrieves completed subagent results and acknowledges delivery", async () => {
 		const manager = createManager();
@@ -508,6 +537,7 @@ describe("SubagentTool", () => {
 				status: "paused",
 				sessionFile: `/tmp/${subagentId}.jsonl`,
 				resumable: true,
+				fastModeActive: subagentId === "0-ResumeA" ? true : undefined,
 			});
 		}
 
@@ -525,6 +555,14 @@ describe("SubagentTool", () => {
 		expect(resumed).toEqual(["0-ResumeA"]);
 		expect(result.details?.subagents[0]?.status).toBe("running");
 		expect(result.details?.subagents[0]?.jobId).toBe("job-0-ResumeA");
+		expect(result.details?.subagents[0]?.fastModeActive).toBeUndefined();
+		await manager.getJob("job-0-ResumeA")?.promise;
+		const completed = await tool.execute("subagent-inspect-resumed-fast-mode", {
+			action: "inspect",
+			ids: ["0-ResumeA"],
+		});
+		expect(completed.details?.subagents[0]?.resultText).toContain("resumed");
+		expect(completed.details?.subagents[0]?.fastModeActive).toBeUndefined();
 		await manager.dispose({ timeoutMs: 100 });
 	});
 

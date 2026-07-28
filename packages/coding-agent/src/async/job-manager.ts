@@ -155,6 +155,8 @@ export interface SubagentRecord {
 	effectiveModel?: string;
 	/** True when the requested model lacked credentials and the subagent fell back to the parent model. */
 	modelFellBack?: boolean;
+	/** Whether fast mode is effectively active for the subagent's current model. */
+	fastModeActive?: boolean;
 }
 
 /** Lightweight, manager-owned resume payload. The async layer treats `data` as opaque. */
@@ -661,16 +663,17 @@ export class AsyncJobManager {
 		this.#subagentRecords.set(record.subagentId, record);
 	}
 
-	/** Patch model metadata onto an existing subagent record (best-effort; no-op if unknown). */
+	/** Patch effective model metadata onto an existing subagent record (best-effort; no-op if unknown). */
 	updateSubagentModel(
 		subagentId: string,
-		model: { requestedModel?: string; effectiveModel?: string; modelFellBack?: boolean },
+		model: { requestedModel?: string; effectiveModel?: string; modelFellBack?: boolean; fastModeActive?: boolean },
 	): void {
 		const record = this.#subagentRecords.get(subagentId);
 		if (!record) return;
 		record.requestedModel = model.requestedModel;
 		record.effectiveModel = model.effectiveModel;
 		record.modelFellBack = model.modelFellBack;
+		record.fastModeActive = model.fastModeActive;
 	}
 
 	#recordFromResumeDescriptor(subagentId: string, filter?: AsyncJobFilter): SubagentRecord | undefined {
@@ -1095,6 +1098,9 @@ export class AsyncJobManager {
 		// Clear any retained progress from the previous run so a resumed subagent
 		// never renders the prior run's tool/output as live before it emits again.
 		this.#subagentProgress.delete(rec.subagentId);
+		// The prior run's provider may have differed or have since auto-disabled
+		// priority. Do not expose its glyph while the replacement is starting.
+		rec.fastModeActive = undefined;
 		const runner = this.#resolveResumeRunner(rec.subagentId);
 		const newJobId = runner?.(rec.subagentId, message, this.#resumeDescriptors.get(rec.subagentId));
 		if (!newJobId) return { ok: false, reason: "resume_failed" };

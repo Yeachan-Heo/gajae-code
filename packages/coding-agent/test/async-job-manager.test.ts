@@ -374,6 +374,28 @@ describe("AsyncJobManager", () => {
 		await manager.waitForAll();
 		expect(manager.getJob(parentJobId)?.status).toBe("cancelled");
 	});
+	test("clears a prior fast-mode glyph before its resumed runner starts", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		let fastModeActiveDuringResume: boolean | undefined;
+		manager.registerSubagentRecord({
+			subagentId: "0-Resume",
+			currentJobId: "prior-job",
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/0-Resume.jsonl",
+			resumable: true,
+			fastModeActive: true,
+		});
+		manager.setResumeRunner(subagentId => {
+			fastModeActiveDuringResume = manager.getSubagentRecord(subagentId)?.fastModeActive;
+			return manager.register("task", "resumed", async () => "done", { id: "resumed-job" });
+		});
+
+		expect(manager.resumeSubagent("0-Resume")).toMatchObject({ ok: true, status: "running" });
+		expect(fastModeActiveDuringResume).toBeUndefined();
+		expect(manager.getSubagentRecord("0-Resume")?.fastModeActive).toBeUndefined();
+		await manager.dispose({ timeoutMs: 100 });
+	});
 	test("retention-zero eviction runs onEvict and records a monitor tombstone", async () => {
 		let evictCount = 0;
 		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });

@@ -544,6 +544,7 @@ function renderAgentProgress(
 	 * countdown) so the output is a pure function of `progress` — required when the
 	 * caller caches these lines (the `subagent` await panel). */
 	staticTime = false,
+	showFastModeIndicator = true,
 ): string[] {
 	const lines: string[] = [];
 	const prefix = isLast ? theme.fg("dim", theme.tree.last) : theme.fg("dim", theme.tree.branch);
@@ -562,6 +563,7 @@ function renderAgentProgress(
 	const displayId = formatTaskId(progress.id);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}`;
+	if (showFastModeIndicator && progress.fastModeActive) statusLine += ` ${theme.icon.fast}`;
 
 	// A provider recovery loop is operationally distinct from normal agent work.
 	if (progress.retryState && progress.status === "running") {
@@ -736,8 +738,11 @@ export function renderSubagentLiveProgress(
 	theme: Theme,
 	spinnerFrame?: number,
 	staticTime = false,
+	/** Whether to show the fast-mode glyph on the detail line. Await panels show
+	 * that glyph on their parent snapshot status row instead. */
+	showFastModeIndicator = true,
 ): string[] {
-	return renderAgentProgress(progress, true, expanded, theme, spinnerFrame, staticTime);
+	return renderAgentProgress(progress, true, expanded, theme, spinnerFrame, staticTime, showFastModeIndicator);
 }
 
 /**
@@ -867,6 +872,7 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 		iconColor,
 		theme,
 	)}`;
+	if (result.fastModeActive) statusLine += ` ${theme.icon.fast}`;
 	statusLine = appendAgentStats(
 		statusLine,
 		{

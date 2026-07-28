@@ -155,6 +155,15 @@ describe("task result receipts", () => {
 		expect(receipt.outputRef).toBeUndefined();
 		expect(receipt.outputUnavailable).toBe(true);
 	});
+	it("preserves explicit fast-mode state from SingleResult receipts", () => {
+		const active = buildTaskReceipt(makeRaw({ fastModeActive: true }));
+		const inactive = buildTaskReceipt(makeRaw({ fastModeActive: false }));
+		const unknown = buildTaskReceipt(makeRaw());
+
+		expect(active.fastModeActive).toBe(true);
+		expect(inactive.fastModeActive).toBe(false);
+		expect("fastModeActive" in unknown).toBe(false);
+	});
 
 	it("surfaces model substitution warnings without raw output", () => {
 		const receipt = buildTaskReceipt(

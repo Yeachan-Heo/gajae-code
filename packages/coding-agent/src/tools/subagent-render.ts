@@ -163,7 +163,7 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 			)
 		: theme.fg("dim", snapshot.status);
 	const duration = theme.fg("dim", formatDuration(snapshot.durationMs));
-	return `${icon} ${id} ${status} ${duration}`;
+	return `${icon} ${id} ${status} ${duration}${snapshot.fastModeActive ? ` ${theme.icon.fast}` : ""}`;
 }
 
 // Heavy per-subagent body. The cache path uses staticTime=true; the bounded dynamic
@@ -210,7 +210,7 @@ function renderSubagentSnapshotBody(
 	// resurrect a live panel (AC5). `staticTime` keeps wall-clock displays out of
 	// cached lines when the body is served by the cache.
 	if (snapshot.progress && snapshot.liveProgressAvailable !== false) {
-		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, staticTime)) {
+		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, staticTime, false)) {
 			lines.push(`  ${pl}`);
 		}
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {

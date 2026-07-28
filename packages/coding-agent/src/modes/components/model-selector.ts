@@ -25,6 +25,8 @@ import {
 } from "../../config/model-registry";
 import {
 	formatModelSelectorValue,
+	formatModelString,
+	resolveAgentModelPatterns,
 	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
@@ -36,6 +38,8 @@ import { compareRankedProviders, type ProviderAuthState } from "../../config/pro
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
+import { discoverAgents } from "../../task/discovery";
+import type { AgentDefinition } from "../../task/types";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getConfiguredImageModel } from "../../tools/image-gen";
 import { getTabBarTheme } from "../shared";
@@ -95,6 +99,7 @@ interface RoleAssignment {
 	model: Model;
 	thinkingLevel: ThinkingLevel;
 }
+type RoleAgentDefinitions = ReadonlyArray<Pick<AgentDefinition, "name" | "model" | "thinkingLevel">>;
 
 export type ModelSelectorSelection =
 	| {
@@ -349,6 +354,7 @@ export class ModelSelectorComponent extends Container {
 	#selectedThinkingIndex: number = 0;
 	#assignmentState: "idle" | "assigning" = "idle";
 	#closeAfterAssignment = false;
+	#roleAgentDefinitions?: RoleAgentDefinitions;
 
 	// Preset landing state
 	#viewMode: ModelSelectorViewMode = "presets";
@@ -384,6 +390,7 @@ export class ModelSelectorComponent extends Container {
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
+			agentDefinitions?: RoleAgentDefinitions;
 		},
 	) {
 		super();
@@ -400,6 +407,7 @@ export class ModelSelectorComponent extends Container {
 		this.#currentThinkingLevel = options?.currentThinkingLevel;
 		this.#activeModelProfile = options?.activeModelProfile;
 		this.#configuredDefaultChain = options?.configuredDefaultChain;
+		this.#roleAgentDefinitions = options?.agentDefinitions;
 		this.#isFastForProvider = options?.isFastForProvider ?? (() => false);
 		this.#isFastForSubagentProvider = options?.isFastForSubagentProvider ?? (() => false);
 		// Current-model EFFECTIVE fast state. Defaults to intent for the current
@@ -413,6 +421,16 @@ export class ModelSelectorComponent extends Container {
 
 		// Load current role assignments from settings
 		this.#loadRoleModels();
+		if (!this.#roleAgentDefinitions) {
+			void discoverAgents(this.#settings.getCwd()).then(
+				({ agents }) => {
+					this.#roleAgentDefinitions = agents;
+					this.refreshRoleAssignments();
+					this.#tui.requestRender();
+				},
+				() => {},
+			);
+		}
 
 		// Add top border
 		this.addChild(new DynamicBorder());
@@ -501,8 +519,21 @@ export class ModelSelectorComponent extends Container {
 		const agentModelOverrides = this.#settings.get("task.agentModelOverrides");
 		for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 			const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
-			const roleValue =
+			const explicitOverride =
 				target.settingsPath === "modelRoles" ? this.#settings.getModelRole(role) : agentModelOverrides[role];
+			const roleAgent =
+				target.settingsPath === "task.agentModelOverrides"
+					? this.#roleAgentDefinitions?.find(agent => agent.name === role)
+					: undefined;
+			const roleValue = roleAgent
+				? resolveAgentModelPatterns({
+						settingsOverride: explicitOverride,
+						agentModel: roleAgent.model,
+						settings: this.#settings,
+						activeModelPattern: this.#currentModel ? formatModelString(this.#currentModel) : undefined,
+						fallbackModelPattern: normalizeModelSelectorValue(this.#settings.getModelRole("default"))[0],
+					})
+				: explicitOverride;
 			if (!roleValue) continue;
 
 			const resolved = resolveModelRoleValue(roleValue, allModels, {
@@ -516,7 +547,7 @@ export class ModelSelectorComponent extends Container {
 					thinkingLevel:
 						resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
 							? resolved.thinkingLevel
-							: ThinkingLevel.Inherit,
+							: (roleAgent?.thinkingLevel ?? ThinkingLevel.Inherit),
 				};
 			}
 		}
@@ -1383,13 +1414,11 @@ export class ModelSelectorComponent extends Container {
 
 			const isSelected = i === this.#selectedIndex;
 
-			// Build role badges (inverted: color as background, black text)
+			// Build role badges (inverted: color as background, black text).
 			const roleBadgeTokens: string[] = [];
-			// Whether a non-subagent (modelRoles) badge on the CURRENT model row already
-			// rendered the current-model EFFECTIVE glyph. Only that case should suppress
-			// the standalone current glyph below — a subagent-only match must NOT, since
-			// subagent badges reflect the subagent tier, not the current model.
-			let currentModelEffectiveGlyphRendered = false;
+			// A model can fulfill multiple assignments, but is still one displayed row.
+			// Render its fast indicator once regardless of how many matching role badges it has.
+			let fastGlyphRendered = false;
 			for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 				const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 				const assigned = this.#roles[role];
@@ -1398,10 +1427,8 @@ export class ModelSelectorComponent extends Container {
 					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
 
 					// Subagent roles (task.agentModelOverrides) run under task.serviceTier,
-					// so their ⚡ uses the effective subagent tier. A non-subagent
-					// (modelRoles) badge on the CURRENT model row uses the current-model
-					// effective predicate so a provider auto-disable hides the glyph;
-					// other modelRoles rows show pure intent.
+					// while non-subagent roles on the current row use the effective
+					// current-model predicate so provider auto-disable hides the glyph.
 					const isSubagentRole = roleInfo.settingsPath === "task.agentModelOverrides";
 					const isCurrentRow = this.#currentModel !== undefined && modelsAreEqual(this.#currentModel, item.model);
 					const roleFast = isSubagentRole
@@ -1409,19 +1436,15 @@ export class ModelSelectorComponent extends Container {
 						: isCurrentRow
 							? this.#isCurrentModelFastModeActive()
 							: this.#isFastForProvider(assigned.model.provider);
-					if (roleFast && isCurrentRow && !isSubagentRole) {
-						currentModelEffectiveGlyphRendered = true;
-					}
-					const fastSuffix = roleFast ? ` ${theme.icon.fast}` : "";
+					const fastSuffix = roleFast && !fastGlyphRendered ? ` ${theme.icon.fast}` : "";
+					if (roleFast) fastGlyphRendered = true;
 					roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}${fastSuffix}`);
 				}
 			}
 			// Active/current non-role row: show the fast glyph on the session's current
-			// model row. Suppress only when a non-subagent current-row badge already
-			// rendered the current-model effective glyph (duplicate-glyph guard) — a
-			// subagent-only match must not hide the current model's own indicator.
+			// model row only when no role badge already supplied it.
 			if (
-				!currentModelEffectiveGlyphRendered &&
+				!fastGlyphRendered &&
 				this.#currentModel !== undefined &&
 				modelsAreEqual(this.#currentModel, item.model) &&
 				this.#isCurrentModelFastModeActive()

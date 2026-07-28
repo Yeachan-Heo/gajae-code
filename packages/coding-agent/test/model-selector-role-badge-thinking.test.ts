@@ -12,6 +12,7 @@ import {
 	theme,
 } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
+import { loadBundledAgents } from "../src/task/agents";
 
 function normalizeRenderedText(text: string): string {
 	return (
@@ -685,10 +686,12 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\n");
 
 		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(thinkingRendered).toContain("Reasoning for Default");
-		expect(thinkingRendered).toContain("off");
-		expect(thinkingRendered).not.toContain("high");
-		expect(thinkingRendered).not.toContain("xhigh");
+		const reasoningHeading = "Reasoning for Default";
+		expect(thinkingRendered).toContain(reasoningHeading);
+		const reasoningChoices = thinkingRendered.slice(thinkingRendered.indexOf(reasoningHeading));
+		expect(reasoningChoices).toContain("off");
+		expect(reasoningChoices).not.toContain("high");
+		expect(reasoningChoices).not.toContain("xhigh");
 	});
 
 	test("does not prompt for non-reasoning OpenAI models", async () => {
@@ -737,11 +740,13 @@ function createFastSelector(args: {
 	isFastForSubagentProvider?: (provider?: string) => boolean;
 	isCurrentModelFastModeActive?: () => boolean;
 	currentModel?: Model;
+	agentDefinitions?: Array<{ name: string; model?: string[]; thinkingLevel?: ThinkingLevel }>;
 }): ModelSelectorComponent {
 	const { models, settings, isFastForProvider, currentModel } = args;
 	// Subagent roles default to the same predicate as the session unless a test
 	// exercises the session-vs-subagent tier divergence explicitly.
 	const isFastForSubagentProvider = args.isFastForSubagentProvider ?? isFastForProvider;
+	const agentDefinitions = args.agentDefinitions ?? loadBundledAgents();
 	const modelRegistry = {
 		getAll: () => models,
 		hasConfiguredProviderAuth: () => false,
@@ -759,7 +764,12 @@ function createFastSelector(args: {
 		scoped,
 		() => {},
 		() => {},
-		{ isFastForProvider, isFastForSubagentProvider, isCurrentModelFastModeActive: args.isCurrentModelFastModeActive },
+		{
+			isFastForProvider,
+			isFastForSubagentProvider,
+			isCurrentModelFastModeActive: args.isCurrentModelFastModeActive,
+			agentDefinitions,
+		},
 	);
 }
 
@@ -771,7 +781,7 @@ describe("ModelSelector fast-mode indicator", () => {
 		}
 	});
 
-	test("AC-1: renders fast glyph after DEFAULT and EXECUTOR badges for priority tier", async () => {
+	test("AC-1: renders one fast glyph for a shared DEFAULT and EXECUTOR row", async () => {
 		installTestTheme();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
@@ -790,10 +800,10 @@ describe("ModelSelector fast-mode indicator", () => {
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain(`DEFAULT (low) ${iconFast}`);
-		expect(rendered).toContain(`EXECUTOR (high) ${iconFast}`);
-		// Duplicate-glyph guard: the current model already carries role glyphs, so no
-		// extra standalone active-row glyph is added.
-		expect(countOccurrences(rendered, iconFast)).toBe(2);
+		expect(rendered).toContain("EXECUTOR (high)");
+		expect(rendered).not.toContain(`EXECUTOR (high) ${iconFast}`);
+		// All matching assignments share one displayed model row.
+		expect(countOccurrences(rendered, iconFast)).toBe(1);
 		// Regression: each badge label and thinking label renders exactly once, in order.
 		expect(countOccurrences(rendered, "DEFAULT")).toBe(1);
 		expect(countOccurrences(rendered, "EXECUTOR")).toBe(1);
@@ -801,6 +811,132 @@ describe("ModelSelector fast-mode indicator", () => {
 		expect(rendered.indexOf("(low)")).toBeLessThan(rendered.indexOf(iconFast));
 	});
 
+	test("synthesizes inherited role-agent assignments with their effective thinking levels", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const settings = Settings.isolated({
+			modelRoles: { default: `${model.provider}/${model.id}:low` },
+		});
+		const selector = createFastSelector({
+			models: [model],
+			settings,
+			isFastForProvider: () => true,
+			currentModel: model,
+		});
+
+		await Bun.sleep(0);
+		installTestTheme();
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("DEFAULT (low)");
+		expect(rendered).toContain("EXECUTOR (medium)");
+		expect(rendered).toContain("ARCHITECT (high)");
+		expect(rendered).toContain("PLANNER (medium)");
+		expect(rendered).toContain("CRITIC (high)");
+		expect(countOccurrences(rendered, theme.icon.fast)).toBe(1);
+	});
+	test("uses discovered project/user role-agent definitions for inherited assignments", async () => {
+		installTestTheme();
+		const current = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!current) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const inherited = createOpenAIModel("openai", "gpt-discovered-executor");
+		const selector = createFastSelector({
+			models: [current, inherited],
+			settings: Settings.isolated({ modelRoles: { default: `${current.provider}/${current.id}:low` } }),
+			isFastForProvider: () => false,
+			currentModel: current,
+			agentDefinitions: [
+				{
+					name: "executor",
+					model: [`${inherited.provider}/${inherited.id}:high`],
+					thinkingLevel: ThinkingLevel.Medium,
+				},
+			],
+		});
+
+		await Bun.sleep(0);
+		installTestTheme();
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain(`${inherited.id} EXECUTOR (high)`);
+		expect(rendered).not.toContain(`${current.id} EXECUTOR`);
+	});
+
+	test("uses the effective subagent provider when rendering inherited fast glyphs", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const settings = Settings.isolated({});
+
+		const matchingSelector = createFastSelector({
+			models: [model],
+			settings,
+			isFastForProvider: () => false,
+			isFastForSubagentProvider: provider => provider === "anthropic",
+			currentModel: model,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+		expect(countOccurrences(normalizeRenderedText(matchingSelector.render(220).join("\n")), theme.icon.fast)).toBe(1);
+
+		const nonMatchingSelector = createFastSelector({
+			models: [model],
+			settings,
+			isFastForProvider: () => false,
+			isFastForSubagentProvider: () => false,
+			currentModel: model,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+		expect(countOccurrences(normalizeRenderedText(nonMatchingSelector.render(220).join("\n")), theme.icon.fast)).toBe(
+			0,
+		);
+	});
+
+	test("explicit role-agent overrides replace inherited assignments", async () => {
+		installTestTheme();
+		const inherited = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!inherited) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const override = createOpenAIModel("openai", "gpt-5-role-override");
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": { executor: `${override.provider}/${override.id}:high` },
+		});
+		const selector = createFastSelector({
+			models: [inherited, override],
+			settings,
+			isFastForProvider: () => false,
+			currentModel: inherited,
+		});
+
+		await Bun.sleep(0);
+		installTestTheme();
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("EXECUTOR (high)");
+		expect(rendered).toContain("ARCHITECT (high)");
+		expect(rendered).toContain("PLANNER (medium)");
+		expect(rendered).toContain("CRITIC (high)");
+		expect(rendered.indexOf(override.id)).toBeLessThan(rendered.indexOf("EXECUTOR"));
+	});
+
+	test("renders all five assignment badges with at most one fast glyph on a shared model row", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const selector = createFastSelector({
+			models: [model],
+			settings: Settings.isolated({ modelRoles: { default: `${model.provider}/${model.id}:low` } }),
+			isFastForProvider: () => true,
+			isFastForSubagentProvider: () => true,
+			currentModel: model,
+		});
+
+		await Bun.sleep(0);
+		installTestTheme();
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		for (const role of ["DEFAULT", "EXECUTOR", "ARCHITECT", "PLANNER", "CRITIC"]) {
+			expect(countOccurrences(rendered, role)).toBe(1);
+		}
+		expect(countOccurrences(rendered, theme.icon.fast)).toBe(1);
+	});
 	test("subagent role glyph reflects the subagent tier, not the session tier", async () => {
 		// Regression for #691 round-2 blocker: serviceTier=priority but
 		// task.serviceTier=none. DEFAULT (modelRoles) runs in the main session and is
@@ -877,7 +1013,7 @@ describe("ModelSelector fast-mode indicator", () => {
 		expect(rendered).not.toContain(iconFast);
 	});
 
-	test("AC-4: active non-role current model row shows fast glyph via currentModel", async () => {
+	test("AC-4: current model row still shows one fast glyph with inherited roles", async () => {
 		installTestTheme();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected model");
@@ -893,7 +1029,7 @@ describe("ModelSelector fast-mode indicator", () => {
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).not.toContain("DEFAULT");
-		expect(rendered).not.toContain("EXECUTOR");
+		expect(rendered).toContain("EXECUTOR (medium)");
 		expect(rendered).toContain(iconFast);
 		expect(countOccurrences(rendered, iconFast)).toBe(1);
 	});

@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Subagent task and retained-result rows now show the fast-mode indicator for the actual effective provider/model, including runtime fallback and substitution changes.
 
 ### Fixed
 
