@@ -313,4 +313,85 @@ describe("deep-interview staged transitions", () => {
 			process.env.GJC_SESSION_ID = saved;
 		}
 	});
+
+	it("merges an incremental round patch without resending prior rounds", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const stageRound = (record: Record<string, unknown>) =>
+			run(root, [
+				"stage",
+				"--for",
+				"record-round",
+				"--input",
+				JSON.stringify({ state: { rounds: [record] } }),
+				"--json",
+			]);
+		await stageRound({ round: 1, round_key: "r1", question_text: "q1", lifecycle: "answered" });
+		await run(root, ["apply", "--json"]);
+		// Second patch carries ONLY round 2 — round 1 must survive the merge.
+		await stageRound({ round: 2, round_key: "r2", question_text: "q2", lifecycle: "answered" });
+		await run(root, ["apply", "--json"]);
+		// Third patch enriches ONLY round 1 to scored — still no resend of round 2.
+		await stageRound({ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.3 });
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		expect(applied.ok).toBe(true);
+		const after = await readState(root);
+		const rounds = (after.state as Record<string, unknown>).rounds as Record<string, unknown>[];
+		expect(rounds.length).toBe(2);
+		const round1 = rounds.find(r => r.round_key === "r1");
+		expect(round1?.lifecycle).toBe("scored");
+		expect(round1?.question_text).toBe("q1");
+	});
+
+	it("derives current_ambiguity from the latest scored round, ignoring hand-set values", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"record-round",
+			"--input",
+			JSON.stringify({
+				state: {
+					// Agent tries to hand-set an unrelated current_ambiguity.
+					current_ambiguity: 0.01,
+					rounds: [{ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.37 }],
+				},
+			}),
+			"--json",
+		]);
+		const checked = parse((await run(root, ["check", "--json"])).stdout);
+		expect(checked.result_ambiguity).toBe(0.37);
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		expect(applied.current_ambiguity).toBe(0.37);
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).current_ambiguity).toBe(0.37);
+	});
+
+	it("clamps derived ambiguity to the deterministic floor on disputed facts", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({
+				state: {
+					established_facts: [{ id: "f1", statement: "disputed fact", round: 1, disputed: true }],
+					rounds: [{ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.02 }],
+				},
+			}),
+			"--json",
+		]);
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		// One unresolved disputed fact => floor 0.10 > reported 0.02.
+		expect(applied.current_ambiguity).toBe(0.1);
+		const after = await readState(root);
+		const state = after.state as Record<string, unknown>;
+		expect(state.current_ambiguity).toBe(0.1);
+		const round = (state.rounds as Record<string, unknown>[]).find(r => r.round_key === "r1");
+		expect(round?.reported_ambiguity).toBe(0.02);
+		expect(round?.ambiguity).toBe(0.1);
+	});
 });

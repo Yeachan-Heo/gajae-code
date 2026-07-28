@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import {
 	assertDeepInterviewEnvelopeInputLimits,
 	assertDeepInterviewStructuredResponseWithinLimit,
@@ -243,6 +244,12 @@ async function readCurrentState(cwd: string, sessionId: string): Promise<Current
 /**
  * The single merge both `check` and `apply` execute. `check` reports its result;
  * `apply` persists it. Divergence between the two is structurally impossible.
+ *
+ * Ambiguity is runtime-owned: after the merge, `current_ambiguity` is derived
+ * from the latest scored round, and the deterministic floor is recomputed and
+ * clamped via `applyAmbiguityFloorToEnvelope` — an agent-supplied
+ * `current_ambiguity` or under-reported round score is advisory input only and
+ * can never under-report below what persisted evidence supports.
  */
 function computeMergedEnvelope(
 	current: Record<string, unknown>,
@@ -265,6 +272,7 @@ function computeMergedEnvelope(
 	merged.version = WORKFLOW_STATE_VERSION;
 	if (typeof merged.current_phase !== "string" || !merged.current_phase) merged.current_phase = "interviewing";
 	merged.session_id = draft.session_id;
+	merged = deriveRuntimeAmbiguity(merged);
 	try {
 		assertDeepInterviewEnvelopeInputLimits(merged);
 	} catch (error) {
@@ -275,6 +283,31 @@ function computeMergedEnvelope(
 		);
 	}
 	return merged;
+}
+
+/**
+ * Derive `state.current_ambiguity` from the latest scored round, then enforce the
+ * deterministic floor. The CLI — not the agent — owns the effective ambiguity.
+ */
+function deriveRuntimeAmbiguity(merged: Record<string, unknown>): Record<string, unknown> {
+	const state = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : undefined;
+	if (state) {
+		const rounds = Array.isArray(state.rounds) ? state.rounds.filter(isPlainObject) : [];
+		let latestScored: Record<string, unknown> | undefined;
+		for (const round of rounds) {
+			if (round.lifecycle !== "scored" || typeof round.ambiguity !== "number") continue;
+			if (
+				!latestScored ||
+				(typeof round.round === "number" &&
+					typeof latestScored.round === "number" &&
+					round.round >= latestScored.round)
+			) {
+				latestScored = round;
+			}
+		}
+		if (latestScored) state.current_ambiguity = latestScored.ambiguity;
+	}
+	return applyAmbiguityFloorToEnvelope(merged).envelope as Record<string, unknown>;
 }
 
 // -----------------------------------------------------------------------------
@@ -408,6 +441,7 @@ async function handleCheck(cwd: string): Promise<Record<string, unknown>> {
 		result_phase: merged.current_phase,
 		result_round_count: Array.isArray(state.rounds) ? state.rounds.length : 0,
 		result_fact_count: Array.isArray(state.established_facts) ? state.established_facts.length : 0,
+		...(typeof state.current_ambiguity === "number" ? { result_ambiguity: state.current_ambiguity } : {}),
 	};
 }
 
@@ -469,6 +503,7 @@ async function handleApply(cwd: string): Promise<Record<string, unknown>> {
 			}
 			await removeDraft(cwd, sessionId);
 			await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-stage", path: statePath });
+			const appliedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : {};
 			return {
 				ok: true,
 				verb: "apply",
@@ -477,6 +512,9 @@ async function handleApply(cwd: string): Promise<Record<string, unknown>> {
 				session_id: sessionId,
 				applied_revision: appliedRevision,
 				state_path: statePath,
+				...(typeof appliedState.current_ambiguity === "number"
+					? { current_ambiguity: appliedState.current_ambiguity }
+					: {}),
 				content_sha256: createHash("sha256").update(JSON.stringify(merged)).digest("hex").slice(0, 32),
 			};
 		},
