@@ -1,28 +1,29 @@
 import { expect, test } from "bun:test";
-import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ConnectionState } from "../../router/connection-state";
+import { processInbound } from "../../server";
 import {
-	HandlerRegistry,
-	registerBuiltinHandlers,
-	fsReadFileHandler,
-	fsWriteFileHandler,
+	configReadHandler,
+	fsCreateDirectoryHandler,
 	fsGetMetadataHandler,
 	fsReadDirectoryHandler,
-	fsCreateDirectoryHandler,
+	fsReadFileHandler,
 	fsRemoveHandler,
-	configReadHandler,
+	fsWriteFileHandler,
+	HandlerRegistry,
 	modelListHandler,
+	registerBuiltinHandlers,
 } from "../../suites/handlers";
-import { processInbound } from "../../server";
-import { ConnectionState } from "../../router/connection-state";
 import { ThreadRuntimeManager } from "../../thread-runtime/thread-runtime-manager";
 
 const tempDir = mkdtempSync(join(tmpdir(), "gjc-app-server-suites-"));
 const enc = (s: string) => new TextEncoder().encode(s);
-const dec = (b: Uint8Array | undefined) => (b ? (JSON.parse(new TextDecoder().decode(b)) as Record<string, unknown>) : undefined);
+const dec = (b: Uint8Array | undefined) =>
+	b ? (JSON.parse(new TextDecoder().decode(b)) as Record<string, unknown>) : undefined;
 
-test("HandlerRegistry: register, look up, unregister", () => {
+test("HandlerRegistry: register, look up, unregister", async () => {
 	const reg = new HandlerRegistry();
 	reg.register("test/method", () => ({ ok: true, result: 42 }));
 	expect(reg.has("test/method")).toBe(true);
@@ -32,10 +33,10 @@ test("HandlerRegistry: register, look up, unregister", () => {
 	expect(reg.has("test/method")).toBe(false);
 });
 
-test("fs/readFile: returns base64 data for a file", () => {
+test("fs/readFile: returns base64 data for a file", async () => {
 	const path = join(tempDir, "read-test.txt");
 	writeFileSync(path, "hello world");
-	const result = fsReadFileHandler({ path });
+	const result = await fsReadFileHandler({ path });
 	expect(result.ok).toBe(true);
 	if (result.ok) {
 		const r = result.result as Record<string, unknown>;
@@ -43,32 +44,32 @@ test("fs/readFile: returns base64 data for a file", () => {
 	}
 });
 
-test("fs/readFile: missing path param returns invalidParams", () => {
+test("fs/readFile: missing path param returns invalidParams", async () => {
 	expect(fsReadFileHandler({})).toMatchObject({ ok: false, errorKey: "invalidParams" });
 });
 
-test("fs/readFile: non-existent file returns notFound", () => {
+test("fs/readFile: non-existent file returns notFound", async () => {
 	expect(fsReadFileHandler({ path: "/nonexistent/file/path" })).toMatchObject({ ok: false, errorKey: "notFound" });
 });
 
-test("fs/writeFile: writes base64 data to a file", () => {
+test("fs/writeFile: writes base64 data to a file", async () => {
 	const path = join(tempDir, "write-test.txt");
-	const result = fsWriteFileHandler({ path, dataBase64: Buffer.from("written content").toString("base64") });
+	const result = await fsWriteFileHandler({ path, dataBase64: Buffer.from("written content").toString("base64") });
 	expect(result.ok).toBe(true);
 	const { readFileSync } = require("node:fs");
 	expect(readFileSync(path, "utf-8")).toBe("written content");
 });
 
-test("fs/writeFile: creates parent directories recursively", () => {
+test("fs/writeFile: creates parent directories recursively", async () => {
 	const path = join(tempDir, "subdir", "nested", "file.txt");
-	const result = fsWriteFileHandler({ path, dataBase64: "dGVzdA==" });
+	const result = await fsWriteFileHandler({ path, dataBase64: "dGVzdA==" });
 	expect(result.ok).toBe(true);
 });
 
-test("fs/getMetadata: returns file metadata", () => {
+test("fs/getMetadata: returns file metadata", async () => {
 	const path = join(tempDir, "meta-test.txt");
 	writeFileSync(path, "content");
-	const result = fsGetMetadataHandler({ path });
+	const result = await fsGetMetadataHandler({ path });
 	expect(result.ok).toBe(true);
 	if (result.ok) {
 		const r = result.result as Record<string, unknown>;
@@ -78,32 +79,32 @@ test("fs/getMetadata: returns file metadata", () => {
 	}
 });
 
-test("fs/readDirectory: lists entries", () => {
+test("fs/readDirectory: lists entries", async () => {
 	mkdirSync(join(tempDir, "listdir"), { recursive: true });
 	writeFileSync(join(tempDir, "listdir", "file-a.txt"), "a");
 	writeFileSync(join(tempDir, "listdir", "file-b.txt"), "b");
-	const result = fsReadDirectoryHandler({ path: join(tempDir, "listdir") });
+	const result = await fsReadDirectoryHandler({ path: join(tempDir, "listdir") });
 	expect(result.ok).toBe(true);
 	if (result.ok) {
-		expect(result.result).toHaveLength(2);
+		expect((result.result as { entries: unknown[] }).entries).toHaveLength(2);
 	}
 });
 
-test("fs/createDirectory: creates a directory", () => {
+test("fs/createDirectory: creates a directory", async () => {
 	const path = join(tempDir, "created-dir");
-	const result = fsCreateDirectoryHandler({ path });
+	const result = await fsCreateDirectoryHandler({ path });
 	expect(result.ok).toBe(true);
 });
 
-test("fs/remove: removes a file", () => {
+test("fs/remove: removes a file", async () => {
 	const path = join(tempDir, "to-remove.txt");
 	writeFileSync(path, "x");
-	const result = fsRemoveHandler({ path });
+	const result = await fsRemoveHandler({ path });
 	expect(result.ok).toBe(true);
 });
 
-test("config/read: returns ConfigReadResponse shape with codexHome set to gjc agent dir", () => {
-	const result = configReadHandler({});
+test("config/read: returns ConfigReadResponse shape with codexHome set to gjc agent dir", async () => {
+	const result = await configReadHandler({});
 	expect(result.ok).toBe(true);
 	if (result.ok) {
 		const r = result.result as Record<string, unknown>;
@@ -115,8 +116,8 @@ test("config/read: returns ConfigReadResponse shape with codexHome set to gjc ag
 	}
 });
 
-test("model/list: returns ModelListResponse shape with data array", () => {
-	const result = modelListHandler({});
+test("model/list: returns ModelListResponse shape with data array", async () => {
+	const result = await modelListHandler({});
 	expect(result.ok).toBe(true);
 	if (result.ok) {
 		const r = result.result as Record<string, unknown>;
@@ -125,7 +126,7 @@ test("model/list: returns ModelListResponse shape with data array", () => {
 	}
 });
 
-test("registerBuiltinHandlers: registers all built-in methods", () => {
+test("registerBuiltinHandlers: registers all built-in methods", async () => {
 	const reg = new HandlerRegistry();
 	registerBuiltinHandlers(reg);
 	expect(reg.has("fs/readFile")).toBe(true);
@@ -136,7 +137,7 @@ test("registerBuiltinHandlers: registers all built-in methods", () => {
 	expect(reg.has("hooks/list")).toBe(true);
 });
 
-test("processInbound + handler registry: fs/readFile dispatched through the server", () => {
+test("processInbound + handler registry: fs/readFile dispatched through the server", async () => {
 	const path = join(tempDir, "dispatch-test.txt");
 	writeFileSync(path, "dispatched content");
 	const s = new ConnectionState();
@@ -144,29 +145,43 @@ test("processInbound + handler registry: fs/readFile dispatched through the serv
 	const reg = new HandlerRegistry();
 	registerBuiltinHandlers(reg);
 	// Initialize handshake
-	processInbound(s, mgr, enc('{"id":1,"method":"initialize","params":{}}'), undefined, "websocket", reg);
-	processInbound(s, mgr, enc('{"method":"initialized"}'), undefined, "websocket", reg);
+	await processInbound(s, mgr, enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'), undefined, "websocket", reg);
+	await processInbound(s, mgr, enc('{"method":"initialized"}'), undefined, "websocket", reg);
 	// Dispatch fs/readFile through the handler registry
-	const result = processInbound(s, mgr, enc(`{"id":2,"method":"fs/readFile","params":{"path":"${path}"}}`), undefined, "websocket", reg);
+	const result = await processInbound(
+		s,
+		mgr,
+		enc(`{"id":2,"method":"fs/readFile","params":{"path":"${path}"}}`),
+		undefined,
+		"websocket",
+		reg,
+	);
 	const parsed = dec(result.response)!;
 	expect(parsed.id).toBe(2);
 	const res = parsed.result as Record<string, unknown>;
 	expect(Buffer.from(res.dataBase64 as string, "base64").toString()).toBe("dispatched content");
 });
 
-test("processInbound: unregistered method falls through to notSupported", () => {
+test("processInbound: unregistered method falls through to notSupported", async () => {
 	const s = new ConnectionState();
 	const mgr = new ThreadRuntimeManager();
 	const reg = new HandlerRegistry();
 	registerBuiltinHandlers(reg);
-	processInbound(s, mgr, enc('{"id":1,"method":"initialize","params":{}}'), undefined, "websocket", reg);
-	processInbound(s, mgr, enc('{"method":"initialized"}'), undefined, "websocket", reg);
-	const result = processInbound(s, mgr, enc('{"id":2,"method":"collaborationMode/list","params":{}}'), undefined, "websocket", reg);
+	await processInbound(s, mgr, enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'), undefined, "websocket", reg);
+	await processInbound(s, mgr, enc('{"method":"initialized"}'), undefined, "websocket", reg);
+	const result = await processInbound(
+		s,
+		mgr,
+		enc('{"id":2,"method":"collaborationMode/list","params":{}}'),
+		undefined,
+		"websocket",
+		reg,
+	);
 	const parsed = dec(result.response)!;
 	expect((parsed.error as Record<string, unknown>).code).toBe(-32081);
 });
 
-test("cleanup temp dir", () => {
+test("cleanup temp dir", async () => {
 	rmSync(tempDir, { recursive: true, force: true });
 	expect(true).toBe(true);
 });

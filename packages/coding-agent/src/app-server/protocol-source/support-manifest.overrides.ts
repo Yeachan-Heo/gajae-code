@@ -12,7 +12,28 @@ export type SupportManifestOverride = {
 
 const noBackend = "No GJC backend exists for this Codex-only suite.";
 const unsupported = { support: "not_supported" as const, gjcSeam: null, gjcBackendPath: null, semanticGaps: ["No equivalent GJC backend."], translationNotes: [], owner: "app-server", testIds: [], reason: noBackend };
+const implemented = (gjcSeam: string, testId: string): SupportManifestOverride => ({
+	support: "implemented",
+	gjcSeam,
+	gjcBackendPath: "packages/coding-agent/src/app-server/suites/handlers.ts",
+	semanticGaps: [],
+	translationNotes: [],
+	owner: "app-server",
+	testIds: [testId],
+	reason: "GJC has a production handler registered by registerBuiltinHandlers.",
+});
 export const supportManifestOverrides: Record<string, SupportManifestOverride> = {
+	"fs/readFile": implemented("fsReadFileHandler", "processInbound + handler registry: fs/readFile dispatched through the server"),
+	"fs/writeFile": implemented("fsWriteFileHandler", "fs/writeFile: writes a base64 file"),
+	"fs/getMetadata": implemented("fsGetMetadataHandler", "fs/getMetadata: reports file metadata"),
+	"fs/readDirectory": implemented("fsReadDirectoryHandler", "fs/readDirectory: lists entries"),
+	"fs/createDirectory": implemented("fsCreateDirectoryHandler", "fs/createDirectory: creates recursively"),
+	"fs/remove": implemented("fsRemoveHandler", "fs/remove: removes a file tree"),
+	"config/read": implemented("configReadHandler", "config/read: returns codex-compatible config shape"),
+	"model/list": implemented("modelListHandler", "model/list: returns ModelListResponse shape with data array"),
+	"skills/list": implemented("skillsListHandler", "skills/list: returns an empty catalog"),
+	"hooks/list": implemented("hooksListHandler", "hooks/list: returns an empty catalog"),
+	"experimentalFeature/list": implemented("experimentalFeatureListHandler", "experimentalFeature/list: returns an empty catalog"),
 	"account/login/cancel": unsupported,
 	"account/login/start": unsupported,
 	"account/logout": unsupported,

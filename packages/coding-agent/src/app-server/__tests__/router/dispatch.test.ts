@@ -41,7 +41,7 @@ test("classifyInbound: jsonrpc was already stripped by the codec; a leftover is 
 
 test("dispatchClientRequest: notInitialized when the handshake has not completed", () => {
 	const state = new ConnectionState();
-	const verdict = dispatchClientRequest(state, classifyInbound(req("thread/start")));
+	const verdict = dispatchClientRequest(state, classifyInbound(req("thread/start", 1, { cwd: "/workspace" })));
 	expect(verdict.kind).toBe("notInitialized");
 });
 
@@ -49,7 +49,7 @@ test("dispatchClientRequest: alreadyInitialized on a duplicate initialize after 
 	const state = new ConnectionState();
 	state.beginInitialize(undefined);
 	state.completeInitialize();
-	const verdict = dispatchClientRequest(state, classifyInbound(req("initialize")));
+	const verdict = dispatchClientRequest(state, classifyInbound(req("initialize", 1, { clientInfo: { name: "test", version: "1" } })));
 	expect(verdict.kind).toBe("alreadyInitialized");
 });
 
@@ -64,23 +64,44 @@ test("dispatchClientRequest: an experimental method on a stable connection -> no
 	expect(verdict.reason).toBe("experimentalGate");
 });
 
-test("dispatchClientRequest: an experimental method on an experimentalApi connection is handled", () => {
+test("dispatchClientRequest: a planned method remains notSupported on an experimentalApi connection", () => {
 	const state = new ConnectionState();
 	state.beginInitialize({ capabilities: { experimentalApi: true } });
 	state.completeInitialize();
-	const verdict = dispatchClientRequest(state, classifyInbound(req("fuzzyFileSearch/sessionStart")));
-	expect(verdict.kind).toBe("handle");
+	const verdict = dispatchClientRequest(
+		state,
+		classifyInbound(req("fuzzyFileSearch/sessionStart", 1, { roots: ["/workspace"], sessionId: "session-1" })),
+	);
+	expect(verdict).toMatchObject({ kind: "notSupported", reason: "backendLess" });
+});
+
+test("dispatchClientRequest: rejects malformed params for implemented methods before a handler boundary", () => {
+	const state = initializedState();
+	const malformed = [
+		["fs/readFile", { path: 1 }],
+		["fs/writeFile", { path: "/workspace/file", dataBase64: 1 }],
+	] as const;
+	for (const [method, params] of malformed) {
+		expect(dispatchClientRequest(state, classifyInbound(req(method, 7, params)))).toEqual({ kind: "invalidParams", id: 7 });
+	}
+});
+
+test("dispatchClientRequest: preserves vendored unknown-key and optional-params semantics", () => {
+	const state = initializedState();
+	expect(dispatchClientRequest(state, classifyInbound(req("config/read", 8, { unknown: true }))).kind).toBe("handle");
+	expect(dispatchClientRequest(state, classifyInbound({ method: "account/logout", id: 9 }))).toMatchObject({ kind: "notSupported", id: 9 });
+});
+
+test("dispatchClientRequest: an explicitly implemented method reaches the handler verdict", () => {
+	const state = initializedState({ experimentalApi: true });
+	expect(dispatchClientRequest(state, classifyInbound(req("config/read", 10, {}))).kind).toBe("handle");
 });
 
 test("dispatchClientRequest: a backend-less (not_supported) method -> notSupported(backendLess)", () => {
 	const state = new ConnectionState();
 	state.beginInitialize(undefined);
 	state.completeInitialize();
-	// Pick a method known to be not_supported in the overrides (realtime/remoteControl/marketplace/etc.).
-	// Find one dynamically so the test does not hardcode a name that may shift.
-	const notSupportedMethod = findNotSupportedMethod();
-	if (!notSupportedMethod) throw new Error("no not_supported method in manifest to test");
-	const verdict = dispatchClientRequest(state, classifyInbound(req(notSupportedMethod)));
+	const verdict = dispatchClientRequest(state, classifyInbound(req("account/login/cancel", 1, { loginId: "login-1" })));
 	expect(verdict.kind).toBe("notSupported");
 	if (verdict.kind !== "notSupported") throw new Error("unreachable");
 	expect(verdict.reason).toBe("backendLess");
@@ -121,8 +142,9 @@ test("catalog membership helpers reflect the pinned bundle", () => {
 	expect(isClientRequestMethod("initialized")).toBe(false);
 });
 
-function findNotSupportedMethod(): string | undefined {
-	// Imported here to keep the test self-contained; matches the dispatch module's import.
-	const { supportManifest } = require("../../protocol-source/support-manifest.generated");
-	return (supportManifest as Array<{ method: string; support: string }>).find(r => r.support === "not_supported")?.method;
+function initializedState(capabilities?: { experimentalApi?: boolean }): ConnectionState {
+	const state = new ConnectionState();
+	state.beginInitialize({ capabilities });
+	state.completeInitialize();
+	return state;
 }

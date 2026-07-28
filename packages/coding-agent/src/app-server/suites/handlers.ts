@@ -6,11 +6,19 @@
 // marketplace, windowsSandbox, ChatGPT auth) return -32081 automatically by the
 // dispatcher (no handler registered = notSupported verdict from dispatchClientRequest).
 
+export interface HandlerContext {
+	respond?: (result: unknown) => void;
+	emitTo?: (connectionId: string, method: string, params: unknown) => void;
+	broadcastThread?: (threadId: string, method: string, params: unknown) => void;
+	requestClient?: (threadId: string, method: string, params: unknown) => string | undefined;
+	subscribe?: (threadId: string) => void;
+}
+
 export type HandlerResult =
 	| { ok: true; result: unknown }
 	| { ok: false; errorKey: import("../transport/errors").AppServerErrorKey };
 
-export type MethodHandler = (params: unknown) => HandlerResult;
+export type MethodHandler = (params: unknown, context?: HandlerContext) => HandlerResult | Promise<HandlerResult>;
 
 /** Registry of handlers for implemented client-request methods. */
 export class HandlerRegistry {
@@ -45,7 +53,7 @@ export class HandlerRegistry {
 // --- Built-in handlers for trivially backable methods ---
 
 /** fs/readFile: read a file and return base64. */
-export const fsReadFileHandler: MethodHandler = (params) => {
+export const fsReadFileHandler: MethodHandler = params => {
 	const p = params as Record<string, unknown> | undefined;
 	const path = p?.path;
 	if (typeof path !== "string") return { ok: false, errorKey: "invalidParams" };
@@ -59,7 +67,7 @@ export const fsReadFileHandler: MethodHandler = (params) => {
 };
 
 /** fs/writeFile: write a file from base64. */
-export const fsWriteFileHandler: MethodHandler = (params) => {
+export const fsWriteFileHandler: MethodHandler = params => {
 	const p = params as Record<string, unknown> | undefined;
 	const path = p?.path;
 	const dataBase64 = p?.dataBase64;
@@ -76,7 +84,7 @@ export const fsWriteFileHandler: MethodHandler = (params) => {
 };
 
 /** fs/getMetadata: return metadata for a path. */
-export const fsGetMetadataHandler: MethodHandler = (params) => {
+export const fsGetMetadataHandler: MethodHandler = params => {
 	const p = params as Record<string, unknown> | undefined;
 	const path = p?.path;
 	if (typeof path !== "string") return { ok: false, errorKey: "invalidParams" };
@@ -89,8 +97,8 @@ export const fsGetMetadataHandler: MethodHandler = (params) => {
 				isDirectory: stat.isDirectory(),
 				isFile: stat.isFile(),
 				isSymlink: stat.isSymbolicLink(),
-				createdAtMs: stat.birthtimeMs,
-				modifiedAtMs: stat.mtimeMs,
+				createdAtMs: Math.trunc(stat.birthtimeMs),
+				modifiedAtMs: Math.trunc(stat.mtimeMs),
 			},
 		};
 	} catch {
@@ -99,7 +107,7 @@ export const fsGetMetadataHandler: MethodHandler = (params) => {
 };
 
 /** fs/readDirectory: list directory entries. */
-export const fsReadDirectoryHandler: MethodHandler = (params) => {
+export const fsReadDirectoryHandler: MethodHandler = params => {
 	const p = params as Record<string, unknown> | undefined;
 	const path = p?.path;
 	if (typeof path !== "string") return { ok: false, errorKey: "invalidParams" };
@@ -110,14 +118,14 @@ export const fsReadDirectoryHandler: MethodHandler = (params) => {
 			const stat = statSync(`${path}/${fileName}`);
 			return { fileName, isDirectory: stat.isDirectory(), isFile: stat.isFile() };
 		});
-		return { ok: true, result };
+		return { ok: true, result: { entries: result } };
 	} catch {
 		return { ok: false, errorKey: "notFound" };
 	}
 };
 
 /** fs/createDirectory: create a directory. */
-export const fsCreateDirectoryHandler: MethodHandler = (params) => {
+export const fsCreateDirectoryHandler: MethodHandler = params => {
 	const p = params as Record<string, unknown> | undefined;
 	const path = p?.path;
 	const recursive = p?.recursive !== false; // default true
@@ -132,7 +140,7 @@ export const fsCreateDirectoryHandler: MethodHandler = (params) => {
 };
 
 /** fs/remove: remove a file or directory tree. */
-export const fsRemoveHandler: MethodHandler = (params) => {
+export const fsRemoveHandler: MethodHandler = params => {
 	const p = params as Record<string, unknown> | undefined;
 	const path = p?.path;
 	if (typeof path !== "string") return { ok: false, errorKey: "invalidParams" };
@@ -177,23 +185,22 @@ export const modelListHandler: MethodHandler = () => {
 };
 
 /** skills/list: list gjc skills for a cwd. */
-export const skillsListHandler: MethodHandler = (params) => {
-	const p = (params as Record<string, unknown> | undefined) ?? {};
+export const skillsListHandler: MethodHandler = () => {
 	// List gjc skills; the full skill-discovery integration is a later phase.
 	return {
 		ok: true,
-		result: [],
+		result: { data: [] },
 	};
 };
 
 /** hooks/list: list gjc hooks for a cwd. */
 export const hooksListHandler: MethodHandler = () => {
-	return { ok: true, result: [] };
+	return { ok: true, result: { data: [] } };
 };
 
 /** experimentalFeature/list: list feature flags. */
 export const experimentalFeatureListHandler: MethodHandler = () => {
-	return { ok: true, result: [] };
+	return { ok: true, result: { data: [] } };
 };
 
 /**

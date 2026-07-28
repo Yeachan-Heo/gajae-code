@@ -13,20 +13,26 @@
 // client requesting an experimental method gets `notSupported` (the method exists in the
 // catalog but is not enabled for this connection), matching the upstream capability contract.
 
-import {
-	clientNotifications,
-	clientRequests,
-} from "../protocol-source/catalogs.generated";
 import type { CatalogEntry } from "../protocol-source/catalogs.generated";
-import { supportManifest, type SupportManifestRow } from "../protocol-source/support-manifest.generated";
-import type { ConnectionState } from "./connection-state";
+import { clientNotifications, clientRequests } from "../protocol-source/catalogs.generated";
+import { experimentalValidators, stableValidators } from "../protocol-source/schema-validators.generated";
+import { type SupportManifestRow, supportManifest } from "../protocol-source/support-manifest.generated";
 import type { AppServerErrorKey } from "../transport/errors";
+import { coerceId } from "../transport/framing";
+import type { ConnectionState } from "./connection-state";
 
 export type MessageDirection = "clientRequest" | "clientNotification";
 
 /** A categorized inbound client message. */
 export type InboundClassification =
-	| { direction: "clientRequest"; method: string; stability: "stable" | "experimental"; id: string | number; params: unknown; support: SupportManifestRow["support"] }
+	| {
+			direction: "clientRequest";
+			method: string;
+			stability: "stable" | "experimental";
+			id: string | number;
+			params: unknown;
+			support: SupportManifestRow["support"];
+	  }
 	| { direction: "clientNotification"; method: string; stability: "stable" | "experimental"; params: unknown }
 	| { direction: "unknown"; method: string; id: string | number }
 	| { direction: "invalid"; reason: AppServerErrorKey; id: string | number | undefined };
@@ -47,26 +53,36 @@ function isObject(value: unknown): value is Record<string, unknown> {
  * stripped by the framing codec). This is PURE — it performs no side effects and sends
  * nothing; the caller decides what to emit based on the classification.
  */
-export function classifyInbound(frame: Record<string, unknown>): InboundClassification {
+export function classifyInbound(
+	frame: Record<string, unknown>,
+	decodedId: string | number | undefined = coerceId(frame.id),
+): InboundClassification {
 	const method = typeof frame.method === "string" ? frame.method : "";
-	// id presence distinguishes a request from a notification.
-	const hasId = Object.hasOwn(frame, "id") && frame.id !== undefined && frame.id !== null;
-	const id = hasId ? (frame.id as string | number) : undefined;
-	// Within the hasId branch, narrow id to a legal JSON-RPC id before returning it on an `unknown` frame.
-	const requestId: string | number | undefined = typeof id === "string" || typeof id === "number" ? id : undefined;
+	// An `id` member distinguishes requests from notifications. Its value was normalized by
+	// decodeLine so this routing layer cannot accidentally accept a different id domain.
+	const hasId = Object.hasOwn(frame, "id");
+	const id = decodedId;
 
 	if (!method) {
+		// A frame with no method is invalid. Report only the sanitized id: echoing a raw id that
+		// coerceId already rejected would put an illegal id back on the wire.
 		return { direction: "invalid", reason: "invalidRequest", id };
 	}
 	if (hasId) {
+		if (id === undefined) {
+			// The frame carried an `id` member that coerceId rejected as illegal (non-integer,
+			// -0, out of safe range, empty string). JSON-RPC requires a null id in that error
+			// envelope: echoing the raw value would emit the same illegal id back to the peer.
+			return {
+				direction: "invalid",
+				reason: "invalidRequest",
+				id: undefined,
+			};
+		}
 		const catalogEntry = clientRequestByName.get(method);
 		if (!catalogEntry) {
 			// An id-bearing frame with an unknown method is methodNotFound (it expects a response).
-			return { direction: "unknown", method, id: requestId ?? "" };
-		}
-		// A request whose id is not a legal JSON-RPC id type is invalid.
-		if (typeof id !== "string" && typeof id !== "number") {
-			return { direction: "invalid", reason: "invalidRequest", id };
+			return { direction: "unknown", method, id };
 		}
 		const support = supportByName.get(method)?.support ?? "planned";
 		return {
@@ -104,15 +120,13 @@ export function classifyInbound(frame: Record<string, unknown>): InboundClassifi
  */
 export type DispatchVerdict =
 	| { kind: "handle"; method: string; id: string | number; params: unknown }
+	| { kind: "invalidParams"; id: string | number }
 	| { kind: "notSupported"; method: string; id: string | number; reason: "backendLess" | "experimentalGate" }
 	| { kind: "notInitialized"; id: string | number }
 	| { kind: "alreadyInitialized"; id: string | number }
 	| { kind: "methodNotFound"; method: string; id: string | number };
 
-export function dispatchClientRequest(
-	state: ConnectionState,
-	classification: InboundClassification,
-): DispatchVerdict {
+export function dispatchClientRequest(state: ConnectionState, classification: InboundClassification): DispatchVerdict {
 	if (classification.direction === "unknown") {
 		return { kind: "methodNotFound", method: classification.method, id: classification.id };
 	}
@@ -120,21 +134,34 @@ export function dispatchClientRequest(
 	if (classification.direction !== "clientRequest") {
 		throw new Error(`dispatchClientRequest received a non-request classification: ${classification.direction}`);
 	}
-	// Handshake gate.
+	// Experimental capability gate.
+	if (classification.stability === "experimental" && !state.capabilities?.experimentalApi) {
+		return { kind: "notSupported", method: classification.method, id: classification.id, reason: "experimentalGate" };
+	}
+	// Handshake gate. This precedes param validation so an uninitialized caller gets the
+	// locked -32600 envelope rather than leaking schema detail about a request it may not
+	// make yet.
 	const authz = state.authorize(classification.method);
 	if (!authz.ok) {
 		return authz.key === "alreadyInitialized"
 			? { kind: "alreadyInitialized", id: classification.id }
 			: { kind: "notInitialized", id: classification.id };
 	}
-	// Experimental capability gate.
-	if (classification.stability === "experimental" && !state.capabilities?.experimentalApi) {
-		return { kind: "notSupported", method: classification.method, id: classification.id, reason: "experimentalGate" };
-	}
-	// Support manifest gate.
-	if (classification.support === "not_supported") {
+	// Support manifest gate. An unbacked method is -32081 regardless of param shape.
+	if (classification.support !== "implemented") {
 		return { kind: "notSupported", method: classification.method, id: classification.id, reason: "backendLess" };
 	}
+	// Validate wire params before any handler, broker, prompt, or session boundary. The
+	// vendored schemas intentionally tolerate unknown object keys where they omit
+	// additionalProperties.
+	const validators = state.capabilities?.experimentalApi ? experimentalValidators : stableValidators;
+	const validate = validators.clientRequestParams[classification.method];
+	// A method absent from the negotiated profile has no validator. That is a support gap,
+	// not a param error, so it must surface as the locked -32081 rather than -32602.
+	if (!validate) {
+		return { kind: "notSupported", method: classification.method, id: classification.id, reason: "backendLess" };
+	}
+	if (!validate(classification.params)) return { kind: "invalidParams", id: classification.id };
 	return { kind: "handle", method: classification.method, id: classification.id, params: classification.params };
 }
 
