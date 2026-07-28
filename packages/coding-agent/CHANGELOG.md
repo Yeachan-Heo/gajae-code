@@ -3,6 +3,8 @@
 ## [Unreleased]
 ### Resume fixes
 
+- Deep-interview draft recovery is now self-healing and fail-closed: `check` dry-runs the same state transition as consume, invariant failures include stable path/expected/actual details and deterministic recovery, failed consumes remain replayable, batch edits are atomic, and the workflow mutation guard admits only verified pure `gjc`/read-only shell pipelines while rejecting mixed or expanded command forms. Schema and invariant documentation is source-verified.
+
 - Memory consolidation redacts GitHub tokens. The scrubber covered AWS ids, JWTs and keyword-prefixed keys, but GitHub tokens carry none of those keywords, so they reached `MEMORY.md` and `memory_summary.md` verbatim — and the summary is injected into every later session. Now covers the same three prefixes the contribution-prep scrubber already handled.
 - The native skill hook resolves its config paths through the trusted directory helpers. It read `GJC_CODING_AGENT_DIR` / `GJC_CONFIG_DIR` straight from `process.env`, which Bun populates from `cwd/.env` before any module runs, so a repository could point the hook at a directory it ships and inject its own `skills.customDirectories` — bypassing the escalation guards that already exist for exactly this.
 - Workflow settings are read from the config root under home. `GJC_CONFIG_DIR` is documented as a dirname under home and `dirs.ts` implements it that way, but the ralplan, ultragoal and deep-interview settings readers used the value as a full path, so setting it to the documented form made them look under the current working directory and silently fall back to built-in defaults.

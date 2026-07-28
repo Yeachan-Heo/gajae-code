@@ -578,4 +578,327 @@ describe("CLI-owned deep-interview draft consumption", () => {
 			await env.restore();
 		}
 	});
+	it("check dry-runs the exact consume-side state invariants and names the violated invariant", async () => {
+		const env = await workspace();
+		try {
+			await kickoff(env.cwd, "parity");
+			const setup = await setSetup(env.cwd, await create(env.cwd, "initialize-context", "parity"));
+			json(await consume(env.cwd, "initialize-context", setup));
+			let topology = await create(env.cwd, "confirm-topology", "parity");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/components");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "set", "/components/0/id", "core");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/deferred_components");
+			json(await consume(env.cwd, "confirm-topology", topology));
+			let answer = await create(env.cwd, "record-answer", "parity", [
+				"--round",
+				"1",
+				"--question-id",
+				"q1",
+				"--round-id",
+				"r1",
+				"--component-id",
+				"core",
+				"--dimension",
+				"goal",
+			]);
+			answer = await edit(env.cwd, answer.id, answer.draft_revision, "set", "/question", JSON.stringify("Q?"));
+			answer = await edit(env.cwd, answer.id, answer.draft_revision, "append", "/answer/selected_options", "yes");
+			answer = draft(
+				await native(env.cwd, [
+					"draft",
+					"edit",
+					"--draft-id",
+					answer.id,
+					"--expected-draft-revision",
+					String(answer.draft_revision),
+					"--op",
+					"set",
+					"--path",
+					"/answer/custom_input",
+					"--null",
+					"--json",
+				]),
+			);
+			json(await consume(env.cwd, "record-answer", answer));
+			// Decoder-valid payload violating the global_scores==component-min state invariant:
+			// component score 0.5 for goal, global 1.
+			let result = await create(env.cwd, "apply-round-result", "parity", ["--round-key", "interview-1::rid:r1"]);
+			result = await edit(env.cwd, result.id, result.draft_revision, "append", "/component_updates");
+			result = await edit(
+				env.cwd,
+				result.id,
+				result.draft_revision,
+				"set",
+				"/component_updates/0/component_id",
+				"core",
+			);
+			for (const dimension of ["goal", "constraints", "criteria"]) {
+				result = await edit(env.cwd, result.id, result.draft_revision, "set", `/global_scores/${dimension}`, "1");
+				result = await edit(
+					env.cwd,
+					result.id,
+					result.draft_revision,
+					"set",
+					`/component_updates/0/scores/${dimension}`,
+					dimension === "goal" ? "0.5" : "1",
+				);
+			}
+			const checked = json(await native(env.cwd, ["draft", "check", "--draft-id", result.id, "--json"]));
+			expect(checked).toMatchObject({ valid: false });
+			const issues = checked.issues as Record<string, unknown>[];
+			expect(issues[0]).toMatchObject({
+				code: "DI_STATE_SCHEMA_INVALID",
+				invariant: "global_scores_must_equal_component_min",
+				path: "/global_scores/goal",
+				expected: 0.5,
+				actual: 1,
+			});
+			// consume fails with the identical named invariant
+			const failedConsume = await consume(env.cwd, "apply-round-result", result);
+			expect(failedConsume.status).not.toBe(0);
+			expect(failedConsume.stderr).toContain("global_scores_must_equal_component_min");
+			// after fixing the payload, the same draft consumes successfully (not bricked)
+			result = draft(await native(env.cwd, ["draft", "show", "--draft-id", result.id, "--json"]));
+			result = await edit(env.cwd, result.id, result.draft_revision, "set", "/global_scores/goal", "0.5");
+			const recheck = json(await native(env.cwd, ["draft", "check", "--draft-id", result.id, "--json"]));
+			expect(recheck).toMatchObject({ valid: true });
+			expect(json(await consume(env.cwd, "apply-round-result", result))).toMatchObject({ consumed: true });
+		} finally {
+			await env.restore();
+		}
+	});
+
+	it("applies batch edits atomically and accepts --expected-draft-revision latest for edit", async () => {
+		const env = await workspace();
+		try {
+			await kickoff(env.cwd, "batch");
+			const created = await create(env.cwd, "initialize-context", "batch");
+			const batched = await native(env.cwd, [
+				"draft",
+				"edit",
+				"--draft-id",
+				created.id,
+				"--expected-draft-revision",
+				"latest",
+				"--op",
+				"set",
+				"--path",
+				"/type",
+				"--value",
+				"greenfield",
+				"--op",
+				"set",
+				"--path",
+				"/threshold",
+				"--value",
+				"0.05",
+				"--op",
+				"append",
+				"--path",
+				"/trace",
+				"--value",
+				"seed",
+				"--json",
+			]);
+			const after = draft(batched);
+			expect(after.draft_revision).toBe(created.draft_revision + 1);
+			const payload = (
+				json(await native(env.cwd, ["draft", "show", "--draft-id", created.id, "--json"])).draft as {
+					payload: Record<string, unknown>;
+				}
+			).payload;
+			expect(payload).toMatchObject({ type: "greenfield", threshold: 0.05, trace: ["seed"] });
+			// a batch with one invalid op fails atomically: nothing lands
+			const failed = await native(env.cwd, [
+				"draft",
+				"edit",
+				"--draft-id",
+				created.id,
+				"--expected-draft-revision",
+				"latest",
+				"--op",
+				"set",
+				"--path",
+				"/interview_id",
+				"--value",
+				"interview-1",
+				"--op",
+				"set",
+				"--path",
+				"/threshold",
+				"--value",
+				"nan",
+				"--json",
+			]);
+			expect(failed.status).not.toBe(0);
+			expect(failed.stderr).toContain("DI_DRAFT_INVALID_VALUE");
+			const untouched = json(await native(env.cwd, ["draft", "show", "--draft-id", created.id, "--json"])).draft as {
+				payload: Record<string, unknown>;
+				draft_revision: number;
+			};
+			expect(untouched.payload.interview_id).toBeUndefined();
+			expect(untouched.payload.threshold).toBe(0.05);
+			expect(untouched.draft_revision).toBe(after.draft_revision);
+		} finally {
+			await env.restore();
+		}
+	});
+
+	it("emits recovery guidance instead of echoing error codes", async () => {
+		const env = await workspace();
+		try {
+			await kickoff(env.cwd, "recovery");
+			const created = await create(env.cwd, "initialize-context", "recovery");
+			const conflicted = await native(env.cwd, [
+				"draft",
+				"edit",
+				"--draft-id",
+				created.id,
+				"--expected-draft-revision",
+				"99",
+				"--op",
+				"set",
+				"--path",
+				"/type",
+				"--value",
+				"greenfield",
+				"--json",
+			]);
+			expect(conflicted.status).not.toBe(0);
+			const issue = (JSON.parse(conflicted.stderr!) as { issue: Record<string, string> }).issue;
+			expect(issue.code).toBe("DI_DRAFT_REVISION_CONFLICT");
+			expect(issue.message).not.toBe("DI_DRAFT_REVISION_CONFLICT");
+			expect(issue.recovery).toContain("draft show");
+		} finally {
+			await env.restore();
+		}
+	});
+	it("replays an apply-round-result receipt-persistence failure without another state write", async () => {
+		const env = await workspace();
+		const prior = process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
+		try {
+			await kickoff(env.cwd, "arr-receipt");
+			const setup = await setSetup(env.cwd, await create(env.cwd, "initialize-context", "arr-receipt"));
+			json(await consume(env.cwd, "initialize-context", setup));
+			let topology = await create(env.cwd, "confirm-topology", "arr-receipt");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/components");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "set", "/components/0/id", "core");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/deferred_components");
+			json(await consume(env.cwd, "confirm-topology", topology));
+			let answer = await create(env.cwd, "record-answer", "arr-receipt", [
+				"--round",
+				"1",
+				"--question-id",
+				"q1",
+				"--round-id",
+				"r1",
+				"--component-id",
+				"core",
+				"--dimension",
+				"goal",
+			]);
+			answer = await edit(env.cwd, answer.id, answer.draft_revision, "set", "/question", JSON.stringify("Q?"));
+			answer = await edit(env.cwd, answer.id, answer.draft_revision, "append", "/answer/selected_options", "yes");
+			answer = draft(
+				await native(env.cwd, [
+					"draft",
+					"edit",
+					"--draft-id",
+					answer.id,
+					"--expected-draft-revision",
+					String(answer.draft_revision),
+					"--op",
+					"set",
+					"--path",
+					"/answer/custom_input",
+					"--null",
+					"--json",
+				]),
+			);
+			json(await consume(env.cwd, "record-answer", answer));
+			let result = await create(env.cwd, "apply-round-result", "arr-receipt", [
+				"--round-key",
+				"interview-1::rid:r1",
+			]);
+			result = await edit(env.cwd, result.id, result.draft_revision, "append", "/component_updates");
+			result = await edit(
+				env.cwd,
+				result.id,
+				result.draft_revision,
+				"set",
+				"/component_updates/0/component_id",
+				"core",
+			);
+			for (const dimension of ["goal", "constraints", "criteria"]) {
+				result = await edit(env.cwd, result.id, result.draft_revision, "set", `/global_scores/${dimension}`, "1");
+				result = await edit(
+					env.cwd,
+					result.id,
+					result.draft_revision,
+					"set",
+					`/component_updates/0/scores/${dimension}`,
+					"1",
+				);
+			}
+			process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE = "1";
+			const failed = await consume(env.cwd, "apply-round-result", result);
+			expect(failed.status).toBe(2);
+			expect(failed.stderr).toContain("DI_DRAFT_RECEIPT_PERSIST_FAILED");
+			const revisionAfterFailure = (await state(env.cwd, "arr-receipt")).state_revision;
+			delete process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
+			// The state write landed; retry must finalize the draft without another state write.
+			const repaired = json(await consume(env.cwd, "apply-round-result", result));
+			expect(repaired).toMatchObject({ consumed: true, draft_id: result.id });
+			expect((await state(env.cwd, "arr-receipt")).state_revision).toBe(revisionAfterFailure);
+		} finally {
+			if (prior === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
+			else process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE = prior;
+			await env.restore();
+		}
+	});
+
+	it("binds the dry-run preflight to the supplied expected state revision", async () => {
+		const env = await workspace();
+		try {
+			await kickoff(env.cwd, "dryrun-cas");
+			const { dryRunDeepInterviewRepairMutation } = await import(
+				"@gajae-code/coding-agent/gjc-runtime/deep-interview-repair"
+			);
+			const stale = await dryRunDeepInterviewRepairMutation(
+				[
+					"initialize-context",
+					"--session-id",
+					"dryrun-cas",
+					"--schema-version",
+					"1",
+					"--expected-revision",
+					"7",
+					"--input-json",
+					'{"type":"greenfield","threshold":0.05}',
+					"--json",
+				],
+				env.cwd,
+			);
+			expect(stale.status).toBe(3);
+			expect(stale.stderr).toContain("DI_REVISION_CONFLICT");
+			const bound = await dryRunDeepInterviewRepairMutation(
+				[
+					"initialize-context",
+					"--session-id",
+					"dryrun-cas",
+					"--schema-version",
+					"1",
+					"--expected-revision",
+					"0",
+					"--input-json",
+					'{"type":"greenfield","threshold":0.05}',
+					"--json",
+				],
+				env.cwd,
+			);
+			expect(JSON.parse(bound.stdout!)).toMatchObject({ ok: true, state_revision: 0 });
+		} finally {
+			await env.restore();
+		}
+	});
 });

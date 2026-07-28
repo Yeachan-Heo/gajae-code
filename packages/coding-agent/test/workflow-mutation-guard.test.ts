@@ -855,6 +855,66 @@ describe("workflow mutation guard", () => {
 		).rejects.toBeInstanceOf(ToolError);
 	});
 
+	it("admits pure gjc pipelines, chains, and quoted-heredoc-fed gjc during a planning phase", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+
+		for (const command of [
+			"gjc deep-interview draft create --for initialize-context --session-id s1 --json",
+			"gjc deep-interview draft check --draft-id abc --json | jq .valid",
+			"gjc deep-interview inspect --session-id s1 --selector summary --json && gjc deep-interview draft show --draft-id abc --json",
+			"gjc state read --json; gjc ultragoal status --json",
+			"GJC_SESSION_ID=s1 gjc deep-interview sanity-check --session-id s1 --json",
+			"echo hi | gjc deep-interview draft check --draft-id abc --json",
+			'gjc deep-interview draft edit --draft-id abc --expected-draft-revision 1 --op set --path /question --value "What?" --json',
+			'gjc deep-interview draft create --for apply-round-result --session-id s1 --json <<\'EOF\'\n{"unused": "stdin data with open( and writeFile( text"}\nEOF',
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(false);
+			expect(decision.targets).toEqual([]);
+		}
+	});
+
+	it("still flags mixed pipelines, redirections, substitution, and unquoted heredocs around gjc", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+
+		for (const command of [
+			// non-whitelisted writing segment alongside gjc
+			'gjc state read --json && python -c \'open("src/product.ts", "w").write("x")\'',
+			"gjc state read --json; tee src/product.ts",
+			// redirection disqualifies the whitelist
+			"gjc deep-interview inspect --session-id s1 --json > src/product.ts",
+			// command substitution disqualifies
+			'gjc deep-interview draft check --draft-id $(cat id.txt) --json && node -e \'require("fs").writeFileSync("src/product.ts","x")\'',
+			// unquoted heredoc bodies expand; not analyzable
+			"gjc deep-interview draft create --for initialize-context --session-id s1 --json <<EOF\n$(rm -rf src)\nEOF\nnode -e 'fs.writeFileSync(\"src/product.ts\",\"x\")' -e 'open('",
+			// sort -o writes files; sort is not whitelisted (bare or quoted)
+			"gjc state read --json | sort -o src/product.ts",
+			'gjc state read --json | "sort" -o src/product.ts',
+			// backslash continuation can hide a command behind a heredoc delimiter
+			'gjc deep-interview draft check --draft-id abc --json <<\'EOF\' \\\n; python -c \'open("src/product.ts","w").write("x")\'\nEOF\nnode -e \'fs.writeFileSync("src/product.ts","x")\' -e \'open(\'',
+			// arbitrary env prefixes could redirect executable resolution
+			'PATH=/tmp/evil gjc state read --json && node -e \'require("fs").writeFileSync("src/product.ts","x")\' -e \'open(\'',
+			'LD_PRELOAD=/tmp/evil.so gjc state read --json && ruby -e \'File.open("src/product.ts","w").write("x")\'',
+			// subshell parens disqualify
+			'(gjc state read --json) && node -e \'require("fs").writeFileSync("src/product.ts","x")\' -e \'open(\'',
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(true);
+		}
+	});
+
 	it("BashTool-shaped product mutation throws ToolError and leaves files byte-identical (#2698 / #2665)", async () => {
 		// Mirrors the agent-session bash wrapper: assertWorkflowMutationAllowed runs
 		// before BashTool.execute. A blocked mutation must not touch product or

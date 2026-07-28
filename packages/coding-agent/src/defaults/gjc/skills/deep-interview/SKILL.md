@@ -715,7 +715,77 @@ Skipping any stage is possible but reduces quality assurance:
 - Use `read/search/find exploration or a bounded read-only planner/architect subagent` for brownfield codebase exploration (run BEFORE asking user about codebase)
 - Use opus model (temperature 0.1) for ambiguity scoring — consistency is critical
 - Round 0 topology confirmation happens before ambiguity scoring; Phase 2 scoring must honor locked topology and rotate targeting across active components when more than one is present
-- Normal interview persistence uses CLI-owned drafts: `gjc deep-interview draft create|edit|show|check|rebase|discard`, followed by the matching typed command with `--draft-id --expected-draft-revision <latest_draft_revision> --json`. All public draft commands require standalone `--json`; value-taking flags use exactly `--name value`, while `--json` and `--null` take no value, and there is no public `draft consume` command. Use `--value`, standalone `--null`, and append scaffolds for bounded payload fields: valueless append on a missing object-item array appends `{}`, valueless append on a missing scalar-item array initializes `[]`, and appending to an existing scalar-item array requires `--value` or `--value-file`. Retain each returned `draft_revision`. `check` reports a stale state base but does not mutate; explicitly `rebase` only with the caller-observed `--to-state-revision` and then check again. Inline JSON request flags are compatibility-only. Never construct a full payload or generic `gjc state write --input` envelope. Generic `gjc state` remains compatibility/recovery-only for the explicit clear and final handoff paths; never edit `.gjc/_session-{sessionid}/state` directly without force override.
+- Normal interview persistence uses CLI-owned drafts: `gjc deep-interview draft create|edit|show|check|rebase|discard`, followed by the matching typed command with `--draft-id --expected-draft-revision <latest_draft_revision> --json`. All public draft commands require standalone `--json`; value-taking flags use exactly `--name value`, while `--json` and `--null` take no value, and there is no public `draft consume` command. Use `--value`, standalone `--null`, and append scaffolds for bounded payload fields: valueless append on a missing object-item array appends `{}`, valueless append on a missing scalar-item array initializes `[]`, and appending to an existing scalar-item array requires `--value` or `--value-file`. Retain each returned `draft_revision`. `draft edit` accepts multiple `--op` groups in one call, applied atomically (either every operation lands in one draft write or the stored draft is untouched), and `--expected-draft-revision latest` for edit only; consume CAS stays strict. `check` dry-runs the exact consume-side validation (including `apply-round-result` state invariants) at the reported `state_revision`, and invariant errors name the violated invariant, offending path, expected/actual values, and a deterministic recovery command. `check` reports a stale state base but does not mutate; explicitly `rebase` only with the caller-observed `--to-state-revision` and then check again. Inline JSON request flags are compatibility-only. Never construct a full payload or generic `gjc state write --input` envelope. Generic `gjc state` remains compatibility/recovery-only for the explicit clear and final handoff paths; never edit `.gjc/_session-{sessionid}/state` directly without force override.
+
+<!-- BEGIN GENERATED: deep-interview-draft-schemas (scripts/verify-deep-interview-docs.ts) -->
+```text
+## initialize-context
+  /challenge_modes_used/N: string required
+  /codebase_context: text
+  /initial_context_summary: text
+  /initial_idea: text
+  /interview_id: id
+  /language: text
+  /threshold: score required
+  /threshold_source: text
+  /trace_summary: text
+  /trace/N: string required
+  /type: enum(greenfield|brownfield) required
+## confirm-topology
+  /components/N/active: boolean
+  /components/N/id: id required
+  /components/N/name: string
+  /components/N/status: enum(active|deferred)
+  /deferred_components/N: id required
+## record-answer
+  /answer/custom_input: text required nullable
+  /answer/selected_options/N: string required
+  /question: text required
+## apply-round-result
+  /bookkeeping/counter_deltas/<ID>: safe-int required
+  /bookkeeping/resolution: enum(auto_research_accepted|auto_answer|direct|refined|cited_confirmation) required
+  /bookkeeping/round_ids/N: id required
+  /component_updates/N/component_id: id required
+  /component_updates/N/scores/constraints: score required
+  /component_updates/N/scores/context: score required
+  /component_updates/N/scores/criteria: score required
+  /component_updates/N/scores/goal: score required
+  /fact_ops/N/component: text
+  /fact_ops/N/dimension: enum(goal|constraints|criteria|context)
+  /fact_ops/N/evidence: text
+  /fact_ops/N/id: id required
+  /fact_ops/N/op: enum(add|dispute|supersede) required
+  /fact_ops/N/statement: text
+  /fact_ops/N/target_id: id
+  /global_scores/constraints: score required
+  /global_scores/context: score required
+  /global_scores/criteria: score required
+  /global_scores/goal: score required
+  /ontology/entities/N/fields/N: text required
+  /ontology/entities/N/id: id required
+  /ontology/entities/N/name: text required
+  /ontology/entities/N/type: text required
+  /ontology/reasoning/N/evidence: text
+  /ontology/reasoning/N/statement: text required
+  /ontology/relationships/N/from_entity_id: id required
+  /ontology/relationships/N/id: id required
+  /ontology/relationships/N/to_entity_id: id required
+  /ontology/relationships/N/type: text required
+  /targeting/last_targeted_component_id: id required nullable
+  /targeting/target_component_id: id required
+  /targeting/target_dimension: enum(goal|constraints|criteria|context) required
+  /targeting/weakest_component_id: id required
+  /targeting/weakest_dimension: enum(goal|constraints|criteria|context) required
+  /triggers/N/component: id required
+  /triggers/N/contradictedFactId: id
+  /triggers/N/dimension: enum(goal|constraints|criteria|context) required
+  /triggers/N/evidence: text
+  /triggers/N/kind: enum(A|B|C|D) required
+  /triggers/N/name: text required
+  /triggers/N/rationale: text
+  /triggers/N/status: enum(active|disputed|unresolved) required
+```
+<!-- END GENERATED: deep-interview-draft-schemas -->
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority

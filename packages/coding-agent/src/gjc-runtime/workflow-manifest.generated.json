@@ -361,7 +361,7 @@
         ],
         "name": "expected-draft-revision",
         "required": true,
-        "type": "number"
+        "type": "string"
       },
       {
         "appliesToVerbs": [

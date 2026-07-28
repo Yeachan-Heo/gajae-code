@@ -1035,6 +1035,141 @@ export function deepInterviewAnswerIdentityEqual(
 	);
 }
 
+export interface DeepInterviewInvariantDetail {
+	invariant: string;
+	path: string;
+	expected?: unknown;
+	actual?: unknown;
+}
+
+/**
+ * Structured state-invariant violation. `message` stays exactly the stable
+ * machine code (existing callers match on it); the violated invariant name,
+ * offending JSON path, and expected/actual values travel as fields so error
+ * surfaces can tell the caller which single correction to make.
+ */
+export class DeepInterviewInvariantError extends Error {
+	readonly code: string;
+	readonly invariant: string;
+	readonly path: string;
+	readonly expected?: unknown;
+	readonly actual?: unknown;
+	constructor(code: string, detail: DeepInterviewInvariantDetail) {
+		super(code);
+		this.code = code;
+		this.invariant = detail.invariant;
+		this.path = detail.path;
+		this.expected = detail.expected;
+		this.actual = detail.actual;
+	}
+}
+
+export function deepInterviewInvariantDetail(error: unknown): DeepInterviewInvariantDetail | undefined {
+	if (!(error instanceof DeepInterviewInvariantError)) return undefined;
+	return {
+		invariant: error.invariant,
+		path: error.path,
+		...(error.expected === undefined ? {} : { expected: error.expected }),
+		...(error.actual === undefined ? {} : { actual: error.actual }),
+	};
+}
+
+/**
+ * Stable identifiers for every named state invariant enforced by
+ * `applyDeepInterviewRoundResultV1` and `validateDeepInterviewV1Envelope`.
+ * Docs are verified against this list; adding an invariant here requires a
+ * matching docs update (scripts/verify-deep-interview-docs.ts).
+ */
+export const DEEP_INTERVIEW_STATE_INVARIANTS: readonly { id: string; description: string }[] = [
+	{
+		id: "round_lifecycle_must_be_known",
+		description: "Target round lifecycle must be answered, pending_scoring, or scored.",
+	},
+	{ id: "round_question_id_required", description: "Target round must carry a non-empty question_id." },
+	{ id: "state_type_must_be_interview_type", description: "state.type must be greenfield or brownfield." },
+	{
+		id: "global_scores_must_be_valid_scores",
+		description: "Every required dimension in global_scores must be a number in [0,1].",
+	},
+	{
+		id: "rounds_must_be_scored_in_order",
+		description: "All earlier non-round-0 rounds must be scored before this round.",
+	},
+	{
+		id: "active_components_must_have_scores",
+		description: "Every active topology component must have scores for all required dimensions.",
+	},
+	{
+		id: "global_scores_must_equal_component_min",
+		description: "global_scores[d] must equal the minimum of that dimension across active component scores.",
+	},
+	{ id: "fact_op_id_required", description: "Every fact operation must carry a non-empty string id." },
+	{
+		id: "fact_add_requires_statement_and_new_id",
+		description: "fact add requires a statement and an id that is not already established.",
+	},
+	{ id: "fact_dispute_requires_existing_fact", description: "fact dispute must reference an existing fact id." },
+	{
+		id: "fact_supersede_requires_existing_fact_and_target",
+		description: "fact supersede must reference an existing fact id and an existing target_id.",
+	},
+	{
+		id: "trigger_fields_must_be_valid",
+		description:
+			"Trigger kind must be A-D, status known, name/component non-empty, and dimension valid for the interview type.",
+	},
+	{
+		id: "non_active_trigger_requires_rationale",
+		description: "Disputed or unresolved triggers must carry a rationale.",
+	},
+	{
+		id: "trigger_contradicted_fact_must_exist",
+		description: "trigger.contradictedFactId must reference an existing fact.",
+	},
+	{
+		id: "trigger_component_must_exist_in_topology",
+		description: "trigger.component must reference a component present in the confirmed topology.",
+	},
+	{
+		id: "ontology_entities_must_be_well_formed",
+		description:
+			"Every ontology entity needs string id/name/type (name non-empty) plus fields and relationships arrays.",
+	},
+	{
+		id: "ontology_snapshot_rounds_must_increase",
+		description: "The prior ontology snapshot round must be a safe integer smaller than the round being scored.",
+	},
+	{
+		id: "targeting_must_match_derived_target",
+		description: "Optional targeting assertions must equal the natively derived target component/dimension.",
+	},
+	{
+		id: "bookkeeping_round_ids_must_reference_rounds",
+		description: "bookkeeping.round_ids must be unique and reference durable round keys or round ids.",
+	},
+	{
+		id: "counter_deltas_must_be_safe_integers",
+		description: "Every counter delta and existing counter value must be a safe integer.",
+	},
+	{
+		id: "threshold_must_be_valid_score",
+		description: "state.threshold must be a number in [0,1] with 4-decimal precision.",
+	},
+	{
+		id: "threshold_units_must_match_threshold",
+		description: "state.threshold_units must be a safe integer in [1,10000] equal to scoreToUnits(threshold).",
+	},
+	{
+		id: "active_trigger_requires_score_regression",
+		description:
+			"An active trigger requires a prior scored round whose dimension score did not improve and whose effective ambiguity increased.",
+	},
+	{
+		id: "envelope_schema_invalid",
+		description: "The persisted deep-interview envelope failed native v1 schema validation at the reported path.",
+	},
+] as const;
+
 /** Apply one closed v1 scoring round. The input contains evidence only; all convergence state is derived here. */
 export function applyDeepInterviewRoundResultV1(
 	envelopeValue: unknown,
@@ -1042,6 +1177,15 @@ export function applyDeepInterviewRoundResultV1(
 	result: DeepInterviewRoundResultV1,
 	now: string,
 ): DeepInterviewApplyRoundResult {
+	// The explicit function-type annotation lets control-flow analysis treat calls as never-returning.
+	const fail: (invariant: string, path: string, expected?: unknown, actual?: unknown) => never = (
+		invariant,
+		path,
+		expected,
+		actual,
+	) => {
+		throw new DeepInterviewInvariantError("DI_STATE_SCHEMA_INVALID", { invariant, path, expected, actual });
+	};
 	const envelope = normalizeDeepInterviewEnvelope(envelopeValue);
 	const state = { ...(envelope.state ?? {}) };
 	const rounds = asRecordArray(state.rounds) as unknown as DeepInterviewRoundRecord[];
@@ -1049,8 +1193,19 @@ export function applyDeepInterviewRoundResultV1(
 	if (index < 0) throw new Error("DI_ROUND_NOT_FOUND");
 	const shell = rounds[index];
 	if (shell.lifecycle !== "answered" && shell.lifecycle !== "pending_scoring" && shell.lifecycle !== "scored")
-		throw new Error("DI_STATE_SCHEMA_INVALID");
-	if (typeof shell.question_id !== "string" || shell.question_id === "") throw new Error("DI_STATE_SCHEMA_INVALID");
+		fail(
+			"round_lifecycle_must_be_known",
+			`/state/rounds[round_key=${roundKey}]/lifecycle`,
+			"answered|pending_scoring|scored",
+			shell.lifecycle,
+		);
+	if (typeof shell.question_id !== "string" || shell.question_id === "")
+		fail(
+			"round_question_id_required",
+			`/state/rounds[round_key=${roundKey}]/question_id`,
+			"non-empty string",
+			shell.question_id,
+		);
 	const digest = deepInterviewRoundResultDigest({
 		round: shell.round,
 		question_id: shell.question_id,
@@ -1063,7 +1218,8 @@ export function applyDeepInterviewRoundResultV1(
 	}
 
 	const type = state.type;
-	if (type !== "greenfield" && type !== "brownfield") throw new Error("DI_STATE_SCHEMA_INVALID");
+	if (type !== "greenfield" && type !== "brownfield")
+		fail("state_type_must_be_interview_type", "/state/type", "greenfield|brownfield", type);
 	const dimensions: DeepInterviewDimension[] =
 		type === "brownfield" ? ["goal", "constraints", "criteria", "context"] : ["goal", "constraints", "criteria"];
 	const componentScores =
@@ -1071,8 +1227,15 @@ export function applyDeepInterviewRoundResultV1(
 		Object.fromEntries((result.component_updates ?? []).map(update => [update.component_id, update.scores]));
 	const finiteScore = (value: unknown): value is number =>
 		typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
-	if (!dimensions.every(dimension => finiteScore(result.global_scores[dimension])))
-		throw new Error("DI_STATE_SCHEMA_INVALID");
+	for (const dimension of dimensions) {
+		if (!finiteScore(result.global_scores[dimension]))
+			fail(
+				"global_scores_must_be_valid_scores",
+				`/global_scores/${dimension}`,
+				"number in [0,1]",
+				result.global_scores[dimension],
+			);
+	}
 	/**
 	 * Rounds must be scored in order, but the Round 0 topology gate is not a
 	 * scorable round: the recorder persists it as an `answered` shell to bind the
@@ -1082,15 +1245,21 @@ export function applyDeepInterviewRoundResultV1(
 	 * deadlock every later round forever, so the gate is excluded by identity
 	 * rather than by an ordering range.
 	 */
-	if (
-		rounds.some(
+	{
+		const unscored = rounds.find(
 			round =>
 				round.lifecycle !== "scored" &&
 				round.round !== 0 &&
 				(round.round < shell.round || (round.round === shell.round && round.round_key < shell.round_key)),
-		)
-	)
-		throw new Error("DI_STATE_SCHEMA_INVALID");
+		);
+		if (unscored)
+			fail(
+				"rounds_must_be_scored_in_order",
+				`/state/rounds[round_key=${unscored.round_key}]/lifecycle`,
+				"scored",
+				unscored.lifecycle,
+			);
+	}
 
 	const topology = isPlainObject(state.topology) ? state.topology : undefined;
 	const activeComponents =
@@ -1107,22 +1276,39 @@ export function applyDeepInterviewRoundResultV1(
 				!isPlainObject(componentScores[id]) ||
 				!dimensions.every(d => finiteScore(componentScores[id][d]))
 			)
-				throw new Error("DI_STATE_SCHEMA_INVALID");
+				fail(
+					"active_components_must_have_scores",
+					`/component_updates[component_id=${String(id)}]/scores`,
+					`scores for every dimension of ${dimensions.join(",")}`,
+					componentScores[String(id)],
+				);
 		}
 		for (const dimension of dimensions) {
 			const weakest = Math.min(
 				...activeComponents.map(component => componentScores[String(component.id)][dimension]),
 			);
-			if (result.global_scores[dimension] !== weakest) throw new Error("DI_STATE_SCHEMA_INVALID");
+			if (result.global_scores[dimension] !== weakest)
+				fail(
+					"global_scores_must_equal_component_min",
+					`/global_scores/${dimension}`,
+					weakest,
+					result.global_scores[dimension],
+				);
 		}
 	}
 	const facts = asRecordArray(state.established_facts);
 	for (const operation of result.fact_ops ?? []) {
 		if (!operation || typeof operation.id !== "string" || operation.id === "")
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail("fact_op_id_required", "/fact_ops", "operation with non-empty string id", operation?.id);
 		const factIndex = facts.findIndex(fact => fact.id === operation.id);
 		if (operation.op === "add") {
-			if (!operation.statement || factIndex >= 0) throw new Error("DI_STATE_SCHEMA_INVALID");
+			if (!operation.statement || factIndex >= 0)
+				fail(
+					"fact_add_requires_statement_and_new_id",
+					`/fact_ops[id=${operation.id}]`,
+					"statement present and id not already established",
+					{ statement: operation.statement, exists: factIndex >= 0 },
+				);
 			facts.push({
 				id: operation.id,
 				statement: operation.statement,
@@ -1133,11 +1319,22 @@ export function applyDeepInterviewRoundResultV1(
 				disputed: false,
 			});
 		} else if (operation.op === "dispute") {
-			if (factIndex < 0) throw new Error("DI_STATE_SCHEMA_INVALID");
+			if (factIndex < 0)
+				fail(
+					"fact_dispute_requires_existing_fact",
+					`/fact_ops[id=${operation.id}]/id`,
+					"existing fact id",
+					operation.id,
+				);
 			facts[factIndex] = { ...facts[factIndex], disputed: true };
 		} else {
 			if (factIndex < 0 || !operation.target_id || !facts.some(fact => fact.id === operation.target_id))
-				throw new Error("DI_STATE_SCHEMA_INVALID");
+				fail(
+					"fact_supersede_requires_existing_fact_and_target",
+					`/fact_ops[id=${operation.id}]`,
+					"existing fact id and existing target_id",
+					{ id: operation.id, target_id: operation.target_id },
+				);
 			facts[factIndex] = { ...facts[factIndex], disputed: true, superseded_by: operation.target_id };
 		}
 	}
@@ -1152,18 +1349,38 @@ export function applyDeepInterviewRoundResultV1(
 			trigger.component === "" ||
 			!dimensions.includes(trigger.dimension as DeepInterviewDimension)
 		)
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail(
+				"trigger_fields_must_be_valid",
+				"/triggers",
+				`kind A-D, status active|disputed|unresolved, non-empty name/component, dimension in ${dimensions.join(",")}`,
+				trigger,
+			);
 		if ((trigger.status === "disputed" || trigger.status === "unresolved") && !trigger.rationale)
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail(
+				"non_active_trigger_requires_rationale",
+				`/triggers[name=${trigger.name}]/rationale`,
+				"non-empty rationale",
+				trigger.rationale,
+			);
 		if (trigger.contradictedFactId && !facts.some(fact => fact.id === trigger.contradictedFactId))
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail(
+				"trigger_contradicted_fact_must_exist",
+				`/triggers[name=${trigger.name}]/contradictedFactId`,
+				"existing fact id",
+				trigger.contradictedFactId,
+			);
 		if (
 			topology &&
 			Array.isArray(topology.components) &&
 			topology.components.length > 0 &&
 			!topology.components.some(component => isPlainObject(component) && component.id === trigger.component)
 		)
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail(
+				"trigger_component_must_exist_in_topology",
+				`/triggers[name=${trigger.name}]/component`,
+				"component id present in state.topology.components",
+				trigger.component,
+			);
 	}
 	const priorSnapshot = Array.isArray(state.ontology_snapshots) ? state.ontology_snapshots.at(-1) : undefined;
 	const priorEntities =
@@ -1181,19 +1398,27 @@ export function applyDeepInterviewRoundResultV1(
 					)
 					.map(relationship => relationship.id),
 	}));
-	if (
-		!entities.every(
+	{
+		const malformed = entities.find(
 			entity =>
-				entity &&
-				typeof entity.id === "string" &&
-				typeof entity.name === "string" &&
-				entity.name !== "" &&
-				typeof entity.type === "string" &&
-				Array.isArray(entity.fields) &&
-				Array.isArray(entity.relationships),
-		)
-	)
-		throw new Error("DI_STATE_SCHEMA_INVALID");
+				!(
+					entity &&
+					typeof entity.id === "string" &&
+					typeof entity.name === "string" &&
+					entity.name !== "" &&
+					typeof entity.type === "string" &&
+					Array.isArray(entity.fields) &&
+					Array.isArray(entity.relationships)
+				),
+		);
+		if (malformed)
+			fail(
+				"ontology_entities_must_be_well_formed",
+				"/ontology/entities",
+				"string id/name/type (name non-empty), fields and relationships arrays",
+				malformed,
+			);
+	}
 	if (isPlainObject(priorSnapshot)) {
 		const priorSnapshotRound = priorSnapshot.round;
 		if (
@@ -1201,7 +1426,12 @@ export function applyDeepInterviewRoundResultV1(
 			!Number.isSafeInteger(priorSnapshotRound) ||
 			priorSnapshotRound >= shell.round
 		)
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail(
+				"ontology_snapshot_rounds_must_increase",
+				"/state/ontology_snapshots[-1]/round",
+				`safe integer < ${shell.round}`,
+				priorSnapshotRound,
+			);
 	}
 	const basis = entities.length === 0 ? "no_entities" : priorSnapshot === undefined ? "first_round" : "compared";
 	const unmatchedPrior = new Set(priorEntities.map((_, index) => index));
@@ -1309,7 +1539,12 @@ export function applyDeepInterviewRoundResultV1(
 			(result.targeting.target_dimension !== undefined && result.targeting.target_dimension !== targetDimension) ||
 			(result.targeting.weakest_dimension !== undefined && result.targeting.weakest_dimension !== targetDimension))
 	)
-		throw new Error("DI_STATE_SCHEMA_INVALID");
+		fail(
+			"targeting_must_match_derived_target",
+			"/targeting",
+			{ target_component_id: targetComponent, target_dimension: targetDimension },
+			result.targeting,
+		);
 	const weightedUnits = weightedAmbiguityUnits(result.global_scores, type);
 	const weightedAmbiguity = weightedUnits / 10_000;
 	const resolution = result.bookkeeping?.resolution ?? (result.auto_answered ? "auto_answer" : "direct");
@@ -1328,7 +1563,12 @@ export function applyDeepInterviewRoundResultV1(
 		new Set(requestedRoundIds).size !== requestedRoundIds.length ||
 		!requestedRoundIds.every(id => typeof id === "string" && durableRoundReferences.has(id))
 	)
-		throw new Error("DI_STATE_SCHEMA_INVALID");
+		fail(
+			"bookkeeping_round_ids_must_reference_rounds",
+			"/bookkeeping/round_ids",
+			"unique ids referencing durable round keys or round ids",
+			requestedRoundIds,
+		);
 	const appendRoundIds = (field: string): string[] => [
 		...(Array.isArray(state[field]) ? state[field].filter((id): id is string => typeof id === "string") : []),
 		...requestedRoundIds.filter(id => !(Array.isArray(state[field]) ? state[field] : []).includes(id)),
@@ -1339,7 +1579,12 @@ export function applyDeepInterviewRoundResultV1(
 			!Number.isSafeInteger(delta) ||
 			(typeof counters[key] !== "undefined" && !Number.isSafeInteger(counters[key]))
 		)
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail(
+				"counter_deltas_must_be_safe_integers",
+				`/bookkeeping/counter_deltas/${key}`,
+				"safe integer delta over safe integer counter",
+				{ delta, counter: counters[key] },
+			);
 		counters[key] = (typeof counters[key] === "number" ? counters[key] : 0) + delta;
 	}
 	const nextState: Record<string, unknown> = {
@@ -1367,7 +1612,7 @@ export function applyDeepInterviewRoundResultV1(
 	const floor = floorBreakdown.floor;
 	const effectiveAmbiguity = clampReportedAmbiguity(weightedAmbiguity, floor).effective;
 	const threshold = state.threshold ?? envelope.threshold;
-	if (!finiteScore(threshold)) throw new Error("DI_STATE_SCHEMA_INVALID");
+	if (!finiteScore(threshold)) fail("threshold_must_be_valid_score", "/state/threshold", "number in [0,1]", threshold);
 	const thresholdUnits = state.threshold_units ?? envelope.threshold_units ?? scoreToUnits(threshold);
 	if (
 		typeof thresholdUnits !== "number" ||
@@ -1376,7 +1621,7 @@ export function applyDeepInterviewRoundResultV1(
 		thresholdUnits > 10_000 ||
 		scoreToUnits(threshold) !== thresholdUnits
 	)
-		throw new Error("DI_STATE_SCHEMA_INVALID");
+		fail("threshold_units_must_match_threshold", "/state/threshold_units", scoreToUnits(threshold), thresholdUnits);
 	const milestone = deriveAmbiguityMilestone(scoreToUnits(effectiveAmbiguity), thresholdUnits);
 	nextState.threshold_units = thresholdUnits;
 	const priorScoredRounds = rounds
@@ -1413,7 +1658,17 @@ export function applyDeepInterviewRoundResultV1(
 			candidateDimension > priorDimension ||
 			effectiveAmbiguity <= priorRound.ambiguity
 		)
-			throw new Error("DI_STATE_SCHEMA_INVALID");
+			fail(
+				"active_trigger_requires_score_regression",
+				`/triggers[name=${trigger.name}]`,
+				"prior scored round with non-improving dimension score and increased effective ambiguity",
+				{
+					prior_dimension_score: priorDimension,
+					new_dimension_score: candidateDimension,
+					prior_effective_ambiguity: priorRound?.ambiguity,
+					new_effective_ambiguity: effectiveAmbiguity,
+				},
+			);
 	}
 	rounds[index] = {
 		...shell,

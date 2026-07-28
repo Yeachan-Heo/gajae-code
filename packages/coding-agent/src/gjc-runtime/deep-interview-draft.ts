@@ -13,7 +13,11 @@ import {
 	deepInterviewDraftSchema,
 	validateDraftPayload,
 } from "./deep-interview-payload";
-import { type DeepInterviewRepairResult, runDeepInterviewRepairCommand } from "./deep-interview-repair";
+import {
+	type DeepInterviewRepairResult,
+	dryRunDeepInterviewRepairMutation,
+	runDeepInterviewRepairCommand,
+} from "./deep-interview-repair";
 import { canonicalDeepInterviewJson, validateDeepInterviewV1Envelope } from "./deep-interview-state";
 import { modeStatePath } from "./session-layout";
 import {
@@ -61,11 +65,201 @@ export interface DeepInterviewDraftResult {
 	stderr?: string;
 }
 
-function response(status: number, value: unknown): DeepInterviewDraftResult {
-	return status === 0
-		? { status, stdout: `${JSON.stringify(value)}\n` }
-		: { status, stderr: `${JSON.stringify({ ok: false, issue: { code: value, message: value } })}\n` };
+/** Human-readable messages and deterministic recovery hints so draft errors never merely echo their own code. */
+const DRAFT_CODE_MESSAGES: Record<string, { message: string; recovery?: string }> = {
+	DI_DRAFT_REVISION_CONFLICT: {
+		message: "The supplied --expected-draft-revision does not match the draft's current draft_revision.",
+		recovery:
+			"Run: gjc deep-interview draft show --draft-id <id> --json and retry with the reported draft_revision (edit also accepts --expected-draft-revision latest).",
+	},
+	DI_STATE_REVISION_CONFLICT: {
+		message: "The interview state revision changed since the draft was based or attempted.",
+		recovery:
+			"Run: gjc deep-interview draft rebase --draft-id <id> --expected-draft-revision <draft_revision> --to-state-revision <state_revision from check> --json, then retry consume.",
+	},
+	DI_DRAFT_NOT_FOUND: { message: "No draft with this id exists for this workspace." },
+	DI_DRAFT_EXPIRED: {
+		message: "The draft expired.",
+		recovery:
+			"Discard it and create a fresh draft: gjc deep-interview draft create --for <kind> --session-id <session> --json.",
+	},
+	DI_PENDING_SHELL_NOT_FOUND: {
+		message: "No answered round shell matches this draft's round_key in the current state.",
+		recovery:
+			"Record the answer first (record-answer draft) or inspect pending shells: gjc deep-interview inspect --session-id <session> --selector pending --json.",
+	},
+	DI_INVALID_ARGUMENT: { message: "A flag is missing, duplicated, unknown for this action, or malformed." },
+	DI_DRAFT_INVALID_PATH: {
+		message: "The --path pointer does not address a schema-valid location in this draft kind's payload.",
+	},
+	DI_DRAFT_INVALID_VALUE: {
+		message: "The supplied value fails the leaf descriptor (type, enum, range, or byte limit).",
+	},
+	DI_STATE_SCHEMA_INVALID: {
+		message: "The persisted deep-interview state violates a native v1 invariant.",
+		recovery:
+			"Fix the named invariant at the reported path (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <expected> --json), rerun gjc deep-interview draft check --draft-id <id> --json, then retry consume.",
+	},
+	DI_DRAFT_RECEIPT_PERSIST_FAILED: {
+		message: "The state mutation committed but the draft receipt could not be persisted.",
+		recovery:
+			"Re-run the same consume command; the retained attempt replays semantically without another state write.",
+	},
+	DI_UNKNOWN_COMMAND: { message: "The requested action is not a known draft command." },
+	DI_INPUT_MODE_CONFLICT: { message: "Draft-mode and raw-JSON flags cannot be mixed in one invocation." },
+	DI_INVALID_DRAFT_ID: { message: "The --draft-id is not a valid 32-hex draft identifier." },
+	DI_DRAFT_CORRUPT: {
+		message: "The stored draft file is unreadable, oversized, or has unsafe ownership/permissions.",
+	},
+	DI_DRAFT_UNSAFE_ROOT: { message: "The draft storage root is missing, symlinked, shared, or inside the workspace." },
+	DI_DRAFT_LOCK_TIMEOUT: {
+		message: "The draft storage lock stayed busy.",
+		recovery: "Retry the command; stale locks are reclaimed automatically after 30 seconds.",
+	},
+	DI_DRAFT_STORAGE_QUOTA: { message: "Draft storage exceeds its file-count or byte quota." },
+	DI_STATE_ABSENT: { message: "No deep-interview state exists for this session; run the kickoff first." },
+	DI_STATE_CORRUPT: { message: "The persisted deep-interview state file is unreadable." },
+	DI_PHASE_NOT_REPAIRABLE: {
+		message: "The interview is complete, handed off, or inactive; draft mutations are refused.",
+	},
+	DI_PENDING_SHELL_AMBIGUOUS: {
+		message: "Several answered round shells are pending scoring.",
+		recovery:
+			"Pass --round-key explicitly; list candidates via gjc deep-interview inspect --selector pending --json.",
+	},
+	DI_DRAFT_INTERNAL_ERROR: { message: "An unexpected internal draft error occurred; state was not modified." },
+	DI_INTERNAL_ERROR: { message: "An unexpected internal error occurred; the state was not modified." },
+	DI_RECEIPT_MALFORMED: {
+		message: "The persisted state receipt is malformed.",
+		recovery:
+			"Run: gjc deep-interview sanity-check --session-id <session> --json to diagnose, then follow the documented state repair path; never edit .gjc state files directly.",
+	},
+	DI_RECEIPT_MISSING: {
+		message: "The persisted state is missing its integrity receipt.",
+		recovery:
+			"Run: gjc deep-interview sanity-check --session-id <session> --json to diagnose, then follow the documented state repair path; never edit .gjc state files directly.",
+	},
+	DI_RECEIPT_CHECKSUM_MISMATCH: {
+		message: "The persisted state checksum does not match its receipt.",
+		recovery:
+			"Run: gjc deep-interview sanity-check --session-id <session> --json to diagnose, then follow the documented state repair path; never edit .gjc state files directly.",
+	},
+	DI_INVALID_INPUT_JSON: {
+		message: "The draft payload failed strict decoding: an unknown key, wrong type, or out-of-range value.",
+		recovery:
+			"Run: gjc deep-interview draft show --draft-id <id> --json, fix the offending field with draft edit, then re-run draft check.",
+	},
+	DI_INVALID_RESULT_JSON: {
+		message:
+			"The round-result payload failed strict decoding: an unknown key, wrong type, duplicate id, or out-of-range value.",
+		recovery:
+			"Run: gjc deep-interview draft show --draft-id <id> --json, fix the offending field with draft edit, then re-run draft check.",
+	},
+	DI_INVALID_ANSWER_JSON: {
+		message: "The answer payload must be {selected_options: string[], custom_input: string|null} within size limits.",
+		recovery:
+			"Set /answer/selected_options entries and /answer/custom_input with draft edit, then re-run draft check.",
+	},
+	DI_INVALID_QUESTION_JSON: {
+		message: "The question must be a non-empty string within 2048 bytes.",
+		recovery: "Set /question with draft edit, then re-run draft check.",
+	},
+	DI_SETUP_CONFLICT: {
+		message: "initialize-context conflicts with already-initialized fields; existing values cannot be changed.",
+		recovery:
+			"Inspect current state (gjc deep-interview inspect --selector summary --json), then edit the draft to match existing values or discard it.",
+	},
+	DI_TOPOLOGY_CONFLICT: {
+		message: "A different topology is already confirmed; confirm-topology cannot overwrite it.",
+		recovery:
+			"Inspect the confirmed topology (gjc deep-interview inspect --selector topology --json) and discard this draft; topology cannot be replaced.",
+	},
+	DI_ANSWER_CONFLICT: {
+		message: "A different answer is already recorded for this round key.",
+		recovery:
+			"Inspect the recorded round (gjc deep-interview inspect --selector round --round-key <key> --json) and discard this draft; recorded answers cannot be replaced.",
+	},
+	DI_SHELL_CONFLICT: {
+		message: "This round key is already scored with a different answer identity.",
+		recovery:
+			"Inspect the scored round (gjc deep-interview inspect --selector round --round-key <key> --json) and discard this draft; scored rounds are immutable.",
+	},
+	DI_ROUND_RESULT_CONFLICT: {
+		message: "This round is already scored with a different result digest.",
+		recovery:
+			"Inspect the scored round (gjc deep-interview inspect --selector recent-scored --json) and discard this draft; a scored result cannot be replaced.",
+	},
+	DI_ROUND_NOT_FOUND: {
+		message: "No round with the requested round key exists in state.rounds.",
+		recovery:
+			"List pending shells (gjc deep-interview inspect --selector pending --json) and recreate the draft with an existing round key.",
+	},
+};
+
+/** Build one structured issue object for a draft error code (message never echoes the code). */
+function draftIssue(errorCode: string): { code: string; message: string; recovery?: string } {
+	const known = DRAFT_CODE_MESSAGES[errorCode];
+	return {
+		code: errorCode,
+		message:
+			known?.message ??
+			`Deep-interview draft operation failed (${errorCode}); no specific guidance is registered for this code.`,
+		...(known?.recovery ? { recovery: known.recovery } : {}),
+	};
 }
+
+function response(status: number, value: unknown): DeepInterviewDraftResult {
+	if (status === 0) return { status, stdout: `${JSON.stringify(value)}\n` };
+	return {
+		status,
+		stderr: `${JSON.stringify({ ok: false, issue: draftIssue(String(value)) })}\n`,
+	};
+}
+const EDIT_OP_FLAGS = ["--op", "--path", "--value", "--value-file", "--null"] as const;
+
+/**
+ * Parse an `edit` invocation into singleton flags plus one or more operation
+ * groups. Each group starts at `--op` and owns the following `--path` /
+ * `--value` / `--value-file` / `--null` flags, so several edits can be applied
+ * atomically in a single call instead of one fragile call per field.
+ */
+function parseEditInput(input: readonly string[]): { flags: Map<string, string>; ops: Map<string, string>[] } {
+	const flags = new Map<string, string>();
+	const ops: Map<string, string>[] = [];
+	let currentOp: Map<string, string> | undefined;
+	for (let i = 1; i < input.length; i++) {
+		const key = input[i];
+		if (!key.startsWith("--") || key.includes("=")) throw new Error("DI_INVALID_ARGUMENT");
+		if (key === "--json") {
+			if (flags.has(key)) throw new Error("DI_INVALID_ARGUMENT");
+			if (input[i + 1] === "true") i++;
+			flags.set(key, "true");
+			continue;
+		}
+		if ((EDIT_OP_FLAGS as readonly string[]).includes(key)) {
+			if (key === "--op") {
+				currentOp = new Map();
+				ops.push(currentOp);
+			}
+			if (!currentOp || currentOp.has(key)) throw new Error("DI_INVALID_ARGUMENT");
+			if (key === "--null") {
+				currentOp.set(key, "true");
+				continue;
+			}
+			const value = input[++i];
+			if (value === undefined || value.startsWith("--")) throw new Error("DI_INVALID_ARGUMENT");
+			currentOp.set(key, value);
+			continue;
+		}
+		if (flags.has(key)) throw new Error("DI_INVALID_ARGUMENT");
+		const value = input[++i];
+		if (value === undefined || value.startsWith("--")) throw new Error("DI_INVALID_ARGUMENT");
+		flags.set(key, value);
+	}
+	if (ops.length === 0) throw new Error("DI_INVALID_ARGUMENT");
+	return { flags, ops };
+}
+
 function code(error: unknown): string {
 	return error instanceof Error ? error.message : "DI_DRAFT_INTERNAL_ERROR";
 }
@@ -501,7 +695,13 @@ function semanticallyEqual(left: unknown, right: unknown): boolean {
 		? left === right
 		: canonicalDeepInterviewJson(left) === canonicalDeepInterviewJson(right);
 }
+function targetRound(draft: Draft, state: Record<string, unknown>): Record<string, unknown> | undefined {
+	return (Array.isArray(state.rounds) ? state.rounds : [])
+		.map(asRecord)
+		.find(round => round.round_key === draft.round_key);
+}
 function mutationEffectDigest(draft: Draft, state: Record<string, unknown>): string {
+	const round = draft.kind === "apply-round-result" ? targetRound(draft, state) : undefined;
 	const evidence =
 		draft.kind === "initialize-context"
 			? Object.fromEntries(
@@ -514,7 +714,9 @@ function mutationEffectDigest(draft: Draft, state: Record<string, unknown>): str
 				? state.topology
 				: draft.kind === "record-answer"
 					? state.rounds
-					: undefined;
+					: draft.kind === "apply-round-result"
+						? { lifecycle: round?.lifecycle ?? null, round_result_digest: round?.round_result_digest ?? null }
+						: undefined;
 	return createHash("sha256")
 		.update(canonicalDeepInterviewJson(evidence ?? null))
 		.digest("hex");
@@ -547,6 +749,12 @@ function committedDraftMutation(draft: Draft, state: Record<string, unknown>): b
 					round.lifecycle === "answered",
 			);
 	}
+	if (draft.kind === "apply-round-result") {
+		// The scored lifecycle proves the state write landed. A competing write that
+		// scored the same round differently is still caught downstream: the replayed
+		// repair command fails with DI_ROUND_RESULT_CONFLICT on a digest mismatch.
+		return targetRound(draft, state)?.lifecycle === "scored";
+	}
 	return false;
 }
 
@@ -570,6 +778,67 @@ async function injectCompetingWrite(cwd: string, draft: Draft, revision: number)
 	});
 }
 
+/** Build the legacy repair-command argv for a draft against the given state and expected revision. */
+function buildLegacyArgs(draft: Draft, state: Record<string, unknown>, expectedRevision: number): string[] {
+	const legacy = [
+		draft.kind,
+		"--json",
+		"--session-id",
+		draft.session_id,
+		"--schema-version",
+		"1",
+		"--expected-revision",
+		String(expectedRevision),
+	];
+	if (draft.kind === "initialize-context" || draft.kind === "confirm-topology")
+		legacy.push("--input-json", JSON.stringify(draft.payload));
+	if (draft.kind === "record-answer") {
+		legacy.push(
+			"--round",
+			required(new Map(Object.entries(draft.identity)), "round"),
+			"--question-id",
+			required(new Map(Object.entries(draft.identity)), "question-id"),
+			"--question-json",
+			String(draft.payload.question),
+			"--answer-json",
+			JSON.stringify(draft.payload.answer),
+		);
+		for (const key of ["round-id", "component-id", "dimension"]) {
+			const value = draft.identity[key];
+			if (value) legacy.push(`--${key}`, value);
+		}
+	}
+	if (draft.kind === "apply-round-result") {
+		const shell = (Array.isArray(state.rounds) ? state.rounds : [])
+			.map(asRecord)
+			.find(round => round.round_key === draft.round_key);
+		if (!shell) throw new Error("DI_PENDING_SHELL_NOT_FOUND");
+		legacy.push(
+			"--round",
+			String(shell.round),
+			"--question-id",
+			String(shell.question_id),
+			"--result-json",
+			JSON.stringify({
+				...draft.payload,
+				...(draft.payload.bookkeeping
+					? {
+							bookkeeping: {
+								...asRecord(draft.payload.bookkeeping),
+								resolution:
+									asRecord(draft.payload.bookkeeping).resolution === "complete"
+										? "direct"
+										: asRecord(draft.payload.bookkeeping).resolution,
+							},
+						}
+					: {}),
+			}),
+		);
+		if (typeof shell.round_id === "string") legacy.push("--round-id", shell.round_id);
+	}
+	return legacy;
+}
+
 async function runDeepInterviewDraftCommandInternal(
 	input: readonly string[],
 	cwd: string,
@@ -585,7 +854,9 @@ async function runDeepInterviewDraftCommandInternal(
 			].includes(action)
 		)
 			throw new Error("DI_UNKNOWN_COMMAND");
-		const flags = args(input);
+		const isEdit = action === "edit";
+		const parsedEdit = isEdit ? parseEditInput(input) : undefined;
+		const flags = isEdit ? parsedEdit!.flags : args(input);
 		const allowed: Record<string, readonly string[]> = {
 			create: [
 				"--for",
@@ -598,7 +869,7 @@ async function runDeepInterviewDraftCommandInternal(
 				"--component-id",
 				"--dimension",
 			],
-			edit: ["--draft-id", "--expected-draft-revision", "--op", "--path", "--value", "--value-file", "--null"],
+			edit: ["--draft-id", "--expected-draft-revision"],
 			show: ["--draft-id"],
 			check: ["--draft-id"],
 			rebase: ["--draft-id", "--expected-draft-revision", "--to-state-revision"],
@@ -670,12 +941,12 @@ async function runDeepInterviewDraftCommandInternal(
 				return response(0, { ok: true, draft_id: id, discarded: true });
 			}
 			if (action === "edit") {
-				if (
-					draft.status !== "active" ||
-					Number(required(flags, "--expected-draft-revision")) !== draft.draft_revision
-				)
+				const expected = required(flags, "--expected-draft-revision");
+				if (draft.status !== "active" || (expected !== "latest" && Number(expected) !== draft.draft_revision))
 					throw new Error("DI_DRAFT_REVISION_CONFLICT");
-				await editPayload(draft, flags);
+				// All ops apply to the in-memory payload and persist in one write, so a
+				// batch either lands atomically or fails leaving the stored draft untouched.
+				for (const op of parsedEdit!.ops) await editPayload(draft, op);
 				draft.draft_revision++;
 				draft.updated_at = new Date().toISOString();
 				await write(cwd, draft);
@@ -712,73 +983,50 @@ async function runDeepInterviewDraftCommandInternal(
 			} catch (error) {
 				schemaIssue = code(error);
 			}
-			if (action === "check")
+			if (action !== "check" && schemaIssue) throw new Error(schemaIssue);
+			if (action === "check") {
+				const issues: Record<string, unknown>[] = [];
+				if (schemaIssue) {
+					issues.push(draftIssue(schemaIssue));
+				} else {
+					// Dry-run the exact consume-side mutation transform (including
+					// state-level invariants) so check validates precisely what
+					// consume validates at this state revision.
+					try {
+						const dry = await dryRunDeepInterviewRepairMutation(
+							buildLegacyArgs(draft, current.state, current.revision),
+							cwd,
+						);
+						if (dry.status !== 0) {
+							const parsedIssue = (() => {
+								try {
+									return (JSON.parse(dry.stderr ?? "{}") as { issue?: Record<string, unknown> }).issue;
+								} catch {
+									return undefined;
+								}
+							})();
+							issues.push(parsedIssue ?? draftIssue("DI_INTERNAL_ERROR"));
+						}
+					} catch (error) {
+						issues.push(draftIssue(code(error)));
+					}
+				}
 				return response(0, {
 					ok: true,
 					draft_id: id,
-					valid: schemaIssue === undefined,
+					valid: issues.length === 0,
 					state_revision: current.revision,
 					stale: draft.base_revision !== current.revision,
-					issues: schemaIssue ? [{ code: schemaIssue, message: schemaIssue }] : [],
+					issues,
 				});
-			if (schemaIssue) throw new Error(schemaIssue);
-			const legacy = [
-				draft.kind,
-				"--json",
-				"--session-id",
-				draft.session_id,
-				"--schema-version",
-				"1",
-				"--expected-revision",
-				String(draft.attempt ? current.revision : draft.base_revision),
-			];
-			if (draft.kind === "initialize-context" || draft.kind === "confirm-topology")
-				legacy.push("--input-json", JSON.stringify(draft.payload));
-			if (draft.kind === "record-answer")
-				legacy.push(
-					"--round",
-					required(new Map(Object.entries(draft.identity)), "round"),
-					"--question-id",
-					required(new Map(Object.entries(draft.identity)), "question-id"),
-					"--question-json",
-					String(draft.payload.question),
-					"--answer-json",
-					JSON.stringify(draft.payload.answer),
-				);
-			if (draft.kind === "record-answer")
-				for (const key of ["round-id", "component-id", "dimension"]) {
-					const value = draft.identity[key];
-					if (value) legacy.push(`--${key}`, value);
-				}
-			if (draft.kind === "apply-round-result") {
-				const shell = (Array.isArray(current.state.rounds) ? current.state.rounds : [])
-					.map(asRecord)
-					.find(round => round.round_key === draft.round_key);
-				if (!shell) throw new Error("DI_PENDING_SHELL_NOT_FOUND");
-				legacy.push(
-					"--round",
-					String(shell.round),
-					"--question-id",
-					String(shell.question_id),
-					"--result-json",
-					JSON.stringify({
-						...draft.payload,
-						...(draft.payload.bookkeeping
-							? {
-									bookkeeping: {
-										...asRecord(draft.payload.bookkeeping),
-										resolution:
-											asRecord(draft.payload.bookkeeping).resolution === "complete"
-												? "direct"
-												: asRecord(draft.payload.bookkeeping).resolution,
-									},
-								}
-							: {}),
-					}),
-				);
-				if (typeof shell.round_id === "string") legacy.push("--round-id", shell.round_id);
 			}
+			const legacy = buildLegacyArgs(draft, current.state, draft.attempt ? current.revision : draft.base_revision);
 			const replayingAttempt = draft.attempt !== undefined;
+			const stalledAttempt =
+				draft.attempt !== undefined &&
+				current.revision === draft.attempt.state_revision &&
+				attemptMatchesDraft(draft) &&
+				draft.attempt.effect_digest === mutationEffectDigest(draft, current.state);
 			if (!draft.attempt) {
 				draft.attempt = {
 					state_revision: current.revision,
@@ -788,6 +1036,9 @@ async function runDeepInterviewDraftCommandInternal(
 				draft.updated_at = new Date().toISOString();
 				await write(cwd, draft);
 				await injectCompetingWrite(cwd, draft, current.revision);
+			} else if (stalledAttempt) {
+				// The prior attempt failed before the state write landed (revision and
+				// effect digest are unchanged), so the same request is safe to re-run.
 			} else if (
 				current.revision !== draft.attempt.state_revision + 1 ||
 				!attemptMatchesDraft(draft) ||
@@ -798,6 +1049,12 @@ async function runDeepInterviewDraftCommandInternal(
 			}
 			const result: DeepInterviewRepairResult = await runDeepInterviewRepairCommand(legacy, cwd);
 			if (result.status !== 0) {
+				// The consume failed before the state write landed, so the persisted
+				// attempt would otherwise brick every replay (revision can never reach
+				// attempt.state_revision + 1). Clear it so the draft stays retryable.
+				draft.attempt = undefined;
+				draft.updated_at = new Date().toISOString();
+				await write(cwd, draft);
 				if (result.stderr?.includes("DI_REVISION_CONFLICT")) throw new Error("DI_STATE_REVISION_CONFLICT");
 				return result;
 			}
