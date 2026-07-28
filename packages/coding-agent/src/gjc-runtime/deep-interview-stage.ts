@@ -275,13 +275,6 @@ function computeMergedEnvelope(
 // Verbs
 // -----------------------------------------------------------------------------
 
-export interface StageVerbSummaries {
-	stage: Record<string, unknown>;
-	check: Record<string, unknown>;
-	apply: Record<string, unknown>;
-	discard: Record<string, unknown>;
-}
-
 async function handleStage(args: readonly string[], cwd: string): Promise<Record<string, unknown>> {
 	const rawInput = flagValue(args, "--input");
 	if (rawInput === undefined || rawInput === "") {
