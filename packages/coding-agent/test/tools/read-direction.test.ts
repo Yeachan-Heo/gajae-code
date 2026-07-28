@@ -300,9 +300,9 @@ describe("read truncation direction resolution", () => {
 		expect(bothText).toMatch(/entry-\d{2}-/);
 	});
 
-	test("keeps ACP explicit-head metadata in the same coordinates as disk", async () => {
+	test("keeps ACP explicit-head at the baseline budget while disk bare reads retain receipt budget", async () => {
 		const file = path.join(tempDir, "acp.txt");
-		const source = Array.from({ length: 120 }, (_, index) => `line-${index + 1}`).join("\n");
+		const source = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`).join("\n");
 		await fs.writeFile(file, source);
 		const settings = Settings.isolated({
 			"read.summarize.enabled": false,
@@ -319,8 +319,13 @@ describe("read truncation direction resolution", () => {
 			{ path: file, truncation: "head" },
 		);
 
-		expect(acp.details?.meta?.truncation).toEqual(disk.details?.meta?.truncation);
-		expect(textOf(acp)).toBe(textOf(disk));
+		expect(displayLines(acp)).toHaveLength(3_000);
+		expect(displayLines(acp)[0]).toBe("line-1");
+		expect(displayLines(acp).at(-1)).toBe("line-3000");
+		expect(displayLines(disk)).toHaveLength(50);
+		expect(displayLines(disk)[0]).toBe("line-1");
+		expect(displayLines(disk).at(-1)).toBe("line-50");
+		expect(textOf(acp)).not.toBe(textOf(disk));
 	});
 
 	test("keeps explicit range context windows bounded and EOF-clamped across disk and ACP directional reads", async () => {
@@ -365,9 +370,11 @@ describe("read truncation direction resolution", () => {
 						shownRange?: { start: number; end: number };
 						headRange?: { start: number; end: number };
 						tailRange?: { start: number; end: number };
+						rangeBase?: "file" | "window";
 				  }
 				| undefined;
 			expect(truncation).toBeDefined();
+			expect(truncation?.rangeBase).toBe("window");
 			const ranges = [truncation?.shownRange, truncation?.headRange, truncation?.tailRange].filter(
 				(range): range is { start: number; end: number } => range !== undefined,
 			);

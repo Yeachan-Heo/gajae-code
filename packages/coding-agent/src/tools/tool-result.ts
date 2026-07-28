@@ -34,7 +34,12 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 
 	truncationWindows(
 		windows: ReadWindow,
-		options?: { artifactId?: string; noticeOwner?: "body"; maxBytes?: number },
+		options?: {
+			artifactId?: string;
+			noticeOwner?: "body";
+			maxBytes?: number;
+			rangeBase?: "file" | "window";
+		},
 	): this {
 		this.#meta.truncationWindows(windows, options);
 		return this;

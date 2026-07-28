@@ -33,6 +33,8 @@ import { renderError } from "./tool-errors";
  */
 export interface TruncationMeta {
 	direction: "head" | "tail" | "middle";
+	/** Coordinate basis for shown/head/tail ranges. Omitted means file coordinates; "window" is the selected-range coordinate system. */
+	rangeBase?: "file" | "window";
 	noticeOwner?: "body";
 	truncatedBy: "lines" | "bytes" | "middle";
 	totalLines: number;
@@ -213,15 +215,21 @@ export class OutputMetaBuilder {
 	/** Add metadata from the actual head/tail windows retained by middle truncation. */
 	truncationWindows(
 		windows: ReadWindow,
-		options: { artifactId?: string; noticeOwner?: "body"; maxBytes?: number } = {},
+		options: {
+			artifactId?: string;
+			noticeOwner?: "body";
+			maxBytes?: number;
+			rangeBase?: "file" | "window";
+		} = {},
 	): this {
 		if (windows.kind === "full") return this;
 
-		const { artifactId, noticeOwner } = options;
+		const { artifactId, noticeOwner, rangeBase } = options;
 		const maxBytes = options.maxBytes ?? (windows as ReadWindow & { maxBytes?: number }).maxBytes;
 		const outputLinesOverride = (windows as ReadWindow & { outputLinesOverride?: number }).outputLinesOverride;
 		const outputBytesOverride = (windows as ReadWindow & { outputBytesOverride?: number }).outputBytesOverride;
 		const owner = noticeOwner !== undefined ? { noticeOwner } : {};
+		const rangeBaseMeta = rangeBase !== undefined ? { rangeBase } : {};
 		const hiddenReason = (windows as ReadWindow & { truncatedBy?: "lines" | "bytes" | "middle" }).truncatedBy;
 		const fallbackTruncatedBy: "lines" | "bytes" = hiddenReason === "bytes" ? "bytes" : "lines";
 		const partialTail = windows.tail?.kind === "partial-line" ? windows.tail : undefined;
@@ -236,6 +244,7 @@ export class OutputMetaBuilder {
 				direction: windows.kind === "tail-only" ? "tail" : "middle",
 				truncatedBy: "bytes",
 				...owner,
+				...rangeBaseMeta,
 				totalLines: windows.totalLines,
 				totalBytes: windows.totalBytes,
 				outputLines:
@@ -261,6 +270,7 @@ export class OutputMetaBuilder {
 				direction: "head",
 				truncatedBy: fallbackTruncatedBy,
 				...owner,
+				...rangeBaseMeta,
 				totalLines: windows.totalLines,
 				totalBytes: windows.totalBytes,
 				outputLines: outputLinesOverride ?? head.lines,
@@ -279,6 +289,7 @@ export class OutputMetaBuilder {
 				direction: "tail",
 				truncatedBy: fallbackTruncatedBy,
 				...owner,
+				...rangeBaseMeta,
 				totalLines: windows.totalLines,
 				totalBytes: windows.totalBytes,
 				outputLines: outputLinesOverride ?? tail.lines,
@@ -297,6 +308,7 @@ export class OutputMetaBuilder {
 			direction: "middle",
 			truncatedBy: "middle",
 			...owner,
+			...rangeBaseMeta,
 			totalLines: windows.totalLines,
 			totalBytes: windows.totalBytes,
 			outputLines: head.lines + tail.lines + 1,

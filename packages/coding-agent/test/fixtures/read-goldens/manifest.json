@@ -260,7 +260,7 @@
 
     "settings": { "read.summarize.enabled": false },
     "hashLines": [true, false],
-    "reason": "ACP-backed bare reads preserve tail-default behavior and parity with disk-backed bare reads."
+    "reason": "ACP-backed bare reads use the baseline 3000-line/50 KiB directional budget; disk receipts retain their 50-line/10 KiB budget."
   },
   {
     "bucket": "changed",

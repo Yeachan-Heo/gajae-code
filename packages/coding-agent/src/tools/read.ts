@@ -1205,7 +1205,7 @@ const readSchema = z
 			.enum(["head", "last", "both"])
 			.optional()
 			.describe(
-				"which end of an over-budget result to keep: head | last | both. Route defaults are route-aware: read.truncation is consulted for bare local and archive-member routes (factory default: last), while URL, converted, directory, range, internal, and other routes default to head. SQLite row, schema, query, and raw reads ignore this parameter.",
+				"which end of an over-budget result to keep: head | last | both. Route defaults are route-aware: read.truncation is consulted for bare local and archive-member routes (factory default: last), while URL, converted, directory, range, internal, and other routes default to head. SQLite row, schema, and query reads ignore this parameter; raw reads honor explicit directions.",
 			),
 	})
 	.strict();
@@ -1636,6 +1636,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			options.truncationMetadataBodyRelative || (offset !== undefined && direction !== "head")
 				? relativeWindow
 				: window;
+		const metadataRangeBase =
+			options.truncationMetadataBodyRelative || (offset !== undefined && direction !== "head")
+				? "window"
+				: undefined;
 		const shouldAddHashLines = displayMode.hashLines;
 		const shouldAddLineNumbers = !shouldAddHashLines && displayMode.lineNumbers;
 		const maxColumns = options.raw ? 0 : resolveOutputMaxColumns(this.session.settings);
@@ -1780,6 +1784,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				resultBuilder.truncationWindows(metadataWindow, {
 					noticeOwner: bodyFooterPath !== undefined && direction !== "head" ? "body" : undefined,
 					maxBytes: direction === "head" ? undefined : budgetBytes,
+					rangeBase: metadataRangeBase,
 				});
 			}
 		} else if (truncationResult?.truncated) {
@@ -2683,6 +2688,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			| undefined;
 		let directionalWindow: ReadWindow | undefined;
 		let directionalNoticeOwner: "body" | undefined;
+		let directionalRangeBase: "file" | "window" | undefined;
 
 		if (mimeType) {
 			if (params.truncation !== undefined && params.truncation !== "head") {
@@ -2859,7 +2865,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								sourcePath: absolutePath,
 								entityLabel: "file",
 								raw: isRawSelector(parsed),
-								receiptPath: bareEligible ? localReadPath : undefined,
 								cacheLinesFor: absolutePath,
 								truncationDirection: localDirection,
 							});
@@ -2945,6 +2950,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const metadataWindow = rebaseWindow(window, -startLine);
 						directionalWindow = metadataWindow;
 						directionalNoticeOwner = isBareReceipt ? "body" : undefined;
+						directionalRangeBase = offset !== undefined && localDirection !== "head" ? "window" : undefined;
 						const directionalPartial = windowHasPartialSegment(window);
 						const shouldAddDirectionalHashLines = !rawSelector && displayMode.hashLines;
 						const shouldAddDirectionalLineNumbers = rawSelector
@@ -3218,6 +3224,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (directionalWindow) {
 			resultBuilder.truncationWindows(directionalWindow, {
 				noticeOwner: directionalNoticeOwner,
+				rangeBase: directionalRangeBase,
 			});
 		}
 		if (columnTruncated > 0) {

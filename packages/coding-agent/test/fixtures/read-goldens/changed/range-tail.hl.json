@@ -23,6 +23,7 @@
     "truncation": {
       "direction": "tail",
       "truncatedBy": "bytes",
+      "rangeBase": "window",
       "totalLines": 120,
       "totalBytes": 73919,
       "outputLines": 102,
