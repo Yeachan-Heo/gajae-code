@@ -150,19 +150,29 @@ describe("sticky viewport production evidence verifier", () => {
 		await verifyStickyViewportShowcase(await capture());
 	});
 	it("fails closed for semantic evidence and provenance corruption", async () => {
-		const root = await capture();
+		// `capture()` spawns a ~2.2s subprocess. Capture once and clone the
+		// deterministic output so each corruption case stays isolated without
+		// paying that cost seven times, which overruns the timeout budget.
+		const base = await capture();
+		const cloneBase = async () => {
+			const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-semantic-"));
+			roots.push(clone);
+			await fs.cp(base, clone, { recursive: true });
+			return clone;
+		};
+		const root = await cloneBase();
 		const key = "manual-new-output/80x24/unicode-color";
 		await fs.writeFile(path.join(root, key, "terminal.txt"), "forged\n");
 		await rehash(root, key, "terminal.txt");
 		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("semantic evidence");
-		const provenanceRoot = await capture();
+		const provenanceRoot = await cloneBase();
 		const metadataPath = path.join(provenanceRoot, key, "metadata.json");
 		const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
 		metadata.provenance.capture_mode = "fixture";
 		await Bun.write(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
 		await rehash(provenanceRoot, key, "metadata.json");
 		await expect(verifyStickyViewportShowcase(provenanceRoot)).rejects.toThrow("metadata schema");
-		const noticeRoot = await capture();
+		const noticeRoot = await cloneBase();
 		const noticeMetadataPath = path.join(noticeRoot, key, "metadata.json");
 		const noticeMetadata = JSON.parse(await fs.readFile(noticeMetadataPath, "utf8"));
 		noticeMetadata.output_revision = "0";
@@ -170,7 +180,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await rehash(noticeRoot, key, "metadata.json");
 		await expect(verifyStickyViewportShowcase(noticeRoot)).rejects.toThrow("manual notice invariant");
 
-		const capacityRoot = await capture();
+		const capacityRoot = await cloneBase();
 		const capacityKey = "capacity-one/80x24/unicode-color";
 		const capacityMetadataPath = path.join(capacityRoot, capacityKey, "metadata.json");
 		const capacityMetadata = JSON.parse(await fs.readFile(capacityMetadataPath, "utf8"));
@@ -179,7 +189,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await rehash(capacityRoot, capacityKey, "metadata.json");
 		await expect(verifyStickyViewportShowcase(capacityRoot)).rejects.toThrow("capacity metadata/frame mismatch");
 
-		const cjkRoot = await capture();
+		const cjkRoot = await cloneBase();
 		const cjkKey = "narrow-cjk/48x10/unicode-color";
 		for (const name of ["terminal.txt", "terminal-ansi.txt", "terminal.html"] as const) {
 			const artifactPath = path.join(cjkRoot, cjkKey, name);
@@ -193,7 +203,7 @@ describe("sticky viewport production evidence verifier", () => {
 			"narrow CJK visible terminal evidence missing",
 		);
 
-		const evidenceRoot = await capture();
+		const evidenceRoot = await cloneBase();
 		const evidencePath = path.join(evidenceRoot, key, "metadata.json");
 		const evidence = JSON.parse(await fs.readFile(evidencePath, "utf8"));
 		evidence.state.manual_historical_rows = [];
@@ -201,7 +211,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await rehash(evidenceRoot, key, "metadata.json");
 		await expect(verifyStickyViewportShowcase(evidenceRoot)).rejects.toThrow("manual historical transcript evidence");
 
-		const nonNarrowCjkRoot = await capture();
+		const nonNarrowCjkRoot = await cloneBase();
 		const nonNarrowMetadataPath = path.join(nonNarrowCjkRoot, key, "metadata.json");
 		const nonNarrowMetadata = JSON.parse(await fs.readFile(nonNarrowMetadataPath, "utf8"));
 		nonNarrowMetadata.cjk_phrase_boundaries = ["意味のある文の境界"];
