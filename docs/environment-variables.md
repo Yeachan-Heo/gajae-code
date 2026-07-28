@@ -337,6 +337,19 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 
 OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth.kimi.com`.
 
+### Kiro (Amazon Q / CodeWhisperer)
+
+| Variable                          | Default / behavior                                                       |
+| --------------------------------- | ------------------------------------------------------------------------ |
+| `GJC_KIRO_CODEWHISPERER_OPTOUT`   | Sets the `x-amzn-codewhisperer-optout` request header. Unset (default) omits the header entirely. |
+
+Kiro requests reach Amazon's CodeWhisperer/Kiro control and runtime planes, which
+may apply upstream data-collection semantics that GJC does not control. Kiro CLI
+2.14.2 hardcodes `x-amzn-codewhisperer-optout: false`, but the header's polarity
+is undocumented, so GJC never asserts a data-sharing preference on your behalf:
+the header is omitted unless you set this variable explicitly. Set it only when
+you have confirmed the value your account requires.
+
 ### Gemini CLI compatibility
 
 | Variable                   | Default / behavior                                              |
