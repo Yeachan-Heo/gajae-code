@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 import math
 import os
@@ -150,7 +151,7 @@ HOTSPOT_STATUSES = (
 )
 PROFILERS = ("bun", "node", "clinic", "instruments", "perf", "other", "none")
 PARITY_VERDICTS = ("pass", "fail", "not-run")
-EXPECTED_PREREGISTRATION_POLICY_SHA256 = "a908bba0c9ab8bbb1ad38185d909249d0ce71f4ba90ecb71c0dff068bbbec705"
+EXPECTED_PREREGISTRATION_POLICY_SHA256 = "1fcadb3829aef34ca410b41c7146ec8843b9339ec27e57868467dfeed0ae027f"
 
 
 class EvidenceError(Exception):
@@ -1066,7 +1067,7 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
     sealed_contract = _expect_dict(prereg.get("sealedInputContract"), "preregistration.sealedInputContract")
     if (
         sealed_contract.get("loadAverage1mDriftScope")
-        != "Compare telemetryBefore.loadAverage1m across attempts against the first attempt telemetryBefore value only. telemetryAfter does not participate in ambient drift but remains required, absolutely bounded, and diagnostic."
+        != "Compare telemetryBefore.loadAverage1m across attempts as a one-sided upward increase from the first attempt telemetryBefore value: a later value minus the first value must be less than or equal to maximumLoadAverage1mDrift. Lower later values do not violate ambient drift. telemetryAfter does not participate in ambient drift but remains required, absolutely bounded, and diagnostic."
         or sealed_contract.get("freeMemoryFractionDriftScope")
         != "Compare every telemetryBefore.freeMemoryBytes and telemetryAfter.freeMemoryBytes value against the first attempt telemetryBefore value."
     ):
@@ -1845,7 +1846,9 @@ def _validate_sealed_inputs(
         if first_before_load is None:
             first_before_load = before_load
             first_free_memory = before_free
-        elif abs(before_load - first_before_load) > contract["maximumLoadAverage1mDrift"]:
+        elif Decimal(str(before_load)) - Decimal(str(first_before_load)) > Decimal(
+            str(contract["maximumLoadAverage1mDrift"])
+        ):
             raise EvidenceError(f"{label}.telemetryBefore.loadAverage1m ambient drift")
         if first_free_memory is None:
             raise EvidenceError("attempt ledger free-memory reference is missing")

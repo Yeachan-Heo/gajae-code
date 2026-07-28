@@ -1140,16 +1140,39 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			expect(validationCodes(await readResult(output))).toContain("SEALED_INPUT_INVALID");
 		}
 	});
-	test("uses only cross-attempt telemetryBefore load for ambient drift while retaining telemetryAfter controls", async () => {
-		const ambientDriftInput = path.join(temporaryRoot, "ambient-load-drift-input");
-		const ambientDriftOutput = path.join(temporaryRoot, "ambient-load-drift-output");
-		await writeCorpus(ambientDriftInput);
-		await mutateLedger(ambientDriftInput, ledger => {
-			const attempt = (ledger.attempts as JsonObject[])[1]!;
-			((attempt.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 2.01;
+	test("applies one-sided upward ambient load drift while retaining absolute and free-memory controls", async () => {
+		const lowerLaterInput = path.join(temporaryRoot, "lower-later-load-input");
+		const lowerLaterOutput = path.join(temporaryRoot, "lower-later-load-output");
+		await writeCorpus(lowerLaterInput);
+		await mutateLedger(lowerLaterInput, ledger => {
+			const attempts = ledger.attempts as JsonObject[];
+			((attempts[0]!.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 2.5;
+			((attempts[1]!.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 0.25;
 		});
-		expect(invoke(ambientDriftInput, ambientDriftOutput).exitCode).toBe(3);
-		expect((await readResult(ambientDriftOutput)).diagnostics.validationErrors).toContainEqual(
+		expect(invoke(lowerLaterInput, lowerLaterOutput).exitCode).toBe(0);
+		expect((await readResult(lowerLaterOutput)).evidenceStatus).toBe("SUFFICIENT_EVIDENCE");
+
+		const exactIncreaseInput = path.join(temporaryRoot, "exact-upward-load-drift-input");
+		const exactIncreaseOutput = path.join(temporaryRoot, "exact-upward-load-drift-output");
+		await writeCorpus(exactIncreaseInput);
+		await mutateLedger(exactIncreaseInput, ledger => {
+			const attempts = ledger.attempts as JsonObject[];
+			((attempts[0]!.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 1.2;
+			((attempts[1]!.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 2.2;
+		});
+		expect(invoke(exactIncreaseInput, exactIncreaseOutput).exitCode).toBe(0);
+		expect((await readResult(exactIncreaseOutput)).evidenceStatus).toBe("SUFFICIENT_EVIDENCE");
+
+		const excessiveIncreaseInput = path.join(temporaryRoot, "excessive-upward-load-drift-input");
+		const excessiveIncreaseOutput = path.join(temporaryRoot, "excessive-upward-load-drift-output");
+		await writeCorpus(excessiveIncreaseInput);
+		await mutateLedger(excessiveIncreaseInput, ledger => {
+			const attempts = ledger.attempts as JsonObject[];
+			((attempts[0]!.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 1.2;
+			((attempts[1]!.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 2.200001;
+		});
+		expect(invoke(excessiveIncreaseInput, excessiveIncreaseOutput).exitCode).toBe(3);
+		expect((await readResult(excessiveIncreaseOutput)).diagnostics.validationErrors).toContainEqual(
 			expect.objectContaining({
 				code: "SEALED_INPUT_INVALID",
 				message: expect.stringContaining("telemetryBefore.loadAverage1m ambient drift"),

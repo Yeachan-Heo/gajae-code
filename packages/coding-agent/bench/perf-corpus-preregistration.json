@@ -247,7 +247,7 @@
     ],
     "maximumLoadAverage1m": 4,
     "maximumLoadAverage1mDrift": 1,
-    "loadAverage1mDriftScope": "Compare telemetryBefore.loadAverage1m across attempts against the first attempt telemetryBefore value only. telemetryAfter does not participate in ambient drift but remains required, absolutely bounded, and diagnostic.",
+    "loadAverage1mDriftScope": "Compare telemetryBefore.loadAverage1m across attempts as a one-sided upward increase from the first attempt telemetryBefore value: a later value minus the first value must be less than or equal to maximumLoadAverage1mDrift. Lower later values do not violate ambient drift. telemetryAfter does not participate in ambient drift but remains required, absolutely bounded, and diagnostic.",
     "minimumFreeMemoryBytes": 4294967296,
     "maximumFreeMemoryBytes": 1099511627776,
     "maximumFreeMemoryFractionDrift": 0.25,
