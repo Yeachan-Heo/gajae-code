@@ -260,7 +260,7 @@ describe("deep-interview CLI-owned draft contract", () => {
 		const toolUsage = extractSection(skill, "Tool_Usage");
 
 		expect(repairCli).toContain(
-			"Value-taking flags use exactly `--name value`; `--json` and `--null` are standalone flags and take no value.",
+			"Value-taking flags use exactly `--name value`; `--json`, `--null`, and `--to-current` are standalone flags and take no value.",
 		);
 		expect(repairCli).toContain(
 			"A valueless `append` on a missing object-item array appends an `{}` scaffold; on a missing scalar-item array it initializes `[]`.",
@@ -270,7 +270,7 @@ describe("deep-interview CLI-owned draft contract", () => {
 		);
 		expect(repairCli).toContain("--op append --path /deferred_components --json");
 		expect(toolUsage).toContain(
-			"value-taking flags use exactly `--name value`, while `--json` and `--null` take no value",
+			"value-taking flags use exactly `--name value`, while `--json`, `--null`, and `--to-current` take no value",
 		);
 		expect(steps).toContain("valueless append on a missing scalar-item array initializes `[]`");
 		expect(steps).toContain("--op append --path /deferred_components --json");
@@ -289,7 +289,7 @@ describe("deep-interview CLI-owned draft contract", () => {
 			) ?? []),
 		];
 
-		expect(toolUsage).toContain("draft create|edit|show|check|rebase|discard");
+		expect(toolUsage).toContain("draft create|edit|edit-batch|show|check|rebase|discard");
 		expect(toolUsage).toContain("there is no public `draft consume` command");
 		expect(skill).not.toMatch(/\bgjc deep-interview draft consume\b/);
 		expect(normalFlowDocs).not.toMatch(
@@ -302,15 +302,15 @@ describe("deep-interview CLI-owned draft contract", () => {
 			expect(example).toContain("--json");
 		}
 
-		for (const command of ["create", "edit", "show", "check", "rebase", "discard"]) {
+		for (const command of ["create", "edit", "edit-batch", "show", "check", "rebase", "discard"]) {
 			expect(normalFlowDocs).toMatch(new RegExp(`draft ${command}[^\\n]*--json`));
 		}
 		expect(normalFlowDocs).toContain(
-			"draft rebase  --draft-id ID --expected-draft-revision N --to-state-revision N --json",
+			"draft rebase  --draft-id ID --expected-draft-revision N (--to-current|--to-state-revision N) --json",
 		);
 		expect(normalFlowDocs).toContain("draft discard --draft-id ID --expected-draft-revision N --json");
-		expect(normalFlowDocs).toContain("without consuming or mutating it; it reports when the draft base is stale");
-		expect(normalFlowDocs).toContain("caller-observed current state revision as `--to-state-revision`");
+		expect(normalFlowDocs).toContain("dry-runs the same state transition as consume without mutating it");
+		expect(normalFlowDocs).toContain("or `--to-current`");
 		expect(toolUsage).toContain("Inline JSON request flags are compatibility-only");
 		expect(toolUsage).toContain("Never construct a full payload");
 	});

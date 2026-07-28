@@ -6,20 +6,140 @@ This is the native repair and inspection surface for an existing GJC deep-interv
 
 ## Normal-flow draft protocol
 
-All commands require standalone `--json`. Value-taking flags use exactly `--name value`; `--json` and `--null` are standalone flags and take no value. Flags cannot repeat, and identifiers match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Normal mutations use CLI-owned drafts, never caller-serialized JSON:
+All commands require standalone `--json`. Value-taking flags use exactly `--name value`; `--json`, `--null`, and `--to-current` are standalone flags and take no value. Flags cannot repeat, and identifiers match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Normal mutations use CLI-owned drafts, never caller-serialized state envelopes:
 
 ```text
 gjc deep-interview draft create  --for initialize-context|confirm-topology|record-answer|apply-round-result --session-id ID [identity flags] --json
 gjc deep-interview draft edit    --draft-id ID --expected-draft-revision N --op set|append|remove --path /pointer [--value SCALAR|--value-file PATH|--null] --json
+gjc deep-interview draft edit-batch --draft-id ID --expected-draft-revision N --operations-json '[{"op":"set","path":"/pointer","value":"SCALAR"}]' --json
 gjc deep-interview draft show    --draft-id ID --json
 gjc deep-interview draft check   --draft-id ID --json
-gjc deep-interview draft rebase  --draft-id ID --expected-draft-revision N --to-state-revision N --json
+gjc deep-interview draft rebase  --draft-id ID --expected-draft-revision N (--to-current|--to-state-revision N) --json
 gjc deep-interview draft discard --draft-id ID --expected-draft-revision N --json
 ```
 
-Create returns `draft_id`, `draft_revision`, and state `base_revision`. Every edit/rebase is CAS on `draft_revision` and returns its next value. `check` validates the complete bounded payload against current state without consuming or mutating it; it reports when the draft base is stale. To rebase a state-stale active draft, pass the caller-observed current state revision as `--to-state-revision`, then check again. Drafts are private workspace/session-bound CLI storage, atomically written with restrictive permissions, automatically expired/cleaned up, and retained briefly after consumption for idempotent receipts. Do not read, copy, or reconstruct draft storage.
+Create returns `draft_id`, `draft_revision`, and state `base_revision`. Every edit/rebase is CAS on `draft_revision` and returns its next value. Prefer one bounded `edit-batch` when several scalar edits form one payload update; the batch applies atomically and increments the draft revision once. `check` decodes the complete payload and dry-runs the same state transition as consume without mutating it; `applicable_at_state_revision` identifies the validated snapshot and `stale` reports a different draft base. To rebase a state-stale active draft, use the returned recovery action or `--to-current`; rebase validates the transition against current state before changing the base. Drafts are private workspace/session-bound CLI storage, atomically written with restrictive permissions, automatically expired/cleaned up, and retained briefly after consumption for idempotent receipts. Do not read, copy, or reconstruct draft storage.
 
 Use only kind-allowed JSON-pointer paths. `set` writes one scalar: use `--value` for strings/numbers/booleans, `--null` for null, and `--value-file` only for bounded text. A valueless `append` on a missing object-item array appends an `{}` scaffold; on a missing scalar-item array it initializes `[]`. An existing scalar-item array still requires `--value` or `--value-file` for `append`. `remove` takes no value. Build arrays and nested objects with scaffolds and scalar edits, never inline JSON.
+
+<!-- BEGIN GENERATED DEEP-INTERVIEW DRAFT PATHS -->
+## Generated editable draft paths
+
+This table is generated from the runtime draft descriptors. It defines paths accepted by `draft edit`/`edit-batch`; `draft check` additionally evaluates state-dependent transition invariants.
+
+### `initialize-context`
+
+| Path | Descriptor |
+|---|---|
+| `/` | object required |
+| `/type` | enum required enum=greenfield|brownfield |
+| `/interview_id` | id optional |
+| `/initial_idea` | text optional |
+| `/initial_context_summary` | text optional |
+| `/codebase_context` | text optional |
+| `/challenge_modes_used` | array optional maxItems=64 |
+| `/challenge_modes_used/<index>` | string required |
+| `/threshold` | score required |
+| `/threshold_source` | text optional |
+| `/language` | text optional |
+| `/trace` | array optional maxItems=64 |
+| `/trace/<index>` | string required |
+| `/trace_summary` | text optional |
+
+### `confirm-topology`
+
+| Path | Descriptor |
+|---|---|
+| `/` | object required |
+| `/components` | array required maxItems=64 |
+| `/components/<index>` | object required |
+| `/components/<index>/id` | id required |
+| `/components/<index>/name` | string optional |
+| `/components/<index>/status` | enum optional enum=active|deferred |
+| `/components/<index>/active` | boolean optional |
+| `/deferred_components` | array required maxItems=64 |
+| `/deferred_components/<index>` | id required |
+
+### `record-answer`
+
+| Path | Descriptor |
+|---|---|
+| `/` | object required |
+| `/question` | text required |
+| `/answer` | object required |
+| `/answer/selected_options` | array required maxItems=64 |
+| `/answer/selected_options/<index>` | string required |
+| `/answer/custom_input` | text required nullable |
+
+### `apply-round-result`
+
+| Path | Descriptor |
+|---|---|
+| `/` | object required |
+| `/global_scores` | object required |
+| `/global_scores/goal` | score required |
+| `/global_scores/constraints` | score required |
+| `/global_scores/criteria` | score required |
+| `/global_scores/context` | score required |
+| `/component_updates` | array optional maxItems=12 |
+| `/component_updates/<index>` | object required |
+| `/component_updates/<index>/component_id` | id required |
+| `/component_updates/<index>/scores` | object required |
+| `/component_updates/<index>/scores/goal` | score required |
+| `/component_updates/<index>/scores/constraints` | score required |
+| `/component_updates/<index>/scores/criteria` | score required |
+| `/component_updates/<index>/scores/context` | score required |
+| `/targeting` | object optional |
+| `/targeting/target_component_id` | id required |
+| `/targeting/target_dimension` | enum required enum=goal|constraints|criteria|context |
+| `/targeting/weakest_component_id` | id required |
+| `/targeting/weakest_dimension` | enum required enum=goal|constraints|criteria|context |
+| `/targeting/last_targeted_component_id` | id required nullable |
+| `/triggers` | array optional maxItems=16 |
+| `/triggers/<index>` | object required |
+| `/triggers/<index>/kind` | enum required enum=A|B|C|D |
+| `/triggers/<index>/name` | text required |
+| `/triggers/<index>/status` | enum required enum=active|disputed|unresolved |
+| `/triggers/<index>/component` | id required |
+| `/triggers/<index>/dimension` | enum required enum=goal|constraints|criteria|context |
+| `/triggers/<index>/evidence` | text optional |
+| `/triggers/<index>/contradictedFactId` | id optional |
+| `/triggers/<index>/rationale` | text optional |
+| `/fact_ops` | array optional maxItems=32 |
+| `/fact_ops/<index>` | object required |
+| `/fact_ops/<index>/op` | enum required enum=add|dispute|supersede |
+| `/fact_ops/<index>/id` | id required |
+| `/fact_ops/<index>/statement` | text optional |
+| `/fact_ops/<index>/component` | text optional |
+| `/fact_ops/<index>/dimension` | enum optional enum=goal|constraints|criteria|context |
+| `/fact_ops/<index>/evidence` | text optional |
+| `/fact_ops/<index>/target_id` | id optional |
+| `/ontology` | object optional |
+| `/ontology/entities` | array required maxItems=32 |
+| `/ontology/entities/<index>` | object required |
+| `/ontology/entities/<index>/id` | id required |
+| `/ontology/entities/<index>/name` | text required |
+| `/ontology/entities/<index>/type` | text required |
+| `/ontology/entities/<index>/fields` | array required maxItems=16 |
+| `/ontology/entities/<index>/fields/<index>` | text required |
+| `/ontology/relationships` | array required maxItems=16 |
+| `/ontology/relationships/<index>` | object required |
+| `/ontology/relationships/<index>/id` | id required |
+| `/ontology/relationships/<index>/from_entity_id` | id required |
+| `/ontology/relationships/<index>/to_entity_id` | id required |
+| `/ontology/relationships/<index>/type` | text required |
+| `/ontology/reasoning` | array required maxItems=32 |
+| `/ontology/reasoning/<index>` | object required |
+| `/ontology/reasoning/<index>/statement` | text required |
+| `/ontology/reasoning/<index>/evidence` | text optional |
+| `/bookkeeping` | object optional |
+| `/bookkeeping/resolution` | enum required enum=auto_research_accepted|auto_answer|direct|refined|cited_confirmation |
+| `/bookkeeping/round_ids` | array optional maxItems=32 |
+| `/bookkeeping/round_ids/<index>` | id required |
+| `/bookkeeping/counter_deltas` | object optional |
+| `/bookkeeping/counter_deltas/<id>` | safe-int required |
+
+<!-- END GENERATED DEEP-INTERVIEW DRAFT PATHS -->
 
 After check, consume through the matching typed command: `gjc deep-interview initialize-context|confirm-topology|record-answer|apply-round-result --draft-id ID --expected-draft-revision <latest_draft_revision> --json`. Consume applies state CAS from the draft base revision, stamps a receipt, and marks the draft consumed. There is no public `draft consume` command. `record-answer` remains recorder-first: draft recovery is only for an answer shell the `ask` recorder did not persist. Full payload/envelope reconstruction is forbidden in normal flow.
 

@@ -227,6 +227,71 @@ describe("deep-interview drafts", () => {
 		}
 	});
 
+	it("applies a bounded edit batch atomically with one draft revision", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-workspace-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-root-"));
+		const prior = process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
+		process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = root;
+		try {
+			await seedState(cwd, "batch-session");
+			const created = await runDeepInterviewDraftCommand(
+				["create", "--for", "initialize-context", "--session-id", "batch-session"],
+				cwd,
+			);
+			const draft = JSON.parse(created.stdout!).draft as { id: string; draft_revision: number };
+			const edited = await runDeepInterviewDraftCommand(
+				[
+					"edit-batch",
+					"--draft-id",
+					draft.id,
+					"--expected-draft-revision",
+					String(draft.draft_revision),
+					"--operations-json",
+					JSON.stringify([
+						{ op: "set", path: "/type", value: "greenfield" },
+						{ op: "set", path: "/threshold", value: "0.5" },
+					]),
+				],
+				cwd,
+			);
+			const updated = JSON.parse(edited.stdout!).draft as {
+				draft_revision: number;
+				payload: Record<string, unknown>;
+			};
+			expect(updated.draft_revision).toBe(2);
+			expect(updated.payload).toMatchObject({ type: "greenfield", threshold: 0.5 });
+			const rejected = await runDeepInterviewDraftCommand(
+				[
+					"edit-batch",
+					"--draft-id",
+					draft.id,
+					"--expected-draft-revision",
+					"2",
+					"--operations-json",
+					JSON.stringify([
+						{ op: "set", path: "/threshold", value: "0.75" },
+						{ op: "set", path: "/unknown", value: "rejected" },
+					]),
+				],
+				cwd,
+			);
+			expect(rejected.status).toBe(2);
+			expect(rejected.stderr).toContain("DI_DRAFT_INVALID_PATH");
+			const unchanged = JSON.parse(
+				(await runDeepInterviewDraftCommand(["show", "--draft-id", draft.id], cwd)).stdout!,
+			).draft as { draft_revision: number; payload: Record<string, unknown> };
+			expect(unchanged).toMatchObject({ draft_revision: 2, payload: { threshold: 0.5 } });
+			expect(
+				JSON.parse((await runDeepInterviewDraftCommand(["check", "--draft-id", draft.id], cwd)).stdout!),
+			).toMatchObject({ valid: true, draft_revision: 2 });
+		} finally {
+			if (prior === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
+			else process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = prior;
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects sparse indexes, object values, and required field removal", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-workspace-"));
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-root-"));

@@ -240,6 +240,7 @@ describe("CLI-owned deep-interview draft consumption", () => {
 	});
 	it("applies a complete greenfield result through a CLI-owned draft", async () => {
 		const env = await workspace();
+		const priorReceiptFailure = process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
 		try {
 			await kickoff(env.cwd, "result");
 			const setup = await setSetup(env.cwd, await create(env.cwd, "initialize-context", "result"));
@@ -291,11 +292,49 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				),
 			);
 			json(await consume(env.cwd, "record-answer", answer));
-			const complete = await populateCompleteResult(
+			let complete = await populateCompleteResult(
 				env.cwd,
 				await create(env.cwd, "apply-round-result", "result", ["--round-key", "interview-1::rid:r1"]),
 			);
-			expect(json(await consume(env.cwd, "apply-round-result", complete))).toMatchObject({ consumed: true });
+			complete = await edit(env.cwd, complete.id, complete.draft_revision, "set", "/global_scores/goal", "0.5");
+			const invalidCheck = json(await native(env.cwd, ["draft", "check", "--draft-id", complete.id, "--json"]));
+			expect(invalidCheck).toMatchObject({
+				valid: false,
+				stale: false,
+				applicable_at_state_revision: 3,
+				issues: [
+					{
+						code: "DI_STATE_SCHEMA_INVALID",
+						invariant: "global_score_equals_weakest_active_component",
+						path: "/global_scores/goal",
+						expected: 1,
+						actual: 0.5,
+					},
+				],
+			});
+			complete = await edit(env.cwd, complete.id, complete.draft_revision, "set", "/global_scores/goal", "1");
+			expect(json(await native(env.cwd, ["draft", "check", "--draft-id", complete.id, "--json"]))).toMatchObject({
+				valid: true,
+				stale: false,
+				applicable_at_state_revision: 3,
+				draft_revision: complete.draft_revision,
+			});
+			process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE = "1";
+			expect(await consume(env.cwd, "apply-round-result", complete)).toMatchObject({
+				status: 2,
+				stderr: expect.stringContaining("DI_DRAFT_RECEIPT_PERSIST_FAILED"),
+			});
+			expect((await state(env.cwd, "result")).state_revision).toBe(4);
+			expect(json(await native(env.cwd, ["draft", "show", "--draft-id", complete.id, "--json"]))).toMatchObject({
+				draft: { attempt: { state_revision: 3 } },
+			});
+			delete process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
+			const replayed = json(await consume(env.cwd, "apply-round-result", complete));
+			expect(replayed).toMatchObject({
+				consumed: true,
+				receipt: { native_projection: { transition: { lifecycle: "scored" } } },
+			});
+			expect((await state(env.cwd, "result")).state_revision).toBe(4);
 			const projected = await state(env.cwd, "result");
 			expect(projected.current_phase).toBe("interviewing");
 			expect(
@@ -306,6 +345,8 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				criteria: 1,
 			});
 		} finally {
+			if (priorReceiptFailure === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
+			else process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE = priorReceiptFailure;
 			await env.restore();
 		}
 	});
@@ -437,8 +478,7 @@ describe("CLI-owned deep-interview draft consumption", () => {
 					prepared.id,
 					"--expected-draft-revision",
 					String(prepared.draft_revision),
-					"--to-state-revision",
-					"1",
+					"--to-current",
 					"--json",
 				]),
 			);

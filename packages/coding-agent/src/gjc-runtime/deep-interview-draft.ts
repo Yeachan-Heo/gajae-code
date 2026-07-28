@@ -10,11 +10,21 @@ import {
 	type DraftDescriptor,
 	type DraftLeafDescriptor,
 	type DraftObjectDescriptor,
+	decodeApplyRoundResultPayload,
 	deepInterviewDraftSchema,
 	validateDraftPayload,
 } from "./deep-interview-payload";
 import { type DeepInterviewRepairResult, runDeepInterviewRepairCommand } from "./deep-interview-repair";
-import { canonicalDeepInterviewJson, validateDeepInterviewV1Envelope } from "./deep-interview-state";
+import {
+	applyDeepInterviewRoundResultV1,
+	canonicalDeepInterviewJson,
+	DeepInterviewInvariantError,
+	deepInterviewAnswerIdentityEqual,
+	deepInterviewRoundResultDigest,
+	deriveRoundKey,
+	questionHash,
+	validateDeepInterviewV1Envelope,
+} from "./deep-interview-state";
 import { modeStatePath } from "./session-layout";
 import {
 	isNativeDeepInterviewV1,
@@ -52,7 +62,12 @@ interface Draft {
 	identity: Record<string, string>;
 	payload: Record<string, unknown>;
 	receipt?: Record<string, unknown>;
-	attempt?: { state_revision: number; request_digest: string; effect_digest: string };
+	attempt?: {
+		state_revision: number;
+		request_digest: string;
+		effect_digest: string;
+		expected_round_result_digest?: string;
+	};
 }
 
 export interface DeepInterviewDraftResult {
@@ -62,12 +77,42 @@ export interface DeepInterviewDraftResult {
 }
 
 function response(status: number, value: unknown): DeepInterviewDraftResult {
-	return status === 0
-		? { status, stdout: `${JSON.stringify(value)}\n` }
-		: { status, stderr: `${JSON.stringify({ ok: false, issue: { code: value, message: value } })}\n` };
+	if (status === 0) return { status, stdout: `${JSON.stringify(value)}\n` };
+	const issue =
+		value && typeof value === "object" && !Array.isArray(value)
+			? value
+			: { code: String(value), message: String(value) };
+	return { status, stderr: `${JSON.stringify({ ok: false, issue })}\n` };
 }
+
+function issue(error: unknown): Record<string, unknown> {
+	if (error instanceof DeepInterviewInvariantError) return { message: error.issue.code, ...error.issue };
+	const errorCode = error instanceof Error ? error.message : "DI_DRAFT_INTERNAL_ERROR";
+	return { code: errorCode, message: errorCode };
+}
+
 function code(error: unknown): string {
-	return error instanceof Error ? error.message : "DI_DRAFT_INTERNAL_ERROR";
+	return String(issue(error).code);
+}
+
+function statusForCode(errorCode: string): number {
+	if (
+		[
+			"DI_SETUP_CONFLICT",
+			"DI_TOPOLOGY_CONFLICT",
+			"DI_ANSWER_CONFLICT",
+			"DI_SHELL_CONFLICT",
+			"DI_ROUND_RESULT_CONFLICT",
+		].includes(errorCode)
+	)
+		return 4;
+	if (
+		errorCode === "DI_STATE_SCHEMA_INVALID" ||
+		errorCode === "DI_STATE_REVISION_CONFLICT" ||
+		errorCode === "DI_ROUND_NOT_FOUND"
+	)
+		return 3;
+	return 2;
 }
 function inside(parent: string, child: string): boolean {
 	const relative = path.relative(parent, child);
@@ -262,7 +307,7 @@ function args(input: readonly string[]): Map<string, string> {
 	for (let i = 1; i < input.length; i++) {
 		const key = input[i];
 		if (!key.startsWith("--") || key.includes("=") || flags.has(key)) throw new Error("DI_INVALID_ARGUMENT");
-		if (key === "--null") {
+		if (key === "--null" || key === "--to-current") {
 			flags.set(key, "true");
 			continue;
 		}
@@ -286,7 +331,10 @@ function required(flags: Map<string, string>, name: string): string {
 	if (!value) throw new Error("DI_INVALID_ARGUMENT");
 	return value;
 }
-async function revision(cwd: string, session: string): Promise<{ revision: number; state: Record<string, unknown> }> {
+async function revision(
+	cwd: string,
+	session: string,
+): Promise<{ revision: number; state: Record<string, unknown>; envelope: Record<string, unknown> }> {
 	const stateFile = modeStatePath(cwd, session, "deep-interview");
 	const observed = await readExistingStateForMutation(stateFile);
 	if (observed.kind === "absent") throw new Error("DI_STATE_ABSENT");
@@ -311,7 +359,7 @@ async function revision(cwd: string, session: string): Promise<{ revision: numbe
 		throw new Error("DI_STATE_SCHEMA_INVALID");
 	const state = asRecord(observed.value.state);
 	if (!Object.keys(state).length) throw new Error("DI_STATE_SCHEMA_INVALID");
-	return { revision: stateRevision as number, state };
+	return { revision: stateRevision as number, state, envelope: observed.value };
 }
 function asRecord(value: unknown): Record<string, unknown> {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -479,6 +527,144 @@ async function editPayload(draft: Draft, flags: Map<string, string>): Promise<vo
 	}
 	if (!Array.isArray(parent)) parent[key] = output;
 }
+
+async function editPayloadBatch(draft: Draft, encoded: string): Promise<void> {
+	let operations: unknown;
+	try {
+		operations = JSON.parse(encoded);
+	} catch {
+		throw new Error("DI_DRAFT_INVALID_BATCH");
+	}
+	if (!Array.isArray(operations) || operations.length === 0 || operations.length > 64)
+		throw new Error("DI_DRAFT_INVALID_BATCH");
+	for (const value of operations) {
+		const operation = asRecord(value);
+		if (
+			Object.keys(operation).some(key => !["op", "path", "value", "null"].includes(key)) ||
+			typeof operation.op !== "string" ||
+			typeof operation.path !== "string" ||
+			(operation.value !== undefined && typeof operation.value !== "string") ||
+			(operation.null !== undefined && operation.null !== true) ||
+			(operation.value !== undefined && operation.null === true)
+		)
+			throw new Error("DI_DRAFT_INVALID_BATCH");
+		const flags = new Map<string, string>([
+			["--op", operation.op],
+			["--path", operation.path],
+		]);
+		if (typeof operation.value === "string") flags.set("--value", operation.value);
+		if (operation.null === true) flags.set("--null", "true");
+		await editPayload(draft, flags);
+	}
+}
+
+function validateDraftTransition(draft: Draft, current: Awaited<ReturnType<typeof revision>>): void {
+	validateDraftPayload(draft.kind, draft.payload, current.state);
+	if (draft.kind === "initialize-context") {
+		const unresolvedSetup =
+			current.state.setup !== null &&
+			typeof current.state.setup === "object" &&
+			!Array.isArray(current.state.setup) &&
+			(current.state.setup as Record<string, unknown>).status === "unresolved";
+		for (const [key, value] of Object.entries(draft.payload)) {
+			if (
+				Object.hasOwn(current.state, key) &&
+				canonicalDeepInterviewJson(current.state[key]) !== canonicalDeepInterviewJson(value) &&
+				(key !== "type" || !unresolvedSetup || current.envelope.trace !== undefined)
+			)
+				throw new Error("DI_SETUP_CONFLICT");
+		}
+		return;
+	}
+	if (draft.kind === "confirm-topology") {
+		const existing =
+			current.state.topology && typeof current.state.topology === "object" && !Array.isArray(current.state.topology)
+				? (current.state.topology as Record<string, unknown>)
+				: undefined;
+		const isEmptyPending =
+			existing?.status === "pending" &&
+			Array.isArray(existing.components) &&
+			existing.components.length === 0 &&
+			Array.isArray(existing.deferred_components) &&
+			existing.deferred_components.length === 0;
+		if (existing && !isEmptyPending) {
+			const { status: _status, confirmed_at: _confirmedAt, ...prior } = existing;
+			if (canonicalDeepInterviewJson(prior) !== canonicalDeepInterviewJson(draft.payload))
+				throw new Error("DI_TOPOLOGY_CONFLICT");
+		}
+		return;
+	}
+	if (draft.kind === "record-answer") {
+		const round = Number(draft.identity.round);
+		const questionId = draft.identity["question-id"];
+		if (!Number.isSafeInteger(round) || !questionId) throw new Error("DI_DRAFT_INVALID_PAYLOAD");
+		const roundId = draft.identity["round-id"] || undefined;
+		const answer = asRecord(draft.payload.answer);
+		const key = deriveRoundKey(
+			typeof current.state.interview_id === "string" ? current.state.interview_id : undefined,
+			{ round, round_id: roundId, questionId },
+		);
+		const existing = (Array.isArray(current.state.rounds) ? current.state.rounds : [])
+			.map(asRecord)
+			.find(candidate => candidate.round_key === key);
+		if (
+			existing &&
+			!deepInterviewAnswerIdentityEqual(existing as Parameters<typeof deepInterviewAnswerIdentityEqual>[0], {
+				round,
+				round_key: key,
+				round_id: roundId,
+				question_id: questionId,
+				component: draft.identity["component-id"] || undefined,
+				dimension: draft.identity.dimension || undefined,
+				question_text: String(draft.payload.question),
+				question_hash: questionHash(String(draft.payload.question)),
+				selected_options: Array.isArray(answer.selected_options)
+					? answer.selected_options.filter((value): value is string => typeof value === "string")
+					: [],
+				custom_input: typeof answer.custom_input === "string" ? answer.custom_input : undefined,
+			})
+		)
+			throw new Error(existing.lifecycle === "scored" ? "DI_SHELL_CONFLICT" : "DI_ANSWER_CONFLICT");
+		return;
+	}
+	if (!draft.round_key) throw new Error("DI_PENDING_SHELL_NOT_FOUND");
+	const result = decodeApplyRoundResultPayload(draft.payload, current.state);
+	applyDeepInterviewRoundResultV1(current.envelope, draft.round_key, result, new Date().toISOString());
+}
+
+function expectedRoundResultDigest(draft: Draft, state: Record<string, unknown>): string | undefined {
+	if (draft.kind !== "apply-round-result" || !draft.round_key) return undefined;
+	const shell = (Array.isArray(state.rounds) ? state.rounds : [])
+		.map(asRecord)
+		.find(round => round.round_key === draft.round_key);
+	if (shell?.lifecycle !== "answered" && shell?.lifecycle !== "pending_scoring") return undefined;
+	if (typeof shell.question_id !== "string" || !Number.isSafeInteger(shell.round)) return undefined;
+	const result = decodeApplyRoundResultPayload(draft.payload, state);
+	return deepInterviewRoundResultDigest({
+		round: Number(shell.round),
+		question_id: shell.question_id,
+		round_id: typeof shell.round_id === "string" ? shell.round_id : null,
+		result,
+	});
+}
+
+function applyRoundResultCommitted(draft: Draft, state: Record<string, unknown>): boolean {
+	if (draft.kind !== "apply-round-result" || !draft.round_key) return false;
+	const shell = (Array.isArray(state.rounds) ? state.rounds : [])
+		.map(asRecord)
+		.find(round => round.round_key === draft.round_key);
+	if (shell?.lifecycle !== "scored" || typeof shell.question_id !== "string" || !Number.isSafeInteger(shell.round))
+		return false;
+	const expectedDigest =
+		draft.attempt?.expected_round_result_digest ??
+		deepInterviewRoundResultDigest({
+			round: Number(shell.round),
+			question_id: shell.question_id,
+			round_id: typeof shell.round_id === "string" ? shell.round_id : null,
+			result: decodeApplyRoundResultPayload(draft.payload, state),
+		});
+	return shell.round_result_digest === expectedDigest;
+}
 function requestDigest(draft: Draft): string {
 	return createHash("sha256")
 		.update(
@@ -514,7 +700,11 @@ function mutationEffectDigest(draft: Draft, state: Record<string, unknown>): str
 				? state.topology
 				: draft.kind === "record-answer"
 					? state.rounds
-					: undefined;
+					: draft.kind === "apply-round-result"
+						? (Array.isArray(state.rounds) ? state.rounds : [])
+								.map(asRecord)
+								.find(round => round.round_key === draft.round_key)
+						: undefined;
 	return createHash("sha256")
 		.update(canonicalDeepInterviewJson(evidence ?? null))
 		.digest("hex");
@@ -547,7 +737,7 @@ function committedDraftMutation(draft: Draft, state: Record<string, unknown>): b
 					round.lifecycle === "answered",
 			);
 	}
-	return false;
+	return applyRoundResultCommitted(draft, state);
 }
 
 async function injectCompetingWrite(cwd: string, draft: Draft, revision: number): Promise<void> {
@@ -580,7 +770,7 @@ async function runDeepInterviewDraftCommandInternal(
 		if (
 			!action ||
 			![
-				...["create", "edit", "show", "check", "rebase", "discard"],
+				...["create", "edit", "edit-batch", "show", "check", "rebase", "discard"],
 				...(allowInternalConsume ? ["consume-internal"] : []),
 			].includes(action)
 		)
@@ -599,9 +789,10 @@ async function runDeepInterviewDraftCommandInternal(
 				"--dimension",
 			],
 			edit: ["--draft-id", "--expected-draft-revision", "--op", "--path", "--value", "--value-file", "--null"],
+			"edit-batch": ["--draft-id", "--expected-draft-revision", "--operations-json"],
 			show: ["--draft-id"],
 			check: ["--draft-id"],
-			rebase: ["--draft-id", "--expected-draft-revision", "--to-state-revision"],
+			rebase: ["--draft-id", "--expected-draft-revision", "--to-state-revision", "--to-current"],
 			discard: ["--draft-id", "--expected-draft-revision"],
 			"consume-internal": ["--draft-id", "--expected-draft-revision", "--kind"],
 		};
@@ -664,18 +855,21 @@ async function runDeepInterviewDraftCommandInternal(
 			await cleanup(cwd);
 			if (action === "show") return response(0, { ok: true, draft });
 			if (action === "discard") {
+				if (draft.attempt) throw new Error("DI_DRAFT_ATTEMPT_UNCERTAIN");
 				if (Number(required(flags, "--expected-draft-revision")) !== draft.draft_revision)
 					throw new Error("DI_DRAFT_REVISION_CONFLICT");
 				await fs.unlink(await file(cwd, id));
 				return response(0, { ok: true, draft_id: id, discarded: true });
 			}
-			if (action === "edit") {
+			if (action === "edit" || action === "edit-batch") {
+				if (draft.attempt) throw new Error("DI_DRAFT_ATTEMPT_UNCERTAIN");
 				if (
 					draft.status !== "active" ||
 					Number(required(flags, "--expected-draft-revision")) !== draft.draft_revision
 				)
 					throw new Error("DI_DRAFT_REVISION_CONFLICT");
-				await editPayload(draft, flags);
+				if (action === "edit") await editPayload(draft, flags);
+				else await editPayloadBatch(draft, required(flags, "--operations-json"));
 				draft.draft_revision++;
 				draft.updated_at = new Date().toISOString();
 				await write(cwd, draft);
@@ -688,9 +882,19 @@ async function runDeepInterviewDraftCommandInternal(
 				)
 					throw new Error("DI_DRAFT_REVISION_CONFLICT");
 				const current = await revision(cwd, draft.session_id);
-				if (Number(required(flags, "--to-state-revision")) !== current.revision)
-					throw new Error("DI_STATE_REVISION_CONFLICT");
-				validateDraftPayload(draft.kind, draft.payload, current.state);
+				const hasExplicitRevision = flags.has("--to-state-revision");
+				if (hasExplicitRevision === flags.has("--to-current")) throw new Error("DI_INVALID_ARGUMENT");
+				if (hasExplicitRevision && Number(required(flags, "--to-state-revision")) !== current.revision)
+					return response(3, {
+						code: "DI_STATE_REVISION_CONFLICT",
+						message: "DI_STATE_REVISION_CONFLICT",
+						current_state_revision: current.revision,
+						draft_base_revision: draft.base_revision,
+						recovery: { action: "rebase_to_current" },
+					});
+				if (draft.attempt && draft.attempt.effect_digest !== mutationEffectDigest(draft, current.state))
+					throw new Error("DI_DRAFT_ATTEMPT_UNCERTAIN");
+				validateDraftTransition(draft, current);
 				draft.base_revision = current.revision;
 				draft.attempt = undefined;
 				draft.draft_revision++;
@@ -706,22 +910,46 @@ async function runDeepInterviewDraftCommandInternal(
 			if (draft.status === "consumed")
 				return response(0, { ok: true, draft_id: id, consumed: true, receipt: draft.receipt });
 			const current = await revision(cwd, draft.session_id);
-			let schemaIssue: string | undefined;
+			let validationIssue: Record<string, unknown> | undefined;
 			try {
-				validateDraftPayload(draft.kind, draft.payload, current.state);
+				validateDraftTransition(draft, current);
 			} catch (error) {
-				schemaIssue = code(error);
+				validationIssue = issue(error);
 			}
 			if (action === "check")
 				return response(0, {
 					ok: true,
 					draft_id: id,
-					valid: schemaIssue === undefined,
+					valid: validationIssue === undefined,
 					state_revision: current.revision,
+					applicable_at_state_revision: current.revision,
+					draft_revision: draft.draft_revision,
 					stale: draft.base_revision !== current.revision,
-					issues: schemaIssue ? [{ code: schemaIssue, message: schemaIssue }] : [],
+					issues: validationIssue ? [validationIssue] : [],
 				});
-			if (schemaIssue) throw new Error(schemaIssue);
+			if (validationIssue) return response(statusForCode(String(validationIssue.code)), validationIssue);
+			if (!draft.attempt && draft.base_revision !== current.revision)
+				return response(3, {
+					code: "DI_STATE_REVISION_CONFLICT",
+					message: "DI_STATE_REVISION_CONFLICT",
+					current_state_revision: current.revision,
+					draft_base_revision: draft.base_revision,
+					recovery: {
+						action: "rebase",
+						command: [
+							"gjc",
+							"deep-interview",
+							"draft",
+							"rebase",
+							"--draft-id",
+							draft.id,
+							"--expected-draft-revision",
+							String(draft.draft_revision),
+							"--to-current",
+							"--json",
+						],
+					},
+				});
 			const legacy = [
 				draft.kind,
 				"--json",
@@ -730,7 +958,7 @@ async function runDeepInterviewDraftCommandInternal(
 				"--schema-version",
 				"1",
 				"--expected-revision",
-				String(draft.attempt ? current.revision : draft.base_revision),
+				String(draft.attempt?.state_revision ?? draft.base_revision),
 			];
 			if (draft.kind === "initialize-context" || draft.kind === "confirm-topology")
 				legacy.push("--input-json", JSON.stringify(draft.payload));
@@ -778,40 +1006,80 @@ async function runDeepInterviewDraftCommandInternal(
 				);
 				if (typeof shell.round_id === "string") legacy.push("--round-id", shell.round_id);
 			}
-			const replayingAttempt = draft.attempt !== undefined;
+			let replayingAttempt = false;
 			if (!draft.attempt) {
+				const expectedResultDigest = expectedRoundResultDigest(draft, current.state);
 				draft.attempt = {
 					state_revision: current.revision,
 					request_digest: requestDigest(draft),
 					effect_digest: mutationEffectDigest(draft, current.state),
+					...(expectedResultDigest === undefined ? {} : { expected_round_result_digest: expectedResultDigest }),
 				};
 				draft.updated_at = new Date().toISOString();
 				await write(cwd, draft);
 				await injectCompetingWrite(cwd, draft, current.revision);
-			} else if (
-				current.revision !== draft.attempt.state_revision + 1 ||
-				!attemptMatchesDraft(draft) ||
-				draft.attempt.effect_digest === mutationEffectDigest(draft, current.state) ||
-				!committedDraftMutation(draft, current.state)
-			) {
-				throw new Error("DI_STATE_REVISION_CONFLICT");
+			} else {
+				if (!attemptMatchesDraft(draft)) throw new Error("DI_STATE_REVISION_CONFLICT");
+				const currentEffectDigest = mutationEffectDigest(draft, current.state);
+				const uncommittedRetry =
+					draft.base_revision === draft.attempt.state_revision &&
+					current.revision === draft.attempt.state_revision &&
+					currentEffectDigest === draft.attempt.effect_digest;
+				replayingAttempt =
+					current.revision === draft.attempt.state_revision + 1 &&
+					currentEffectDigest !== draft.attempt.effect_digest &&
+					committedDraftMutation(draft, current.state);
+				if (!uncommittedRetry && !replayingAttempt) throw new Error("DI_STATE_REVISION_CONFLICT");
+				if (replayingAttempt) legacy[legacy.indexOf("--expected-revision") + 1] = String(current.revision);
 			}
+			const persistedAttempt = draft.attempt;
 			const result: DeepInterviewRepairResult = await runDeepInterviewRepairCommand(legacy, cwd);
 			if (result.status !== 0) {
-				if (result.stderr?.includes("DI_REVISION_CONFLICT")) throw new Error("DI_STATE_REVISION_CONFLICT");
+				const after = await revision(cwd, draft.session_id).catch(() => undefined);
+				if (result.stderr?.includes("DI_REVISION_CONFLICT"))
+					return response(3, {
+						code: "DI_STATE_REVISION_CONFLICT",
+						message: "DI_STATE_REVISION_CONFLICT",
+						current_state_revision: after?.revision ?? current.revision,
+						draft_base_revision: draft.base_revision,
+						recovery: {
+							action: "rebase",
+							command: [
+								"gjc",
+								"deep-interview",
+								"draft",
+								"rebase",
+								"--draft-id",
+								draft.id,
+								"--expected-draft-revision",
+								String(draft.draft_revision),
+								"--to-current",
+								"--json",
+							],
+						},
+					});
 				return result;
+			}
+			const receipt =
+				replayingAttempt && draft.receipt
+					? draft.receipt
+					: (JSON.parse(result.stdout ?? "{}") as Record<string, unknown>);
+			if (process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE === "1" && !replayingAttempt) {
+				draft.status = "active";
+				draft.receipt = receipt;
+				draft.attempt = persistedAttempt;
+				await write(cwd, draft);
+				throw new Error("DI_DRAFT_RECEIPT_PERSIST_FAILED");
 			}
 			draft.status = "consumed";
 			draft.updated_at = new Date().toISOString();
-			draft.receipt = JSON.parse(result.stdout ?? "{}") as Record<string, unknown>;
+			draft.receipt = receipt;
 			draft.attempt = undefined;
-			if (process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE === "1" && !replayingAttempt)
-				throw new Error("DI_DRAFT_RECEIPT_PERSIST_FAILED");
 			await write(cwd, draft);
 			return response(0, { ok: true, draft_id: id, consumed: true, receipt: draft.receipt });
 		});
 	} catch (error) {
-		return response(code(error) === "DI_STATE_REVISION_CONFLICT" ? 3 : 2, code(error));
+		return response(statusForCode(code(error)), issue(error));
 	}
 }
 export async function runDeepInterviewDraftCommand(

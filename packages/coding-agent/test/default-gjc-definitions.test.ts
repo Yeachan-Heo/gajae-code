@@ -129,6 +129,7 @@ describe("default GJC definitions", () => {
 		expect(verbs.filter(verb => verb.name.startsWith("draft ")).map(verb => verb.name)).toEqual([
 			"draft create",
 			"draft edit",
+			"draft edit-batch",
 			"draft show",
 			"draft check",
 			"draft rebase",
@@ -233,11 +234,18 @@ describe("default GJC definitions", () => {
 			{ name: "value", type: "string", required: false },
 			{ name: "value-file", type: "string", required: false },
 		]);
+		expect(argsFor("draft edit-batch")).toEqual([
+			{ name: "draft-id", type: "string", required: true },
+			{ name: "expected-draft-revision", type: "number", required: true },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "operations-json", type: "string", required: true },
+		]);
 		expect(argsFor("draft rebase")).toEqual([
 			{ name: "draft-id", type: "string", required: true },
 			{ name: "expected-draft-revision", type: "number", required: true },
 			{ name: "json", type: "boolean", required: true },
-			{ name: "to-state-revision", type: "number", required: true },
+			{ name: "to-current", type: "boolean", required: false },
+			{ name: "to-state-revision", type: "number", required: false },
 		]);
 		for (const verb of ["draft show", "draft check"]) {
 			expect(argsFor(verb)).toEqual([
@@ -662,7 +670,9 @@ Project executor override body.
 		expect(ultragoal).toContain("not rubber-stamp its earlier verdict");
 
 		// Fallback routing mirrors the existing subagent resume outcomes.
-		expect(ultragoal).toContain("`context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback");
+		expect(ultragoal).toContain(
+			"`context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback",
+		);
 
 		// Terminal critic resumption on iteration.
 		expect(ultragoal).toContain("resume the prior terminal-critic subagent when resumable");

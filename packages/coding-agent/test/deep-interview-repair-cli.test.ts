@@ -1361,7 +1361,7 @@ describe("deep-interview typed repair CLI", () => {
 				["draft", "create", "--for", "initialize-context", "--session-id", session, "--json"],
 				cwd,
 			);
-			expect(result.status).toBe(2);
+			expect(result.status).toBe(3);
 			expect(JSON.parse(result.stderr!)).toEqual({
 				ok: false,
 				issue: { code: "DI_STATE_SCHEMA_INVALID", message: "DI_STATE_SCHEMA_INVALID" },

@@ -336,6 +336,7 @@
       {
         "appliesToVerbs": [
           "draft edit",
+          "draft edit-batch",
           "draft show",
           "draft check",
           "draft rebase",
@@ -352,6 +353,7 @@
       {
         "appliesToVerbs": [
           "draft edit",
+          "draft edit-batch",
           "draft rebase",
           "draft discard",
           "initialize-context",
@@ -407,16 +409,31 @@
       },
       {
         "appliesToVerbs": [
+          "draft edit-batch"
+        ],
+        "name": "operations-json",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
           "draft rebase"
         ],
         "name": "to-state-revision",
-        "required": true,
         "type": "number"
+      },
+      {
+        "appliesToVerbs": [
+          "draft rebase"
+        ],
+        "name": "to-current",
+        "type": "boolean"
       },
       {
         "appliesToVerbs": [
           "draft create",
           "draft edit",
+          "draft edit-batch",
           "draft show",
           "draft check",
           "draft rebase",
@@ -648,6 +665,10 @@
       },
       {
         "name": "draft edit",
+        "surface": "draft-action"
+      },
+      {
+        "name": "draft edit-batch",
         "surface": "draft-action"
       },
       {
