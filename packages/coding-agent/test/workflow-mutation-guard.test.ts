@@ -332,6 +332,8 @@ describe("workflow mutation guard", () => {
 			`echo eval source .\ncat <<'TOK' > /tmp/spec.md\n${specBody}\nTOK`,
 			// `function cat` in ARGUMENT position is not a shadow declaration (Codex P2).
 			`echo function cat\ncat <<'FNC' > /tmp/spec.md\n${specBody}\nFNC`,
+			// `command -v eval` only DESCRIBES eval; it is not an evaluated command (Codex P2).
+			`command -v eval\ncat <<'CMV' > /tmp/spec.md\n${specBody}\nCMV`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -378,10 +380,14 @@ describe("workflow mutation guard", () => {
 			// `builtin`/`command` wrappers still reach the evaluated command (Codex P1).
 			"builtin eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			"command -- eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Leading redirections precede the command word (Codex P1).
+			"</dev/null eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Bash's `function name()` hybrid form is still a declaration (Codex P1).
 			"function cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Function shadows after reserved words are still declarations (Codex P1).
 			"if true; then cat() { bash -s; }; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// A nested subshell's `)` is an operator: `#` after it comments out the fake opener (Codex P1).
+			"x=$( (true)# ; cat <<'EOF'\n)\nrm src/product.ts\nEOF",
 			// `case` pattern `)` desyncs the depth scanner — fail closed (Codex P1).
 			"x=$(case x in x) true;; esac)#lit; cat() { bash -s; }\ncat <<'EOF'\nrm src/product.ts\nEOF",
 			// eval/source can install a shadow from quoted data the syntax view blanked (Codex P1).

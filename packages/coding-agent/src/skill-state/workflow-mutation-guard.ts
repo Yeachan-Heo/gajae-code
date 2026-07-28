@@ -459,8 +459,12 @@ interface HeredocMaskResult {
 interface ShellQuoteState {
 	inSingle: boolean;
 	inDouble: boolean;
-	/** Open `$(`/`<(`/`>(` substitutions: a `)` closing one is a word character, not an operator. */
-	substitutionDepth: number;
+	/**
+	 * Paren stack inside substitutions: `true` for a `$(`/`<(`/`>(` opener
+	 * (its `)` is a word character), `false` for a plain nested paren (its `)`
+	 * is an operator, so a following `#` starts a comment).
+	 */
+	parenStack: boolean[];
 }
 
 /**
@@ -531,22 +535,23 @@ function maskLineForSyntax(
 		}
 		if (
 			character === "(" &&
-			(previous === "$" || previous === "<" || previous === ">" || state.substitutionDepth > 0)
+			(previous === "$" || previous === "<" || previous === ">" || state.parenStack.length > 0)
 		) {
 			// Substitution opener, or any paren nested INSIDE one (e.g. `$((1))`,
 			// `$(f (x))`): both must be balanced before the substitution closes.
-			state.substitutionDepth++;
+			state.parenStack.push(previous === "$" || previous === "<" || previous === ">");
 			masked += character;
 			dequoted += character;
 			previous = character;
 			continue;
 		}
-		if (character === ")" && state.substitutionDepth > 0) {
-			state.substitutionDepth--;
+		if (character === ")" && state.parenStack.length > 0) {
+			const wasSubstitutionOpener = state.parenStack.pop() === true;
 			masked += character;
 			dequoted += character;
-			// Substitution close binds to the surrounding word: `#` after it is literal.
-			previous = "x";
+			// A substitution close binds to the surrounding word (`x=$(true)#lit`);
+			// a nested subshell close is an operator, so `#` after it comments.
+			previous = wasSubstitutionOpener ? "x" : ")";
 			continue;
 		}
 		if (
@@ -604,6 +609,9 @@ const SHELL_RESERVED_PREFIX_WORDS = new Set([
 	"!",
 ]);
 
+/** A redirection token (`</dev/null`, `2>err`, `>out`) — not a command word. */
+const SHELL_REDIRECTION_TOKEN_RE = /^\d*[<>]/;
+
 /** Command-position words of one command-list segment: the first real word plus words after reserved prefixes. */
 function commandPositionWords(segment: string): string[] {
 	const words: string[] = [];
@@ -613,13 +621,19 @@ function commandPositionWords(segment: string): string[] {
 		if (!word) continue;
 		if (expectCommand) {
 			if (/^\w+=/.test(word)) continue;
+			// Leading redirections precede the command word (`</dev/null eval …`).
+			if (SHELL_REDIRECTION_TOKEN_RE.test(word)) continue;
 			if (SHELL_COMMAND_WRAPPER_WORDS.has(word.toLowerCase())) {
 				// The wrapper's effective command follows, possibly after options/`--`.
 				afterWrapper = true;
 				continue;
 			}
-			// Wrapper options (`command -p`, `builtin --`) precede the real command.
-			if (afterWrapper && (word === "--" || word.startsWith("-"))) continue;
+			if (afterWrapper && (word === "--" || word.startsWith("-"))) {
+				// `command -v`/`-V` only DESCRIBES its operand — the rest is data.
+				if (/^-[a-zA-Z]*[vV]/.test(word)) return words;
+				// Other wrapper options (`command -p`, `builtin --`) precede the real command.
+				continue;
+			}
 			afterWrapper = false;
 			if (SHELL_RESERVED_PREFIX_WORDS.has(word.toLowerCase())) {
 				// Reserved word keeps the NEXT word in command position.
@@ -772,7 +786,7 @@ function maskHeredocBodiesPass(
 	const lines = command.split("\n");
 	const out: string[] = [];
 	const dequotedLines: string[] = [];
-	const state: ShellQuoteState = { inSingle: false, inDouble: false, substitutionDepth: 0 };
+	const state: ShellQuoteState = { inSingle: false, inDouble: false, parenStack: [] };
 	let previousContinued = false;
 	let opaqueExpansion = false;
 	let mutatingConsumer = false;
