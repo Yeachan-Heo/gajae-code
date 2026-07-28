@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 - Provider streams now surface first-event watchdog expiry as a typed timeout so callers can apply bounded retry policy without parsing error prose.
+- Codex named-tool requests now recognize provider `Tool choice '<name>' not found in 'tools' parameter` errors as runtime capability failures and retry once without forcing the choice.
 
 ## [0.12.0] - 2026-07-28
 

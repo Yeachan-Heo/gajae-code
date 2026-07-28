@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "kind": "pr-merge-lane-retirement-receipt",
+  "generatedAt": "2026-07-28",
+  "status": "terminal",
+  "lane": "#3422/#3429 CI-wait hold, unblock, exact-head rebase, and merge",
+  "doctrine": "held non-mutating pending shared schemas/config.schema.json drift repair (#3431); resumed immediately on repair merge; each PR rebased once onto current dev with its exact single-file receipt scope preserved; merged only after exact-head CI green and mergeStateStatus CLEAN",
+  "blocker": {
+    "description": "schemas/config.schema.json drift on dev, upstream of both PRs' Affected path validation / root-check failures (check:schemas)",
+    "resolvedBy": {
+      "pr": 3431,
+      "title": "chore(schemas): regenerate config schema for session.resumeModelBehavior",
+      "mergeCommitSha": "fbb43434e",
+      "mergedIntoDevAt": "prior to dev tip 20b0aedf6"
+    }
+  },
+  "mergedByThisLane": [
+    {
+      "pr": 3422,
+      "title": "chore(artifacts): record merge-batch lane retirement receipt (#3392/#3401/#3404/#3416, issues #3264/#3354)",
+      "branch": "chore/batch-lane-retirement-receipt",
+      "scope": "single file: artifacts/pr3392-batch-lane-retirement-receipt.json (+109/-0)",
+      "rebasedOnto": "origin/dev @ 20b0aedf6",
+      "rebasedHeadSha": "fe293dc25196b74d3148d718aaaa539d5fa720cd",
+      "preMergeVerdict": "exact-head CI all green; mergeStateStatus CLEAN; mergeable MERGEABLE against dev tip 2f9f3af1d (no second rebase needed)",
+      "mergeCommitSha": "c03037fe5146328d8e36d66e7b0edaf534eaab8b",
+      "mergedAt": "2026-07-28T17:51:41Z"
+    },
+    {
+      "pr": 3429,
+      "title": "docs: record #3373/#3357/#3344/#3293 repair batch merge receipt",
+      "branch": "docs/repair-batch-3373-3357-3344-3293-receipt",
+      "scope": "single file: artifacts/repair-pr3373-3357-3344-3293-batch-receipt.json (+58/-0)",
+      "rebasedOnto": "origin/dev @ 20b0aedf6",
+      "rebasedHeadSha": "02038b58f24e0fde3cbbefed8962355580b7ea13",
+      "preMergeVerdict": "exact-head CI all green; mergeStateStatus CLEAN; mergeable MERGEABLE against dev tip 2f9f3af1d (no second rebase needed)",
+      "mergeCommitSha": "8064536c68f06c0a71bcd4669079f2315602afb7",
+      "mergedAt": "2026-07-28T17:51:45Z"
+    }
+  ],
+  "notes": [
+    "Untracked local handoff-hold artifact (pr3422-pr3429-ci-wait-handoff-receipt.json) was intentionally never committed to either PR since it was not part of their exact one-file scope; deleted after lane retirement.",
+    "Both PRs verified with `bun scripts/generate-json-schemas.ts --check` clean at their rebased heads prior to push.",
+    "No repeated reruns of old-head CI performed while held; resumed and rebased exactly once each after #3431 landed."
+  ],
+  "outcome": "Both #3422 and #3429 merged into dev. Worktree clean. No outstanding blocker owned by this lane. Lane retired.",
+  "finalDevHeadObserved": "8064536c6"
+}

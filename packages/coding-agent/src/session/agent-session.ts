@@ -278,6 +278,7 @@ import {
 	registerCoordinatorRuntimeStateFinalizer,
 } from "../gjc-runtime/session-state-sidecar";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
+import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heartbeat";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -512,6 +513,11 @@ export interface AgentSessionConfig {
 	workerIntegrationRequest?: (signal: AbortSignal) => Promise<void>;
 	/** Bound terminal worker-integration settlement for embedded hosts and deterministic lifecycle tests. */
 	workerIntegrationTimeoutMs?: number;
+	/**
+	 * Override the runtime-owned `gjc team` worker heartbeat reporter. Defaults to a
+	 * reporter derived from the team worker environment, or none outside a worker pane.
+	 */
+	teamWorkerHeartbeatReporter?: GjcTeamWorkerHeartbeatReporter;
 
 	/** Loaded skills (already discovered by SDK) */
 	skills?: Skill[];
@@ -1803,6 +1809,10 @@ export class AgentSession {
 	#turnIndex = 0;
 	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler;
 	#workerIntegrationRequestedForTurn = false;
+	/** Runtime-owned team worker heartbeat; `undefined` outside a `gjc team` worker pane. */
+	#teamWorkerHeartbeat: GjcTeamWorkerHeartbeatReporter | undefined;
+	#teamWorkerTurnsInFlight = 0;
+	#unregisterTeamWorkerAsyncJobChange: (() => void) | undefined;
 	// First-party internal before-agent-start contributors (not user hooks).
 	#beforeAgentStartContributors: BeforeAgentStartContributor[] = [];
 
@@ -2157,6 +2167,8 @@ export class AgentSession {
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
+			// Runtime-owned worker liveness follows Agent turns and background jobs
+			// in #refreshTeamWorkerHeartbeat(), including internally dispatched turns.
 		}
 	}
 
@@ -2263,8 +2275,20 @@ export class AgentSession {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
+			this.#refreshTeamWorkerHeartbeat();
 			this.#flushPendingBackgroundExchanges();
 			this.#flushPendingAgentEnd();
+		}
+	}
+
+	#refreshTeamWorkerHeartbeat(): void {
+		const hasOwnedBackgroundJob =
+			this.#agentId !== undefined &&
+			(this.#ownedAsyncJobManager?.getRunningJobs({ ownerId: this.#agentId }).length ?? 0) > 0;
+		if (this.#teamWorkerTurnsInFlight > 0 || hasOwnedBackgroundJob) {
+			this.#teamWorkerHeartbeat?.start();
+		} else {
+			this.#teamWorkerHeartbeat?.stop();
 		}
 	}
 
@@ -2319,6 +2343,14 @@ export class AgentSession {
 				}),
 			config.workerIntegrationTimeoutMs,
 		);
+		// One publisher per worker process: subagent sessions share this process and its
+		// team env, so letting each create a reporter would run N timers writing the same
+		// record. The top-level session owns the pane's liveness.
+		this.#teamWorkerHeartbeat =
+			config.teamWorkerHeartbeatReporter ??
+			((config.taskDepth ?? 0) === 0
+				? GjcTeamWorkerHeartbeatReporter.forProcess(() => this.sessionManager.getCwd())
+				: undefined);
 		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
 		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
@@ -2480,6 +2512,9 @@ export class AgentSession {
 		this.#ttsrManager = config.ttsrManager;
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
+		this.#unregisterTeamWorkerAsyncJobChange = this.#ownedAsyncJobManager?.onChange(() => {
+			this.#refreshTeamWorkerHeartbeat();
+		});
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
@@ -2574,7 +2609,24 @@ export class AgentSession {
 
 	/** Advance the tool-choice queue and return the next directive for the upcoming LLM call. */
 	nextToolChoice(): ToolChoice | undefined {
-		return this.#toolChoiceQueue.nextToolChoice();
+		const choice = this.#toolChoiceQueue.nextToolChoice();
+		if (!choice || typeof choice === "string") return choice;
+
+		const toolName = choice.type === "tool" ? choice.name : "function" in choice ? choice.function.name : choice.name;
+		const activeTool = this.agent.state.tools.find(
+			tool => tool.name === toolName || tool.customWireName === toolName,
+		);
+		if (!activeTool) {
+			this.#toolChoiceQueue.degradeInFlight(`Tool "${toolName}" is no longer active.`);
+			return undefined;
+		}
+
+		const refreshed = buildNamedToolChoiceResult(activeTool.name, this.model);
+		if (!refreshed.exactNamed || !refreshed.choice) {
+			this.#toolChoiceQueue.degradeInFlight(refreshed.resolved?.reason ?? "Named tool choice is unavailable.");
+			return undefined;
+		}
+		return refreshed.choice;
 	}
 
 	/**
@@ -3242,6 +3294,18 @@ export class AgentSession {
 			this.#closedExtensionTurnGeneration = undefined;
 		} else if (event.type === "turn_end") {
 			this.#closedExtensionTurnGeneration = this.#extensionTurnGeneration;
+		}
+		if (event.type === "turn_start") {
+			this.#teamWorkerTurnsInFlight++;
+			this.#refreshTeamWorkerHeartbeat();
+		} else if (event.type === "turn_end") {
+			this.#teamWorkerTurnsInFlight = Math.max(0, this.#teamWorkerTurnsInFlight - 1);
+			this.#refreshTeamWorkerHeartbeat();
+		} else if (event.type === "agent_end") {
+			// Failed Agent runs can emit agent_end without turn_end. Reset rather than
+			// leaking a positive count that would report an idle/failed worker forever.
+			this.#teamWorkerTurnsInFlight = 0;
+			this.#refreshTeamWorkerHeartbeat();
 		}
 		if (event.type === "message_update") {
 			// Fast path: message_update maps to no sidecar state, so we must not
@@ -5377,6 +5441,9 @@ export class AgentSession {
 		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
 		await disposeVmContextsByOwner(this.#evalKernelOwnerId);
 		this.#releasePowerAssertion();
+		this.#unregisterTeamWorkerAsyncJobChange?.();
+		this.#unregisterTeamWorkerAsyncJobChange = undefined;
+		this.#teamWorkerHeartbeat?.dispose();
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
@@ -5421,6 +5488,9 @@ export class AgentSession {
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		this.#unregisterResourceGc?.();
 		this.#unregisterResourceGc = undefined;
+		this.#unregisterTeamWorkerAsyncJobChange?.();
+		this.#unregisterTeamWorkerAsyncJobChange = undefined;
+		this.#teamWorkerHeartbeat?.dispose();
 		const work = Promise.allSettled([
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).

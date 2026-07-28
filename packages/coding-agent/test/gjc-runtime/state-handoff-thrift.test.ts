@@ -132,6 +132,9 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			"repository_binding",
 			"created_at",
 			"pending_approval_path",
+			// #3428 (33dbf1e7c) added the configured auto-handoff admission to the
+			// final-stage receipt payload without extending this consumer key matrix.
+			"auto_handoff",
 		]);
 		expect(scrub(ralplanReceipt.stdout ?? "")).toMatchInlineSnapshot(`
 			"{
@@ -147,7 +150,13 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			    "displayPath": "/tmp/SCRUBBED"
 			  },
 			  "created_at": "<iso>",
-			  "pending_approval_path": "/tmp/SCRUBBED"
+			  "pending_approval_path": "/tmp/SCRUBBED",
+			  "auto_handoff": {
+			    "configuredTarget": "off",
+			    "effectiveTarget": "off",
+			    "degradationReason": null,
+			    "source": "default"
+			  }
 			}
 			"
 			`);

@@ -12,7 +12,14 @@ import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } 
 import type { AuthStorage } from "../../src/session/auth-storage";
 import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
 
-import { type AgentDefinition, type AgentProgress, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../../src/task/types";
+import {
+	type AgentDefinition,
+	type AgentProgress,
+	type SubagentLifecyclePayload,
+	type SubagentProgressPayload,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+	TASK_SUBAGENT_PROGRESS_CHANNEL,
+} from "../../src/task/types";
 
 import { EventBus } from "../../src/utils/event-bus";
 
@@ -210,6 +217,44 @@ describe("runSubprocess yield reminders", () => {
 				scope: "subagent",
 			}),
 		]);
+	});
+
+	it("publishes the persisted session file for observer lifecycle and progress events", async () => {
+		const sessionFile = "/tmp/subagent-observer.jsonl";
+		const lifecycleEvents: SubagentLifecyclePayload[] = [];
+		const progressEvents: SubagentProgressPayload[] = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+			lifecycleEvents.push(payload as SubagentLifecyclePayload);
+		});
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressEvents.push(payload as SubagentProgressPayload);
+		});
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-observer-session-file",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-observer-session-file",
+			eventBus,
+			sessionFile,
+		});
+
+		expect(lifecycleEvents.map(event => event.status)).toEqual(["started", "completed"]);
+		expect(lifecycleEvents.every(event => event.sessionFile === sessionFile)).toBe(true);
+		expect(progressEvents.length).toBeGreaterThan(0);
+		expect(progressEvents.every(event => event.sessionFile === sessionFile)).toBe(true);
 	});
 
 	it("clears provider retry state on the first recovered assistant event", async () => {

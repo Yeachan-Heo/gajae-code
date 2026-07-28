@@ -1528,6 +1528,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 	startupAckPath: string;
 	replacementToken: string;
 	startupAckTimeoutMs: number;
+	env: NodeJS.ProcessEnv;
 }): Promise<string> {
 	if (input.config.dry_run)
 		return `%memory-guard-${input.worker.id}-${stableHash(`${input.worker.id}:${now()}`).slice(0, 8)}`;
@@ -1536,6 +1537,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 		input.worker,
 		input.platform,
 		`Send startup ACK before resuming: gjc team api worker-startup-ack --input '{"team_name":"${input.config.team_name}","worker_id":"${input.worker.id}","protocol_version":"1","replacement_token":"${input.replacementToken}"}' --json. ${GJC_TEAM_CONTINUATION_PROMPT}`,
+		input.env,
 	);
 	const workerCwd = input.worker.worktree_path ?? input.config.leader.cwd;
 	const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(input.config.tmux_command, input.platform);
@@ -1887,6 +1889,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			startupAckPath,
 			replacementToken,
 			startupAckTimeoutMs,
+			env: input.env,
 		});
 	} catch (error) {
 		await restorePredecessorStartupState();
@@ -2770,7 +2773,7 @@ async function startTmuxSession(
 			const splitDirection: string = worker.index === 1 ? "-h" : "-v";
 			const splitTarget: string =
 				worker.index === 1 ? config.tmux_target : (rightStackRootPaneId ?? config.tmux_target);
-			const workerCommand = buildWorkerCommand(config, worker);
+			const workerCommand = buildWorkerCommand(config, worker, process.platform, undefined, env);
 			const workerCwd = worker.worktree_path ?? config.leader.cwd;
 			const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);
 			const splitArgs = [
@@ -4299,11 +4302,13 @@ function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: numb
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallbackMs;
 }
 
-function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
+/** Positive stale windows are clamped so a worker can publish strictly before expiry. */
+export function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
 	const raw = env.GJC_TEAM_HEARTBEAT_STALE_MS?.trim();
 	if (!raw) return 120_000;
 	const parsed = Number(raw);
-	return Number.isFinite(parsed) ? parsed : 120_000;
+	if (!Number.isFinite(parsed)) return 120_000;
+	return parsed > 0 ? Math.max(3, parsed) : parsed;
 }
 async function writeLifecycleNudge(
 	dir: string,
@@ -4802,6 +4807,41 @@ export async function updateGjcWorkerHeartbeat(
 	return withGjcTeamMutationFence(dir, () =>
 		updateWorkerHeartbeat(workerRuntime, teamName, worker, heartbeat, cwd, env),
 	);
+}
+/**
+ * Refresh liveness without discarding metadata written by other heartbeat
+ * producers. The read/merge/write sequence shares the team mutation fence with
+ * CLI heartbeat updates, so a runtime tick cannot overwrite a newer turn count.
+ */
+export async function refreshGjcWorkerHeartbeat(
+	teamName: string,
+	worker: string,
+	pid: number,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<WorkerHeartbeatFile> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, async () => {
+		const current = await readWorkerHeartbeat(workerRuntime, teamName, worker, cwd, env);
+		const processStartTime = await readLinuxProcessStartTime(pid);
+		const turnCount = current?.turn_count;
+		return updateWorkerHeartbeat(
+			workerRuntime,
+			teamName,
+			worker,
+			{
+				...current,
+				pid,
+				last_turn_at: now(),
+				turn_count: Number.isSafeInteger(turnCount) && (turnCount ?? -1) >= 0 ? (turnCount ?? 0) : 0,
+				alive: true,
+				// Never carry another process's incarnation across a pid change.
+				process_start_time: processStartTime ?? (current?.pid === pid ? current.process_start_time : undefined),
+			},
+			cwd,
+			env,
+		);
+	});
 }
 export async function writeGjcWorkerInbox(
 	teamName: string,

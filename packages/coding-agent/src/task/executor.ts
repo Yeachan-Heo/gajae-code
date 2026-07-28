@@ -970,7 +970,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				task,
 				assignment,
 				progress: progressSnapshot,
-				sessionFile: null,
+				sessionFile: sessionFile ?? undefined,
 			});
 		}
 		lastProgressEmitMs = Date.now();
@@ -1714,7 +1714,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					agentSource: agent.source,
 					description: options.description,
 					status: "started",
-					sessionFile: null,
+					sessionFile: sessionFile ?? undefined,
 					index,
 				});
 			}
@@ -2162,7 +2162,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			agentSource: agent.source,
 			description: options.description,
 			status: progress.status as "completed" | "failed" | "aborted" | "paused",
-			sessionFile: null,
+			sessionFile: sessionFile ?? undefined,
 			index,
 		});
 	}
