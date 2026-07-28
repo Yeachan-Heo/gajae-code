@@ -197,6 +197,16 @@ When delegating:
 
 When delegating with native subagents, an await timeout only limits the leader's wait. It is not subagent failure evidence and must not be used as a cancellation reason; inspect or continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
+### Subagent reuse and resumption (token efficiency)
+
+Fresh spawns re-pay the full context ramp-up (file reads, domain orientation, contract restatement) on every delegation. When a later slice or lane targets the **same sub-domain/module/system** as a prior subagent of the same role, **resume the prior subagent instead of freshly spawning**:
+
+- Track the subagent id per role + domain as it is created; on the next same-domain `executor` slice or same-scope `architect` review lane, resume that id and inject only the delta (new targets, new acceptance criteria, the updated frozen change set) rather than re-briefing from scratch.
+- Reuse is domain-scoped: resume only when the prior context is an asset. A slice in a genuinely different sub-domain/module/system gets a fresh spawn — stale cross-domain context is a liability, not a saving.
+- Resumability requires retained subagent resume metadata and a persistent parent session; use existing `subagent` resume/steer controls only. Route per attempt: `running` → steer/inject to the same id and await; `queued` → retain or await the same id; terminal (`completed`/`failed`/`cancelled`) with context available → resume the same id; `context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback for that slice.
+- A resumed subagent is still the same worker under the same contract: it must not mutate `.gjc/_session-{sessionid}/ultragoal`, call goal tools, or absorb checkpoint/goal-state ownership, and review lanes (`architect`, `critic`) stay read-only when resumed.
+- Resumption never weakens gates: a resumed `architect` review or `executor` QA lane must still evaluate the current frozen change set on its own evidence, not rubber-stamp its earlier verdict.
+
 If an Ultragoal request has no approved plan or consensus artifact **and** the scope genuinely needs one, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Skip `ralplan` for small scope: work that fits a single reviewable PR and is tied to a single domain/subsystem can proceed directly from the brief — record that judgment in the ledger instead of running a planning round. Reach for `ralplan` when the scope spans multiple domains/subsystems, needs cross-cutting sequencing, or would not fit a single PR.
 
 The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
@@ -370,6 +380,8 @@ The critic must verify that the `human_blocked` classification is genuine, inclu
 ### Invocation and containment
 
 At each terminus, the leader gives the read-only `critic` role agent `brief.md`, `goals.json`, `ledger.jsonl`, and the cumulative change set. For completion, invoke it before assembling the final-aggregate gate JSON. For pause, invoke it after the `human_blocked` classification and before `goal({"op":"pause"})`. The terminal critic must not spawn nested `ralplan`, `team`, `deep-interview`, or `ultragoal` workflows. This creates no interactive surface: `ask` remains blocked while an Ultragoal run is active.
+
+On repeat terminus attempts within the same run (after an `ITERATE`/`REJECT` reopen cycle or a superseded pause classification), **resume the prior terminal-critic subagent when resumable** instead of freshly spawning one: the critic already holds `brief.md`, `goals.json`, the ledger history, and its own prior findings, so re-invocation only needs the delta (new ledger events, the updated cumulative change set, and evidence addressing the prior blockers). Resume via existing `subagent` resume/steer controls; on `context_unavailable`, `not_found`, `no_runner`, or `resume_failed` — or after a process restart — fall back to a fresh `critic` spawn with the full context bundle. A resumed terminal critic remains read-only, keeps the same containment rules, and must issue a fresh verdict against the current state — a prior `ITERATE` is never carried forward as pre-judged, and each verdict is still recorded through `gjc ultragoal record-critic-verdict`.
 
 ### Non-OKAY loop and ceiling
 

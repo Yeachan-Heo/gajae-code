@@ -648,6 +648,28 @@ Project executor override body.
 		expect(ultragoal).toContain("red-team lane depends on architect fixes");
 	});
 
+	it("documents same-domain subagent reuse and terminal-critic resumption for token efficiency", async () => {
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
+
+		// Same-domain executor/architect reuse instead of fresh spawns.
+		expect(ultragoal).toContain("### Subagent reuse and resumption (token efficiency)");
+		expect(ultragoal).toContain("resume the prior subagent instead of freshly spawning");
+		expect(ultragoal).toContain("Reuse is domain-scoped");
+		expect(ultragoal).toContain("stale cross-domain context is a liability");
+		expect(ultragoal).toContain("Resumption never weakens gates");
+		expect(ultragoal).toContain("not rubber-stamp its earlier verdict");
+
+		// Fallback routing mirrors the existing subagent resume outcomes.
+		expect(ultragoal).toContain("`context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback");
+
+		// Terminal critic resumption on iteration.
+		expect(ultragoal).toContain("resume the prior terminal-critic subagent when resumable");
+		expect(ultragoal).toContain("a prior `ITERATE` is never carried forward as pre-judged");
+		expect(ultragoal).toContain("fall back to a fresh `critic` spawn with the full context bundle");
+	});
+
 	it("routes simple clear implementation requests directly without contradictory workflow escalation", async () => {
 		const systemPrompt = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "prompts", "system", "system-prompt.md"),
