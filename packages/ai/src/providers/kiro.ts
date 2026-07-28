@@ -613,8 +613,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 				const messageType = message.headers[":message-type"];
 				const eventType = message.headers[":event-type"];
 				if (messageType === "exception" || messageType === "error") {
-					const payload = parsePayload(message.payload);
-					throw new Error(String(payload.message ?? eventType ?? "Kiro stream error"));
+					throw new Error("Kiro stream error");
 				}
 				if (messageType !== "event") continue;
 				const payload = parsePayload(message.payload);

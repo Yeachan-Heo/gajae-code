@@ -376,6 +376,91 @@ describe("Kiro OAuth error redaction adoption", () => {
 		expectStatusOnly(error instanceof Error ? error.message : String(error), "Kiro social token refresh failed");
 		expect(response.bodyUsed).toBe(false);
 	});
+
+	test("redacts a Builder ID device-flow semantic error returned with HTTP 200", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		let call = 0;
+		stubFetch(async () => {
+			call += 1;
+			if (call === 1) {
+				return Response.json({
+					deviceCode: "device-code",
+					userCode: "USER-CODE",
+					verificationUriComplete: "https://example.invalid/verify",
+					interval: 0,
+					expiresIn: 60,
+				});
+			}
+			return Response.json({
+				error: "access_denied",
+				error_description: "account 123456789012 requestId 8f2c1d90-secret",
+			});
+		});
+
+		const error = await loginKiro({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			method: "builder-id",
+		}).catch((cause: unknown) => cause);
+
+		expect(error instanceof Error ? error.message : String(error)).toBe("Kiro device flow failed");
+	});
+
+	test("redacts a Builder ID refresh semantic error returned with HTTP 200", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		stubFetch(async () =>
+			Response.json({
+				error: "invalid_grant",
+				error_description: "account 123456789012 requestId 8f2c1d90-secret",
+			}),
+		);
+
+		const error = await refreshKiroToken({
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 1,
+			kiroMethod: "builder-id",
+			kiroProfileArn: KIRO_BUILDER_ID_PROFILE_ARN,
+		}).catch((cause: unknown) => cause);
+
+		expect(error instanceof Error ? error.message : String(error)).toBe("Kiro token refresh failed");
+	});
+
+	test("keeps polling through Builder ID pending and slow-down responses", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		let call = 0;
+		stubFetch(async () => {
+			call += 1;
+			switch (call) {
+				case 1:
+					return Response.json({
+						deviceCode: "device-code",
+						userCode: "USER-CODE",
+						verificationUriComplete: "https://example.invalid/verify",
+						interval: 0,
+						expiresIn: 60,
+					});
+				case 2:
+					return Response.json({ error: "authorization_pending" });
+				case 3:
+					return Response.json({ error: "slow_down" });
+				default:
+					return Response.json({ accessToken: "new-access", refreshToken: "new-refresh", expiresIn: 28_800 });
+			}
+		});
+
+		const credentials = await loginKiro({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			method: "builder-id",
+		});
+
+		expect(credentials.access).toBe("new-access");
+		expect(call).toBe(4);
+	}, 10_000);
 });
 
 describe("Kiro social refresh resilience", () => {
