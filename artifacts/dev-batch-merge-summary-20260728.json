@@ -1,0 +1,38 @@
+{
+  "schema": "gajae.dev-batch-merge-summary.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "note": "Session summary for this lane's dev-batch review/merge pass. All items below reviewed against exact PR heads with signed GJC verdicts posted directly on the corresponding GitHub PR/issue.",
+  "originLaneObjective": {
+    "issue": 2580,
+    "pr": 2611,
+    "status": "TERMINAL_MERGED",
+    "evidence": "dev commit 96f64a8e2"
+  },
+  "merged": [
+    { "pr": 3407, "issueClosed": 3403, "mergeCommit": "84f4dc60c" },
+    { "pr": 3417, "issueClosed": 3402, "mergeCommit": "e38700db3" },
+    { "pr": 3423, "issueClosed": 3389, "mergeCommit": "78c1eb66b" },
+    { "pr": 3428, "issueClosed": 3398, "mergeCommit": "7336a2851" },
+    { "pr": 3424, "issueClosed": 3390, "mergeCommit": "04e517d7e" },
+    { "pr": 3432, "issueClosed": null, "mergeCommit": "20b0aedf6" },
+    { "pr": 3433, "issueClosed": null, "mergeCommit": "2f9f3af1d" },
+    { "pr": 3434, "issueClosed": null, "mergeCommit": "6a2368189", "note": "internal repair authored this pass: guarded #maybePromptResumeModelChoice() against a settings-less ctx, fixing 5 deterministic SelectorController session-deletion test failures introduced by #3418" },
+    { "pr": 3437, "issueClosed": null, "mergeCommit": "a4e6af7d8" }
+  ],
+  "closedNotMerged": [
+    { "pr": 3425, "reason": "exact duplicate of #3407 for #3403, closed in favor of the earlier-created, already-vetted PR" },
+    { "pr": 3426, "reason": "confirmed PR-local regression (8 model-selector-profile + 1 provider-onboarding-wizard test failures from an async discoverAgents() race in model-selector.ts); closed in favor of #3417 which does not touch that file" },
+    { "pr": 3410, "reason": "this lane's own timeout-widening duplicate; consolidated to #3409 as sole canonical blocker per owner directive (deterministic replacement required, not a wall-clock bump)" },
+    { "pr": 3412, "reason": "duplicate of #3409, same consolidation" }
+  ],
+  "leftOpenPendingOwnerCall": [
+    { "pr": 3409, "reason": "sole canonical timeout-widening blocker for the team-worker memory-guard test flake; explicitly not merged per owner directive pending a deterministic (non-wall-clock) fix" },
+    { "pr": 3415, "reason": "REQUEST_CHANGES stands (fail-open heredoc-masking bypass for ssh/stdin mutators); superseding fix appears to have landed separately as #3421 (05562aae7), not re-litigated this pass" },
+    { "pr": 3391, "reason": "reviewed clean at exact head 8ca1c65eb (background/subagent heartbeat liveness generalization), all local tests pass, but GitHub-side exact-head CI was not re-confirmed this pass before the session moved to higher-priority items" }
+  ],
+  "attributionNotes": [
+    "The recurring 'stale base' CI failures across this batch (#3407, #3428, #3433, #3434, #3437) were all confirmed via git merge-base / local clean-merge tests to be base-drift artifacts from dev's very high merge cadence during this session, not real defects — each was resolved by a single rebase-and-repush cycle onto the current dev tip using each PR's maintainer_can_modify=true fork-branch push access.",
+    "dev's own full-suite red state during this session had three independently-tracked, non-overlapping root causes: (1) team-runtime.test.ts memory-guard test hard 5000ms timeout under CI shard contention (tracked at #3409, deterministic fix still owed), (2) SDK-operation-inventory 'pending review source seam' gap for resolveConfiguredDefaultModel (resolved externally, confirmed absent from later runs), (3) SelectorController session-deletion TypeError from #3418's unconditional settings access (fixed this pass via #3434). None of these blocked merging PRs whose own diffs did not overlap the affected files, per the 'red/pending dev is not a blanket freeze' doctrine established this session."
+  ],
+  "reviewedAt": "2026-07-28T18:10:00Z"
+}
