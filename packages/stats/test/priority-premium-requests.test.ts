@@ -8,25 +8,31 @@ import { syncAllSessions } from "../src/aggregator";
 import { closeDb, getOverallStats, getRecentRequests } from "../src/db";
 import { parseSessionFile } from "../src/parser";
 
-const originalConfigDir = process.env.PI_CONFIG_DIR;
+const originalConfigDir = process.env.GJC_CONFIG_DIR;
+const originalAgentDirEnv = process.env.GJC_CODING_AGENT_DIR;
 const originalAgentDir = getAgentDir();
 let tempDir: TempDir | null = null;
 
 beforeEach(() => {
-	tempDir = TempDir.createSync("@pi-stats-priority-");
-	const configDir = path.relative(os.homedir(), tempDir.join("config"));
-	process.env.PI_CONFIG_DIR = configDir;
-	setAgentDir(path.join(os.homedir(), configDir, "agent"));
+	tempDir = TempDir.createSync(path.join(os.homedir(), ".pi-stats-priority-"));
+	const configDir = path.relative(os.homedir(), tempDir.path());
+	process.env.GJC_CONFIG_DIR = configDir;
+	setAgentDir(tempDir.join("test-agent"));
 });
 
 afterEach(() => {
 	closeDb();
 	if (originalConfigDir === undefined) {
-		delete process.env.PI_CONFIG_DIR;
+		delete process.env.GJC_CONFIG_DIR;
 	} else {
-		process.env.PI_CONFIG_DIR = originalConfigDir;
+		process.env.GJC_CONFIG_DIR = originalConfigDir;
 	}
 	setAgentDir(originalAgentDir);
+	if (originalAgentDirEnv === undefined) {
+		delete process.env.GJC_CODING_AGENT_DIR;
+	} else {
+		process.env.GJC_CODING_AGENT_DIR = originalAgentDirEnv;
+	}
 	tempDir?.removeSync();
 	tempDir = null;
 });
