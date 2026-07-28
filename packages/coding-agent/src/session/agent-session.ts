@@ -4271,10 +4271,12 @@ export class AgentSession {
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
 
-			// Check for retryable errors first (overloaded, rate limit, server errors)
-			if (this.#isRetryableError(msg)) {
-				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
-					.transportFailure;
+			// Check retryable failures plus clean auth rejections whose OAuth
+			// credential can be force-refreshed once before surfacing the error.
+			const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
+				.transportFailure;
+			const authFailure = classifyFallbackTrigger(transportFailure ?? { status: msg.errorStatus }).class === "auth";
+			if (this.#isRetryableError(msg) || authFailure) {
 				const didRetry = await this.#handleRetryableError(msg, false, transportFailure);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
@@ -14156,18 +14158,29 @@ export class AgentSession {
 	 * i.e. retry a bounded number of times (capped at retry.maxRetries) and then
 	 * surface, instead of joining the unbounded transient-retry class.
 	 *
-	 * Targets the ollama-chat API, which is exclusively ollama-cloud (local
-	 * Ollama uses the openai-responses API). That remote, queued backend can
-	 * stall before its first token even for tiny prompts; an unbounded
-	 * continuation retry re-issues the full request on every attempt and can
-	 * silently spike upstream usage (#713). First-party providers keep their
-	 * existing unbounded first-event-timeout retry behavior.
+	 * Targets remote, billable backends whose pre-first-token stall can repeat
+	 * indefinitely:
+	 * - `ollama-chat` is exclusively ollama-cloud (local Ollama uses the
+	 *   openai-responses API); its queued backend can stall before the first
+	 *   token even for tiny prompts (#713).
+	 * - `kiro-streaming` re-issues the full CodeWhisperer conversation state on
+	 *   every attempt against a metered Kiro entitlement, so an unbounded loop
+	 *   silently burns quota.
+	 *
+	 * First-party providers keep their existing unbounded first-event-timeout
+	 * retry behavior.
 	 */
 	#shouldFailClosedOnFirstEventTimeout(message: AssistantMessage): boolean {
 		// Prefer the active model's API (the model that produced the error);
 		// the errored message's API is a fallback for the rare case where the
 		// session model has already moved on.
-		return this.model?.api === "ollama-chat" || message.api === "ollama-chat";
+		const activeApi = this.model?.api;
+		return (
+			activeApi === "ollama-chat" ||
+			activeApi === "kiro-streaming" ||
+			message.api === "ollama-chat" ||
+			message.api === "kiro-streaming"
+		);
 	}
 
 	#isTerminalErrorMessage(errorMessage: string): boolean {
@@ -14662,14 +14675,23 @@ export class AgentSession {
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit") &&
 			(await this.#markFailedCredential(trigger));
+		// A supposedly-fresh OAuth token can be revoked early by a peer refresh.
+		// Recover one clean auth failure by invalidating and refreshing/rotating the
+		// exact credential; the retry counter makes this strictly one-shot.
+		const credentialRecovered =
+			!managedFallback &&
+			trigger.class === "auth" &&
+			this.#retryAttempt === 0 &&
+			!assistantMessageHasVisibleOrToolContent(message) &&
+			(await this.#markFailedCredential(trigger));
+		credentialRotated ||= credentialRecovered;
 		// A content-free credential rotation is inherently replay-safe: no partial
 		// output, no tool calls, no extension-observable streaming state was produced
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
 		// content-free check is the replay-safety guarantee for credential rotation.
 		const canReplayRotatedCredential = credentialRotated;
 		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures,
-		// content-free quota/rate-limit credential rotations, and the explicit Codex
-		// capacity-overload event.
+		// content-free credential rotations, and the explicit Codex capacity-overload event.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const bareDefaultWrappedFirstEventTimeout = isBareDefaultWrappedFirstEventTimeout(message);
@@ -14693,7 +14715,7 @@ export class AgentSession {
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+			: credentialRecovered || legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
 				? "retry"
 				: "exhausted";
 		// Credential rotation is unbounded: a fresh credential is a different

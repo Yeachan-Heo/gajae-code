@@ -59,4 +59,132 @@ describe("usage report column ordering", () => {
 			expect(aliceCol).toBeLessThan(bobCol);
 		}
 	});
+
+	test("renders Kiro subscription balances as separate account rows", () => {
+		const kiroReport = (account: string, fraction: number): UsageReport => ({
+			provider: "kiro",
+			fetchedAt: NOW,
+			metadata: { account, subscriptionTitle: "KIRO PRO MAX" },
+			limits: [
+				{
+					id: "kiro:credit",
+					label: "Credits",
+					status: "ok",
+					amount: { usedFraction: fraction, unit: "requests" },
+					scope: {
+						provider: "kiro",
+						accountId: account,
+						tier: "KIRO PRO MAX",
+						windowId: "billing-cycle",
+					},
+					window: { id: "billing-cycle", label: "Billing cycle", resetsAt: NOW + 86_400_000 },
+				},
+			],
+		});
+
+		const output = stripAnsi(
+			renderUsageReports([kiroReport("kiro builder-id", 0.2), kiroReport("kiro github", 0.4)], theme, NOW, 100),
+		);
+		const lines = output.split("\n");
+
+		expect(lines.filter(line => line.includes("Credits (KIRO PRO MAX)"))).toHaveLength(2);
+		expect(lines.some(line => line.includes("kiro builder-id"))).toBe(true);
+		expect(lines.some(line => line.includes("kiro github"))).toBe(true);
+		expect(lines.some(line => line.includes("kiro builder-id") && line.includes("kiro github"))).toBe(false);
+	});
+	test("renders unavailable Kiro accounts as separate error rows", () => {
+		const reports: UsageReport[] = [
+			{
+				provider: "kiro",
+				fetchedAt: NOW,
+				limits: [],
+				metadata: {
+					account: "kiro builder-id",
+					unavailableReason: "Profile resolution returned HTTP 400",
+				},
+			},
+			{
+				provider: "kiro",
+				fetchedAt: NOW,
+				limits: [],
+				metadata: {
+					account: "kiro github",
+					unavailableReason: "GetUsageLimits returned HTTP 403",
+				},
+			},
+		];
+
+		const output = stripAnsi(renderUsageReports(reports, theme, NOW, 100));
+
+		expect(output).toContain("kiro builder-id -- unavailable: Profile resolution returned HTTP 400");
+		expect(output).toContain("kiro github -- unavailable: GetUsageLimits returned HTTP 403");
+		expect(output).not.toContain("-- no limits");
+		expect(output.indexOf("kiro builder-id")).toBeLessThan(output.indexOf("kiro github"));
+	});
+
+	test("keeps identically labelled Kiro credentials in separate rows", () => {
+		// Every Builder ID credential carries Kiro CLI's single hardcoded profile
+		// ARN, so two Builder ID accounts derive the same label. Grouping on the
+		// label would merge their independent balances into one column pair.
+		const builderId = (fraction: number): UsageReport => ({
+			provider: "kiro",
+			fetchedAt: NOW,
+			metadata: { account: "kiro builder-id" },
+			limits: [
+				{
+					id: "kiro:credit",
+					label: "Credits",
+					status: "ok",
+					amount: { usedFraction: fraction, unit: "requests" },
+					scope: { provider: "kiro", windowId: "billing-cycle" },
+					window: { id: "billing-cycle", label: "Billing cycle", resetsAt: NOW + 86_400_000 },
+				},
+			],
+		});
+
+		const lines = stripAnsi(renderUsageReports([builderId(0.1), builderId(0.9)], theme, NOW, 100)).split("\n");
+		const headers = lines.filter(line => line.includes("kiro builder-id"));
+
+		// One row per credential, and no row carrying two account columns.
+		expect(headers).toHaveLength(2);
+		for (const header of headers) {
+			expect(header.split("kiro builder-id")).toHaveLength(2);
+		}
+		expect(lines.filter(line => line.includes("90% free"))).toHaveLength(1);
+		expect(lines.filter(line => line.includes("10% free"))).toHaveLength(1);
+	});
+
+	test("numbers Kiro accounts that carry no identifying metadata at all", () => {
+		// With no email/accountId/account metadata the renderer falls back to
+		// positional labels; a fixed index would render every row as "account 1".
+		const bare = (reason: string): UsageReport =>
+			({
+				provider: "kiro",
+				fetchedAt: NOW,
+				limits: [],
+				metadata: { unavailableReason: reason },
+			}) as UsageReport;
+
+		const output = stripAnsi(renderUsageReports([bare("HTTP 403"), bare("HTTP 400")], theme, NOW, 100));
+
+		expect(output).toContain("account 1 -- unavailable: HTTP 403");
+		expect(output).toContain("account 2 -- unavailable: HTTP 400");
+	});
+
+	test("continues positional numbering after limited accounts", () => {
+		const limited = report("", 0.5, 0.25);
+		limited.provider = "kiro";
+		limited.metadata = {};
+		for (const entry of limited.limits) entry.scope = { ...entry.scope, provider: "kiro" };
+		const unavailable: UsageReport = {
+			provider: "kiro",
+			fetchedAt: NOW,
+			limits: [],
+			metadata: { unavailableReason: "HTTP 403" },
+		};
+
+		const output = stripAnsi(renderUsageReports([limited, unavailable], theme, NOW, 100));
+		expect(output).toContain("account 2 -- unavailable: HTTP 403");
+		expect(output).not.toContain("account 1 -- unavailable: HTTP 403");
+	});
 });

@@ -12,6 +12,7 @@ import {
 import { parseModelString } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
+import { KIRO_STATIC_SEED } from "../../ai/src/provider-models/kiro";
 import { normalizeModelSelectorValue, selectorHead } from "../src/config/model-selector-value";
 
 type Role = "default" | "executor" | "planner" | "critic" | "architect";
@@ -72,6 +73,17 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 			planner: "anthropic/claude-opus-5:low",
 			critic: "anthropic/claude-opus-5:high",
 			architect: "anthropic/claude-opus-5:xhigh",
+		},
+	},
+	{
+		name: "kiro-opus",
+		requiredProviders: ["kiro"],
+		mapping: {
+			default: "kiro/claude-opus-5:xhigh",
+			executor: "kiro/claude-sonnet-5",
+			planner: "kiro/claude-opus-5:low",
+			critic: "kiro/claude-opus-5:high",
+			architect: "kiro/claude-opus-5:xhigh",
 		},
 	},
 	{
@@ -361,6 +373,17 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "kiro-opus-gpt",
+		requiredProviders: ["kiro"],
+		mapping: {
+			default: "kiro/claude-opus-5:xhigh",
+			executor: "kiro/gpt-5.6-terra:low",
+			planner: "kiro/claude-sonnet-5",
+			critic: "kiro/gpt-5.6-sol:xhigh",
+			architect: "kiro/gpt-5.6-sol:high",
+		},
+	},
+	{
 		name: "codex-opencodego",
 		requiredProviders: ["openai-codex", "opencode-go"],
 		mapping: {
@@ -403,6 +426,7 @@ function selectorExists(selector: string): boolean {
 	const parsed = parseModelString(selector);
 	if (!parsed) return false;
 	if (parsed.provider === "grok-build") return ["grok-composer-2.5-fast", "grok-build"].includes(parsed.id);
+	if (parsed.provider === "kiro") return KIRO_STATIC_SEED.some(model => model.id === parsed.id);
 	return (modelsJson as Record<string, Record<string, unknown>>)[parsed.provider]?.[parsed.id] !== undefined;
 }
 
@@ -426,6 +450,13 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 		default: "anthropic/claude-opus-5:xhigh",
 		planner: "anthropic/claude-sonnet-5",
 	},
+	"kiro-opus-gpt": {
+		default: "kiro/claude-opus-5:xhigh",
+		executor: "kiro/gpt-5.6-terra:low",
+		planner: "kiro/claude-sonnet-5",
+		critic: "kiro/gpt-5.6-sol:xhigh",
+		architect: "kiro/gpt-5.6-sol:high",
+	},
 	"codex-opencodego": {
 		executor: "opencode-go/deepseek-v4-pro",
 		planner: "opencode-go/kimi-k2.6",
@@ -439,7 +470,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 33-profile matrix cell-for-cell", () => {
+	test("contains exact 35-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -597,6 +628,7 @@ describe("built-in model profile catalog", () => {
 			"CURSOR",
 			"MINIMAX",
 			"ALIBABA TOKEN PLAN",
+			"KIRO",
 			"COMBOS",
 		]);
 		expect(recommendModelProfileForProvider("openai-codex", profiles)?.name).toBe("codex-medium");
@@ -614,6 +646,7 @@ describe("built-in model profile catalog", () => {
 		expect(recommendModelProfileForProvider("alibaba-token-plan", profiles)?.name).toBe(
 			"alibaba-token-plan-balanced",
 		);
+		expect(recommendModelProfileForProvider("kiro", profiles)?.name).toBe("kiro-opus");
 		expect(getModelProfilePresentation("alibaba-token-plan-balanced")).toEqual({
 			displayName: "Balanced",
 			providerGroup: "ALIBABA TOKEN PLAN",

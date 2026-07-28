@@ -234,6 +234,11 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			await logger.time("print:prompt:next", () => session.prompt(message));
 		}
 
+		// Agent-end handlers can schedule immediate credential-refresh or fallback
+		// continuations after prompt() resolves. Keep the JSON subscriber and text
+		// result path alive until those continuations have actually quiesced.
+		await session.waitForIdle();
+
 		// In text mode, output final response.
 		if (mode === "text") {
 			const lastMessage = session.state.messages.findLast(message => message.role === "assistant");
