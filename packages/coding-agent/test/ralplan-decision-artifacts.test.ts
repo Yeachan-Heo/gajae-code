@@ -34,7 +34,7 @@ const criticApprovalContractPatterns = [
 
 const ralplanReviewPipelineContractPatterns = [
 	/Review fan-out after Planner persistence/u,
-	/launch fresh Architect and Critic review lanes against the same immutable Planner receipt\/path\/sha\/stage_n/u,
+	/launch the Architect and Critic ONCE per run as detached, resumable review lanes/u,
 	/Plan-only Critic lane/u,
 	/does not consume Architect output/u,
 	/Sequential fallback/u,
@@ -55,6 +55,22 @@ const staleCriticApprovalPatterns = [
 	/non-`APPROVE` Critic verdict/u,
 	/Critic returns `APPROVE`/u,
 	/without `APPROVE`/u,
+] as const;
+
+const persistedRoleAgentsContractPatterns = [
+	/### Persisted role agents \(consensus loop\)/u,
+	/Architect and Critic are also launched once per run as detached, resumable subagents/u,
+	/resume the SAME persisted Architect and Critic lane subagents with the mandatory re-review context bundle instead of fresh-spawning\./u,
+	/Resume routing table \(for every persisted role: Planner, Architect, and Critic\)/u,
+	/fresh-spawn fallback for that role\/lane on that pass; record the fallback metadata\./u,
+	/a resumed Architect or Critic natively retains prior-pass context/u,
+	/--architect-id <id> --architect-resumable <true\|false>/u,
+	/--critic-id <id> --critic-resumable <true\|false>/u,
+] as const;
+
+const stalePersistedRoleAgentsContractPatterns = [
+	/### Persisted Planner \(consensus loop\)/u,
+	/Architect and Critic are fresh independent spawns each pass/u,
 ] as const;
 
 const criticReReviewRatchetPatterns = [
@@ -84,7 +100,7 @@ const architectReReviewRatchetPatterns = [
 const staleArchitectReReviewRatchetPatterns = [/^- Never approve CRITICAL or HIGH severity issues\.$/mu] as const;
 
 const ralplanReReviewContractPatterns = [
-	/Pass 2\+ runs sequentially Architect -> Critic/u,
+	/Pass 2\+ resumes the SAME persisted Architect and Critic lane subagents with the mandatory re-review context bundle and runs sequentially Architect -> Critic/u,
 	/Pass 2\+ re-reviews MUST run sequentially Architect -> Critic/u,
 	/Critic receives the current-pass Architect receipt\/path and performs the rule-5 counter-review before consolidated feedback routes to Planner revision\./u,
 	/\*\*Re-review context bundle \(pass 2\+; mandatory\):\*\*/u,
@@ -149,6 +165,12 @@ describe("ralplan decision artifacts", () => {
 			expect(content).toMatch(pattern);
 		}
 		for (const pattern of staleReviewPipelineContractPatterns) {
+			expect(content).not.toMatch(pattern);
+		}
+		for (const pattern of persistedRoleAgentsContractPatterns) {
+			expect(content).toMatch(pattern);
+		}
+		for (const pattern of stalePersistedRoleAgentsContractPatterns) {
 			expect(content).not.toMatch(pattern);
 		}
 		for (const pattern of staleCriticApprovalPatterns) {
