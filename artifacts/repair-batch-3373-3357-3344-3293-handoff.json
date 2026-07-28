@@ -1,0 +1,31 @@
+{
+  "lane": "PR repair batch — #3373/#3357/#3344/#3293 — session handoff",
+  "repo": "Yeachan-Heo/gajae-code",
+  "classification": "ci-wait",
+  "status": "hold — retiring resident session",
+  "generated_at": "2026-07-28T15:55:00Z",
+  "completed_work": {
+    "prs_terminal": [
+      { "number": 3373, "state": "CLOSED (superseded)", "successor": "PR #3413, merge commit 34cd145c03089028d0505eeb7514fc5effe449dc" },
+      { "number": 3357, "state": "MERGED" },
+      { "number": 3344, "state": "MERGED" },
+      { "number": 3293, "state": "MERGED via repair PR #3418" }
+    ],
+    "receipt_landed": "artifacts/repair-pr3373-3357-3344-3293-batch-receipt.json (this session's own working branch; canonical copy pending dev landing via #3429)",
+    "verification_summary": "All four merges were rebased/revalidated against dev at merge time (tsc --noEmit clean, targeted regression suites green, three real type errors introduced by #3373's own rebase fixed and reverified). No outstanding code work owned by this lane."
+  },
+  "pending_item": {
+    "pr": 3429,
+    "title": "docs: record #3373/#3357/#3344/#3293 repair batch merge receipt",
+    "branch": "docs/repair-batch-3373-3357-3344-3293-receipt",
+    "head": "0f4a2a2ae73d5b45624438a2f460395436791543",
+    "base": "dev",
+    "kind": "doc-only artifact, zero source diff",
+    "mergeable": "MERGEABLE (per GitHub, last checked at handoff time)",
+    "gate": "Held unmerged pending Dev CI run 30374478224 (exact dev head dae17134cb3e411294d83f10ca70158bee804db1) reaching a terminal (non-cancelled) conclusion. Status at handoff: in_progress, conclusion empty.",
+    "gate_owner": "dev-CI lane (per explicit instruction: this lane does not poll unrelated dev CI as a completion gate; the dev-CI lane owns producing a fresh exact-head Dev CI proof)",
+    "next_action_for_resuming_census": "Check `gh run view 30374478224 --json status,conclusion`. If conclusion=success, merge #3429 with `gh pr merge 3429 --merge --delete-branch=false` (doc-only, safe to fast-follow any dev movement — no rebase needed unless #3429 shows CONFLICTING). If conclusion=failure and the failure is attributable to a concrete regression (not the already-diagnosed team-worker-memory-guard flake, which has two independent fixes in flight elsewhere: fix/team-worker-memory-guard-test-timeout e72c35528, fix/team-memory-guard-flaky-timeout f8df1ee2a), do not merge #3429 until dev is confirmed green again; #3429 carries no source risk itself. If the run was cancelled/superseded again by a later push, re-resolve against whatever the new dev tip's own Dev CI run is before merging."
+  },
+  "no_other_blockers": true,
+  "outcome": "Session retiring as CI-wait. All source-level repair work for #3373/#3357/#3344/#3293 is terminal and already in dev. The single remaining item (#3429, doc-only receipt) is correctly gated on dev-CI lane's own terminal-green proof and requires no further action from this lane beyond the handoff above."
+}
