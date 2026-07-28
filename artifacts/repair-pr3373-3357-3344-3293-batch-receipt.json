@@ -1,0 +1,58 @@
+{
+  "lane": "PR repair batch — #3373 exact head + #3357/#3344/#3293 exact-head reconciliation",
+  "repo": "Yeachan-Heo/gajae-code",
+  "target_branch": "dev",
+  "status": "terminal",
+  "closed_at": "2026-07-28T15:44:45Z",
+  "prs": [
+    {
+      "number": 3373,
+      "title": "fix(acp): harden Air prompt termination and session recovery",
+      "original_fork_head": "probepark:fix/acp-v1-prompt-termination",
+      "repair_pr": 3413,
+      "repair_head_final": "999284edacbc1cd7729d1fe3334726b013f86c71",
+      "merge_commit": "34cd145c03089028d0505eeb7514fc5effe449dc",
+      "status": "merged",
+      "notes": "Two full rebases onto current dev were required mid-session: dev advanced ~97 then a further 3 commits while the repair branch was pinned to a stale merge-base. The stale rebase surfaced three real (non-baseline) type errors this branch's own diff introduced: adapter.ts explicit-annotation narrowing loss on ReverseRequest.controller, broker/transport.ts open-handler discarding send()'s new backpressure-detection return value, and sdk/bus/index.ts choices Map widening AskRemoteControlId to string. All three fixed with minimal, targeted changes and reverified (tsc --noEmit clean; 900+ targeted ACP/SDK/broker/reconciliation/reverse-rpc/ask-answer-source/compaction/notifications tests green) before the final push. Confirmed via a vanilla-dev checkout that none of the three errors exist upstream of this branch's own diff.",
+      "local_verification": "packages/agent full suite 607/610 (3 pre-existing sandbox-local OPENAI_BASE_URL proxy failures, reproduced identically on vanilla dev, not a code issue); packages/coding-agent check:types clean; targeted regression net 900+ tests green; packages/stats 42/42 (after resyncing a stale local .node artifact, not a code issue).",
+      "original_pr_closure": "PR #3373 closed 2026-07-28T15:44:45Z with an explicit successor-evidence comment (merge commit 34cd145c03089028d0505eeb7514fc5effe449dc confirmed ancestor of dev tip dae17134cb3e411294d83f10ca70158bee804db1 via git merge-base --is-ancestor) — https://github.com/Yeachan-Heo/gajae-code/pull/3373#issuecomment-5106357335"
+    },
+    {
+      "number": 3357,
+      "title": "fix: make eager task delegation available with tool discovery",
+      "fork_head": "yeongjunyoo:fix/tool-discovery-followthrough",
+      "exact_head_check": "repair/pr-3357-tool-discovery local branch was byte-identical to origin/pr/3357/head (2f02bec78) at review time — single commit, no drift",
+      "status": "merged directly (no repair PR needed)",
+      "merge_pr": 3357
+    },
+    {
+      "number": 3344,
+      "title": "fix(session): managed session offloading review blockers",
+      "fork_head": "Yeachan-Heo:research/RAM-RSS-regressions",
+      "status": "merged",
+      "merge_pr": 3344,
+      "final_head": "534762350040a382cfc0dd5dc78a1a48dd4ae853",
+      "local_verification": "packages/coding-agent check:types clean; 9-file managed-session/blob-store/resident-cache regression net 107/107 green (after resyncing stale local .node artifact)",
+      "original_pr_closure": "PR #3344 itself was the merged head (owner-authored fork, pushed to directly); GitHub marked it merged at 2026-07-28T15:39:41Z"
+    },
+    {
+      "number": 3293,
+      "title": "feat(session): add session.resumeModelBehavior to control resume model restore",
+      "fork_head": "minislively:feat/session-resume-model-behavior",
+      "repair_pr": 3418,
+      "status": "merged via repair PR #3418 (fork PR, no push access; repair-branch pattern used as with #3373)",
+      "final_head": "571f6345936d4968374cdcf61b11535d3e021b90",
+      "local_verification": "bun install refresh required (stale lockfile in the ad-hoc review worktree produced spurious missing-@types/bun cascading errors, not a real regression — confirmed clean after bun install --frozen-lockfile); tsc --noEmit clean; targeted suite (agent-session-resume-model-behavior, selector-controller-resume-model, slash-commands/session) 10/10 green",
+      "original_pr_closure": "PR #3293 auto-marked merged at 2026-07-28T15:39:51Z (GitHub recognized #3293's original commits as ancestors of #3418's merge commit via the linked-closure keyword)"
+    }
+  ],
+  "shared_dev_red_separated": {
+    "flake_identified": "team worker memory guard wiring > selects the hottest Linux worker... [5000ms timeout] observed on dev@c97da89c1af (run 30358765702, attempt 1); resolved green on rerun (attempt 2) without code change; reproduced 0/4 failures locally against dev tip both in isolation and full-file runs",
+    "other_owners_already_fixing": "confirmed two independent worktrees already in flight with dedicated timeout-headroom fixes for this exact test before this lane touched it: fix/team-worker-memory-guard-test-timeout (e72c35528) and fix/team-memory-guard-flaky-timeout (f8df1ee2a) — this lane deliberately did not duplicate that work, only reran/rerouted CI to confirm the flake and unblocked serialized integration",
+    "not_owned_by_this_lane": true
+  },
+  "shared_workspace_note": "This session ran in a shared working directory (/mnt/offloading/Workspace/gajae-code-batch-owner-session-runtime) concurrently used by at least one other resident agent lane doing unrelated CI-infrastructure work (risk-canary manifest / virtual-integration validation, touching .github/workflows/dev-ci.yml and scripts/ci-*.ts). Those files were left untouched and unstaged throughout — every commit in this lane used explicit `git add <path>` scoped to only the files this lane intentionally edited.",
+  "final_dev_head_at_close": "dae17134cb3e411294d83f10ca70158bee804db1 (Merge pull request #3418), confirmed ancestor-containing 34cd145c03089028d0505eeb7514fc5effe449dc (#3413), the #3357 merge, and the #3344/#3418 merges; dev continued advancing under other owners after this batch closed",
+  "dev_ci_post_merge_note": "The Dev CI run for #3413's own push (30373979454) terminal-cancelled with zero jobs recorded — scheduler/transport-level supersession from the immediately-following #3344/#3418 pushes in the same serialized concurrency group, not a product failure (no job ever started, so no code-path executed and failed). The dev-CI lane owns producing a fresh exact-head Dev CI proof for the current tip; not polled to completion here per explicit instruction that unrelated dev CI is not this lane's completion gate.",
+  "outcome": "All four PRs are terminal: #3373 closed as superseded with explicit successor-evidence (merge commit + ancestor proof) after #3413 merged; #3357, #3344, and #3293 (via #3418) are merged into dev. No outstanding blocker owned by this lane. This lane is retired."
+}
