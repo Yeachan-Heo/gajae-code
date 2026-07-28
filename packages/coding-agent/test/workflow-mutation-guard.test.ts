@@ -393,6 +393,10 @@ describe("workflow mutation guard", () => {
 			"$\"eval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// A continuation between `$` and its locale-translated quote also yields eval (Codex P1).
 			"$\\\n\"eval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// ANSI-C escape sequences decode at runtime — fail closed (Codex P1).
+			"$'\\145val' 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A continuation inside double quotes still splits a command word (Codex P1).
+			"\"e\\\nval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Bash's `function name()` hybrid form is still a declaration (Codex P1).
 			"function cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Function shadows after reserved words are still declarations (Codex P1).
