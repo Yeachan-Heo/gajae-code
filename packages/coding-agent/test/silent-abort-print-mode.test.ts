@@ -73,6 +73,7 @@ function createMockSession(
 		extensionRunner: undefined,
 		subscribe: () => () => {},
 		prompt: async () => {},
+		waitForIdle: async () => {},
 		dispose: async () => {},
 	} as unknown as AgentSession;
 }
@@ -126,6 +127,7 @@ function createPrintModeTrackingSession(
 			};
 		},
 		prompt,
+		waitForIdle: async () => {},
 		dispose,
 	} as unknown as AgentSession;
 
@@ -311,6 +313,19 @@ describe("Print mode", () => {
 
 		expect(tracking.lifecycle).toEqual(["dispose:start", "dispose:end"]);
 		expect(tracking.unsubscribeCount()).toBe(0);
+	});
+
+	it("waits for retry continuations before rendering and disposing", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+		installImmediateStderrMock([]);
+		installImmediateStdoutMock();
+		const session = createMockSession([makeAssistantMessage()]);
+		const waitForIdle = vi.fn(async () => {});
+		(session as unknown as { waitForIdle(): Promise<void> }).waitForIdle = waitForIdle;
+
+		await runPrintMode(session, { mode: "text", initialMessage: "retry me" });
+
+		expect(waitForIdle).toHaveBeenCalledTimes(1);
 	});
 
 	it("continues JSON event processing after a callback EPIPE and disposes before unsubscribing", async () => {

@@ -106,6 +106,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "anthropic/claude-opus-5:high",
 		architect: "anthropic/claude-opus-5:xhigh",
 	}),
+	profile("kiro-opus", ["kiro"], {
+		default: "kiro/claude-opus-5:xhigh",
+		executor: "kiro/claude-sonnet-5",
+		planner: "kiro/claude-opus-5:low",
+		critic: "kiro/claude-opus-5:high",
+		architect: "kiro/claude-opus-5:xhigh",
+	}),
 	profile("claude-fable", ["anthropic"], {
 		default: "anthropic/claude-fable-5:xhigh",
 		executor: "anthropic/claude-sonnet-5",
@@ -298,6 +305,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "openai-codex/gpt-5.6-sol:xhigh",
 		architect: "openai-codex/gpt-5.6-sol:high",
 	}),
+	profile("kiro-opus-gpt", ["kiro"], {
+		default: "kiro/claude-opus-5:xhigh",
+		executor: "kiro/gpt-5.6-terra:low",
+		planner: "kiro/claude-sonnet-5",
+		critic: "kiro/gpt-5.6-sol:xhigh",
+		architect: "kiro/gpt-5.6-sol:high",
+	}),
 	profile("codex-opencodego", ["openai-codex", "opencode-go"], {
 		default: "openai-codex/gpt-5.6-sol:low",
 		executor: "opencode-go/deepseek-v4-pro",
@@ -330,6 +344,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
 	"claude-opus": { displayName: "Claude Opus", providerGroup: "CLAUDE" },
 	"claude-fable": { displayName: "Claude Fable", providerGroup: "CLAUDE" },
+	"kiro-opus": { displayName: "Kiro Opus", providerGroup: "KIRO" },
 	"glm-eco": { displayName: "GLM Eco", providerGroup: "GLM" },
 	"glm-medium": { displayName: "GLM Medium", providerGroup: "GLM" },
 	"glm-pro": { displayName: "GLM Pro", providerGroup: "GLM" },
@@ -355,6 +370,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"alibaba-token-plan-balanced": { displayName: "Balanced", providerGroup: "ALIBABA TOKEN PLAN" },
 	"alibaba-token-plan-qwenmaxxing": { displayName: "QwenMaxxing", providerGroup: "ALIBABA TOKEN PLAN" },
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
+	"kiro-opus-gpt": { displayName: "Kiro Opus + GPT-5.6", providerGroup: "KIRO" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
 };
@@ -370,6 +386,7 @@ const PROFILE_GROUP_ORDER = [
 	"CURSOR",
 	"MINIMAX",
 	"ALIBABA TOKEN PLAN",
+	"KIRO",
 	"COMBOS",
 ];
 
@@ -388,6 +405,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	cursor: "cursor-medium",
 	"minimax-code": "minimax-medium",
 	"alibaba-token-plan": "alibaba-token-plan-balanced",
+	kiro: "kiro-opus",
 };
 
 export function getModelProfilePresentation(

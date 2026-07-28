@@ -97,6 +97,27 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				maxLevel: ThinkingLevel.XHigh,
 			}),
 			model("anthropic", "claude-sonnet-5"),
+			model("kiro", "claude-opus-5", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("kiro", "claude-sonnet-5"),
+			model("kiro", "gpt-5.6-sol", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("kiro", "gpt-5.6-terra", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("kiro", "gpt-5.6-luna", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
 			model("opencode-go", "deepseek-v4-pro"),
 			model("opencode-go", "kimi-k2.6"),
 			model("opencode-go", "mimo-v2.5-pro"),
@@ -562,6 +583,16 @@ describe("model profile activation", () => {
 			},
 		],
 		[
+			"kiro-opus",
+			{
+				default: "kiro/claude-opus-5:xhigh",
+				executor: "kiro/claude-sonnet-5",
+				planner: "kiro/claude-opus-5:low",
+				critic: "kiro/claude-opus-5:high",
+				architect: "kiro/claude-opus-5:xhigh",
+			},
+		],
+		[
 			"opus-codex",
 			{
 				default: "anthropic/claude-opus-5:xhigh",
@@ -569,6 +600,16 @@ describe("model profile activation", () => {
 				planner: "anthropic/claude-sonnet-5",
 				critic: "openai-codex/gpt-5.6-sol:xhigh",
 				architect: "openai-codex/gpt-5.6-sol:high",
+			},
+		],
+		[
+			"kiro-opus-gpt",
+			{
+				default: "kiro/claude-opus-5:xhigh",
+				executor: "kiro/gpt-5.6-terra:low",
+				planner: "kiro/claude-sonnet-5",
+				critic: "kiro/gpt-5.6-sol:xhigh",
+				architect: "kiro/gpt-5.6-sol:high",
 			},
 		],
 		[

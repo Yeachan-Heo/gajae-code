@@ -132,6 +132,7 @@ import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
 import { HookSelectorComponent } from "../components/hook-selector";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
+import { type KiroLoginMethod, KiroLoginMethodSelectorComponent } from "../components/kiro-login-method-selector";
 import { ModelSelectorComponent } from "../components/model-selector";
 import type {
 	NotificationsEditorOperations,
@@ -2446,12 +2447,13 @@ export class SelectorController {
 		});
 	}
 
-	async #handleOAuthLogin(providerId: string): Promise<void> {
+	async #handleOAuthLogin(providerId: string, kiroMethod?: KiroLoginMethod): Promise<void> {
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
 		const useManualInput = CALLBACK_SERVER_PROVIDERS.has(providerId as OAuthProvider);
 		try {
 			await this.ctx.session.modelRegistry.authStorage.login(providerId as OAuthProvider, {
+				kiroMethod,
 				onAuth: (info: { url: string; instructions?: string }) => {
 					this.ctx.chatContainer.addChild(new Spacer(1));
 					this.ctx.chatContainer.addChild(new Text(theme.fg("dim", info.url), 1, 0));
@@ -2530,6 +2532,22 @@ export class SelectorController {
 		}
 	}
 
+	#showKiroLoginMethodSelector(): void {
+		this.showSelector(done => {
+			const selector = new KiroLoginMethodSelectorComponent(
+				(method: KiroLoginMethod) => {
+					done();
+					void this.#handleOAuthLogin("kiro", method);
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
 	async showOAuthSelector(
 		mode: "login" | "logout",
 		providerId?: string,
@@ -2542,7 +2560,11 @@ export class SelectorController {
 				return;
 			}
 			if (mode === "login") {
-				await this.#handleOAuthLogin(providerId);
+				if (providerId === "kiro") {
+					this.#showKiroLoginMethodSelector();
+				} else {
+					await this.#handleOAuthLogin(providerId);
+				}
 			} else {
 				await this.#handleOAuthLogout(providerId);
 			}
@@ -2688,7 +2710,11 @@ export class SelectorController {
 					selector.stopValidation();
 					done();
 					if (mode === "login") {
-						await this.#handleOAuthLogin(selectedProviderId);
+						if (selectedProviderId === "kiro") {
+							this.#showKiroLoginMethodSelector();
+						} else {
+							await this.#handleOAuthLogin(selectedProviderId);
+						}
 					} else {
 						await this.#handleOAuthLogout(selectedProviderId);
 					}

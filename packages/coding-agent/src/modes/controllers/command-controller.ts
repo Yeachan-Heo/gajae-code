@@ -1522,19 +1522,31 @@ function formatWindowSuffix(label: string, windowLabel: string, uiTheme: typeof 
 	return uiTheme.fg("dim", `(${windowLabel})`);
 }
 
+/** Read a string field from a report's untyped provider metadata bag. */
+function reportMetadataString(report: UsageReport, key: string): string | undefined {
+	const value = report.metadata?.[key];
+	return typeof value === "string" ? value : undefined;
+}
+
 function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: number): string {
-	const email = (report.metadata?.email as string | undefined) ?? limit.scope.accountId;
+	const email = reportMetadataString(report, "email") ?? limit.scope.accountId;
 	if (email) return email;
-	const accountId = (report.metadata?.accountId as string | undefined) ?? limit.scope.accountId;
+	const accountId = reportMetadataString(report, "accountId") ?? limit.scope.accountId;
 	if (accountId) return accountId;
+	// Providers with opaque tokens (Kiro) carry no email/accountId, so they
+	// publish a derived, non-secret account label instead of nothing.
+	const account = reportMetadataString(report, "account");
+	if (account) return account;
 	return `account ${index + 1}`;
 }
 
 function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
-	const email = report.metadata?.email as string | undefined;
+	const email = reportMetadataString(report, "email");
 	if (email) return email;
-	const accountId = report.metadata?.accountId as string | undefined;
+	const accountId = reportMetadataString(report, "accountId");
 	if (accountId) return accountId;
+	const account = reportMetadataString(report, "account");
+	if (account) return account;
 	return `account ${index + 1}`;
 }
 
@@ -1719,10 +1731,18 @@ export function renderUsageReports(
 			string,
 			{ label: string; windowLabel: string; limits: UsageLimit[]; reports: UsageReport[] }
 		>();
-		for (const report of providerReports) {
+		providerReports.forEach((report, reportIndex) => {
 			for (const limit of report.limits) {
 				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
-				const key = `${formatLimitTitle(limit)}|${windowId}`;
+				// Kiro credentials are independent subscription balances, so keep each
+				// account in its own row instead of merging them into columns. Key on
+				// the report's position rather than its account label or object
+				// identity: labels are derived from login method plus profile ARN and
+				// are not unique (every Builder ID credential shares one hardcoded
+				// ARN), and the same report object can legitimately appear twice, so
+				// either alternative would silently merge two balances into one row.
+				const accountKey = provider === "kiro" ? String(reportIndex) : "";
+				const key = `${formatLimitTitle(limit)}|${windowId}|${accountKey}`;
 				const windowLabel = limit.window?.label ?? windowId;
 				const entry = limitGroups.get(key) ?? {
 					label: formatLimitTitle(limit),
@@ -1734,7 +1754,7 @@ export function renderUsageReports(
 				entry.reports.push(report);
 				limitGroups.set(key, entry);
 			}
-		}
+		});
 
 		lines.push(uiTheme.bold(uiTheme.fg("accent", providerName)));
 
@@ -1800,16 +1820,27 @@ export function renderUsageReports(
 			}
 		}
 
-		// Render accounts with no rate limits (e.g. business/enterprise plans).
+		// Render accounts with no rate limits (e.g. business/enterprise plans) or
+		// account-scoped usage failures that must remain visible.
 		const unlimitedReports = providerReports.filter(report => report.limits.length === 0);
-		for (const report of unlimitedReports) {
-			const label = formatUnlimitedReportLabel(report, 0);
-			const tier = report.metadata?.planType as string | undefined;
+		unlimitedReports.forEach(report => {
+			// Pass the real position so multiple credentials without any account
+			// metadata fall back to distinct `account N` labels instead of every
+			// row collapsing onto `account 1`.
+			const label = formatUnlimitedReportLabel(report, providerReports.indexOf(report));
+			const tier = reportMetadataString(report, "planType") ?? reportMetadataString(report, "subscriptionTitle");
 			const tierSuffix = tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
+			const unavailableReason = reportMetadataString(report, "unavailableReason");
+			if (unavailableReason) {
+				lines.push(
+					`${uiTheme.fg("error", uiTheme.status.error)} ${label}${tierSuffix} ${uiTheme.fg("dim", `-- unavailable: ${unavailableReason}`)}`,
+				);
+				return;
+			}
 			lines.push(
 				`${uiTheme.fg("success", uiTheme.status.success)} ${label}${tierSuffix} ${uiTheme.fg("dim", "-- no limits")}`,
 			);
-		}
+		});
 		// No per-provider footer; global header shows last check.
 	}
 

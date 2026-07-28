@@ -124,6 +124,7 @@ describe("AgentSession resilient retry", () => {
 		messageApi?: AssistantMessage["api"];
 		messageProvider?: string;
 		messageModel?: string;
+		emitStart?: boolean;
 		requestedModels?: string[];
 		settingsOverrides?: Record<string, unknown>;
 	}): AgentSession {
@@ -168,7 +169,7 @@ describe("AgentSession resilient retry", () => {
 						...(options.transportFailure === undefined ? {} : { transportFailure: options.transportFailure }),
 						timestamp: Date.now(),
 					};
-					stream.push({ type: "start", partial: message });
+					if (options.emitStart !== false) stream.push({ type: "start", partial: message });
 					stream.push({ type: "error", reason: "error", error: message });
 				});
 				return stream;
@@ -931,6 +932,66 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
+	});
+
+	it("refreshes and retries one rejected OAuth credential under bare defaults", async () => {
+		const kiroModel: Model<"kiro-streaming"> = {
+			id: "claude-sonnet-4.6",
+			name: "claude-sonnet-4.6",
+			api: "kiro-streaming",
+			provider: "kiro",
+			baseUrl: "https://runtime.us-east-1.kiro.dev/",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 64_000,
+		};
+		const requestedModels: string[] = [];
+		const invalidate = vi.spyOn(authStorage, "invalidateCredentialMatching").mockResolvedValue(true);
+		session = buildStatusErrorSession({
+			model: kiroModel,
+			errorMessage: "Kiro HTTP 403",
+			errorStatus: 403,
+			transportFailure: { kind: "transport", status: 403 },
+			emitStart: false,
+			recoveredContent: "recovered after forced refresh",
+			requestedModels,
+			bareDefault: true,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		expect(await modelRegistry.getApiKey(kiroModel, session.sessionId)).toBe("kiro-test-key");
+
+		await session.prompt("refresh rejected credential");
+		await session.waitForIdle();
+
+		expect(invalidate).toHaveBeenCalledTimes(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		expect(lastAssistant(session).content).toContainEqual({ type: "text", text: "recovered after forced refresh" });
+	});
+
+	it("keeps the errored Ollama message fail-closed after the active model changes", async () => {
+		const activeModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!activeModel) throw new Error("Expected bundled Anthropic test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model: activeModel,
+			messageApi: "ollama-chat",
+			errorMessage: "Provider stream timed out while waiting for the first event",
+			recoveredContent: "recovered",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("model changed after Ollama timeout");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.unbounded).toBe(false);
+		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
 
 	it("bounds ollama-cloud first-event timeout retries instead of looping unbounded (#713)", async () => {
