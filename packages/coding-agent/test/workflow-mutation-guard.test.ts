@@ -323,6 +323,10 @@ describe("workflow mutation guard", () => {
 			`cat <<'PIPE' | grep -c retrieval | sort\n${specBody}\nPIPE`,
 			// A stray quote inside a comment must not poison cross-line quote state (Codex P2).
 			`# don't trip on this apostrophe\ncat <<'CMT' > /tmp/spec.md\n${specBody}\nCMT`,
+			// `#` after `)` is a comment boundary too (Codex P2).
+			`(true)# don't trip here either\ncat <<'PRN' > /tmp/spec.md\n${specBody}\nPRN`,
+			// A spec body DOCUMENTING a shadow definition is inert data, not a real shadow (Codex P2).
+			`cat <<'SHD' > /tmp/spec.md\nexample: cat() { bash -s; } and alias cat=evil\n${specBody}\nSHD`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,

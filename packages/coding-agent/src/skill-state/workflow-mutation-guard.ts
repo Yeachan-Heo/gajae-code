@@ -507,7 +507,7 @@ function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: stri
 		}
 		if (
 			character === "#" &&
-			(previous === "" || previous === " " || previous === "\t" || ";|&(".includes(previous))
+			(previous === "" || previous === " " || previous === "\t" || ";|&()".includes(previous))
 		) {
 			// Comment: blank the remainder without evaluating quotes inside it.
 			masked += " ".repeat(line.length - masked.length);
@@ -537,21 +537,6 @@ const DATA_CONSUMER_SHADOW_RE = new RegExp(
 	`(?:^|[\\s;|&({\`])(?:function\\s+(?:${DATA_CONSUMER_NAMES})\\b|(?:${DATA_CONSUMER_NAMES})\\s*\\(\\s*\\)|alias\\s+(?:${DATA_CONSUMER_NAMES})=)`,
 	"i",
 );
-
-/**
- * Cut a quote-masked line at an unquoted `#` comment start (line start or after
- * whitespace/separator), so a `<<` inside comment text is never an opener.
- */
-function cutShellComment(syntaxLine: string): string {
-	for (let index = 0; index < syntaxLine.length; index++) {
-		if (syntaxLine[index] !== "#") continue;
-		const previous = index === 0 ? "" : syntaxLine[index - 1];
-		if (previous === "" || previous === " " || previous === "\t" || ";|&(".includes(previous)) {
-			return syntaxLine.slice(0, index);
-		}
-	}
-	return syntaxLine;
-}
 
 /** First command word of a pipeline-segment slice of a quote-masked opener line. */
 function firstCommandWord(segment: string): string {
@@ -622,11 +607,21 @@ function heredocConsumerKind(syntaxLine: string, at: number): "data" | "mutating
  */
 function maskHeredocBodies(command: string): HeredocMaskResult {
 	if (!command.includes("<<")) return { masked: command, opaqueExpansion: false, mutatingConsumer: false };
-	// A function/alias definition of an allowlisted consumer name anywhere in the
-	// command means the name cannot be trusted; keep every body live (fail closed).
-	const shadowed = DATA_CONSUMER_SHADOW_RE.test(command);
+	const first = maskHeredocBodiesPass(command, false);
+	// A function/alias definition of an allowlisted consumer name in the COMMAND
+	// SYNTAX (heredoc bodies and quoted/commented text excluded — a spec that
+	// merely documents `cat() { … }` is inert) means the name cannot be trusted;
+	// redo the pass with masking disabled so every body stays live (fail closed).
+	if (DATA_CONSUMER_SHADOW_RE.test(first.syntaxView)) {
+		return maskHeredocBodiesPass(command, true).result;
+	}
+	return first.result;
+}
+
+function maskHeredocBodiesPass(command: string, shadowed: boolean): { result: HeredocMaskResult; syntaxView: string } {
 	const lines = command.split("\n");
 	const out: string[] = [];
+	const syntaxLines: string[] = [];
 	const state: ShellQuoteState = { inSingle: false, inDouble: false };
 	let previousContinued = false;
 	let opaqueExpansion = false;
@@ -637,7 +632,8 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 		// Cross-line quote masking decides whether a `<<` is real syntax or inert
 		// data — even when the enclosing quote opened on a previous line.
 		const { masked, continued } = maskLineForSyntax(line, state);
-		const syntax = cutShellComment(masked);
+		const syntax = masked;
+		syntaxLines.push(syntax);
 		const isContinuationLine = previousContinued;
 		previousContinued = continued;
 		for (const match of line.matchAll(BASH_HEREDOC_OPEN_RE)) {
@@ -661,7 +657,12 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 					break;
 				}
 			}
-			if (end === -1) return { masked: command, opaqueExpansion, mutatingConsumer };
+			if (end === -1) {
+				return {
+					result: { masked: command, opaqueExpansion, mutatingConsumer },
+					syntaxView: syntaxLines.join("\n"),
+				};
+			}
 			const maskBody = kind === "data" || kind === "mutating";
 			for (let body = index + 1; body < end; body++) {
 				const bodyLine = lines[body] ?? "";
@@ -670,11 +671,15 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 			}
 			out.push(lines[end] ?? "");
 			index = end;
-			// Heredoc bodies are data: they never affect the shell quote state.
+			// Heredoc bodies are data: they never affect the shell quote state or
+			// the syntax view used for shadow detection.
 			previousContinued = false;
 		}
 	}
-	return { masked: out.join("\n"), opaqueExpansion, mutatingConsumer };
+	return {
+		result: { masked: out.join("\n"), opaqueExpansion, mutatingConsumer },
+		syntaxView: syntaxLines.join("\n"),
+	};
 }
 
 function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
