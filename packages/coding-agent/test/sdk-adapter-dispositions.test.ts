@@ -160,6 +160,17 @@ function inputFor(operation: Operation, secret = false): Record<string, unknown>
 			return { id: "openai/gpt-4o-mini" };
 		case "model.profile.set":
 			return { id: "missing-profile" };
+		case "projection.append":
+			return {
+				envelope: {
+					schemaVersion: 1,
+					recordKind: "turn",
+					sourceKey: "adapter-disposition",
+					payload: { probe: true },
+				},
+			};
+		case "projection.read":
+			return { afterRevision: 0 };
 		case "thinking.set":
 			return { level: "low" };
 		case "permission_mode.set":

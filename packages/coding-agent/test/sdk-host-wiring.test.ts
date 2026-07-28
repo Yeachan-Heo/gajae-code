@@ -2512,6 +2512,144 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("capacity-full abort-and-prompt does not abort the prior run and releases failed reservations", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-delivery-capacity-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-delivery-capacity-${Date.now()}`;
+	let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
+	let abortCalls = 0;
+	let rejectAbort = true;
+	const sendUserMessage: ExtensionActions["sendUserMessage"] = async (content, options) => {
+		const text = String(content);
+		if (text === "preflight reject") throw Object.assign(new Error("preflight rejected"), { code: "unavailable" });
+		await firePreflightAccept(options);
+		if (text === "send reject") throw Object.assign(new Error("send rejected"), { code: "unavailable" });
+	};
+	const sessionContext = {
+		...context(cwd, sessionId),
+		abort: async () => {
+			abortCalls++;
+			if (rejectAbort) throw Object.assign(new Error("abort rejected"), { code: "unavailable" });
+			for (let index = 0; index < 128; index++) {
+				await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+				await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+			}
+		},
+	};
+	handlers = start(sessionContext, undefined, sendUserMessage, true);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (id: string, operation: string, input: Record<string, unknown>) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+	};
+	const accepted = [];
+	for (let index = 0; index < 128; index++) {
+		accepted.push(await request(`follow-up-${index}`, "turn.follow_up", { text: `queued ${index}` }));
+	}
+	expect(accepted.every(response => response.ok === true)).toBe(true);
+
+	const full = await request("capacity-full", "turn.abort_and_prompt", { text: "replacement" });
+	expect(full).toMatchObject({ ok: false, error: { code: "busy" } });
+	expect(abortCalls).toBe(0);
+
+	// Free one delivery record, then force an abort rejection. A leaked reservation
+	// would make the retry below report busy despite the newly available slot.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+	const rejected = await request("abort-rejected", "turn.abort_and_prompt", { text: "rejected replacement" });
+	expect(rejected).toMatchObject({ ok: false, error: { code: "unavailable" } });
+	expect(abortCalls).toBe(1);
+	const preflightRejected = await request("preflight-rejected", "turn.follow_up", { text: "preflight reject" });
+	expect(preflightRejected).toMatchObject({ ok: false, error: { code: "unavailable" } });
+	const sendRejected = await request("send-rejected", "turn.follow_up", { text: "send reject" });
+	expect(sendRejected).toMatchObject({ ok: true, result: { accepted: true } });
+	await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "send rejection terminal");
+
+	rejectAbort = false;
+	const retry = await request("abort-retry", "turn.abort_and_prompt", { text: "replacement" });
+	expect(retry).toMatchObject({ ok: true, result: { accepted: true } });
+	expect(abortCalls).toBe(2);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 30_000);
+
+test("prompt delivery capacity evicts terminal records before active records", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-eviction-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-terminal-eviction-${Date.now()}`;
+	let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
+	const sessionContext = context(cwd, sessionId);
+	const sendUserMessage: ExtensionActions["sendUserMessage"] = async (content, options) => {
+		await firePreflightAccept(options);
+		if (String(content) !== "terminal target") return;
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+	};
+	handlers = start(sessionContext, undefined, sendUserMessage, true);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (id: string, operation: string, input: Record<string, unknown>) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+	};
+	let terminalResponseAttempted = false;
+	const originalSendTo = NotificationServer.prototype.sendTo;
+	const sendToSpy = spyOn(NotificationServer.prototype, "sendTo").mockImplementation(function (connectionId, json) {
+		const frame = JSON.parse(json) as { type?: unknown; id?: unknown };
+		if (frame.type === "control_response" && frame.id === "terminal-target") {
+			terminalResponseAttempted = true;
+			throw new Error("simulated terminal acknowledgement loss");
+		}
+		originalSendTo.call(this, connectionId, json);
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "terminal-target",
+			operation: "turn.prompt",
+			input: { text: "terminal target", clientRef: "terminal-target-ref" },
+		}),
+	);
+	await waitFor(() => terminalResponseAttempted, "terminal acknowledgement attempt");
+	const first = (await request("active-0", "turn.follow_up", { text: "active-0" })).result as {
+		commandId: string;
+		turnId: string;
+	};
+	for (let index = 1; index < 127; index++)
+		await request(`active-${index}`, "turn.follow_up", { text: `active-${index}` });
+
+	const replacement = await request("replacement", "turn.follow_up", { text: "replacement" });
+	expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
+	sendToSpy.mockRestore();
+
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+	await waitFor(
+		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === first.commandId),
+		"active record lifecycle after terminal eviction",
+	);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 30_000);
 test("SDK session switches rotate endpoint authority before publishing the replacement host", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-switch-"));
 	dirs.push(cwd);

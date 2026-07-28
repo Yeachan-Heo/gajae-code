@@ -26,6 +26,10 @@ import type {
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import {
+	registerSdkControlAuthority,
+	type SdkControlAuthority,
+} from "../../extensibility/extensions/sdk-control-authority";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
 import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
@@ -114,7 +118,11 @@ export class ExtensionUiController {
 	#activeHookCustomCancel?: () => void;
 
 	#hookSelectorResizeHandler?: () => void;
-	constructor(private ctx: InteractiveModeContext) {}
+	#projectionAuthority = Symbol("app-server-projection") as SdkControlAuthority;
+
+	constructor(private ctx: InteractiveModeContext) {
+		registerSdkControlAuthority(this.#sdkControl, this.#projectionAuthority);
+	}
 
 	#clearActiveHookCustom(): void {
 		const component = this.#activeHookCustomComponent;
@@ -159,7 +167,11 @@ export class ExtensionUiController {
 		};
 	}
 
-	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
+	#sdkControl = async (
+		operation: string,
+		input: Record<string, unknown>,
+		authority?: SdkControlAuthority,
+	): Promise<unknown> => {
 		const session = this.ctx.session;
 		switch (operation) {
 			case "model.set": {
@@ -252,8 +264,16 @@ export class ExtensionUiController {
 					});
 				return { backgrounded: true };
 			case "projection.append":
+				if (authority !== this.#projectionAuthority)
+					throw Object.assign(new Error("projection.append is reserved for the app-server runtime."), {
+						code: "forbidden",
+					});
 				return appendAppServerProjection(session.sessionManager, input.envelope);
 			case "projection.read":
+				if (authority !== this.#projectionAuthority)
+					throw Object.assign(new Error("projection.read is reserved for the app-server runtime."), {
+						code: "forbidden",
+					});
 				return readAppServerProjections(
 					session.sessionManager,
 					validateAppServerProjectionAfterRevision(input.afterRevision),
@@ -590,6 +610,7 @@ export class ExtensionUiController {
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,
+			sdkControlAuthority: this.#projectionAuthority,
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -906,6 +927,7 @@ export class ExtensionUiController {
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,
+			sdkControlAuthority: this.#projectionAuthority,
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),

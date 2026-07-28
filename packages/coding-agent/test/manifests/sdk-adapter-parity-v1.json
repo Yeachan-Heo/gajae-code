@@ -5199,7 +5199,7 @@
 			"adapterTestId": "AD-T-C53",
 			"sdkId": "model.profile.set",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C53",
 			"argv": [
@@ -5209,13 +5209,13 @@
 				"--test-name-pattern",
 				"^AD-T-C53:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C53",
 			"sdkId": "model.profile.set",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C53",
 			"argv": [
@@ -5225,13 +5225,13 @@
 				"--test-name-pattern",
 				"^AD-D-C53:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C53",
 			"sdkId": "model.profile.set",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C53",
 			"argv": [
@@ -5241,7 +5241,7 @@
 				"--test-name-pattern",
 				"^AD-S-C53:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C53",
@@ -5391,7 +5391,7 @@
 			"adapterTestId": "AD-T-C55",
 			"sdkId": "projection.read",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C55",
 			"argv": [
@@ -5401,13 +5401,13 @@
 				"--test-name-pattern",
 				"^AD-T-C55:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C55",
 			"sdkId": "projection.read",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C55",
 			"argv": [
@@ -5417,13 +5417,13 @@
 				"--test-name-pattern",
 				"^AD-D-C55:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C55",
 			"sdkId": "projection.read",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C55",
 			"argv": [
@@ -5433,7 +5433,7 @@
 				"--test-name-pattern",
 				"^AD-S-C55:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C55",

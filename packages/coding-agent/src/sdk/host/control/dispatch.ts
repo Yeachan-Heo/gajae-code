@@ -56,6 +56,7 @@ const SHARED_ERROR_CODES = new Set([
 	"unknown_operation",
 	"invalid_input",
 	"busy",
+	"forbidden",
 	"resource_gone",
 	"unsupported_protocol",
 	"provider_lease_conflict",

@@ -179,7 +179,7 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["C25", "C26", "C52", "C53", "C54"].includes(id))
+	if (["C25", "C26", "C52", "C54", "C55"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	if (id === "C38")
 		return dispositions({
@@ -225,8 +225,9 @@ function controlErrors(id: string): string[] {
 		C50: ["nothing_to_retry", "busy"],
 		C51: ["retry_not_pending"],
 		C52: ["not_foldable", "already_backgrounded", "no_active_bash"],
-		C53: ["invalid_input", "idempotency_conflict", "projection_corrupt"],
-		C54: ["invalid_input", "projection_corrupt"],
+		C53: ["invalid_input"],
+		C54: ["invalid_input", "idempotency_conflict", "projection_corrupt"],
+		C55: ["invalid_input", "projection_corrupt"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];
 }

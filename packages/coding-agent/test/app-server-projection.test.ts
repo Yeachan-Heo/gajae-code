@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
+import { findOperation } from "../src/sdk/protocol/operation-registry";
 import {
+	type AppServerProjectionStore,
 	appendAppServerProjection,
 	readAppServerProjections,
 	validateAppServerProjectionEnvelope,
-	type AppServerProjectionStore,
 } from "../src/session/app-server-projection";
 import { APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE, SessionManager } from "../src/session/session-manager";
-import { findOperation } from "../src/sdk/protocol/operation-registry";
 
 function projectionStore(entries: Array<Record<string, unknown>>): AppServerProjectionStore {
 	return {
@@ -43,9 +43,30 @@ test("app-server projection contract validates, persists ordinal cursors, and re
 		sourceKey: "second",
 		payload: { ordinal: 2 },
 	});
-	expect(first.revision).toBe(1);
-	expect(second.revision).toBe(2);
+	expect(first).toEqual({ entryId: "entry-1", revision: 1 });
+	expect(second).toEqual({ entryId: "entry-3", revision: 2 });
 	expect(reused).toEqual({ entryId: first.entryId, revision: 1, reused: true });
+	await expect(
+		appendAppServerProjection(store, {
+			schemaVersion: 1,
+			recordKind: "turn",
+			sourceKey: "first",
+			payload: { a: 1, b: 3 },
+		}),
+	).rejects.toMatchObject({ code: "idempotency_conflict" });
+	expect(readAppServerProjections(store)).toEqual({
+		records: [
+			{
+				entryId: first.entryId,
+				envelope: { schemaVersion: 1, recordKind: "turn", sourceKey: "first", payload: { b: 2, a: 1 } },
+			},
+			{
+				entryId: second.entryId,
+				envelope: { schemaVersion: 1, recordKind: "turn", sourceKey: "second", payload: { ordinal: 2 } },
+			},
+		],
+		revision: 2,
+	});
 	expect(readAppServerProjections(projectionStore(entries), 1)).toEqual({
 		records: [{ entryId: second.entryId, envelope: { schemaVersion: 1, recordKind: "turn", sourceKey: "second", payload: { ordinal: 2 } } }],
 		revision: 2,
@@ -53,6 +74,31 @@ test("app-server projection contract validates, persists ordinal cursors, and re
 	expect(readAppServerProjections(store, 2).records).toEqual([]);
 	expect(() => readAppServerProjections(store, -1)).toThrow(/afterRevision/);
 	expect(() => validateAppServerProjectionEnvelope({ schemaVersion: 2 })).toThrow(/projection.append/);
+});
+
+test("new projections flush before acknowledgement", async () => {
+	const entries: Array<Record<string, unknown>> = [];
+	let flushes = 0;
+	const store: AppServerProjectionStore = {
+		getEntries: () => entries as never,
+		appendAppServerProjectionEntry: data => {
+			const id = `entry-${entries.length + 1}`;
+			entries.push({ id, type: "custom", customType: APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE, data });
+			return id;
+		},
+		flush: async () => {
+			flushes++;
+			if (flushes === 1) throw new Error("persistence failed");
+		},
+	};
+	const envelope = { schemaVersion: 1, recordKind: "turn", sourceKey: "first", payload: {} };
+	await expect(appendAppServerProjection(store, envelope)).rejects.toThrow("persistence failed");
+	expect(flushes).toBe(1);
+	await expect(appendAppServerProjection(store, envelope)).resolves.toEqual({
+		entryId: "entry-1",
+		revision: 1,
+		reused: true,
+	});
 });
 
 test("projection persistence fails closed for malformed, duplicate, and non-monotonic reserved records", async () => {
@@ -94,11 +140,29 @@ test("generic custom entries cannot forge app-server projections", () => {
 	expect(() => session.appendCustomEntry(APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE, {})).toThrow(/reserved/);
 });
 
-test("projection operation inventory declares its typed errors", () => {
-	expect(findOperation("control", "projection.append")?.errorCodes).toEqual([
-		"invalid_input",
-		"idempotency_conflict",
-		"projection_corrupt",
-	]);
-	expect(findOperation("control", "projection.read")?.errorCodes).toEqual(["invalid_input", "projection_corrupt"]);
+test("projection operation inventory declares its typed errors and shifted control rows", () => {
+	const modelProfile = findOperation("control", "model.profile.set");
+	const append = findOperation("control", "projection.append");
+	const read = findOperation("control", "projection.read");
+	expect(modelProfile?.id).toBe("C53");
+	expect(modelProfile?.errorCodes).toEqual(["invalid_input"]);
+	expect(modelProfile?.adapterDispositions).toMatchObject({
+		telegram: "generic_safe",
+		discord: "generic_safe",
+		slack: "generic_safe",
+	});
+	expect(append?.id).toBe("C54");
+	expect(append?.errorCodes).toEqual(["invalid_input", "idempotency_conflict", "projection_corrupt"]);
+	expect(append?.adapterDispositions).toMatchObject({
+		telegram: "prohibited",
+		discord: "prohibited",
+		slack: "prohibited",
+	});
+	expect(read?.id).toBe("C55");
+	expect(read?.errorCodes).toEqual(["invalid_input", "projection_corrupt"]);
+	expect(read?.adapterDispositions).toMatchObject({
+		telegram: "prohibited",
+		discord: "prohibited",
+		slack: "prohibited",
+	});
 });

@@ -13,6 +13,23 @@ export interface AppServerProjectionStore {
 	flush(): Promise<void>;
 }
 
+export interface AppServerProjectionAppendResult {
+	entryId: string;
+	revision: number;
+	reused?: true;
+}
+
+export interface AppServerProjectionReadResult {
+	records: Array<{ entryId: string; envelope: unknown }>;
+	revision: number;
+}
+
+/** Typed projection capability held only by the owning app-server runtime. */
+export interface AppServerProjectionCapability {
+	append(value: unknown): Promise<AppServerProjectionAppendResult>;
+	read(afterRevision?: unknown): AppServerProjectionReadResult;
+}
+
 interface PersistedAppServerProjectionEnvelope extends AppServerProjectionEnvelope {
 	projectionOrdinal: number;
 }
@@ -27,7 +44,10 @@ function canonicalJson(value: unknown): string {
 		.join(",")}}`;
 }
 
-function projectionError(code: "invalid_input" | "idempotency_conflict" | "projection_corrupt", message: string): Error {
+function projectionError(
+	code: "invalid_input" | "idempotency_conflict" | "projection_corrupt",
+	message: string,
+): Error {
 	return Object.assign(new Error(message), { code });
 }
 
@@ -61,7 +81,11 @@ export function validateAppServerProjectionAfterRevision(value: unknown): number
 }
 
 function projectionDigest(envelope: AppServerProjectionEnvelope): string {
-	return canonicalJson({ schemaVersion: envelope.schemaVersion, recordKind: envelope.recordKind, payload: envelope.payload });
+	return canonicalJson({
+		schemaVersion: envelope.schemaVersion,
+		recordKind: envelope.recordKind,
+		payload: envelope.payload,
+	});
 }
 
 function readPersistedProjection(value: unknown): PersistedAppServerProjectionEnvelope {
@@ -72,50 +96,61 @@ function readPersistedProjection(value: unknown): PersistedAppServerProjectionEn
 		throw projectionError("projection_corrupt", "Persisted app-server projection record has an invalid ordinal.");
 	try {
 		const { projectionOrdinal: _projectionOrdinal, ...envelope } = persisted;
-		return { ...validateAppServerProjectionEnvelope(envelope), projectionOrdinal: persisted.projectionOrdinal as number };
+		return {
+			...validateAppServerProjectionEnvelope(envelope),
+			projectionOrdinal: persisted.projectionOrdinal as number,
+		};
 	} catch {
 		throw projectionError("projection_corrupt", "Persisted app-server projection record is malformed.");
 	}
 }
 
-function persistedProjections(store: AppServerProjectionStore): Array<{ entry: SessionEntry; persisted: PersistedAppServerProjectionEnvelope }> {
+function persistedProjections(
+	store: AppServerProjectionStore,
+): Array<{ entry: SessionEntry; persisted: PersistedAppServerProjectionEnvelope }> {
 	const projections: Array<{ entry: SessionEntry; persisted: PersistedAppServerProjectionEnvelope }> = [];
 	let priorOrdinal = 0;
 	for (const entry of store.getEntries()) {
 		if (entry.type !== "custom" || entry.customType !== APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE) continue;
 		const persisted = readPersistedProjection((entry as { data?: unknown }).data);
 		if (persisted.projectionOrdinal <= priorOrdinal)
-			throw projectionError("projection_corrupt", "Persisted app-server projection ordinals must be unique and strictly increasing.");
+			throw projectionError(
+				"projection_corrupt",
+				"Persisted app-server projection ordinals must be unique and strictly increasing.",
+			);
 		priorOrdinal = persisted.projectionOrdinal;
 		projections.push({ entry, persisted });
 	}
 	return projections;
 }
 
-export async function appendAppServerProjection(store: AppServerProjectionStore, value: unknown): Promise<{
-	entryId: string;
-	revision: number;
-	reused?: true;
-}> {
+export async function appendAppServerProjection(
+	store: AppServerProjectionStore,
+	value: unknown,
+): Promise<AppServerProjectionAppendResult> {
 	const envelope = validateAppServerProjectionEnvelope(value);
 	const existing = persistedProjections(store).find(({ persisted }) => persisted.sourceKey === envelope.sourceKey);
 	if (existing) {
 		if (projectionDigest(existing.persisted) !== projectionDigest(envelope))
-			throw projectionError("idempotency_conflict", "projection.append sourceKey already exists with different content.");
+			throw projectionError(
+				"idempotency_conflict",
+				"projection.append sourceKey already exists with different content.",
+			);
 		await store.flush();
 		return { entryId: existing.entry.id, revision: existing.persisted.projectionOrdinal, reused: true };
 	}
-	const projectionOrdinal = Math.max(0, ...persistedProjections(store).map(({ persisted }) => persisted.projectionOrdinal)) + 1;
+	const projectionOrdinal =
+		Math.max(0, ...persistedProjections(store).map(({ persisted }) => persisted.projectionOrdinal)) + 1;
 	const entryId = store.appendAppServerProjectionEntry({ ...envelope, projectionOrdinal });
 	await store.flush();
 	return { entryId, revision: projectionOrdinal };
 }
 
 /** `afterRevision` is the last returned projection ordinal, retained under its wire name. */
-export function readAppServerProjections(store: AppServerProjectionStore, afterRevision?: unknown): {
-	records: Array<{ entryId: string; envelope: unknown }>;
-	revision: number;
-} {
+export function readAppServerProjections(
+	store: AppServerProjectionStore,
+	afterRevision?: unknown,
+): AppServerProjectionReadResult {
 	const afterOrdinal = validateAppServerProjectionAfterRevision(afterRevision);
 	const projections = persistedProjections(store);
 	return {
