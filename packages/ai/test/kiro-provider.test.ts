@@ -342,6 +342,18 @@ describe("Kiro provider", () => {
 		expect(end.toolCall.incompleteArguments).toBe(true);
 	});
 
+	test("redacts mid-stream exception and error payloads before they reach the transcript", async () => {
+		const leaked = "account 123456789012 profile arn:aws:codewhisperer:us-east-1:123456789012:profile/SECRET";
+		for (const messageType of ["exception", "error"] as const) {
+			const events = await collectKiroEvents([kiroEventFrame("serviceException", { message: leaked }, messageType)]);
+
+			const failure = events.find(event => event.type === "error");
+			if (failure?.type !== "error") throw new Error("Expected error event");
+			expect(failure.error.errorMessage).toBe("Kiro stream error");
+			expect(failure.error.errorMessage).not.toContain(leaked);
+		}
+	});
+
 	test("keeps the first completed tool call when its id is repeated", async () => {
 		const events = await collectKiroEvents([
 			kiroEventFrame("toolUseEvent", { toolUseId: "tu-1", name: "echo", input: '{"a":1}', stop: true }),

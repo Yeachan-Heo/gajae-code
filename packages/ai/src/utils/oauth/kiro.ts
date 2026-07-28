@@ -208,7 +208,6 @@ interface TokenResponse {
 	tokenType?: unknown;
 	expiresIn?: unknown;
 	error?: unknown;
-	error_description?: unknown;
 	interval?: unknown;
 }
 
@@ -324,8 +323,7 @@ async function pollForToken(
 			intervalMs += 5000;
 			continue;
 		}
-		const description = typeof token.error_description === "string" ? token.error_description : "";
-		throw new Error(`Kiro device flow failed: ${error}${description ? `: ${description}` : ""}`);
+		throw new Error("Kiro device flow failed");
 	}
 
 	throw new Error("Kiro device flow timed out");
@@ -562,9 +560,7 @@ export async function refreshKiroToken(credentials: OAuthCredentials): Promise<O
 		refreshToken: credentials.refresh,
 	});
 	if (typeof token.accessToken !== "string") {
-		const error = typeof token.error === "string" ? token.error : "unknown";
-		const description = typeof token.error_description === "string" ? token.error_description : "";
-		throw new Error(`Kiro token refresh failed: ${error}${description ? `: ${description}` : ""}`);
+		throw new Error("Kiro token refresh failed");
 	}
 	const expiresInToken = typeof token.expiresIn === "number" ? token.expiresIn : 28800;
 	// Preserve Kiro routing metadata from the incoming credential and backfill
