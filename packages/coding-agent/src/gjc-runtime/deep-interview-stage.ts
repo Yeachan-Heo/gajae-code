@@ -4,6 +4,7 @@ import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import {
 	assertDeepInterviewEnvelopeInputLimits,
+	assertDeepInterviewIntentManifest,
 	assertDeepInterviewStructuredResponseWithinLimit,
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
@@ -172,6 +173,15 @@ const RUNTIME_OWNED_ENVELOPE_KEYS = [
 	"last_applied_draft_id",
 ] as const;
 
+/**
+ * Nested `state.*` keys owned by the Round-0 ask recorder. A staged/write
+ * payload can never set them: a fabricated contract (missing digest/
+ * confirmation binding) would poison state so every later merge fails
+ * `invalid intent contract`, bricking the interview until a destructive
+ * `clear --force`. The recorder is the only writer that can lock intent.
+ */
+const RECORDER_OWNED_STATE_KEYS = ["intent_contract", "intent_review"] as const;
+
 /** Strip runtime-owned keys from a staged payload; returns the ignored key names. */
 function sanitizeStagedPayload(payload: Record<string, unknown>): {
 	payload: Record<string, unknown>;
@@ -185,7 +195,42 @@ function sanitizeStagedPayload(payload: Record<string, unknown>): {
 			ignoredKeys.push(key);
 		}
 	}
+	if (isPlainObject(next.state)) {
+		const state = { ...(next.state as Record<string, unknown>) };
+		for (const key of RECORDER_OWNED_STATE_KEYS) {
+			if (key in state) {
+				delete state[key];
+				ignoredKeys.push(`state.${key}`);
+			}
+		}
+		next.state = state;
+	}
 	return { payload: next, ignoredKeys };
+}
+
+/**
+ * Self-heal a poisoned merge base: a persisted `state.intent_contract` that
+ * fails canonical validation can only come from a pre-guard poisoned write
+ * (the recorder always persists valid manifests). Left in place it makes
+ * every merge throw, bricking the interview. Drop it (and any equally
+ * unverifiable intent_review) from the base and report the repair.
+ */
+function healPoisonedIntentContract(base: Record<string, unknown>): {
+	base: Record<string, unknown>;
+	healed: boolean;
+} {
+	if (!isPlainObject(base.state)) return { base, healed: false };
+	const state = base.state as Record<string, unknown>;
+	if (state.intent_contract === undefined) return { base, healed: false };
+	try {
+		assertDeepInterviewIntentManifest(state.intent_contract);
+		return { base, healed: false };
+	} catch {
+		const healedState = { ...state };
+		delete healedState.intent_contract;
+		delete healedState.intent_review;
+		return { base: { ...base, state: healedState }, healed: true };
+	}
 }
 
 function parseTransition(raw: string | undefined): DeepInterviewStageTransition {
@@ -363,9 +408,12 @@ function computeMergedEnvelope(
 	draft: DeepInterviewStageDraft,
 	nowIso: string,
 ): Record<string, unknown> {
+	// A poisoned (unverifiable) intent contract in the persisted base would make
+	// every merge throw forever; heal it instead of bricking the interview.
+	const { base: healedCurrent, healed } = healPoisonedIntentContract(current);
 	let merged: Record<string, unknown>;
 	try {
-		merged = mergeDeepInterviewEnvelope(current, draft.payload) as Record<string, unknown>;
+		merged = mergeDeepInterviewEnvelope(healedCurrent, draft.payload) as Record<string, unknown>;
 	} catch (error) {
 		throw new DeepInterviewStageError(
 			"DI_STAGE_MERGE_REJECTED",
@@ -373,6 +421,7 @@ function computeMergedEnvelope(
 			"fix the payload and re-stage (`gjc deep-interview discard` then `stage`)",
 		);
 	}
+	if (healed) merged.intent_contract_healed_at = nowIso;
 	merged.skill = "deep-interview";
 	merged.active = true;
 	merged.updated_at = nowIso;

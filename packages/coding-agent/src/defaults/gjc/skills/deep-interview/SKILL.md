@@ -538,6 +538,68 @@ Then apply the self-proofread once (DIPP-5) to narrative status text, generated 
 Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round write is required for the answer shell; only scoring enrichment/state maintenance remains. For scoring enrichment and state maintenance, use the native `gjc deep-interview` surface and keep every payload **incremental**: stage only the delta for the current round (`stage --for record-round` with just the one round record carrying its `round_key`; the runtime merges it into the existing transcript by durable key), only the changed facts (`--for update-facts`; facts merge losslessly by `id` — a one-fact patch never erases prior facts), or only the changed maintenance fields (`--for merge-state`). Never resend the whole `rounds` array or the full state envelope — earlier rounds are already persisted, resending them is wasteful and racy, and the merge preserves them without your copy. Optionally dry-run with `check`, then commit with `apply`; for a simple immediate update, `gjc deep-interview write --input '<json>'` is the one-shot equivalent (incremental merge; add `--reset` only when deliberately replacing state — the locked intent contract survives a reset). Ambiguity is **runtime-owned**: `apply`/`write` derive `current_ambiguity` from the latest scored round and clamp it to the deterministic floor; report the round's scores and your raw `ambiguity` on the round record, then read the effective value back from the command output (`current_ambiguity`/`result_ambiguity`) instead of hand-setting `state.current_ambiguity`. The session resolves from `GJC_SESSION_ID` automatically; exactly one draft is pending at a time, and a revision conflict at `apply` invalidates the draft with typed recovery — re-stage the same small delta against current state, never do revision arithmetic. Never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
 Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, and `lateral_panel_failures` alongside the existing fields.
 
+#### Delta payload schemas
+
+Every staged/write payload is one JSON object `{"state": { …delta only… }}`. Envelope lifecycle keys (`current_phase`, `active`, `skill`, `version`, `state_revision`, `receipt`, `updated_at`, `last_applied_draft_id`) are runtime-owned — if included they are stripped and reported back as `ignored_runtime_owned_keys`, never persisted. `state.intent_contract` and `state.intent_review` are recorder-owned: only the Round 0 / intent-review `ask` recorder can write them (they carry canonical digests and answer-hash bindings you cannot fabricate); a payload carrying them is stripped the same way — never hand-construct an intent contract.
+
+**`stage --for record-round`** — exactly one round record, merged into the transcript by `round_key`:
+
+```json
+{
+  "state": {
+    "rounds": [
+      {
+        "round": <n>,
+        "round_key": "<durable key from the answered shell>",
+        "lifecycle": "scored",
+        "ambiguity": <raw 0..1 score>,
+        "scores": { "goal": 0.9, "constraints": 0.8, "criteria": 0.9, "context": 0.85 },
+        "weakest_component_id": "<component id>",
+        "weakest_dimension": "goal|constraints|criteria|context",
+        "component_scores": { "<component-id>": { "goal": 0.9, "constraints": 0.8, "criteria": 0.9, "context": 0.85, "gaps": { } } },
+        "structured_scorer_output": { },
+        "ontology": { },
+        "ontology_stability": { }
+      }
+    ]
+  }
+}
+```
+
+Include only the one round being enriched; identity fields (`question_text`, `answer_hash`) already persisted on the shell never need resending — the merge preserves them and never downgrades `scored` back to `answered`.
+
+**`stage --for update-facts`** — only the changed fact records, merged field-wise by `id`:
+
+```json
+{
+  "state": {
+    "established_facts": [
+      { "id": "<fact-id>", "statement": "<fact>", "round": <n>, "disputed": false }
+    ]
+  }
+}
+```
+
+To dispute: send `{ "id": "<fact-id>", "disputed": true }`. To supersede: send `{ "id": "<old-id>", "disputed": false, "superseded_by": "<new-id>" }` plus the new fact record. A delta can never hard-delete a fact — unaddressed facts survive verbatim, so never resend the full facts array.
+
+**`stage --for merge-state`** — only the changed maintenance fields (shallow-merged into `state`; `null` deletes a key):
+
+```json
+{
+  "state": {
+    "ambiguity_milestone": "<band>",
+    "auto_answer_streak": <n>,
+    "refined_rounds": [<n>],
+    "lateral_reviews": [ { "round": <n>, "personas": [], "findings": "<summary>" } ],
+    "topology": { "components": [ … ], "last_targeted_component_id": "<id>" }
+  }
+}
+```
+
+`topology` and other object fields replace whole — include the full object when changing any part of it; `rounds` and `established_facts` are the only keyed-merge collections.
+
+**`write --input`** — same `{"state":{…}}` shape and same merge semantics as a staged `merge-state` apply, committed in one step. `write --reset --input` replaces the whole `state` with the payload (the locked `intent_contract` is re-attached automatically); use it only for deliberate re-initialization.
+
 ### Step 2f: Check Tiered Confirmation Cadence
 
 Confirmation cadence is tiered by round, adopted from ouroboros's ooo interview, while the hard safety cap is retained:

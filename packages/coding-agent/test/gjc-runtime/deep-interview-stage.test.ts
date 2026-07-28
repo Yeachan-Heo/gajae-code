@@ -753,4 +753,59 @@ describe("deep-interview staged transitions", () => {
 			expect((read.envelope as Record<string, unknown>).active).toBe(false);
 		}
 	});
+
+	it("strips recorder-owned intent keys from staged payloads", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const staged = parse(
+			(
+				await run(root, [
+					"write",
+					"--input",
+					JSON.stringify({
+						state: {
+							intent_contract: { version: 1, status: "confirmed", items: [] },
+							intent_review: { version: 1, status: "approved" },
+							note: "payload with fabricated contract",
+						},
+					}),
+					"--json",
+				])
+			).stdout,
+		);
+		expect(staged.ok).toBe(true);
+		expect(staged.ignored_runtime_owned_keys).toEqual(
+			expect.arrayContaining(["state.intent_contract", "state.intent_review"]),
+		);
+		const after = await readState(root);
+		const state = after.state as Record<string, unknown>;
+		expect(state.intent_contract).toBeUndefined();
+		expect(state.intent_review).toBeUndefined();
+		expect(state.note).toBe("payload with fabricated contract");
+	});
+
+	it("self-heals a poisoned intent contract in persisted state instead of bricking", async () => {
+		const root = await tempDir();
+		await seed(root);
+		// Simulate the pre-guard poisoned write: an unverifiable contract already
+		// persisted (as happened in the dogfood run before the sanitizer existed).
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const current = await readState(root);
+		(current.state as Record<string, unknown>).intent_contract = {
+			version: 1,
+			status: "confirmed",
+			items: [{ id: "artifact:roadmap", category: "artifact", statement: "roadmap" }],
+		};
+		await fs.writeFile(statePath, `${JSON.stringify(current, null, 2)}\n`, "utf-8");
+		// Any later delta write must succeed, not fail with `invalid intent contract`.
+		const written = parse(
+			(await run(root, ["write", "--input", JSON.stringify({ state: { note: "after poison" } }), "--json"])).stdout,
+		);
+		expect(written.ok).toBe(true);
+		const after = await readState(root);
+		const state = after.state as Record<string, unknown>;
+		expect(state.intent_contract).toBeUndefined();
+		expect(state.note).toBe("after poison");
+		expect(typeof after.intent_contract_healed_at).toBe("string");
+	});
 });
