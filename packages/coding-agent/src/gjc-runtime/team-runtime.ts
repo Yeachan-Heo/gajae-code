@@ -551,6 +551,40 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-task-approval",
 ] as const;
 
+export type GjcTeamApiOperation = (typeof GJC_TEAM_API_OPERATIONS)[number];
+
+export class UnknownGjcTeamApiOperationError extends Error {
+	readonly code = "unknown_team_api_operation";
+	readonly operation: string;
+	readonly suggestions: readonly string[];
+
+	constructor(operation: string, suggestions: readonly string[]) {
+		const guidance =
+			suggestions.length > 0
+				? `did you mean ${suggestions.join(" or ")}?`
+				: "run gjc team api --help for supported operations";
+		super(`unknown_team_api_operation:${operation}; ${guidance}`);
+		this.name = "UnknownGjcTeamApiOperationError";
+		this.operation = operation;
+		this.suggestions = suggestions;
+	}
+}
+
+function isGjcTeamApiOperation(operation: string): operation is GjcTeamApiOperation {
+	return (GJC_TEAM_API_OPERATIONS as readonly string[]).includes(operation);
+}
+
+function unknownGjcTeamApiOperationSuggestions(operation: string): readonly string[] {
+	if (operation === "heartbeat") return ["read-worker-heartbeat", "update-worker-heartbeat"];
+	if (operation === "get-task") return ["read-task"];
+	return [];
+}
+
+function resolveGjcTeamApiOperation(operation: string): GjcTeamApiOperation {
+	if (isGjcTeamApiOperation(operation)) return operation;
+	throw new UnknownGjcTeamApiOperationError(operation, unknownGjcTeamApiOperationSuggestions(operation));
+}
+
 function currentTimeMs(): number {
 	return gjcTeamRuntimeTestSeams?.nowMs?.() ?? Date.now();
 }
@@ -4896,12 +4930,13 @@ export async function executeGjcTeamApiOperation(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<unknown> {
+	const resolvedOperation = resolveGjcTeamApiOperation(operation);
 	const teamName = String(input.team_name ?? input.teamName ?? "").trim();
 	if (!teamName) throw new Error("missing_team_name");
 	const workerInput = input.worker ?? input.worker_id ?? input.workerId;
 	const worker = String(workerInput ?? "worker-1");
 	const explicitWorker = workerInput == null ? undefined : String(workerInput);
-	switch (operation) {
+	switch (resolvedOperation) {
 		case "list-tasks":
 			return { tasks: await listGjcTeamTasks(teamName, cwd, env) };
 		case "read-task":
@@ -5247,7 +5282,8 @@ export async function executeGjcTeamApiOperation(
 		case "read-shutdown-ack":
 			return readGjcShutdownAck(teamName, worker, cwd, env);
 		default:
-			throw new Error(`unknown_team_api_operation:${operation}`);
+			resolvedOperation satisfies never;
+			throw new UnknownGjcTeamApiOperationError(operation, []);
 	}
 }
 
