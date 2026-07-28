@@ -180,6 +180,11 @@ export function loadFixture(json: string): ReplayFixture {
  * gate measures reclaimable growth.
  */
 export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}): Promise<ReplayResult> {
+	// The debounced width-settle repair is wall-clock-timed; in a deterministic
+	// replay it would fire at a nondeterministic logical position and break
+	// byte-parity comparisons between runs. Disable it for the harness.
+	const previousSettleMs = Bun.env.GJC_TUI_WIDTH_SETTLE_MS;
+	Bun.env.GJC_TUI_WIDTH_SETTLE_MS = "0";
 	const collect = opts.metrics ?? true;
 	if (collect) {
 		renderMetrics.reset();
@@ -294,6 +299,9 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 		advisoryOnly: true,
 		evidenceClass: "wall-clock-proxy",
 	};
+
+	if (previousSettleMs === undefined) delete Bun.env.GJC_TUI_WIDTH_SETTLE_MS;
+	else Bun.env.GJC_TUI_WIDTH_SETTLE_MS = previousSettleMs;
 
 	return { metrics, finalViewport, scrollback, writeCount, writeLog: term.getWriteLog(), turns: turnIndex, latency };
 }

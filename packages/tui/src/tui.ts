@@ -671,7 +671,19 @@ export class TUI extends Container {
 	#widthSettleTimer: NodeJS.Timeout | undefined;
 	#widthSettleRepairPending = false;
 	#lastObservedWidth = 0;
+	// Trailing debounce for the settled width repair. Tunable for tests and
+	// hosts: GJC_TUI_WIDTH_SETTLE_MS / PI_TUI_WIDTH_SETTLE_MS; 0 disables the
+	// settled repair entirely (deterministic replay harnesses need this — a
+	// wall-clock-timed full replay lands at nondeterministic logical positions).
+	readonly #widthSettleMs = TUI.#readWidthSettleMs();
 	static readonly #WIDTH_SETTLE_MS = 1000;
+
+	static #readWidthSettleMs(): number {
+		const raw = Bun.env.GJC_TUI_WIDTH_SETTLE_MS ?? Bun.env.PI_TUI_WIDTH_SETTLE_MS;
+		if (raw === undefined || raw === "") return TUI.#WIDTH_SETTLE_MS;
+		const parsed = Number.parseInt(raw, 10);
+		return Number.isFinite(parsed) && parsed >= 0 ? parsed : TUI.#WIDTH_SETTLE_MS;
+	}
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
 	// Input-priority scheduling: an input keystroke must never be starved behind a
@@ -917,6 +929,15 @@ export class TUI extends Container {
 		this.#manualOutputNotice = false;
 		this.#paintedManualOutputNotice = false;
 		this.#committedTranscriptRows = [];
+		// The old transcript identity is being replaced wholesale, which supersedes
+		// any stale old-width artifact a deferred settle repair would have fixed.
+		// Cancel both the armed timer and a pending deferred repair so an unrelated
+		// later render cannot trigger an out-of-window full clear+replay.
+		if (this.#widthSettleTimer) {
+			clearTimeout(this.#widthSettleTimer);
+			this.#widthSettleTimer = undefined;
+		}
+		this.#widthSettleRepairPending = false;
 	}
 
 	/** Allow one semantic-neighbor reconciliation after a definitive same-transcript rebuild. */
@@ -1105,21 +1126,6 @@ export class TUI extends Container {
 
 	followLiveViewport(): boolean {
 		if (this.#manualViewportTop === undefined) return false;
-		if (this.#widthSettleRepairPending) {
-			// A settled width repair was deferred while the user was reading
-			// scrollback (repainting mid-read would have destroyed their position).
-			// Returning to live is the moment to run it: drop manual state and let
-			// the forced full clear+replay land them at the live bottom.
-			this.#manualViewportTop = undefined;
-			this.#manualViewportAnchor = null;
-			this.#manualViewportFallbackAnchors = [];
-			this.#reconcileMissingViewportAnchor = false;
-			this.#manualOutputNotice = false;
-			this.#committedTranscriptRows = [];
-			this.#paintedManualOutputNotice = false;
-			this.requestRender(true, "resize.width-settled.deferred");
-			return true;
-		}
 		const height = this.terminal.rows;
 		const width = this.terminal.columns;
 		const paddedLiveLines = this.#padBeforeBottomPinnedComponent(
@@ -1156,6 +1162,14 @@ export class TUI extends Container {
 				this.#previousLines = liveLines;
 				if (this.#scrollbackResumeViewportTop === undefined) {
 					this.#nativeScrollbackViewportTop = liveViewportTop;
+				}
+				// A settled width repair was deferred while the user was reading
+				// scrollback (repainting mid-read would have destroyed their
+				// position). The transactional live repaint above has committed, so
+				// manual state is safely released — now schedule the deferred full
+				// clear+replay that repairs old-width wrapping in history.
+				if (this.#widthSettleRepairPending) {
+					this.requestRender(true, "resize.width-settled.deferred");
 				}
 			},
 			true,
@@ -1649,6 +1663,7 @@ export class TUI extends Container {
 	 * existing behavior.
 	 */
 	#scheduleWidthSettleRedraw(): void {
+		if (this.#widthSettleMs <= 0) return;
 		if (this.#widthSettleTimer) clearTimeout(this.#widthSettleTimer);
 		this.#widthSettleTimer = setTimeout(() => {
 			this.#widthSettleTimer = undefined;
@@ -1660,7 +1675,7 @@ export class TUI extends Container {
 			// moment they return to live.
 			if (this.#manualViewportTop !== undefined) return;
 			this.requestRender(true, "resize.width-settled");
-		}, TUI.#WIDTH_SETTLE_MS);
+		}, this.#widthSettleMs);
 		this.#widthSettleTimer.unref?.();
 	}
 

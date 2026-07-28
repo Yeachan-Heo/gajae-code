@@ -169,7 +169,10 @@ describe("debounced full redraw on terminal width change", () => {
 		expect(tui.fullRedraws).toBe(beforeDeadline);
 
 		// Returning to live runs the deferred repair: one full clear+replay at the
-		// new width, landing at the live bottom with no stale pending flag.
+		// new width, landing at the live bottom with no stale pending flag. The
+		// write log is cleared here so the assertions below prove the FOLLOW-LIVE
+		// frames contain the repair — not leftovers from startup or setup.
+		term.clearWriteLog();
 		expect(tui.followLiveViewport()).toBe(true);
 		await term.waitForRender();
 		const afterFollow = tui.fullRedraws;
