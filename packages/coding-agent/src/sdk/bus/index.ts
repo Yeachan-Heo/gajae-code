@@ -4385,6 +4385,9 @@ export function createNotificationsExtension(
 				controlSurface.cancelPendingPreflightsForConnection(connectionId);
 				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
+				// The socket is gone, so its fence has nothing left to refuse. Dropping the
+				// entry keeps the set bounded by live connections instead of growing forever.
+				fencedConnections.delete(connectionId);
 				// Deliberate deviation from the plan's "claim prompt_failed on old-owner
 				// disconnect": that would break the shipped Q26 reconnect contract, where a
 				// client may drop its socket and reconcile the still-running prompt without
