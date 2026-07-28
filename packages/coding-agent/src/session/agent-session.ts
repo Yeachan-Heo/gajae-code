@@ -36,8 +36,8 @@ import {
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
 	type MidRunMaintenanceOutcome,
-	resolveTelemetry,
 	type RunSettlementProof,
+	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";

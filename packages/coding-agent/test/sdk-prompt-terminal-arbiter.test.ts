@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
 import {
-	settleProcessRestart,
 	type DurableReconciliationRecord,
 	type ReconciliationStore,
+	settleProcessRestart,
 } from "../src/sdk/bus/reconciliation-store";
 import type { SdkPromptTerminalOutcome } from "../src/sdk/prompt-status";
 

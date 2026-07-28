@@ -1,9 +1,9 @@
-import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import {
+	ACP_CORE_V1_CASE_IDS,
 	ACPX_GIT_HEAD,
 	ACPX_VERSION,
-	ACP_CORE_V1_CASE_IDS,
 	runAcpConformance,
 	type UpstreamReport,
 } from "../scripts/run-acp-conformance";

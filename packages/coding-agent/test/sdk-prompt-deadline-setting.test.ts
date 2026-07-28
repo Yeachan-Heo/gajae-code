@@ -36,11 +36,12 @@ describe("sdk.promptDeadlineMs", () => {
 			await Bun.file(new URL("../../../schemas/config.schema.json", import.meta.url)).text(),
 		) as {
 			properties: {
-				sdk: { properties: { promptDeadlineMs: { minimum: number; maximum: number } } };
+				sdk: { properties: { promptDeadlineMs: { type: string; minimum: number; maximum: number } } };
 			};
 		};
 
 		expect(schema.properties.sdk.properties.promptDeadlineMs).toMatchObject({
+			type: "integer",
 			minimum: 60_000,
 			maximum: 86_400_000,
 		});

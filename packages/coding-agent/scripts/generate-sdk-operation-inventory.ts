@@ -150,6 +150,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:runIdleCompaction": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:abortBranchSummary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:abortHandoff": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:abortPromptAndWait":
+		"internal SDK prompt-terminalization resource fence over a host-captured run handle, not an independent public SDK control seam",
 	"agent_session:prepareContributionPrep": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setResourceSampler": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setRetainedMemorySampler": "internal accessor/plumbing, not a user-facing control seam",

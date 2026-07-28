@@ -87,6 +87,10 @@ describe("SDK operation inventory", () => {
 				"agent_session:awaitPendingContextTransformations",
 				"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 			],
+			[
+				"agent_session:abortPromptAndWait",
+				"internal SDK prompt-terminalization resource fence over a host-captured run handle, not an independent public SDK control seam",
+			],
 		]);
 		for (const [sourceId, rationale] of expected) {
 			const record = records.find(candidate => candidate.sourceId === sourceId);

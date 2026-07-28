@@ -2,11 +2,7 @@
  * Kind-aware invocation reconciliation (prompt | skill) with optional durable store.
  * Preserves Q26 admit/first-terminal/capacity/TTL semantics; indexes and caps are per-kind.
  */
-import {
-	type PromptReconciliationStatus,
-	type SdkPromptTerminalOutcome,
-	type TurnPromptReconciliation,
-} from "../prompt-status";
+import type { PromptReconciliationStatus, SdkPromptTerminalOutcome, TurnPromptReconciliation } from "../prompt-status";
 import {
 	PROMPT_RECONCILIATION_ACTIVE_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_CAPACITY,

@@ -3657,6 +3657,17 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:abortPromptAndWait",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal SDK prompt-terminalization resource fence over a host-captured run handle, not an independent public SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:cancelAndSubmit",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
