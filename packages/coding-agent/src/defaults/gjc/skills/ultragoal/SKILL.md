@@ -178,28 +178,26 @@ Ultragoal execution should use GJC's bundled role-agent roster when a durable st
 - Use `architect` for read-only architecture and code-review lanes, including `CLEAR` / `WATCH` / `BLOCK` status.
 - Use `critic` for read-only plan or handoff critique before execution proceeds.
 
-### Mandatory implementation delegation on big scope
+### Implementation delegation guidance
 
-When a story's implementation scope is **big enough**, the Ultragoal leader MUST delegate the implementation to one or more `executor` subagents instead of writing the code inline itself. This is a hard requirement, not a preference: solo inline implementation of a big-scope story is a gate violation, and the completion cleanup/review gate must treat missing delegation on a big-scope story as a blocker.
+Direct inline implementation by the leader is the default. Delegate to `executor` subagents only when the expected diffs land in **genuinely different sub-domains, modules, or systems** — separable surfaces with independent acceptance criteria and no shared-file contention. File count or line count alone does not force delegation; a large change confined to one domain/subsystem is usually better done inline or by a single sequenced `executor`.
 
-A story's implementation scope is **big enough** to force delegation when any of the following hold:
+Delegation is worth it when:
 
-- It spans **3+ files** or **2+ cleanly separable surfaces/modules** that can be implemented against bounded, independent acceptance criteria.
-- It is estimated at **~200+ lines of net implementation change**, or is otherwise large enough that a single inline pass would crowd out the leader's checkpoint/verification duties.
-- It decomposes into **independent slices** that can proceed in parallel without shared-file contention.
-- The leader has already made **2+ inline edit passes** on the same story and implementation is still materially incomplete.
+- The story spans **multiple distinct sub-domains / modules / systems** (e.g. a CLI surface plus an unrelated runtime subsystem plus docs tooling) whose slices can proceed in parallel without coordinating on the same files.
+- Each slice can be bounded with explicit targets and acceptance criteria that are verifiable independently of the other slices.
+- The leader's checkpoint/verification duties would otherwise be crowded out by juggling unrelated domains inline.
 
-Forced-delegation rules:
+When delegating:
 
-- Split the story into cleanly separable slices, give each `executor` bounded targets and explicit acceptance criteria, and keep checkpoint/goal-state ownership in the leader.
-- Prefer **parallel** `executor` subagents for independent slices; sequence only slices with a real dependency.
-- If a big-scope story cannot be cleanly split, record the reason as a durable ledger note and delegate the whole implementation to a single `executor` rather than doing it inline; the leader still owns verification.
-- Small, atomic, single-file changes below these thresholds stay with the leader — do not over-delegate trivial work.
+- Give each `executor` bounded targets and explicit acceptance criteria, and keep checkpoint/goal-state ownership in the leader.
+- Parallelize only across genuinely different sub-domains/modules/systems; sequence anything with a real dependency or shared-surface overlap.
+- Work within a single domain/subsystem stays with the leader as direct edits — do not split one cohesive change across subagents, and do not over-delegate trivial work.
 - After integrating delegated slices, run `architect` / `critic` review lanes; worker agents never mutate `.gjc/_session-{sessionid}/ultragoal` or call goal tools.
 
 When delegating with native subagents, an await timeout only limits the leader's wait. It is not subagent failure evidence and must not be used as a cancellation reason; inspect or continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
-If an Ultragoal request has no approved plan or consensus artifact, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Do not silently substitute ad-hoc execution for missing planning.
+If an Ultragoal request has no approved plan or consensus artifact **and** the scope genuinely needs one, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Skip `ralplan` for small scope: work that fits a single reviewable PR and is tied to a single domain/subsystem can proceed directly from the brief — record that judgment in the ledger instead of running a planning round. Reach for `ralplan` when the scope spans multiple domains/subsystems, needs cross-cutting sequencing, or would not fit a single PR.
 
 The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
 
@@ -207,8 +205,8 @@ The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `
 
 Native subagent parallelism is a contract for bounded `executor` delegation, not a runtime scheduler and not a Team-mode rule:
 
-- **MUST use native `executor` parallelism** when a story meets the big-scope delegation threshold above and decomposes into independent implementation slices that can be bounded by per-slice coordination contracts.
-- **SHOULD prefer parallel `executor` subagents** for independent files/surfaces, and sequence only real dependencies, unsafe shared-file overlap, sub-threshold trivial work, or work that lacks a safe contract.
+- **Use native `executor` parallelism only** when a story's expected diffs fall in genuinely different sub-domains/modules/systems, each boundable by a per-slice coordination contract.
+- **Default to direct leader edits** otherwise; sequence any work with real dependencies, shared-file overlap, or a single-domain footprint, and never parallelize work that lacks a safe contract.
 - Worker agents **MUST NOT mutate `.gjc/_session-{sessionid}/ultragoal`**, call goal tools, make checkpoint decisions, own integration, or own final verification. The Ultragoal leader keeps those responsibilities.
 
 Before workers start, each per-slice coordination contract MUST name the target files/surfaces, independence assumptions, allowed coordination channel, conflict-escalation rule, expected evidence, and terminal status. Conflict or assignment changes remain leader-owned and must be auditable through durable ledger evidence.
