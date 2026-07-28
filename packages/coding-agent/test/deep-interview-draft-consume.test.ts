@@ -818,6 +818,9 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				expected: 0.5,
 				actual: 1,
 			});
+			// The printed recovery must name a runnable draft operation, never a bare
+			// `--op set` on an object path (which the draft editor rejects).
+			expect(String(issues[0].recovery)).toContain("--op set --path /global_scores/goal");
 			// consume fails with the identical named invariant
 			const failedConsume = await consume(env.cwd, "apply-round-result", result);
 			expect(failedConsume.status).not.toBe(0);

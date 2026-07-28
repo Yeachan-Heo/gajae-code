@@ -166,9 +166,6 @@ const REPAIR_CODE_MESSAGES: Record<string, { message: string; recovery?: string 
 	DI_OUTPUT_LIMIT_EXCEEDED: { message: "The projected response exceeds the CLI output byte limit." },
 	DI_INPUT_MODE_CONFLICT: { message: "Draft-mode and raw-JSON flags cannot be mixed in one invocation." },
 };
-/** Recovery for invariants whose offending datum lives in the caller-editable payload. */
-const PAYLOAD_INVARIANT_RECOVERY =
-	"Correct the named invariant at the reported path so actual matches expected (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <payload-path> --value <value> --json), rerun gjc deep-interview draft check --draft-id <id> --json until valid, then retry consume.";
 /** Recovery for invariants whose offending datum lives in persisted state, which drafts cannot edit. */
 const STATE_INVARIANT_RECOVERY =
 	"The violated invariant is in persisted state, not the draft payload. Inspect it (gjc deep-interview inspect --session-id <session> --selector summary|pending|recent-scored --json) and complete the missing lifecycle step (e.g. score earlier pending rounds first); if the state itself is corrupt, follow the documented state repair path via sanity-check — never edit .gjc state files directly.";
@@ -189,6 +186,30 @@ function isRequiredSetupPointer(pointer: string): boolean {
 	return requiredSetupPointers.has(pointer);
 }
 /**
+ * Render a runnable recovery for a payload invariant. `draft edit --op set`
+ * only accepts scalar leaves, and a missing array item must be scaffolded with
+ * `append` first, so the emitted command is chosen from the reported pointer's
+ * descriptor rather than always suggesting `set`.
+ */
+function payloadInvariantRecovery(detail: DeepInterviewInvariantDetail): string {
+	const rerun = "then rerun gjc deep-interview draft check --draft-id <id> --json until valid, and retry consume.";
+	const prefix = "gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest";
+	const value = detail.expected === undefined ? "<value>" : JSON.stringify(detail.expected);
+	// A trailing object segment (e.g. `/component_updates/2/scores`) is not a
+	// scalar leaf: the caller must append the item, then set each scalar under it.
+	const arrayItem = detail.path.match(/^(\/[A-Za-z_]+)\/(\d+)(\/.*)?$/);
+	if (arrayItem) {
+		const [, arrayPointer, indexText, rest] = arrayItem;
+		const leaf = rest && /\/[A-Za-z_]+$/.test(rest) && !rest.endsWith("/scores");
+		const setPart = leaf
+			? `${prefix} --op set --path ${detail.path} --value ${value} --json`
+			: `${prefix} --op append --path ${arrayPointer} --json` +
+				` (repeat until index ${indexText} exists), then set each required scalar under ${detail.path}/<dimension>`;
+		return `Fix ${detail.path} in the draft payload: ${setPart}, ${rerun}`;
+	}
+	return `Fix ${detail.path} in the draft payload (${prefix} --op set --path ${detail.path} --value ${value} --json), ${rerun}`;
+}
+/**
  * Invariant detail paths starting with `/state/` point at the persisted
  * envelope; everything else (`/global_scores/...`, `/triggers...`, `/fact_ops...`,
  * `/bookkeeping/...`, `/targeting`, `/ontology/...`) is payload-addressable.
@@ -204,7 +225,8 @@ function invariantRecovery(detail: DeepInterviewInvariantDetail): string {
 			: `set it back to ${existing} (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path ${detail.path} --value ${existing} --json)`;
 		return `State already initialized ${detail.path}; setup fields cannot be changed. To proceed, ${correction}, then rerun gjc deep-interview draft check --draft-id <id> --json.`;
 	}
-	return detail.path.startsWith("/state/") ? STATE_INVARIANT_RECOVERY : PAYLOAD_INVARIANT_RECOVERY;
+	if (detail.path.startsWith("/state/")) return STATE_INVARIANT_RECOVERY;
+	return payloadInvariantRecovery(detail);
 }
 function issue(code: string, detail?: DeepInterviewInvariantDetail) {
 	const known = REPAIR_CODE_MESSAGES[code];

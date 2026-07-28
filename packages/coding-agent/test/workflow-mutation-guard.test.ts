@@ -869,6 +869,7 @@ describe("workflow mutation guard", () => {
 			'gjc deep-interview draft edit --draft-id abc --expected-draft-revision 1 --op set --path /question --value "What?" --json',
 			"gjc deep-interview draft edit --draft-id abc --expected-draft-revision 1 --op set --path /type --value brownfield --op set --path /codebase_context --value 'Release uses `bun run release`; output may contain >, <, |, and $(literal) as inert text.' --json",
 			'bun -e \'const p=Bun.spawnSync(["gjc","deep-interview","inspect","--selector","round","--json"]); process.stdout.write(p.stdout); process.stderr.write(p.stderr); process.exit(p.exitCode)\'',
+			"bash -c 'gjc deep-interview inspect --selector summary --json'",
 			'gjc deep-interview draft create --for apply-round-result --session-id s1 --json <<\'EOF\'\n{"unused": "stdin data with open( and writeFile( text"}\nEOF',
 		]) {
 			const decision = await getWorkflowMutationDecision({
@@ -893,6 +894,10 @@ describe("workflow mutation guard", () => {
 			'bun -e \'await Bun.write("src/product.ts", "x")\'',
 			"bun -e 'await Bun.write(`src/product.ts`, \"x\")'",
 			"bun -e 'await Bun.write(target, \"x\")'",
+			// A literal nested shell script is a real command list; its mutations count.
+			"bash -c 'rm src/product.ts'",
+			"sh -c 'touch src/product.ts'",
+			'zsh -c "echo x > src/product.ts"',
 			// redirection disqualifies the whitelist
 			"gjc deep-interview inspect --session-id s1 --json > src/product.ts",
 			// command substitution disqualifies

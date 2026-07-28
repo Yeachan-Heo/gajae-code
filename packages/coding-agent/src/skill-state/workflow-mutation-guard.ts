@@ -535,7 +535,15 @@ function isPureGjcReadOnlyBashCommand(command: string): boolean {
 	return true;
 }
 
-function extractBashTargets(args: unknown): ExtractedTargets {
+/**
+ * Literal `sh|bash|zsh -c '<script>'` payloads. The nested script is a real
+ * command list, so its mutations must be extracted too; a quoted script never
+ * matches the top-level mutator patterns, which would otherwise read as safe.
+ */
+const BASH_NESTED_SHELL_RE =
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:ba|z|da)?sh\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*c\s+(?:(')([^']*)'|(")([^"]*)")/g;
+
+function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
 	const targets: ExtractedTargets = { paths: [], unknown: false };
@@ -547,6 +555,20 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 	// workflow-sanctioned CLI is never blocked as unknown-target (#guard-vs-cli conflict).
 	if (isPureGjcReadOnlyBashCommand(command)) {
 		return targets;
+	}
+	// Recurse into literal nested shell scripts. A bounded depth keeps this
+	// terminating; anything deeper is not statically analyzable, so fail closed.
+	for (const match of command.matchAll(BASH_NESTED_SHELL_RE)) {
+		const script = match[2] ?? match[4] ?? "";
+		if (depth >= 2) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			break;
+		}
+		const nested = extractBashTargets({ command: script }, depth + 1);
+		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+		if (nested.unknown) targets.unknown = true;
+		if (nested.explicitMutation) targets.explicitMutation = true;
 	}
 	const bunWriteCallCount = [...command.matchAll(BASH_BUN_WRITE_CALL_RE)].length;
 	let classifiedBunWriteCount = 0;
