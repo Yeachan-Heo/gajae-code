@@ -1573,7 +1573,15 @@ export class TUI extends Container {
 			clearTimeout(this.#widthSettleTimer);
 			this.#widthSettleTimer = undefined;
 		}
-		this.#widthSettleRepairPending = false;
+		// An armed TIMER dies with the session, but an already-deferred repair
+		// (deadline passed while the user was reading scrollback) must survive a
+		// temporary stop/start (Ctrl-Z resume, external editor): manual viewport
+		// ownership survives restart, so followLiveViewport() still needs the flag
+		// to run the deferred repair. Without manual ownership the flag is moot —
+		// start() issues a forced full render that repairs everything anyway.
+		if (this.#manualViewportTop === undefined) {
+			this.#widthSettleRepairPending = false;
+		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.#previousLines.length > 0) {
 			const targetRow = this.#previousLines.length; // Line after the last content

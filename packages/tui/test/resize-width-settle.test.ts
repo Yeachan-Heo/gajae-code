@@ -187,4 +187,34 @@ describe("debounced full redraw on terminal width change", () => {
 
 		tui.stop();
 	});
+
+	it("keeps the deferred repair across stop/start while manual viewport survives", async () => {
+		const term = new VirtualTerminal(COLS, 30);
+		const tui = new TUI(term);
+		tui.start();
+		await term.waitForRender();
+		await buildTranscript(tui, term, 60);
+
+		// Manual viewport, width change, deadline passes while manual -> deferred.
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await term.waitForRender();
+		term.resize(COLS - 15, 30);
+		await term.waitForRender();
+		await Bun.sleep(SETTLE_MS + 200);
+
+		// Ctrl-Z resume / external editor: temporary stop/start. Manual viewport
+		// ownership survives restart, and so must the deferred repair.
+		tui.stop();
+		tui.start();
+		await term.waitForRender();
+
+		term.clearWriteLog();
+		expect(tui.followLiveViewport()).toBe(true);
+		await term.waitForRender();
+		const out = term.getWriteLog().join("");
+		expect(out).toContain("\x1b[2J\x1b[H\x1b[3J");
+		expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+
+		tui.stop();
+	});
 });
