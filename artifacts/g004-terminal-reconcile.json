@@ -1,0 +1,61 @@
+{
+  "recorded_at": "2026-07-28T15:05:00Z",
+  "prior_reconcile_ref": "artifacts/g004-parallel-integration-batch-1.json",
+  "summary": "Terminal reconciliation for this lane (#3350 risk-canary + #3366 conflict-integration + #3299/old-owner-drafts follow-up). Resident lane retiring.",
+  "final_state": {
+    "pr_3366": {
+      "status": "MERGED",
+      "merge_commit_sha": "09caa962f6716b4b33c202d6125a6373edea5424",
+      "merged_at": "2026-07-28T14:24:40Z",
+      "verified_via": "gh api repos/Yeachan-Heo/gajae-code/pulls/3366 --jq '{state,merged,merge_commit_sha,merged_at}' (REST, post-GraphQL-rate-limit)",
+      "disposition": "terminal, no further action"
+    },
+    "issue_3350": {
+      "status": "HELD — contract-overlap, not global freeze",
+      "local_branch": "g004-revalidate",
+      "local_head": "6efc61f29b92476545ed14c82ab33c7d00a311ae",
+      "pushed_to_origin": true,
+      "push_evidence": "git push origin g004-revalidate -> 'new branch g004-revalidate -> g004-revalidate'; git ls-remote --heads origin g004-revalidate confirms 6efc61f29b92476545ed14c82ab33c7d00a311ae",
+      "pr_opened": false,
+      "hold_reason": "branch modifies .github/workflows/dev-ci.yml and scripts/ci-dev-affected.ts directly, overlapping the recurring 'Affected path validation' dev-CI failure contract (evidence producer + coding-agent shard-2-of-8 flake class seen across census followups 1/2/4). Must not open a PR until rebased onto current dev tip and attribution-verified not to reproduce that flake class.",
+      "commits_behind_dev_at_push_time": 94,
+      "disposition": "work preserved on origin, PR intentionally not opened this pass — remains actionable next session via rebase"
+    },
+    "issue_3299_pr": {
+      "status": "no action, out of batch scope, unrelated investigation-only PR",
+      "disposition": "terminal for this lane"
+    },
+    "old_owner_drafts": {
+      "status": "none found beyond already-tracked #3350 local work",
+      "disposition": "terminal for this lane"
+    },
+    "pr_3375_dev_recovery": {
+      "status": "still OPEN, mergeable_state=dirty, not merged",
+      "note": "not owned by this lane; left untouched per doctrine (another owner's blocker-repair PR)",
+      "disposition": "out of scope, no action taken"
+    },
+    "dev_tip_at_lane_retirement": "ade83f07238f171f38c49df510ef0f7ce7eab1df",
+    "dev_note": "dev is being actively advanced by other owners (yeongjunyoo #3357 and further merges observed) independent of this lane; not polled to completion per parallel-integration doctrine — out of this lane's scoped responsibility"
+  },
+  "artifacts_committed_and_pushed": [
+    "artifacts/g002-pr3355-review-report.json",
+    "artifacts/g003-cli-replay.json",
+    "artifacts/g004-census-hold-3350-3366.json",
+    "artifacts/g004-census-hold-3350-3366-followup.json",
+    "artifacts/g004-census-hold-3350-3366-followup2.json",
+    "artifacts/g004-census-hold-3350-3366-followup3.json",
+    "artifacts/g004-census-hold-3350-3366-followup4.json",
+    "artifacts/g004-census-hold-3350-3366-followup5.json",
+    "artifacts/g004-parallel-integration-batch-1.json",
+    "artifacts/g004-virtual-integration-dogfood.json",
+    "scripts/ci-risk-canary-manifest.ts",
+    "scripts/ci-risk-canary-manifest.test.ts",
+    "scripts/ci-virtual-integration.ts",
+    "scripts/ci-virtual-integration.test.ts",
+    "scripts/ci-dev-affected.ts (modified)",
+    "scripts/ci-dev-affected.test.ts (modified)",
+    "scripts/dev-ci-guard-topology.test.ts (modified)",
+    ".github/workflows/dev-ci.yml (modified)"
+  ],
+  "lane_status": "TERMINAL — one concrete merge landed (#3366), one concrete hold recorded with exact reason and clear next step (#3350), no unattributed CI failures, no owned uncommitted work remaining. Resident lane retires."
+}
