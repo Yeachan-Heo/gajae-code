@@ -1,0 +1,28 @@
+{
+  "schema": "gajae.issue-triage-sequencing.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "context": { "devHead": "e6e694fa9", "devStatus": "red (stats + SDK canonicalization only)" },
+  "issues": [
+    {
+      "number": 3389,
+      "title": "executor subagents fail within 1-2s before reaching the LLM, with no error body",
+      "rootCauseArea": "packages/coding-agent/src/sdk/broker/session-index.ts, src/sdk/broker/state-version.ts (broker session-index replay/snapshot layer)",
+      "correlation": "origin/dev has an active, ongoing series of commits touching this exact file set: aed7b56ce (tolerate already-closed index append handles), 733d4a186 (preserve repair prefix watermark), 48e3ecd97 (recover corrupt session index history), a7ccb1fa3 (compact broker session index) — i.e. this is the same layer as the current dev-red 'SDK canonicalization' work in flight.",
+      "sequencingDecision": "BLOCKED_ON_DEV_SDK_REPAIR",
+      "rationale": "Instruction is explicit: do not touch integrated dev repair files while dev is red. The subagent-launch-failure root cause (session-index replay / UnsupportedStateVersionError producer) sits inside the exact files the in-flight SDK canonicalization repair owns. Investigating/patching now risks colliding with unmerged in-flight changes to the same lines.",
+      "safeIndependentSubtask": "Request 1 (propagate the launch-failure cause to the caller instead of an empty status:failed body) is UX-surface work in the subagent-launch/Task-tool result path, not the session-index internals — it does not require touching the red files and could be sequenced independently once identified precisely. Not started this pass; flagged for next pass after dev is green and the exact surface is confirmed clear of in-flight SDK files.",
+      "action": "No repair performed this pass. Re-triage after dev returns to green."
+    },
+    {
+      "number": 3390,
+      "title": "Provider stream timed out while waiting for the first event: no retry, timeout hard-fixed at 120s",
+      "rootCauseArea": "packages/coding-agent/src/session/agent-session.ts (RetryErrorClassification, KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES / ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MESSAGES allowlists), src/task/provider-retry-status.ts",
+      "correlation": "Not in the sdk/broker/session-index.ts file set touched by the in-flight dev-red SDK canonicalization commits. Independent layer.",
+      "existingInfra": "A first_event_timeout classification and provider-specific retry allowlists already exist (currently scoped to Kimi Code and the Alibaba token-plan provider only) — general retry/backoff for this classification is a scoping extension of existing machinery, not new plumbing.",
+      "sequencingDecision": "INDEPENDENT_OF_DEV_RED — eligible for repair without touching dev-red files",
+      "action": "No repair performed this pass (deferred to a follow-up pass to keep this batch's scope to review/triage); confirmed not blocked by dev-red and not requiring owner confirmation (it is a defect fix — no new user-facing contract), so it can proceed ahead of #3389 once picked up."
+    }
+  ],
+  "recommendedOrder": ["#3398 (triaged this pass, OWNER_CONFIRMATION_REQUIRED, no code change)", "#3391 (reviewed this pass, no independent blocker, held pending dev-green for merge)", "#3390 (independent of dev-red, next repair candidate)", "#3389 (blocked on dev-red SDK canonicalization; re-triage after dev green)"],
+  "reviewedAt": "2026-07-29T00:00:00Z"
+}

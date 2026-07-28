@@ -1,0 +1,28 @@
+{
+  "schema": "gajae.pr-review-verdict.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "pullRequest": {
+    "number": 3407,
+    "reviewedHeadSha": "9fcae7630727c3ac38f28f8b24fe57e463372924",
+    "baseBranch": "dev",
+    "closesIssue": 3403
+  },
+  "context": {
+    "devHead": "c97da89c1afadcf20fc949307f2996aaeffecfca",
+    "devStatus": "red — no merge while dev is red (unchanged constraint from #3389/#3390/#3391/#3398 pass)",
+    "fastGate": "reported failed upstream; overridden per explicit instruction because the change is a clear, independently reproducible bug fix (not a scope/contract judgment call)"
+  },
+  "verdict": "confirmed-clean-fix-no-blocker",
+  "summary": "Diff is exactly 3 files: packages/coding-agent/src/prompts/system/eager-todo.md, packages/coding-agent/test/eager-todo-prompt.test.ts (new), CHANGELOG.md. Independently re-derived the bug from source rather than trusting the PR description: TodoOpEntry/InitListEntry in packages/coding-agent/src/tools/todo-write.ts define the only accepted todo_write shape as {ops:[{op:'init', list:[{phase, items:string[]}]}]} — there is no top-level {op,todos} shape, no per-item 'content'/'details'/'status' fields, and init cannot set in_progress (normalizeInProgressTask auto-promotes the first pending task). The pre-fix eager-todo.md text ('single init op', per-task content/details, keep exactly one task in_progress) used none of the real field names and omitted the required top-level ops wrapper and phase/list structure entirely — this is the same failure GitHub issue #3403 reproduces (ops:'Invalid input: expected array, received undefined' when the model follows the old reminder literally, forced via toolChoice on the very first turn). The PR's replacement text states the ops/list wrapper explicitly and embeds a canonical JSON example that is byte-for-byte the accepted schema shape.",
+  "verification": [
+    "Fetched refs/pull/3407/head; confirmed head sha 9fcae7630... matches gh pr view headRefOid exactly.",
+    "git diff origin/dev pr-3407 -- eager-todo.md/eager-todo-prompt.test.ts reviewed line-by-line; no changes outside prompt text + new test + changelog.",
+    "Cross-checked the new prompt's canonical JSON example field-for-field against todoWriteSchema/TodoOpEntry/InitListEntry (todo-write.ts:47-69): op enum includes 'init', list entries require {phase:string, items:string[] min 1} — example matches exactly, no invented fields.",
+    "Ran the PR's own new test in a clean worktree at the exact reviewed head: `bun test test/eager-todo-prompt.test.ts` in packages/coding-agent -> 1 pass, 0 fail, 7 expect() calls. Test asserts the embedded JSON example deep-equals the canonical payload, that prompt text contains the 'ops' array reference, and that removed vocabulary (task `content`, `in_progress`, 'all later tasks `pending`') is absent.",
+    "Confirmed CI statusCheckRollup on the PR is independently green (all COMPLETED/SUCCESS or SKIPPED, including the affected-path test job for this exact test file) — the 'fast gate failed' condition named in the instruction is a separate gate from GitHub's own CI, not contradicted by CI evidence.",
+    "Confirmed no PR review comments/requested-changes are attached (reviews/comments/latestReviews all empty) — nothing outstanding to reconcile with the override."
+  ],
+  "findings": [],
+  "action": "No repair performed — fix is already correct and self-verifying (test enforces prompt/schema agreement going forward). Fast-gate failure overridden per instruction since the defect is clear and reproducible and this review found no independent blocker. Per sequencing constraints, PR is not merged while dev remains red at c97da89c; no dev repair files were touched.",
+  "reviewedAt": "2026-07-28T00:00:00Z"
+}

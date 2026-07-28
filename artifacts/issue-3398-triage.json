@@ -1,0 +1,24 @@
+{
+  "schema": "gajae.issue-triage-verdict.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "issue": { "number": 3398, "title": "ralplan: no config option for automatic ralplan → ultragoal handoff (add opt-in gjc.ralplan.autoHandoff)" },
+  "verifiedAgainst": { "ref": "origin/dev", "note": "commit not pinned in local artifact context; verified against fetched origin/dev tip at review time" },
+  "independentVerification": {
+    "status": "confirmed",
+    "checks": [
+      { "claim": "no gjc.ralplan.autoHandoff key exists; only maxIterations/maxReviewPassesPerLane present", "result": "confirmed", "evidence": "packages/coding-agent/src/config/settings-schema.ts:504,509 on origin/dev" },
+      { "claim": "SKILL.md step 8 only skips re-ask on explicit-execution exception; step 9 handoff goes through gjc state ralplan write + skill tool chain guard", "result": "confirmed", "evidence": "packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md steps 8-9" },
+      { "claim": "readCurrentTmuxLeaderContext is not side-effect-free; it calls tagTmuxSessionAsGjcLeader (a tmux set-option write) and must not be reused directly as a read-only gate-evaluation probe", "result": "confirmed", "evidence": "packages/coding-agent/src/gjc-runtime/team-runtime.ts readCurrentTmuxLeaderContext, calls tagTmuxSessionAsGjcLeader" }
+    ],
+    "assessment": "Issue is technically accurate, well-scoped, and internally consistent. Genuine capability gap, not a misunderstanding of existing behavior."
+  },
+  "classification": "OWNER_CONFIRMATION_REQUIRED",
+  "classificationRationale": [
+    "User-facing config/workflow contract change: introduces a new settings key that can bypass the ralplan final approval `ask` gate by default-off opt-in.",
+    "Changes headless/RPC client behavior semantics (workflowGate presentation) when enabled — a product/UX decision, not a pure bugfix.",
+    "Adds a 'team' auto-handoff path with a new read-only tmux preflight probe that must be created (net-new code, not a pointer fix) — scope decision belongs to product owner, not unilateral implementation.",
+    "No existing regression or safety defect is being fixed; this is a net-new capability request, so implementation must wait for explicit owner/product confirmation of the proposed contract (key name, value space, degrade semantics) before any code changes."
+  ],
+  "action": "No implementation mutation performed. Awaiting owner/product confirmation of the proposed `gjc.ralplan.autoHandoff` contract (values off|ultragoal|team, degrade-to-off semantics, read-only preflight requirement) before any settings-schema, ralplan-runtime, or SKILL.md changes are made.",
+  "reviewedAt": "2026-07-29T00:00:00Z"
+}

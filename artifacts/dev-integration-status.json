@@ -1,0 +1,45 @@
+{
+  "schema": "gajae.dev-integration-status.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "note": "Re-check performed after owner correction: the prior blanket freeze and OWNER_CONFIRMATION_REQUIRED are no longer standalone hold reasons. Merge-worthy work now proceeds through serialized dev integration once current dev is terminal green; a red dev only holds work for its own concrete CI reason.",
+  "devHead": "c97da89c1afadcf20fc949307f2996aaeffecfca",
+  "devCiStatus": "red",
+  "concreteFailure": {
+    "check": "Affected path validation / test:@gajae-code/coding-agent:shard-2-of-8",
+    "runUrl": "https://github.com/Yeachan-Heo/gajae-code/actions/runs/30358765702/job/90274588692",
+    "test": "team-runtime.test.ts > team worker memory guard wiring > selects the hottest Linux worker, checkpoints it, and syncs config and manifest on replacement",
+    "failureMode": "hard test timeout at 5000ms (single run recorded, no rerun on this commit yet)",
+    "rootCauseArea": "packages/coding-agent/src/gjc-runtime/team-runtime.ts memory-guard replacement path + packages/coding-agent/test/gjc-runtime/team-runtime.test.ts (introduced by 5d822f560 'feat(coding-agent): guard team worker memory')",
+    "relationToReviewedWork": "Not touched by, and not correlated with, PR #3391 (team-worker-heartbeat.ts) or PR #3407 (eager-todo.md prompt/schema/test). Different subsystem and different file set; this is dev's own pre-existing red state at its current tip, not something introduced by the reviewed PRs."
+  },
+  "sequencing": [
+    {
+      "item": "PR #3391 (team-worker-heartbeat)",
+      "reviewStatus": "reviewed clean, exact head, no independent blocker found",
+      "mergeDecision": "HOLD_FOR_CONCRETE_CI_REASON",
+      "rationale": "Not held by blanket freeze; held because dev tip is red on shard-2's team-runtime timeout. Eligible to merge as soon as dev reaches terminal green (or the failing shard is confirmed flaky/rerun-green) — no re-review needed unless the PR head or dev base changes."
+    },
+    {
+      "item": "PR #3407 (eager-todo prompt/schema fix, closes #3403)",
+      "reviewStatus": "reviewed clean, exact head, fast-gate override already applied for reproducible-bug fix, own test passes",
+      "mergeDecision": "HOLD_FOR_CONCRETE_CI_REASON",
+      "rationale": "Same as #3391 — same dev tip, same concrete red gate, unrelated file area. Eligible to merge once dev is green."
+    },
+    {
+      "item": "#3389 (subagent launch failures)",
+      "mergeDecision": "STILL_SEQUENCED_BEHIND_IN_FLIGHT_DEV_COMMITS",
+      "rationale": "This hold is not the lifted blanket freeze — it is a distinct technical reason: the root cause sits inside session-index.ts/state-version.ts, the exact files an active in-flight series of dev commits (aed7b56ce, 733d4a186, 48e3ecd97, a7ccb1fa3) is still modifying. Investigating/patching now risks colliding with unmerged in-flight changes to the same lines. Re-triage once that series lands and the surface is confirmed clear."
+    },
+    {
+      "item": "#3390 (provider stream timeout, no retry)",
+      "mergeDecision": "ELIGIBLE_NOW",
+      "rationale": "Independent of dev-red file set and independent of the in-flight SDK canonicalization series; owner correction removes the only remaining reason (batch-scope deferral) this was not already picked up. Next candidate for implementation — no code change made this pass, scope of this pass was review/verdict only."
+    },
+    {
+      "item": "#3398 (ralplan autoHandoff config)",
+      "mergeDecision": "STILL_NO_MERGEABLE_CODE",
+      "rationale": "Owner correction lifts OWNER_CONFIRMATION_REQUIRED as an automatic hold reason, but there is no implementation to move — this is a net-new capability request with no PR/diff produced (contract: key name, value space, degrade semantics were never decided). Nothing here is being held back that is otherwise merge-ready; unblocking the label does not manufacture code. Remains open for scoping/implementation, not a sequencing hold."
+    }
+  ],
+  "reviewedAt": "2026-07-28T00:00:00Z"
+}

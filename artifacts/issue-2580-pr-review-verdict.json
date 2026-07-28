@@ -1,0 +1,25 @@
+{
+  "schema": "gajae.pr-review-verdict.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "pullRequest": {
+    "number": 2611,
+    "reviewedHeadSha": "b691ea31c3883d21490833b70034d11368448085",
+    "baseSha": "da70d8cdcffdc0e1d0ad4df47f9fdbff74cd270b",
+    "baseBranch": "dev"
+  },
+  "reviewer": { "sessionId": "019f74b4-fb5e-7000-a9ba-7f228d3c668a", "adapter": "gjc-ultragoal" },
+  "verdict": "merge-ready",
+  "summary": "Exact hosted PR head passed the mandatory authority cleaner, Architect review, QA/red-team review, focused tests, package checks, build, and hosted CI before merge.",
+  "blockingFindings": [],
+  "nonBlockingCaveats": [],
+  "verification": { "evidence": [
+    { "command": "bun test --timeout 30000 packages/coding-agent/test/gjc-runtime/team-runtime.test.ts", "status": "passed", "summary": "95 tests passed with 0 failures and 824 expectations on the reviewed successor.", "observedAt": "2026-07-18T19:48:47Z" },
+    { "command": "bun --cwd=packages/coding-agent run check && bun --cwd=packages/coding-agent run build", "status": "passed", "summary": "Coding-agent type/check and build gates passed on the reviewed successor.", "observedAt": "2026-07-18T19:48:47Z" },
+    { "command": "GitHub hosted CI for PR #2611 head b691ea31c3883d21490833b70034d11368448085", "status": "passed", "summary": "All required hosted checks reached terminal success before merge.", "observedAt": "2026-07-18T19:48:47Z" }
+  ] },
+  "checks": {
+    "policy": { "status": "pass", "summary": "Exact-head cleaner, Architect, QA/red-team, and hosted CI gates approved the PR before the commit-bound merge." },
+    "boundary": { "status": "pass", "summary": "The change merged only into dev; main, release, publish, deployment, and secret boundaries were not triggered." }
+  },
+  "reviewedAt": "2026-07-18T19:48:47Z"
+}

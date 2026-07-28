@@ -1,0 +1,61 @@
+{
+  "schema": "gajae.dev-integration-status.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "note": "Reconciliation pass after owner corrections (freeze lifted; hand off timeout-widening blocker to gajae-code-dev-ci-deterministic-recovery-tests; continue serialized merges of non-overlapping green PRs; new intake #3414/#3415).",
+  "originLaneObjective": {
+    "issue": 2580,
+    "pr": 2611,
+    "status": "TERMINAL_MERGED",
+    "evidence": "origin/dev contains 96f64a8e2 'fix(team): safely continue stalled live workers (#2611)' (squash-merge of this lane's b691ea31c head). No further action owed by this lane on issue-2580."
+  },
+  "devHeadAtReconciliation": "ade83f07238f171f38c49df510ef0f7ce7eab1df",
+  "devCiAtReconciliation": "pending (combined status; checks still queuing at time of this pass)",
+  "items": [
+    {
+      "pr": 3414,
+      "subject": "team: typed error for unknown gjc team api operations (command-boundary catch, JSON/text contract, suggestions, crash-reporter avoidance)",
+      "status": "MERGED",
+      "mergeCommit": "bb7794ae1 (fix(team): return actionable errors for unknown API operations (#3414))",
+      "independentSpotCheck": "Diff confirms: (1) command-boundary-only catch in team.ts — narrow try/catch around exactly the executeGjcTeamApiOperation call, rethrows anything that is not UnknownGjcTeamApiOperationError, so unrelated failures still reach the normal crash path unchanged; (2) JSON contract {ok:false,error,operation,suggestions} vs text contract single stderr line, both asserted by the PR's own CLI-spawn test; (3) suggestions are a static hardcoded map (heartbeat, get-task) — deterministic, no fuzzy-match instability; (4) operation is resolved/validated before team_name extraction, matching the changelog's ordering claim, confirmed in the diff hunk; (5) changelog's 'before' claim (plain Error, uncaught) matches pre-PR origin/dev source read directly. No blocker found; already landed, no action needed."
+    },
+    {
+      "pr": 3415,
+      "subject": "owner-authored heredoc parser fix for the workflow-mutation guard",
+      "status": "HOLD_REAL_BLOCKER",
+      "mergeableState": "mergeable=true, unstable (CI not yet terminal)",
+      "existingVerdict": "REQUEST CHANGES (pre-existing review at /tmp/pr3415-review.md, reconfirmed this pass, not re-litigated)",
+      "blockingFinding": "maskHeredocBodies() defaults to blanking any heredoc body whose opener does not match the script-consumer or mutating-consumer allowlists — inverts the safe default. Reproduced: `ssh myhost <<'EOF'` / `rm -rf /important` / `EOF` is not blocked post-PR (was blocked pre-PR). Same gap for git apply/am, crontab -, docker/kubectl exec -i, mysql/psql/redis-cli, sftp batch, expect.",
+      "action": "Left open, not merged. Owner-authored intent does not substitute for closing a reproduced fail-open security regression in a safety-contract guard; per instructions this needed frontier-depth adversarial review and a real blocker was found, so MERGE_READY is not granted. No new mutation performed this pass."
+    },
+    {
+      "pr": 3409,
+      "status": "HANDS_OFF_PER_OWNER_HANDOFF",
+      "action": "Not touched. Sole mutation ownership assigned to gajae-code-dev-ci-deterministic-recovery-tests per explicit owner correction. Duplicate single-line timeout-widening attempt for team-runtime.test.ts memory-guard test; left open as internal repair blocker."
+    },
+    {
+      "pr": 3410,
+      "status": "HANDS_OFF_PER_OWNER_HANDOFF",
+      "action": "This lane's own timeout-widening attempt (head e72c35528). Not merged, not touched further, left open per owner correction pending the deterministic replacement or owner cancellation. No further commits pushed to it this pass."
+    },
+    {
+      "pr": 3412,
+      "status": "HANDS_OFF_PER_OWNER_HANDOFF",
+      "action": "Not touched. Third duplicate of the same timeout-widening pattern; same handoff applies."
+    },
+    {
+      "pr": 3391,
+      "status": "NEEDS_RE_REVIEW_HEAD_CHANGED",
+      "priorReviewedHead": "258a63faf3f4f419e648ed0c0edf5e362cf5dbac",
+      "currentHead": "8ca1c65ebcc11c0cd366fb625ab5aa002e988a8f",
+      "action": "Head advanced with genuine new content (team-runtime.ts +41/-.., team-worker-heartbeat.ts refactor, deep-interview changes folded in via rebase) since the prior clean review. The prior 'no-independent-blocker-found' verdict does not cover this head. Not merged. Re-review of the exact new head is required before this can be granted MERGE_READY; not performed this pass (scope was reconciliation, not fresh adversarial review under tight effort budget)."
+    },
+    {
+      "pr": 3407,
+      "status": "REVIEWED_CLEAN_AWAITING_TERMINAL_DEV_GREEN",
+      "reviewedHead": "9fcae7630727c3ac38f28f8b24fe57e463372924 (unchanged since prior review)",
+      "mergeabilityNote": "GitHub API flapped mergeable=false/dirty then unknown across repeated polls in this fast-moving merge train; a local `git merge --no-commit` of the exact PR head onto current origin/dev at the time completed with 'Automatic merge went well' (CHANGELOG.md auto-merged), suggesting the dirty reading was a stale/transitional mergeability computation rather than a real conflict, but this needs one more confirmed poll immediately before invoking merge.",
+      "action": "Not merged this pass — dev's own CI was still 'pending' (not yet terminal green) at reconciliation time for the current tip ade83f072, and GitHub's own mergeable flag had not settled. No blocker found in the review; eligible to merge as soon as (a) dev reaches terminal green and (b) mergeable resolves clean on a fresh poll."
+    }
+  ],
+  "reviewedAt": "2026-07-28T00:00:00Z"
+}
