@@ -240,7 +240,6 @@ describe("CLI-owned deep-interview draft consumption", () => {
 	});
 	it("applies a complete greenfield result through a CLI-owned draft", async () => {
 		const env = await workspace();
-		const priorReceiptFailure = process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
 		try {
 			await kickoff(env.cwd, "result");
 			const setup = await setSetup(env.cwd, await create(env.cwd, "initialize-context", "result"));
@@ -292,49 +291,11 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				),
 			);
 			json(await consume(env.cwd, "record-answer", answer));
-			let complete = await populateCompleteResult(
+			const complete = await populateCompleteResult(
 				env.cwd,
 				await create(env.cwd, "apply-round-result", "result", ["--round-key", "interview-1::rid:r1"]),
 			);
-			complete = await edit(env.cwd, complete.id, complete.draft_revision, "set", "/global_scores/goal", "0.5");
-			const invalidCheck = json(await native(env.cwd, ["draft", "check", "--draft-id", complete.id, "--json"]));
-			expect(invalidCheck).toMatchObject({
-				valid: false,
-				stale: false,
-				applicable_at_state_revision: 3,
-				issues: [
-					{
-						code: "DI_STATE_SCHEMA_INVALID",
-						invariant: "global_score_equals_weakest_active_component",
-						path: "/global_scores/goal",
-						expected: 1,
-						actual: 0.5,
-					},
-				],
-			});
-			complete = await edit(env.cwd, complete.id, complete.draft_revision, "set", "/global_scores/goal", "1");
-			expect(json(await native(env.cwd, ["draft", "check", "--draft-id", complete.id, "--json"]))).toMatchObject({
-				valid: true,
-				stale: false,
-				applicable_at_state_revision: 3,
-				draft_revision: complete.draft_revision,
-			});
-			process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE = "1";
-			expect(await consume(env.cwd, "apply-round-result", complete)).toMatchObject({
-				status: 2,
-				stderr: expect.stringContaining("DI_DRAFT_RECEIPT_PERSIST_FAILED"),
-			});
-			expect((await state(env.cwd, "result")).state_revision).toBe(4);
-			expect(json(await native(env.cwd, ["draft", "show", "--draft-id", complete.id, "--json"]))).toMatchObject({
-				draft: { attempt: { state_revision: 3 } },
-			});
-			delete process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
-			const replayed = json(await consume(env.cwd, "apply-round-result", complete));
-			expect(replayed).toMatchObject({
-				consumed: true,
-				receipt: { native_projection: { transition: { lifecycle: "scored" } } },
-			});
-			expect((await state(env.cwd, "result")).state_revision).toBe(4);
+			expect(json(await consume(env.cwd, "apply-round-result", complete))).toMatchObject({ consumed: true });
 			const projected = await state(env.cwd, "result");
 			expect(projected.current_phase).toBe("interviewing");
 			expect(
@@ -345,8 +306,6 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				criteria: 1,
 			});
 		} finally {
-			if (priorReceiptFailure === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE;
-			else process.env.GJC_DEEP_INTERVIEW_DRAFT_FAIL_RECEIPT_PERSISTENCE = priorReceiptFailure;
 			await env.restore();
 		}
 	});
@@ -478,7 +437,8 @@ describe("CLI-owned deep-interview draft consumption", () => {
 					prepared.id,
 					"--expected-draft-revision",
 					String(prepared.draft_revision),
-					"--to-current",
+					"--to-state-revision",
+					"1",
 					"--json",
 				]),
 			);
@@ -588,37 +548,9 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				stderr: expect.stringContaining("DI_STATE_REVISION_CONFLICT"),
 			});
 			delete process.env.GJC_DEEP_INTERVIEW_DRAFT_INJECT_COMPETING_WRITE;
-			let repeatedIssue: string | undefined;
-			for (let retry = 0; retry < 8; retry++) {
-				const blocked = await consume(env.cwd, "initialize-context", prepared);
-				expect(blocked.status).toBe(3);
-				const parsed = JSON.parse(blocked.stderr!) as {
-					issue: {
-						code: string;
-						current_state_revision: number;
-						draft_base_revision: number;
-						recovery: { action: string; command: string[] };
-					};
-				};
-				expect(parsed.issue).toMatchObject({
-					code: "DI_STATE_REVISION_CONFLICT",
-					current_state_revision: 1,
-					draft_base_revision: 0,
-					recovery: {
-						action: "rebase",
-						command: expect.arrayContaining(["rebase", "--to-current"]),
-					},
-				});
-				if (repeatedIssue === undefined) repeatedIssue = JSON.stringify(parsed.issue);
-				else expect(JSON.stringify(parsed.issue)).toBe(repeatedIssue);
-			}
-			expect(json(await native(env.cwd, ["draft", "show", "--draft-id", prepared.id, "--json"]))).toMatchObject({
-				draft: {
-					draft_revision: prepared.draft_revision,
-					base_revision: 0,
-					status: "active",
-					attempt: { state_revision: 0 },
-				},
+			expect(await consume(env.cwd, "initialize-context", prepared)).toMatchObject({
+				status: 3,
+				stderr: expect.stringContaining("DI_STATE_REVISION_CONFLICT"),
 			});
 			const after = await state(env.cwd, "attempt-conflict");
 			expect(after.state_revision).toBe(1);

@@ -7,8 +7,6 @@ import {
 	applyDeepInterviewRoundResultV1,
 	canonicalDeepInterviewJson,
 	type DeepInterviewFactOperation,
-	DeepInterviewInvariantError,
-	type DeepInterviewInvariantIssue,
 	type DeepInterviewResolution,
 	type DeepInterviewRoundResultV1,
 	deepInterviewAnswerIdentityEqual,
@@ -54,15 +52,12 @@ class RepairError extends Error {
 	constructor(
 		readonly code: string,
 		readonly status = 2,
-		readonly details?: DeepInterviewInvariantIssue,
 	) {
 		super(code);
 	}
 }
-
-function issue(error: RepairError | string) {
-	if (typeof error === "string") return { code: error, message: error };
-	return { code: error.code, message: error.code, ...(error.details ?? {}) };
+function issue(code: string) {
+	return { code, message: code };
 }
 function errorResult(error: unknown): DeepInterviewRepairResult {
 	const typed =
@@ -78,10 +73,8 @@ function errorResult(error: unknown): DeepInterviewRepairResult {
 							? 4
 							: 3,
 					)
-				: error instanceof DeepInterviewInvariantError
-					? new RepairError(error.issue.code, error.issue.code.includes("CONFLICT") ? 4 : 3, error.issue)
-					: new RepairError("DI_INTERNAL_ERROR", 3);
-	return { status: typed.status, stderr: `${JSON.stringify({ ok: false, issue: issue(typed) })}\n` };
+				: new RepairError("DI_INTERNAL_ERROR", 3);
+	return { status: typed.status, stderr: `${JSON.stringify({ ok: false, issue: issue(typed.code) })}\n` };
 }
 function strictJson(value: string): unknown {
 	let index = 0;
@@ -958,8 +951,6 @@ async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<
 					},
 				};
 			} catch (error) {
-				if (error instanceof DeepInterviewInvariantError)
-					throw new RepairError(error.issue.code, error.issue.code.includes("CONFLICT") ? 4 : 3, error.issue);
 				if (error instanceof Error && error.message.startsWith("DI_"))
 					throw new RepairError(error.message, error.message.includes("CONFLICT") ? 4 : 3);
 				throw error;

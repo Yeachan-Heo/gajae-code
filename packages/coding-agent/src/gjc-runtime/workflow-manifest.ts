@@ -168,15 +168,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		verbs: [
 			...stateVerbs(),
 			...flagVerbs(["kickoff", "write-spec"]),
-			...draftVerbs([
-				"draft create",
-				"draft edit",
-				"draft edit-batch",
-				"draft show",
-				"draft check",
-				"draft rebase",
-				"draft discard",
-			]),
+			...draftVerbs(["draft create", "draft edit", "draft show", "draft check", "draft rebase", "draft discard"]),
 			...positionalVerbs([
 				"initialize-context",
 				"confirm-topology",
@@ -225,7 +217,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				required: true,
 				appliesToVerbs: [
 					"draft edit",
-					"draft edit-batch",
 					"draft show",
 					"draft check",
 					"draft rebase",
@@ -242,7 +233,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				required: true,
 				appliesToVerbs: [
 					"draft edit",
-					"draft edit-batch",
 					"draft rebase",
 					"draft discard",
 					"initialize-context",
@@ -262,9 +252,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ name: "value", type: "string", appliesToVerbs: ["draft edit"] },
 			{ name: "value-file", type: "string", appliesToVerbs: ["draft edit"] },
 			{ name: "null", type: "boolean", appliesToVerbs: ["draft edit"] },
-			{ name: "operations-json", type: "string", required: true, appliesToVerbs: ["draft edit-batch"] },
-			{ name: "to-state-revision", type: "number", appliesToVerbs: ["draft rebase"] },
-			{ name: "to-current", type: "boolean", appliesToVerbs: ["draft rebase"] },
+			{ name: "to-state-revision", type: "number", required: true, appliesToVerbs: ["draft rebase"] },
 			{
 				name: "json",
 				type: "boolean",
@@ -272,7 +260,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				appliesToVerbs: [
 					"draft create",
 					"draft edit",
-					"draft edit-batch",
 					"draft show",
 					"draft check",
 					"draft rebase",
