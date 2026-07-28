@@ -624,20 +624,26 @@ describe("conflict surfacing is truncation-direction independent", () => {
 		expect(session.conflictHistory?.get(1)).toBeDefined();
 	});
 
-	it("keeps true source line numbers for a conflict kept by a tail window", async () => {
-		// Pad the head so a `last` window drops it: the surviving conflict must
-		// still report its real file line numbers, not window-relative ones.
-		const padding = Array.from({ length: 40 }, (_, index) => `pad ${index + 1}`);
+	it("keeps true source line numbers for a conflict kept by a truncated tail window", async () => {
+		// The padding must exceed `read.receiptBudgetLines` (default 50) or the
+		// `last` read fits whole, nothing is dropped, and the line-number
+		// assertion below would pass even if tail rebasing were broken. At 80
+		// padding lines the window genuinely starts mid-file, so the recorded
+		// start line can only be right if origins are rebased to real file
+		// coordinates rather than window-relative ones.
+		const padding = Array.from({ length: 80 }, (_, index) => `pad ${index + 1}`);
 		await Bun.write(path.join(tempDir, "padded.ts"), [...padding, ...TWO_WAY.split("\n")].join("\n"));
 		const session = createTestSession(tempDir);
 		const read = await getTool(session, "read");
 
 		const text = getText(await read.execute("read-padded", { path: "padded.ts", truncation: "last" }));
 
+		// Prove the window actually truncated: the first padding line is gone.
+		expect(text).not.toContain("pad 1\n");
 		expect(text).toContain("⚠");
 		const entry = session.conflictHistory?.get(1);
 		expect(entry).toBeDefined();
-		// The marker block starts on file line 42 (40 padding lines + "line 1").
-		expect(entry?.startLine).toBe(42);
+		// The marker block starts on file line 82 (80 padding lines + "line 1").
+		expect(entry?.startLine).toBe(82);
 	});
 });
