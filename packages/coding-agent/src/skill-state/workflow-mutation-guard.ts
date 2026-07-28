@@ -608,17 +608,28 @@ const SHELL_RESERVED_PREFIX_WORDS = new Set([
 function commandPositionWords(segment: string): string[] {
 	const words: string[] = [];
 	let expectCommand = true;
+	let afterWrapper = false;
 	for (const word of segment.trim().split(/\s+/)) {
 		if (!word) continue;
-		if (expectCommand && (/^\w+=/.test(word) || SHELL_COMMAND_WRAPPER_WORDS.has(word.toLowerCase()))) continue;
-		if (SHELL_RESERVED_PREFIX_WORDS.has(word.toLowerCase())) {
-			// Reserved word keeps the NEXT word in command position.
-			expectCommand = true;
-			continue;
+		if (expectCommand) {
+			if (/^\w+=/.test(word)) continue;
+			if (SHELL_COMMAND_WRAPPER_WORDS.has(word.toLowerCase())) {
+				// The wrapper's effective command follows, possibly after options/`--`.
+				afterWrapper = true;
+				continue;
+			}
+			// Wrapper options (`command -p`, `builtin --`) precede the real command.
+			if (afterWrapper && (word === "--" || word.startsWith("-"))) continue;
+			afterWrapper = false;
+			if (SHELL_RESERVED_PREFIX_WORDS.has(word.toLowerCase())) {
+				// Reserved word keeps the NEXT word in command position.
+				continue;
+			}
+			words.push(word.split("/").pop()?.toLowerCase() ?? "");
+			expectCommand = false;
 		}
-		if (!expectCommand) continue;
-		words.push(word.split("/").pop()?.toLowerCase() ?? "");
-		expectCommand = false;
+		// Argument position: only real list operators (handled by the segment
+		// split) restore command position — reserved-word TEXT here is data.
 	}
 	return words;
 }

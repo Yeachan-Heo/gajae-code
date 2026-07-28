@@ -377,6 +377,9 @@ describe("workflow mutation guard", () => {
 			"if eval 'cat(){ bash -s; }'; then :; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
 			// `builtin`/`command` wrappers still reach the evaluated command (Codex P1).
 			"builtin eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"command -- eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Bash's `function name()` hybrid form is still a declaration (Codex P1).
+			"function cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Function shadows after reserved words are still declarations (Codex P1).
 			"if true; then cat() { bash -s; }; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
 			// `case` pattern `)` desyncs the depth scanner — fail closed (Codex P1).
