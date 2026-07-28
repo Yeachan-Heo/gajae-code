@@ -578,11 +578,16 @@ function maskLineForSyntax(
 
 const DATA_CONSUMER_NAMES = new Set(HEREDOC_DATA_CONSUMERS);
 /**
- * Shell-evaluated payloads (`eval …`, `source …`, `. file`) can install a
- * shadow from data the syntax view has blanked (quoted strings, /dev/stdin);
- * one in COMMAND POSITION disables masking entirely (fail closed).
+ * Command-position words that force the fail-closed pass. `eval`/`source`/`.`
+ * can install a shadow from data the syntax view has blanked (quoted strings,
+ * /dev/stdin). `case` introduces pattern `)` terminators that desync the
+ * substitution-depth scanner (`$(case x in x) …;; esac)`), making comment
+ * detection unreliable — masking is disabled rather than guessing.
  */
-const SHELL_EVALUATED_COMMANDS = new Set(["eval", "source", "."]);
+const SHELL_EVALUATED_COMMANDS = new Set(["eval", "source", ".", "case"]);
+
+/** Wrappers whose next word is still the effective command (`builtin eval …`, `command cat …`). */
+const SHELL_COMMAND_WRAPPER_WORDS = new Set(["sudo", "builtin", "command", "exec", "nohup", "nice"]);
 
 /** Reserved words that introduce a nested command position (`if eval …`, `while eval …`). */
 const SHELL_RESERVED_PREFIX_WORDS = new Set([
@@ -605,7 +610,7 @@ function commandPositionWords(segment: string): string[] {
 	let expectCommand = true;
 	for (const word of segment.trim().split(/\s+/)) {
 		if (!word) continue;
-		if (expectCommand && (/^\w+=/.test(word) || word === "sudo")) continue;
+		if (expectCommand && (/^\w+=/.test(word) || SHELL_COMMAND_WRAPPER_WORDS.has(word.toLowerCase()))) continue;
 		if (SHELL_RESERVED_PREFIX_WORDS.has(word.toLowerCase())) {
 			// Reserved word keeps the NEXT word in command position.
 			expectCommand = true;
@@ -643,21 +648,31 @@ function hasShellEvaluatedCommand(dequotedView: string): boolean {
  */
 function hasDataConsumerShadow(dequotedView: string): boolean {
 	for (const segment of commandListSegments(dequotedView)) {
-		const words = segment.trim().split(/\s+/).filter(Boolean);
-		const first = words[0]?.toLowerCase() ?? "";
-		if (first === "function" && DATA_CONSUMER_NAMES.has(words[1]?.split("/").pop()?.toLowerCase() ?? "")) {
-			return true;
-		}
-		if (
-			first === "alias" &&
-			words.slice(1).some(word => DATA_CONSUMER_NAMES.has(word.split("=")[0]?.toLowerCase() ?? ""))
-		) {
-			return true;
+		const words = commandPositionWords(segment);
+		for (let index = 0; index < words.length; index++) {
+			const word = words[index] ?? "";
+			if (word === "function") {
+				// commandPositionWords stops after the first non-reserved word, so
+				// re-inspect the raw segment for the name following `function`.
+				const rawWords = segment.trim().split(/\s+/).filter(Boolean);
+				const at = rawWords.findIndex(raw => raw.toLowerCase() === "function");
+				const name = rawWords[at + 1]?.split("/").pop()?.toLowerCase() ?? "";
+				if (DATA_CONSUMER_NAMES.has(name)) return true;
+			}
+			if (word === "alias") {
+				const rawWords = segment.trim().split(/\s+/).filter(Boolean);
+				if (rawWords.some(raw => DATA_CONSUMER_NAMES.has(raw.split("=")[0]?.toLowerCase() ?? ""))) return true;
+			}
 		}
 	}
-	// `name()` / `name ()` at a command-list start (POSIX function definition).
+	// `name()` / `name ()` in command position — allow reserved-word prefixes
+	// (`then cat() { … }`) before the name (POSIX function definition).
 	const nameGroup = [...DATA_CONSUMER_NAMES].join("|");
-	return new RegExp(`(?:^|[;|&{(\`\\n])\\s*(?:${nameGroup})\\s*\\(\\s*\\)`, "i").test(dequotedView);
+	const reservedGroup = [...SHELL_RESERVED_PREFIX_WORDS].filter(word => /^\w+$/.test(word)).join("|");
+	return new RegExp(
+		`(?:^|[;|&{(\`\\n])\\s*(?:(?:${reservedGroup}|\\{|!)\\s+)*(?:${nameGroup})\\s*\\(\\s*\\)`,
+		"i",
+	).test(dequotedView);
 }
 
 /** First command word of a pipeline-segment slice of a quote-masked opener line. */

@@ -375,6 +375,12 @@ describe("workflow mutation guard", () => {
 			"x=$((1))#lit; cat() { bash -s; }\ncat <<'EOF'\nrm src/product.ts\nEOF",
 			// eval after a reserved word is still a command position (Codex P1).
 			"if eval 'cat(){ bash -s; }'; then :; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// `builtin`/`command` wrappers still reach the evaluated command (Codex P1).
+			"builtin eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Function shadows after reserved words are still declarations (Codex P1).
+			"if true; then cat() { bash -s; }; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// `case` pattern `)` desyncs the depth scanner — fail closed (Codex P1).
+			"x=$(case x in x) true;; esac)#lit; cat() { bash -s; }\ncat <<'EOF'\nrm src/product.ts\nEOF",
 			// eval/source can install a shadow from quoted data the syntax view blanked (Codex P1).
 			"eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			"source /dev/stdin <<'DEF'\ncat(){ bash -s; }\nDEF\ncat <<'EOF'\nrm src/product.ts\nEOF",
