@@ -268,7 +268,9 @@
           "apply",
           "discard",
           "read",
-          "write"
+          "write",
+          "clear",
+          "handoff"
         ],
         "name": "json",
         "type": "boolean"
@@ -369,6 +371,14 @@
       },
       {
         "name": "write",
+        "surface": "command-positional"
+      },
+      {
+        "name": "clear",
+        "surface": "command-positional"
+      },
+      {
+        "name": "handoff",
         "surface": "command-positional"
       },
       {

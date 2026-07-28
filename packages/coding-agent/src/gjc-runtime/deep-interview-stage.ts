@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import { syncSkillActiveState } from "../skill-state/active-state";
+import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import {
@@ -11,6 +13,7 @@ import {
 } from "./deep-interview-state";
 import { sessionStateDir } from "./session-layout";
 import { resolveGjcSessionForWrite, SessionResolutionError, writeSessionActivityMarker } from "./session-resolution";
+import { runNativeStateCommand } from "./state-runtime";
 import {
 	persistedStateRevision,
 	readExistingStateForMutation,
@@ -713,6 +716,7 @@ async function handleApply(args: readonly string[], cwd: string): Promise<Record
 			} catch {
 				// Swallow: state is committed; the next apply/discard settles the draft.
 			}
+			await syncStageHud(cwd, sessionId, merged);
 			const appliedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : {};
 			return {
 				ok: true,
@@ -877,6 +881,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 				},
 			});
 			await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-stage", path: statePath });
+			await syncStageHud(cwd, sessionId, merged);
 			const writtenState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : {};
 			return {
 				ok: true,
@@ -895,13 +900,34 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 	);
 }
 
+/**
+ * Publish a committed envelope to the active-state/HUD mirror. Best-effort:
+ * the durable commit already happened; a projection failure must never fail
+ * the command (matches syncDeepInterviewHud in deep-interview-runtime.ts).
+ */
+async function syncStageHud(cwd: string, sessionId: string, envelope: Record<string, unknown>): Promise<void> {
+	try {
+		const phase = typeof envelope.current_phase === "string" ? envelope.current_phase : "interviewing";
+		await syncSkillActiveState({
+			cwd,
+			skill: "deep-interview",
+			active: phase !== "complete",
+			phase,
+			sessionId,
+			source: "gjc-deep-interview-native",
+			hud: deriveDeepInterviewHud(envelope, { phase }),
+		});
+	} catch {
+		// HUD sync is best-effort and must not change command semantics.
+	}
+}
+
 /** Thin lifecycle passthroughs: same runtime plumbing, gjc deep-interview surface. */
 async function handleLifecyclePassthrough(
 	verb: "clear" | "handoff",
 	args: readonly string[],
 	cwd: string,
 ): Promise<DeepInterviewStageCommandResult> {
-	const { runNativeStateCommand } = await import("./state-runtime");
 	const forwarded =
 		verb === "clear"
 			? ["clear", "--mode", "deep-interview", ...args]

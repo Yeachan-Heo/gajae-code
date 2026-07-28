@@ -178,7 +178,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		verbs: [
 			...stateVerbs(),
 			...flagVerbs(["kickoff", "write-spec"]),
-			...positionalVerbs(["stage", "check", "apply", "discard", "read", "write"]),
+			...positionalVerbs(["stage", "check", "apply", "discard", "read", "write", "clear", "handoff"]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
 		typedArgs: [
@@ -195,7 +195,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "json",
 				type: "boolean",
-				appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard", "read", "write"],
+				appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard", "read", "write", "clear", "handoff"],
 			},
 			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "write"] },
 			{ name: "reset", type: "boolean", appliesToVerbs: ["write"] },

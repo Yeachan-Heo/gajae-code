@@ -842,4 +842,36 @@ describe("deep-interview staged transitions", () => {
 		// null markers delete/omit rather than persisting nulls or erroring.
 		expect(state.initial_context_summary ?? undefined).toBeUndefined();
 	});
+
+	it("refreshes the active-state/HUD projection after write and apply", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const snapshotPath = path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "state", "skill-active-state.json");
+		const readHudAmbiguity = async (): Promise<string | undefined> => {
+			const snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8")) as Record<string, unknown>;
+			const skills = snapshot.active_skills as Record<string, unknown>[];
+			const entry = skills.find(s => s.skill === "deep-interview");
+			const chips = ((entry?.hud as Record<string, unknown> | undefined)?.chips ?? []) as Record<string, unknown>[];
+			return chips.find(c => c.label === "ambiguity")?.value as string | undefined;
+		};
+		// Direct write with a scored round updates the HUD projection.
+		await run(root, [
+			"write",
+			"--input",
+			JSON.stringify({ state: { rounds: [{ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.44 }] } }),
+			"--json",
+		]);
+		expect(await readHudAmbiguity()).toContain("44%");
+		// Staged apply refreshes it again.
+		await run(root, [
+			"stage",
+			"--for",
+			"record-round",
+			"--input",
+			JSON.stringify({ state: { rounds: [{ round: 2, round_key: "r2", lifecycle: "scored", ambiguity: 0.21 }] } }),
+			"--json",
+		]);
+		await run(root, ["apply", "--json"]);
+		expect(await readHudAmbiguity()).toContain("21%");
+	});
 });
