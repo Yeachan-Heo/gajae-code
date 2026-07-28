@@ -290,6 +290,26 @@ export function findLedgerReceiptEvent(
 		}) ?? null
 	);
 }
+/**
+ * A final-aggregate receipt whose recorded ledger checkpoint quality gate is
+ * missing a clean `criticReview` OKAY can never satisfy the completion guard,
+ * yet is not "stale" under {@link validateReceiptFreshBase}. Detect it so an
+ * identical-evidence complete replay can re-verify and re-mint with a
+ * corrected gate instead of no-opping into a permanently blocked run.
+ */
+export function finalAggregateReceiptMissingCriticOkay(
+	ledger: readonly UltragoalLedgerEvent[],
+	receipt: UltragoalCompletionVerification,
+): boolean {
+	if (receipt.receiptKind !== "final-aggregate") return false;
+	const event = findLedgerReceiptEvent(ledger, receipt);
+	if (!event) return false;
+	const gate = event.qualityGateJson;
+	if (typeof gate !== "object" || gate === null || Array.isArray(gate)) return true;
+	const criticReview = (gate as Record<string, unknown>).criticReview;
+	if (typeof criticReview !== "object" || criticReview === null || Array.isArray(criticReview)) return true;
+	return (criticReview as Record<string, unknown>).verdict !== "OKAY";
+}
 
 export function validateReceiptFreshBase(input: {
 	plan: UltragoalPlan;
