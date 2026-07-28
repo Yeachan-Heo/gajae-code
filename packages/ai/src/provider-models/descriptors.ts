@@ -7,6 +7,7 @@ import type { ModelManagerOptions } from "../model-manager";
 import type { Api, KnownProvider } from "../types";
 import type { OAuthProvider } from "../utils/oauth/types";
 import { googleModelManagerOptions } from "./google";
+import { kiroModelManagerOptions } from "./kiro";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
 	alibabaTokenPlanModelManagerOptions,
@@ -130,6 +131,7 @@ function catalogDescriptor(
  * OpenAI code provider) are handled separately because they require different config shapes.
  */
 export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
+	descriptor("kiro", "claude-opus-5", config => kiroModelManagerOptions(config)),
 	descriptor("anthropic", "claude-sonnet-5", config => anthropicModelManagerOptions(config)),
 	catalogDescriptor(
 		"alibaba-token-plan",

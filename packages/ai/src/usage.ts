@@ -140,7 +140,11 @@ export interface UsageCredential {
 	accountId?: string;
 	projectId?: string;
 	email?: string;
+	/** Stable row id from the credential store; never sent to providers. */
+	credentialId?: number;
 	enterpriseUrl?: string;
+	kiroMethod?: "builder-id" | "google" | "github";
+	kiroProfileArn?: string;
 	metadata?: Record<string, unknown>;
 }
 
@@ -154,7 +158,7 @@ export interface UsageFetchParams {
 
 /** Shared runtime utilities for fetchers. */
 export interface UsageFetchContext {
-	fetch: typeof fetch;
+	fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 	logger?: UsageLogger;
 	retryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 }

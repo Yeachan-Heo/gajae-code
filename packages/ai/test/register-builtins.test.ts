@@ -3,6 +3,7 @@ import "../src/providers/openai-completions";
 import "../src/providers/openai-responses";
 import { getBundledModel } from "../src/models";
 import {
+	KIRO_LAZY_STREAM_LIMITS,
 	resolveLazyStreamFirstEventFallbackMs,
 	setBedrockProviderModule,
 	streamBedrock,
@@ -10,6 +11,7 @@ import {
 import { stream as streamModel } from "../src/stream";
 import type { AssistantMessage, Context, Model } from "../src/types";
 import type { AssistantMessageEventStream } from "../src/utils/event-stream";
+import { getStreamIdleTimeoutMs } from "../src/utils/idle-iterator";
 
 function createModel(): Model<"bedrock-converse-stream"> {
 	return {
@@ -188,6 +190,7 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 	it("returns 300s for slow-first-event providers without a configured fallback", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan")).toBe(300_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code")).toBe(300_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("kiro")).toBeUndefined();
 	});
 	it("returns undefined for unrelated providers", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("openai")).toBeUndefined();
@@ -196,7 +199,23 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 	it("prefers a configured wrapper fallback over the provider default", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan", 42_000)).toBe(42_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code", 42_000)).toBe(42_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("kiro", 42_000)).toBe(42_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("google-gemini-cli", 300_000)).toBe(300_000);
+	});
+});
+
+describe("kiro lazy-stream idle floor", () => {
+	it("owns the first-event floor at the wrapper level for aliased providers", () => {
+		expect(KIRO_LAZY_STREAM_LIMITS.defaultFirstEventTimeoutMs).toBe(300_000);
+		expect(
+			resolveLazyStreamFirstEventFallbackMs("kiro-alias", KIRO_LAZY_STREAM_LIMITS.defaultFirstEventTimeoutMs),
+		).toBe(300_000);
+	});
+	it("widens the steady-state idle watchdog to the first-event floor", () => {
+		expect(getStreamIdleTimeoutMs(KIRO_LAZY_STREAM_LIMITS.defaultIdleTimeoutMs)).toBe(300_000);
+	});
+	it("leaves the shared idle default untouched for other providers", () => {
+		expect(getStreamIdleTimeoutMs()).toBe(120_000);
 	});
 });
 

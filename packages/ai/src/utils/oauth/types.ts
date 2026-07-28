@@ -1,3 +1,5 @@
+export type KiroLoginMethod = "google" | "github" | "builder-id";
+
 export type OAuthCredentials = {
 	refresh: string;
 	access: string;
@@ -6,8 +8,9 @@ export type OAuthCredentials = {
 	projectId?: string;
 	email?: string;
 	accountId?: string;
+	kiroMethod?: KiroLoginMethod;
+	kiroProfileArn?: string;
 };
-
 export type OAuthProvider =
 	| "alibaba-token-plan"
 	| "anthropic"
@@ -27,6 +30,7 @@ export type OAuthProvider =
 	| "huggingface"
 	| "kimi-code"
 	| "kilo"
+	| "kiro"
 	| "kagi"
 	| "litellm"
 	| "lm-studio"
@@ -87,6 +91,7 @@ export interface OAuthController {
 	onPrompt?(prompt: OAuthPrompt): Promise<string>;
 	signal?: AbortSignal;
 	fetch?: typeof globalThis.fetch;
+	kiroMethod?: KiroLoginMethod;
 }
 
 export interface OAuthLoginCallbacks extends OAuthController {

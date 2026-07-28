@@ -32,6 +32,7 @@ import type { CursorOptions } from "./providers/cursor";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import type { KiroOptions } from "./providers/kiro";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 // Heavy provider stream functions are imported lazily via register-builtins,
@@ -46,6 +47,7 @@ import {
 	streamGoogle,
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
+	streamKiro,
 	streamOllama,
 	streamOpenAICodexResponses,
 	streamOpenAICompletions,
@@ -362,6 +364,9 @@ export function stream<TApi extends Api>(
 				context,
 				providerOptions as GoogleGeminiCliOptions,
 			);
+
+		case "kiro-streaming":
+			return streamKiro(model as Model<"kiro-streaming">, context, providerOptions as KiroOptions);
 
 		case "ollama-chat":
 			return streamOllama(model as Model<"ollama-chat">, context, providerOptions as OllamaChatOptions);
@@ -817,6 +822,8 @@ function mapOptionsForApi<TApi extends Api>(
 			return castApi<"bedrock-converse-stream">({ ...bedrockBase, maxTokens, thinkingBudgets });
 		}
 
+		case "kiro-streaming":
+			return castApi<"kiro-streaming">(base);
 		case "openai-completions":
 			return castApi<"openai-completions">({
 				...base,

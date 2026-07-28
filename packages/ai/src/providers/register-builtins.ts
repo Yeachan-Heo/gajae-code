@@ -31,6 +31,7 @@ import type { CursorOptions } from "./cursor";
 import type { GoogleOptions } from "./google";
 import type { GoogleGeminiCliOptions } from "./google-gemini-cli";
 import type { GoogleVertexOptions } from "./google-vertex";
+import type { KiroOptions } from "./kiro";
 import type { OllamaChatOptions } from "./ollama";
 import type { OpenAICodexResponsesOptions } from "./openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./openai-completions";
@@ -145,6 +146,7 @@ let openAICodexResponsesProviderModulePromise: Promise<LazyProviderModule<"opena
 let openAICompletionsProviderModulePromise: Promise<LazyProviderModule<"openai-completions">> | undefined;
 let openAIResponsesProviderModulePromise: Promise<LazyProviderModule<"openai-responses">> | undefined;
 let ollamaProviderModulePromise: Promise<LazyProviderModule<"ollama-chat">> | undefined;
+let kiroProviderModulePromise: Promise<LazyProviderModule<"kiro-streaming">> | undefined;
 let cursorProviderModulePromise: Promise<LazyProviderModule<"cursor-agent">> | undefined;
 let bedrockProviderModuleOverride: LazyProviderModule<"bedrock-converse-stream"> | undefined;
 let bedrockProviderModulePromise: Promise<LazyProviderModule<"bedrock-converse-stream">> | undefined;
@@ -192,7 +194,26 @@ interface LazyStreamLimits {
 const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
 	defaultFirstEventTimeoutMs: 300_000,
 };
+/**
+ * Providers whose first streamed event legitimately lands after the global
+ * 100s floor and do not own wrapper-specific limits.
+ */
 const SLOW_FIRST_EVENT_PROVIDERS = new Set(["alibaba-token-plan", "kimi-code"]);
+
+/**
+ * Kiro owns both watchdog floors at the wrapper level so custom/aliased
+ * provider names retain the same behavior. Its reasoning tiers can exceed the
+ * shared first-event floor and go silent between tokens longer than the 120s idle floor
+ * while the upstream plans a tool call, so the watchdog aborted mid-response
+ * with `Provider stream stalled while waiting for the next event`. That abort
+ * is only auto-retried when the turn is still replay-safe, so a stall after a
+ * tool call surfaced as a hard failure instead of recovering. Widen the idle
+ * floor to match the five-minute first-event floor above.
+ */
+export const KIRO_LAZY_STREAM_LIMITS: LazyStreamLimits = {
+	defaultFirstEventTimeoutMs: 300_000,
+	defaultIdleTimeoutMs: 300_000,
+};
 
 /**
  * Resolves the first-event timeout fallback for the outer lazy-stream watchdog.
@@ -391,6 +412,13 @@ function loadOllamaProviderModule(): Promise<LazyProviderModule<"ollama-chat">> 
 	return ollamaProviderModulePromise;
 }
 
+function loadKiroProviderModule(): Promise<LazyProviderModule<"kiro-streaming">> {
+	kiroProviderModulePromise ||= import("./kiro").then(module => ({
+		stream: (model, context, options) => module.streamKiro(model, context, options as KiroOptions),
+	}));
+	return kiroProviderModulePromise;
+}
+
 function loadCursorProviderModule(): Promise<LazyProviderModule<"cursor-agent">> {
 	cursorProviderModulePromise ||= import("./cursor").then(module => {
 		const provider = module as CursorProviderModule;
@@ -430,5 +458,6 @@ export const streamOpenAICompletions = createLazyStream(loadOpenAICompletionsPro
 export const streamOpenAIResponses = createLazyStream(loadOpenAIResponsesProviderModule);
 export const streamCursor = createLazyStream(loadCursorProviderModule);
 export const streamOllama = createLazyStream(loadOllamaProviderModule);
+export const streamKiro = createLazyStream(loadKiroProviderModule, KIRO_LAZY_STREAM_LIMITS);
 
 export const streamBedrock = createLazyStream(loadBedrockProviderModule);

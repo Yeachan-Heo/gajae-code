@@ -29,11 +29,13 @@ import { githubCopilotUsageProvider } from "./usage/github-copilot";
 import { antigravityUsageProvider } from "./usage/google-antigravity";
 import { grokCliRankingStrategy, grokCliUsageProvider } from "./usage/grok-cli";
 import { kimiUsageProvider } from "./usage/kimi";
+import { kiroUsageProvider } from "./usage/kiro";
 import { codexRankingStrategy, openaiCodexUsageProvider } from "./usage/openai-codex";
 import { zaiUsageProvider } from "./usage/zai";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
+import { loginKiro } from "./utils/oauth/kiro";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
 import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId } from "./utils/oauth/types";
 
@@ -529,6 +531,7 @@ const DEFAULT_USAGE_PROVIDERS: UsageProvider[] = [
 	zaiUsageProvider,
 	githubCopilotUsageProvider,
 	grokCliUsageProvider,
+	kiroUsageProvider,
 ];
 
 const DEFAULT_USAGE_PROVIDER_MAP = new Map<Provider, UsageProvider>(
@@ -1713,6 +1716,16 @@ export class AuthStorage {
 				});
 				break;
 			}
+			case "kiro": {
+				credentials = await loginKiro({
+					onAuth: (url, instructions) => ctrl.onAuth({ url, instructions }),
+					onPrompt: ctrl.onPrompt,
+					onProgress: ctrl.onProgress,
+					signal: ctrl.signal,
+					method: ctrl.kiroMethod,
+				});
+				break;
+			}
 			case "google-gemini-cli": {
 				const { loginGeminiCli } = await import("./utils/oauth/google-gemini-cli");
 				credentials = await loginGeminiCli({
@@ -2053,7 +2066,7 @@ export class AuthStorage {
 	// Queries provider usage endpoints to detect rate limits before they occur.
 	// ─────────────────────────────────────────────────────────────────────────────
 
-	#buildUsageCredential(credential: OAuthCredential): UsageCredential {
+	#buildUsageCredential(credential: OAuthCredential, credentialId?: number): UsageCredential {
 		return {
 			type: "oauth",
 			accessToken: credential.access,
@@ -2063,6 +2076,9 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			kiroMethod: credential.kiroMethod,
+			kiroProfileArn: credential.kiroProfileArn,
+			credentialId,
 		};
 	}
 
@@ -2120,8 +2136,9 @@ export class AuthStorage {
 		provider: Provider,
 		credential: OAuthCredential,
 		baseUrl?: string,
+		credentialId?: number,
 	): UsageRequestDescriptor {
-		return this.#buildUsageRequest(provider, this.#buildUsageCredential(credential), baseUrl);
+		return this.#buildUsageRequest(provider, this.#buildUsageCredential(credential, credentialId), baseUrl);
 	}
 
 	#buildRefreshableOauthCredential(credential: UsageCredential): OAuthCredential | null {
@@ -2137,6 +2154,8 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			kiroMethod: credential.kiroMethod,
+			kiroProfileArn: credential.kiroProfileArn,
 		};
 	}
 
@@ -2150,6 +2169,8 @@ export class AuthStorage {
 			projectId: refreshed.projectId ?? credential.projectId,
 			email: refreshed.email ?? credential.email,
 			enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
+			kiroMethod: refreshed.kiroMethod ?? credential.kiroMethod,
+			kiroProfileArn: refreshed.kiroProfileArn ?? credential.kiroProfileArn,
 		};
 	}
 
@@ -2197,6 +2218,8 @@ export class AuthStorage {
 			projectId: next.projectId,
 			email: next.email,
 			enterpriseUrl: next.enterpriseUrl,
+			kiroMethod: next.kiroMethod ?? existing.kiroMethod,
+			kiroProfileArn: next.kiroProfileArn ?? existing.kiroProfileArn,
 		});
 	}
 
@@ -2359,7 +2382,7 @@ export class AuthStorage {
 				const request =
 					credential.type === "api_key"
 						? this.#buildUsageRequest(provider, { type: "api_key", apiKey: credential.key }, baseUrl)
-						: this.#buildUsageRequestForOauth(provider, credential, baseUrl);
+						: this.#buildUsageRequestForOauth(provider, credential, baseUrl, entry.id);
 				if (providerImpl.supports && !providerImpl.supports(request)) continue;
 				requests.push(request);
 			}
@@ -3298,6 +3321,8 @@ export class AuthStorage {
 			}
 			if (!result) return undefined;
 			const updated: OAuthCredential = {
+				// Preserve provider-specific routing fields across refresh.
+				...selection.credential,
 				type: "oauth",
 				access: result.newCredentials.access,
 				refresh: result.newCredentials.refresh,
@@ -3306,6 +3331,8 @@ export class AuthStorage {
 				email: result.newCredentials.email ?? selection.credential.email,
 				projectId: result.newCredentials.projectId ?? selection.credential.projectId,
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
+				kiroMethod: result.newCredentials.kiroMethod ?? selection.credential.kiroMethod,
+				kiroProfileArn: result.newCredentials.kiroProfileArn ?? selection.credential.kiroProfileArn,
 			};
 			this.#replaceCredentialAt(provider, selection.index, updated);
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
@@ -3611,6 +3638,11 @@ export class AuthStorage {
 		const markSuspect = this.#store.markCredentialSuspect?.bind(this.#store);
 		if (markSuspect) {
 			await markSuspect(matched.id, { signal });
+		} else if (provider === "kiro" && matched.type === "oauth") {
+			// Kiro social access tokens can be invalidated by another client refresh
+			// hours before their local expiry timestamp. A 401/403 therefore needs a
+			// real refresh of the same pinned credential, not merely a snapshot reload.
+			await this.refreshCredentialById(matched.id, signal);
 		} else {
 			await this.reload();
 		}
@@ -3758,6 +3790,8 @@ export class AuthStorage {
 				email: refreshed.email ?? target.credential.email,
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
+				kiroMethod: refreshed.kiroMethod ?? target.credential.kiroMethod,
+				kiroProfileArn: refreshed.kiroProfileArn ?? target.credential.kiroProfileArn,
 				mcpBinding: target.credential.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated);
@@ -4145,6 +4179,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
+			-- Additive shared storage for Kiro's long-lived device registration.
+			CREATE TABLE IF NOT EXISTS kiro_kv (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
 		`);
 
 		if (!this.#authCredentialsTableExists()) {

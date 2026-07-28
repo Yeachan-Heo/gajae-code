@@ -23,6 +23,7 @@ import type {
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import type { KiroOptions } from "./providers/kiro";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -43,6 +44,7 @@ export type KnownApi =
 	| "google-gemini-cli"
 	| "google-vertex"
 	| "ollama-chat"
+	| "kiro-streaming"
 	| "cursor-agent";
 export type Api = KnownApi | (string & {});
 export interface ApiOptionsMap {
@@ -55,6 +57,7 @@ export interface ApiOptionsMap {
 	"google-generative-ai": GoogleOptions;
 	"google-gemini-cli": GoogleGeminiCliOptions;
 	"google-vertex": GoogleVertexOptions;
+	"kiro-streaming": KiroOptions;
 	"ollama-chat": OllamaChatOptions;
 	"cursor-agent": CursorOptions;
 }
@@ -140,6 +143,7 @@ export type KnownProvider =
 	| "cerebras"
 	| "openrouter"
 	| "kilo"
+	| "kiro"
 	| "vercel-ai-gateway"
 	| "zai"
 	| "glm-zcode"
