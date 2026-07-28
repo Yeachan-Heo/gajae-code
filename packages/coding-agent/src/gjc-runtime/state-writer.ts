@@ -96,7 +96,6 @@ export interface GuardedStateWriterOptions extends StateWriterOptions {
 	policy: StateWritePolicy;
 	expectedRevision?: number;
 	sourceRevision?: number;
-	lockHeld?: boolean;
 }
 
 export type GuardedWriteResult =
@@ -114,6 +113,11 @@ export interface StateWriterOptions {
 	 * `withFileLock` defaults.
 	 */
 	lock?: FileLockOptions;
+	/**
+	 * Caller already holds the workflow state lock for this target path (via
+	 * `withWorkflowStateLock`). Skip re-acquisition to avoid self-deadlock.
+	 */
+	lockHeld?: boolean;
 }
 
 export class StateWriteConflictError extends Error {
@@ -681,63 +685,71 @@ export async function writeWorkflowEnvelopeAtomic(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
-	const stamped = stampWorkflowEnvelopeChecksum(withReceipt, filePath);
-	const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
-	if (!parsed.success) {
-		throw new Error(
-			`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
-				.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
-				.join("; ")}`,
-		);
-	}
-	// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
-	// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
-	// historically the sole call site in state-runtime.ts). Re-assert that gate on every
-	// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
-	// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
-	// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
-	//
-	// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
-	// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
-	// sentinel that is not a per-skill manifest state) leave the transition graph and are
-	// intentionally exempt.
-	if (options?.audit?.forced !== true && parsed.data.active === true) {
-		const toPhase = parsed.data.current_phase.trim();
-		if (toPhase) {
-			// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
-			// module load, and active-state -> state-writer -> workflow-manifest -> active-state
-			// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
-			const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
-			const skill = parsed.data.skill;
-			// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
-			// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
-			if (!isKnownWorkflowState(skill, toPhase)) {
-				throw new Error(
-					`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
-				);
-			}
-			// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
-			// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
-			// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
-			// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
-			// internal repairs / ralplan short-mode stage skips move between valid states without a
-			// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
-			// stderr) so such transitions are non-silent without breaking those flows.
-			const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
-			if (
-				fromPhase &&
-				fromPhase !== toPhase &&
-				isKnownWorkflowState(skill, fromPhase) &&
-				!isValidTransition(skill, fromPhase, toPhase)
-			) {
-				await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+	const write = async (): Promise<string> => {
+		const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
+		const stamped = stampWorkflowEnvelopeChecksum(withReceipt, filePath);
+		const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
+		if (!parsed.success) {
+			throw new Error(
+				`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
+					.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+					.join("; ")}`,
+			);
+		}
+		// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
+		// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
+		// historically the sole call site in state-runtime.ts). Re-assert that gate on every
+		// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
+		// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
+		// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
+		//
+		// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
+		// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
+		// sentinel that is not a per-skill manifest state) leave the transition graph and are
+		// intentionally exempt.
+		if (options?.audit?.forced !== true && parsed.data.active === true) {
+			const toPhase = parsed.data.current_phase.trim();
+			if (toPhase) {
+				// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
+				// module load, and active-state -> state-writer -> workflow-manifest -> active-state
+				// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
+				const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
+				const skill = parsed.data.skill;
+				// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
+				// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
+				if (!isKnownWorkflowState(skill, toPhase)) {
+					throw new Error(
+						`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
+					);
+				}
+				// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
+				// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
+				// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
+				// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
+				// internal repairs / ralplan short-mode stage skips move between valid states without a
+				// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
+				// stderr) so such transitions are non-silent without breaking those flows.
+				const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
+				if (
+					fromPhase &&
+					fromPhase !== toPhase &&
+					isKnownWorkflowState(skill, fromPhase) &&
+					!isValidTransition(skill, fromPhase, toPhase)
+				) {
+					await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+				}
 			}
 		}
-	}
-	await atomicWrite(filePath, jsonText(stamped));
-	await maybeAudit(filePath, options);
-	return filePath;
+		await atomicWrite(filePath, jsonText(stamped));
+		await maybeAudit(filePath, options);
+		return filePath;
+	};
+	// Serialize with every other writer of the same state path. Without this, a
+	// revision-preserving envelope write (seed/spec persistence) can interleave
+	// inside a staged apply's check-then-write window and be silently overwritten
+	// (#3387 architect finding 1). Callers already inside `withWorkflowStateLock`
+	// for this path pass `lockHeld: true`.
+	return options?.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options?.lock);
 }
 
 export async function writeTextAtomic(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {

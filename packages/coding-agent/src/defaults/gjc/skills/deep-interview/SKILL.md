@@ -95,14 +95,14 @@ If this raw bundled skill is loaded by GJC's native skill loader through `/skill
 
 ## Corrupt current-session state recovery
 
-When deep-interview detects its own current-session state is corrupt, tampered, unreadable, or stale on resume, run `gjc state clear --force --mode deep-interview` before reseeding or restarting. Scope the clear to the current session via `--session-id`, the command payload, or `GJC_SESSION_ID`; it clears only deep-interview state for that session and never clears other skills or sessions.
+When deep-interview detects its own current-session state is corrupt, tampered, unreadable, or stale on resume, run `gjc deep-interview clear --force` before reseeding or restarting. Scope the clear to the current session via `--session-id` or `GJC_SESSION_ID`; it clears only deep-interview state for that session and never clears other skills or sessions.
 
 ## Phase 0: Resolve Ambiguity Threshold (blocking prerequisite)
 
 Complete this phase before Phase 1, before brownfield exploration, before GJC state persistence, before Round 0, and before any ambiguity scoring. Do not continue if the resolved threshold and source are unknown.
 
 1. **Prefer pre-resolved native state**:
-   - First inspect active deep-interview state with `gjc state deep-interview read --json`.
+   - First inspect active deep-interview state with `gjc deep-interview read --json`.
    - If state contains a finite numeric `threshold` and a non-empty `threshold_source`, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
 2. **Only if native state lacks a resolved threshold, read threshold settings in runtime precedence order**:
    - YAML config first: read the **single** modern config path the environment selects — `$GJC_CODING_AGENT_DIR/config.yml` when `GJC_CODING_AGENT_DIR` is set, else `$GJC_CONFIG_DIR/agent/config.yml` when `GJC_CONFIG_DIR` is set, else `~/.gjc/agent/config.yml`. Do not cascade through the other YAML locations when the selected one is absent or invalid.
@@ -120,19 +120,19 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
 
 5. **Carry threshold source forward mechanically**:
    - Substitute `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` throughout the remaining instructions before continuing.
-   - Include `threshold_source` in the first `gjc state write` payload and preserve it on later state updates; do not edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
+   - Include `threshold_source` in the first `gjc deep-interview write` payload and preserve it on later state updates; do not edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
    - Include both threshold and source in the final spec metadata.
 - Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, default to English unless `{{ARGUMENTS}}` makes another user/session language obvious or the user explicitly requests another language. Do not add language-specific special cases.
 
 ## Phase 0.5: Suitability Gate
 
-Run this gate after the Phase 0 threshold marker and before Phase 1, brownfield exploration, `gjc state write`, Round 0, ambiguity scoring, or spec writing.
+Run this gate after the Phase 0 threshold marker and before Phase 1, brownfield exploration, `gjc deep-interview write`, Round 0, ambiguity scoring, or spec writing.
 
 If the user request appended after this skill as the final `User:` line is already clear, bounded, low-risk, and asks for a quick fix, single change, known file/symbol edit, explicit command, or direct answer:
 
 1. **Stop deep-interview immediately**:
-   - First inspect current-session state with `gjc state read --mode deep-interview --json` (include `--session-id <current-session-id>` when available).
-   - Clear through `gjc state clear --force --mode deep-interview --json` only when the state is a newly seeded empty interview: no recorded `rounds`, no `spec_path`, no `handoff_from`, no final/pending spec, and no user-confirmed topology.
+   - First inspect current-session state with `gjc deep-interview read --json` (include `--session-id <current-session-id>` when available).
+   - Clear through `gjc deep-interview clear --force --json` only when the state is a newly seeded empty interview: no recorded `rounds`, no `spec_path`, no `handoff_from`, no final/pending spec, and no user-confirmed topology.
    - If state already contains rounds, a spec path, handoff metadata, pending approval, or confirmed topology, do not clear it. Preserve the active interview and ask the user whether to continue, cancel, or explicitly clear the workflow.
    - Do not initialize deep-interview state.
    - Do not run Round 0.
@@ -181,7 +181,7 @@ Run this phase only when the active deep-interview state or invocation indicates
    - Preferred: pass the spec markdown **inline** to the native deep-interview write command (`--write … --spec "<markdown>"`) — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/_session-{sessionid}/specs`.
    - Only if a spec is too large to pass inline, stage it with the `write` tool to a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree, then pass that path to `--spec`. The planning phase-boundary block tolerates these neutral temp writes; never stage interview artifacts inside the repo or under `.gjc/`, and do not improvise repo-relative scratch files.
 
-4. **Initialize state** via `gjc state write`:
+4. **Initialize state** via `gjc deep-interview write --input '<json>'`:
 
 ```json
 {
@@ -535,7 +535,7 @@ Then apply the self-proofread once (DIPP-5) to narrative status text, generated 
 
 ### Step 2e: Update State
 
-Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. For scoring enrichment and state maintenance, use the native staged-transition path and keep every payload **incremental**: stage only the delta for the current round (`--for record-round` with just the one round record carrying its `round_key`; the runtime merges it into the existing transcript by durable key), only the changed facts (`--for update-facts`), or only the changed maintenance fields (`--for merge-state`). Never resend the whole `rounds` array or the full state envelope — earlier rounds are already persisted, resending them is wasteful and racy, and the merge preserves them without your copy. Optionally dry-run with `check`, then commit with `apply`. Ambiguity is **runtime-owned**: `apply` derives `current_ambiguity` from the latest scored round and clamps it to the deterministic floor; report the round's scores and your raw `ambiguity` on the round record, then read the effective value back from the `apply`/`check` output (`current_ambiguity`/`result_ambiguity`) instead of hand-setting `state.current_ambiguity`. The session resolves from `GJC_SESSION_ID` automatically; exactly one draft is pending at a time, and a revision conflict at `apply` invalidates the draft with typed recovery — re-stage the same small delta against current state, never do revision arithmetic. When the staged path is unavailable or metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
+Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round write is required for the answer shell; only scoring enrichment/state maintenance remains. For scoring enrichment and state maintenance, use the native `gjc deep-interview` surface and keep every payload **incremental**: stage only the delta for the current round (`stage --for record-round` with just the one round record carrying its `round_key`; the runtime merges it into the existing transcript by durable key), only the changed facts (`--for update-facts`; facts merge losslessly by `id` — a one-fact patch never erases prior facts), or only the changed maintenance fields (`--for merge-state`). Never resend the whole `rounds` array or the full state envelope — earlier rounds are already persisted, resending them is wasteful and racy, and the merge preserves them without your copy. Optionally dry-run with `check`, then commit with `apply`; for a simple immediate update, `gjc deep-interview write --input '<json>'` is the one-shot equivalent (incremental merge; add `--reset` only when deliberately replacing state — the locked intent contract survives a reset). Ambiguity is **runtime-owned**: `apply`/`write` derive `current_ambiguity` from the latest scored round and clamp it to the deterministic floor; report the round's scores and your raw `ambiguity` on the round record, then read the effective value back from the command output (`current_ambiguity`/`result_ambiguity`) instead of hand-setting `state.current_ambiguity`. The session resolves from `GJC_SESSION_ID` automatically; exactly one draft is pending at a time, and a revision conflict at `apply` invalidates the draft with typed recovery — re-stage the same small delta against current state, never do revision arithmetic. Never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
 Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, and `lateral_panel_failures` alongside the existing fields.
 
 ### Step 2f: Check Tiered Confirmation Cadence
@@ -752,10 +752,10 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 ### Phase 5b: Handoff before chain
 
-Before invoking `/skill:ralplan`, `/skill:team`, or `/skill:ultragoal`, the final spec must already be persisted through the native deep-interview write command. For ordinary user-selected handoff, mark deep-interview ready for the skill tool's chain guard:
+Before invoking `/skill:ralplan`, `/skill:team`, or `/skill:ultragoal`, the final spec must already be persisted through the native deep-interview write command (`gjc deep-interview --write --stage final …`). That command itself moves the workflow to the `handoff` phase, so no separate state write is needed for the skill tool's chain guard. Verify readiness with:
 
 ```
-gjc state deep-interview write --input '{"current_phase":"handoff"}' --json
+gjc deep-interview read --json
 ```
 
 For a preselected deliberate ralplan path, prefer the single sanctioned bridge command instead:
@@ -800,7 +800,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Use `read/search/find exploration or a bounded read-only planner/architect subagent` for brownfield codebase exploration (run BEFORE asking user about codebase)
 - Use opus model (temperature 0.1) for ambiguity scoring — consistency is critical
 - Round 0 topology confirmation happens before ambiguity scoring; Phase 2 scoring must honor locked topology and rotate targeting across active components when more than one is present
-- Use `gjc state write` / `gjc state read` for interview state persistence; the initial and subsequent deep-interview state payloads must include `threshold_source` alongside `threshold`; do not edit `.gjc/_session-{sessionid}/state` directly without force override. For incremental scoring/maintenance updates, prefer the deep-interview staged-transition verbs (`stage --for <transition> --input '<json>'`, `check`, `apply`, `discard`) — stage only the current delta (one round record by `round_key`, changed facts, or changed fields), never the whole transcript; the session is inherited from `GJC_SESSION_ID`, revision CAS is runtime-owned, and the effective `current_ambiguity` is derived and clamped by the CLI at `apply` — read it from the command output rather than setting it yourself.
+- Use `gjc deep-interview write` / `gjc deep-interview read` for interview state persistence; the initial and subsequent deep-interview state payloads must include `threshold_source` alongside `threshold`; do not edit `.gjc/_session-{sessionid}/state` directly without force override. For incremental scoring/maintenance updates, prefer the staged-transition verbs (`stage --for <transition> --input '<json>'`, `check`, `apply`, `discard`) — stage only the current delta (one round record by `round_key`, changed facts, or changed fields), never the whole transcript; `write` is incremental by default and replaces only with an explicit `--reset`; the session is inherited from `GJC_SESSION_ID`, revision CAS is runtime-owned, and the effective `current_ambiguity` is derived and clamped by the CLI at `apply`/`write` — read it from the command output rather than setting it yourself.
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority
@@ -942,7 +942,7 @@ Optional settings in `.gjc/settings.json`:
 
 ## Resume
 
-If interrupted, run `/skill:deep-interview` again. The skill resumes from GJC workflow state via `gjc state read`; do not read or edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
+If interrupted, run `/skill:deep-interview` again. The skill resumes from GJC workflow state via `gjc deep-interview read`; do not read or edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
 
 ## Integration with staged team routing
 

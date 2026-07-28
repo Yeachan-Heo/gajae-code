@@ -317,6 +317,38 @@ function draftIsStale(draft: DeepInterviewStageDraft, current: CurrentState): bo
 }
 
 /**
+ * Lossless keyed merge for `state.established_facts` under the staged surface.
+ * The generic envelope merge replaces the whole facts array; the staged contract
+ * is delta-only, so a one-fact patch must never erase prior confirmed/disputed
+ * facts (they carry the deterministic-floor evidence). Facts with an `id` merge
+ * field-wise by id; facts without an id are appended with exact-duplicate dedup.
+ * Staged deltas can never hard-delete a fact — dispute/supersede instead.
+ */
+function mergeEstablishedFacts(existing: readonly unknown[], incoming: readonly unknown[]): Record<string, unknown>[] {
+	const result: Record<string, unknown>[] = [];
+	const indexById = new Map<string, number>();
+	const add = (value: unknown): void => {
+		if (!isPlainObject(value)) return;
+		const id = typeof value.id === "string" && value.id.trim() !== "" ? value.id : undefined;
+		if (id !== undefined) {
+			const existingIndex = indexById.get(id);
+			if (existingIndex === undefined) {
+				indexById.set(id, result.length);
+				result.push({ ...value });
+			} else {
+				result[existingIndex] = { ...result[existingIndex], ...value };
+			}
+			return;
+		}
+		if (result.some(item => JSON.stringify(item) === JSON.stringify(value))) return;
+		result.push({ ...value });
+	};
+	for (const fact of existing) add(fact);
+	for (const fact of incoming) add(fact);
+	return result;
+}
+
+/**
  * The single merge both `check` and `apply` execute. `check` reports its result;
  * `apply` persists it. Divergence between the two is structurally impossible.
  *
@@ -347,7 +379,17 @@ function computeMergedEnvelope(
 	merged.version = WORKFLOW_STATE_VERSION;
 	if (typeof merged.current_phase !== "string" || !merged.current_phase) merged.current_phase = "interviewing";
 	merged.session_id = draft.session_id;
-	merged = deriveRuntimeAmbiguity(merged);
+	// Staged facts are deltas: re-merge against the prior facts losslessly so a
+	// one-fact patch cannot erase confirmed/disputed history (#3387 finding 2).
+	const mergedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : undefined;
+	const priorState = isPlainObject(current.state) ? (current.state as Record<string, unknown>) : undefined;
+	if (mergedState && priorState && Array.isArray(priorState.established_facts)) {
+		mergedState.established_facts = mergeEstablishedFacts(
+			priorState.established_facts,
+			Array.isArray(mergedState.established_facts) ? mergedState.established_facts : [],
+		);
+	}
+	merged = deriveRuntimeAmbiguity(merged, current);
 	try {
 		assertDeepInterviewEnvelopeInputLimits(merged);
 	} catch (error) {
@@ -361,26 +403,39 @@ function computeMergedEnvelope(
 }
 
 /**
- * Derive `state.current_ambiguity` from the latest scored round, then enforce the
- * deterministic floor. The CLI — not the agent — owns the effective ambiguity.
+ * Derive `state.current_ambiguity` — the CLI, not the agent, owns the effective
+ * ambiguity. A staged `state.current_ambiguity` is never trusted directly:
+ * - with a valid latest scored round (finite numeric `round` AND finite
+ *   `ambiguity`), the value derives from that round;
+ * - with no valid scored evidence, the PRIOR persisted value is retained (a
+ *   fresh interview keeps its seeded 1.0 — a staged 0.01 cannot survive);
+ * then the deterministic floor is recomputed and clamped.
  */
-function deriveRuntimeAmbiguity(merged: Record<string, unknown>): Record<string, unknown> {
+function deriveRuntimeAmbiguity(
+	merged: Record<string, unknown>,
+	previousState: Record<string, unknown>,
+): Record<string, unknown> {
 	const state = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : undefined;
 	if (state) {
 		const rounds = Array.isArray(state.rounds) ? state.rounds.filter(isPlainObject) : [];
 		let latestScored: Record<string, unknown> | undefined;
 		for (const round of rounds) {
-			if (round.lifecycle !== "scored" || typeof round.ambiguity !== "number") continue;
-			if (
-				!latestScored ||
-				(typeof round.round === "number" &&
-					typeof latestScored.round === "number" &&
-					round.round >= latestScored.round)
-			) {
-				latestScored = round;
-			}
+			if (round.lifecycle !== "scored") continue;
+			if (typeof round.ambiguity !== "number" || !Number.isFinite(round.ambiguity)) continue;
+			if (typeof round.round !== "number" || !Number.isFinite(round.round)) continue;
+			if (!latestScored || round.round >= (latestScored.round as number)) latestScored = round;
 		}
-		if (latestScored) state.current_ambiguity = latestScored.ambiguity;
+		if (latestScored) {
+			state.current_ambiguity = latestScored.ambiguity;
+		} else {
+			// No valid scored evidence in the merged state: the staged value is
+			// discarded and the prior runtime-owned value (seed default 1.0) holds.
+			const prior = isPlainObject(previousState.state)
+				? (previousState.state as Record<string, unknown>).current_ambiguity
+				: undefined;
+			if (typeof prior === "number" && Number.isFinite(prior)) state.current_ambiguity = prior;
+			else delete state.current_ambiguity;
+		}
 	}
 	return applyAmbiguityFloorToEnvelope(merged).envelope as Record<string, unknown>;
 }
@@ -655,10 +710,170 @@ async function handleDiscard(args: readonly string[], cwd: string): Promise<Reco
 }
 
 // -----------------------------------------------------------------------------
+// Direct verbs: read / write / clear / handoff
+// -----------------------------------------------------------------------------
+
+async function handleRead(args: readonly string[], cwd: string): Promise<Record<string, unknown>> {
+	const sessionId = resolveStageSession(args, cwd);
+	const current = await readCurrentState(cwd, sessionId);
+	if (!current.exists) {
+		return {
+			ok: true,
+			verb: "read",
+			session_id: sessionId,
+			exists: false,
+			state_path: statePathFor(cwd, sessionId),
+		};
+	}
+	const draftRead = await readDraft(cwd, sessionId);
+	return {
+		ok: true,
+		verb: "read",
+		session_id: sessionId,
+		exists: true,
+		state_path: statePathFor(cwd, sessionId),
+		revision: current.revision,
+		content_sha256: current.sha256,
+		envelope: current.value,
+		...(draftRead.kind === "valid"
+			? {
+					pending_draft: {
+						draft_id: draftRead.draft.draft_id,
+						transition: draftRead.draft.transition,
+						created_at: draftRead.draft.created_at,
+					},
+				}
+			: {}),
+	};
+}
+
+/**
+ * Direct write: an immediate stage+apply of one sanitized JSON payload —
+ * incremental merge by default, whole-state replacement with `--reset` (the
+ * locked intent contract survives a reset through the merge's immutability
+ * guard). Uses the same lock, sanitizer, merge, ambiguity derivation, and
+ * guarded revision-stamping writer as the staged path, so `write` cannot
+ * express anything `stage`+`apply` could not.
+ */
+async function handleWrite(args: readonly string[], cwd: string): Promise<Record<string, unknown>> {
+	const rawInput = flagValue(args, "--input");
+	if (rawInput === undefined || rawInput === "") {
+		throw new DeepInterviewStageError("DI_STAGE_USAGE", "--input '<json>' (or @file) is required for write");
+	}
+	const rawPayload = await parseJsonInput(rawInput, cwd);
+	const sessionId = resolveStageSession(args, cwd, rawPayload.session_id);
+	const reset = hasFlag(args, "--reset");
+	const { payload, ignoredKeys } = sanitizeStagedPayload(rawPayload);
+	assertCorePayloadSchema(payload);
+
+	const statePath = statePathFor(cwd, sessionId);
+	return withWorkflowStateLock(
+		statePath,
+		async () => {
+			const pendingDraft = await readDraft(cwd, sessionId);
+			if (pendingDraft.kind === "valid") {
+				throw new DeepInterviewStageError(
+					"DI_STAGE_DRAFT_EXISTS",
+					`a staged draft is pending (draft_id=${pendingDraft.draft.draft_id}); direct write would race it`,
+					"apply it (`gjc deep-interview apply`) or discard it (`gjc deep-interview discard`) first",
+				);
+			}
+			const current = await readCurrentState(cwd, sessionId);
+			const nowIso = new Date().toISOString();
+			const syntheticDraft: DeepInterviewStageDraft = {
+				version: DRAFT_VERSION,
+				draft_id: randomUUID(),
+				session_id: sessionId,
+				transition: "merge-state",
+				staged_against_revision: current.revision,
+				staged_against_sha256: current.sha256,
+				payload,
+				created_at: nowIso,
+			};
+			// --reset replaces: merge against an empty base but re-lock the intent
+			// contract from prior state through the merge's own immutability guard.
+			const base = reset
+				? (() => {
+						const priorState = isPlainObject(current.value.state)
+							? (current.value.state as Record<string, unknown>)
+							: {};
+						return priorState.intent_contract !== undefined
+							? { state: { intent_contract: priorState.intent_contract, intent_contract_required: true } }
+							: {};
+					})()
+				: current.value;
+			const merged = computeMergedEnvelope(base as Record<string, unknown>, syntheticDraft, nowIso);
+			merged.last_applied_draft_id = syntheticDraft.draft_id;
+			const written = await writeGuardedWorkflowEnvelopeAtomic(statePath, merged, {
+				cwd,
+				policy: "source",
+				expectedRevision: current.revision,
+				lockHeld: true,
+				receipt: {
+					cwd,
+					skill: "deep-interview",
+					owner: "gjc-runtime",
+					command: `gjc deep-interview write${reset ? " --reset" : ""}`,
+					sessionId,
+					nowIso,
+					mutationId: syntheticDraft.draft_id,
+				},
+				audit: {
+					category: "state",
+					verb: reset ? "write-reset" : "write-incremental",
+					owner: "gjc-runtime",
+					skill: "deep-interview",
+					sessionId,
+					mutationId: syntheticDraft.draft_id,
+				},
+			});
+			await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-stage", path: statePath });
+			const writtenState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : {};
+			return {
+				ok: true,
+				verb: "write",
+				mode: reset ? "reset" : "incremental",
+				session_id: sessionId,
+				applied_revision: written.revision,
+				state_path: statePath,
+				...(typeof writtenState.current_ambiguity === "number"
+					? { current_ambiguity: writtenState.current_ambiguity }
+					: {}),
+				...(ignoredKeys.length > 0 ? { ignored_runtime_owned_keys: ignoredKeys } : {}),
+			};
+		},
+		{ cwd },
+	);
+}
+
+/** Thin lifecycle passthroughs: same runtime plumbing, gjc deep-interview surface. */
+async function handleLifecyclePassthrough(
+	verb: "clear" | "handoff",
+	args: readonly string[],
+	cwd: string,
+): Promise<DeepInterviewStageCommandResult> {
+	const { runNativeStateCommand } = await import("./state-runtime");
+	const forwarded =
+		verb === "clear"
+			? ["clear", "--mode", "deep-interview", ...args]
+			: ["handoff", "--mode", "deep-interview", ...args];
+	return runNativeStateCommand([...forwarded], cwd);
+}
+
+// -----------------------------------------------------------------------------
 // Dispatch
 // -----------------------------------------------------------------------------
 
-export const DEEP_INTERVIEW_STAGE_VERBS = ["stage", "check", "apply", "discard"] as const;
+export const DEEP_INTERVIEW_STAGE_VERBS = [
+	"stage",
+	"check",
+	"apply",
+	"discard",
+	"read",
+	"write",
+	"clear",
+	"handoff",
+] as const;
 export type DeepInterviewStageVerb = (typeof DEEP_INTERVIEW_STAGE_VERBS)[number];
 
 export function isDeepInterviewStageVerb(value: string | undefined): value is DeepInterviewStageVerb {
@@ -686,6 +901,15 @@ export async function runDeepInterviewStageCommand(
 			case "discard":
 				summary = await handleDiscard(args, cwd);
 				break;
+			case "read":
+				summary = await handleRead(args, cwd);
+				break;
+			case "write":
+				summary = await handleWrite(args, cwd);
+				break;
+			case "clear":
+			case "handoff":
+				return await handleLifecyclePassthrough(verb, args, cwd);
 		}
 		const status = summary.ok === false ? 3 : 0;
 		const stdout = json

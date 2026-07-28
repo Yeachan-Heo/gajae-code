@@ -71,8 +71,8 @@ describe("deep-interview simple-request escape hatch", () => {
 
 		const suitabilityGate = steps.slice(suitabilityGateIndex, initializeIndex);
 		expect(suitabilityGate).toMatch(/clear,\s+bounded,\s+low-risk/i);
-		expect(suitabilityGate).toContain("gjc state read --mode deep-interview --json");
-		expect(suitabilityGate).toContain("gjc state clear --force --mode deep-interview");
+		expect(suitabilityGate).toContain("gjc deep-interview read --json");
+		expect(suitabilityGate).toContain("gjc deep-interview clear --force");
 		expect(suitabilityGate).toMatch(/newly seeded empty interview/i);
 		expect(suitabilityGate).toMatch(/no recorded `rounds`[\s\S]*no `spec_path`[\s\S]*no `handoff_from`/i);
 		expect(suitabilityGate).toMatch(/If state already contains rounds[\s\S]*do not clear it/i);

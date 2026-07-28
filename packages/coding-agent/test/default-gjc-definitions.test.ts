@@ -538,7 +538,14 @@ Project executor override body.
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
 		expect(content).toContain("do not edit `.gjc/_session-{sessionid}/state` directly without force override");
-		expect(content).toContain("gjc state clear --force --mode deep-interview");
+		expect(content).toContain("gjc deep-interview clear --force");
+		expect(content).toContain("gjc deep-interview read --json");
+		expect(content).toContain("gjc deep-interview write --input");
+		expect(content).toContain("`--reset` only when deliberately replacing state");
+		expect(content).not.toContain("gjc state read");
+		expect(content).not.toContain("gjc state write");
+		expect(content).not.toContain("gjc state clear");
+		expect(content).not.toContain("gjc state deep-interview");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
 		expect(content).toContain(
@@ -560,7 +567,6 @@ Project executor override body.
 			"Skill(",
 			"gajae-code:",
 			"/gajae-code",
-			"gjc deep-interview",
 		]) {
 			expect(content).not.toContain(forbidden);
 		}

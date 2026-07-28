@@ -75,7 +75,18 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 	{
 		name: "session-id",
 		type: "string",
-		appliesToVerbs: [...STATE_VERBS, "kickoff", "write-spec", "write-artifact", "stage", "check", "apply", "discard"],
+		appliesToVerbs: [
+			...STATE_VERBS,
+			"kickoff",
+			"write-spec",
+			"write-artifact",
+			"stage",
+			"check",
+			"apply",
+			"discard",
+			"read",
+			"write",
+		],
 	},
 	{ name: "thread-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
 	{ name: "turn-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
@@ -167,7 +178,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		verbs: [
 			...stateVerbs(),
 			...flagVerbs(["kickoff", "write-spec"]),
-			...positionalVerbs(["stage", "check", "apply", "discard"]),
+			...positionalVerbs(["stage", "check", "apply", "discard", "read", "write"]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
 		typedArgs: [
@@ -181,8 +192,13 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ name: "spec", type: "string", required: true, appliesToVerbs: ["write-spec"] },
 			{ name: "handoff", type: "enum", enumValues: ["ralplan"], appliesToVerbs: ["write-spec"] },
 			{ name: "deliberate", type: "boolean", appliesToVerbs: ["write-spec"] },
-			{ name: "json", type: "boolean", appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard"] },
-			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage"] },
+			{
+				name: "json",
+				type: "boolean",
+				appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard", "read", "write"],
+			},
+			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "write"] },
+			{ name: "reset", type: "boolean", appliesToVerbs: ["write"] },
 			{
 				name: "for",
 				type: "enum",

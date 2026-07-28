@@ -59,8 +59,15 @@ describe("deep-interview staged transitions", () => {
 			"--input",
 			JSON.stringify({
 				state: {
-					rounds: [{ round: 1, round_key: "r1", question_text: "What output format?", lifecycle: "answered" }],
-					current_ambiguity: 0.42,
+					rounds: [
+						{
+							round: 1,
+							round_key: "r1",
+							question_text: "What output format?",
+							lifecycle: "scored",
+							ambiguity: 0.42,
+						},
+					],
 					free_form_note: "flexible fields survive",
 				},
 			}),
@@ -515,5 +522,235 @@ describe("deep-interview staged transitions", () => {
 		expect(parse(oversized.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_INPUT_INVALID" });
 		const dirInput = await run(root, ["stage", "--for", "merge-state", "--input", `@${root}`, "--json"]);
 		expect(parse(dirInput.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_INPUT_INVALID" });
+	});
+
+	it("retains prior ambiguity when a staged patch has no valid scored round", async () => {
+		const root = await tempDir();
+		await seed(root);
+		// Seeded state carries current_ambiguity 1.0; a bare hand-set 0.01 with no
+		// scored round must NOT survive.
+		await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { current_ambiguity: 0.01 } }),
+			"--json",
+		]);
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		expect(applied.current_ambiguity).toBe(1);
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).current_ambiguity).toBe(1);
+	});
+
+	it("ignores malformed scored rounds when deriving ambiguity", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"record-round",
+			"--input",
+			JSON.stringify({
+				state: {
+					rounds: [
+						// Malformed: scored lifecycle but no numeric round.
+						{ round_key: "bogus", lifecycle: "scored", ambiguity: 0.01 },
+						{ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.55 },
+					],
+				},
+			}),
+			"--json",
+		]);
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		expect(applied.current_ambiguity).toBe(0.55);
+	});
+
+	it("preserves prior facts across a one-fact staged delta", async () => {
+		const root = await tempDir();
+		await seed(root);
+		// Establish two facts, one disputed (holds the floor at 0.10).
+		await run(root, [
+			"stage",
+			"--for",
+			"update-facts",
+			"--input",
+			JSON.stringify({
+				state: {
+					established_facts: [
+						{ id: "f1", statement: "confirmed fact", round: 1, disputed: false },
+						{ id: "f2", statement: "disputed fact", round: 1, disputed: true },
+					],
+				},
+			}),
+			"--json",
+		]);
+		await run(root, ["apply", "--json"]);
+		// Delta: add ONE new fact — f1/f2 must survive.
+		await run(root, [
+			"stage",
+			"--for",
+			"update-facts",
+			"--input",
+			JSON.stringify({
+				state: { established_facts: [{ id: "f3", statement: "new fact", round: 2, disputed: false }] },
+			}),
+			"--json",
+		]);
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		const after = await readState(root);
+		const facts = (after.state as Record<string, unknown>).established_facts as Record<string, unknown>[];
+		expect(facts.map(f => f.id).sort()).toEqual(["f1", "f2", "f3"]);
+		expect(facts.find(f => f.id === "f2")?.disputed).toBe(true);
+		// No scored round exists, so the prior seeded ambiguity (1.0) is retained;
+		// the disputed-fact floor is recorded as pressure evidence.
+		expect(applied.current_ambiguity).toBe(1);
+		const floorInfo = (after.state as Record<string, unknown>).ambiguity_floor as Record<string, unknown>;
+		expect(floorInfo.disputed_fact_count).toBe(1);
+		expect(floorInfo.floor).toBe(0.1);
+		// Field-wise update by id: supersede the disputed fact, floor releases.
+		await run(root, [
+			"stage",
+			"--for",
+			"update-facts",
+			"--input",
+			JSON.stringify({
+				state: { established_facts: [{ id: "f2", disputed: false, superseded_by: "f3" }] },
+			}),
+			"--json",
+		]);
+		await run(root, ["apply", "--json"]);
+		const final = await readState(root);
+		const finalFacts = (final.state as Record<string, unknown>).established_facts as Record<string, unknown>[];
+		expect(finalFacts.length).toBe(3);
+		const f2 = finalFacts.find(f => f.id === "f2");
+		expect(f2?.superseded_by).toBe("f3");
+		expect(f2?.statement).toBe("disputed fact");
+	});
+
+	it("serializes a sanctioned envelope writer against an in-flight apply", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { note: "apply under contention" } }),
+			"--json",
+		]);
+		// Fire a sanctioned revision-preserving writer (re-seed) CONCURRENTLY with
+		// apply. With the writer-wide path lock, both serialize: whichever writes
+		// second sees the other's write. Legal outcomes: apply succeeds (seed ran
+		// first or second under the lock) or apply reports a typed conflict —
+		// never a silent overwrite of the later write or a torn state file.
+		const [applied, reseeded] = await Promise.all([
+			run(root, ["apply", "--json"]),
+			runNativeDeepInterviewCommand(["--json", "concurrent reseed"], root),
+		]);
+		expect(reseeded.status).toBe(0);
+		expect([0, 2]).toContain(applied.status);
+		if (applied.status === 2) {
+			expect(parse(applied.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_REVISION_CONFLICT" });
+		}
+		// State file is intact and canonical afterwards regardless of ordering.
+		const after = await readState(root);
+		expect(after.skill).toBe("deep-interview");
+		expect(after.active).toBe(true);
+		const checked = await run(root, ["check", "--json"]);
+		// Any remaining draft is either consumed (NO_DRAFT) or stale-detected.
+		if (checked.status !== 0) {
+			const body = parse(checked.stderr ?? checked.stdout);
+			expect(["DI_STAGE_NO_DRAFT", "DI_STAGE_REVISION_CONFLICT"]).toContain(body.code as string);
+		}
+	});
+
+	it("read returns the envelope, revision, sha, and pending draft", async () => {
+		const root = await tempDir();
+		const missing = parse((await run(root, ["read", "--json"])).stdout);
+		expect(missing).toMatchObject({ ok: true, verb: "read", exists: false });
+		await seed(root);
+		await run(root, ["stage", "--for", "merge-state", "--input", JSON.stringify({ state: {} }), "--json"]);
+		const read = parse((await run(root, ["read", "--json"])).stdout);
+		expect(read.exists).toBe(true);
+		expect(typeof read.revision).toBe("number");
+		expect(typeof read.content_sha256).toBe("string");
+		expect((read.envelope as Record<string, unknown>).skill).toBe("deep-interview");
+		expect((read.pending_draft as Record<string, unknown>).transition).toBe("merge-state");
+	});
+
+	it("write merges incrementally by default and replaces with --reset", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const first = parse(
+			(
+				await run(root, [
+					"write",
+					"--input",
+					JSON.stringify({
+						state: { note_a: "kept", established_facts: [{ id: "f1", statement: "fact", round: 1 }] },
+					}),
+					"--json",
+				])
+			).stdout,
+		);
+		expect(first).toMatchObject({ ok: true, verb: "write", mode: "incremental" });
+		const second = parse(
+			(await run(root, ["write", "--input", JSON.stringify({ state: { note_b: "added" } }), "--json"])).stdout,
+		);
+		expect(second.mode).toBe("incremental");
+		expect(second.applied_revision).toBeGreaterThan(first.applied_revision as number);
+		const merged = await readState(root);
+		const mergedState = merged.state as Record<string, unknown>;
+		// Incremental: both notes and prior facts survive.
+		expect(mergedState.note_a).toBe("kept");
+		expect(mergedState.note_b).toBe("added");
+		expect((mergedState.established_facts as unknown[]).length).toBe(1);
+		// Reset replaces free-form state.
+		const reset = parse(
+			(await run(root, ["write", "--reset", "--input", JSON.stringify({ state: { fresh: true } }), "--json"]))
+				.stdout,
+		);
+		expect(reset.mode).toBe("reset");
+		const after = await readState(root);
+		const afterState = after.state as Record<string, unknown>;
+		expect(afterState.fresh).toBe(true);
+		expect(afterState.note_a).toBeUndefined();
+		expect(afterState.note_b).toBeUndefined();
+	});
+
+	it("write refuses while a staged draft is pending and strips runtime-owned keys", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, ["stage", "--for", "merge-state", "--input", JSON.stringify({ state: {} }), "--json"]);
+		const blocked = await run(root, ["write", "--input", JSON.stringify({ state: { x: 1 } }), "--json"]);
+		expect(parse(blocked.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_DRAFT_EXISTS" });
+		await run(root, ["discard", "--json"]);
+		const smuggle = parse(
+			(
+				await run(root, [
+					"write",
+					"--input",
+					JSON.stringify({ current_phase: "handoff", skill: "ralplan", state: { y: 2 } }),
+					"--json",
+				])
+			).stdout,
+		);
+		expect(smuggle.ignored_runtime_owned_keys).toEqual(expect.arrayContaining(["current_phase", "skill"]));
+		const after = await readState(root);
+		expect(after.current_phase).toBe("interviewing");
+		expect(after.skill).toBe("deep-interview");
+	});
+
+	it("clear routes through the lifecycle plumbing", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const cleared = await run(root, ["clear", "--force", "--json"]);
+		expect(cleared.status).toBe(0);
+		const read = parse((await run(root, ["read", "--json"])).stdout);
+		// Cleared state persists a terminal envelope (active:false) or none at all.
+		if (read.exists) {
+			expect((read.envelope as Record<string, unknown>).active).toBe(false);
+		}
 	});
 });

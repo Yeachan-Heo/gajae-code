@@ -114,7 +114,9 @@
           "stage",
           "check",
           "apply",
-          "discard"
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -264,18 +266,28 @@
           "stage",
           "check",
           "apply",
-          "discard"
+          "discard",
+          "read",
+          "write"
         ],
         "name": "json",
         "type": "boolean"
       },
       {
         "appliesToVerbs": [
-          "stage"
+          "stage",
+          "write"
         ],
         "name": "input",
         "required": true,
         "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write"
+        ],
+        "name": "reset",
+        "type": "boolean"
       },
       {
         "appliesToVerbs": [
@@ -349,6 +361,14 @@
       },
       {
         "name": "discard",
+        "surface": "command-positional"
+      },
+      {
+        "name": "read",
+        "surface": "command-positional"
+      },
+      {
+        "name": "write",
         "surface": "command-positional"
       },
       {
@@ -584,7 +604,9 @@
           "stage",
           "check",
           "apply",
-          "discard"
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -976,7 +998,9 @@
           "stage",
           "check",
           "apply",
-          "discard"
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -1466,7 +1490,9 @@
           "stage",
           "check",
           "apply",
-          "discard"
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"

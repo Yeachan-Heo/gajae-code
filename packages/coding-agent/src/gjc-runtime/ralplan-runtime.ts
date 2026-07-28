@@ -782,6 +782,7 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 			existing.updated_at = new Date().toISOString();
 			await writeWorkflowEnvelopeAtomic(statePath, existing, {
 				cwd,
+				lockHeld: true,
 				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan persist-run-id", sessionId },
 				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 			});
@@ -1036,6 +1037,7 @@ async function applyPersistedRoleStateUpdate(
 			existing.updated_at = new Date().toISOString();
 			await writeWorkflowEnvelopeAtomic(statePath, existing, {
 				cwd,
+				lockHeld: true,
 				receipt: {
 					cwd,
 					skill: "ralplan",
@@ -1083,6 +1085,7 @@ async function applyLaneVerdictUpdate(
 			existing.updated_at = new Date().toISOString();
 			await writeWorkflowEnvelopeAtomic(statePath, existing, {
 				cwd,
+				lockHeld: true,
 				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan lane-verdict", sessionId },
 				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 			});
