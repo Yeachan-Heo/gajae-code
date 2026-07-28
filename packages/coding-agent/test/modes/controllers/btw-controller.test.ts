@@ -112,7 +112,11 @@ describe("BtwController", () => {
 		await Promise.resolve();
 
 		expect(dispatchedQuestion).toBe(sentinel);
-		expect(instructionFactory.mock.calls[0]?.[0]).not.toContain("PRIVATE_OVERRIDE");
+		const instruction = instructionFactory.mock.calls[0]?.[0];
+		expect(instruction).not.toContain("PRIVATE_OVERRIDE");
+		expect(instruction).toContain("Tools are unavailable in this side chat");
+		expect(instruction).toContain("Never claim to browse or search the web, open a gate");
+		expect(instruction).toContain("press Esc and ask in the main chat");
 	});
 
 	it("accepts an exact UTF-8 question limit and rejects one byte over", async () => {

@@ -37,6 +37,10 @@
 - Ralplan now bounds architect and critic re-review lanes independently through `gjc.ralplan.maxReviewPassesPerLane` (integer 1–10; default 1). Per-lane budget exhaustion emits a lane-specific `PLANNING-STUCK` exit 3, fails closed against on-disk artifact floors, and repairs crash-gap retries. Architect and critic `gjc ralplan --write` calls can optionally pass `--lane-verdict`, which drives HUD lane pass counts and the latest verdict; critic/architect prompts and the ralplan SKILL workflow now ratchet re-reviews through persisted receipts.
 - Ralplan consensus review lanes now persist same-session Architect and Critic subagent metadata (`--architect-id` / `--architect-resumable`, `--critic-id` / `--critic-resumable`) and resume those reviewers by default on pass 2+ with the mandatory re-review context bundle. Unavailable reviewer context falls back to a fresh lane spawn with role-scoped fallback metadata, preserving the existing sequential re-review cadence and receipt-only contract.
 
+### Fixed
+
+- `/btw` now explicitly refuses to claim invisible tool activity such as web searches, workflow gates, commands, or file reads. When a side-chat answer requires an unavailable action, it directs the user back to the main chat instead of implying the action ran.
+
 ## [0.11.11] - 2026-07-26
 
 ### Added
