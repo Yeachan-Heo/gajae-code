@@ -1,0 +1,54 @@
+{
+  "schema": "gajae.issue-triage-sequencing.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "note": "Runtime/workflow backlog batch per owner directive: #2600, #2549, #2895, #2902, #2893. Contributor-ledger priority applied (existing closed PR attempts checked for every item before any new mutation); at most one mutation this pass.",
+  "linkedIssueClosuresChecked": {
+    "prs": [3441, 3391, 3435],
+    "result": "NONE_LINKED",
+    "evidence": "GitHub GraphQL closingIssuesReferences returned an empty node list for all three PR numbers — no issue closed by exact-merge evidence this round."
+  },
+  "items": [
+    {
+      "issue": 2600,
+      "title": "internal continuations can still hit AgentBusyError instead of busy-aware queuing",
+      "priorAttempts": "none (no linked PRs)",
+      "reproductionEvidence": "Confirmed both log call sites present unchanged on origin/dev (agent-session.ts #scheduleAgentContinue fail() and #logCompactionContinuationError), both logger.warn on AgentBusyError races.",
+      "action": "MUTATED_THIS_PASS",
+      "pr": 3446,
+      "scopeDecision": "Applied only the log-severity remediation the issue itself explicitly endorses as an acceptable alternative ('...without logging a warning-level failure'). Did not attempt full busy-aware requeuing of internal continuations: that touches the same machinery the existing agent-session-retry-busy-recovery.test.ts wedge-prevention contract guards, and the directly-neighboring issue #2549 has twice failed hostile review for subtle cross-process/async-atomicity defects in this exact area. A log-noise fix carries essentially zero regression risk to that hardened contract; a queuing-behavior fix would require live multi-race verification this sandbox cannot responsibly perform blind.",
+      "regressionEvidence": "New test added; reproduced original failure against unfixed source (reverted fix, confirmed test fails identically), restored fix, confirmed pass. 17/17 relevant tests pass; bun run check clean."
+    },
+    {
+      "issue": 2549,
+      "title": "coordinator-mcp: turns from broker-spawned sessions never reach terminal state",
+      "priorAttempts": "THREE closed, unmerged: #2551 (closed after signed hostile review found unresolved security/cross-process-atomicity/restart-incarnation/adversarial-coverage blockers), #2605 (diagnostic-only improvement, closed unmerged), #2919 (closed on owner-direct backlog burn — exact head REQUEST_CHANGES for a runtime-directory containment boundary escape; explicit note: 'the reconciled #2549 repair belongs in one maintainer-owned mutation lane; this external branch will not be mutated').",
+      "reproductionEvidence": "Confirmed root cause still live on current dev: GJC_COORDINATOR_SESSION_STATE_FILE env is wired into tmux/lifecycle-control-runtime launch paths but sdk/broker/lifecycle.ts's spawn env allowlist (GJC_AGENT_DIR, GJC_CODING_AGENT_DIR, GJC_SESSION_ID, GJC_STATE_ROOT, GJC_LIFECYCLE_REQUEST_ID, GJC_SDK_LIFECYCLE_REQUEST) still has no entry for it — grep for GJC_COORDINATOR_SESSION_STATE_FILE_ENV across origin/dev shows every launch path except broker/lifecycle.ts.",
+      "action": "NOT_MUTATED_THIS_PASS",
+      "rationale": "Explicitly owner-flagged as a single-maintainer-owned mutation lane after two hostile-review failures for security/atomicity reasons this sandbox pass cannot adequately re-verify (no live multi-process broker harness exercised). Documented root cause with exact evidence above rather than attempting a third unreviewed mutation; deferred to the owner-designated lane per the explicit #2919 closing note."
+    },
+    {
+      "issue": 2895,
+      "title": "Subagent completion can report unpersisted owner-worktree edits",
+      "priorAttempts": "none (no linked PRs)",
+      "reproductionEvidence": "Issue body is a terse incident report (specific executor task ids/head sha from an internal run) rather than a generally-reproducible repro recipe; no corresponding code path was identified this pass with the effort budget available.",
+      "action": "NOT_MUTATED_THIS_PASS",
+      "rationale": "Insufficient reproduction evidence established this pass to safely scope a fix; needs a follow-up pass with a concrete general repro (not just the one incident's ids) before any mutation."
+    },
+    {
+      "issue": 2902,
+      "title": "Ralplan cannot represent or verify contradictory review dispositions",
+      "priorAttempts": "THREE closed, unmerged attempts, all titled 'feat(ralplan): typed review conflicts and disposition stage' (#2953, #2966, #3013) — repeated failed attempts at the same net-new typed-conflict schema/workflow feature.",
+      "action": "NOT_MUTATED_THIS_PASS",
+      "rationale": "Net-new workflow contract (new schema, new blocking gate semantics for Architect/Critic conflict resolution) with three prior failed attempts — same risk profile as #2549's repeated hostile-review failures. Needs the same single-maintainer-owned-lane treatment, not a blind fourth attempt in the time available this pass."
+    },
+    {
+      "issue": 2893,
+      "title": "Review wrapper rejects valid findings payloads",
+      "priorAttempts": "Bundled into the same closed/unmerged #3013 attempt as #2902 (not resolved independently).",
+      "reproductionEvidence": "Traced task/executor.ts's finalizeSubprocessOutput -> normalizeCompleteData (only backfills `findings` when absent, does not reject an already-present `findings`) -> buildOutputValidator -> jtdToJsonSchema. JTD (RFC 8927) schemas are closed-by-default unless the declaring schema sets additionalProperties: true, so a caller-declared outputSchema for a review-type task that lists `review` but not `findings`/additionalProperties would reject a payload containing both — consistent with the reported symptom. Could not pin down the exact declaring schema/call site (AgentDefinition.output is caller-supplied, not a fixed built-in schema in this codebase) within this pass's effort budget.",
+      "action": "NOT_MUTATED_THIS_PASS",
+      "rationale": "Root-cause mechanism (JTD closed-by-default) is identified with reasonable confidence but the exact declaring schema was not conclusively located; per the explicit 'establish reproduction ... evidence before mutation' instruction, this does not yet meet the bar for a confident, narrowly-scoped fix. Documented the mechanism for a follow-up pass rather than guessing at the fix location."
+    }
+  ],
+  "reviewedAt": "2026-07-28T19:15:00Z"
+}
