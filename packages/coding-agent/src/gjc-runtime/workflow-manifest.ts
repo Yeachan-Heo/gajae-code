@@ -229,7 +229,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			},
 			{
 				name: "expected-draft-revision",
-				type: "number",
+				// `draft edit` additionally accepts the literal `latest`; all other verbs require the exact number.
+				type: "string",
 				required: true,
 				appliesToVerbs: [
 					"draft edit",
@@ -246,6 +247,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				type: "enum",
 				enumValues: ["set", "append", "remove"],
 				required: true,
+				// Repeatable: each `--op` opens a new operation group ({--path,--value,--value-file,--null}) applied atomically in one call.
 				appliesToVerbs: ["draft edit"],
 			},
 			{ name: "path", type: "string", required: true, appliesToVerbs: ["draft edit"] },

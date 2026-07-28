@@ -309,7 +309,8 @@ describe("deep-interview CLI-owned draft contract", () => {
 			"draft rebase  --draft-id ID --expected-draft-revision N --to-state-revision N --json",
 		);
 		expect(normalFlowDocs).toContain("draft discard --draft-id ID --expected-draft-revision N --json");
-		expect(normalFlowDocs).toContain("without consuming or mutating it; it reports when the draft base is stale");
+		expect(normalFlowDocs).toContain("without consuming or mutating it");
+		expect(normalFlowDocs).toContain("it also reports when the draft base is stale");
 		expect(normalFlowDocs).toContain("caller-observed current state revision as `--to-state-revision`");
 		expect(toolUsage).toContain("Inline JSON request flags are compatibility-only");
 		expect(toolUsage).toContain("Never construct a full payload");

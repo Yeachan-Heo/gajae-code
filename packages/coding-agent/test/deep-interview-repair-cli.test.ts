@@ -135,7 +135,12 @@ describe("deep-interview typed repair CLI", () => {
 			expect(inspect.status).toBe(3);
 			expect(JSON.parse(inspect.stderr!)).toEqual({
 				ok: false,
-				issue: { code: "DI_STATE_SCHEMA_INVALID", message: "DI_STATE_SCHEMA_INVALID" },
+				issue: {
+					code: "DI_STATE_SCHEMA_INVALID",
+					message: "The persisted deep-interview state violates a native v1 invariant.",
+					recovery:
+						"Fix the named invariant at the reported path (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <expected> --json), rerun gjc deep-interview draft check --draft-id <id> --json, then retry consume.",
+				},
 			});
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
@@ -189,7 +194,12 @@ describe("deep-interview typed repair CLI", () => {
 				expect(result.status).toBe(3);
 				expect(JSON.parse(result.stderr!)).toEqual({
 					ok: false,
-					issue: { code: "DI_STATE_SCHEMA_INVALID", message: "DI_STATE_SCHEMA_INVALID" },
+					issue: {
+						code: "DI_STATE_SCHEMA_INVALID",
+						message: "The persisted deep-interview state violates a native v1 invariant.",
+						recovery:
+							"Fix the named invariant at the reported path (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <expected> --json), rerun gjc deep-interview draft check --draft-id <id> --json, then retry consume.",
+					},
 				});
 			}
 		} finally {
@@ -249,7 +259,12 @@ describe("deep-interview typed repair CLI", () => {
 			expect(mutation.status).toBe(3);
 			expect(JSON.parse(mutation.stderr!)).toEqual({
 				ok: false,
-				issue: { code: "DI_STATE_SCHEMA_INVALID", message: "DI_STATE_SCHEMA_INVALID" },
+				issue: {
+					code: "DI_STATE_SCHEMA_INVALID",
+					message: "The persisted deep-interview state violates a native v1 invariant.",
+					recovery:
+						"Fix the named invariant at the reported path (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <expected> --json), rerun gjc deep-interview draft check --draft-id <id> --json, then retry consume.",
+				},
 			});
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
@@ -290,7 +305,10 @@ describe("deep-interview typed repair CLI", () => {
 			expect(oversized.status).toBe(2);
 			expect(JSON.parse(oversized.stderr!)).toEqual({
 				ok: false,
-				issue: { code: "DI_OUTPUT_LIMIT_EXCEEDED", message: "DI_OUTPUT_LIMIT_EXCEEDED" },
+				issue: {
+					code: "DI_OUTPUT_LIMIT_EXCEEDED",
+					message: "The projected response exceeds the CLI output byte limit.",
+				},
 			});
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
@@ -614,6 +632,31 @@ describe("deep-interview typed repair CLI", () => {
 			expect(initialized.state).toMatchObject({ threshold: Number(threshold), threshold_units: 500 });
 			expect(initialized.state.setup).toBeUndefined();
 		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("defaults typed commands to GJC_SESSION_ID when --session-id is omitted", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+		const session = "env-repair-session";
+		const priorSession = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = session;
+		try {
+			const stateFile = modeStatePath(cwd, session, "deep-interview");
+			await fs.mkdir(path.dirname(stateFile), { recursive: true });
+			await Bun.write(
+				stateFile,
+				JSON.stringify({
+					state_revision: 1,
+					state: { interview_id: "env", type: "greenfield", threshold: 0.05, rounds: [] },
+				}),
+			);
+			const result = await runDeepInterviewRepairCommand(["inspect", "--selector", "summary", "--json"], cwd);
+			expect(result.status, result.stderr).toBe(0);
+			expect(JSON.parse(result.stdout!).state_revision).toBe(1);
+		} finally {
+			if (priorSession === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = priorSession;
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -1364,7 +1407,12 @@ describe("deep-interview typed repair CLI", () => {
 			expect(result.status).toBe(2);
 			expect(JSON.parse(result.stderr!)).toEqual({
 				ok: false,
-				issue: { code: "DI_STATE_SCHEMA_INVALID", message: "DI_STATE_SCHEMA_INVALID" },
+				issue: {
+					code: "DI_STATE_SCHEMA_INVALID",
+					message: "The persisted deep-interview state violates a native v1 invariant.",
+					recovery:
+						"Fix the named invariant at the reported path (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <expected> --json), rerun gjc deep-interview draft check --draft-id <id> --json, then retry consume.",
+				},
 			});
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
