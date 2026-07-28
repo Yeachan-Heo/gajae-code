@@ -354,6 +354,14 @@ describe("workflow mutation guard", () => {
 			// A downstream pipe stage can execute the body even when the opener is inert (Codex P1).
 			"cat <<'EOF' | bash\nrm src/product.ts\nEOF",
 			"cat <<'EOF' | grep -v noop | sh\nrm src/product.ts\nEOF",
+			// Escaped `|` keeps `cat` as an ARGUMENT to bash -s, not a pipe stage (Codex P1).
+			"bash -s \\| cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A shadowed allowlisted name executes the body through its function body (Codex P1).
+			"cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A line-continued opener hides the downstream interpreter stage (Codex P1).
+			"cat <<'EOF' \\\n| bash\nrm src/product.ts\nEOF",
+			// A multiline double-quoted string containing `cat <<'EOF'` is data, not an opener (Codex P1).
+			"printf '%s' \"\ncat <<'EOF'\n\" > /dev/null\nrm src/product.ts\nEOF",
 			// Unquoted delimiter + command substitution in body expands at runtime — fail closed.
 			"cat <<EOF > /tmp/out.md\n$(rm src/product.ts)\nEOF",
 			// Unterminated heredoc is unparseable — body scanned as before, mutation caught.

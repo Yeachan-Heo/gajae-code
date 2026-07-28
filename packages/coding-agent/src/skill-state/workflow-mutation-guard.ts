@@ -455,38 +455,70 @@ interface HeredocMaskResult {
 	mutatingConsumer: boolean;
 }
 
+/** Quote state carried ACROSS physical lines so multiline quoted strings cannot fake heredoc openers. */
+interface ShellQuoteState {
+	inSingle: boolean;
+	inDouble: boolean;
+}
+
 /**
- * Blank out double-quoted spans (like `maskSingleQuotedSpans`) so a `<<` inside
- * `"…"` argument data is not misread as a heredoc opener. A backslash-escaped
- * `\"` never toggles the quote state — outside quotes it is a literal quote
- * character, inside quotes it is escaped data — so `"a \" << \" b"` stays one
- * masked span. Unbalanced quotes return the original text so the caller stays
- * fail-closed rather than blind.
+ * Mask one physical line for syntax analysis, carrying `state` across lines:
+ * quoted spans and backslash-escaped characters become spaces (they are data,
+ * never syntax), so a `<<` inside `"…"`/`'…'` — even when the quote opened on a
+ * PREVIOUS line — or an escaped separator like `\|` is never misread. The
+ * output is the same length as the input so match offsets stay aligned.
+ * `continued` reports an unescaped trailing backslash outside quotes (logical
+ * line continuation).
  */
-function maskDoubleQuotedSpans(text: string): string {
+function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: string; continued: boolean } {
 	let masked = "";
-	let inDouble = false;
 	let escaped = false;
-	for (const character of text) {
+	for (const character of line) {
+		if (state.inSingle) {
+			if (character === "'") {
+				state.inSingle = false;
+				masked += "'";
+			} else masked += " ";
+			continue;
+		}
 		if (escaped) {
 			escaped = false;
-			masked += inDouble && character !== "\n" ? " " : character;
+			masked += " ";
 			continue;
 		}
 		if (character === "\\") {
 			escaped = true;
-			masked += inDouble ? " " : character;
+			masked += " ";
+			continue;
+		}
+		if (state.inDouble) {
+			if (character === '"') {
+				state.inDouble = false;
+				masked += '"';
+			} else masked += " ";
+			continue;
+		}
+		if (character === "'") {
+			state.inSingle = true;
+			masked += "'";
 			continue;
 		}
 		if (character === '"') {
-			inDouble = !inDouble;
-			masked += character;
+			state.inDouble = true;
+			masked += '"';
 			continue;
 		}
-		masked += inDouble && character !== "\n" ? " " : character;
+		masked += character;
 	}
-	return inDouble ? text : masked;
+	return { masked, continued: escaped };
 }
+
+const DATA_CONSUMER_NAMES = [...HEREDOC_DATA_CONSUMERS].join("|");
+/** A function/alias (re)definition of an allowlisted data-consumer name — masking must not trust the name. */
+const DATA_CONSUMER_SHADOW_RE = new RegExp(
+	`(?:^|[\\s;|&({\`])(?:function\\s+(?:${DATA_CONSUMER_NAMES})\\b|(?:${DATA_CONSUMER_NAMES})\\s*\\(\\s*\\)|alias\\s+(?:${DATA_CONSUMER_NAMES})=)`,
+	"i",
+);
 
 /**
  * Cut a quote-masked line at an unquoted `#` comment start (line start or after
@@ -565,28 +597,41 @@ function heredocConsumerKind(syntaxLine: string, at: number): "data" | "mutating
  * be live code. Stdin appliers (patch/ed/ex/sqlite3) flag `mutatingConsumer`
  * and the caller fails closed. Unquoted-delimiter bodies still expand
  * `$(…)`/backticks in real shells, so masked ones flag `opaqueExpansion`. A
- * `<<` inside a comment or a quoted span is not an opener. An unterminated
- * heredoc is not statically maskable; the original text is returned so the
- * scanner stays fail-closed rather than blind.
+ * `<<` inside a comment or a quoted span (including a quote opened on a
+ * previous line) is not an opener; a line-continued opener, a shadowed
+ * data-consumer name (`cat() { … }`), and an unterminated heredoc all keep
+ * their bodies live so the scanner stays fail-closed rather than blind.
  */
 function maskHeredocBodies(command: string): HeredocMaskResult {
 	if (!command.includes("<<")) return { masked: command, opaqueExpansion: false, mutatingConsumer: false };
+	// A function/alias definition of an allowlisted consumer name anywhere in the
+	// command means the name cannot be trusted; keep every body live (fail closed).
+	const shadowed = DATA_CONSUMER_SHADOW_RE.test(command);
 	const lines = command.split("\n");
 	const out: string[] = [];
+	const state: ShellQuoteState = { inSingle: false, inDouble: false };
+	let previousContinued = false;
 	let opaqueExpansion = false;
 	let mutatingConsumer = false;
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index] ?? "";
 		out.push(line);
-		// Quote masking + comment cutting decide whether a `<<` is real syntax or
-		// inert data on this opener line.
-		const syntax = cutShellComment(maskDoubleQuotedSpans(maskSingleQuotedSpans(line)));
+		// Cross-line quote masking decides whether a `<<` is real syntax or inert
+		// data — even when the enclosing quote opened on a previous line.
+		const { masked, continued } = maskLineForSyntax(line, state);
+		const syntax = cutShellComment(masked);
+		const isContinuationLine = previousContinued;
+		previousContinued = continued;
 		for (const match of line.matchAll(BASH_HEREDOC_OPEN_RE)) {
 			const at = match.index ?? 0;
 			if (syntax.slice(at, at + 2) !== "<<") continue;
 			const delimiter = match[2] ?? match[3] ?? match[5] ?? "";
 			if (!delimiter) continue;
-			const kind = heredocConsumerKind(syntax, at);
+			let kind = heredocConsumerKind(syntax, at);
+			// A continued/continuation opener line hides part of the pipeline
+			// (`cat <<'EOF' \` / `| bash`); a shadowed consumer name is untrustworthy.
+			// Both downgrade masking eligibility, never block eligibility.
+			if (kind === "data" && (shadowed || continued || isContinuationLine)) kind = "other";
 			if (kind === "mutating") mutatingConsumer = true;
 			const quoted = match[2] !== undefined || match[3] !== undefined || match[4] !== undefined;
 			const stripTabs = match[1] === "-";
@@ -607,6 +652,8 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 			}
 			out.push(lines[end] ?? "");
 			index = end;
+			// Heredoc bodies are data: they never affect the shell quote state.
+			previousContinued = false;
 		}
 	}
 	return { masked: out.join("\n"), opaqueExpansion, mutatingConsumer };
