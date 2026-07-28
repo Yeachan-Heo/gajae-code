@@ -2,6 +2,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir } from "@gajae-code/utils";
+import { verifyObligations } from "../app-server/obligations-verifier";
+
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -110,6 +112,7 @@ export interface UltragoalGoal {
 	status: UltragoalGoalStatus;
 	createdAt: string;
 	updatedAt: string;
+	supersedable?: boolean;
 	startedAt?: string;
 	completedAt?: string;
 	evidence?: string;
@@ -130,6 +133,71 @@ export interface UltragoalPlan {
 	createdAt: string;
 	updatedAt: string;
 	[key: string]: unknown;
+	ledgerIntegrity?: UltragoalLedgerIntegrity;
+	protectedGateIntegrityVersion?: 1;
+}
+interface UltragoalLedgerIntegrity {
+	eventCount: number;
+	headDigest: string;
+}
+
+interface ProtectedGateWitness {
+	goalId: string;
+	generation: string;
+	gateDigest: string;
+}
+
+interface ProtectedGateGenerationRotation {
+	previousGeneration: string;
+	generation: string;
+}
+
+function protectedGateGenerationRotations(
+	ledger: readonly UltragoalLedgerEvent[],
+): readonly ProtectedGateGenerationRotation[] {
+	const rotations: ProtectedGateGenerationRotation[] = [];
+	const previousGenerations = new Set<string>();
+	const generations = new Set<string>();
+	for (const event of ledger) {
+		if (event.event !== "protected_gate_generation_reseeded") continue;
+		if (
+			typeof event.previousGeneration !== "string" ||
+			!event.previousGeneration.trim() ||
+			typeof event.generation !== "string" ||
+			!event.generation.trim() ||
+			!Array.isArray(event.protectedGateIds) ||
+			event.protectedGateIds.some(id => typeof id !== "string" || !id.trim())
+		)
+			throw new Error("Ultragoal plan tampering detected: protected-gate generation rotation is malformed.");
+		const gateIds = event.protectedGateIds as string[];
+		if (
+			new Set(gateIds).size !== gateIds.length ||
+			previousGenerations.has(event.previousGeneration) ||
+			generations.has(event.generation)
+		)
+			throw new Error("Ultragoal plan tampering detected: protected-gate generation rotation is conflicting.");
+		previousGenerations.add(event.previousGeneration);
+		generations.add(event.generation);
+		rotations.push({ previousGeneration: event.previousGeneration, generation: event.generation });
+	}
+	return rotations;
+}
+
+function accountedProtectedGateGenerations(
+	ledger: readonly UltragoalLedgerEvent[],
+	generation: string,
+): ReadonlySet<string> {
+	const rotations = protectedGateGenerationRotations(ledger);
+	const previousByGeneration = new Map(rotations.map(rotation => [rotation.generation, rotation.previousGeneration]));
+	const accounted = new Set<string>();
+	let current: string | undefined = generation;
+	while (current) {
+		if (accounted.has(current))
+			throw new Error("Ultragoal plan tampering detected: protected-gate generation rotation is cyclic.");
+		accounted.add(current);
+		current = previousByGeneration.get(current);
+	}
+	return accounted;
 }
 
 export type UltragoalReceiptKind = "per-goal" | "final-aggregate";
@@ -145,6 +213,7 @@ export interface UltragoalCompletionVerification {
 	gjcObjective: string;
 	qualityGateHash: string;
 	planGeneration: string;
+	protectedGateGeneration?: string;
 	basis: {
 		planHashBeforeCheckpoint: string;
 		latestRelevantLedgerEventIdBeforeCheckpoint: string | null;
@@ -322,6 +391,65 @@ export function hashStructuredValue(value: unknown): string {
 		.digest("hex");
 }
 
+/**
+ * Completion-gate reuse is about the evidence semantics, not JSON spelling.
+ * Evidence prose is normalized so formatting-only edits cannot mint a new gate.
+ */
+function canonicalCompletionQualityGateValue(value: unknown, key?: string): unknown {
+	if (Array.isArray(value)) return value.map(item => canonicalCompletionQualityGateValue(item));
+	if (typeof value === "string")
+		return key?.toLowerCase().includes("evidence") ? value.trim().replace(/\s+/g, " ") : value;
+	if (typeof value !== "object" || value === null) return value;
+	const record = value as Record<string, unknown>;
+	const sorted: Record<string, unknown> = {};
+	for (const childKey of Object.keys(record).sort()) {
+		const item = record[childKey];
+		if (item !== undefined) sorted[childKey] = canonicalCompletionQualityGateValue(item, childKey);
+	}
+	return sorted;
+}
+
+function completionQualityGateHash(gate: JsonObject): string {
+	return hashStructuredValue(canonicalCompletionQualityGateValue(gate));
+}
+
+function assertCompletionQualityGateSectionFields(gate: JsonObject): void {
+	const allowedFields: Record<string, readonly string[]> = {
+		architectReview: [
+			"architectureStatus",
+			"productStatus",
+			"codeStatus",
+			"recommendation",
+			"evidence",
+			"commands",
+			"blockers",
+		],
+		executorQa: [
+			"status",
+			"e2eStatus",
+			"redTeamStatus",
+			"evidence",
+			"e2eCommands",
+			"redTeamCommands",
+			"artifactRefs",
+			"contractCoverage",
+			"surfaceEvidence",
+			"adversarialCases",
+			"blockers",
+			// Consumed by the computer change-set tiering checks (see declaredPaths below).
+			"changedPaths",
+			"computerTouching",
+		],
+		iteration: ["status", "evidence", "fullRerun", "rerunCommands", "blockers"],
+	};
+	for (const [field, allowed] of Object.entries(allowedFields)) {
+		const section = qualityGateObject(gate[field]);
+		const unsupported = section ? Object.keys(section).filter(key => !allowed.includes(key)) : [];
+		if (unsupported.length > 0)
+			throw new Error(`qualityGate.${field} contains unsupported fields: ${unsupported.join(", ")}`);
+	}
+}
+
 export function getUltragoalPaths(cwd: string, sessionId?: string | null): UltragoalPaths {
 	const explicitSessionId = sessionId?.trim() || process.env.GJC_SESSION_ID?.trim();
 	const dir = explicitSessionId ? sessionUltragoalDir(cwd, explicitSessionId) : path.join(gjcRoot(cwd), "ultragoal");
@@ -343,6 +471,7 @@ export async function appendLedger(
 	cwd: string,
 	event: JsonObject,
 	sessionId?: string | null,
+	updatePlanHead = true,
 ): Promise<UltragoalLedgerEvent> {
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
@@ -356,6 +485,19 @@ export async function appendLedger(
 		cwd,
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
+	if (updatePlanHead && (await Bun.file(paths.goalsPath).exists())) {
+		const persisted = (await Bun.file(paths.goalsPath).json()) as UltragoalPlan;
+		if (persisted.goals.some(goal => goal.supersedable === false) && event.event !== "steering_rejected") {
+			persisted.ledgerIntegrity = ledgerHead(await readUltragoalLedger(cwd, resolvedSessionId));
+			await writeGuardedJsonAtomic(paths.goalsPath, persisted, {
+				cwd,
+				policy: "source",
+				expectedRevision:
+					typeof persisted.state_revision === "number" ? persistedStateRevision(persisted) : undefined,
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
+			});
+		}
+	}
 	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
 	return entry;
 }
@@ -364,17 +506,55 @@ export async function readUltragoalLedger(cwd: string, sessionId?: string | null
 	const resolvedSessionId =
 		sessionId?.trim() ||
 		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
+	const paths = getUltragoalPaths(cwd, resolvedSessionId);
+	let raw: string;
 	try {
-		const raw = await Bun.file(getUltragoalPaths(cwd, resolvedSessionId).ledgerPath).text();
+		raw = await Bun.file(paths.ledgerPath).text();
+	} catch (error) {
+		if (isEnoent(error) && !(await Bun.file(paths.goalsPath).exists())) return [];
+		throw ledgerIntegrityError(paths.ledgerPath, error);
+	}
+	if (!raw.trim() && (await Bun.file(paths.goalsPath).exists())) throw ledgerIntegrityError(paths.ledgerPath);
+	try {
 		return raw
 			.split(/\r?\n/)
 			.map(line => line.trim())
 			.filter(line => line.length > 0)
 			.map(line => JSON.parse(line) as UltragoalLedgerEvent);
 	} catch (error) {
-		if (isEnoent(error)) return [];
-		throw error;
+		throw ledgerIntegrityError(paths.ledgerPath, error);
 	}
+}
+
+function ledgerIntegrityError(ledgerPath: string, cause?: unknown): Error {
+	const detail = cause instanceof Error && cause.message ? ` (${cause.message})` : "";
+	return new Error(
+		`Ultragoal ledger integrity evidence is missing or corrupt at ${ledgerPath}${detail}. Do not continue with this plan. Note \`gjc state clear --force --mode ultragoal\` only deactivates the workflow state receipt; it does NOT repair or remove the durable plan, so recovery also requires deliberately removing or restoring this session's ultragoal goals.json and ledger.jsonl.`,
+	);
+}
+
+export function ledgerHead(ledger: readonly UltragoalLedgerEvent[]): UltragoalLedgerIntegrity {
+	let headDigest = "";
+	for (const event of ledger) headDigest = hashStructuredValue({ previous: headDigest, event });
+	return { eventCount: ledger.length, headDigest };
+}
+
+function assertLedgerHeadIntegrity(plan: UltragoalPlan, ledger: readonly UltragoalLedgerEvent[]): void {
+	const expected = plan.ledgerIntegrity;
+	if (!expected) {
+		if (plan.protectedGateIntegrityVersion === 1 || plan.goals.some(goal => goal.supersedable === false))
+			throw new Error("Ultragoal plan tampering detected: protected plan is missing its ledger integrity head.");
+		return;
+	}
+	if (!Number.isInteger(expected.eventCount) || expected.eventCount < 0 || typeof expected.headDigest !== "string")
+		throw new Error("Ultragoal plan tampering detected: goals.json has an invalid ledger integrity head.");
+	if (
+		ledger.length < expected.eventCount ||
+		ledgerHead(ledger.slice(0, expected.eventCount)).headDigest !== expected.headDigest
+	)
+		throw new Error(
+			"Ultragoal plan tampering detected: ledger history no longer matches the plan-bound integrity head.",
+		);
 }
 
 export const DEFAULT_ULTRAGOAL_NUDGE_BUDGET = 10;
@@ -529,6 +709,28 @@ export async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: st
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getUltragoalPaths(cwd, resolvedSessionId);
+	const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+	if (plan.goals.some(goal => goal.supersedable === false) && plan.protectedGateIntegrityVersion === undefined) {
+		plan.protectedGateIntegrityVersion = 1;
+		plan.ledgerIntegrity = ledgerHead(ledger);
+	}
+	assertLedgerHeadIntegrity(plan, ledger);
+	assertProtectedGateIntegrity(plan, ledger);
+	const generation = resolveProtectedGateGeneration(plan, ledger);
+	const established = protectedGateWitnesses(ledger, generation);
+	const newWitnesses = plan.goals
+		.filter(goal => goal.supersedable === false && !established.has(goal.id))
+		.map(goal => ({
+			event: "protected_gate_established",
+			goalId: goal.id,
+			generation,
+			gateDigest: protectedGateDigest(goal),
+		}));
+	// Establish witnesses before persisting their protected rows. A failed plan write can
+	// leave an extra witness, but it cannot leave a protected row without its witness.
+	for (const witness of newWitnesses) await appendLedger(cwd, witness, resolvedSessionId, false);
+	const ledgerAfterWitnesses = newWitnesses.length > 0 ? await readUltragoalLedger(cwd, resolvedSessionId) : ledger;
+	plan.ledgerIntegrity = ledgerHead(ledgerAfterWitnesses);
 	await writeArtifact(paths.briefPath, `${plan.brief.trim()}\n`, {
 		cwd,
 		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
@@ -540,6 +742,162 @@ export async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: st
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
 	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.goalsPath });
+}
+
+/**
+ * Returns the plan's protected-gate generation, minting one when the plan predates protected gates.
+ *
+ * A missing generation is only tampering when the plan or ledger actually carries protection: a
+ * legacy plan with no protected gate and no witness has nothing to protect, so hard-failing it
+ * would lock every pre-existing run out of the runtime instead of guarding anything.
+ */
+function resolveProtectedGateGeneration(plan: UltragoalPlan, ledger: readonly UltragoalLedgerEvent[]): string {
+	const generation = plan.protectedGateGeneration;
+	if (typeof generation === "string" && generation.trim()) return generation;
+	const hasProtectedGoal = plan.goals.some(goal => goal.supersedable === false);
+	const hasWitness = ledger.some(event => event.event === "protected_gate_established");
+	if (hasProtectedGoal || hasWitness)
+		throw new Error("Ultragoal plan tampering detected: protected gate generation is missing from goals.json.");
+	const minted = crypto.randomUUID();
+	plan.protectedGateGeneration = minted;
+	return minted;
+}
+
+function protectedGateDigest(goal: UltragoalGoal): string {
+	return hashStructuredValue({ id: goal.id, title: goal.title, objective: goal.objective, supersedable: false });
+}
+
+function protectedGateStatusFromLedger(
+	goal: UltragoalGoal,
+	ledger: readonly UltragoalLedgerEvent[],
+): UltragoalGoalStatus {
+	let status: UltragoalGoalStatus = "pending";
+	for (const event of ledger) {
+		if (event.goalId !== goal.id) continue;
+		if (event.event === "goal_started") status = "active";
+		else if (event.event === "review_blockers_recorded") status = "review_blocked";
+		else if (event.event === "goal_checkpointed") {
+			const checkpointStatus = parseGoalStatus(event.status);
+			status = checkpointStatus;
+			if (checkpointStatus === "complete") {
+				const receipt = goal.completionVerification;
+				if (
+					!receipt ||
+					event.eventId !== receipt.checkpointLedgerEventId ||
+					hashStructuredValue(event.completionVerification) !== hashStructuredValue(receipt)
+				)
+					throw new Error(
+						`Ultragoal plan tampering detected: protected gate ${goal.id} lacks its receipt-bound complete checkpoint witness.`,
+					);
+			}
+		}
+	}
+	return status;
+}
+
+function protectedGateWitnesses(
+	ledger: readonly UltragoalLedgerEvent[],
+	generation: string,
+): ReadonlyMap<string, ProtectedGateWitness> {
+	const witnesses = new Map<string, ProtectedGateWitness>();
+	for (const event of ledger) {
+		if (
+			event.event === "protected_gate_established" &&
+			typeof event.goalId === "string" &&
+			event.generation === generation &&
+			typeof event.gateDigest === "string"
+		) {
+			witnesses.set(event.goalId, { goalId: event.goalId, generation, gateDigest: event.gateDigest });
+		}
+	}
+	return witnesses;
+}
+
+function assertProtectedGateIntegrity(plan: UltragoalPlan, ledger: readonly UltragoalLedgerEvent[]): void {
+	const generation = plan.protectedGateGeneration;
+	if (plan.protectedGateIntegrityVersion !== undefined && plan.protectedGateIntegrityVersion !== 1)
+		throw new Error("Ultragoal plan tampering detected: protected-gate integrity provenance is invalid.");
+	if (typeof generation !== "string" || !generation.trim()) {
+		const hasProtectedEvidence =
+			plan.protectedGateIntegrityVersion === 1 ||
+			plan.goals.some(goal => goal.supersedable === false) ||
+			ledger.some(
+				event =>
+					event.event === "protected_gate_established" || event.event === "protected_gate_generation_reseeded",
+			);
+		if (!hasProtectedEvidence) return;
+		throw new Error("Ultragoal plan tampering detected: protected gate generation is missing from goals.json.");
+	}
+	const trustedLedger = plan.ledgerIntegrity === undefined ? ledger : ledger.slice(0, plan.ledgerIntegrity.eventCount);
+	if (
+		ledger
+			.slice(trustedLedger.length)
+			.some(
+				event =>
+					event.event === "protected_gate_established" || event.event === "protected_gate_generation_reseeded",
+			)
+	)
+		throw new Error(
+			"Ultragoal plan tampering detected: protected-gate security evidence extends beyond the trusted ledger head.",
+		);
+	const accountedGenerations = accountedProtectedGateGenerations(trustedLedger, generation);
+	const witnesses = new Map<string, ProtectedGateWitness>();
+	for (const event of trustedLedger) {
+		if (event.event !== "protected_gate_established") continue;
+		if (
+			typeof event.goalId !== "string" ||
+			typeof event.generation !== "string" ||
+			!event.generation.trim() ||
+			typeof event.gateDigest !== "string" ||
+			!event.gateDigest
+		)
+			throw new Error("Ultragoal plan tampering detected: protected-gate witness is malformed in the ledger.");
+		if (!accountedGenerations.has(event.generation))
+			throw new Error(
+				`Ultragoal plan tampering detected: protected-gate witness generation ${event.generation} is not accounted for by the current plan generation. Restore goals.json or reseed through create-goals.`,
+			);
+		const key = `${event.generation}\u0000${event.goalId}`;
+		if (witnesses.has(key))
+			throw new Error(`Ultragoal plan tampering detected: duplicate protected-gate witness for ${event.goalId}.`);
+		witnesses.set(key, { goalId: event.goalId, generation: event.generation, gateDigest: event.gateDigest });
+	}
+	for (const rotation of protectedGateGenerationRotations(trustedLedger)) {
+		if (!accountedGenerations.has(rotation.generation))
+			throw new Error(
+				"Ultragoal plan tampering detected: protected-gate generation rotation is outside the current chain.",
+			);
+		const event = trustedLedger.find(
+			item =>
+				item.event === "protected_gate_generation_reseeded" &&
+				item.previousGeneration === rotation.previousGeneration &&
+				item.generation === rotation.generation,
+		);
+		const expectedIds = [...witnesses.values()]
+			.filter(witness => witness.generation === rotation.previousGeneration)
+			.map(witness => witness.goalId)
+			.sort();
+		const recordedIds = Array.isArray(event?.protectedGateIds)
+			? [...(event.protectedGateIds as string[])].sort()
+			: [];
+		if (expectedIds.length !== recordedIds.length || expectedIds.some((id, index) => id !== recordedIds[index]))
+			throw new Error(
+				"Ultragoal plan tampering detected: protected-gate generation rotation does not match established gate ids.",
+			);
+	}
+	for (const witness of witnesses.values()) {
+		if (witness.generation !== generation) continue;
+		const goal = plan.goals.find(item => item.id === witness.goalId);
+		if (goal?.supersedable !== false || protectedGateDigest(goal) !== witness.gateDigest) {
+			throw new Error(
+				`Ultragoal plan tampering detected: ledger-established protected gate ${witness.goalId} no longer matches its immutable protected-gate witness in goals.json. Restore the gate before continuing.`,
+			);
+		}
+		const witnessedStatus = protectedGateStatusFromLedger(goal, trustedLedger);
+		if (goal.status !== witnessedStatus)
+			throw new Error(
+				`Ultragoal plan tampering detected: protected gate ${goal.id} status ${goal.status} is not justified by its durable ledger history (${witnessedStatus}).`,
+			);
+	}
 }
 
 function chooseReceiptKind(
@@ -654,6 +1012,9 @@ function buildCompletionReceipt(input: {
 		gjcObjective: input.plan.gjcObjective,
 		qualityGateHash: hashStructuredValue(input.qualityGateJson),
 		planGeneration: generation.planGeneration,
+		...(input.goal.supersedable === false
+			? { protectedGateGeneration: resolveProtectedGateGeneration(input.plan, input.ledger) }
+			: {}),
 		basis: generation.basis,
 		checkpointLedgerEventId: input.checkpointLedgerEventId,
 		validationBatch,
@@ -930,9 +1291,10 @@ function normalizeGoalStatus(value: unknown): UltragoalGoalStatus {
 function parseGoalStatus(value: unknown): UltragoalGoalStatus {
 	const status = normalizeGoalStatus(value);
 	if (status === "pending" && value !== "pending") {
-		throw new Error(
-			"checkpoint --status must be pending, active, complete, failed, blocked, review_blocked, or superseded",
-		);
+		throw new Error("checkpoint --status must be pending, active, complete, failed, blocked, or review_blocked");
+	}
+	if (status === "superseded") {
+		throw new Error("checkpoint --status must be pending, active, complete, failed, blocked, or review_blocked");
 	}
 	return status;
 }
@@ -997,6 +1359,13 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 		...(typeof record.state_revision === "number" && Number.isFinite(record.state_revision)
 			? { state_revision: record.state_revision }
 			: {}),
+		...(typeof record.protectedGateGeneration === "string" && record.protectedGateGeneration.trim()
+			? { protectedGateGeneration: record.protectedGateGeneration }
+			: {}),
+		...(record.protectedGateIntegrityVersion === 1 ? { protectedGateIntegrityVersion: 1 as const } : {}),
+		...(typeof record.ledgerIntegrity === "object" && record.ledgerIntegrity !== null
+			? { ledgerIntegrity: record.ledgerIntegrity as UltragoalLedgerIntegrity }
+			: {}),
 	};
 }
 
@@ -1005,7 +1374,11 @@ export async function readUltragoalPlan(cwd: string, sessionId?: string | null):
 		sessionId?.trim() ||
 		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
 	try {
-		return normalizePlan(await Bun.file(getUltragoalPaths(cwd, resolvedSessionId).goalsPath).json());
+		const plan = normalizePlan(await Bun.file(getUltragoalPaths(cwd, resolvedSessionId).goalsPath).json());
+		const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+		assertLedgerHeadIntegrity(plan, ledger);
+		assertProtectedGateIntegrity(plan, ledger);
+		return plan;
 	} catch (error) {
 		if (isEnoent(error)) return null;
 		throw error;
@@ -1142,6 +1515,15 @@ export async function createUltragoalPlan(input: {
 }): Promise<UltragoalPlan> {
 	const brief = input.brief.trim();
 	if (!brief) throw new Error("ultragoal brief is required");
+	const existingPlan = await readUltragoalPlan(input.cwd, input.sessionId);
+	const unresolvedProtectedGoals = existingPlan?.goals.filter(
+		goal => goal.supersedable === false && goal.status !== "complete",
+	);
+	if (unresolvedProtectedGoals && unresolvedProtectedGoals.length > 0) {
+		throw new Error(
+			`Cannot reseed ultragoal plan while protected gate(s) ${unresolvedProtectedGoals.map(goal => `${goal.id} (${goal.status})`).join(", ")} remain unresolved. Genuinely resolve each protected gate before create-goals; protected gates cannot be discarded by reseeding.`,
+		);
+	}
 	const now = new Date().toISOString();
 	// Parse the untrimmed brief so the raw-line delimiter contract holds: a
 	// leading-indented `@goal` on the first line must stay objective text rather
@@ -1180,7 +1562,54 @@ export async function createUltragoalPlan(input: {
 		repositoryBinding,
 		createdAt: now,
 		updatedAt: now,
+		protectedGateGeneration: crypto.randomUUID(),
 	};
+	if (existingPlan) {
+		const priorLedger = await readUltragoalLedger(input.cwd, input.sessionId);
+		for (const goal of existingPlan.goals.filter(goal => goal.supersedable === false)) {
+			const receipt = goal.completionVerification;
+			const checkpoint = receipt ? findLedgerReceiptEvent(priorLedger, receipt) : null;
+			if (
+				goal.status !== "complete" ||
+				!receipt ||
+				validateReceiptFreshBase({
+					plan: existingPlan,
+					ledger: priorLedger,
+					goal,
+					receipt,
+					receiptKind: receipt.receiptKind,
+				}) !== null ||
+				checkpoint?.event !== "goal_checkpointed" ||
+				checkpoint.goalId !== goal.id ||
+				checkpoint.status !== "complete" ||
+				hashStructuredValue(checkpoint.completionVerification) !== hashStructuredValue(receipt)
+			) {
+				throw new Error(
+					`Cannot reseed ultragoal plan while protected gate ${goal.id} lacks a fresh receipt bound to its complete goal_checkpointed ledger event. Genuinely resolve each protected gate before create-goals.`,
+				);
+			}
+		}
+	}
+	const previousGeneration = existingPlan?.protectedGateGeneration;
+	if (typeof previousGeneration === "string" && previousGeneration.trim()) {
+		const priorLedger = await readUltragoalLedger(input.cwd, input.sessionId);
+		if (priorLedger.some(event => event.event === "protected_gate_established")) {
+			await appendLedger(
+				input.cwd,
+				{
+					event: "protected_gate_generation_reseeded",
+					previousGeneration,
+					generation: plan.protectedGateGeneration,
+					protectedGateIds: (existingPlan?.goals ?? [])
+						.filter(goal => goal.supersedable === false)
+						.map(goal => goal.id),
+				},
+				input.sessionId,
+				false,
+			);
+		}
+	}
+	plan.ledgerIntegrity = ledgerHead(await readUltragoalLedger(input.cwd, input.sessionId));
 	await writePlan(input.cwd, plan, input.sessionId);
 	await appendLedger(input.cwd, { event: "plan_created", goalIds: plan.goals.map(goal => goal.id) }, input.sessionId);
 	return plan;
@@ -1297,8 +1726,13 @@ export async function startNextUltragoalGoal(input: {
 		goal.startedAt = goal.startedAt ?? now;
 		goal.updatedAt = now;
 		plan.updatedAt = now;
-		await writePlan(input.cwd, plan, input.sessionId);
 		await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id }, input.sessionId);
+		plan.ledgerIntegrity = ledgerHead(await readUltragoalLedger(input.cwd, input.sessionId));
+		const persisted = (await Bun.file(
+			getUltragoalPaths(input.cwd, input.sessionId).goalsPath,
+		).json()) as UltragoalPlan;
+		if (persisted.state_revision !== undefined) plan.state_revision = persistedStateRevision(persisted);
+		await writePlan(input.cwd, plan, input.sessionId);
 	}
 	return {
 		plan,
@@ -2589,6 +3023,8 @@ async function validateCompletionQualityGate(
 		ledger?: readonly UltragoalLedgerEvent[];
 	} = {},
 ): Promise<void> {
+	assertCompletionQualityGateSectionFields(gate);
+
 	const batchMode = options.goal?.validationBatch;
 	const receiptKind =
 		options.plan && options.goal && options.ledger
@@ -2599,6 +3035,9 @@ async function validateCompletionQualityGate(
 	// reports the whole list rather than forcing an edit/retry loop per field (#3474).
 	const found = new QualityGateDiagnostics();
 	if (batchMode && options.goal && options.goal.id !== batchMode.finalGoalId) {
+		// Upstream invariant: a protected (non-supersedable) gate can never defer its review.
+		if (options.goal.supersedable === false)
+			throw new Error("protected gate completion cannot be deferred to a validation batch member");
 		found.check("deferredToBatch", "deferred_gate_invalid", () => {
 			validateDeferredCompletionQualityGate(gate, options.goal!, batchMode, options.changeSet);
 		});
@@ -2611,6 +3050,8 @@ async function validateCompletionQualityGate(
 	// boundary is derived from `chooseReceiptKind` rather than from synthesized
 	// durable batch metadata, which would restale/deadlock on appended goals.
 	if (!batchMode && options.goal && receiptKind === "per-goal" && qualityGateObject(gate.deferredToBatch)) {
+		if (options.goal.supersedable === false)
+			throw new Error("protected gate completion cannot be deferred to a validation batch member");
 		found.check("deferredToBatch", "deferred_gate_invalid", () => {
 			validateDeferredCompletionQualityGate(gate, options.goal!, undefined, options.changeSet);
 		});
@@ -2648,8 +3089,8 @@ async function validateCompletionQualityGate(
 	}
 	const allowedKeys = new Set(
 		batchMode
-			? ["architectReview", "executorQa", "iteration", "validationBatchClose", "criticReview"]
-			: ["architectReview", "executorQa", "iteration", "criticReview"],
+			? ["architectReview", "executorQa", "iteration", "validationBatchClose", "criticReview", "protectedExecution"]
+			: ["architectReview", "executorQa", "iteration", "criticReview", "protectedExecution"],
 	);
 	const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
 	if (unsupportedKeys.length > 0) {
@@ -2769,12 +3210,139 @@ async function validateCompletionQualityGate(
 		requireEmptyBlockers(iteration.blockers, "iteration.blockers"),
 	);
 	found.check("iteration.reviewCohort", "review_cohort_invalid", () => validateReviewCohort(gate, iteration));
+	found.throwIfAny();
+	if (options.goal?.supersedable === false) {
+		await validateProtectedGateExecution(cwd, gate, architectReview, executorQa, iteration);
+		await verifyProtectedGateObligations();
+	}
+
+	/**
+	 * A protected completion is admitted only after the runtime independently
+	 * re-executes the frozen obligations from the GJC package, not the caller's
+	 * project. Fresh protected replays re-run this verifier; idempotent replays
+	 * are refused before a recorded result can be reused.
+	 */
+	async function verifyProtectedGateObligations(): Promise<void> {
+		let result: { verified: string[]; blocked: string[] };
+		try {
+			result = await verifyObligations();
+		} catch (error) {
+			throw new Error(
+				`protected gate completion blocked: runtime obligations verifier did not produce a passing result (${error instanceof Error ? error.message : String(error)}).`,
+			);
+		}
+		if (result.blocked.includes("manifest"))
+			throw new Error(
+				"protected gate completion unavailable: the frozen obligations manifest is missing or invalid in the GJC package.",
+			);
+		if (result.blocked.includes("compiled-artifact"))
+			throw new Error(
+				"protected gate completion unavailable: obligations re-execution is unavailable in a compiled GJC artifact.",
+			);
+		if (result.blocked.length > 0) {
+			throw new Error(
+				`protected gate completion blocked: runtime obligations verifier blocked ${result.blocked.join(", ")}; agent-authored verifier claims are not accepted.`,
+			);
+		}
+		if (result.verified.length === 0) {
+			throw new Error(
+				"protected gate completion blocked: runtime obligations verifier produced no verified obligations; agent-authored verifier claims are not accepted.",
+			);
+		}
+	}
 	if (batchMode && options.goal && options.plan && options.ledger) {
 		found.check("validationBatchClose", "batch_close_invalid", () =>
 			validateBatchCloseQualityGate(gate, options.plan!, batchMode, options.ledger!, options.changeSet),
 		);
 	}
 	found.throwIfAny();
+}
+
+/**
+ * Protected gates bind every asserted command to a conservatively allowlisted CLI
+ * replay that the runtime re-executes and compares to recorded output. This makes
+ * command claims reproducible, but does not prove self-authored commands test all work.
+ */
+async function validateProtectedGateExecution(
+	cwd: string,
+	gate: JsonObject,
+	architectReview: JsonObject,
+	executorQa: JsonObject,
+	iteration: JsonObject,
+): Promise<void> {
+	const execution = qualityGateObject(gate.protectedExecution);
+	if (!execution || Object.keys(execution).length !== 1) {
+		throw new Error(
+			"protected gate completion requires protectedExecution.artifactRefs with replayable evidence for every asserted command; self-authored command strings alone are not accepted",
+		);
+	}
+	const artifactIds = requireStringLinks(execution.artifactRefs, "protectedExecution.artifactRefs");
+	const artifactRefs = buildRowIdMap(
+		requireObjectArray(executorQa.artifactRefs, "executorQa.artifactRefs"),
+		"executorQa.artifactRefs",
+	);
+	requireResolvedLinks(artifactIds, artifactRefs, "protectedExecution.artifactRefs");
+	const replayedCommands = new Set<string>();
+	const replayArtifactCommands = new Map<string, string>();
+	for (const artifactId of artifactIds) {
+		const fieldName = `executorQa.artifactRefs.${artifactId}`;
+		const record = await readCliReplayRecord(cwd, artifactRefs.get(artifactId)!, fieldName);
+		if (!record || record.replayExempt !== undefined) {
+			throw new Error(
+				"protected gate completion requires protectedExecution artifacts to be directly replayable CLI records, not replay exemptions or unverified artifacts",
+			);
+		}
+		const command = nonEmptyStringArray(record.command);
+		if (!command) throw new Error(`protected gate completion replay artifact ${artifactId} has no argv command`);
+		await validateCliReplay(cwd, artifactRefs.get(artifactId)!, fieldName, { live: true });
+		const commandText = command.join(" ");
+		replayedCommands.add(commandText);
+		replayArtifactCommands.set(artifactId, commandText);
+	}
+
+	const assertedCommands = [
+		...nonEmptyStringArray(architectReview.commands)!,
+		...nonEmptyStringArray(executorQa.e2eCommands)!,
+		...nonEmptyStringArray(executorQa.redTeamCommands)!,
+		...nonEmptyStringArray(iteration.rerunCommands)!,
+	];
+	for (const [artifactId, command] of replayArtifactCommands) {
+		if (!assertedCommands.includes(command)) {
+			throw new Error(
+				`protected gate completion replay artifact ${artifactId} command ${JSON.stringify(command)} does not match an asserted verification command`,
+			);
+		}
+	}
+
+	for (const command of assertedCommands) {
+		if (!replayedCommands.has(command)) {
+			throw new Error(
+				`protected gate completion command ${JSON.stringify(command)} has no matching live protectedExecution replay; placeholder or non-executed command claims are refused`,
+			);
+		}
+	}
+}
+
+function assertCompletionQualityGateUnused(
+	goal: UltragoalGoal,
+	ledger: readonly UltragoalLedgerEvent[],
+	gate: JsonObject,
+): void {
+	const gateHash = completionQualityGateHash(gate);
+	const currentPlanStartedAt = ledger.findLastIndex(event => event.event === "plan_created");
+	const reusedBy = ledger.slice(currentPlanStartedAt + 1).find(event => {
+		return (
+			event.event === "goal_checkpointed" &&
+			event.status === "complete" &&
+			event.goalId !== goal.id &&
+			completionQualityGateHash(qualityGateObject(event.qualityGateJson) ?? {}) === gateHash
+		);
+	});
+	if (reusedBy) {
+		throw new Error(
+			`completion quality gate already accepted for ${String(reusedBy.goalId)} in this plan; per-goal verification evidence must be distinct`,
+		);
+	}
 }
 
 function validateBatchCloseQualityGate(
@@ -3329,6 +3897,9 @@ async function readRequiredCompletionQualityGate(
 		goal: options.goal,
 		ledger: options.ledger,
 	});
+	if (options.plan && options.goal && options.ledger) {
+		assertCompletionQualityGateUnused(options.goal, options.ledger, completionGate);
+	}
 	return completionGate;
 }
 
@@ -3365,6 +3936,13 @@ export async function checkpointUltragoalGoal(input: {
 	if (!goal) throw new Error(`No ultragoal goal found for ${input.goalId}.`);
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("checkpoint evidence is required");
+	if (input.status === "superseded") assertGoalMaySupersede(goal, "checkpoint");
+	const reviewBlockedGoal =
+		input.status === "complete" && typeof goal.steering?.kind === "string" && goal.steering.kind === "review_blocker"
+			? plan.goals.find(item => item.id === nonEmptyString(goal.steering?.blockedGoalId))
+			: undefined;
+	if (reviewBlockedGoal?.status === "review_blocked")
+		assertGoalMaySupersede(reviewBlockedGoal, "checkpoint review-blocker completion");
 	const ledgerBefore = await readUltragoalLedger(input.cwd);
 	const matchingIdempotentEvents = ledgerBefore.filter(
 		event =>
@@ -3432,6 +4010,10 @@ export async function checkpointUltragoalGoal(input: {
 		matchingIdempotentEvent &&
 		!staleCompleteReceiptReplay
 	) {
+		if (input.status === "complete" && goal.supersedable === false)
+			throw new Error(
+				`Goal ${goal.id} is protected; refusing idempotent completion replay so obligations are not reused.`,
+			);
 		if (batchMetadata) {
 			const receipt = goal.completionVerification;
 			const receiptBatch = receipt?.validationBatch;
@@ -3490,17 +4072,10 @@ export async function checkpointUltragoalGoal(input: {
 				: undefined;
 	const now = new Date().toISOString();
 	const beforeStatus = goal.status;
-	if (input.status === "complete") {
-		const blockedGoalId =
-			typeof goal.steering?.kind === "string" && goal.steering.kind === "review_blocker"
-				? nonEmptyString(goal.steering.blockedGoalId)
-				: null;
-		const blockedGoal = blockedGoalId ? plan.goals.find(item => item.id === blockedGoalId) : undefined;
-		if (blockedGoal?.status === "review_blocked") {
-			blockedGoal.status = "superseded";
-			blockedGoal.evidence = `Resolved by verification blocker story ${goal.id}: ${evidence}`;
-			blockedGoal.updatedAt = now;
-		}
+	if (reviewBlockedGoal?.status === "review_blocked") {
+		reviewBlockedGoal.status = "superseded";
+		reviewBlockedGoal.evidence = `Resolved by verification blocker story ${goal.id}: ${evidence}`;
+		reviewBlockedGoal.updatedAt = now;
 	}
 	const receiptKind = input.status === "complete" ? chooseReceiptKind(plan, ledgerBefore, goal, input.status) : null;
 	const pendingCheckpointEventId = crypto.randomUUID();
@@ -3521,9 +4096,22 @@ export async function checkpointUltragoalGoal(input: {
 	goal.updatedAt = now;
 	if (input.status === "complete") goal.completedAt = now;
 	plan.updatedAt = now;
-	await writePlan(input.cwd, plan);
-	const persistedPlan = await readUltragoalPlan(input.cwd);
-	if (persistedPlan?.state_revision !== undefined) plan.state_revision = persistedPlan.state_revision;
+	if (input.status === "complete") {
+		await appendLedger(input.cwd, {
+			eventId: pendingCheckpointEventId,
+			event: "goal_checkpointed",
+			goalId: goal.id,
+			status: input.status,
+			evidence,
+			qualityGateJson,
+			completionVerification: goal.completionVerification,
+		});
+		plan.ledgerIntegrity = ledgerHead(await readUltragoalLedger(input.cwd));
+		const persistedPlan = (await Bun.file(getUltragoalPaths(input.cwd).goalsPath).json()) as UltragoalPlan;
+		if (persistedPlan.state_revision !== undefined) plan.state_revision = persistedStateRevision(persistedPlan);
+		await writePlan(input.cwd, plan);
+		return plan;
+	}
 	await appendLedger(input.cwd, {
 		eventId: pendingCheckpointEventId,
 		event: "goal_checkpointed",
@@ -3533,6 +4121,10 @@ export async function checkpointUltragoalGoal(input: {
 		qualityGateJson,
 		completionVerification: goal.completionVerification,
 	});
+	plan.ledgerIntegrity = ledgerHead(await readUltragoalLedger(input.cwd));
+	const persistedPlan = (await Bun.file(getUltragoalPaths(input.cwd).goalsPath).json()) as UltragoalPlan;
+	if (persistedPlan.state_revision !== undefined) plan.state_revision = persistedStateRevision(persistedPlan);
+	await writePlan(input.cwd, plan);
 	return plan;
 }
 export interface UltragoalCheckpointContinuation {
@@ -3609,6 +4201,17 @@ function findGoalOrThrow(plan: UltragoalPlan, goalId: string, kind: UltragoalSte
 	const goal = plan.goals.find(item => item.id === id);
 	if (!goal) throw new Error(`No ultragoal goal found for ${id}.`);
 	return goal;
+}
+
+/**
+ * Required gates are rejected rather than copied to replacement goals, so replacement flows cannot launder the obligation.
+ */
+function assertGoalMaySupersede(goal: UltragoalGoal, context: string): void {
+	if (goal.supersedable === false) {
+		throw new Error(
+			`${context} cannot supersede ${goal.id} because it is a non-supersedable required gate; this route cannot close it`,
+		);
+	}
 }
 
 function requireGoalStatus(
@@ -3772,6 +4375,7 @@ async function splitUltragoalSubgoal(input: {
 		rationale: input.rationale,
 	});
 	const target = findGoalOrThrow(input.plan, input.goalId, kind);
+	assertGoalMaySupersede(target, `steer ${kind}`);
 	requireGoalStatus(target, ["pending"], kind);
 	const ledger = await readUltragoalLedger(input.cwd);
 	requireValidationBatchSteeringAllowed(input.plan, target, kind, ledger);
@@ -3878,6 +4482,8 @@ async function revisePendingUltragoalWording(input: {
 	if (input.objective !== undefined && !objective)
 		throw new Error("steer --objective must be non-empty for revise_pending_wording");
 	if (!title && !objective) throw new Error("revise_pending_wording requires --title and/or --objective");
+	if (goal.supersedable === false)
+		throw new Error(`steer ${kind} cannot revise ${goal.id} because it is a non-supersedable required gate`);
 	const changedFields: string[] = [];
 	if (title !== undefined) {
 		goal.title = title;
@@ -3941,6 +4547,7 @@ async function markBlockedUltragoalSuperseded(input: {
 	if (remainingRequiredGoals.length === 0) {
 		throw new Error(`steer ${kind} cannot supersede ${goal.id} because it is the only remaining required goal`);
 	}
+	assertGoalMaySupersede(goal, `steer ${kind}`);
 	const now = new Date().toISOString();
 	goal.status = "superseded";
 	goal.evidence = evidence;
@@ -4013,8 +4620,11 @@ export async function recordUltragoalReviewBlockers(input: {
 		steering: { kind: "review_blocker", blockedGoalId: input.goalId },
 	});
 	plan.updatedAt = now;
-	await writePlan(input.cwd, plan);
 	await appendLedger(input.cwd, { event: "review_blockers_recorded", goalId: input.goalId, blockerGoalId: nextId });
+	plan.ledgerIntegrity = ledgerHead(await readUltragoalLedger(input.cwd));
+	const persisted = (await Bun.file(getUltragoalPaths(input.cwd).goalsPath).json()) as UltragoalPlan;
+	if (persisted.state_revision !== undefined) plan.state_revision = persistedStateRevision(persisted);
+	await writePlan(input.cwd, plan);
 	return { plan, blockerGoalId: nextId };
 }
 
@@ -4628,7 +5238,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"",
 			"FLAGS",
 			"      --goal-id=<value>            Durable .gjc/ultragoal goal id, e.g. G001",
-			"      --status=<value>             pending|active|complete|failed|blocked|review_blocked|superseded",
+			"      --status=<value>             pending|active|complete|failed|blocked|review_blocked",
 			"      --evidence=<value>           Completion or checkpoint evidence text",
 			"      --quality-gate-json=<value>  JSON string or path for complete checkpoints",
 			"      --json                       Output a machine-readable receipt",

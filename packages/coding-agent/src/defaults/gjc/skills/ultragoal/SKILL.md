@@ -111,6 +111,8 @@ Loop until `gjc ultragoal status` reports all goals complete:
 8. Checkpoint the durable ledger. Complete checkpoints require `--quality-gate-json` only:
    `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --quality-gate-json <quality-gate-json-or-path>`
    A successful complete checkpoint is story completion, not automatic run completion. Read the checkpoint output: when it prints `Next ultragoal goal: <id>`, continue that active story under the same aggregate GJC goal; when it prints `All ultragoal goals are complete`, the durable run is terminal. `gjc ultragoal complete-goals` remains the supported manual next-story command if continuation output was missed.
+   A non-supersedable protected gate additionally causes the runtime to run the frozen app-server obligations verifier from the installed GJC package at checkpoint time. Completion requires that runtime-produced re-execution result to verify every required obligation against the current GJC-package snapshot; an agent-supplied claim, a missing receipt, or a stale receipt is refused. Protected completion is unavailable in a compiled GJC artifact, and a protected goal cannot be a deferred validation-batch member. A same-evidence idempotent replay of a protected completion is refused rather than reusing a recorded pass. This proves only that those frozen obligations and receipt contracts passed on that snapshot. It does not establish that agent-authored quality-gate prose or arbitrary claimed commands cover all work; changing such prose can still evade semantic reuse checks, but cannot satisfy this runtime verifier requirement.
+   Within one plan, each goal's complete checkpoint must submit distinct semantic quality-gate evidence. Replaying the same payload for the same unprotected goal is allowed; another goal cannot reuse it after key-order changes or whitespace-only edits to evidence, and unsupported no-op fields are rejected. This applies to validation-batch members because each member submits its own gate.
 9. If blocked or failed, checkpoint failure:
    `gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"`
 10. For legacy per-story completed-goal blockers, preserve the non-terminal blocker with:
@@ -164,9 +166,9 @@ Steering invariants:
 
 - Do not edit the aggregate goal objective, original brief constraints, quality gates, or completion status. The aggregate objective is a stable pointer to `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`, not an enumeration of initial goal ids.
 - Do not hard-delete goals, auto-complete work, weaken verification, or silently mutate `.gjc/_session-{sessionid}/ultragoal`.
-- Accepted and rejected attempts append structured audit entries to `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`.
+- Accepted attempts and rejected typed steering attempts after a plan has been admitted append structured audit entries to `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`; malformed kinds and missing/corrupt plans are rejected before an audit entry can be safely appended.
 - Superseded goals remain in `goals.json` with steering metadata and are skipped for scheduling.
-- Blocked goals without replacements are skipped for scheduling but still block final completion until later explicit steering replaces or supersedes them.
+- Blocked goals without replacements are skipped for scheduling but still block final completion until later explicit steering replaces or supersedes them. Goals marked `supersedable: false` are the exception: supersede routes reject them, so they remain blocking until resolved through another permitted path.
 
 UserPromptSubmit structured steering directives are a planned/deferred routing surface. Normal prose does not mutate state.
 
@@ -259,7 +261,7 @@ gjc ultragoal create-goals --brief-file <path> --validation-batch-json '[{"schem
 
 Checkpoint contract summary — the full contract lives in the `validation-batch-contracts` fragment (`skill-fragments/ultragoal/validation-batch-contracts.md`); load it before checkpointing any batch member:
 
-- **Non-final members** checkpoint `complete` with a single top-level `deferredToBatch` quality gate (kind `validation-batch-deferred`) proving targeted verification, a declaration-matched lane set, and a cumulative-since-base change set — never `architectReview`, `executorQa`, or `validationBatchClose`; deferring never manufactures fake review approvals.
+- **Non-final members** checkpoint `complete` with a single top-level `deferredToBatch` quality gate (kind `validation-batch-deferred`) proving targeted verification, a declaration-matched lane set, and a cumulative-since-base change set — never `architectReview`, `executorQa`, or `validationBatchClose`; deferring never manufactures fake review approvals. A non-final member cannot be a protected gate; protected completion is not deferred.
 - **The final member** (`finalGoalId`) checkpoints `complete` with the normal full strict gate PLUS a top-level `validationBatchClose` proof covering all members; out-of-order close is rejected, close state is append-only proof on the final member only, and batch invalidation is fail-closed. Like the deferred gate, every close field except `coverageEvidence` is auto-filled from durable receipts and the computed diff — the minimal close is `{"validationBatchClose":{"coverageEvidence":"..."}}` alongside the strict gate.
 
 ### Intra-goal validation-lane parallelism
@@ -386,6 +388,8 @@ For safe CLI replay artifacts, the JSON at `path` must be an object like `{"sche
 Compiled GJC binaries fail executable replay closed because their `process.execPath` launches GJC rather than a Bun CLI. Those runs must use the existing audited `replayExempt` structural fallback; the validator never resolves an untrusted `bun` from `PATH`.
 
 Focused `bun test` execution is blocked because repository test source is still arbitrary host code without an operating-system sandbox. The current `replayExempt` contract continues to require an existing screenshot, automation transcript, or PTY structural fallback; a `test-report` or `bun-test-report` JSON file is intentionally not accepted yet. Keep that design work open until test-result provenance, output binding, and consumer authority can be made fail-closed. Allowed `reasonCode` values remain `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
+
+For a goal marked `supersedable: false`, add a top-level `protectedExecution` object with `artifactRefs` naming directly replayable `cli-replay` artifacts. Every string in `architectReview.commands`, `executorQa.e2eCommands`, `executorQa.redTeamCommands`, and `iteration.rerunCommands` must exactly equal the argv joined with spaces for one referenced replay, and every referenced replay must match one of those asserted commands. The runtime reruns those conservative, allowlisted argv commands and compares the live result to the replay record; semantically identical gate evidence already accepted for another goal in the same plan is refused. This proves that the listed replay commands are currently reproducible and binds the gate to one protected goal. It does **not** prove that self-authored commands adequately test the goal, that review conclusions are true, or that artifacts were produced by the claimed historical run; those remain residual weaknesses until a stronger independently authored contract/receipt verifier exists.
 
 ## Terminal critic gate
 

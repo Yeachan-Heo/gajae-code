@@ -303,12 +303,11 @@ describe("ultragoal nudge guard", () => {
 		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
 		expect(countUltragoalNudges(ledger, "G001")).toBe(2);
 		expect(countUltragoalNudges(ledger, "G002")).toBe(1);
-		// Reset the ledger: counts return to zero with no goals.json counter involved.
+		// Nudge counts live only in the ledger, never in a goals.json counter. Emptying the ledger
+		// beside an existing plan is now rejected as missing integrity evidence (protected-gate
+		// tamper detection), so prove the derivation directly: a goal with no nudge events counts zero.
 		const { paths } = await getUltragoalStatus(cwd, TEST_SESSION_ID);
-		await fs.writeFile(paths.ledgerPath, "");
-		const reset = await readUltragoalLedger(cwd, TEST_SESSION_ID);
-		expect(countUltragoalNudges(reset, "G001")).toBe(0);
-		expect(countUltragoalNudges(reset, "G002")).toBe(0);
+		expect(countUltragoalNudges(ledger, "G003")).toBe(0);
 		const goalsRaw = await fs.readFile(paths.goalsPath, "utf-8");
 		expect(goalsRaw).not.toContain("nudgeCount");
 	});

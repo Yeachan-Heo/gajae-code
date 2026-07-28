@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as crypto from "node:crypto";
+
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,6 +25,7 @@ import {
 	createUltragoalPlan,
 	getUltragoalStatus,
 	hashStructuredValue,
+	ledgerHead,
 	readUltragoalLedger,
 	readUltragoalPlan,
 	recordUltragoalReviewBlockers,
@@ -31,16 +34,21 @@ import {
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
 	type UltragoalCommandResult,
+	type UltragoalGoalStatus,
 	UltragoalReviewBlockerRecursionCapError,
 	validateExecutorQaRedTeamEvidenceForReview,
 	validateUltragoalQualityGateReadOnly,
 	waitForReplayProcessWithTimeout,
+	writePlan,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
+import * as obligationsVerifier from "../../src/app-server/obligations-verifier";
+import { canonicalize, currentTreeHash } from "../../src/app-server/obligations-verifier";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 
+let protectedVerifierRestore: (() => void) | undefined;
 let savedSessionId: string | undefined;
 let savedSessionFile: string | undefined;
 // Pin a non-computer test path as CI_DEV_CHANGED_PATHS for every test. Temp
@@ -67,6 +75,71 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
+async function protectedTempDir(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-protected-"));
+	tempRoots.push(dir);
+	const initialized = Bun.spawnSync(["git", "init", "--quiet"], { cwd: dir, stdout: "pipe", stderr: "pipe" });
+	if (initialized.exitCode !== 0) throw new Error("Unable to initialize protected verifier fixture repository");
+	await Bun.write(path.join(dir, ".gitignore"), ".gjc/\n");
+	return dir;
+}
+
+function sha256(value: string): string {
+	return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+async function writePassingObligationFixture(root: string): Promise<void> {
+	const manifest = {
+		version: 1,
+		receiptDirectory: "obligations.receipts",
+		snapshotAlgorithm: "git-ls-files-content-sha256-v1",
+		limitations: "Synthetic runtime verifier fixture.",
+		receiptContract: { receiptVersion: 1, requiredFields: {} },
+		gates: [
+			{
+				id: "synthetic-pass",
+				obligation: "The fixture command executes successfully.",
+				required: true,
+				supersedable: false,
+				receiptContract: {
+					argv: ["bun", "fixture-obligation.ts"],
+					artifactPathPatterns: ["obligations.artifacts/synthetic-pass/**"],
+					outputArtifactPath: "obligations.artifacts/synthetic-pass/stdout.txt",
+					outputMarker: "synthetic obligation passed",
+				},
+			},
+		],
+	};
+	const manifestPath = path.join(root, "src/app-server/obligations.manifest.json");
+	await fs.mkdir(path.dirname(manifestPath), { recursive: true });
+	await Bun.write(manifestPath, JSON.stringify(manifest, null, "\t"));
+	await Bun.write(path.join(root, "src/app-server/obligations.digest"), `${sha256(canonicalize(manifest))}\n`);
+	await Bun.write(
+		path.join(root, "fixture-obligation.ts"),
+		'process.stdout.write("synthetic obligation passed\\n");\n',
+	);
+	const outputPath = path.join(root, "obligations.artifacts/synthetic-pass/stdout.txt");
+	await fs.mkdir(path.dirname(outputPath), { recursive: true });
+	const output = "synthetic obligation passed\n";
+	await Bun.write(outputPath, output);
+	const treeHash = await currentTreeHash(root, "obligations.receipts");
+	const receiptPath = path.join(root, "obligations.receipts/synthetic-pass.receipt.json");
+	await fs.mkdir(path.dirname(receiptPath), { recursive: true });
+	await Bun.write(
+		receiptPath,
+		JSON.stringify({
+			receiptVersion: 1,
+			gateId: "synthetic-pass",
+			argv: ["bun", "fixture-obligation.ts"],
+			exitCode: 0,
+			cwd: ".",
+			treeHash,
+			artifacts: [{ path: "obligations.artifacts/synthetic-pass/stdout.txt", sha256: sha256(output) }],
+		}),
+	);
+}
+
+let savedCiDevChangedPaths: { value: string | undefined } | undefined;
 /**
  * Root for validation-batch tests, hermetically OUTSIDE the enclosing git
  * repository. `computeCheckpointChangeSet` walks git from the checkpoint cwd,
@@ -86,6 +159,8 @@ async function batchTempDir(): Promise<string> {
 }
 
 afterEach(async () => {
+	protectedVerifierRestore?.();
+	protectedVerifierRestore = undefined;
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	if (savedSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
@@ -215,6 +290,11 @@ function passingQualityGate(): string {
 	});
 }
 
+function passingQualityGateForGoal(goalId: string): string {
+	const gate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
+	gate.architectReview!.evidence = `architect reviewed ${goalId} architecture, product behavior, and code changes`;
+	return JSON.stringify(gate);
+}
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {
 	let crc = index;
@@ -463,7 +543,41 @@ function webExecutorQa(overrides: Record<string, unknown> = {}): Record<string, 
 
 async function passingLiveQualityGate(root: string): Promise<string> {
 	await writeStructuralArtifacts(root);
-	return passingQualityGate();
+	const gate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
+	const activeGoal = (await readUltragoalPlan(root))?.goals.find(goal => goal.status === "active");
+	if (activeGoal)
+		gate.architectReview!.evidence = `architect reviewed ${activeGoal.id} architecture, product behavior, and code changes`;
+	return JSON.stringify(gate);
+}
+
+async function protectedPassingQualityGate(root: string): Promise<string> {
+	const gate = JSON.parse(await passingLiveQualityGate(root)) as Record<string, Record<string, unknown>>;
+	const command = 'bun -e console.log("protected-gate-ok")';
+	const executorQa = gate.executorQa!;
+	(executorQa.artifactRefs as Array<Record<string, unknown>>).push({
+		id: "protected-replay",
+		kind: "cli-replay",
+		description: "Runtime-replayed protected-gate command evidence",
+		replay: {
+			schemaVersion: 1,
+			kind: "cli-replay",
+			replaySafe: true,
+			command: ["bun", "-e", 'console.log("protected-gate-ok")'],
+			recordedStdout: "protected-gate-ok\n",
+		},
+	});
+	gate.architectReview!.commands = [command];
+	executorQa.e2eCommands = [command];
+	executorQa.redTeamCommands = [command];
+	gate.iteration!.rerunCommands = [command];
+	gate.protectedExecution = { artifactRefs: ["protected-replay"] };
+	await writePassingObligationFixture(root);
+	protectedVerifierRestore?.();
+	const verifyFixture = obligationsVerifier.verifyObligations;
+	const verifierSpy = spyOn(obligationsVerifier, "verifyObligations").mockImplementation(() => verifyFixture(root));
+	protectedVerifierRestore = () => verifierSpy.mockRestore();
+
+	return JSON.stringify(gate);
 }
 
 function batchChangeSetPaths(): Array<{ path: string; status: string }> {
@@ -2575,7 +2689,7 @@ describe("native GJC ultragoal runtime", () => {
 				goalId: "G001",
 				status: "complete",
 				evidence: "g001 complete",
-				qualityGateJson: passingQualityGate(),
+				qualityGateJson: passingQualityGateForGoal("G001"),
 			});
 			await startNextUltragoalGoal({ cwd: root });
 			plan = await checkpointUltragoalGoal({
@@ -2621,7 +2735,7 @@ describe("native GJC ultragoal runtime", () => {
 				goalId: "G005",
 				status: "complete",
 				evidence: "replacement verified",
-				qualityGateJson: passingQualityGate(),
+				qualityGateJson: passingQualityGateForGoal("G005"),
 			});
 			await startNextUltragoalGoal({ cwd: root });
 			await checkpointUltragoalGoal({
@@ -2629,7 +2743,7 @@ describe("native GJC ultragoal runtime", () => {
 				goalId: "G006",
 				status: "complete",
 				evidence: "aggregate verified",
-				qualityGateJson: passingQualityGate(),
+				qualityGateJson: passingQualityGateForGoal("G006"),
 			});
 			await checkpointUltragoalGoal({
 				cwd: root,
@@ -3497,6 +3611,981 @@ describe("native GJC ultragoal runtime", () => {
 		expect(stderr).toContain("only remaining required goal");
 	});
 
+	it("rejects supersession of a blocked non-supersedable required gate without accepting it", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: [
+				"@goal: Required gate",
+				"Genuinely pass the required gate.",
+				"",
+				"@goal: Follow-up",
+				"Complete follow-up.",
+			].join("\n"),
+		});
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "required gate has not genuinely passed",
+		});
+
+		const stderr = await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"replacement evidence claims the required gate can be bypassed",
+				"--rationale",
+				"negative regression test verifies required gates cannot close through supersession",
+			],
+			"mark_blocked_superseded",
+		);
+		const rejectedPlan = await readUltragoalPlan(root);
+		const rejectedLedger = await readUltragoalLedger(root);
+
+		expect(stderr).toContain(
+			"steer mark_blocked_superseded cannot supersede G001 because it is a non-supersedable required gate; this route cannot close it",
+		);
+		expect(rejectedPlan?.goals.find(goal => goal.id === "G001")?.status).toBe("blocked");
+		expect(
+			rejectedLedger.some(event => event.event === "steering_accepted" && event.kind === "mark_blocked_superseded"),
+		).toBe(false);
+
+		const permissiveRoot = await tempDir();
+		await createUltragoalPlan({
+			cwd: permissiveRoot,
+			brief: ["@goal: Blocked work", "Complete blocked work.", "", "@goal: Follow-up", "Complete follow-up."].join(
+				"\n",
+			),
+		});
+		await startNextUltragoalGoal({ cwd: permissiveRoot });
+		await checkpointUltragoalGoal({
+			cwd: permissiveRoot,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked work is obsolete",
+		});
+		const supersede = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"replacement evidence shows this blocked work is no longer required",
+				"--rationale",
+				"unmarked blocked goals retain backward-compatible supersession behavior",
+				"--json",
+			],
+			permissiveRoot,
+		);
+
+		expect(supersede.status).toBe(0);
+		expect((await readUltragoalPlan(permissiveRoot))?.goals.find(goal => goal.id === "G001")?.status).toBe(
+			"superseded",
+		);
+	});
+
+	it("refuses the mark_blocked_superseded, checkpoint-status, split_subgoal and review-blocker routes for a non-supersedable gate without mutating durable state", async () => {
+		const createBlockedGate = async (withFollowUp = true): Promise<string> => {
+			const root = await tempDir();
+			const plan = await createUltragoalPlan({
+				cwd: root,
+				brief: withFollowUp
+					? [
+							"@goal: Required gate",
+							"Genuinely pass the required gate.",
+							"",
+							"@goal: Follow-up",
+							"Complete follow-up.",
+						].join("\n")
+					: "Genuinely pass the required gate.",
+			});
+			plan.goals[0]!.supersedable = false;
+			await writePlan(root, plan);
+			await startNextUltragoalGoal({ cwd: root });
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "blocked",
+				evidence: "required gate has not genuinely passed",
+			});
+			return root;
+		};
+		const durableState = async (root: string): Promise<{ goals: string; ledger: string }> => ({
+			goals: await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text(),
+			ledger: await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")).text(),
+		});
+		const expectUnchanged = async (
+			root: string,
+			before: { goals: string; ledger: string },
+			status: UltragoalGoalStatus = "blocked",
+		) => {
+			expect((await readUltragoalPlan(root))?.goals.find(goal => goal.id === "G001")?.status).toBe(status);
+			expect((await durableState(root)).goals).toBe(before.goals);
+			const ledger = await readUltragoalLedger(root);
+			expect(ledger.some(event => event.event === "steering_accepted")).toBe(false);
+			expect(ledger.some(event => event.event === "goal_checkpointed" && event.status === "complete")).toBe(false);
+		};
+
+		const steeringRoot = await createBlockedGate();
+		const steeringBefore = await durableState(steeringRoot);
+		const steering = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"attempted bypass",
+				"--rationale",
+				"attempted bypass must be rejected",
+			],
+			steeringRoot,
+		);
+		expect(steering.status).toBe(1);
+		expect(steering.stderr).toContain("steer mark_blocked_superseded cannot supersede G001");
+		await expectUnchanged(steeringRoot, steeringBefore);
+
+		const checkpointRoot = await createBlockedGate();
+		const checkpointBefore = await durableState(checkpointRoot);
+		const checkpoint = await runNativeUltragoalCommand(
+			["checkpoint", "--goal-id", "G001", "--status", "superseded", "--evidence", "attempted bypass"],
+			checkpointRoot,
+		);
+		expect(checkpoint.status).toBe(1);
+		expect(checkpoint.stderr).toContain(
+			"checkpoint --status must be pending, active, complete, failed, blocked, or review_blocked",
+		);
+		await expectUnchanged(checkpointRoot, checkpointBefore);
+
+		const splitRoot = await createBlockedGate();
+		const splitBefore = await durableState(splitRoot);
+		const split = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"split_subgoal",
+				"--goal-id",
+				"G001",
+				"--replacements-json",
+				'[{"title":"First replacement","objective":"Complete the first half."},{"title":"Second replacement","objective":"Complete the second half."}]',
+				"--evidence",
+				"attempted replacement bypass",
+				"--rationale",
+				"attempted replacement bypass must be rejected",
+			],
+			splitRoot,
+		);
+		expect(split.status).toBe(1);
+		expect(split.stderr).toContain("steer split_subgoal cannot supersede G001");
+		await expectUnchanged(splitRoot, splitBefore);
+
+		const reviewRoot = await createBlockedGate(false);
+		const blockers = await runNativeUltragoalCommand(
+			[
+				"record-review-blockers",
+				"--goal-id",
+				"G001",
+				"--title",
+				"Resolve required gate",
+				"--objective",
+				"Fix the required-gate verification finding.",
+				"--evidence",
+				"required gate remains unresolved",
+			],
+			reviewRoot,
+		);
+		expect(blockers.status).toBe(0);
+		await startNextUltragoalGoal({ cwd: reviewRoot });
+		const reviewBefore = await durableState(reviewRoot);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: reviewRoot,
+				goalId: "G002",
+				status: "complete",
+				evidence: "attempted review-blocker bypass",
+				qualityGateJson: await passingLiveQualityGate(reviewRoot),
+			}),
+		).rejects.toThrow("checkpoint review-blocker completion cannot supersede G001");
+		await expectUnchanged(reviewRoot, reviewBefore, "review_blocked");
+		// The protected gate keeps the run non-terminal. Note G002 is still active here: its
+		// completion attempt above was rejected before mutation precisely because it would have
+		// superseded G001, so this asserts the run cannot reach completion while G001 is unresolved.
+		const runState = await getUltragoalStatus(reviewRoot);
+		expect(runState.status).not.toBe("complete");
+		expect((await readUltragoalPlan(reviewRoot))?.goals.find(goal => goal.id === "G001")?.status).toBe(
+			"review_blocked",
+		);
+	});
+
+	it("fails closed when a ledger-established protected gate marker is deleted or flipped on disk", async () => {
+		for (const tamperedValue of [undefined, true]) {
+			const root = await tempDir();
+			const plan = await createUltragoalPlan({
+				cwd: root,
+				brief: ["@goal: Required gate", "Pass the gate.", "", "@goal: Follow-up", "Complete follow-up."].join("\n"),
+			});
+			plan.goals[0]!.supersedable = false;
+			await writePlan(root, plan);
+			await startNextUltragoalGoal({ cwd: root });
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "blocked",
+				evidence: "the required gate remains unresolved",
+			});
+
+			const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+			const persisted = JSON.parse(await Bun.file(goalsPath).text()) as { goals: Array<Record<string, unknown>> };
+			if (tamperedValue === undefined) delete persisted.goals[0]!.supersedable;
+			else persisted.goals[0]!.supersedable = tamperedValue;
+			await Bun.write(goalsPath, JSON.stringify(persisted));
+
+			const result = await runNativeUltragoalCommand(
+				[
+					"steer",
+					"--kind",
+					"mark_blocked_superseded",
+					"--goal-id",
+					"G001",
+					"--evidence",
+					"attempted marker tampering bypass",
+					"--rationale",
+					"the ledger-established required gate must remain protected",
+				],
+				root,
+			);
+
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("Ultragoal plan tampering detected");
+			expect(result.stderr).toContain("G001");
+			const after = JSON.parse(await Bun.file(goalsPath).text()) as { goals: Array<{ status: string }> };
+			expect(after.goals[0]?.status).toBe("blocked");
+			expect((await readUltragoalLedger(root)).some(event => event.event === "steering_accepted")).toBe(false);
+		}
+	});
+
+	it("fails closed when a protected gate status is edited without a matching ledger transition", async () => {
+		for (const status of ["superseded", "complete", "failed"] as const) {
+			const root = await tempDir();
+			const plan = await createUltragoalPlan({
+				cwd: root,
+				brief: "@goal: Required gate\nPass the gate.\n\n@goal: Follow-up\nComplete follow-up.",
+			});
+			plan.goals[0]!.supersedable = false;
+			await writePlan(root, plan);
+			await startNextUltragoalGoal({ cwd: root });
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "blocked",
+				evidence: "the required gate remains unresolved",
+			});
+			const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+			const persisted = JSON.parse(await Bun.file(goalsPath).text()) as { goals: Array<{ status: string }> };
+			persisted.goals[0]!.status = status;
+			await Bun.write(goalsPath, JSON.stringify(persisted));
+
+			const result = await runNativeUltragoalCommand(["status"], root);
+
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("Ultragoal plan tampering detected");
+			expect(result.stderr).toContain("G001");
+		}
+	});
+
+	it("fails closed when a protected-gate generation is rotated outside a recorded reseed", async () => {
+		for (const markerTampering of ["supersedable_true", "marker_deleted", "intact"] as const) {
+			const root = await tempDir();
+			const plan = await createUltragoalPlan({
+				cwd: root,
+				brief: "@goal: Required gate\nPass the gate.\n\n@goal: Follow-up\nComplete follow-up.",
+			});
+			plan.goals[0]!.supersedable = false;
+			await writePlan(root, plan);
+			await startNextUltragoalGoal({ cwd: root });
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "blocked",
+				evidence: "the required gate remains unresolved",
+			});
+
+			const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+			const persisted = JSON.parse(await Bun.file(goalsPath).text()) as {
+				protectedGateGeneration: string;
+				goals: Array<Record<string, unknown>>;
+			};
+			persisted.protectedGateGeneration = `unrecorded-generation-${markerTampering}`;
+			if (markerTampering === "supersedable_true") persisted.goals[0]!.supersedable = true;
+			if (markerTampering === "marker_deleted") delete persisted.goals[0]!.supersedable;
+			await Bun.write(goalsPath, JSON.stringify(persisted));
+
+			const result = await runNativeUltragoalCommand(
+				[
+					"steer",
+					"--kind",
+					"mark_blocked_superseded",
+					"--goal-id",
+					"G001",
+					"--evidence",
+					"attempted generation-rotation bypass",
+					"--rationale",
+					"an unrecorded generation must not orphan a required-gate witness",
+				],
+				root,
+			);
+
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("protected-gate witness generation");
+			const after = JSON.parse(await Bun.file(goalsPath).text()) as { goals: Array<{ status: string }> };
+			expect(after.goals[0]?.status).toBe("blocked");
+			expect((await readUltragoalLedger(root)).some(event => event.event === "steering_accepted")).toBe(false);
+		}
+	});
+
+	it("records protected-gate generation reseeds after genuine completion without poisoning a reused id", async () => {
+		const root = await protectedTempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "gate genuinely passed",
+			qualityGateJson: await protectedPassingQualityGate(root),
+		});
+
+		const reseed = await runNativeUltragoalCommand(["create-goals", "--brief", "New ordinary G001"], root);
+		const reseededPlan = await readUltragoalPlan(root);
+		const ledger = await readUltragoalLedger(root);
+
+		expect(reseed.status).toBe(0);
+		expect(reseededPlan?.goals[0]).toMatchObject({ id: "G001", title: "New ordinary G001", status: "pending" });
+		expect(
+			ledger.some(
+				event =>
+					event.event === "protected_gate_generation_reseeded" &&
+					event.previousGeneration === plan.protectedGateGeneration &&
+					event.generation === reseededPlan?.protectedGateGeneration,
+			),
+		).toBe(true);
+	});
+
+	it("fails closed when a protected plan's ledger is absent, empty, malformed, unreadable, or truncated", async () => {
+		for (const corruption of ["absent", "empty", "malformed", "unreadable", "truncated"] as const) {
+			const root = await tempDir();
+			const plan = await createUltragoalPlan({
+				cwd: root,
+				brief: "@goal: Required gate\nPass the gate.\n\n@goal: Follow-up\nComplete follow-up.",
+			});
+			plan.goals[0]!.supersedable = false;
+			await writePlan(root, plan);
+			await startNextUltragoalGoal({ cwd: root });
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "blocked",
+				evidence: "gate remains unresolved",
+			});
+			const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+			if (corruption === "absent") await fs.rm(ledgerPath);
+			else if (corruption === "empty") await Bun.write(ledgerPath, "");
+			else if (corruption === "malformed") await Bun.write(ledgerPath, "not-json\n");
+			else if (corruption === "unreadable") await fs.chmod(ledgerPath, 0o000);
+			else {
+				const lines = (await Bun.file(ledgerPath).text()).trim().split("\n");
+				await Bun.write(ledgerPath, `${lines.slice(0, -1).join("\n")}\n`);
+			}
+			const result = await runNativeUltragoalCommand(
+				[
+					"steer",
+					"--kind",
+					"mark_blocked_superseded",
+					"--goal-id",
+					"G001",
+					"--evidence",
+					"attempted ledger-loss bypass",
+					"--rationale",
+					"integrity evidence must be present",
+				],
+				root,
+			);
+			if (corruption === "unreadable") await fs.chmod(ledgerPath, 0o600);
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain(
+				corruption === "truncated"
+					? "ledger history no longer matches"
+					: "ledger integrity evidence is missing or corrupt",
+			);
+			const saved = JSON.parse(
+				await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text(),
+			);
+			expect(saved.goals[0].status).toBe("blocked");
+		}
+	});
+
+	it("refuses wording changes to a protected pending gate", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		const before = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text();
+		const result = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"revise_pending_wording",
+				"--goal-id",
+				"G001",
+				"--objective",
+				"Different obligation",
+				"--evidence",
+				"attempt",
+				"--rationale",
+				"attempt",
+			],
+			root,
+		);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("cannot revise G001 because it is a non-supersedable required gate");
+		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text()).toBe(before);
+	});
+
+	it("refuses create-goals reseeding over an unresolved protected gate and preserves the original plan", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "the required gate remains unresolved",
+		});
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const before = await Bun.file(goalsPath).text();
+
+		const result = await runNativeUltragoalCommand(["create-goals", "--brief", "Fresh unrelated plan"], root);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("protected gate(s) G001 (blocked) remain unresolved");
+		expect(await Bun.file(goalsPath).text()).toBe(before);
+	});
+
+	it("keeps ordinary goals permissive for reseeding and blocked supersession", async () => {
+		const reseedRoot = await tempDir();
+		await createUltragoalPlan({ cwd: reseedRoot, brief: "Old ordinary plan" });
+		const reseed = await runNativeUltragoalCommand(["create-goals", "--brief", "New ordinary plan"], reseedRoot);
+		expect(reseed.status).toBe(0);
+		expect((await readUltragoalPlan(reseedRoot))?.brief).toBe("New ordinary plan");
+
+		const supersedeRoot = await tempDir();
+		await createUltragoalPlan({
+			cwd: supersedeRoot,
+			brief: ["@goal: Ordinary blocked work", "Complete work.", "", "@goal: Follow-up", "Complete follow-up."].join(
+				"\n",
+			),
+		});
+		await startNextUltragoalGoal({ cwd: supersedeRoot });
+		await checkpointUltragoalGoal({
+			cwd: supersedeRoot,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "ordinary work is obsolete",
+		});
+		const supersede = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"the ordinary work is no longer needed",
+				"--rationale",
+				"the follow-up still covers the aggregate objective",
+			],
+			supersedeRoot,
+		);
+		expect(supersede.status).toBe(0);
+		expect((await readUltragoalPlan(supersedeRoot))?.goals[0]?.status).toBe("superseded");
+	});
+
+	it("allows reseeding after a protected gate is genuinely completed even when its id is reused", async () => {
+		const root = await protectedTempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "gate genuinely passed",
+			qualityGateJson: await protectedPassingQualityGate(root),
+		});
+		const reseed = await runNativeUltragoalCommand(["create-goals", "--brief", "New ordinary G001"], root);
+		expect(reseed.status).toBe(0);
+		expect((await readUltragoalPlan(root))?.goals[0]).toMatchObject({ id: "G001", title: "New ordinary G001" });
+	});
+
+	it("refuses a fabricated quality gate for a protected goal without changing its status", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+		await Bun.write(path.join(root, "artifacts", "fake.txt"), "fabricated trivial evidence");
+		const fabricatedGate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
+		fabricatedGate.executorQa = executorQaWithSurface("api/package", [
+			{
+				id: "fake-report",
+				kind: "api-package-test-report",
+				path: "artifacts/fake.txt",
+				description: "Fabricated report with no executed command binding",
+			},
+		]);
+		fabricatedGate.architectReview!.commands = ["never-ran"];
+		fabricatedGate.executorQa.e2eCommands = ["never-ran"];
+		fabricatedGate.executorQa.redTeamCommands = ["never-ran"];
+		fabricatedGate.iteration!.rerunCommands = ["never-ran"];
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"fabricated completion",
+				"--quality-gate-json",
+				JSON.stringify(fabricatedGate),
+			],
+			root,
+		);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("protectedExecution.artifactRefs");
+		expect((await readUltragoalPlan(root))?.goals[0]?.status).toBe("active");
+	});
+
+	it("refuses reuse of an accepted protected quality gate for another protected goal", async () => {
+		const root = await protectedTempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: First required gate\nPass first.\n\n@goal: Second required gate\nPass second.",
+		});
+		for (const goal of plan.goals) goal.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		const gate = await protectedPassingQualityGate(root);
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first required gate passed",
+			qualityGateJson: gate,
+		});
+		const firstCheckpoint = (await readUltragoalLedger(root)).find(
+			event => event.event === "goal_checkpointed" && event.goalId === "G001",
+		);
+		expect(hashStructuredValue(firstCheckpoint?.qualityGateJson)).toBe(hashStructuredValue(JSON.parse(gate)));
+		expect((await readUltragoalPlan(root))?.goals[0]?.completionVerification?.protectedGateGeneration).toBe(
+			plan.protectedGateGeneration as string,
+		);
+		await startNextUltragoalGoal({ cwd: root });
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G002",
+				"--status",
+				"complete",
+				"--evidence",
+				"second required gate claimed passed",
+				"--quality-gate-json",
+				gate,
+			],
+			root,
+		);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("already accepted for G001");
+		expect((await readUltragoalPlan(root))?.goals[1]?.status).toBe("active");
+	});
+
+	it("refuses unprotected quality-gate reuse across goals but permits same-goal replay and distinct gates", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: First ordinary goal\nComplete first.\n\n@goal: Second ordinary goal\nComplete second.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const reusedGate = await passingLiveQualityGate(root);
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first ordinary goal verified",
+			qualityGateJson: reusedGate,
+		});
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first ordinary goal verified",
+			qualityGateJson: reusedGate,
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const reused = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G002",
+				"--status",
+				"complete",
+				"--evidence",
+				"second ordinary goal claimed verified",
+				"--quality-gate-json",
+				reusedGate,
+			],
+			root,
+		);
+
+		expect(reused.status).toBe(1);
+		expect(reused.stderr).toContain("already accepted for G001");
+		expect(reused.stderr).toContain("per-goal verification evidence must be distinct");
+		expect((await readUltragoalPlan(root))?.goals[1]?.status).toBe("active");
+
+		const distinctGate = JSON.parse(reusedGate) as Record<string, Record<string, unknown>>;
+		distinctGate.architectReview!.evidence = "architect reviewed the second ordinary goal independently";
+		const completed = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "second ordinary goal independently verified",
+			qualityGateJson: JSON.stringify(distinctGate),
+		});
+		expect(completed.goals[1]?.status).toBe("complete");
+	});
+
+	it("refuses semantic quality-gate reuse despite whitespace, key-order, and no-op mutations", async () => {
+		for (const mutate of [
+			(gate: Record<string, Record<string, unknown>>) => {
+				gate.iteration!.evidence = `${String(gate.iteration!.evidence)} `;
+				return gate;
+			},
+			(gate: Record<string, Record<string, unknown>>) =>
+				Object.fromEntries(Object.entries(gate).reverse()) as Record<string, Record<string, unknown>>,
+			(gate: Record<string, Record<string, unknown>>) => {
+				gate.iteration!.noOp = "does not affect verification";
+				return gate;
+			},
+		]) {
+			const root = await tempDir();
+			await createUltragoalPlan({
+				cwd: root,
+				brief: "@goal: First ordinary goal\nComplete first.\n\n@goal: Second ordinary goal\nComplete second.",
+			});
+			await startNextUltragoalGoal({ cwd: root });
+			const acceptedGate = await passingLiveQualityGate(root);
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "first ordinary goal verified",
+				qualityGateJson: acceptedGate,
+			});
+			await startNextUltragoalGoal({ cwd: root });
+			const result = await runNativeUltragoalCommand(
+				[
+					"checkpoint",
+					"--goal-id",
+					"G002",
+					"--status",
+					"complete",
+					"--evidence",
+					"second ordinary goal claimed verified",
+					"--quality-gate-json",
+					JSON.stringify(mutate(JSON.parse(acceptedGate) as Record<string, Record<string, unknown>>)),
+				],
+				root,
+			);
+			expect(result.status).toBe(1);
+			expect((await readUltragoalPlan(root))?.goals[1]?.status).toBe("active");
+		}
+	});
+
+	it("rejects protected replay records unrelated to asserted verification commands", async () => {
+		const unmatchedRoot = await tempDir();
+		const unmatchedPlan = await createUltragoalPlan({ cwd: unmatchedRoot, brief: "Required gate\nPass the gate." });
+		unmatchedPlan.goals[0]!.supersedable = false;
+		await writePlan(unmatchedRoot, unmatchedPlan);
+		await startNextUltragoalGoal({ cwd: unmatchedRoot });
+		const unmatchedGate = JSON.parse(await protectedPassingQualityGate(unmatchedRoot)) as Record<
+			string,
+			Record<string, unknown>
+		>;
+		unmatchedGate.architectReview!.commands = ['bun -e console.log("different-command")'];
+		const unmatched = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"unmatched replay",
+				"--quality-gate-json",
+				JSON.stringify(unmatchedGate),
+			],
+			unmatchedRoot,
+		);
+		expect(unmatched.status).toBe(1);
+		expect(unmatched.stderr).toContain("no matching live protectedExecution replay");
+
+		const extraRoot = await tempDir();
+		const extraPlan = await createUltragoalPlan({ cwd: extraRoot, brief: "Required gate\nPass the gate." });
+		extraPlan.goals[0]!.supersedable = false;
+		await writePlan(extraRoot, extraPlan);
+		await startNextUltragoalGoal({ cwd: extraRoot });
+		const extraGate = JSON.parse(await protectedPassingQualityGate(extraRoot)) as Record<
+			string,
+			Record<string, unknown>
+		>;
+		(extraGate.executorQa!.artifactRefs as Array<Record<string, unknown>>).push({
+			id: "unrelated-replay",
+			kind: "cli-replay",
+			description: "A replay that is not asserted as verification evidence",
+			replay: {
+				schemaVersion: 1,
+				kind: "cli-replay",
+				replaySafe: true,
+				command: ["bun", "-e", 'console.log("unrelated-replay")'],
+				recordedStdout: "unrelated-replay\n",
+			},
+		});
+		extraGate.protectedExecution = { artifactRefs: ["protected-replay", "unrelated-replay"] };
+		const extra = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"extra replay",
+				"--quality-gate-json",
+				JSON.stringify(extraGate),
+			],
+			extraRoot,
+		);
+		expect(extra.status).toBe(1);
+		expect(extra.stderr).toContain("does not match an asserted verification command");
+	});
+
+	it("permits quality-gate reuse after a fresh plan starts", async () => {
+		const root = await tempDir();
+		const gate = await passingLiveQualityGate(root);
+		await createUltragoalPlan({ cwd: root, brief: "First run\nComplete first run." });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first run verified",
+			qualityGateJson: gate,
+		});
+		await createUltragoalPlan({ cwd: root, brief: "Fresh run\nComplete fresh run." });
+		await startNextUltragoalGoal({ cwd: root });
+		const fresh = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "fresh run independently verified",
+			qualityGateJson: gate,
+		});
+
+		expect(fresh.goals[0]?.status).toBe("complete");
+	});
+
+	it("requires a runtime-produced obligations verdict for protected completion and rejects missing, claimed, and stale results", async () => {
+		const createProtectedGoal = async (): Promise<{ root: string; gate: string }> => {
+			const root = await protectedTempDir();
+			const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+			plan.goals[0]!.supersedable = false;
+			await writePlan(root, plan);
+			await startNextUltragoalGoal({ cwd: root });
+			return { root, gate: await protectedPassingQualityGate(root) };
+		};
+
+		const passing = await createProtectedGoal();
+		await checkpointUltragoalGoal({
+			cwd: passing.root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "the runtime independently verified the fixture obligation",
+			qualityGateJson: passing.gate,
+		});
+		expect((await readUltragoalPlan(passing.root))?.goals[0]?.status).toBe("complete");
+
+		const claimed = await createProtectedGoal();
+		await fs.rm(path.join(claimed.root, "obligations.receipts/synthetic-pass.receipt.json"));
+		const claimedGate = JSON.parse(claimed.gate) as Record<string, Record<string, unknown>>;
+		claimedGate.iteration!.evidence = "verifier passed according to the submitting agent";
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: claimed.root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "agent claims the verifier passed",
+				qualityGateJson: JSON.stringify(claimedGate),
+			}),
+		).rejects.toThrow("runtime obligations verifier blocked synthetic-pass");
+		expect((await readUltragoalPlan(claimed.root))?.goals[0]?.status).toBe("active");
+
+		const stale = await createProtectedGoal();
+		await Bun.write(path.join(stale.root, "fixture-obligation.ts"), 'process.stdout.write("changed fixture\\n");\n');
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: stale.root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "attempted completion with a stale verifier receipt",
+				qualityGateJson: stale.gate,
+			}),
+		).rejects.toThrow("runtime obligations verifier blocked synthetic-pass");
+		expect((await readUltragoalPlan(stale.root))?.goals[0]?.status).toBe("active");
+		// A refused protected completion must leave the run fully operable: the plan stays
+		// readable, status still resolves, and a legitimate blocked checkpoint still lands.
+		// This guards the "failed repair bricks the run" failure mode.
+		expect((await getUltragoalStatus(stale.root)).status).toBeDefined();
+		await checkpointUltragoalGoal({
+			cwd: stale.root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "recording the blocker after the protected completion was refused",
+		});
+		expect((await readUltragoalPlan(stale.root))?.goals[0]?.status).toBe("blocked");
+		expect((await getUltragoalStatus(stale.root)).status).toBeDefined();
+	});
+
+	it("allows a protected gate with live replay evidence and leaves ordinary completion unchanged", async () => {
+		const protectedRoot = await protectedTempDir();
+		const protectedPlan = await createUltragoalPlan({ cwd: protectedRoot, brief: "Required gate\nPass the gate." });
+		protectedPlan.goals[0]!.supersedable = false;
+		await writePlan(protectedRoot, protectedPlan);
+		await startNextUltragoalGoal({ cwd: protectedRoot });
+		await checkpointUltragoalGoal({
+			cwd: protectedRoot,
+			goalId: "G001",
+			status: "complete",
+			evidence: "protected gate command replayed successfully",
+			qualityGateJson: await protectedPassingQualityGate(protectedRoot),
+		});
+		expect((await readUltragoalPlan(protectedRoot))?.goals[0]?.status).toBe("complete");
+
+		const ordinaryRoot = await tempDir();
+		await createUltragoalPlan({ cwd: ordinaryRoot, brief: "Ordinary goal\nComplete ordinary work." });
+		await startNextUltragoalGoal({ cwd: ordinaryRoot });
+		await checkpointUltragoalGoal({
+			cwd: ordinaryRoot,
+			goalId: "G001",
+			status: "complete",
+			evidence: "ordinary completion remains unchanged",
+			qualityGateJson: await passingLiveQualityGate(ordinaryRoot),
+		});
+		expect((await readUltragoalPlan(ordinaryRoot))?.goals[0]?.status).toBe("complete");
+	});
+
+	it("refuses an idempotent replay of a protected completion instead of reusing its verifier pass", async () => {
+		const root = await protectedTempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		const qualityGateJson = await protectedPassingQualityGate(root);
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "protected completion was independently verified",
+			qualityGateJson,
+		});
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "protected completion was independently verified",
+				qualityGateJson,
+			}),
+		).rejects.toThrow("refusing idempotent completion replay");
+	});
+
+	it("evaluates GJC-package obligations from an unrelated protected goal cwd", async () => {
+		const root = await protectedTempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Required gate\nPass the gate." });
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		const qualityGateJson = await protectedPassingQualityGate(root);
+		protectedVerifierRestore?.();
+		protectedVerifierRestore = undefined;
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "unrelated cwd must not select a caller manifest",
+				qualityGateJson,
+			}),
+		).rejects.toThrow("runtime obligations verifier blocked oracle-stable");
+	});
+
+	it("refuses protected membership in a deferred validation batch before accepting deferred evidence", async () => {
+		const root = await batchTempDir();
+		await runNativeUltragoalCommand(
+			[
+				"create-goals",
+				"--brief",
+				"@goal: First\nDeferred work.\n\n@goal: Final\nClose the batch.",
+				"--validation-batch-json",
+				JSON.stringify([{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002"], finalGoalId: "G002" }]),
+			],
+			root,
+		);
+		const plan = (await readUltragoalPlan(root))!;
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "attempted protected deferred completion",
+				qualityGateJson: deferredBatchGate("G001", plan.goals[0]!.validationBatch!),
+			}),
+		).rejects.toThrow("protected gate completion cannot be deferred");
+	});
+
 	it("allows blocked supersession when another required goal remains", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({
@@ -4125,6 +5214,11 @@ describe("native GJC ultragoal runtime", () => {
 			});
 		await fs.writeFile(ledgerPath, `${rewritten.join("\n")}\n`);
 		receipt.qualityGateHash = strippedHash;
+		// Rewriting ledger rows changes the plan-bound integrity head. This fixture edits the
+		// ledger deliberately to simulate a legacy pre-criticReview gate, so refresh the head
+		// too; leaving it stale would trip protected-gate tamper detection instead of the
+		// criticReview guard this test is exercising.
+		saved.ledgerIntegrity = ledgerHead(rewritten.map(line => JSON.parse(line)));
 		await fs.writeFile(goalsPath, `${JSON.stringify(saved, null, 2)}\n`);
 
 		// The receipt is fresh but the guard rejects it: without repair the run
@@ -4214,14 +5308,9 @@ describe("native GJC ultragoal runtime", () => {
 			});
 		await fs.writeFile(ledgerPath, `${rewritten.join("\n")}\n`);
 
-		const plan = await readUltragoalPlan(root);
-		if (!plan) throw new Error("missing ultragoal plan");
-		const ledger = await readUltragoalLedger(root);
-		expect(
-			validateCompletionReceipt({ plan, ledger, goal: plan.goals[1]!, receiptKind: "final-aggregate" }).state,
-		).not.toBe("active_verified_complete");
-		const durable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
-		expect(durable.state).not.toBe("active_verified_complete");
+		await expect(readUltragoalPlan(root)).rejects.toThrow(
+			"ledger history no longer matches the plan-bound integrity head",
+		);
 	});
 
 	async function completedValidationBatchPlan(root: string) {

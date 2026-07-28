@@ -163,14 +163,19 @@ function passingQualityGate(): string {
 	});
 }
 
-async function passingLiveQualityGate(root: string): Promise<string> {
+async function passingLiveQualityGate(root: string, goalId?: string): Promise<string> {
 	await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
 	await fs.writeFile(path.join(root, "artifacts", "api-report.txt"), "API package consumer test passed\n");
 	await fs.writeFile(
 		path.join(root, "artifacts", "adversarial-report.txt"),
 		"Boundary and adversarial tests passed\n",
 	);
-	return passingQualityGate();
+	// Completion gates must be distinct per goal: an identical payload is rejected as reused
+	// evidence, so tag the gate with the goal it belongs to.
+	if (!goalId) return passingQualityGate();
+	const gate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
+	gate.iteration.evidence = `${gate.iteration.evidence} (${goalId})`;
+	return JSON.stringify(gate);
 }
 
 async function createTwoGoalPlan(root: string, mode: "aggregate" | "per-story" = "aggregate"): Promise<void> {
@@ -276,7 +281,7 @@ async function completeGoal(root: string, goalId: string): Promise<void> {
 		goalId,
 		status: "complete",
 		evidence: `${goalId} verified complete`,
-		qualityGateJson: await passingLiveQualityGate(root),
+		qualityGateJson: await passingLiveQualityGate(root, goalId),
 	});
 }
 
