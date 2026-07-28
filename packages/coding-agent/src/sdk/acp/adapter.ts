@@ -354,13 +354,14 @@ export class AcpSdkAdapter {
 			!this.#ownsReverseLease(connectionId, capability, leaseId)
 		)
 			return;
-		const active: ReverseRequest = { state: "pending", controller: new AbortController() };
+		const controller = new AbortController();
+		const active: ReverseRequest = { state: "pending", controller };
 		this.#reverseRequests.set(id, active);
 		try {
 			const request = frame.payload as JsonObject | undefined;
 			const method = typeof request?.method === "string" ? request.method : "";
 			const payload = request?.payload && typeof request.payload === "object" ? (request.payload as JsonObject) : {};
-			const result = await this.#forwardReverse(method, payload, active.controller.signal);
+			const result = await this.#forwardReverse(method, payload, controller.signal);
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
 			this.#client.send({ type: "reverse_response", id, connectionId, leaseId, ok: true, result });

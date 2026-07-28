@@ -1642,7 +1642,7 @@ function createSdkUiAskAnswerSource(
 		signal?: AbortSignal,
 	): Promise<AskAnswerSourceResult> => {
 		if (signal?.aborted) return undefined;
-		const choices = new Map<string, { kind: "value"; value: string } | { kind: "control"; controlId: string }>();
+		const choices = new Map<string, AskRemoteInteraction>();
 		const oneOf =
 			request.interaction === "selector"
 				? [

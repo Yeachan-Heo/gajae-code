@@ -81,7 +81,7 @@ export class BrokerTransport {
 			},
 			websocket: {
 				maxPayloadLength: MAX_BROKER_JSON_FRAME_BYTES * 2,
-				open: socket => send(socket, { type: "broker_hello", protocolVersion: PROTOCOL_VERSION }),
+				open: socket => void send(socket, { type: "broker_hello", protocolVersion: PROTOCOL_VERSION }),
 				message: (socket, message) => void this.#handleMessage(socket, message),
 				drain: socket => {
 					if (this.#shutdownBackpressured.delete(socket)) this.#scheduleStopAfterShutdownResponse();
