@@ -58,6 +58,12 @@ function nonEmpty(lines: string[]): string[] {
 	return lines.filter(line => line.length > 0);
 }
 
+function trimTrailingBlank(lines: string[]): string[] {
+	let end = lines.length;
+	while (end > 0 && lines[end - 1].length === 0) end--;
+	return lines.slice(0, end);
+}
+
 function countSequence(haystack: string, needle: string): number {
 	let count = 0;
 	let offset = 0;
@@ -258,18 +264,26 @@ describe("width-settle debounce red-team", () => {
 
 	it("TMUX-STALE-BAND settled repair replays the full transcript so scrollback is repaired too", async () => {
 		const result = await runWidthRepair(true);
+		// The reference buffer carries construction-time interior blank rows (it is
+		// rendered incrementally), so content is compared via nonEmpty. Stale blank
+		// bands in the POST buffer are still caught: after a real clear+replay the
+		// post buffer must have no interior blank rows, asserted separately below.
+		const postTrimmed = trimTrailingBlank(result.post.scrollback);
 		const postRows = nonEmpty(result.post.scrollback);
 		const referenceRows = nonEmpty(result.reference.scrollback);
 		finishCase(
 			"TMUX-STALE-BAND",
-			"With TMUX set, interim frames stay viewport-only, but the ONE debounced settled repair is a full clear+replay: post-settle scrollback must match a clean 22-column render. The replay storm is avoided by running once per settled sequence, not once per SIGWINCH.",
+			"With TMUX set, interim frames stay viewport-only, but the ONE debounced settled repair is a full clear+replay: post-settle scrollback must match a clean 22-column render row-for-row. The replay storm is avoided by running once per settled sequence, not once per SIGWINCH.",
 			{
 				postStateMatchesFreshTarget: postRows.join("\n") === referenceRows.join("\n"),
+				postHasNoInteriorBlankRows: postTrimmed.every(line => line.length > 0),
 				postViewportMatchesFreshTarget: result.post.viewport.join("\n") === result.reference.viewport.join("\n"),
 				settledRedrawExactlyOne: result.redrawsAfterSettle - result.redrawsBeforeSettle === 1,
-				// tmux keeps 3J suppressed (shouldPreserveScrollbackOnFullClear), but the
-				// settled write must be a real clear+replay, not a 2K viewport patch.
-				settledWriteClearsAndReplays: result.post.writeLog.includes("\x1b[2J\x1b[H"),
+				// The settled repair forces the scrollback clear even where per-event
+				// full clears keep 3J suppressed (forceScrollbackClear): replaying
+				// WITHOUT erasing history would stack the new transcript on top of
+				// the stale-width copy.
+				settledWriteClearsAndReplays: result.post.writeLog.includes("\x1b[2J\x1b[H\x1b[3J"),
 				widthChangedContentVisible: result.post.viewport.some(line => line.startsWith("R31-")),
 			},
 			{

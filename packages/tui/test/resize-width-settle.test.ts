@@ -149,4 +149,39 @@ describe("debounced full redraw on terminal width change", () => {
 
 		tui.stop();
 	});
+
+	it("defers the settled repair while the user reads scrollback and runs it on follow-live", async () => {
+		const term = new VirtualTerminal(COLS, 30);
+		const tui = new TUI(term);
+		tui.start();
+		await term.waitForRender();
+		await buildTranscript(tui, term, 60);
+
+		// Enter manual viewport (user reading history), then resize the width.
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await term.waitForRender();
+		term.resize(COLS - 15, 30);
+		await term.waitForRender();
+		const beforeDeadline = tui.fullRedraws;
+
+		// The deadline passes while manual: no forced replay may rip the user out.
+		await Bun.sleep(SETTLE_MS + 200);
+		expect(tui.fullRedraws).toBe(beforeDeadline);
+
+		// Returning to live runs the deferred repair: one full clear+replay at the
+		// new width, landing at the live bottom with no stale pending flag.
+		expect(tui.followLiveViewport()).toBe(true);
+		await term.waitForRender();
+		const afterFollow = tui.fullRedraws;
+		expect(afterFollow).toBe(beforeDeadline + 1);
+		const out = term.getWriteLog().join("");
+		expect(out).toContain("\x1b[2J\x1b[H\x1b[3J");
+		expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+
+		// The flag was consumed: nothing further fires after another window.
+		await Bun.sleep(SETTLE_MS + 200);
+		expect(tui.fullRedraws).toBe(afterFollow);
+
+		tui.stop();
+	});
 });

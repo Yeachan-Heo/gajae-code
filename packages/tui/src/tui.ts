@@ -1105,6 +1105,21 @@ export class TUI extends Container {
 
 	followLiveViewport(): boolean {
 		if (this.#manualViewportTop === undefined) return false;
+		if (this.#widthSettleRepairPending) {
+			// A settled width repair was deferred while the user was reading
+			// scrollback (repainting mid-read would have destroyed their position).
+			// Returning to live is the moment to run it: drop manual state and let
+			// the forced full clear+replay land them at the live bottom.
+			this.#manualViewportTop = undefined;
+			this.#manualViewportAnchor = null;
+			this.#manualViewportFallbackAnchors = [];
+			this.#reconcileMissingViewportAnchor = false;
+			this.#manualOutputNotice = false;
+			this.#committedTranscriptRows = [];
+			this.#paintedManualOutputNotice = false;
+			this.requestRender(true, "resize.width-settled.deferred");
+			return true;
+		}
 		const height = this.terminal.rows;
 		const width = this.terminal.columns;
 		const paddedLiveLines = this.#padBeforeBottomPinnedComponent(
@@ -1639,6 +1654,11 @@ export class TUI extends Container {
 			this.#widthSettleTimer = undefined;
 			if (this.#stopped) return;
 			this.#widthSettleRepairPending = true;
+			// While the user is reading scrollback (manual viewport), a forced
+			// clear+replay would rip them out of history mid-read. Keep the flag
+			// armed instead; followLiveViewport() runs the deferred repair the
+			// moment they return to live.
+			if (this.#manualViewportTop !== undefined) return;
 			this.requestRender(true, "resize.width-settled");
 		}, TUI.#WIDTH_SETTLE_MS);
 		this.#widthSettleTimer.unref?.();
@@ -3027,8 +3047,8 @@ export class TUI extends Container {
 
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
-			logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
 			if (this.#widthSettleRepairPending) {
+				logRedraw(`width settled (${this.#previousWidth} -> ${width})`);
 				// The one debounced post-resize repair: a full clear+replay so stale
 				// old-width wrapping is repaired in scrollback history too, not just
 				// the live viewport. forceScrollbackClear erases the stale-width
@@ -3038,6 +3058,7 @@ export class TUI extends Container {
 				this.#widthSettleRepairPending = false;
 				fullRender(true, "width settled", true);
 			} else if (useViewportRepaintPath(this.terminal)) {
+				logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
 				// In viewport-repaint sessions a per-event full replay can either pile
 				// the transcript back onto scrollback (tmux/screen) or visibly jump to
 				// the transcript top (Windows Terminal). Repaint the viewport only,
@@ -3045,6 +3066,7 @@ export class TUI extends Container {
 				// changes from requestRender(true).
 				viewportRepaint(`terminal width changed (${this.#previousWidth} -> ${width})`);
 			} else {
+				logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
 				fullRender(true, "terminal width changed");
 			}
 			return;
