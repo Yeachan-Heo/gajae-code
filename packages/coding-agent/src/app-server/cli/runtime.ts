@@ -1,23 +1,28 @@
 // app-server CLI runtime: the `gjc app-server` command entry point.
 //
-// Replicates all codex app-server CLI entrypoints:
+// Implements this SUBSET of the codex app-server CLI entrypoints. Entries marked
+// NOT IMPLEMENTED are recognised codex surface this command does not provide;
+// entries marked GJC OVERRIDE deviate deliberately from upstream codex behaviour.
 //   gjc app-server                          (default stdio)
 //   gjc app-server --stdio                  (explicit stdio)
 //   gjc app-server --listen stdio://        (explicit stdio URL)
 //   gjc app-server --listen ws://IP:PORT    (WebSocket TCP)
 //   gjc app-server --listen unix://PATH     (WebSocket over Unix socket)
-//   gjc app-server --listen off             (no transport; valid standalone)
-//   gjc app-server proxy --sock PATH        (raw stream proxy to a Unix socket)
+//   gjc app-server --listen off             (no transport; GJC OVERRIDE, standalone)
+//   gjc app-server proxy --sock PATH        (NOT IMPLEMENTED: no proxy branch, no --sock flag)
 //   gjc app-server generate-ts --out DIR    (emit generated TypeScript types)
 //   gjc app-server generate-json-schema --out DIR (emit JSON Schema bundle)
 //
-// Auth flags (ws/unix non-loopback only, pinned from vendored behavior.json):
+// Auth flags: ws:// listeners beyond loopback require --ws-auth. Loopback ws://
+// listeners may omit authentication for local development. unix:// listeners may
+// omit authentication; filesystem socket permissions are their access boundary.
 //   --ws-auth capability-token|signed-bearer-token
 //   --ws-token-file | --ws-token-sha256 (mutually exclusive)
 //   --ws-shared-secret-file --ws-issuer --ws-audience --ws-max-clock-skew-seconds
 
-import { parseListenUrl, type ListenMode } from "../transport/listen";
-import { createAppServer, type AppServer } from "../create-app-server";
+import { createAppServerRuntime } from "../create-app-server";
+import { parseWsAuthFlags, type WsAuthConfig } from "../transport/auth";
+import { isLoopback, type ListenMode, parseListenUrl } from "../transport/listen";
 
 export interface AppServerCliArgs {
 	listen?: string;
@@ -37,6 +42,7 @@ export interface ResolvedAppServerConfig {
 	mode: ListenMode;
 	maxFrameBytes: number;
 	maxLoadedThreads: number;
+	wsAuth?: WsAuthConfig;
 }
 
 /**
@@ -52,11 +58,59 @@ export function resolveAppServerArgs(args: AppServerCliArgs): ResolvedAppServerC
 	if (maxLoadedThreads !== undefined && (!Number.isInteger(maxLoadedThreads) || maxLoadedThreads < 1)) {
 		throw new Error("--max-loaded-threads must be a positive integer");
 	}
+	const hasWsAuthArg = [
+		args.wsAuth,
+		args.wsTokenFile,
+		args.wsTokenSha256,
+		args.wsSharedSecretFile,
+		args.wsIssuer,
+		args.wsAudience,
+		args.wsMaxClockSkewSeconds,
+	].some(value => value !== undefined);
+	const wsAuth = hasWsAuthArg
+		? parseWsAuthFlags({
+				"ws-auth": args.wsAuth,
+				"ws-token-file": args.wsTokenFile,
+				"ws-token-sha256": args.wsTokenSha256,
+				"ws-shared-secret-file": args.wsSharedSecretFile,
+				"ws-issuer": args.wsIssuer,
+				"ws-audience": args.wsAudience,
+				"ws-max-clock-skew-seconds": args.wsMaxClockSkewSeconds,
+			})
+		: undefined;
+	if (mode.kind === "ws" && !isLoopback(mode) && !wsAuth) {
+		throw new Error(
+			"non-loopback ws:// listeners require authentication; configure --ws-auth with --ws-token-file or --ws-token-sha256",
+		);
+	}
 	return {
 		mode,
 		maxFrameBytes: maxFrameBytes ?? 4 * 1024 * 1024,
 		maxLoadedThreads: maxLoadedThreads ?? 16,
+		wsAuth,
 	};
+}
+
+export interface StdioWriter {
+	write(frame: Uint8Array): boolean;
+	once(event: "drain" | "error", listener: (() => void) | ((error: Error) => void)): void;
+	off(event: "drain" | "error", listener: (() => void) | ((error: Error) => void)): void;
+}
+
+export function writeStdioFrame(writer: StdioWriter, frame: Uint8Array): Promise<void> {
+	if (writer.write(frame)) return Promise.resolve();
+	return new Promise<void>((resolve, reject) => {
+		const onDrain = () => {
+			writer.off("error", onError);
+			resolve();
+		};
+		const onError = (error: Error) => {
+			writer.off("drain", onDrain);
+			reject(error);
+		};
+		writer.once("drain", onDrain);
+		writer.once("error", onError);
+	});
 }
 
 /**
@@ -65,18 +119,22 @@ export function resolveAppServerArgs(args: AppServerCliArgs): ResolvedAppServerC
  * production stdio entry point.
  */
 export async function runStdioServer(config: ResolvedAppServerConfig): Promise<void> {
-	const server = createAppServer({ maxLoadedThreads: config.maxLoadedThreads }, { maxFrameBytes: config.maxFrameBytes });
+	const runtime = createAppServerRuntime(
+		{ maxLoadedThreads: config.maxLoadedThreads },
+		{ maxFrameBytes: config.maxFrameBytes },
+	);
 	const readline = require("node:readline");
 	const rl = readline.createInterface({ input: process.stdin, terminal: false });
-	rl.on("line", (line: string) => {
-		const result = server.process(new TextEncoder().encode(line), "stdio");
-		if (result.response) {
-			process.stdout.write(result.response);
-		}
-	});
-	return new Promise(resolve => {
-		rl.on("close", () => resolve());
-	});
+	const connection = runtime.createConnection(
+		frame => writeStdioFrame(process.stdout, frame),
+		"stdio",
+		() => rl.close(),
+	);
+	try {
+		for await (const line of rl) await connection.process(new TextEncoder().encode(line));
+	} finally {
+		await connection.close();
+	}
 }
 
 /**
@@ -87,7 +145,12 @@ export async function generateTs(outDir: string): Promise<void> {
 	const { join } = require("node:path");
 	const source = join(__dirname, "..", "protocol-source");
 	mkdirSync(outDir, { recursive: true });
-	for (const file of ["types.generated.ts", "validators.generated.ts", "catalogs.generated.ts", "support-manifest.generated.ts"]) {
+	for (const file of [
+		"types.generated.ts",
+		"validators.generated.ts",
+		"catalogs.generated.ts",
+		"support-manifest.generated.ts",
+	]) {
 		const src = join(source, file);
 		if (!existsSync(src)) throw new Error(`Generated artifact not found: ${file}`);
 		copyFileSync(src, join(outDir, file));

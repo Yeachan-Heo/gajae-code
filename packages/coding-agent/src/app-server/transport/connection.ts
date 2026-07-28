@@ -1,95 +1,97 @@
 // app-server per-connection bounded outbound queue.
 //
-// Each transport connection gets its own bounded queue. When the queue saturates, the
-// slow-client policy kicks in:
-//   - stdio: pause reading stdin until the outbound drains (backpressure).
-//   - websocket/unix: disconnect the connection after the queue exhausts (the connection
-//     is too slow to keep up; reconnect will replay missed events via the event stream).
+// Each transport connection gets its own bounded queue. A slow writer pauses producers
+// until the outbound queue drains, preserving every accepted frame in FIFO order.
 
 export interface BoundedOutboundOptions {
-	/** Max queued outbound frames before slow-client policy triggers. */
+	/** Max queued outbound frames before producers wait for capacity. */
 	readonly capacity?: number;
 	/** Called to actually send a frame to the transport. */
 	readonly send: (frame: Uint8Array) => Promise<void>;
-	/** Called when the queue saturates and the slow-client policy triggers. */
-	readonly onSlowClient?: () => void;
 }
 
-const DEFAULT_CAPACITY = 256;
+export const DEFAULT_OUTBOUND_QUEUE_CAPACITY = 256;
 
 export class BoundedOutboundQueue {
 	readonly #capacity: number;
 	readonly #send: (frame: Uint8Array) => Promise<void>;
-	readonly #onSlowClient?: () => void;
-	#queue: Uint8Array[] = [];
-	#flushing = false;
+	#queue: Array<{ frame: Uint8Array; completion: PromiseWithResolvers<void> }> = [];
+	#spaceWaiters: Array<() => void> = [];
 	#closed = false;
-	#dropped = 0;
+	#failure: Error | undefined;
+	#flushPromise: Promise<void> | undefined;
 
 	constructor(options: BoundedOutboundOptions) {
-		this.#capacity = options.capacity ?? DEFAULT_CAPACITY;
+		this.#capacity = options.capacity ?? DEFAULT_OUTBOUND_QUEUE_CAPACITY;
 		this.#send = options.send;
-		this.#onSlowClient = options.onSlowClient;
 	}
 
 	get queued(): number {
 		return this.#queue.length;
 	}
-	get dropped(): number {
-		return this.#dropped;
-	}
+
 	get closed(): boolean {
 		return this.#closed;
 	}
 
-	/**
-	 * Enqueue a frame. Returns true if accepted, false if the queue is closed or the
-	 * slow-client policy has been triggered (caller should stop reading / disconnect).
-	 */
-	enqueue(frame: Uint8Array): boolean {
-		if (this.#closed) return false;
-		if (this.#queue.length >= this.#capacity) {
-			this.#dropped++;
-			this.#onSlowClient?.();
-			return false;
+	/** Enqueue a frame, waiting for room rather than dropping a slow client's frames. */
+	async enqueue(frame: Uint8Array): Promise<boolean> {
+		while (!this.#closed && !this.#failure && this.#queue.length >= this.#capacity) {
+			await new Promise<void>(resolve => this.#spaceWaiters.push(resolve));
 		}
-		this.#queue.push(frame);
-		void this.#flush();
+		if (this.#failure) throw this.#failure;
+		if (this.#closed) return false;
+		const completion = Promise.withResolvers<void>();
+		this.#queue.push({ frame, completion });
+		this.#startFlush();
+		await completion.promise;
 		return true;
 	}
 
-	/** Close the queue; no more frames accepted. Pending frames are flushed. */
+	/** Close the queue; no more frames accepted. A terminal writer failure is reported to the caller. */
 	async close(): Promise<void> {
 		this.#closed = true;
-		await this.#drain();
+		this.#releaseAllSpace();
+		await this.#flushPromise;
+		if (this.#failure) throw this.#failure;
+	}
+
+	#releaseSpace(): void {
+		this.#spaceWaiters.shift()?.();
+	}
+
+	#releaseAllSpace(): void {
+		for (const resolve of this.#spaceWaiters.splice(0)) resolve();
+	}
+
+	#fail(error: unknown): void {
+		if (this.#failure) return;
+		this.#failure = error instanceof Error ? error : new Error(String(error));
+		for (const queued of this.#queue.splice(0)) queued.completion.reject(this.#failure);
+		this.#releaseAllSpace();
+	}
+
+	#startFlush(): void {
+		if (this.#flushPromise || this.#failure) return;
+		let settled: Promise<void>;
+		settled = this.#flush().finally(() => {
+			if (this.#flushPromise !== settled) return;
+			this.#flushPromise = undefined;
+			if (this.#queue.length > 0 && !this.#failure) this.#startFlush();
+		});
+		this.#flushPromise = settled;
 	}
 
 	async #flush(): Promise<void> {
-		if (this.#flushing) return;
-		this.#flushing = true;
-		try {
-			while (this.#queue.length > 0 && !this.#closed) {
-				const frame = this.#queue.shift()!;
-				try {
-					await this.#send(frame);
-				} catch {
-					// Transport send failed; re-enqueue and stop (caller handles disconnect).
-					this.#queue.unshift(frame);
-					break;
-				}
-			}
-		} finally {
-			this.#flushing = false;
-		}
-	}
-
-	async #drain(): Promise<void> {
-		while (this.#queue.length > 0) {
-			const frame = this.#queue.shift()!;
+		while (this.#queue.length > 0 && !this.#failure) {
+			const queued = this.#queue[0]!;
 			try {
-				await this.#send(frame);
-			} catch {
-				break;
+				await this.#send(queued.frame);
+				this.#queue.shift();
+				queued.completion.resolve();
+				this.#releaseSpace();
+			} catch (error) {
+				this.#fail(error);
 			}
 		}
 	}

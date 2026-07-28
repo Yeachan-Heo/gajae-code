@@ -1,14 +1,90 @@
 import { Command, Flags } from "@gajae-code/utils/cli";
-import { resolveAppServerArgs, runStdioServer, generateTs, generateJsonSchema, type AppServerCliArgs } from "../app-server/cli/runtime";
-import { createAppServer } from "../app-server/create-app-server";
+import {
+	type AppServerCliArgs,
+	generateJsonSchema,
+	generateTs,
+	resolveAppServerArgs,
+	runStdioServer,
+} from "../app-server/cli/runtime";
+import { type AppServerConnection, createAppServerRuntime } from "../app-server/create-app-server";
+import { checkWsAuth, type WsAuthConfig } from "../app-server/transport/auth";
+
+export interface AppServerWebSocket {
+	send(frame: Uint8Array): number;
+	close?(code?: number, reason?: string): void;
+}
+
+export interface AppServerWebSocketWriter {
+	readonly writer: (frame: Uint8Array) => Promise<void>;
+	drain(): void;
+	fail(error: Error): void;
+}
+
+/** Adapts Bun's synchronous send status into the app-server's awaitable writer contract. */
+export function createAppServerWebSocketWriter(ws: AppServerWebSocket): AppServerWebSocketWriter {
+	let waiting: PromiseWithResolvers<void> | undefined;
+	let failure: Error | undefined;
+	return {
+		writer: async frame => {
+			if (failure) throw failure;
+			const status = ws.send(frame);
+			if (status > 0) return;
+			if (status === 0) throw new Error("WebSocket dropped outbound app-server frame");
+			waiting ??= Promise.withResolvers<void>();
+			await waiting.promise;
+			if (failure) throw failure;
+		},
+		drain: () => {
+			waiting?.resolve();
+			waiting = undefined;
+		},
+		fail: error => {
+			failure ??= error;
+			waiting?.reject(failure);
+			waiting = undefined;
+		},
+	};
+}
+
+/** Close a peer that sent a malformed or oversized framed message. */
+export function closeRejectedWebSocket(ws: AppServerWebSocket, reason: "malformed" | "oversize"): void {
+	if (reason === "oversize") ws.close?.(1009, "Message too big");
+	else ws.close?.(1002, "Protocol error");
+}
+
+function handleTransportFailure(connection: AppServerConnection, error: unknown): void {
+	void connection.close().catch(closeError => {
+		process.stderr.write(`app-server: failed to close transport after error: ${String(closeError)}\n`);
+	});
+	process.stderr.write(`app-server: transport connection failed: ${String(error)}\n`);
+}
+
+function unauthorizedUpgradeResponse(request: Request, wsAuth: WsAuthConfig | undefined): Response | undefined {
+	if (!wsAuth) return undefined;
+	try {
+		const result = checkWsAuth(wsAuth, Object.fromEntries(request.headers.entries()));
+		if (result.ok) return undefined;
+		return new Response("Unauthorized", {
+			status: result.statusCode,
+			headers: result.wwwAuthenticate ? { "WWW-Authenticate": result.wwwAuthenticate } : undefined,
+		});
+	} catch {
+		return new Response("Service Unavailable", { status: 503 });
+	}
+}
 
 export default class AppServer extends Command {
-	static description = "Run the gjc app-server — a JSON-RPC server with 100% codex app-server interface parity.";
+	static description = "Run the gjc app-server — a JSON-RPC protocol subset in progress.";
 	static strict = false;
 	static flags = {
 		stdio: Flags.boolean({ description: "Use stdio transport (default)" }),
-		listen: Flags.string({ description: "Listen URL: stdio:// (default), ws://IP:PORT, unix://PATH, or off" }),
-		"ws-auth": Flags.string({ description: "WebSocket auth mode: capability-token|signed-bearer-token" }),
+		listen: Flags.string({
+			description:
+				"Listen URL: stdio:// (default), ws://IP:PORT, unix://PATH, or off. Non-loopback ws:// requires --ws-auth; loopback ws:// and unix:// may omit it for local development and filesystem-permission-protected sockets.",
+		}),
+		"ws-auth": Flags.string({
+			description: "WebSocket auth mode required for non-loopback ws://: capability-token|signed-bearer-token",
+		}),
 		"ws-token-file": Flags.string({ description: "Capability token file path" }),
 		"ws-token-sha256": Flags.string({ description: "Expected SHA-256 of the capability token" }),
 		"ws-shared-secret-file": Flags.string({ description: "Signed-bearer shared secret file path" }),
@@ -18,7 +94,6 @@ export default class AppServer extends Command {
 		"max-frame-bytes": Flags.string({ description: "Maximum inbound frame size in bytes" }),
 		"max-loaded-threads": Flags.string({ description: "Maximum number of loaded threads" }),
 		out: Flags.string({ description: "Output directory for generate-ts / generate-json-schema" }),
-		json: Flags.boolean({ description: "Output JSON" }),
 	};
 	static examples = [
 		"$ gjc app-server --stdio",
@@ -60,27 +135,29 @@ export default class AppServer extends Command {
 			wsMaxClockSkewSeconds: flags["ws-max-clock-skew-seconds"] as string | undefined,
 		};
 		const config = resolveAppServerArgs(args);
-		const server = createAppServer({ maxLoadedThreads: config.maxLoadedThreads }, { maxFrameBytes: config.maxFrameBytes });
-
 		if (config.mode.kind === "stdio") {
-			const readline = require("node:readline");
-			const rl = readline.createInterface({ input: process.stdin, terminal: false });
-			rl.on("line", (line: string) => {
-				const result = server.process(new TextEncoder().encode(line), "stdio");
-				if (result.response) process.stdout.write(result.response);
-			});
-			return new Promise(resolve => { rl.on("close", () => resolve()); });
+			return runStdioServer(config);
 		}
 		if (config.mode.kind === "off") {
 			// Valid standalone mode: no transport, no probes, idle until signal.
 			return new Promise(resolve => {
-				process.on("SIGTERM", () => { process.exitCode = 0; resolve(); });
-				process.on("SIGINT", () => { process.exitCode = 0; resolve(); });
+				process.on("SIGTERM", () => {
+					process.exitCode = 0;
+					resolve();
+				});
+				process.on("SIGINT", () => {
+					process.exitCode = 0;
+					resolve();
+				});
 			});
 		}
 		// ws:// and unix:// listeners: bind a Bun WebSocket server.
 		if (config.mode.kind === "ws") {
 			const { host, port } = config.mode;
+			const runtime = createAppServerRuntime(
+				{ maxLoadedThreads: config.maxLoadedThreads },
+				{ maxFrameBytes: config.maxFrameBytes },
+			);
 			const wsServer = Bun.serve({
 				port,
 				hostname: host,
@@ -92,65 +169,116 @@ export default class AppServer extends Command {
 					if (req.method === "GET" && (url.pathname === "/readyz" || url.pathname === "/healthz")) {
 						return new Response("OK", { status: 200 });
 					}
+					const unauthorized = unauthorizedUpgradeResponse(req, config.wsAuth);
+					if (unauthorized) return unauthorized;
 					if (server.upgrade(req)) return;
 					return new Response("Not Found", { status: 404 });
 				},
 				websocket: {
 					open(ws) {
-						// Each connection gets its own connection state via a fresh AppServer.
-						(ws as unknown as { _server: ReturnType<typeof createAppServer> })._server = createAppServer(
-							{ maxLoadedThreads: config.maxLoadedThreads },
-							{ maxFrameBytes: config.maxFrameBytes },
+						const writer = createAppServerWebSocketWriter(ws);
+						(ws as unknown as { _connection: AppServerConnection; _writer: AppServerWebSocketWriter })._writer =
+							writer;
+						(
+							ws as unknown as { _connection: AppServerConnection; _writer: AppServerWebSocketWriter }
+						)._connection = runtime.createConnection(writer.writer, "websocket", reason =>
+							closeRejectedWebSocket(ws, reason),
 						);
 					},
 					message(ws, message) {
-						const connServer = (ws as unknown as { _server: ReturnType<typeof createAppServer> })._server;
+						const connection = (ws as unknown as { _connection: AppServerConnection })._connection;
 						const text = typeof message === "string" ? message : new TextDecoder().decode(message);
-						const result = connServer.process(new TextEncoder().encode(text), "websocket");
-						if (result.response) ws.send(new TextDecoder().decode(result.response));
+						void connection
+							.process(new TextEncoder().encode(text))
+							.catch(error => handleTransportFailure(connection, error));
+					},
+					drain(ws) {
+						(ws as unknown as { _writer: AppServerWebSocketWriter })._writer.drain();
+					},
+					close(ws) {
+						const socket = ws as unknown as {
+							_connection: AppServerConnection;
+							_writer: AppServerWebSocketWriter;
+						};
+						socket._writer.fail(new Error("WebSocket closed"));
+						void socket._connection.close().catch(error => handleTransportFailure(socket._connection, error));
 					},
 				},
 			});
 			process.stderr.write(`app-server: ws:// listening on ${host}:${port}\n`);
 			return new Promise(resolve => {
-				process.on("SIGTERM", () => { wsServer.stop(); resolve(); });
-				process.on("SIGINT", () => { wsServer.stop(); resolve(); });
+				process.on("SIGTERM", () => {
+					wsServer.stop();
+					resolve();
+				});
+				process.on("SIGINT", () => {
+					wsServer.stop();
+					resolve();
+				});
 			});
 		}
 		// unix:// — same WebSocket-over-Unix semantics.
 		if (config.mode.kind === "unix" && config.mode.path) {
 			const socketPath = config.mode.path;
+			const runtime = createAppServerRuntime(
+				{ maxLoadedThreads: config.maxLoadedThreads },
+				{ maxFrameBytes: config.maxFrameBytes },
+			);
 			const wsServer = Bun.serve({
 				unix: socketPath,
-			fetch(req, server) {
+				fetch(req, server) {
 					const url = new URL(req.url);
 					const origin = req.headers.get("origin");
 					if (origin) return new Response("Forbidden", { status: 403 });
 					if (req.method === "GET" && (url.pathname === "/readyz" || url.pathname === "/healthz")) {
 						return new Response("OK", { status: 200 });
 					}
+					const unauthorized = unauthorizedUpgradeResponse(req, config.wsAuth);
+					if (unauthorized) return unauthorized;
 					if (server.upgrade(req)) return;
 					return new Response("Not Found", { status: 404 });
 				},
 				websocket: {
 					open(ws) {
-						(ws as unknown as { _server: ReturnType<typeof createAppServer> })._server = createAppServer(
-							{ maxLoadedThreads: config.maxLoadedThreads },
-							{ maxFrameBytes: config.maxFrameBytes },
+						const writer = createAppServerWebSocketWriter(ws);
+						(ws as unknown as { _connection: AppServerConnection; _writer: AppServerWebSocketWriter })._writer =
+							writer;
+						(
+							ws as unknown as { _connection: AppServerConnection; _writer: AppServerWebSocketWriter }
+						)._connection = runtime.createConnection(writer.writer, "unix", reason =>
+							closeRejectedWebSocket(ws, reason),
 						);
 					},
 					message(ws, message) {
-						const connServer = (ws as unknown as { _server: ReturnType<typeof createAppServer> })._server;
+						const connection = (ws as unknown as { _connection: AppServerConnection })._connection;
 						const text = typeof message === "string" ? message : new TextDecoder().decode(message);
-						const result = connServer.process(new TextEncoder().encode(text), "unix");
-						if (result.response) ws.send(new TextDecoder().decode(result.response));
+						void connection
+							.process(new TextEncoder().encode(text))
+							.catch(error => handleTransportFailure(connection, error));
+					},
+					drain(ws) {
+						(ws as unknown as { _writer: AppServerWebSocketWriter })._writer.drain();
+					},
+					close(ws) {
+						const socket = ws as unknown as {
+							_connection: AppServerConnection;
+							_writer: AppServerWebSocketWriter;
+						};
+						socket._writer.fail(new Error("WebSocket closed"));
+						void socket._connection.close().catch(error => handleTransportFailure(socket._connection, error));
 					},
 				},
 			});
 			process.stderr.write(`app-server: unix:// listening on ${socketPath}\n`);
 			return new Promise(resolve => {
-				process.on("SIGTERM", () => { wsServer.stop(); resolve(); });
-				process.on("SIGINT", () => { wsServer.stop(); resolve(); });
+				process.on("SIGTERM", () => {
+					wsServer.stop();
+					resolve();
+				});
+				process.on("SIGINT", () => {
+					wsServer.stop();
+					resolve();
+				});
 			});
 		}
 	}

@@ -6,6 +6,12 @@
 // and cancels only on turn/thread transition, shutdown, or loss of the last responder.
 
 export type ServerRequestStatus = "pending" | "resolved" | "cancelled";
+export type ServerRequestOutcome = "result" | "error";
+
+export interface ServerRequestError {
+	readonly code: number;
+	readonly message: string;
+}
 
 export interface ServerRequest {
 	readonly id: string;
@@ -14,7 +20,9 @@ export interface ServerRequest {
 	readonly threadId: string;
 	readonly eligibleConnections: Set<string>;
 	status: ServerRequestStatus;
+	outcome: ServerRequestOutcome | undefined;
 	result: unknown;
+	error: ServerRequestError | undefined;
 	resolvedBy: string | undefined;
 	createdAt: number;
 }
@@ -42,11 +50,22 @@ export class ServerRequestBroker {
 		return this.#pending.size;
 	}
 
+	/** Look up a pending request without changing its lifecycle. */
+	getPending(id: string): ServerRequest | undefined {
+		return this.#pending.get(id);
+	}
+
 	/**
 	 * Create a pending server request and return it. The caller (transport) sends the
 	 * request frame to each eligible connection. Returns undefined if no eligible connections.
 	 */
-	create(id: string, method: string, params: unknown, threadId: string, eligibleConnections: Set<string>): ServerRequest | undefined {
+	create(
+		id: string,
+		method: string,
+		params: unknown,
+		threadId: string,
+		eligibleConnections: Set<string>,
+	): ServerRequest | undefined {
 		if (eligibleConnections.size === 0) return undefined;
 		const request: ServerRequest = {
 			id,
@@ -55,7 +74,9 @@ export class ServerRequestBroker {
 			threadId,
 			eligibleConnections: new Set(eligibleConnections),
 			status: "pending",
+			outcome: undefined,
 			result: undefined,
+			error: undefined,
 			resolvedBy: undefined,
 			createdAt: Date.now(),
 		};
@@ -66,10 +87,24 @@ export class ServerRequestBroker {
 	/** Resolve a pending request with the first responder's result. */
 	resolve(id: string, connectionId: string, result: unknown): boolean {
 		const request = this.#pending.get(id);
-		if (!request || request.status !== "pending") return false;
+		if (request?.status !== "pending") return false;
 		if (!request.eligibleConnections.has(connectionId)) return false;
 		(request as { status: ServerRequestStatus }).status = "resolved";
+		(request as { outcome: ServerRequestOutcome }).outcome = "result";
 		(request as { result: unknown }).result = result;
+		(request as { resolvedBy: string }).resolvedBy = connectionId;
+		this.#pending.delete(id);
+		return true;
+	}
+
+	/** Resolve a pending request with an error response from the first responder. */
+	resolveError(id: string, connectionId: string, error: ServerRequestError): boolean {
+		const request = this.#pending.get(id);
+		if (request?.status !== "pending") return false;
+		if (!request.eligibleConnections.has(connectionId)) return false;
+		(request as { status: ServerRequestStatus }).status = "resolved";
+		(request as { outcome: ServerRequestOutcome }).outcome = "error";
+		(request as { error: ServerRequestError }).error = error;
 		(request as { resolvedBy: string }).resolvedBy = connectionId;
 		this.#pending.delete(id);
 		return true;
@@ -86,6 +121,15 @@ export class ServerRequestBroker {
 			return "cancelled";
 		}
 		return "updated";
+	}
+
+	/** Remove a disconnected connection from every pending request. */
+	handleDisconnect(connectionId: string): number {
+		let cancelled = 0;
+		for (const id of this.#pending.keys()) {
+			if (this.removeConnection(id, connectionId) === "cancelled") cancelled++;
+		}
+		return cancelled;
 	}
 
 	/** Cancel a request (on turn/thread transition or shutdown). */

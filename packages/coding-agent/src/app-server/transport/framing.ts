@@ -76,9 +76,10 @@ export function decodeLine(line: Uint8Array, options: FrameCodecOptions = {}): D
 }
 
 /** Coerce a decoded `id` to the wire-legal union, or `undefined` for notifications. */
-function coerceId(value: unknown): JsonRpcId | undefined {
+export function coerceId(value: unknown): JsonRpcId | undefined {
 	if (typeof value === "string" && value.length > 0) return value;
-	if (typeof value === "number" && Number.isFinite(value) && Number.isSafeInteger(value)) return value;
+	if (typeof value === "number" && Number.isFinite(value) && Number.isSafeInteger(value) && !Object.is(value, -0))
+		return value;
 	return undefined;
 }
 
