@@ -36,6 +36,16 @@
 						"disabled"
 					],
 					"default": "copy-retain"
+				},
+				"resumeModelBehavior": {
+					"type": "string",
+					"enum": [
+						"keepSessionModel",
+						"useCurrentDefault",
+						"ask"
+					],
+					"description": "When resuming a session: keep the model that session last used, switch to the currently configured default model, or ask (TUI only; falls back to keeping the session's model in headless/CLI resume).",
+					"default": "keepSessionModel"
 				}
 			},
 			"additionalProperties": false
@@ -93,6 +103,16 @@
 								}
 							},
 							"additionalProperties": false
+						},
+						"sound": {
+							"type": "string",
+							"enum": [
+								"all",
+								"important",
+								"none"
+							],
+							"description": "Choose which Telegram notifications play a sound.",
+							"default": "all"
 						},
 						"rich": {
 							"type": "object",

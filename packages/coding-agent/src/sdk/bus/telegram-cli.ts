@@ -22,7 +22,7 @@ import * as path from "node:path";
 import { $credentialEnv, getAgentDir } from "@gajae-code/utils";
 import { tokenFingerprint } from "./config";
 import { isFreshLiveOwner, readOwnerFreshnessSnapshot } from "./telegram-daemon";
-import { runTelegramReferenceClient } from "./telegram-reference";
+import { runTelegramReferenceClient, type TelegramNotificationSound } from "./telegram-reference";
 
 interface CliArgs {
 	botToken?: string;
@@ -31,11 +31,14 @@ interface CliArgs {
 	sessionId?: string;
 	repo: string;
 	apiBase?: string;
+	sound: TelegramNotificationSound;
 	force: boolean;
 }
 
-function parseArgs(argv: string[]): CliArgs {
-	const args: CliArgs = { repo: process.cwd(), force: false };
+class CliUsageError extends Error {}
+
+export function parseArgs(argv: string[]): CliArgs {
+	const args: CliArgs = { repo: process.cwd(), sound: "all", force: false };
 	for (let i = 0; i < argv.length; i++) {
 		const next = () => argv[++i];
 		switch (argv[i]) {
@@ -57,6 +60,14 @@ function parseArgs(argv: string[]): CliArgs {
 			case "--api-base":
 				args.apiBase = next();
 				break;
+			case "--sound": {
+				const sound = next();
+				if (sound !== "all" && sound !== "important" && sound !== "none") {
+					throw new CliUsageError("--sound must be all, important, or none");
+				}
+				args.sound = sound;
+				break;
+			}
 			case "--force":
 				args.force = true;
 				break;
@@ -82,6 +93,7 @@ function printHelpAndExit(): never {
 			"  --session-id <id>       Resolve <repo>/.gjc/state/sdk/<id>.json",
 			"  --repo <dir>            Repo root for endpoint discovery (default: cwd)",
 			"  --api-base <url>        Telegram API base (default: https://api.telegram.org)",
+			"  --sound <all|important|none> Telegram notification sound (default: all)",
 			"  --force                 Bypass active daemon guard (debug only; may cause Telegram 409 conflicts)",
 			"",
 		].join("\n"),
@@ -149,7 +161,16 @@ async function activeDaemonOwnsToken(input: { botToken: string; chatId: string }
 }
 
 async function main(): Promise<void> {
-	const args = parseArgs(process.argv.slice(2));
+	let args: CliArgs;
+	try {
+		args = parseArgs(process.argv.slice(2));
+	} catch (error) {
+		if (error instanceof CliUsageError) {
+			process.stderr.write(`error: ${error.message}\n`);
+			process.exit(2);
+		}
+		throw error;
+	}
 	const apiBase = args.apiBase ?? "https://api.telegram.org";
 	// Trusted sources only: this token is the bot the client talks to, so whatever
 	// can set it receives the session's notifications and the operator's replies.
@@ -180,7 +201,7 @@ async function main(): Promise<void> {
 		process.exit(1);
 	}
 	process.stderr.write(`notifications: bridging ${endpointFile} <-> Telegram chat ${chatId}\n`);
-	await runTelegramReferenceClient({ botToken, chatId, endpointFile, apiBase });
+	await runTelegramReferenceClient({ botToken, chatId, endpointFile, apiBase, sound: args.sound });
 }
 
 if (import.meta.main) {

@@ -294,6 +294,17 @@ export const SETTINGS_SCHEMA = {
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
 	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
 	"notifications.telegram.streaming.enabled": { type: "boolean", default: true },
+	"notifications.telegram.sound": {
+		type: "enum",
+		values: ["all", "important", "none"] as const,
+		default: "all",
+		ui: {
+			tab: "notifications",
+			label: "Telegram Notification Sounds",
+			description: "Choose which Telegram notifications play a sound.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.telegram.rich.enabled": {
 		type: "boolean",
 		default: true,
@@ -3952,6 +3963,7 @@ export interface NotificationsSettings {
 	telegram: {
 		botToken: string | undefined;
 		chatId: string | undefined;
+		sound: "all" | "important" | "none";
 		btw: {
 			enabled: boolean;
 		};

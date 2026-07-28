@@ -60,27 +60,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 	const config = notificationConfigFromFile(loaded.value);
 	if (!config.enabled) return undefined;
 	if (kind === "discord") {
-		if (
-			!isDiscordConfigured({
-				...config,
-				sessionScope: "all",
-				idleTimeoutMs: 60_000,
-				rich: { enabled: true },
-				richDraft: { enabled: false },
-				toolActivity: { enabled: false },
-				topics: { nameTemplate: undefined },
-				btw: { enabled: true },
-				streaming: { enabled: true },
-			})
-		) {
+		if (!isDiscordConfigured(config)) {
 			throw new Error("Discord notifications are enabled but configuration is incomplete");
 		}
-		const discord = config.discord as {
-			botToken: string;
-			applicationId: string;
-			guildId: string;
-			parentChannelId: string;
-		};
+		const discord = config.discord;
 		const { botToken, applicationId, guildId, parentChannelId } = discord;
 		const identity = crypto
 			.createHash("sha256")
@@ -95,28 +78,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			presentation: { redact: config.redact, verbosity: config.verbosity },
 		};
 	}
-	if (
-		!isSlackConfigured({
-			...config,
-			sessionScope: "all",
-			idleTimeoutMs: 60_000,
-			rich: { enabled: true },
-			richDraft: { enabled: false },
-			toolActivity: { enabled: false },
-			topics: { nameTemplate: undefined },
-			btw: { enabled: true },
-			streaming: { enabled: true },
-		})
-	) {
+	if (!isSlackConfigured(config)) {
 		throw new Error("Slack notifications are enabled but configuration is incomplete");
 	}
-	const slack = config.slack as {
-		botToken: string;
-		appToken: string;
-		workspaceId: string;
-		channelId: string;
-		authorizedUserId?: string;
-	};
+	const slack = config.slack;
 	const { botToken, appToken, workspaceId, channelId, authorizedUserId } = slack;
 	const identity = crypto
 		.createHash("sha256")

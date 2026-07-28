@@ -32,6 +32,7 @@ export interface NotificationsEditorPreferences {
 	richDraftEnabled: boolean;
 	toolActivityEnabled: boolean;
 	streamingEnabled: boolean;
+	sound: "all" | "important" | "none";
 }
 
 /** Secret-safe snapshot used to render the Notifications tab. */
@@ -160,7 +161,8 @@ type HomeActionId =
 	| "reconnect"
 	| "remove"
 	| "preferences"
-	| "tool-activity";
+	| "tool-activity"
+	| "sound";
 
 interface Action {
 	id: HomeActionId | "telegram" | "external" | "save" | "save-inactive" | "cancel" | "confirm";
@@ -197,6 +199,7 @@ function emptyState(): NotificationsEditorState {
 			richDraftEnabled: false,
 			toolActivityEnabled: false,
 			streamingEnabled: true,
+			sound: "all",
 		},
 	};
 }
@@ -942,6 +945,9 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			case "test":
 				draft.streamingEnabled = !draft.streamingEnabled;
 				return;
+			case "sound":
+				draft.sound = draft.sound === "all" ? "important" : draft.sound === "important" ? "none" : "all";
+				return;
 			default:
 				return;
 		}
@@ -1091,6 +1097,11 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				id: "test",
 				label: `Telegram streaming: ${draft.streamingEnabled ? "on" : "off"}`,
 				description: "Toggle the unsaved Telegram streaming preference.",
+			},
+			{
+				id: "sound",
+				label: `Telegram notification sound: ${draft.sound}`,
+				description: "Cycle between all, important, and none notification sounds.",
 			},
 			{ id: "save", label: "Save preferences", description: "Atomically persist this preference draft." },
 			{ id: "cancel", label: "Cancel and discard draft", description: "Leave saved preferences unchanged." },

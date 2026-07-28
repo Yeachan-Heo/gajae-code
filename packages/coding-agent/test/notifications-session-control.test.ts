@@ -28,6 +28,7 @@ const BASE_CONFIG: NotificationConfig = {
 	redact: false,
 	verbosity: "lean",
 	sessionScope: "all",
+	sound: "important",
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },

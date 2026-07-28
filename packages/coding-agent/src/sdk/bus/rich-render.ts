@@ -62,7 +62,7 @@ export function shouldPromoteRich(input: { enabled?: boolean; send: ThreadedSend
  */
 export async function deliverRichWithFallback(
 	botApi: BotApi,
-	base: { chat_id: string | number; message_thread_id?: number },
+	base: { chat_id: string | number; message_thread_id?: number; disable_notification?: true },
 	send: ThreadedSend,
 	signal: AbortSignal,
 	fallbackDeliver: () => Promise<void>,
@@ -99,7 +99,7 @@ export async function deliverRichWithFallback(
  */
 export async function deliverRichActionWithFallback(
 	botApi: BotApi,
-	base: { chat_id: string | number; message_thread_id?: number },
+	base: { chat_id: string | number; message_thread_id?: number; disable_notification?: true },
 	opts: { markdown: string; replyMarkup?: unknown },
 	signal: AbortSignal,
 	htmlFallback: () => Promise<number | undefined>,

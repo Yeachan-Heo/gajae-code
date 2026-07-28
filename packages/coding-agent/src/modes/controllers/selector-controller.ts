@@ -352,6 +352,7 @@ export function createNotificationsEditorOperations(
 					richDraftEnabled: config.richDraft.enabled,
 					toolActivityEnabled: config.toolActivity.enabled,
 					streamingEnabled: config.streaming.enabled,
+					sound: config.sound,
 				},
 			};
 		},
@@ -725,6 +726,7 @@ export function createNotificationsEditorOperations(
 						{ path: "notifications.redact", op: "set", value: preferences.redact },
 						{ path: "notifications.verbosity", op: "set", value: preferences.verbosity },
 						{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
+						{ path: "notifications.telegram.sound", op: "set", value: preferences.sound },
 						{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
 						{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
 						{ path: "notifications.telegram.streaming.enabled", op: "set", value: preferences.streamingEnabled },
