@@ -60,6 +60,13 @@ const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s
 /** Literal `sh|bash|zsh -c '<script>'` payloads whose nested script must also be scanned. */
 const BASH_NESTED_SHELL_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:ba|z|da)?sh\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*c\s+(?:(')([^']*)'|(")([^"]*)")/g;
+/** Heredoc opener (`<<`/`<<-` plus an optionally quoted delimiter); `<<<` here-strings excluded. */
+const BASH_HEREDOC_OPEN_RE = /(?<!<)<<(?!<)(-?)\s*(?:'([^'\s]+)'|"([^"\s]+)"|(\\)?([A-Za-z_][\w.-]*))/g;
+/** Opener-line interpreters that execute their stdin, making a heredoc body live shell/script code. */
+const BASH_HEREDOC_SCRIPT_CONSUMER_RE =
+	/(?:^|[\s;&|(`])(?:[^\s;&|()`]*\/)?(?:(?:ba|z|da|k)?sh|python3?|node|bun|deno|ruby|perl|php|eval|source|xargs|parallel)(?=[\s;&|)`<]|$)/i;
+/** Opener-line stdin appliers whose heredoc body mutates files in ways no body scan can model. */
+const BASH_HEREDOC_MUTATING_CONSUMER_RE = /(?:^|[\s;&|(`])(?:[^\s;&|()`]*\/)?(?:patch|ed|ex|sqlite3)(?=[\s;&|)`<]|$)/i;
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -418,6 +425,69 @@ function isDeviceSinkPath(value: string): boolean {
 	return DEVICE_SINK_PATHS.has(cleanShellWord(value));
 }
 
+interface HeredocMaskResult {
+	masked: string;
+	/** An unquoted-delimiter heredoc body carried `$(…)`/backtick expansion — live code the scanner cannot model. */
+	opaqueExpansion: boolean;
+	/** The heredoc feeds a stdin applier (patch/ed/ex/sqlite3) whose body mutates files no scan can attribute. */
+	mutatingConsumer: boolean;
+}
+
+/**
+ * Blank out heredoc BODY lines so document payloads (markdown specs, plans,
+ * fixtures) piped to a data consumer (`cat <<'EOF' > /tmp/spec.md`) are not
+ * misread as shell commands: body text like `a > b` or stray apostrophes must
+ * not register redirection targets or unbalance the quote masker. Bodies stay
+ * UNMASKED (scanned as today) when the opener line feeds a script consumer
+ * (sh/python/patch/…), because there the body is live code. Unquoted-delimiter
+ * bodies still expand `$(…)`/backticks in real shells, so those flag
+ * `opaqueExpansion` and the caller fails closed. An unterminated heredoc is not
+ * statically maskable; the original text is returned so the scanner stays
+ * fail-closed rather than blind.
+ */
+function maskHeredocBodies(command: string): HeredocMaskResult {
+	if (!command.includes("<<")) return { masked: command, opaqueExpansion: false, mutatingConsumer: false };
+	const lines = command.split("\n");
+	const out: string[] = [];
+	let opaqueExpansion = false;
+	let mutatingConsumer = false;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index] ?? "";
+		out.push(line);
+		// Per-line quote masking decides whether a `<<` (and the consumer name) is
+		// real syntax or quoted data on this opener line.
+		const visible = maskSingleQuotedSpans(line);
+		const scriptConsumer = BASH_HEREDOC_SCRIPT_CONSUMER_RE.test(visible);
+		const mutatesFromStdin = BASH_HEREDOC_MUTATING_CONSUMER_RE.test(visible);
+		for (const match of line.matchAll(BASH_HEREDOC_OPEN_RE)) {
+			const at = match.index ?? 0;
+			if (visible.slice(at, at + 2) !== "<<") continue;
+			const delimiter = match[2] ?? match[3] ?? match[5] ?? "";
+			if (!delimiter) continue;
+			if (mutatesFromStdin) mutatingConsumer = true;
+			const quoted = match[2] !== undefined || match[3] !== undefined || match[4] !== undefined;
+			const stripTabs = match[1] === "-";
+			let end = -1;
+			for (let scan = index + 1; scan < lines.length; scan++) {
+				const candidate = stripTabs ? (lines[scan] ?? "").replace(/^\t+/, "") : (lines[scan] ?? "");
+				if (candidate === delimiter) {
+					end = scan;
+					break;
+				}
+			}
+			if (end === -1) return { masked: command, opaqueExpansion, mutatingConsumer };
+			for (let body = index + 1; body < end; body++) {
+				const bodyLine = lines[body] ?? "";
+				if (!quoted && /\$\(|`/.test(bodyLine)) opaqueExpansion = true;
+				out.push(scriptConsumer ? bodyLine : "");
+			}
+			out.push(lines[end] ?? "");
+			index = end;
+		}
+	}
+	return { masked: out.join("\n"), opaqueExpansion, mutatingConsumer };
+}
+
 function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -440,10 +510,21 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		if (nested.unknown) targets.unknown = true;
 		if (nested.explicitMutation) targets.explicitMutation = true;
 	}
+	// Heredoc bodies fed to data consumers are inert document payloads; mask them
+	// so spec/plan text cannot fake redirections. Script-consumer bodies survive
+	// the mask and are still scanned as live code below.
+	const heredoc = maskHeredocBodies(command);
+	if (heredoc.opaqueExpansion || heredoc.mutatingConsumer) {
+		targets.explicitMutation = true;
+		targets.unknown = true;
+	}
 	// Nested scripts were read from the raw text above; every scanner below works
 	// on the masked view so quoted argument data cannot look like a redirection.
-	const scanned = maskSingleQuotedSpans(command);
-	if (BASH_OPAQUE_INTERPRETER_WRITE_RE.test(command) || BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(command)) {
+	const scanned = maskSingleQuotedSpans(heredoc.masked);
+	if (
+		BASH_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked) ||
+		BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)
+	) {
 		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
@@ -502,6 +583,9 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
 			if (!cleaned || cleaned.startsWith("-")) continue;
+			// Redirection/heredoc operator words (`>/dev/null`, `<<'DOC'`, `2>&1`) are
+			// not argument paths; their targets are captured by the redirect scanners.
+			if (/^\d*[<>]/.test(cleaned)) continue;
 			addPath(targets, cleaned);
 		}
 	}

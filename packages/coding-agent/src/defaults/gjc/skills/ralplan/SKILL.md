@@ -45,7 +45,7 @@ gjc ralplan --write --stage <type> --stage_n <N> --artifact "markdown file path 
 gjc ralplan --write --stage <type> --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT
 ```
 
-Use stages `planner`, `architect`, `critic`, `revision`, `post-interview`, `adr`, or `final`; increment `--stage_n` each consensus pass. The writer accepts inline markdown, an artifact path prepared outside `.gjc/`, or `--artifact-env GJC_RALPLAN_ARTIFACT`, persists `stage-<NN>-<stage>.md` plus `index.jsonl` under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`, and copies `final` to `pending-approval.md`. Ralplan mutation blocking is enforced in code; use temp directories (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) only for oversized scratch artifacts, never the repo or `.gjc/`.
+Use stages `planner`, `architect`, `critic`, `revision`, `post-interview`, `adr`, or `final`; increment `--stage_n` each consensus pass. The writer accepts inline markdown, an artifact path prepared outside `.gjc/`, or `--artifact-env GJC_RALPLAN_ARTIFACT`, persists `stage-<NN>-<stage>.md` plus `index.jsonl` under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`, and copies `final` to `pending-approval.md`. Ralplan mutation blocking is enforced in code; use temp directories (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) only for oversized scratch artifacts, never the repo or `.gjc/`. Staging via the `write` tool or a quoted-delimiter bash heredoc (`cat > /tmp/plan.md <<'EOF' … EOF`) into those temp roots is tolerated by the planning-phase guard.
 
 Restricted read-only role agents (`planner`, `architect`, `critic`) must pass markdown through `GJC_RALPLAN_ARTIFACT` with `--artifact-env GJC_RALPLAN_ARTIFACT`; their restricted bash environment disables artifact file-path ingestion.
 

@@ -180,6 +180,7 @@ Run this phase only when the active deep-interview state or invocation indicates
    - Direct `.gjc/` file edits are forbidden unless an explicit force override is active; do not use `write`, `edit`, or `ast_edit` against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or other `.gjc/` paths during normal workflow operation.
    - Preferred: pass the spec markdown **inline** to the native deep-interview write command (`--write … --spec "<markdown>"`) — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/_session-{sessionid}/specs`.
    - Only if a spec is too large to pass inline, stage it with the `write` tool to a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree, then pass that path to `--spec`. The planning phase-boundary block tolerates these neutral temp writes; never stage interview artifacts inside the repo or under `.gjc/`, and do not improvise repo-relative scratch files.
+   - When staging via bash instead of the `write` tool, a heredoc into a neutral temp path (`cat > /tmp/spec.md <<'EOF' … EOF`) is also tolerated; quote the heredoc delimiter (`<<'EOF'`) so the document body stays inert. Never stage into the repo or `.gjc/`, and prefer the `write` tool over bash for large bodies.
 
 4. **Initialize state** via `gjc deep-interview write --input '<json>'`:
 

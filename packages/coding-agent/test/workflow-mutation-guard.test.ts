@@ -297,6 +297,65 @@ describe("workflow mutation guard", () => {
 		}
 	});
 
+	it("does not misread heredoc document bodies as mutations during active deep-interview (#false-positive)", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		// Markdown spec bodies contain `>` quotes, `a > b` prose, apostrophes, and
+		// even shell-looking lines — all inert data when the heredoc feeds a data
+		// consumer writing to neutral temp scratch.
+		const specBody = [
+			"# Spec: Memory System",
+			"",
+			"- retrieval: session > project > global precedence",
+			"- don't hardcode `~/.gjc`; user's overrides matter",
+			"| Round | Prior → New | 66.5% → 62.3% |",
+			"rm -rf src is what we must never do",
+			"echo x > src/product.ts (quoted example, not a command)",
+		].join("\n");
+
+		for (const command of [
+			`cat > /tmp/mem-spec.md <<'SPECEOF'\n${specBody}\nSPECEOF\nwc -l /tmp/mem-spec.md`,
+			`cat <<'EOF' > /tmp/plan-draft.md\n${specBody}\nEOF`,
+			`tee /tmp/spec.md >/dev/null <<'DOC'\n${specBody}\nDOC`,
+			`cat <<-'TABDOC' > /tmp/spec.md\n\tindented body a > b\n\tTABDOC`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(false);
+		}
+	});
+
+	it("still blocks heredocs that mutate product paths or execute their body", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of [
+			// Redirect target on the OPENER line is product code — blocked regardless of body.
+			"cat <<'EOF' > src/product.ts\ninert body\nEOF",
+			// Script consumers keep their bodies live: mutations inside count.
+			"bash <<'EOF'\nrm src/product.ts\nEOF",
+			'python3 <<PY\nopen("src/product.ts", "w").write("x")\nPY',
+			"patch -p1 <<'EOF'\n--- a/src/product.ts\n+++ b/src/product.ts\nEOF",
+			// Unquoted delimiter + command substitution in body expands at runtime — fail closed.
+			"cat <<EOF > /tmp/out.md\n$(rm src/product.ts)\nEOF",
+			// Unterminated heredoc is unparseable — body scanned as before, mutation caught.
+			"cat <<'EOF' > /tmp/out.md\necho x > src/product.ts",
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(true);
+		}
+	});
+
 	it("blocks mutating bash targets during active deep-interview", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
