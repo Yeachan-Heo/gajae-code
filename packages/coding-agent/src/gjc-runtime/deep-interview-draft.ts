@@ -1029,7 +1029,28 @@ async function runDeepInterviewDraftCommandInternal(
 					current.revision === draft.attempt.state_revision + 1 &&
 					currentEffectDigest !== draft.attempt.effect_digest &&
 					committedDraftMutation(draft, current.state);
-				if (!uncommittedRetry && !replayingAttempt) throw new Error("DI_STATE_REVISION_CONFLICT");
+				if (!uncommittedRetry && !replayingAttempt)
+					return response(3, {
+						code: "DI_STATE_REVISION_CONFLICT",
+						message: "DI_STATE_REVISION_CONFLICT",
+						current_state_revision: current.revision,
+						draft_base_revision: draft.base_revision,
+						recovery: {
+							action: "rebase",
+							command: [
+								"gjc",
+								"deep-interview",
+								"draft",
+								"rebase",
+								"--draft-id",
+								draft.id,
+								"--expected-draft-revision",
+								String(draft.draft_revision),
+								"--to-current",
+								"--json",
+							],
+						},
+					});
 				if (replayingAttempt) legacy[legacy.indexOf("--expected-revision") + 1] = String(current.revision);
 			}
 			const persistedAttempt = draft.attempt;

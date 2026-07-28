@@ -588,9 +588,37 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				stderr: expect.stringContaining("DI_STATE_REVISION_CONFLICT"),
 			});
 			delete process.env.GJC_DEEP_INTERVIEW_DRAFT_INJECT_COMPETING_WRITE;
-			expect(await consume(env.cwd, "initialize-context", prepared)).toMatchObject({
-				status: 3,
-				stderr: expect.stringContaining("DI_STATE_REVISION_CONFLICT"),
+			let repeatedIssue: string | undefined;
+			for (let retry = 0; retry < 8; retry++) {
+				const blocked = await consume(env.cwd, "initialize-context", prepared);
+				expect(blocked.status).toBe(3);
+				const parsed = JSON.parse(blocked.stderr!) as {
+					issue: {
+						code: string;
+						current_state_revision: number;
+						draft_base_revision: number;
+						recovery: { action: string; command: string[] };
+					};
+				};
+				expect(parsed.issue).toMatchObject({
+					code: "DI_STATE_REVISION_CONFLICT",
+					current_state_revision: 1,
+					draft_base_revision: 0,
+					recovery: {
+						action: "rebase",
+						command: expect.arrayContaining(["rebase", "--to-current"]),
+					},
+				});
+				if (repeatedIssue === undefined) repeatedIssue = JSON.stringify(parsed.issue);
+				else expect(JSON.stringify(parsed.issue)).toBe(repeatedIssue);
+			}
+			expect(json(await native(env.cwd, ["draft", "show", "--draft-id", prepared.id, "--json"]))).toMatchObject({
+				draft: {
+					draft_revision: prepared.draft_revision,
+					base_revision: 0,
+					status: "active",
+					attempt: { state_revision: 0 },
+				},
 			});
 			const after = await state(env.cwd, "attempt-conflict");
 			expect(after.state_revision).toBe(1);
