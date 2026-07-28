@@ -238,17 +238,20 @@ const SOURCE_CLASS_VALUES: readonly PerfCorpusFixtureResult["sourceClass"][] = [
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const LOGICAL_BUN_EXECUTABLE = "bun";
 const LOGICAL_RUNNER_SCRIPT = "packages/coding-agent/bench/perf-corpus.bench.ts";
-const LOGICAL_RUNNER_FLAGS = new Set(["--smol", "--expose-gc"]);
+const LOGICAL_RUNNER_ARGV: readonly (readonly string[])[] = [
+	[LOGICAL_BUN_EXECUTABLE, LOGICAL_RUNNER_SCRIPT],
+	[LOGICAL_BUN_EXECUTABLE, "--smol", LOGICAL_RUNNER_SCRIPT],
+	[LOGICAL_BUN_EXECUTABLE, "--expose-gc", LOGICAL_RUNNER_SCRIPT],
+	[LOGICAL_BUN_EXECUTABLE, "--smol", "--expose-gc", LOGICAL_RUNNER_SCRIPT],
+];
 
 function isLogicalRunnerArgv(value: unknown): value is string[] {
-	if (!Array.isArray(value) || value.length <= 1 || value[0] !== LOGICAL_BUN_EXECUTABLE) return false;
-	const argumentsAfterExecutable = value.slice(1);
 	return (
-		argumentsAfterExecutable.every(
-			argument =>
-				typeof argument === "string" &&
-				(argument === LOGICAL_RUNNER_SCRIPT || LOGICAL_RUNNER_FLAGS.has(argument)),
-		) && argumentsAfterExecutable.filter(argument => argument === LOGICAL_RUNNER_SCRIPT).length === 1
+		Array.isArray(value) &&
+		LOGICAL_RUNNER_ARGV.some(
+			expected =>
+				value.length === expected.length && value.every((argument, index) => argument === expected[index]),
+		)
 	);
 }
 const REPORT_FIELDS = [

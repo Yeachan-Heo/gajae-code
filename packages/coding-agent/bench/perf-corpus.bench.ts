@@ -62,6 +62,43 @@ const MEASUREMENT_CLOSURE_SELECTORS: readonly string[] = [
 	"packages/utils/package.json",
 	"packages/utils/src",
 ];
+const LOGICAL_RUNNER_SCRIPT = "packages/coding-agent/bench/perf-corpus.bench.ts";
+const CANONICAL_RUNNER_EXEC_ARGV: readonly (readonly string[])[] = [
+	[],
+	["--smol"],
+	["--expose-gc"],
+	["--smol", "--expose-gc"],
+];
+
+function isCanonicalRunnerExecArgv(value: readonly string[]): boolean {
+	return CANONICAL_RUNNER_EXEC_ARGV.some(
+		expected => value.length === expected.length && value.every((argument, index) => argument === expected[index]),
+	);
+}
+
+function authenticateCanonicalRunnerEntrypoint(): readonly string[] {
+	const actualEntrypoint = Bun.main;
+	const argvEntrypoint = process.argv[1];
+	let canonicalEntrypoint: string;
+	let resolvedActualEntrypoint: string;
+	let resolvedArgvEntrypoint: string;
+	try {
+		canonicalEntrypoint = fs.realpathSync(import.meta.path);
+		resolvedActualEntrypoint = fs.realpathSync(actualEntrypoint);
+		resolvedArgvEntrypoint = fs.realpathSync(argvEntrypoint ?? "");
+	} catch (error) {
+		throw new Error("benchmark runner invocation is outside the frozen public contract", { cause: error });
+	}
+	if (
+		resolvedActualEntrypoint !== canonicalEntrypoint ||
+		resolvedArgvEntrypoint !== canonicalEntrypoint ||
+		process.argv.length !== 2 ||
+		!isCanonicalRunnerExecArgv(process.execArgv)
+	) {
+		throw new Error("benchmark runner invocation is outside the frozen public contract");
+	}
+	return [...process.execArgv];
+}
 
 function sha256Bytes(value: Uint8Array | string): string {
 	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
@@ -199,6 +236,7 @@ export function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeF
 }
 
 function reproductionInvocation(
+	runnerExecArgv: readonly string[],
 	profile: MemoryWorkloadProfile,
 	durationTargetMs: number,
 	iterationsTarget: number,
@@ -210,15 +248,7 @@ function reproductionInvocation(
 		GJC_MEMORY_SURFACE_ORDER: memorySurfaceOrder.join(","),
 	};
 	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
-	const allowedFlags = new Set(["--smol", "--expose-gc"]);
-	if (process.execArgv.some(argument => !allowedFlags.has(argument)) || process.argv.length > 2) {
-		throw new Error("benchmark runner invocation is outside the frozen public contract");
-	}
-	const argv = [
-		"bun",
-		...process.execArgv,
-		"packages/coding-agent/bench/perf-corpus.bench.ts",
-	];
+	const argv = ["bun", ...runnerExecArgv, LOGICAL_RUNNER_SCRIPT];
 	return { command: argv.join(" "), argv, environment };
 }
 const MEMORY_CHILD_ARGUMENT = "--gjc-memory-child";
@@ -577,6 +607,7 @@ function buildFixture(
 }
 
 export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+	const runnerExecArgv = authenticateCanonicalRunnerEntrypoint();
 	const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
 	const configuredDurationMs = Number(process.env.GJC_MEMORY_DURATION_MS);
 	const durationTargetMs =
@@ -612,7 +643,7 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 		throw new Error("benchmark checkout provenance changed while workloads were running");
 	}
 	const git = initialGit;
-	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
+	const invocation = reproductionInvocation(runnerExecArgv, profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
 	const runner: PerfCorpusReport["runner"] = {
 		command: invocation.command,
 		runtimeCommand: invocation.command,

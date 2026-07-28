@@ -4,7 +4,10 @@ import { chmodSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resolveGitProvenance, runPerfCorpusBenchmark } from "../bench/perf-corpus.bench";
+import {
+	resolveGitProvenance,
+	runPerfCorpusBenchmark as runPerfCorpusBenchmarkFromCanonicalEntrypoint,
+} from "../bench/perf-corpus.bench";
 import {
 	MEMORY_CAPTURE_SEMANTICS_ID,
 	type MemoryBaselineMetric,
@@ -16,6 +19,7 @@ import {
 const driverPath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-analysis.py");
 const preregistrationPath = path.resolve(import.meta.dir, "../bench/perf-corpus-preregistration.json");
 const templatePath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-template.ipynb");
+const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
 const bundleDirectory = path.dirname(driverPath);
 const gitSha = "0123456789abcdef0123456789abcdef01234567";
 const expectedTemplateSha256 = "dab587637aa4202c97348dbe2f856df95827598bc8abd87079af8b6e91884d36";
@@ -34,6 +38,19 @@ let expectedClosureDigest = "";
 let expectedScheduleDigest = "";
 let expectedProtocolDigest = "";
 const sealedDigestsByDirectory = new Map<string, { attemptLedgerSha256: string; rawManifestSha256: string }>();
+
+function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+	const originalBunMain = Bun.main;
+	const originalArgv = [...process.argv];
+	try {
+		(Bun as { main: string }).main = canonicalBenchmarkPath;
+		process.argv.splice(0, process.argv.length, originalArgv[0] ?? "bun", canonicalBenchmarkPath);
+		return runPerfCorpusBenchmarkFromCanonicalEntrypoint(options);
+	} finally {
+		(Bun as { main: string }).main = originalBunMain;
+		process.argv.splice(0, process.argv.length, ...originalArgv);
+	}
+}
 
 interface ScheduleItem {
 	attemptId: string;
@@ -970,6 +987,25 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		invalidRunnerArgvCase("alternate script", [
 			"bun",
 			"packages/coding-agent/bench/memory-baseline-session-child.ts",
+		]),
+		invalidRunnerArgvCase("post-script flag", ["bun", "packages/coding-agent/bench/perf-corpus.bench.ts", "--smol"]),
+		invalidRunnerArgvCase("duplicate smol flag", [
+			"bun",
+			"--smol",
+			"--smol",
+			"packages/coding-agent/bench/perf-corpus.bench.ts",
+		]),
+		invalidRunnerArgvCase("duplicate expose-gc flag", [
+			"bun",
+			"--expose-gc",
+			"--expose-gc",
+			"packages/coding-agent/bench/perf-corpus.bench.ts",
+		]),
+		invalidRunnerArgvCase("reversed flags", [
+			"bun",
+			"--expose-gc",
+			"--smol",
+			"packages/coding-agent/bench/perf-corpus.bench.ts",
 		]),
 	];
 

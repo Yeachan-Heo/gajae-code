@@ -11,7 +11,7 @@ import {
 	normalizeProcessTreeRss,
 	resolveGitProvenance,
 	resolveMeasurementRuntimeProvenance,
-	runPerfCorpusBenchmark,
+	runPerfCorpusBenchmark as runPerfCorpusBenchmarkFromCanonicalEntrypoint,
 	updateMemoryObservedExtrema,
 } from "../bench/perf-corpus.bench";
 import {
@@ -41,6 +41,21 @@ const memoryControlKeys = [
 	"GJC_MEMORY_DURATION_MS",
 	"GJC_MEMORY_SURFACE_ORDER",
 ] as const;
+const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
+
+function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+	const originalBunMain = Bun.main;
+	const originalArgv = [...process.argv];
+	try {
+		(Bun as { main: string }).main = canonicalBenchmarkPath;
+		process.argv.splice(0, process.argv.length, originalArgv[0] ?? "bun", canonicalBenchmarkPath);
+		return runPerfCorpusBenchmarkFromCanonicalEntrypoint(options);
+	} finally {
+		(Bun as { main: string }).main = originalBunMain;
+		process.argv.splice(0, process.argv.length, ...originalArgv);
+	}
+}
+
 let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
 function expectedPublicRunnerArgv(): string[] {
 	return ["bun", ...process.execArgv, "packages/coding-agent/bench/perf-corpus.bench.ts"];
@@ -105,6 +120,43 @@ describe("perf corpus schema + runner", () => {
 				expect(Number.isFinite(metric.systemMicros)).toBe(true);
 			}
 			expect(Number.isFinite(fixture.rssMemory.growthBytes)).toBe(true);
+		}
+	});
+	test.each([
+		["post-script flag", [canonicalBenchmarkPath, "--smol"]],
+		["duplicate --smol", ["--smol", "--smol", canonicalBenchmarkPath]],
+		["duplicate --expose-gc", ["--expose-gc", "--expose-gc", canonicalBenchmarkPath]],
+		["reversed flags", ["--expose-gc", "--smol", canonicalBenchmarkPath]],
+	])("rejects a non-canonical direct invocation with %s", (_name, argumentsAfterBun) => {
+		const result = Bun.spawnSync([process.execPath, ...argumentsAfterBun], {
+			cwd: path.resolve(import.meta.dir, "../../.."),
+		});
+		expect(result.exitCode).not.toBe(0);
+		expect(new TextDecoder().decode(result.stdout)).toBe("");
+		expect(new TextDecoder().decode(result.stderr)).toContain(
+			"benchmark runner invocation is outside the frozen public contract",
+		);
+	});
+
+	test("rejects an imported alternate wrapper before it can produce a canonical report", async () => {
+		const wrapperDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-perf-corpus-wrapper-"));
+		const wrapperPath = path.join(wrapperDirectory, "alternate-wrapper.ts");
+		try {
+			await Bun.write(
+				wrapperPath,
+				`import { runPerfCorpusBenchmark } from ${JSON.stringify(canonicalBenchmarkPath)};\n` +
+					`process.stdout.write(JSON.stringify(runPerfCorpusBenchmark()));\n`,
+			);
+			const result = Bun.spawnSync([process.execPath, wrapperPath], {
+				cwd: path.resolve(import.meta.dir, "../../.."),
+			});
+			expect(result.exitCode).not.toBe(0);
+			expect(new TextDecoder().decode(result.stdout)).toBe("");
+			expect(new TextDecoder().decode(result.stderr)).toContain(
+				"benchmark runner invocation is outside the frozen public contract",
+			);
+		} finally {
+			await fs.rm(wrapperDirectory, { recursive: true, force: true });
 		}
 	});
 	test("prefers checked-out HEAD over workflow SHA provenance", () => {
@@ -231,6 +283,24 @@ describe("perf corpus schema + runner", () => {
 			"packages/coding-agent/bench/perf-corpus.bench.ts\u2029",
 		]) {
 			const argv = ["bun", scriptPath];
+			const runner = {
+				...report.runner,
+				command: argv.join(" "),
+				runtimeCommand: argv.join(" "),
+				argv,
+				runtimeControlIdentity: "",
+			};
+			runner.runtimeControlIdentity = memoryRuntimeControlIdentity(runner);
+			expect(validatePerfCorpusReport({ ...report, runner }).errors).toContain(
+				"runner.argv must begin with bun and contain only logical repository-relative values",
+			);
+		}
+		for (const argv of [
+			["bun", "packages/coding-agent/bench/perf-corpus.bench.ts", "--smol"],
+			["bun", "--smol", "--smol", "packages/coding-agent/bench/perf-corpus.bench.ts"],
+			["bun", "--expose-gc", "--expose-gc", "packages/coding-agent/bench/perf-corpus.bench.ts"],
+			["bun", "--expose-gc", "--smol", "packages/coding-agent/bench/perf-corpus.bench.ts"],
+		]) {
 			const runner = {
 				...report.runner,
 				command: argv.join(" "),
