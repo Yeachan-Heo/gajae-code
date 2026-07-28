@@ -228,8 +228,10 @@ function rebaseWindow(window: ReadWindow, offset: number): ReadWindow {
 		head: rebaseSegment(window.head),
 		tail: rebaseSegment(window.tail),
 	};
-	const reason = (window as ReadWindow & { truncatedBy?: "lines" | "bytes" | "middle" }).truncatedBy;
-	if (reason !== undefined) Object.defineProperty(rebased, "truncatedBy", { value: reason, enumerable: false });
+	for (const key of ["maxBytes", "truncatedBy", "outputLinesOverride", "outputBytesOverride"] as const) {
+		const descriptor = Object.getOwnPropertyDescriptor(window, key);
+		if (descriptor) Object.defineProperty(rebased, key, descriptor);
+	}
 	return rebased;
 }
 
@@ -1628,7 +1630,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					budgetBytes,
 				);
 		const window = rebaseWindow(relativeWindow, receipt ? 0 : rangeStart);
-		const metadataWindow = options.truncationMetadataBodyRelative ? relativeWindow : window;
+		// Keep explicit ranges in the selected-window coordinate system for truncation metadata.
+		// Rendered output still uses `window`, whose anchors retain absolute file line numbers.
+		const metadataWindow =
+			options.truncationMetadataBodyRelative || (offset !== undefined && direction !== "head")
+				? relativeWindow
+				: window;
 		const shouldAddHashLines = displayMode.hashLines;
 		const shouldAddLineNumbers = !shouldAddHashLines && displayMode.lineNumbers;
 		const maxColumns = options.raw ? 0 : resolveOutputMaxColumns(this.session.settings);
@@ -2935,7 +2942,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 					if (collectMode !== "head") {
 						const window = streamResultWindow(streamResult, collectMode, startLine, collectEndExclusive);
-						directionalWindow = window;
+						const metadataWindow = rebaseWindow(window, -startLine);
+						directionalWindow = metadataWindow;
 						directionalNoticeOwner = isBareReceipt ? "body" : undefined;
 						const directionalPartial = windowHasPartialSegment(window);
 						const shouldAddDirectionalHashLines = !rawSelector && displayMode.hashLines;
@@ -2963,9 +2971,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						if (partialTailWarning) {
 							Object.defineProperty(window, "outputLinesOverride", { value: 0, enumerable: false });
 							Object.defineProperty(window, "outputBytesOverride", { value: 0, enumerable: false });
+							Object.defineProperty(metadataWindow, "outputLinesOverride", { value: 0, enumerable: false });
+							Object.defineProperty(metadataWindow, "outputBytesOverride", { value: 0, enumerable: false });
 						}
 						const baseWindowResult =
-							window.kind === "full" ? undefined : makeWindowResult(window, selectedContent);
+							window.kind === "full" ? undefined : makeWindowResult(metadataWindow, selectedContent);
 						const windowResult =
 							baseWindowResult && partialTailWarning
 								? { ...baseWindowResult, outputLines: 0, outputBytes: 0, lastLineExceedsLimit: true }
@@ -2988,7 +2998,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const windowEnd = Math.min(collectEndExclusive ?? totalFileLines, totalFileLines);
 						let bodyFooter: string | undefined;
 						if (isBareReceipt && window.kind !== "full" && !partialTailWarning) {
-							const footer = formatDirectionalFooter(localReadPath, window);
+							const footer = formatDirectionalFooter(localReadPath, metadataWindow);
 							if (footer) {
 								outputText += `\n\n${footer}`;
 								bodyFooter = footer;

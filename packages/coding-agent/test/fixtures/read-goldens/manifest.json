@@ -260,7 +260,7 @@
 
     "settings": { "read.summarize.enabled": false },
     "hashLines": [true, false],
-    "reason": "ACP-backed bare reads change their receipt budget from 3000 lines to 50 lines."
+    "reason": "ACP-backed bare reads preserve tail-default behavior and parity with disk-backed bare reads."
   },
   {
     "bucket": "changed",
@@ -305,10 +305,10 @@
     "bucket": "changed",
     "phase": 1,
     "name": "range-tail",
-    "request": { "path": "{FIXTURE}/prose.txt:50-200", "truncation": "last" },
+    "request": { "path": "{FIXTURE}/range-tail.txt:1-120", "truncation": "last" },
     "settings": { "read.summarize.enabled": false },
     "hashLines": [true, false],
-    "reason": "An explicit range can request tail truncation independently of the default."
+    "reason": "An explicit range with truncation=last retains the end of the selected window."
   },
   {
     "bucket": "surface",

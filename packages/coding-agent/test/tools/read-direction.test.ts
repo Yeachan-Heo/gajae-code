@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import type { ToolSession } from "../../src/tools";
+import { formatOutputNotice } from "../../src/tools/output-meta";
 import { ReadTool } from "../../src/tools/read";
 import { pathDefault, type ReadRoute, resolveEffectiveDirection } from "../../src/tools/read-internals";
 
@@ -109,10 +110,18 @@ describe("read truncation direction resolution", () => {
 			.description;
 		const lastDescription = new ReadTool(createSession(tempDir, Settings.isolated({ "read.truncation": "last" })))
 			.description;
+		const factoryDescription = new ReadTool(createSession(tempDir, Settings.isolated())).description;
 
 		expect(headDescription).toContain("Configured default: head");
 		expect(lastDescription).toContain("Configured default: last");
 		expect(lastDescription).toContain("50 lines");
+		expect(factoryDescription).toContain("Configured default: last");
+		expect(headDescription).toContain("configured truncation direction is head");
+		expect(lastDescription).toContain("configured truncation direction is last");
+		expect(factoryDescription).toContain("configured truncation direction is last");
+		expect(headDescription).not.toContain("taken from the **end** of the file by default");
+		expect(lastDescription).not.toContain("taken from the **end** of the file by default");
+		expect(factoryDescription).not.toContain("taken from the **end** of the file by default");
 		expect(lastDescription).toContain("10 KiB");
 		expect(headDescription).not.toContain("current no-parameter path retains the head");
 		expect(lastDescription).not.toContain("current no-parameter path retains the head");
@@ -147,6 +156,7 @@ describe("read truncation direction resolution", () => {
 		const lastRenderedLine = (text: string) =>
 			[...text.split("\n")].reverse().find(line => line.startsWith("line-")) ?? "";
 		expect(lastRenderedLine(defaultBare).startsWith("line-900 ")).toBe(true);
+		expect(firstRenderedLine(defaultBare).startsWith("line-892 ")).toBe(true);
 
 		const bareLast = textOf(await tool.execute("direction-bare-last", { path: file, truncation: "last" }));
 		expect(lastRenderedLine(bareLast).startsWith("line-900 ")).toBe(true);
@@ -337,6 +347,53 @@ describe("read truncation direction resolution", () => {
 				}
 			}
 		}
+	});
+
+	test("keeps ranged directional metadata in selected-window coordinates", async () => {
+		const file = path.join(tempDir, "ranged-direction-metadata.txt");
+		const source = Array.from({ length: 900 }, (_, index) => `line-${index + 1} ${"x".repeat(1100)}`).join("\n");
+		await fs.writeFile(file, source);
+		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		for (const truncationDirection of ["last", "both"] as const) {
+			const result = await new ReadTool(createSession(tempDir, settings)).execute("ranged-direction-metadata", {
+				path: `${file}:100-200`,
+				truncation: truncationDirection,
+			});
+			const truncation = result.details?.meta?.truncation as
+				| {
+						totalLines: number;
+						shownRange?: { start: number; end: number };
+						headRange?: { start: number; end: number };
+						tailRange?: { start: number; end: number };
+				  }
+				| undefined;
+			expect(truncation).toBeDefined();
+			const ranges = [truncation?.shownRange, truncation?.headRange, truncation?.tailRange].filter(
+				(range): range is { start: number; end: number } => range !== undefined,
+			);
+			expect(ranges.length).toBeGreaterThan(0);
+			for (const range of ranges) expect(range.end).toBeLessThanOrEqual(truncation?.totalLines ?? 0);
+			const notice = formatOutputNotice(result.details?.meta);
+			expect(notice).toContain(`of ${truncation?.totalLines}`);
+			for (const match of notice.matchAll(/(\d+)-(\d+)/g)) {
+				expect(Number(match[2])).toBeLessThanOrEqual(truncation?.totalLines ?? 0);
+			}
+		}
+		const hashSettings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: true });
+		const hashResult = await new ReadTool(createSession(tempDir, hashSettings)).execute(
+			"ranged-direction-hashlines",
+			{
+				path: `${file}:100-200`,
+				truncation: "last",
+			},
+		);
+		const anchors = textOf(hashResult)
+			.split("\n")
+			.map(line => /^(\d+)[a-z]{2}\|/.exec(line)?.[1])
+			.filter((line): line is string => line !== undefined)
+			.map(Number);
+		expect(anchors[0]).toBe(156);
+		expect(anchors.at(-1)).toBe(203);
 	});
 
 	test("applies direction to archive directory listings", async () => {

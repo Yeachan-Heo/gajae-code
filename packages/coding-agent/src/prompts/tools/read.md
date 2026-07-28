@@ -15,7 +15,7 @@ Read files, directories, archives, SQLite databases, images, documents, internal
 ## Selectors
 Append `:<sel>` to `path`. The bare path falls back to the default mode.
 
-- _(none)_ — parseable code → structural summary (signatures kept, bodies elided); a plain text file → a bounded receipt of about {{RECEIPT_LINES}} lines or {{RECEIPT_KIB}} KiB, whichever is smaller, taken from the **end** of the file by default (configured default: {{TRUNCATION_DEFAULT}}; factory default: last). Line+hash anchors keep their real file line numbers and a footer names the omitted range. Archive members use the larger {{DEFAULT_MAX_LINES}}-line / 50 KiB budget. Converted documents, notebooks, URLs and directory listings still start from the beginning.
+- _(none)_ — parseable code → structural summary (signatures kept, bodies elided); a plain text file → a bounded receipt of about {{RECEIPT_LINES}} lines or {{RECEIPT_KIB}} KiB, whichever is smaller; the configured truncation direction is {{TRUNCATION_DEFAULT}} (factory default: last). Line+hash anchors keep their real file line numbers and a footer names the omitted range. Archive members use the larger {{DEFAULT_MAX_LINES}}-line / 50 KiB budget. Converted documents, notebooks, URLs and directory listings still start from the beginning.
 - `:50` / `:50-` — read from line 50 onward.
 - `:50-200` — lines 50–200 inclusive.
 - `:50+150` — 150 lines starting at line 50.

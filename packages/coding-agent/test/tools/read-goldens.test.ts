@@ -359,6 +359,11 @@ async function createFixtures(root: string): Promise<FixtureState> {
 		(_, index) => `prose-${String(index + 1).padStart(3, "0")} ${"stable fixture text ".repeat(4).trim()}`,
 	);
 	fs.writeFileSync(path.join(root, "prose.txt"), proseLines.join("\n"));
+	const rangeTailLines = Array.from(
+		{ length: 120 },
+		(_, index) => `range-tail-${String(index + 1).padStart(3, "0")} ${"x".repeat(600)}`,
+	);
+	fs.writeFileSync(path.join(root, "range-tail.txt"), rangeTailLines.join("\n"));
 	const summaryLines = [
 		"export function readGoldensSummaryFixture(input: string): string {",
 		"\tconst values: string[] = [];",
