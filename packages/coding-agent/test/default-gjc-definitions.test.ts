@@ -662,7 +662,9 @@ Project executor override body.
 		expect(ultragoal).toContain("not rubber-stamp its earlier verdict");
 
 		// Fallback routing mirrors the existing subagent resume outcomes.
-		expect(ultragoal).toContain("`context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback");
+		expect(ultragoal).toContain(
+			"`context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback",
+		);
 
 		// Terminal critic resumption on iteration.
 		expect(ultragoal).toContain("resume the prior terminal-critic subagent when resumable");
