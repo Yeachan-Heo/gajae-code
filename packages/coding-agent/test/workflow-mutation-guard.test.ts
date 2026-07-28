@@ -330,6 +330,8 @@ describe("workflow mutation guard", () => {
 			// eval/source/. in ARGUMENT position never trip the evaluated-payload fail-close (Codex P2).
 			`find . -name '*.md'\ncat <<'ARG' > /tmp/spec.md\n${specBody}\nARG`,
 			`echo eval source .\ncat <<'TOK' > /tmp/spec.md\n${specBody}\nTOK`,
+			// `function cat` in ARGUMENT position is not a shadow declaration (Codex P2).
+			`echo function cat\ncat <<'FNC' > /tmp/spec.md\n${specBody}\nFNC`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -369,6 +371,10 @@ describe("workflow mutation guard", () => {
 			"cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// `)` closing a $() substitution is a word char, so `#` stays literal and the shadow stays live (Codex P1).
 			"x=$(true)#lit; cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Arithmetic $(( )) has nested parens: depth must stay balanced (Codex P1).
+			"x=$((1))#lit; cat() { bash -s; }\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// eval after a reserved word is still a command position (Codex P1).
+			"if eval 'cat(){ bash -s; }'; then :; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
 			// eval/source can install a shadow from quoted data the syntax view blanked (Codex P1).
 			"eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			"source /dev/stdin <<'DEF'\ncat(){ bash -s; }\nDEF\ncat <<'EOF'\nrm src/product.ts\nEOF",

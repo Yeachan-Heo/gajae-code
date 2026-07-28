@@ -529,7 +529,12 @@ function maskLineForSyntax(
 			previous = character;
 			continue;
 		}
-		if (character === "(" && (previous === "$" || previous === "<" || previous === ">")) {
+		if (
+			character === "(" &&
+			(previous === "$" || previous === "<" || previous === ">" || state.substitutionDepth > 0)
+		) {
+			// Substitution opener, or any paren nested INSIDE one (e.g. `$((1))`,
+			// `$(f (x))`): both must be balanced before the substitution closes.
 			state.substitutionDepth++;
 			masked += character;
 			dequoted += character;
@@ -571,12 +576,7 @@ function maskLineForSyntax(
 	return { masked, dequoted, continued: escaped };
 }
 
-const DATA_CONSUMER_NAMES = [...HEREDOC_DATA_CONSUMERS].join("|");
-/** A function/alias (re)definition of an allowlisted data-consumer name — masking must not trust the name. */
-const DATA_CONSUMER_SHADOW_RE = new RegExp(
-	`(?:^|[\\s;|&({\`])(?:function\\s+(?:${DATA_CONSUMER_NAMES})\\b|(?:${DATA_CONSUMER_NAMES})\\s*\\(\\s*\\)|alias\\s+(?:${DATA_CONSUMER_NAMES})=)`,
-	"i",
-);
+const DATA_CONSUMER_NAMES = new Set(HEREDOC_DATA_CONSUMERS);
 /**
  * Shell-evaluated payloads (`eval …`, `source …`, `. file`) can install a
  * shadow from data the syntax view has blanked (quoted strings, /dev/stdin);
@@ -584,27 +584,85 @@ const DATA_CONSUMER_SHADOW_RE = new RegExp(
  */
 const SHELL_EVALUATED_COMMANDS = new Set(["eval", "source", "."]);
 
+/** Reserved words that introduce a nested command position (`if eval …`, `while eval …`). */
+const SHELL_RESERVED_PREFIX_WORDS = new Set([
+	"if",
+	"then",
+	"else",
+	"elif",
+	"while",
+	"until",
+	"do",
+	"time",
+	"coproc",
+	"{",
+	"!",
+]);
+
+/** Command-position words of one command-list segment: the first real word plus words after reserved prefixes. */
+function commandPositionWords(segment: string): string[] {
+	const words: string[] = [];
+	let expectCommand = true;
+	for (const word of segment.trim().split(/\s+/)) {
+		if (!word) continue;
+		if (expectCommand && (/^\w+=/.test(word) || word === "sudo")) continue;
+		if (SHELL_RESERVED_PREFIX_WORDS.has(word.toLowerCase())) {
+			// Reserved word keeps the NEXT word in command position.
+			expectCommand = true;
+			continue;
+		}
+		if (!expectCommand) continue;
+		words.push(word.split("/").pop()?.toLowerCase() ?? "");
+		expectCommand = false;
+	}
+	return words;
+}
+
+/** Command-list segments of a dequoted view (split at `;`, `|`, `&`, `(`, backtick, newline). */
+function commandListSegments(dequotedView: string): string[] {
+	return dequotedView.split(/[;|&(`\n]/);
+}
+
 /**
  * True when any command-position word of the dequoted syntax view is
- * eval/source/`.` — command position means the first non-assignment,
- * non-sudo word after a command separator (`;`, `|`, `&`, `(`, backtick,
- * newline, or line start). `echo eval` and `find .` never match because
- * their tokens sit in argument position.
+ * eval/source/`.` — including nested positions after reserved words
+ * (`if eval …`). `echo eval` and `find .` never match because their
+ * tokens sit in argument position.
  */
 function hasShellEvaluatedCommand(dequotedView: string): boolean {
-	for (const list of dequotedView.split(/[;|&(`\n]/)) {
-		if (SHELL_EVALUATED_COMMANDS.has(firstCommandWord(list))) return true;
+	return commandListSegments(dequotedView).some(segment =>
+		commandPositionWords(segment).some(word => SHELL_EVALUATED_COMMANDS.has(word)),
+	);
+}
+
+/**
+ * True when live syntax actually DECLARES a shadow of an allowlisted
+ * data-consumer name: `name()` at a command-list start, `function name`,
+ * or `alias name=…` — each in command position, so `echo function cat`
+ * (argument position) never matches.
+ */
+function hasDataConsumerShadow(dequotedView: string): boolean {
+	for (const segment of commandListSegments(dequotedView)) {
+		const words = segment.trim().split(/\s+/).filter(Boolean);
+		const first = words[0]?.toLowerCase() ?? "";
+		if (first === "function" && DATA_CONSUMER_NAMES.has(words[1]?.split("/").pop()?.toLowerCase() ?? "")) {
+			return true;
+		}
+		if (
+			first === "alias" &&
+			words.slice(1).some(word => DATA_CONSUMER_NAMES.has(word.split("=")[0]?.toLowerCase() ?? ""))
+		) {
+			return true;
+		}
 	}
-	return false;
+	// `name()` / `name ()` at a command-list start (POSIX function definition).
+	const nameGroup = [...DATA_CONSUMER_NAMES].join("|");
+	return new RegExp(`(?:^|[;|&{(\`\\n])\\s*(?:${nameGroup})\\s*\\(\\s*\\)`, "i").test(dequotedView);
 }
 
 /** First command word of a pipeline-segment slice of a quote-masked opener line. */
 function firstCommandWord(segment: string): string {
-	for (const word of segment.trim().split(/\s+/)) {
-		if (!word || /^\w+=/.test(word) || word === "sudo") continue;
-		return word.split("/").pop()?.toLowerCase() ?? "";
-	}
-	return "";
+	return commandPositionWords(segment)[0] ?? "";
 }
 
 /**
@@ -675,7 +733,7 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 	// (`e\val`, `'ev'al`) cannot hide the word, while heredoc bodies and
 	// comments stay excluded — a spec that merely DOCUMENTS `cat() { … }` or
 	// mentions "eval" in prose stays inert.
-	if (DATA_CONSUMER_SHADOW_RE.test(first.dequotedView) || hasShellEvaluatedCommand(first.dequotedView)) {
+	if (hasDataConsumerShadow(first.dequotedView) || hasShellEvaluatedCommand(first.dequotedView)) {
 		return maskHeredocBodiesPass(command, true).result;
 	}
 	return first.result;
