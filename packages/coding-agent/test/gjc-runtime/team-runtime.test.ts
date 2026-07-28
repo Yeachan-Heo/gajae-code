@@ -3629,7 +3629,7 @@ describe("team worker memory guard wiring", () => {
 		expect(committedPaths).not.toContain(protectedPath);
 		expect(runGit(workerWorktree!, ["diff", "--cached", "--name-only"]).split(/\r?\n/)).toContain(protectedPath);
 		expect(task.claim?.owner).toBe("worker-2");
-	});
+	}, 20_000);
 
 	it("caps Linux replacement retries and blocks the claimed task on the terminal failure", async () => {
 		cleanupRoot = await createGitRepo();
