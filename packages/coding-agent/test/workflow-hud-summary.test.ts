@@ -51,6 +51,66 @@ describe("workflow HUD summary builders", () => {
 		expect(hud.chips?.find(chip => chip.label === "stages")?.value).toBe("P·A·C");
 	});
 
+	it("renders ralplan review-pass chips between stages and verdict without exceeding the final HUD shape", () => {
+		const hud = buildRalplanHudSummary({
+			stage: "critic",
+			iterationFromIndex: 1,
+			stages: "P·A·C",
+			architectPasses: 1,
+			criticPasses: 2,
+			reviewPassBudget: 3,
+			verdict: "ITERATE",
+		});
+		expect(hud.chips?.map(chip => `${chip.label}:${chip.value}:${chip.priority}`)).toEqual([
+			"stage:critic:10",
+			"iter:1:30",
+			"stages:P·A·C:35",
+			"arch:1/3:36",
+			"crit:2/3:38",
+			"verdict:ITERATE:40",
+		]);
+
+		const finalHud = buildRalplanHudSummary({
+			stage: "final",
+			iterationFromIndex: 1,
+			stages: "P·A·C·F",
+			architectPasses: 1,
+			criticPasses: 1,
+			reviewPassBudget: 1,
+			verdict: "OKAY",
+			pendingApproval: true,
+		});
+		expect(finalHud.chips?.map(chip => chip.label)).toEqual(["pending", "stage", "iter", "stages", "verdict"]);
+	});
+
+	it("keeps a zero-pass ralplan HUD byte-identical to the pre-counter shape", () => {
+		const baseline = {
+			stage: "planner",
+			iterationFromIndex: 1,
+			stages: "P",
+			updatedAt: "2026-07-28T00:00:00.000Z",
+		};
+		expect(
+			buildRalplanHudSummary({
+				...baseline,
+				architectPasses: 0,
+				criticPasses: 0,
+				reviewPassBudget: 1,
+			}),
+		).toEqual(buildRalplanHudSummary(baseline));
+	});
+
+	it("renders OKAY and REJECT with their closed-vocabulary severities", () => {
+		const okay = buildRalplanHudSummary({ stage: "critic", verdict: "OKAY" });
+		const reject = buildRalplanHudSummary({ stage: "critic", verdict: "REJECT" });
+		const clear = buildRalplanHudSummary({ stage: "architect", verdict: "CLEAR" });
+		const block = buildRalplanHudSummary({ stage: "architect", verdict: "BLOCK" });
+		expect(okay.chips?.find(chip => chip.label === "verdict")?.severity).toBe("success");
+		expect(reject.chips?.find(chip => chip.label === "verdict")?.severity).toBe("blocked");
+		expect(clear.chips?.find(chip => chip.label === "verdict")?.severity).toBe("success");
+		expect(block.chips?.find(chip => chip.label === "verdict")?.severity).toBe("blocked");
+	});
+
 	it("renders ultragoal latest ledger event as a main chip", () => {
 		const hud = buildUltragoalHudSummary({
 			status: "blocked",

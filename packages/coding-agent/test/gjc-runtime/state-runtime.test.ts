@@ -8,6 +8,7 @@ import {
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -44,6 +45,42 @@ function envelopeState(stdout: string | undefined): Record<string, unknown> {
 	const inner = parsed.state;
 	if (inner && typeof inner === "object" && !Array.isArray(inner)) return inner as Record<string, unknown>;
 	return parsed;
+}
+
+async function writeRalplanArtifact(
+	root: string,
+	runId: string,
+	stage: string,
+	stageN: number,
+	artifact: string,
+	laneVerdict?: string,
+) {
+	return await runNativeRalplanCommand(
+		[
+			"--write",
+			"--stage",
+			stage,
+			"--stage_n",
+			String(stageN),
+			"--artifact",
+			artifact,
+			"--run-id",
+			runId,
+			...(laneVerdict ? ["--lane-verdict", laneVerdict] : []),
+			"--json",
+		],
+		root,
+	);
+}
+
+async function readRalplanHudChips(root: string): Promise<Array<{ label: string; value?: string; severity?: string }>> {
+	const active = JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8")) as {
+		active_skills?: Array<{
+			skill: string;
+			hud?: { chips?: Array<{ label: string; value?: string; severity?: string }> };
+		}>;
+	};
+	return active.active_skills?.find(entry => entry.skill === "ralplan")?.hud?.chips ?? [];
 }
 
 describe("native gjc state runtime", () => {
@@ -645,6 +682,51 @@ describe("native gjc state runtime", () => {
 		expect(stage?.value).toBe("architect");
 		expect(verdict?.value).toBe("ITERATE");
 		expect(verdict?.severity).toBe("warning");
+	});
+
+	it("keeps a lane verdict visible after artifact-then-state write order", async () => {
+		const root = await tempDir();
+		const runId = "state-after-artifact";
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "critic", 2, "# critique", "ITERATE")).status).toBe(0);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "after-artifact" })],
+					root,
+				)
+			).status,
+		).toBe(0);
+		expect((await readRalplanHudChips(root)).find(chip => chip.label === "verdict")?.value).toBe("ITERATE");
+	});
+
+	it("prefers a run-scoped lane verdict over a stale legacy ralplan verdict", async () => {
+		const root = await tempDir();
+		const runId = "state-lane-precedence";
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", JSON.stringify({ verdict: "ITERATE" })],
+					root,
+				)
+			).status,
+		).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "critic", 2, "# critique", "OKAY")).status).toBe(0);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "verdict-less" })],
+					root,
+				)
+			).status,
+		).toBe(0);
+
+		const state = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"));
+		expect(state).toMatchObject({ verdict: "ITERATE", last_review_verdict: "OKAY" });
+		const verdict = (await readRalplanHudChips(root)).find(chip => chip.label === "verdict");
+		expect(verdict?.value).toBe("OKAY");
+		expect(verdict?.severity).toBe("success");
 	});
 
 	it("clears the active entry when clearing a workflow receipt", async () => {

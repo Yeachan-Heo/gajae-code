@@ -354,6 +354,10 @@
 						"maxIterations": {
 							"type": "number",
 							"default": 5
+						},
+						"maxReviewPassesPerLane": {
+							"type": "number",
+							"default": 1
 						}
 					},
 					"additionalProperties": false

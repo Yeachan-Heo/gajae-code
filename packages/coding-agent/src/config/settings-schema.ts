@@ -506,6 +506,11 @@ export const SETTINGS_SCHEMA = {
 		default: 5,
 		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 20,
 	},
+	"gjc.ralplan.maxReviewPassesPerLane": {
+		type: "number",
+		default: 1,
+		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 10,
+	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Appearance

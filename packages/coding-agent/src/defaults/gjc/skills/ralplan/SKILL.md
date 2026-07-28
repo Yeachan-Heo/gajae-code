@@ -63,14 +63,25 @@ The consensus workflow:
    - Deliberate mode only: pre-mortem (3 scenarios) + expanded test plan (unit/integration/e2e/observability)
 2. **User feedback** *(--interactive only)*: If `--interactive` is set, use the `ask` tool to present the draft plan **plus the Principles / Drivers / Options summary** before review (Proceed to review / Request changes / Skip review). Otherwise, automatically proceed to review.
 3. **Review fan-out after Planner persistence**: launch fresh Architect and Critic review lanes against the same immutable Planner receipt/path/sha/stage_n when Critic is **plan-only** and does not consume Architect output.
-   - **Architect lane**: challenge architecture, surface tradeoff tensions, and enrich thin plans with synthesis or missed sub-scope. Persist with `gjc ralplan --write --stage architect --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return receipt/path plus `CLEAR`/`WATCH`/`BLOCK` and `APPROVE`/`COMMENT`/`REQUEST CHANGES`.
-   - **Plan-only Critic lane**: independently check quality, principle-option consistency, alternatives, risks, acceptance criteria, and verification; when the plan is thin, request concrete expansion rather than only defects. Persist with `gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return receipt/path plus `OKAY`/`ITERATE`/`REJECT`.
+   - **Architect lane**: challenge architecture, surface tradeoff tensions, and enrich thin plans with synthesis or missed sub-scope. Persist with `gjc ralplan --write --stage architect --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --lane-verdict <token> --json`, then return receipt/path plus `CLEAR`/`WATCH`/`BLOCK` and `APPROVE`/`COMMENT`/`REQUEST CHANGES`.
+   - **Plan-only Critic lane**: independently check quality, principle-option consistency, alternatives, risks, acceptance criteria, and verification; when the plan is thin, request concrete expansion rather than only defects. Persist with `gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --lane-verdict <token> --json`, then return receipt/path plus `OKAY`/`ITERATE`/`REJECT`.
    - **Sequential fallback**: if Critic must evaluate Architect findings, verdict, antithesis, tradeoffs, synthesis, status, or any Architect-produced artifact, await the Architect result before issuing that Architect-dependent Critic pass.
+   - Every Architect/Critic assignment, including each pass-2+ re-review assignment in step 5, MUST instruct the reviewer to include `--lane-verdict <token>` on its existing `gjc ralplan --write`: Architect passes its Architectural Status token (`CLEAR`/`WATCH`/`BLOCK`), and Critic passes its verdict token (`OKAY`/`ITERATE`/`REJECT`). The flag is optional so legacy invocations stay valid.
 4. **Review join gate**: before consensus, revision, reconciliation, finalization, or approval, verify both Architect and Critic receipts/verdicts exist for the same Planner artifact/pass (`path`, `sha256`, `stage_n`). A non-`CLEAR` Architect verdict, non-`APPROVE` Architect decision, or any non-`OKAY` Critic verdict routes back to Planner revision; do not finalize from only one review lane.
-5. **Re-review loop** (max 5 iterations; **runtime-enforced**): Any non-`OKAY` Critic verdict (`ITERATE` or `REJECT`) or Architect result that is not `CLEAR`/`APPROVE` MUST run the same full closed loop:
+5. **Re-review loop** (max 5 iterations; **runtime-enforced**): Any non-`OKAY` Critic verdict (`ITERATE` or `REJECT`) or Architect result that is not `CLEAR`/`APPROVE` MUST run the same full closed loop. Pass 2+ runs sequentially Architect -> Critic: await the Architect result and its receipt/path before assigning Critic; Critic receives the current-pass Architect receipt/path and performs the rule-5 counter-review before consolidated feedback routes to Planner revision. From pass 2, both reviewers are bound by the five-rule ratchet: delta-only review, novelty justification, verdict monotonicity, severity scoping, and Critic counter-review of Architect scope inflation; unjustified inflation does not force a revision.
    a. Collect Architect + Critic feedback
    b. Revise the plan by resuming the SAME persisted Planner subagent with consolidated Architect + Critic feedback (see **Persisted Planner** below); fall back to a fresh Planner spawn only per the fallback routing table
-   c. Return to the review fan-out or sequential fallback path above
+
+   **Re-review context bundle (pass 2+; mandatory):** Every pass-2+ Architect or Critic assignment MUST include:
+   1. the explicit review pass number `N` for that lane, stated literally as `review pass N` in the assignment text, where **N is the ordinal review pass for that lane across the entire ralplan run/re-review loop** (equivalently the opener-iteration ordinal): the review of the initial Planner artifact is `review pass 1`, the review of the first revised Planner artifact is `review pass 2`, and so on; **N never resets within an opener iteration and never resets when a new `revision` opener begins in the same run** — it increments monotonically with every review the lane performs in the run. This ordinal is a workflow counter distinct from the runtime lane budget (which counts lane writes per opener iteration, WI-5): at the default budget the two coincide numerically, but the ratchet ("from pass 2") always keys off the run-level N so normal post-revision re-reviews activate delta-only review, monotonicity, and the sequential cadence;
+   2. the current revision receipt under review (`path`, `sha256`, `stage_n`);
+   3. the prior Planner/revision artifact path that the previous pass reviewed;
+   4. the prior same-lane review artifact path (`stage-NN-architect.md` / `stage-NN-critic.md`) with its receipt fields;
+   5. the consolidated prior blockers and the revision's claimed resolutions, as orchestrator-collected pointers into those artifacts (never pasted bodies);
+   6. Critic pass-2+ only: the current-pass Architect receipt/path, awaited first per the sequential cadence, so the rule-5 counter-review is evaluable.
+
+   Fresh spawns always receive everything required to apply delta-only review (rule 1), novelty justification (rule 2), monotonicity (rule 3), severity scoping (rule 4), and counter-review (rule 5).
+   c. For pass 2+, run Architect -> Critic sequentially: await the Architect result and receipt/path, then issue Critic with the mandatory context bundle, including the current-pass Architect receipt/path. Critic performs the rule-5 counter-review before consolidated feedback routes to Planner revision.
       - Persist each Planner revision with `gjc ralplan --write --stage revision --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json` before re-review, then pass the receipt/path forward instead of duplicating the full revision markdown in the parent conversation.
    d. Re-join Architect and Critic verdicts for the same revised Planner artifact/pass
    e. Repeat this loop until Critic returns `OKAY` **and** Architect is `CLEAR`/`APPROVE` for the same Planner artifact/pass, or 5 iterations are reached
@@ -102,7 +113,7 @@ The consensus workflow:
 
    The skill tool then dispatches the execution skill same-turn and runs `gjc state ralplan handoff --to <team|ultragoal> --json` in-process to atomically demote ralplan, promote the callee, and sync `.gjc/_session-{sessionid}/state/skill-active-state.json`. You do not need to run the handoff verb yourself.
 
-> **Important:** Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane after Planner persistence. Any Architect-dependent Critic pass MUST remain sequential: await Architect before issuing Critic, then apply the same review join gate before consensus.
+> **Important:** Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane after Planner persistence (review pass 1). Pass 2+ re-reviews MUST run sequentially Architect -> Critic: await Architect before issuing Critic, pass the current-pass Architect receipt/path to Critic for the rule-5 counter-review, then apply the same review join gate before consensus.
 
 ## Consensus iteration cap (operator contract)
 
@@ -117,6 +128,28 @@ The consensus workflow:
   "gjc": {
     "ralplan": {
       "maxIterations": 3
+    }
+  }
+}
+```
+
+## Per-lane review budget (operator contract)
+
+- Default: **1** Architect pass and **1** Critic pass per opener iteration.
+- Override via `gjc.ralplan.maxReviewPassesPerLane`: project `.gjc/settings.json` overrides user settings; the value is an integer **1..10** registered in the public settings schema.
+- On overflow: exit code **3** with the **`PLANNING-STUCK`** marker and lane-specific JSON/stderr detail.
+- `post-interview`, `adr`, and `final` are always allowed.
+- Identical re-writes dedupe without stuck-signaling — including after a crash between artifact write and ledger append: the identical retry repairs the missing ledger row and returns the dedupe receipt.
+- A new `--run-id` starts a fresh budget.
+- A rule-2-justified blocker routes through a Planner `revision` opener (new iteration, fresh lane budget), never a second same-iteration review pass.
+- Override example (project `.gjc/settings.json`):
+
+```json
+{
+  "gjc": {
+    "ralplan": {
+      "maxIterations": 3,
+      "maxReviewPassesPerLane": 2
     }
   }
 }
