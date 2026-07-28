@@ -1,0 +1,18 @@
+{
+  "schema": "gajae.dev-batch-merge-summary.v1",
+  "repo": { "owner": "Yeachan-Heo", "name": "gajae-code" },
+  "note": "Second round this session: agent/tool-choice + session/TUI batch.",
+  "merged": [
+    { "pr": 3441, "issueClosed": null, "mergeCommit": "37b57d280", "summary": "stale named Codex tool_choice handling: revalidate queued named choices against current active tools + current model before serving; recognize Codex's 'not found in tools parameter' 400 as a capability failure eligible for the existing retry-without-tool_choice fallback; degradeInFlight (pre-existing, requeue-safe-bypassing) consumed exactly once, no arbitrary tool coercion." },
+    { "pr": 3391, "issueClosed": null, "mergeCommit": "b2bbfd80d", "summary": "team-worker heartbeat liveness generalized to background/subagent AsyncJobManager activity via turn_start/turn_end, not just top-level prompt-in-flight; agent_end defensive reset. Rebased twice this session (once with a real conflict in a generated docs-index file, resolved by regenerating rather than hand-editing); verified locally both times before push." },
+    { "pr": 3435, "issueClosed": null, "mergeCommit": "5d84a1b59", "summary": "Session Observer subagent transcript discovery: stop hardcoding sessionFile:null on lifecycle/progress events, pass the already-locally-computed per-invocation session path through. Verified session-identity/no-cross-session-leak via runSubprocess's per-call closure scoping (no shared mutable state); fork PR required a maintainer Actions-approval gate, approved this pass." }
+  ],
+  "explicitlyNotMerged": [
+    { "pr": 3409, "reason": "sole canonical team-worker memory-guard test-timeout blocker; left open per repeated owner directive — do not merge a wall-clock timeout widening as the real fix, deterministic replacement still owed." }
+  ],
+  "operationalNotes": [
+    "#3435's Dev CI and Public-site-sync runs both landed in GitHub's 'action_required' state (first-time-contributor Actions approval gate for a fork PR) — approved both via POST .../actions/runs/{id}/approve before they could proceed to a real pass/fail verdict.",
+    "#3391's rebase hit one real merge conflict, in the generated packages/coding-agent/src/internal-urls/docs-index.generated.ts — resolved by regenerating via its own generator script (bun packages/coding-agent/scripts/generate-docs-index.ts) rather than hand-resolving conflict markers in a generated artifact."
+  ],
+  "reviewedAt": "2026-07-28T18:40:00Z"
+}
