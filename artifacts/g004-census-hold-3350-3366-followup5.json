@@ -1,0 +1,58 @@
+{
+  "recorded_at": "2026-07-28T13:05:00Z",
+  "prior_reconcile_ref": "artifacts/g004-census-hold-3350-3366-followup4.json (recorded_at 2026-07-28T12:40:00Z)",
+  "owner": "sole owner, #3350 risk-canary + #3366 conflict-integration coverage",
+  "scope_note": "user follow-up: re-verify #3350/#3366/#3299 and old owner drafts, exact-proof only (gh/git commands, no inference).",
+  "reconciliation": {
+    "dev": {
+      "expected_at_prior_followup": "c97da89c1afadcf20fc949307f2996aaeffecfca",
+      "actual_current": "c97da89c1afadcf20fc949307f2996aaeffecfca",
+      "delta": "NONE — dev tip unchanged since followup4 (evidence: gh api repos/.../commits/dev .sha)",
+      "ci_state": "still red at same tip. Dev CI run 30358765702 headSha=c97da89c1 conclusion=failure status=completed, unchanged (gh run list --branch dev --json databaseId,headSha,conclusion,status). No new Dev CI run has fired since followup4."
+    },
+    "pr_3366": {
+      "expected_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "actual_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "match": true,
+      "state": "OPEN",
+      "mergeStateStatus": "CLEAN",
+      "mergeable": "MERGEABLE",
+      "note": "unchanged from followup4 (gh pr view 3366 --json headRefOid,state,mergeStateStatus,mergeable). Six consecutive reconciles with identical head commit."
+    },
+    "issue_3350": {
+      "state": "OPEN",
+      "pr": "none opened yet (issue timeline still has zero cross-referenced events: gh api repos/.../issues/3350/timeline --jq 'select(.event==\"cross-referenced\")' returns empty)",
+      "local_work": "still uncommitted on branch g004-revalidate (git status --short): modified .github/workflows/dev-ci.yml, scripts/ci-dev-affected.ts(.test.ts), scripts/dev-ci-guard-topology.test.ts; untracked scripts/ci-risk-canary-manifest.ts(.test.ts), scripts/ci-virtual-integration.ts(.test.ts), plus prior artifact files — same file set as followup4.",
+      "current_head_evidence": "local branch g004-revalidate at HEAD 29f142572, now 30 commits behind origin/dev (git rev-list --count g004-revalidate..origin/dev), unchanged from followup4 since dev did not advance."
+    },
+    "issue_3299_pr": {
+      "url": "https://github.com/Yeachan-Heo/gajae-code/pull/3299",
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeStateStatus": "CLEAN",
+      "mergeable": "MERGEABLE",
+      "headRefOid": "25ca76a45b606ee35e2f1c70021e4ff0041c7bcc",
+      "note": "unchanged from followup4 (gh pr view 3299). Still investigation-only, no overlap with #3350/#3366 found."
+    },
+    "old_owner_drafts": {
+      "definition_used": "uncommitted/local draft work on branch g004-revalidate predating this census, plus any other open owner-authored draft PRs surfaced by gh queries this pass",
+      "found": "no additional owner drafts beyond the already-tracked local g004-revalidate work and #3375 (dev-recovery PR). No separate stale draft PRs located via gh this pass; unchanged from followup4."
+    },
+    "dev_recovery_in_flight": {
+      "pr_3375": {
+        "state": "OPEN",
+        "mergedAt": null,
+        "headRefOid": "3728d6905a86e117d48d317dce9e797c84e71917",
+        "mergeStateStatus": "DIRTY",
+        "mergeable": "CONFLICTING",
+        "note": "unchanged from followup4 (gh pr view 3375 --json mergeStateStatus,mergeable). Still DIRTY/CONFLICTING against dev tip c97da89c1; head commit unchanged."
+      }
+    }
+  },
+  "critic_hold_verdict": {
+    "decision": "HOLD — no merge, no close (unchanged across six consecutive census passes)",
+    "rationale": "No state changed since followup4: dev tip and CI failure identical, #3366 still CLEAN/MERGEABLE but blocked by owner-freeze-while-dev-red policy, #3375 still DIRTY/CONFLICTING, #3350 still has no PR, #3299 still unrelated. No old owner draft beyond already-tracked items.",
+    "retire_condition": "unchanged: dev CI green at a tip past #3375 landing AND (#3366 merged or explicitly closed) AND (#3350 has a merged/closed PR or the issue itself is closed).",
+    "next_check": "Re-poll dev CI conclusion at next tip; re-check #3375 conflict resolution. No merge/close/skill-chain performed this pass, consistent with owner freeze."
+  }
+}

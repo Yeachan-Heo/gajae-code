@@ -61,7 +61,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
-		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() }}");
+		// The aggregate stays `always()`-driven so it can fail closed on skipped
+		// dependencies; issue #3350 additionally excludes virtual-integration
+		// dispatches so one merge candidate never triggers the full graph.
+		expect(workflow).toContain(
+			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}",
+		);
 		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
@@ -89,7 +94,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("remains a required producer audit binding");
 		expect(workflow).not.toContain("continue-on-error");
 		const protectedJob = workflow.slice(workflow.indexOf("  affected:\n"), workflow.indexOf("\n  gjc-state-gates-matrix:"));
-		expect(protectedJob).toContain("if: ${{ always() }}");
+		// `always()` must lead so the aggregate still evaluates (and fails closed)
+		// when a dependency is skipped or cancelled.
+		expect(protectedJob).toContain("if: ${{ always() &&");
 		expect(protectedJob).toContain("name: Validate finalized affected evidence");
 		expect(protectedJob).not.toContain("continue-on-error");
 		const validationStart = protectedJob.indexOf("name: Validate finalized affected evidence");
@@ -1173,6 +1180,8 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"test",
 			"scripts/ci-dev-affected.test.ts",
 			"scripts/dev-ci-guard-topology.test.ts",
+			"scripts/ci-risk-canary-manifest.test.ts",
+			"scripts/ci-virtual-integration.test.ts",
 		]);
 	});
 
@@ -1515,5 +1524,53 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		expect(entries.find(entry => entry.key === "cli-smoke")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "runtime-check")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-16")?.native).toBe(true);
+	});
+});
+
+describe("risk-triggered canary selection (issue #3350)", () => {
+	const codingAgent: WorkspacePackage = {
+		name: "@gajae-code/coding-agent",
+		dir: "packages/coding-agent",
+		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const bridgeClient: WorkspacePackage = {
+		name: "@gajae-code/bridge-client",
+		dir: "packages/bridge-client",
+		manifest: { name: "@gajae-code/bridge-client", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const targetingPackages: WorkspacePackage[] = [codingAgent, bridgeClient];
+	const notificationsCanary = "packages/coding-agent/test/notifications-live-stream.test.ts";
+	const testFiles = [notificationsCanary, "packages/bridge-client/test/client.test.ts"];
+
+	function targeted(paths: readonly string[]) {
+		return planTargetedTasks(paths, targetingPackages, testFiles);
+	}
+
+	test("session lifecycle changes include the affected notifications canary", () => {
+		const tasks = targeted(["packages/coding-agent/src/session/session-manager.ts"]);
+		const canary = tasks.find(task => task.key === `test:${notificationsCanary}`);
+		expect(canary).toBeDefined();
+		expect(canary?.command).toEqual(["bun", "test", notificationsCanary]);
+	});
+
+	test("canaries are represented in the matrix identity surface", () => {
+		const entry = describeTasks(targeted(["packages/coding-agent/src/session/session-manager.ts"])).find(task => task.key === `test:${notificationsCanary}`);
+		expect(entry?.identity).toBeTruthy();
+	});
+
+	test("plain package changes retain direct targeting without coding-agent canaries", () => {
+		const tasks = planTargetedTasks(["packages/example/src/index.ts"], packages, []);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/example");
+		expect(keys.some(key => key.startsWith("test:packages/coding-agent/"))).toBe(false);
+	});
+
+	test("a declared canary test is de-duplicated when selected directly and by risk", () => {
+		const keys = targeted([notificationsCanary]).map(task => task.key);
+		expect(keys.filter(key => key === `test:${notificationsCanary}`)).toHaveLength(1);
+	});
+
+	test("doc-only changes remain an empty plan", () => {
+		expect(targeted(["docs/readme.md"])).toEqual([]);
 	});
 });

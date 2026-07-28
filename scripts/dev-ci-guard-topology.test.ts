@@ -19,8 +19,11 @@ interface WorkflowJob {
 	needs?: string[];
 	if?: string;
 	env?: Record<string, string>;
+	permissions?: Record<string, string>;
+	concurrency?: { group?: string; "cancel-in-progress"?: boolean };
 	steps: WorkflowStep[];
 }
+
 
 interface WorkflowDocument {
 	on: { workflow_dispatch: { inputs: Record<string, unknown> } };
@@ -123,13 +126,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 
 	test("validates the same requested commit in the guard, planner, and shards (no arbitrary dispatch head)", async () => {
 		const d = await workflow();
-		// The arbitrary dispatch HEAD inputs are removed: a manual run can only pin the
-		// diff base, never a head that diverges from what the planner/shards test.
+		// The explicit dispatch HEAD input is reserved for virtual integration; the guard
+		// still pins the planner/shards source to github.sha and never reads it.
 		const dispatchInputs = Object.keys(d.on.workflow_dispatch.inputs);
-		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository"]);
-		expect(dispatchInputs).not.toContain("head_sha");
+		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository", "head_sha", "base_sha_override"]);
 		expect(dispatchInputs).not.toContain("head_ref");
 		expect(dispatchInputs).not.toContain("head_repository");
+
 
 		const guard = requiredJob(d, "telegram-daemon-generation");
 		// The guard head SHA never reads inputs.head_sha; for push/dispatch it is
@@ -172,5 +175,63 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(authorityFetch).toContain('guard-base "${GITHUB_BASE_SHA}"');
 		expect(checkoutStep(guard.steps).with?.["fetch-depth"]).toBe(0);
 		expect(authorityFetch).not.toContain("--depth");
+	});
+});
+
+describe("virtual integration job topology (issue #3350)", () => {
+	test("pins the exact head and serializes the integration job", async () => {
+		const d = await workflow();
+		const job = requiredJob(d, "virtual-integration");
+		expect(job.if).toBe("${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' }}");
+		expect(job.concurrency).toEqual({ group: "dev-ci-virtual-integration", "cancel-in-progress": false });
+		expect(job.permissions).toEqual({ contents: "read", actions: "read" });
+		expect(requiredEnvValue(job, "CI_VI_HEAD_SHA")).toBe("${{ inputs.head_sha }}");
+		expect(requiredEnvValue(job, "CI_VI_BASE_SHA_OVERRIDE")).toBe("${{ inputs.base_sha_override }}");
+		expect(checkoutStep(job.steps).with?.ref).toBe("${{ inputs.head_sha }}");
+		const verify = namedStep(job, "Verify checked-out source head");
+		expect(verify.run).toContain("git rev-parse HEAD");
+		expect(verify.run).toContain("$CI_VI_HEAD_SHA");
+	});
+
+	test("isolates head_sha dispatches from the ordinary graph", async () => {
+		const d = await workflow();
+		const exclusion = "!(github.event_name == 'workflow_dispatch' && inputs.head_sha != '')";
+		const ordinaryRoots = Object.entries(d.jobs)
+			.filter(([name, job]) => name !== "virtual-integration" && !job.needs)
+			.map(([name]) => name);
+		expect(ordinaryRoots).toEqual(["affected-plan", "gjc-state-gates-matrix"]);
+		for (const name of ordinaryRoots) expect(requiredJob(d, name).if).toContain(exclusion);
+		expect(requiredJob(d, "virtual-integration").if).not.toContain(exclusion);
+		for (const name of ["affected-evidence-producer", "affected", "gjc-state-gates"])
+			expect(requiredJob(d, name).if).toContain(exclusion);
+	});
+
+	test("fails closed without retry-ish or continue-on-error behavior", async () => {
+		const d = await workflow();
+		const job = requiredJob(d, "virtual-integration");
+		const serialized = JSON.stringify(job);
+		expect(job.steps.some(step => Object.prototype.hasOwnProperty.call(step, "continue-on-error"))).toBe(false);
+		expect(serialized).not.toContain("continue-on-error");
+		expect(serialized).not.toMatch(/\b(?:sleep|retry)\b/i);
+	});
+
+	test("stays opt-in per merge candidate and validates only the virtual integration canaries", async () => {
+		const d = await workflow();
+		// head_sha is optional so ordinary dispatch runs skip the job entirely; the
+		// job's own `if` is what requires it, keeping cost bounded.
+		const headInput = d.on.workflow_dispatch.inputs.head_sha as { required?: boolean } | undefined;
+		expect(headInput?.required).toBe(false);
+		const overrideInput = d.on.workflow_dispatch.inputs.base_sha_override as { required?: boolean } | undefined;
+		expect(overrideInput?.required).toBe(false);
+		const job = requiredJob(d, "virtual-integration");
+		expect(namedStep(job, "Validate virtual integration").run).toBe("bun scripts/ci-virtual-integration.ts --validate");
+		const canaryStep = namedStep(job, "Run risk-selected canaries");
+		expect(canaryStep.run).toBe("bun scripts/ci-virtual-integration.ts --run-canaries");
+		expect(requiredEnvValue(canaryStep, "CI_VI_BASE_SHA")).toBe("${{ steps.green-dev.outputs.base_sha }}");
+		expect(requiredEnvValue(canaryStep, "CI_VI_BASE_RUN_ID")).toBe("${{ steps.green-dev.outputs.base_run_id }}");
+		expect(JSON.stringify(canaryStep)).not.toContain("JSON.parse");
+		const serialized = JSON.stringify(job);
+		expect(serialized).not.toContain('JSON.parse(await Bun.file(".ci-virtual-integration.json").text())');
+		expect(serialized).not.toContain("scripts/ci-dev-affected.ts --matrix-json");
 	});
 });

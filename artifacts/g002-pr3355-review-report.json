@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-consumer-report",
+  "subject": "adversarial read-only review of PR #3355 (as merged)",
+  "reviewed_commit": "f0071229cb20bbef3923dcc184728364acf0280e",
+  "note": "owner-recorded PR head 8617389dacba408bfdf4d942d4926c89dd1597b3 is not present in this worktree object DB; f0071229c is its merge on dev with identical content",
+  "files_changed": [
+    "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md"
+  ],
+  "diffstat": ".../src/defaults/gjc/skills/ultragoal/SKILL.md     | 28 ++++++++++------------\n 1 file changed, 13 insertions(+), 15 deletions(-)",
+  "gate_sections_unchanged": {
+    "completion_gate": {
+      "sha256_before": "f8083562451e87f1278aa13464d5a3ddfc3b608526b5d5e9aafe27fc4cf48f1b",
+      "sha256_after": "f8083562451e87f1278aa13464d5a3ddfc3b608526b5d5e9aafe27fc4cf48f1b",
+      "identical": true
+    },
+    "terminal_critic_gate": {
+      "sha256_before": "8e89d660bca40efba1dec25c3c856d9c1c0cf8b5196cb52bf96ccec4bb546279",
+      "sha256_after": "8e89d660bca40efba1dec25c3c856d9c1c0cf8b5196cb52bf96ccec4bb546279",
+      "identical": true
+    },
+    "pause_discipline": {
+      "sha256_before": "9755f4979f97b716f41b36172c4f018acace32845307db5ff8aff5653ba1458b",
+      "sha256_after": "9755f4979f97b716f41b36172c4f018acace32845307db5ff8aff5653ba1458b",
+      "identical": true
+    }
+  },
+  "quality_gate_key_counts_on_dev": {
+    "architectReview": 3,
+    "executorQa": 5,
+    "criticReview": 3,
+    "validationBatchClose": 2,
+    "contractCoverage": 3,
+    "surfaceEvidence": 4,
+    "adversarialCases": 2,
+    "Terminal critic gate": 2,
+    "ai-slop-cleaner": 4,
+    "classify-blocker": 2,
+    "record-critic-verdict": 3
+  },
+  "ralplan_skill_touched_by_pr": false,
+  "ralplan_join_gate_phrase_counts_on_dev": {
+    "Review join gate": 1,
+    "both Architect and Critic receipts": 1,
+    "do not finalize from only one review lane": 1,
+    "PLANNING-STUCK": 4,
+    "maxIterations": 3,
+    "pending approval": 7
+  },
+  "delegation_gate_violation_sentence": {
+    "count_before": 1,
+    "count_after": 0,
+    "removed": true
+  },
+  "verdict": "no gate weakening; documentation-only scope confirmed",
+  "residual_risk_advisory": "delegation is now judgment-based with no objective threshold and no completion-gate backstop; under-delegation is unenforceable and the ledger-recorded ralplan-skip judgment is the sole audit trail"
+}

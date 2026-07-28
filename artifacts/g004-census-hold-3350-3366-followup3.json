@@ -1,0 +1,51 @@
+{
+  "recorded_at": "2026-07-28T10:05:00Z",
+  "prior_reconcile_ref": "artifacts/g004-census-hold-3350-3366-followup2.json (recorded_at 2026-07-28T09:20:00Z)",
+  "owner": "sole owner, #3350 risk-canary + #3366 conflict-integration coverage",
+  "reconciliation": {
+    "dev": {
+      "expected_at_census_open": "ec49c5d7d (prior actual_current, was in_progress)",
+      "actual_current": "e6e694fa92ba163f299f3e063dc58210bccb82ca",
+      "delta": "dev advanced 2 commits past ec49c5d7d: ff87d5cdb -> e6e694fa9 (merge of #3400, fix/dev-ci-type-error). Unrelated to #3350/#3366.",
+      "ci_state": "still red at latest tip — CONFIRMED WORSE: prior in_progress run at ec49c5d7d resolved to failure (Dev CI conclusion=failure, run 30346335741); CI workflow at ec49c5d7d also failure. At new tip e6e694fa9: Dev CI run cancelled (completed, no successor queued), CI workflow run completed with conclusion=failure on a DIFFERENT job class than the recurring 'Affected path validation' failures seen in prior three reconciles.",
+      "ci_failing_jobs_at_e6e694fa9": [
+        "test-shard / test:@gajae-code/stats",
+        "test-shard / runtime-check",
+        "test"
+      ],
+      "evidence": [
+        "run 30348929314 headSha=e6e694fa9 workflow=CI conclusion=failure status=completed",
+        "run 30348924583 headSha=e6e694fa9 workflow=Dev CI conclusion=cancelled status=completed",
+        "run 30346335741 headSha=ec49c5d7d workflow=Dev CI conclusion=failure status=completed (now terminal, was in_progress at last reconcile)",
+        "run 30345346823 headSha=3726d4a07 workflow=Dev CI conclusion=cancelled status=completed"
+      ]
+    },
+    "pr_3366": {
+      "title": "test(read): pin conflict surfacing across truncation directions",
+      "expected_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "actual_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "match": true,
+      "state": "OPEN",
+      "mergeStateStatus": "UNKNOWN (still not recomputed by GitHub against current dev tip)",
+      "note": "unchanged across four consecutive reconciles; unrelated in substance to #3350 risk-canary work"
+    },
+    "issue_3350": {
+      "state": "OPEN",
+      "pr": "none opened yet (search for cross-referenced PRs mentioning #3350 returns empty)",
+      "local_work": "still uncommitted on branch g004-revalidate, same file set: scripts/ci-risk-canary-manifest.ts(.test.ts), scripts/ci-virtual-integration.ts(.test.ts), plus modifications to .github/workflows/dev-ci.yml, scripts/ci-dev-affected.ts(.test.ts), scripts/dev-ci-guard-topology.test.ts",
+      "current_head_evidence": "local branch g004-revalidate still at HEAD 29f142572, now behind dev tip e6e694fa9 by 28 commits (was 26 at prior followup2). No new local test run performed this pass; no local file changes since last verified green run (28 pass / 93 pass) — re-verifying not required.",
+      "timeline": "still empty — no linked PR exists yet"
+    },
+    "dev_recovery_in_flight": {
+      "pr_3375": {"title": "fix(ci): restore dev formatting and stats isolation", "state": "OPEN", "mergedAt": null, "mergeStateStatus": "UNKNOWN", "mergeable": "UNKNOWN", "headRefOid": "3728d6905a86e117d48d317dce9e797c84e71917", "note": "still open/unmerged — head unchanged from prior three reconciles; mergeStateStatus flipped from CLEAN/MERGEABLE to UNKNOWN (GitHub has not recomputed against new dev tip yet)"},
+      "pr_3400": {"title": "fix(dev-ci): type the deep-interview stage fact-count assertion", "state": "MERGED", "note": "new since prior followup2; unrelated to #3350/#3366/#3375 scope, does not resolve the recurring Affected path validation failure class"},
+      "action": "not duplicated; still deferring to #3375 owners for remaining dev-red repair. Note: newest terminal CI failure at e6e694fa9 is a different job class (test:@gajae-code/stats, runtime-check) than #3375's stated scope (dev formatting and stats isolation) and than the recurring Affected path validation failures — dev-red surface is widening, not narrowing."
+    }
+  },
+  "critic_hold_verdict": {
+    "decision": "HOLD — no merge, no close (unchanged across four consecutive census passes)",
+    "rationale": "Dev CI/CI have not reached a green terminal state at any observed tip since census open. The previously in_progress run at ec49c5d7d has now resolved to failure, confirming dev was red at that tip too. Current dev tip e6e694fa9 shows a completed CI failure on a new job class (test:@gajae-code/stats, runtime-check) in addition to the prior recurring Affected path validation failures, and Dev CI cancelled with no successful successor. #3375 (dev-recovery PR) remains OPEN/unmerged; its mergeStateStatus is now UNKNOWN pending GitHub recompute. #3400 merged onto dev since the last reconcile but is unrelated to #3350/#3366 and does not resolve the dev-red state. Per owner-freeze policy this still prohibits merging #3366 (unchanged, mergeStateStatus UNKNOWN) or opening/landing a #3350 risk-canary PR from local uncommitted work.",
+    "retire_condition": "unchanged: dev CI green at a tip past #3375 landing AND (#3366 merged or explicitly closed) AND (#3350 has a merged/closed PR or the issue itself is closed).",
+    "next_check": "Re-poll dev CI/CI conclusion at the next dev tip, and re-check #3375 merge status and mergeStateStatus recompute. No merge/close/skill-chain performed this pass, consistent with owner freeze; no ultragoal invocation triggered per instruction."
+  }
+}

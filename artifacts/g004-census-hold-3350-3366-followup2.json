@@ -1,0 +1,54 @@
+{
+  "recorded_at": "2026-07-28T09:20:00Z",
+  "prior_reconcile_ref": "artifacts/g004-census-hold-3350-3366-followup.json (recorded_at 2026-07-28T08:38:50Z)",
+  "owner": "sole owner, #3350 risk-canary + #3366 conflict-integration coverage",
+  "reconciliation": {
+    "dev": {
+      "expected_at_census_open": "784e4b0b1 (prior actual_current)",
+      "actual_current": "ec49c5d7d522d451d83c3b2ac0b839447a9dd7fa",
+      "delta": "dev advanced 8 commits past 784e4b0b1: a518d2209 (merge of #3393, feat/deep-interview-unified-surface) -> 3726d4a07 (merge of #3395, fix/deep-interview-intent-guard) -> ec49c5d7d (merge of #3396, fix/deep-interview-hud-and-null-prose). All three PRs (#3393/#3395/#3396) merged/closed, all deep-interview scope, none touch #3350/#3366.",
+      "ci_state": "still unresolved/red pattern — most recent completed run at a518d2209 is failure; run at 3726d4a07 is cancelled; run at current tip ec49c5d7d is in_progress (not yet terminal)",
+      "ci_failing_jobs_at_a518d2209": [
+        "Affected path validation / test:@gajae-code/coding-agent:shard-7-of-8",
+        "Affected path validation / check:@gajae-code/coding-agent",
+        "Affected path validation / evidence producer",
+        "Affected path validation"
+      ],
+      "evidence": [
+        "run 30346545871 headSha=ec49c5d7d workflow=CI status=in_progress",
+        "run 30346335741 headSha=ec49c5d7d workflow=Dev CI status=in_progress (current dev tip, unresolved)",
+        "run 30345346823 headSha=3726d4a07 workflow=Dev CI conclusion=cancelled status=completed",
+        "run 30343747079 headSha=a518d2209 workflow=Dev CI conclusion=failure status=completed (same Affected path validation failure class as prior two reconciles)"
+      ]
+    },
+    "pr_3366": {
+      "title": "test(read): pin conflict surfacing across truncation directions",
+      "expected_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "actual_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "match": true,
+      "state": "OPEN",
+      "mergeStateStatus": "UNKNOWN (still not recomputed by GitHub against current dev tip)",
+      "note": "unchanged from prior two reconciles; unrelated in substance to #3350 risk-canary work"
+    },
+    "issue_3350": {
+      "state": "OPEN",
+      "pr": "none opened yet (timeline query for cross-referenced/connected events returns empty)",
+      "local_work": "still uncommitted on branch g004-revalidate, same file set: scripts/ci-risk-canary-manifest.ts(.test.ts), scripts/ci-virtual-integration.ts(.test.ts), plus modifications to .github/workflows/dev-ci.yml, scripts/ci-dev-affected.ts(.test.ts), scripts/dev-ci-guard-topology.test.ts",
+      "current_head_evidence": "local branch g004-revalidate still at HEAD 29f142572, now behind dev tip ec49c5d7d by 26 commits (was 18 at prior followup, 5 at first reconcile). No new local test run performed this pass — no local file changes since last verified green run (28 pass / 93 pass); re-verifying not required.",
+      "timeline": "still empty — no linked PR exists yet"
+    },
+    "dev_recovery_in_flight": {
+      "pr_3375": {"title": "fix(ci): restore dev formatting and stats isolation", "state": "OPEN", "merged": false, "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE", "headRefOid": "3728d6905a86e117d48d317dce9e797c84e71917", "note": "still open/unmerged — unchanged head/state from prior two reconciles"},
+      "pr_3393": {"title": "feat(deep-interview): full gjc deep-interview surface + architect re-review fixes", "state": "CLOSED", "merged": true, "note": "new since prior followup; unrelated to #3350/#3366, not #3375-dev-recovery scope"},
+      "pr_3395": {"title": "fix(deep-interview): recorder-owned intent keys + delta schemas in SKILL.md", "state": "CLOSED", "merged": true, "note": "new since prior followup; unrelated"},
+      "pr_3396": {"title": "fix(deep-interview): close architect round-3 WATCH findings / accept null prose markers", "state": "CLOSED", "merged": true, "note": "new since prior followup; unrelated"},
+      "action": "not duplicated; still deferring to #3375 owners for remaining dev-red repair (Affected path validation failures persist at latest terminal tip a518d2209)"
+    }
+  },
+  "critic_hold_verdict": {
+    "decision": "HOLD — no merge, no close (unchanged across three consecutive census passes)",
+    "rationale": "Dev CI has not reached a green terminal state at any observed tip since census open; latest terminal (non-cancelled, non-in-progress) run at a518d2209 is still failure, on the identical Affected path validation job class as the prior two reconciles. Current dev tip ec49c5d7d has a Dev CI run in_progress (not yet resolved). #3375 (dev-recovery PR) remains OPEN/unmerged, now CLEAN/MERGEABLE but not landed. Per owner-freeze policy this still prohibits merging #3366 (unchanged, mergeStateStatus UNKNOWN) or opening/landing a #3350 risk-canary PR from local uncommitted work. Three more unrelated PRs (#3393/#3395/#3396, all deep-interview scope) merged onto dev since the last reconcile but do not touch #3350/#3366 territory and do not satisfy the retire condition.",
+    "retire_condition": "unchanged: dev CI green at a tip past #3375 landing AND (#3366 merged or explicitly closed) AND (#3350 has a merged/closed PR or the issue itself is closed).",
+    "next_check": "Re-poll dev CI conclusion once the in_progress run at ec49c5d7d completes, and re-check #3375 merge status. No merge/close/skill-chain performed this pass, consistent with owner freeze; no ultragoal invocation triggered per instruction."
+  }
+}

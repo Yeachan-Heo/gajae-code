@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "kind": "cli-dogfood-trace",
+  "subject": "scripts/ci-virtual-integration.ts end-to-end execution",
+  "note": "Replaces the prior echo-only cli-replay artifact, which a terminal critic correctly rejected as not proving the virtual-integration CLI actually runs.",
+  "fixture": "throwaway git repo under /tmp/vi-dogfood/fixture (git init, base commit, head commit touching packages/coding-agent/src/session/session-manager.ts)",
+  "validate_mode": {
+    "command": "CI_VI_HEAD_SHA=<head> CI_VI_BASE_SHA=<base> CI_VI_BASE_RUN_ID=999002 CI_VI_BASE_CONCLUSION=success bun scripts/ci-virtual-integration.ts --validate",
+    "exit_code": 0,
+    "side_effect": ".ci-virtual-integration.json written with canonical bytes (trailing newline verified)",
+    "emitted_evidence": {
+      "schemaVersion": 1,
+      "subject": "ci-virtual-integration",
+      "headSha": "c1b9ad53b4d56714ead453fda42f7fe83b5d2619",
+      "baseSha": "41ba7de85688d62675acf311971161276a137e8f",
+      "baseRunId": "999002",
+      "mergeTreeSha": "6d1a5c7f7b684cf19a2a2976bc7f822bd03bb7ff",
+      "canaryTasks": [
+        "packages/coding-agent/test/notifications-live-stream.test.ts",
+        "packages/coding-agent/test/session-manager-resident-cache.test.ts"
+      ]
+    }
+  },
+  "run_canaries_mode": {
+    "command": "CI_VI_BASE_SHA=<base> CI_VI_BASE_RUN_ID=999002 bun scripts/ci-virtual-integration.ts --run-canaries",
+    "exit_code": 0,
+    "canary_invocation_count": 2,
+    "expected_invocation_count": 2,
+    "invocations": [
+      {
+        "canary": "notifications-live-stream",
+        "cwd": "/tmp/ci-virtual-merge-zJUT0V/merged"
+      },
+      {
+        "canary": "session-manager-resident-cache",
+        "cwd": "/tmp/ci-virtual-merge-zJUT0V/merged"
+      }
+    ],
+    "merged_worktree_cwd_verified": true,
+    "observation": "Each canary executed with cwd inside the materialized merge worktree, not the candidate head checkout, proving canaries exercise the merged state."
+  },
+  "verdict": "FROZEN_REVIEW_ONLY: dogfood trace satisfied; no merge performed or requested."
+}

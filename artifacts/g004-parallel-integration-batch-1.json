@@ -1,0 +1,36 @@
+{
+  "recorded_at": "2026-07-28T14:55:00Z",
+  "doctrine": "parallel/serialized integration: red/pending dev is not a repo-wide freeze; merge independently reviewed, exact-head-green, non-overlapping PRs while blocker repair runs; hold only work touching/dependent on the failing contract or causing attribution ambiguity",
+  "batch_actions": [
+    {
+      "item": "pr_3366",
+      "action": "MERGED",
+      "method": "squash",
+      "pre_merge_dev_head": "09caa962f6716b4b33c202d6125a6373edea5424 (this dev head resulted from the #3366 merge commit itself)",
+      "merge_commit": "09caa962f6716b4b33c202d6125a6373edea5424",
+      "pre_merge_verification": "PR head 6079ec037 unchanged across 6 census reconciles; mergeStateStatus CLEAN/MERGEABLE; gh pr checks 3366 all pass; no overlap with failing 'Affected path validation / test:@gajae-code/coding-agent:shard-2-of-8' contract (PR touches packages/coding-agent/test/tools/conflict-integration.test.ts only, not ci-dev-affected.ts or dev-ci.yml)",
+      "status": "terminal, complete"
+    },
+    {
+      "item": "issue_3350_local_work",
+      "action": "HOLD",
+      "hold_class": "contract-overlap (not global freeze)",
+      "reason": "local branch g004-revalidate modifies .github/workflows/dev-ci.yml and scripts/ci-dev-affected.ts(.test.ts) directly — this is the exact 'Affected path validation' contract implicated in the recurring dev-CI failure class (evidence producer + coding-agent shard-2-of-8, seen recurring across followup/followup2/followup4 census passes). Per doctrine this must hold regardless of dev's momentary green/red state.",
+      "secondary_reason": "no PR opened yet; branch now 72 commits behind origin/dev (git rev-list --count g004-revalidate..origin/dev), up from 30 at last census — not rebase-current, not independently reviewed, so not MERGE_READY on procedural grounds either.",
+      "next_step_to_clear_hold": "rebase g004-revalidate onto current dev tip, get its own CI green on the exact rebased head, and confirm the recurring shard-2-of-8/evidence-producer failure class is not reproduced by this change specifically (attribution check) before opening a PR."
+    },
+    {
+      "item": "issue_3299_pr",
+      "action": "NO ACTION",
+      "reason": "unrelated investigation-only PR, no overlap with #3350/#3366, not part of this batch"
+    },
+    {
+      "item": "old_owner_drafts",
+      "action": "NO ACTION",
+      "reason": "none found beyond already-tracked #3350 local work"
+    }
+  ],
+  "dev_head_at_decision_time": "a8fdf67f19897ebb8e6f9c83a844ddd9d3521e90",
+  "dev_ci_at_decision_time": "run 30370451179 status=pending at that head; run 30369059456 (prior head 984b4c12) status=in_progress; dev is being actively integrated by other owners (yeongjunyoo merged #3357, multiple rapid dev-tip advances observed) — per doctrine this is not polled further as it is outside this batch's scoped lane",
+  "classification": "no CI failure attributable to this batch's own changes was observed or caused; the recurring 'Affected path validation' failure class is a pre-existing/external condition on dev, not introduced by #3366 (which merged clean) or #3350 (which remains held, unmerged, and therefore cannot have caused it)"
+}

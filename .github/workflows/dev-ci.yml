@@ -19,6 +19,14 @@ on:
         description: Base owner/repository containing base_ref (must be this repository).
         required: true
         type: string
+      head_sha:
+        description: Exact 40-hex PR head commit SHA to validate against the latest terminal-green dev. Set it to request virtual-integration validation for one merge candidate.
+        required: false
+        type: string
+      base_sha_override:
+        description: Optional exact 40-hex dev base SHA that must equal the API-resolved latest terminal-green dev head. Leave empty to accept the resolved base.
+        required: false
+        type: string
 
 # Least privilege by default: no dev-ci job needs a write-scoped GITHUB_TOKEN.
 # Every job only checks out, installs, tests, and exchanges artifacts through the
@@ -37,6 +45,7 @@ jobs:
   # exact diff via CI_DEV_CHANGED_PATHS instead of re-resolving the base ref.
   affected-plan:
     name: Affected path validation / plan
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -614,7 +623,7 @@ jobs:
   # validates the finalized bundle downloaded by its immutable artifact ID.
   affected-evidence-producer:
     name: Affected path validation / evidence producer
-    if: ${{ always() }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
     needs: [affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -703,7 +712,7 @@ jobs:
 
   affected:
     name: Affected path validation
-    if: ${{ always() }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
     needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -779,6 +788,7 @@ jobs:
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
@@ -812,7 +822,7 @@ jobs:
   # Branch protection must keep requiring this stable aggregate status.
   gjc-state-gates:
     name: gjc-state-gates
-    if: ${{ always() }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
     needs: [gjc-state-gates-matrix]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -822,3 +832,87 @@ jobs:
           result='${{ needs.gjc-state-gates-matrix.result }}'
           echo "gjc-state-gates shard result: $result"
           test "$result" = success
+
+  virtual-integration:
+    name: Virtual integration validation
+    # Opt-in per merge candidate: dispatch with head_sha set. Without it the job
+    # is skipped, so ordinary PR/push runs never pay for virtual integration.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: dev-ci-virtual-integration
+      cancel-in-progress: false
+    env:
+      CI_VI_HEAD_SHA: ${{ inputs.head_sha }}
+      # Distinct from the diff-oriented base_sha input: this override, when set,
+      # must equal the API-resolved latest terminal-green dev head or validation
+      # fails closed.
+      CI_VI_BASE_SHA_OVERRIDE: ${{ inputs.base_sha_override }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.head_sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_VI_HEAD_SHA" || { echo "Checked-out SHA $head does not match $CI_VI_HEAD_SHA"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3.14"
+      - name: Resolve latest terminal-green dev run
+        id: green-dev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run list --workflow "Dev CI" --branch dev --status success --limit 1 --json headSha,databaseId,conclusion |
+            bun -e '
+              const runs = JSON.parse(await Bun.stdin.text());
+              const run = runs[0];
+              const headSha = typeof run?.headSha === "string" ? run.headSha : "";
+              const runId = run?.databaseId === undefined || run?.databaseId === null ? "" : String(run.databaseId);
+              if (run?.conclusion !== "success" || !/^[0-9a-f]{40}$/i.test(headSha) || !/^[0-9]+$/.test(runId)) {
+                console.error("No terminal-green dev run found");
+                process.exit(1);
+              }
+              console.log(`base_sha=${headSha}`);
+              console.log(`base_run_id=${runId}`);
+              console.log(`base_conclusion=${run.conclusion}`);
+            ' >> "$GITHUB_OUTPUT"
+      - name: Fetch resolved base
+        run: git fetch --no-tags origin dev
+      - name: Validate virtual integration
+        env:
+          CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}
+          CI_VI_BASE_RUN_ID: ${{ steps.green-dev.outputs.base_run_id }}
+          CI_VI_BASE_CONCLUSION: ${{ steps.green-dev.outputs.base_conclusion }}
+        run: bun scripts/ci-virtual-integration.ts --validate
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - name: Install system deps
+        run: bash scripts/ci-install-system-deps.sh
+      - run: bun install --frozen-lockfile
+      - name: Run risk-selected canaries
+        env:
+          CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}
+          CI_VI_BASE_RUN_ID: ${{ steps.green-dev.outputs.base_run_id }}
+        shell: bash
+        run: bun scripts/ci-virtual-integration.ts --run-canaries
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-virtual-integration-${{ github.run_id }}
+          path: .ci-virtual-integration.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true

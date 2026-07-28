@@ -1,0 +1,50 @@
+{
+  "recorded_at": "2026-07-28T06:45:00Z",
+  "reconciled_at": "2026-07-28T07:05:00Z",
+  "owner": "sole owner, #3350 risk-canary + #3366 conflict-integration coverage",
+  "reconciliation": {
+    "dev": {
+      "expected_at_census_open": "2dbbf7924d9ab2c219f7c212d8b5a84932dd8867",
+      "actual_at_first_reconcile": "fc517b13ab643f973fcfc0a3c18411292bd7943f",
+      "actual_current": "efdc293981ef7f3e8bf853a964bdd69eddbfaff2",
+      "delta": "dev advanced twice more since first reconcile: fc517b13a -> 2b139fb05 (merge of #3382) -> efdc29398 (merge of #3380, dev-recovery revert). Both #3382 and #3380 are now merged/closed.",
+      "ci_state": "red/unknown (still unresolved)",
+      "evidence": [
+        "run 30333697427 headSha=29f1425721782 conclusion=failure",
+        "run 30331974909 headSha=5f5122a3f82 conclusion=failure",
+        "run 30334686713 headSha=2dbbf7924d9 conclusion=cancelled",
+        "run 30335201232 headSha=fc517b13ab6 conclusion=cancelled",
+        "run 30335597007 headSha=2b139fb0538 conclusion=cancelled",
+        "run 30336555429 headSha=efdc2939816 status=in_progress (current dev tip, unresolved)"
+      ]
+    },
+    "pr_3366": {
+      "title": "test(read): pin conflict surfacing across truncation directions",
+      "expected_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "actual_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "match": true,
+      "state": "OPEN",
+      "mergeable_state": "unknown (GitHub has not recomputed mergeability against current dev tip yet)",
+      "note": "unrelated in substance to #3350 risk-canary work; tracked jointly under same ownership. Not a duplicate of #3375/#3380 dev-recovery."
+    },
+    "issue_3350": {
+      "state": "OPEN",
+      "pr": "none opened yet",
+      "local_work": "uncommitted on branch g004-revalidate: scripts/ci-risk-canary-manifest.ts(.test.ts), scripts/ci-virtual-integration.ts(.test.ts), plus modifications to .github/workflows/dev-ci.yml, scripts/ci-dev-affected.ts(.test.ts), scripts/dev-ci-guard-topology.test.ts",
+      "current_head_evidence": "at local HEAD 29f142572 (branch g004-revalidate, behind dev tip efdc29398 by 5 commits): bun test scripts/ci-risk-canary-manifest.test.ts scripts/ci-virtual-integration.test.ts -> 28 pass / 0 fail / 55 expect() calls; bun test scripts/ci-dev-affected.test.ts scripts/dev-ci-guard-topology.test.ts -> 93 pass / 0 fail / 661 expect() calls. All local risk-canary + virtual-integration + affected-path evidence is green at current head. This is local verification only, not a substitute for dev CI resolving.",
+      "timeline": "GitHub issue timeline is empty — no linked PR exists yet"
+    },
+    "dev_recovery_in_flight": {
+      "pr_3375": {"title": "fix(ci): restore dev formatting and stats isolation", "state": "OPEN", "merged": false, "mergeable_state": "clean"},
+      "pr_3380": {"title": "revert(coding-agent): replace typed deep-interview repair CLI with staged JSON transitions", "state": "CLOSED", "merged": true},
+      "pr_3382": {"title": "fix(deep-interview): make setup-conflict recovery runnable for required fields", "state": "CLOSED", "merged": true},
+      "action": "not duplicated; still deferring to #3375 owners for remaining dev-red repair"
+    }
+  },
+  "critic_hold_verdict": {
+    "decision": "HOLD — no merge (unchanged)",
+    "rationale": "Dev CI conclusion is still red/unknown at every observed dev tip through the latest reconcile (failure, failure, cancelled x3, in_progress). Per owner-freeze policy, unknown/red dev prohibits merging #3366 (green, clean, but merges onto a red base) or opening/landing a #3350 risk-canary PR from the local uncommitted work, even though local test evidence for that work is fully green at current head.",
+    "retire_condition": "Only retire this workstream once GitHub records a durable terminal state: dev CI green at a tip past all dev-recovery PRs (#3375 landing, in addition to already-merged #3380/#3382), AND (#3366 merged or explicitly closed) AND (#3350 has a merged/closed PR or the issue itself is closed).",
+    "next_check": "Re-poll dev CI conclusion for tip efdc29398 (currently in_progress) and #3375 merge status; do not act on dev-recovery internals; no merge/close performed this pass, consistent with owner freeze."
+  }
+}

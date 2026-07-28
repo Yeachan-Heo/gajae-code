@@ -1,0 +1,68 @@
+{
+  "recorded_at": "2026-07-28T12:40:00Z",
+  "prior_reconcile_ref": "artifacts/g004-census-hold-3350-3366-followup3.json (recorded_at 2026-07-28T10:05:00Z)",
+  "owner": "sole owner, #3350 risk-canary + #3366 conflict-integration coverage",
+  "scope_note": "user follow-up explicitly asked to also check #3299 and 'old owner drafts'; included below, exact-proof only (gh/git commands, no inference).",
+  "reconciliation": {
+    "dev": {
+      "expected_at_prior_followup": "e6e694fa92ba163f299f3e063dc58210bccb82ca",
+      "actual_current": "c97da89c1afadcf20fc949307f2996aaeffecfca",
+      "delta": "dev advanced past e6e694fa9 to c97da89c1 (evidence: gh api repos/.../commits/dev .sha)",
+      "ci_state": "still red at latest tip. Dev CI run 30358765702 headSha=c97da89c1 conclusion=failure status=completed. Failing jobs (gh run view 30358765702 --json jobs): 'Affected path validation / test:@gajae-code/coding-agent:shard-2-of-8', 'Affected path validation / evidence producer', 'Affected path validation' — this is the SAME recurring failure class seen in followup/followup2, which had temporarily been superseded by a different class (test:@gajae-code/stats, runtime-check) at e6e694fa9 in followup3. CI workflow at prior tip e3274992249f58088bc2142e816dcf32ee9d9537 also failure.",
+      "runs_evidence": [
+        "run 30358765702 headSha=c97da89c1 workflow=Dev CI conclusion=failure status=completed",
+        "run 30352038622 headSha=e327499224 workflow=CI conclusion=failure status=completed"
+      ]
+    },
+    "pr_3366": {
+      "title": "test(read): pin conflict surfacing across truncation directions",
+      "expected_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "actual_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "match": true,
+      "state": "OPEN",
+      "mergeStateStatus": "CLEAN",
+      "mergeable": "MERGEABLE",
+      "note": "CHANGED since followup3: mergeStateStatus recomputed from UNKNOWN to CLEAN/MERGEABLE (gh pr view 3366 --json mergeStateStatus,mergeable). Head commit unchanged across five reconciles. GitHub-mergeable does not mean dev-green; dev tip CI is still failing (Affected path validation)."
+    },
+    "issue_3350": {
+      "state": "OPEN",
+      "pr": "none opened yet (issue timeline has zero cross-referenced events: gh api repos/.../issues/3350/timeline --jq 'select(.event==\"cross-referenced\")' returns empty)",
+      "local_work": "still uncommitted on branch g004-revalidate (git status --short): modified .github/workflows/dev-ci.yml, scripts/ci-dev-affected.ts(.test.ts), scripts/dev-ci-guard-topology.test.ts; untracked scripts/ci-risk-canary-manifest.ts(.test.ts), scripts/ci-virtual-integration.ts(.test.ts), plus prior artifact files.",
+      "current_head_evidence": "local branch g004-revalidate at HEAD 29f142572, now 30 commits behind origin/dev (git rev-list --count g004-revalidate..origin/dev), up from 28 at followup3. No new local test run performed this pass; not required since no local file changes occurred."
+    },
+    "issue_3299_pr": {
+      "found_via": "gh issue view 3299 resolved to a PR (gh pr view 3299 confirms)",
+      "title": "test(build): add workspace build-dependency-order regression (investigation: race not reproduced)",
+      "url": "https://github.com/Yeachan-Heo/gajae-code/pull/3299",
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeStateStatus": "CLEAN",
+      "mergeable": "MERGEABLE",
+      "headRefOid": "25ca76a45b606ee35e2f1c70021e4ff0041c7bcc",
+      "relation_to_3350_3366": "no overlap found — this is an investigation-only PR (dogfood build race after #3275) per its own body: 'This PR does not apply a speculative code fix... none reproduced or could be confirmed.' Not referenced by #3350, #3366, or #3375 in any artifact or gh timeline query so far.",
+      "note": "included per explicit user request; no other prior artifact in this repo references #3299 (grep across artifacts/ and docs/ found no genuine match, only an unrelated numeric coincidence in artifacts/compaction-mining-v2.json)."
+    },
+    "old_owner_drafts": {
+      "definition_used": "uncommitted/local draft work on branch g004-revalidate predating this census, plus any other open owner-authored draft PRs surfaced by gh queries this pass",
+      "found": "no additional owner drafts beyond the already-tracked local g004-revalidate work and #3375 (dev-recovery PR, also owner/queue-adjacent). No separate stale draft PRs were located via gh search this pass; if a specific draft is meant, its identifier (branch name, PR #, or file path) is needed to locate exact proof — none was found by re-scanning artifacts/ and docs/ for 'draft'."
+    },
+    "dev_recovery_in_flight": {
+      "pr_3375": {
+        "title": "fix(ci): restore dev formatting and stats isolation",
+        "state": "OPEN",
+        "mergedAt": null,
+        "headRefOid": "3728d6905a86e117d48d317dce9e797c84e71917",
+        "mergeStateStatus": "DIRTY",
+        "mergeable": "CONFLICTING",
+        "note": "CHANGED since followup3: mergeStateStatus recomputed from UNKNOWN to DIRTY/CONFLICTING against new dev tip c97da89c1 (gh pr view 3375 --json mergeStateStatus,mergeable). Head commit unchanged across five reconciles — PR now has merge conflicts against dev and cannot land as-is."
+      },
+      "pr_3400": {"note": "unchanged from followup3, already merged, unrelated"}
+    }
+  },
+  "critic_hold_verdict": {
+    "decision": "HOLD — no merge, no close (unchanged across five consecutive census passes)",
+    "rationale": "Dev CI failing at current tip c97da89c1 with the original recurring 'Affected path validation' failure class re-appearing (evidence producer + coding-agent shard-2-of-8), confirming dev-red has not been resolved and the failure surface has not stabilized across reconciles. #3375, the PR meant to fix this, is now DIRTY/CONFLICTING against dev (was UNKNOWN, never CLEAN at any observed reconcile) — its mergeability has regressed, not improved. #3366 is individually MERGEABLE/CLEAN but per owner-freeze policy still cannot merge while dev is red. #3350 has no PR and no cross-referenced activity. #3299 is unrelated in substance (investigation-only build-race PR) and does not affect this hold. No 'old owner draft' beyond already-tracked items was located with exact proof.",
+    "retire_condition": "unchanged: dev CI green at a tip past #3375 landing AND (#3366 merged or explicitly closed) AND (#3350 has a merged/closed PR or the issue itself is closed).",
+    "next_check": "Re-poll dev CI conclusion at next tip; re-check #3375 conflict resolution and mergeStateStatus. No merge/close/skill-chain performed this pass, consistent with owner freeze; no ultragoal invocation triggered."
+  }
+}

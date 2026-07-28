@@ -3,6 +3,7 @@
 import { $ } from "bun";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import { selectCanaryTests } from "./ci-risk-canary-manifest";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
@@ -901,7 +902,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 	}
 	if (needCiSelftest) {
-		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts"]);
+		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 	}
 	if (needYamlParse) {
@@ -909,6 +910,14 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 	}
 	if (needPermissionCheck) {
 		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
+	}
+
+	// Risk-triggered subsystem canaries (issue #3350). Direct affected-path
+	// selection above is unchanged; canaries are additive and de-duplicated by
+	// task key, so they flow through the canonical plan, shard receipts, the
+	// evidence manifest, and fail-closed aggregation exactly like direct tests.
+	for (const canary of selectCanaryTests(relevant)) {
+		addTestFileTask(tasks, canary);
 	}
 
 	ensureNativeBuild(tasks);
@@ -1011,7 +1020,7 @@ function isTestFilePath(changedPath: string): boolean {
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts";
+	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts" || changedPath === "scripts/ci-risk-canary-manifest.ts" || changedPath === "scripts/ci-risk-canary-manifest.test.ts" || changedPath === "scripts/ci-virtual-integration.ts" || changedPath === "scripts/ci-virtual-integration.test.ts";
 }
 
 

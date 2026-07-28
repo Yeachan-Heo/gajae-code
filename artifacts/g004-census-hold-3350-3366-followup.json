@@ -1,0 +1,54 @@
+{
+  "recorded_at": "2026-07-28T08:38:50Z",
+  "prior_reconcile_ref": "artifacts/g004-census-hold-3350-3366.json (reconciled_at 2026-07-28T07:05:00Z)",
+  "owner": "sole owner, #3350 risk-canary + #3366 conflict-integration coverage",
+  "reconciliation": {
+    "dev": {
+      "expected_at_census_open": "efdc29398 (prior actual_current)",
+      "actual_current": "784e4b0b1e27a76f5ce46b822c12644caff58e9e",
+      "delta": "dev advanced further past efdc29398: 8e4533909 (merge of #3385) -> 2b139... already counted -> a4abfc40f (merge of #3385) -> af4ed5b73 (merge of #3386) -> 784e4b0b1 (merge of #3387, feat/deep-interview-runtime-ambiguity). #3385, #3386, #3387 all merged/closed. None relate to #3350/#3366.",
+      "ci_state": "red (now terminal, not unknown) — Dev CI conclusion=failure, status=completed at head 784e4b0b1 (run 30341508840)",
+      "ci_failing_jobs": [
+        "Affected path validation / check:@gajae-code/coding-agent",
+        "Affected path validation / evidence producer",
+        "Affected path validation"
+      ],
+      "evidence": [
+        "run 30341508840 headSha=784e4b0b1 conclusion=failure status=completed",
+        "run 30337742721 headSha=af4ed5b73 conclusion=failure status=completed (prior tip, also red)",
+        "run 30337624214 headSha=a4abfc40f conclusion=cancelled status=completed"
+      ]
+    },
+    "pr_3366": {
+      "title": "test(read): pin conflict surfacing across truncation directions",
+      "expected_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "actual_head": "6079ec037f35b3e9c29039a0d54685b31e6d8764",
+      "match": true,
+      "state": "OPEN",
+      "mergeStateStatus": "UNKNOWN (GitHub still has not recomputed mergeability against current dev tip)",
+      "note": "unchanged from prior reconcile; unrelated in substance to #3350 risk-canary work"
+    },
+    "issue_3350": {
+      "state": "OPEN",
+      "pr": "none opened yet (timeline query for cross-referenced/referenced events returns empty)",
+      "local_work": "still uncommitted on branch g004-revalidate, unchanged file set: scripts/ci-risk-canary-manifest.ts(.test.ts), scripts/ci-virtual-integration.ts(.test.ts), plus modifications to .github/workflows/dev-ci.yml, scripts/ci-dev-affected.ts(.test.ts), scripts/dev-ci-guard-topology.test.ts",
+      "current_head_evidence": "local branch g004-revalidate still at HEAD 29f142572, now behind dev tip 784e4b0b1 by 18 commits (was 5 at prior reconcile). No new local test run performed this pass — no code changes since last verified green run (28 pass / 93 pass, see prior artifact); re-verifying was not required since no local files changed.",
+      "timeline": "still empty — no linked PR exists yet"
+    },
+    "dev_recovery_in_flight": {
+      "pr_3375": {"title": "fix(ci): restore dev formatting and stats isolation", "state": "OPEN", "merged": false, "mergeable_state": "clean", "headRefOid": "3728d6905a86e117d48d317dce9e797c84e71917", "note": "still open/unmerged — unchanged from prior reconcile"},
+      "pr_3380": {"state": "CLOSED", "merged": true, "note": "already accounted for in prior reconcile"},
+      "pr_3382": {"state": "CLOSED", "merged": true, "note": "already accounted for in prior reconcile"},
+      "pr_3385": {"title": "fix(guard): block only explicit filesystem mutations during planning phases", "state": "CLOSED", "merged": true, "note": "new since prior reconcile; unrelated to #3350/#3366, not #3375-dev-recovery scope"},
+      "pr_3386": {"title": "fix(deep-interview): stage followup", "state": "CLOSED", "merged": true, "note": "new since prior reconcile; unrelated"},
+      "pr_3387": {"title": "feat(deep-interview): runtime-owned ambiguity and incremental staging guidance", "state": "CLOSED", "merged": true, "note": "new since prior reconcile; unrelated"},
+      "action": "not duplicated; still deferring to #3375 owners for remaining dev-red repair (Affected path validation failures persist at current tip)"
+    }
+  },
+  "critic_hold_verdict": {
+    "decision": "HOLD — no merge, no close (unchanged from prior pass)",
+    "rationale": "Dev CI is now confirmed red in a terminal state (failure/completed, not merely cancelled/in_progress) at current tip 784e4b0b1, specifically on Affected path validation jobs. #3375 (the dev-recovery PR most relevant to this failure class) remains OPEN/unmerged. Per owner-freeze policy this still prohibits merging #3366 (unchanged, mergeable_state UNKNOWN) or opening/landing a #3350 risk-canary PR from local uncommitted work. Three unrelated PRs (#3385/#3386/#3387, all deep-interview scope) merged onto dev since the last reconcile but do not touch #3350/#3366 territory and do not satisfy the retire condition.",
+    "retire_condition": "unchanged: dev CI green at a tip past #3375 landing AND (#3366 merged or explicitly closed) AND (#3350 has a merged/closed PR or the issue itself is closed).",
+    "next_check": "Re-poll dev CI conclusion at next dev tip and #3375 merge status; do not act on dev-recovery internals; no merge/close performed this pass, consistent with owner freeze. No overlap with dev-recovery workstream was introduced by this census."
+  }
+}
