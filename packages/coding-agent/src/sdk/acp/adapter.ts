@@ -267,6 +267,7 @@ export class AcpSdkAdapter {
 		if (this.#closed || !this.#providers.length) return;
 		if (this.#reclaiming) return await this.#reclaiming;
 		this.#reclaiming = (async () => {
+			this.#abortActiveReverseRequests();
 			this.#connectionId = this.#client.connectionId;
 			if (!this.#connectionId) this.#connectionId = await this.#waitForConnectionId();
 			for (const provider of this.#providers) await this.registerProvider(provider);
@@ -417,6 +418,14 @@ export class AcpSdkAdapter {
 		if (this.#reverseRequests.get(id) !== request) return;
 		if (request.cancelTimer) clearTimeout(request.cancelTimer);
 		this.#reverseRequests.delete(id);
+	}
+
+	#abortActiveReverseRequests(): void {
+		for (const [id, request] of this.#reverseRequests) {
+			request.state = "cancelled";
+			request.controller?.abort();
+			this.#finishReverse(id, request);
+		}
 	}
 
 	async #forwardReverse(method: string, payload: JsonObject, signal: AbortSignal): Promise<unknown> {

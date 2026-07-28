@@ -601,6 +601,47 @@ export function acpProviderRegistrations(
 	];
 }
 
+export function createAcpReverseConnection(connection: AgentSideConnection, sessionId: string): AcpReverseConnection {
+	const methods: Record<string, string> = {
+		"fs.readTextFile": "readTextFile",
+		"fs.writeTextFile": "writeTextFile",
+		"terminal.create": "createTerminal",
+		"permission.request": "requestPermission",
+	};
+	return {
+		request: async (
+			method: string,
+			params: JsonObject,
+			options?: { cancellationSignal?: AbortSignal },
+		): Promise<unknown> => {
+			// Form elicitation must use the raw request surface so SDK cancellation
+			// reaches Air as ACP `$/cancel_request`.
+			if (method === "ui.elicit") {
+				const rawRequest = (connection as unknown as Record<string, unknown>).request;
+				if (typeof rawRequest !== "function")
+					throw new AcpSdkAdapterError("acp_reverse_unavailable", "ACP elicitation request is unavailable.");
+				return await (
+					rawRequest as (
+						method: string,
+						input: JsonObject,
+						options?: { cancellationSignal?: AbortSignal },
+					) => Promise<unknown>
+				).call(connection, "elicitation/create", { ...params, sessionId }, options);
+			}
+			const name = methods[method] ?? method;
+			const target = (connection as unknown as Record<string, unknown>)[name];
+			if (typeof target !== "function")
+				throw new AcpSdkAdapterError("acp_reverse_unavailable", `ACP reverse method is unavailable: ${method}`);
+			// Every ACP client request is session-scoped; the SDK host only supplies the
+			// method payload, so the session identity is attached here.
+			const request = method.startsWith("terminal.") ? params : { ...params, sessionId };
+			// Call through the connection so `this` stays bound; extracting the method
+			// loses its receiver and the ACP SDK then fails on `this.connection`.
+			return await (target as (input: JsonObject) => Promise<unknown>).call(connection, request);
+		},
+	};
+}
+
 /** Maps ACP permission handling to the session's canonical SDK policy. */
 export async function applyAcpPermissionMode(
 	adapter: Pick<AcpSdkAdapter, "control">,
@@ -1398,27 +1439,7 @@ export class AcpAgent implements Agent {
 	}
 
 	#reverseConnection(sessionId: string): AcpReverseConnection {
-		const methods: Record<string, string> = {
-			"fs.readTextFile": "readTextFile",
-			"fs.writeTextFile": "writeTextFile",
-			"terminal.create": "createTerminal",
-			"permission.request": "requestPermission",
-			"ui.elicit": "unstable_createElicitation",
-		};
-		return {
-			request: async (method: string, params: JsonObject): Promise<unknown> => {
-				const name = methods[method] ?? method;
-				const target = (this.#connection as unknown as Record<string, unknown>)[name];
-				if (typeof target !== "function")
-					throw new AcpSdkAdapterError("acp_reverse_unavailable", `ACP reverse method is unavailable: ${method}`);
-				// Every ACP client request is session-scoped; the SDK host only supplies the
-				// method payload, so the session identity is attached here.
-				const request = method.startsWith("terminal.") ? params : { ...params, sessionId };
-				// Call through the connection so `this` stays bound; extracting the method
-				// loses its receiver and the ACP SDK then fails on `this.connection`.
-				return await (target as (input: JsonObject) => Promise<unknown>).call(this.#connection, request);
-			},
-		};
+		return createAcpReverseConnection(this.#connection, sessionId);
 	}
 
 	#observeSessionActivity(record: SessionRecord, frame: JsonObject): void {

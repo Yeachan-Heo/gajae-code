@@ -139,6 +139,54 @@ describe("createAgentSession wires getAskAnswerSource into built-in AskTool", ()
 			expect(aborted).toBe(false);
 			expect(result.content[0]?.type).toBe("text");
 			if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("yes");
+
+			disposeSource();
+			const disposeDecline = registerAskAnswerSource(session.sessionId, {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: async () => undefined,
+			});
+			await expect(
+				askTool!.execute(
+					"call-headless-decline",
+					{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }] }] },
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow("cancelled by the remote client");
+			disposeDecline();
+
+			const order: string[] = [];
+			let disposeReplacement: (() => void) | undefined;
+			const disposeInitial = registerAskAnswerSource(session.sessionId, {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: async () => {
+					order.push("first");
+					disposeReplacement = registerAskAnswerSource(session.sessionId, {
+						awaitAnswer: async () => undefined,
+						awaitAnswerRequest: async () => {
+							order.push("second");
+							return "no";
+						},
+					});
+					return "yes";
+				},
+			});
+			await askTool!.execute(
+				"call-headless-source-refresh",
+				{
+					questions: [
+						{ id: "first", question: "First?", options: [{ label: "yes" }] },
+						{ id: "second", question: "Second?", options: [{ label: "no" }] },
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+			expect(order).toEqual(["first", "second"]);
+			disposeReplacement?.();
+			disposeInitial();
 		} finally {
 			disposeSource();
 			await session.dispose?.();

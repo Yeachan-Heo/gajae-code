@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { parseArgs } from "../src/cli/args";
 import { resolveAcpStartupOptions } from "../src/main";
 import {
@@ -6,6 +7,7 @@ import {
 	acpSessionStateFromConfig,
 	applyAcpPermissionMode,
 	applyAcpStartupOptions,
+	createAcpReverseConnection,
 	paginateAcpSessions,
 } from "../src/modes/acp/acp-agent";
 import type { CreateAgentSessionOptions } from "../src/sdk";
@@ -35,6 +37,28 @@ test("ACP registers the SDK UI provider only for clients with form elicitation",
 	expect(providerNames({ elicitation: { form: {} } })).toContain("ui");
 	expect(providerNames({ elicitation: {} })).not.toContain("ui");
 	expect(providerNames(undefined)).not.toContain("ui");
+});
+
+test("ACP form elicitation uses the cancellation-aware raw request surface", async () => {
+	const calls: unknown[][] = [];
+	const connection = {
+		request: async (...args: unknown[]) => {
+			calls.push(args);
+			return { action: "cancel" };
+		},
+	} as unknown as AgentSideConnection;
+	const signal = new AbortController().signal;
+	const reverse = createAcpReverseConnection(connection, "session-1");
+
+	await reverse.request?.("ui.elicit", { mode: "form", message: "Choose" }, { cancellationSignal: signal });
+
+	expect(calls).toEqual([
+		[
+			"elicitation/create",
+			{ mode: "form", message: "Choose", sessionId: "session-1" },
+			{ cancellationSignal: signal },
+		],
+	]);
 });
 
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {

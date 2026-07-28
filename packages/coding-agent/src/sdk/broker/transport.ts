@@ -33,8 +33,15 @@ function tokenMatches(expected: string, actual: string | null): boolean {
 function isInput(value: unknown): value is RequestInput {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function send(socket: ServerWebSocket<unknown>, frame: Record<string, unknown>): void {
-	socket.send(JSON.stringify(frame));
+function send(socket: ServerWebSocket<unknown>, frame: Record<string, unknown>): number {
+	return socket.send(JSON.stringify(frame));
+}
+
+export type BrokerShutdownSendAction = "dropped" | "wait_for_drain" | "close";
+
+export function brokerShutdownSendAction(status: number): BrokerShutdownSendAction {
+	if (status === 0) return "dropped";
+	return status < 0 ? "wait_for_drain" : "close";
 }
 function sendError(socket: ServerWebSocket<unknown>, id: string | undefined, code: string, message: string): void {
 	send(socket, { type: "broker_response", ...(id === undefined ? {} : { id }), ok: false, error: { code, message } });
@@ -46,6 +53,8 @@ export class BrokerTransport {
 	readonly #requestedPort: number;
 	#server: Bun.Server<undefined> | null = null;
 	#port = 0;
+	readonly #shutdownBackpressured = new WeakSet<ServerWebSocket<unknown>>();
+	#shutdownRequested = false;
 	constructor(broker: Broker, token: string, port = 0) {
 		this.#broker = broker;
 		this.#token = token;
@@ -74,6 +83,9 @@ export class BrokerTransport {
 				maxPayloadLength: MAX_BROKER_JSON_FRAME_BYTES * 2,
 				open: socket => send(socket, { type: "broker_hello", protocolVersion: PROTOCOL_VERSION }),
 				message: (socket, message) => void this.#handleMessage(socket, message),
+				drain: socket => {
+					if (this.#shutdownBackpressured.delete(socket)) this.#scheduleStopAfterShutdownResponse();
+				},
 			},
 		});
 		this.#port = this.#server.port ?? 0;
@@ -85,6 +97,10 @@ export class BrokerTransport {
 		if (server) await server.stop(true);
 	}
 	async #handleMessage(socket: ServerWebSocket<unknown>, raw: string | Buffer): Promise<void> {
+		if (this.#shutdownRequested) {
+			sendError(socket, undefined, "unavailable", "broker is shutting down");
+			return;
+		}
 		if (Buffer.byteLength(raw) > MAX_BROKER_JSON_FRAME_BYTES) {
 			sendError(socket, undefined, "payload_too_large", "broker JSON frame exceeds 4 MiB limit");
 			return;
@@ -117,8 +133,13 @@ export class BrokerTransport {
 			return;
 		}
 		if (frame.operation === "broker.shutdown") {
-			send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } });
-			setTimeout(() => void this.#broker.stop(), 0);
+			const action = brokerShutdownSendAction(
+				send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } }),
+			);
+			if (action === "dropped") return;
+			this.#shutdownRequested = true;
+			if (action === "wait_for_drain") this.#shutdownBackpressured.add(socket);
+			else this.#scheduleStopAfterShutdownResponse();
 			return;
 		}
 		try {
@@ -127,5 +148,8 @@ export class BrokerTransport {
 		} catch {
 			sendError(socket, frame.id, "unavailable", "broker request failed");
 		}
+	}
+	#scheduleStopAfterShutdownResponse(): void {
+		setTimeout(() => void this.#broker.stop(), 25);
 	}
 }

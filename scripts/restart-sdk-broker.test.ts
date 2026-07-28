@@ -1,21 +1,16 @@
 import { expect, test } from "bun:test";
-import type { BrokerDiscovery } from "../packages/coding-agent/src/sdk/broker/discovery";
-import { restartSdkBroker, type RestartSdkBrokerDeps } from "./restart-sdk-broker";
+import {
+	type BrokerDiscoveryLike,
+	restartSdkBroker,
+	type RestartSdkBrokerDeps,
+} from "./restart-sdk-broker-core";
 
-function discovery(pid: number, incarnation: string): BrokerDiscovery {
+function discovery(pid: number, incarnation: string): BrokerDiscoveryLike {
 	return {
-		version: 1,
-		protocolVersion: 3,
-		packageGeneration: "test",
-		ownerId: `owner-${pid}`,
 		pid,
 		incarnation,
-		host: "127.0.0.1",
-		port: 40_000 + pid,
 		url: `ws://127.0.0.1:${40_000 + pid}`,
 		token: `token-${pid}`,
-		startedAt: 1_000,
-		heartbeatAt: 1_000,
 	};
 }
 
