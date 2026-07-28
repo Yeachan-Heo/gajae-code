@@ -10,6 +10,7 @@
  * Run: `bun packages/coding-agent/bench/perf-corpus.bench.ts`
  */
 
+import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
@@ -85,8 +86,8 @@ function kernelProcessArguments(): string[] {
 			.filter(Boolean);
 	}
 	if (process.platform === "darwin") {
-		const result = Bun.spawnSync(["ps", "-ww", "-p", String(process.pid), "-o", "args="]);
-		if (result.exitCode !== 0) {
+		const result = childProcess.spawnSync("/bin/ps", ["-ww", "-p", String(process.pid), "-o", "args="]);
+		if (result.status !== 0) {
 			throw new Error("kernel process arguments unavailable");
 		}
 		return new TextDecoder()
@@ -722,7 +723,6 @@ function computePerfCorpusBenchmark(
 	}
 	return report;
 }
-
 
 export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
 	return computePerfCorpusBenchmark(authenticateCanonicalRunnerEntrypoint(), options);
