@@ -364,6 +364,11 @@ describe("workflow mutation guard", () => {
 			"bash -s \\| cat <<'EOF'\nrm src/product.ts\nEOF",
 			// A shadowed allowlisted name executes the body through its function body (Codex P1).
 			"cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// `)` closing a $() substitution is a word char, so `#` stays literal and the shadow stays live (Codex P1).
+			"x=$(true)#lit; cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// eval/source can install a shadow from quoted data the syntax view blanked (Codex P1).
+			"eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"source /dev/stdin <<'DEF'\ncat(){ bash -s; }\nDEF\ncat <<'EOF'\nrm src/product.ts\nEOF",
 			// A line-continued opener hides the downstream interpreter stage (Codex P1).
 			"cat <<'EOF' \\\n| bash\nrm src/product.ts\nEOF",
 			// A multiline double-quoted string containing `cat <<'EOF'` is data, not an opener (Codex P1).

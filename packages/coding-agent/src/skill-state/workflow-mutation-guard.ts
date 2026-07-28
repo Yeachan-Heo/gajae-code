@@ -455,10 +455,12 @@ interface HeredocMaskResult {
 	mutatingConsumer: boolean;
 }
 
-/** Quote state carried ACROSS physical lines so multiline quoted strings cannot fake heredoc openers. */
+/** Quote/substitution state carried ACROSS physical lines so multiline constructs cannot fake heredoc openers. */
 interface ShellQuoteState {
 	inSingle: boolean;
 	inDouble: boolean;
+	/** Open `$(`/`<(`/`>(` substitutions: a `)` closing one is a word character, not an operator. */
+	substitutionDepth: number;
 }
 
 /**
@@ -466,11 +468,13 @@ interface ShellQuoteState {
  * quoted spans and backslash-escaped characters become spaces (they are data,
  * never syntax), so a `<<` inside `"…"`/`'…'` — even when the quote opened on a
  * PREVIOUS line — or an escaped separator like `\|` is never misread. An
- * unquoted `#` starts a comment: the rest of the line is blanked without
- * touching quote state, so a stray quote inside a comment cannot poison later
- * lines. The output is the same length as the input so match offsets stay
- * aligned. `continued` reports an unescaped trailing backslash outside quotes
- * (logical line continuation).
+ * unquoted `#` at a word boundary starts a comment: the rest of the line is
+ * blanked without touching quote state, so a stray quote inside a comment
+ * cannot poison later lines. A `)` closing a `$(`/`<(`/`>(` substitution is
+ * part of the current word (`x=$(true)#literal`), not a comment boundary. The
+ * output is the same length as the input so match offsets stay aligned.
+ * `continued` reports an unescaped trailing backslash outside quotes (logical
+ * line continuation).
  */
 function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: string; continued: boolean } {
 	let masked = "";
@@ -505,6 +509,19 @@ function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: stri
 			previous = character;
 			continue;
 		}
+		if (character === "(" && (previous === "$" || previous === "<" || previous === ">")) {
+			state.substitutionDepth++;
+			masked += character;
+			previous = character;
+			continue;
+		}
+		if (character === ")" && state.substitutionDepth > 0) {
+			state.substitutionDepth--;
+			masked += character;
+			// Substitution close binds to the surrounding word: `#` after it is literal.
+			previous = "x";
+			continue;
+		}
 		if (
 			character === "#" &&
 			(previous === "" || previous === " " || previous === "\t" || ";|&()".includes(previous))
@@ -537,6 +554,12 @@ const DATA_CONSUMER_SHADOW_RE = new RegExp(
 	`(?:^|[\\s;|&({\`])(?:function\\s+(?:${DATA_CONSUMER_NAMES})\\b|(?:${DATA_CONSUMER_NAMES})\\s*\\(\\s*\\)|alias\\s+(?:${DATA_CONSUMER_NAMES})=)`,
 	"i",
 );
+/**
+ * Shell-evaluated payloads (`eval …`, `source …`, `. file`) can install a
+ * shadow from data the syntax view has blanked (quoted strings, /dev/stdin);
+ * their presence in live syntax disables masking entirely (fail closed).
+ */
+const SHELL_EVALUATED_PAYLOAD_RE = /(?:^|[\s;|&({`\n])(?:eval|source|\.)(?=[\s;|&)`\n]|$)/;
 
 /** First command word of a pipeline-segment slice of a quote-masked opener line. */
 function firstCommandWord(segment: string): string {
@@ -608,11 +631,12 @@ function heredocConsumerKind(syntaxLine: string, at: number): "data" | "mutating
 function maskHeredocBodies(command: string): HeredocMaskResult {
 	if (!command.includes("<<")) return { masked: command, opaqueExpansion: false, mutatingConsumer: false };
 	const first = maskHeredocBodiesPass(command, false);
-	// A function/alias definition of an allowlisted consumer name in the COMMAND
-	// SYNTAX (heredoc bodies and quoted/commented text excluded — a spec that
-	// merely documents `cat() { … }` is inert) means the name cannot be trusted;
-	// redo the pass with masking disabled so every body stays live (fail closed).
-	if (DATA_CONSUMER_SHADOW_RE.test(first.syntaxView)) {
+	// Fail closed on live-syntax constructs that can install a shadow the syntax
+	// view cannot see: a function/alias definition of an allowlisted consumer
+	// name, or any shell-evaluated payload (`eval`/`source`/`.`) whose argument
+	// is blanked quoted data. Heredoc bodies and quoted/commented text are
+	// excluded, so a spec that merely DOCUMENTS `cat() { … }` stays inert.
+	if (DATA_CONSUMER_SHADOW_RE.test(first.syntaxView) || SHELL_EVALUATED_PAYLOAD_RE.test(first.syntaxView)) {
 		return maskHeredocBodiesPass(command, true).result;
 	}
 	return first.result;
@@ -622,7 +646,7 @@ function maskHeredocBodiesPass(command: string, shadowed: boolean): { result: He
 	const lines = command.split("\n");
 	const out: string[] = [];
 	const syntaxLines: string[] = [];
-	const state: ShellQuoteState = { inSingle: false, inDouble: false };
+	const state: ShellQuoteState = { inSingle: false, inDouble: false, substitutionDepth: 0 };
 	let previousContinued = false;
 	let opaqueExpansion = false;
 	let mutatingConsumer = false;
