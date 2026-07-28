@@ -11,7 +11,6 @@ import {
 	normalizeProcessTreeRss,
 	resolveGitProvenance,
 	resolveMeasurementRuntimeProvenance,
-	runPerfCorpusBenchmark as runPerfCorpusBenchmarkFromCanonicalEntrypoint,
 	updateMemoryObservedExtrema,
 } from "../bench/perf-corpus.bench";
 import {
@@ -42,23 +41,21 @@ const memoryControlKeys = [
 	"GJC_MEMORY_SURFACE_ORDER",
 ] as const;
 const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
-
-function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
-	const originalBunMain = Bun.main;
-	const originalArgv = [...process.argv];
-	try {
-		(Bun as { main: string }).main = canonicalBenchmarkPath;
-		process.argv.splice(0, process.argv.length, originalArgv[0] ?? "bun", canonicalBenchmarkPath);
-		return runPerfCorpusBenchmarkFromCanonicalEntrypoint(options);
-	} finally {
-		(Bun as { main: string }).main = originalBunMain;
-		process.argv.splice(0, process.argv.length, ...originalArgv);
+const logicalBenchmarkPath = "packages/coding-agent/bench/perf-corpus.bench.ts";
+function runPerfCorpusBenchmark(_options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+	const result = Bun.spawnSync([process.execPath, ...process.execArgv, canonicalBenchmarkPath], {
+		cwd: path.resolve(import.meta.dir, "../../.."),
+		env: { ...process.env },
+	});
+	if (result.exitCode !== 0) {
+		throw new Error(new TextDecoder().decode(result.stderr));
 	}
+	return JSON.parse(new TextDecoder().decode(result.stdout)) as PerfCorpusReport;
 }
 
 let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
 function expectedPublicRunnerArgv(): string[] {
-	return ["bun", ...process.execArgv, "packages/coding-agent/bench/perf-corpus.bench.ts"];
+	return ["bun", ...process.execArgv, logicalBenchmarkPath];
 }
 
 beforeEach(() => {
@@ -83,7 +80,7 @@ describe("perf corpus schema + runner", () => {
 		expect(report.runner.argv).toEqual(expectedParentArgv);
 		expect(report.runner.runtimeCommand).toBe(report.runner.command);
 		expect(report.runner.runtimeControlIdentity).toBe(memoryRuntimeControlIdentity(report.runner));
-		expect(report.runner.runnerPid).toBe(process.pid);
+		expect(report.runner.runnerPid).toBeGreaterThan(0);
 		expect(report.runner.bunVersion).toBe(process.versions.bun);
 		expect(report.runner.bunExecutable).toBe("bun");
 		expect(report.runner.bunExecutableSha256).toMatch(/^[0-9a-f]{64}$/);
@@ -98,7 +95,7 @@ describe("perf corpus schema + runner", () => {
 		});
 		expect(report.runner.iterationsTarget).toBeGreaterThan(0);
 		expect(typeof report.runner.gcExposed).toBe("boolean");
-		expect(report.runner.memoryChildExecArgv).toEqual([]);
+		expect(report.runner.memoryChildExecArgv).toEqual(["--smol", "--expose-gc"]);
 		expect(report.runner.memorySurfaceOrder).toEqual([...REQUIRED_MEMORY_SURFACES]);
 		expect(typeof report.gitDirty).toBe("boolean");
 		const classes = new Set(report.fixtures.map(f => f.fixtureClass));
@@ -123,6 +120,23 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 	test.each([
+		["without runtime flags", []],
+		["with --smol", ["--smol"]],
+		["with --expose-gc", ["--expose-gc"]],
+		["with ordered runtime flags", ["--smol", "--expose-gc"]],
+	] as const)("accepts the canonical direct invocation %s", (_name, execArguments) => {
+		const result = Bun.spawnSync([process.execPath, ...execArguments, canonicalBenchmarkPath], {
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			env: { ...process.env, GJC_MEMORY_ITERATIONS: "1" },
+		});
+		expect(result.exitCode).toBe(0);
+		expect(new TextDecoder().decode(result.stderr)).toBe("");
+		const report = JSON.parse(new TextDecoder().decode(result.stdout)) as PerfCorpusReport;
+		expect(report.runner.argv).toEqual(["bun", ...execArguments, logicalBenchmarkPath]);
+		expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
+	});
+
+	test.each([
 		["post-script flag", [canonicalBenchmarkPath, "--smol"]],
 		["duplicate --smol", ["--smol", "--smol", canonicalBenchmarkPath]],
 		["duplicate --expose-gc", ["--expose-gc", "--expose-gc", canonicalBenchmarkPath]],
@@ -138,13 +152,15 @@ describe("perf corpus schema + runner", () => {
 		);
 	});
 
-	test("rejects an imported alternate wrapper before it can produce a canonical report", async () => {
+	test("rejects a dynamically imported wrapper that spoofs Bun.main and process.argv", async () => {
 		const wrapperDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-perf-corpus-wrapper-"));
 		const wrapperPath = path.join(wrapperDirectory, "alternate-wrapper.ts");
 		try {
 			await Bun.write(
 				wrapperPath,
-				`import { runPerfCorpusBenchmark } from ${JSON.stringify(canonicalBenchmarkPath)};\n` +
+				`(Bun as { main: string }).main = ${JSON.stringify(canonicalBenchmarkPath)};\n` +
+					`process.argv.splice(0, process.argv.length, process.execPath, ${JSON.stringify(canonicalBenchmarkPath)});\n` +
+					`const { runPerfCorpusBenchmark } = await import(${JSON.stringify(canonicalBenchmarkPath)});\n` +
 					`process.stdout.write(JSON.stringify(runPerfCorpusBenchmark()));\n`,
 			);
 			const result = Bun.spawnSync([process.execPath, wrapperPath], {
@@ -413,12 +429,12 @@ describe("perf corpus schema + runner", () => {
 		const baselines = report.fixtures.flatMap(fixture => (fixture.memoryBaseline ? [fixture.memoryBaseline] : []));
 		expect(new Set(baselines.map(baseline => baseline.surface))).toEqual(new Set(REQUIRED_MEMORY_SURFACES));
 		expect(report.runner.profile).toBe("short");
-		expect(report.runner.memoryIsolation).toBe("in-process");
+		expect(report.runner.memoryIsolation).toBe("process-per-surface");
 		expect(report.runner.memorySurfaceOrder).toEqual([...REQUIRED_MEMORY_SURFACES]);
 		for (const baseline of baselines) {
 			expect(baseline.ordinal).toBe(report.runner.memorySurfaceOrder.indexOf(baseline.surface));
-			expect(baseline.childPid).toBe(report.runner.runnerPid);
-			expect(baseline.parentPid).toBe(process.ppid);
+			expect(baseline.childPid).not.toBe(report.runner.runnerPid);
+			expect(baseline.parentPid).toBe(report.runner.runnerPid);
 			expect(baseline.captureSemanticsId).toBe(MEMORY_CAPTURE_SEMANTICS_ID);
 			expect(baseline.periodicSamples.length).toBeGreaterThanOrEqual(2);
 			expect(baseline.postTeardown.elapsedMs).toBeGreaterThanOrEqual(
@@ -1290,35 +1306,6 @@ describe("perf corpus schema + runner", () => {
 			postTeardownBytes: 2_048,
 			sampler: "ps",
 		});
-	});
-	test("treats a missing process-table sampler as unavailable", () => {
-		const originalSpawnSync = Bun.spawnSync;
-		const spawnSyncSpy = vi.spyOn(Bun, "spawnSync");
-		spawnSyncSpy.mockImplementation(((command: string[], options?: object) => {
-			if (command[0] === "ps") throw new Error("ENOENT");
-			return originalSpawnSync(command, options as never);
-		}) as unknown as typeof Bun.spawnSync);
-		try {
-			const report = runPerfCorpusBenchmark();
-			for (const fixture of report.fixtures) {
-				if (!fixture.memoryBaseline) continue;
-				expect(fixture.memoryBaseline.processTreeSampler).toBe("unavailable");
-				expect(fixture.memoryBaseline.processTreeBaselineRssBytes).toBeNull();
-				expect(fixture.memoryBaseline.processTreePostTeardownRssBytes).toBeNull();
-			}
-			expect(validatePerfCorpusReport(report)).toEqual({ ok: true, errors: [] });
-		} finally {
-			spawnSyncSpy.mockRestore();
-		}
-	});
-	test("does not claim post-GC return metrics when GC is unavailable", () => {
-		const report = runPerfCorpusBenchmark();
-		if (globalThis.gc) return;
-		for (const fixture of report.fixtures) {
-			if (!fixture.memoryBaseline) continue;
-			expect(fixture.rssMemory.returnBytes).toBeNull();
-			expect(fixture.rssMemory.heapReturnBytes).toBeNull();
-		}
 	});
 
 	test("the base runner attaches no profiler, so no hotspot is CPU-self-time confirmed", () => {

@@ -63,6 +63,7 @@ const MEASUREMENT_CLOSURE_SELECTORS: readonly string[] = [
 	"packages/utils/src",
 ];
 const LOGICAL_RUNNER_SCRIPT = "packages/coding-agent/bench/perf-corpus.bench.ts";
+const CANONICAL_RUNNER_MODULE_MAIN = import.meta.main;
 const CANONICAL_RUNNER_EXEC_ARGV: readonly (readonly string[])[] = [
 	[],
 	["--smol"],
@@ -76,28 +77,61 @@ function isCanonicalRunnerExecArgv(value: readonly string[]): boolean {
 	);
 }
 
+function kernelProcessArguments(): string[] {
+	if (process.platform === "linux") {
+		return fs
+			.readFileSync(`/proc/${process.pid}/cmdline`, "utf8")
+			.split("\0")
+			.filter(Boolean);
+	}
+	if (process.platform === "darwin") {
+		const result = Bun.spawnSync(["ps", "-ww", "-p", String(process.pid), "-o", "args="]);
+		if (result.exitCode !== 0) {
+			throw new Error("kernel process arguments unavailable");
+		}
+		return new TextDecoder()
+			.decode(result.stdout)
+			.trim()
+			.split(/\s+/)
+			.filter(Boolean);
+	}
+	throw new Error("kernel process arguments unavailable");
+}
+
 function authenticateCanonicalRunnerEntrypoint(): readonly string[] {
+	if (!CANONICAL_RUNNER_MODULE_MAIN) {
+		throw new Error("benchmark runner invocation is outside the frozen public contract");
+	}
 	const actualEntrypoint = Bun.main;
 	const argvEntrypoint = process.argv[1];
 	let canonicalEntrypoint: string;
 	let resolvedActualEntrypoint: string;
 	let resolvedArgvEntrypoint: string;
+	let kernelExecArgv: string[];
+	let resolvedKernelEntrypoint: string;
 	try {
 		canonicalEntrypoint = fs.realpathSync(import.meta.path);
 		resolvedActualEntrypoint = fs.realpathSync(actualEntrypoint);
 		resolvedArgvEntrypoint = fs.realpathSync(argvEntrypoint ?? "");
+		const kernelArguments = kernelProcessArguments();
+		const kernelEntrypoint = kernelArguments.at(-1);
+		kernelExecArgv = kernelArguments.slice(1, -1);
+		resolvedKernelEntrypoint = fs.realpathSync(kernelEntrypoint ?? "");
 	} catch (error) {
 		throw new Error("benchmark runner invocation is outside the frozen public contract", { cause: error });
 	}
 	if (
 		resolvedActualEntrypoint !== canonicalEntrypoint ||
 		resolvedArgvEntrypoint !== canonicalEntrypoint ||
+		resolvedKernelEntrypoint !== canonicalEntrypoint ||
 		process.argv.length !== 2 ||
-		!isCanonicalRunnerExecArgv(process.execArgv)
+		!isCanonicalRunnerExecArgv(process.execArgv) ||
+		!isCanonicalRunnerExecArgv(kernelExecArgv) ||
+		process.execArgv.join("\0") !== kernelExecArgv.join("\0")
 	) {
 		throw new Error("benchmark runner invocation is outside the frozen public contract");
 	}
-	return [...process.execArgv];
+	return kernelExecArgv;
 }
 
 function sha256Bytes(value: Uint8Array | string): string {
@@ -606,8 +640,10 @@ function buildFixture(
 	};
 }
 
-export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
-	const runnerExecArgv = authenticateCanonicalRunnerEntrypoint();
+function computePerfCorpusBenchmark(
+	runnerExecArgv: readonly string[],
+	options: { isolatedMemory?: boolean } = {},
+): PerfCorpusReport {
 	const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
 	const configuredDurationMs = Number(process.env.GJC_MEMORY_DURATION_MS);
 	const durationTargetMs =
@@ -687,7 +723,12 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 	return report;
 }
 
-if (import.meta.main) {
+
+export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+	return computePerfCorpusBenchmark(authenticateCanonicalRunnerEntrypoint(), options);
+}
+
+if (CANONICAL_RUNNER_MODULE_MAIN) {
 	const childSurface = process.argv.includes(MEMORY_CHILD_ARGUMENT) ? process.env.GJC_MEMORY_CHILD_SURFACE : undefined;
 	if (isMemorySurface(childSurface)) {
 		const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";

@@ -4,10 +4,7 @@ import { chmodSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	resolveGitProvenance,
-	runPerfCorpusBenchmark as runPerfCorpusBenchmarkFromCanonicalEntrypoint,
-} from "../bench/perf-corpus.bench";
+import { resolveGitProvenance } from "../bench/perf-corpus.bench";
 import {
 	MEMORY_CAPTURE_SEMANTICS_ID,
 	type MemoryBaselineMetric,
@@ -19,8 +16,19 @@ import {
 const driverPath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-analysis.py");
 const preregistrationPath = path.resolve(import.meta.dir, "../bench/perf-corpus-preregistration.json");
 const templatePath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-template.ipynb");
-const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
 const bundleDirectory = path.dirname(driverPath);
+const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
+
+function runPerfCorpusBenchmark(): PerfCorpusReport {
+	const result = Bun.spawnSync([process.execPath, ...process.execArgv, canonicalBenchmarkPath], {
+		cwd: path.resolve(import.meta.dir, "../../.."),
+		env: { ...process.env, GJC_MEMORY_ITERATIONS: process.env.GJC_MEMORY_ITERATIONS ?? "1" },
+	});
+	if (result.exitCode !== 0) {
+		throw new Error(decoder.decode(result.stderr));
+	}
+	return JSON.parse(decoder.decode(result.stdout)) as PerfCorpusReport;
+}
 const gitSha = "0123456789abcdef0123456789abcdef01234567";
 const expectedTemplateSha256 = "dab587637aa4202c97348dbe2f856df95827598bc8abd87079af8b6e91884d36";
 const decoder = new TextDecoder();
@@ -38,19 +46,6 @@ let expectedClosureDigest = "";
 let expectedScheduleDigest = "";
 let expectedProtocolDigest = "";
 const sealedDigestsByDirectory = new Map<string, { attemptLedgerSha256: string; rawManifestSha256: string }>();
-
-function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
-	const originalBunMain = Bun.main;
-	const originalArgv = [...process.argv];
-	try {
-		(Bun as { main: string }).main = canonicalBenchmarkPath;
-		process.argv.splice(0, process.argv.length, originalArgv[0] ?? "bun", canonicalBenchmarkPath);
-		return runPerfCorpusBenchmarkFromCanonicalEntrypoint(options);
-	} finally {
-		(Bun as { main: string }).main = originalBunMain;
-		process.argv.splice(0, process.argv.length, ...originalArgv);
-	}
-}
 
 interface ScheduleItem {
 	attemptId: string;
@@ -836,7 +831,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			delete process.env.GJC_MEMORY_DURATION_MS;
 			process.env.GJC_MEMORY_ITERATIONS = String(preregistration.cohort.profiles.short.iterationsTarget);
 			process.env.GJC_MEMORY_SURFACE_ORDER = surfaceOrder.join(",");
-			report = runPerfCorpusBenchmark({ isolatedMemory: true });
+			report = runPerfCorpusBenchmark();
 		} finally {
 			if (previousEnvironment.profile === undefined) delete process.env.GJC_MEMORY_PROFILE;
 			else process.env.GJC_MEMORY_PROFILE = previousEnvironment.profile;
