@@ -524,9 +524,16 @@ export function formatFullOutputReference(artifactId: string): string {
 	return `Read artifact://${artifactId} for full output`;
 }
 
+function formatTruncationRangeTotal(truncation: TruncationMeta): string {
+	return truncation.rangeBase === "window"
+		? `the selected ${truncation.totalLines}-line range`
+		: `${truncation.totalLines}`;
+}
+
 export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
+	const rangeTotal = formatTruncationRangeTotal(truncation);
 	if (truncation.partialLine) {
-		let notice = `Showing last ${formatBytes(truncation.partialLine.bytes)} of line ${truncation.partialLine.line} of ${truncation.totalLines}`;
+		let notice = `Showing last ${formatBytes(truncation.partialLine.bytes)} of line ${truncation.partialLine.line} of ${rangeTotal}`;
 		if (truncation.partialLine.sourceBytes > truncation.partialLine.bytes) {
 			notice += ` (line is ${formatBytes(truncation.partialLine.sourceBytes)})`;
 		}
@@ -547,9 +554,9 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		const headPart = head ? `lines ${head.start}-${head.end}` : "";
 		const tailPart = tail ? `${tail.start}-${tail.end}` : "";
 		if (headPart && tailPart) {
-			notice = `Showing ${headPart} and ${tailPart} of ${totalLines}; ${elidedLines.toLocaleString()} middle line${elidedLines === 1 ? "" : "s"} (${formatBytes(elidedBytes)}) elided`;
+			notice = `Showing ${headPart} and ${tailPart} of ${rangeTotal}; ${elidedLines.toLocaleString()} middle line${elidedLines === 1 ? "" : "s"} (${formatBytes(elidedBytes)}) elided`;
 		} else {
-			notice = `Showing ${truncation.outputLines} of ${totalLines} lines; middle elided`;
+			notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}; middle elided`;
 		}
 		if (truncation.artifactId != null) {
 			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
@@ -559,9 +566,9 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 
 	const range = truncation.shownRange;
 	if (range && range.end >= range.start) {
-		notice = `Showing lines ${range.start}-${range.end} of ${truncation.totalLines}`;
+		notice = `Showing lines ${range.start}-${range.end} of ${rangeTotal}`;
 	} else {
-		notice = `Showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
+		notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}`;
 	}
 
 	if (truncation.truncatedBy === "bytes") {

@@ -328,6 +328,38 @@ describe("read truncation direction resolution", () => {
 		expect(textOf(acp)).not.toBe(textOf(disk));
 	});
 
+	test("retains a giant first-line head preview on ACP and disk routes", async () => {
+		const file = path.join(tempDir, "giant-first-line.txt");
+		const source = `${"G".repeat(60_000)}\nsecond\nthird`;
+		await fs.writeFile(file, source);
+		const settings = Settings.isolated({
+			"read.summarize.enabled": false,
+			"read.truncation": "head",
+			readHashLines: false,
+		});
+		const disk = await new ReadTool(createSession(tempDir, settings)).execute("giant-disk-head", {
+			path: file,
+			truncation: "head",
+		});
+		const acp = await new ReadTool(createSession(tempDir, settings, { readTextFile: async () => source })).execute(
+			"giant-acp-head",
+			{ path: file, truncation: "head" },
+		);
+
+		const diskText = textOf(disk);
+		const acpText = textOf(acp);
+		for (const resultText of [diskText, acpText]) {
+			expect(resultText.length).toBeGreaterThan(0);
+			expect(resultText.startsWith("G")).toBe(true);
+		}
+		expect(disk.details?.truncation?.firstLineExceedsLimit).toBe(true);
+		expect(acp.details?.truncation?.firstLineExceedsLimit).toBe(true);
+		// ACP head keeps the historical 50 KiB UTF-8 snippet byte-for-byte.
+		expect(acpText).toBe("G".repeat(50 * 1024));
+		expect(formatOutputNotice(acp.details?.meta)).toContain("Showing 0 of 3 lines");
+		expect(formatOutputNotice(disk.details?.meta)).toContain("Showing 0 of 3 lines");
+	});
+
 	test("keeps explicit range context windows bounded and EOF-clamped across disk and ACP directional reads", async () => {
 		const file = path.join(tempDir, "acp-range-context.txt");
 		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
@@ -381,7 +413,7 @@ describe("read truncation direction resolution", () => {
 			expect(ranges.length).toBeGreaterThan(0);
 			for (const range of ranges) expect(range.end).toBeLessThanOrEqual(truncation?.totalLines ?? 0);
 			const notice = formatOutputNotice(result.details?.meta);
-			expect(notice).toContain(`of ${truncation?.totalLines}`);
+			expect(notice).toContain(`of the selected ${truncation?.totalLines}-line range`);
 			for (const match of notice.matchAll(/(\d+)-(\d+)/g)) {
 				expect(Number(match[2])).toBeLessThanOrEqual(truncation?.totalLines ?? 0);
 			}

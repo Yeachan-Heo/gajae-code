@@ -20,6 +20,13 @@ describe("output truncation metadata plumbing", () => {
 		});
 	});
 
+	test("labels selected-window coordinates in truncation notices", () => {
+		const windows = truncateMiddleWindows("a\nb\nc\nd\ne", { maxBytes: 5, maxLines: 3 });
+		const meta = outputMeta().truncationWindows(windows, { rangeBase: "window" }).get();
+		const notice = formatOutputNotice(meta);
+		expect(notice).toContain("of the selected 5-line range");
+	});
+
 	test("marks partial middle tails without inventing a complete tail range", () => {
 		const windows = truncateMiddleWindows(`short\n${"Z".repeat(60_000)}`, { maxBytes: 10 * 1024, maxLines: 50 });
 		const meta = outputMeta().truncationWindows(windows).get();

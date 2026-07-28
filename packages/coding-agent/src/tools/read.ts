@@ -1629,6 +1629,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					budgetLines,
 					budgetBytes,
 				);
+		// A directional head window cannot render anything when its first source line
+		// exceeds the byte budget. Fall back to the historical head truncator so ACP
+		// still emits the same UTF-8 preview and metadata as the pre-direction code.
+		const oversizedHeadWindow =
+			!receipt &&
+			direction === "head" &&
+			options.resultByteCeiling === undefined &&
+			relativeWindow.kind === "head-only" &&
+			relativeWindow.head === undefined;
+		const legacyHeadByteCeiling = options.resultByteCeiling ?? (oversizedHeadWindow ? budgetBytes : undefined);
 		const window = rebaseWindow(relativeWindow, receipt ? 0 : rangeStart);
 		// Keep explicit ranges in the selected-window coordinate system for truncation metadata.
 		// Rendered output still uses `window`, whose anchors retain absolute file line numbers.
@@ -1663,6 +1673,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				: (window.head?.origin.startLine ?? window.tail?.origin.startLine ?? startLineDisplay),
 		};
 
+		let usedLegacyHeadTruncation = false;
 		let outputText = partialTailWarning
 			? formatOversizedLineWarning(
 					bodyFooterPath!,
@@ -1691,24 +1702,25 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// Preserve the historical head byte-cap oversized-line behavior. The
 		// directional window model is used for tail/both; head remains the old
 		// oracle so existing hashline and snippet contracts stay byte-identical.
-		if (!receipt && direction === "head" && options.resultByteCeiling !== undefined) {
+		if (!receipt && direction === "head" && legacyHeadByteCeiling !== undefined) {
 			const legacy = truncateHead(rangeText, {
-				maxBytes: options.resultByteCeiling,
+				maxBytes: legacyHeadByteCeiling,
 				maxLines: Number.MAX_SAFE_INTEGER,
 			});
 			truncationResult = legacy;
+			usedLegacyHeadTruncation = legacy.truncated === true;
 			details.truncation = legacy.truncated ? legacy : undefined;
 			if (legacy.firstLineExceedsLimit) {
 				const firstLine = allLines[startLine] ?? "";
 				const firstLineBytes = Buffer.byteLength(firstLine, "utf-8");
-				const snippet = truncateHeadBytes(firstLine, options.resultByteCeiling);
+				const snippet = truncateHeadBytes(firstLine, legacyHeadByteCeiling);
 				if (shouldAddHashLines) {
-					outputText = `[Line ${startLineDisplay} is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(options.resultByteCeiling)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`;
+					outputText = `[Line ${startLineDisplay} is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(legacyHeadByteCeiling)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`;
 				} else {
 					outputText = formatTextWithMode(snippet.text, startLineDisplay, false, shouldAddLineNumbers);
 				}
 				if (snippet.text.length === 0) {
-					outputText = `[Line ${startLineDisplay} is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(options.resultByteCeiling)} limit. Unable to display a valid UTF-8 snippet.]`;
+					outputText = `[Line ${startLineDisplay} is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(legacyHeadByteCeiling)} limit. Unable to display a valid UTF-8 snippet.]`;
 				}
 				details.displayContent = { text: snippet.text, startLine: startLineDisplay };
 			} else if (legacy.truncated) {
@@ -1773,6 +1785,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					totalBytes: Buffer.byteLength(selectedContent, "utf-8"),
 				};
 				resultBuilder.truncation(diskLike, {
+					direction: "head",
+					startLine: startLineDisplay,
+					totalFileLines: totalLines,
+				});
+			} else if (usedLegacyHeadTruncation && truncationResult?.truncated) {
+				resultBuilder.truncation(truncationResult, {
 					direction: "head",
 					startLine: startLineDisplay,
 					totalFileLines: totalLines,
