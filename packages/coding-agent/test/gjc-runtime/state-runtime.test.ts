@@ -46,7 +46,6 @@ function envelopeState(stdout: string | undefined): Record<string, unknown> {
 	return parsed;
 }
 
-
 describe("native gjc state runtime", () => {
 	it("reads an empty receipt as {}", async () => {
 		const root = await tempDir();
@@ -647,7 +646,6 @@ describe("native gjc state runtime", () => {
 		expect(verdict?.value).toBe("ITERATE");
 		expect(verdict?.severity).toBe("warning");
 	});
-
 
 	it("clears the active entry when clearing a workflow receipt", async () => {
 		const root = await tempDir();

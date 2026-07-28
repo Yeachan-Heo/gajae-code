@@ -89,7 +89,6 @@ function deduplicateRalplanIndexRowsByStageIdentity(rows: readonly RalplanIndexR
 	});
 }
 
-
 export type RalplanIterationCapDecision =
 	| {
 			allowed: true;
@@ -221,8 +220,7 @@ export function evaluateRalplanReviewLaneBudget(input: {
 	const indexCurrent = summary.currentStages.filter(stage => stage === lane).length;
 	const parsedTotal = rows.filter(row => row.stage === lane).length;
 	const onDiskRaw = input.onDiskLaneCounts?.[lane];
-	const onDiskTotal =
-		typeof onDiskRaw === "number" && Number.isInteger(onDiskRaw) && onDiskRaw > 0 ? onDiskRaw : 0;
+	const onDiskTotal = typeof onDiskRaw === "number" && Number.isInteger(onDiskRaw) && onDiskRaw > 0 ? onDiskRaw : 0;
 	const diskExcess = Math.max(0, onDiskTotal - parsedTotal);
 	const currentPasses = indexCurrent + diskExcess;
 	const projectedPasses = currentPasses + 1;
@@ -265,7 +263,6 @@ function getErrorCode(error: unknown): string | undefined {
 /** Filename pattern for persisted planner/revision stage artifacts. */
 const OPENER_ARTIFACT_RE = /^stage-\d{2,}-(planner|revision)\.md$/;
 const LANE_ARTIFACT_RE = /^stage-\d{2,}-(architect|critic)\.md$/;
-
 
 /**
  * Count on-disk planner/revision stage artifacts for a run. Used as a floor when
@@ -353,11 +350,7 @@ export async function loadRalplanIndexForCap(
 }
 
 function parseBoundedPositiveInteger(value: unknown, limit: number): number | null {
-	return typeof value === "number" &&
-		Number.isFinite(value) &&
-		Number.isInteger(value) &&
-		value >= 1 &&
-		value <= limit
+	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 1 && value <= limit
 		? value
 		: null;
 }
@@ -436,9 +429,7 @@ function parseMaxReviewPassesPerLaneSettings(parsed: unknown): RalplanReviewPass
 	return parsePresentMaxReviewPassesPerLane(ralplanSettings.maxReviewPassesPerLane);
 }
 
-async function readSettingsMaxReviewPassesPerLane(
-	settingsPath: string,
-): Promise<RalplanReviewPassesPerLaneSetting> {
+async function readSettingsMaxReviewPassesPerLane(settingsPath: string): Promise<RalplanReviewPassesPerLaneSetting> {
 	let raw: string;
 	try {
 		raw = await Bun.file(settingsPath).text();
@@ -919,7 +910,10 @@ function parseLaneVerdictArgs(
 	const rawVerdict = plannerFlagValue(args, "--lane-verdict");
 	if (rawVerdict === undefined) return undefined;
 	if (stage !== "architect" && stage !== "critic") {
-		throw new RalplanCommandError(2, `--lane-verdict is only valid with --stage architect or critic (received ${stage}).`);
+		throw new RalplanCommandError(
+			2,
+			`--lane-verdict is only valid with --stage architect or critic (received ${stage}).`,
+		);
 	}
 	const verdict = rawVerdict.trim().toUpperCase();
 	if (!LANE_VERDICTS[stage].has(verdict)) {
@@ -1272,7 +1266,6 @@ async function ensureFinalPendingApproval(
 	return pendingApprovalPath;
 }
 
-
 /** Append the missing row for a deterministic artifact that survived a crash gap. */
 async function repairMissingStageArtifactLedger(
 	cwd: string,
@@ -1554,10 +1547,10 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	const reviewBudgetWarning =
 		laneBudgetDecision.lane && laneBudgetDecision.finalSlot && laneBudgetDecision.maxReviewPassesPerLane > 1
 			? {
-				lane: laneBudgetDecision.lane,
-				passes: laneBudgetDecision.projectedPasses,
-				max: laneBudgetDecision.maxReviewPassesPerLane,
-			}
+					lane: laneBudgetDecision.lane,
+					passes: laneBudgetDecision.projectedPasses,
+					max: laneBudgetDecision.maxReviewPassesPerLane,
+				}
 			: undefined;
 
 	const payload: Record<string, unknown> = {

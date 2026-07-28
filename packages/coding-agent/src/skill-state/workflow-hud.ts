@@ -204,7 +204,11 @@ export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSumma
 				: verdict === "APPROVE" || verdict === "CLEAR" || verdict === "OKAY"
 					? "success"
 					: undefined;
-	const reviewPassChip = (label: "arch" | "crit", passes: number | undefined, priority: number): WorkflowHudChip | null => {
+	const reviewPassChip = (
+		label: "arch" | "crit",
+		passes: number | undefined,
+		priority: number,
+	): WorkflowHudChip | null => {
 		if (
 			state.pendingApproval ||
 			typeof passes !== "number" ||

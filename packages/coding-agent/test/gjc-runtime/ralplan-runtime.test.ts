@@ -21,8 +21,8 @@ import {
 	modeStatePath,
 	sessionPlansDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
@@ -1587,7 +1587,7 @@ describe("ralplan review lane budget", () => {
 		}
 
 		const truncatedDir = await writeRunArtifact("truncated", "stage-02-architect.md");
-		await fs.writeFile(truncatedDir + "/index.jsonl", '{"stage":"planner","stage_n":1}\n', "utf-8");
+		await fs.writeFile(path.join(truncatedDir, "index.jsonl"), '{"stage":"planner","stage_n":1}\n', "utf-8");
 		const truncated = await writeRalplanArtifact(root, "truncated", "architect", 3, "# truncated retry");
 		expect(truncated.status).toBe(3);
 		expect(JSON.parse(truncated.stdout ?? "{}")).toMatchObject({ passes: 1, projected_passes: 2 });
@@ -1642,7 +1642,6 @@ describe("ralplan review lane budget", () => {
 		expect(existsSync(nextArtifactPath)).toBe(false);
 		expect(await fs.readFile(indexPath, "utf-8")).toBe(indexBefore);
 	});
-
 });
 
 describe("ralplan crash-gap dedupe repair", () => {
@@ -1665,7 +1664,11 @@ describe("ralplan crash-gap dedupe repair", () => {
 			.filter(Boolean);
 		expect(indexLines).toHaveLength(1);
 		const repairedRow = JSON.parse(indexLines[0]);
-		expect(repairedRow).toMatchObject({ stage: "architect", stage_n: 2, path: path.join(runDir, "stage-02-architect.md") });
+		expect(repairedRow).toMatchObject({
+			stage: "architect",
+			stage_n: 2,
+			path: path.join(runDir, "stage-02-architect.md"),
+		});
 		const repairedDecision = evaluateRalplanReviewLaneBudget({
 			rows: [{ stage: repairedRow.stage, stageN: repairedRow.stage_n }],
 			stage: "architect",
@@ -1741,9 +1744,7 @@ describe("ralplan crash-gap dedupe repair", () => {
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line));
-		expect(repairedRows).toEqual([
-			expect.objectContaining({ stage: "final", stage_n: 2, path: artifactPath }),
-		]);
+		expect(repairedRows).toEqual([expect.objectContaining({ stage: "final", stage_n: 2, path: artifactPath })]);
 	});
 
 	it("recreates a missing pending approval for ledger-backed final dedupe and refuses a mismatch", async () => {
@@ -1784,7 +1785,11 @@ describe("ralplan crash-gap dedupe repair", () => {
 		expect((await writeRalplanArtifact(root, runId, "architect", 2, "# repaired")).status).toBe(0);
 		const newPass = await writeRalplanArtifact(root, runId, "architect", 3, "# genuinely new");
 		expect(newPass.status).toBe(0);
-		expect(JSON.parse(newPass.stdout ?? "{}").review_budget_warning).toEqual({ lane: "architect", passes: 2, max: 2 });
+		expect(JSON.parse(newPass.stdout ?? "{}").review_budget_warning).toEqual({
+			lane: "architect",
+			passes: 2,
+			max: 2,
+		});
 	});
 
 	it("deduplicates a repaired short row before consuming a raised-budget slot", async () => {
@@ -1809,7 +1814,9 @@ describe("ralplan crash-gap dedupe repair", () => {
 			.split("\n")
 			.map(line => JSON.parse(line));
 		expect(repairedRows).toHaveLength(2);
-		expect(repairedRows.filter(row => typeof row.path === "string" && typeof row.sha256 === "string")).toHaveLength(1);
+		expect(repairedRows.filter(row => typeof row.path === "string" && typeof row.sha256 === "string")).toHaveLength(
+			1,
+		);
 		expect(
 			evaluateRalplanReviewLaneBudget({
 				rows: repairedRows.map(row => ({ stage: row.stage, stageN: row.stage_n })),
@@ -1821,7 +1828,11 @@ describe("ralplan crash-gap dedupe repair", () => {
 
 		const newPass = await writeRalplanArtifact(root, runId, "architect", 3, "# genuinely new");
 		expect(newPass.status).toBe(0);
-		expect(JSON.parse(newPass.stdout ?? "{}").review_budget_warning).toEqual({ lane: "architect", passes: 2, max: 2 });
+		expect(JSON.parse(newPass.stdout ?? "{}").review_budget_warning).toEqual({
+			lane: "architect",
+			passes: 2,
+			max: 2,
+		});
 		const persistedRows = (await fs.readFile(path.join(runDir, "index.jsonl"), "utf-8"))
 			.trim()
 			.split("\n")
@@ -1844,11 +1855,7 @@ describe("ralplan review lane budget settings", () => {
 			);
 			await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 			const projectPath = path.join(root, ".gjc", "settings.json");
-			await fs.writeFile(
-				projectPath,
-				JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 3 } } }),
-				"utf-8",
-			);
+			await fs.writeFile(projectPath, JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 3 } } }), "utf-8");
 			expect(await resolveRalplanMaxReviewPassesPerLane(root)).toEqual({
 				maxReviewPassesPerLane: 3,
 				source: projectPath,
@@ -1891,11 +1898,7 @@ describe("ralplan review lane budget settings", () => {
 		const root = await tempDir();
 		const projectPath = path.join(root, ".gjc", "settings.json");
 		await fs.mkdir(path.dirname(projectPath), { recursive: true });
-		await fs.writeFile(
-			projectPath,
-			JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 99 } } }),
-			"utf-8",
-		);
+		await fs.writeFile(projectPath, JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 99 } } }), "utf-8");
 
 		await expect(resolveRalplanMaxReviewPassesPerLane(root)).rejects.toThrow(projectPath);
 	});
@@ -1931,9 +1934,7 @@ describe("ralplan review lane budget replays", () => {
 		for (const [index, [label, stage]] of sequence.entries()) {
 			results.set(label, await writeRalplanArtifact(root, runId, stage, index + 1, `# ${label}`));
 		}
-		const refusals = [...results.entries()]
-			.filter(([, result]) => result.status === 3)
-			.map(([label]) => label);
+		const refusals = [...results.entries()].filter(([, result]) => result.status === 3).map(([label]) => label);
 		expect(refusals).toEqual(["a2", "a6", "rev6", "c6", "a8"]);
 		for (const [label, result] of results) {
 			expect(result.status).toBe(refusals.includes(label) ? 3 : 0);
@@ -1962,7 +1963,15 @@ describe("ralplan review lane budget replays", () => {
 			}
 			return results;
 		};
-		const t3code = await replay("healthy-t3code", ["planner", "architect", "critic", "revision", "architect", "critic", "final"]);
+		const t3code = await replay("healthy-t3code", [
+			"planner",
+			"architect",
+			"critic",
+			"revision",
+			"architect",
+			"critic",
+			"final",
+		]);
 		const browserUse = await replay("healthy-browser-use", ["planner", "architect", "critic", "final"]);
 		for (const result of [...t3code, ...browserUse]) {
 			expect(result.status).toBe(0);
@@ -2044,7 +2053,13 @@ describe("ralplan review lane budget rigor and receipts", () => {
 		expect(textThird.stderr).toContain("Stop re-invoking the architect review lane");
 
 		const defaultRoot = await tempDir();
-		const defaultResult = await writeRalplanArtifact(defaultRoot, "default-no-warning", "architect", 1, "# default pass");
+		const defaultResult = await writeRalplanArtifact(
+			defaultRoot,
+			"default-no-warning",
+			"architect",
+			1,
+			"# default pass",
+		);
 		expect(defaultResult.status).toBe(0);
 		expect(JSON.parse(defaultResult.stdout ?? "{}").review_budget_warning).toBeUndefined();
 	});
@@ -2121,7 +2136,13 @@ describe("ralplan HUD lane verdict carriage", () => {
 			expect(Object.hasOwn(state, key)).toBe(false);
 		}
 
-		const verdictlessActiveWrite = await writeRalplanArtifact(root, activeRunId, "architect", 2, "# active architecture");
+		const verdictlessActiveWrite = await writeRalplanArtifact(
+			root,
+			activeRunId,
+			"architect",
+			2,
+			"# active architecture",
+		);
 		expect(verdictlessActiveWrite.status).toBe(0);
 		const chips = await readRalplanHudChips(root);
 		expect(chips.some(chip => chip.value === "BLOCK")).toBe(false);
@@ -2132,7 +2153,9 @@ describe("ralplan HUD lane verdict carriage", () => {
 		const root = await tempDir();
 		const runId = "hud-state-then-artifact";
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
-		expect((await writeRalplanLaneVerdictArtifact(root, runId, "architect", 2, "# architecture", "BLOCK")).status).toBe(0);
+		expect(
+			(await writeRalplanLaneVerdictArtifact(root, runId, "architect", 2, "# architecture", "BLOCK")).status,
+		).toBe(0);
 		expect(
 			(
 				await runNativeStateCommand(
@@ -2202,7 +2225,9 @@ describe("ralplan HUD lane verdict carriage", () => {
 			"utf-8",
 		);
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
-		expect((await writeRalplanLaneVerdictArtifact(root, runId, "architect", 2, "# architecture", "CLEAR")).status).toBe(0);
+		expect(
+			(await writeRalplanLaneVerdictArtifact(root, runId, "architect", 2, "# architecture", "CLEAR")).status,
+		).toBe(0);
 		expect((await readRalplanHudChips(root)).find(chip => chip.label === "arch")?.value).toBe("1/3");
 	});
 
@@ -2210,7 +2235,9 @@ describe("ralplan HUD lane verdict carriage", () => {
 		const root = await tempDir();
 		const runId = "hud-chip-cap";
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
-		expect((await writeRalplanLaneVerdictArtifact(root, runId, "architect", 2, "# architecture", "CLEAR")).status).toBe(0);
+		expect(
+			(await writeRalplanLaneVerdictArtifact(root, runId, "architect", 2, "# architecture", "CLEAR")).status,
+		).toBe(0);
 		expect((await writeRalplanLaneVerdictArtifact(root, runId, "critic", 3, "# critique", "OKAY")).status).toBe(0);
 		const reviewChips = await readRalplanHudChips(root);
 		expect(reviewChips).toHaveLength(6);
@@ -2258,7 +2285,9 @@ describe("ralplan HUD lane verdict carriage", () => {
 		const runOne = "hud-reset-one";
 		const runTwo = "hud-reset-two";
 		expect((await writeRalplanArtifact(root, runOne, "planner", 1, "# plan one")).status).toBe(0);
-		expect((await writeRalplanLaneVerdictArtifact(root, runOne, "critic", 2, "# critique one", "ITERATE")).status).toBe(0);
+		expect(
+			(await writeRalplanLaneVerdictArtifact(root, runOne, "critic", 2, "# critique one", "ITERATE")).status,
+		).toBe(0);
 		expect(
 			(
 				await runNativeStateCommand(
