@@ -565,6 +565,8 @@ function maskLineForSyntax(
 		if (character === "'") {
 			state.inSingle = true;
 			masked += "'";
+			// ANSI-C quoting `$'…'`: bash strips the `$` during quote removal.
+			if (dequoted.endsWith("$")) dequoted = dequoted.slice(0, -1);
 			previous = character;
 			continue;
 		}
@@ -807,8 +809,15 @@ function maskHeredocBodiesPass(
 		// data — even when the enclosing quote opened on a previous line.
 		const { masked, dequoted, continued } = maskLineForSyntax(line, state);
 		const syntax = masked;
-		dequotedLines.push(dequoted);
 		const isContinuationLine = previousContinued;
+		// Bash removes a backslash-newline pair entirely: fold a continuation into
+		// the previous dequoted line so split command words (`e\` + `val`)
+		// reassemble for command/shadow detection.
+		if (isContinuationLine && dequotedLines.length > 0) {
+			dequotedLines[dequotedLines.length - 1] += dequoted;
+		} else {
+			dequotedLines.push(dequoted);
+		}
 		previousContinued = continued;
 		for (const match of line.matchAll(BASH_HEREDOC_OPEN_RE)) {
 			const at = match.index ?? 0;
