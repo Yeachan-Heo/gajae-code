@@ -380,8 +380,9 @@ describe("workflow mutation guard", () => {
 			// `builtin`/`command` wrappers still reach the evaluated command (Codex P1).
 			"builtin eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			"command -- eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
-			// Leading redirections precede the command word (Codex P1).
+			// Leading redirections precede the command word — attached or separated (Codex P1).
 			"</dev/null eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"< /dev/null eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Bash's `function name()` hybrid form is still a declaration (Codex P1).
 			"function cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Function shadows after reserved words are still declarations (Codex P1).

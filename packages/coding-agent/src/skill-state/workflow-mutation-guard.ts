@@ -617,12 +617,22 @@ function commandPositionWords(segment: string): string[] {
 	const words: string[] = [];
 	let expectCommand = true;
 	let afterWrapper = false;
+	let afterBareRedirection = false;
 	for (const word of segment.trim().split(/\s+/)) {
 		if (!word) continue;
+		// A bare redirection operator (`<`, `2>`) consumes the NEXT word as its target.
+		if (afterBareRedirection) {
+			afterBareRedirection = false;
+			continue;
+		}
 		if (expectCommand) {
 			if (/^\w+=/.test(word)) continue;
 			// Leading redirections precede the command word (`</dev/null eval …`).
-			if (SHELL_REDIRECTION_TOKEN_RE.test(word)) continue;
+			// A bare operator (`<`, `2>`) additionally consumes its separated target.
+			if (SHELL_REDIRECTION_TOKEN_RE.test(word)) {
+				if (/^\d*[<>]+$/.test(word)) afterBareRedirection = true;
+				continue;
+			}
 			if (SHELL_COMMAND_WRAPPER_WORDS.has(word.toLowerCase())) {
 				// The wrapper's effective command follows, possibly after options/`--`.
 				afterWrapper = true;
