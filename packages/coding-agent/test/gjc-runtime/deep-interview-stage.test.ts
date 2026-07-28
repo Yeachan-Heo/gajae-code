@@ -808,4 +808,38 @@ describe("deep-interview staged transitions", () => {
 		expect(state.note).toBe("after poison");
 		expect(typeof after.intent_contract_healed_at).toBe("string");
 	});
+
+	it("accepts the documented initialize payload with null prose markers first try", async () => {
+		const root = await tempDir();
+		// The skill's Phase 1 template seeds nullable prose fields as null — this
+		// exact shape must succeed on the FIRST write, with no failed probe.
+		const written = parse(
+			(
+				await run(root, [
+					"write",
+					"--input",
+					JSON.stringify({
+						state: {
+							interview_id: "iv-1",
+							type: "brownfield",
+							initial_idea: "future roadmap discussion",
+							initial_context_summary: null,
+							rounds: [],
+							established_facts: [],
+							trace_summary: null,
+							codebase_context: null,
+							restated_goal: null,
+						},
+					}),
+					"--json",
+				])
+			).stdout,
+		);
+		expect(written.ok).toBe(true);
+		const after = await readState(root);
+		const state = after.state as Record<string, unknown>;
+		expect(state.initial_idea).toBe("future roadmap discussion");
+		// null markers delete/omit rather than persisting nulls or erroring.
+		expect(state.initial_context_summary ?? undefined).toBeUndefined();
+	});
 });

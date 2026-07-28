@@ -483,20 +483,23 @@ export function assertDeepInterviewEnvelopeInputLimits(envelope: Record<string, 
 		typeof envelope.state === "object" && envelope.state !== null && !Array.isArray(envelope.state)
 			? (envelope.state as Record<string, unknown>)
 			: {};
+	// `null` is legal everywhere prose is optional: the skill template seeds
+	// `initial_context_summary: null` and the merge treats `null` as a deletion
+	// marker, so only present non-null values are bounded.
 	for (const field of ["initial_idea", "initial_context", "initial_context_summary"] as const) {
 		const nestedValue = state[field];
-		if (nestedValue !== undefined)
+		if (nestedValue !== undefined && nestedValue !== null)
 			assertDeepInterviewInputWithinLimit(nestedValue as string, MAX_INITIAL_CONTEXT_LENGTH, `state.${field}`);
 		const topLevelValue = envelope[field];
-		if (topLevelValue !== undefined)
+		if (topLevelValue !== undefined && topLevelValue !== null)
 			assertDeepInterviewInputWithinLimit(topLevelValue as string, MAX_INITIAL_CONTEXT_LENGTH, field);
 	}
 	for (const field of ["user_response", "answer"] as const) {
 		const nestedValue = state[field];
-		if (nestedValue !== undefined)
+		if (nestedValue !== undefined && nestedValue !== null)
 			assertDeepInterviewInputWithinLimit(nestedValue as string, MAX_USER_RESPONSE_LENGTH, `state.${field}`);
 		const topLevelValue = envelope[field];
-		if (topLevelValue !== undefined)
+		if (topLevelValue !== undefined && topLevelValue !== null)
 			assertDeepInterviewInputWithinLimit(topLevelValue as string, MAX_USER_RESPONSE_LENGTH, field);
 	}
 	if (!Array.isArray(state.rounds)) return;
@@ -507,7 +510,7 @@ export function assertDeepInterviewEnvelopeInputLimits(envelope: Record<string, 
 			const value = record[field];
 			// A structured scorer may use an unrelated object-valued `answer`; only prose
 			// values in a legacy answer slot are user input subject to this cap.
-			if (value === undefined || (field === "answer" && typeof value !== "string")) continue;
+			if (value === undefined || value === null || (field === "answer" && typeof value !== "string")) continue;
 			assertDeepInterviewInputWithinLimit(
 				value as string,
 				MAX_USER_RESPONSE_LENGTH,
