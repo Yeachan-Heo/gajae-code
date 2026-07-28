@@ -341,6 +341,12 @@ describe("workflow mutation guard", () => {
 			"bash <<'EOF'\nrm src/product.ts\nEOF",
 			'python3 <<PY\nopen("src/product.ts", "w").write("x")\nPY',
 			"patch -p1 <<'EOF'\n--- a/src/product.ts\n+++ b/src/product.ts\nEOF",
+			// Unknown/non-allowlisted consumers keep their bodies live too (Codex P1).
+			"awk -f - <<'EOF'\nBEGIN { x } # rm src/product.ts via body\necho x > src/product.ts\nEOF",
+			// A `<<` inside a comment is not an opener; the following live line still mutates (Codex P1).
+			"# <<'EOF'\nrm src/product.ts\nEOF",
+			// A `<<` inside double-quoted argument data is not an opener either.
+			'printf "%s" "<<\'EOF\'"\nrm src/product.ts\nEOF',
 			// Unquoted delimiter + command substitution in body expands at runtime — fail closed.
 			"cat <<EOF > /tmp/out.md\n$(rm src/product.ts)\nEOF",
 			// Unterminated heredoc is unparseable — body scanned as before, mutation caught.
