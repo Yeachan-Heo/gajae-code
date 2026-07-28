@@ -42,6 +42,9 @@ const MOUSE_SELECTION_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "
 /** Discrete mouse-wheel notch size in terminal rows (xterm/less-style). */
 export const DEFAULT_WHEEL_LINES = 3;
 
+/** DA1 (`CSI ? … c`) and XTSMGRAPHICS (`CSI ? … S`) replies to the sixel probe. */
+const DEVICE_REPORT_PATTERN = /^\x1b\[\?[\d;]*[cS]$/u;
+
 function stripTerminalControls(text: string): string {
 	return Bun.stripANSI(text)
 		.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/gu, "")
@@ -1895,6 +1898,15 @@ export class TUI extends Container {
 
 		// Consume terminal cell size responses without blocking unrelated input.
 		if (this.#consumeCellSizeResponse(data)) {
+			return;
+		}
+
+		// DA1 and XTSMGRAPHICS replies belong to the sixel probe, whose listener runs
+		// above. Reaching this point means the probe already finished, timed out, or
+		// was cleared by a stop()/start() cycle while the terminal still owed the
+		// reply. These are terminal-to-host reports, never user input, so drop them
+		// instead of typing them into the focused component.
+		if (DEVICE_REPORT_PATTERN.test(data)) {
 			return;
 		}
 
