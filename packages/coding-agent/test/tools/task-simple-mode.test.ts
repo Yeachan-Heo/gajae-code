@@ -110,6 +110,18 @@ describe("task.simple", () => {
 			expect(properties.spawnPlan).toBeDefined();
 		}
 	});
+	it("documents explicit worktree requests as isolated delegation", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+
+		const tool = await TaskTool.create(createSession({ "task.isolation.mode": "auto" }));
+
+		expect(tool.description).toContain(
+			'REQUIRED when the user explicitly requests a worktree (for example, "use worktree")',
+		);
+	});
 	it("hides IRC guidance when the IRC tool is not available", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: TEST_AGENTS,

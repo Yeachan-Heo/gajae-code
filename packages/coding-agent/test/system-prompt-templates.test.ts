@@ -281,6 +281,16 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
 		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
 	});
+	test("system-prompt routes explicit worktree requests through isolated delegation", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, baseRenderContext);
+
+		expect(rendered).toContain('explicit user request to use a worktree (for example, "use worktree")');
+		expect(rendered).toContain("delegate implementation through `task` with `isolated: true`");
+		expect(rendered).toContain("in-session counterpart of launching `gjc --worktree`");
+		expect(rendered).toContain("report that conflict instead of editing in the parent session");
+	});
 
 	test("keeps system and project as separate ordered blocks; volatile facts excluded from stable prefix", async () => {
 		await withTempDir(async dir => {

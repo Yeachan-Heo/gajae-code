@@ -488,12 +488,14 @@ Project executor override body.
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
+		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
+		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
 		expect(routing).toContain("read the full skill text and follow it exactly");
 		expect(routing).toContain("Before explicit execution approval or a valid non-off ralplan final runtime receipt");
 		expect(routing).toContain(
 			"reconciliation must persist its final receipt before choosing approval or an admitted handoff",
 		);
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(9);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 

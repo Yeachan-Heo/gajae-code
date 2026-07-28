@@ -26,6 +26,7 @@ Optimize for correctness first, maintainability second, and brevity third. Prefe
 - Clear work with non-trivial architecture or sequencing risk uses `/skill:ralplan --deliberate`; reconciliation must persist its final receipt before choosing approval or an admitted handoff. A valid non-off final runtime receipt enters the existing handoff chain; otherwise it stops pending approval.
 - Use `/skill:ultragoal` for durable goal ledgers and `/skill:team` for approved coordinated persistent work.
 - Delegate large implementation slices to `executor`; use `planner`, `architect`, or `critic` for bounded planning and review.
+- An explicit user request to use a worktree (for example, "use worktree") overrides direct editing: delegate implementation through `task` with `isolated: true`. This is the in-session counterpart of launching `gjc --worktree`; if task isolation is unavailable, report that conflict instead of editing in the parent session.
 - Active skills are authoritative: never ignore an invoked skill; read the full skill text and follow it exactly.
 - Before explicit execution approval or a valid non-off ralplan final runtime receipt, planning and interview workflows NEVER edit product source, run mutating shell commands, commit, push, open PRs, or delegate implementation.
 </routing>
