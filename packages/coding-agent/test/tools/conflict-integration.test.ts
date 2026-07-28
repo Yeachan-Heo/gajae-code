@@ -577,3 +577,67 @@ describe("write resolves conflicts via conflict://N", () => {
 		expect(after).toBe("// extra line\n// another extra\nline 1\nnewApi(x)\nline N\n");
 	});
 });
+
+// Conflict surfacing must not depend on which end of the file truncation kept.
+// PR #3348 flipped the bare-read default from `head` to `last` while the scan
+// lived only on the head render path, so every conflict silently disappeared
+// from bare reads. Pin all three directions explicitly.
+describe("conflict surfacing is truncation-direction independent", () => {
+	let tempDir: string;
+
+	beforeAll(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+	});
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "conflict-dir-"));
+	});
+
+	afterEach(async () => {
+		await fs.rm(tempDir, { recursive: true, force: true });
+	});
+
+	for (const truncation of ["head", "last", "both"] as const) {
+		it(`registers and warns for an explicit \`${truncation}\` read`, async () => {
+			await Bun.write(path.join(tempDir, "foo.ts"), TWO_WAY);
+			const session = createTestSession(tempDir);
+			const read = await getTool(session, "read");
+
+			const result = await read.execute(`read-${truncation}`, { path: "foo.ts", truncation });
+			const text = getText(result);
+
+			expect(text).toContain("⚠");
+			expect(text).toContain("1 unresolved conflict detected");
+			expect(session.conflictHistory?.get(1)).toBeDefined();
+		});
+	}
+
+	it("registers on a bare read under the configured default direction", async () => {
+		await Bun.write(path.join(tempDir, "foo.ts"), TWO_WAY);
+		const session = createTestSession(tempDir);
+		const read = await getTool(session, "read");
+
+		const text = getText(await read.execute("read-bare", { path: "foo.ts" }));
+
+		expect(text).toContain("⚠");
+		expect(session.conflictHistory?.get(1)).toBeDefined();
+	});
+
+	it("keeps true source line numbers for a conflict kept by a tail window", async () => {
+		// Pad the head so a `last` window drops it: the surviving conflict must
+		// still report its real file line numbers, not window-relative ones.
+		const padding = Array.from({ length: 40 }, (_, index) => `pad ${index + 1}`);
+		await Bun.write(path.join(tempDir, "padded.ts"), [...padding, ...TWO_WAY.split("\n")].join("\n"));
+		const session = createTestSession(tempDir);
+		const read = await getTool(session, "read");
+
+		const text = getText(await read.execute("read-padded", { path: "padded.ts", truncation: "last" }));
+
+		expect(text).toContain("⚠");
+		const entry = session.conflictHistory?.get(1);
+		expect(entry).toBeDefined();
+		// The marker block starts on file line 42 (40 padding lines + "line 1").
+		expect(entry?.startLine).toBe(42);
+	});
+});
