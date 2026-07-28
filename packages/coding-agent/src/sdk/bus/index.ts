@@ -2173,6 +2173,7 @@ function sdkControlSurface(
 	admitPrompt: (clientRef?: string) => void,
 	releasePromptAdmission: (clientRef?: string) => void,
 	awaitReconciliationReady: () => Promise<void> = async () => {},
+	reservePromptDelivery: (requesterConnectionId?: string) => () => void,
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
@@ -2280,6 +2281,7 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation = false,
+		deliveryReservation?: () => void,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
@@ -2296,9 +2298,14 @@ function sdkControlSurface(
 					code: "unavailable",
 				});
 			}
-			admitPrompt(trimmedClientRef);
 		}
+		const releaseDeliveryReservation = deliveryReservation ?? reservePromptDelivery(requesterConnectionId);
+		let admitted = false;
 		try {
+			if (trackReconciliation) {
+				admitPrompt(trimmedClientRef);
+				admitted = true;
+			}
 			if (forceFresh && isSessionBusy()) {
 				throw Object.assign(
 					new Error("Previous turn did not finish aborting before replacement prompt submission."),
@@ -2315,7 +2322,8 @@ function sdkControlSurface(
 					},
 				);
 		} catch (error) {
-			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
+			releaseDeliveryReservation();
+			if (admitted) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		}
 		const promptImages = Array.isArray(images) ? (images as { data: string; mimeType?: string }[]) : [];
@@ -2334,6 +2342,7 @@ function sdkControlSurface(
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
 		let preflightSettled = false;
 		let accepted = false;
+		let acceptancePromise: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
 		const settlePreflight = (result: PreflightTerminalResult) => {
 			if (preflightSettled) return;
@@ -2349,20 +2358,25 @@ function sdkControlSurface(
 			connectionId: requesterConnectionId,
 			cancel: cancelPreflight,
 		});
-		const settleAccepted = async () => {
-			if (preflightSettled) return;
-			accepted = true;
-			try {
-				await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
-			} catch (error) {
-				// Durable acceptance failed, so the prompt was never accepted: reject the
-				// control preflight and rethrow so the awaiting session does not execute it.
-				accepted = false;
-				onPromptAcceptFailed(correlation);
-				settlePreflight({ status: "rejected", error });
-				throw error;
-			}
-			settlePreflight({ status: "accepted" });
+		const settleAccepted = () => {
+			if (preflightSettled) return Promise.resolve();
+			if (acceptancePromise) return acceptancePromise;
+			acceptancePromise = (async () => {
+				accepted = true;
+				try {
+					await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
+					releaseDeliveryReservation();
+					settlePreflight({ status: "accepted" });
+				} catch (error) {
+					accepted = false;
+					onPromptAcceptFailed(correlation);
+					releaseDeliveryReservation();
+					if (admitted) releasePromptAdmission(trimmedClientRef);
+					settlePreflight({ status: "rejected", error });
+					throw error;
+				}
+			})();
+			return acceptancePromise;
 		};
 		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
 		const onPreflightAcceptCommit = settleAccepted;
@@ -2408,7 +2422,8 @@ function sdkControlSurface(
 			if (result.status === "rejected") throw result.error;
 			return { commandId, turnId, accepted: true, ...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}) };
 		} catch (error) {
-			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
+			releaseDeliveryReservation();
+			if (admitted) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		} finally {
 			pendingPreflightCancellations.delete(preflightKey(requesterConnectionId, correlation));
@@ -2435,8 +2450,25 @@ function sdkControlSurface(
 			return await abortOwnedPrompt(requesterConnectionId);
 		},
 		abortAndPrompt: async text => {
-			await awaitAbortReady();
-			return await submitPrompt(text, undefined, true, undefined, false, controlRequesterContext.getStore());
+			const requesterConnectionId = controlRequesterContext.getStore();
+			const releaseDeliveryReservation = reservePromptDelivery(requesterConnectionId);
+			try {
+				await awaitAbortReady();
+				return await submitPrompt(
+					text,
+					undefined,
+					true,
+					undefined,
+					false,
+					requesterConnectionId,
+					undefined,
+					false,
+					releaseDeliveryReservation,
+				);
+			} catch (error) {
+				releaseDeliveryReservation();
+				throw error;
+			}
 		},
 		cancelPendingPreflights,
 		cancelPendingPreflightsForConnection,
@@ -2818,6 +2850,10 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
+		// Projection writes delegate through the owning session's typed seam, which retains the
+		// real SessionManager store and its single-writer/flush-backed authority.
+		appendProjection: envelope => typed("projection.append", { envelope }),
+		readProjection: afterRevision => typed("projection.read", { afterRevision }),
 		installedOperations: installedOperations(ctx, "control"),
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
@@ -3717,7 +3753,7 @@ export function createNotificationsExtension(
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
 		const PROMPT_SUBMISSION_CAPACITY = 128;
-		const PROMPT_SUBMISSION_TTL_MS = 5 * 60_000;
+		const PROMPT_TERMINAL_DELIVERY_TTL_MS = 5 * 60_000;
 		const PROMPT_TERMINAL_TOMBSTONE_CAPACITY = 256;
 		const PROMPT_TERMINAL_TOMBSTONE_TTL_MS = 15 * 60_000;
 		// SDK-owned terminalization grace; injectable in tests, never a user setting.
@@ -3742,16 +3778,18 @@ export function createNotificationsExtension(
 					outcome?: SdkPromptTerminalOutcome;
 			  };
 		type PromptSubmission = {
+			requesterRef: string;
 			acknowledged: boolean;
 			connectionId: string;
 			abandoned: boolean;
 			failed: boolean;
 			error: unknown;
 			terminal: boolean;
+			terminalAt?: number;
 			retainCorrelation: boolean;
 			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
 			fatal?: boolean;
-			createdAt: number;
+			terminalAt?: number;
 			deadlineMs: number;
 			deadlineTimer?: Parameters<typeof clearTimeout>[0];
 			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
@@ -3818,26 +3856,26 @@ export function createNotificationsExtension(
 			removePendingPromptCorrelation(correlation);
 			if (submission) addTerminalTombstone(key, submission.connectionId);
 		};
-		const expirePromptDelivery = (key: string, submission: PromptSubmission) => {
-			if (!submission.terminal) return;
-			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
-			promptSubmissions.delete(key);
+		const expireTerminalPromptDelivery = (key: string, submission: PromptSubmission, now = Date.now()) => {
+			if (!submission.terminal || submission.terminalAt === undefined) return;
+			if (submission.terminalAt + PROMPT_TERMINAL_DELIVERY_TTL_MS > now) return;
 			// A fatal closure is transport-level, not a committed semantic terminal: the
 			// durable record stays authoritative, so it must never leave a tombstone.
-			if (submission.fatal) return;
+			if (submission.fatal) {
+				if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+				promptSubmissions.delete(key);
+				return;
+			}
 			const [commandId, turnId] = key.split(":", 2);
 			if (!commandId || !turnId) return;
-			removePendingPromptCorrelation({ commandId, turnId });
-			addTerminalTombstone(key, submission.connectionId);
+			finalizePrompt(key, { commandId, turnId });
 		};
 		const cleanupPromptRecords = (now = Date.now()) => {
 			kindReconciliation.cleanup();
 			reconciliation.cleanup();
 			for (const [key, tombstone] of promptTerminalTombstones)
 				if (tombstone.expiresAt <= now) promptTerminalTombstones.delete(key);
-			for (const [key, submission] of promptSubmissions)
-				if (submission.terminal && submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now)
-					expirePromptDelivery(key, submission);
+			for (const [key, submission] of promptSubmissions) expireTerminalPromptDelivery(key, submission, now);
 		};
 		const abandonPrompt = (submission: PromptSubmission) => {
 			submission.abandoned = true;
@@ -3856,7 +3894,11 @@ export function createNotificationsExtension(
 			const key = promptSubmissionKey(correlation);
 			const submission = promptSubmissions.get(key);
 			if (!submission) return;
-			runtime.host.emitEvent({ kind: frame.type, payload: frame });
+			runtime.host.emitEvent({
+				kind: frame.type,
+				payload: frame,
+				audience: { requesterRef: submission.requesterRef, ...correlation },
+			});
 			if (submission.abandoned) {
 				if (submission.terminal) finalizePrompt(key, correlation);
 				return;
@@ -3881,13 +3923,19 @@ export function createNotificationsExtension(
 			cleanupPromptRecords();
 			const correlation = runtime.activePromptCorrelation;
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission || submission.abandoned) return;
+			if (!submission) return;
 			const frame = {
 				type: "event",
 				kind: event.type,
 				payload: toAgentWireEventPayload(event),
 				...correlation,
 			};
+			runtime.host.emitEvent({
+				kind: event.type,
+				payload: frame.payload,
+				...correlation,
+				audience: { requesterRef: submission.requesterRef, ...correlation },
+			});
 			if (!submission.acknowledged) {
 				submission.bufferedFrames.push(frame);
 				return;
@@ -3915,6 +3963,24 @@ export function createNotificationsExtension(
 				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
 			}
 		};
+		let pendingPromptDeliveryReservations = 0;
+		const reservePromptDelivery = (requesterConnectionId?: string) => {
+			if (!requesterConnectionId) return () => {};
+			cleanupPromptRecords();
+			while (promptSubmissions.size + pendingPromptDeliveryReservations >= PROMPT_SUBMISSION_CAPACITY) {
+				const terminal = [...promptSubmissions.entries()].find(([, submission]) => submission.terminal);
+				if (!terminal)
+					throw Object.assign(new Error("Prompt delivery capacity is temporarily exhausted."), { code: "busy" });
+				expireTerminalPromptDelivery(terminal[0], terminal[1], Number.POSITIVE_INFINITY);
+			}
+			pendingPromptDeliveryReservations++;
+			let released = false;
+			return () => {
+				if (released) return;
+				released = true;
+				pendingPromptDeliveryReservations--;
+			};
+		};
 		const recordPromptAccepted = async (
 			correlation: { commandId: string; turnId: string },
 			requesterConnectionId?: string,
@@ -3931,16 +3997,15 @@ export function createNotificationsExtension(
 			// failures that race the durable write still emit correlated terminals.
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
-				const oldestTerminal = [...promptSubmissions.entries()].find(([, submission]) => submission.terminal);
-				if (!oldestTerminal)
-					throw Object.assign(
-						new Error("Too many active prompt submissions; reconcile or await terminal state."),
-						{ code: "reconciliation_capacity" },
-					);
-				expirePromptDelivery(oldestTerminal[0], oldestTerminal[1]);
+				const terminal = [...promptSubmissions.entries()].find(([, submission]) => submission.terminal);
+				if (!terminal)
+					throw Object.assign(new Error("Prompt delivery capacity is temporarily exhausted."), { code: "busy" });
+				expireTerminalPromptDelivery(terminal[0], terminal[1], Number.POSITIVE_INFINITY);
 			}
+			const key = promptSubmissionKey(correlation);
 			pendingPromptCorrelations.push(correlation);
 			const submission: PromptSubmission = {
+				requesterRef: clientRef ?? requesterConnectionId,
 				acknowledged: false,
 				connectionId: requesterConnectionId,
 				abandoned: false,
@@ -3948,14 +4013,13 @@ export function createNotificationsExtension(
 				error: undefined,
 				terminal: false,
 				retainCorrelation: trackReconciliation,
-				createdAt: Date.now(),
 				deadlineMs: settings?.get("sdk.promptDeadlineMs") ?? 1_800_000,
 				phase: "active",
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
 				bufferedFrames: [],
 			};
-			promptSubmissions.set(promptSubmissionKey(correlation), submission);
+			promptSubmissions.set(key, submission);
 			if (trackReconciliation) await notePromptReconciliationAccepted(correlation, clientRef);
 			submission.deadlineTimer = setTimeout(() => {
 				void terminalizePrompt(
@@ -3981,6 +4045,7 @@ export function createNotificationsExtension(
 			if (!submission || submission.terminal) return false;
 			submission.terminal = true;
 			submission.phase = "publication_closed";
+			submission.terminalAt = Date.now();
 			return true;
 		};
 		/**
@@ -4220,6 +4285,7 @@ export function createNotificationsExtension(
 			admitPromptSubmission,
 			releasePromptAdmission,
 			() => reconciliationReady,
+			reservePromptDelivery,
 			settings,
 			configOverrides,
 			configRevision,
