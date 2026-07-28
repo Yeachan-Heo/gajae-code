@@ -10,15 +10,8 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
-import type { SdkControlAuthority } from "../extensibility/extensions/sdk-control-authority";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
-import {
-	appendAppServerProjection,
-	readAppServerProjections,
-	validateAppServerProjectionAfterRevision,
-} from "../session/app-server-projection";
-
 import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
 
@@ -48,7 +41,6 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 
 	const { reportSendError, reportRuntimeError, onShutdown, uiContext } = options;
 	const shutdown = onShutdown ?? (() => {});
-	const projectionAuthority = Symbol("app-server-projection") as SdkControlAuthority;
 
 	runner.initialize(
 		// ExtensionActions
@@ -177,7 +169,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			},
 			getJobs: () => session.getAsyncJobSnapshot(),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
-			sdkControl: async (operation, input, authority?: SdkControlAuthority) => {
+			sdkControl: async (operation, input) => {
 				switch (operation) {
 					case "model.set": {
 						const selector = typeof input.id === "string" ? input.id : "";
@@ -277,20 +269,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { backgrounded: true };
 					}
 					case "projection.append":
-						if (authority !== projectionAuthority)
-							throw Object.assign(new Error("projection.append is reserved for the app-server runtime."), {
-								code: "forbidden",
-							});
-						return appendAppServerProjection(session.sessionManager, input.envelope);
 					case "projection.read":
-						if (authority !== projectionAuthority)
-							throw Object.assign(new Error("projection.read is reserved for the app-server runtime."), {
-								code: "forbidden",
-							});
-						return readAppServerProjections(
-							session.sessionManager,
-							validateAppServerProjectionAfterRevision(input.afterRevision),
-						);
+						throw Object.assign(new Error(`${operation} is reserved for the app-server runtime.`), {
+							code: "forbidden",
+						});
+
 					case "compaction.auto.set":
 						session.setAutoCompactionEnabled(input.on === true);
 						return { changed: true };
@@ -436,7 +419,6 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						});
 				}
 			},
-			sdkControlAuthority: projectionAuthority,
 		},
 		// ExtensionCommandContextActions — commands invokable via prompt("/command")
 		{

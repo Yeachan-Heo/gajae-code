@@ -97,7 +97,6 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
-import type { SdkControlAuthority } from "./sdk-control-authority";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -419,11 +418,7 @@ export interface ExtensionContext {
 	operateGoal?(op: "create" | "get" | "resume" | "pause" | "complete" | "drop", objective?: string): Promise<unknown>;
 
 	/** Typed nonvisual session controls exposed to the SDK host. */
-	sdkControl?(
-		operation: string,
-		input: Record<string, unknown>,
-		authority?: SdkControlAuthority,
-	): unknown | Promise<unknown>;
+	sdkControl?(operation: string, input: Record<string, unknown>): unknown | Promise<unknown>;
 	/** Install a permission callback backed by a live SDK reverse provider lease. */
 	setSdkPermissionProvider?(
 		provider:
@@ -1507,13 +1502,7 @@ export interface ExtensionContextActions {
 			  ) => Promise<ClientBridgePermissionOutcome>)
 			| undefined,
 	) => void;
-	sdkControl?: (
-		operation: string,
-		input: Record<string, unknown>,
-		authority?: SdkControlAuthority,
-	) => unknown | Promise<unknown>;
-	/** Internal authority held by the app-server runtime for projection controls. */
-	sdkControlAuthority?: SdkControlAuthority;
+	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
 	invokeSkill?: (
 		name: string,
 		args?: string,

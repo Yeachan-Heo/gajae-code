@@ -45,6 +45,7 @@ import {
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
+import type { AppServerProjectionCapability } from "../../session/app-server-projection";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -2174,6 +2175,7 @@ function sdkControlSurface(
 	releasePromptAdmission: (clientRef?: string) => void,
 	awaitReconciliationReady: () => Promise<void> = async () => {},
 	reservePromptDelivery: (requesterConnectionId?: string) => () => void,
+	projectionCapability: AppServerProjectionCapability | undefined,
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
@@ -2850,10 +2852,14 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
-		// Projection writes delegate through the owning session's typed seam, which retains the
-		// real SessionManager store and its single-writer/flush-backed authority.
-		appendProjection: envelope => typed("projection.append", { envelope }),
-		readProjection: afterRevision => typed("projection.read", { afterRevision }),
+		appendProjection: envelope =>
+			projectionCapability
+				? projectionCapability.append(envelope)
+				: unavailable("projection.append", "no projection capability is installed")(),
+		readProjection: afterRevision =>
+			projectionCapability
+				? projectionCapability.read(afterRevision)
+				: unavailable("projection.read", "no projection capability is installed")(),
 		installedOperations: installedOperations(ctx, "control"),
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
@@ -3274,6 +3280,7 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
+		projectionCapability?: AppServerProjectionCapability;
 		ensureTelegramDaemon?: (input: {
 			settings: Settings;
 			cwd: string;
@@ -4286,6 +4293,7 @@ export function createNotificationsExtension(
 			releasePromptAdmission,
 			() => reconciliationReady,
 			reservePromptDelivery,
+			options.projectionCapability,
 			settings,
 			configOverrides,
 			configRevision,

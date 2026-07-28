@@ -124,6 +124,7 @@ import {
 	type SecretObfuscator,
 } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
+import { appendAppServerProjection, readAppServerProjections } from "../session/app-server-projection";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
@@ -1991,6 +1992,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
 					createNotificationsExtension(api, {
+						projectionCapability: {
+							append: value => appendAppServerProjection(sessionManager, value),
+							read: afterRevision => readAppServerProjections(sessionManager, afterRevision),
+						},
 						settings,
 						controller: notificationSessionController,
 						spawnedByGjc,

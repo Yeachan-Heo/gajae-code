@@ -5,6 +5,7 @@ import { initializeExtensions } from "../../src/modes/runtime-init";
 import { createAgentSession } from "../../src/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../../src/sdk/bus";
+import { appendAppServerProjection, readAppServerProjections } from "../../src/session/app-server-projection";
 import { SessionManager } from "../../src/session/session-manager";
 import {
 	cleanupFixtureRoot,
@@ -64,6 +65,10 @@ export async function startProductionSdkHost(
 						api =>
 							createNotificationsExtension(api, {
 								settings,
+								projectionCapability: {
+									append: value => appendAppServerProjection(session.sessionManager, value),
+									read: afterRevision => readAppServerProjections(session.sessionManager, afterRevision),
+								},
 								onSdkRequest: (kind, _connectionId, frame) => {
 									const operation = kind === "control" ? frame.operation : frame.query;
 									if (typeof operation === "string") observed.push({ kind, operation });
