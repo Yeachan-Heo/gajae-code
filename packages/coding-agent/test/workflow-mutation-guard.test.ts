@@ -321,6 +321,8 @@ describe("workflow mutation guard", () => {
 			`cat <<-'TABDOC' > /tmp/spec.md\n\tindented body a > b\n\tTABDOC`,
 			`cat <<'CNT' | wc -l\n${specBody}\nCNT`,
 			`cat <<'PIPE' | grep -c retrieval | sort\n${specBody}\nPIPE`,
+			// A stray quote inside a comment must not poison cross-line quote state (Codex P2).
+			`# don't trip on this apostrophe\ncat <<'CMT' > /tmp/spec.md\n${specBody}\nCMT`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,

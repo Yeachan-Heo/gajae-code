@@ -465,30 +465,36 @@ interface ShellQuoteState {
  * Mask one physical line for syntax analysis, carrying `state` across lines:
  * quoted spans and backslash-escaped characters become spaces (they are data,
  * never syntax), so a `<<` inside `"…"`/`'…'` — even when the quote opened on a
- * PREVIOUS line — or an escaped separator like `\|` is never misread. The
- * output is the same length as the input so match offsets stay aligned.
- * `continued` reports an unescaped trailing backslash outside quotes (logical
- * line continuation).
+ * PREVIOUS line — or an escaped separator like `\|` is never misread. An
+ * unquoted `#` starts a comment: the rest of the line is blanked without
+ * touching quote state, so a stray quote inside a comment cannot poison later
+ * lines. The output is the same length as the input so match offsets stay
+ * aligned. `continued` reports an unescaped trailing backslash outside quotes
+ * (logical line continuation).
  */
 function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: string; continued: boolean } {
 	let masked = "";
 	let escaped = false;
+	let previous = "";
 	for (const character of line) {
 		if (state.inSingle) {
 			if (character === "'") {
 				state.inSingle = false;
 				masked += "'";
 			} else masked += " ";
+			previous = character;
 			continue;
 		}
 		if (escaped) {
 			escaped = false;
 			masked += " ";
+			previous = character;
 			continue;
 		}
 		if (character === "\\") {
 			escaped = true;
 			masked += " ";
+			previous = character;
 			continue;
 		}
 		if (state.inDouble) {
@@ -496,19 +502,31 @@ function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: stri
 				state.inDouble = false;
 				masked += '"';
 			} else masked += " ";
+			previous = character;
 			continue;
+		}
+		if (
+			character === "#" &&
+			(previous === "" || previous === " " || previous === "\t" || ";|&(".includes(previous))
+		) {
+			// Comment: blank the remainder without evaluating quotes inside it.
+			masked += " ".repeat(line.length - masked.length);
+			return { masked, continued: false };
 		}
 		if (character === "'") {
 			state.inSingle = true;
 			masked += "'";
+			previous = character;
 			continue;
 		}
 		if (character === '"') {
 			state.inDouble = true;
 			masked += '"';
+			previous = character;
 			continue;
 		}
 		masked += character;
+		previous = character;
 	}
 	return { masked, continued: escaped };
 }
