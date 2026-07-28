@@ -669,7 +669,7 @@ export class TUI extends Container {
 	#lastRenderWriteSucceeded = false;
 	#renderTimer: NodeJS.Timeout | undefined;
 	#widthSettleTimer: NodeJS.Timeout | undefined;
-	#widthSettleBaseline = 0;
+	#lastObservedWidth = 0;
 	static readonly #WIDTH_SETTLE_MS = 1000;
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
@@ -1247,6 +1247,9 @@ export class TUI extends Container {
 	start(): void {
 		this.#stopped = false;
 		this.#terminalUnavailable = false;
+		// Seed the observed width so a spurious post-start resize event (iTerm2 tab
+		// activation, the self-sent SIGWINCH after resume) is not read as a reflow.
+		this.#lastObservedWidth = this.terminal.columns;
 		this.terminal.setMouseEnabled?.(this.options.enableMouse === true);
 		this.terminal.start(
 			data => this.#handleInput(data),
@@ -1590,31 +1593,49 @@ export class TUI extends Container {
 	 * is a no-op otherwise.
 	 */
 	requestResizeRender(): void {
-		const widthChanged = this.#previousWidth !== this.terminal.columns;
+		// Width is tracked against the last OBSERVED terminal width, not against
+		// #previousWidth (the last committed frame). Those diverge whenever resize
+		// events coalesce inside one frame budget: a 100->90->100 burst would leave
+		// #previousWidth at 100 the whole time, so a commit-keyed debounce would
+		// never see the second transition and could skip the only repair frame.
+		const observedWidth = this.terminal.columns;
+		const widthChanged = observedWidth !== this.#lastObservedWidth;
+		this.#lastObservedWidth = observedWidth;
 		const heightChanged = this.#previousHeight !== this.terminal.rows;
 		if (widthChanged) this.#scheduleWidthSettleRedraw();
 		this.requestRender(heightChanged && !useViewportRepaintPath(this.terminal), "resize");
 	}
 
 	/**
-	 * Width reflow leaves artifacts that a differential render cannot repair: lines
-	 * wrapped at the old column count stay on screen as stale bands. Only a full
-	 * redraw fixes them, but forcing one per SIGWINCH during a drag-resize is a
-	 * replay storm. So width changes arm a trailing timer instead: interim frames
-	 * keep the normal (cheap) render path, and one forced full redraw commits
-	 * #WIDTH_SETTLE_MS after the last width change. Height-only changes are
-	 * unaffected — they reflow nothing and keep their existing behavior.
+	 * Width reflow leaves artifacts that the immediate resize frame does not always
+	 * repair: lines wrapped at the old column count can survive as stale bands. The
+	 * immediate frame is unchanged by this timer — `#doRender` still promotes a real
+	 * width change to `fullRender`/`viewportRepaint` on the spot. What this adds is a
+	 * single trailing repair: one forced redraw #WIDTH_SETTLE_MS after the last
+	 * observed width change, so a drag-resize converges on a correct frame without
+	 * forcing an extra full redraw per SIGWINCH.
+	 *
+	 * Every observed width sequence gets exactly one repair, including one that
+	 * ends back at its starting width. Skipping the drag-and-return case would
+	 * require proving that a frame committed at the final geometry *after* the
+	 * final resize event, which the render pipeline does not guarantee; one extra
+	 * repaint is cheaper than a missed repair.
+	 *
+	 * Scope: the repair is dispatched through `requestRender(true)`, so on
+	 * viewport-repaint hosts (tmux/screen/zellij, Windows Terminal, process
+	 * terminals) it repaints the live viewport rather than replaying the whole
+	 * transcript. Rows that already scrolled off keep their old-width wrapping —
+	 * reconstructing them is what caused the replay storm that
+	 * `resize-replay-storm.test.ts` pins against.
+	 *
+	 * Height-only changes are unaffected: they reflow nothing and keep their
+	 * existing behavior.
 	 */
 	#scheduleWidthSettleRedraw(): void {
-		if (this.#widthSettleTimer) {
-			clearTimeout(this.#widthSettleTimer);
-		} else {
-			this.#widthSettleBaseline = this.#previousWidth;
-		}
+		if (this.#widthSettleTimer) clearTimeout(this.#widthSettleTimer);
 		this.#widthSettleTimer = setTimeout(() => {
 			this.#widthSettleTimer = undefined;
 			if (this.#stopped) return;
-			if (this.terminal.columns === this.#widthSettleBaseline) return;
 			this.requestRender(true, "resize.width-settled");
 		}, TUI.#WIDTH_SETTLE_MS);
 		this.#widthSettleTimer.unref?.();
