@@ -3,6 +3,18 @@ import { Text } from "../src/components/text";
 import { TUI } from "../src/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
+// Adversarial companion to resize-width-settle.test.ts. The split is by evidence,
+// not by topic: that file pins the redraw-count contract with the cheapest possible
+// setup, while every case here asserts against real captured terminal output —
+// escape sequences, viewport rows, and scroll buffers compared to an independently
+// rendered clean target-width reference.
+//
+// Cases live here only when they need that captured-output evidence or a host this
+// harness must fake (tmux/process-terminal). Anything a count assertion can pin
+// belongs in the base file; a case duplicated across both files is dead weight, so
+// stop/restart cancellation lives only there, where restarting before the deadline
+// gives it a real failure mode.
+
 const START_WIDTH = 44;
 const SETTLED_WIDTH = 22;
 const ROWS = 12;
@@ -271,63 +283,6 @@ describe("width-settle debounce red-team", () => {
 				settledFullRedrawDelta: result.redrawsAfterSettle - result.redrawsBeforeSettle,
 			},
 		);
-	});
-
-	it("STOP-START cancels the old timer and does not double-render after restart", async () => {
-		delete process.env.TMUX;
-		const term = new VirtualTerminal(START_WIDTH, ROWS, { isProcessTerminal: false });
-		const tui = new TUI(term);
-		try {
-			tui.start();
-			await settle(term);
-			await addTranscript(tui, term);
-			term.clearWriteLog();
-			term.resize(SETTLED_WIDTH, ROWS);
-			await settle(term);
-			const redrawsBeforeStop = tui.fullRedraws;
-			tui.stop();
-			term.clearWriteLog();
-			await Bun.sleep(SETTLE_MS + 150);
-			await term.flush();
-			const stoppedWriteLog = term.getWriteLog().join("");
-			const redrawsWhileStopped = tui.fullRedraws;
-
-			term.clearWriteLog();
-			const redrawsBeforeRestart = tui.fullRedraws;
-			tui.start();
-			await settle(term);
-			const restartWriteLog = term.getWriteLog().join("");
-			const redrawsAfterRestart = tui.fullRedraws;
-			term.clearWriteLog();
-			await Bun.sleep(SETTLE_MS + 150);
-			await term.flush();
-			const postRestartWriteLog = term.getWriteLog().join("");
-			const redrawsAfterRestartWindow = tui.fullRedraws;
-			finishCase(
-				"STOP-START",
-				"Stopping during the debounce window cancels it; restarting performs one normal forced frame and never receives a delayed orphaned write.",
-				{
-					noWriteWhileStopped: stoppedWriteLog === "",
-					noRedrawWhileStopped: redrawsWhileStopped === redrawsBeforeStop,
-					exactlyOneRestartRedraw: redrawsAfterRestart - redrawsBeforeRestart === 1,
-					restartWritesAFrame: restartWriteLog.length > 0,
-					noDoubleRedrawAfterRestart: redrawsAfterRestartWindow === redrawsAfterRestart,
-					noDelayedWriteAfterRestart: postRestartWriteLog === "",
-				},
-				{
-					redrawsBeforeStop,
-					redrawsWhileStopped,
-					redrawsBeforeRestart,
-					redrawsAfterRestart,
-					redrawsAfterRestartWindow,
-					stoppedWriteLength: stoppedWriteLog.length,
-					restartWriteLength: restartWriteLog.length,
-					postRestartWriteLength: postRestartWriteLog.length,
-				},
-			);
-		} finally {
-			tui.stop();
-		}
 	});
 
 	it("UNRELATED-FORCE keeps the settle timer sane after a forced render", async () => {
