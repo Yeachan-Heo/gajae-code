@@ -840,6 +840,10 @@ function maskHeredocBodiesPass(
 			// quote removal.
 			if (previousDequoted.endsWith("$") && (line.startsWith("'") || line.startsWith('"'))) {
 				previousDequoted = previousDequoted.slice(0, -1);
+				// The masker already opened this quote as ordinary (it ran before the
+				// fold), so re-check the rejoined ANSI-C span for runtime-decoding
+				// escapes (`$\` + `'\145val'`) it could not have flagged.
+				if (line.startsWith("'") && /^'[^']*\\/.test(line)) sawAnsiCEscape = true;
 			}
 			dequotedLines[dequotedLines.length - 1] = previousDequoted + dequoted;
 		} else {

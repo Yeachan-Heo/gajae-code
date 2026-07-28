@@ -395,6 +395,8 @@ describe("workflow mutation guard", () => {
 			"$\\\n\"eval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// ANSI-C escape sequences decode at runtime — fail closed (Codex P1).
 			"$'\\145val' 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// ANSI-C opener split by a continuation still carries runtime escapes (Codex P1).
+			"$\\\n'\\145val' 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// A continuation inside double quotes still splits a command word (Codex P1).
 			"\"e\\\nval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Bash's `function name()` hybrid form is still a declaration (Codex P1).
