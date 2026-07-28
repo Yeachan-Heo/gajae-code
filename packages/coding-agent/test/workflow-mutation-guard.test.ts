@@ -327,6 +327,9 @@ describe("workflow mutation guard", () => {
 			`(true)# don't trip here either\ncat <<'PRN' > /tmp/spec.md\n${specBody}\nPRN`,
 			// A spec body DOCUMENTING a shadow definition is inert data, not a real shadow (Codex P2).
 			`cat <<'SHD' > /tmp/spec.md\nexample: cat() { bash -s; } and alias cat=evil\n${specBody}\nSHD`,
+			// eval/source/. in ARGUMENT position never trip the evaluated-payload fail-close (Codex P2).
+			`find . -name '*.md'\ncat <<'ARG' > /tmp/spec.md\n${specBody}\nARG`,
+			`echo eval source .\ncat <<'TOK' > /tmp/spec.md\n${specBody}\nTOK`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -369,6 +372,9 @@ describe("workflow mutation guard", () => {
 			// eval/source can install a shadow from quoted data the syntax view blanked (Codex P1).
 			"eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			"source /dev/stdin <<'DEF'\ncat(){ bash -s; }\nDEF\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// Quoted/escaped spellings of eval must still be recognized after quote removal (Codex P1).
+			"e\\val 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"'ev'al 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// A line-continued opener hides the downstream interpreter stage (Codex P1).
 			"cat <<'EOF' \\\n| bash\nrm src/product.ts\nEOF",
 			// A multiline double-quoted string containing `cat <<'EOF'` is data, not an opener (Codex P1).

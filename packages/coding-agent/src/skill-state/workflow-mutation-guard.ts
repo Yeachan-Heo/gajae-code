@@ -471,27 +471,43 @@ interface ShellQuoteState {
  * unquoted `#` at a word boundary starts a comment: the rest of the line is
  * blanked without touching quote state, so a stray quote inside a comment
  * cannot poison later lines. A `)` closing a `$(`/`<(`/`>(` substitution is
- * part of the current word (`x=$(true)#literal`), not a comment boundary. The
- * output is the same length as the input so match offsets stay aligned.
+ * part of the current word (`x=$(true)#literal`), not a comment boundary.
+ * `masked` is the same length as the input so match offsets stay aligned.
+ * `dequoted` applies bash-like QUOTE REMOVAL instead — quote/backslash marks
+ * drop, quoted word characters stay, quoted metacharacters neutralize to `_` —
+ * so obfuscated spellings (`e\val`, `'ev'al`) reassemble into their real
+ * command word without quoted data ever forming fake command boundaries.
  * `continued` reports an unescaped trailing backslash outside quotes (logical
  * line continuation).
  */
-function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: string; continued: boolean } {
+function maskLineForSyntax(
+	line: string,
+	state: ShellQuoteState,
+): { masked: string; dequoted: string; continued: boolean } {
 	let masked = "";
+	let dequoted = "";
 	let escaped = false;
 	let previous = "";
+	// Quoted data keeps word characters (so `'ev'al` reassembles to `eval`) but
+	// neutralizes everything else to `_` so it can never form a command boundary.
+	const dequoteData = (character: string): string => (/[\w./-]/.test(character) ? character : "_");
 	for (const character of line) {
 		if (state.inSingle) {
-			if (character === "'") {
-				state.inSingle = false;
-				masked += "'";
-			} else masked += " ";
+			if (character === "'") state.inSingle = false;
+			else {
+				masked += " ";
+				dequoted += dequoteData(character);
+				previous = character;
+				continue;
+			}
+			masked += "'";
 			previous = character;
 			continue;
 		}
 		if (escaped) {
 			escaped = false;
 			masked += " ";
+			dequoted += dequoteData(character);
 			previous = character;
 			continue;
 		}
@@ -502,22 +518,28 @@ function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: stri
 			continue;
 		}
 		if (state.inDouble) {
-			if (character === '"') {
-				state.inDouble = false;
-				masked += '"';
-			} else masked += " ";
+			if (character === '"') state.inDouble = false;
+			else {
+				masked += " ";
+				dequoted += dequoteData(character);
+				previous = character;
+				continue;
+			}
+			masked += '"';
 			previous = character;
 			continue;
 		}
 		if (character === "(" && (previous === "$" || previous === "<" || previous === ">")) {
 			state.substitutionDepth++;
 			masked += character;
+			dequoted += character;
 			previous = character;
 			continue;
 		}
 		if (character === ")" && state.substitutionDepth > 0) {
 			state.substitutionDepth--;
 			masked += character;
+			dequoted += character;
 			// Substitution close binds to the surrounding word: `#` after it is literal.
 			previous = "x";
 			continue;
@@ -528,7 +550,7 @@ function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: stri
 		) {
 			// Comment: blank the remainder without evaluating quotes inside it.
 			masked += " ".repeat(line.length - masked.length);
-			return { masked, continued: false };
+			return { masked, dequoted, continued: false };
 		}
 		if (character === "'") {
 			state.inSingle = true;
@@ -543,9 +565,10 @@ function maskLineForSyntax(line: string, state: ShellQuoteState): { masked: stri
 			continue;
 		}
 		masked += character;
+		dequoted += character;
 		previous = character;
 	}
-	return { masked, continued: escaped };
+	return { masked, dequoted, continued: escaped };
 }
 
 const DATA_CONSUMER_NAMES = [...HEREDOC_DATA_CONSUMERS].join("|");
@@ -557,9 +580,23 @@ const DATA_CONSUMER_SHADOW_RE = new RegExp(
 /**
  * Shell-evaluated payloads (`eval …`, `source …`, `. file`) can install a
  * shadow from data the syntax view has blanked (quoted strings, /dev/stdin);
- * their presence in live syntax disables masking entirely (fail closed).
+ * one in COMMAND POSITION disables masking entirely (fail closed).
  */
-const SHELL_EVALUATED_PAYLOAD_RE = /(?:^|[\s;|&({`\n])(?:eval|source|\.)(?=[\s;|&)`\n]|$)/;
+const SHELL_EVALUATED_COMMANDS = new Set(["eval", "source", "."]);
+
+/**
+ * True when any command-position word of the dequoted syntax view is
+ * eval/source/`.` — command position means the first non-assignment,
+ * non-sudo word after a command separator (`;`, `|`, `&`, `(`, backtick,
+ * newline, or line start). `echo eval` and `find .` never match because
+ * their tokens sit in argument position.
+ */
+function hasShellEvaluatedCommand(dequotedView: string): boolean {
+	for (const list of dequotedView.split(/[;|&(`\n]/)) {
+		if (SHELL_EVALUATED_COMMANDS.has(firstCommandWord(list))) return true;
+	}
+	return false;
+}
 
 /** First command word of a pipeline-segment slice of a quote-masked opener line. */
 function firstCommandWord(segment: string): string {
@@ -633,19 +670,24 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 	const first = maskHeredocBodiesPass(command, false);
 	// Fail closed on live-syntax constructs that can install a shadow the syntax
 	// view cannot see: a function/alias definition of an allowlisted consumer
-	// name, or any shell-evaluated payload (`eval`/`source`/`.`) whose argument
-	// is blanked quoted data. Heredoc bodies and quoted/commented text are
-	// excluded, so a spec that merely DOCUMENTS `cat() { … }` stays inert.
-	if (DATA_CONSUMER_SHADOW_RE.test(first.syntaxView) || SHELL_EVALUATED_PAYLOAD_RE.test(first.syntaxView)) {
+	// name, or a command-position eval/source/`.` whose argument is blanked
+	// quoted data. Both run against the DEQUOTED view so quoting tricks
+	// (`e\val`, `'ev'al`) cannot hide the word, while heredoc bodies and
+	// comments stay excluded — a spec that merely DOCUMENTS `cat() { … }` or
+	// mentions "eval" in prose stays inert.
+	if (DATA_CONSUMER_SHADOW_RE.test(first.dequotedView) || hasShellEvaluatedCommand(first.dequotedView)) {
 		return maskHeredocBodiesPass(command, true).result;
 	}
 	return first.result;
 }
 
-function maskHeredocBodiesPass(command: string, shadowed: boolean): { result: HeredocMaskResult; syntaxView: string } {
+function maskHeredocBodiesPass(
+	command: string,
+	shadowed: boolean,
+): { result: HeredocMaskResult; dequotedView: string } {
 	const lines = command.split("\n");
 	const out: string[] = [];
-	const syntaxLines: string[] = [];
+	const dequotedLines: string[] = [];
 	const state: ShellQuoteState = { inSingle: false, inDouble: false, substitutionDepth: 0 };
 	let previousContinued = false;
 	let opaqueExpansion = false;
@@ -655,9 +697,9 @@ function maskHeredocBodiesPass(command: string, shadowed: boolean): { result: He
 		out.push(line);
 		// Cross-line quote masking decides whether a `<<` is real syntax or inert
 		// data — even when the enclosing quote opened on a previous line.
-		const { masked, continued } = maskLineForSyntax(line, state);
+		const { masked, dequoted, continued } = maskLineForSyntax(line, state);
 		const syntax = masked;
-		syntaxLines.push(syntax);
+		dequotedLines.push(dequoted);
 		const isContinuationLine = previousContinued;
 		previousContinued = continued;
 		for (const match of line.matchAll(BASH_HEREDOC_OPEN_RE)) {
@@ -684,7 +726,7 @@ function maskHeredocBodiesPass(command: string, shadowed: boolean): { result: He
 			if (end === -1) {
 				return {
 					result: { masked: command, opaqueExpansion, mutatingConsumer },
-					syntaxView: syntaxLines.join("\n"),
+					dequotedView: dequotedLines.join("\n"),
 				};
 			}
 			const maskBody = kind === "data" || kind === "mutating";
@@ -702,7 +744,7 @@ function maskHeredocBodiesPass(command: string, shadowed: boolean): { result: He
 	}
 	return {
 		result: { masked: out.join("\n"), opaqueExpansion, mutatingConsumer },
-		syntaxView: syntaxLines.join("\n"),
+		dequotedView: dequotedLines.join("\n"),
 	};
 }
 
