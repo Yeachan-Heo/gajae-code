@@ -503,11 +503,22 @@ function cutShellComment(syntaxLine: string): string {
 	return syntaxLine;
 }
 
+/** First command word of a pipeline-segment slice of a quote-masked opener line. */
+function firstCommandWord(segment: string): string {
+	for (const word of segment.trim().split(/\s+/)) {
+		if (!word || /^\w+=/.test(word) || word === "sudo") continue;
+		return word.split("/").pop()?.toLowerCase() ?? "";
+	}
+	return "";
+}
+
 /**
- * Classify the simple command that consumes the heredoc at offset `at` of the
- * comment-cut, quote-masked opener line. Only explicitly inert data consumers
- * qualify for body masking; stdin appliers fail closed; everything else
- * (interpreters, awk, unknown binaries) keeps its body live.
+ * Classify the command consuming the heredoc at offset `at` of the comment-cut,
+ * quote-masked opener line — including every DOWNSTREAM pipe stage, because
+ * `cat <<'EOF' | bash` hands the body to the interpreter even though `cat` is
+ * inert. Only a pipeline whose every stage is an explicitly inert data consumer
+ * qualifies for body masking; any stdin applier stage fails closed; anything
+ * else (interpreters, awk, unknown binaries) keeps the body live.
  */
 function heredocConsumerKind(syntaxLine: string, at: number): "data" | "mutating" | "other" {
 	let start = 0;
@@ -518,16 +529,30 @@ function heredocConsumerKind(syntaxLine: string, at: number): "data" | "mutating
 			break;
 		}
 	}
-	let command = "";
-	for (const word of syntaxLine.slice(start, at).trim().split(/\s+/)) {
-		if (!word || /^\w+=/.test(word) || word === "sudo") continue;
-		command = word;
-		break;
+	// The heredoc's own simple command plus every downstream `|` stage until the
+	// command list ends (`;`, `&&`, `||`, `&`, backtick, or subshell close).
+	const segments: string[] = [syntaxLine.slice(start, at)];
+	let cursor = at;
+	while (cursor < syntaxLine.length) {
+		const character = syntaxLine[cursor] ?? "";
+		if (character === ";" || character === "&" || character === "`" || character === ")") break;
+		if (character === "|") {
+			if (syntaxLine[cursor + 1] === "|") break;
+			let stageEnd = cursor + 1;
+			while (stageEnd < syntaxLine.length && !";|&`)".includes(syntaxLine[stageEnd] ?? "")) stageEnd++;
+			segments.push(syntaxLine.slice(cursor + 1, stageEnd));
+			cursor = stageEnd;
+			continue;
+		}
+		cursor++;
 	}
-	const base = command.split("/").pop()?.toLowerCase() ?? "";
-	if (HEREDOC_MUTATING_CONSUMERS.has(base)) return "mutating";
-	if (HEREDOC_DATA_CONSUMERS.has(base)) return "data";
-	return "other";
+	let kind: "data" | "mutating" | "other" = "data";
+	for (const segment of segments) {
+		const base = firstCommandWord(segment);
+		if (HEREDOC_MUTATING_CONSUMERS.has(base)) return "mutating";
+		if (!HEREDOC_DATA_CONSUMERS.has(base)) kind = "other";
+	}
+	return kind;
 }
 
 /**

@@ -319,6 +319,8 @@ describe("workflow mutation guard", () => {
 			`cat <<'EOF' > /tmp/plan-draft.md\n${specBody}\nEOF`,
 			`tee /tmp/spec.md >/dev/null <<'DOC'\n${specBody}\nDOC`,
 			`cat <<-'TABDOC' > /tmp/spec.md\n\tindented body a > b\n\tTABDOC`,
+			`cat <<'CNT' | wc -l\n${specBody}\nCNT`,
+			`cat <<'PIPE' | grep -c retrieval | sort\n${specBody}\nPIPE`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -349,6 +351,9 @@ describe("workflow mutation guard", () => {
 			'printf "%s" "<<\'EOF\'"\nrm src/product.ts\nEOF',
 			// Escaped quotes must not re-expose a quoted `<<` as an opener (Codex P1).
 			'cat "a \\" <<\'EOF\' \\" b"\nrm src/product.ts\nEOF',
+			// A downstream pipe stage can execute the body even when the opener is inert (Codex P1).
+			"cat <<'EOF' | bash\nrm src/product.ts\nEOF",
+			"cat <<'EOF' | grep -v noop | sh\nrm src/product.ts\nEOF",
 			// Unquoted delimiter + command substitution in body expands at runtime — fail closed.
 			"cat <<EOF > /tmp/out.md\n$(rm src/product.ts)\nEOF",
 			// Unterminated heredoc is unparseable — body scanned as before, mutation caught.
