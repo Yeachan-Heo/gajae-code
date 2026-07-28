@@ -3,6 +3,18 @@ import { Text } from "../src/components/text";
 import { TUI } from "../src/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
+// Adversarial companion to resize-width-settle.test.ts. The split is by evidence,
+// not by topic: that file pins the redraw-count contract with the cheapest possible
+// setup, while every case here asserts against real captured terminal output —
+// escape sequences, viewport rows, and scroll buffers compared to an independently
+// rendered clean target-width reference.
+//
+// Cases live here only when they need that captured-output evidence or a host this
+// harness must fake (tmux/process-terminal). Anything a count assertion can pin
+// belongs in the base file; a case duplicated across both files is dead weight, so
+// stop/restart cancellation lives only there, where restarting before the deadline
+// gives it a real failure mode.
+
 const START_WIDTH = 44;
 const SETTLED_WIDTH = 22;
 const ROWS = 12;
@@ -44,6 +56,12 @@ function capture(term: VirtualTerminal): Capture {
 
 function nonEmpty(lines: string[]): string[] {
 	return lines.filter(line => line.length > 0);
+}
+
+function trimTrailingBlank(lines: string[]): string[] {
+	let end = lines.length;
+	while (end > 0 && lines[end - 1].length === 0) end--;
+	return lines.slice(0, end);
 }
 
 function countSequence(haystack: string, needle: string): number {
@@ -244,18 +262,28 @@ describe("width-settle debounce red-team", () => {
 		);
 	});
 
-	it("TMUX-STALE-BAND measures whether viewport-only settle repairs scrollback", async () => {
+	it("TMUX-STALE-BAND settled repair replays the full transcript so scrollback is repaired too", async () => {
 		const result = await runWidthRepair(true);
+		// The reference buffer carries construction-time interior blank rows (it is
+		// rendered incrementally), so content is compared via nonEmpty. Stale blank
+		// bands in the POST buffer are still caught: after a real clear+replay the
+		// post buffer must have no interior blank rows, asserted separately below.
+		const postTrimmed = trimTrailingBlank(result.post.scrollback);
 		const postRows = nonEmpty(result.post.scrollback);
 		const referenceRows = nonEmpty(result.reference.scrollback);
 		finishCase(
 			"TMUX-STALE-BAND",
-			"With TMUX set, the settled request routes through viewportRepaint: the LIVE viewport must match a clean 22-column render, while already-scrolled-off history keeps its old-width wrapping (reconstructing it is the replay storm resize-replay-storm.test.ts pins against).",
+			"With TMUX set, interim frames stay viewport-only, but the ONE debounced settled repair is a full clear+replay: post-settle scrollback must match a clean 22-column render row-for-row. The replay storm is avoided by running once per settled sequence, not once per SIGWINCH.",
 			{
+				postStateMatchesFreshTarget: postRows.join("\n") === referenceRows.join("\n"),
+				postHasNoInteriorBlankRows: postTrimmed.every(line => line.length > 0),
 				postViewportMatchesFreshTarget: result.post.viewport.join("\n") === result.reference.viewport.join("\n"),
 				settledRedrawExactlyOne: result.redrawsAfterSettle - result.redrawsBeforeSettle === 1,
-				settledWriteUsesViewportRepaint:
-					result.post.writeLog.includes("\x1b[2K") && !result.post.writeLog.includes("\x1b[3J"),
+				// The settled repair forces the scrollback clear even where per-event
+				// full clears keep 3J suppressed (forceScrollbackClear): replaying
+				// WITHOUT erasing history would stack the new transcript on top of
+				// the stale-width copy.
+				settledWriteClearsAndReplays: result.post.writeLog.includes("\x1b[2J\x1b[H\x1b[3J"),
 				widthChangedContentVisible: result.post.viewport.some(line => line.startsWith("R31-")),
 			},
 			{
@@ -271,63 +299,6 @@ describe("width-settle debounce red-team", () => {
 				settledFullRedrawDelta: result.redrawsAfterSettle - result.redrawsBeforeSettle,
 			},
 		);
-	});
-
-	it("STOP-START cancels the old timer and does not double-render after restart", async () => {
-		delete process.env.TMUX;
-		const term = new VirtualTerminal(START_WIDTH, ROWS, { isProcessTerminal: false });
-		const tui = new TUI(term);
-		try {
-			tui.start();
-			await settle(term);
-			await addTranscript(tui, term);
-			term.clearWriteLog();
-			term.resize(SETTLED_WIDTH, ROWS);
-			await settle(term);
-			const redrawsBeforeStop = tui.fullRedraws;
-			tui.stop();
-			term.clearWriteLog();
-			await Bun.sleep(SETTLE_MS + 150);
-			await term.flush();
-			const stoppedWriteLog = term.getWriteLog().join("");
-			const redrawsWhileStopped = tui.fullRedraws;
-
-			term.clearWriteLog();
-			const redrawsBeforeRestart = tui.fullRedraws;
-			tui.start();
-			await settle(term);
-			const restartWriteLog = term.getWriteLog().join("");
-			const redrawsAfterRestart = tui.fullRedraws;
-			term.clearWriteLog();
-			await Bun.sleep(SETTLE_MS + 150);
-			await term.flush();
-			const postRestartWriteLog = term.getWriteLog().join("");
-			const redrawsAfterRestartWindow = tui.fullRedraws;
-			finishCase(
-				"STOP-START",
-				"Stopping during the debounce window cancels it; restarting performs one normal forced frame and never receives a delayed orphaned write.",
-				{
-					noWriteWhileStopped: stoppedWriteLog === "",
-					noRedrawWhileStopped: redrawsWhileStopped === redrawsBeforeStop,
-					exactlyOneRestartRedraw: redrawsAfterRestart - redrawsBeforeRestart === 1,
-					restartWritesAFrame: restartWriteLog.length > 0,
-					noDoubleRedrawAfterRestart: redrawsAfterRestartWindow === redrawsAfterRestart,
-					noDelayedWriteAfterRestart: postRestartWriteLog === "",
-				},
-				{
-					redrawsBeforeStop,
-					redrawsWhileStopped,
-					redrawsBeforeRestart,
-					redrawsAfterRestart,
-					redrawsAfterRestartWindow,
-					stoppedWriteLength: stoppedWriteLog.length,
-					restartWriteLength: restartWriteLog.length,
-					postRestartWriteLength: postRestartWriteLog.length,
-				},
-			);
-		} finally {
-			tui.stop();
-		}
 	});
 
 	it("UNRELATED-FORCE keeps the settle timer sane after a forced render", async () => {

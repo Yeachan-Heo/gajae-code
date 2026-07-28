@@ -14,6 +14,7 @@
 - `waitForRenderCommit` / generation-scoped render tokens resolve only after a successful buffer write (or fail open on stopped/unavailable terminals), enabling awaitable progress frames for interactive resume without hanging (#2914).
 - Streaming layout contraction followed by regrowth no longer re-admits an already committed logical row into native terminal scrollback, preventing occasional duplicated assistant lines after Markdown reflow.
 - Repeated clearing of an already-clear viewport output source is now a render-request no-op, matching identical non-null source updates.
+- A terminal width change now ends in one forced full redraw 1000ms after the last observed resize event, repairing stale bands left by lines wrapped at the old column count — across the full transcript, including scrollback history, on every host. Interim resize frames keep their cheap per-host path; the debounce is what makes the one full replay safe, so drag-resizing still does not replay the transcript per `SIGWINCH`. While the user is reading scrollback (manual viewport), the repair is deferred and runs when they return to live output. Height-only changes are unaffected (#3360, #3361).
 
 ## [0.11.11] - 2026-07-26
 

@@ -15,7 +15,7 @@
 import { Buffer } from "node:buffer";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $envpos, isEnoent, logger } from "@gajae-code/utils";
+import { $credentialEnv, $envpos, isEnoent, logger } from "@gajae-code/utils";
 import type { FetchImpl } from "../types";
 
 const OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -70,8 +70,19 @@ async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
 	}
 }
 
+/** Test seam: the ADC credentials file path as resolved from trusted env. */
+export function resolveAdcCredentialsPathForTest(): string | undefined {
+	return $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
+}
+
 async function loadAdcCredentials(): Promise<{ source: string; creds: AdcFileCredentials } | undefined> {
-	const gacPath = Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+	// Trusted sources only: this path is read as service-account / authorized-user
+	// credentials and exchanged for a Google access token, so whatever can set it
+	// chooses the identity the agent authenticates as. `Bun.env` is `process.env`
+	// and the env module merges the caller's `cwd/.env` into it, so reading it
+	// there would let repository content point this at a key file it ships.
+	// `stream.ts` already resolves the same variable through `$credentialEnv`.
+	const gacPath = $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
 	if (gacPath) {
 		const creds = await readJsonFile<AdcFileCredentials>(gacPath);
 		if (!creds) {

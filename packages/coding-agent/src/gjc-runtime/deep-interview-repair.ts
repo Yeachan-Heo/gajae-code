@@ -7,9 +7,11 @@ import {
 	applyDeepInterviewRoundResultV1,
 	canonicalDeepInterviewJson,
 	type DeepInterviewFactOperation,
+	type DeepInterviewInvariantDetail,
 	type DeepInterviewResolution,
 	type DeepInterviewRoundResultV1,
 	deepInterviewAnswerIdentityEqual,
+	deepInterviewInvariantDetail,
 	deriveRoundKey,
 	questionHash,
 	validateDeepInterviewV1Envelope,
@@ -52,12 +54,144 @@ class RepairError extends Error {
 	constructor(
 		readonly code: string,
 		readonly status = 2,
+		readonly detail?: DeepInterviewInvariantDetail,
 	) {
 		super(code);
 	}
 }
-function issue(code: string) {
-	return { code, message: code };
+/** Human-readable messages and deterministic recovery commands so errors never merely echo their own code. */
+const REPAIR_CODE_MESSAGES: Record<string, { message: string; recovery?: string }> = {
+	DI_INVALID_RESULT_JSON: {
+		message:
+			"The round-result payload failed strict decoding: an unknown key, wrong type, duplicate id, or out-of-range value.",
+		recovery:
+			"Correct --result-json to match the closed schema, or use the CLI-owned apply-round-result draft flow and rerun draft check before consume.",
+	},
+	DI_INVALID_INPUT_JSON: {
+		message: "The input payload failed strict decoding: an unknown key, wrong type, or out-of-range value.",
+		recovery:
+			"Correct --input-json to match the closed schema, or use the matching CLI-owned draft flow and rerun draft check before consume.",
+	},
+	DI_INVALID_ANSWER_JSON: {
+		message: "The answer JSON must be {selected_options: string[], custom_input: string|null} within size limits.",
+		recovery:
+			"Correct --answer-json, or create a record-answer draft, edit /answer/selected_options and /answer/custom_input, then rerun draft check.",
+	},
+	DI_INVALID_QUESTION_JSON: {
+		message: "The question must be a non-empty JSON string within 2048 bytes.",
+		recovery:
+			"Correct --question-json, or set /question in a record-answer draft and rerun draft check before consume.",
+	},
+	DI_STATE_SCHEMA_INVALID: {
+		message: "The persisted deep-interview state violates a native v1 invariant.",
+		recovery:
+			"Fix the named invariant at the reported path (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <expected> --json), rerun gjc deep-interview draft check --draft-id <id> --json, then retry consume.",
+	},
+	DI_REVISION_CONFLICT: {
+		message: "The state revision changed since it was read; re-read the current revision and retry.",
+		recovery:
+			"Run: gjc deep-interview draft check --draft-id <id> --json for the current state_revision, then gjc deep-interview draft rebase --draft-id <id> --expected-draft-revision <draft_revision> --to-state-revision <state_revision> --json and retry.",
+	},
+	DI_SETUP_CONFLICT: {
+		message: "initialize-context conflicts with already-initialized fields; existing values cannot be changed.",
+		recovery:
+			"Inspect current state (gjc deep-interview inspect --selector summary --json), then make the request match the existing values or drop the conflicting fields.",
+	},
+	DI_TOPOLOGY_CONFLICT: {
+		message: "A different topology is already confirmed; confirm-topology cannot overwrite it.",
+		recovery:
+			"Inspect the confirmed topology (gjc deep-interview inspect --selector topology --json); a confirmed topology cannot be replaced.",
+	},
+	DI_ANSWER_CONFLICT: {
+		message: "A different answer is already recorded for this round key.",
+		recovery:
+			"Inspect the recorded round (gjc deep-interview inspect --selector round --round-key <key> --json); recorded answers cannot be replaced.",
+	},
+	DI_SHELL_CONFLICT: {
+		message: "This round key is already scored with a different answer identity.",
+		recovery:
+			"Inspect the scored round (gjc deep-interview inspect --selector round --round-key <key> --json); scored rounds are immutable.",
+	},
+	DI_ROUND_RESULT_CONFLICT: {
+		message: "This round is already scored with a different result digest.",
+		recovery:
+			"Inspect the scored round (gjc deep-interview inspect --selector recent-scored --json); a scored result cannot be replaced — discard the conflicting draft or request.",
+	},
+	DI_ROUND_NOT_FOUND: {
+		message: "No round with the requested round key exists in state.rounds.",
+		recovery:
+			"List pending shells (gjc deep-interview inspect --selector pending --json) and retry with an existing round key.",
+	},
+	DI_PHASE_NOT_REPAIRABLE: {
+		message: "The interview is complete, handed off, or inactive; state mutations are refused.",
+	},
+	DI_INVALID_ARGUMENT: { message: "A flag is missing, duplicated, unknown for this verb, or malformed." },
+	DI_INTERNAL_ERROR: { message: "An unexpected internal error occurred; the state was not modified." },
+	DI_JSON_REQUIRED: { message: "Typed deep-interview commands require the --json flag." },
+	DI_UNKNOWN_COMMAND: { message: "The requested verb is not a known typed deep-interview command." },
+	DI_STATE_ABSENT: { message: "No deep-interview state exists for this session; run the kickoff first." },
+	DI_STATE_CORRUPT: { message: "The persisted deep-interview state file is unreadable." },
+	DI_RECEIPT_MALFORMED: {
+		message: "The persisted state receipt is malformed.",
+		recovery:
+			"Run gjc deep-interview sanity-check --session-id <session> --json, then follow the documented state repair path; never edit .gjc state files directly.",
+	},
+	DI_RECEIPT_MISSING: {
+		message: "The persisted state is missing its integrity receipt.",
+		recovery:
+			"Run gjc deep-interview sanity-check --session-id <session> --json, then follow the documented state repair path; never edit .gjc state files directly.",
+	},
+	DI_RECEIPT_CHECKSUM_MISMATCH: {
+		message: "The persisted state checksum does not match its receipt.",
+		recovery:
+			"Run gjc deep-interview sanity-check --session-id <session> --json, then follow the documented state repair path; never edit .gjc state files directly.",
+	},
+	DI_INVALID_SESSION_ID: { message: "The --session-id is missing or not a valid identifier." },
+	DI_INVALID_EXPECTED_REVISION: { message: "The --expected-revision is missing or not a non-negative integer." },
+	DI_INVALID_SCHEMA_VERSION: { message: "The --schema-version must be 1." },
+	DI_INVALID_ROUND: { message: "The --round is missing or not a positive integer." },
+	DI_INVALID_QUESTION_ID: { message: "The --question-id is missing or not a valid identifier." },
+	DI_INVALID_ROUND_ID: { message: "The --round-id is not a valid identifier." },
+	DI_INVALID_COMPONENT_ID: { message: "The --component-id is not a valid identifier." },
+	DI_INVALID_DIMENSION: { message: "The --dimension must be goal, constraints, criteria, or context." },
+	DI_INVALID_SELECTOR: { message: "The --selector is missing or not a known inspect selector." },
+	DI_SELECTOR_ARGUMENT_INVALID: { message: "A flag is not valid for the requested inspect selector." },
+	DI_INVALID_LIMIT: { message: "The --limit must be an integer between 1 and 25." },
+	DI_CURSOR_INVALID: { message: "The --cursor token is malformed or does not match the current view." },
+	DI_CURSOR_STALE: {
+		message: "The --cursor was minted against an older state revision or view.",
+		recovery: "Re-run the inspect command without --cursor to mint a fresh cursor.",
+	},
+	DI_OUTPUT_LIMIT_EXCEEDED: { message: "The projected response exceeds the CLI output byte limit." },
+	DI_INPUT_MODE_CONFLICT: { message: "Draft-mode and raw-JSON flags cannot be mixed in one invocation." },
+};
+/** Recovery for invariants whose offending datum lives in the caller-editable payload. */
+const PAYLOAD_INVARIANT_RECOVERY =
+	"Correct the named invariant at the reported path so actual matches expected (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <payload-path> --value <value> --json), rerun gjc deep-interview draft check --draft-id <id> --json until valid, then retry consume.";
+/** Recovery for invariants whose offending datum lives in persisted state, which drafts cannot edit. */
+const STATE_INVARIANT_RECOVERY =
+	"The violated invariant is in persisted state, not the draft payload. Inspect it (gjc deep-interview inspect --session-id <session> --selector summary|pending|recent-scored --json) and complete the missing lifecycle step (e.g. score earlier pending rounds first); if the state itself is corrupt, follow the documented state repair path via sanity-check — never edit .gjc state files directly.";
+/**
+ * Invariant detail paths starting with `/state/` point at the persisted
+ * envelope; everything else (`/global_scores/...`, `/triggers...`, `/fact_ops...`,
+ * `/bookkeeping/...`, `/targeting`, `/ontology/...`) is payload-addressable.
+ */
+function invariantRecovery(detail: DeepInterviewInvariantDetail): string {
+	return detail.path.startsWith("/state/") ? STATE_INVARIANT_RECOVERY : PAYLOAD_INVARIANT_RECOVERY;
+}
+function issue(code: string, detail?: DeepInterviewInvariantDetail) {
+	const known = REPAIR_CODE_MESSAGES[code];
+	const message = detail
+		? `${detail.invariant} violated at ${detail.path}`
+		: (known?.message ??
+			`Deep-interview operation failed (${code}); no specific guidance is registered for this code.`);
+	const recovery = detail ? invariantRecovery(detail) : known?.recovery;
+	return {
+		code,
+		message,
+		...(recovery ? { recovery } : {}),
+		...(detail ?? {}),
+	};
 }
 function errorResult(error: unknown): DeepInterviewRepairResult {
 	const typed =
@@ -74,7 +208,10 @@ function errorResult(error: unknown): DeepInterviewRepairResult {
 							: 3,
 					)
 				: new RepairError("DI_INTERNAL_ERROR", 3);
-	return { status: typed.status, stderr: `${JSON.stringify({ ok: false, issue: issue(typed.code) })}\n` };
+	return {
+		status: typed.status,
+		stderr: `${JSON.stringify({ ok: false, issue: issue(typed.code, typed.detail) })}\n`,
+	};
 }
 function strictJson(value: string): unknown {
 	let index = 0;
@@ -643,8 +780,9 @@ function parse(args: readonly string[]): ParsedRepairCommand {
 		flags.set(token, value);
 	}
 	if (!hasJson) throw new RepairError("DI_JSON_REQUIRED");
-	const session = flags.get("--session-id");
+	const session = flags.get("--session-id") ?? process.env.GJC_SESSION_ID?.trim();
 	if (!session || !ID.test(session)) throw new RepairError("DI_INVALID_SESSION_ID");
+	flags.set("--session-id", session);
 	return { verb, flags };
 }
 function safeInt(value: string | undefined, code: string, positive = false): number {
@@ -762,33 +900,239 @@ export async function runDeepInterviewRepairCommand(
 		return errorResult(error);
 	}
 }
-async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<string, unknown>> {
-	const configs: Record<Exclude<DeepInterviewRepairVerb, "inspect" | "sanity-check">, readonly string[]> = {
-		"initialize-context": ["--session-id", "--schema-version", "--expected-revision", "--input-json"],
-		"confirm-topology": ["--session-id", "--schema-version", "--expected-revision", "--input-json"],
-		"record-answer": [
-			"--session-id",
-			"--schema-version",
-			"--expected-revision",
-			"--round",
-			"--question-id",
-			"--question-json",
-			"--answer-json",
-			"--round-id",
-			"--component-id",
-			"--dimension",
-		],
-		"apply-round-result": [
-			"--session-id",
-			"--schema-version",
-			"--expected-revision",
-			"--round",
-			"--question-id",
-			"--result-json",
-			"--round-id",
-		],
+type MutationVerb = Exclude<DeepInterviewRepairVerb, "inspect" | "sanity-check">;
+const MUTATION_ALLOWED_FLAGS: Record<MutationVerb, readonly string[]> = {
+	"initialize-context": ["--session-id", "--schema-version", "--expected-revision", "--input-json"],
+	"confirm-topology": ["--session-id", "--schema-version", "--expected-revision", "--input-json"],
+	"record-answer": [
+		"--session-id",
+		"--schema-version",
+		"--expected-revision",
+		"--round",
+		"--question-id",
+		"--question-json",
+		"--answer-json",
+		"--round-id",
+		"--component-id",
+		"--dimension",
+	],
+	"apply-round-result": [
+		"--session-id",
+		"--schema-version",
+		"--expected-revision",
+		"--round",
+		"--question-id",
+		"--result-json",
+		"--round-id",
+	],
+};
+
+/**
+ * The single mutation transform shared verbatim by the committing `mutate` path
+ * and the read-only `dryRunDeepInterviewRepairMutation` preflight, so a
+ * preflight "valid" is mathematically identical to the commit predicate.
+ */
+function buildMutationTransform(
+	parsed: ParsedRepairCommand,
+	setupInput: Record<string, unknown> | undefined,
+	topologyInput: Record<string, unknown> | undefined,
+	now: string,
+	capture: (projection: object | undefined) => void,
+): (current: Record<string, unknown>) => { kind: "noop" } | { kind: "write"; value: Record<string, unknown> } {
+	return current => {
+		const state = (
+			current.state && typeof current.state === "object" && !Array.isArray(current.state) ? current.state : {}
+		) as Record<string, unknown>;
+		if (parsed.verb === "initialize-context") {
+			const input = setupInput!;
+			const unresolvedSetup =
+				state.setup !== null &&
+				typeof state.setup === "object" &&
+				!Array.isArray(state.setup) &&
+				(state.setup as Record<string, unknown>).status === "unresolved";
+			const missing: Record<string, unknown> = {};
+			for (const [key, value] of Object.entries(input)) {
+				if (key === "type" && unresolvedSetup) {
+					if (
+						current.trace !== undefined &&
+						canonicalDeepInterviewJson(state.type) !== canonicalDeepInterviewJson(value)
+					)
+						throw new RepairError("DI_SETUP_CONFLICT", 4);
+					if (canonicalDeepInterviewJson(state.type) !== canonicalDeepInterviewJson(value)) missing[key] = value;
+				} else if (Object.hasOwn(state, key)) {
+					if (canonicalDeepInterviewJson(state[key]) !== canonicalDeepInterviewJson(value))
+						throw new RepairError("DI_SETUP_CONFLICT", 4);
+				} else {
+					missing[key] = value;
+				}
+			}
+			if (Object.keys(missing).length === 0 && !unresolvedSetup) return { kind: "noop" as const };
+			const { setup: _setup, ...initializedState } = state;
+			return {
+				kind: "write" as const,
+				value: { ...current, schema_version: 1, state: { ...initializedState, ...missing } },
+			};
+		}
+		if (parsed.verb === "confirm-topology") {
+			const input = topologyInput!;
+			assertTopologyInspectable(input, now);
+			const existing = state.topology;
+			const normalized = canonicalDeepInterviewJson(input);
+			if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+				const existingTopology = existing as Record<string, unknown>;
+				const isEmptyPendingTopology =
+					existingTopology.status === "pending" &&
+					Array.isArray(existingTopology.components) &&
+					existingTopology.components.length === 0 &&
+					Array.isArray(existingTopology.deferred_components) &&
+					existingTopology.deferred_components.length === 0;
+				if (!isEmptyPendingTopology) {
+					const { status: _status, confirmed_at: _confirmedAt, ...prior } = existingTopology;
+					if (canonicalDeepInterviewJson(prior) === normalized) return { kind: "noop" as const };
+					throw new RepairError("DI_TOPOLOGY_CONFLICT", 4);
+				}
+			}
+			const { setup: _setup, ...confirmedState } = state;
+			return {
+				kind: "write" as const,
+				value: {
+					...current,
+					schema_version: 1,
+					state: { ...confirmedState, topology: { ...input, status: "confirmed", confirmed_at: now } },
+				},
+			};
+		}
+		const round = safeInt(parsed.flags.get("--round"), "DI_INVALID_ROUND", true);
+		const questionId = parsed.flags.get("--question-id");
+		if (!questionId || !ID.test(questionId)) throw new RepairError("DI_INVALID_QUESTION_ID");
+		const roundId = parsed.flags.get("--round-id");
+		if (roundId !== undefined && !ID.test(roundId)) throw new RepairError("DI_INVALID_ROUND_ID");
+		const key = deriveRoundKey(typeof state.interview_id === "string" ? state.interview_id : undefined, {
+			round,
+			round_id: roundId,
+			questionId,
+		});
+		if (parsed.verb === "record-answer") {
+			const component = parsed.flags.get("--component-id");
+			const requestedDimension = parsed.flags.get("--dimension");
+			if (component !== undefined && !ID.test(component)) throw new RepairError("DI_INVALID_COMPONENT_ID");
+			if (
+				requestedDimension !== undefined &&
+				!DIMENSIONS.includes(requestedDimension as (typeof DIMENSIONS)[number])
+			)
+				throw new RepairError("DI_INVALID_DIMENSION");
+			const question = stringJson(parsed.flags.get("--question-json"));
+			const answer = decodeDeepInterviewAnswerJson(parsed.flags.get("--answer-json"));
+			const rounds = Array.isArray(state.rounds) ? [...state.rounds] : [];
+			const candidate = {
+				round,
+				round_key: key,
+				round_id: roundId ?? undefined,
+				question_id: questionId,
+				component,
+				dimension: requestedDimension,
+				question_text: question,
+				question_hash: questionHash(question),
+				answer_hash: answerHash(answer.selected_options, answer.custom_input ?? undefined),
+				selected_options: answer.selected_options,
+				custom_input: answer.custom_input ?? undefined,
+			};
+			const existing = rounds.find(
+				value => value && typeof value === "object" && (value as Record<string, unknown>).round_key === key,
+			);
+			if (existing) {
+				if (
+					deepInterviewAnswerIdentityEqual(
+						existing as Parameters<typeof deepInterviewAnswerIdentityEqual>[0],
+						candidate,
+					)
+				)
+					return { kind: "noop" as const };
+				throw new RepairError(
+					(existing as Record<string, unknown>).lifecycle === "scored"
+						? "DI_SHELL_CONFLICT"
+						: "DI_ANSWER_CONFLICT",
+					4,
+				);
+			}
+			rounds.push({
+				...candidate,
+				lifecycle: "answered",
+				answered_at: now,
+			});
+			return { kind: "write" as const, value: { ...current, schema_version: 1, state: { ...state, rounds } } };
+		}
+		const result = decodeDeepInterviewRoundResultJson(parsed.flags.get("--result-json"), state);
+		try {
+			const outcome = applyDeepInterviewRoundResultV1(current, key, result, now);
+			capture(outcome.projection);
+			if (outcome.kind === "noop") return { kind: "noop" as const };
+			return {
+				kind: "write" as const,
+				value: {
+					...persistNativeTriggerMetrics(state, outcome.envelope, key, result),
+					schema_version: 1,
+				},
+			};
+		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("DI_"))
+				throw new RepairError(
+					error.message,
+					error.message.includes("CONFLICT") ? 4 : 3,
+					deepInterviewInvariantDetail(error),
+				);
+			throw error;
+		}
 	};
-	const { session, revision } = validateMutation(parsed, configs[parsed.verb as keyof typeof configs]);
+}
+
+/**
+ * Read-only preflight that runs the exact commit-side mutation transform
+ * (decoders + state-level invariants such as `applyDeepInterviewRoundResultV1`)
+ * against the current persisted state, without acquiring the write lock or
+ * writing. `status: 0` means the identical consume would pass its validation
+ * at the observed state revision.
+ */
+export async function dryRunDeepInterviewRepairMutation(
+	args: readonly string[],
+	cwd: string,
+): Promise<DeepInterviewRepairResult> {
+	try {
+		const parsed = parse(args);
+		if (parsed.verb === "inspect" || parsed.verb === "sanity-check") throw new RepairError("DI_UNKNOWN_COMMAND");
+		const { session, revision } = validateMutation(parsed, MUTATION_ALLOWED_FLAGS[parsed.verb as MutationVerb]);
+		const setupInput =
+			parsed.verb === "initialize-context"
+				? decodeDeepInterviewSetupJson(parsed.flags.get("--input-json"))
+				: undefined;
+		const topologyInput =
+			parsed.verb === "confirm-topology"
+				? decodeDeepInterviewTopologyJson(parsed.flags.get("--input-json"))
+				: undefined;
+		const path = statePath(cwd, session);
+		const diagnostic = diagnoseDeepInterviewState(await readExistingStateForMutation(path), path);
+		if (diagnostic.code || !diagnostic.value) throw new RepairError(diagnostic.code ?? "DI_INTERNAL_ERROR", 3);
+		// Revision binding: the dry-run must validate the exact revision the caller
+		// observed. If the state advanced between the caller's read and this reread,
+		// report the same retryable conflict a real consume would.
+		const observedRevision =
+			typeof diagnostic.value.state_revision === "number" && Number.isSafeInteger(diagnostic.value.state_revision)
+				? diagnostic.value.state_revision
+				: 0;
+		if (revision !== undefined && observedRevision !== revision) throw new RepairError("DI_REVISION_CONFLICT", 3);
+		const transform = buildMutationTransform(parsed, setupInput, topologyInput, new Date().toISOString(), () => {});
+		const outcome = transform(diagnostic.value);
+		return {
+			status: 0,
+			stdout: `${JSON.stringify({ ok: true, would: outcome.kind, state_revision: observedRevision })}\n`,
+		};
+	} catch (error) {
+		return errorResult(error);
+	}
+}
+
+async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<string, unknown>> {
+	const { session, revision } = validateMutation(parsed, MUTATION_ALLOWED_FLAGS[parsed.verb as MutationVerb]);
 	const setupInput =
 		parsed.verb === "initialize-context" ? decodeDeepInterviewSetupJson(parsed.flags.get("--input-json")) : undefined;
 	const topologyInput =
@@ -798,6 +1142,9 @@ async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<
 	const path = statePath(cwd, session);
 	const now = new Date().toISOString();
 	let nativeProjection: object | undefined;
+	const transform = buildMutationTransform(parsed, setupInput, topologyInput, now, projection => {
+		nativeProjection = projection;
+	});
 	const output = await transformGuardedWorkflowEnvelopeAtomic(path, {
 		cwd,
 		expectedRevision: revision!,
@@ -815,146 +1162,7 @@ async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<
 		},
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId: session },
 		transform(current) {
-			const state = (
-				current.state && typeof current.state === "object" && !Array.isArray(current.state) ? current.state : {}
-			) as Record<string, unknown>;
-			if (parsed.verb === "initialize-context") {
-				const input = setupInput!;
-				const unresolvedSetup =
-					state.setup !== null &&
-					typeof state.setup === "object" &&
-					!Array.isArray(state.setup) &&
-					(state.setup as Record<string, unknown>).status === "unresolved";
-				const missing: Record<string, unknown> = {};
-				for (const [key, value] of Object.entries(input)) {
-					if (key === "type" && unresolvedSetup) {
-						if (
-							current.trace !== undefined &&
-							canonicalDeepInterviewJson(state.type) !== canonicalDeepInterviewJson(value)
-						)
-							throw new RepairError("DI_SETUP_CONFLICT", 4);
-						if (canonicalDeepInterviewJson(state.type) !== canonicalDeepInterviewJson(value))
-							missing[key] = value;
-					} else if (Object.hasOwn(state, key)) {
-						if (canonicalDeepInterviewJson(state[key]) !== canonicalDeepInterviewJson(value))
-							throw new RepairError("DI_SETUP_CONFLICT", 4);
-					} else {
-						missing[key] = value;
-					}
-				}
-				if (Object.keys(missing).length === 0 && !unresolvedSetup) return { kind: "noop" as const };
-				const { setup: _setup, ...initializedState } = state;
-				return {
-					kind: "write" as const,
-					value: { ...current, schema_version: 1, state: { ...initializedState, ...missing } },
-				};
-			}
-			if (parsed.verb === "confirm-topology") {
-				const input = topologyInput!;
-				assertTopologyInspectable(input, now);
-				const existing = state.topology;
-				const normalized = canonicalDeepInterviewJson(input);
-				if (existing && typeof existing === "object" && !Array.isArray(existing)) {
-					const existingTopology = existing as Record<string, unknown>;
-					const isEmptyPendingTopology =
-						existingTopology.status === "pending" &&
-						Array.isArray(existingTopology.components) &&
-						existingTopology.components.length === 0 &&
-						Array.isArray(existingTopology.deferred_components) &&
-						existingTopology.deferred_components.length === 0;
-					if (!isEmptyPendingTopology) {
-						const { status: _status, confirmed_at: _confirmedAt, ...prior } = existingTopology;
-						if (canonicalDeepInterviewJson(prior) === normalized) return { kind: "noop" as const };
-						throw new RepairError("DI_TOPOLOGY_CONFLICT", 4);
-					}
-				}
-				const { setup: _setup, ...confirmedState } = state;
-				return {
-					kind: "write" as const,
-					value: {
-						...current,
-						schema_version: 1,
-						state: { ...confirmedState, topology: { ...input, status: "confirmed", confirmed_at: now } },
-					},
-				};
-			}
-			const round = safeInt(parsed.flags.get("--round"), "DI_INVALID_ROUND", true);
-			const questionId = parsed.flags.get("--question-id");
-			if (!questionId || !ID.test(questionId)) throw new RepairError("DI_INVALID_QUESTION_ID");
-			const roundId = parsed.flags.get("--round-id");
-			if (roundId !== undefined && !ID.test(roundId)) throw new RepairError("DI_INVALID_ROUND_ID");
-			const key = deriveRoundKey(typeof state.interview_id === "string" ? state.interview_id : undefined, {
-				round,
-				round_id: roundId,
-				questionId,
-			});
-			if (parsed.verb === "record-answer") {
-				const component = parsed.flags.get("--component-id");
-				const requestedDimension = parsed.flags.get("--dimension");
-				if (component !== undefined && !ID.test(component)) throw new RepairError("DI_INVALID_COMPONENT_ID");
-				if (
-					requestedDimension !== undefined &&
-					!DIMENSIONS.includes(requestedDimension as (typeof DIMENSIONS)[number])
-				)
-					throw new RepairError("DI_INVALID_DIMENSION");
-				const question = stringJson(parsed.flags.get("--question-json"));
-				const answer = decodeDeepInterviewAnswerJson(parsed.flags.get("--answer-json"));
-				const rounds = Array.isArray(state.rounds) ? [...state.rounds] : [];
-				const candidate = {
-					round,
-					round_key: key,
-					round_id: roundId ?? undefined,
-					question_id: questionId,
-					component,
-					dimension: requestedDimension,
-					question_text: question,
-					question_hash: questionHash(question),
-					answer_hash: answerHash(answer.selected_options, answer.custom_input ?? undefined),
-					selected_options: answer.selected_options,
-					custom_input: answer.custom_input ?? undefined,
-				};
-				const existing = rounds.find(
-					value => value && typeof value === "object" && (value as Record<string, unknown>).round_key === key,
-				);
-				if (existing) {
-					if (
-						deepInterviewAnswerIdentityEqual(
-							existing as Parameters<typeof deepInterviewAnswerIdentityEqual>[0],
-							candidate,
-						)
-					)
-						return { kind: "noop" as const };
-					throw new RepairError(
-						(existing as Record<string, unknown>).lifecycle === "scored"
-							? "DI_SHELL_CONFLICT"
-							: "DI_ANSWER_CONFLICT",
-						4,
-					);
-				}
-				rounds.push({
-					...candidate,
-					lifecycle: "answered",
-					answered_at: now,
-				});
-				return { kind: "write" as const, value: { ...current, schema_version: 1, state: { ...state, rounds } } };
-			}
-			const result = decodeDeepInterviewRoundResultJson(parsed.flags.get("--result-json"), state);
-			try {
-				const outcome = applyDeepInterviewRoundResultV1(current, key, result, now);
-				nativeProjection = outcome.projection;
-				if (outcome.kind === "noop") return { kind: "noop" as const };
-				return {
-					kind: "write" as const,
-					value: {
-						...persistNativeTriggerMetrics(state, outcome.envelope, key, result),
-						schema_version: 1,
-					},
-				};
-			} catch (error) {
-				if (error instanceof Error && error.message.startsWith("DI_"))
-					throw new RepairError(error.message, error.message.includes("CONFLICT") ? 4 : 3);
-				throw error;
-			}
+			return transform(current);
 		},
 	});
 	const warnings =

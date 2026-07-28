@@ -24,6 +24,12 @@ import { VirtualTerminal } from "./virtual-terminal";
 // forces.
 //
 // Set PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1 to opt back into the old behavior.
+//
+// Scope note: these tests observe the IMMEDIATE per-event resize frames only.
+// The debounced width-settle repair (resize-width-settle*.test.ts) intentionally
+// performs ONE full clear+replay ~1000ms after the last width change — that
+// single settled replay is the sanctioned exception to the per-event guard
+// pinned here, made safe by running once per settled sequence.
 
 const COLS = 100;
 

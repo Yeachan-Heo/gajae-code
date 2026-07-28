@@ -669,8 +669,21 @@ export class TUI extends Container {
 	#lastRenderWriteSucceeded = false;
 	#renderTimer: NodeJS.Timeout | undefined;
 	#widthSettleTimer: NodeJS.Timeout | undefined;
+	#widthSettleRepairPending = false;
 	#lastObservedWidth = 0;
+	// Trailing debounce for the settled width repair. Instance-local: taken from
+	// options.widthSettleMs when provided (deterministic harnesses pass 0 to
+	// disable), otherwise from GJC_TUI_WIDTH_SETTLE_MS / PI_TUI_WIDTH_SETTLE_MS,
+	// otherwise 1000. Sampled once at construction.
+	#widthSettleMs: number = TUI.#readWidthSettleMs();
 	static readonly #WIDTH_SETTLE_MS = 1000;
+
+	static #readWidthSettleMs(): number {
+		const raw = Bun.env.GJC_TUI_WIDTH_SETTLE_MS ?? Bun.env.PI_TUI_WIDTH_SETTLE_MS;
+		if (raw === undefined || raw === "") return TUI.#WIDTH_SETTLE_MS;
+		const parsed = Number.parseInt(raw, 10);
+		return Number.isFinite(parsed) && parsed >= 0 ? parsed : TUI.#WIDTH_SETTLE_MS;
+	}
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
 	// Input-priority scheduling: an input keystroke must never be starved behind a
@@ -774,12 +787,22 @@ export class TUI extends Container {
 		private readonly options: {
 			enableMouse?: boolean;
 			copySelection?: (text: string) => void | Promise<void>;
+			/**
+			 * Trailing debounce for the settled width repair, in ms. `0` disables the
+			 * settled repair (deterministic harnesses need this — a wall-clock-timed
+			 * full replay lands at nondeterministic logical positions). Defaults to
+			 * `GJC_TUI_WIDTH_SETTLE_MS` / `PI_TUI_WIDTH_SETTLE_MS`, then 1000.
+			 */
+			widthSettleMs?: number;
 		} = {},
 	) {
 		super();
 		this.terminal = terminal;
 		if (showHardwareCursor !== undefined) {
 			this.#showHardwareCursor = showHardwareCursor;
+		}
+		if (options.widthSettleMs !== undefined && Number.isFinite(options.widthSettleMs) && options.widthSettleMs >= 0) {
+			this.#widthSettleMs = options.widthSettleMs;
 		}
 		this.#imeCursorActive = !this.#showHardwareCursor && this.#useImeBlockCursor;
 		this.#unsubscribeTabWidthChange = onDefaultTabWidthChange(() => {
@@ -916,6 +939,15 @@ export class TUI extends Container {
 		this.#manualOutputNotice = false;
 		this.#paintedManualOutputNotice = false;
 		this.#committedTranscriptRows = [];
+		// The old transcript identity is being replaced wholesale, which supersedes
+		// any stale old-width artifact a deferred settle repair would have fixed.
+		// Cancel both the armed timer and a pending deferred repair so an unrelated
+		// later render cannot trigger an out-of-window full clear+replay.
+		if (this.#widthSettleTimer) {
+			clearTimeout(this.#widthSettleTimer);
+			this.#widthSettleTimer = undefined;
+		}
+		this.#widthSettleRepairPending = false;
 	}
 
 	/** Allow one semantic-neighbor reconciliation after a definitive same-transcript rebuild. */
@@ -1140,6 +1172,14 @@ export class TUI extends Container {
 				this.#previousLines = liveLines;
 				if (this.#scrollbackResumeViewportTop === undefined) {
 					this.#nativeScrollbackViewportTop = liveViewportTop;
+				}
+				// A settled width repair was deferred while the user was reading
+				// scrollback (repainting mid-read would have destroyed their
+				// position). The transactional live repaint above has committed, so
+				// manual state is safely released — now schedule the deferred full
+				// clear+replay that repairs old-width wrapping in history.
+				if (this.#widthSettleRepairPending) {
+					this.requestRender(true, "resize.width-settled.deferred");
 				}
 			},
 			true,
@@ -1533,6 +1573,15 @@ export class TUI extends Container {
 			clearTimeout(this.#widthSettleTimer);
 			this.#widthSettleTimer = undefined;
 		}
+		// An armed TIMER dies with the session, but an already-deferred repair
+		// (deadline passed while the user was reading scrollback) must survive a
+		// temporary stop/start (Ctrl-Z resume, external editor): manual viewport
+		// ownership survives restart, so followLiveViewport() still needs the flag
+		// to run the deferred repair. Without manual ownership the flag is moot —
+		// start() issues a forced full render that repairs everything anyway.
+		if (this.#manualViewportTop === undefined) {
+			this.#widthSettleRepairPending = false;
+		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.#previousLines.length > 0) {
 			const targetRow = this.#previousLines.length; // Line after the last content
@@ -1608,12 +1657,19 @@ export class TUI extends Container {
 
 	/**
 	 * Width reflow leaves artifacts that the immediate resize frame does not always
-	 * repair: lines wrapped at the old column count can survive as stale bands. The
-	 * immediate frame is unchanged by this timer — `#doRender` still promotes a real
-	 * width change to `fullRender`/`viewportRepaint` on the spot. What this adds is a
-	 * single trailing repair: one forced redraw #WIDTH_SETTLE_MS after the last
-	 * observed width change, so a drag-resize converges on a correct frame without
-	 * forcing an extra full redraw per SIGWINCH.
+	 * repair: lines wrapped at the old column count can survive as stale bands — in
+	 * the live viewport and in scrollback history. The immediate frame is unchanged
+	 * by this timer — `#doRender` still promotes a real width change to
+	 * `fullRender`/`viewportRepaint` on the spot. What this adds is a single
+	 * trailing repair #WIDTH_SETTLE_MS after the last observed width change.
+	 *
+	 * The settled repair is a FULL transcript replay on every host, including
+	 * viewport-repaint hosts (tmux/screen/zellij, Windows Terminal, process
+	 * terminals) where per-SIGWINCH forced redraws are normally suppressed. That
+	 * per-event replay is the storm `resize-replay-storm.test.ts` pins against;
+	 * the debounce is what makes the full replay safe here — it happens once per
+	 * settled width sequence, so scrollback artifacts are repaired without
+	 * replaying the transcript on every resize event.
 	 *
 	 * Every observed width sequence gets exactly one repair, including one that
 	 * ends back at its starting width. Skipping the drag-and-return case would
@@ -1621,23 +1677,23 @@ export class TUI extends Container {
 	 * final resize event, which the render pipeline does not guarantee; one extra
 	 * repaint is cheaper than a missed repair.
 	 *
-	 * Scope: the repair is dispatched through `requestRender(true)`, so on
-	 * viewport-repaint hosts (tmux/screen/zellij, Windows Terminal, process
-	 * terminals) it repaints the live viewport rather than replaying the whole
-	 * transcript. Rows that already scrolled off keep their old-width wrapping —
-	 * reconstructing them is what caused the replay storm that
-	 * `resize-replay-storm.test.ts` pins against.
-	 *
 	 * Height-only changes are unaffected: they reflow nothing and keep their
 	 * existing behavior.
 	 */
 	#scheduleWidthSettleRedraw(): void {
+		if (this.#widthSettleMs <= 0) return;
 		if (this.#widthSettleTimer) clearTimeout(this.#widthSettleTimer);
 		this.#widthSettleTimer = setTimeout(() => {
 			this.#widthSettleTimer = undefined;
 			if (this.#stopped) return;
+			this.#widthSettleRepairPending = true;
+			// While the user is reading scrollback (manual viewport), a forced
+			// clear+replay would rip them out of history mid-read. Keep the flag
+			// armed instead; followLiveViewport() runs the deferred repair the
+			// moment they return to live.
+			if (this.#manualViewportTop !== undefined) return;
 			this.requestRender(true, "resize.width-settled");
-		}, TUI.#WIDTH_SETTLE_MS);
+		}, this.#widthSettleMs);
 		this.#widthSettleTimer.unref?.();
 	}
 
@@ -2900,9 +2956,10 @@ export class TUI extends Container {
 		}
 		// Helper to clear scrollback and viewport and render all new lines
 		let viewportRepaint: (reason: string, targetViewportTop?: number) => void;
-		const fullRender = (clear: boolean, reason = "full render"): void => {
+		const fullRender = (clear: boolean, reason = "full render", forceScrollbackClear = false): void => {
 			if (
 				clear &&
+				!forceScrollbackClear &&
 				shouldPreserveScrollbackOnFullClear(this.terminal) &&
 				this.#scrollbackResumeViewportTop !== undefined
 			) {
@@ -2913,9 +2970,15 @@ export class TUI extends Container {
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			// Skip clearing scrollback (3J) in hosts where clear/replay can snap the
-			// native viewport away from the live prompt (tmux/screen, Windows ConPTY).
+			// native viewport away from the live prompt (tmux/screen, Windows ConPTY) —
+			// unless the caller explicitly needs history erased (the settled width
+			// repair, where a replay WITHOUT 3J would stack the new transcript on top
+			// of the stale-width copy instead of replacing it).
 			if (clear)
-				buffer += shouldPreserveScrollbackOnFullClear(this.terminal) ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
+				buffer +=
+					!forceScrollbackClear && shouldPreserveScrollbackOnFullClear(this.terminal)
+						? "\x1b[2J\x1b[H"
+						: "\x1b[2J\x1b[H\x1b[3J";
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
 				// Lines were pre-terminated/normalized by #applyLineResets; image
@@ -2935,7 +2998,7 @@ export class TUI extends Container {
 					this.#nativeScrollbackViewportTop = clear
 						? this.#viewportTopRow
 						: Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
-					if (clear && !shouldPreserveScrollbackOnFullClear(this.terminal)) {
+					if (clear && (forceScrollbackClear || !shouldPreserveScrollbackOnFullClear(this.terminal))) {
 						this.#scrollbackResumeViewportTop = undefined;
 					}
 					this.#previousLines = newLines;
@@ -3017,14 +3080,26 @@ export class TUI extends Container {
 
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
-			logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
-			if (useViewportRepaintPath(this.terminal)) {
-				// In viewport-repaint sessions a full replay can either pile the transcript
-				// back onto scrollback (tmux/screen) or visibly jump to the transcript top
-				// (Windows Terminal). Repaint the viewport only, mirroring the height-change
-				// branch and neutralizing fake width changes from requestRender(true).
+			if (this.#widthSettleRepairPending) {
+				logRedraw(`width settled (${this.#previousWidth} -> ${width})`);
+				// The one debounced post-resize repair: a full clear+replay so stale
+				// old-width wrapping is repaired in scrollback history too, not just
+				// the live viewport. forceScrollbackClear erases the stale-width
+				// history instead of stacking the replay on top of it. Safe against
+				// the replay storm because it runs once per settled width sequence,
+				// never once per SIGWINCH.
+				this.#widthSettleRepairPending = false;
+				fullRender(true, "width settled", true);
+			} else if (useViewportRepaintPath(this.terminal)) {
+				logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
+				// In viewport-repaint sessions a per-event full replay can either pile
+				// the transcript back onto scrollback (tmux/screen) or visibly jump to
+				// the transcript top (Windows Terminal). Repaint the viewport only,
+				// mirroring the height-change branch and neutralizing fake width
+				// changes from requestRender(true).
 				viewportRepaint(`terminal width changed (${this.#previousWidth} -> ${width})`);
 			} else {
+				logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
 				fullRender(true, "terminal width changed");
 			}
 			return;

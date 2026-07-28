@@ -149,4 +149,72 @@ describe("debounced full redraw on terminal width change", () => {
 
 		tui.stop();
 	});
+
+	it("defers the settled repair while the user reads scrollback and runs it on follow-live", async () => {
+		const term = new VirtualTerminal(COLS, 30);
+		const tui = new TUI(term);
+		tui.start();
+		await term.waitForRender();
+		await buildTranscript(tui, term, 60);
+
+		// Enter manual viewport (user reading history), then resize the width.
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await term.waitForRender();
+		term.resize(COLS - 15, 30);
+		await term.waitForRender();
+		const beforeDeadline = tui.fullRedraws;
+
+		// The deadline passes while manual: no forced replay may rip the user out.
+		await Bun.sleep(SETTLE_MS + 200);
+		expect(tui.fullRedraws).toBe(beforeDeadline);
+
+		// Returning to live runs the deferred repair: one full clear+replay at the
+		// new width, landing at the live bottom with no stale pending flag. The
+		// write log is cleared here so the assertions below prove the FOLLOW-LIVE
+		// frames contain the repair — not leftovers from startup or setup.
+		term.clearWriteLog();
+		expect(tui.followLiveViewport()).toBe(true);
+		await term.waitForRender();
+		const afterFollow = tui.fullRedraws;
+		expect(afterFollow).toBe(beforeDeadline + 1);
+		const out = term.getWriteLog().join("");
+		expect(out).toContain("\x1b[2J\x1b[H\x1b[3J");
+		expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+
+		// The flag was consumed: nothing further fires after another window.
+		await Bun.sleep(SETTLE_MS + 200);
+		expect(tui.fullRedraws).toBe(afterFollow);
+
+		tui.stop();
+	});
+
+	it("keeps the deferred repair across stop/start while manual viewport survives", async () => {
+		const term = new VirtualTerminal(COLS, 30);
+		const tui = new TUI(term);
+		tui.start();
+		await term.waitForRender();
+		await buildTranscript(tui, term, 60);
+
+		// Manual viewport, width change, deadline passes while manual -> deferred.
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await term.waitForRender();
+		term.resize(COLS - 15, 30);
+		await term.waitForRender();
+		await Bun.sleep(SETTLE_MS + 200);
+
+		// Ctrl-Z resume / external editor: temporary stop/start. Manual viewport
+		// ownership survives restart, and so must the deferred repair.
+		tui.stop();
+		tui.start();
+		await term.waitForRender();
+
+		term.clearWriteLog();
+		expect(tui.followLiveViewport()).toBe(true);
+		await term.waitForRender();
+		const out = term.getWriteLog().join("");
+		expect(out).toContain("\x1b[2J\x1b[H\x1b[3J");
+		expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+
+		tui.stop();
+	});
 });

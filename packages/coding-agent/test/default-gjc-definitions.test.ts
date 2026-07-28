@@ -225,7 +225,7 @@ describe("default GJC definitions", () => {
 		]);
 		expect(argsFor("draft edit")).toEqual([
 			{ name: "draft-id", type: "string", required: true },
-			{ name: "expected-draft-revision", type: "number", required: true },
+			{ name: "expected-draft-revision", type: "string", required: true },
 			{ name: "json", type: "boolean", required: true },
 			{ name: "null", type: "boolean", required: false },
 			{ name: "op", type: "enum", required: true },
@@ -235,7 +235,7 @@ describe("default GJC definitions", () => {
 		]);
 		expect(argsFor("draft rebase")).toEqual([
 			{ name: "draft-id", type: "string", required: true },
-			{ name: "expected-draft-revision", type: "number", required: true },
+			{ name: "expected-draft-revision", type: "string", required: true },
 			{ name: "json", type: "boolean", required: true },
 			{ name: "to-state-revision", type: "number", required: true },
 		]);
@@ -247,14 +247,14 @@ describe("default GJC definitions", () => {
 		}
 		expect(argsFor("draft discard")).toEqual([
 			{ name: "draft-id", type: "string", required: true },
-			{ name: "expected-draft-revision", type: "number", required: true },
+			{ name: "expected-draft-revision", type: "string", required: true },
 			{ name: "json", type: "boolean", required: true },
 		]);
 
 		for (const verb of ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"]) {
 			expect(argsFor(verb)).toEqual([
 				{ name: "draft-id", type: "string", required: true },
-				{ name: "expected-draft-revision", type: "number", required: true },
+				{ name: "expected-draft-revision", type: "string", required: true },
 				{ name: "json", type: "boolean", required: true },
 			]);
 		}

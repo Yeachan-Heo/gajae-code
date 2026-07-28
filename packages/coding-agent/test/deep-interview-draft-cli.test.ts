@@ -54,6 +54,27 @@ describe("deep-interview drafts", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+	it("defaults draft create to GJC_SESSION_ID when --session-id is omitted", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-workspace-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-root-"));
+		const priorRoot = process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
+		const priorSession = process.env.GJC_SESSION_ID;
+		process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = root;
+		process.env.GJC_SESSION_ID = "env-draft-session";
+		try {
+			await seedState(cwd, "env-draft-session");
+			const created = await runDeepInterviewDraftCommand(["create", "--for", "initialize-context"], cwd);
+			expect(created.status, created.stderr).toBe(0);
+			expect(JSON.parse(created.stdout!).draft.session_id).toBe("env-draft-session");
+		} finally {
+			if (priorRoot === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
+			else process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = priorRoot;
+			if (priorSession === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = priorSession;
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 	it("rejects public internal-consume requests before parsing flags or mutating state", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-workspace-"));
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-root-"));

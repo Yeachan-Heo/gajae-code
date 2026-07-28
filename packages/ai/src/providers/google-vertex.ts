@@ -1,4 +1,4 @@
-import { $env } from "@gajae-code/utils";
+import { $credentialEnv, $env } from "@gajae-code/utils";
 import type { Context, Model, StreamFunction } from "../types";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { getVertexAccessToken } from "./google-auth";
@@ -58,12 +58,17 @@ export const streamGoogleVertex: StreamFunction<"google-vertex"> = (
 		},
 	});
 
+/** Test seam: the Vertex API key as resolved from options plus trusted env. */
+export function resolveVertexApiKeyForTest(options?: GoogleVertexOptions): string | undefined {
+	return resolveApiKey(options);
+}
+
 function resolveApiKey(options?: GoogleVertexOptions): string | undefined {
 	// options.apiKey may contain sentinel values like "<authenticated>" or "N/A"
 	// leaked from the agent loop — only use it if it looks like a real API key.
 	const optKey = options?.apiKey;
 	const realKey = optKey && !optKey.startsWith("<") && optKey !== "N/A" ? optKey : undefined;
-	return realKey || $env.GOOGLE_CLOUD_API_KEY;
+	return realKey || $credentialEnv("GOOGLE_CLOUD_API_KEY");
 }
 
 function resolveProject(options?: GoogleVertexOptions): string {

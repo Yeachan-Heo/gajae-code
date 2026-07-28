@@ -50,13 +50,45 @@ const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
 const BASH_MUTATION_COMMAND_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:(?:command|exec)\s+)?(?:[^\s;&|]*\/)?['"]?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)['"]?\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
-const BASH_OPAQUE_INTERPRETER_WRITE_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
-const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:<<[-]?\s*['"]?\w+['"]?)[\s\S]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
+/** Literal filesystem targets passed to common interpreter write APIs. */
+const BASH_INTERPRETER_FILE_TARGET_RE = /(?:open|writeFile(?:Sync)?)\s*\(\s*["']([^"']+)["']/gi;
 const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?dd\b([^;&|\n]*)/gi;
+/** `sort -o <file>` / `sort --output=<file>` writes the named file without any shell redirection. */
+const BASH_SORT_OUTPUT_RE =
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?['"]?sort['"]?\b([^;&|\n]*)/gi;
+
+/**
+ * Read-only helpers that may appear alongside `gjc` in a whitelisted pipeline.
+ * Deliberately tiny: every entry must be incapable of writing files even via
+ * its own options (`sort -o`/`tee` style output flags disqualify a command
+ * from this list), and redirections disqualify the whitelist entirely.
+ */
+const GJC_PIPELINE_READ_ONLY_COMMANDS = new Set([
+	"gjc",
+	"cat",
+	"echo",
+	"jq",
+	"grep",
+	"head",
+	"tail",
+	"wc",
+	"cut",
+	"tr",
+	"true",
+]);
+/**
+ * Env assignment prefix tolerated before a whitelisted command: only names the
+ * sanctioned workflows genuinely need, with plain values. PATH, loader
+ * variables (LD_/DYLD_ prefixes), and arbitrary names are rejected so the prefix
+ * cannot redirect which executable a bare `gjc` resolves to.
+ */
+const SIMPLE_ENV_ASSIGNMENT_RE =
+	/^(?:GJC_SESSION_ID|GJC_STATE_SESSION_ID|LC_ALL|LANG|TZ|NO_COLOR)=[A-Za-z0-9_@%^+,./:-]*$/;
+/** Any mention of a bare `gjc` word; such commands must be provably pure or fail closed. */
+const MENTIONS_GJC_RE = /(?:^|[\s;&|("'`])gjc(?:[\s;&|)"'`]|$)/;
+const HEREDOC_OPERATOR_RE = /<<-?\s*(['"])(\w+)\1/;
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -77,6 +109,7 @@ export interface WorkflowMutationGuardInput {
 interface ExtractedTargets {
 	paths: string[];
 	unknown: boolean;
+	explicitMutation?: boolean;
 }
 
 export interface WorkflowMutationDecision {
@@ -386,6 +419,119 @@ function isDeviceSinkPath(value: string): boolean {
 	return DEVICE_SINK_PATHS.has(cleanShellWord(value));
 }
 
+/**
+ * Remove quoted-delimiter heredoc bodies (pure stdin data) from a command so the
+ * remaining text contains only real shell syntax. Returns null when the command
+ * is not safely analyzable: an unquoted heredoc delimiter (its body undergoes
+ * command/parameter expansion) or a missing terminator both disqualify it.
+ */
+function stripQuotedHeredocBodies(command: string): string | null {
+	const lines = command.split("\n");
+	const kept: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const withoutQuoted = line.replace(HEREDOC_OPERATOR_RE, " ");
+		// Any remaining heredoc operator has an unquoted delimiter (its body expands) — not analyzable.
+		if (withoutQuoted.includes("<<")) return null;
+		const heredoc = line.match(HEREDOC_OPERATOR_RE);
+		kept.push(withoutQuoted);
+		if (!heredoc) continue;
+		const delimiter = heredoc[2];
+		const dashed = heredoc[0].startsWith("<<-");
+		let terminated = false;
+		for (i++; i < lines.length; i++) {
+			const candidate = dashed ? lines[i].replace(/^\t+/, "") : lines[i];
+			if (candidate === delimiter) {
+				terminated = true;
+				break;
+			}
+		}
+		if (!terminated) return null;
+	}
+	return kept.join("\n");
+}
+
+/**
+ * Mask inert quoted argument data before scanning shell operators. Characters
+ * such as backticks, semicolons, pipes, and redirection glyphs inside a
+ * single-quoted `--value` are literal CLI data and must not make a direct GJC
+ * invocation look like shell execution. Double-quoted command substitutions
+ * remain fail-closed because Bash executes them before invoking GJC.
+ */
+function maskQuotedShellData(command: string): string | null {
+	let quote: "single" | "double" | undefined;
+	let masked = "";
+	for (let index = 0; index < command.length; index++) {
+		const character = command[index] ?? "";
+		if (quote === "single") {
+			if (character === "'") {
+				quote = undefined;
+				masked += character;
+			} else {
+				masked += "x";
+			}
+			continue;
+		}
+		if (quote === "double") {
+			if (character === '"') {
+				quote = undefined;
+				masked += character;
+				continue;
+			}
+			if (character === "`" || (character === "$" && command[index + 1] === "(")) return null;
+			if (character === "\\" && index + 1 < command.length) {
+				masked += "xx";
+				index++;
+			} else {
+				masked += "x";
+			}
+			continue;
+		}
+		if (character === "'") quote = "single";
+		else if (character === '"') quote = "double";
+		masked += character;
+	}
+	return quote ? null : masked;
+}
+
+/**
+ * Whether every pipeline/list segment of `command` is a `gjc` invocation or a
+ * known read-only helper, with no redirections, command substitution, process
+ * substitution, backticks, or unquoted heredocs. Such commands cannot write
+ * repository files, so the guard admits them before the opaque-interpreter
+ * heuristics would otherwise flag `gjc`-driven shell functions/heredocs as
+ * unknown-target — the CLI the workflow itself instructs the agent to run.
+ */
+function isPureGjcReadOnlyBashCommand(command: string): boolean {
+	if (!MENTIONS_GJC_RE.test(command)) return false;
+	const stripped = stripQuotedHeredocBodies(command);
+	if (stripped === null) return false;
+	const masked = maskQuotedShellData(stripped);
+	if (masked === null) return false;
+	// A carriage return can hide a following command from the line-oriented scan.
+	if (masked.includes("\r")) return false;
+	// Backslash line continuations change Bash's logical-line structure (e.g. a
+	// continued quoted-heredoc delimiter can hide a trailing command from a
+	// physical-line scanner), so any backslash outside quoted data disqualifies the fast path.
+	if (masked.includes("\\")) return false;
+	if (/[`<>()]|\$\(|\$\{/.test(masked)) return false;
+	const segments = masked
+		.split(/\|\||&&|[|;&\n]/)
+		.map(segment => segment.trim())
+		.filter(segment => segment.length > 0);
+	if (segments.length === 0) return false;
+	for (const segment of segments) {
+		const words = shellWords(segment);
+		let index = 0;
+		while (index < words.length && SIMPLE_ENV_ASSIGNMENT_RE.test(words[index] ?? "")) index++;
+		const executable = words[index];
+		// The executable word must be an unquoted bare allowlisted name; quoting
+		// tricks (`"sort"`) or paths never qualify.
+		if (!executable || !/^[a-z]+$/.test(executable) || !GJC_PIPELINE_READ_ONLY_COMMANDS.has(executable)) return false;
+	}
+	return true;
+}
+
 function extractBashTargets(args: unknown): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -394,19 +540,55 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 		targets.unknown = true;
 		return targets;
 	}
-	if (BASH_OPAQUE_INTERPRETER_WRITE_RE.test(command) || BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(command)) {
-		targets.unknown = true;
+	// Pure `gjc`/read-only pipelines are admitted before the opaque heuristics so the
+	// workflow-sanctioned CLI is never blocked as unknown-target (#guard-vs-cli conflict).
+	if (isPureGjcReadOnlyBashCommand(command)) {
+		return targets;
+	}
+	for (const match of command.matchAll(BASH_INTERPRETER_FILE_TARGET_RE)) {
+		targets.explicitMutation = true;
+		const target = match[1]?.trim();
+		if (target && !isDeviceSinkPath(target)) addPath(targets, target);
 	}
 	// `exec 1<>file` rebinds a descriptor, so a later `>/dev/null` may not reach the device at all.
 	if (BASH_EXEC_REDIRECT_RE.test(command)) {
+		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
 	for (const match of command.matchAll(BASH_EXTENDED_WRITE_RE)) {
+		targets.explicitMutation = true;
 		const cleaned = cleanShellWord(match[1] ?? "");
 		if (!cleaned) targets.unknown = true;
 		else if (!isDeviceSinkPath(cleaned)) addPath(targets, cleaned);
 	}
+	for (const match of command.matchAll(BASH_SORT_OUTPUT_RE)) {
+		targets.explicitMutation = true;
+		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
+		for (let index = 0; index < parts.length; index++) {
+			const part = parts[index];
+			if (part === "-o" || part === "--output") {
+				const output = parts[index + 1];
+				if (!output) targets.unknown = true;
+				else if (!isDeviceSinkPath(output)) addPath(targets, output);
+			} else if (part.startsWith("--output=")) {
+				const output = part.slice("--output=".length);
+				if (!output) targets.unknown = true;
+				else if (!isDeviceSinkPath(output)) addPath(targets, output);
+			} else if (/^-[A-Za-z]*o$/.test(part)) {
+				// combined short options ending in -o, e.g. `-uo file`
+				const output = parts[index + 1];
+				if (!output) targets.unknown = true;
+				else if (!isDeviceSinkPath(output)) addPath(targets, output);
+			} else if (/^-[A-Za-z]*o.+$/.test(part)) {
+				// attached short-option argument, e.g. `-osrc/product.ts` or `-uosrc/product.ts`
+				const output = part.slice(part.indexOf("o", 1) + 1);
+				if (!output) targets.unknown = true;
+				else if (!isDeviceSinkPath(output)) addPath(targets, output);
+			}
+		}
+	}
 	for (const match of command.matchAll(BASH_DD_OUTPUT_RE)) {
+		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
 		// Every `of=` counts: GNU dd honors the last one, so `of=/dev/null of=real.ts` writes real.ts.
 		const outputs = parts.filter(part => part.startsWith("of="));
@@ -421,11 +603,13 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
 		const hasInPlaceFlag = parts.some(part => /^-.*i/.test(part));
 		if (!hasInPlaceFlag) continue;
+		targets.explicitMutation = true;
 		const target = [...parts].reverse().find(part => part && !part.startsWith("-"));
 		if (target) addPath(targets, target);
 		else targets.unknown = true;
 	}
 	for (const match of command.matchAll(BASH_MUTATION_COMMAND_RE)) {
+		targets.explicitMutation = true;
 		const redirected = match[2]?.trim();
 		if (redirected) {
 			const cleaned = cleanShellWord(redirected);
@@ -666,7 +850,7 @@ export async function getWorkflowMutationDecision(
 	}
 	if (input.forceOverride) return { blocked: false, targets: [] };
 	const message = planningPhaseBlockMessage(planning.skill);
-	if (targets.unknown) {
+	if (targets.unknown && (input.tool.name !== "bash" || targets.explicitMutation)) {
 		return {
 			blocked: true,
 			message,
