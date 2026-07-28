@@ -821,7 +821,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 	});
 });
 
-describe("native gjc ralplan runtime — persisted Planner state", () => {
+describe("native gjc ralplan runtime — persisted role-agent state", () => {
 	const statePath = (root: string) => ralplanStatePath(root);
 
 	async function readState(root: string): Promise<Record<string, unknown>> {
@@ -884,6 +884,189 @@ describe("native gjc ralplan runtime — persisted Planner state", () => {
 		expect(result.status).toBe(0);
 		const state = await readState(root);
 		expect(state.planner_resumable).toBe(false);
+	});
+
+	it("records review-lane ids in run state and echoes per-lane state", async () => {
+		const root = await tempDir();
+		const architect = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"architect",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Architecture review",
+				"--run-id",
+				"persisted-review-roles",
+				"--architect-id",
+				"0-Architect",
+				"--architect-resumable",
+				"true",
+				"--json",
+			],
+			root,
+		);
+		expect(architect.status).toBe(0);
+		expect(JSON.parse(architect.stdout ?? "{}").architect_state).toEqual({
+			architect_id: "0-Architect",
+			architect_resumable: true,
+		});
+
+		const critic = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"critic",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Critic review",
+				"--run-id",
+				"persisted-review-roles",
+				"--critic-id",
+				"0-Critic",
+				"--json",
+			],
+			root,
+		);
+		expect(critic.status).toBe(0);
+		expect(JSON.parse(critic.stdout ?? "{}").critic_state).toEqual({ critic_id: "0-Critic" });
+
+		const state = await readState(root);
+		expect(state.architect_id).toBe("0-Architect");
+		expect(state.architect_resumable).toBe(true);
+		expect(state.critic_id).toBe("0-Critic");
+		expect("critic_resumable" in state).toBe(false);
+	});
+
+	it("rejects reviewer metadata on the wrong review stage with exit 2", async () => {
+		const root = await tempDir();
+		const architectOnCritic = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"critic",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"x",
+				"--run-id",
+				"wrong-architect-stage",
+				"--architect-id",
+				"0-Architect",
+			],
+			root,
+		);
+		expect(architectOnCritic.status).toBe(2);
+		expect(architectOnCritic.stderr).toContain("--architect-id is only valid with --stage architect");
+
+		const criticOnArchitect = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"architect",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"x",
+				"--run-id",
+				"wrong-critic-stage",
+				"--critic-resumable",
+				"false",
+			],
+			root,
+		);
+		expect(criticOnArchitect.status).toBe(2);
+		expect(criticOnArchitect.stderr).toContain("--critic-resumable is only valid with --stage critic");
+	});
+
+	it("rejects invalid review-lane ids and resumable values with exit 2", async () => {
+		const root = await tempDir();
+		const invalidArchitectId = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"architect",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"x",
+				"--run-id",
+				"invalid-architect-id",
+				"--architect-id",
+				"invalid id",
+			],
+			root,
+		);
+		expect(invalidArchitectId.status).toBe(2);
+		expect(invalidArchitectId.stderr).toContain("invalid --architect-id");
+
+		const invalidCriticResumable = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"critic",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"x",
+				"--run-id",
+				"invalid-critic-resumable",
+				"--critic-resumable",
+				"maybe",
+			],
+			root,
+		);
+		expect(invalidCriticResumable.status).toBe(2);
+		expect(invalidCriticResumable.stderr).toContain("invalid --critic-resumable");
+	});
+
+	it("records fallback metadata on a critic write", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"critic",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"# Fresh critic review",
+				"--run-id",
+				"critic-fallback",
+				"--critic-id",
+				"1-CriticFresh",
+				"--critic-resumable",
+				"false",
+				"--fallback-reason",
+				"context_unavailable",
+				"--fallback-attempted-id",
+				"0-CriticOld",
+				"--fallback-stage-n",
+				"2",
+				"--fallback-receipt-path",
+				".gjc/plans/ralplan/critic-fallback/stage-02-critic.md",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+		expect(JSON.parse(result.stdout ?? "{}").critic_state).toEqual({
+			critic_id: "1-CriticFresh",
+			critic_resumable: false,
+			critic_fallback_reason: "context_unavailable",
+			critic_fallback_attempted_id: "0-CriticOld",
+			critic_fallback_stage_n: 2,
+			critic_fallback_receipt_path: ".gjc/plans/ralplan/critic-fallback/stage-02-critic.md",
+		});
+		const state = await readState(root);
+		expect(state.critic_id).toBe("1-CriticFresh");
+		expect(state.critic_resumable).toBe(false);
+		expect(state.critic_fallback_reason).toBe("context_unavailable");
+		expect(state.critic_fallback_attempted_id).toBe("0-CriticOld");
+		expect(state.critic_fallback_stage_n).toBe(2);
+		expect(state.critic_fallback_receipt_path).toBe(".gjc/plans/ralplan/critic-fallback/stage-02-critic.md");
 	});
 
 	it("omits planner fields when no planner flags are supplied (existing writes unaffected)", async () => {
@@ -1676,6 +1859,129 @@ describe("ralplan crash-gap dedupe repair", () => {
 		});
 		expect(repairedDecision).toMatchObject({ currentPasses: 1, projectedPasses: 2 });
 		expect(repairedDecision.ledgerNote).toBeUndefined();
+	});
+
+	it("does not apply stale critic metadata while repairing a crash gap", async () => {
+		const root = await tempDir();
+		const staleRunId = "stale-critic-metadata";
+		const activeRunId = "active-critic-metadata";
+		const staleRunDir = ralplanRunDir(root, staleRunId);
+		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.writeFile(path.join(staleRunDir, "stage-02-critic.md"), "# stale critique\n", "utf-8");
+		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
+		const stateBefore = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
+		expect(stateBefore.run_id).toBe(activeRunId);
+
+		const repaired = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"critic",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"# stale critique",
+				"--run-id",
+				staleRunId,
+				"--critic-id",
+				"0-StaleCritic",
+				"--critic-resumable",
+				"false",
+				"--fallback-reason",
+				"context_unavailable",
+				"--fallback-attempted-id",
+				"1-StaleCritic",
+				"--fallback-stage-n",
+				"2",
+				"--fallback-receipt-path",
+				".gjc/plans/ralplan/stale-critic-metadata/stage-02-critic.md",
+				"--json",
+			],
+			root,
+		);
+
+		expect(repaired.status).toBe(0);
+		const payload = JSON.parse(repaired.stdout ?? "{}");
+		expect(payload.deduplicated).toBe(true);
+		expect(payload.critic_state).toBeUndefined();
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"))).toEqual(stateBefore);
+	});
+
+	it("does not apply stale architect metadata while repairing a crash gap", async () => {
+		const root = await tempDir();
+		const staleRunId = "stale-architect-metadata";
+		const activeRunId = "active-architect-metadata";
+		const staleRunDir = ralplanRunDir(root, staleRunId);
+		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.writeFile(path.join(staleRunDir, "stage-02-architect.md"), "# stale architecture\n", "utf-8");
+		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
+		const stateBefore = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
+		expect(stateBefore.run_id).toBe(activeRunId);
+
+		const repaired = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"architect",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"# stale architecture",
+				"--run-id",
+				staleRunId,
+				"--architect-id",
+				"0-StaleArchitect",
+				"--architect-resumable",
+				"true",
+				"--json",
+			],
+			root,
+		);
+
+		expect(repaired.status).toBe(0);
+		const payload = JSON.parse(repaired.stdout ?? "{}");
+		expect(payload.deduplicated).toBe(true);
+		expect(payload.architect_state).toBeUndefined();
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"))).toEqual(stateBefore);
+	});
+
+	it("applies active critic metadata while repairing a crash gap", async () => {
+		const root = await tempDir();
+		const runId = "active-critic-repair";
+		const runDir = ralplanRunDir(root, runId);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		await fs.writeFile(path.join(runDir, "stage-02-critic.md"), "# critique\n", "utf-8");
+
+		const repaired = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"critic",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"# critique",
+				"--run-id",
+				runId,
+				"--critic-id",
+				"0-ActiveCritic",
+				"--critic-resumable",
+				"true",
+				"--json",
+			],
+			root,
+		);
+
+		expect(repaired.status).toBe(0);
+		expect(JSON.parse(repaired.stdout ?? "{}")).toMatchObject({
+			deduplicated: true,
+			critic_state: { critic_id: "0-ActiveCritic", critic_resumable: true },
+		});
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"))).toMatchObject({
+			run_id: runId,
+			critic_id: "0-ActiveCritic",
+			critic_resumable: true,
+		});
 	});
 
 	it("refuses a different-content crash-gap retry without touching the artifact or ledger", async () => {

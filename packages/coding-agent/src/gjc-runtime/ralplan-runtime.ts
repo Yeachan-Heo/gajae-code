@@ -591,6 +591,10 @@ const VALUE_FLAGS = new Set([
 	"--critic",
 	"--planner-id",
 	"--planner-resumable",
+	"--architect-id",
+	"--architect-resumable",
+	"--critic-id",
+	"--critic-resumable",
 	"--fallback-reason",
 	"--fallback-attempted-id",
 	"--fallback-stage-n",
@@ -788,9 +792,12 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 	);
 }
 
-/* --------------------------- planner run-state --------------------------- */
+/* ---------------------- persisted role-agent run-state --------------------- */
 
-interface PlannerStateUpdate {
+type PersistedRole = "planner" | RalplanReviewLane;
+
+interface PersistedRoleStateUpdate {
+	role: PersistedRole;
 	subagentId?: string;
 	resumable?: boolean;
 	fallbackReason?: string;
@@ -804,6 +811,14 @@ interface LaneVerdictUpdate {
 	verdict: string;
 	stageN: number;
 }
+
+const PERSISTED_ROLES = ["planner", "architect", "critic"] as const;
+
+const PERSISTED_ROLE_FLAGS: Record<PersistedRole, { id: string; resumable: string }> = {
+	planner: { id: "--planner-id", resumable: "--planner-resumable" },
+	architect: { id: "--architect-id", resumable: "--architect-resumable" },
+	critic: { id: "--critic-id", resumable: "--critic-resumable" },
+};
 
 const LANE_VERDICTS: Record<RalplanReviewLane, ReadonlySet<string>> = {
 	architect: new Set(["CLEAR", "WATCH", "BLOCK"]),
@@ -822,7 +837,7 @@ function assertSubagentId(value: string, label: string): void {
 	}
 }
 
-function plannerFlagValue(args: readonly string[], flag: string): string | undefined {
+function roleStateFlagValue(args: readonly string[], flag: string): string | undefined {
 	const value = flagValue(args, flag);
 	if (value === undefined && hasFlag(args, flag)) {
 		throw new RalplanCommandError(2, `missing value for ${flag}.`);
@@ -830,19 +845,64 @@ function plannerFlagValue(args: readonly string[], flag: string): string | undef
 	return value;
 }
 
+function persistedRoleForStage(stage: RalplanStage): PersistedRole | undefined {
+	if (stage === "planner" || stage === "revision") return "planner";
+	if (stage === "architect" || stage === "critic") return stage;
+	return undefined;
+}
+
+function suppliedPersistedRoleFlag(args: readonly string[], role: PersistedRole): string | undefined {
+	const flags = PERSISTED_ROLE_FLAGS[role];
+	if (hasFlag(args, flags.id)) return flags.id;
+	if (hasFlag(args, flags.resumable)) return flags.resumable;
+	return undefined;
+}
+
 /**
- * Parse the optional persisted-Planner metadata flags that may ride alongside a
- * `--write`. Returns `undefined` when none are present so existing writes are
- * unaffected. Throws `RalplanCommandError` on any malformed value. This records
- * a same-session audit/routing hint, not a durable subagent registry.
+ * Parse the optional same-session persisted role-agent metadata that may ride
+ * alongside a `--write`. Planner metadata rides planner/revision stages;
+ * Architect and Critic metadata ride only their matching review lane. This is
+ * an audit/routing hint, not a durable subagent registry.
  */
-function parsePlannerStateArgs(args: readonly string[]): PlannerStateUpdate | undefined {
-	const subagentId = plannerFlagValue(args, "--planner-id");
-	const resumableRaw = plannerFlagValue(args, "--planner-resumable");
-	const fallbackReason = plannerFlagValue(args, "--fallback-reason");
-	const fallbackAttemptedId = plannerFlagValue(args, "--fallback-attempted-id");
-	const fallbackStageNRaw = plannerFlagValue(args, "--fallback-stage-n");
-	const fallbackReceiptPath = plannerFlagValue(args, "--fallback-receipt-path");
+function parsePersistedRoleStateArgs(
+	args: readonly string[],
+	stage: RalplanStage,
+): PersistedRoleStateUpdate | undefined {
+	const role = persistedRoleForStage(stage);
+	for (const candidate of PERSISTED_ROLES) {
+		const suppliedFlag = suppliedPersistedRoleFlag(args, candidate);
+		if (suppliedFlag && candidate !== role) {
+			const expectedStages = candidate === "planner" ? "planner or revision" : candidate;
+			throw new RalplanCommandError(
+				2,
+				`${suppliedFlag} is only valid with --stage ${expectedStages} (received ${stage}).`,
+			);
+		}
+	}
+
+	const fallbackFlagsPresent = [
+		"--fallback-reason",
+		"--fallback-attempted-id",
+		"--fallback-stage-n",
+		"--fallback-receipt-path",
+	].some(flag => hasFlag(args, flag));
+	if (!role) {
+		if (fallbackFlagsPresent) {
+			throw new RalplanCommandError(
+				2,
+				`--fallback-reason is only valid with --stage planner, revision, architect, or critic (received ${stage}).`,
+			);
+		}
+		return undefined;
+	}
+
+	const flags = PERSISTED_ROLE_FLAGS[role];
+	const subagentId = roleStateFlagValue(args, flags.id);
+	const resumableRaw = roleStateFlagValue(args, flags.resumable);
+	const fallbackReason = roleStateFlagValue(args, "--fallback-reason");
+	const fallbackAttemptedId = roleStateFlagValue(args, "--fallback-attempted-id");
+	const fallbackStageNRaw = roleStateFlagValue(args, "--fallback-stage-n");
+	const fallbackReceiptPath = roleStateFlagValue(args, "--fallback-receipt-path");
 
 	const anyPresent = [
 		subagentId,
@@ -854,14 +914,13 @@ function parsePlannerStateArgs(args: readonly string[]): PlannerStateUpdate | un
 	].some(value => value !== undefined);
 	if (!anyPresent) return undefined;
 
-	const update: PlannerStateUpdate = {};
-
+	const update: PersistedRoleStateUpdate = { role };
 	if (subagentId !== undefined) {
-		assertSubagentId(subagentId, "--planner-id");
+		assertSubagentId(subagentId, flags.id);
 		update.subagentId = subagentId;
 	}
 	if (resumableRaw !== undefined) {
-		update.resumable = parseBooleanFlag(resumableRaw, "--planner-resumable");
+		update.resumable = parseBooleanFlag(resumableRaw, flags.resumable);
 	}
 
 	const anyFallback = [fallbackReason, fallbackAttemptedId, fallbackStageNRaw, fallbackReceiptPath].some(
@@ -869,7 +928,7 @@ function parsePlannerStateArgs(args: readonly string[]): PlannerStateUpdate | un
 	);
 	if (anyFallback) {
 		if (!fallbackReason) {
-			throw new RalplanCommandError(2, "--fallback-reason is required when recording planner fallback metadata.");
+			throw new RalplanCommandError(2, `--fallback-reason is required when recording ${role} fallback metadata.`);
 		}
 		if (!KNOWN_FALLBACK_REASONS.has(fallbackReason)) {
 			throw new RalplanCommandError(
@@ -881,13 +940,13 @@ function parsePlannerStateArgs(args: readonly string[]): PlannerStateUpdate | un
 		if (fallbackAttemptedId === undefined) {
 			throw new RalplanCommandError(
 				2,
-				"--fallback-attempted-id is required when recording planner fallback metadata.",
+				`--fallback-attempted-id is required when recording ${role} fallback metadata.`,
 			);
 		}
 		assertSubagentId(fallbackAttemptedId, "--fallback-attempted-id");
 		update.fallbackAttemptedId = fallbackAttemptedId;
 		if (fallbackStageNRaw === undefined) {
-			throw new RalplanCommandError(2, "--fallback-stage-n is required when recording planner fallback metadata.");
+			throw new RalplanCommandError(2, `--fallback-stage-n is required when recording ${role} fallback metadata.`);
 		}
 		update.fallbackStageN = parseStageN(fallbackStageNRaw);
 		if (fallbackReceiptPath !== undefined) {
@@ -907,7 +966,7 @@ function parseLaneVerdictArgs(
 	stage: RalplanStage,
 	stageN: number,
 ): LaneVerdictUpdate | undefined {
-	const rawVerdict = plannerFlagValue(args, "--lane-verdict");
+	const rawVerdict = roleStateFlagValue(args, "--lane-verdict");
 	if (rawVerdict === undefined) return undefined;
 	if (stage !== "architect" && stage !== "critic") {
 		throw new RalplanCommandError(
@@ -925,24 +984,38 @@ function parseLaneVerdictArgs(
 	return { lane: stage, verdict, stageN };
 }
 
-/** Snake-case projection of a PlannerStateUpdate for state JSON + receipts. Omitted fields stay absent — an unknown `planner_resumable` is encoded by omission, never literal null. */
-function plannerStatePayload(update: PlannerStateUpdate): Record<string, unknown> {
+/**
+ * Snake-case projection of persisted role metadata for state JSON + receipts.
+ * Omitted fields stay absent — an unknown resumability value is never encoded
+ * as literal null.
+ */
+function persistedRoleStatePayload(update: PersistedRoleStateUpdate): Record<string, unknown> {
 	const payload: Record<string, unknown> = {};
-	if (update.subagentId !== undefined) payload.planner_subagent_id = update.subagentId;
-	if (update.resumable !== undefined) payload.planner_resumable = update.resumable;
-	if (update.fallbackReason !== undefined) payload.planner_fallback_reason = update.fallbackReason;
-	if (update.fallbackAttemptedId !== undefined) payload.planner_fallback_attempted_id = update.fallbackAttemptedId;
-	if (update.fallbackStageN !== undefined) payload.planner_fallback_stage_n = update.fallbackStageN;
-	if (update.fallbackReceiptPath !== undefined) payload.planner_fallback_receipt_path = update.fallbackReceiptPath;
+	const prefix = update.role;
+	if (update.subagentId !== undefined) {
+		payload[prefix === "planner" ? "planner_subagent_id" : `${prefix}_id`] = update.subagentId;
+	}
+	if (update.resumable !== undefined) payload[`${prefix}_resumable`] = update.resumable;
+	if (update.fallbackReason !== undefined) payload[`${prefix}_fallback_reason`] = update.fallbackReason;
+	if (update.fallbackAttemptedId !== undefined) payload[`${prefix}_fallback_attempted_id`] = update.fallbackAttemptedId;
+	if (update.fallbackStageN !== undefined) payload[`${prefix}_fallback_stage_n`] = update.fallbackStageN;
+	if (update.fallbackReceiptPath !== undefined) {
+		payload[`${prefix}_fallback_receipt_path`] = update.fallbackReceiptPath;
+	}
 	return payload;
 }
 
 /**
- * Merge persisted-Planner metadata into the ralplan run-state JSON. Same-session
- * audit/routing hint only — it records what the caller has already proven and is
- * NOT a durable cross-process subagent registry.
+ * Merge persisted role-agent metadata into the ralplan run-state JSON, optionally only for its active run.
+ * This is a same-session audit/routing hint only; it does not create a durable
+ * cross-process subagent registry, ledger entry, or additional state file.
  */
-async function applyPlannerStateUpdate(cwd: string, sessionId: string, update: PlannerStateUpdate): Promise<void> {
+async function applyPersistedRoleStateUpdate(
+	cwd: string,
+	sessionId: string,
+	update: PersistedRoleStateUpdate,
+	expectedActiveRunId?: string,
+): Promise<boolean> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	return await withWorkflowStateLock(
 		statePath,
@@ -955,7 +1028,8 @@ async function applyPlannerStateUpdate(cwd: string, sessionId: string, update: P
 				);
 			}
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
-			Object.assign(existing, plannerStatePayload(update));
+			if (expectedActiveRunId !== undefined && existing.run_id !== expectedActiveRunId) return false;
+			Object.assign(existing, persistedRoleStatePayload(update));
 			if (typeof existing.skill !== "string") existing.skill = "ralplan";
 			if (typeof existing.active !== "boolean") existing.active = true;
 			if (typeof existing.current_phase !== "string") existing.current_phase = "planner";
@@ -963,9 +1037,16 @@ async function applyPlannerStateUpdate(cwd: string, sessionId: string, update: P
 			existing.updated_at = new Date().toISOString();
 			await writeWorkflowEnvelopeAtomic(statePath, existing, {
 				cwd,
-				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan planner-state", sessionId },
+				receipt: {
+					cwd,
+					skill: "ralplan",
+					owner: "gjc-runtime",
+					command: `gjc ralplan ${update.role}-state`,
+					sessionId,
+				},
 				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 			});
+			return true;
 		},
 		{ cwd },
 	);
@@ -1410,8 +1491,8 @@ async function buildRalplanHud(options: {
 }
 
 async function handleArtifactWrite(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
-	const plannerState = parsePlannerStateArgs(args);
 	const resolved = await resolveArtifactArgs(args, cwd);
+	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
 	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
 	const repositoryBinding = await enforceRalplanRepositoryBinding(cwd, resolved.sessionId);
@@ -1467,12 +1548,26 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		}
 		if (resolved.stage === "final") await ensureFinalPendingApproval(cwd, resolved, onDiskArtifact);
 		const repairedArtifact = await repairMissingStageArtifactLedger(cwd, resolved, onDiskArtifact);
-		if (plannerState) await applyPlannerStateUpdate(cwd, resolved.sessionId, plannerState);
+		let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
+		if (
+			persistedRoleState &&
+			(await applyPersistedRoleStateUpdate(cwd, resolved.sessionId, persistedRoleState, resolved.runId))
+		) {
+			appliedPersistedRoleState = persistedRoleState;
+		}
 		let appliedLaneVerdict: LaneVerdictUpdate | undefined;
 		if (laneVerdict && (await applyLaneVerdictUpdate(cwd, resolved.sessionId, laneVerdict, resolved.runId))) {
 			appliedLaneVerdict = laneVerdict;
 		}
-		return buildDeduplicatedResult(resolved, repairedArtifact, sha256, cwd, repositoryBinding, appliedLaneVerdict);
+		return buildDeduplicatedResult(
+			resolved,
+			repairedArtifact,
+			sha256,
+			cwd,
+			repositoryBinding,
+			appliedLaneVerdict,
+			appliedPersistedRoleState,
+		);
 	}
 
 	// Consensus iteration budget (#3165): refuse new planner/revision openers past the cap.
@@ -1527,8 +1622,8 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(cwd, resolved.sessionId, resolved.runId, resolved.stage);
 	const persisted = await persistArtifact(resolved, cwd, content, sha256);
-	if (plannerState) {
-		await applyPlannerStateUpdate(cwd, resolved.sessionId, plannerState);
+	if (persistedRoleState) {
+		await applyPersistedRoleStateUpdate(cwd, resolved.sessionId, persistedRoleState);
 	}
 	if (laneVerdict) {
 		await applyLaneVerdictUpdate(cwd, resolved.sessionId, laneVerdict);
@@ -1563,7 +1658,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		created_at: persisted.createdAt,
 	};
 	if (persisted.pendingApprovalPath) payload.pending_approval_path = persisted.pendingApprovalPath;
-	if (plannerState) payload.planner_state = plannerStatePayload(plannerState);
+	if (persistedRoleState) payload[`${persistedRoleState.role}_state`] = persistedRoleStatePayload(persistedRoleState);
 	if (reviewBudgetWarning) payload.review_budget_warning = reviewBudgetWarning;
 	if (laneVerdict) payload.lane_verdict = { lane: laneVerdict.lane, verdict: laneVerdict.verdict };
 
@@ -1576,7 +1671,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 /**
  * Deterministic receipt for an identical repeated `--write`. Ledger-backed duplicates
  * do not rewrite artifacts, append rows, or churn run state; a crash-gap repair may
- * complete riding planner/lane metadata before returning this receipt.
+ * complete riding persisted role/lane metadata before returning this receipt.
  */
 function buildDeduplicatedResult(
 	resolved: ResolvedArtifactArgs,
@@ -1585,6 +1680,7 @@ function buildDeduplicatedResult(
 	cwd: string,
 	repositoryBinding: RepositoryBinding,
 	laneVerdict?: LaneVerdictUpdate,
+	persistedRoleState?: PersistedRoleStateUpdate,
 ): RalplanCommandResult {
 	const payload: Record<string, unknown> = {
 		run_id: resolved.runId,
@@ -1597,6 +1693,9 @@ function buildDeduplicatedResult(
 		deduplicated: true,
 	};
 	if (laneVerdict) payload.lane_verdict = { lane: laneVerdict.lane, verdict: laneVerdict.verdict };
+	if (persistedRoleState) {
+		payload[`${persistedRoleState.role}_state`] = persistedRoleStatePayload(persistedRoleState);
+	}
 	if (resolved.stage === "final") {
 		payload.pending_approval_path = path.join(
 			sessionPlansDir(cwd, resolved.sessionId),

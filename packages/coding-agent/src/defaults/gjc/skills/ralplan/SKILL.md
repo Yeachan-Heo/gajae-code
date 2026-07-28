@@ -54,7 +54,7 @@ RECEIPT-ONLY guideline: role agents (`planner`, `architect`, and `critic`) persi
 This skill runs GJC planning in consensus mode for the provided arguments.
 
 The consensus workflow:
-1. **Planner** creates the initial plan and a compact **RALPLAN-DR summary** before review. Launch the Planner ONCE per run as a detached, resumable subagent (await it before the Architect) and record its returned subagent id as the run's persisted Planner id; persist the stage with `gjc ralplan --write --stage planner --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT --planner-id <id> --planner-resumable <true|false>` (see **Persisted Planner** below):
+1. **Planner** creates the initial plan and a compact **RALPLAN-DR summary** before review. Launch the Planner ONCE per run as a detached, resumable subagent (await it before the Architect) and record its returned subagent id as the run's persisted Planner id; persist the stage with `gjc ralplan --write --stage planner --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT --planner-id <id> --planner-resumable <true|false>` (see **Persisted role agents** below):
    - After persistence, return only the receipt/path plus compact planning status; do not paste the full plan markdown back to the caller unless explicitly requested.
    - Principles (3-5)
    - Decision Drivers (top 3)
@@ -62,15 +62,15 @@ The consensus workflow:
    - If only one viable option remains, explicit invalidation rationale for alternatives
    - Deliberate mode only: pre-mortem (3 scenarios) + expanded test plan (unit/integration/e2e/observability)
 2. **User feedback** *(--interactive only)*: If `--interactive` is set, use the `ask` tool to present the draft plan **plus the Principles / Drivers / Options summary** before review (Proceed to review / Request changes / Skip review). Otherwise, automatically proceed to review.
-3. **Review fan-out after Planner persistence**: launch fresh Architect and Critic review lanes against the same immutable Planner receipt/path/sha/stage_n when Critic is **plan-only** and does not consume Architect output.
-   - **Architect lane**: challenge architecture, surface tradeoff tensions, and enrich thin plans with synthesis or missed sub-scope. Persist with `gjc ralplan --write --stage architect --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --lane-verdict <token> --json`, then return receipt/path plus `CLEAR`/`WATCH`/`BLOCK` and `APPROVE`/`COMMENT`/`REQUEST CHANGES`.
-   - **Plan-only Critic lane**: independently check quality, principle-option consistency, alternatives, risks, acceptance criteria, and verification; when the plan is thin, request concrete expansion rather than only defects. Persist with `gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --lane-verdict <token> --json`, then return receipt/path plus `OKAY`/`ITERATE`/`REJECT`.
+3. **Review fan-out after Planner persistence**: launch the Architect and Critic ONCE per run as detached, resumable review lanes against the same immutable Planner receipt/path/sha/stage_n. Their pass-1 fan-out remains parallel when Critic is **plan-only** and does not consume Architect output (see **Persisted role agents** below).
+   - **Architect lane**: challenge architecture, surface tradeoff tensions, and enrich thin plans with synthesis or missed sub-scope. Persist with `gjc ralplan --write --stage architect --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --architect-id <id> --architect-resumable <true|false> --lane-verdict <token> --json`, then return receipt/path plus `CLEAR`/`WATCH`/`BLOCK` and `APPROVE`/`COMMENT`/`REQUEST CHANGES`.
+   - **Plan-only Critic lane**: independently check quality, principle-option consistency, alternatives, risks, acceptance criteria, and verification; when the plan is thin, request concrete expansion rather than only defects. Persist with `gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --critic-id <id> --critic-resumable <true|false> --lane-verdict <token> --json`, then return receipt/path plus `OKAY`/`ITERATE`/`REJECT`.
    - **Sequential fallback**: if Critic must evaluate Architect findings, verdict, antithesis, tradeoffs, synthesis, status, or any Architect-produced artifact, await the Architect result before issuing that Architect-dependent Critic pass.
    - Every Architect/Critic assignment, including each pass-2+ re-review assignment in step 5, MUST instruct the reviewer to include `--lane-verdict <token>` on its existing `gjc ralplan --write`: Architect passes its Architectural Status token (`CLEAR`/`WATCH`/`BLOCK`), and Critic passes its verdict token (`OKAY`/`ITERATE`/`REJECT`). The flag is optional so legacy invocations stay valid.
 4. **Review join gate**: before consensus, revision, reconciliation, finalization, or approval, verify both Architect and Critic receipts/verdicts exist for the same Planner artifact/pass (`path`, `sha256`, `stage_n`). A non-`CLEAR` Architect verdict, non-`APPROVE` Architect decision, or any non-`OKAY` Critic verdict routes back to Planner revision; do not finalize from only one review lane.
-5. **Re-review loop** (max 5 iterations; **runtime-enforced**): Any non-`OKAY` Critic verdict (`ITERATE` or `REJECT`) or Architect result that is not `CLEAR`/`APPROVE` MUST run the same full closed loop. Pass 2+ runs sequentially Architect -> Critic: await the Architect result and its receipt/path before assigning Critic; Critic receives the current-pass Architect receipt/path and performs the rule-5 counter-review before consolidated feedback routes to Planner revision. From pass 2, both reviewers are bound by the five-rule ratchet: delta-only review, novelty justification, verdict monotonicity, severity scoping, and Critic counter-review of Architect scope inflation; unjustified inflation does not force a revision.
+5. **Re-review loop** (max 5 iterations; **runtime-enforced**): Any non-`OKAY` Critic verdict (`ITERATE` or `REJECT`) or Architect result that is not `CLEAR`/`APPROVE` MUST run the same full closed loop. Pass 2+ resumes the SAME persisted Architect and Critic lane subagents with the mandatory re-review context bundle and runs sequentially Architect -> Critic: await the Architect result and its receipt/path before assigning Critic; Critic receives the current-pass Architect receipt/path and performs the rule-5 counter-review before consolidated feedback routes to Planner revision. From pass 2, both reviewers are bound by the five-rule ratchet: delta-only review, novelty justification, verdict monotonicity, severity scoping, and Critic counter-review of Architect scope inflation; unjustified inflation does not force a revision.
    a. Collect Architect + Critic feedback
-   b. Revise the plan by resuming the SAME persisted Planner subagent with consolidated Architect + Critic feedback (see **Persisted Planner** below); fall back to a fresh Planner spawn only per the fallback routing table
+   b. Revise the plan by resuming the SAME persisted Planner subagent with consolidated Architect + Critic feedback (see **Persisted role agents** below); fall back to a fresh Planner spawn only per the fallback routing table
 
    **Re-review context bundle (pass 2+; mandatory):** Every pass-2+ Architect or Critic assignment MUST include:
    1. the explicit review pass number `N` for that lane, stated literally as `review pass N` in the assignment text, where **N is the ordinal review pass for that lane across the entire ralplan run/re-review loop** (equivalently the opener-iteration ordinal): the review of the initial Planner artifact is `review pass 1`, the review of the first revised Planner artifact is `review pass 2`, and so on; **N never resets within an opener iteration and never resets when a new `revision` opener begins in the same run** — it increments monotonically with every review the lane performs in the run. This ordinal is a workflow counter distinct from the runtime lane budget (which counts lane writes per opener iteration, WI-5): at the default budget the two coincide numerically, but the ratchet ("from pass 2") always keys off the run-level N so normal post-revision re-reviews activate delta-only review, monotonicity, and the sequential cadence;
@@ -80,8 +80,8 @@ The consensus workflow:
    5. the consolidated prior blockers and the revision's claimed resolutions, as orchestrator-collected pointers into those artifacts (never pasted bodies);
    6. Critic pass-2+ only: the current-pass Architect receipt/path, awaited first per the sequential cadence, so the rule-5 counter-review is evaluable.
 
-   Fresh spawns always receive everything required to apply delta-only review (rule 1), novelty justification (rule 2), monotonicity (rule 3), severity scoping (rule 4), and counter-review (rule 5).
-   c. For pass 2+, run Architect -> Critic sequentially: await the Architect result and receipt/path, then issue Critic with the mandatory context bundle, including the current-pass Architect receipt/path. Critic performs the rule-5 counter-review before consolidated feedback routes to Planner revision.
+   **The re-review context bundle remains mandatory regardless of whether a reviewer is resumed or uses a fresh-spawn fallback.** A fresh-spawn fallback always receives everything required to apply delta-only review (rule 1), novelty justification (rule 2), monotonicity (rule 3), severity scoping (rule 4), and counter-review (rule 5).
+   c. For pass 2+, resume (or fresh-spawn only per the routing table) Architect -> Critic sequentially: await the Architect result and receipt/path, then issue Critic with the mandatory context bundle, including the current-pass Architect receipt/path. Critic performs the rule-5 counter-review before consolidated feedback routes to Planner revision.
       - Persist each Planner revision with `gjc ralplan --write --stage revision --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json` before re-review, then pass the receipt/path forward instead of duplicating the full revision markdown in the parent conversation.
    d. Re-join Architect and Critic verdicts for the same revised Planner artifact/pass
    e. Repeat this loop until Critic returns `OKAY` **and** Architect is `CLEAR`/`APPROVE` for the same Planner artifact/pass, or 5 iterations are reached
@@ -158,32 +158,32 @@ The consensus workflow:
 
 Follow this ralplan-internal consensus workflow for consensus mode details.
 
-### Persisted Planner (consensus loop)
+### Persisted role agents (consensus loop)
 
-The Planner is a **same-session persisted subagent**: launched detached once, awaited before review fan-out, then **resumed** with consolidated Architect + Critic challenge and enrichment on each re-review pass. Architect and Critic are fresh independent spawns each pass; Critic may run in parallel only when plan-only and tied to the same Planner receipt/path/sha/stage_n. Do NOT modify the subagent control surface; use existing `subagent` resume/steer controls only.
+The Planner, Architect, and Critic are **same-session persisted subagents**. Launch the Planner detached once and await it before review fan-out; Architect and Critic are also launched once per run as detached, resumable subagents in the pass-1 fan-out (parallel only for the plan-only Critic lane tied to the same Planner receipt/path/sha/stage_n). On pass 2+, resume the SAME persisted Planner with consolidated feedback and resume the SAME persisted Architect and Critic lane subagents with the mandatory re-review context bundle instead of fresh-spawning. Do NOT modify the subagent control surface; use existing `subagent` resume/steer controls only.
 
-**Persistence boundary:** same-parent, active-session continuity only. Resumability requires retained subagent resume metadata and a persistent parent session (in-memory parent yields `resumable:false`), not just `.gjc` run-state. A terminal subagent can still resume when its retained descriptor points at a saved subagent session; after process restart, missing metadata, or failed/unavailable resume, use fresh Planner fallback.
+**Persistence boundary:** same-parent, active-session continuity only. Resumability requires retained subagent resume metadata and a persistent parent session (in-memory parent yields `resumable:false`), not just `.gjc` run-state. A terminal subagent can still resume when its retained descriptor points at a saved subagent session; after process restart, missing metadata, or failed/unavailable resume, use the fresh role/lane fallback.
 
-**Resume routing table** (per re-review pass, when resuming the persisted Planner id):
+**Resume routing table (for every persisted role: Planner, Architect, and Critic)** (per re-review pass, when resuming that role's persisted id):
 
 | Resume outcome | Action |
 |---|---|
-| `running` | `steer`/inject the consolidated feedback to the same id, then await — do NOT fresh-spawn |
-| `queued` | retain/update the queued message or await the same id — do NOT fresh-spawn just because it is queued |
-| `context_unavailable`, `not_found`, `no_runner`, `resume_failed` | fresh Planner spawn for that pass; record the fallback metadata. `not_found` should only mean same-session resume metadata is unavailable, not merely that a terminal live job was evicted. |
-| terminal (`completed`/`failed`/`cancelled`) + revision message | resume the same id when context is available; otherwise use the fresh fallback above |
+| `running` | `steer`/inject that role's follow-up context to the same id, then await — do NOT fresh-spawn |
+| `queued` | retain/update the queued message or `await` the same id — do NOT fresh-spawn just because it is queued |
+| `context_unavailable`, `not_found`, `no_runner`, `resume_failed` | fresh-spawn fallback for that role/lane on that pass; record the fallback metadata. `not_found` should only mean same-session resume metadata is unavailable, not merely that a terminal live job was evicted. |
+| terminal (`completed`/`failed`/`cancelled`) + follow-up message | resume the same id when context is available; otherwise use the fresh-spawn fallback above |
 
-**Recording persisted-Planner metadata** (audit/routing only — never claim `subagent list` proves resumability, since the snapshot does not expose `resumable`). Ride these optional flags on the normal `--write` for the planner/revision stage of the pass:
+**Ratchet synergy:** a resumed Architect or Critic natively retains prior-pass context, but the re-review context bundle remains mandatory regardless so the fresh-spawn fallback remains fully functional and applies all five rules.
 
-```
-gjc ralplan --write --stage revision --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT \
-  --planner-id <id> --planner-resumable <true|false> \
-  --fallback-reason <context_unavailable|not_found|no_runner|resume_failed|process_restart|missing_record> \
-  --fallback-attempted-id <id> --fallback-stage-n <N> \
-  --fallback-receipt-path <fresh-planner-stage-artifact-path> --json
-```
+**Recording persisted-role-agent metadata** (audit/routing only — never claim `subagent list` proves resumability, since the snapshot does not expose `resumable`). Ride the matching optional flags on the role's normal `--write` for the pass:
 
-Set `--planner-resumable true` only when the parent session is provably persistent; set/record `false` after an observed `context_unavailable`; otherwise omit it (unknown). Fallback flags are recorded only when a fresh-spawn fallback actually occurs: a fallback record requires `--fallback-reason` **together with** `--fallback-attempted-id` and `--fallback-stage-n` (the failed id and the pass it failed on), while `--fallback-receipt-path` (the fresh Planner's stage artifact) is optional.
+| Role | Normal write stage | Metadata flags |
+|---|---|---|
+| Planner | `planner` or `revision` | `--planner-id <id> --planner-resumable <true|false>` |
+| Architect | `architect` | `--architect-id <id> --architect-resumable <true|false>` |
+| Critic | `critic` | `--critic-id <id> --critic-resumable <true|false>` |
+
+The existing fallback flags ride the same role's normal write: `--fallback-reason <context_unavailable|not_found|no_runner|resume_failed|process_restart|missing_record>`, `--fallback-attempted-id <id>`, `--fallback-stage-n <N>`, and optional `--fallback-receipt-path <fresh-role-stage-artifact-path>`. A planner/revision write records Planner fallback metadata, an Architect write records Architect fallback metadata, and a Critic write records Critic fallback metadata. Set the matching `--*-resumable` flag to `true` only when the parent session is provably persistent; set/record `false` after an observed `context_unavailable`; otherwise omit it (unknown). Fallback flags are recorded only when a fresh-spawn fallback actually occurs: a fallback record requires `--fallback-reason` **together with** `--fallback-attempted-id` and `--fallback-stage-n` (the failed id and the pass it failed on), while `--fallback-receipt-path` is optional.
 
 ## Pre-Execution Gate
 
