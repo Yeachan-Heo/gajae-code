@@ -41,16 +41,18 @@ Persist planning artifacts and handoffs through the ralplan CLI writer, never di
 Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden unless an explicit force override is active.
 
 ```bash
-gjc ralplan --write --stage <type> --stage_n <N> --artifact "markdown file path or markdown string"
+gjc ralplan --write --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact "markdown file path or markdown string"
 # restricted role agents use:
-gjc ralplan --write --stage <type> --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT
+gjc ralplan --write --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT
 ```
 
 Use stages `planner`, `architect`, `critic`, `revision`, `post-interview`, `adr`, or `final`; increment `--stage_n` each consensus pass. The writer accepts inline markdown, an artifact path prepared outside `.gjc/`, or `--artifact-env GJC_RALPLAN_ARTIFACT`, persists `stage-<NN>-<stage>.md` plus `index.jsonl` under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`, and copies `final` to `pending-approval.md`. Ralplan mutation blocking is enforced in code; use temp directories (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) only for oversized scratch artifacts, never the repo or `.gjc/`. Staging via the `write` tool or a quoted-delimiter bash heredoc (`cat > /tmp/plan.md <<'EOF' … EOF`) into those temp roots is tolerated by the planning-phase guard.
 
 Restricted read-only role agents (`planner`, `architect`, `critic`) must pass markdown through `GJC_RALPLAN_ARTIFACT` with `--artifact-env GJC_RALPLAN_ARTIFACT`; their restricted bash environment disables artifact file-path ingestion.
 
-RECEIPT-ONLY guideline: role agents (`planner`, `architect`, and `critic`) persist durable outputs via `gjc ralplan --write` and return ONLY the receipt fields (`run_id`, `path`, `sha256`) plus verdict/status routing fields; include `stage` and `stage_n` when available, and never return the full persisted body.
+RECEIPT-ONLY guideline: role agents (`planner`, `architect`, and `critic`) persist durable outputs via `gjc ralplan --write` and return ONLY the receipt fields (`session_id`, `run_id`, `path`, `sha256`) plus verdict/status routing fields; include `stage` and `stage_n` when available, and never return the full persisted body.
+
+The ralplan seed/write receipt's `session_id` is the immutable workflow owner session and `run_id` is the run identity. Include both in every Planner/Architect/Critic assignment and every parent-side revision/post-interview/ADR/final write. A role subagent's own session id is transcript/resume identity only and MUST NOT own ralplan state or artifacts.
 
 This skill runs GJC planning in consensus mode for the provided arguments.
 

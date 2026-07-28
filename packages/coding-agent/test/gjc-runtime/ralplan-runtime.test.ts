@@ -346,6 +346,95 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		expect(JSON.parse(indexLine).sha256).toBe(payload.sha256);
 	});
 
+	it("keeps role-subagent writes in the seeded owner session", async () => {
+		const root = await tempDir();
+		const ownerSessionId = "owner-session";
+		const childSessionId = "planner-subagent-session";
+		const seed = await runNativeRalplanCommand(
+			["--session-id", ownerSessionId, "--json", "plan without fragmenting artifacts"],
+			root,
+		);
+		expect(seed.status).toBe(0);
+		const seedReceipt = JSON.parse(seed.stdout ?? "{}") as { session_id: string; run_id: string };
+		expect(seedReceipt).toMatchObject({ session_id: ownerSessionId, run_id: ownerSessionId });
+
+		const previousSessionId = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = childSessionId;
+		try {
+			const result = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"planner",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"# Owner-scoped plan",
+					"--run-id",
+					seedReceipt.run_id,
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			expect(JSON.parse(result.stdout ?? "{}")).toMatchObject({
+				session_id: ownerSessionId,
+				run_id: seedReceipt.run_id,
+			});
+		} finally {
+			process.env.GJC_SESSION_ID = previousSessionId;
+		}
+
+		const ownerArtifact = path.join(
+			sessionPlansDir(root, ownerSessionId),
+			"ralplan",
+			seedReceipt.run_id,
+			"stage-01-planner.md",
+		);
+		const childArtifact = path.join(
+			sessionPlansDir(root, childSessionId),
+			"ralplan",
+			seedReceipt.run_id,
+			"stage-01-planner.md",
+		);
+		expect(await fs.readFile(ownerArtifact, "utf-8")).toBe("# Owner-scoped plan\n");
+		expect(existsSync(childArtifact)).toBe(false);
+		expect(existsSync(modeStatePath(root, childSessionId, "ralplan"))).toBe(false);
+	});
+
+	it("rejects an explicit session that conflicts with an existing run owner", async () => {
+		const root = await tempDir();
+		const ownerSessionId = "owner-session";
+		const childSessionId = "critic-subagent-session";
+		const seed = await runNativeRalplanCommand(
+			["--session-id", ownerSessionId, "--json", "preserve immutable run ownership"],
+			root,
+		);
+		const { run_id: runId } = JSON.parse(seed.stdout ?? "{}") as { run_id: string };
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--session-id",
+				childSessionId,
+				"--run-id",
+				runId,
+				"--stage",
+				"critic",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Critic",
+				"--json",
+			],
+			root,
+		);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain(`run ${runId} is owned by session ${ownerSessionId}, not ${childSessionId}`);
+		expect(existsSync(modeStatePath(root, childSessionId, "ralplan"))).toBe(false);
+	});
+
 	it("--artifact <file> reads contents from disk", async () => {
 		const root = await tempDir();
 		const artifactPath = path.join(root, "draft.md");

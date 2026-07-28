@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir } from "@gajae-code/utils";
@@ -22,7 +23,7 @@ import {
 	RepositoryBindingError,
 } from "./repository-binding";
 import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
-import { gjcRoot, modeStatePath, sessionPlansDir } from "./session-layout";
+import { gjcRoot, modeStatePath, sessionIdFromDirName, sessionPlansDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
@@ -1342,6 +1343,69 @@ async function persistRalplanFinalAdmission(
 	);
 }
 
+async function findExistingRalplanRunOwners(cwd: string, runId: string): Promise<string[]> {
+	let entries: Dirent<string>[];
+	try {
+		entries = await fs.readdir(gjcRoot(cwd), { withFileTypes: true });
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT" || err.code === "ENOTDIR") return [];
+		throw error;
+	}
+
+	const owners = await Promise.all(
+		entries.map(async entry => {
+			if (!entry.isDirectory()) return undefined;
+			const sessionId = sessionIdFromDirName(entry.name);
+			if (!sessionId) return undefined;
+
+			const stateRead = await readExistingStateForMutation(ralplanStatePath(cwd, sessionId));
+			const stateOwnsRun =
+				stateRead.kind === "valid" &&
+				typeof stateRead.value.run_id === "string" &&
+				stateRead.value.run_id.trim() === runId;
+			if (stateOwnsRun) return sessionId;
+
+			try {
+				const stat = await fs.stat(path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId));
+				return stat.isDirectory() ? sessionId : undefined;
+			} catch (error) {
+				const err = error as NodeJS.ErrnoException;
+				if (err.code === "ENOENT" || err.code === "ENOTDIR") return undefined;
+				throw error;
+			}
+		}),
+	);
+	return owners.filter((owner): owner is string => owner !== undefined).sort();
+}
+
+async function resolveArtifactSessionId(args: readonly string[], cwd: string, explicitRunId: string | undefined) {
+	const flagSessionId = flagValue(args, "--session-id");
+	const currentSession = resolveGjcSessionForWrite(cwd, {
+		flagValue: flagSessionId,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	if (!explicitRunId) return currentSession.gjcSessionId;
+
+	const owners = await findExistingRalplanRunOwners(cwd, explicitRunId);
+	if (owners.length === 0) return currentSession.gjcSessionId;
+	if (owners.length > 1) {
+		throw new RalplanCommandError(
+			2,
+			`ralplan run ${explicitRunId} has multiple owner sessions (${owners.join(", ")}); repair the fragmented run before writing`,
+		);
+	}
+
+	const ownerSessionId = owners[0]!;
+	if (flagSessionId !== undefined && currentSession.gjcSessionId !== ownerSessionId) {
+		throw new RalplanCommandError(
+			2,
+			`ralplan run ${explicitRunId} is owned by session ${ownerSessionId}, not ${currentSession.gjcSessionId}`,
+		);
+	}
+	return ownerSessionId;
+}
+
 async function resolveArtifactArgs(args: readonly string[], cwd: string): Promise<ResolvedArtifactArgs> {
 	const stage = flagValue(args, "--stage");
 	if (!stage) throw new RalplanCommandError(2, "--stage is required for ralplan --write");
@@ -1362,20 +1426,18 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 		throw new RalplanCommandError(2, `--artifact-env must be ${GJC_RALPLAN_ARTIFACT_ENV}`);
 	}
 
-	const session = resolveGjcSessionForWrite(cwd, {
-		flagValue: flagValue(args, "--session-id"),
-		envSessionId: process.env.GJC_SESSION_ID,
-	});
-	const sessionId = session.gjcSessionId;
+	const explicitRunId = flagValue(args, "--run-id")?.trim();
+	if (explicitRunId) assertSafePathComponent(explicitRunId, "run-id");
+
+	const sessionId = await resolveArtifactSessionId(args, cwd, explicitRunId);
 	assertSafePathComponent(sessionId, "session-id");
 	const sessionIdRaw = sessionId;
 
 	// Precedence for run_id:
 	//   1. explicit --run-id flag
-	//   2. existing run_id field in .gjc/state[/sessions/<id>]/ralplan-state.json
-	//   3. explicit --session-id flag (use as run id)
+	//   2. existing run_id field in the resolved owner session's ralplan state
+	//   3. resolved owner session id
 	//   4. freshly generated default run id
-	const explicitRunId = flagValue(args, "--run-id")?.trim();
 	const runId = explicitRunId || (await readActiveRunId(cwd, sessionId)) || sessionIdRaw || defaultRunId();
 	assertSafePathComponent(runId, "run-id");
 
@@ -1967,6 +2029,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 			: undefined;
 
 	const payload: Record<string, unknown> = {
+		session_id: resolved.sessionId,
 		run_id: persisted.runId,
 		path: persisted.path,
 		stage: persisted.stage,
@@ -2009,6 +2072,7 @@ async function buildDeduplicatedResult(
 	persistedRoleState?: PersistedRoleStateUpdate,
 ): Promise<RalplanCommandResult> {
 	const payload: Record<string, unknown> = {
+		session_id: resolved.sessionId,
 		run_id: resolved.runId,
 		path: existing.path,
 		stage: resolved.stage,
@@ -2180,6 +2244,7 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 	});
 
 	const summary = {
+		session_id: resolved.sessionId,
 		skill: "ralplan",
 		mode,
 		state_path: statePath,
