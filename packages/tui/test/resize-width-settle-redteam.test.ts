@@ -256,18 +256,20 @@ describe("width-settle debounce red-team", () => {
 		);
 	});
 
-	it("TMUX-STALE-BAND measures whether viewport-only settle repairs scrollback", async () => {
+	it("TMUX-STALE-BAND settled repair replays the full transcript so scrollback is repaired too", async () => {
 		const result = await runWidthRepair(true);
 		const postRows = nonEmpty(result.post.scrollback);
 		const referenceRows = nonEmpty(result.reference.scrollback);
 		finishCase(
 			"TMUX-STALE-BAND",
-			"With TMUX set, the settled request routes through viewportRepaint: the LIVE viewport must match a clean 22-column render, while already-scrolled-off history keeps its old-width wrapping (reconstructing it is the replay storm resize-replay-storm.test.ts pins against).",
+			"With TMUX set, interim frames stay viewport-only, but the ONE debounced settled repair is a full clear+replay: post-settle scrollback must match a clean 22-column render. The replay storm is avoided by running once per settled sequence, not once per SIGWINCH.",
 			{
+				postStateMatchesFreshTarget: postRows.join("\n") === referenceRows.join("\n"),
 				postViewportMatchesFreshTarget: result.post.viewport.join("\n") === result.reference.viewport.join("\n"),
 				settledRedrawExactlyOne: result.redrawsAfterSettle - result.redrawsBeforeSettle === 1,
-				settledWriteUsesViewportRepaint:
-					result.post.writeLog.includes("\x1b[2K") && !result.post.writeLog.includes("\x1b[3J"),
+				// tmux keeps 3J suppressed (shouldPreserveScrollbackOnFullClear), but the
+				// settled write must be a real clear+replay, not a 2K viewport patch.
+				settledWriteClearsAndReplays: result.post.writeLog.includes("\x1b[2J\x1b[H"),
 				widthChangedContentVisible: result.post.viewport.some(line => line.startsWith("R31-")),
 			},
 			{
