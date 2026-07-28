@@ -45,9 +45,9 @@ import {
 } from "../../sdk/acp";
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
-import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
+import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -597,7 +597,7 @@ export function acpProviderRegistrations(
 		...(resolveAcpPermissionMode(capabilities, env) === "prompt"
 			? [{ capability: "permission", definitions: [] }]
 			: []),
-		{ capability: "ui", definitions: [] },
+		...(capabilities?.elicitation?.form ? [{ capability: "ui", definitions: [] }] : []),
 	];
 }
 
@@ -618,82 +618,6 @@ export async function applyAcpStartupOptions(
 ): Promise<void> {
 	if (options?.modelId) await adapter.setModel(options.modelId);
 	if (options?.thinkingLevel) await adapter.control("thinking.set", { level: options.thinkingLevel });
-}
-
-/** ACP form elicitation uses the client-facing reverse surface without owning a session runtime. */
-export function createAcpExtensionUiContext(
-	connection: AgentSideConnection,
-	getSessionId: () => string,
-	capabilities: ClientCapabilities | undefined,
-): {
-	select: (
-		message: string,
-		options: string[],
-		dialog?: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void },
-	) => Promise<string | undefined>;
-	confirm: (
-		message: string,
-		detail?: string,
-		dialog?: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void },
-	) => Promise<boolean>;
-	input: (
-		message: string,
-		placeholder?: string,
-		dialog?: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void },
-	) => Promise<string | undefined>;
-} {
-	const elicit = async (
-		kind: "select" | "confirm" | "input",
-		message: string,
-		options: string[] | undefined,
-		dialog: { signal?: AbortSignal; timeout?: number; onTimeout?: () => void } | undefined,
-	): Promise<unknown> => {
-		if (!capabilities?.elicitation?.form || dialog?.signal?.aborted) return undefined;
-		const request = (
-			connection as unknown as { unstable_createElicitation(input: JsonObject): Promise<JsonObject> }
-		).unstable_createElicitation({
-			sessionId: getSessionId(),
-			message,
-			requestedSchema: {
-				type: "object",
-				properties: {
-					value:
-						kind === "confirm" ? { type: "boolean" } : { type: "string", ...(options ? { enum: options } : {}) },
-				},
-				required: ["value"],
-			},
-		});
-		let timer: NodeJS.Timeout | undefined;
-		const timeout =
-			dialog?.timeout === undefined
-				? undefined
-				: new Promise<undefined>(resolve => {
-						timer = setTimeout(() => {
-							dialog.onTimeout?.();
-							resolve(undefined);
-						}, dialog.timeout);
-					});
-		try {
-			const response = timeout ? await Promise.race([request, timeout]) : await request;
-			return object(object(response)?.content)?.value;
-		} catch {
-			return undefined;
-		} finally {
-			if (timer) clearTimeout(timer);
-		}
-	};
-	return {
-		select: async (message, options, dialog) => {
-			const value = await elicit("select", message, options, dialog);
-			return typeof value === "string" && options.includes(value) ? value : undefined;
-		},
-		confirm: async (message, detail, dialog) =>
-			(await elicit("confirm", detail ? `${message}\n\n${detail}` : message, undefined, dialog)) === true,
-		input: async (message, placeholder, dialog) => {
-			const value = await elicit("input", placeholder ? `${message}\n\n${placeholder}` : message, undefined, dialog);
-			return typeof value === "string" ? value : undefined;
-		},
-	};
 }
 
 /**
@@ -1134,8 +1058,9 @@ export class AcpAgent implements Agent {
 		if (attached) {
 			if (path.resolve(attached.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
-			if (mcpServers.length > 0)
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
+			// ACP clients replay their declared MCP servers when reconnecting. The live
+			// session host remains authoritative for its immutable configuration, so
+			// attachment must not reinterpret the replay as a mutation request.
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -1173,8 +1098,8 @@ export class AcpAgent implements Agent {
 		const indexed = await this.#scopedBrokerSession(id, cwd);
 		this.#assertSessionEpoch(id, epoch);
 		if (indexed?.live) {
-			if (mcpServers.length > 0)
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} already has immutable MCP configuration.`);
+			// A reconnect may repeat the client's MCP declaration. Attaching to the
+			// existing endpoint preserves the live host's immutable configuration.
 			const result = await this.#brokerEndpoint(id, indexed.endpointGeneration);
 			this.#assertSessionEpoch(id, epoch);
 			await this.#attach(id, cwd, endpoint(result), epoch);

@@ -31,6 +31,12 @@ test("ACP registers a permission provider only for prompt handling", () => {
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "invalid" } } })).toContain("permission");
 });
 
+test("ACP registers the SDK UI provider only for clients with form elicitation", () => {
+	expect(providerNames({ elicitation: { form: {} } })).toContain("ui");
+	expect(providerNames({ elicitation: {} })).not.toContain("ui");
+	expect(providerNames(undefined)).not.toContain("ui");
+});
+
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {
 	const modes: string[] = [];
 	const adapter = {

@@ -29,10 +29,13 @@
 - The documented `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` environment variable now overrides the OpenAI-code web-search model; it is resolved GJC-first ahead of the legacy `PI_CODEX_WEB_SEARCH_MODEL` name (previously only the legacy name was read, so the documented name was a silent no-op).
 - ACP prompt completion no longer hangs clients: terminal prompt outcomes are now projected through ACP after the SDK finalizes them.
 - Prompt terminalization now exposes exactly one normalized outcome per accepted prompt, preserving the terminal reason or controlled failure code across SDK and ACP clients.
+- ACP clients can reconnect to a live session while replaying their MCP server declarations. The live session keeps its immutable MCP configuration instead of rejecting the reconnect as a configuration mutation.
+- ACP `AskUserQuestion` now routes through the registered SDK UI provider as a schema-valid form elicitation, including selector, free-text, and navigation-control responses for Air.
 
 ### Added
 
 - Deterministic tests for session_switch await policy (selector defer vs default/branch await), control-drain ordering, host pre-response readiness gating, and resume progress lease-before-switch behavior (#2914).
+- Added `bun run restart:sdk-broker` for authenticated, identity-checked SDK broker replacement during local Air/ACP testing.
 - Added an isolated Bun memory-baseline corpus with short/soak profiles across CLI, AgentSession, blob buffers, workers, Telegram, TUI, and shared/native boundaries; reports keep RSS, heap, external buffers, process-tree endpoints, active resources, throughput, and teardown evidence separate and advisory until variance is characterized.
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - `/model`, `/login`, and `/provider` now order providers through one shared ranking: providers you already have (valid auth, in-flight validation, or a configured non-OAuth provider) come first, then providers whose stored credentials failed validation, then a curated list of well-known providers with regional and device variants grouped behind their primary, then everything else by display name. In `/model` rows, role/default rank and recent usage still take precedence over provider order (#3243).

@@ -48,6 +48,7 @@ import type { ClientBridge } from "../../session/client-bridge";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
+	AskAnswerSource,
 	AskAnswerSourceResult,
 	AskRemoteControl,
 	AskRemoteInteraction,
@@ -57,13 +58,13 @@ import type {
 	AskSettlementResult,
 } from "../../tools";
 import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
+import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
 import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { projectQ10Models } from "../models.js";
-import { acpFinalTextFromMessage } from "../acp/final-text";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -1633,6 +1634,80 @@ async function requestRecoveredSelectedAck(
 	}
 }
 
+function createSdkUiAskAnswerSource(
+	requestElicitation: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>,
+): AskAnswerSource {
+	const awaitAnswerRequest = async (
+		request: AskAnswerRequest,
+		signal?: AbortSignal,
+	): Promise<AskAnswerSourceResult> => {
+		if (signal?.aborted) return undefined;
+		const choices = new Map<string, { kind: "value"; value: string } | { kind: "control"; controlId: string }>();
+		const oneOf =
+			request.interaction === "selector"
+				? [
+						...request.options.map((label, index) => {
+							const value = `option:${index}`;
+							choices.set(value, { kind: "value", value: label });
+							return { const: value, title: label };
+						}),
+						...request.controls
+							.filter(control => control.enabled)
+							.map(control => {
+								const value = `control:${control.id}`;
+								choices.set(value, { kind: "control", controlId: control.id });
+								return { const: value, title: control.label };
+							}),
+					]
+				: [];
+		const response = await requestElicitation(
+			{
+				mode: "form",
+				message: request.question,
+				requestedSchema: {
+					type: "object",
+					properties: {
+						value: { type: "string", ...(oneOf.length > 0 ? { oneOf } : {}) },
+					},
+					required: ["value"],
+				},
+			},
+			signal,
+		);
+		if (signal?.aborted || !isRecord(response) || response.action !== "accept") return undefined;
+		const value = isRecord(response.content) ? response.content.value : undefined;
+		if (typeof value !== "string") return undefined;
+		if (request.interaction !== "selector") return value;
+		const interaction = choices.get(value);
+		if (!interaction) return undefined;
+		if (interaction.kind === "value") return interaction.value;
+		let settled: Promise<AskSettlementResult> | undefined;
+		return {
+			source: "remote",
+			interaction,
+			settle(settlement) {
+				if (!settled) {
+					settled = Promise.resolve(
+						settlement.kind === "commit"
+							? { kind: "committed", ack: { status: "failed", reason: "unsupported" } }
+							: settlement.kind === "invalid"
+								? { kind: "invalid_closed" }
+								: { kind: "resolved_without_commit" },
+					);
+				}
+				return settled;
+			},
+		};
+	};
+	return {
+		async awaitAnswer(question, options, signal) {
+			const answer = await awaitAnswerRequest({ question, options, interaction: "selector", controls: [] }, signal);
+			if (!answer || typeof answer === "string") return answer;
+			return answer.interaction.kind === "value" ? answer.interaction.value : undefined;
+		},
+		awaitAnswerRequest,
+	};
+}
 /** Register the interactive `ask` answer source for a session (the ask tool
  * races the local UI against a remote reply). Returns the deregister disposer. */
 function registerInteractiveAnswerSource(
@@ -3423,6 +3498,7 @@ export function createNotificationsExtension(
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
+		let disposeUiAnswerSource: (() => void) | undefined;
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
@@ -3446,6 +3522,16 @@ export function createNotificationsExtension(
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
+				return;
+			}
+			if (capability === "ui") {
+				disposeUiAnswerSource?.();
+				disposeUiAnswerSource = registerAskAnswerSource(
+					id,
+					createSdkUiAskAnswerSource(
+						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
+					),
+				);
 				return;
 			}
 			if (capability !== "fs") return;
@@ -3484,6 +3570,10 @@ export function createNotificationsExtension(
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
+			if (capability === "ui") {
+				disposeUiAnswerSource?.();
+				disposeUiAnswerSource = undefined;
+			}
 		};
 
 		const hostCapCache = new Map<string, ReadonlySet<string>>();

@@ -232,13 +232,19 @@ test("ACP reverse dispatch requires exact current lease ownership and rejects in
 test("ACP reverse cancellation remains terminal after its tombstone TTL while the callback is still running", async () => {
 	const sdk = new FakeSdkClient();
 	const callback = Promise.withResolvers<unknown>();
+	let cancellationSignal: AbortSignal | undefined;
 	const adapter = new AcpSdkAdapter({
 		url: "ws://unused",
 		token: "secret",
 		client: sdk as never,
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		reverseCancelTtlMs: 5,
-		connection: { request: async () => await callback.promise },
+		connection: {
+			request: async (_method, _params, options) => {
+				cancellationSignal = options?.cancellationSignal;
+				return await callback.promise;
+			},
+		},
 	});
 	await adapter.start();
 	try {
@@ -251,6 +257,7 @@ test("ACP reverse cancellation remains terminal after its tombstone TTL while th
 			payload: { method: "ui.select", payload: {} },
 		});
 		sdk.emit({ type: "reverse_cancel", id: "slow-cancelled" });
+		expect(cancellationSignal?.aborted).toBe(true);
 		await Bun.sleep(10);
 		callback.resolve({ selected: "yes" });
 		await Bun.sleep(0);

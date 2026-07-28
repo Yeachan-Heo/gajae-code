@@ -1281,9 +1281,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		// attended TUI asks would route to emitGate() and hang forever waiting on
 		// a remote responder.
 		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
-		const canUseWorkflowGate = !hasInteractiveUi && gateEmitter?.supportsRemoteGateAnswers() === true;
-		// Headless fallback: SDK workflow gates are the non-TUI answer path.
-		if (!canUseWorkflowGate && (!context?.hasUI || !context.ui)) {
+		const answerSource = this.session.getAskAnswerSource?.();
+		const canUseWorkflowGate =
+			!hasInteractiveUi && !answerSource && gateEmitter?.supportsRemoteGateAnswers() === true;
+		// Headless fallback: an SDK answer source or workflow gate is the non-TUI answer path.
+		if (!hasInteractiveUi && !answerSource && !canUseWorkflowGate) {
 			context?.abort();
 			throw new ToolAbortError("Ask tool requires interactive mode");
 		}
@@ -1291,9 +1293,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const extensionUi = context?.ui;
 		const ui: UIContext = {
 			select: (prompt, options, dialogOptions) => {
-				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
-				const source = this.session.getAskAnswerSource?.();
-				if (!source) return extensionUi.select(prompt, options, dialogOptions);
+				const source = answerSource;
+				if (!source) {
+					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
+					return extensionUi.select(prompt, options, dialogOptions);
+				}
 				// Race the local UI against a remote answer (e.g. an SDK reply) so asks
 				// can be answered without local UI interaction. The first valid answer
 				// wins; the loser is aborted so neither side is left hanging:
@@ -1378,17 +1382,19 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					.catch(ignoreRemoteAnswerFailure);
 
 				const local = extensionUi
-					.select(prompt, options, { ...dialogOptions, signal: localController.signal })
-					.then(answer => {
-						if (generation === remoteGeneration) remoteGeneration++;
-						remoteController.abort();
-						return { winner: "local" as const, value: answer };
-					})
-					.catch(error => {
-						if (generation === remoteGeneration) remoteGeneration++;
-						remoteController.abort();
-						throw error;
-					});
+					? extensionUi
+							.select(prompt, options, { ...dialogOptions, signal: localController.signal })
+							.then(answer => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								return { winner: "local" as const, value: answer };
+							})
+							.catch(error => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								throw error;
+							})
+					: new Promise<never>(() => {});
 				// The losing selector may reject when aborted after the race already settled;
 				// swallow that so it is not an unhandled rejection (the race result is unaffected).
 				void local.catch(() => undefined);
@@ -1406,9 +1412,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				});
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
-				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
-				const source = this.session.getAskAnswerSource?.();
-				if (!source) return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+				const source = answerSource;
+				if (!source) {
+					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
+					return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+				}
 				// Race the local editor against a remote free-text answer so "Other / type
 				// your own" custom input can be provided remotely (e.g. a typed Telegram
 				// reply) instead of blocking on the local-only editor. Mirrors `select`.
@@ -1452,17 +1460,24 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					})
 					.catch(ignoreRemoteAnswerFailure);
 				const local = extensionUi
-					.editor(title, prefill, { ...(dialogOptions ?? {}), signal: localController.signal }, editorOptions)
-					.then(answer => {
-						if (generation === remoteGeneration) remoteGeneration++;
-						remoteController.abort();
-						return { winner: "local" as const, value: answer };
-					})
-					.catch(error => {
-						if (generation === remoteGeneration) remoteGeneration++;
-						remoteController.abort();
-						throw error;
-					});
+					? extensionUi
+							.editor(
+								title,
+								prefill,
+								{ ...(dialogOptions ?? {}), signal: localController.signal },
+								editorOptions,
+							)
+							.then(answer => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								return { winner: "local" as const, value: answer };
+							})
+							.catch(error => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								throw error;
+							})
+					: new Promise<never>(() => {});
 				void local.catch(() => undefined);
 				return Promise.race([local, remote]).then(result => {
 					if (result.winner === "remote") {

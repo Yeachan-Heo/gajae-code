@@ -61,7 +61,7 @@ import type {
 	ClientBridgePermissionToolCall,
 } from "../src/session/client-bridge";
 import { SessionManager } from "../src/session/session-manager";
-import { getAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SdkPermissionProvider =
@@ -2646,6 +2646,187 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 	expect(await requested).toEqual({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
 	socket.close();
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
+});
+
+test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-ui-provider-${Date.now()}`;
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(context(cwd, sessionId));
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	const frames: Record<string, unknown>[] = [];
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const priorAnswerSource = { awaitAnswer: async () => "fallback" };
+	const disposePriorAnswerSource = registerAskAnswerSource(sessionId, priorAnswerSource);
+	expect(getAskAnswerSource(sessionId)).toBe(priorAnswerSource);
+	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "ui",
+			connectionId,
+			capability: "ui",
+			definitions: [],
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "ui"),
+		"UI provider registration",
+	);
+	const requested = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{ question: "Choose one", options: ["First", "Second"], interaction: "selector", controls: [] },
+		new AbortController().signal,
+	);
+	await waitFor(() => frames.some(frame => frame.type === "reverse_request"), "reverse elicitation request");
+	const request = frames.find(frame => frame.type === "reverse_request")!;
+	expect(request).toMatchObject({
+		payload: {
+			method: "ui.elicit",
+			payload: {
+				mode: "form",
+				message: "Choose one",
+				requestedSchema: {
+					type: "object",
+					properties: {
+						value: {
+							type: "string",
+							oneOf: [
+								{ const: "option:0", title: "First" },
+								{ const: "option:1", title: "Second" },
+							],
+						},
+					},
+					required: ["value"],
+				},
+			},
+		},
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: request.id,
+			connectionId,
+			leaseId: request.leaseId,
+			ok: true,
+			result: { action: "accept", content: { value: "option:1" } },
+		}),
+	);
+	expect(await requested).toBe("Second");
+	const freeText = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{ question: "Explain", options: [], interaction: "custom_editor", controls: [] },
+		new AbortController().signal,
+	);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 2,
+		"reverse free-text elicitation",
+	);
+	const freeTextRequest = frames.filter(frame => frame.type === "reverse_request")[1]!;
+	expect(freeTextRequest).toMatchObject({
+		payload: {
+			method: "ui.elicit",
+			payload: {
+				mode: "form",
+				message: "Explain",
+				requestedSchema: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					required: ["value"],
+				},
+			},
+		},
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: freeTextRequest.id,
+			connectionId,
+			leaseId: freeTextRequest.leaseId,
+			ok: true,
+			result: { action: "accept", content: { value: "Because" } },
+		}),
+	);
+	expect(await freeText).toBe("Because");
+
+	const navigation = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{
+			question: "Continue",
+			options: [],
+			interaction: "selector",
+			controls: [{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: true }],
+		},
+		new AbortController().signal,
+	);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 3,
+		"reverse navigation elicitation",
+	);
+	const navigationRequest = frames.filter(frame => frame.type === "reverse_request")[2]!;
+	expect(navigationRequest).toMatchObject({
+		payload: {
+			payload: {
+				requestedSchema: {
+					properties: {
+						value: {
+							type: "string",
+							oneOf: [{ const: "control:navigation_forward", title: "Done" }],
+						},
+					},
+				},
+			},
+		},
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: navigationRequest.id,
+			connectionId,
+			leaseId: navigationRequest.leaseId,
+			ok: true,
+			result: { action: "accept", content: { value: "control:navigation_forward" } },
+		}),
+	);
+	const navigationReceipt = await navigation;
+	expect(navigationReceipt).toMatchObject({
+		source: "remote",
+		interaction: { kind: "control", controlId: "navigation_forward" },
+	});
+	if (!navigationReceipt || typeof navigationReceipt === "string")
+		throw new Error("Expected a typed navigation receipt.");
+	expect(await navigationReceipt.settle({ kind: "commit" })).toEqual({
+		kind: "committed",
+		ack: { status: "failed", reason: "unsupported" },
+	});
+	const aborted = new AbortController();
+	const cancelled = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{ question: "Cancel me", options: ["Wait"], interaction: "selector", controls: [] },
+		aborted.signal,
+	);
+	const cancelledOutcome = cancelled.catch(error => error);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 4,
+		"abortable reverse elicitation",
+	);
+	const cancelledRequest = frames.filter(frame => frame.type === "reverse_request")[3]!;
+	aborted.abort();
+	await waitFor(
+		() => frames.some(frame => frame.type === "reverse_cancel" && frame.id === cancelledRequest.id),
+		"reverse elicitation cancellation",
+	);
+	expect(await cancelledOutcome).toMatchObject({ message: "request_cancelled" });
+
+	socket.close();
+	await waitFor(() => getAskAnswerSource(sessionId) === priorAnswerSource, "prior UI answer source restoration");
+	disposePriorAnswerSource();
 });
 
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {

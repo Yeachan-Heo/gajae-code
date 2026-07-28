@@ -80,6 +80,30 @@ describe("directed reverse RPC leases", () => {
 		expect(cancelled).toHaveLength(1);
 	});
 
+	test("propagates caller aborts to the reverse provider", async () => {
+		const sent: Array<Record<string, unknown>> = [];
+		const runtime = new ReverseLeaseRuntime({
+			sendFrame: (_connectionId, frame) => {
+				sent.push(frame);
+			},
+		});
+		runtime.registerProvider("owner", "ui", {});
+		const controller = new AbortController();
+		const pending = runtime.request("ui", "ui.elicit", {}, controller.signal);
+		const requestId = String(sent[0]?.id);
+
+		controller.abort();
+
+		await expect(pending).rejects.toMatchObject({ name: "request_cancelled" });
+		expect(sent[1]).toMatchObject({
+			type: "reverse_cancel",
+			id: requestId,
+			connectionId: "owner",
+		});
+		expect(() => runtime.respond("owner", requestId, runtime.getLease("ui")!.leaseId, {})).toThrow("unknown_request");
+		runtime.dispose();
+	});
+
 	test("dispose rejects pending requests and clears reverse lease state", async () => {
 		const sent: Array<Record<string, unknown>> = [];
 		const removed: string[] = [];

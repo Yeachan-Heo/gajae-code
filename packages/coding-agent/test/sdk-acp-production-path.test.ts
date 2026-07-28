@@ -971,35 +971,42 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(liveAttachRequests.filter(request => request.operation === "session.get_endpoint")).toEqual([
 		expect.objectContaining({ input: { sessionId: created.sessionId, endpointGeneration: 1 } }),
 	]);
-	expect(providerRegistrations).toHaveLength(registrationsBeforeLiveAttach + 2);
-	const requestsBeforeImmutableMcp = brokerRequests.length;
-	await expect(
+	expect(providerRegistrations).toHaveLength(registrationsBeforeLiveAttach + 1);
+	const requestsBeforeRepeatedMcp = brokerRequests.length;
+	await bounded(
 		loader.resumeSession({
 			sessionId: created.sessionId,
 			cwd,
 			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: [], env: [] }],
 		}),
-	).rejects.toMatchObject({ code: "conflict" });
-	expect(brokerRequests).toHaveLength(requestsBeforeImmutableMcp);
+		"attached session MCP replay",
+	);
+	expect(brokerRequests).toHaveLength(requestsBeforeRepeatedMcp);
 
 	const liveMcpAbort = new AbortController();
 	const liveMcpLoader = new AcpAgent(
 		{
+			sessionUpdate: async () => {},
 			signal: liveMcpAbort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
 		{ agentDir },
 	);
 	const requestsBeforeLiveMcp = brokerRequests.length;
-	await expect(
+	await bounded(
 		liveMcpLoader.loadSession({
 			sessionId: created.sessionId,
 			cwd,
 			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: [], env: [] }],
 		}),
-	).rejects.toMatchObject({ code: "conflict" });
+		"live session MCP replay",
+	);
 	expect(brokerRequests.slice(requestsBeforeLiveMcp)).toEqual([
 		expect.objectContaining({ operation: "session.list", input: { cwd } }),
+		expect.objectContaining({
+			operation: "session.get_endpoint",
+			input: { sessionId: created.sessionId, endpointGeneration: 1 },
+		}),
 	]);
 	liveMcpAbort.abort();
 	const firstGenerationCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;

@@ -14,6 +14,7 @@ const BROKER_OPERATIONS = new Set([
 	"session.resume",
 	"session.close",
 	"session.delete",
+	"broker.shutdown",
 ]);
 type RequestInput = Record<string, unknown>;
 type BrokerRequest = {
@@ -113,6 +114,11 @@ export class BrokerTransport {
 		}
 		if (frame.idempotencyKey !== undefined && typeof frame.idempotencyKey !== "string") {
 			sendError(socket, frame.id, "invalid_input", "idempotencyKey must be a string");
+			return;
+		}
+		if (frame.operation === "broker.shutdown") {
+			send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } });
+			setTimeout(() => void this.#broker.stop(), 0);
 			return;
 		}
 		try {
