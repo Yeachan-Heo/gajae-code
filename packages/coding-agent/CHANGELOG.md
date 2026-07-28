@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Eager Todo initialization now instructs the real `ops`/`init.list` payload shape and verifies the canonical example through the production validator and tool.
 
 ### Fixed
 

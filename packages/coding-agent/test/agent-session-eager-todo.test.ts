@@ -24,6 +24,11 @@ type ObservedPromptCall = {
 	lastMessageRole: AgentMessage["role"];
 	lastMessageText: string;
 };
+function extractFencedJson(text: string): unknown {
+	const match = text.match(/```json\n([\s\S]+?)\n```/u);
+	if (!match?.[1]) throw new Error("Expected a fenced JSON payload");
+	return JSON.parse(match[1]) as unknown;
+}
 
 function isTextContentBlock(value: unknown): value is TextContent {
 	if (!value || typeof value !== "object") return false;
@@ -97,6 +102,7 @@ describe("AgentSession eager todo enforcement", () => {
 	let authStorage: AuthStorage | undefined;
 	const observedCalls: ObservedPromptCall[] = [];
 	const volatilePromptContexts: AgentMessage[][] = [];
+	let todoWriteTool: TodoWriteTool;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-agent-session-eager-todo-");
@@ -127,7 +133,7 @@ describe("AgentSession eager todo enforcement", () => {
 			getSessionSpawns: () => "*",
 			settings,
 		};
-		const todoWriteTool = new TodoWriteTool(toolSession);
+		todoWriteTool = new TodoWriteTool(toolSession);
 		const mockBashTool: AgentTool = {
 			name: "bash",
 			label: "Bash",
@@ -213,6 +219,30 @@ describe("AgentSession eager todo enforcement", () => {
 		expect(observedCalls[0]?.messageTexts.filter(text => text.includes("list all work trees"))).toHaveLength(1);
 		expect(observedCalls[0]?.messageTexts[0]).not.toContain("list all work trees");
 		expect(session.formatSessionAsText()).not.toContain("<user-request>");
+	});
+	it("documents an executable canonical eager todo payload", async () => {
+		await session.prompt("refactor the parser module");
+
+		const reminder = observedCalls[0]?.messageTexts[0];
+		if (!reminder) throw new Error("Expected eager todo reminder");
+
+		const args = extractFencedJson(reminder);
+		const parsed = todoWriteTool.parameters.safeParse(args);
+		expect(parsed.success).toBe(true);
+		if (!parsed.success) throw new Error("Expected canonical eager todo payload to validate");
+
+		const result = await todoWriteTool.execute("canonical-eager-todo", parsed.data);
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.phases.flatMap(phase => phase.tasks).map(task => task.status)).toEqual([
+			"in_progress",
+			"pending",
+			"pending",
+		]);
+
+		expect(reminder).not.toContain('"details"');
+		expect(reminder).not.toContain('"status"');
+		expect(reminder).not.toContain('"todos"');
+		expect(reminder).not.toMatch(/^\s*\{"op"/mu);
 	});
 
 	it("sends eager todo reminder without toolChoice when named forcing degrades", async () => {
