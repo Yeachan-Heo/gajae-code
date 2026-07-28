@@ -150,7 +150,7 @@ HOTSPOT_STATUSES = (
 )
 PROFILERS = ("bun", "node", "clinic", "instruments", "perf", "other", "none")
 PARITY_VERDICTS = ("pass", "fail", "not-run")
-EXPECTED_PREREGISTRATION_POLICY_SHA256 = "49a4c6a575e0bf5829c90fc4646c8a3b2430bb5d1b7f6cdc5019266eca4b1acf"
+EXPECTED_PREREGISTRATION_POLICY_SHA256 = "a908bba0c9ab8bbb1ad38185d909249d0ce71f4ba90ecb71c0dff068bbbec705"
 
 
 class EvidenceError(Exception):
@@ -1063,6 +1063,14 @@ def _validate_preregistration(value: Any) -> dict[str, Any]:
         or "immutable read-only mount" not in str(trusted_policy.get("inputDirectory", ""))
     ):
         raise EvidenceError("preregistration trusted-code policy drift")
+    sealed_contract = _expect_dict(prereg.get("sealedInputContract"), "preregistration.sealedInputContract")
+    if (
+        sealed_contract.get("loadAverage1mDriftScope")
+        != "Compare telemetryBefore.loadAverage1m across attempts against the first attempt telemetryBefore value only. telemetryAfter does not participate in ambient drift but remains required, absolutely bounded, and diagnostic."
+        or sealed_contract.get("freeMemoryFractionDriftScope")
+        != "Compare every telemetryBefore.freeMemoryBytes and telemetryAfter.freeMemoryBytes value against the first attempt telemetryBefore value."
+    ):
+        raise EvidenceError("preregistration telemetry drift scope drift")
     bounds = _expect_dict(prereg.get("bounds"), "preregistration.bounds")
     expected_bounds = {
         "maximumInputFiles": 39,
@@ -1452,6 +1460,14 @@ def _sufficient_result(
             "platformDrift": [],
             "validatedBlockOrder": [report["blockId"] for report in reports],
             "validatedAttemptOrder": [report["attemptId"] for report in reports],
+            "attemptTelemetry": [
+                {
+                    "attemptId": report["attemptId"],
+                    "telemetryBefore": report["captureTelemetry"]["telemetryBefore"],
+                    "telemetryAfter": report["captureTelemetry"]["telemetryAfter"],
+                }
+                for report in reports
+            ],
             "driftOrderTimeTelemetrySensitivities": drift,
         },
         "descriptiveByProfileAndSurface": descriptive,
@@ -1766,7 +1782,7 @@ def _validate_sealed_inputs(
     }
     previous_schedule_index = -1
     previous_end = 0.0
-    first_load: float | None = None
+    first_before_load: float | None = None
     first_free_memory: int | None = None
     validated_attempts: list[dict[str, Any]] = []
     filenames: set[str] = set()
@@ -1825,18 +1841,17 @@ def _validate_sealed_inputs(
             if attempt.get(field) != host[field]:
                 raise EvidenceError(f"{label}.{field} fixed host/power state drift")
         before_load, before_free = validate_telemetry(attempt.get("telemetryBefore"), f"{label}.telemetryBefore", started, ended)
-        after_load, after_free = validate_telemetry(attempt.get("telemetryAfter"), f"{label}.telemetryAfter", started, ended)
-        for load, free_memory in ((before_load, before_free), (after_load, after_free)):
-            if first_load is None:
-                first_load = load
-                first_free_memory = free_memory
-            else:
-                if abs(load - first_load) > contract["maximumLoadAverage1mDrift"]:
-                    raise EvidenceError(f"{label}.loadAverage1m telemetry drift")
-                if first_free_memory is None:
-                    raise EvidenceError("attempt ledger free-memory reference is missing")
-                if abs(free_memory - first_free_memory) / first_free_memory > contract["maximumFreeMemoryFractionDrift"]:
-                    raise EvidenceError(f"{label}.freeMemoryBytes telemetry drift")
+        _, after_free = validate_telemetry(attempt.get("telemetryAfter"), f"{label}.telemetryAfter", started, ended)
+        if first_before_load is None:
+            first_before_load = before_load
+            first_free_memory = before_free
+        elif abs(before_load - first_before_load) > contract["maximumLoadAverage1mDrift"]:
+            raise EvidenceError(f"{label}.telemetryBefore.loadAverage1m ambient drift")
+        if first_free_memory is None:
+            raise EvidenceError("attempt ledger free-memory reference is missing")
+        for free_memory in (before_free, after_free):
+            if abs(free_memory - first_free_memory) / first_free_memory > contract["maximumFreeMemoryFractionDrift"]:
+                raise EvidenceError(f"{label}.freeMemoryBytes telemetry drift")
         if attempt.get("interrupted") is not False:
             raise EvidenceError(f"{label}.interrupted must be false")
         if attempt.get("parentClosed") is not True or attempt.get("childrenClosed") is not True:

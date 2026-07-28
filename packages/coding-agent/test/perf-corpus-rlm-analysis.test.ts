@@ -211,6 +211,11 @@ interface ValidationResult {
 	};
 	diagnostics: {
 		validationErrors: ValidationError[];
+		attemptTelemetry?: Array<{
+			attemptId: string;
+			telemetryBefore: JsonObject;
+			telemetryAfter: JsonObject;
+		}>;
 		driftOrderTimeTelemetrySensitivities?: Record<string, JsonValue>;
 		validatedAttemptOrder?: string[];
 	};
@@ -1135,19 +1140,73 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			expect(validationCodes(await readResult(output))).toContain("SEALED_INPUT_INVALID");
 		}
 	});
+	test("uses only cross-attempt telemetryBefore load for ambient drift while retaining telemetryAfter controls", async () => {
+		const ambientDriftInput = path.join(temporaryRoot, "ambient-load-drift-input");
+		const ambientDriftOutput = path.join(temporaryRoot, "ambient-load-drift-output");
+		await writeCorpus(ambientDriftInput);
+		await mutateLedger(ambientDriftInput, ledger => {
+			const attempt = (ledger.attempts as JsonObject[])[1]!;
+			((attempt.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 2.01;
+		});
+		expect(invoke(ambientDriftInput, ambientDriftOutput).exitCode).toBe(3);
+		expect((await readResult(ambientDriftOutput)).diagnostics.validationErrors).toContainEqual(
+			expect.objectContaining({
+				code: "SEALED_INPUT_INVALID",
+				message: expect.stringContaining("telemetryBefore.loadAverage1m ambient drift"),
+			}),
+		);
 
-	test("rejects host, power, telemetry, interruption, and process-closure drift", async () => {
+		const absoluteAfterInput = path.join(temporaryRoot, "absolute-after-load-input");
+		const absoluteAfterOutput = path.join(temporaryRoot, "absolute-after-load-output");
+		await writeCorpus(absoluteAfterInput);
+		await mutateLedger(absoluteAfterInput, ledger => {
+			const attempt = (ledger.attempts as JsonObject[])[0]!;
+			((attempt.telemetryAfter as JsonObject).loadAverage1m as JsonObject).value = 4.01;
+		});
+		expect(invoke(absoluteAfterInput, absoluteAfterOutput).exitCode).toBe(3);
+		expect((await readResult(absoluteAfterOutput)).diagnostics.validationErrors).toContainEqual(
+			expect.objectContaining({
+				code: "SEALED_INPUT_INVALID",
+				message: expect.stringContaining("telemetryAfter.loadAverage1m exceeds bound"),
+			}),
+		);
+
+		const afterFreeMemoryDriftInput = path.join(temporaryRoot, "after-free-memory-drift-input");
+		const afterFreeMemoryDriftOutput = path.join(temporaryRoot, "after-free-memory-drift-output");
+		await writeCorpus(afterFreeMemoryDriftInput);
+		await mutateLedger(afterFreeMemoryDriftInput, ledger => {
+			const attempt = (ledger.attempts as JsonObject[])[0]!;
+			((attempt.telemetryAfter as JsonObject).freeMemoryBytes as JsonObject).value = 8 * 1024 * 1024 * 1024;
+		});
+		expect(invoke(afterFreeMemoryDriftInput, afterFreeMemoryDriftOutput).exitCode).toBe(3);
+		expect((await readResult(afterFreeMemoryDriftOutput)).diagnostics.validationErrors).toContainEqual(
+			expect.objectContaining({
+				code: "SEALED_INPUT_INVALID",
+				message: expect.stringContaining("freeMemoryBytes telemetry drift"),
+			}),
+		);
+
+		const withinAttemptRiseInput = path.join(temporaryRoot, "within-attempt-load-rise-input");
+		const withinAttemptRiseOutput = path.join(temporaryRoot, "within-attempt-load-rise-output");
+		await writeCorpus(withinAttemptRiseInput);
+		await mutateLedger(withinAttemptRiseInput, ledger => {
+			const attempt = (ledger.attempts as JsonObject[])[0]!;
+			((attempt.telemetryBefore as JsonObject).loadAverage1m as JsonObject).value = 1.54;
+			((attempt.telemetryAfter as JsonObject).loadAverage1m as JsonObject).value = 2.71;
+		});
+		expect(invoke(withinAttemptRiseInput, withinAttemptRiseOutput).exitCode).toBe(0);
+		const withinAttemptRiseResult = await readResult(withinAttemptRiseOutput);
+		expect(withinAttemptRiseResult.evidenceStatus).toBe("SUFFICIENT_EVIDENCE");
+		expect(withinAttemptRiseResult.diagnostics.attemptTelemetry?.[0]).toMatchObject({
+			telemetryBefore: { loadAverage1m: { availability: "supported", value: 1.54 } },
+			telemetryAfter: { loadAverage1m: { availability: "supported", value: 2.71 } },
+		});
+	});
+
+	test("rejects host, power, thermal, interruption, and process-closure drift", async () => {
 		for (const [name, mutate] of [
 			["host", (ledger: JsonObject) => ((ledger.host as JsonObject).hostId = "2".repeat(64))],
 			["power", (ledger: JsonObject) => ((ledger.host as JsonObject).powerSource = "battery")],
-			[
-				"telemetry",
-				(ledger: JsonObject) => {
-					const attempt = (ledger.attempts as JsonObject[])[1]!;
-					const before = attempt.telemetryBefore as JsonObject;
-					(before.loadAverage1m as JsonObject).value = 3;
-				},
-			],
 			[
 				"thermal-critical",
 				(ledger: JsonObject) => {
