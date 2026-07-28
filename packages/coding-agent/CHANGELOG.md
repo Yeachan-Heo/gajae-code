@@ -22,6 +22,7 @@
 - Deterministic tests for session_switch await policy (selector defer vs default/branch await), control-drain ordering, host pre-response readiness gating, and resume progress lease-before-switch behavior (#2914).
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - `/model`, `/login`, and `/provider` now order providers through one shared ranking: providers you already have (valid auth, in-flight validation, or a configured non-OAuth provider) come first, then providers whose stored credentials failed validation, then a curated list of well-known providers with regional and device variants grouped behind their primary, then everything else by display name. In `/model` rows, role/default rank and recent usage still take precedence over provider order (#3243).
+- Ralplan now bounds architect and critic re-review lanes independently through `gjc.ralplan.maxReviewPassesPerLane` (integer 1–10; default 1). Per-lane budget exhaustion emits a lane-specific `PLANNING-STUCK` exit 3, fails closed against on-disk artifact floors, and repairs crash-gap retries. Architect and critic `gjc ralplan --write` calls can optionally pass `--lane-verdict`, which drives HUD lane pass counts and the latest verdict; critic/architect prompts and the ralplan SKILL workflow now ratchet re-reviews through persisted receipts.
 
 ## [0.11.11] - 2026-07-26
 

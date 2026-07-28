@@ -2147,6 +2147,50 @@ describe("ralplan HUD lane verdict carriage", () => {
 		expect(state).toMatchObject({ last_review_verdict: "BLOCK", verdict: "ITERATE" });
 		expect((await readRalplanHudChips(root)).find(chip => chip.label === "verdict")?.value).toBe("BLOCK");
 	});
+	it("keeps a lane verdict visible after artifact-then-state write order", async () => {
+		const root = await tempDir();
+		const runId = "state-after-artifact";
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		expect((await writeRalplanLaneVerdictArtifact(root, runId, "critic", 2, "# critique", "ITERATE")).status).toBe(0);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "after-artifact" })],
+					root,
+				)
+			).status,
+		).toBe(0);
+		expect((await readRalplanHudChips(root)).find(chip => chip.label === "verdict")?.value).toBe("ITERATE");
+	});
+
+	it("prefers a run-scoped lane verdict over a stale legacy ralplan verdict", async () => {
+		const root = await tempDir();
+		const runId = "state-lane-precedence";
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", JSON.stringify({ verdict: "ITERATE" })],
+					root,
+				)
+			).status,
+		).toBe(0);
+		expect((await writeRalplanLaneVerdictArtifact(root, runId, "critic", 2, "# critique", "OKAY")).status).toBe(0);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "verdict-less" })],
+					root,
+				)
+			).status,
+		).toBe(0);
+
+		const state = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
+		expect(state).toMatchObject({ verdict: "ITERATE", last_review_verdict: "OKAY" });
+		const verdict = (await readRalplanHudChips(root)).find(chip => chip.label === "verdict");
+		expect(verdict?.value).toBe("OKAY");
+		expect(verdict?.severity).toBe("success");
+	});
 
 	it("uses the resolved per-lane budget as the review-pass denominator", async () => {
 		const root = await tempDir();
