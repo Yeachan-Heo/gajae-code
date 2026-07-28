@@ -3063,6 +3063,41 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								}
 							}
 						}
+						if (!partialTailWarning) {
+							const conflictBlocks = windowSegments(window).flatMap(segment =>
+								segment.kind === "lines"
+									? scanConflictLines(linesOfSegment(segment), segment.origin.startLine)
+									: [],
+							);
+							if (conflictBlocks.length > 0) {
+								const history = getConflictHistory(this.session);
+								const displayPathForWarning = formatPathRelativeToCwd(absolutePath, this.session.cwd);
+								const entries = conflictBlocks.map(block =>
+									history.register({
+										absolutePath,
+										displayPath: displayPathForWarning,
+										...block,
+									}),
+								);
+								// Cheap full-file scan only when the window already showed
+								// at least one conflict — otherwise pay nothing on clean files.
+								let totalInFile = entries.length;
+								let scanTruncated = false;
+								try {
+									const fileScan = await scanFileForConflicts(absolutePath);
+									totalInFile = Math.max(entries.length, fileScan.blocks.length);
+									scanTruncated = fileScan.scanTruncated;
+								} catch {
+									// Best-effort enrichment; fall back to window-only count.
+								}
+								outputText += formatConflictWarning(entries, {
+									totalInFile,
+									displayPath: displayPathForWarning,
+									scanTruncated,
+								});
+								details.conflictCount = entries.length;
+							}
+						}
 						sourcePath = absolutePath;
 						content = [{ type: "text", text: outputText }];
 					} else {
