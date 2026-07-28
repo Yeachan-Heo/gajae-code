@@ -29,6 +29,7 @@
 - Interactive TUI `/resume` commits a status-container progress lease before inspect/migration/switch work and clears it on every exit path, with generation-scoped render-commit wait that fails open when the terminal is stopped or unavailable (#2914).
 - Interactive `/resume` progress lease fails open when `statusContainer` or UI lacks child-mutation/render-commit surface, preserving headless/minimal controller contexts without weakening full TUI progress-before-switch (#3234 post-merge).
 - The documented `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` environment variable now overrides the OpenAI-code web-search model; it is resolved GJC-first ahead of the legacy `PI_CODEX_WEB_SEARCH_MODEL` name (previously only the legacy name was read, so the documented name was a silent no-op).
+- Telegram `/session_create` and cold resume no longer route macOS or other non-Linux hosts through the Linux-only managed-owner supervisor. Non-Linux launches now bind success and cleanup to the exact tmux server, native session, and live pane process identities, scrub inherited managed-owner authority, and reject children that die during launch stabilization; Linux keeps its existing owner-isolation transaction.
 
 ### Added
 

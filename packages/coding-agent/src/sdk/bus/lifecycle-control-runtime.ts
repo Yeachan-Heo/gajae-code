@@ -21,6 +21,8 @@ import {
 	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
 } from "../../gjc-runtime/managed-owner-admission";
 import {
+	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	MANAGED_OWNER_COMMAND_ENV,
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
@@ -56,6 +58,7 @@ import {
 	type GjcTmuxSessionStatus,
 	listGjcTmuxSessions,
 } from "../../gjc-runtime/tmux-sessions";
+import { processIncarnation } from "../broker/process-incarnation";
 import type {
 	LifecycleErrorReason,
 	ResumeCandidate,
@@ -76,6 +79,29 @@ import {
 	type ResumeEffectResult,
 } from "./lifecycle-orchestrator";
 import { listRecentSessions } from "./recent-activity";
+
+const directLifecycleManagedOwnerEnvUnsets = [
+	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+	GJC_TMUX_OWNER_SERVER_KEY_ENV,
+	MANAGED_OWNER_COMMAND_ENV,
+	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
+	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
+	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
+	MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
+	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+] as const;
+const directLifecycleStabilizationMs = 250;
+
+function directLifecycleEnvArguments(env: Record<string, string>): string {
+	return [
+		...directLifecycleManagedOwnerEnvUnsets.flatMap(name => ["-u", shellQuote(name)]),
+		...Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`),
+	].join(" ");
+}
 
 type NativeControlServerConstructor = new (
 	token: string,
@@ -857,74 +883,343 @@ async function completeLifecycleSpawnTransaction(input: {
 		throw error;
 	}
 }
+function directTmuxReceipt(
+	stdout: string,
+	sessionName: string,
+): { nativeSessionId: string; sessionName: string } | undefined {
+	const line = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+	const [nativeSessionId, receivedName, ...rest] = line.split("\t");
+	return rest.length === 0 && /^\$\d+$/.test(nativeSessionId) && receivedName === sessionName
+		? { nativeSessionId, sessionName: receivedName }
+		: undefined;
+}
+
+type DirectTmuxBinding =
+	| { state: "bound"; serverPid: number; panePid: number; paneDead: boolean; paneDeadStatus: string }
+	| { state: "absent" }
+	| { state: "unverifiable" };
+
+function isKnownNoSessionDiagnostic(stderr: string): boolean {
+	const diagnostic = stderr.trim().toLowerCase();
+	return (
+		diagnostic.length > 0 &&
+		diagnostic.length <= 512 &&
+		/no server running|can't find session|no such session|unknown session/.test(diagnostic)
+	);
+}
+
+function directTmuxBinding(
+	tmux: string,
+	env: NodeJS.ProcessEnv,
+	cwd: string,
+	nativeSessionId: string,
+	sessionName: string,
+): DirectTmuxBinding {
+	const result = Bun.spawnSync(
+		[
+			tmux,
+			"display-message",
+			"-p",
+			"-t",
+			nativeSessionId,
+			"#{pid}\t#{session_id}\t#{session_name}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}",
+		],
+		{ stdout: "pipe", stderr: "pipe", env, cwd },
+	);
+	if (result.exitCode !== 0)
+		return isKnownNoSessionDiagnostic(result.stderr.toString()) ? { state: "absent" } : { state: "unverifiable" };
+	const output = result.stdout.toString();
+	const line = output.endsWith("\n") ? output.slice(0, -1) : output;
+	const [pid, receivedId, receivedName, panePid, paneDead, paneDeadStatus, ...rest] = line.split("\t");
+	return rest.length === 0 &&
+		/^\d+$/.test(pid) &&
+		Number(pid) > 0 &&
+		receivedId === nativeSessionId &&
+		receivedName === sessionName &&
+		/^\d+$/.test(panePid) &&
+		Number(panePid) > 0 &&
+		(paneDead === "0" || paneDead === "1")
+		? {
+				state: "bound",
+				serverPid: Number(pid),
+				panePid: Number(panePid),
+				paneDead: paneDead === "1",
+				paneDeadStatus,
+			}
+		: { state: "unverifiable" };
+}
+
+function directTmuxIdentityIsCurrent(input: {
+	tmux: string;
+	env: NodeJS.ProcessEnv;
+	cwd: string;
+	nativeSessionId: string;
+	sessionName: string;
+	serverPid: number;
+	serverIncarnation: string;
+	readProcessIncarnation: (pid: number) => string | undefined;
+}): boolean {
+	const binding = directTmuxBinding(input.tmux, input.env, input.cwd, input.nativeSessionId, input.sessionName);
+	return (
+		binding.state === "bound" &&
+		binding.serverPid === input.serverPid &&
+		input.readProcessIncarnation(input.serverPid) === input.serverIncarnation
+	);
+}
+function directTmuxPaneLivenessIsCurrent(input: {
+	tmux: string;
+	env: NodeJS.ProcessEnv;
+	cwd: string;
+	nativeSessionId: string;
+	sessionName: string;
+	serverPid: number;
+	serverIncarnation: string;
+	panePid: number;
+	paneIncarnation: string;
+	readProcessIncarnation: (pid: number) => string | undefined;
+}): boolean {
+	const binding = directTmuxBinding(input.tmux, input.env, input.cwd, input.nativeSessionId, input.sessionName);
+	return (
+		binding.state === "bound" &&
+		binding.serverPid === input.serverPid &&
+		input.readProcessIncarnation(input.serverPid) === input.serverIncarnation &&
+		!binding.paneDead &&
+		binding.panePid === input.panePid &&
+		input.readProcessIncarnation(input.panePid) === input.paneIncarnation
+	);
+}
+
+function directTmuxGuardedMutation(input: {
+	tmux: string;
+	env: NodeJS.ProcessEnv;
+	cwd: string;
+	nativeSessionId: string;
+	sessionName: string;
+	serverPid: number;
+	serverIncarnation: string;
+	readProcessIncarnation: (pid: number) => string | undefined;
+	commands: string;
+	success: string;
+}): boolean {
+	if (!directTmuxIdentityIsCurrent(input)) return false;
+	const result = Bun.spawnSync(
+		[
+			input.tmux,
+			"if-shell",
+			"-t",
+			input.nativeSessionId,
+			"-F",
+			lifecycleMetadataPredicate(input.serverPid, input.nativeSessionId, input.sessionName),
+			`${input.commands} ; display-message -p ${input.success}`,
+			"display-message -p __gjc_lifecycle_metadata_refused__",
+		],
+		{ stdout: "pipe", stderr: "pipe", env: input.env, cwd: input.cwd },
+	);
+	return result.exitCode === 0 && result.stdout.toString().trim() === input.success;
+}
+
+function cleanupDirectLifecycleAttempt(input: {
+	tmux: string;
+	env: NodeJS.ProcessEnv;
+	cwd: string;
+	nativeSessionId: string;
+	sessionName: string;
+	serverPid: number;
+	serverIncarnation: string;
+	readProcessIncarnation: (pid: number) => string | undefined;
+}): void {
+	if (
+		!directTmuxGuardedMutation({
+			...input,
+			commands: `kill-session -t '${input.nativeSessionId}'`,
+			success: "__gjc_lifecycle_cleanup_ok__",
+		})
+	)
+		throw cleanupUncertain();
+	if (directTmuxBinding(input.tmux, input.env, input.cwd, input.nativeSessionId, input.sessionName).state !== "absent")
+		throw cleanupUncertain();
+}
+
+async function completeNonLinuxLifecycleSpawn(input: {
+	tmux: string;
+	env: NodeJS.ProcessEnv;
+	sessionId: string;
+	cwd: string;
+	sessionName: string;
+	sessionStateFile: string;
+	command: string;
+	readProcessIncarnation: (pid: number) => string | undefined;
+}): Promise<void> {
+	let attempt:
+		| {
+				nativeSessionId: string;
+				sessionName: string;
+				serverPid: number;
+				serverIncarnation: string;
+				panePid?: number;
+				paneIncarnation?: string;
+		  }
+		| undefined;
+	let primaryError: unknown;
+	try {
+		const created = Bun.spawnSync(
+			[
+				input.tmux,
+				"new-session",
+				"-d",
+				"-P",
+				"-F",
+				"#{session_id}\t#{session_name}",
+				"-s",
+				input.sessionName,
+				"sh",
+				"-c",
+				input.command,
+			],
+			{ stdout: "pipe", stderr: "pipe", env: input.env, cwd: input.cwd },
+		);
+		const receipt = directTmuxReceipt(created.stdout.toString(), input.sessionName);
+		if (!receipt) throw new Error("gjc_lifecycle_tmux_launch_failed");
+		const binding = directTmuxBinding(input.tmux, input.env, input.cwd, receipt.nativeSessionId, receipt.sessionName);
+		const serverIncarnation = binding.state === "bound" && input.readProcessIncarnation(binding.serverPid);
+		const paneIncarnation =
+			binding.state === "bound" && !binding.paneDead && input.readProcessIncarnation(binding.panePid);
+		if (binding.state !== "bound" || !serverIncarnation) throw new Error("gjc_lifecycle_tmux_launch_failed");
+		attempt = { ...receipt, serverPid: binding.serverPid, serverIncarnation };
+		if (!binding.paneDead && paneIncarnation) {
+			attempt.panePid = binding.panePid;
+			attempt.paneIncarnation = paneIncarnation;
+		}
+		if (created.exitCode !== 0 || !directTmuxIdentityIsCurrent({ ...input, ...attempt }))
+			throw new Error("gjc_lifecycle_tmux_launch_failed");
+		const commands = buildGjcTmuxProfileCommands(attempt.nativeSessionId, input.env, {
+			sessionId: input.sessionId,
+			sessionStateFile: input.sessionStateFile,
+			project: input.cwd,
+		})
+			.map(command => command.args.map(tmuxCommandArgument).join(" "))
+			.join(" ; ");
+		if (
+			!directTmuxGuardedMutation({ ...input, ...attempt, commands, success: "__gjc_lifecycle_metadata_ok__" }) ||
+			!directTmuxIdentityIsCurrent({ ...input, ...attempt })
+		)
+			throw new Error("gjc_lifecycle_metadata_write_failed");
+		await Bun.sleep(directLifecycleStabilizationMs);
+		if (
+			attempt.panePid === undefined ||
+			attempt.paneIncarnation === undefined ||
+			!directTmuxPaneLivenessIsCurrent({
+				...input,
+				...attempt,
+				panePid: attempt.panePid,
+				paneIncarnation: attempt.paneIncarnation,
+			})
+		)
+			throw new Error("gjc_lifecycle_tmux_launch_liveness_failed");
+	} catch (error) {
+		primaryError = error;
+	}
+	if (primaryError === undefined) return;
+	let cleanupFailure: unknown;
+	if (attempt) {
+		try {
+			cleanupDirectLifecycleAttempt({ ...input, ...attempt });
+		} catch (error) {
+			cleanupFailure = error;
+		}
+	} else cleanupFailure = cleanupUncertain();
+	if (cleanupFailure !== undefined)
+		throw new AggregateError([primaryError, cleanupFailure], "gjc_lifecycle_cleanup_uncertain");
+	throw primaryError;
+}
 /** Real daemon-safe tmux launcher: canonical owner-isolation plan + GJC tags. */
 export function daemonSpawnCreate(
 	env: NodeJS.ProcessEnv = process.env,
-	opts: { ownerIsolationProbe?: OwnerIsolationProbe } = {},
+	opts: {
+		ownerIsolationProbe?: OwnerIsolationProbe;
+		platform?: NodeJS.Platform;
+		processIncarnation?: (pid: number) => string | undefined;
+	} = {},
 ) {
 	return async (
 		frame: SessionCreateFrame,
 		ids: { lifecycleRequestId: string; intendedSessionId: string; startupPromptRef?: string },
 	): Promise<CreateEffectResult> => {
-		const tmuxBinary = resolveGjcTmuxBinary({ env });
+		const tmuxBinary = resolveGjcTmuxBinary({ env, platform: opts.platform });
 		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
 		const tmux = tmuxBinary.command;
 		const name = tmuxSessionNameFor(ids.intendedSessionId);
 		const { cwd, args } = buildCreateArgv(frame, ids);
 		const sessionStateFile = lifecycleRuntimeStateFile(cwd, ids.intendedSessionId, name);
-		const stateDir = path.dirname(sessionStateFile);
-		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
-		const predecessor = resolveManagedOwnerPredecessorSync(stateDir, ids.intendedSessionId, previousBaseline);
-		const generation = crypto.randomUUID();
-		const runId = crypto.randomUUID();
-		const incarnation = crypto.randomUUID();
-		// Detached: no interactive TTY needed (daemon-safe). These values contain
-		// only opaque ids and paths needed by the resident sidecar to publish its
-		// exact-owner terminal verdict.
-		const childEnv: Record<string, string> = {
+		const commonChildEnv: Record<string, string> = {
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_NOTIFICATIONS: "1",
 			GJC_SESSION_ID: ids.intendedSessionId,
 			GJC_LIFECYCLE_REQUEST_ID: ids.lifecycleRequestId,
 			[GJC_COORDINATOR_SESSION_ID_ENV]: ids.intendedSessionId,
 			[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
-			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
-			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
-			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", ...args]),
-			[MANAGED_OWNER_RUN_ID_ENV]: runId,
-			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
-			...(predecessor
-				? {
-						[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
-						[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
-						[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
-						[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
-						[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
-					}
-				: {}),
 		};
-		if (ids.startupPromptRef) childEnv.GJC_STARTUP_PROMPT_REF = ids.startupPromptRef;
-		const envPairs = Object.entries(childEnv)
-			.map(([key, value]) => `${key}=${shellQuote(value)}`)
-			.join(" ");
-		const command = `cd ${shellQuote(cwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
-		await completeLifecycleSpawnTransaction({
-			tmux,
-			env,
-			sessionId: ids.intendedSessionId,
-			generation,
-			stateDir,
-			cwd,
-			sessionName: name,
-			sessionStateFile,
-			argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
-			ownerIsolationProbe: opts.ownerIsolationProbe,
-			prepareSpawn: () => {
-				if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
-			},
-			previousBaseline,
-		});
+		if (ids.startupPromptRef) commonChildEnv.GJC_STARTUP_PROMPT_REF = ids.startupPromptRef;
+		if ((opts.platform ?? process.platform) === "linux") {
+			const stateDir = path.dirname(sessionStateFile);
+			const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
+			const predecessor = resolveManagedOwnerPredecessorSync(stateDir, ids.intendedSessionId, previousBaseline);
+			const generation = crypto.randomUUID();
+			const runId = crypto.randomUUID();
+			const incarnation = crypto.randomUUID();
+			const managedChildEnv: Record<string, string> = {
+				...commonChildEnv,
+				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
+				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
+				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
+				[MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(["gjc", ...args]),
+				[MANAGED_OWNER_RUN_ID_ENV]: runId,
+				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+				...(predecessor
+					? {
+							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
+							[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
+							[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
+							[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
+							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
+						}
+					: {}),
+			};
+			const managedEnvPairs = Object.entries(managedChildEnv)
+				.map(([key, value]) => `${key}=${shellQuote(value)}`)
+				.join(" ");
+			const command = `cd ${shellQuote(cwd)} && exec env ${managedEnvPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+			await completeLifecycleSpawnTransaction({
+				tmux,
+				env,
+				sessionId: ids.intendedSessionId,
+				generation,
+				stateDir,
+				cwd,
+				sessionName: name,
+				sessionStateFile,
+				argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
+				ownerIsolationProbe: opts.ownerIsolationProbe,
+				prepareSpawn: () => {
+					if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
+				},
+				previousBaseline,
+			});
+		} else {
+			if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
+			const directEnvPairs = directLifecycleEnvArguments(commonChildEnv);
+			const directCommand = `cd ${shellQuote(cwd)} && exec env ${directEnvPairs} gjc ${args.map(shellQuote).join(" ")}`;
+			await completeNonLinuxLifecycleSpawn({
+				tmux,
+				env,
+				sessionId: ids.intendedSessionId,
+				cwd,
+				sessionName: name,
+				sessionStateFile,
+				command: directCommand,
+				readProcessIncarnation: opts.processIncarnation ?? processIncarnation,
+			});
+		}
 
 		return {
 			sessionId: ids.intendedSessionId,
@@ -1018,13 +1313,15 @@ export function daemonResumeSession(
 		sessionsRoot?: string;
 		listSessions?: (env: NodeJS.ProcessEnv) => GjcTmuxSessionStatus[];
 		ownerIsolationProbe?: OwnerIsolationProbe;
+		platform?: NodeJS.Platform;
+		processIncarnation?: (pid: number) => string | undefined;
 	} = {},
 ) {
 	return async (target: {
 		sessionIdOrPrefix: string;
 		path?: string;
 	}): Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] } | { notFound: true }> => {
-		const tmuxBinary = resolveGjcTmuxBinary({ env });
+		const tmuxBinary = resolveGjcTmuxBinary({ env, platform: opts.platform });
 		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
 		const live = (opts.listSessions?.(env) ?? listGjcTmuxSessions(env)).filter(
 			s => s.sessionId === target.sessionIdOrPrefix || s.sessionId?.startsWith(target.sessionIdOrPrefix),
@@ -1085,50 +1382,68 @@ export function daemonResumeSession(
 		const tmux = tmuxBinary.command;
 		const name = tmuxSessionNameFor(resumeId);
 		const sessionStateFile = lifecycleRuntimeStateFile(resolvedResumeCwd, resumeId, name);
-		const stateDir = path.dirname(sessionStateFile);
-		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, resumeId);
-		const predecessor = resolveManagedOwnerPredecessorSync(stateDir, resumeId, previousBaseline);
-		const generation = crypto.randomUUID();
-		const runId = crypto.randomUUID();
-		const incarnation = crypto.randomUUID();
-		const childEnv: Record<string, string> = {
+		const commonChildEnv: Record<string, string> = {
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_NOTIFICATIONS: "1",
 			[GJC_COORDINATOR_SESSION_ID_ENV]: resumeId,
 			[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
-			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
-			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
-			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", "--resume", resumeId]),
-			[MANAGED_OWNER_RUN_ID_ENV]: runId,
-			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
-			...(predecessor
-				? {
-						[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
-						[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
-						[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
-						[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
-						[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
-					}
-				: {}),
 		};
-		const envPairs = Object.entries(childEnv)
-			.map(([key, value]) => `${key}=${shellQuote(value)}`)
-			.join(" ");
-		const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
-		await completeLifecycleSpawnTransaction({
-			tmux,
-			env,
-			sessionId: resumeId,
-			generation,
-			stateDir,
-			cwd: resolvedResumeCwd,
-			sessionName: name,
-			sessionStateFile,
-			argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
-			ownerIsolationProbe: opts.ownerIsolationProbe,
-			previousBaseline,
-		});
+		if ((opts.platform ?? process.platform) === "linux") {
+			const stateDir = path.dirname(sessionStateFile);
+			const previousBaseline = await captureOwnerGenerationBaseline(stateDir, resumeId);
+			const predecessor = resolveManagedOwnerPredecessorSync(stateDir, resumeId, previousBaseline);
+			const generation = crypto.randomUUID();
+			const runId = crypto.randomUUID();
+			const incarnation = crypto.randomUUID();
+			const managedChildEnv: Record<string, string> = {
+				...commonChildEnv,
+				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
+				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
+				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
+				[MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(["gjc", "--resume", resumeId]),
+				[MANAGED_OWNER_RUN_ID_ENV]: runId,
+				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+				...(predecessor
+					? {
+							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
+							[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
+							[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
+							[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
+							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
+						}
+					: {}),
+			};
+			const managedEnvPairs = Object.entries(managedChildEnv)
+				.map(([key, value]) => `${key}=${shellQuote(value)}`)
+				.join(" ");
+			const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${managedEnvPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+			await completeLifecycleSpawnTransaction({
+				tmux,
+				env,
+				sessionId: resumeId,
+				generation,
+				stateDir,
+				cwd: resolvedResumeCwd,
+				sessionName: name,
+				sessionStateFile,
+				argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
+				ownerIsolationProbe: opts.ownerIsolationProbe,
+				previousBaseline,
+			});
+		} else {
+			const directEnvPairs = directLifecycleEnvArguments(commonChildEnv);
+			const directCommand = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${directEnvPairs} gjc ${shellQuote("--resume")} ${shellQuote(resumeId)}`;
+			await completeNonLinuxLifecycleSpawn({
+				tmux,
+				env,
+				sessionId: resumeId,
+				cwd: resolvedResumeCwd,
+				sessionName: name,
+				sessionStateFile,
+				command: directCommand,
+				readProcessIncarnation: opts.processIncarnation ?? processIncarnation,
+			});
+		}
 
 		return {
 			sessionId: resumeId,
