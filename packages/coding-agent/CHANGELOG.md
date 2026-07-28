@@ -28,6 +28,10 @@
 - Interactive `/resume` progress lease fails open when `statusContainer` or UI lacks child-mutation/render-commit surface, preserving headless/minimal controller contexts without weakening full TUI progress-before-switch (#3234 post-merge).
 - The documented `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` environment variable now overrides the OpenAI-code web-search model; it is resolved GJC-first ahead of the legacy `PI_CODEX_WEB_SEARCH_MODEL` name (previously only the legacy name was read, so the documented name was a silent no-op).
 
+### Changed
+
+- Session Observer and the main transcript viewer no longer re-project and re-layout their full transcript on every paint. Source changes still refresh through registry/session-event notifications, while navigation rebuilds only affected layout variants; deterministic counters and replacement-safety coverage preserve selection, follow-tail, raw, expanded, fullscreen, mouse, theme, width, and source-replacement behavior.
+
 ### Added
 
 - Deterministic tests for session_switch await policy (selector defer vs default/branch await), control-drain ordering, host pre-response readiness gating, and resume progress lease-before-switch behavior (#2914).

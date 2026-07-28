@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "kind": "deterministic-structural-performance",
+  "fixture": {
+    "entries": 100,
+    "navigationMoves": 10,
+    "width": 100
+  },
+  "navigation": {
+    "layoutCacheHits": 989,
+    "layoutCacheMisses": 11,
+    "refreshRuns": 0,
+    "rebuildRuns": 10,
+    "layoutHitRate": 0.989
+  },
+  "paintOnly": {
+    "layoutCacheHits": 0,
+    "layoutCacheMisses": 0,
+    "refreshRuns": 0,
+    "rebuildRuns": 0
+  },
+  "acceptance": {
+    "navigationRefreshRunsZero": true,
+    "paintRefreshRunsZero": true,
+    "paintRebuildRunsZero": true,
+    "layoutHitRateAtLeast90Percent": true
+  }
+}

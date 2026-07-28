@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
@@ -7,13 +7,15 @@ import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { createToolTranscriptRenderDescriptor } from "../src/modes/components/tool-transcript-format";
 import {
+	__transcriptViewerPerfCounters,
 	type TranscriptViewerEntry,
 	TranscriptViewerOverlay,
+	type TranscriptViewerOverlayOptions,
 	transcriptViewerEntries,
 } from "../src/modes/components/transcript-viewer-overlay";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { InteractiveMode } from "../src/modes/interactive-mode";
-import { initTheme } from "../src/modes/theme/theme";
+import { getThemeByName, initTheme, setThemeInstance, theme } from "../src/modes/theme/theme";
 import { TranscriptItemRegistry } from "../src/modes/transcript-item-registry";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -453,3 +455,287 @@ function entryForOverlay(
 		...entryOverrides,
 	};
 }
+
+describe("PR2a: render/refresh separation and layout cache", () => {
+	beforeEach(() => {
+		__transcriptViewerPerfCounters.reset();
+		__transcriptViewerPerfCounters.disable();
+	});
+	afterEach(() => {
+		__transcriptViewerPerfCounters.reset();
+		__transcriptViewerPerfCounters.disable();
+	});
+
+	function buildViewer(
+		entries: readonly TranscriptViewerEntry[],
+		options: Partial<TranscriptViewerOverlayOptions> = {},
+	): TranscriptViewerOverlay {
+		return new TranscriptViewerOverlay({
+			getEntries: () => entries,
+			onClose: () => {},
+			...options,
+		});
+	}
+
+	test("render does not refresh or rebuild on repeated paint-only frames", () => {
+		const viewer = buildViewer([entryForOverlay("a", "alpha"), entryForOverlay("b", "beta")]);
+		viewer.render(80); // stabilize width at 80 (constructor already rebuilt at 80)
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.render(80);
+		viewer.render(80);
+		const snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.refreshRuns).toBe(0);
+		expect(snap.rebuildRuns).toBe(0);
+		expect(snap.layoutCacheHits).toBe(0);
+		expect(snap.layoutCacheMisses).toBe(0);
+	});
+
+	test("j/k navigation moves selection and rebuilds so the cursor tracks", () => {
+		const viewer = buildViewer([
+			entryForOverlay("a", "alpha"),
+			entryForOverlay("b", "beta"),
+			entryForOverlay("c", "gamma"),
+		]);
+		viewer.render(80);
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("j");
+		expect(viewer.selectedEntryId).toBe("b");
+		viewer.handleInput("j");
+		expect(viewer.selectedEntryId).toBe("c");
+		viewer.handleInput("k");
+		expect(viewer.selectedEntryId).toBe("b");
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(3);
+		// Cursor marker must land on the currently-selected entry, proving the rebuild ran.
+		const rendered = viewer.render(80);
+		const cursorLines = rendered.filter(line => line.includes("▶"));
+		expect(cursorLines).toHaveLength(1);
+		expect(cursorLines[0]).toContain("[Custom]");
+	});
+
+	test("g/G jump to top and bottom with an explicit rebuild before scroll", () => {
+		const entries = Array.from({ length: 6 }, (_, index) => entryForOverlay(`e${index}`, `entry-${index}`));
+		const viewer = buildViewer(entries, { initialSelection: "latest" });
+		viewer.render(80);
+		expect(viewer.selectedEntryId).toBe("e5");
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("g");
+		expect(viewer.selectedEntryId).toBe("e0");
+		viewer.handleInput("G");
+		expect(viewer.selectedEntryId).toBe("e5");
+		// Each of g and G rebuilds exactly once before requesting paint.
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(2);
+		// The tail entry's body is still on screen after the G rebuild + scroll clamp.
+		expect(viewer.render(80).join("\n")).toContain("entry-5");
+	});
+
+	test("page up/down moves selection and keeps repeated paints stable", () => {
+		const entries = Array.from({ length: 20 }, (_, index) => entryForOverlay(`e${index}`, `entry-${index}`));
+		const viewer = buildViewer(entries);
+		viewer.render(80);
+		viewer.handleInput("G");
+		viewer.render(80); // apply the G-requested tail clamp before capturing the stable frame
+		const atTail = viewer.render(80).join("\n");
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("\x1b[5~"); // pageUp
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(1);
+		const paged = viewer.render(80).join("\n");
+		expect(paged).not.toStrictEqual(atTail);
+		// Paint-only frames after the page are byte-identical (no refresh, no rebuild).
+		__transcriptViewerPerfCounters.reset();
+		expect(viewer.render(80).join("\n")).toStrictEqual(paged);
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(0);
+		// pageDown also rebuilds exactly once and restores the tail viewport byte-for-byte.
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("\x1b[6~"); // pageDown
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(1);
+		expect(viewer.render(80).join("\n")).toStrictEqual(atTail);
+	});
+
+	test("raw toggle rebuilds so the entry body switches between markdown and raw", () => {
+		const viewer = buildViewer([entryForOverlay("a", "# heading\n\nbody text")]);
+		viewer.handleInput(" "); // expand -> markdown path
+		const markdown = viewer.render(80).join("\n");
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("r");
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(1);
+		const raw = viewer.render(80).join("\n");
+		expect(raw).not.toStrictEqual(markdown);
+		viewer.handleInput("r");
+		// Toggle back reproduces the original markdown byte-for-byte.
+		expect(viewer.render(80).join("\n")).toStrictEqual(markdown);
+	});
+
+	test("fullscreen enter and exit each rebuild so the display set changes between modes", () => {
+		const viewer = buildViewer([entryForOverlay("a", "alpha"), entryForOverlay("b", "beta")]);
+		viewer.render(80);
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("\r");
+		expect(viewer.isFullscreen).toBe(true);
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(1);
+		const fullscreen = viewer.render(80).join("\n");
+		viewer.handleInput("\x1b");
+		expect(viewer.isFullscreen).toBe(false);
+		expect(__transcriptViewerPerfCounters.snapshot().rebuildRuns).toBe(2);
+		const normal = viewer.render(80).join("\n");
+		expect(normal).not.toStrictEqual(fullscreen);
+	});
+
+	test("fullscreen scrolling does not rebuild or refresh (viewport slice only)", () => {
+		const longBody = Array.from({ length: 400 }, (_, index) => `line-${index}`).join("\n");
+		const viewer = buildViewer([entryForOverlay("a", longBody)]);
+		viewer.handleInput("\r"); // enter fullscreen
+		viewer.render(80); // stabilize width/state
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("j");
+		viewer.handleInput("k");
+		viewer.handleInput("\x1b[6~"); // pageDown
+		viewer.handleInput("\x1b[5~"); // pageUp
+		const snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.rebuildRuns).toBe(0);
+		expect(snap.refreshRuns).toBe(0);
+		expect(snap.layoutCacheHits).toBe(0);
+		expect(snap.layoutCacheMisses).toBe(0);
+		// The scroll offset actually moved, proving the slice window shifted without rebuilding.
+		const midScroll = viewer.render(80).join("\n");
+		viewer.handleInput("\x1b[6~"); // pageDown again
+		const furtherScroll = viewer.render(80).join("\n");
+		expect(furtherScroll).not.toStrictEqual(midScroll);
+	});
+
+	test("cache lifecycle: cold rebuild misses, stable navigation then hits", () => {
+		const entries = Array.from({ length: 5 }, (_, index) => entryForOverlay(`e${index}`, `entry-${index}`));
+		const viewer = buildViewer(entries);
+		viewer.render(80); // populate cache at width 80 (counters disabled)
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.render(120); // width change forces rebuild; cache empty at new width
+		let snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.rebuildRuns).toBe(1);
+		expect(snap.layoutCacheMisses).toBe(5);
+		expect(snap.layoutCacheHits).toBe(0);
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("j"); // selected=1; the old selected (e0) needs its unselected variant and the newly selected (e1) needs its selected variant, so both miss
+		snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.layoutCacheHits).toBe(3);
+		expect(snap.layoutCacheMisses).toBe(2);
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("k"); // selected=0; all variants pre-cached
+		snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.layoutCacheHits).toBe(5);
+		expect(snap.layoutCacheMisses).toBe(0);
+	});
+
+	test("navigation with more than ten entries achieves at least 90% layout hits after the first rebuild", () => {
+		const entries = Array.from({ length: 20 }, (_, index) => entryForOverlay(`e${index}`, `entry-${index}`));
+		const viewer = buildViewer(entries);
+		viewer.render(80); // populate cache (counters disabled)
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		// Each move only misses the newly-selected variant; everything else hits.
+		viewer.handleInput("j");
+		viewer.handleInput("j");
+		viewer.handleInput("j");
+		viewer.handleInput("k");
+		viewer.handleInput("k");
+		viewer.handleInput("k");
+		const snap = __transcriptViewerPerfCounters.snapshot();
+		const total = snap.layoutCacheHits + snap.layoutCacheMisses;
+		expect(total).toBeGreaterThan(0);
+		expect(snap.layoutCacheHits / total).toBeGreaterThanOrEqual(0.9);
+	});
+
+	test("width change produces fresh cache misses for the new variant key", () => {
+		const viewer = buildViewer([entryForOverlay("a", "alpha"), entryForOverlay("b", "beta")]);
+		viewer.render(80);
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.render(120);
+		const snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.rebuildRuns).toBe(1);
+		expect(snap.layoutCacheMisses).toBe(2);
+		expect(snap.layoutCacheHits).toBe(0);
+		__transcriptViewerPerfCounters.reset();
+		viewer.render(80);
+		const returned = __transcriptViewerPerfCounters.snapshot();
+		expect(returned.layoutCacheMisses).toBe(2);
+		expect(returned.layoutCacheHits).toBe(0);
+	});
+
+	test("theme reference change clears the cache and re-runs markdown layout", async () => {
+		const original = theme;
+		try {
+			const viewer = buildViewer([entryForOverlay("a", "# heading\n\nbody")]);
+			viewer.handleInput(" "); // expand -> markdown path uses mdTheme
+			viewer.render(80);
+			__transcriptViewerPerfCounters.enable();
+			__transcriptViewerPerfCounters.reset();
+			const other = await getThemeByName("blue-crab");
+			expect(other).toBeDefined();
+			setThemeInstance(other!);
+			viewer.render(80);
+			const snap = __transcriptViewerPerfCounters.snapshot();
+			expect(snap.rebuildRuns).toBe(1);
+			expect(snap.layoutCacheHits).toBe(0);
+			expect(snap.layoutCacheMisses).toBe(1);
+		} finally {
+			setThemeInstance(original);
+		}
+	});
+
+	test("refresh clears the cache so same-id changed closures cannot serve stale lines", () => {
+		let displayText = "original-content";
+		const entry: TranscriptViewerEntry = {
+			id: "x",
+			kind: "custom",
+			label: "Custom",
+			payload: { text: "raw-payload", metadata: {}, source: "raw-payload" },
+			foldable: true,
+			getDisplayText: () => displayText,
+		};
+		const viewer = new TranscriptViewerOverlay({
+			getEntries: () => [entry],
+			onClose: () => {},
+		});
+		viewer.handleInput(" "); // expand so getDisplayText feeds the markdown path
+		expect(viewer.render(80).join("\n")).toContain("original-content");
+		displayText = "updated-content";
+		viewer.refresh();
+		const after = viewer.render(80).join("\n");
+		expect(after).toContain("updated-content");
+		expect(after).not.toContain("original-content");
+	});
+
+	test("invalidateLayoutEntries drops every variant for the targeted ids", () => {
+		const viewer = buildViewer([entryForOverlay("a", "alpha"), entryForOverlay("b", "beta")]);
+		viewer.render(80); // populate cache: a's selected variant and b's unselected variant
+		// Warm every selected-state variant first. The initial render only caches the selected
+		// variant of `a` and the unselected variant of `b`; the first j/k warms the two missing
+		// variants (b's selected and a's unselected).
+		viewer.handleInput("j");
+		viewer.handleInput("k");
+		// With all variants warm, a no-invalidation j/k sequence hits every variant.
+		__transcriptViewerPerfCounters.enable();
+		__transcriptViewerPerfCounters.reset();
+		viewer.handleInput("j");
+		viewer.handleInput("k");
+		let snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.layoutCacheMisses).toBe(0);
+		expect(snap.layoutCacheHits).toBe(4);
+		// Targeted invalidation drops only `a`'s variants; `b` stays fully cached, so only the
+		// two `a` variants repopulate across the next j/k.
+		__transcriptViewerPerfCounters.reset();
+		viewer.invalidateLayoutEntries(["a"]);
+		viewer.handleInput("j");
+		viewer.handleInput("k");
+		snap = __transcriptViewerPerfCounters.snapshot();
+		expect(snap.layoutCacheMisses).toBe(2);
+		expect(snap.layoutCacheHits).toBe(2);
+	});
+});

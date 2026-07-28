@@ -148,8 +148,21 @@ export class SessionObserverOverlayComponent extends TranscriptViewerOverlay {
 		const cache = this.#cache;
 		const snapshot = readStableSnapshot(filePath, cache?.completeOffset ?? 0);
 		if (!snapshot) {
-			// An unreadable source is never allowed to keep presenting a prior file as current.
-			if (cache) this.#clearSource();
+			// A cached offset may exceed a replaced (shorter) file's new size, in which case the
+			// offset-tail snapshot is null even though the replacement is readable. Without a
+			// render-time refresh, that null would drop the replacement entirely, so attempt one
+			// full stable snapshot at offset 0 and validate it before installing. Unreadable or
+			// invalid sources still fail closed and never keep presenting a prior file as current.
+			if (cache) {
+				const replacement = readStableSnapshot(filePath, 0);
+				const candidate = replacement ? cacheEntries(filePath, replacement) : null;
+				if (candidate) {
+					this.#cache = candidate;
+					this.resetSourceState();
+					return candidate.entries;
+				}
+				this.#clearSource();
+			}
 			return [];
 		}
 
