@@ -347,6 +347,8 @@ describe("workflow mutation guard", () => {
 			"# <<'EOF'\nrm src/product.ts\nEOF",
 			// A `<<` inside double-quoted argument data is not an opener either.
 			'printf "%s" "<<\'EOF\'"\nrm src/product.ts\nEOF',
+			// Escaped quotes must not re-expose a quoted `<<` as an opener (Codex P1).
+			'cat "a \\" <<\'EOF\' \\" b"\nrm src/product.ts\nEOF',
 			// Unquoted delimiter + command substitution in body expands at runtime — fail closed.
 			"cat <<EOF > /tmp/out.md\n$(rm src/product.ts)\nEOF",
 			// Unterminated heredoc is unparseable — body scanned as before, mutation caught.

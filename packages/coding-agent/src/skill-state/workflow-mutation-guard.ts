@@ -457,13 +457,27 @@ interface HeredocMaskResult {
 
 /**
  * Blank out double-quoted spans (like `maskSingleQuotedSpans`) so a `<<` inside
- * `"…"` argument data is not misread as a heredoc opener. Unbalanced quotes
- * return the original text so the caller stays fail-closed rather than blind.
+ * `"…"` argument data is not misread as a heredoc opener. A backslash-escaped
+ * `\"` never toggles the quote state — outside quotes it is a literal quote
+ * character, inside quotes it is escaped data — so `"a \" << \" b"` stays one
+ * masked span. Unbalanced quotes return the original text so the caller stays
+ * fail-closed rather than blind.
  */
 function maskDoubleQuotedSpans(text: string): string {
 	let masked = "";
 	let inDouble = false;
+	let escaped = false;
 	for (const character of text) {
+		if (escaped) {
+			escaped = false;
+			masked += inDouble && character !== "\n" ? " " : character;
+			continue;
+		}
+		if (character === "\\") {
+			escaped = true;
+			masked += inDouble ? " " : character;
+			continue;
+		}
 		if (character === '"') {
 			inDouble = !inDouble;
 			masked += character;
