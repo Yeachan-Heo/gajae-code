@@ -480,7 +480,10 @@ interface ShellQuoteState {
  * `dequoted` applies bash-like QUOTE REMOVAL instead — quote/backslash marks
  * drop, quoted word characters stay, quoted metacharacters neutralize to `_` —
  * so obfuscated spellings (`e\val`, `'ev'al`) reassemble into their real
- * command word without quoted data ever forming fake command boundaries.
+ * command word without quoted data ever forming fake command boundaries. A
+ * leading `$` immediately before `'…'` (ANSI-C) or `"…"` (locale-translated)
+ * is stripped during quote removal too, so `$'eval'`/`$"eval"` dequote to
+ * plain `eval`, matching real bash quote-removal semantics for both forms.
  * `continued` reports an unescaped trailing backslash outside quotes (logical
  * line continuation).
  */
@@ -573,6 +576,9 @@ function maskLineForSyntax(
 		if (character === '"') {
 			state.inDouble = true;
 			masked += '"';
+			// `$"…"` locale-translated strings undergo the same quote removal as
+			// ANSI-C `$'…'`: bash drops the `$`, so `$"eval"` dequotes to `eval`.
+			if (dequoted.endsWith("$")) dequoted = dequoted.slice(0, -1);
 			previous = character;
 			continue;
 		}
@@ -815,9 +821,10 @@ function maskHeredocBodiesPass(
 		// reassemble for command/shadow detection.
 		if (isContinuationLine && dequotedLines.length > 0) {
 			let previousDequoted = dequotedLines[dequotedLines.length - 1] ?? "";
-			// A continuation can also split ANSI-C quoting (`$\` + `'eval'`): the
-			// rejoined `$'` still drops its `$` during quote removal.
-			if (previousDequoted.endsWith("$") && line.startsWith("'")) {
+			// A continuation can also split ANSI-C/locale quoting (`$\` + `'eval'` or
+			// `$\` + `"eval"`): the rejoined `$'`/`$"` still drops its `$` during
+			// quote removal.
+			if (previousDequoted.endsWith("$") && (line.startsWith("'") || line.startsWith('"'))) {
 				previousDequoted = previousDequoted.slice(0, -1);
 			}
 			dequotedLines[dequotedLines.length - 1] = previousDequoted + dequoted;
