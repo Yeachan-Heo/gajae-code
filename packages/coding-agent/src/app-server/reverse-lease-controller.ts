@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { REVERSE_HEARTBEAT_MS } from "../sdk/host/reverse-leases";
+import { MAX_REVERSE_OUTSTANDING, REVERSE_HEARTBEAT_MS, REVERSE_LEASE_TTL_MS } from "../sdk/host/reverse-leases";
+
 import type { SdkFrame } from "../sdk/host/types";
 
 export type ReverseLeaseRequestHandler = (
@@ -56,6 +57,8 @@ export interface ReverseLeaseControllerRuntimeOptions {
 	readonly setInterval?: (callback: () => void, milliseconds: number) => unknown;
 	/** Test seam paired with setInterval. */
 	readonly clearInterval?: (handle: unknown) => void;
+	/** Test seam for deterministic lease-expiry fences. */
+	readonly now?: () => number;
 }
 
 export interface ReverseLeaseControllerOptions extends ReverseLeaseControllerRuntimeOptions {
@@ -82,6 +85,14 @@ function errorDetails(error: unknown): { code: string; message: string } {
 		message: typeof candidate?.message === "string" ? candidate.message : "Reverse provider request failed.",
 	};
 }
+function leaseExpiry(value: unknown, fallback: number): number {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string") {
+		const parsed = Date.parse(value);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return fallback;
+}
 
 /**
  * Maintains provider leases owned by one child SdkClient.
@@ -101,6 +112,19 @@ export class ReverseLeaseController {
 	readonly #leases = new Map<string, string>();
 	readonly #idempotencyKeys = new Map<string, string>();
 	readonly #reverseRequests = new Map<string, PendingReverseRequest>();
+	readonly #leaseExpiresAt = new Map<string, number>();
+	readonly #leaseConnections = new Map<string, string>();
+	readonly #releasedLeaseKeys = new Set<string>();
+	readonly #completedReverseRequests = new Set<string>();
+	readonly #registrationSequences = new Map<string, number>();
+	#registrationSequence = 0;
+
+	readonly #now: () => number;
+	readonly #leaseTtlMs: number;
+	/** Keep 16 sequential request windows of the protocol's outstanding cap. */
+	static readonly #maxCompletedReverseRequests = MAX_REVERSE_OUTSTANDING * 16;
+	#connectionGeneration = 0;
+	#lifecycleGeneration = 0;
 	#connectionId?: string;
 	#heartbeatTimer?: unknown;
 	#unsubscribeFrame?: () => void;
@@ -134,6 +158,8 @@ export class ReverseLeaseController {
 		this.#onError = options.onError;
 		this.#setInterval = options.setInterval ?? ((callback, milliseconds) => setInterval(callback, milliseconds));
 		this.#clearInterval = options.clearInterval ?? (handle => clearInterval(handle as NodeJS.Timeout));
+		this.#now = options.now ?? Date.now;
+		this.#leaseTtlMs = REVERSE_LEASE_TTL_MS;
 		for (const provider of options.providers ?? []) this.#addProvider(provider);
 	}
 
@@ -153,20 +179,33 @@ export class ReverseLeaseController {
 		return this.#leases.get(capability);
 	}
 
+	get completedReverseRequestCount(): number {
+		return this.#completedReverseRequests.size;
+	}
+
 	/** Starts the child transport and registers all configured providers. */
 	async start(): Promise<void> {
 		if (this.#closed)
 			throw new ReverseLeaseControllerError("controller_closed", "Reverse lease controller is closed.");
 		if (this.#started) return;
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#unsubscribeFrame ??= this.#client.onFrame(frame => this.#onFrame(frame));
 		this.#unsubscribeReconnect ??= this.#client.onReconnect(() => {
 			void this.#reclaimProviders().catch(error => this.#reportError(error));
 		});
 		try {
 			await this.#client.connect();
+			if (!this.#isLifecycleCurrent(lifecycleGeneration))
+				throw new ReverseLeaseControllerError("controller_closed", "Reverse lease controller is closed.");
 			this.#syncConnectionId();
 			this.#requireConnectionId();
-			for (const provider of this.#providers.values()) await this.#registerProvider(provider);
+			for (const provider of this.#providers.values()) {
+				if (!this.#isLifecycleCurrent(lifecycleGeneration))
+					throw new ReverseLeaseControllerError("controller_closed", "Reverse lease controller is closed.");
+				await this.#registerProvider(provider);
+			}
+			if (!this.#isLifecycleCurrent(lifecycleGeneration))
+				throw new ReverseLeaseControllerError("controller_closed", "Reverse lease controller is closed.");
 			this.#started = true;
 			this.#heartbeatTimer ??= this.#setInterval(
 				() => void this.#heartbeatLeases().catch(error => this.#reportError(error)),
@@ -193,6 +232,7 @@ export class ReverseLeaseController {
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#lifecycleGeneration += 1;
 		this.#started = false;
 		if (this.#heartbeatTimer !== undefined) {
 			this.#clearInterval(this.#heartbeatTimer);
@@ -202,18 +242,16 @@ export class ReverseLeaseController {
 		this.#unsubscribeFrame = undefined;
 		this.#unsubscribeReconnect?.();
 		this.#unsubscribeReconnect = undefined;
-		const connectionId = this.#currentConnectionId();
-		if (connectionId) {
-			for (const leaseId of this.#leases.values()) {
-				try {
-					this.#client.send({ type: "lease_release", connectionId, leaseId });
-				} catch (error) {
-					this.#reportError(error);
-				}
-			}
+		const fallbackConnectionId = this.#currentConnectionId();
+		for (const [capability, leaseId] of this.#leases) {
+			const connectionId = this.#leaseConnections.get(capability) ?? fallbackConnectionId;
+			if (connectionId) this.#releaseLease(connectionId, leaseId);
 		}
 		this.#leases.clear();
+		this.#leaseExpiresAt.clear();
+		this.#leaseConnections.clear();
 		this.#reverseRequests.clear();
+		this.#completedReverseRequests.clear();
 		await this.#client.close();
 	}
 
@@ -234,8 +272,21 @@ export class ReverseLeaseController {
 	}
 
 	#syncConnectionId(): void {
-		if (typeof this.#client.connectionId === "string" && this.#client.connectionId.length > 0)
-			this.#connectionId = this.#client.connectionId;
+		const connectionId = this.#client.connectionId;
+		if (typeof connectionId === "string" && connectionId.length > 0) this.#setConnectionId(connectionId);
+	}
+
+	#setConnectionId(connectionId: string): boolean {
+		const changed = this.#connectionId !== undefined && this.#connectionId !== connectionId;
+		if (this.#connectionId !== connectionId) {
+			this.#connectionId = connectionId;
+			this.#connectionGeneration += 1;
+		}
+		return changed;
+	}
+
+	#isLifecycleCurrent(lifecycleGeneration: number): boolean {
+		return !this.#closed && this.#lifecycleGeneration === lifecycleGeneration;
 	}
 
 	#currentConnectionId(): string | undefined {
@@ -253,7 +304,11 @@ export class ReverseLeaseController {
 	async #registerProvider(provider: ReverseLeaseProvider): Promise<void> {
 		if (this.#closed)
 			throw new ReverseLeaseControllerError("controller_closed", "Reverse lease controller is closed.");
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		const connectionId = this.#requireConnectionId();
+		const connectionGeneration = this.#connectionGeneration;
+		const registrationSequence = ++this.#registrationSequence;
+		this.#registrationSequences.set(provider.capability, registrationSequence);
 		let idempotencyKey = this.#idempotencyKeys.get(provider.capability);
 		if (!idempotencyKey) {
 			idempotencyKey = this.#idempotencyKeyFactory();
@@ -272,15 +327,61 @@ export class ReverseLeaseController {
 		const leaseId = typeof result?.leaseId === "string" ? result.leaseId : undefined;
 		if (!leaseId)
 			throw new ReverseLeaseControllerError("lease_registration_failed", "Provider registration omitted leaseId.");
+		const current =
+			this.#isLifecycleCurrent(lifecycleGeneration) &&
+			this.#registrationSequences.get(provider.capability) === registrationSequence &&
+			this.#registrationIsCurrentConnection(connectionId, connectionGeneration);
+		if (!current) {
+			this.#releaseStaleRegistrationLease(provider.capability, connectionId, leaseId);
+			throw new ReverseLeaseControllerError(
+				"lease_registration_failed",
+				"Provider registration response belongs to a stale connection.",
+			);
+		}
 		this.#leases.set(provider.capability, leaseId);
+		this.#leaseConnections.set(provider.capability, connectionId);
+		this.#leaseExpiresAt.set(
+			provider.capability,
+			leaseExpiry(result?.leaseExpiresAt, this.#now() + this.#leaseTtlMs),
+		);
+	}
+
+	#registrationIsCurrentConnection(connectionId: string, connectionGeneration: number): boolean {
+		this.#syncConnectionId();
+		return this.#connectionId === connectionId && this.#connectionGeneration === connectionGeneration;
+	}
+
+	#releaseStaleRegistrationLease(capability: string, connectionId: string, leaseId: string): void {
+		this.#syncConnectionId();
+		if (
+			this.#connectionId !== connectionId &&
+			this.#leases.get(capability) === leaseId &&
+			this.#leaseConnections.get(capability) === this.#connectionId
+		)
+			return;
+		this.#releaseLease(connectionId, leaseId);
+	}
+
+	#releaseLease(connectionId: string, leaseId: string): void {
+		const key = `${connectionId}\u0000${leaseId}`;
+		if (this.#releasedLeaseKeys.has(key)) return;
+		this.#releasedLeaseKeys.add(key);
+		try {
+			this.#client.send({ type: "lease_release", connectionId, leaseId });
+		} catch (error) {
+			this.#reportError(error);
+		}
 	}
 
 	async #reclaimProviders(): Promise<void> {
 		if (this.#closed || !this.#started || this.#providers.size === 0) return;
 		if (this.#reclaiming) return await this.#reclaiming;
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		let reclaimConnectionGeneration = this.#connectionGeneration;
 		const reclaim = (async () => {
 			await this.#client.awaitHello?.();
 			this.#syncConnectionId();
+			reclaimConnectionGeneration = this.#connectionGeneration;
 			this.#requireConnectionId();
 			for (const provider of this.#providers.values()) await this.#registerProvider(provider);
 		})();
@@ -288,7 +389,14 @@ export class ReverseLeaseController {
 		try {
 			await reclaim;
 		} finally {
-			if (this.#reclaiming === reclaim) this.#reclaiming = undefined;
+			if (this.#reclaiming === reclaim) {
+				this.#reclaiming = undefined;
+				if (
+					this.#isLifecycleCurrent(lifecycleGeneration) &&
+					this.#connectionGeneration !== reclaimConnectionGeneration
+				)
+					void this.#reclaimProviders().catch(error => this.#reportError(error));
+			}
 		}
 	}
 
@@ -305,8 +413,10 @@ export class ReverseLeaseController {
 			await this.#client.awaitHello?.();
 			const connectionId = this.#currentConnectionId();
 			if (!connectionId) return;
-			for (const leaseId of this.#leases.values())
+			for (const [capability, leaseId] of this.#leases) {
 				this.#client.send({ type: "provider_heartbeat", connectionId, leaseId });
+				this.#leaseExpiresAt.set(capability, this.#now() + this.#leaseTtlMs);
+			}
 		} catch (error) {
 			this.#reportError(error);
 		}
@@ -315,8 +425,7 @@ export class ReverseLeaseController {
 	#onFrame(frame: SdkFrame): void {
 		if (this.#closed) return;
 		if ((frame.type === "hello" || frame.type === "server_hello") && typeof frame.connectionId === "string") {
-			const changed = this.#connectionId !== undefined && this.#connectionId !== frame.connectionId;
-			this.#connectionId = frame.connectionId;
+			const changed = this.#setConnectionId(frame.connectionId);
 			if (changed) void this.#reclaimProviders().catch(error => this.#reportError(error));
 			return;
 		}
@@ -340,6 +449,7 @@ export class ReverseLeaseController {
 		const capability = requiredString(frame, "capability");
 		const leaseId = requiredString(frame, "leaseId");
 		if (!id || !connectionId || !capability || !leaseId) return;
+		if (this.#completedReverseRequests.has(id)) return;
 		if (!this.#ownsLease(connectionId, capability, leaseId) || this.#reverseRequests.has(id)) return;
 		const provider = this.#providers.get(capability);
 		if (!provider) return;
@@ -372,7 +482,10 @@ export class ReverseLeaseController {
 				error: details,
 			});
 		} finally {
-			if (this.#reverseRequests.get(id) === request) this.#reverseRequests.delete(id);
+			if (this.#reverseRequests.get(id) === request) {
+				this.#reverseRequests.delete(id);
+				this.#rememberCompletedReverseRequest(id);
+			}
 		}
 	}
 
@@ -390,8 +503,24 @@ export class ReverseLeaseController {
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
-			this.#ownsLease(connectionId, capability, leaseId)
+			this.#ownsLease(connectionId, capability, leaseId) &&
+			this.#leaseIsLive(capability, leaseId)
 		);
+	}
+
+	#leaseIsLive(capability: string, leaseId: string): boolean {
+		const expiresAt = this.#leaseExpiresAt.get(capability);
+		return this.#leases.get(capability) === leaseId && expiresAt !== undefined && expiresAt > this.#now();
+	}
+
+	#rememberCompletedReverseRequest(id: string): void {
+		this.#completedReverseRequests.delete(id);
+		this.#completedReverseRequests.add(id);
+		while (this.#completedReverseRequests.size > ReverseLeaseController.#maxCompletedReverseRequests) {
+			const oldest = this.#completedReverseRequests.values().next().value;
+			if (typeof oldest !== "string") break;
+			this.#completedReverseRequests.delete(oldest);
+		}
 	}
 
 	#reportError(error: unknown): void {
