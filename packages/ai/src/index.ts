@@ -36,6 +36,7 @@ export * from "./usage/github-copilot";
 export * from "./usage/google-antigravity";
 export * from "./usage/grok-cli";
 export * from "./usage/kimi";
+export * from "./usage/kiro";
 export * from "./usage/minimax-code";
 export * from "./usage/openai-codex";
 export * from "./usage/zai";

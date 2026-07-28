@@ -511,6 +511,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			email: refreshed.email,
 			projectId: refreshed.projectId,
 			enterpriseUrl: refreshed.enterpriseUrl,
+			kiroMethod: refreshed.kiroMethod,
+			kiroProfileArn: refreshed.kiroProfileArn,
 		};
 	}
 

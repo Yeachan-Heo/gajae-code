@@ -45,6 +45,8 @@ export const oauthCredentialSchema = z
 		projectId: z.string().optional(),
 		email: z.string().optional(),
 		accountId: z.string().optional(),
+		kiroMethod: z.enum(["builder-id", "google", "github"]).optional(),
+		kiroProfileArn: z.string().min(1).optional(),
 		mcpBinding: mcpOAuthBindingSchema.optional(),
 	})
 	.strict();
