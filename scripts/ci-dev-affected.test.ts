@@ -1031,6 +1031,22 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			nativeBuild: false,
 		});
 	});
+	test("schema and app-server changes schedule the independent parity gate in PR and push plans", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/app-server/protocol-source/vendor/app-server.schema.bundle.json",
+			"packages/coding-agent/vendor/codex-app-server-schema/stable/json/ClientRequest.json",
+			"packages/coding-agent/src/app-server/router/dispatch.ts",
+			"scripts/sync-codex-app-server-schema.ts",
+		]) {
+			for (const tasks of [targeted([changedPath]), planTasks([changedPath], targetingPackages)]) {
+				const parity = tasks.find(task => task.key === "codex-app-server-parity");
+				expect(parity?.command).toEqual(["bun", "run", "verify:codex-app-server-parity"]);
+			}
+		}
+		for (const tasks of [targeted(["packages/coding-agent/src/edit/foo.ts"]), planTasks(["packages/coding-agent/src/edit/foo.ts"], targetingPackages)]) {
+			expect(tasks.some(task => task.key === "codex-app-server-parity")).toBe(false);
+		}
+	});
 
 test("tab-worker graph changes always include install-methods and are Darwin relevant", () => {
 		for (const changedPath of [

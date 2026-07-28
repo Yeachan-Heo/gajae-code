@@ -1,0 +1,92 @@
+{
+	"schemaVersion": 1,
+	"kind": "t3code-startup-trace",
+	"provenance": {
+		"client": "T3 Code (Alpha)",
+		"clientVersion": "0.0.28",
+		"cfBundleVersion": "0.0.28",
+		"cfBundleShortVersionString": "0.0.28",
+		"appBundlePath": "/Applications/T3 Code (Alpha).app",
+		"extractedFrom": "Contents/Resources/app.asar.unpacked/apps/server/dist/bin.mjs",
+		"sourceSha256": "c69b9ebf8ddf0b30194616b49163bc5b6e3670be5549b81567b56f3dcd7aebd3",
+		"extractionMethod": "static read of the shipped provider bundle (probeCodexAppServerProvider, buildCodexInitializeParams, requestAllCodexModels)",
+		"capturedAt": "2026-07-27",
+		"note": "Static extraction from the shipped client bundle, not a live socket transcript. It documents code paths for trace replay only and cannot satisfy the real-t3 gate."
+	},
+	"spawnContract": {
+		"argv": ["<binaryPath>", "app-server"],
+		"appendsCallerArgs": "The separate session-start path resolves <binaryPath> with [\"app-server\", ...options.appServerArgs].",
+		"env": {
+			"CODEX_HOME": "<expandHomePath(homePath)> when a home path is configured",
+			"extendEnv": true
+		},
+		"cwd": "<input.cwd>",
+		"transport": "stdio over the spawned child"
+	},
+	"startupSequence": [
+		{
+			"step": 1,
+			"direction": "client->server",
+			"type": "request",
+			"method": "initialize",
+			"params": {
+				"clientInfo": {
+					"name": "t3code_desktop",
+					"title": "T3 Code Desktop",
+					"version": "0.1.0 in probeCodexAppServerProvider; the separate buildCodexInitializeParams helper uses its version variable"
+				},
+				"capabilities": { "experimentalApi": true }
+			},
+			"contractNotes": [
+				"The two observed initialize call sites both set experimentalApi:true; this fixture does not establish a response profile.",
+				"The observed params include clientInfo.title.",
+				"The probe parses initialize.userAgent with /\\/([^\\s]+)/; when it does not match, the derived version is undefined."
+			]
+		},
+		{
+			"step": 2,
+			"direction": "client->server",
+			"type": "notification",
+			"method": "initialized",
+			"paramsOmitted": true,
+			"contractNotes": [
+				"The client calls client.notify(\"initialized\", void 0), so the params member is OMITTED from the frame entirely rather than sent as null. A replay must omit params, not send params:null."
+			]
+		},
+		{
+			"step": 3,
+			"direction": "client->server",
+			"type": "request",
+			"method": "account/read",
+			"params": {},
+			"contractNotes": [
+				"The probe returns early when account is absent and requiresOpenaiAuth is true; otherwise it continues to skills/list and model/list."
+			]
+		},
+		{
+			"step": 4,
+			"direction": "client->server",
+			"type": "request",
+			"method": "skills/list",
+			"params": { "cwds": ["<input.cwd>"] },
+			"contractNotes": ["Issued concurrently with model/list via Effect.all with unbounded concurrency."]
+		},
+		{
+			"step": 5,
+			"direction": "client->server",
+			"type": "request",
+			"method": "model/list",
+			"params": {},
+			"pagination": {
+				"style": "cursor",
+				"loop": "requests {} initially and { cursor } when cursor is truthy, assigning response.nextCursor after every response until it is falsy",
+				"contractNotes": ["The observed loop terminates when response.nextCursor is falsy."]
+			}
+		}
+	],
+	"gateMapping": {
+		"trace-replay": "This artifact backs the trace-replay protocol-contract gate.",
+		"real-t3": "NOT satisfied by this artifact. Requires executing the real 0.0.28 binary against gjc."
+	},
+	"scopeImplication": "The extracted probe path sends initialize, initialized, account/read, then—unless it returns early for missing account with requiresOpenaiAuth—concurrent skills/list and paginated model/list. This static extraction does not show the current behavior of a live GJC server."
+}

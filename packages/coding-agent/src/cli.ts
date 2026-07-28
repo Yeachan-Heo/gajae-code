@@ -39,6 +39,7 @@ export const commands: CommandEntry[] = [
 	{ name: "state", load: () => import("./commands/state").then(m => m.default) },
 	{ name: "setup", load: () => import("./commands/setup").then(m => m.default) },
 	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
+	{ name: "app-server", load: () => import("./commands/app-server").then(m => m.default) },
 	{ name: "skills", load: () => import("./commands/skills").then(m => m.default) },
 	{ name: "session", load: () => import("./commands/session").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },

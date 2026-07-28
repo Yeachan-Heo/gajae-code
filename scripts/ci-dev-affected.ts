@@ -781,6 +781,10 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	if (needsNativeRuntime) {
 		add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 	}
+	if (!fullWorkspace && paths.some(isCodexAppServerParityPath)) {
+		add(tasks, "codex-app-server-parity", "Codex app-server schema parity", ["bun", "run", "verify:codex-app-server-parity"]);
+	}
+
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts"]);
@@ -917,6 +921,9 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "ci:check:full"]);
 		}
 	}
+	if (!fullWorkspace && relevant.some(isCodexAppServerParityPath)) {
+		add(tasks, "codex-app-server-parity", "Codex app-server schema parity", ["bun", "run", "verify:codex-app-server-parity"]);
+	}
 
 	if (needsDarwinArm64TabWorkerSmoke(relevant)) {
 		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
@@ -1041,6 +1048,16 @@ function isTestFilePath(changedPath: string): boolean {
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
 	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts";
+}
+function isCodexAppServerParityPath(changedPath: string): boolean {
+	return (
+		changedPath.startsWith("packages/coding-agent/src/app-server/") ||
+		changedPath.startsWith("packages/coding-agent/vendor/codex-app-server-schema/") ||
+		changedPath === "scripts/sync-codex-app-server-schema.ts" ||
+		changedPath === "scripts/sync-codex-app-server-schema.test.ts" ||
+		changedPath === "scripts/verify-codex-app-server-parity.ts" ||
+		changedPath === "scripts/check-codex-app-server-main-drift.ts"
+	);
 }
 
 
