@@ -15,29 +15,93 @@
 		"auto_retry_end",
 		"model_fallback_switched",
 		"ttsr_triggered",
-		"todo_reminder",
-		"todo_auto_clear",
 		"irc_message",
 		"subagent_steer_message",
 		"notice",
 		"thinking_level_changed",
 		"goal_updated"
 	],
-	"futureItemFamilies": [
+	"futureItemFamilies": [],
+	"assistantMessageEvents": [
 		{
-			"event": "tool_execution_start",
-			"family": "tool",
-			"reason": "Tool-call items are owned by G007."
+			"discriminator": "start",
+			"classification": "permitted-unmapped",
+			"reason": "Assistant stream envelope does not create a non-agent-message ThreadItem."
 		},
 		{
-			"event": "tool_execution_update",
-			"family": "tool",
-			"reason": "Tool-call items are owned by G007."
+			"discriminator": "text_start",
+			"classification": "permitted-unmapped",
+			"reason": "Assistant text belongs to the reviewed agent-message family."
 		},
 		{
-			"event": "tool_execution_end",
-			"family": "tool",
-			"reason": "Tool-call items are owned by G007."
+			"discriminator": "text_delta",
+			"classification": "permitted-unmapped",
+			"reason": "Assistant text belongs to the reviewed agent-message family."
+		},
+		{
+			"discriminator": "text_end",
+			"classification": "permitted-unmapped",
+			"reason": "Assistant text belongs to the reviewed agent-message family."
+		},
+		{
+			"discriminator": "done",
+			"classification": "permitted-unmapped",
+			"reason": "Assistant stream completion is a boundary, not a non-agent-message ThreadItem."
+		},
+		{
+			"discriminator": "error",
+			"classification": "permitted-unmapped",
+			"reason": "Assistant stream errors are handled by the owning agent-message or tool family."
+		},
+		{
+			"discriminator": "toolChoiceIncapability",
+			"classification": "permitted-unmapped",
+			"reason": "Tool-choice capability metadata is not a ThreadItem."
+		},
+		{
+			"discriminator": "thinking_start",
+			"classification": "mapped",
+			"reason": "Starts a stable reasoning item."
+		},
+		{
+			"discriminator": "thinking_delta",
+			"classification": "mapped",
+			"reason": "Emits a stable reasoning text delta."
+		},
+		{
+			"discriminator": "thinking_end",
+			"classification": "mapped",
+			"reason": "Completes the reasoning item after raw and summary streams end."
+		},
+		{
+			"discriminator": "reasoning_summary_start",
+			"classification": "mapped",
+			"reason": "Starts the summary side of a stable reasoning item."
+		},
+		{
+			"discriminator": "reasoning_summary_delta",
+			"classification": "mapped",
+			"reason": "Emits a stable reasoning summary delta."
+		},
+		{
+			"discriminator": "reasoning_summary_end",
+			"classification": "mapped",
+			"reason": "Completes the summary side of a stable reasoning item."
+		},
+		{
+			"discriminator": "toolcall_start",
+			"classification": "mapped",
+			"reason": "Starts the concrete mapped tool item when model output identifies the call."
+		},
+		{
+			"discriminator": "toolcall_delta",
+			"classification": "mapped",
+			"reason": "Enriches the existing concrete tool item without starting a duplicate."
+		},
+		{
+			"discriminator": "toolcall_end",
+			"classification": "mapped",
+			"reason": "Records the final model tool-call arguments; execution owns terminal state."
 		}
 	],
 	"events": [
@@ -67,49 +131,49 @@
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Uses a correlated assistant turn-end message and closes remaining started items."
+			"reason": "The agent-message family may close its correlated item here; the tool reducer only consumes explicit tool results and never closes remaining items on this internal boundary."
 		},
 		{
 			"discriminator": "message_start",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Starts an assistant-message item when no matching lifecycle exists."
+			"reason": "Starts an assistant-message item or reduces a tool-result/assistant snapshot for a mapped G007 family."
 		},
 		{
 			"discriminator": "message_update",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Records the latest assistant state and emits text/error deltas."
+			"reason": "Reduces reasoning and model tool-call inner events; assistant text remains owned by G005."
 		},
 		{
 			"discriminator": "message_end",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Terminalizes the corresponding started assistant-message item."
+			"reason": "Terminalizes the corresponding started assistant-message item or reduces a correlated tool-result/assistant snapshot."
 		},
 		{
 			"discriminator": "tool_execution_start",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
-			"classification": "future-item-family",
-			"reason": "Tool-call items belong to G007."
+			"classification": "mapped",
+			"reason": "Starts or enriches a mapped commandExecution, fileChange, mcpToolCall, webSearch, or plan item; honest-unmapped kinds are dropped."
 		},
 		{
 			"discriminator": "tool_execution_update",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
-			"classification": "future-item-family",
-			"reason": "Tool-call items belong to G007."
+			"classification": "mapped",
+			"reason": "Updates an existing mapped tool item and emits family-specific deltas."
 		},
 		{
 			"discriminator": "tool_execution_end",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
-			"classification": "future-item-family",
-			"reason": "Tool-call items belong to G007."
+			"classification": "mapped",
+			"reason": "Completes the correlated mapped tool item, including failed items without terminalizing the turn."
 		},
 		{
 			"discriminator": "auto_compaction_start",
@@ -157,15 +221,15 @@
 			"discriminator": "todo_reminder",
 			"sourceType": "AgentSessionEvent",
 			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-			"classification": "permitted-unmapped",
-			"reason": "Todo reminders are not agent-message items; G007 owns other item families."
+			"classification": "mapped",
+			"reason": "Updates the stable plan item with the current todo snapshot."
 		},
 		{
 			"discriminator": "todo_auto_clear",
 			"sourceType": "AgentSessionEvent",
 			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-			"classification": "permitted-unmapped",
-			"reason": "Todo metadata has no agent-message item semantics in G005."
+			"classification": "mapped",
+			"reason": "Updates the stable plan item to an empty todo snapshot."
 		},
 		{
 			"discriminator": "irc_message",
