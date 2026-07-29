@@ -2860,6 +2860,35 @@ export const SETTINGS_SCHEMA = {
 			description: "Minimum interval between os.tmpdir scans for stale screenshot directories.",
 		},
 	},
+	"sessions.inventory.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Session Inventory",
+			description: "Default-OFF, report-only inventory of session transcript age and size.",
+		},
+	},
+	"sessions.inventory.maxAgeDays": {
+		type: "number",
+		default: 90,
+		validate: (value: number) => Number.isFinite(value) && value >= 1,
+		ui: {
+			tab: "tools",
+			label: "Session Inventory Maximum Age (days)",
+			description: "Report-only session inventory threshold in days.",
+		},
+	},
+	"sessions.inventory.maxTotalSizeMb": {
+		type: "number",
+		default: 2048,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+		ui: {
+			tab: "tools",
+			label: "Session Inventory Maximum Total Size (MB)",
+			description: "Report-only session inventory threshold in megabytes.",
+		},
+	},
 
 	// Tool execution
 	"tools.intentTracing": {

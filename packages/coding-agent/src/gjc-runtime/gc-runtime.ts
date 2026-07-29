@@ -25,7 +25,8 @@ export type GcStore =
 	| "file_locks"
 	| "tmux_sessions"
 	| "registry_entries"
-	| "local_roots";
+	| "local_roots"
+	| "sessions";
 
 export const GC_STORES: readonly GcStore[] = [
 	"harness_leases",
@@ -34,6 +35,7 @@ export const GC_STORES: readonly GcStore[] = [
 	"tmux_sessions",
 	"registry_entries",
 	"local_roots",
+	"sessions",
 ] as const;
 
 /** Why a probed pid is kept instead of treated as dead. */
@@ -446,8 +448,9 @@ export function gcHelpText(): string {
 		"  -j, --json        Emit machine-readable JSON",
 		"  --repair-session-index  Explicitly quarantine a corrupt session-index suffix and retain its valid prefix",
 		"",
-		"Liveness-only: a record is removed only when its owning process is dead",
-		"(ESRCH). Live / permission-denied / unknown processes are always kept.",
+		"Liveness-only: records in other stores are removed only when their owning process is dead",
+		"(ESRCH). Live / permission-denied / unknown processes are always kept. Session transcripts",
+		"are report-only and are never removed by --prune or --force.",
 		"",
 	].join("\n");
 }
@@ -460,12 +463,14 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		{ teamWorkersGcAdapter },
 		{ tmuxSessionsGcAdapter },
 		{ localRootsGcAdapter },
+		{ sessionInventoryGcAdapter },
 	] = await Promise.all([
 		import("../harness-control-plane/gc-adapter"),
 		import("../config/file-lock-gc"),
 		import("./team-gc"),
 		import("./tmux-gc"),
 		import("../internal-urls/local-root-gc"),
+		import("../session/session-inventory-gc"),
 	]);
 	return [
 		harnessLeasesGcAdapter,
@@ -474,5 +479,6 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		tmuxSessionsGcAdapter,
 		registryEntriesGcAdapter,
 		localRootsGcAdapter,
+		sessionInventoryGcAdapter,
 	];
 }
