@@ -139,7 +139,7 @@ export class ThreadRuntimeManager {
 	readonly #pendingThreadIds = new Set<string>();
 	readonly #reservations = new Set<AdmissionReservation>();
 	readonly #config: AdmissionConfig;
-	readonly #activeSpawns = { current: 0 };
+	#activeSpawns = 0;
 	#closeOwned: CloseOwnedCallback | undefined;
 
 	constructor(config: Partial<AdmissionConfig> = {}) {
@@ -171,8 +171,11 @@ export class ThreadRuntimeManager {
 			return;
 		}
 		this.#closeOwned = (threadId, ownership, authority, client, closeChild, closeRuntime) => {
-			previous(threadId, ownership, authority, client, closeChild, closeRuntime);
-			callback(threadId, ownership, authority, client, closeChild, closeRuntime);
+			try {
+				previous(threadId, ownership, authority, client, closeChild, closeRuntime);
+			} finally {
+				callback(threadId, ownership, authority, client, closeChild, closeRuntime);
+			}
 		};
 	}
 
@@ -225,17 +228,15 @@ export class ThreadRuntimeManager {
 
 	/** A spawn semaphore token. */
 	acquireSpawnToken(): SpawnToken {
-		if (this.#activeSpawns.current >= this.#config.spawnSemaphore)
-			throw Object.assign(new Error("Spawn semaphore exhausted; too many concurrent thread startups."), {
-				code: "conflict",
-			});
-		this.#activeSpawns.current++;
+		if (this.#activeSpawns >= this.#config.spawnSemaphore)
+			throw conflict("Spawn semaphore exhausted; too many concurrent thread startups.");
+		this.#activeSpawns++;
 		let released = false;
 		return {
 			release: () => {
 				if (released) return;
 				released = true;
-				this.#activeSpawns.current--;
+				this.#activeSpawns--;
 			},
 		};
 	}
@@ -251,8 +252,10 @@ export class ThreadRuntimeManager {
 		connectionId?: string,
 		options: RegisterOptions = {},
 	): ManagedThread {
-		if (this.#threads.has(threadId)) throw conflict(`Thread ${threadId} is already loaded.`);
 		const reservation = options.reservation;
+		if (this.#threads.has(threadId)) throw conflict(`Thread ${threadId} is already loaded.`);
+		if (this.#pendingThreadIds.has(threadId) && reservation?.threadId !== threadId)
+			throw conflict(`Thread ${threadId} is already loading.`);
 		if (reservation) {
 			if (!this.#reservations.has(reservation)) throw conflict("Admission reservation is not active.");
 			if (reservation.connectionId !== connectionId)
@@ -298,19 +301,17 @@ export class ThreadRuntimeManager {
 	get(threadId: string): ManagedThread | undefined {
 		return this.#threads.get(threadId);
 	}
-
 	setActiveTurn(threadId: string, active: boolean): void {
 		const thread = this.#threads.get(threadId);
 		if (thread) {
-			(thread as { activeTurn: boolean }).activeTurn = active;
-			(thread as { lastActivity: number }).lastActivity = Date.now();
+			thread.activeTurn = active;
+			thread.lastActivity = Date.now();
 		}
 	}
 
 	adjustPendingApprovals(threadId: string, delta: number): void {
 		const thread = this.#threads.get(threadId);
-		if (thread)
-			(thread as { pendingApprovals: number }).pendingApprovals = Math.max(0, thread.pendingApprovals + delta);
+		if (thread) thread.pendingApprovals = Math.max(0, thread.pendingApprovals + delta);
 	}
 
 	/** Remove a published runtime and invoke the bridge close hook when requested. */
@@ -351,7 +352,8 @@ export class ThreadRuntimeManager {
 
 	/**
 	 * Evict idle owned children past their TTL. Never evicts threads with active turns or
-	 * pending approvals. Evicts oldest-first (LRU), using the captured authority for fencing.
+	 * pending approvals. Evicts oldest-first (LRU), passing each captured authority to the
+	 * close callback.
 	 */
 	evictIdleOwned(): number {
 		const now = Date.now();
@@ -395,16 +397,17 @@ export class ThreadRuntimeManager {
 	shutdown(): { detached: string[]; terminated: string[] } {
 		const detached: string[] = [];
 		const terminated: string[] = [];
-		for (const [threadId, thread] of this.#threads) {
-			if (thread.ownership === "attached") detached.push(threadId);
-			else {
-				terminated.push(threadId);
-				this.#invokeClose(thread);
-			}
+		const threads = [...this.#threads.values()];
+		for (const thread of threads) {
+			if (thread.ownership === "attached") detached.push(thread.threadId);
+			else terminated.push(thread.threadId);
 		}
 		for (const reservation of [...this.#reservations]) reservation.release();
 		this.#threads.clear();
 		this.#connectionLoads.clear();
+		for (const thread of threads) {
+			if (thread.ownership === "spawned") this.#invokeClose(thread);
+		}
 		return { detached, terminated };
 	}
 }

@@ -151,6 +151,21 @@ test("a delta before message_start implicitly emits exactly one start before the
 	expectValidNotifications(notifications);
 });
 
+test("an identified delta can start a later item after an earlier item completed", () => {
+	const r = reducer([1, 2, 3, 4]);
+	const first = assistant("first", "response-first");
+	const second = assistant("second", "response-second");
+	r.accept(messageStart(first));
+	r.accept(messageEnd(first));
+
+	const notifications = [...r.accept(messageUpdate(second, "second")), ...r.accept(messageEnd(second))];
+
+	expect(methods(notifications)).toEqual(["item/started", "item/agentMessage/delta", "item/completed"]);
+	expect(completed(notifications).params.item.text).toBe("second");
+	expect(r.openItemCount).toBe(0);
+	expectValidNotifications(notifications);
+});
+
 test("duplicate lifecycle events and late deltas do not reopen or duplicate an item", () => {
 	const r = reducer([1, 2]);
 	const initial = assistant("", "response-duplicate");
@@ -160,10 +175,7 @@ test("duplicate lifecycle events and late deltas do not reopen or duplicate an i
 		...r.accept(messageUpdate(final, "done")),
 		...r.accept(messageEnd(final)),
 	];
-	const terminal = completed(first);
 	expectValidNotifications(first);
-	const mutableItem = terminal.params.item as unknown as { text: string };
-	mutableItem.text = "mutated only in the notification";
 	const replay = [
 		...r.accept(messageStart(initial)),
 		...r.accept(messageUpdate(final, "done")),
@@ -173,21 +185,74 @@ test("duplicate lifecycle events and late deltas do not reopen or duplicate an i
 	expect(methods(replay)).toEqual([]);
 	expect(r.accept(messageUpdate(final, "late"))).toEqual([]);
 	expect(r.openItemCount).toBe(0);
-	expect(r.snapshots).toEqual([
-		{
-			id: terminal.params.item.id,
-			text: "done",
-			startedAtMs: 1,
-			completedAtMs: 2,
-			state: "completed",
-		},
-	]);
+});
+
+test("distinct messages with identical fields stay distinct without durable identity", () => {
+	const r = reducer([1, 2, 3, 4]);
+	const first = assistant("same", undefined, 1);
+	const second = assistant("same", undefined, 1);
+	const notifications = [
+		...r.accept(messageStart(first)),
+		...r.accept(messageStart(second)),
+		...r.accept(messageEnd(first)),
+		...r.accept(messageEnd(second)),
+	];
+
+	expect(methods(notifications)).toEqual(["item/started", "item/started", "item/completed", "item/completed"]);
+	const startedIds = notifications
+		.filter((notification): notification is ItemStartedNotification => notification.method === "item/started")
+		.map(notification => notification.params.item.id);
+	expect(new Set(startedIds).size).toBe(2);
+	expect(r.openItemCount).toBe(0);
+	expectValidNotifications(notifications);
+});
+
+test("an update with multiple open items fails closed instead of choosing the first", () => {
+	const r = reducer([1, 2]);
+	const first = assistant("", "open-one");
+	const second = assistant("", "open-two");
+	const unknown = assistant("delta", undefined, 2);
+	const startedNotifications = [...r.accept(messageStart(first)), ...r.accept(messageStart(second))];
+
+	expect(methods(startedNotifications)).toEqual(["item/started", "item/started"]);
+	expect(r.accept(messageUpdate(unknown, "delta"))).toEqual([]);
+	expect(r.accept(messageEnd(unknown))).toEqual([]);
+	expect(r.openItemCount).toBe(2);
+});
+
+test("completeTurn refuses ambiguous authoritative state for multiple open items", () => {
+	const r = reducer([1, 2]);
+	const first = assistant("first", "open-one");
+	const second = assistant("second", "open-two");
+	r.accept(messageStart(first));
+	r.accept(messageStart(second));
+
+	const unknown = assistant("final", undefined, 3);
+	expect(() => r.completeTurn({ kind: "completed", messages: [unknown] })).toThrow(
+		"Cannot correlate authoritative agent-message state",
+	);
+	expect(r.openItemCount).toBe(2);
 });
 
 test("a message_end without a started lifecycle is omitted", () => {
 	const r = reducer();
 	expect(r.accept(messageEnd(assistant("never started", "never-started")))).toEqual([]);
 	expect(r.openItemCount).toBe(0);
+});
+
+test("completeTurn refuses to close an item without authoritative state", () => {
+	const r = reducer([1, 2]);
+	const initial = assistant("initial", "response-no-final");
+	r.accept(messageStart(initial));
+
+	expect(() => r.completeTurn({ kind: "failed" })).toThrow("no authoritative message");
+	expect(r.openItemCount).toBe(1);
+
+	const final = assistant("authoritative final", "response-no-final");
+	const notifications = r.completeTurn({ kind: "failed", messages: [final] });
+	expect(completed(notifications).params.item.text).toBe("authoritative final");
+	expect(r.openItemCount).toBe(0);
+	expectValidNotifications(notifications);
 });
 
 test("agent_end and interrupted completeTurn terminalize every started item", () => {
@@ -205,9 +270,10 @@ test("agent_end and interrupted completeTurn terminalize every started item", ()
 	expectValidNotifications(notifications);
 
 	const second = reducer([40, 50]);
-	const secondMessage = assistant("failed answer", "response-failed");
-	second.accept(messageStart(secondMessage));
-	const closed = second.completeTurn({ kind: "failed" });
+	const secondStart = assistant("partial failure", "response-failed");
+	const secondFinal = assistant("failed answer", "response-failed");
+	second.accept(messageStart(secondStart));
+	const closed = second.completeTurn({ kind: "failed", messages: [secondFinal] });
 	expect(methods(closed)).toEqual(["item/completed"]);
 	expect(completed(closed).params.item.text).toBe("failed answer");
 	expect(second.openItemCount).toBe(0);
@@ -241,8 +307,8 @@ test("two assistant messages use distinct deterministic fallback ids and replay 
 	const second = assistant("second", undefined, 2);
 	const events: AgentSessionEvent[] = [
 		messageStart(first),
-		messageStart(second),
 		messageEnd(first),
+		messageStart(second),
 		messageEnd(second),
 	];
 	const run = (sequence: readonly AgentSessionEvent[]): string[] => {
@@ -256,11 +322,13 @@ test("two assistant messages use distinct deterministic fallback ids and replay 
 	};
 
 	const ids = run(events);
+	const replayFirst = assistant("first", undefined, 1);
+	const replaySecond = assistant("second", undefined, 2);
 	const replayIds = run([
-		messageStart(assistant("first", undefined, 1)),
-		messageStart(assistant("second", undefined, 2)),
-		messageEnd(assistant("first", undefined, 1)),
-		messageEnd(assistant("second", undefined, 2)),
+		messageStart(replayFirst),
+		messageEnd(replayFirst),
+		messageStart(replaySecond),
+		messageEnd(replaySecond),
 	]);
 	expect(ids).toHaveLength(2);
 	expect(new Set(ids).size).toBe(2);

@@ -10,7 +10,6 @@ import { classifyInbound, dispatchClientRequest } from "./router/dispatch";
 import type { ServerRequestBroker } from "./server-requests/broker";
 import type { HandlerContext, HandlerRegistry } from "./suites/handlers";
 import { type ChildBridgeOptions, loadThread } from "./thread-runtime/child-bridge";
-
 import type { ThreadRuntimeManager } from "./thread-runtime/thread-runtime-manager";
 import { serializeError, serializeResult } from "./transport/errors";
 import { decodeLine, encodeMessage, type FrameCodecOptions } from "./transport/framing";
@@ -45,15 +44,17 @@ function isClientResponse(
 	return !Object.hasOwn(frame, "method") && id !== undefined && hasResult !== hasError;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function isErrorResponse(value: unknown): value is { code: number; message: string } {
+	if (!isRecord(value)) return false;
 	return (
-		typeof value === "object" &&
-		value !== null &&
-		!Array.isArray(value) &&
-		typeof (value as Record<string, unknown>).code === "number" &&
-		Number.isFinite((value as Record<string, unknown>).code) &&
-		Number.isInteger((value as Record<string, unknown>).code) &&
-		typeof (value as Record<string, unknown>).message === "string"
+		typeof value.code === "number" &&
+		Number.isFinite(value.code) &&
+		Number.isInteger(value.code) &&
+		typeof value.message === "string"
 	);
 }
 
@@ -151,9 +152,9 @@ export async function processInbound(
 			return { response: serializeError(verdict.id, "invalidParams", transport) ?? undefined };
 		case "handle": {
 			if (classification.method === "thread/start") {
-				if (!threadStartBridge)
+				if (typeof threadStartBridge?.create !== "function")
 					return { response: serializeError(verdict.id, "notSupported", transport) ?? undefined };
-				const params = (verdict.params ?? {}) as Record<string, unknown>;
+				const params = isRecord(verdict.params) ? verdict.params : {};
 				try {
 					const runtime = await loadThread(threadStartBridge, {
 						connectionId: context?.connectionId,
@@ -164,7 +165,7 @@ export async function processInbound(
 					});
 					return { response: serializeResult(verdict.id, runtime.response, transport) ?? undefined };
 				} catch (error) {
-					const key = (error as { code?: string }).code === "conflict" ? "conflict" : "internalError";
+					const key = isRecord(error) && error.code === "conflict" ? "conflict" : "internalError";
 					return { response: serializeError(verdict.id, key, transport) ?? undefined };
 				}
 			}

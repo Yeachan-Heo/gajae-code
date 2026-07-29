@@ -105,7 +105,7 @@ export interface ChildBridgeOptions {
 	readonly manager: ThreadRuntimeManager;
 	/** Transactional injected lifecycle adapter. */
 	readonly create?: ChildCreate;
-	/** Legacy authority-only seam retained for the manager's admission tests. */
+	/** Authority-only compatibility adapter. */
 	readonly spawn?: (threadId: string, ownership: ThreadOwnership) => Promise<EndpointAuthority | undefined>;
 	/** Authority-fenced close for legacy spawns or children without a local close hook. */
 	readonly close?: (
@@ -226,26 +226,9 @@ function responseFor(
 	return response;
 }
 
-async function invokeReadiness(child: ChildCreateResult): Promise<void> {
-	await child.awaitReady();
-}
-
-async function invokeAttachmentClose(attachment: ReverseLeaseAttachment | undefined): Promise<void> {
-	if (attachment) await attachment.close();
-}
-
-function requestFromLegacy(
-	threadIdOrRequest: string | ThreadLoadRequest,
-	ownership?: ThreadOwnership,
-	connectionId?: string,
-): ThreadLoadRequest {
-	if (typeof threadIdOrRequest !== "string") return threadIdOrRequest;
-	return { threadId: threadIdOrRequest, ownership, connectionId };
-}
-
 /**
- * Load one retained child transactionally. The string overload is a compatibility seam for
- * the original authority-only tests; the request overload is the production boundary.
+ * Load one retained child transactionally. The string overload preserves the authority-only
+ * adapter API; the request overload is the production boundary.
  */
 export async function loadThread(opts: ChildBridgeOptions, request: ThreadLoadRequest): Promise<LoadedThreadRuntime>;
 export async function loadThread(
@@ -260,29 +243,43 @@ export async function loadThread(
 	legacyOwnership?: ThreadOwnership,
 	legacyConnectionId?: string,
 ): Promise<LoadedThreadRuntime | undefined> {
-	const request = requestFromLegacy(threadIdOrRequest, legacyOwnership, legacyConnectionId);
+	const request =
+		typeof threadIdOrRequest === "string"
+			? { threadId: threadIdOrRequest, ownership: legacyOwnership, connectionId: legacyConnectionId }
+			: threadIdOrRequest;
 	const ownership = request.ownership ?? "spawned";
 	const adapter = opts.create;
 
-	// Preserve the authority-only manager seam for its focused admission tests.
+	wireCloseCallback(opts);
 	if (!adapter) {
 		if (!opts.spawn) throw new Error("No child lifecycle adapter was supplied.");
 		const threadId = requiredString(request.threadId, "threadId");
 		const token = opts.manager.acquireSpawnToken();
 		try {
 			const authority = await opts.spawn(threadId, ownership);
-			opts.manager.register(threadId, ownership, authority, request.connectionId);
-			return;
+			try {
+				opts.manager.register(threadId, ownership, authority, request.connectionId);
+				return;
+			} catch (error) {
+				if (ownership === "spawned" && opts.close) {
+					try {
+						await opts.close(threadId, ownership, authority);
+					} catch {
+						// Preserve the publication failure after attempting authority-fenced cleanup.
+					}
+				}
+				throw error;
+			}
 		} finally {
 			token.release();
 		}
 	}
 
-	wireCloseCallback(opts);
 	const cwd = normalizedCwd(request);
 	const idempotencyKey = request.idempotencyKey ?? `thread-start:${randomUUID()}`;
 	const provisionalThreadId = request.threadId ?? `pending:${idempotencyKey}`;
 	let reservation: AdmissionReservation | undefined;
+	let observerClose: CloseOnce | undefined;
 	let token: { release: () => void } | undefined;
 	let attachment: ReverseLeaseAttachment | undefined;
 	let attachmentClose: CloseOnce | undefined;
@@ -294,9 +291,14 @@ export async function loadThread(
 	const closeResources = async (): Promise<void> => {
 		let firstError: unknown;
 		try {
-			if (attachmentClose) await attachmentClose();
+			if (observerClose) await observerClose();
 		} catch (error) {
 			firstError = error;
+		}
+		try {
+			if (attachmentClose) await attachmentClose();
+		} catch (error) {
+			firstError ??= error;
 		}
 		if (clientClose && attachment?.ownsClient !== true) {
 			try {
@@ -349,17 +351,30 @@ export async function loadThread(
 		if (ownership === "spawned" && !childAuthority)
 			throw new Error("Spawned child did not provide endpoint authority.");
 
-		await invokeReadiness(child);
+		await child.awaitReady();
+		const observerClosers: Array<() => void> = [];
+		observerClose = closeOnce(async () => {
+			let firstError: unknown;
+			for (const close of observerClosers) {
+				try {
+					close();
+				} catch (error) {
+					firstError ??= error;
+				}
+			}
+			if (firstError) throw firstError;
+		});
 
-		// Install the complete retained-client observer surface after semantic readiness so
-		// reconnect failures cannot be lost during the publication window.
-		client.onFrame(frame => opts.onFrame?.(child!, frame));
-		client.onReconnect(() => opts.onReconnect?.(child!));
-		client.onReconnectFailed(error => opts.onReconnectFailed?.(child!, error));
+		// Install observers after semantic readiness but before publication so no post-ready
+		// frame is lost. Callbacks must tolerate the runtime still being transactional/unpublished.
+		observerClosers.push(client.onFrame(frame => opts.onFrame?.(child, frame)));
+		observerClosers.push(client.onReconnect(() => opts.onReconnect?.(child)));
+		observerClosers.push(client.onReconnectFailed(error => opts.onReconnectFailed?.(child, error)));
 
 		if (opts.attachReverseLeaseController) {
-			attachment = (await opts.attachReverseLeaseController(client, child, request)) ?? undefined;
-			if (attachment) attachmentClose = closeOnce(() => invokeAttachmentClose(attachment));
+			const attached = (await opts.attachReverseLeaseController(client, child, request)) ?? undefined;
+			attachment = attached;
+			if (attached) attachmentClose = closeOnce(() => attached.close());
 		}
 
 		const effectiveSettings =

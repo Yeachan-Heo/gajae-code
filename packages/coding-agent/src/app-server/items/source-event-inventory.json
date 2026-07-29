@@ -7,6 +7,8 @@
 		"coreEventFile": "packages/agent/src/types.ts"
 	},
 	"permittedUnmapped": [
+		"agent_start",
+		"turn_start",
 		"auto_compaction_start",
 		"auto_compaction_end",
 		"auto_retry_start",
@@ -43,43 +45,43 @@
 			"discriminator": "agent_start",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
-			"classification": "mapped",
-			"reason": "Lifecycle boundary is consumed as a no-op for this per-turn reducer."
+			"classification": "permitted-unmapped",
+			"reason": "Agent lifecycle boundary does not emit an agent-message item."
 		},
 		{
 			"discriminator": "agent_end",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Closes all started agent-message items at the agent boundary."
+			"reason": "Closes started agent-message items with authoritative state at the agent boundary."
 		},
 		{
 			"discriminator": "turn_start",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
-			"classification": "mapped",
-			"reason": "Turn boundary is consumed as a no-op; turn identity is injected into the reducer."
+			"classification": "permitted-unmapped",
+			"reason": "Turn lifecycle boundary does not emit an agent-message item."
 		},
 		{
 			"discriminator": "turn_end",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Uses the final assistant message and closes remaining started items."
+			"reason": "Uses a correlated assistant turn-end message and closes remaining started items."
 		},
 		{
 			"discriminator": "message_start",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Starts an assistant-message item exactly once."
+			"reason": "Starts an assistant-message item when no matching lifecycle exists."
 		},
 		{
 			"discriminator": "message_update",
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Updates authoritative assistant state and emits text/error deltas."
+			"reason": "Records the latest assistant state and emits text/error deltas."
 		},
 		{
 			"discriminator": "message_end",

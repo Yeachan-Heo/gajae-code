@@ -49,32 +49,17 @@ export interface ItemCompletedNotification {
 
 export type WireNotification = ItemStartedNotification | AgentMessageDeltaNotification | ItemCompletedNotification;
 
-export interface AgentMessageItemSnapshot {
-	readonly id: string;
-	readonly text: string;
-	readonly startedAtMs: number;
-	readonly completedAtMs?: number;
-	readonly state: "open" | "completed";
-}
-
 export type AgentMessageTurnOutcomeKind = "completed" | "interrupted" | "failed";
 
 export interface AgentMessageTurnOutcome {
 	kind: AgentMessageTurnOutcomeKind;
-	/** Final messages from the authoritative turn result, when available. */
 	messages?: readonly AgentMessage[];
-	/** Alias for callers that have one final message rather than a list. */
-	message?: AgentMessage;
-	/** Explicitly named form for retained clients that distinguish source snapshots. */
-	authoritativeMessages?: readonly AgentMessage[];
-	/** Explicitly named form for one authoritative source snapshot. */
-	authoritativeMessage?: AgentMessage;
 }
 
 interface ItemState {
 	id: string;
 	text: string;
-	message?: AssistantMessage;
+	authoritativeMessage?: AssistantMessage;
 	startedAtMs: number;
 	completedAtMs?: number;
 	state: "open" | "completed";
@@ -99,24 +84,12 @@ function sourceIdentity(message: AssistantMessage): string | undefined {
 	return undefined;
 }
 
-function messageFingerprint(message: AssistantMessage): string {
-	return [
-		message.timestamp,
-		message.api,
-		message.provider,
-		message.model,
-		message.stopReason,
-		extractAssistantText(message),
-	].join("\u001f");
-}
-
 export class AgentMessageReducer {
 	readonly #threadId: string;
 	readonly #turnId: string;
 	readonly #clock: () => number;
 	readonly #items = new Map<string, ItemState>();
 	readonly #sourceToItem = new Map<string, string>();
-	readonly #fingerprintToItem = new Map<string, string>();
 	readonly #messageToItem = new WeakMap<object, string>();
 	#fallbackSequence = 0;
 
@@ -132,24 +105,6 @@ export class AgentMessageReducer {
 			if (item.state === "open") count += 1;
 		}
 		return count;
-	}
-
-	get snapshots(): readonly AgentMessageItemSnapshot[] {
-		return Object.freeze(
-			Array.from(this.#items.values(), item =>
-				Object.freeze({
-					id: item.id,
-					text: item.text,
-					startedAtMs: item.startedAtMs,
-					...(item.completedAtMs === undefined ? {} : { completedAtMs: item.completedAtMs }),
-					state: item.state,
-				}),
-			),
-		);
-	}
-
-	get snapshot(): readonly AgentMessageItemSnapshot[] {
-		return this.snapshots;
 	}
 
 	accept(event: AgentSessionEvent): readonly WireNotification[] {
@@ -187,10 +142,10 @@ export class AgentMessageReducer {
 	}
 
 	completeTurn(outcome: AgentMessageTurnOutcome): readonly WireNotification[] {
-		const authoritative = this.#outcomeMessages(outcome);
+		const authoritative = (outcome.messages ?? []).filter(isAssistantMessage);
 		const assignments = this.#resolveAuthoritativeAssignments(authoritative);
 		for (const item of this.#items.values()) {
-			if (item.state === "open" && !item.message) {
+			if (item.state === "open" && !item.authoritativeMessage && !assignments.has(item.id)) {
 				throw new Error(`Cannot terminalize agent-message item ${item.id}: no authoritative message`);
 			}
 		}
@@ -209,17 +164,13 @@ export class AgentMessageReducer {
 		if (!isAssistantMessage(message)) return [];
 		const existing = this.#findItem(message, false);
 		if (existing) {
-			if (existing.state === "open") {
-				existing.implicitStart = false;
-				this.#setAuthoritative(existing, message);
-			}
+			if (existing.state === "open") existing.implicitStart = false;
 			return [];
 		}
 		const implicit = this.#onlyOpenImplicitItem();
 		if (implicit) {
 			implicit.implicitStart = false;
 			this.#rememberMessage(message, implicit.id, sourceIdentity(message));
-			this.#setAuthoritative(implicit, message);
 			return [];
 		}
 		const item = this.#createItem(message, false);
@@ -231,7 +182,7 @@ export class AgentMessageReducer {
 		let item = this.#findItem(event.message, true);
 		const notifications: WireNotification[] = [];
 		if (!item) {
-			if (this.#items.size > 0 && this.openItemCount === 0) return [];
+			if (this.#items.size > 0 && sourceIdentity(event.message) === undefined) return [];
 			item = this.#createItem(event.message, true);
 			notifications.push(this.#startedNotification(item));
 		}
@@ -258,9 +209,11 @@ export class AgentMessageReducer {
 	}
 
 	#acceptTurnEnd(message: AgentMessage): readonly WireNotification[] {
-		if (isAssistantMessage(message)) {
-			const item = this.#findItem(message, true);
-			if (item?.state === "open") this.#setAuthoritative(item, message);
+		const authoritative = isAssistantMessage(message) ? [message] : [];
+		const assignments = this.#resolveAuthoritativeAssignments(authoritative);
+		for (const [itemId, source] of assignments) {
+			const item = this.#items.get(itemId);
+			if (item?.state === "open") this.#setAuthoritative(item, source);
 		}
 		return this.#closeOpenItems();
 	}
@@ -281,7 +234,6 @@ export class AgentMessageReducer {
 		const item: ItemState = {
 			id,
 			text: extractAssistantText(message),
-			message,
 			startedAtMs: this.#clock(),
 			state: "open",
 			implicitStart,
@@ -317,32 +269,21 @@ export class AgentMessageReducer {
 		}
 		const rememberedId = this.#messageToItem.get(message);
 		if (rememberedId) return this.#items.get(rememberedId);
-		const fingerprintId = this.#fingerprintToItem.get(messageFingerprint(message));
-		if (fingerprintId) return this.#items.get(fingerprintId);
 		if (!allowOpenFallback) return undefined;
 		const openItems = Array.from(this.#items.values()).filter(item => item.state === "open");
-		if (openItems.length === 1) {
-			const item = openItems[0];
-			this.#rememberMessage(message, item.id, source);
-			return item;
-		}
-		if (openItems.length > 1) {
-			const item = openItems[0];
-			this.#rememberMessage(message, item.id, source);
-			return item;
-		}
-		return undefined;
+		if (openItems.length !== 1 || this.#items.size !== 1) return undefined;
+		const item = openItems[0];
+		this.#rememberMessage(message, item.id, source);
+		return item;
 	}
 
 	#rememberMessage(message: AssistantMessage, itemId: string, source: string | undefined): void {
 		this.#messageToItem.set(message, itemId);
 		if (source) this.#sourceToItem.set(source, itemId);
-		const fingerprint = messageFingerprint(message);
-		if (!this.#fingerprintToItem.has(fingerprint)) this.#fingerprintToItem.set(fingerprint, itemId);
 	}
 
 	#setAuthoritative(item: ItemState, message: AssistantMessage): void {
-		item.message = message;
+		item.authoritativeMessage = message;
 		item.text = extractAssistantText(message);
 		this.#rememberMessage(message, item.id, sourceIdentity(message));
 	}
@@ -377,6 +318,11 @@ export class AgentMessageReducer {
 	}
 
 	#closeOpenItems(): readonly WireNotification[] {
+		for (const item of this.#items.values()) {
+			if (item.state === "open" && !item.authoritativeMessage) {
+				throw new Error(`Cannot terminalize agent-message item ${item.id}: no authoritative message`);
+			}
+		}
 		const notifications: WireNotification[] = [];
 		for (const item of this.#items.values()) {
 			if (item.state === "open") notifications.push(...this.#closeItem(item));
@@ -394,13 +340,6 @@ export class AgentMessageReducer {
 		};
 	}
 
-	#outcomeMessages(outcome: AgentMessageTurnOutcome): AssistantMessage[] {
-		const messages: AgentMessage[] = [...(outcome.authoritativeMessages ?? []), ...(outcome.messages ?? [])];
-		if (outcome.authoritativeMessage) messages.push(outcome.authoritativeMessage);
-		if (outcome.message) messages.push(outcome.message);
-		return messages.filter(isAssistantMessage);
-	}
-
 	#resolveAuthoritativeAssignments(messages: readonly AssistantMessage[]): Map<string, AssistantMessage> {
 		const assignments = new Map<string, AssistantMessage>();
 		const openItems = Array.from(this.#items.values()).filter(item => item.state === "open");
@@ -410,11 +349,11 @@ export class AgentMessageReducer {
 				if (known.state === "open" && !assignments.has(known.id)) assignments.set(known.id, message);
 				continue;
 			}
-			const next = openItems.find(item => !assignments.has(item.id));
-			if (next) {
-				assignments.set(next.id, message);
-				this.#rememberMessage(message, next.id, sourceIdentity(message));
+			if (openItems.length === 0) continue;
+			if (openItems.length !== 1) {
+				throw new Error(`Cannot correlate authoritative agent-message state for turn ${this.#turnId}`);
 			}
+			if (!assignments.has(openItems[0].id)) assignments.set(openItems[0].id, message);
 		}
 		return assignments;
 	}

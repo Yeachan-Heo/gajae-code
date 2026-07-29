@@ -69,9 +69,9 @@ class Runtime implements AppServerRuntime {
 	) {
 		this.manager = new ThreadRuntimeManager(config);
 		this.#frameCodec = frameCodec;
-		this.#threadStartAdapter = options.threadStartAdapter
-			? { ...options.threadStartAdapter, manager: this.manager }
-			: undefined;
+		const adapter = options.threadStartAdapter;
+		this.#threadStartAdapter =
+			typeof adapter?.create === "function" ? { ...adapter, manager: this.manager } : undefined;
 		registerBuiltinHandlers(this.registry);
 	}
 
