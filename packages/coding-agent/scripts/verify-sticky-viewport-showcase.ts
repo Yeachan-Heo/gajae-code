@@ -79,6 +79,7 @@ const SEMANTIC_ROOT_IDS = [
 const STATE_KEYS = [
 	"manual",
 	"notice",
+	"observed_output_revision",
 	"transcript_capacity",
 	"composer_visible",
 	"resize_probes",
@@ -544,6 +545,16 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		const pinBoundary = object(stateEvidence.pin_boundary, `metadata ${key} pin boundary`);
 		const cursor = object(stateEvidence.cursor, `metadata ${key} cursor`);
 		const selection = stateEvidence.selection;
+		const expectedManual = state !== "live-overflow" && state !== "capacity-zero";
+		const expectedNotice = state === "manual-new-output";
+		const expectedRevision = expectedNotice ? "1" : "0";
+		if (
+			stateEvidence.manual !== expectedManual ||
+			stateEvidence.notice !== expectedNotice ||
+			stateEvidence.observed_output_revision !== expectedRevision ||
+			metadata.output_revision !== stateEvidence.observed_output_revision
+		)
+			fail(`renderer-owned viewport state mismatch for ${key}`);
 		const semanticAnchor =
 			state === "capacity-zero"
 				? stateEvidence.semantic_anchor

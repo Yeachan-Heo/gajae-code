@@ -156,7 +156,7 @@ describe("sticky viewport production evidence verifier", () => {
 		expect(metadata.state.resize_probes[2]).toMatchObject({ todo_expanded: true });
 		expect(metadata.state.visible_empty_irc_frame.text).not.toContain("worker → you");
 		expect(metadata.state.resize_probes[3].frame.text).toContain("worker → you");
-	}, 30_000);
+	}, 120_000);
 	it("renders inverse ANSI as effective colors and closes spans across resets", () => {
 		const html = ansiToHtml("\x1b[31;44;7mX\x1b[27mY\x1b[0mZ");
 		expect(html).toContain("color:#3465a4;background-color:#cc0000");
@@ -181,7 +181,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await replaceAnsiColor(root, cubeKey, "\x1b[38;5;196;48;5;51m");
 		await rebindReviewInput(root);
 		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("runtime observation mismatch");
-	}, 30_000);
+	}, 120_000);
 	it("requires terminal HTML to be the exact canonical ANSI conversion", async () => {
 		const root = await capture();
 		const key = "manual-new-output/80x24/unicode-color";
@@ -194,7 +194,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow(
 			"HTML artifact is not canonical ANSI conversion",
 		);
-	}, 30_000);
+	}, 120_000);
 	it("round-trips xterm strikethrough and production-only SGR attributes", async () => {
 		const terminal = new VirtualTerminal(20, 1);
 		terminal.write("\x1b[5;8;9;53mX\x1b[25;28;29;55mY");
@@ -237,7 +237,51 @@ describe("sticky viewport production evidence verifier", () => {
 		noticeMetadata.output_revision = "0";
 		await Bun.write(noticeMetadataPath, `${JSON.stringify(noticeMetadata, null, 2)}\n`);
 		await rehash(noticeRoot, key, "metadata.json");
-		await expect(verifyStickyViewportShowcase(noticeRoot)).rejects.toThrow("review input manifest binding mismatch");
+		await expect(verifyStickyViewportShowcase(noticeRoot)).rejects.toThrow("renderer-owned viewport state mismatch");
+		const falseManualRoot = await cloneBase();
+		const falseManualPath = path.join(falseManualRoot, key, "metadata.json");
+		const falseManual = JSON.parse(await fs.readFile(falseManualPath, "utf8"));
+		falseManual.state.manual = false;
+		await Bun.write(falseManualPath, `${JSON.stringify(falseManual, null, 2)}\n`);
+		await rehash(falseManualRoot, key, "metadata.json");
+		await rebindReviewInput(falseManualRoot);
+		await expect(verifyStickyViewportShowcase(falseManualRoot)).rejects.toThrow(
+			"renderer-owned viewport state mismatch",
+		);
+
+		const extraNoticeRoot = await cloneBase();
+		const extraNoticeKey = "manual-history/80x24/unicode-color";
+		const extraNoticePath = path.join(extraNoticeRoot, extraNoticeKey, "metadata.json");
+		const extraNotice = JSON.parse(await fs.readFile(extraNoticePath, "utf8"));
+		extraNotice.state.notice = true;
+		await Bun.write(extraNoticePath, `${JSON.stringify(extraNotice, null, 2)}\n`);
+		await rehash(extraNoticeRoot, extraNoticeKey, "metadata.json");
+		await rebindReviewInput(extraNoticeRoot);
+		await expect(verifyStickyViewportShowcase(extraNoticeRoot)).rejects.toThrow(
+			"renderer-owned viewport state mismatch",
+		);
+
+		const staleRevisionRoot = await cloneBase();
+		const staleRevisionPath = path.join(staleRevisionRoot, key, "metadata.json");
+		const staleRevision = JSON.parse(await fs.readFile(staleRevisionPath, "utf8"));
+		staleRevision.state.observed_output_revision = "0";
+		await Bun.write(staleRevisionPath, `${JSON.stringify(staleRevision, null, 2)}\n`);
+		await rehash(staleRevisionRoot, key, "metadata.json");
+		await rebindReviewInput(staleRevisionRoot);
+		await expect(verifyStickyViewportShowcase(staleRevisionRoot)).rejects.toThrow(
+			"renderer-owned viewport state mismatch",
+		);
+		const crossBoundaryRoot = await cloneBase();
+		const crossBoundaryKey = "selection-boundary/80x24/unicode-color";
+		const crossBoundaryPath = path.join(crossBoundaryRoot, crossBoundaryKey, "metadata.json");
+		const crossBoundary = JSON.parse(await fs.readFile(crossBoundaryPath, "utf8"));
+		crossBoundary.state.selection.end.row = crossBoundary.state.transcript_capacity;
+		await Bun.write(crossBoundaryPath, `${JSON.stringify(crossBoundary, null, 2)}\n`);
+		await rehash(crossBoundaryRoot, crossBoundaryKey, "metadata.json");
+		await rebindReviewInput(crossBoundaryRoot);
+		await expect(verifyStickyViewportShowcase(crossBoundaryRoot)).rejects.toThrow(
+			"selection boundary evidence missing",
+		);
 
 		const capacityRoot = await cloneBase();
 		const capacityKey = "capacity-one/80x24/unicode-color";

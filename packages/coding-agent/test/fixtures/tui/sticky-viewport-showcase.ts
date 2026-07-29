@@ -291,7 +291,20 @@ export async function renderStickyViewportShowcase(
 		if (entry.stateId === "selection-boundary") {
 			mode.ui.requestRender(true);
 			await terminal.waitForRender();
-			mode.ui.setViewportSelection({ line: 1, column: 1 }, { line: 2, column: 17 });
+			const beforeSelection = mode.ui.getViewportObservation();
+			if (!beforeSelection || beforeSelection.transcriptCapacity < 2)
+				throw new Error("selection boundary lacks two painted transcript rows");
+			mode.ui.setViewportSelection(
+				{ line: beforeSelection.transcriptCapacity - 1, column: 1 },
+				{ line: beforeSelection.transcriptCapacity, column: 17 },
+			);
+			await terminal.waitForRender();
+			if (mode.ui.getViewportObservation()?.selection !== null)
+				throw new Error("selection crossed into the pinned row");
+			mode.ui.setViewportSelection(
+				{ line: beforeSelection.transcriptCapacity - 2, column: 1 },
+				{ line: beforeSelection.transcriptCapacity - 1, column: 17 },
+			);
 		}
 		mode.ui.requestRender(true);
 		await terminal.waitForRender();
@@ -319,11 +332,16 @@ export async function renderStickyViewportShowcase(
 			terminalText: Bun.stripANSI(retainedFrame),
 			terminalAnsiText: retainedFrame,
 			sourceRevision: "production-tui-virtual-terminal-v3",
-			outputRevision: entry.stateId === "manual-new-output" ? "1" : "0",
+			outputRevision:
+				observation.outputRevision ??
+				(() => {
+					throw new Error("renderer produced no output revision");
+				})(),
 			cjkPhraseBoundaries: entry.stateId === "narrow-cjk" ? CJK_BOUNDARIES : [],
 			state: {
-				manual: entry.stateId !== "live-overflow",
-				notice: entry.stateId === "manual-new-output",
+				manual: observation.manualHistory,
+				notice: observation.newOutputNoticeVisible,
+				observed_output_revision: observation.outputRevision,
 				transcript_capacity: observation.transcriptCapacity,
 				composer_visible: focused === mode.editor,
 				resize_probes: resizeProbes,

@@ -208,8 +208,11 @@ async function capture(
 	const rendered = await renderStickyViewportShowcase(entry);
 	if (!rendered.state.composer_visible)
 		throw new Error(`${entry.key}: focused composer was not visible in production frame`);
-	if (entry.stateId === "manual-new-output" && rendered.state.notice !== true)
-		throw new Error(`${entry.key}: manual output notice precondition failed`);
+	if (
+		(entry.stateId === "manual-new-output" && rendered.state.notice !== true) ||
+		(entry.stateId !== "manual-new-output" && rendered.state.notice !== false)
+	)
+		throw new Error(`${entry.key}: renderer-owned output notice precondition failed`);
 	if (
 		JSON.stringify(rendered.cjkPhraseBoundaries) !==
 		JSON.stringify(entry.stateId === "narrow-cjk" ? CJK_PHRASE_BOUNDARIES : [])
