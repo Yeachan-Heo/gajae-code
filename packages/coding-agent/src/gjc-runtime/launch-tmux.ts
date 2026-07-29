@@ -1247,7 +1247,7 @@ function createIsolatedTmuxSession(
 				startTime: server.startTime!,
 				pidProven: server.pidProven,
 			};
-			cleanupCreatedTmuxSessionAfterFailure(plan, spawn, options, probe, new Error("owner_generation_stale"));
+			cleanupCreatedTmuxSessionAfterFailure(plan, spawn, options, probe);
 		},
 	});
 	// A failed planned spawn is the new-session failure. Let its established
