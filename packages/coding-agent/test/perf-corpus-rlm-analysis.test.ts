@@ -884,12 +884,16 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			ledger.measurementGitSha = report.gitSha;
 			ledger.closureDigest = report.runner.closureDigest;
 			ledger.worktreeFingerprint = report.runner.worktreeFingerprint;
+			(ledger.host as JsonObject).platform = report.runner.platform;
+			(ledger.host as JsonObject).arch = report.runner.arch;
 			for (const attempt of ledger.attempts as JsonObject[]) {
 				attempt.sequence = 1;
 				attempt.cooldownAfterPreviousSeconds = 0;
 				attempt.measurementGitSha = report.gitSha;
 				attempt.closureDigest = report.runner.closureDigest;
 				attempt.worktreeFingerprint = report.runner.worktreeFingerprint;
+				attempt.platform = report.runner.platform;
+				attempt.arch = report.runner.arch;
 			}
 		});
 		expect(
