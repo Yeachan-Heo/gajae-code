@@ -311,14 +311,14 @@ export async function appendProjectionRecord<P extends ProjectionPayload>(
 		},
 	);
 	const operationError = errorFromOperation(response);
-	if (operationError?.code !== undefined || operationError?.message !== undefined) {
-		const candidate = appendResultCandidate(response);
-		if (candidate?.ok === false || candidate?.error !== undefined || candidate?.code !== undefined) {
-			throw new ProjectionAppendError(
-				operationError.code === "idempotency_conflict" ? "idempotency_conflict" : "projection_append_failed",
-				operationError.message ?? `projection.append failed (${operationError.code ?? "unknown"}).`,
-			);
-		}
+	const candidate = appendResultCandidate(response);
+	// A definitive rejection is a rejection even when the child omits an error object; a revision
+	// alongside `ok:false` must never be mistaken for a durable receipt.
+	if (candidate?.ok === false || candidate?.accepted === false || candidate?.error !== undefined) {
+		throw new ProjectionAppendError(
+			operationError?.code === "idempotency_conflict" ? "idempotency_conflict" : "projection_append_failed",
+			operationError?.message ?? `projection.append failed (${operationError?.code ?? "unknown"}).`,
+		);
 	}
 	const revision = revisionFromAppend(response);
 	return {

@@ -661,8 +661,11 @@ export class TurnController {
 				await drain;
 				await active.processingTail;
 			} catch (error) {
-				this.#markRecovery(active, this.#asControllerError(error, "internal"));
-				throw active.failure;
+				// A terminal frame in the drain disposes the turn, so `active.failure` may already be
+				// cleared. Surface the classified original error rather than throwing `undefined`.
+				const classified = this.#asControllerError(error, "internal");
+				this.#markRecovery(active, classified);
+				throw active.failure ?? classified;
 			}
 		})();
 		return await active.responseDeliveredPromise;

@@ -33,6 +33,7 @@ interface FakeOptions {
 class FakeClient implements SessionClient {
 	readonly calls: Array<{ operation: string; input: Record<string, unknown> }> = [];
 	readonly appended: ProjectionEnvelope[] = [];
+	appendResponse: unknown;
 	private revision = 0;
 
 	constructor(private readonly options: FakeOptions = {}) {}
@@ -69,6 +70,7 @@ class FakeClient implements SessionClient {
 			const envelope = input.envelope as ProjectionEnvelope;
 			this.appended.push(envelope);
 			this.revision += 1;
+			if (this.appendResponse !== undefined) return this.appendResponse;
 			return { entryId: `append-${this.revision}`, revision: this.revision };
 		}
 		if (operation === "projection.read") return { records: [], revision: 0 };
@@ -393,4 +395,56 @@ test("TurnControllerError codes stay distinct for admission and durability failu
 	expect(new TurnControllerError("idempotency_conflict", "c").code).toBe("idempotency_conflict");
 	expect(new TurnControllerError("projection_corrupt", "p").code).toBe("projection_corrupt");
 	expect(new TurnControllerError("recovery_required", "r").code).toBe("recovery_required");
+});
+
+test("a buffered terminal delivery failure rejects with the classified error, never undefined", async () => {
+	for (const failing of ["turn/completed", "thread/tokenUsage/updated"]) {
+		const client = new FakeClient();
+		const manager = managerWith(client);
+		const controller = new TurnController({
+			manager,
+			emit: notification => {
+				if (notification.method === failing) throw new Error(`writer rejected ${failing}`);
+			},
+			idFactory: () => APP_TURN_ID,
+		});
+
+		const handle = await controller.start({ threadId: THREAD_ID, params: { text: "hello" } });
+		// Buffered before the barrier, so the terminal is processed inside the delivery drain.
+		controller.acceptFrame(
+			THREAD_ID,
+			lifecycleFrame("agent_end", { messages: [assistant("done")], stopReason: "completed" }),
+		);
+
+		let rejection: unknown;
+		try {
+			await handle.responseDelivered();
+		} catch (error) {
+			rejection = error;
+		}
+		// The drain disposes the terminal turn, so `active.failure` is gone; the original error must
+		// still surface instead of an unclassifiable `undefined` rejection.
+		expect(rejection, failing).toBeDefined();
+		expect((rejection as { message?: string }).message, failing).toContain(failing);
+		expect(client.appended.at(-1)?.recordKind, failing).toBe("app-server.turn.terminal");
+		expect(controller.activeTurnCount, failing).toBe(0);
+	}
+});
+
+test("an errorless rejected projection append is never treated as a durable receipt", async () => {
+	for (const rejected of [
+		{ ok: false, revision: 1 },
+		{ accepted: false, revision: 1 },
+	]) {
+		const client = new FakeClient();
+		// The child definitively rejects the append yet still returns a revision.
+		client.appendResponse = rejected;
+		const manager = managerWith(client);
+		const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+
+		await expect(controller.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
+			code: "recovery_required",
+		});
+		expect(controller.getState(THREAD_ID), JSON.stringify(rejected)).toBe("recovery_required");
+	}
 });
