@@ -255,8 +255,9 @@ class Runtime implements AppServerRuntime {
 					this.broker.cancel(id, "request publication was abandoned");
 				};
 				const unregister = this.#registerUnpublished(connection.id, finalizeUnpublished);
-				// A settled request needs no abandonment finalizer; releasing it keeps the registry from
-				// retaining entries for the lifetime of a long-lived connection.
+				// A settled request needs no abandonment finalizer. This is a MEMORY-LEAK guard, not a
+				// correctness fence: a stale finalizer would only call `broker.cancel` on an already
+				// settled id, which is a no-op. It therefore has no behavioural mutation test.
 				void request.settled.then(unregister, unregister);
 				deferred.push(async () => {
 					unregister();

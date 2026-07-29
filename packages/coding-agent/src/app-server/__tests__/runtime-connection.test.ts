@@ -1218,4 +1218,33 @@ test("runtime connection: a settled approval releases its abandonment finalizer"
 	// Closing the connection now must not cancel anything: every finalizer was already released.
 	await connection.close();
 	expect(runtime.broker.pendingCount).toBe(0);
+	// Settle a request BEFORE its deferred publication runs, then tear the connection down. The
+	// release hook is a leak guard rather than a correctness fence (cancelling a settled id is a
+	// no-op), so this asserts the observable invariant: no resurrection and no accounting drift.
+	const second = runtime.createConnection(() => {});
+	await initialize(second);
+	runtime.subscriptions.subscribe(second.id, "thread-b");
+	runtime.manager.register("thread-b", "spawned", undefined, second.id);
+	let settledEarly: string | undefined;
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		settledEarly = context?.requestClient?.("thread-b", "execCommandApproval", {
+			conversationId: "thread-b",
+			callId: "call-2",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		// Cancel while still unpublished, so the settlement precedes publication.
+		if (settledEarly) runtime.broker.cancel(settledEarly, "settled before publication");
+		return { ok: true, result: { dataBase64: "" } };
+	});
+	await second.process(enc('{"id":20,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+	await Bun.sleep(0);
+	expect(settledEarly).toBeDefined();
+	expect(runtime.broker.pendingCount).toBe(0);
+	expect(runtime.manager.get("thread-b")?.pendingApprovals ?? 0).toBe(0);
+	await second.close();
+	expect(runtime.broker.pendingCount).toBe(0);
 });
