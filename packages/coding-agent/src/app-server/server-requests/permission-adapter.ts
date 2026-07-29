@@ -245,14 +245,12 @@ function fileChangesFor(
 	}
 	const path = input ? stringField(input, "path") : undefined;
 	if (toolName === "write" && path !== undefined && typeof input?.content === "string") {
-		// WriteTool creates OR overwrites. `add` would assert the file does not exist, so only claim
-		// that when the caller states it; otherwise describe the full replacement as an update whose
-		// diff is the new content. Never assert a fact about the filesystem we have not established.
-		const overwrites = input.overwrites === true || input.exists === true;
+		// WriteTool creates OR overwrites and its schema is only `{path, content}`, so nothing at this
+		// seam reveals whether the file already exists. `add` would assert it does not, which we have
+		// not established. Report the full replacement as an update whose diff is the new content:
+		// that is true for both a create and an overwrite.
 		return {
-			[path]: overwrites
-				? { type: "update", unified_diff: input.content, move_path: null }
-				: { type: "add", content: input.content },
+			[path]: { type: "update", unified_diff: input.content, move_path: null },
 		} as ApplyPatchApprovalParams["fileChanges"];
 	}
 	if (toolName === "delete" && path !== undefined) {

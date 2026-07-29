@@ -371,31 +371,17 @@ test("eval cells project into a protocol-valid command approval", () => {
 	}
 });
 
-test("a write that overwrites is not described as an add", () => {
-	// WriteTool creates OR overwrites. Claiming `add` for an overwrite tells the approving human the
-	// file does not exist, which is a materially different decision.
-	const overwrite = mapToolCallToCodexRequest(
-		{
-			toolCallId: "c",
-			toolName: "write",
-			title: "write",
-			rawInput: { path: "/tmp/a.ts", content: "next", overwrites: true },
-		},
-		{ conversationId: "thread-1" },
-	);
-	expect(
-		(overwrite.params as { fileChanges: Record<string, { type: string }> }).fileChanges["/tmp/a.ts"],
-	).toMatchObject({ type: "update" });
-	expect(stableValidators.serverRequestParams.applyPatchApproval(overwrite.params)).toBe(true);
-
-	// With no overwrite signal, a create is still reported as an add.
-	const create = mapToolCallToCodexRequest(
-		{ toolCallId: "c", toolName: "write", title: "write", rawInput: { path: "/tmp/new.ts", content: "hi" } },
-		{ conversationId: "thread-1" },
-	);
-	expect(
-		(create.params as { fileChanges: Record<string, { type: string }> }).fileChanges["/tmp/new.ts"],
-	).toMatchObject({
-		type: "add",
-	});
+test("a write is never described as an add, because existence is unknown at this seam", () => {
+	// WriteTool creates OR overwrites, and its schema is only {path, content}. Claiming `add` would
+	// tell the approving human the file does not exist — a materially different decision we have no
+	// evidence for. Both cases report the full replacement as an update.
+	for (const path of ["/tmp/a.ts", "/tmp/new.ts"]) {
+		const mapped = mapToolCallToCodexRequest(
+			{ toolCallId: "c", toolName: "write", title: "write", rawInput: { path, content: "next" } },
+			{ conversationId: "thread-1" },
+		);
+		const changes = (mapped.params as { fileChanges: Record<string, { type: string }> }).fileChanges;
+		expect(changes[path], path).toMatchObject({ type: "update" });
+		expect(stableValidators.serverRequestParams.applyPatchApproval(mapped.params), path).toBe(true);
+	}
 });
