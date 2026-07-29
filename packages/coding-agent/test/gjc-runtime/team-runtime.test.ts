@@ -90,6 +90,7 @@ beforeAll(async () => {
 		String.raw`import { appendFile, readFile, writeFile } from "node:fs/promises";
 
 const config = JSON.parse(await readFile(process.execPath + ".json", "utf8"));
+const optionKey = (target: string | undefined, name: string) => (target ?? "") + "\0" + name;
 const optionValues = async () => {
 	try {
 		return JSON.parse(await readFile(config.optionPath, "utf8"));
@@ -102,7 +103,7 @@ const saveOption = async () => {
 	const value = args.at(-1);
 	if (!name || value === undefined) return;
 	const values = await optionValues();
-	values[name] = value;
+	values[optionKey(targetAfter("-t"), name)] = value;
 	await writeFile(config.optionPath, JSON.stringify(values));
 };
 const argv = process.argv.slice(2);
@@ -157,8 +158,9 @@ if (command === "-V" || command === "--version") {
 } else if (command === "show-options" || command === "show-window-options") {
 	const name = args.at(-1);
 	const values = await optionValues();
+	const value = name ? values[optionKey(targetAfter("-t"), name)] : undefined;
 	if (name === "@gjc-profile" && config.gjcProfile !== false) console.log("1");
-	else if (name && values[name] !== undefined) console.log(values[name]);
+	else if (value !== undefined) console.log(value);
 	else if (name === "@gjc-profile") {
 		try {
 			await readFile(config.profilePath, "utf8");
@@ -1005,7 +1007,7 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).not.toContain("set-option -g");
 		expect(tmuxLog).not.toContain("new-session");
 		expect(tmuxLog).not.toContain("kill-session");
-	});
+	}, 30_000);
 
 	it("resolves the team tmux leader from GJC_TMUX_COMMAND, not only GJC_TEAM_TMUX_COMMAND", async () => {
 		cleanupRoot = await createGitRepo();

@@ -1415,10 +1415,9 @@ describe("default GJC tmux launch", () => {
 	});
 
 	it("omits the server PID guard clause when cleaning up on a platform that cannot prove it", () => {
-		// The non-Linux server probe reports a placeholder PID, so a `#{pid}` clause
-		// built from it can never match the live tmux server and the guarded cleanup
-		// is refused with gjc_tmux_exact_cleanup_uncertain instead of removing the
-		// session it just created.
+		// The non-Linux server probe reports a placeholder PID. Exact cleanup
+		// therefore cannot prove the original server and must preserve the
+		// provisional session rather than dispatching an unguarded destruction.
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
 		const previousIsTTY = stdout.isTTY;
@@ -1446,10 +1445,7 @@ describe("default GJC tmux launch", () => {
 				},
 			});
 
-			const guarded = calls.find(call => call.args[0] === "if-shell");
-			expect(guarded?.args.slice(0, 4)).toEqual(["if-shell", "-t", NATIVE_SESSION_ID, "-F"]);
-			expect(guarded?.args[4]).not.toContain("#{pid}");
-			expect(guarded?.args[4]).toContain(`#{==:#{session_id},${NATIVE_SESSION_ID}}`);
+			expect(calls.some(call => call.args[0] === "if-shell")).toBe(false);
 			expect(writeSpy).not.toHaveBeenCalled();
 		} finally {
 			Object.defineProperty(stdout, "isTTY", { configurable: true, value: previousIsTTY });
