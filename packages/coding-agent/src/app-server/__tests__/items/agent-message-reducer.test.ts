@@ -150,6 +150,33 @@ test("a delta before message_start implicitly emits exactly one start before the
 	expect(completed(notifications).params.item.text).toBe("partial final");
 	expectValidNotifications(notifications);
 });
+test("mismatched source identities keep an implicit update item distinct from a delayed start", () => {
+	const r = reducer([10, 20, 30, 40]);
+	const sourceA = assistant("A partial", "response-A");
+	const sourceBStart = assistant("B start", "response-B");
+	const sourceAFinal = assistant("A final", "response-A");
+	const sourceBFinal = assistant("B final", "response-B");
+	const notifications = [
+		...r.accept(messageUpdate(sourceA, "A partial")),
+		...r.accept(messageStart(sourceBStart)),
+		...r.accept(messageEnd(sourceBFinal)),
+		...r.accept(messageEnd(sourceAFinal)),
+	];
+
+	const startedIds = notifications
+		.filter((notification): notification is ItemStartedNotification => notification.method === "item/started")
+		.map(notification => notification.params.item.id);
+	const completedIds = notifications
+		.filter((notification): notification is ItemCompletedNotification => notification.method === "item/completed")
+		.map(notification => notification.params.item.id);
+	expect(startedIds).toEqual(["agent-message:response:response-A", "agent-message:response:response-B"]);
+	expect(new Set(startedIds).size).toBe(2);
+	expect(completedIds).toEqual(["agent-message:response:response-B", "agent-message:response:response-A"]);
+	expect(new Set(completedIds)).toEqual(new Set(startedIds));
+	expect(notifications.filter(notification => notification.method === "item/completed")).toHaveLength(2);
+	expect(r.openItemCount).toBe(0);
+	expectValidNotifications(notifications);
+});
 
 test("an identified delta can start a later item after an earlier item completed", () => {
 	const r = reducer([1, 2, 3, 4]);
@@ -240,19 +267,22 @@ test("a message_end without a started lifecycle is omitted", () => {
 	expect(r.openItemCount).toBe(0);
 });
 
-test("completeTurn refuses to close an item without authoritative state", () => {
-	const r = reducer([1, 2]);
+test("interrupted turns may fall back to the last observed message, while completed turns fail closed", () => {
+	const interrupted = reducer([1, 2]);
 	const initial = assistant("initial", "response-no-final");
-	r.accept(messageStart(initial));
+	interrupted.accept(messageStart(initial));
 
-	expect(() => r.completeTurn({ kind: "failed" })).toThrow("no authoritative message");
-	expect(r.openItemCount).toBe(1);
+	const interruptedNotifications = interrupted.completeTurn({ kind: "interrupted" });
+	expect(methods(interruptedNotifications)).toEqual(["item/completed"]);
+	expect(completed(interruptedNotifications).params.item.text).toBe("initial");
+	expect(interrupted.openItemCount).toBe(0);
+	expectValidNotifications(interruptedNotifications);
 
-	const final = assistant("authoritative final", "response-no-final");
-	const notifications = r.completeTurn({ kind: "failed", messages: [final] });
-	expect(completed(notifications).params.item.text).toBe("authoritative final");
-	expect(r.openItemCount).toBe(0);
-	expectValidNotifications(notifications);
+	const completedTurn = reducer([3, 4]);
+	const completedStartNotifications = completedTurn.accept(messageStart(initial));
+	expectValidNotifications(completedStartNotifications);
+	expect(() => completedTurn.completeTurn({ kind: "completed" })).toThrow("no authoritative message");
+	expect(completedTurn.openItemCount).toBe(1);
 });
 
 test("agent_end and interrupted completeTurn terminalize every started item", () => {
@@ -278,6 +308,19 @@ test("agent_end and interrupted completeTurn terminalize every started item", ()
 	expect(completed(closed).params.item.text).toBe("failed answer");
 	expect(second.openItemCount).toBe(0);
 	expectValidNotifications(closed);
+});
+test("cancelled agent_end closes a message_start snapshot before the first delta", () => {
+	const r = reducer([10, 20]);
+	const start = assistant("start snapshot", "response-cancelled");
+	const notifications = [
+		...r.accept(messageStart(start)),
+		...r.accept({ type: "agent_end", messages: [], stopReason: "cancelled" }),
+	];
+
+	expect(methods(notifications)).toEqual(["item/started", "item/completed"]);
+	expect(completed(notifications).params.item.text).toBe("start snapshot");
+	expect(r.openItemCount).toBe(0);
+	expectValidNotifications(notifications);
 });
 
 test("durable session entry identity wins over object identity across replay snapshots", () => {

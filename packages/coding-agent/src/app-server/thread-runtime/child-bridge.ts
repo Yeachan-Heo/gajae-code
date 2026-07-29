@@ -11,6 +11,7 @@ import { experimentalValidators, stableValidators } from "../protocol-source/sch
 import type {
 	AdmissionReservation,
 	EndpointAuthority,
+	ManagedThread,
 	ThreadEffectiveSettings,
 	ThreadOwnership,
 	ThreadRuntimeManager,
@@ -287,6 +288,7 @@ export async function loadThread(
 	let childClose: CloseOnce | undefined;
 
 	let publishedThreadId: string | undefined;
+	let publishedThread: ManagedThread | undefined;
 
 	const closeResources = async (): Promise<void> => {
 		let firstError: unknown;
@@ -337,19 +339,32 @@ export async function loadThread(
 		};
 		const child = await adapter(createRequest);
 		if (!child || !isRecord(child)) throw new Error("Child adapter did not return a runtime.");
-		const sessionId = requiredString(child.sessionId, "sessionId");
-		const actualCwd = requiredString(child.cwd, "cwd");
-		const client = child.client;
-		if (!client) throw new Error("Child adapter did not retain a session client.");
-		const childAuthority = child.authority;
 
-		clientClose = closeOnce(() => client.close());
-		childClose = closeOnce(() => {
-			if (child.closeChild) return child.closeChild(childAuthority);
-			if (opts.close) return opts.close(sessionId, ownership, childAuthority);
-		});
+		// Capture every safe cleanup handle before validating adapter fields. A malformed result may
+		// still own a live transport and authority-fenced child that must be closed on rollback.
+		const childAuthority = child.authority;
+		const client = child.client;
+		const childCloseHook = child.closeChild;
+		let cleanupThreadId = createRequest.threadId;
+		if (client && typeof client === "object" && typeof client.close === "function") {
+			clientClose = closeOnce(() => client.close());
+		}
+		if (typeof childCloseHook === "function" || typeof opts.close === "function") {
+			childClose = closeOnce(() => {
+				if (typeof childCloseHook === "function") return childCloseHook(childAuthority);
+				if (typeof opts.close === "function") return opts.close(cleanupThreadId, ownership, childAuthority);
+			});
+		}
+
+		const sessionId = requiredString(child.sessionId, "sessionId");
+		cleanupThreadId = sessionId;
+		const actualCwd = requiredString(child.cwd, "cwd");
+		if (!client || typeof client !== "object" || typeof client.close !== "function")
+			throw new Error("Child adapter did not retain a session client.");
 		if (ownership === "spawned" && !childAuthority)
 			throw new Error("Spawned child did not provide endpoint authority.");
+		if (ownership === "spawned" && typeof childCloseHook !== "function" && typeof opts.close !== "function")
+			throw new Error("Spawned child did not provide authority-fenced cleanup.");
 
 		await child.awaitReady();
 		const observerClosers: Array<() => void> = [];
@@ -397,7 +412,7 @@ export async function loadThread(
 			response,
 		};
 
-		opts.manager.register(sessionId, ownership, childAuthority, request.connectionId, {
+		publishedThread = opts.manager.register(sessionId, ownership, childAuthority, request.connectionId, {
 			reservation,
 			sessionId,
 			cwd: actualCwd,
@@ -405,6 +420,7 @@ export async function loadThread(
 			effectiveSettings,
 			closeChild: childClose,
 			closeRuntime: closeResources,
+			lifecycle: "committing",
 		});
 		publishedThreadId = sessionId;
 		reservation = undefined;
@@ -412,25 +428,29 @@ export async function loadThread(
 		try {
 			if (request.subscribe) await request.subscribe(sessionId);
 			else if (opts.subscribe) await opts.subscribe(sessionId, request.connectionId);
+			if (opts.manager.get(sessionId) !== publishedThread || !opts.manager.markActive(sessionId))
+				throw new Error("Thread runtime publication was lost during subscription.");
 		} catch (error) {
 			try {
 				if (request.unsubscribe) await request.unsubscribe(sessionId);
 				else if (opts.unsubscribe) await opts.unsubscribe(sessionId, request.connectionId);
 			} catch {
-				// Preserve the original subscription failure while still rolling back the runtime.
+				// Preserve the original subscription or ownership failure while still rolling back.
 			}
-			opts.manager.remove(sessionId, false);
+			if (opts.manager.get(sessionId) === publishedThread) opts.manager.remove(sessionId, false);
+			publishedThread = undefined;
 			publishedThreadId = undefined;
 			try {
 				await closeResources();
 			} catch {
-				// Preserve the subscription failure; cleanup was attempted through idempotent closers.
+				// Preserve the primary failure; cleanup was attempted through idempotent closers.
 			}
 			throw error;
 		}
 		return runtime;
 	} catch (error) {
-		if (publishedThreadId) opts.manager.remove(publishedThreadId, false);
+		if (publishedThreadId && opts.manager.get(publishedThreadId) === publishedThread)
+			opts.manager.remove(publishedThreadId, false);
 		try {
 			await closeResources();
 		} catch {

@@ -107,8 +107,10 @@ class Runtime implements AppServerRuntime {
 			connectionId: connection.id,
 			broker: this.broker,
 			threadStartAdapter: this.#threadStartAdapter,
+			isActive: active,
 			subscribe: threadId => {
-				if (active()) this.subscriptions.subscribe(connection.id, threadId);
+				if (!active()) throw new Error("Connection is inactive.");
+				this.subscriptions.subscribe(connection.id, threadId);
 			},
 			unsubscribe: threadId => {
 				if (active()) this.subscriptions.unsubscribe(connection.id, threadId);

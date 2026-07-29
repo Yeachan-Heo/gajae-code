@@ -30,6 +30,7 @@ export interface InboundResult {
 
 export interface InboundContext extends HandlerContext {
 	readonly connectionId?: string;
+	readonly isActive?: () => boolean;
 	readonly broker?: ServerRequestBroker;
 	readonly threadStartAdapter?: ChildBridgeOptions;
 	readonly unsubscribe?: (threadId: string) => void;
@@ -61,7 +62,7 @@ function isErrorResponse(value: unknown): value is { code: number; message: stri
 /** Process one inbound frame. The async boundary serializes connection processing. */
 export async function processInbound(
 	state: ConnectionState,
-	_manager: ThreadRuntimeManager,
+	manager: ThreadRuntimeManager,
 	line: Uint8Array,
 	frameCodec?: FrameCodecOptions,
 	transport: "stdio" | "websocket" | "unix" = "websocket",
@@ -163,6 +164,27 @@ export async function processInbound(
 						subscribe: context?.subscribe ? threadId => context.subscribe?.(threadId) : undefined,
 						unsubscribe: context?.unsubscribe ? threadId => context.unsubscribe?.(threadId) : undefined,
 					});
+					if (context?.isActive && !context.isActive()) {
+						try {
+							await context.unsubscribe?.(runtime.threadId);
+						} catch {
+							// Connection teardown already removed the subscription; preserve the liveness failure.
+						}
+						const managed = manager.get(runtime.threadId);
+						if (managed && managed.sessionId === runtime.sessionId && managed.client === runtime.client) {
+							if (managed.closeRuntime) {
+								manager.remove(runtime.threadId, false);
+								try {
+									await managed.closeRuntime();
+								} catch {
+									// Preserve the connection-loss failure after attempting idempotent cleanup.
+								}
+							} else {
+								manager.remove(runtime.threadId);
+							}
+						}
+						throw new Error("Requester connection is inactive.");
+					}
 					return { response: serializeResult(verdict.id, runtime.response, transport) ?? undefined };
 				} catch (error) {
 					const key = isRecord(error) && error.code === "conflict" ? "conflict" : "internalError";

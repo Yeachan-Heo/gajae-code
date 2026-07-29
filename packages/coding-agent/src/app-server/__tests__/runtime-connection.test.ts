@@ -10,6 +10,42 @@ const itemStarted = (id: string, startedAtMs = 0) => ({
 	turnId: "turn-a",
 });
 
+const effectiveSettings = (sessionId: string, cwd: string) => ({
+	model: "requested-model",
+	modelProvider: "openai",
+	serviceTier: null,
+	cwd,
+	instructionSources: [],
+	approvalPolicy: "untrusted",
+	approvalsReviewer: "user",
+	sandbox: { type: "dangerFullAccess" },
+	reasoningEffort: null,
+	thread: {
+		id: sessionId,
+		sessionId,
+		forkedFromId: null,
+		parentThreadId: null,
+		preview: "preview",
+		ephemeral: false,
+		isPinned: false,
+		modelProvider: "openai",
+		createdAt: 0,
+		updatedAt: 0,
+		recencyAt: null,
+		status: { type: "idle" },
+		path: null,
+		cwd,
+		cliVersion: "1",
+		source: "cli",
+		threadSource: null,
+		agentNickname: null,
+		agentRole: null,
+		gitInfo: null,
+		name: null,
+		turns: [],
+	},
+});
+
 async function initialize(connection: { process(line: Uint8Array): Promise<void> }): Promise<void> {
 	await connection.process(
 		enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'),
@@ -443,4 +479,165 @@ test("runtime connection: production assembly forwards thread/start to the injec
 	expect(dec(frames[0]!)).toMatchObject({ id: 2, error: { code: -32603 } });
 	expect(runtime.manager.loadedCount).toBe(0);
 	expect(runtime.manager.pendingCount).toBe(0);
+});
+
+test("runtime connection: requester close during thread/start readiness rolls back the published runtime", async () => {
+	const readyEntered = Promise.withResolvers<void>();
+	const releaseReady = Promise.withResolvers<void>();
+	let clientClose = 0;
+	let childClose = 0;
+	let observerClose = 0;
+	let reverseLeaseClose = 0;
+	const sessionId = "runtime-connection-session";
+	const cwd = "/tmp";
+	const client = {
+		onFrame: () => () => {
+			observerClose += 1;
+		},
+		onReconnect: () => () => {
+			observerClose += 1;
+		},
+		onReconnectFailed: () => () => {
+			observerClose += 1;
+		},
+		request: async () => ({}),
+		query: async () => ({}),
+		control: async () => ({}),
+		close: async () => {
+			clientClose += 1;
+		},
+	};
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: {
+			create: async () => ({
+				sessionId,
+				cwd,
+				authority: {
+					endpointGeneration: 1,
+					endpointIncarnation: "c".repeat(64),
+					endpointMtimeMs: 1,
+					pid: 1234,
+				},
+				client,
+				awaitReady: async () => {
+					readyEntered.resolve();
+					await releaseReady.promise;
+				},
+				closeChild: async () => {
+					childClose += 1;
+				},
+				effectiveSettings: effectiveSettings(sessionId, cwd),
+			}),
+			attachReverseLeaseController: async () => ({
+				close: async () => {
+					reverseLeaseClose += 1;
+				},
+			}),
+		},
+	});
+	const frames: Uint8Array[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(frame);
+	});
+	await initialize(connection);
+	frames.length = 0;
+
+	const processing = connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	await readyEntered.promise;
+	const closing = connection.close();
+	releaseReady.resolve();
+	await Promise.all([processing, closing]);
+
+	expect(frames).toHaveLength(0);
+	expect(runtime.manager.loadedCount).toBe(0);
+	expect(runtime.manager.pendingCount).toBe(0);
+	expect(clientClose).toBe(1);
+	expect(childClose).toBe(1);
+	expect(observerClose).toBe(3);
+	expect(reverseLeaseClose).toBe(1);
+	expect(runtime.subscriptions.isSubscribed(connection.id, sessionId)).toBe(false);
+});
+
+test("runtime connection: close immediately after thread/start subscribe rolls back the runtime", async () => {
+	let clientClose = 0;
+	let childClose = 0;
+	let observerClose = 0;
+	let reverseLeaseClose = 0;
+	let closing!: Promise<void>;
+	const sessionId = "runtime-connection-subscribe-session";
+	const cwd = "/tmp";
+	const client = {
+		onFrame: () => () => {
+			observerClose += 1;
+		},
+		onReconnect: () => () => {
+			observerClose += 1;
+		},
+		onReconnectFailed: () => () => {
+			observerClose += 1;
+		},
+		request: async () => ({}),
+		query: async () => ({}),
+		control: async () => ({}),
+		close: async () => {
+			clientClose += 1;
+		},
+	};
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: {
+			create: async () => ({
+				sessionId,
+				cwd,
+				authority: {
+					endpointGeneration: 2,
+					endpointIncarnation: "d".repeat(64),
+					endpointMtimeMs: 1,
+					pid: 1234,
+				},
+				client,
+				awaitReady: async () => {},
+				closeChild: async () => {
+					childClose += 1;
+				},
+				effectiveSettings: effectiveSettings(sessionId, cwd),
+			}),
+			attachReverseLeaseController: async () => ({
+				close: async () => {
+					reverseLeaseClose += 1;
+				},
+			}),
+		},
+	});
+	const frames: Uint8Array[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(frame);
+	});
+	const subscribe = runtime.subscriptions.subscribe.bind(runtime.subscriptions);
+	runtime.subscriptions.subscribe = (connectionId, threadId) => {
+		subscribe(connectionId, threadId);
+		closing = connection.close();
+	};
+	await initialize(connection);
+	frames.length = 0;
+
+	const processing = connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	await processing;
+	await closing;
+
+	expect(frames).toHaveLength(0);
+	expect(runtime.manager.loadedCount).toBe(0);
+	expect(runtime.manager.pendingCount).toBe(0);
+	expect(clientClose).toBe(1);
+	expect(childClose).toBe(1);
+	expect(observerClose).toBe(3);
+	expect(reverseLeaseClose).toBe(1);
+	expect(runtime.subscriptions.isSubscribed(connection.id, sessionId)).toBe(false);
 });

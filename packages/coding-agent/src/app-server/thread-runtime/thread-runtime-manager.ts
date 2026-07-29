@@ -60,6 +60,8 @@ export interface ThreadEffectiveSettings {
 	readonly multiAgentMode?: unknown;
 }
 
+export type ManagedThreadLifecycle = "committing" | "active";
+
 export interface ManagedThread {
 	readonly threadId: string;
 	readonly sessionId: string;
@@ -72,6 +74,7 @@ export interface ManagedThread {
 	readonly closeRuntime: (() => Promise<void>) | undefined;
 	readonly loadedAt: number;
 	readonly connectionId: string | undefined;
+	lifecycle: ManagedThreadLifecycle;
 	activeTurn: boolean;
 	pendingApprovals: number;
 	lastActivity: number;
@@ -126,6 +129,7 @@ type RegisterOptions = {
 	readonly effectiveSettings?: ThreadEffectiveSettings;
 	readonly closeChild?: (authority: EndpointAuthority | undefined) => Promise<void> | void;
 	readonly closeRuntime?: () => Promise<void>;
+	readonly lifecycle?: ManagedThreadLifecycle;
 };
 
 function conflict(message: string): Error & { code: "conflict" } {
@@ -287,6 +291,7 @@ export class ThreadRuntimeManager {
 			closeRuntime: options.closeRuntime,
 			loadedAt: now,
 			connectionId,
+			lifecycle: options.lifecycle ?? "active",
 			activeTurn: false,
 			pendingApprovals: 0,
 			lastActivity: now,
@@ -300,6 +305,15 @@ export class ThreadRuntimeManager {
 
 	get(threadId: string): ManagedThread | undefined {
 		return this.#threads.get(threadId);
+	}
+
+	/** Mark a published committing runtime active after subscription completes. */
+	markActive(threadId: string): ManagedThread | undefined {
+		const thread = this.#threads.get(threadId);
+		if (thread?.lifecycle !== "committing") return undefined;
+		thread.lifecycle = "active";
+		thread.lastActivity = Date.now();
+		return thread;
 	}
 	setActiveTurn(threadId: string, active: boolean): void {
 		const thread = this.#threads.get(threadId);
@@ -351,15 +365,16 @@ export class ThreadRuntimeManager {
 	}
 
 	/**
-	 * Evict idle owned children past their TTL. Never evicts threads with active turns or
-	 * pending approvals. Evicts oldest-first (LRU), passing each captured authority to the
-	 * close callback.
+	 * Evict idle owned children past their TTL. Never evicts threads that are committing,
+	 * have active turns, or have pending approvals. Evicts oldest-first (LRU), passing each
+	 * captured authority to the close callback.
 	 */
 	evictIdleOwned(): number {
 		const now = Date.now();
 		const evictable: ManagedThread[] = [];
 		for (const thread of this.#threads.values()) {
 			if (thread.ownership !== "spawned") continue;
+			if (thread.lifecycle === "committing") continue;
 			if (thread.activeTurn || thread.pendingApprovals > 0) continue;
 			if (now - thread.lastActivity >= this.#config.idleTtlMs) evictable.push(thread);
 		}

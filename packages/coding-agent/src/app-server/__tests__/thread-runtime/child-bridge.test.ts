@@ -392,3 +392,216 @@ test("transactional load: subscribe failure removes publication and rolls back t
 	expect(counters.childClose).toBe(1);
 	expect(closedAuthority?.endpointGeneration).toBe(9);
 });
+test("transactional load: malformed session id captures cleanup before validation", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	let readyCalls = 0;
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "",
+			cwd: path.resolve("cwd"),
+			authority: authority(21),
+			client: fakeClient(counters),
+			awaitReady: async () => {
+				readyCalls++;
+			},
+			closeChild: async () => {
+				counters.childClose++;
+			},
+		}),
+	};
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("did not provide sessionId");
+	expect(readyCalls).toBe(0);
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
+
+test("transactional load: malformed cwd captures cleanup before validation", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	let readyCalls = 0;
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-invalid-cwd",
+			cwd: "",
+			authority: authority(22),
+			client: fakeClient(counters),
+			awaitReady: async () => {
+				readyCalls++;
+			},
+			closeChild: async () => {
+				counters.childClose++;
+			},
+		}),
+	};
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("did not provide cwd");
+	expect(readyCalls).toBe(0);
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
+
+test("transactional load: missing client still closes a spawned child", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	let readyCalls = 0;
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-missing-client",
+			cwd: path.resolve("cwd"),
+			authority: authority(23),
+			client: undefined as unknown as SessionClient,
+			awaitReady: async () => {
+				readyCalls++;
+			},
+			closeChild: async () => {
+				counters.childClose++;
+			},
+		}),
+	};
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("did not retain a session client");
+	expect(readyCalls).toBe(0);
+	expect(counters.close).toBe(0);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
+
+test("transactional load: spawned child without authority-fenced cleanup fails before readiness", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0 };
+	let readyCalls = 0;
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-missing-closer",
+			cwd: path.resolve("cwd"),
+			authority: authority(24),
+			client: fakeClient(counters),
+			awaitReady: async () => {
+				readyCalls++;
+			},
+		}),
+	};
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("authority-fenced cleanup");
+	expect(readyCalls).toBe(0);
+	expect(counters.close).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
+
+test("transactional load: committing publication is protected from cross-connection eviction", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 1, idleTtlMs: 0 });
+	const firstCounters = { close: 0, childClose: 0 };
+	const secondCounters = { close: 0, childClose: 0 };
+	let releaseSubscribe: () => void = () => {};
+	let subscribeStarted: () => void = () => {};
+	const started = new Promise<void>(resolve => {
+		subscribeStarted = resolve;
+	});
+	const blocked = new Promise<void>(resolve => {
+		releaseSubscribe = resolve;
+	});
+	const createChild = async (threadId: string, counters: { close: number; childClose: number }) => ({
+		sessionId: threadId,
+		cwd: path.resolve(threadId),
+		authority: authority(threadId === "thread-a" ? 25 : 26),
+		client: fakeClient(counters),
+		awaitReady: async () => {},
+		closeChild: async () => {
+			counters.childClose++;
+		},
+	});
+	const optsA: ChildBridgeOptions = {
+		manager,
+		create: request => createChild(request.threadId ?? "missing-thread", firstCounters),
+		readEffectiveSettings: async (_client, child) => settings(child.sessionId, child.cwd),
+		subscribe: async threadId => {
+			expect(threadId).toBe("thread-a");
+			subscribeStarted();
+			await blocked;
+		},
+	};
+	const optsB: ChildBridgeOptions = {
+		manager,
+		create: request => createChild(request.threadId ?? "missing-thread", secondCounters),
+		readEffectiveSettings: async (_client, child) => settings(child.sessionId, child.cwd),
+	};
+	const first = loadThread(optsA, { threadId: "thread-a", connectionId: "conn-a" });
+	await started;
+	expect(manager.get("thread-a")?.lifecycle).toBe("committing");
+
+	let secondFailure: unknown;
+	try {
+		await loadThread(optsB, { threadId: "thread-b", connectionId: "conn-b" });
+	} catch (error) {
+		secondFailure = error;
+	} finally {
+		releaseSubscribe();
+	}
+	expect(secondFailure).toBeDefined();
+	expect((secondFailure as { code?: string }).code).toBe("conflict");
+	expect(manager.get("thread-a")).toBeDefined();
+	expect(firstCounters.close).toBe(0);
+	expect(firstCounters.childClose).toBe(0);
+
+	await first;
+	expect(manager.get("thread-a")?.lifecycle).toBe("active");
+	await loadThread(optsB, { threadId: "thread-b", connectionId: "conn-b" });
+	expect(manager.get("thread-a")).toBeUndefined();
+	expect(manager.get("thread-b")?.lifecycle).toBe("active");
+	await Bun.sleep(0);
+	expect(firstCounters.close).toBe(1);
+	expect(firstCounters.childClose).toBe(1);
+});
+test("transactional load: lost ownership after subscribe fails closed", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	let releaseSubscribe: () => void = () => {};
+	let subscribeStarted: () => void = () => {};
+	let unsubscribed = 0;
+	const started = new Promise<void>(resolve => {
+		subscribeStarted = resolve;
+	});
+	const blocked = new Promise<void>(resolve => {
+		releaseSubscribe = resolve;
+	});
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-lost",
+			cwd: path.resolve("cwd"),
+			authority: authority(27),
+			client: fakeClient(counters),
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose++;
+			},
+		}),
+		readEffectiveSettings: async () => settings("session-lost", path.resolve("cwd")),
+		subscribe: async () => {
+			subscribeStarted();
+			await blocked;
+		},
+		unsubscribe: async () => {
+			unsubscribed++;
+		},
+	};
+	const load = loadThread(opts, { threadId: "session-lost" });
+	await started;
+	expect(manager.get("session-lost")?.lifecycle).toBe("committing");
+	manager.remove("session-lost", false);
+	releaseSubscribe();
+	await expect(load).rejects.toThrow("publication was lost");
+	expect(unsubscribed).toBe(1);
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});

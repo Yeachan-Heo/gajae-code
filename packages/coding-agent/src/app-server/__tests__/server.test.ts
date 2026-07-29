@@ -256,6 +256,7 @@ test("server: injected thread/start returns a stable schema response after publi
 			authority: authority(11),
 			client: serverClient(),
 			awaitReady: async () => {},
+			closeChild: async () => {},
 		}),
 		readEffectiveSettings: async () => effectiveSettings("server-session-stable", cwd),
 	};
@@ -285,6 +286,8 @@ test("server: injected thread/start returns a stable schema response after publi
 	expect(stableValidators.clientRequestResults["thread/start"](response)).toBe(true);
 	expect((response.thread as Record<string, unknown>).id).toBe("server-session-stable");
 	expect(response).not.toHaveProperty("runtimeWorkspaceRoots");
+	expect(response).not.toHaveProperty("activePermissionProfile");
+	expect(response).not.toHaveProperty("multiAgentMode");
 	const stableThread = response.thread as Record<string, unknown>;
 	expect(stableThread).not.toHaveProperty("extra");
 	expect(stableThread).not.toHaveProperty("historyMode");
@@ -304,6 +307,7 @@ test("server: injected thread/start selects the experimental 13-field response",
 			authority: authority(12),
 			client: serverClient(),
 			awaitReady: async () => {},
+			closeChild: async () => {},
 		}),
 		readEffectiveSettings: async () => effectiveSettings("server-session-experimental", cwd),
 	};

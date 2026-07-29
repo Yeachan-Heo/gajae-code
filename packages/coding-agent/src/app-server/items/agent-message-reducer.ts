@@ -59,6 +59,8 @@ export interface AgentMessageTurnOutcome {
 interface ItemState {
 	id: string;
 	text: string;
+	source?: string;
+	lastObservedMessage?: AssistantMessage;
 	authoritativeMessage?: AssistantMessage;
 	startedAtMs: number;
 	completedAtMs?: number;
@@ -118,7 +120,7 @@ export class AgentMessageReducer {
 			case "turn_end":
 				return this.#acceptTurnEnd(event.message);
 			case "agent_end":
-				return this.#acceptAgentEnd(event.messages);
+				return this.#acceptAgentEnd(event.messages, event.stopReason);
 			case "agent_start":
 			case "turn_start":
 			case "tool_execution_start":
@@ -144,8 +146,14 @@ export class AgentMessageReducer {
 	completeTurn(outcome: AgentMessageTurnOutcome): readonly WireNotification[] {
 		const authoritative = (outcome.messages ?? []).filter(isAssistantMessage);
 		const assignments = this.#resolveAuthoritativeAssignments(authoritative);
+		const allowObservedFallback = this.#allowsObservedFallback(outcome.kind);
 		for (const item of this.#items.values()) {
-			if (item.state === "open" && !item.authoritativeMessage && !assignments.has(item.id)) {
+			if (
+				item.state === "open" &&
+				!item.authoritativeMessage &&
+				!assignments.has(item.id) &&
+				!(allowObservedFallback && item.lastObservedMessage)
+			) {
 				throw new Error(`Cannot terminalize agent-message item ${item.id}: no authoritative message`);
 			}
 		}
@@ -153,7 +161,7 @@ export class AgentMessageReducer {
 			const item = this.#items.get(itemId);
 			if (item?.state === "open") this.#setAuthoritative(item, message);
 		}
-		const notifications = this.#closeOpenItems();
+		const notifications = this.#closeOpenItems(allowObservedFallback);
 		if (this.openItemCount !== 0) {
 			throw new Error(`Agent-message turn ${this.#turnId} completed with open items`);
 		}
@@ -167,10 +175,11 @@ export class AgentMessageReducer {
 			if (existing.state === "open") existing.implicitStart = false;
 			return [];
 		}
+		const source = sourceIdentity(message);
 		const implicit = this.#onlyOpenImplicitItem();
-		if (implicit) {
+		if (implicit && this.#isSourceCompatible(implicit, source)) {
 			implicit.implicitStart = false;
-			this.#rememberMessage(message, implicit.id, sourceIdentity(message));
+			this.#rememberMessage(message, implicit.id, source);
 			return [];
 		}
 		const item = this.#createItem(message, false);
@@ -187,7 +196,8 @@ export class AgentMessageReducer {
 			notifications.push(this.#startedNotification(item));
 		}
 		if (item.state === "completed") return notifications;
-		this.#setAuthoritative(item, event.message);
+		this.#setObserved(item, event.message);
+
 		const assistantEvent = event.assistantMessageEvent;
 		if (assistantEvent.type === "done") this.#setAuthoritative(item, assistantEvent.message);
 		if (assistantEvent.type === "text_delta" && assistantEvent.delta.length > 0) {
@@ -218,14 +228,17 @@ export class AgentMessageReducer {
 		return this.#closeOpenItems();
 	}
 
-	#acceptAgentEnd(messages: readonly AgentMessage[]): readonly WireNotification[] {
+	#acceptAgentEnd(
+		messages: readonly AgentMessage[],
+		stopReason: "completed" | "paused" | "cancelled" | "maintenance" | undefined,
+	): readonly WireNotification[] {
 		const authoritative = messages.filter(isAssistantMessage);
 		const assignments = this.#resolveAuthoritativeAssignments(authoritative);
 		for (const [itemId, source] of assignments) {
 			const item = this.#items.get(itemId);
 			if (item?.state === "open") this.#setAuthoritative(item, source);
 		}
-		return this.#closeOpenItems();
+		return this.#closeOpenItems(this.#allowsObservedFallback(stopReason));
 	}
 
 	#createItem(message: AssistantMessage, implicitStart: boolean): ItemState {
@@ -234,6 +247,8 @@ export class AgentMessageReducer {
 		const item: ItemState = {
 			id,
 			text: extractAssistantText(message),
+			source,
+			lastObservedMessage: message,
 			startedAtMs: this.#clock(),
 			state: "open",
 			implicitStart,
@@ -265,32 +280,76 @@ export class AgentMessageReducer {
 		const source = sourceIdentity(message);
 		if (source) {
 			const itemId = this.#sourceToItem.get(source);
-			if (itemId) return this.#items.get(itemId);
+			if (itemId) {
+				const item = this.#items.get(itemId);
+				if (item && this.#isSourceCompatible(item, source)) return item;
+			}
 		}
 		const rememberedId = this.#messageToItem.get(message);
-		if (rememberedId) return this.#items.get(rememberedId);
+		if (rememberedId) {
+			const item = this.#items.get(rememberedId);
+			if (item && this.#isSourceCompatible(item, source)) return item;
+		}
 		if (!allowOpenFallback) return undefined;
 		const openItems = Array.from(this.#items.values()).filter(item => item.state === "open");
 		if (openItems.length !== 1 || this.#items.size !== 1) return undefined;
 		const item = openItems[0];
+		if (!this.#isSourceCompatible(item, source)) return undefined;
 		this.#rememberMessage(message, item.id, source);
 		return item;
 	}
 
+	#isSourceCompatible(item: ItemState, source: string | undefined): boolean {
+		return source === undefined || item.source === undefined || item.source === source;
+	}
+
 	#rememberMessage(message: AssistantMessage, itemId: string, source: string | undefined): void {
+		const item = this.#items.get(itemId);
+		if (!item || !this.#isSourceCompatible(item, source)) return;
+		if (source) {
+			const existingItemId = this.#sourceToItem.get(source);
+			if (existingItemId !== undefined && existingItemId !== itemId) return;
+			item.source = source;
+			this.#sourceToItem.set(source, itemId);
+		}
 		this.#messageToItem.set(message, itemId);
-		if (source) this.#sourceToItem.set(source, itemId);
+	}
+
+	#setObserved(item: ItemState, message: AssistantMessage): void {
+		const source = sourceIdentity(message);
+		if (!this.#rememberedSource(item, source)) {
+			throw new Error(`Cannot correlate agent-message source for item ${item.id}`);
+		}
+		item.lastObservedMessage = message;
+		item.text = extractAssistantText(message);
+		this.#rememberMessage(message, item.id, source);
 	}
 
 	#setAuthoritative(item: ItemState, message: AssistantMessage): void {
+		this.#setObserved(item, message);
 		item.authoritativeMessage = message;
-		item.text = extractAssistantText(message);
-		this.#rememberMessage(message, item.id, sourceIdentity(message));
+	}
+
+	#rememberedSource(item: ItemState, source: string | undefined): boolean {
+		const mappedItemId = source === undefined ? undefined : this.#sourceToItem.get(source);
+		return this.#isSourceCompatible(item, source) && (mappedItemId === undefined || mappedItemId === item.id);
 	}
 
 	#fallbackItemId(): string {
 		this.#fallbackSequence += 1;
 		return `agent-message:${this.#threadId}:${this.#turnId}:${this.#fallbackSequence}`;
+	}
+
+	#allowsObservedFallback(
+		policy: AgentMessageTurnOutcomeKind | "paused" | "cancelled" | "maintenance" | undefined,
+	): boolean {
+		return (
+			policy === "interrupted" ||
+			policy === "failed" ||
+			policy === "paused" ||
+			policy === "cancelled" ||
+			policy === "maintenance"
+		);
 	}
 
 	#deltaNotification(itemId: string, delta: string): AgentMessageDeltaNotification {
@@ -317,9 +376,13 @@ export class AgentMessageReducer {
 		];
 	}
 
-	#closeOpenItems(): readonly WireNotification[] {
+	#closeOpenItems(allowObservedFallback = false): readonly WireNotification[] {
 		for (const item of this.#items.values()) {
-			if (item.state === "open" && !item.authoritativeMessage) {
+			if (
+				item.state === "open" &&
+				!item.authoritativeMessage &&
+				!(allowObservedFallback && item.lastObservedMessage)
+			) {
 				throw new Error(`Cannot terminalize agent-message item ${item.id}: no authoritative message`);
 			}
 		}
@@ -350,7 +413,7 @@ export class AgentMessageReducer {
 				continue;
 			}
 			if (openItems.length === 0) continue;
-			if (openItems.length !== 1) {
+			if (openItems.length !== 1 || !this.#isSourceCompatible(openItems[0], sourceIdentity(message))) {
 				throw new Error(`Cannot correlate authoritative agent-message state for turn ${this.#turnId}`);
 			}
 			if (!assignments.has(openItems[0].id)) assignments.set(openItems[0].id, message);

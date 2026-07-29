@@ -53,7 +53,7 @@
 			"sourceType": "AgentEvent",
 			"sourceFile": "packages/agent/src/types.ts",
 			"classification": "mapped",
-			"reason": "Closes started agent-message items with authoritative state at the agent boundary."
+			"reason": "Closes started agent-message items with authoritative terminal state, or last observed source state for interrupted/failed stops, at the agent boundary."
 		},
 		{
 			"discriminator": "turn_start",
