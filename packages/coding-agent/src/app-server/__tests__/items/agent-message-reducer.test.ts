@@ -345,6 +345,28 @@ test("durable session entry identity wins over object identity across replay sna
 	expect(completed(secondNotifications).params.item.text).toBe("replayed final");
 });
 
+test("a persisted entry identity aliases the existing response identity across live completion and replay", () => {
+	const liveStart = assistant("", "response-persisted", 10);
+	const persistedFinal = assistant("persisted final", "response-persisted", 10);
+	associateSessionMessageEntryId(persistedFinal, "entry-persisted");
+
+	const live = reducer([1, 2]);
+	const liveNotifications = [...live.accept(messageStart(liveStart)), ...live.accept(messageEnd(persistedFinal))];
+	expectValidNotifications(liveNotifications);
+	expect(started(liveNotifications).params.item.id).toBe("agent-message:response:response-persisted");
+	expect(completed(liveNotifications).params.item.text).toBe("persisted final");
+
+	const replayStart = assistant("", "response-persisted", 10);
+	const replayFinal = assistant("persisted final", "response-persisted", 10);
+	associateSessionMessageEntryId(replayStart, "entry-persisted");
+	associateSessionMessageEntryId(replayFinal, "entry-persisted");
+	const replay = reducer([1, 2]);
+	const replayNotifications = [...replay.accept(messageStart(replayStart)), ...replay.accept(messageEnd(replayFinal))];
+	expectValidNotifications(replayNotifications);
+	expect(started(replayNotifications).params.item.id).toBe(started(liveNotifications).params.item.id);
+	expect(replay.openItemCount).toBe(0);
+});
+
 test("two assistant messages use distinct deterministic fallback ids and replay identically", () => {
 	const first = assistant("first", undefined, 1);
 	const second = assistant("second", undefined, 2);

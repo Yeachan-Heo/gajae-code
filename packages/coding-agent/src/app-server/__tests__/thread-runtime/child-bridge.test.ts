@@ -75,15 +75,41 @@ function fakeClient(counters: { close: number }): SessionClient {
 
 test("loadThread: acquires token, spawns child, registers thread, releases token", async () => {
 	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 4, spawnSemaphore: 1 });
+	let closeCalls = 0;
 	const opts: ChildBridgeOptions = {
 		manager,
 		spawn: async (_id, _ownership) => authority(1),
+		close: async () => {
+			closeCalls += 1;
+		},
 	};
 	await loadThread(opts, "t1", "spawned", "conn-a");
 	expect(manager.get("t1")).toBeDefined();
 	expect(manager.get("t1")?.authority?.endpointGeneration).toBe(1);
+	manager.terminate("t1");
+	await Bun.sleep(0);
+	expect(closeCalls).toBe(1);
 });
 
+test("loadThread: legacy spawned path rejects before spawn when no child closer exists", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 4 });
+	let spawnCalls = 0;
+	await expect(
+		loadThread(
+			{
+				manager,
+				spawn: async () => {
+					spawnCalls += 1;
+					return authority(1);
+				},
+			},
+			"missing-closer",
+			"spawned",
+		),
+	).rejects.toThrow("requires authority-fenced cleanup");
+	expect(spawnCalls).toBe(0);
+	expect(manager.loadedCount).toBe(0);
+});
 test("loadThread: spawn failure releases the token without registering", async () => {
 	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 4, spawnSemaphore: 1 });
 	const opts: ChildBridgeOptions = {
@@ -91,11 +117,12 @@ test("loadThread: spawn failure releases the token without registering", async (
 		spawn: async () => {
 			throw new Error("spawn failed");
 		},
+		close: async () => {},
 	};
 	await expect(loadThread(opts, "t1", "spawned")).rejects.toThrow("spawn failed");
 	expect(manager.get("t1")).toBeUndefined();
 	// Token was released, so a new load succeeds.
-	const opts2: ChildBridgeOptions = { manager, spawn: async () => authority(2) };
+	const opts2: ChildBridgeOptions = { manager, spawn: async () => authority(2), close: async () => {} };
 	await loadThread(opts2, "t2", "spawned");
 	expect(manager.get("t2")).toBeDefined();
 });
@@ -109,6 +136,7 @@ test("loadThread: spawn semaphore bounds concurrent loads", async () => {
 			new Promise<EndpointAuthority>(resolve => {
 				resolveSpawn = () => resolve(authority(1));
 			}),
+		close: async () => {},
 	};
 	// Start first load — it blocks in spawn (never resolves until we call resolveSpawn).
 	const first = loadThread(opts, "t1", "spawned");

@@ -59,7 +59,7 @@ export interface AgentMessageTurnOutcome {
 interface ItemState {
 	id: string;
 	text: string;
-	source?: string;
+	sources: Set<string>;
 	lastObservedMessage?: AssistantMessage;
 	authoritativeMessage?: AssistantMessage;
 	startedAtMs: number;
@@ -79,11 +79,16 @@ function extractAssistantText(message: AssistantMessage): string {
 		.join("\n");
 }
 
-function sourceIdentity(message: AssistantMessage): string | undefined {
+function sourceIdentities(message: AssistantMessage): readonly string[] {
+	const identities: string[] = [];
+	if (message.responseId) identities.push(`response:${message.responseId}`);
 	const entryId = getSessionMessageEntryId(message);
-	if (entryId) return `entry:${entryId}`;
-	if (message.responseId) return `response:${message.responseId}`;
-	return undefined;
+	if (entryId) identities.push(`entry:${entryId}`);
+	return identities;
+}
+
+function primaryIdentity(message: AssistantMessage): string | undefined {
+	return sourceIdentities(message)[0];
 }
 
 export class AgentMessageReducer {
@@ -175,11 +180,11 @@ export class AgentMessageReducer {
 			if (existing.state === "open") existing.implicitStart = false;
 			return [];
 		}
-		const source = sourceIdentity(message);
+		const sources = sourceIdentities(message);
 		const implicit = this.#onlyOpenImplicitItem();
-		if (implicit && this.#isSourceCompatible(implicit, source)) {
+		if (implicit && this.#isSourceCompatible(implicit, sources)) {
 			implicit.implicitStart = false;
-			this.#rememberMessage(message, implicit.id, source);
+			this.#rememberMessage(message, implicit.id, sources);
 			return [];
 		}
 		const item = this.#createItem(message, false);
@@ -191,7 +196,7 @@ export class AgentMessageReducer {
 		let item = this.#findItem(event.message, true);
 		const notifications: WireNotification[] = [];
 		if (!item) {
-			if (this.#items.size > 0 && sourceIdentity(event.message) === undefined) return [];
+			if (this.#items.size > 0 && sourceIdentities(event.message).length === 0) return [];
 			item = this.#createItem(event.message, true);
 			notifications.push(this.#startedNotification(item));
 		}
@@ -242,19 +247,20 @@ export class AgentMessageReducer {
 	}
 
 	#createItem(message: AssistantMessage, implicitStart: boolean): ItemState {
-		const source = sourceIdentity(message);
-		const id = source ? `agent-message:${source}` : this.#fallbackItemId();
+		const sources = sourceIdentities(message);
+		const identity = primaryIdentity(message);
+		const id = identity ? `agent-message:${identity}` : this.#fallbackItemId();
 		const item: ItemState = {
 			id,
 			text: extractAssistantText(message),
-			source,
+			sources: new Set(sources),
 			lastObservedMessage: message,
 			startedAtMs: this.#clock(),
 			state: "open",
 			implicitStart,
 		};
 		this.#items.set(id, item);
-		this.#rememberMessage(message, item.id, source);
+		this.#rememberMessage(message, item.id, sources);
 		return item;
 	}
 
@@ -277,62 +283,71 @@ export class AgentMessageReducer {
 	}
 
 	#findItem(message: AssistantMessage, allowOpenFallback: boolean): ItemState | undefined {
-		const source = sourceIdentity(message);
-		if (source) {
+		const sources = sourceIdentities(message);
+		const mappedItemIds = new Set<string>();
+		for (const source of sources) {
 			const itemId = this.#sourceToItem.get(source);
-			if (itemId) {
-				const item = this.#items.get(itemId);
-				if (item && this.#isSourceCompatible(item, source)) return item;
+			if (itemId) mappedItemIds.add(itemId);
+		}
+		if (mappedItemIds.size > 1) throw new Error("Agent-message identities resolve to different items");
+		const mappedItemId = mappedItemIds.values().next().value;
+		if (mappedItemId) {
+			const item = this.#items.get(mappedItemId);
+			if (item && this.#isSourceCompatible(item, sources)) {
+				this.#rememberMessage(message, item.id, sources);
+				return item;
 			}
 		}
+
 		const rememberedId = this.#messageToItem.get(message);
 		if (rememberedId) {
 			const item = this.#items.get(rememberedId);
-			if (item && this.#isSourceCompatible(item, source)) return item;
+			if (item && this.#isSourceCompatible(item, sources)) {
+				this.#rememberMessage(message, item.id, sources);
+				return item;
+			}
 		}
 		if (!allowOpenFallback) return undefined;
 		const openItems = Array.from(this.#items.values()).filter(item => item.state === "open");
 		if (openItems.length !== 1 || this.#items.size !== 1) return undefined;
 		const item = openItems[0];
-		if (!this.#isSourceCompatible(item, source)) return undefined;
-		this.#rememberMessage(message, item.id, source);
+		if (!this.#isSourceCompatible(item, sources)) return undefined;
+		this.#rememberMessage(message, item.id, sources);
 		return item;
 	}
 
-	#isSourceCompatible(item: ItemState, source: string | undefined): boolean {
-		return source === undefined || item.source === undefined || item.source === source;
+	#isSourceCompatible(item: ItemState, sources: readonly string[]): boolean {
+		if (sources.length === 0 || item.sources.size === 0) return true;
+		return sources.some(source => item.sources.has(source));
 	}
 
-	#rememberMessage(message: AssistantMessage, itemId: string, source: string | undefined): void {
+	#rememberMessage(message: AssistantMessage, itemId: string, sources: readonly string[]): void {
 		const item = this.#items.get(itemId);
-		if (!item || !this.#isSourceCompatible(item, source)) return;
-		if (source) {
+		if (!item || !this.#isSourceCompatible(item, sources)) return;
+		for (const source of sources) {
 			const existingItemId = this.#sourceToItem.get(source);
-			if (existingItemId !== undefined && existingItemId !== itemId) return;
-			item.source = source;
+			if (existingItemId !== undefined && existingItemId !== itemId)
+				throw new Error(`Agent-message identity ${source} already belongs to another item`);
+		}
+		for (const source of sources) {
+			item.sources.add(source);
 			this.#sourceToItem.set(source, itemId);
 		}
 		this.#messageToItem.set(message, itemId);
 	}
 
 	#setObserved(item: ItemState, message: AssistantMessage): void {
-		const source = sourceIdentity(message);
-		if (!this.#rememberedSource(item, source)) {
+		const sources = sourceIdentities(message);
+		if (!this.#isSourceCompatible(item, sources))
 			throw new Error(`Cannot correlate agent-message source for item ${item.id}`);
-		}
+		this.#rememberMessage(message, item.id, sources);
 		item.lastObservedMessage = message;
 		item.text = extractAssistantText(message);
-		this.#rememberMessage(message, item.id, source);
 	}
 
 	#setAuthoritative(item: ItemState, message: AssistantMessage): void {
 		this.#setObserved(item, message);
 		item.authoritativeMessage = message;
-	}
-
-	#rememberedSource(item: ItemState, source: string | undefined): boolean {
-		const mappedItemId = source === undefined ? undefined : this.#sourceToItem.get(source);
-		return this.#isSourceCompatible(item, source) && (mappedItemId === undefined || mappedItemId === item.id);
 	}
 
 	#fallbackItemId(): string {
@@ -413,7 +428,7 @@ export class AgentMessageReducer {
 				continue;
 			}
 			if (openItems.length === 0) continue;
-			if (openItems.length !== 1 || !this.#isSourceCompatible(openItems[0], sourceIdentity(message))) {
+			if (openItems.length !== 1 || !this.#isSourceCompatible(openItems[0], sourceIdentities(message))) {
 				throw new Error(`Cannot correlate authoritative agent-message state for turn ${this.#turnId}`);
 			}
 			if (!assignments.has(openItems[0].id)) assignments.set(openItems[0].id, message);

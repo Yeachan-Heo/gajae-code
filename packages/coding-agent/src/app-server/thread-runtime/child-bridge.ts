@@ -254,17 +254,22 @@ export async function loadThread(
 	wireCloseCallback(opts);
 	if (!adapter) {
 		if (!opts.spawn) throw new Error("No child lifecycle adapter was supplied.");
+		const closeLegacyChild = ownership === "spawned" ? opts.close : undefined;
+		if (ownership === "spawned" && !closeLegacyChild)
+			throw new Error("Legacy spawned child requires authority-fenced cleanup.");
 		const threadId = requiredString(request.threadId, "threadId");
 		const token = opts.manager.acquireSpawnToken();
 		try {
 			const authority = await opts.spawn(threadId, ownership);
 			try {
-				opts.manager.register(threadId, ownership, authority, request.connectionId);
+				opts.manager.register(threadId, ownership, authority, request.connectionId, {
+					closeChild: closeLegacyChild ? captured => closeLegacyChild(threadId, ownership, captured) : undefined,
+				});
 				return;
 			} catch (error) {
-				if (ownership === "spawned" && opts.close) {
+				if (closeLegacyChild) {
 					try {
-						await opts.close(threadId, ownership, authority);
+						await closeLegacyChild(threadId, ownership, authority);
 					} catch {
 						// Preserve the publication failure after attempting authority-fenced cleanup.
 					}
