@@ -4,7 +4,6 @@ import { closeSync, fstatSync, openSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import {
 	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
@@ -20,6 +19,7 @@ import {
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "../native/index.js";
+import { loadNative } from "../native/loader-state.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -48,6 +48,33 @@ afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
+});
+describe("native addon capability validation", () => {
+	it("skips a same-version stale addon missing durableReplacePath", () => {
+		const context = {
+			isCompiledBinary: false,
+			platformTag: "win32-x64",
+			packageVersion: "current",
+			versionSentinelExport: "__piNativesVCurrent",
+			candidates: ["stale.node", "fresh.node"],
+		};
+		const compatible = {
+			__piNativesVCurrent() {},
+			__piNativesPublishOutcomeV1() {},
+			renameNoReplacePath() {},
+			probeWindowsJobMemory() {},
+			durableReplacePath() {},
+		};
+		const loaded = loadNative({
+			context,
+			extractEmbeddedAddons: () => [],
+			stageNodeModulesAddon: () => null,
+			requireCandidate: candidate =>
+				candidate === "stale.node" ? { ...compatible, durableReplacePath: undefined } : compatible,
+		});
+
+		expect(loaded).toBe(compatible);
+	});
 });
 
 describe.skipIf(process.platform !== "win32")("Windows native path identity", () => {
@@ -165,6 +192,21 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			mutationState: "not_committed",
 		});
 		expect(await fs.readFile(destination, "utf8")).toBe("old");
+	});
+	it("retains an ambiguous post-mutation durable replacement outcome", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged-directory");
+		const destination = path.join(root, "current-directory");
+		await fs.mkdir(source);
+		await fs.writeFile(path.join(source, "state.json"), "new");
+
+		expect(durableReplacePath(source, destination)).toMatchObject({
+			ok: false,
+			mutationState: "unknown",
+			durabilityState: "not_provable",
+			reason: "destination_verification_failed",
+		});
+		expect(await fs.readFile(path.join(destination, "state.json"), "utf8")).toBe("new");
 	});
 	it("smokes caller-fd security with fs.openSync and rejects arbitrary fds without terminating", async () => {
 		const root = await temporaryDirectory();

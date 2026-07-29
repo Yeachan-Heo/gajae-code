@@ -4498,6 +4498,71 @@ mod platform {
 			Err("io_error")
 		}
 	}
+	#[derive(PartialEq)]
+	enum ReplacePathIdentity {
+		Missing,
+		Present { volume_serial_number: u32, file_index: u64 },
+		Unobservable,
+	}
+
+	fn observe_replace_path_identity(path: &Path) -> ReplacePathIdentity {
+		let handle = match open_path(path, true, FILE_READ_ATTRIBUTES) {
+			Ok(handle) => handle,
+			Err("not_found") => return ReplacePathIdentity::Missing,
+			Err(_) => return ReplacePathIdentity::Unobservable,
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let observed = if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+			ReplacePathIdentity::Unobservable
+		} else {
+			ReplacePathIdentity::Present {
+				volume_serial_number: information.dwVolumeSerialNumber,
+				file_index:           (u64::from(information.nFileIndexHigh) << 32)
+					| u64::from(information.nFileIndexLow),
+			}
+		};
+		unsafe { CloseHandle(handle) };
+		observed
+	}
+
+	fn move_file_ex_failure(
+		os_code: i32,
+		source_before: ReplacePathIdentity,
+		destination_before: ReplacePathIdentity,
+		source_path: &Path,
+		destination_path: &Path,
+	) -> NativeDurableReplaceResult {
+		let unchanged = source_before != ReplacePathIdentity::Unobservable
+			&& destination_before != ReplacePathIdentity::Unobservable
+			&& source_before == observe_replace_path_identity(source_path)
+			&& destination_before == observe_replace_path_identity(destination_path);
+		NativeDurableReplaceResult {
+			ok:               false,
+			code:             Some("move_file_ex_failed".to_owned()),
+			os_code:          Some(os_code),
+			mutation_state:   if unchanged {
+				"not_committed"
+			} else {
+				"unknown"
+			}
+			.to_owned(),
+			durability_state: if unchanged {
+				"not_attempted"
+			} else {
+				"not_provable"
+			}
+			.to_owned(),
+			reason:           if unchanged {
+				"move_file_ex_failed"
+			} else {
+				"unknown"
+			}
+			.to_owned(),
+			primitive:        "move_file_ex_write_through".to_owned(),
+			phase:            "replace".to_owned(),
+		}
+	}
+
 	pub(super) fn durable_replace_path(
 		source_path: &Path,
 		destination_path: &Path,
@@ -4514,6 +4579,8 @@ mod platform {
 				return NativeDurableReplaceResult::failure(code, None, "not_committed", "preflight");
 			},
 		};
+		let source_before = observe_replace_path_identity(&source_path);
+		let destination_before = observe_replace_path_identity(&destination_path);
 		let mut source_wide: Vec<u16> = source_path.as_os_str().encode_wide().collect();
 		let mut destination_wide: Vec<u16> = destination_path.as_os_str().encode_wide().collect();
 		source_wide.push(0);
@@ -4528,24 +4595,25 @@ mod platform {
 			)
 		};
 		if moved == 0 {
-			return NativeDurableReplaceResult::failure(
-				"move_file_ex_failed",
-				Some(unsafe { GetLastError() } as i32),
-				"not_committed",
-				"replace",
+			return move_file_ex_failure(
+				unsafe { GetLastError() } as i32,
+				source_before,
+				destination_before,
+				&source_path,
+				&destination_path,
 			);
 		}
 		match std::fs::symlink_metadata(&destination_path) {
 			Ok(metadata) if metadata.is_file() => NativeDurableReplaceResult::success(),
 			_ => NativeDurableReplaceResult {
-				ok: false,
-				code: Some("destination_verification_failed".to_owned()),
-				os_code: None,
-				mutation_state: "unknown".to_owned(),
+				ok:               false,
+				code:             Some("destination_verification_failed".to_owned()),
+				os_code:          None,
+				mutation_state:   "unknown".to_owned(),
 				durability_state: "not_provable".to_owned(),
-				reason: "destination_verification_failed".to_owned(),
-				primitive: "move_file_ex_write_through".to_owned(),
-				phase: "verify".to_owned(),
+				reason:           "destination_verification_failed".to_owned(),
+				primitive:        "move_file_ex_write_through".to_owned(),
+				phase:            "verify".to_owned(),
 			},
 		}
 	}
@@ -4655,7 +4723,10 @@ mod platform {
 			let Some(parent_path) = path.parent() else {
 				return NativeExactUnlinkResult::failure("io_error");
 			};
-			let detached_path = parent_path.join(quarantine_name).to_string_lossy().into_owned();
+			let detached_path = parent_path
+				.join(quarantine_name)
+				.to_string_lossy()
+				.into_owned();
 			return detach_directory(
 				handle.target,
 				parent_handle,
@@ -5290,8 +5361,9 @@ mod platform {
 				// libuv's conversion. Arbitrary integers can invoke the CRT
 				// invalid-parameter handler instead of returning -1, so scope a no-op
 				// handler to this thread and return a typed validation failure instead.
-				let previous_handler =
-					unsafe { _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter)) };
+				let previous_handler = unsafe {
+					_set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter))
+				};
 				let handle = unsafe { _get_osfhandle(caller_fd) };
 				unsafe {
 					_set_thread_local_invalid_parameter_handler(previous_handler);
@@ -5309,7 +5381,10 @@ mod platform {
 		Ok(handle)
 	}
 
-	fn same_file_identity(left: HANDLE, right: HANDLE) -> Result<bool, NativeOwnerOnlySecurityResult> {
+	fn same_file_identity(
+		left: HANDLE,
+		right: HANDLE,
+	) -> Result<bool, NativeOwnerOnlySecurityResult> {
 		let mut left_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		let mut right_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(left, &mut left_information) } == 0
@@ -5317,11 +5392,9 @@ mod platform {
 		{
 			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
 		}
-		Ok(
-			left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
-				&& left_information.nFileIndexHigh == right_information.nFileIndexHigh
-				&& left_information.nFileIndexLow == right_information.nFileIndexLow,
-		)
+		Ok(left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
+			&& left_information.nFileIndexHigh == right_information.nFileIndexHigh
+			&& left_information.nFileIndexLow == right_information.nFileIndexLow)
 	}
 
 	fn checked_caller_handle(
@@ -5343,15 +5416,12 @@ mod platform {
 		kind: &str,
 		caller_fd: i32,
 	) -> NativeOwnerOnlySecurityResult {
-		let (path_handle, caller) = match checked_caller_handle(
-			path,
-			kind,
-			caller_fd,
-			READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-		) {
-			Ok(handles) => handles,
-			Err(result) => return result,
-		};
+		let (path_handle, caller) =
+			match checked_caller_handle(path, kind, caller_fd, READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+			{
+				Ok(handles) => handles,
+				Err(result) => return result,
+			};
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
 			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),

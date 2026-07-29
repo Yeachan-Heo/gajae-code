@@ -6,9 +6,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	acquireManagedLock,
+	captureManagedFileNoFollow,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
+	replaceManagedFileExactSync,
 	retainManagedDirectoryAuthority,
 	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
@@ -230,15 +233,18 @@ describe("native publish outcome classification", () => {
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let tempDir: string;
 	let storage: { deleteSessionWithArtifacts(sessionPath: string): Promise<void> };
+	let platformDescriptor: PropertyDescriptor | undefined;
 
 	beforeEach(async () => {
 		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-session-storage-"));
+		platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 		const { FileSessionStorage } = await import("../src/session/session-storage");
 		storage = new FileSessionStorage();
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
 		await fsp.rm(tempDir, { recursive: true, force: true });
 	});
 
@@ -276,6 +282,88 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 				}),
 			).rejects.toThrow("migration_busy");
 			expect(fs.existsSync(destination)).toBe(false);
+		});
+	});
+	describe("Windows durable managed replacement", () => {
+		const useWindowsPlatform = (): void => {
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
+			vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
+			vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
+			vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
+			vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+			vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+		};
+
+		it("uses durable replacement for the real managed caller and rejects a stale writer", () => {
+			useWindowsPlatform();
+			const destination = path.join(tempDir, "managed.jsonl");
+			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
+			const root = managedDirectoryRoot(tempDir);
+			const durable = vi.spyOn(native, "durableReplacePath").mockImplementation((source, target) => {
+				fs.renameSync(source, target);
+				return {
+					ok: true,
+					mutationState: "committed",
+					durabilityState: "durable",
+					reason: "none",
+					primitive: "move_file_ex_write_through",
+					phase: "complete",
+					diagnostic: { schemaVersion: 1, collectionState: "complete" },
+				} as never;
+			});
+			const store = new ManagedSessionDescendantStore(root, tempDir, undefined, "windows-existing-verify-first");
+			store.replaceSync("managed.jsonl", Buffer.from("replacement\n"));
+			expect(durable).toHaveBeenCalledTimes(1);
+			expect(fs.readFileSync(destination, "utf8")).toBe("replacement\n");
+
+			const stale = captureManagedFileNoFollow(destination);
+			fs.writeFileSync(destination, "successor\n", { mode: 0o600 });
+			expect(() => replaceManagedFileExactSync(destination, Buffer.from("stale\n"), stale, root)).toThrow(
+				"managed_replace_identity_mismatch",
+			);
+			expect(durable).toHaveBeenCalledTimes(1);
+			expect(fs.readFileSync(destination, "utf8")).toBe("successor\n");
+		});
+
+		it("retains staging evidence after an unknown durable replacement outcome", () => {
+			useWindowsPlatform();
+			const destination = path.join(tempDir, "unknown.jsonl");
+			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
+			const root = managedDirectoryRoot(tempDir);
+			vi.spyOn(native, "durableReplacePath").mockReturnValue({
+				ok: false,
+				mutationState: "unknown",
+				durabilityState: "not_provable",
+				reason: "unknown",
+				primitive: "move_file_ex_write_through",
+				phase: "rename",
+				diagnostic: { schemaVersion: 1, collectionState: "partial" },
+			} as never);
+			const expected = captureManagedFileNoFollow(destination);
+			expect(() => replaceManagedFileExactSync(destination, Buffer.from("replacement\n"), expected, root)).toThrow(
+				"unknown",
+			);
+			expect(fs.readFileSync(destination, "utf8")).toBe("authorized\n");
+			expect(fs.readdirSync(tempDir).some(name => name.includes(".replacement"))).toBe(true);
+		});
+	});
+
+	describe("managed async lock release", () => {
+		it("releases a normal lock and preserves a successor introduced before release", async () => {
+			const root = managedDirectoryRoot(tempDir);
+			const lock = await acquireManagedLock(tempDir, "release", root);
+			await lock.release();
+			expect(fs.existsSync(lock.path)).toBe(false);
+
+			const raced = await acquireManagedLock(tempDir, "successor", root);
+			const retired = `${raced.path}.${raced.attemptId}.moved`;
+			fs.renameSync(raced.path, retired);
+			fs.writeFileSync(raced.path, `${JSON.stringify({ attemptId: "successor" })}\n`, { mode: 0o600 });
+			await expect(raced.release()).rejects.toThrow("migration_busy");
+			expect(JSON.parse(fs.readFileSync(raced.path, "utf8"))).toEqual({ attemptId: "successor" });
+			fs.unlinkSync(raced.path);
+			fs.unlinkSync(retired);
 		});
 	});
 });
