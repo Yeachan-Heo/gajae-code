@@ -96,7 +96,14 @@ type CommandExecutionItem = Extract<ThreadItem, { type: "commandExecution" }>;
 type FileChangeItem = Extract<ThreadItem, { type: "fileChange" }>;
 type McpToolCallItem = Extract<ThreadItem, { type: "mcpToolCall" }>;
 type WebSearchItem = Extract<ThreadItem, { type: "webSearch" }>;
-type ToolCatalogItem = CommandExecutionItem | FileChangeItem | McpToolCallItem | WebSearchItem | PlanItem;
+type DynamicToolCallItem = Extract<ThreadItem, { type: "dynamicToolCall" }>;
+type ToolCatalogItem =
+	| CommandExecutionItem
+	| FileChangeItem
+	| McpToolCallItem
+	| WebSearchItem
+	| PlanItem
+	| DynamicToolCallItem;
 
 type BaseState<TItem extends ThreadItem = ThreadItem> = {
 	readonly id: string;
@@ -421,7 +428,9 @@ function itemTypeIsTool(type: ThreadItem["type"]): type is ToolCatalogItem["type
 		type === "fileChange" ||
 		type === "mcpToolCall" ||
 		type === "webSearch" ||
-		type === "plan"
+		type === "plan" ||
+		// The generic pinned tool-call item, used for real tools that have no dedicated type.
+		type === "dynamicToolCall"
 	);
 }
 
@@ -750,6 +759,20 @@ export class ToolItemReducer {
 					durationMs: null,
 				};
 				break;
+			case "dynamicToolCall":
+				// The pinned generic tool-call item: used for real tools with no dedicated type.
+				item = {
+					type: classification.type,
+					id,
+					namespace: classification.mcp?.server ?? null,
+					tool: classification.mcp?.tool ?? toolName,
+					arguments: normalizedArgs,
+					status: "inProgress",
+					contentItems: null,
+					success: null,
+					durationMs: null,
+				};
+				break;
 			case "webSearch":
 				item = {
 					type: classification.type,
@@ -940,6 +963,14 @@ export class ToolItemReducer {
 				return {
 					...state.item,
 					status: isError ? "failed" : "completed",
+					durationMs: state.item.durationMs ?? durationMs,
+				};
+			case "dynamicToolCall":
+				// Without this the item would terminalize still reporting inProgress and success:null.
+				return {
+					...state.item,
+					status: isError ? "failed" : "completed",
+					success: !isError,
 					durationMs: state.item.durationMs ?? durationMs,
 				};
 			case "webSearch":

@@ -407,3 +407,37 @@ test("a summary part is announced before the first delta targeting it", () => {
 	expect(emitted.filter(method => method === "item/reasoning/summaryPartAdded")).toHaveLength(1);
 	expectValidNotifications(notifications);
 });
+
+test("named catalog tools actually emit validated items, not just a mapping claim", () => {
+	// Classification advertising a type is worthless if the reducer drops the events: assert the
+	// full lifecycle reaches the wire and passes the generated stable validators.
+	for (const toolName of ["computer", "generate_image"]) {
+		const r = reducer([1_000, 2_000]);
+		const started = r.accept({
+			type: "tool_execution_start",
+			toolCallId: `call-${toolName}`,
+			toolName,
+			args: { prompt: "do the thing" },
+		});
+		expect(methods(started), toolName).toContain("item/started");
+		expect(r.openItemCount, toolName).toBe(1);
+
+		const finished = r.accept({
+			type: "tool_execution_end",
+			toolCallId: `call-${toolName}`,
+			toolName,
+			result: { content: [{ type: "text", text: "ok" }] },
+			isError: false,
+		});
+		expect(methods(finished), toolName).toContain("item/completed");
+		// A terminalized item must report its real outcome, not a stale inProgress/success:null.
+		expect(completed(finished).params.item, toolName).toMatchObject({
+			type: "dynamicToolCall",
+			status: "completed",
+			success: true,
+			tool: toolName,
+		});
+		expect(r.openItemCount, toolName).toBe(0);
+		expectValidNotifications([...started, ...finished]);
+	}
+});

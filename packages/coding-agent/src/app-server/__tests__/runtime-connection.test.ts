@@ -991,3 +991,81 @@ test("runtime connection: an approval accept and a deny each settle the awaiting
 		expect(runtime.broker.pendingCount, scenario.name).toBe(0);
 	}
 });
+
+test("runtime connection: a client that never received a request cannot settle it", async () => {
+	const runtime = createAppServerRuntime();
+	const frames: Uint8Array[] = [];
+	const receiver = runtime.createConnection(frame => {
+		frames.push(frame);
+	});
+	// This connection is subscribed and therefore eligible, but its writer always fails, so it never
+	// actually receives the approval frame.
+	let unreachableFails = false;
+	const unreachable = runtime.createConnection(() => {
+		if (unreachableFails) throw new Error("writer is gone");
+	});
+	await initialize(receiver);
+	await initialize(unreachable);
+	runtime.subscriptions.subscribe(receiver.id, "thread-a");
+	runtime.subscriptions.subscribe(unreachable.id, "thread-a");
+	frames.length = 0;
+	// Only the approval publication fails for this connection, not its handshake.
+	unreachableFails = true;
+
+	let requestId: string | undefined;
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		requestId = context?.requestClient?.("thread-a", "execCommandApproval", {
+			conversationId: "thread-a",
+			callId: "call-1",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		return { ok: true, result: { dataBase64: "" } };
+	});
+	await receiver.process(enc('{"id":3,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+	await Bun.sleep(5);
+
+	expect(requestId).toBeDefined();
+	const pending = runtime.broker.getPending(requestId!);
+	expect(pending).toBeDefined();
+	// The unreachable connection was dropped from the eligible set, so its answer is refused.
+	expect(runtime.broker.resolve(requestId!, unreachable.id, { decision: "approved" })).toBe(false);
+	// The connection that actually got the frame can still answer.
+	expect(runtime.broker.resolve(requestId!, receiver.id, { decision: "approved" })).toBe(true);
+	await expect(pending!.settled).resolves.toMatchObject({ kind: "resolved", connectionId: receiver.id });
+});
+
+test("runtime connection: manager shutdown settles a pending approval", async () => {
+	const runtime = createAppServerRuntime();
+	const connection = runtime.createConnection(() => {});
+	await initialize(connection);
+	runtime.subscriptions.subscribe(connection.id, "thread-a");
+
+	let requestId: string | undefined;
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		requestId = context?.requestClient?.("thread-a", "execCommandApproval", {
+			conversationId: "thread-a",
+			callId: "call-1",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		return { ok: true, result: { dataBase64: "" } };
+	});
+	runtime.manager.register("thread-a", "spawned", undefined, connection.id);
+	await connection.process(enc('{"id":3,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+	await Bun.sleep(5);
+
+	const settled = runtime.broker.getPending(requestId!)?.settled;
+	expect(settled).toBeDefined();
+	// Shutdown removes every thread, so it owes the same departing-thread guarantee as evict/remove:
+	// the waiter must settle rather than hang until timeout.
+	runtime.manager.shutdown();
+	await expect(settled).resolves.toMatchObject({ kind: "cancelled" });
+	expect(runtime.broker.pendingCount).toBe(0);
+});

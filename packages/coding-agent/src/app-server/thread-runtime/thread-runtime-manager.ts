@@ -434,6 +434,9 @@ export class ThreadRuntimeManager {
 		for (const reservation of [...this.#reservations]) reservation.release();
 		this.#threads.clear();
 		this.#connectionLoads.clear();
+		// Shutdown removes every thread, so it owes the same departing-thread guarantee as
+		// remove/evict/detach/terminate: any pending approval waiter must be settled, not orphaned.
+		for (const thread of threads) this.#onThreadGone?.(thread.threadId, "terminated");
 		for (const thread of threads) {
 			if (thread.ownership === "spawned") this.#invokeClose(thread);
 		}

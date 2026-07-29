@@ -223,7 +223,32 @@ class Runtime implements AppServerRuntime {
 				void request.settled.then(() => {
 					this.manager.adjustPendingApprovals(threadId, -1);
 				});
-				for (const connectionId of request.eligibleConnections) queueMessage(connectionId, { id, method, params });
+				// Only a connection that actually receives the request frame may answer it. Publication is
+				// deferred, so drop each recipient from the eligible set if its enqueue never lands
+				// (closed connection, backpressure, writer error); otherwise an eligible-but-unsent client
+				// could settle a predictable request id it never saw. If nobody receives it, settle now
+				// rather than holding the thread and its pendingApprovals until timeout.
+				const recipients = [...request.eligibleConnections];
+				deferred.push(async () => {
+					let delivered = 0;
+					for (const connectionId of recipients) {
+						const target = active() ? this.#connections.get(connectionId) : undefined;
+						try {
+							if (!target) throw new Error("connection is gone");
+							await target.enqueueMessage({ id, method, params });
+							delivered += 1;
+						} catch (error) {
+							request.eligibleConnections.delete(connectionId);
+							logger.warn("Dropping unreachable app-server server-request recipient", {
+								connectionId,
+								id,
+								method,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
+					if (delivered === 0) this.broker.cancel(id, "no eligible connection received the request");
+				});
 				return id;
 			},
 		};
