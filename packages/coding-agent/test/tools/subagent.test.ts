@@ -641,10 +641,13 @@ describe("SubagentTool", () => {
 		expect(result.details?.subagents[0]?.status).toBe("running");
 		expect(result.details?.awaitOutcome).toBe("timed_out");
 		expect(result.details?.interrupted).toBeUndefined();
+		expect(result.details?.awaitMode).toBe("bounded");
+		expect(result.details?.join).toBe("all_terminal");
 		expect(guidance).toContain("Still running");
 		expect(guidance).toContain("not a failure");
 		expect(guidance).toContain("never cancel just because an await timed out");
 		expect(guidance).toContain("cancel only if the subagent has actually failed");
+		expect(guidance).toContain("until_terminal");
 		expect(guidance).not.toContain("steer");
 		expect(guidance).not.toContain("shutdown");
 
@@ -658,6 +661,134 @@ describe("SubagentTool", () => {
 		expect(completed.details?.subagents[0]?.status).toBe("completed");
 		expect(completed.details?.subagents[0]?.resultText).toContain("slow result");
 		expect(manager.getJob("job-slow")?.status).toBe("completed");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("until_terminal waits past the bounded default for a job that finishes within deadline", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		manager.register("task", "until-terminal success", async () => gate.promise, {
+			id: "job-until-success",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-UntilSuccess",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "until terminal success",
+					assignment: "Finish within deadline.",
+				},
+			},
+		});
+		setTimeout(() => gate.resolve("finished within deadline"), 80);
+
+		const started = Date.now();
+		const result = await tool.execute("subagent-await-until-success", {
+			action: "await",
+			ids: ["0-UntilSuccess"],
+			mode: "until_terminal",
+			deadline_ms: 5_000,
+			heartbeat_ms: 0,
+		});
+		const elapsed = Date.now() - started;
+
+		expect(result.details?.awaitOutcome).toBe("completed");
+		expect(result.details?.awaitMode).toBe("until_terminal");
+		expect(result.details?.join).toBe("all_terminal");
+		expect(result.details?.subagents[0]?.status).toBe("completed");
+		expect(result.details?.subagents[0]?.resultText).toContain("finished within deadline");
+		expect(elapsed).toBeGreaterThanOrEqual(60);
+		expect(elapsed).toBeLessThan(4_000);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("until_terminal times out at a short deadline while the job is still running", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "until-terminal timeout", async () => gate.promise, {
+			id: "job-until-timeout",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-UntilTimeout",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "until terminal timeout",
+					assignment: "Stay running past deadline.",
+				},
+			},
+		});
+
+		const result = await tool.execute("subagent-await-until-timeout", {
+			action: "await",
+			ids: ["0-UntilTimeout"],
+			mode: "until_terminal",
+			deadline_ms: 30,
+			heartbeat_ms: 0,
+		});
+
+		expect(result.details?.awaitOutcome).toBe("timed_out");
+		expect(result.details?.awaitMode).toBe("until_terminal");
+		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(manager.getJob(jobId)?.status).toBe("running");
+
+		gate.resolve("late finish");
+		await manager.getJob(jobId)?.promise;
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("join any_terminal completes when the first of two jobs finishes", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const first = Promise.withResolvers<string>();
+		const second = Promise.withResolvers<string>();
+		const firstJobId = manager.register("task", "any-terminal first", async () => first.promise, {
+			id: "job-any-first",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-AnyFirst",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "finishes first",
+				},
+			},
+		});
+		const secondJobId = manager.register("task", "any-terminal second", async () => second.promise, {
+			id: "job-any-second",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-AnySecond",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "stays running",
+				},
+			},
+		});
+		setTimeout(() => first.resolve("first done"), 20);
+
+		const result = await tool.execute("subagent-await-any-terminal", {
+			action: "await",
+			ids: ["0-AnyFirst", "0-AnySecond"],
+			mode: "until_terminal",
+			deadline_ms: 5_000,
+			heartbeat_ms: 0,
+			join: "any_terminal",
+		});
+
+		expect(result.details?.awaitOutcome).toBe("completed");
+		expect(result.details?.awaitMode).toBe("until_terminal");
+		expect(result.details?.join).toBe("any_terminal");
+		expect(result.details?.subagents.find(s => s.id === "0-AnyFirst")?.status).toBe("completed");
+		expect(result.details?.subagents.find(s => s.id === "0-AnySecond")?.status).toBe("running");
+		expect(manager.getJob(firstJobId)?.status).toBe("completed");
+		expect(manager.getJob(secondJobId)?.status).toBe("running");
+
+		second.resolve("second done later");
+		await manager.getJob(secondJobId)?.promise;
 		await manager.dispose({ timeoutMs: 100 });
 	});
 

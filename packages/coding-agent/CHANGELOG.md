@@ -3,6 +3,10 @@
 
 ### Added
 
+- `subagent await` supports `mode: "until_terminal"` with optional `deadline_ms` (default 10 min), sparse `heartbeat_ms` progress, and `join: "any_terminal" | "all_terminal"`, so long-running reviewers can be waited on in one tool call instead of repeated 30s bounded polls (#3472).
+
+### Fixed
+
 - `gjc ultragoal quality-gate init` scaffolds a multi-surface quality-gate template (`--surface` repeatable, `--out` required) so agents can fill evidence once and use read-only `quality-gate validate` multi-error diagnostics instead of discovering missing fields one checkpoint at a time (#3474).
 
 ### Added

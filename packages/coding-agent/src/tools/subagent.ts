@@ -12,6 +12,12 @@ import { ToolError } from "./tool-errors";
 
 const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
 const MAX_AWAIT_TIMEOUT_MS = 60 * 60 * 1000;
+/** Default hard deadline for `mode: "until_terminal"` awaits (10 minutes). */
+const DEFAULT_UNTIL_TERMINAL_DEADLINE_MS = 600_000;
+/** Default onUpdate heartbeat interval for `until_terminal` (sparse progress). */
+const DEFAULT_UNTIL_TERMINAL_HEARTBEAT_MS = 120_000;
+/** Floor for progress-timer intervals when heartbeats are enabled. */
+const MIN_PROGRESS_INTERVAL_MS = 500;
 const DEFAULT_LIST_LIMIT = 10;
 const MAX_LIST_LIMIT = 50;
 const RECEIPT_PREVIEW_WIDTH = 280;
@@ -32,7 +38,38 @@ const subagentSchema = z.object({
 	id: z.string().optional().describe("single subagent id or backing job id for resume/steer"),
 	message: z.string().optional().describe("message to deliver when resuming or steering a subagent"),
 	pause: z.boolean().optional().describe("pause after steering a currently running subagent"),
-	timeout_ms: z.number().min(0).max(MAX_AWAIT_TIMEOUT_MS).optional().describe("await timeout in milliseconds"),
+	timeout_ms: z
+		.number()
+		.min(0)
+		.max(MAX_AWAIT_TIMEOUT_MS)
+		.optional()
+		.describe("bounded await timeout in milliseconds (default 30000; ignored when mode is until_terminal)"),
+	mode: z
+		.enum(["bounded", "until_terminal"])
+		.optional()
+		.describe(
+			'await wait mode: "bounded" (default, uses timeout_ms) or "until_terminal" (wait until join condition or deadline_ms)',
+		),
+	deadline_ms: z
+		.number()
+		.min(0)
+		.max(MAX_AWAIT_TIMEOUT_MS)
+		.optional()
+		.describe("until_terminal hard deadline in milliseconds (default 600000); child keeps running if deadline expires"),
+	heartbeat_ms: z
+		.number()
+		.min(0)
+		.max(MAX_AWAIT_TIMEOUT_MS)
+		.optional()
+		.describe(
+			"until_terminal onUpdate progress heartbeat interval in milliseconds (default 120000; 0 disables heartbeats)",
+		),
+	join: z
+		.enum(["all_terminal", "any_terminal"])
+		.optional()
+		.describe(
+			'await join policy: "all_terminal" (default, wait for every watched job) or "any_terminal" (resolve when any watched job terminals)',
+		),
 	limit: z.number().min(1).max(MAX_LIST_LIMIT).optional().describe("maximum subagents to return"),
 	verbosity: z
 		.enum(["receipt", "preview", "full"])
@@ -87,6 +124,8 @@ export interface SubagentSnapshot {
 }
 
 export type SubagentAwaitOutcome = "completed" | "timed_out" | "interrupted";
+export type SubagentAwaitMode = "bounded" | "until_terminal";
+export type SubagentAwaitJoin = "all_terminal" | "any_terminal";
 
 const AWAIT_INTERRUPTED_GUIDANCE =
 	"Await interrupted; this subagent continues. Inspect its current state or cancel it only when necessary.";
@@ -97,6 +136,10 @@ export interface SubagentToolDetails {
 	awaitOutcome?: SubagentAwaitOutcome;
 	/** True only when the parent await was interrupted; the child was not cancelled. */
 	interrupted?: true;
+	/** Wait mode used for this await; omitted when no wait was started. */
+	awaitMode?: SubagentAwaitMode;
+	/** Join policy used for this await; omitted when no wait was started. */
+	join?: SubagentAwaitJoin;
 }
 
 export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentToolDetails> {
@@ -365,10 +408,32 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			});
 		}
 
-		const timeoutMs = Math.min(
-			MAX_AWAIT_TIMEOUT_MS,
-			Math.max(0, Math.floor(params.timeout_ms ?? DEFAULT_AWAIT_TIMEOUT_MS)),
-		);
+		const awaitMode: SubagentAwaitMode = params.mode ?? "bounded";
+		const join: SubagentAwaitJoin = params.join ?? "all_terminal";
+		const waitMs =
+			awaitMode === "until_terminal"
+				? Math.min(
+						MAX_AWAIT_TIMEOUT_MS,
+						Math.max(0, Math.floor(params.deadline_ms ?? DEFAULT_UNTIL_TERMINAL_DEADLINE_MS)),
+					)
+				: Math.min(
+						MAX_AWAIT_TIMEOUT_MS,
+						Math.max(0, Math.floor(params.timeout_ms ?? DEFAULT_AWAIT_TIMEOUT_MS)),
+					);
+		// Heartbeats only apply to until_terminal; bounded keeps the 500ms change-gated poll.
+		const heartbeatMs =
+			awaitMode === "until_terminal"
+				? Math.min(
+						MAX_AWAIT_TIMEOUT_MS,
+						Math.max(0, Math.floor(params.heartbeat_ms ?? DEFAULT_UNTIL_TERMINAL_HEARTBEAT_MS)),
+					)
+				: MIN_PROGRESS_INTERVAL_MS;
+		const progressIntervalMs =
+			awaitMode === "until_terminal"
+				? heartbeatMs === 0
+					? 0
+					: Math.max(MIN_PROGRESS_INTERVAL_MS, heartbeatMs)
+				: MIN_PROGRESS_INTERVAL_MS;
 		const watchedJobIds = runningJobs.map(job => job.id);
 		manager.watchJobs(watchedJobIds);
 		let lastEmittedSignature: string | undefined;
@@ -380,7 +445,12 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			lastEmittedSignature = signature;
 			onUpdate(result);
 		};
-		const progressTimer = onUpdate ? setInterval(() => emitIfChanged(false), 500) : undefined;
+		// until_terminal forces sparse heartbeats even when the signature is idle so the
+		// parent sees the tool is still waiting; bounded keeps change-gated 500ms polls.
+		const progressTimer =
+			onUpdate && progressIntervalMs > 0
+				? setInterval(() => emitIfChanged(awaitMode === "until_terminal"), progressIntervalMs)
+				: undefined;
 		// Initial emission so the panel appears immediately; later idle ticks are
 		// gated on a value-based rendered-state signature so unchanged progress no
 		// longer rebuilds the renderer component or mutates transcript lines above
@@ -389,8 +459,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 
 		let awaitOutcome: SubagentAwaitOutcome;
 		const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<SubagentAwaitOutcome>();
-		const timeoutTimer = setTimeout(() => resolveTimeout("timed_out"), timeoutMs);
-		const completionPromise = Promise.all(runningJobs.map(job => job.promise)).then(() => "completed" as const);
+		const timeoutTimer = setTimeout(() => resolveTimeout("timed_out"), waitMs);
+		const jobPromises = runningJobs.map(job => job.promise);
+		const completionPromise = (
+			join === "any_terminal" ? Promise.race(jobPromises) : Promise.all(jobPromises)
+		).then(() => "completed" as const);
 		let onAbort: (() => void) | undefined;
 		try {
 			if (signal) {
@@ -431,6 +504,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			verbosity: params.verbosity ?? "receipt",
 			attachLiveProgress: true,
 			awaitOutcome,
+			awaitMode,
+			join,
 		});
 	}
 
@@ -549,6 +624,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			verbosity?: SubagentParams["verbosity"];
 			attachLiveProgress?: boolean;
 			awaitOutcome?: SubagentAwaitOutcome;
+			awaitMode?: SubagentAwaitMode;
+			join?: SubagentAwaitJoin;
 		},
 	): Promise<AgentToolResult<SubagentToolDetails>> {
 		const verifiedOutputIds = await this.#verifiedOutputIds(records);
@@ -583,14 +660,23 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				}
 			}
 		}
-		return this.#buildSnapshotResult(snapshots, options.title, options.awaitOutcome);
+		return this.#buildSnapshotResult(snapshots, options.title, {
+			awaitOutcome: options.awaitOutcome,
+			awaitMode: options.awaitMode,
+			join: options.join,
+		});
 	}
 
 	#buildSnapshotResult(
 		snapshots: SubagentSnapshot[],
 		title: string,
-		awaitOutcome?: SubagentAwaitOutcome,
+		receipt?: {
+			awaitOutcome?: SubagentAwaitOutcome;
+			awaitMode?: SubagentAwaitMode;
+			join?: SubagentAwaitJoin;
+		},
 	): AgentToolResult<SubagentToolDetails> {
+		const awaitOutcome = receipt?.awaitOutcome;
 		const lines = [`## ${title} (${snapshots.length})`, ""];
 		for (const snapshot of snapshots) {
 			lines.push(`### ${snapshot.id} — ${snapshot.status}`);
@@ -625,6 +711,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				subagents: snapshots,
 				...(awaitOutcome ? { awaitOutcome } : {}),
 				...(awaitOutcome === "interrupted" ? { interrupted: true } : {}),
+				...(receipt?.awaitMode ? { awaitMode: receipt.awaitMode } : {}),
+				...(receipt?.join ? { join: receipt.join } : {}),
 			},
 		};
 	}
@@ -711,7 +799,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const subagent = job.metadata?.subagent;
 		const runningTimeoutGuidance =
 			timedOut && job.status === "running"
-				? "Still running after the await timeout; timeout only bounded this wait and is not a failure. Inspect progress, continue independent work, and never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong."
+				? "Still running after the await timeout; timeout only bounded this wait and is not a failure. Inspect progress, continue independent work, and never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong. For long-running reviewers, prefer mode=until_terminal with a suitable deadline_ms instead of repeated short bounded awaits."
 				: undefined;
 		const output = previewJobOutput(job, verbosity);
 		const outputRef = record && verifiedOutputIds.has(record.subagentId) ? `agent://${record.subagentId}` : undefined;

@@ -14,8 +14,14 @@ Inspect selected subagents by `ids`; omit `ids` to inspect current running subag
 
 ## `action: "await"`
 Wait for selected subagents by `ids`; omit `ids` to wait for current running subagents.
-- Always set `timeout_ms` when the result is not immediately required forever.
-- Await timeout only bounds this tool call's wait; it does not stop the subagent and is not a failure reason.
+- `mode` (optional): `"bounded"` (default) or `"until_terminal"`.
+  - **bounded**: uses `timeout_ms` (default 30000). Good for short checks and independent work loops.
+  - **until_terminal**: waits in a single tool call until the join condition is met or `deadline_ms` (default 600000 / 10 min) expires. Prefer this for long reviewers and other multi-minute children so you do not re-poll every 30s.
+- `deadline_ms` (optional): hard wait cap for `until_terminal` only. On expiry, `awaitOutcome` is `timed_out` and the child keeps running.
+- `heartbeat_ms` (optional): sparse `onUpdate` progress interval for `until_terminal` (default 120000; `0` disables heartbeats). Does not cause artificial timeouts.
+- `join` (optional): `"all_terminal"` (default, wait for every watched job) or `"any_terminal"` (resolve when any watched job reaches a terminal status; final snapshots still cover all requested ids).
+- Always set `timeout_ms` (bounded) or `deadline_ms` (until_terminal) when the result is not required for the full default window.
+- Await timeout/deadline only bounds this tool call's wait; it does not stop the subagent and is not a failure reason.
 - On timeout, inspect progress and keep doing independent work. Never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 - Completed results are receipt-first by default: bounded preview plus `agent://<id>` output ref when available, not full retained output.
 
