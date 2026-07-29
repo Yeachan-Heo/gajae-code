@@ -856,8 +856,18 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(report.runner.closureDigest).toBe(sha256(`${report.runner.closureManifest.join("\n")}\n`));
 		expect(report.runner.runtimeControlIdentity).toBe(memoryRuntimeControlIdentity(report.runner));
 
+		// Replay the REAL runner provenance block over the deterministic synthetic body. The real
+		// short-profile measurement payload (periodicSamples/extrema/slopes/sampling/postTeardown) is
+		// host- and timing-dependent, and the driver enforces preregistered sample-count, elapsed-duration,
+		// and timestamp-separation bounds that a variable-speed CI runner cannot be guaranteed to meet.
+		// So provenance crosses the Python boundary for real while the payload stays synthetic; the real
+		// report's own invariants are asserted directly above and below this graft.
 		await writeCorpus(input);
 		const replayReport = JSON.parse(await fs.readFile(path.join(input, "short-01.json"), "utf8")) as PerfCorpusReport;
+		// The graft is only valid while the synthetic short-01 fixture and the real bench run agree on
+		// surface order; assert that correspondence before overwriting it, so a preregistration schedule
+		// change fails here instead of as an opaque ordinal error inside the driver.
+		expect(replayReport.runner.memorySurfaceOrder).toEqual(report.runner.memorySurfaceOrder);
 		replayReport.gitSha = report.gitSha;
 		replayReport.gitDirty = false;
 		replayReport.runner = structuredClone(report.runner);
@@ -1267,6 +1277,32 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			await mutateLedger(input, mutate);
 			expect(invoke(input, output).exitCode).toBe(3);
 			expect(validationCodes(await readResult(output))).toContain("SEALED_INPUT_INVALID");
+		}
+	});
+
+	test("rejects report/ledger host platform and arch binding drift", async () => {
+		for (const [name, field, ledgerValue] of [
+			["platform", "platform", "linux"],
+			["arch", "arch", "x64"],
+		] as const) {
+			const input = path.join(temporaryRoot, `host-binding-${name}-input`);
+			const output = path.join(temporaryRoot, `host-binding-${name}-output`);
+			await writeCorpus(input);
+			// Keep ledger host and every attempt internally consistent so the earlier host/power
+			// equality gate still passes; only the report/ledger binding may disagree.
+			await mutateLedger(input, ledger => {
+				(ledger.host as JsonObject)[field] = ledgerValue;
+				for (const attempt of ledger.attempts as JsonObject[]) attempt[field] = ledgerValue;
+			});
+			expect(invoke(input, output).exitCode).toBe(3);
+			const result = await readResult(output);
+			expect(
+				result.diagnostics.validationErrors.some(
+					error => error.message?.includes(`host ${field} binding mismatch`) === true,
+				),
+			).toBe(true);
+			expect(result.admission.short.admittedBlocks).toBe(0);
+			expect(result.admission.soak.admittedBlocks).toBe(0);
 		}
 	});
 
