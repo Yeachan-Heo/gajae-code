@@ -433,17 +433,22 @@ describe("InputController keybinding setup", () => {
 		expect(spies.toggleIrcSidebar).toHaveBeenCalledTimes(1);
 	});
 
-	it("registers remapped IRC sidebar shortcuts", async () => {
-		const { InputController, ctx, editor } = await createContext({ ircSidebarToggleKeys: ["ctrl+alt+i"] });
+	it("dispatches only a remapped IRC sidebar shortcut", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ ircSidebarToggleKeys: ["ctrl+alt+i"] });
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
 
-		expect(editor.setCustomKeyHandler).toHaveBeenCalledWith("ctrl+alt+i", expect.any(Function));
+		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "ctrl+alt+i",
+		);
+		expect(registration).toBeDefined();
 		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("alt+i", expect.any(Function));
+		expect((registration?.[1] as () => boolean)()).toBe(true);
+		expect(spies.toggleIrcSidebar).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not register a sidebar handler when its binding is explicitly empty", async () => {
+	it("does not register a sidebar handler when the shortcut is explicitly unbound", async () => {
 		const { InputController, ctx, editor } = await createContext({ ircSidebarToggleKeys: [] });
 		new InputController(ctx).setupKeyHandlers();
 

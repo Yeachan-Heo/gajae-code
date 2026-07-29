@@ -82,6 +82,35 @@ export function computeIrcSplitWidths(width: number): {
 		rightWidth: sidebarWidth,
 	};
 }
+/**
+ * Resolves the single shared work-lane geometry. The left lane is used by both
+ * transcript and todo content whenever the IRC lane is effective.
+ */
+export function computeIrcWorkLaneWidths(
+	width: number,
+	sidebarVisible: boolean,
+): { leftWidth: number; separatorWidth: number; rightWidth: number } {
+	const fullWidth = Math.max(0, Math.floor(width));
+	return sidebarVisible
+		? computeIrcSplitWidths(fullWidth)
+		: { leftWidth: fullWidth, separatorWidth: 0, rightWidth: 0 };
+}
+
+export class IrcLeftLaneComponent implements Component {
+	constructor(
+		private readonly content: Component,
+		private readonly isSidebarVisible: (width: number) => boolean,
+	) {}
+
+	render(width: number): string[] {
+		const layout = computeIrcWorkLaneWidths(width, this.isSidebarVisible(width));
+		return this.content.render(layout.leftWidth);
+	}
+
+	invalidate(): void {
+		this.content.invalidate?.();
+	}
+}
 
 type SemanticLine = Readonly<{
 	kind: "header" | "body" | "elision" | "blank";
@@ -288,7 +317,7 @@ export class IrcSplitViewComponent implements ViewportAnchorProvider {
 	renderWithViewportAnchors(width: number): ViewportAnchorRender {
 		if (!this.#visible) return renderComponentWithViewportAnchors(this.leftPane, width);
 		const componentTheme = typeof this.componentTheme === "function" ? this.componentTheme() : this.componentTheme;
-		const { leftWidth, separatorWidth, rightWidth } = computeIrcSplitWidths(width);
+		const { leftWidth, separatorWidth, rightWidth } = computeIrcWorkLaneWidths(width, this.#visible);
 		if (rightWidth === 0) return renderComponentWithViewportAnchors(this.leftPane, width);
 		const separator = separatorWidth > 0 ? componentTheme.fg("dim", ` ${componentTheme.boxSharp.vertical} `) : "";
 		const leftRender = withTerminalGraphicsFallback(

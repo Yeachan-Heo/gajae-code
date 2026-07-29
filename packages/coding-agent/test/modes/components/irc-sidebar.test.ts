@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
 	computeIrcSplitWidths,
+	computeIrcWorkLaneWidths,
 	getIrcSidebarSemanticToken,
 	IRC_SIDEBAR_MAX_RENDER_ROWS,
+	IrcLeftLaneComponent,
 	type IrcSidebarTheme,
 	IrcSplitViewComponent,
 } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
@@ -137,6 +139,18 @@ describe("computeIrcSplitWidths", () => {
 			expect(result.rightWidth === 0).toBe(width < 65);
 			expect(result.leftWidth).toBeGreaterThanOrEqual(Math.floor(width * 0.5));
 		}
+	});
+});
+describe("shared work lane", () => {
+	it("keeps dependent pre-boundary content in the transcript lane only while IRC is effective", () => {
+		const todo = new TestPane("todo content");
+		const lane = new IrcLeftLaneComponent(todo, width => width >= 65);
+
+		expect(computeIrcWorkLaneWidths(64, true)).toEqual({ leftWidth: 64, separatorWidth: 0, rightWidth: 0 });
+		expect(computeIrcWorkLaneWidths(65, true)).toEqual({ leftWidth: 32, separatorWidth: 3, rightWidth: 30 });
+		expect(lane.render(64)).toEqual(["todo content"]);
+		expect(lane.render(80)).toEqual(["todo content"]);
+		expect(todo.widths).toEqual([64, computeIrcSplitWidths(80).leftWidth]);
 	});
 });
 
