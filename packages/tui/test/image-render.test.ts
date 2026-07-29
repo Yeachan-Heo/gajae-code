@@ -369,6 +369,32 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 		expect(chunks.at(-1)).toContain("m=0");
 	});
 
+	it("retries Kitty pixel transmission after the writer rejects the first attempt", () => {
+		let attempts = 0;
+		setKittyTransmitWriter(() => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("transmit rejected");
+		});
+
+		expect(() =>
+			renderImage(BASE64_DUMMY, SQUARE_DIMENSIONS, {
+				imageId: 42,
+				placementId: 43,
+				maxWidthCells: 2,
+				maxHeightCells: 2,
+			}),
+		).toThrow("transmit rejected");
+		const replay = renderImage(BASE64_DUMMY, SQUARE_DIMENSIONS, {
+			imageId: 42,
+			placementId: 43,
+			maxWidthCells: 2,
+			maxHeightCells: 2,
+		});
+
+		expect(attempts).toBe(2);
+		expect(replay?.sequence).toContain("a=p,i=42,p=43");
+	});
+
 	it("repainting one component does not delete a sibling placement with identical content", () => {
 		const makeImage = () =>
 			new Image(
@@ -431,11 +457,52 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 
 		expect(model.images.size).toBe(1);
 		expect(new Set(model.placements.keys())).toEqual(new Set([`${placementB!.imageId}:${placementB!.placementId}`]));
+		model.apply(linesA);
+		expect(model.images.size).toBe(1);
+		expect(model.placements.size).toBe(2);
+		expect(transmitted).toHaveLength(1);
 	});
 
-	it("ignores malformed Kitty placement identifiers", () => {
-		expect(extractKittyPlacementReferences("\x1b_Ga=p,i=123junk,p=7,r=2,C=1,q=2\x1b\\")).toEqual([]);
-		expect(extractKittyPlacementReferences("\x1b_Ga=p,i=123,p=7,r=2junk,C=1,q=2\x1b\\")).toEqual([]);
+	it("extracts multiple bounded placement commands from one line", () => {
+		const first = "\x1b_Ga=p,i=1,p=2,r=3,C=1,q=2\x1b\\";
+		const second = "\x1b_Ga=p,i=4294967295,p=4294967295,r=4294967295,C=1,q=2\x1b\\";
+
+		expect(extractKittyPlacementReferences(`${first}text${second}`)).toEqual([
+			{ imageId: 1, placementId: 2, rows: 3 },
+			{ imageId: 4294967295, placementId: 4294967295, rows: 4294967295 },
+		]);
+	});
+
+	it("rejects malformed, ambiguous, payload-bearing, and unbounded placement commands", () => {
+		const invalid = [
+			"\x1b_Ga=p,i=123junk,p=7,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=123,p=7,r=2junk,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=4294967296,p=7,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=4294967296,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,r=4294967296,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=0,p=8,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=0,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,r=0,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=-7,p=8,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=+7,p=8,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7.0,p=8,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7e0,p=8,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i= 7,p=8,r=2,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,r=2,C=0,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,r=2,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,C=1,q=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,r=2;AAAA\x1b\\",
+			"\x1b_Ga=t,a=p,i=7,p=8,r=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,p=9,r=2\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,r=2,m=1\x1b\\",
+			"\x1b_Ga=t,i=7,p=8,r=2\x1b\\",
+			"\x1b_Ga=T,i=7,p=8,r=2;AAAA\x1b\\",
+			"\x1b_Ga=d,d=i,i=7,p=8\x1b\\",
+			"\x1b_Ga=p,i=7,p=8,r=2",
+		];
+		for (const sequence of invalid) expect(extractKittyPlacementReferences(sequence)).toEqual([]);
+		expect(extractKittyPlacementReferences(`\x1b_Ga=p,i=7,p=8,r=2\x1b\\${"x".repeat(256 * 1024)}`)).toEqual([]);
+		expect(extractKittyPlacementReferences("x".repeat(256 * 1024 + 1))).toEqual([]);
 	});
 
 	it("legacy a=T emission stacks placements in the terminal model (regression contrast)", () => {

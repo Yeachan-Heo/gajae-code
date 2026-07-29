@@ -13,6 +13,7 @@ import {
 	TERMINAL,
 	TUI,
 } from "@gajae-code/tui";
+import type { Terminal, TerminalAppearance } from "@gajae-code/tui/terminal";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -31,6 +32,118 @@ class MutableLinesComponent implements Component {
 
 	render(width: number): string[] {
 		return this.#lines.map(line => line.slice(0, width));
+	}
+}
+
+class RawMutableLinesComponent implements Component {
+	#lines: string[];
+
+	constructor(lines: string[]) {
+		this.#lines = [...lines];
+	}
+
+	setLines(lines: string[]): void {
+		this.#lines = [...lines];
+	}
+
+	invalidate(): void {}
+
+	render(): string[] {
+		return this.#lines;
+	}
+}
+
+class FaultingVirtualTerminal implements Terminal {
+	#available = true;
+	#writeFailureAt: number | undefined;
+	#writes = 0;
+
+	constructor(readonly terminal: VirtualTerminal) {}
+
+	setWriteFailureAt(writeFailureAt: number | undefined): void {
+		this.#writeFailureAt = writeFailureAt;
+		if (writeFailureAt === undefined) this.#available = true;
+	}
+
+	get writeCount(): number {
+		return this.#writes;
+	}
+
+	start(onInput: (data: string) => void, onResize: () => void): void {
+		this.terminal.start(onInput, onResize);
+	}
+
+	stop(): void {
+		this.terminal.stop();
+	}
+
+	drainInput(maxMs?: number, idleMs?: number): Promise<void> {
+		return this.terminal.drainInput(maxMs, idleMs);
+	}
+
+	write(data: string): void {
+		if (!this.#available || (this.#writeFailureAt !== undefined && this.#writes + 1 >= this.#writeFailureAt)) {
+			this.#available = false;
+			throw Object.assign(new Error("deterministic image repaint failure"), { code: "EIO" });
+		}
+		this.#writes += 1;
+		this.terminal.write(data);
+	}
+
+	get available(): boolean {
+		return this.#available;
+	}
+
+	get columns(): number {
+		return this.terminal.columns;
+	}
+
+	get rows(): number {
+		return this.terminal.rows;
+	}
+
+	get kittyProtocolActive(): boolean {
+		return this.terminal.kittyProtocolActive;
+	}
+
+	get appearance(): TerminalAppearance | undefined {
+		return this.terminal.appearance;
+	}
+
+	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void {
+		this.terminal.onAppearanceChange(callback);
+	}
+
+	moveBy(lines: number): void {
+		this.write(lines > 0 ? `\x1b[${lines}B` : `\x1b[${-lines}A`);
+	}
+
+	hideCursor(): void {
+		this.write("\x1b[?25l");
+	}
+
+	showCursor(): void {
+		this.write("\x1b[?25h");
+	}
+
+	clearLine(): void {
+		this.write("\x1b[K");
+	}
+
+	clearFromCursor(): void {
+		this.write("\x1b[J");
+	}
+
+	clearScreen(): void {
+		this.write("\x1b[H\x1b[0J");
+	}
+
+	setTitle(title: string): void {
+		this.write(`\x1b]0;${title}\x07`);
+	}
+
+	setProgress(active: boolean): void {
+		this.write(active ? "\x1b]9;4;3\x07" : "\x1b]9;4;0;\x07");
 	}
 }
 
@@ -282,6 +395,499 @@ describe("TUI terminal-state regressions", () => {
 				const followedOutput = term.getWriteLog().join("");
 				expect(followedOutput).toContain(encodeKittyPlacementDelete(placement!));
 				expect(extractKittyPlacementReferences(followedOutput)).toEqual([]);
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("soft-deletes a same-row Kitty placement before differential replacement and replays without retransmit", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			const transmissions: string[] = [];
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(sequence => transmissions.push(sequence));
+
+			const image = new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const imageLines = image.render(40);
+			const component = new RawMutableLinesComponent(["header", ...imageLines, "footer"]);
+			const term = new VirtualTerminal(40, 8);
+			const tui = new TUI(term);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+				expect(transmissions).toHaveLength(1);
+
+				term.clearWriteLog();
+				component.setLines(["header", "replacement", "", "footer"]);
+				tui.requestRender();
+				await settle(term);
+				const replacedOutput = term.getWriteLog().join("");
+				const deleteSequence = encodeKittyPlacementDelete(placement!);
+				expect(replacedOutput).toContain(deleteSequence);
+				expect(replacedOutput.indexOf(deleteSequence)).toBeLessThan(replacedOutput.indexOf("\x1b[2K"));
+				expect(extractKittyPlacementReferences(replacedOutput)).toEqual([]);
+
+				term.clearWriteLog();
+				component.setLines(["header", ...imageLines, "footer"]);
+				tui.requestRender();
+				await settle(term);
+				expect(extractKittyPlacementReferences(term.getWriteLog().join(""))).toEqual([placement]);
+				expect(transmissions).toHaveLength(1);
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("preserves the committed Kitty placement ledger when a differential paint fails", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(() => {});
+
+			const image = new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const imageLines = image.render(40);
+			const component = new RawMutableLinesComponent(["header", ...imageLines, "footer"]);
+			const baseTerminal = new VirtualTerminal(40, 8);
+			const terminal = new FaultingVirtualTerminal(baseTerminal);
+			const tui = new TUI(terminal);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(baseTerminal);
+				const [placement] = extractKittyPlacementReferences(baseTerminal.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				baseTerminal.clearWriteLog();
+				terminal.setWriteFailureAt(terminal.writeCount + 1);
+				component.setLines(["header", "replacement", "", "footer"]);
+				tui.requestRender();
+				await settle(baseTerminal);
+				expect(baseTerminal.getWriteLog()).toEqual([]);
+
+				terminal.setWriteFailureAt(undefined);
+				baseTerminal.clearWriteLog();
+				tui.start();
+				await settle(baseTerminal);
+				expect(baseTerminal.getWriteLog().join("")).toContain(encodeKittyPlacementDelete(placement!));
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("rolls back manual viewport ownership when the scroll repaint fails", async () => {
+			const baseTerminal = new VirtualTerminal(30, 6);
+			const terminal = new FaultingVirtualTerminal(baseTerminal);
+			const tui = new TUI(terminal);
+			tui.addChild(new MutableLinesComponent(rows("history-", 20)));
+
+			try {
+				tui.start();
+				await settle(baseTerminal);
+				terminal.setWriteFailureAt(terminal.writeCount + 1);
+				expect(tui.scrollViewportPages(-1)).toBe(false);
+
+				terminal.setWriteFailureAt(undefined);
+				baseTerminal.clearWriteLog();
+				tui.start();
+				await settle(baseTerminal);
+				expect(visible(baseTerminal)).toEqual(rows("history-", 20).slice(-6));
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("soft-deletes and replays a Kitty placement across terminal resize", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			const transmissions: string[] = [];
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(sequence => transmissions.push(sequence));
+
+			const term = new VirtualTerminal(40, 8);
+			const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+			tui.addChild(
+				new Image(
+					"AA==",
+					"image/png",
+					{ fallbackColor: value => value },
+					{ maxWidthCells: 4, maxHeightCells: 2, refetch: () => "AA==" },
+					{ widthPx: 20, heightPx: 20 },
+				),
+			);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				term.clearWriteLog();
+				term.resize(30, 8);
+				await settle(term);
+				const resizedOutput = term.getWriteLog().join("");
+				expect(resizedOutput).toContain(encodeKittyPlacementDelete(placement!));
+				expect(extractKittyPlacementReferences(resizedOutput)).toEqual([placement]);
+				expect(transmissions).toHaveLength(1);
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("cleans a partial Kitty span and replays it when manual navigation revisits the anchor", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			const placement = "\x1b_Ga=p,i=301,p=302,c=2,r=3,C=1,q=2\x1b\\";
+			const term = new VirtualTerminal(40, 5, { isProcessTerminal: true });
+			const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+			tui.addChild(new RawMutableLinesComponent([placement, "", "", "tail-0", "tail-1"]));
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+				term.resize(40, 4);
+				await settle(term);
+				const output = term.getWriteLog().join("");
+				expect(output).toContain(encodeKittyPlacementDelete({ imageId: 301, placementId: 302, rows: 3 }));
+				expect(extractKittyPlacementReferences(output)).toEqual([]);
+
+				term.clearWriteLog();
+				expect(tui.scrollViewportBy(-1)).toBe(true);
+				await term.flush();
+				expect(extractKittyPlacementReferences(term.getWriteLog().join(""))).toEqual([
+					{ imageId: 301, placementId: 302, rows: 3 },
+				]);
+			} finally {
+				tui.stop();
+				setTerminalImageProtocol(originalProtocol);
+			}
+		});
+
+		it("keeps an unchanged Kitty placement when unpin coalesces with an unrelated edit", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(() => {});
+
+			const term = new VirtualTerminal(40, 3);
+			const tui = new TUI(term);
+			const transcript = new MutableLinesComponent(["body"]);
+			const image = new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			tui.addChild(transcript);
+			tui.addChild(image);
+			tui.setBottomPinnedComponent(image);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				term.clearWriteLog();
+				tui.setBottomPinnedComponent(null);
+				transcript.setLines(["changed"]);
+				tui.requestRender();
+				await settle(term);
+				expect(term.getWriteLog().join("")).not.toContain(encodeKittyPlacementDelete(placement!));
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("cleans a formerly pinned placement when manual repaint adopts transcript geometry", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(() => {});
+
+			const term = new VirtualTerminal(40, 6);
+			const tui = new TUI(term);
+			const transcript = new MutableLinesComponent(rows("history-", 10));
+			const image = new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			tui.addChild(transcript);
+			tui.addChild(image);
+			tui.setBottomPinnedComponent(image);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+				expect(tui.scrollViewportPages(-1)).toBe(true);
+				await term.flush();
+
+				term.clearWriteLog();
+				tui.setBottomPinnedComponent(null);
+				await settle(term);
+				expect(term.getWriteLog().join("")).not.toContain(encodeKittyPlacementDelete(placement!));
+
+				term.clearWriteLog();
+				expect(tui.scrollViewportBy(-1)).toBe(true);
+				await term.flush();
+				const output = term.getWriteLog().join("");
+				expect(output).toContain(encodeKittyPlacementDelete(placement!));
+				expect(extractKittyPlacementReferences(output)).toEqual([]);
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("replays every overlapping Kitty span after fixed-point differential expansion", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			const placementA = "\x1b_Ga=p,i=101,p=102,c=2,r=2,C=1,q=2\x1b\\";
+			const placementB = "\x1b_Ga=p,i=201,p=202,c=2,r=2,C=1,q=2\x1b\\";
+			const component = new RawMutableLinesComponent([placementA, placementB, "old", "tail"]);
+			const term = new VirtualTerminal(40, 6);
+			const tui = new TUI(term);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+				component.setLines([placementA, placementB, "new", "tail"]);
+				tui.requestRender();
+				await settle(term);
+				const output = term.getWriteLog().join("");
+				expect(output).toContain(encodeKittyPlacementDelete({ imageId: 101, placementId: 102, rows: 2 }));
+				expect(output).toContain(encodeKittyPlacementDelete({ imageId: 201, placementId: 202, rows: 2 }));
+				expect(extractKittyPlacementReferences(output)).toEqual([
+					{ imageId: 101, placementId: 102, rows: 2 },
+					{ imageId: 201, placementId: 202, rows: 2 },
+				]);
+			} finally {
+				tui.stop();
+				setTerminalImageProtocol(originalProtocol);
+			}
+		});
+
+		it("soft-deletes a high logical-row placement before forced full replay", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(() => {});
+
+			const image = new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const initialLines = [...rows("history-", 18), ...image.render(40), "tail"];
+			const component = new RawMutableLinesComponent(initialLines);
+			const term = new VirtualTerminal(40, 6);
+			const tui = new TUI(term);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				term.clearWriteLog();
+				component.setLines([...rows("history-", 18), "replacement", "", "tail"]);
+				tui.requestRender(true, "test.forced-image-removal");
+				await settle(term);
+				expect(term.getWriteLog().join("")).toContain(encodeKittyPlacementDelete(placement!));
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("soft-deletes Kitty placements on stop and restores them without retransmit on restart", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			const transmissions: string[] = [];
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(sequence => transmissions.push(sequence));
+
+			const term = new VirtualTerminal(40, 6);
+			const tui = new TUI(term);
+			tui.addChild(
+				new Image(
+					"AA==",
+					"image/png",
+					{ fallbackColor: value => value },
+					{ maxWidthCells: 4, maxHeightCells: 2, refetch: () => "AA==" },
+					{ widthPx: 20, heightPx: 20 },
+				),
+			);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				term.clearWriteLog();
+				tui.stop();
+				expect(term.getWriteLog().join("")).toContain(encodeKittyPlacementDelete(placement!));
+
+				term.clearWriteLog();
+				tui.start();
+				await settle(term);
+				expect(extractKittyPlacementReferences(term.getWriteLog().join(""))).toEqual([placement]);
+				expect(transmissions).toHaveLength(1);
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("tracks and cleans a removed bottom-pinned Kitty placement", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(() => {});
+
+			const term = new VirtualTerminal(40, 6);
+			const tui = new TUI(term);
+			const transcript = new MutableLinesComponent(["body"]);
+			const pinnedImage = new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			tui.addChild(transcript);
+			tui.addChild(pinnedImage);
+			tui.setBottomPinnedComponent(pinnedImage);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				term.clearWriteLog();
+				tui.setBottomPinnedComponent(null);
+				tui.detachChild(pinnedImage);
+				tui.requestRender();
+				await settle(term);
+				expect(term.getWriteLog().join("")).toContain(encodeKittyPlacementDelete(placement!));
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
+			}
+		});
+
+		it("tracks and cleans a hidden Kitty image overlay", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(() => {});
+
+			const term = new VirtualTerminal(40, 8);
+			const tui = new TUI(term);
+			tui.addChild(new MutableLinesComponent(["base-0", "base-1", "base-2", "base-3"]));
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+				const overlay = tui.showOverlay(
+					new Image(
+						"AA==",
+						"image/png",
+						{ fallbackColor: value => value },
+						{ maxWidthCells: 4, maxHeightCells: 2 },
+						{ widthPx: 20, heightPx: 20 },
+					),
+					{ anchor: "center", width: 10 },
+				);
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				term.clearWriteLog();
+				overlay.hide();
+				await settle(term);
+				expect(term.getWriteLog().join("")).toContain(encodeKittyPlacementDelete(placement!));
 			} finally {
 				tui.stop();
 				setCellDimensions(originalCellDimensions);
