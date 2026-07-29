@@ -187,8 +187,18 @@ function passingQualityGate(): string {
 				sourceHash: "sha256:test-frozen-source",
 				joined: true,
 				lanes: {
-					cleaner: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "cleaner clean", blockers: [] },
-					architect: { status: "CLEAR", sourceHash: "sha256:test-frozen-source", evidence: "architect clear", blockers: [] },
+					cleaner: {
+						status: "passed",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "cleaner clean",
+						blockers: [],
+					},
+					architect: {
+						status: "CLEAR",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "architect clear",
+						blockers: [],
+					},
 					qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
 				},
 			},
@@ -488,9 +498,24 @@ function deferredBatchGate(
 					sourceHash: "sha256:test-frozen-source",
 					joined: true,
 					lanes: {
-						cleaner: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "cleaner clean", blockers: [] },
-						architect: { status: "CLEAR", sourceHash: "sha256:test-frozen-source", evidence: "architect clear", blockers: [] },
-						qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
+						cleaner: {
+							status: "passed",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "cleaner clean",
+							blockers: [],
+						},
+						architect: {
+							status: "CLEAR",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "architect clear",
+							blockers: [],
+						},
+						qa: {
+							status: "passed",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "qa passed",
+							blockers: [],
+						},
 					},
 				},
 				rerunCommands: ["bun test validation batch"],
@@ -1484,7 +1509,13 @@ describe("native GJC ultragoal runtime", () => {
 				redTeamCommands: [],
 				blockers: ["qa blocker"],
 			},
-			iteration: { status: "failed", fullRerun: false, rerunCommands: [], evidence: "", blockers: ["iteration blocker"] },
+			iteration: {
+				status: "failed",
+				fullRerun: false,
+				rerunCommands: [],
+				evidence: "",
+				blockers: ["iteration blocker"],
+			},
 			bogusKey: {},
 		};
 		const gatePath = path.join(root, "broken-gate.json");
@@ -3941,9 +3972,24 @@ describe("native GJC ultragoal runtime", () => {
 							sourceHash: "sha256:test-frozen-source",
 							joined: true,
 							lanes: {
-								cleaner: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "cleaner clean", blockers: [] },
-								architect: { status: "CLEAR", sourceHash: "sha256:test-frozen-source", evidence: "architect clear", blockers: [] },
-								qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
+								cleaner: {
+									status: "passed",
+									sourceHash: "sha256:test-frozen-source",
+									evidence: "cleaner clean",
+									blockers: [],
+								},
+								architect: {
+									status: "CLEAR",
+									sourceHash: "sha256:test-frozen-source",
+									evidence: "architect clear",
+									blockers: [],
+								},
+								qa: {
+									status: "passed",
+									sourceHash: "sha256:test-frozen-source",
+									evidence: "qa passed",
+									blockers: [],
+								},
 							},
 						},
 						rerunCommands: ["bun test:e2e"],

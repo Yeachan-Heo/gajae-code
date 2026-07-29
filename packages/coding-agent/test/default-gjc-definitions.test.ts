@@ -415,7 +415,9 @@ Project executor override body.
 		expect(ultragoal).toContain("### Validation batches (explicit phase/module boundaries)");
 		expect(ultragoal).toContain("## Boundary completion cohort gate");
 		expect(ultragoal).toContain("gjc ultragoal quality-gate validate");
-		expect(ultragoal).toContain("reports **all** structural, evidence, surface, cohort, and declaration errors in one run");
+		expect(ultragoal).toContain(
+			"reports **all** structural, evidence, surface, cohort, and declaration errors in one run",
+		);
 		expect(ultragoal).toContain("strictly read-only");
 		expect(ultragoal).toContain("once per boundary generation");
 		expect(ultragoal).toContain("iteration.reviewCohort");
@@ -461,7 +463,9 @@ Project executor override body.
 		// C: intra-goal validation-lane parallelism.
 		expect(ultragoal).toContain("### Intra-goal validation-lane parallelism");
 		expect(ultragoal).toContain("Cohort lanes are parallel by construction");
-		expect(ultragoal).toContain("`cleaner`, `architect`, and `qa` can run concurrently against the identical immutable snapshot");
+		expect(ultragoal).toContain(
+			"`cleaner`, `architect`, and `qa` can run concurrently against the identical immutable snapshot",
+		);
 		expect(ultragoal).toContain("join before checkpoint");
 		expect(ultragoal).toContain("Fall back to **sequential** lanes");
 		expect(ultragoal).toContain("red-team lane depends on architect fixes");
