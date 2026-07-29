@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { stableValidators } from "../../protocol-source/schema-validators.generated";
 import {
 	type ChildBridgeOptions,
+	type ChildCreateResult,
 	loadThread,
 	type SessionClient,
 	wireCloseCallback,
@@ -420,6 +421,37 @@ test("transactional load: subscribe failure removes publication and rolls back t
 	expect(counters.childClose).toBe(1);
 	expect(closedAuthority?.endpointGeneration).toBe(9);
 });
+
+test("transactional load: experimental workspace roots must be an own effective-settings field", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	const sessionId = "session-inherited-workspace-roots";
+	const cwd = path.resolve("cwd");
+	const inheritedSettings = Object.assign(Object.create({ runtimeWorkspaceRoots: [] }), settings(sessionId, cwd), {
+		activePermissionProfile: null,
+		multiAgentMode: "proactive",
+	}) as ThreadEffectiveSettings;
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId,
+			cwd,
+			authority: authority(14),
+			client: fakeClient(counters),
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose += 1;
+			},
+			effectiveSettings: inheritedSettings,
+		}),
+	};
+
+	await expect(loadThread(opts, { cwd, experimentalApi: true })).rejects.toThrow("missing runtimeWorkspaceRoots");
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
 test("transactional load: malformed session id captures cleanup before validation", async () => {
 	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
 	const counters = { close: 0, childClose: 0 };
@@ -496,6 +528,225 @@ test("transactional load: missing client still closes a spawned child", async ()
 	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("did not retain a session client");
 	expect(readyCalls).toBe(0);
 	expect(counters.close).toBe(0);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
+
+test("transactional load: invalid retained-client methods fail before readiness", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	const client = fakeClient(counters);
+	(client as unknown as Record<string, unknown>).request = 1;
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-invalid-client-method",
+			cwd: path.resolve("cwd"),
+			authority: authority(25),
+			client,
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose += 1;
+			},
+		}),
+	};
+
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("missing request()");
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+});
+
+test("transactional load: observer registration must return callable disposers", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	const client: SessionClient = {
+		...fakeClient(counters),
+		onFrame: (() => 42) as unknown as SessionClient["onFrame"],
+	};
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-invalid-disposer",
+			cwd: path.resolve("cwd"),
+			authority: authority(26),
+			client,
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose += 1;
+			},
+		}),
+	};
+
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("onFrame() did not return a disposer");
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+});
+
+test("transactional load: malformed reverse-lease attachments fail closed", async () => {
+	for (const [index, attachment] of [{}, { ownsClient: true }, 1].entries()) {
+		const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+		const counters = { close: 0, childClose: 0 };
+		const sessionId = `session-invalid-attachment-${index}`;
+		const opts: ChildBridgeOptions = {
+			manager,
+			create: async () => ({
+				sessionId,
+				cwd: path.resolve("cwd"),
+				authority: authority(30 + index),
+				client: fakeClient(counters),
+				awaitReady: async () => {},
+				closeChild: async () => {
+					counters.childClose += 1;
+				},
+			}),
+			attachReverseLeaseController: async () => attachment as never,
+		};
+
+		await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow(/attachment/);
+		expect(counters.close).toBe(1);
+		expect(counters.childClose).toBe(1);
+		expect(manager.loadedCount).toBe(0);
+	}
+});
+
+test("transactional load: a throwing attachment ownership accessor cannot skip downstream cleanup", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	let attachmentClose = 0;
+	const attachment = {
+		close: async () => {
+			attachmentClose += 1;
+		},
+	};
+	Object.defineProperty(attachment, "ownsClient", {
+		get: () => {
+			throw new Error("ownsClient getter failed");
+		},
+	});
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-attachment-getter",
+			cwd: path.resolve("cwd"),
+			authority: authority(34),
+			client: fakeClient(counters),
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose += 1;
+			},
+		}),
+		attachReverseLeaseController: async () => attachment,
+	};
+
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("ownsClient getter failed");
+	expect(attachmentClose).toBe(1);
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+});
+
+test("transactional load: undefined thrown by an attachment accessor still rejects and cleans up", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	let attachmentClose = 0;
+	const attachment = {
+		close: async () => {
+			attachmentClose += 1;
+		},
+	};
+	Object.defineProperty(attachment, "ownsClient", {
+		get: () => {
+			throw undefined;
+		},
+	});
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-attachment-undefined-throw",
+			cwd: path.resolve("cwd"),
+			authority: authority(37),
+			client: fakeClient(counters),
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose += 1;
+			},
+		}),
+		attachReverseLeaseController: async () => attachment,
+	};
+	let rejected = false;
+	try {
+		await loadThread(opts, { cwd: "cwd" });
+	} catch (error) {
+		rejected = true;
+		expect(error).toBeUndefined();
+	}
+
+	expect(rejected).toBe(true);
+	expect(attachmentClose).toBe(1);
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+});
+
+test("transactional load: failed client-owning attachment close falls back to direct client close", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	let attachmentClose = 0;
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-attachment-close-fail",
+			cwd: path.resolve("cwd"),
+			authority: authority(35),
+			client: fakeClient(counters),
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose += 1;
+			},
+		}),
+		attachReverseLeaseController: async () => ({
+			ownsClient: true,
+			close: async () => {
+				attachmentClose += 1;
+				throw new Error("attachment close failed");
+			},
+		}),
+		readEffectiveSettings: async () => {
+			throw new Error("settings failed");
+		},
+	};
+
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("settings failed");
+	expect(attachmentClose).toBe(1);
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+});
+
+test("transactional load: throwing child accessors do not hide independently readable cleanup", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	const child = {
+		sessionId: "session-throwing-client-getter",
+		cwd: path.resolve("cwd"),
+		authority: authority(36),
+		awaitReady: async () => {},
+		closeChild: async () => {
+			counters.childClose += 1;
+		},
+	};
+	Object.defineProperty(child, "client", {
+		get: () => {
+			throw new Error("client getter failed");
+		},
+	});
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => child as unknown as ChildCreateResult,
+	};
+
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("client getter failed");
 	expect(counters.childClose).toBe(1);
 	expect(manager.loadedCount).toBe(0);
 	expect(manager.pendingCount).toBe(0);

@@ -87,10 +87,6 @@ function sourceIdentities(message: AssistantMessage): readonly string[] {
 	return identities;
 }
 
-function primaryIdentity(message: AssistantMessage): string | undefined {
-	return sourceIdentities(message)[0];
-}
-
 export class AgentMessageReducer {
 	readonly #threadId: string;
 	readonly #turnId: string;
@@ -248,7 +244,7 @@ export class AgentMessageReducer {
 
 	#createItem(message: AssistantMessage, implicitStart: boolean): ItemState {
 		const sources = sourceIdentities(message);
-		const identity = primaryIdentity(message);
+		const identity = sources[0];
 		const id = identity ? `agent-message:${identity}` : this.#fallbackItemId();
 		const item: ItemState = {
 			id,

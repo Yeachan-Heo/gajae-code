@@ -1219,6 +1219,7 @@ export class Agent {
 		const runId = this.#activeRunId;
 		const managedLogicalRunId = this.#managedLogicalRunOwner;
 		const activeLogicalRunId = managedLogicalRunId ?? runId;
+		if (activeLogicalRunId !== undefined && this.#terminalizedLogicalRunIds.has(activeLogicalRunId)) return false;
 		if (
 			targetLogicalRunId !== undefined &&
 			activeLogicalRunId !== undefined &&

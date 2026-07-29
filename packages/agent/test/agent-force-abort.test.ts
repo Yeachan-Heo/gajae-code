@@ -142,6 +142,22 @@ describe("Agent.forceAbort", () => {
 		expect(forcedClaimReason).toBeUndefined();
 	});
 
+	it("does not quarantine a run when forceAbort is called reentrantly from its terminal event", async () => {
+		const model = createMockModel({ responses: [{ content: ["completed"] }] });
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model.stream,
+		});
+		let reentrantResult: boolean | undefined;
+		agent.subscribe(event => {
+			if (event.type === "agent_end") reentrantResult = agent.forceAbort("reentrant terminal listener");
+		});
+
+		await agent.prompt("complete normally");
+
+		expect(reentrantResult).toBe(false);
+		expect(await agent.resourceLedger.waitForSettlement("1", { graceMs: 25 })).toEqual({ status: "settled" });
+	});
 	it("forces an ignored abort back to idle and accepts a following prompt", async () => {
 		const model = createMockModel({ responses: [{ content: ["after force"] }] });
 		const hangingStream = new AssistantMessageEventStream();

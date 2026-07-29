@@ -562,7 +562,7 @@ test("runtime connection: requester close during thread/start readiness rolls ba
 	expect(runtime.subscriptions.isSubscribed(connection.id, sessionId)).toBe(false);
 });
 
-test("runtime connection: close immediately after thread/start subscribe rolls back the runtime", async () => {
+test("runtime connection: close before thread/start subscription mutation leaves no stale subscriber", async () => {
 	let clientClose = 0;
 	let childClose = 0;
 	let observerClose = 0;
@@ -618,8 +618,8 @@ test("runtime connection: close immediately after thread/start subscribe rolls b
 	});
 	const subscribe = runtime.subscriptions.subscribe.bind(runtime.subscriptions);
 	runtime.subscriptions.subscribe = (connectionId, threadId) => {
-		subscribe(connectionId, threadId);
 		closing = connection.close();
+		subscribe(connectionId, threadId);
 	};
 	await initialize(connection);
 	frames.length = 0;

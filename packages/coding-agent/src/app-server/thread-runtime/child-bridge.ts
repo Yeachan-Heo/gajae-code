@@ -139,6 +139,60 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+interface PropertyRead {
+	readonly value: unknown;
+	readonly failed: boolean;
+	readonly error: unknown;
+}
+
+function readProperty(record: Record<string, unknown>, key: string): PropertyRead {
+	try {
+		return { value: record[key], failed: false, error: undefined };
+	} catch (error) {
+		return { value: undefined, failed: true, error };
+	}
+}
+
+function firstReadFailure(reads: readonly PropertyRead[]): PropertyRead | undefined {
+	return reads.find(read => read.failed);
+}
+
+function assertSessionClient(value: unknown): asserts value is SessionClient {
+	if (!isRecord(value)) throw new Error("Child adapter did not retain a session client.");
+	for (const method of [
+		"onFrame",
+		"onReconnect",
+		"onReconnectFailed",
+		"request",
+		"query",
+		"control",
+		"close",
+	] as const) {
+		const read = readProperty(value, method);
+		if (read.failed) throw read.error;
+		if (typeof read.value !== "function") throw new Error(`Child session client is missing ${method}().`);
+	}
+}
+
+function requireDisposer(value: unknown, name: string): () => void {
+	if (typeof value !== "function") throw new Error(`Child session client ${name}() did not return a disposer.`);
+	return value as () => void;
+}
+
+function isEndpointAuthority(value: unknown): value is EndpointAuthority {
+	return (
+		isRecord(value) &&
+		typeof value.endpointGeneration === "number" &&
+		Number.isInteger(value.endpointGeneration) &&
+		typeof value.endpointIncarnation === "string" &&
+		value.endpointIncarnation.length > 0 &&
+		typeof value.endpointMtimeMs === "number" &&
+		Number.isFinite(value.endpointMtimeMs) &&
+		typeof value.pid === "number" &&
+		Number.isInteger(value.pid)
+	);
+}
+
 function requiredString(value: unknown, name: string): string {
 	if (typeof value !== "string" || value.length === 0) throw new Error(`Child adapter did not provide ${name}.`);
 	return value;
@@ -201,7 +255,7 @@ function responseFor(
 		reasoningEffort: settings.reasoningEffort,
 	};
 	if (experimentalApi) {
-		if (settings.runtimeWorkspaceRoots === undefined)
+		if (!Object.hasOwn(settings, "runtimeWorkspaceRoots") || settings.runtimeWorkspaceRoots === undefined)
 			throw new Error("Experimental thread/start response is missing runtimeWorkspaceRoots.");
 		if (!Object.hasOwn(settings, "activePermissionProfile"))
 			throw new Error("Experimental thread/start response is missing activePermissionProfile.");
@@ -287,7 +341,7 @@ export async function loadThread(
 	let reservation: AdmissionReservation | undefined;
 	let observerClose: CloseOnce | undefined;
 	let token: { release: () => void } | undefined;
-	let attachment: ReverseLeaseAttachment | undefined;
+	let attachmentOwnsClient = false;
 	let attachmentClose: CloseOnce | undefined;
 	let clientClose: CloseOnce | undefined;
 	let childClose: CloseOnce | undefined;
@@ -302,12 +356,14 @@ export async function loadThread(
 		} catch (error) {
 			firstError = error;
 		}
+		let attachmentCloseFailed = false;
 		try {
 			if (attachmentClose) await attachmentClose();
 		} catch (error) {
+			attachmentCloseFailed = true;
 			firstError ??= error;
 		}
-		if (clientClose && attachment?.ownsClient !== true) {
+		if (clientClose && (!attachmentOwnsClient || attachmentCloseFailed)) {
 			try {
 				await clientClose();
 			} catch (error) {
@@ -345,33 +401,82 @@ export async function loadThread(
 		const child = await adapter(createRequest);
 		if (!child || !isRecord(child)) throw new Error("Child adapter did not return a runtime.");
 
-		// Capture every safe cleanup handle before validating adapter fields. A malformed result may
-		// still own a live transport and authority-fenced child that must be closed on rollback.
-		const childAuthority = child.authority;
-		const client = child.client;
-		const childCloseHook = child.closeChild;
+		// Read every potentially resource-bearing field independently so one throwing accessor
+		// cannot prevent cleanup handles from being captured from the remaining fields.
+		const childCloseRead = readProperty(child, "closeChild");
+		const authorityRead = readProperty(child, "authority");
+		const clientRead = readProperty(child, "client");
+		const sessionIdRead = readProperty(child, "sessionId");
+		const cwdRead = readProperty(child, "cwd");
+		const awaitReadyRead = readProperty(child, "awaitReady");
+		const effectiveSettingsRead = readProperty(child, "effectiveSettings");
+		const childCloseHook =
+			typeof childCloseRead.value === "function"
+				? (childCloseRead.value as (authority: EndpointAuthority | undefined) => void | Promise<void>)
+				: undefined;
+		const childAuthority = authorityRead.value;
+		const clientRecord = isRecord(clientRead.value) ? clientRead.value : undefined;
+		const clientCloseRead = clientRecord ? readProperty(clientRecord, "close") : undefined;
 		let cleanupThreadId = createRequest.threadId;
-		if (client && typeof client === "object" && typeof client.close === "function") {
-			clientClose = closeOnce(() => client.close());
-		}
-		if (typeof childCloseHook === "function" || typeof opts.close === "function") {
-			childClose = closeOnce(() => {
-				if (typeof childCloseHook === "function") return childCloseHook(childAuthority);
-				if (typeof opts.close === "function") return opts.close(cleanupThreadId, ownership, childAuthority);
+		if (clientRecord && typeof clientCloseRead?.value === "function") {
+			const closeClient = clientCloseRead.value;
+			clientClose = closeOnce(async () => {
+				await closeClient.call(clientRecord);
 			});
 		}
+		if (childCloseHook || typeof opts.close === "function") {
+			childClose = closeOnce(() => {
+				if (childCloseHook)
+					return childCloseHook.call(child, isEndpointAuthority(childAuthority) ? childAuthority : undefined);
+				if (typeof opts.close === "function")
+					return opts.close(
+						cleanupThreadId,
+						ownership,
+						isEndpointAuthority(childAuthority) ? childAuthority : undefined,
+					);
+			});
+		}
+		const propertyFailure = firstReadFailure([
+			childCloseRead,
+			authorityRead,
+			clientRead,
+			sessionIdRead,
+			cwdRead,
+			awaitReadyRead,
+			effectiveSettingsRead,
+			...(clientCloseRead ? [clientCloseRead] : []),
+		]);
+		if (propertyFailure) throw propertyFailure.error;
+		if (childCloseRead.value !== undefined && !childCloseHook)
+			throw new Error("Child adapter provided an invalid closeChild callback.");
 
-		const sessionId = requiredString(child.sessionId, "sessionId");
+		const sessionId = requiredString(sessionIdRead.value, "sessionId");
 		cleanupThreadId = sessionId;
-		const actualCwd = requiredString(child.cwd, "cwd");
-		if (!client || typeof client !== "object" || typeof client.close !== "function")
-			throw new Error("Child adapter did not retain a session client.");
-		if (ownership === "spawned" && !childAuthority)
-			throw new Error("Spawned child did not provide endpoint authority.");
-		if (ownership === "spawned" && typeof childCloseHook !== "function" && typeof opts.close !== "function")
+		const actualCwd = requiredString(cwdRead.value, "cwd");
+		const clientValue = clientRead.value;
+		assertSessionClient(clientValue);
+		const client = clientValue;
+		const authority = authorityRead.value;
+		if (authority !== undefined && !isEndpointAuthority(authority))
+			throw new Error("Child adapter provided malformed endpoint authority.");
+		if (ownership === "spawned" && !authority) throw new Error("Spawned child did not provide endpoint authority.");
+		if (ownership === "spawned" && !childCloseHook && typeof opts.close !== "function")
 			throw new Error("Spawned child did not provide authority-fenced cleanup.");
+		if (typeof awaitReadyRead.value !== "function") throw new Error("Child adapter did not provide awaitReady().");
+		const awaitReady = awaitReadyRead.value as () => void | Promise<void>;
+		const validatedChild: ChildCreateResult = {
+			sessionId,
+			cwd: actualCwd,
+			authority,
+			client,
+			awaitReady,
+			closeChild: childCloseHook,
+			...(effectiveSettingsRead.value === undefined
+				? {}
+				: { effectiveSettings: effectiveSettingsRead.value as ThreadEffectiveSettings }),
+		};
 
-		await child.awaitReady();
+		await awaitReady.call(child);
 		const observerClosers: Array<() => void> = [];
 		observerClose = closeOnce(async () => {
 			let firstError: unknown;
@@ -387,19 +492,49 @@ export async function loadThread(
 
 		// Install observers after semantic readiness but before publication so no post-ready
 		// frame is lost. Callbacks must tolerate the runtime still being transactional/unpublished.
-		observerClosers.push(client.onFrame(frame => opts.onFrame?.(child, frame)));
-		observerClosers.push(client.onReconnect(() => opts.onReconnect?.(child)));
-		observerClosers.push(client.onReconnectFailed(error => opts.onReconnectFailed?.(child, error)));
+		observerClosers.push(
+			requireDisposer(
+				client.onFrame(frame => opts.onFrame?.(validatedChild, frame)),
+				"onFrame",
+			),
+		);
+		observerClosers.push(
+			requireDisposer(
+				client.onReconnect(() => opts.onReconnect?.(validatedChild)),
+				"onReconnect",
+			),
+		);
+		observerClosers.push(
+			requireDisposer(
+				client.onReconnectFailed(error => opts.onReconnectFailed?.(validatedChild, error)),
+				"onReconnectFailed",
+			),
+		);
 
 		if (opts.attachReverseLeaseController) {
-			const attached = (await opts.attachReverseLeaseController(client, child, request)) ?? undefined;
-			attachment = attached;
-			if (attached) attachmentClose = closeOnce(() => attached.close());
+			const attached = await opts.attachReverseLeaseController(client, validatedChild, request);
+			if (attached !== undefined) {
+				if (!isRecord(attached)) throw new Error("Reverse-lease attachment is malformed.");
+				const closeRead = readProperty(attached, "close");
+				if (typeof closeRead.value === "function") {
+					const closeAttachment = closeRead.value;
+					attachmentClose = closeOnce(async () => {
+						await closeAttachment.call(attached);
+					});
+				}
+				if (closeRead.failed) throw closeRead.error;
+				if (!attachmentClose) throw new Error("Reverse-lease attachment did not provide close().");
+				const ownsClientRead = readProperty(attached, "ownsClient");
+				if (ownsClientRead.failed) throw ownsClientRead.error;
+				if (ownsClientRead.value !== undefined && typeof ownsClientRead.value !== "boolean")
+					throw new Error("Reverse-lease attachment ownsClient must be boolean.");
+				attachmentOwnsClient = ownsClientRead.value === true;
+			}
 		}
 
 		const effectiveSettings =
-			child.effectiveSettings ??
-			(opts.readEffectiveSettings ? await opts.readEffectiveSettings(client, child, request) : undefined);
+			validatedChild.effectiveSettings ??
+			(opts.readEffectiveSettings ? await opts.readEffectiveSettings(client, validatedChild, request) : undefined);
 		if (!effectiveSettings) throw new Error("Child adapter did not provide effective thread settings.");
 		if (!isRecord(effectiveSettings)) throw new Error("Child adapter returned malformed effective thread settings.");
 		if (effectiveSettings.cwd !== actualCwd)
@@ -411,13 +546,13 @@ export async function loadThread(
 			sessionId,
 			ownership,
 			cwd: actualCwd,
-			authority: childAuthority,
+			authority,
 			client,
 			effectiveSettings,
 			response,
 		};
 
-		publishedThread = opts.manager.register(sessionId, ownership, childAuthority, request.connectionId, {
+		publishedThread = opts.manager.register(sessionId, ownership, authority, request.connectionId, {
 			reservation,
 			sessionId,
 			cwd: actualCwd,
