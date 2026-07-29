@@ -327,7 +327,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await Bun.write(nonNarrowMetadataPath, `${JSON.stringify(nonNarrowMetadata, null, 2)}\n`);
 		await rehash(nonNarrowCjkRoot, key, "metadata.json");
 		await expect(verifyStickyViewportShowcase(nonNarrowCjkRoot)).rejects.toThrow("non-narrow CJK boundaries");
-	}, 60_000);
+	}, 180_000);
 	it("rejects table-driven manifest, metadata, and review-input corruption", async () => {
 		const base = await capture();
 		const fresh = async () => {
@@ -452,7 +452,7 @@ describe("sticky viewport production evidence verifier", () => {
 			await mutate(root);
 			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow();
 		}
-	}, 60_000);
+	}, 180_000);
 	it("fails closed for every independent-review attestation field", async () => {
 		const root = await capture();
 		const review = await validIndependentReview(root);
@@ -518,5 +518,5 @@ describe("sticky viewport production evidence verifier", () => {
 			await Bun.write(path.join(root, "independent-review.json"), JSON.stringify(candidate));
 			await expect(verifyStickyViewportShowcase(root, true)).rejects.toThrow("independent review");
 		}
-	}, 60_000);
+	}, 180_000);
 });

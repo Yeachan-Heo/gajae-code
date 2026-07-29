@@ -219,8 +219,8 @@ describe("StdinBuffer", () => {
 		it("emits each wire sequence exactly once", () => {
 			setKittyProtocolActive(true);
 			for (const chunk of chunks) processInput(chunk);
-			expect(emittedSequences).toEqual(expected);
-			expect(emittedSequences.map(parseKey)).toEqual(parsed);
+			expect(emittedSequences).toEqual([...expected]);
+			expect(emittedSequences.map(parseKey)).toEqual([...parsed]);
 			setKittyProtocolActive(false);
 		});
 	});

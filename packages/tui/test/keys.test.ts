@@ -147,7 +147,7 @@ describe("Alt+I protocol symmetry", () => {
 			expect(parseKey(data)).toBe(navigation);
 			expect(matchesKey(data, navigation)).toBe(true);
 			expect(matchesKey(data, literal)).toBe(false);
-			for (const otherNavigation of ["alt+left", "alt+right", "alt+up", "alt+down"]) {
+			for (const otherNavigation of ["alt+left", "alt+right", "alt+up", "alt+down"] as const) {
 				expect(matchesKey(data, otherNavigation)).toBe(otherNavigation === navigation);
 			}
 		}
