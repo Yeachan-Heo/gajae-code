@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -42,6 +42,39 @@ function getLastAssistantMessage(session: AgentSession): AssistantMessage {
 		throw new Error("Expected final assistant message");
 	}
 	return lastMessage;
+}
+
+function typedRateLimitStream(model: Model, retryAfterMs: number): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Provider returned error: rate_limit_error: organization quota reached",
+			errorStatus: 429,
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after-ms": String(retryAfterMs) },
+			},
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
 }
 
 describe("AgentSession retry fallback", () => {
@@ -445,6 +478,144 @@ describe("AgentSession retry fallback", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+	});
+
+	it("rotates through the complete credential pool independently of retry.maxRetries", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled test model");
+		authStorage.removeRuntimeApiKey("openai");
+		await authStorage.set(
+			"openai",
+			Array.from({ length: 5 }, (_, index) => ({
+				type: "api_key" as const,
+				key: `account-${index + 1}-key`,
+			})),
+		);
+
+		const providerAffinitySessionId = "complete-pool-session";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, providerAffinitySessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls < 5) {
+					return typedRateLimitStream(requestedModel, 3_600_000);
+				}
+				return createMockModel({ responses: [{ content: ["Recovered with the fifth account"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 1,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "logical-session",
+			providerCacheSessionId: providerAffinitySessionId,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		const visibleErrors: AssistantMessage[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
+				visibleErrors.push(event.message);
+			}
+		});
+
+		await session.prompt("try every stored account");
+
+		expect(calls).toBe(5);
+		expect(requestedKeys).toHaveLength(5);
+		expect(new Set(requestedKeys).size).toBe(5);
+		expect(visibleErrors).toHaveLength(0);
+		expect(retryStartEvents).toHaveLength(4);
+		expect(retryStartEvents).toEqual(retryStartEvents.map(() => expect.objectContaining({ delayMs: 0 })));
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true, attempt: 4 })]);
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
+	});
+
+	it("surfaces only the final 429 after every stored credential is exhausted", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled test model");
+		authStorage.removeRuntimeApiKey("openai");
+		await authStorage.set("openai", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+			{ type: "api_key", key: "account-c-key" },
+		]);
+
+		const providerAffinitySessionId = "exhausted-pool-session";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, providerAffinitySessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				calls++;
+				return typedRateLimitStream(requestedModel, 3_600_000);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 1,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "logical-session",
+			providerCacheSessionId: providerAffinitySessionId,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		const visibleErrors: AssistantMessage[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
+				visibleErrors.push(event.message);
+			}
+		});
+
+		await session.prompt("exhaust every stored account");
+
+		expect(calls).toBe(3);
+		expect(requestedKeys).toHaveLength(3);
+		expect(new Set(requestedKeys).size).toBe(3);
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents).toEqual(retryStartEvents.map(() => expect.objectContaining({ delayMs: 0 })));
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 2 })]);
+		expect(visibleErrors).toHaveLength(1);
+		expect(visibleErrors[0]).toMatchObject({ stopReason: "error", errorStatus: 429 });
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "error", errorStatus: 429 });
 	});
 
 	it("does not replay a Kimi Code first-event timeout through a managed fallback chain", async () => {

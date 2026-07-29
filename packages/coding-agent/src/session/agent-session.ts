@@ -522,6 +522,8 @@ export interface RetainedMemorySample {
 	tuiCachedRenderBytes?: number;
 }
 
+type MessageEndAgentEvent = Extract<AgentEvent, { type: "message_end" }>;
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -3441,6 +3443,40 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	#pendingCredentialRetryError:
+		| {
+				message: AssistantMessage;
+				event: MessageEndAgentEvent;
+		  }
+		| undefined;
+
+	#shouldDeferCredentialRetryError(message: AssistantMessage): boolean {
+		if (
+			message.stopReason !== "error" ||
+			assistantMessageHasVisibleOrToolContent(message) ||
+			this.#defaultFallbackChain().chain.entries.length > 1 ||
+			!this.settings.getGroup("retry").enabled ||
+			this.#modelRegistry.authStorage.hasRuntimeApiKey(message.provider)
+		) {
+			return false;
+		}
+		const trigger = this.#fallbackTriggerFor(message, true, message.transportFailure);
+		return trigger?.class === "quota" || trigger?.class === "rate_limit";
+	}
+
+	#discardPendingCredentialRetryError(message: AssistantMessage): void {
+		if (this.#pendingCredentialRetryError?.message === message) {
+			this.#pendingCredentialRetryError = undefined;
+		}
+	}
+
+	async #flushPendingCredentialRetryError(message?: AssistantMessage): Promise<void> {
+		const pending = this.#pendingCredentialRetryError;
+		if (!pending || (message && pending.message !== message)) return;
+		this.#pendingCredentialRetryError = undefined;
+		await this.#emitSessionEvent(pending.event);
+	}
+
 	// Provider context construction must wait for this chain. Agent event listeners
 	// are synchronous dispatch only; their async work cannot otherwise gate the
 	// next tool-result provider request.
@@ -3712,7 +3748,20 @@ export class AgentSession {
 			});
 		}
 
-		await this.#emitSessionEvent(displayEvent);
+		if (
+			displayEvent.type === "message_end" &&
+			event.type === "message_end" &&
+			event.message.role === "assistant" &&
+			this.#shouldDeferCredentialRetryError(event.message) &&
+			!this.#pendingCredentialRetryError
+		) {
+			this.#pendingCredentialRetryError = {
+				message: event.message,
+				event: displayEvent,
+			};
+		} else {
+			await this.#emitSessionEvent(displayEvent);
+		}
 		if (
 			displayEvent !== event &&
 			displayEvent.type === "message_end" &&
@@ -4010,6 +4059,7 @@ export class AgentSession {
 			// continuation if a newer prompt/abort has moved the run on.
 			if (event.stopReason === "maintenance") {
 				this.#lastAssistantMessage = undefined;
+				await this.#flushPendingCredentialRetryError();
 				const outcome = event.maintenanceOutcome;
 				if (
 					outcome &&
@@ -4052,6 +4102,7 @@ export class AgentSession {
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
 			if (!msg) {
+				await this.#flushPendingCredentialRetryError();
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				this.#resolveRetry();
 				return;
@@ -4070,14 +4121,17 @@ export class AgentSession {
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
 				this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 				this.#lastSuccessfulYieldToolCallId = undefined;
+				await this.#flushPendingCredentialRetryError(msg);
 				return;
 			}
 
 			if (this.#assistantEndedWithSuccessfulYield(msg)) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				if (msg.stopReason !== "error" && msg.stopReason !== "aborted" && (await this.#checkGoalCompletion(msg))) {
+					await this.#flushPendingCredentialRetryError(msg);
 					return;
 				}
+				await this.#flushPendingCredentialRetryError(msg);
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
@@ -4087,8 +4141,12 @@ export class AgentSession {
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
 				const didRetry = await this.#handleRetryableError(msg, false, transportFailure);
-				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+				if (didRetry) {
+					await this.#flushPendingCredentialRetryError(msg);
+					return; // Retry was initiated, don't proceed to compaction
+				}
 			}
+			await this.#flushPendingCredentialRetryError(msg);
 			if (this.#retryAttempt > 0) {
 				// A prior retry ended on a non-retryable (terminal) message: emit
 				// the terminal retry-end and reset so observers clear retry state.
@@ -8315,6 +8373,7 @@ export class AgentSession {
 				await this.#agentEndPublicationPromise;
 			} else {
 				await this.#agentEndHandlingPromise;
+				await this.#waitForPostPromptRecovery();
 				await this.#agentEndPublicationPromise;
 			}
 		}
@@ -14313,25 +14372,41 @@ export class AgentSession {
 		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
 	}
 
-	async #markFailedManagedCredential(trigger: {
+	async #rotateFailedCredential(trigger: {
 		class: FallbackTriggerClass;
 		retryAfterMs?: number;
-	}): Promise<boolean> {
+	}): Promise<"rotated" | "exhausted" | "not-applicable"> {
 		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
-			return false;
+			return "not-applicable";
 		}
 		const authStorage = this.#modelRegistry.authStorage;
+		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
 		if (trigger.class === "auth") {
-			const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
-			if (!isAuthenticated(apiKey)) return false;
-			return authStorage.invalidateCredentialMatching(this.model.provider, apiKey, { sessionId: this.sessionId });
+			const apiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
+			if (!isAuthenticated(apiKey)) return "not-applicable";
+			return (await authStorage.invalidateCredentialMatching(this.model.provider, apiKey, {
+				sessionId: providerAffinitySessionId,
+			}))
+				? "rotated"
+				: "not-applicable";
 		}
-		if (authStorage.hasRuntimeApiKey(this.model.provider)) return false;
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
-		const rotated = await authStorage.markUsageLimitReached(this.model.provider, this.sessionId, {
-			retryAfterMs: trigger.retryAfterMs,
-		});
-		return rotated && (await this.#modelRegistry.getApiKey(this.model, this.sessionId)) !== activeApiKey;
+		if (authStorage.hasRuntimeApiKey(this.model.provider)) return "not-applicable";
+		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
+		if (!isAuthenticated(activeApiKey)) return "not-applicable";
+		const hasRemainingCredential = await authStorage.markUsageLimitReached(
+			this.model.provider,
+			providerAffinitySessionId,
+			{
+				retryAfterMs: trigger.retryAfterMs,
+			},
+		);
+		if (!hasRemainingCredential) return "exhausted";
+		// A runtime credential selector can keep returning the same stored
+		// credential even when peers remain. Treat that as terminal instead of
+		// replaying indefinitely against the pinned account.
+		return (await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) !== activeApiKey
+			? "rotated"
+			: "exhausted";
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -14363,8 +14438,26 @@ export class AgentSession {
 		) {
 			return false;
 		}
+		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+		if (!trigger) {
+			return managedOutcome
+				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
+				: false;
+		}
+		const singleModelCredentialRotation =
+			!managedFallback &&
+			!assistantMessageHasVisibleOrToolContent(message) &&
+			(trigger.class === "quota" || trigger.class === "rate_limit") &&
+			(await this.#rotateFailedCredential(trigger));
+		const singleModelCredentialRotated = singleModelCredentialRotation === "rotated";
+		if (singleModelCredentialRotated) {
+			this.#discardPendingCredentialRetryError(message);
+		}
+		if (singleModelCredentialRotation === "exhausted") {
+			return false;
+		}
 		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures.
-		if (!managedFallback && !legacyRetryConfigured) {
+		if (!managedFallback && !legacyRetryConfigured && !singleModelCredentialRotated) {
 			if (
 				(!this.#isTypedFirstEventTimeout(message) &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
@@ -14375,25 +14468,20 @@ export class AgentSession {
 				return false;
 			}
 		}
-		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
-		if (!trigger) {
-			return managedOutcome
-				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
-				: false;
-		}
 		const legacyUnbounded = classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+			: singleModelCredentialRotated || legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
 				? "retry"
 				: "exhausted";
 		const credentialRotated =
-			managedFallback &&
-			outcome === "advance" &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
-			(await this.#markFailedManagedCredential(trigger));
+			singleModelCredentialRotated ||
+			(managedFallback &&
+				outcome === "advance" &&
+				(trigger.class === "quota" || trigger.class === "rate_limit") &&
+				(await this.#rotateFailedCredential(trigger)) === "rotated");
 		if (credentialRotated && controller.restorePreviousEntryForRetry()) {
 			outcome = "retry";
 		}
@@ -14430,7 +14518,7 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
-			if (managedFallback && !credentialRotated) await this.#markFailedManagedCredential(trigger);
+			if (managedFallback && !credentialRotated) await this.#rotateFailedCredential(trigger);
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
 			if (outcome === "advance") {

@@ -126,15 +126,19 @@ describe("AgentSession resilient retry", () => {
 		messageModel?: string;
 		requestedModels?: string[];
 		settingsOverrides?: Record<string, unknown>;
+		extensionRunner?: ExtensionRunner;
 	}): AgentSession {
 		const model = options.model ?? getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model to exist");
 		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
+		const extensionRunner = options.extensionRunner;
 		const requestedModels = options.requestedModels ?? [];
 		let calls = 0;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			transformContext: extensionRunner ? messages => extensionRunner.emitContext(messages) : undefined,
+			onPayload: extensionRunner ? payload => extensionRunner.emitBeforeProviderRequest(payload) : undefined,
 			streamFn: (requestedModel, context, opts) => {
 				calls++;
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
@@ -186,7 +190,18 @@ describe("AgentSession resilient retry", () => {
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		return new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+			onResponse: extensionRunner
+				? async (response, responseModel) => {
+						await extensionRunner.emitAfterProviderResponse(response, responseModel);
+					}
+				: undefined,
+		});
 	}
 
 	// Builds a session pinned to an explicit model (e.g. ollama-cloud) so
@@ -717,6 +732,150 @@ describe("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("stop");
 		}
+	});
+
+	it("rotates a stored credential and retries a bare-default single-model 429 immediately", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "HTTP 429 rate limit exceeded",
+			errorStatus: 429,
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after": "3600" },
+			},
+			recoveredContent: "recovered with the next account",
+			bareDefault: true,
+			requestedModels,
+		});
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "anthropic-account-a" },
+			{ type: "api_key", key: "anthropic-account-b" },
+		]);
+		const model = session.model;
+		if (!model) throw new Error("Expected an active model");
+		const firstCredential = await modelRegistry.getApiKey(model, session.sessionId);
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+		const visibleErrors: AssistantMessage[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
+				visibleErrors.push(event.message);
+			}
+		});
+
+		await session.prompt("rotate the rate-limited account");
+		await session.waitForIdle();
+
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(visibleErrors).toHaveLength(0);
+		expect(await modelRegistry.getApiKey(model, session.sessionId)).not.toBe(firstCredential);
+		expect(requestedModels).toEqual(["anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"]);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]).toMatchObject({ delayMs: 0 });
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(waitSpy).toHaveBeenCalledWith(0, expect.any(Object));
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+
+	it("rotates a stored credential after a single-model 429 when provider lifecycle extensions are loaded", async () => {
+		let contextHookCalls = 0;
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "HTTP 429 rate limit exceeded",
+			errorStatus: 429,
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after": "3600" },
+			},
+			recoveredContent: "recovered with the next account",
+			bareDefault: true,
+			requestedModels,
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"context",
+						[
+							async () => {
+								contextHookCalls++;
+							},
+						],
+					],
+				]),
+			),
+		});
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "anthropic-account-a" },
+			{ type: "api_key", key: "anthropic-account-b" },
+		]);
+		const model = session.model;
+		if (!model) throw new Error("Expected an active model");
+		const firstCredential = await modelRegistry.getApiKey(model, session.sessionId);
+		const { retryStartEvents, retryEndEvents } = track(session);
+		const visibleErrors: AssistantMessage[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
+				visibleErrors.push(event.message);
+			}
+		});
+
+		await session.prompt("rotate despite the provider lifecycle extension");
+		await session.waitForIdle();
+
+		expect(contextHookCalls).toBe(2);
+		expect(visibleErrors).toHaveLength(0);
+		expect(await modelRegistry.getApiKey(model, session.sessionId)).not.toBe(firstCredential);
+		expect(requestedModels).toEqual(["anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"]);
+		expect(retryStartEvents).toEqual([expect.objectContaining({ delayMs: 0 })]);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+
+	it("surfaces a deferred single-model 429 when no alternate credential exists", async () => {
+		session = buildStatusErrorSession({
+			errorMessage: "HTTP 429 rate limit exceeded",
+			errorStatus: 429,
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after": "3600" },
+			},
+			bareDefault: true,
+		});
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [{ type: "api_key", key: "only-anthropic-account" }]);
+		const visibleErrors: AssistantMessage[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
+				visibleErrors.push(event.message);
+			}
+		});
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("surface the rate limit without an alternate account");
+		await session.waitForIdle();
+
+		expect(visibleErrors).toHaveLength(1);
+		expect(visibleErrors[0].errorStatus).toBe(429);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
 	});
 
 	it("emits auto_retry_end when a retry ends on a terminal error", async () => {

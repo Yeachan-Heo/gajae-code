@@ -1006,6 +1006,19 @@ export class EventController {
 	}
 
 	async #handleAutoRetryStart(event: Extract<AgentSessionEvent, { type: "auto_retry_start" }>): Promise<void> {
+		// A recoverable single-model credential failure defers its terminal
+		// message_end until AgentSession knows whether another account can take
+		// over. Once retry starts, remove the empty provisional component so the
+		// next account owns the only assistant row visible for this turn.
+		if (
+			this.ctx.streamingComponent &&
+			this.ctx.streamingMessage?.role === "assistant" &&
+			this.ctx.streamingMessage.stopReason === "error"
+		) {
+			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
+			this.ctx.streamingComponent = undefined;
+			this.ctx.streamingMessage = undefined;
+		}
 		// Preserve the ORIGINAL editor Escape handler across repeated retry
 		// starts: auto_retry_end only fires at final success/failure, so a
 		// second auto_retry_start must not snapshot the prior retry handler.
