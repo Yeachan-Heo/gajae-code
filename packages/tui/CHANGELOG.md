@@ -7,6 +7,13 @@
 ## [0.12.2] - 2026-07-30
 
 ## [0.12.1] - 2026-07-29
+### Added
+
+- `Tui` now exposes renderer-owned viewport observations so tests and evidence capture can assert against committed paint state instead of re-deriving geometry: `getViewportObservation()` (returns a defensive copy of the latest committed observation), `getViewportAnchorSnapshot()`, `getViewportAnchorComponent()`, `getFocusedComponent()`, and `setViewportSelection()`, plus the `TuiViewportObservation` and `MouseSelectionPoint` types.
+
+### Changed
+
+- Alternate-scroll mode (`DECSET 1007`) is now explicitly disabled at startup, on every mouse-capture toggle, at stop, and during emergency restore, so the host terminal or multiplexer owns mouse-wheel scrollback instead of receiving wheel-to-cursor-key translation. Hosts that never answer a `DECRQM ?1007$p` query (Apple Terminal among them) cannot report this mode, so it is reset unconditionally rather than conditionally on a reported state.
 
 ### Fixed
 
