@@ -167,7 +167,7 @@ import type { JobsObserver } from "../jobs-observer";
 import type { SessionObserverRegistry } from "../session-observer-registry";
 import type { TasksAggregator } from "../tasks-aggregator";
 import type { TranscriptItemRegistry } from "../transcript-item-registry";
-import { acquireResumeProgressLease } from "../utils/ui-helpers";
+import { acquireResumeProgressLease, type ResumeProgressLease } from "../utils/ui-helpers";
 
 const CALLBACK_SERVER_PROVIDERS = new Set<string>([
 	"anthropic",
@@ -2296,11 +2296,29 @@ export class SelectorController {
 		return true;
 	}
 
+	/**
+	 * Guards `handleResumeSession` against overlapping resumes.
+	 *
+	 * `acquireResumeProgressLease` only owns the spinner, so it cannot serialize
+	 * two resumes, and the session picker dispatches resume through a
+	 * void-returning `onSelect` callback — a second selection would otherwise
+	 * start a concurrent transition whose rejection nobody awaits.
+	 */
+	#resumeInFlight = false;
+
 	async handleResumeSession(sessionPath: string): Promise<void> {
-		const previousSessionId = this.ctx.sessionManager.getSessionId();
-		this.#clearTransientSessionUi();
-		const progressLease = acquireResumeProgressLease(this.ctx);
+		if (this.#resumeInFlight) {
+			this.ctx.showStatus("Resume already in progress");
+			return;
+		}
+		this.#resumeInFlight = true;
+		// Everything below runs inside the try so a synchronous failure (a throwing
+		// session-manager accessor, an unavailable status rail) can never strand the
+		// guard and silently disable every later resume.
+		let progressLease: ResumeProgressLease | undefined;
 		try {
+			const previousSessionId = this.ctx.sessionManager.getSessionId();
+			progressLease = acquireResumeProgressLease(this.ctx);
 			await progressLease.committed;
 			const migrationPolicy =
 				this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
@@ -2316,12 +2334,53 @@ export class SelectorController {
 				);
 			}
 			// Switch session via AgentSession (emits hook and tool session events)
-			if (
-				!(await this.ctx.session.switchSession(writableSessionPath, {
+			let switched: boolean;
+			try {
+				switched = await this.ctx.session.switchSession(writableSessionPath, {
 					transition: { origin: INTERACTIVE_SELECTOR_RESUME_ORIGIN },
-				}))
-			)
-				return;
+				});
+			} catch (error) {
+				// `switchSession` opens with `#beginSessionTransition`, which throws
+				// `{ code: "busy" }` while another transition (compaction, handoff, fork,
+				// another switch, …) owns the session. Resume is a UI action dispatched
+				// through a void callback, so report that as status instead of rejecting a
+				// promise nobody awaits. Admission-busy never acquired the lease, so the
+				// owner's transient state — including the `compactionQueuedMessages` that
+				// hold input typed during compaction — must survive untouched.
+				const typed = error as { code?: unknown } | undefined;
+				if (typed?.code === "busy") {
+					this.ctx.showStatus("Another session operation is already in progress");
+					return;
+				}
+				// Any other rejection still propagates, but it can arrive after
+				// `switchSession` already disconnected agent events, aborted the previous
+				// run, and rolled back, so reconcile this call's transient UI first instead
+				// of leaving an aborted run mounted as if it were live. Reconciliation is
+				// best-effort: a failure while tearing down UI must not replace the switch
+				// failure the caller needs to see.
+				try {
+					progressLease.clear();
+					this.#clearTransientSessionUi();
+				} catch {
+					logger.warn("Resume transient-UI reconciliation failed after a session switch error", {
+						classification: "resume-cleanup-failed",
+					});
+				}
+				throw error;
+			}
+			// `#clearTransientSessionUi` drops `compactionQueuedMessages`, so it must stay
+			// untouched on the paths that never acquired the session-transition lease:
+			// admission-busy above and managed-candidate preparation before it.
+			//
+			// Reaching this point means this call *did* acquire the lease, so no other
+			// transition's queued work is at risk. `switchSession` resolves `false` both for
+			// a pre-mutation `session_before_switch` cancellation and for a rollback that
+			// already aborted the previous run, and both cleared here before this change, so
+			// clear either way. Release the spinner first so the status-rail clear cannot
+			// orphan it.
+			progressLease.clear();
+			this.#clearTransientSessionUi();
+			if (!switched) return;
 			const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
 			if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 			this.#refreshSessionTerminalTitle();
@@ -2334,7 +2393,8 @@ export class SelectorController {
 			this.ctx.showStatus("Resumed session");
 			this.#maybePromptResumeModelChoice();
 		} finally {
-			progressLease.clear();
+			progressLease?.clear();
+			this.#resumeInFlight = false;
 		}
 	}
 
