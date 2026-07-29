@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+
+### Fixed
+
+- Lazy-stream first-event timeouts now abort with `FirstEventTimeoutError` so `transportFailure.providerCode` is `stream_first_event_timeout` on the outer watchdog path shared by all bundled providers via `createLazyStream`. Idle stalls remain bare `Error`s (distinct class intentionally) (#3496).
+
 - Provider streams now surface first-event watchdog expiry as a typed timeout so callers can apply bounded retry policy without parsing error prose.
 - Codex websocket first-event timeouts now discard the timed-out connection before the outer retry/fallback layer handles the typed failure, preventing late frames from the abandoned request from being consumed by the replayed turn.
 - Codex named-tool requests now recognize provider `Tool choice '<name>' not found in 'tools' parameter` errors as runtime capability failures and retry once without forcing the choice.

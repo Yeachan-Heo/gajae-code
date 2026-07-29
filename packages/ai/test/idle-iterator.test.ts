@@ -50,4 +50,43 @@ describe("iterateWithIdleTimeout transport facts", () => {
 		expect(error).not.toBeInstanceOf(FirstEventTimeoutError);
 		expect(transportFailureFacts(error)).toBeUndefined();
 	});
+
+	it("stamps first-item expiry as FirstEventTimeoutError with transport facts", async () => {
+		vi.useFakeTimers();
+		const source = (async function* () {
+			await new Promise<never>(() => {});
+		})();
+		const abortReasons: Error[] = [];
+		const iterator = iterateWithIdleTimeout(source, {
+			firstItemTimeoutMs: 10,
+			idleTimeoutMs: 10,
+			errorMessage: "stream idle",
+			firstItemErrorMessage: "Provider stream timed out while waiting for the first event",
+			onFirstItemTimeout: () => {
+				abortReasons.push(
+					new FirstEventTimeoutError("Provider stream timed out while waiting for the first event"),
+				);
+			},
+		});
+
+		const pending = iterator.next();
+		await waitForTimerRegistration();
+		vi.advanceTimersByTime(10);
+		const error = await pending.catch(error => error);
+
+		expect(error).toBeInstanceOf(FirstEventTimeoutError);
+		expect(transportFailureFacts(error)).toEqual({
+			kind: "transport",
+			status: undefined,
+			providerCode: STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
+			anthropicErrorType: undefined,
+			openaiErrorCode: undefined,
+			headers: undefined,
+		});
+		expect(abortReasons).toHaveLength(1);
+		expect(transportFailureFacts(abortReasons[0])).toMatchObject({
+			kind: "transport",
+			providerCode: STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
+		});
+	});
 });

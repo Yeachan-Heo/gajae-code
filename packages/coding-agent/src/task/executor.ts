@@ -50,7 +50,7 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { validateAllocatedTaskId } from "./id";
-import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-status";
+import { classifyProviderRetryFromTransport, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
@@ -1893,11 +1893,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					for (const message of session.messages) {
 						if (message.role === "assistant") rememberAssistantMessage(message);
 					}
+					const failedAssistant = session.getLastAssistantMessage();
 					progress.retryState = {
 						attempt: event.attempt,
 						maxAttempts: event.maxAttempts,
 						unbounded: event.unbounded,
-						kind: classifyProviderRetry(event.errorMessage),
+						kind: classifyProviderRetryFromTransport({
+							providerCode: failedAssistant?.transportFailure?.providerCode,
+							errorMessage: event.errorMessage,
+						}),
 						provider: providerNameFromModel(
 							activeProviderModelString ?? lastAssistantModelString ?? resolvedModelString,
 						),

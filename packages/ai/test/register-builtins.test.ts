@@ -333,6 +333,10 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		const result = await stream.result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider stream timed out while waiting for the first event");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+		});
 	});
 
 	it("explicit streamFirstEventTimeoutMs takes precedence over the Alibaba fallback", async () => {
