@@ -421,6 +421,32 @@ export function resolveForkContextMaxTokens(configured: number, model: Model | u
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool Class
 // ═══════════════════════════════════════════════════════════════════════════
+interface SessionLifetimeArtifactsState {
+	dir?: string;
+	manager?: ArtifactManager;
+	ensurePromise?: Promise<string | null>;
+	authorized: boolean;
+	cleanupRegistered: boolean;
+	originalGetArtifactsDir?: ToolSession["getArtifactsDir"];
+	originalGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
+	originalGetArtifactManager?: ToolSession["getArtifactManager"];
+	originalAgentOutputManager?: AgentOutputManager;
+	installedGetArtifactsDir?: ToolSession["getArtifactsDir"];
+	installedGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
+	installedGetArtifactManager?: ToolSession["getArtifactManager"];
+	installedAgentOutputManager?: AgentOutputManager;
+}
+
+const sessionLifetimeArtifacts = new WeakMap<ToolSession, SessionLifetimeArtifactsState>();
+
+function sessionLifetimeArtifactsState(session: ToolSession): SessionLifetimeArtifactsState {
+	let state = sessionLifetimeArtifacts.get(session);
+	if (!state) {
+		state = { authorized: false, cleanupRegistered: false };
+		sessionLifetimeArtifacts.set(session, state);
+	}
+	return state;
+}
 
 /**
  * Task tool - Delegate tasks to specialized agents.
@@ -438,13 +464,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
 	/**
-	 * Session-lifetime durable artifact root for in-memory parents (no session file).
-	 * Allocated once per TaskTool, reused across task batches, never deleted on task return.
+	 * Session-lifetime durable artifact state is shared atomically by every
+	 * TaskTool created for the same parent ToolSession.
 	 */
-	#durableArtifactsDir: string | undefined;
-	#durableArtifactManager: ArtifactManager | undefined;
-	#durableArtifactsEnsurePromise: Promise<string | null> | undefined;
-	#durableArtifactsAuthorizedOnSession = false;
 
 	get parameters(): TaskToolSchemaInstance {
 		const isolationEnabled = this.session.settings.get("task.isolation.mode") !== "none";
@@ -493,35 +515,41 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * advertise agent:// URIs without a successful allocation.
 	 */
 	async #ensureSessionLifetimeArtifacts(): Promise<{ dir: string; manager: ArtifactManager } | null> {
-		if (this.#durableArtifactsDir && this.#durableArtifactManager) {
-			return { dir: this.#durableArtifactsDir, manager: this.#durableArtifactManager };
-		}
+		const state = sessionLifetimeArtifactsState(this.session);
+		if (state.dir && state.manager) return { dir: state.dir, manager: state.manager };
+
 		const sessionArtifactsDir = this.session.getArtifactsDir?.() ?? null;
 		if (sessionArtifactsDir) {
-			const manager = this.session.getArtifactManager?.() ?? new ArtifactManager(sessionArtifactsDir);
-			this.#durableArtifactsDir = sessionArtifactsDir;
-			this.#durableArtifactManager = manager;
-			this.#authorizeSessionLifetimeArtifacts(sessionArtifactsDir, manager);
+			const existingManager = this.session.getArtifactManager?.() ?? null;
+			if (existingManager && path.resolve(existingManager.dir) !== path.resolve(sessionArtifactsDir)) return null;
+			const manager = existingManager ?? new ArtifactManager(sessionArtifactsDir);
+			state.dir = sessionArtifactsDir;
+			state.manager = manager;
+			this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false);
 			return { dir: sessionArtifactsDir, manager };
 		}
-		this.#durableArtifactsEnsurePromise ??= this.#allocateSessionLifetimeArtifacts();
-		const dir = await this.#durableArtifactsEnsurePromise;
-		if (!dir || !this.#durableArtifactManager) return null;
-		return { dir, manager: this.#durableArtifactManager };
+
+		state.ensurePromise ??= this.#allocateSessionLifetimeArtifacts(state);
+		const dir = await state.ensurePromise;
+		if (!dir || !state.manager) {
+			state.ensurePromise = undefined;
+			return null;
+		}
+		return { dir, manager: state.manager };
 	}
 
-	async #allocateSessionLifetimeArtifacts(): Promise<string | null> {
+	async #allocateSessionLifetimeArtifacts(state: SessionLifetimeArtifactsState): Promise<string | null> {
 		let dir: string;
 		try {
 			dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-session-"));
 		} catch {
-			this.#durableArtifactsDir = undefined;
-			this.#durableArtifactManager = undefined;
+			state.dir = undefined;
+			state.manager = undefined;
 			return null;
 		}
-		this.#durableArtifactsDir = dir;
-		this.#durableArtifactManager = new ArtifactManager(dir);
-		this.#authorizeSessionLifetimeArtifacts(dir, this.#durableArtifactManager);
+		state.dir = dir;
+		state.manager = new ArtifactManager(dir);
+		this.#authorizeSessionLifetimeArtifacts(state, dir, state.manager, true);
 		return dir;
 	}
 
@@ -530,32 +558,58 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * tools and same-session descendants can resolve agent:// without registry-wide
 	 * enumeration (#3302 scoped authorization).
 	 */
-	#authorizeSessionLifetimeArtifacts(dir: string, manager: ArtifactManager): void {
-		if (this.#durableArtifactsAuthorizedOnSession) return;
-		this.#durableArtifactsAuthorizedOnSession = true;
+	#authorizeSessionLifetimeArtifacts(
+		state: SessionLifetimeArtifactsState,
+		dir: string,
+		manager: ArtifactManager,
+		owned: boolean,
+	): void {
+		if (state.authorized) return;
+		state.authorized = true;
+		state.originalGetArtifactsDir = this.session.getArtifactsDir;
+		state.originalGetAuthorizedArtifactsDirs = this.session.getAuthorizedArtifactsDirs;
+		state.originalGetArtifactManager = this.session.getArtifactManager;
+		state.originalAgentOutputManager = this.session.agentOutputManager;
 
-		const originalGetArtifactsDir = this.session.getArtifactsDir;
-		const originalGetAuthorizedArtifactsDirs = this.session.getAuthorizedArtifactsDirs;
-		const originalGetArtifactManager = this.session.getArtifactManager;
-
-		this.session.getArtifactsDir = () => originalGetArtifactsDir?.() ?? dir;
-		this.session.getAuthorizedArtifactsDirs = () => {
+		state.installedGetArtifactsDir = () => state.originalGetArtifactsDir?.() ?? dir;
+		state.installedGetAuthorizedArtifactsDirs = () => {
 			const dirs: string[] = [];
 			const add = (candidate: string | null | undefined) => {
 				if (!candidate) return;
 				const normalized = path.resolve(candidate);
 				if (!dirs.includes(normalized)) dirs.push(normalized);
 			};
-			for (const authorized of originalGetAuthorizedArtifactsDirs?.() ?? []) add(authorized);
+			for (const authorized of state.originalGetAuthorizedArtifactsDirs?.() ?? []) add(authorized);
 			add(dir);
 			return dirs;
 		};
-		this.session.getArtifactManager = () => originalGetArtifactManager?.() ?? manager;
+		state.installedGetArtifactManager = () => state.originalGetArtifactManager?.() ?? manager;
+		this.session.getArtifactsDir = state.installedGetArtifactsDir;
+		this.session.getAuthorizedArtifactsDirs = state.installedGetAuthorizedArtifactsDirs;
+		this.session.getArtifactManager = state.installedGetArtifactManager;
 
-		// Prefer scanning the durable root for resume uniqueness when the parent
-		// never had a file-backed agent output manager.
 		if (!this.session.agentOutputManager) {
-			this.session.agentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null);
+			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null);
+			this.session.agentOutputManager = state.installedAgentOutputManager;
+		}
+
+		if (owned && !state.cleanupRegistered && this.session.registerSessionCleanup) {
+			state.cleanupRegistered = true;
+			this.session.registerSessionCleanup(async () => {
+				try {
+					await fs.rm(dir, { recursive: true, force: true });
+				} finally {
+					if (this.session.getArtifactsDir === state.installedGetArtifactsDir)
+						this.session.getArtifactsDir = state.originalGetArtifactsDir;
+					if (this.session.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
+						this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
+					if (this.session.getArtifactManager === state.installedGetArtifactManager)
+						this.session.getArtifactManager = state.originalGetArtifactManager;
+					if (this.session.agentOutputManager === state.installedAgentOutputManager)
+						this.session.agentOutputManager = state.originalAgentOutputManager;
+					sessionLifetimeArtifacts.delete(this.session);
+				}
+			});
 		}
 	}
 

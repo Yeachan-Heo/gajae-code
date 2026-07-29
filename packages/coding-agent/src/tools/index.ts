@@ -296,6 +296,8 @@ export interface ToolSession {
 	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
 	getArtifactManager?: () => ArtifactManager | null;
+	/** Register teardown work owned by the current logical session. */
+	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => () => void;
 	/** Allocate a new artifact path and ID for session-scoped truncated output. */
 	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string }>;
 	/** Get session spawns */

@@ -96,7 +96,10 @@ function createYieldingSession(output: string): AgentSession {
 	} as unknown as AgentSession;
 }
 
-function createSession(sessionFile: string | null, sessionId = "test-in-memory-session"): ToolSession {
+type TestToolSession = ToolSession & { disposeSession: () => Promise<void> };
+
+function createSession(sessionFile: string | null, sessionId = "test-in-memory-session"): TestToolSession {
+	const cleanups = new Set<() => Promise<void> | void>();
 	return {
 		cwd: "/tmp",
 		hasUI: false,
@@ -105,7 +108,16 @@ function createSession(sessionFile: string | null, sessionId = "test-in-memory-s
 		getSessionId: () => sessionId,
 		getArtifactsDir: () => (sessionFile ? sessionFile.slice(0, -6) : null),
 		getSessionSpawns: () => "*",
-	} as unknown as ToolSession;
+		registerSessionCleanup: (cleanup: () => Promise<void> | void) => {
+			cleanups.add(cleanup);
+			return () => cleanups.delete(cleanup);
+		},
+		disposeSession: async () => {
+			const pending = Array.from(cleanups);
+			cleanups.clear();
+			await Promise.all(pending.map(async cleanup => await cleanup()));
+		},
+	} as unknown as TestToolSession;
 }
 
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
@@ -188,25 +200,25 @@ describe("task no-session output refs", () => {
 		expect(resolved.content).toBe(onDisk);
 		expect(resolved.content).toContain(childOutput);
 
-		// Cleanup durable root allocated for this test session
-		await fs.rm(artifactsDir!, { recursive: true, force: true });
+		await session.disposeSession();
+		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
+		expect(session.getArtifactsDir?.()).toBeNull();
 	});
 
-	it("lets a second detached task resolve the first task's agent:// via the same in-memory parent", async () => {
+	it("shares one root and ID space with authorized descendants but denies foreign trees", async () => {
 		const firstOutput = "architect findings for sibling review";
-		const secondOutput = "critic reviewed prior output";
+		const secondOutput = "architect second-pass output";
 		const sessionId = `sibling-read-${Snowflake.next()}`;
 		let call = 0;
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 			call += 1;
-			const text = call === 1 ? firstOutput : secondOutput;
-			return createSessionResult(createYieldingSession(text));
+			return createSessionResult(createYieldingSession(call === 1 ? firstOutput : secondOutput));
 		});
 
 		const session = createSession(null, sessionId);
 		const firstTool = await TaskTool.create(session);
-
+		const secondTool = await TaskTool.create(session);
 		const firstText = await runDetachedTask(firstTool, {
 			id: "Architect",
 			description: "review code",
@@ -218,55 +230,64 @@ describe("task no-session output refs", () => {
 		const firstArtifactsDir = session.getArtifactsDir?.();
 		expect(firstArtifactsDir).toBeTruthy();
 
-		const prior = await InternalUrlRouter.instance().resolve(firstUri, {
+		const descendantRead = await InternalUrlRouter.instance().resolve(firstUri, {
 			cwd: session.cwd,
-			getArtifactsDir: () => session.getArtifactsDir?.() ?? null,
+			getArtifactsDir: () => null,
 			getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
 		});
-		expect(prior.content).toContain(firstOutput);
-		const secondTool = await TaskTool.create(session);
+		expect(descendantRead.content).toContain(firstOutput);
 
 		const secondText = await runDetachedTask(secondTool, {
-			id: "Critic",
+			id: "Architect",
 			description: "review prior findings",
 			assignment: `Read ${firstUri} and critique.`,
 		});
-		const secondUriMatch = secondText.match(/agent:\/\/(\d+-Critic)/);
+		const secondUriMatch = secondText.match(/agent:\/\/(\d+-Architect)/);
 		expect(secondUriMatch).toBeTruthy();
+		expect(secondUriMatch![1]).not.toBe(firstUriMatch![1]);
+		expect(Number(secondUriMatch![1]!.split("-")[0])).toBeGreaterThan(Number(firstUriMatch![1]!.split("-")[0]));
 
-		// Durable root still holds both outputs for same-session descendants
 		const artifactsDir = session.getArtifactsDir?.();
-		expect(artifactsDir).toBeTruthy();
 		expect(artifactsDir).toBe(firstArtifactsDir);
 		expect(await Bun.file(path.join(artifactsDir!, `${firstUriMatch![1]!}.md`)).text()).toContain(firstOutput);
 		expect(await Bun.file(path.join(artifactsDir!, `${secondUriMatch![1]!}.md`)).text()).toContain(secondOutput);
 
-		const stillReadable = await InternalUrlRouter.instance().resolve(firstUri, {
-			cwd: session.cwd,
-			getArtifactsDir: () => session.getArtifactsDir?.() ?? null,
-			getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
-		});
-		expect(stillReadable.content).toContain(firstOutput);
-
-		await fs.rm(artifactsDir!, { recursive: true, force: true });
+		const foreignRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-foreign-"));
+		try {
+			await expect(
+				InternalUrlRouter.instance().resolve(firstUri, {
+					cwd: session.cwd,
+					getArtifactsDir: () => foreignRoot,
+					getAuthorizedArtifactsDirs: () => [],
+				}),
+			).rejects.toThrow(`agent://${firstUriMatch![1]!} not found`);
+		} finally {
+			await fs.rm(foreignRoot, { recursive: true, force: true });
+			await session.disposeSession();
+		}
+		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
 	});
 
-	it("does not advertise agent:// when durable artifact allocation fails", async () => {
+	it("omits dead URIs after allocation failure and retries a later batch", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
-			createSessionResult(createYieldingSession("output that must not get a dead URI")),
+			createSessionResult(createYieldingSession("output that must remain durable")),
 		);
-
-		vi.spyOn(fs, "mkdtemp").mockRejectedValue(new Error("EACCES: permission denied"));
+		const mkdtempSpy = vi.spyOn(fs, "mkdtemp").mockRejectedValue(new Error("EACCES: permission denied"));
 
 		const session = createSession(null, `alloc-fail-${Snowflake.next()}`);
 		const tool = await TaskTool.create(session);
-		const resultText = await runDetachedTask(tool);
-
-		expect(resultText).toContain("Task completed; output artifact unavailable.");
-		expect(resultText).not.toMatch(/agent:\/\/\d+-NoSession/);
-		expect(resultText).not.toContain('ref="agent://');
-		expect(resultText).not.toContain("output stored in agent://");
+		const failedText = await runDetachedTask(tool);
+		expect(failedText).toContain("Task completed; output artifact unavailable.");
+		expect(failedText).not.toMatch(/agent:\/\/\d+-NoSession/);
 		expect(session.getArtifactsDir?.()).toBeNull();
+		mkdtempSpy.mockRestore();
+
+		const retriedText = await runDetachedTask(tool);
+		expect(retriedText).toMatch(/agent:\/\/\d+-NoSession/);
+		const artifactsDir = session.getArtifactsDir?.();
+		expect(artifactsDir).toBeTruthy();
+		await session.disposeSession();
+		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
 	});
 });

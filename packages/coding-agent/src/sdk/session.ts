@@ -1623,6 +1623,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			},
 			getArtifactManager: () => sessionManager.getArtifactManager(),
+			registerSessionCleanup: cleanup => session?.registerToolSessionCleanup(cleanup) ?? (() => {}),
 			settings,
 			authStorage,
 			modelRegistry,
