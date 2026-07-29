@@ -178,6 +178,9 @@ export type ViewportAnchorId = string;
 export interface TuiViewportObservation {
 	transcriptCapacity: number;
 	pinBoundary: { row: number; pinned: boolean };
+	manualHistory: boolean;
+	newOutputNoticeVisible: boolean;
+	outputRevision: string | null;
 	focused: boolean;
 	cursor: { row: number; col: number; visible: boolean } | null;
 	selection: { start: MouseSelectionPoint; end: MouseSelectionPoint } | null;
@@ -908,9 +911,20 @@ export class TUI extends Container {
 	/** Selects a zero-based painted viewport cell range using the same renderer path as mouse dragging. */
 	setViewportSelection(start: MouseSelectionPoint, end: MouseSelectionPoint): void {
 		if (!this.options.copySelection) return;
-		const viewportTop = this.#manualViewportTop ?? this.#viewportTopRow;
-		this.#mouseSelectionStart = { line: viewportTop + start.line, column: start.column };
-		this.#mouseSelectionEnd = { line: viewportTop + end.line, column: end.column };
+		const map = (point: MouseSelectionPoint): MouseSelectionPoint | null => {
+			const row = Math.max(0, Math.min(this.terminal.rows - 1, point.line));
+			const column = Math.max(0, Math.min(this.terminal.columns - 1, point.column));
+			return this.#mouseSelectionPoint({ x: column + 1, y: row + 1, kind: "drag" });
+		};
+		const mappedStart = map(start);
+		const mappedEnd = map(end);
+		if (mappedStart === null || mappedEnd === null) {
+			this.#clearMouseSelection();
+			this.requestRender(false, "selection");
+			return;
+		}
+		this.#mouseSelectionStart = mappedStart;
+		this.#mouseSelectionEnd = mappedEnd;
 		this.#mouseSelectionDragged = true;
 		this.requestRender(false, "selection");
 	}
@@ -2786,6 +2800,7 @@ export class TUI extends Container {
 				this.#cursorRow = Math.max(0, lines.length - 1);
 				this.#maxLinesRendered = lines.length;
 				this.#viewportTopRow = nextViewportTop;
+				this.#paintedManualOutputNotice = paintManual && this.#manualOutputNotice;
 				this.#recordPaintedViewportObservation(nextViewportTop, height, paintManual);
 				onPainted?.();
 			})
@@ -2836,6 +2851,9 @@ export class TUI extends Container {
 		this.#latestViewportObservation = {
 			transcriptCapacity,
 			pinBoundary: { row: transcriptCapacity, pinned: this.#bottomPinnedComponent !== null },
+			manualHistory: paintManual,
+			newOutputNoticeVisible: paintManual && this.#paintedManualOutputNotice,
+			outputRevision: this.#viewportOutputSource?.revision.toString() ?? null,
 			focused: this.#focusedComponent !== null,
 			cursor: cursor
 				? { row: cursorVisible ? cursorRow! : cursor.row, col: cursor.col, visible: cursorVisible }
@@ -2843,6 +2861,14 @@ export class TUI extends Container {
 			selection: paintedSelection,
 			semanticAnchor,
 		};
+	}
+	#refreshPaintedLiveViewportObservation(height: number): void {
+		this.#committedTranscriptRows = Array.from({ length: height }, (_, screenRow) => {
+			const transcriptRow = this.#viewportTopRow + screenRow;
+			return transcriptRow < this.#manualTranscriptLineCount ? transcriptRow : null;
+		});
+		this.#paintedManualOutputNotice = false;
+		this.#recordPaintedViewportObservation(this.#viewportTopRow, height, false);
 	}
 	#doRender(): void {
 		if (this.#stopped || !this.terminalAvailable) return;
@@ -3035,6 +3061,7 @@ export class TUI extends Container {
 			}
 			const nextViewportTop = resolvedAnchorTop ?? this.#manualViewportTop;
 			if (
+				!this.#mouseSelectionDragged &&
 				this.#previousWidth === width &&
 				this.#previousHeight === height &&
 				nextViewportTop === this.#manualViewportTop &&
@@ -3282,10 +3309,10 @@ export class TUI extends Container {
 		}
 		let appendStart = appendedLines && firstChanged === this.#previousLines.length && firstChanged > 0;
 
-		// No changes - but still need to update hardware cursor position if it moved
+		// No changes - but still need to update hardware cursor position if it moved.
 		if (firstChanged === -1) {
-			this.#writeCursorPosition(cursorPos, newLines.length);
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+			if (this.#writeCursorPosition(cursorPos, newLines.length)) this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
 
@@ -3365,6 +3392,7 @@ export class TUI extends Container {
 						this.#previousHeight = height;
 						this.#maxLinesRendered = newLines.length;
 						this.#viewportTopRow = Math.max(0, newLines.length - height);
+						this.#refreshPaintedLiveViewportObservation(height);
 					})
 				)
 					return;
@@ -3528,6 +3556,7 @@ export class TUI extends Container {
 				this.#previousLines = newLines;
 				this.#previousWidth = width;
 				this.#previousHeight = height;
+				this.#refreshPaintedLiveViewportObservation(height);
 			})
 		)
 			return;
