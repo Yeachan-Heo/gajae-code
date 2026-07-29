@@ -528,6 +528,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false);
 			return { dir: sessionArtifactsDir, manager };
 		}
+		if (!this.session.registerSessionCleanup) return null;
 
 		state.ensurePromise ??= this.#allocateSessionLifetimeArtifacts(state);
 		const dir = await state.ensurePromise;
@@ -583,13 +584,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			add(dir);
 			return dirs;
 		};
-		state.installedGetArtifactManager = () => state.originalGetArtifactManager?.() ?? manager;
+		state.installedGetArtifactManager = () => manager;
 		this.session.getArtifactsDir = state.installedGetArtifactsDir;
 		this.session.getAuthorizedArtifactsDirs = state.installedGetAuthorizedArtifactsDirs;
 		this.session.getArtifactManager = state.installedGetArtifactManager;
 
-		if (!this.session.agentOutputManager) {
-			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null);
+		if (owned || !this.session.agentOutputManager) {
+			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null, {
+				getAuthorizedArtifactsDirs: () => this.session.getAuthorizedArtifactsDirs?.() ?? [],
+			});
 			this.session.agentOutputManager = state.installedAgentOutputManager;
 		}
 
@@ -627,11 +630,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const sessionFile = this.session.getSessionFile();
 		const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
 		if (sessionArtifactsDir) {
+			const candidateManager = this.session.getArtifactManager?.() ?? undefined;
+			const parentArtifactManager =
+				candidateManager && path.resolve(candidateManager.dir) === path.resolve(sessionArtifactsDir)
+					? candidateManager
+					: undefined;
 			return {
 				sessionArtifactsDir,
 				durableArtifactsDir: null,
 				effectiveArtifactsDir: sessionArtifactsDir,
-				parentArtifactManager: this.session.getArtifactManager?.() ?? undefined,
+				parentArtifactManager,
 			};
 		}
 		const durable = await this.#ensureSessionLifetimeArtifacts();
@@ -639,7 +647,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			sessionArtifactsDir: null,
 			durableArtifactsDir: durable?.dir ?? null,
 			effectiveArtifactsDir: durable?.dir,
-			parentArtifactManager: this.session.getArtifactManager?.() ?? durable?.manager,
+			parentArtifactManager: durable?.manager,
 		};
 	}
 

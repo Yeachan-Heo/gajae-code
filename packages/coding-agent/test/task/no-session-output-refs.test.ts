@@ -10,6 +10,7 @@ import { InternalUrlRouter } from "../../src/internal-urls";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent } from "../../src/session/agent-session";
+import { ArtifactManager } from "../../src/session/artifacts";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
@@ -217,6 +218,9 @@ describe("task no-session output refs", () => {
 		});
 
 		const session = createSession(null, sessionId);
+		const priorAuthorizedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-prior-authorized-"));
+		await Bun.write(path.join(priorAuthorizedRoot, "0-Historical.md"), "historical output");
+		session.getAuthorizedArtifactsDirs = () => [priorAuthorizedRoot];
 		const firstTool = await TaskTool.create(session);
 		const secondTool = await TaskTool.create(session);
 		const firstText = await runDetachedTask(firstTool, {
@@ -226,6 +230,7 @@ describe("task no-session output refs", () => {
 		});
 		const firstUriMatch = firstText.match(/agent:\/\/(\d+-Architect)/);
 		expect(firstUriMatch).toBeTruthy();
+		expect(Number(firstUriMatch![1]!.split("-")[0])).toBe(1);
 		const firstUri = `agent://${firstUriMatch![1]!}`;
 		const firstArtifactsDir = session.getArtifactsDir?.();
 		expect(firstArtifactsDir).toBeTruthy();
@@ -264,8 +269,44 @@ describe("task no-session output refs", () => {
 		} finally {
 			await fs.rm(foreignRoot, { recursive: true, force: true });
 			await session.disposeSession();
+			await fs.rm(priorAuthorizedRoot, { recursive: true, force: true });
 		}
 		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
+	});
+
+	it("adopts its owned manager instead of a foreign manager without a primary root", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("owned manager output")),
+		);
+		const foreignRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-foreign-manager-"));
+		const foreignManager = new ArtifactManager(foreignRoot);
+		const session = createSession(null, `foreign-manager-${Snowflake.next()}`);
+		session.getArtifactManager = () => foreignManager;
+		const tool = await TaskTool.create(session);
+		const resultText = await runDetachedTask(tool);
+		expect(resultText).toMatch(/agent:\/\/\d+-NoSession/);
+		const artifactsDir = session.getArtifactsDir?.();
+		expect(artifactsDir).toBeTruthy();
+		expect(path.resolve(session.getArtifactManager?.()?.dir ?? "")).toBe(path.resolve(artifactsDir!));
+		expect((await fs.readdir(foreignRoot)).filter(name => name.endsWith(".md"))).toHaveLength(0);
+		await session.disposeSession();
+		expect(session.getArtifactManager?.()).toBe(foreignManager);
+		await fs.rm(foreignRoot, { recursive: true, force: true });
+	});
+
+	it("does not allocate durable output when session cleanup is unavailable", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("must remain unavailable")),
+		);
+		const session = createSession(null, `no-cleanup-${Snowflake.next()}`);
+		session.registerSessionCleanup = undefined;
+		const tool = await TaskTool.create(session);
+		const resultText = await runDetachedTask(tool);
+		expect(resultText).toContain("Task completed; output artifact unavailable.");
+		expect(resultText).not.toContain("agent://");
+		expect(session.getArtifactsDir?.()).toBeNull();
 	});
 
 	it("omits dead URIs after allocation failure and retries a later batch", async () => {
