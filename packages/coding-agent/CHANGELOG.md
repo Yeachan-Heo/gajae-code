@@ -3,7 +3,10 @@
 ## [Unreleased]
 ### Resume fixes
 
+- Deep-interview round scoring is now one atomic public command with recoverable internal drafts, and continuation is a native finite-state decision persisted with each score. The 100th committed score forces closure and a 101st scoring transaction fails closed, eliminating prompt-only cap drift and repeated normal-flow draft commands.
+
 - Deep-interview draft recovery is now self-healing and fail-closed: `check` dry-runs the same state transition as consume, invariant failures include stable path/expected/actual details and deterministic recovery, failed consumes remain replayable, batch edits are atomic, and the workflow mutation guard admits only verified pure `gjc`/read-only shell pipelines while rejecting mixed or expanded command forms. Schema and invariant documentation is source-verified.
+- Deep-interview setup dogfooding no longer forces the skill to rediscover runtime-owned context: summary inspection exposes threshold source, threshold units, setup status, and bounded language metadata; repair/inspect commands can bind through `GJC_SESSION_ID`; unresolved empty initial ideas can be filled with the user's real answer instead of throwing setup conflicts; and the workflow guard handles semicolons inside quoted `gjc` arguments without blocking sanctioned CLI calls.
 
 - Memory consolidation redacts GitHub tokens. The scrubber covered AWS ids, JWTs and keyword-prefixed keys, but GitHub tokens carry none of those keywords, so they reached `MEMORY.md` and `memory_summary.md` verbatim — and the summary is injected into every later session. Now covers the same three prefixes the contribution-prep scrubber already handled.
 - The native skill hook resolves its config paths through the trusted directory helpers. It read `GJC_CODING_AGENT_DIR` / `GJC_CONFIG_DIR` straight from `process.env`, which Bun populates from `cwd/.env` before any module runs, so a repository could point the hook at a directory it ships and inject its own `skills.customDirectories` — bypassing the escalation guards that already exist for exactly this.

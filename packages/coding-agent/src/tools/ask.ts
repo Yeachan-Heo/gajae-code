@@ -194,7 +194,10 @@ const WorkflowGateMeta = z.object({
 	kind: z.enum(["question", "approval", "execution"]).describe("workflow gate kind"),
 });
 
-function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMeta>) {
+function createQuestionItemSchema(
+	deepInterviewSchema: z.ZodType<DeepInterviewMeta>,
+	requireMetadataForDeepInterviewGate = false,
+) {
 	return z
 		.object({
 			id: z.string().describe("question id"),
@@ -206,6 +209,16 @@ function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMe
 			workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
 		})
 		.superRefine((value, context) => {
+			if (
+				requireMetadataForDeepInterviewGate &&
+				value.workflowGate?.stage === "deep-interview" &&
+				value.deepInterview === undefined
+			)
+				context.addIssue({
+					code: "custom",
+					message: "deep-interview workflow gates require recordable deepInterview metadata",
+					path: ["deepInterview"],
+				});
 			const labels = new Set(value.options.map(option => option.label));
 			const contract = intentContract(value.deepInterview);
 			const review = intentReview(value.deepInterview);
@@ -278,8 +291,11 @@ function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMe
 }
 
 const QuestionItem = createQuestionItemSchema(DeepInterviewMeta);
-const TopologyQuestionItem = createQuestionItemSchema(DeepInterviewTopologyMeta);
-const PostTopologyQuestionItem = createQuestionItemSchema(z.union([DeepInterviewRoundMeta, DeepInterviewReviewMeta]));
+const TopologyQuestionItem = createQuestionItemSchema(DeepInterviewTopologyMeta, true);
+const PostTopologyQuestionItem = createQuestionItemSchema(
+	z.union([DeepInterviewRoundMeta, DeepInterviewReviewMeta]),
+	true,
+);
 
 const OrdinaryQuestionItem = z.object({
 	id: z.string().describe("question id"),

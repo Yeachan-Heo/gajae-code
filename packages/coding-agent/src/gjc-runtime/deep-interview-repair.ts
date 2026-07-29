@@ -780,8 +780,9 @@ function parse(args: readonly string[]): ParsedRepairCommand {
 		flags.set(token, value);
 	}
 	if (!hasJson) throw new RepairError("DI_JSON_REQUIRED");
-	const session = flags.get("--session-id");
+	const session = flags.get("--session-id") ?? process.env.GJC_SESSION_ID;
 	if (!session || !ID.test(session)) throw new RepairError("DI_INVALID_SESSION_ID");
+	if (!flags.has("--session-id")) flags.set("--session-id", session);
 	return { verb, flags };
 }
 function safeInt(value: string | undefined, code: string, positive = false): number {
@@ -899,6 +900,10 @@ export async function runDeepInterviewRepairCommand(
 		return errorResult(error);
 	}
 }
+function unresolvedSetupPlaceholder(value: unknown): boolean {
+	return value === undefined || value === null || value === "";
+}
+
 type MutationVerb = Exclude<DeepInterviewRepairVerb, "inspect" | "sanity-check">;
 const MUTATION_ALLOWED_FLAGS: Record<MutationVerb, readonly string[]> = {
 	"initialize-context": ["--session-id", "--schema-version", "--expected-revision", "--input-json"],
@@ -959,8 +964,11 @@ function buildMutationTransform(
 						throw new RepairError("DI_SETUP_CONFLICT", 4);
 					if (canonicalDeepInterviewJson(state.type) !== canonicalDeepInterviewJson(value)) missing[key] = value;
 				} else if (Object.hasOwn(state, key)) {
-					if (canonicalDeepInterviewJson(state[key]) !== canonicalDeepInterviewJson(value))
+					if (unresolvedSetup && key === "initial_idea" && unresolvedSetupPlaceholder(state[key])) {
+						missing[key] = value;
+					} else if (canonicalDeepInterviewJson(state[key]) !== canonicalDeepInterviewJson(value)) {
 						throw new RepairError("DI_SETUP_CONFLICT", 4);
+					}
 				} else {
 					missing[key] = value;
 				}
@@ -1215,6 +1223,17 @@ const nullableTextView = (value: unknown, limit = 1024) => (typeof value === "st
 const nullableId = (value: unknown) => (typeof value === "string" && ID.test(value) ? value : null);
 const nullableScore = (value: unknown) =>
 	typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+function languageView(value: unknown): Record<string, unknown> | null {
+	const record = asRecord(value);
+	if (!Object.keys(record).length) return null;
+	return {
+		code: nullableTextView(record.code, 64),
+		label: nullableTextView(record.label, 128),
+		source: nullableTextView(record.source, 128),
+		instruction: nullableTextView(record.instruction, 2048),
+	};
+}
+
 function persistNativeTriggerMetrics(
 	priorState: Record<string, unknown>,
 	envelope: Record<string, unknown>,
@@ -1676,9 +1695,32 @@ async function inspect(parsed: ParsedRepairCommand, cwd: string): Promise<DeepIn
 					? state.resolution
 					: null,
 			threshold: nullableScore(state.threshold),
+			threshold_units:
+				typeof state.threshold_units === "number" && Number.isSafeInteger(state.threshold_units)
+					? state.threshold_units
+					: typeof value.threshold_units === "number" && Number.isSafeInteger(value.threshold_units)
+						? value.threshold_units
+						: null,
+			threshold_source: nullableTextView(state.threshold_source ?? value.threshold_source),
+			language: languageView(state.language ?? value.language),
+			setup_status: asRecord(state.setup).status === "unresolved" ? "unresolved" : null,
 			current_ambiguity: nullableScore(state.current_ambiguity),
 			ambiguity_milestone: ["initial", "progress", "refined", "ready"].includes(String(state.ambiguity_milestone))
 				? state.ambiguity_milestone
+				: null,
+			next_action: ["continue_interview", "confirm_continuation", "begin_closure"].includes(
+				String(state.next_action),
+			)
+				? state.next_action
+				: null,
+			next_action_reason: [
+				"minimum_context",
+				"tiered_confirmation",
+				"diminishing_returns",
+				"ambiguity_threshold_reached",
+				"hard_cap_reached",
+			].includes(String(state.next_action_reason))
+				? state.next_action_reason
 				: null,
 			topology_status: asRecord(state.topology).status === "confirmed" ? "confirmed" : "pending",
 			state_revision: revision,
@@ -1746,7 +1788,9 @@ async function inspect(parsed: ParsedRepairCommand, cwd: string): Promise<DeepIn
 			collection = rounds.filter(round => round.lifecycle === "scored").map(round => roundProjection(round));
 		else if (selector === "pending")
 			collection = rounds
-				.filter(round => round.lifecycle === "answered" || round.lifecycle === "pending_scoring")
+				.filter(
+					round => round.round !== 0 && (round.lifecycle === "answered" || round.lifecycle === "pending_scoring"),
+				)
 				.map(round => roundProjection(round, true));
 		else if (selector === "facts")
 			collection = (Array.isArray(state.established_facts) ? state.established_facts : []).map(

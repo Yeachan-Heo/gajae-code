@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
@@ -303,6 +304,15 @@ export function isNativeDeepInterviewV1(value: Record<string, unknown>): boolean
 	return value.schema_version === 1 || (isPlainObject(value.state) && value.state.schema_version === 1);
 }
 
+function canonicalReceiptPath(filePath: string): string {
+	const resolved = path.resolve(filePath);
+	try {
+		return fsSync.realpathSync.native(resolved);
+	} catch {
+		return resolved;
+	}
+}
+
 export function verifyWorkflowEnvelopeReceiptValue(value: unknown, filePath: string): WorkflowReceiptVerification {
 	if (!isPlainObject(value)) return "receipt-malformed";
 	const native = isNativeDeepInterviewV1(value);
@@ -333,7 +343,7 @@ export function verifyWorkflowEnvelopeReceiptValue(value: unknown, filePath: str
 		typeof checksum.value !== "string" ||
 		!/^[0-9a-f]{64}$/.test(checksum.value) ||
 		typeof checksum.covered_path !== "string" ||
-		path.resolve(checksum.covered_path) !== path.resolve(filePath) ||
+		canonicalReceiptPath(checksum.covered_path) !== canonicalReceiptPath(filePath) ||
 		typeof checksum.computed_at !== "string" ||
 		!Number.isFinite(Date.parse(checksum.computed_at))
 	) {

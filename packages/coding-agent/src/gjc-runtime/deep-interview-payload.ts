@@ -80,7 +80,15 @@ const array = (
 });
 
 const DIMENSIONS = ["goal", "constraints", "criteria", "context"] as const;
-const dimensionScores = object(Object.fromEntries(DIMENSIONS.map(dimension => [dimension, score(false)])), false);
+const dimensionScores = object(
+	{
+		goal: score(false),
+		constraints: score(false),
+		criteria: score(false),
+		context: score(),
+	},
+	false,
+);
 const component = object(
 	{ id: id(false), name: string(1024), status: enumeration(["active", "deferred"]), active: boolean() },
 	false,

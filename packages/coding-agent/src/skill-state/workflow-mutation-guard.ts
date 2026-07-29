@@ -411,6 +411,33 @@ function extractEditTargets(args: unknown, tool: ToolWithEditMode): ExtractedTar
 function shellWords(argsText: string): string[] {
 	return argsText.match(/(?:[^\s'"\\]+|'[^']*'|"[^"]*")+/g) ?? [];
 }
+function shellControlSegments(command: string): string[] {
+	const segments: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | undefined;
+	for (let index = 0; index < command.length; index++) {
+		const char = command[index]!;
+		if (quote) {
+			current += char;
+			if (char === quote) quote = undefined;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			current += char;
+			continue;
+		}
+		if (char === ";" || char === "&" || char === "|" || char === "\n") {
+			if (current.trim()) segments.push(current.trim());
+			current = "";
+			continue;
+		}
+		current += char;
+	}
+	if (quote) return [];
+	if (current.trim()) segments.push(current.trim());
+	return segments;
+}
 
 function cleanShellWord(value: string): string {
 	return value.replace(/^['"]|['"]$/g, "");
@@ -471,10 +498,7 @@ function isPureGjcReadOnlyBashCommand(command: string): boolean {
 	const stripped = stripQuotedHeredocBodies(command);
 	if (stripped === null) return false;
 	if (/[`<>()]|\$\(|\$\{/.test(stripped)) return false;
-	const segments = stripped
-		.split(/\|\||&&|[|;&\n]/)
-		.map(segment => segment.trim())
-		.filter(segment => segment.length > 0);
+	const segments = shellControlSegments(stripped);
 	if (segments.length === 0) return false;
 	for (const segment of segments) {
 		const words = shellWords(segment);

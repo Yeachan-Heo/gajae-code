@@ -48,8 +48,8 @@ describe("deep-interview skill conflict-aware scoring contract", () => {
 	it("renders progress exclusively from version 1 native projection paths", () => {
 		const steps = extractSection(skill, "Steps");
 		const applyIndex = steps.indexOf("### Step 2d: Apply Round Result and Report Progress");
-		const applyCommandIndex = steps.indexOf("gjc deep-interview apply-round-result", applyIndex);
-		const reportEndIndex = steps.indexOf("### Step 2e: Check Soft Limits", applyCommandIndex);
+		const applyCommandIndex = steps.indexOf("gjc deep-interview prepare-and-apply-round-result", applyIndex);
+		const reportEndIndex = steps.indexOf("### Step 2e: Follow the Native Continuation Decision", applyCommandIndex);
 		const report = steps.slice(applyCommandIndex, reportEndIndex);
 		const projectionStart = stateSource.indexOf("export interface DeepInterviewRoundResultProjection");
 		const projectionEnd = stateSource.indexOf("\n}", projectionStart);
@@ -72,6 +72,8 @@ describe("deep-interview skill conflict-aware scoring contract", () => {
 			"ontology_counts.stable",
 			"ontology_counts.changed",
 			"ontology_counts.new",
+			"next_action",
+			"next_action_reason",
 			"transition.auto_answer_streak",
 			"transition.lifecycle",
 			"transition.round_key",
@@ -199,13 +201,21 @@ describe("deep-interview ask clarification contract", () => {
 });
 
 describe("deep-interview ouroboros ooo-interview parity port", () => {
-	it("documents the tiered confirmation cadence while keeping the hard cap (feature B)", () => {
-		expect(skill).toMatch(/Tiered Confirmation Cadence/i);
-		expect(skill).toMatch(/Rounds 1-3 \(auto-continue\)/i);
-		expect(skill).toMatch(/Rounds 4-15 \(ask to continue\)/i);
-		expect(skill).toMatch(/Rounds 16\+ \(diminishing-returns warning\)/i);
-		expect(skill).toMatch(/never removes this hard safety cap/i);
-		expect(skill).toContain("Round 100");
+	it("routes continuation exclusively from the native finite-state decision (feature B)", () => {
+		expect(skill).toContain("### Step 2e: Follow the Native Continuation Decision");
+		for (const token of [
+			"continue_interview",
+			"confirm_continuation",
+			"begin_closure",
+			"minimum_context",
+			"tiered_confirmation",
+			"diminishing_returns",
+			"ambiguity_threshold_reached",
+			"hard_cap_reached",
+		])
+			expect(skill).toContain(token);
+		expect(skill).toContain("must not calculate the cadence or hard cap from `{n}`");
+		expect(skill).toContain("101st scoring transaction");
 	});
 
 	it("documents advisory fanout lanes distinct from the milestone panel (feature C)", () => {
@@ -239,10 +249,12 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 describe("deep-interview CLI-owned draft contract", () => {
 	it("uses drafts for all normal-flow payloads and preserves recorder-first answers", () => {
 		const steps = extractSection(skill, "Steps");
-		for (const kind of ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"]) {
+		for (const kind of ["initialize-context", "confirm-topology", "record-answer"]) {
 			expect(steps).toContain(`--for ${kind}`);
 			expect(steps).toContain(`${kind} --draft-id <draft_id>`);
 		}
+		expect(steps).toContain("prepare-and-apply-round-result");
+		expect(steps).not.toContain("draft create --for apply-round-result");
 		expect(steps).not.toContain("draft create --kind");
 		for (const forbidden of ["--input-json", "--question-json", "--answer-json", "--result-json"]) {
 			expect(steps).not.toContain(forbidden);
@@ -295,7 +307,7 @@ describe("deep-interview CLI-owned draft contract", () => {
 		expect(normalFlowDocs).not.toMatch(
 			/\bgjc deep-interview draft consume\b|--input-json|--question-json|--answer-json|--result-json/,
 		);
-		expect(typedConsumeExamples).toHaveLength(8);
+		expect(typedConsumeExamples).toHaveLength(7);
 		expect(normalFlowDocs).toContain("--draft-id ID --expected-draft-revision <latest_draft_revision> --json");
 		for (const example of typedConsumeExamples) {
 			expect(example).toContain("--expected-draft-revision <latest_draft_revision>");

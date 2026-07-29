@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { deriveAmbiguityMilestone, scoreToUnits } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-ambiguity";
 import {
@@ -416,6 +417,44 @@ describe("deep-interview v1 core contracts", () => {
 		);
 		expect(verifyWorkflowEnvelopeReceiptValue({ receipt: null }, filePath)).toBe("receipt-malformed");
 		expect(verifyWorkflowEnvelopeReceiptValue({ skill: "other" }, filePath)).toBe("legacy");
+	});
+	it("accepts a receipt path reached through a filesystem symlink alias", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-receipt-alias-"));
+		const realDirectory = path.join(root, "real");
+		const aliasDirectory = path.join(root, "alias");
+		await fs.mkdir(realDirectory);
+		await fs.symlink(realDirectory, aliasDirectory, "dir");
+		const realPath = path.join(realDirectory, "state.json");
+		const aliasPath = path.join(aliasDirectory, "state.json");
+		const envelope = {
+			skill: "deep-interview",
+			schema_version: 1,
+			receipt: {
+				version: 1,
+				skill: "deep-interview",
+				owner: "gjc-hook",
+				command: "skill activation",
+				state_path: path.join(realDirectory, "active.json"),
+				storage_path: realPath,
+				mutated_at: "2026-01-01T00:00:00.000Z",
+				fresh_until: "2026-01-01T00:30:00.000Z",
+				status: "fresh",
+				mutation_id: "m1",
+				content_sha256: {
+					algorithm: "sha256",
+					value: "",
+					covered_path: realPath,
+					computed_at: "2026-01-01T00:00:00.000Z",
+				},
+			},
+		};
+		envelope.receipt.content_sha256.value = workflowEnvelopeContentSha256(envelope);
+		await Bun.write(realPath, JSON.stringify(envelope));
+		try {
+			expect(verifyWorkflowEnvelopeReceiptValue(envelope, aliasPath)).toBe("native-valid");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 	it("persists component scores before flooring and validates v1 lifecycle safety", () => {
 		const envelope = {

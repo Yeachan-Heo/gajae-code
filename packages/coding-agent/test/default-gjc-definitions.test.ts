@@ -113,7 +113,9 @@ describe("default GJC definitions", () => {
 		expect(normalFlow).toContain("confirm-topology");
 		expect(normalFlow).toContain("record-answer");
 		expect(normalFlow).toContain("apply-round-result");
+		expect(normalFlow).toContain("prepare-and-apply-round-result");
 		expect(normalFlow).toContain("sanity-check");
+		expect(normalFlow).not.toContain("draft create --for apply-round-result");
 		expect(normalFlow).not.toMatch(/gjc state(?: deep-interview)? write --input/);
 
 		const publicExamples = DeepInterview.examples;
@@ -230,6 +232,16 @@ describe("default GJC definitions", () => {
 			{ name: "null", type: "boolean", required: false },
 			{ name: "op", type: "enum", required: true },
 			{ name: "path", type: "string", required: true },
+			{ name: "value", type: "string", required: false },
+			{ name: "value-file", type: "string", required: false },
+		]);
+		expect(argsFor("prepare-and-apply-round-result")).toEqual([
+			{ name: "json", type: "boolean", required: true },
+			{ name: "null", type: "boolean", required: false },
+			{ name: "op", type: "enum", required: true },
+			{ name: "path", type: "string", required: true },
+			{ name: "round-key", type: "string", required: false },
+			{ name: "session-id", type: "string", required: true },
 			{ name: "value", type: "string", required: false },
 			{ name: "value-file", type: "string", required: false },
 		]);

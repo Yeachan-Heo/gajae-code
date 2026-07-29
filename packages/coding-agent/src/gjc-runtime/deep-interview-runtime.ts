@@ -5,7 +5,7 @@ import { getConfigRootDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { scoreToUnits } from "./deep-interview-ambiguity";
-import { runDeepInterviewDraftCommand } from "./deep-interview-draft";
+import { runDeepInterviewDraftCommand, runDeepInterviewDraftPrepareAndConsumeCommand } from "./deep-interview-draft";
 import { runDeepInterviewPostCommitEffects } from "./deep-interview-recorder";
 import { isDeepInterviewRepairVerb, runDeepInterviewRepairCommand } from "./deep-interview-repair";
 import {
@@ -1006,6 +1006,10 @@ function isDeepInterviewDraftInvocation(args: readonly string[]): boolean {
 	const separator = args.indexOf("--");
 	return (separator === -1 || separator > 0) && args[0] === "draft";
 }
+function isDeepInterviewPrepareAndApplyInvocation(args: readonly string[]): boolean {
+	const separator = args.indexOf("--");
+	return (separator === -1 || separator > 0) && args[0] === "prepare-and-apply-round-result";
+}
 function draftCommandArgs(args: readonly string[]): string[] {
 	const normalized: string[] = [];
 	for (let index = 1; index < args.length; index++) {
@@ -1027,6 +1031,8 @@ export async function runNativeDeepInterviewCommand(
 ): Promise<DeepInterviewCommandResult> {
 	try {
 		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd);
+		if (isDeepInterviewPrepareAndApplyInvocation(args))
+			return await runDeepInterviewDraftPrepareAndConsumeCommand(args.slice(1), "apply-round-result", cwd);
 		if (isDeepInterviewRepairInvocation(args)) return await runDeepInterviewRepairCommand(args, cwd);
 		if (isDeepInterviewDraftInvocation(args)) return await runDeepInterviewDraftCommand(draftCommandArgs(args), cwd);
 		const resolved = await resolveDeepInterviewArgs(args, cwd);

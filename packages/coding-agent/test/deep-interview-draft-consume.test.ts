@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { runDeepInterviewDraftCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-draft";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { transformGuardedWorkflowEnvelopeAtomic } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 
 type CommandResult = { status: number; stdout?: string; stderr?: string };
 type Draft = { id: string; draft_revision: number; base_revision: number; receipt?: Record<string, unknown> };
@@ -184,6 +185,72 @@ describe("CLI-owned deep-interview draft consumption", () => {
 			const replay = json(await consume(env.cwd, "initialize-context", prepared));
 			expect(replay.receipt).toEqual(first.receipt);
 			expect((await state(env.cwd, "setup")).state_revision).toBe(1);
+		} finally {
+			await env.restore();
+		}
+	});
+	it("fills an unresolved empty native idea without treating the seed placeholder as setup conflict", async () => {
+		const env = await workspace();
+		try {
+			const session = "late-idea";
+			await kickoff(env.cwd, session);
+			await transformGuardedWorkflowEnvelopeAtomic(modeStatePath(env.cwd, session, "deep-interview"), {
+				cwd: env.cwd,
+				expectedRevision: 0,
+				receipt: {
+					cwd: env.cwd,
+					skill: "deep-interview",
+					owner: "gjc-runtime",
+					command: "test seed empty idea",
+					sessionId: session,
+				},
+				transform(current) {
+					const state = current.state as Record<string, unknown>;
+					return { kind: "write", value: { ...current, state: { ...state, initial_idea: "" } } };
+				},
+			});
+
+			const created = await create(env.cwd, "initialize-context", session);
+			const prepared = draft(
+				await native(env.cwd, [
+					"draft",
+					"edit",
+					"--draft-id",
+					created.id,
+					"--expected-draft-revision",
+					String(created.draft_revision),
+					"--op",
+					"set",
+					"--path",
+					"/type",
+					"--value",
+					"greenfield",
+					"--op",
+					"set",
+					"--path",
+					"/threshold",
+					"--value",
+					"0.05",
+					"--op",
+					"set",
+					"--path",
+					"/initial_idea",
+					"--value",
+					"철학적 AI사용에 대한 복잡한 의사결정 아무거나",
+					"--op",
+					"set",
+					"--path",
+					"/threshold_source",
+					"--value",
+					"default",
+					"--json",
+				]),
+			);
+
+			expect(json(await consume(env.cwd, "initialize-context", prepared))).toMatchObject({ consumed: true });
+			expect((await state(env.cwd, session)).state).toMatchObject({
+				initial_idea: "철학적 AI사용에 대한 복잡한 의사결정 아무거나",
+			});
 		} finally {
 			await env.restore();
 		}

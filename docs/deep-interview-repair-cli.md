@@ -17,6 +17,14 @@ gjc deep-interview draft rebase  --draft-id ID --expected-draft-revision N --to-
 gjc deep-interview draft discard --draft-id ID --expected-draft-revision N --json
 ```
 
+Normal per-round scoring is a single public command. Repeat the bounded edit operation group inside the same invocation:
+
+```text
+gjc deep-interview prepare-and-apply-round-result --session-id ID [--round-key ROUND_KEY] (--op set|append|remove --path /pointer [--value SCALAR|--value-file PATH|--null])... --json
+```
+
+The command creates and consumes its recovery draft internally and returns the ordinary `native_projection` directly. On validation or consumption failure, the structured error includes the retained `draft_id` and `draft_revision`; use the draft commands above only to inspect and repair that failed attempt.
+
 Create returns `draft_id`, `draft_revision`, and state `base_revision`. Every edit/rebase is CAS on `draft_revision` and returns its next value; `draft edit` alone also accepts the literal `latest` (edits are payload-local — consume CAS stays strict). Each `--op` opens one operation group owning the `--path`/`--value`/`--value-file`/`--null` flags that follow it; several groups in one call apply atomically — either every operation lands in one draft write or the stored draft is untouched. `check` validates the complete bounded payload against current state without consuming or mutating it — including a read-only dry-run of the exact consume-side state transform (`apply-round-result` runs the same state invariants consume runs), so a `valid: true` check at a given `state_revision` cannot fail consume-side validation at that same revision; it also reports when the draft base is stale. To rebase a state-stale active draft, pass the caller-observed current state revision as `--to-state-revision`, then check again. Drafts are private workspace/session-bound CLI storage, atomically written with restrictive permissions, automatically expired/cleaned up, and retained briefly after consumption for idempotent receipts. Do not read, copy, or reconstruct draft storage.
 
 Use only kind-allowed JSON-pointer paths. `set` writes one scalar: use `--value` for strings/numbers/booleans, `--null` for null, and `--value-file` only for bounded text. A valueless `append` on a missing object-item array appends an `{}` scaffold; on a missing scalar-item array it initializes `[]`. An existing scalar-item array still requires `--value` or `--value-file` for `append`. `remove` takes no value. Build arrays and nested objects with scaffolds and scalar edits, never inline JSON.
@@ -72,7 +80,7 @@ Objects below are exact-key objects: unlisted keys are rejected. Optional proper
   /bookkeeping/round_ids/N: id required
   /component_updates/N/component_id: id required
   /component_updates/N/scores/constraints: score required
-  /component_updates/N/scores/context: score required
+  /component_updates/N/scores/context: score
   /component_updates/N/scores/criteria: score required
   /component_updates/N/scores/goal: score required
   /fact_ops/N/component: text
@@ -83,7 +91,7 @@ Objects below are exact-key objects: unlisted keys are rejected. Optional proper
   /fact_ops/N/statement: text
   /fact_ops/N/target_id: id
   /global_scores/constraints: score required
-  /global_scores/context: score required
+  /global_scores/context: score
   /global_scores/criteria: score required
   /global_scores/goal: score required
   /ontology/entities/N/fields/N: text required
@@ -232,7 +240,7 @@ Closed view schemas:
 {"TopologyView":{"status":"pending | confirmed","confirmed_at":"string | null","components":["ComponentView"],"deferrals":["DeferralView"],"last_targeted_component_id":"ID | null"},"ComponentView":{"id":"string","name":"TextView","description":"TextView | null","active":true,"deferred":false,"scores":{"goal":0.5,"constraints":0.5,"criteria":0.5,"context":0.5},"weakest_dimension":"goal | constraints | criteria | context | null"},"DeferralView":{"component_id":"string","reason":"TextView","created_at":"string","until_round":null}}
 {"FloorView":{"floor":0.5,"disputed_fact_count":0,"unscored_active_component_count":0,"auto_answer_ratio":0.5,"weighted_ambiguity":0.5,"effective_ambiguity":0.5}}
 ```
-`prior_dimension_score`, `new_dimension_score`, `prior_effective_ambiguity`, and `new_effective_ambiguity` are native-derived from persisted scored round records. All four are `null` for `disputed` and `unresolved` triggers; active-trigger metrics are nullable only when the historical metric is unavailable. `recent-scored` uses `RoundView`; `pending` uses `PendingRoundView`. Canonical stored deferral IDs are adapted only at this projection boundary: `reason` is an empty `TextView`, `created_at` is the topology confirmation timestamp, and `until_round` is `null`.
+`prior_dimension_score`, `new_dimension_score`, `prior_effective_ambiguity`, and `new_effective_ambiguity` are native-derived from persisted scored round records. All four are `null` for `disputed` and `unresolved` triggers; active-trigger metrics are nullable only when the historical metric is unavailable. `recent-scored` uses `RoundView`; `pending` uses `PendingRoundView` and excludes the Round 0 topology-confirmation shell because it is never scored. Canonical stored deferral IDs are adapted only at this projection boundary: `reason` is an empty `TextView`, `created_at` is the topology confirmation timestamp, and `until_round` is `null`.
 
 Paged collections sort deterministically: recent scored by descending `(round, round_key)`; pending by ascending `(round, round_key)`; facts by `(id, insertion index)`; triggers by `(source round, source round key, insertion index)`. Default limit is 10, maximum is 25. Data is capped at 16 KiB and the complete response at 48 KiB. `next_cursor` is an opaque base64url v1 token bound to selector, revision, view hash, and the last sort key. Reuse it only with the same unchanged view: malformed/mismatched cursors yield `DI_CURSOR_INVALID`; changed revision/view yields `DI_CURSOR_STALE`. A topology projection that cannot fit the 16 KiB admission limit yields `DI_OUTPUT_LIMIT_EXCEEDED` and exit 2. For `inspect`, a single item or non-paged view that cannot fit its applicable data or response limit yields `DI_OUTPUT_LIMIT_EXCEEDED` and exit 3.
 
@@ -276,6 +284,7 @@ Errors are JSON on stderr: `{ "ok": false, "issue": { "code": "…", "message": 
 | `counter_deltas_must_be_safe_integers` | Every counter delta and existing counter value must be a safe integer. |
 | `threshold_must_be_valid_score` | state.threshold must be a number in [0,1] with 4-decimal precision. |
 | `threshold_units_must_match_threshold` | state.threshold_units must be a safe integer in [1,10000] equal to scoreToUnits(threshold). |
+| `scored_round_count_must_not_exceed_hard_cap` | Deep-interview scoring permits at most 100 committed non-Round-0 transactions. |
 | `active_trigger_requires_score_regression` | An active trigger requires a prior scored round whose dimension score did not improve and whose effective ambiguity increased. |
 | `envelope_schema_invalid` | The persisted deep-interview envelope failed native v1 schema validation at the reported path. |
 <!-- END GENERATED: deep-interview-state-invariants -->

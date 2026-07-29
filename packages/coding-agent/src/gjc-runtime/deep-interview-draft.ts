@@ -215,6 +215,33 @@ function response(status: number, value: unknown): DeepInterviewDraftResult {
 		stderr: `${JSON.stringify({ ok: false, issue: draftIssue(String(value)) })}\n`,
 	};
 }
+class DraftOperationError extends Error {
+	constructor(
+		code: string,
+		readonly operationIndex: number,
+		readonly path: string | undefined,
+	) {
+		super(code);
+		this.name = "DraftOperationError";
+	}
+}
+
+function errorResponse(status: number, error: unknown): DeepInterviewDraftResult {
+	const errorCode = code(error);
+	return {
+		status,
+		stderr: `${JSON.stringify({
+			ok: false,
+			issue: {
+				...draftIssue(errorCode),
+				...(error instanceof DraftOperationError
+					? { operation_index: error.operationIndex, path: error.path ?? null }
+					: {}),
+			},
+		})}\n`,
+	};
+}
+
 const EDIT_OP_FLAGS = ["--op", "--path", "--value", "--value-file", "--null"] as const;
 
 /**
@@ -946,7 +973,13 @@ async function runDeepInterviewDraftCommandInternal(
 					throw new Error("DI_DRAFT_REVISION_CONFLICT");
 				// All ops apply to the in-memory payload and persist in one write, so a
 				// batch either lands atomically or fails leaving the stored draft untouched.
-				for (const op of parsedEdit!.ops) await editPayload(draft, op);
+				for (const [operationIndex, operation] of parsedEdit!.ops.entries()) {
+					try {
+						await editPayload(draft, operation);
+					} catch (error) {
+						throw new DraftOperationError(code(error), operationIndex, operation.get("--path"));
+					}
+				}
 				draft.draft_revision++;
 				draft.updated_at = new Date().toISOString();
 				await write(cwd, draft);
@@ -1068,7 +1101,7 @@ async function runDeepInterviewDraftCommandInternal(
 			return response(0, { ok: true, draft_id: id, consumed: true, receipt: draft.receipt });
 		});
 	} catch (error) {
-		return response(code(error) === "DI_STATE_REVISION_CONFLICT" ? 3 : 2, code(error));
+		return errorResponse(code(error) === "DI_STATE_REVISION_CONFLICT" ? 3 : 2, error);
 	}
 }
 export async function runDeepInterviewDraftCommand(
@@ -1076,6 +1109,84 @@ export async function runDeepInterviewDraftCommand(
 	cwd: string,
 ): Promise<DeepInterviewDraftResult> {
 	return runDeepInterviewDraftCommandInternal(input, cwd, false);
+}
+
+function draftRecoveryResult(result: DeepInterviewDraftResult, draft: Draft): DeepInterviewDraftResult {
+	if (result.status === 0) return result;
+	let issue: Record<string, unknown>;
+	try {
+		const parsed = JSON.parse(result.stderr ?? "{}") as { issue?: Record<string, unknown> };
+		issue = parsed.issue ?? draftIssue("DI_DRAFT_INTERNAL_ERROR");
+	} catch {
+		issue = draftIssue("DI_DRAFT_INTERNAL_ERROR");
+	}
+	return {
+		status: result.status,
+		stderr: `${JSON.stringify({
+			ok: false,
+			issue: {
+				...issue,
+				draft_id: draft.id,
+				draft_revision: draft.draft_revision,
+				recovery:
+					issue.recovery ??
+					`Run draft show for ${draft.id}, correct it with draft edit, then retry apply-round-result.`,
+			},
+		})}\n`,
+	};
+}
+
+export async function runDeepInterviewDraftPrepareAndConsumeCommand(
+	input: readonly string[],
+	kind: DeepInterviewDraftKind,
+	cwd: string,
+): Promise<DeepInterviewDraftResult> {
+	try {
+		if (kind !== "apply-round-result") throw new Error("DI_UNKNOWN_COMMAND");
+		const parsed = parseEditInput(["prepare-and-consume", ...input]);
+		allow(parsed.flags, ["--session-id", "--round-key", "--json"]);
+		if (!parsed.flags.has("--json")) throw new Error("DI_INVALID_ARGUMENT");
+
+		const createInput = ["create", "--kind", kind, "--session-id", required(parsed.flags, "--session-id")];
+		const roundKey = parsed.flags.get("--round-key");
+		if (roundKey) createInput.push("--round-key", roundKey);
+		createInput.push("--json");
+		const created = await runDeepInterviewDraftCommandInternal(createInput, cwd, false);
+		if (created.status !== 0) return created;
+
+		let draft = (JSON.parse(created.stdout ?? "{}") as { draft: Draft }).draft;
+		const editInput = ["edit", "--draft-id", draft.id, "--expected-draft-revision", String(draft.draft_revision)];
+		for (const operation of parsed.ops) {
+			for (const [flag, value] of operation) {
+				editInput.push(flag);
+				if (flag !== "--null") editInput.push(value);
+			}
+		}
+		editInput.push("--json");
+		const edited = await runDeepInterviewDraftCommandInternal(editInput, cwd, false);
+		if (edited.status !== 0) return draftRecoveryResult(edited, draft);
+
+		draft = (JSON.parse(edited.stdout ?? "{}") as { draft: Draft }).draft;
+		const consumed = await runDeepInterviewDraftCommandInternal(
+			[
+				"consume-internal",
+				"--draft-id",
+				draft.id,
+				"--expected-draft-revision",
+				String(draft.draft_revision),
+				"--kind",
+				kind,
+			],
+			cwd,
+			true,
+		);
+		if (consumed.status !== 0) return draftRecoveryResult(consumed, draft);
+		const receipt = (JSON.parse(consumed.stdout ?? "{}") as { receipt?: Record<string, unknown> }).receipt;
+		if (!receipt) throw new Error("DI_DRAFT_INTERNAL_ERROR");
+		return response(0, receipt);
+	} catch (error) {
+		return errorResponse(code(error) === "DI_STATE_REVISION_CONFLICT" ? 3 : 2, error);
+	}
 }
 
 export async function runDeepInterviewDraftInternalConsumeCommand(

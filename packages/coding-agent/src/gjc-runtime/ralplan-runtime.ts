@@ -995,7 +995,8 @@ function persistedRoleStatePayload(update: PersistedRoleStateUpdate): Record<str
 	}
 	if (update.resumable !== undefined) payload[`${prefix}_resumable`] = update.resumable;
 	if (update.fallbackReason !== undefined) payload[`${prefix}_fallback_reason`] = update.fallbackReason;
-	if (update.fallbackAttemptedId !== undefined) payload[`${prefix}_fallback_attempted_id`] = update.fallbackAttemptedId;
+	if (update.fallbackAttemptedId !== undefined)
+		payload[`${prefix}_fallback_attempted_id`] = update.fallbackAttemptedId;
 	if (update.fallbackStageN !== undefined) payload[`${prefix}_fallback_stage_n`] = update.fallbackStageN;
 	if (update.fallbackReceiptPath !== undefined) {
 		payload[`${prefix}_fallback_receipt_path`] = update.fallbackReceiptPath;

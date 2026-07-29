@@ -293,7 +293,8 @@
       },
       {
         "appliesToVerbs": [
-          "draft create"
+          "draft create",
+          "prepare-and-apply-round-result"
         ],
         "name": "round-key",
         "type": "string"
@@ -365,7 +366,8 @@
       },
       {
         "appliesToVerbs": [
-          "draft edit"
+          "draft edit",
+          "prepare-and-apply-round-result"
         ],
         "enumValues": [
           "set",
@@ -378,7 +380,8 @@
       },
       {
         "appliesToVerbs": [
-          "draft edit"
+          "draft edit",
+          "prepare-and-apply-round-result"
         ],
         "name": "path",
         "required": true,
@@ -386,21 +389,24 @@
       },
       {
         "appliesToVerbs": [
-          "draft edit"
+          "draft edit",
+          "prepare-and-apply-round-result"
         ],
         "name": "value",
         "type": "string"
       },
       {
         "appliesToVerbs": [
-          "draft edit"
+          "draft edit",
+          "prepare-and-apply-round-result"
         ],
         "name": "value-file",
         "type": "string"
       },
       {
         "appliesToVerbs": [
-          "draft edit"
+          "draft edit",
+          "prepare-and-apply-round-result"
         ],
         "name": "null",
         "type": "boolean"
@@ -425,6 +431,7 @@
           "confirm-topology",
           "record-answer",
           "apply-round-result",
+          "prepare-and-apply-round-result",
           "inspect",
           "sanity-check"
         ],
@@ -435,7 +442,8 @@
       {
         "appliesToVerbs": [
           "inspect",
-          "sanity-check"
+          "sanity-check",
+          "prepare-and-apply-round-result"
         ],
         "name": "session-id",
         "required": true,
@@ -680,6 +688,10 @@
       },
       {
         "name": "apply-round-result",
+        "surface": "command-positional"
+      },
+      {
+        "name": "prepare-and-apply-round-result",
         "surface": "command-positional"
       },
       {

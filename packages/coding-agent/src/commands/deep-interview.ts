@@ -3,7 +3,7 @@ import { runNativeDeepInterviewCommand } from "../gjc-runtime/deep-interview-run
 
 export default class DeepInterview extends Command {
 	static description =
-		"Run native GJC deep-interview workflow. Use `draft` for editable CLI-owned mutation inputs; JSON repair verbs are compatibility-only.";
+		"Run native GJC deep-interview workflow. Per-round scoring uses one atomic prepare-and-apply command; drafts remain available for recovery.";
 	static strict = false;
 	static flags = {
 		quick: Flags.boolean({ description: "Seed a quick deep-interview run" }),
@@ -32,6 +32,7 @@ export default class DeepInterview extends Command {
 		"$ gjc deep-interview draft edit --draft-id <id> --expected-draft-revision 1 --op set --path /type --value greenfield --json",
 		"$ gjc deep-interview draft check --draft-id <id> --json",
 		"$ gjc deep-interview initialize-context --draft-id <id> --expected-draft-revision <n> --json",
+		"$ gjc deep-interview prepare-and-apply-round-result --session-id <id> --round-key <key> --op set --path /global_scores/goal --value 0.8 --json",
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md --json",
 		"$ gjc deep-interview inspect --session-id <id> --selector summary --json",
 	];

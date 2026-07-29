@@ -92,6 +92,7 @@ source: "forked from upstream deep-interview skill and rebranded for GJC"
 ## Native Plugin Invocation Guard (Issue #3030)
 
 If this raw bundled skill is loaded by GJC's native skill loader through `/skill:deep-interview`, do not treat that path as permission to skip rendered GJC setup. The user-facing invocation is `/skill:deep-interview`; do not recommend or advertise CLI bridge commands as the deep-interview entrypoint. Regardless of invocation path, Phase 0 below remains blocking and must resolve `gjc.deepInterview.ambiguityThreshold` from pre-resolved native state or settings before any announcement, state write, question, or ambiguity score.
+For native `/skill:deep-interview` runs, `$GJC_SESSION_ID` is the authoritative current session ID. Use it directly in CLI commands. Never search session logs, `.gjc/`, runtime files, or process listings to rediscover it.
 
 ## Corrupt current-session state recovery
 
@@ -104,11 +105,12 @@ Complete this phase before Phase 1, before brownfield exploration, before GJC st
 
 1. **Inspect the native summary first**:
    - Run `gjc deep-interview inspect --session-id <id> --selector summary --json`.
-   - If the summary contains a finite `threshold` and its preserved source is available from native state, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
-2. **Only if native state lacks a resolved threshold, read threshold settings in runtime precedence order**:
+   - If the summary contains a finite `threshold` and a `threshold_source` text value, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and **do not** read config/settings files. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
+2. **Only if native state lacks either the threshold or its source, read threshold settings in runtime precedence order**:
+   - Use `find`/`read` only; never run `bash`, `bun`, `node`, `python`, or ad-hoc filesystem probes to discover optional config. Missing optional config/settings files are expected and must not appear as failed reads.
    - YAML config first: read the **single** modern config path the environment selects — `$GJC_CODING_AGENT_DIR/config.yml` when `GJC_CODING_AGENT_DIR` is set, else `$GJC_CONFIG_DIR/agent/config.yml` when `GJC_CONFIG_DIR` is set, else `~/.gjc/agent/config.yml`. Do not cascade through the other YAML locations when the selected one is absent or invalid.
-   - Then JSON settings: project settings `./.gjc/settings.json`, then user settings `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`.
-   - Read `gjc.deepInterview.ambiguityThreshold` only from files that are known to exist; optional config/settings-file absence is expected and must not be surfaced as failed `Read` calls.
+   - Then JSON settings: project settings `./.gjc/settings.json`, then user settings `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`, but only after a `find` result confirms the exact file exists.
+   - Read `gjc.deepInterview.ambiguityThreshold` only from files that are known to exist.
    - Do not probe arbitrary ancestor candidates such as `../../.gjc/settings.json`; use the current project `.gjc/settings.json` and user settings only.
 3. **Resolve threshold and source**:
    - Use the first valid configured value in the precedence order above; otherwise use the mode default when a resolution flag was passed: `--quick` = `0.6`, `--standard` = `0.5`, `--deep` = `0.35`; with no resolution flag, use the base default `0.05`.
@@ -158,7 +160,7 @@ Run this phase only when the active deep-interview state or invocation indicates
 
 ## Phase 1: Initialize
 
-1. **Parse the user's idea** from the user request appended after this skill as the final `User:` line
+1. **Parse the user's idea** from the user request appended after this skill as the final `User:` line, or from `inspect --selector summary` when native state already has `initial_idea`. If the idea is missing, `null`, empty, or only an operational placeholder such as "No concrete project idea was appended...", stop before any draft command and ask the user for the actual idea with `ask`. The answer to that `ask` becomes `<prompt-safe idea>`; never write a placeholder into `/initial_idea`, never lock topology, and never score ambiguity before the actual idea is known.
 2. **Detect brownfield vs greenfield**:
    - Use focused read/search tools or a canonical read-only role agent (`planner`/`architect`) to check if cwd has existing source code, package files, or git history
    - If source files exist AND the user's idea references modifying/extending something: **brownfield**
@@ -182,17 +184,15 @@ Run this phase only when the active deep-interview state or invocation indicates
    - Preferred: pass the spec markdown **inline** to the native deep-interview write command (`--write … --spec "<markdown>"`) — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/_session-{sessionid}/specs`.
    - Only if a spec is too large to pass inline, stage it with the `write` tool to a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree, then pass that path to `--spec`. The planning phase-boundary block tolerates these neutral temp writes; never stage interview artifacts inside the repo or under `.gjc/`, and do not improvise repo-relative scratch files.
 
-4. **Initialize through a CLI-owned draft.** Create an `initialize-context` draft, edit only its bounded fields, check it, then consume it through the typed command. Never serialize a setup request, envelope, or derived values inline:
+4. **Initialize through a CLI-owned draft only for missing setup fields.** Create an `initialize-context` draft, edit only bounded setup fields, check it, then consume it through the typed command. Never serialize a setup request, envelope, or derived values inline. The native kickoff has usually already seeded `type`, `threshold`, `threshold_source`, and possibly a structured `language` object; reuse exact existing values for required setup fields, fill missing/empty `initial_idea` from the user's free-text answer, and do **not** write `/language` unless native state lacks language entirely and you are writing a plain language instruction string. Do not write labels such as `"Korean"` over native `state.language`, and do not invent threshold-source labels such as `"base default"` when native state says `"default"`.
 ```sh
 gjc deep-interview draft create --for initialize-context --session-id <id> --json
 # Capture draft_id and draft_revision from the response.
-gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /type --value greenfield --json
-gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /initial_idea --value "<prompt-safe idea>" --json
-gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /threshold_source --value "<source>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /type --value <existing_or_detected_type> --op set --path /threshold --value <resolvedThreshold> --op set --path /initial_idea --value "<prompt-safe idea>" --op set --path /threshold_source --value "<resolvedThresholdSource>" --json
 gjc deep-interview draft check --draft-id <draft_id> --json
 gjc deep-interview initialize-context --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
-`draft create` records the state base revision; every edit returns the next `draft_revision`. The native runtime validates, consumes, stamps, and owns the complete state. Retain the returned state revision for inspection only; mutations consume their own checked draft.
+`draft create` records the state base revision; every edit returns the next `draft_revision`. One `draft edit` may contain multiple `--op` groups, applied atomically in a single draft write. The native runtime validates, consumes, stamps, and owns the complete state. Retain the returned state revision for inspection only; mutations consume their own checked draft.
 
 5. **Announce the interview** to the user:
 
@@ -316,7 +316,7 @@ Options should include contextually relevant choices plus free-text, translated/
 
 After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only (DIPP-5); preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
 
-When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line. Recorder-first remains mandatory. If the runtime did not record the answer shell, inspect `pending` or `round` to obtain its identity, then create a `record-answer` draft with that identity, edit scalar leaves, scaffold option arrays, and consume it:
+When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line. Recorder-first remains mandatory. After a recorded answer, run `gjc deep-interview inspect --session-id <id> --selector pending --limit 1 --json` to obtain the oldest scoreable non-topology shell identity. If the runtime did not record the answer shell, then create a `record-answer` draft with the known ask identity, edit scalar leaves, scaffold option arrays, and consume it:
 ```sh
 gjc deep-interview draft create --for record-answer --session-id <id> --round <n> --question-id <id> [--round-id <id>] [--component-id <id>] [--dimension <dimension>] --json
 gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /question --value "<question>" --json
@@ -431,16 +431,12 @@ Respond as JSON. Include an additional "ontology" key containing the entities ar
 **Ontology input:** provide entities, relationships, and concise reasoning in `RoundResult`. The runtime determines first-round/no-entity handling, exact-name stability, deterministic renamed matching, counts, ratio, and snapshot persistence. Report the returned ontology result; do not send caller-computed counts, ratios, or snapshots.
 
 ### Step 2d: Apply Round Result and Report Progress
-After `ask` has recorded (or `record-answer` has recovered) the answer shell, inspect `pending` or `round` for its identity. Create an `apply-round-result` draft, edit only bounded scorer evidence, check it, and consume it once:
+After `ask` has recorded (or `record-answer` has recovered) the answer shell, run exactly `gjc deep-interview inspect --session-id <id> --selector pending --limit 1 --json` for the oldest scoreable non-topology shell, or inspect `round` with a known round key. There is no `gjc deep-interview pending` command. Round 0 topology confirmation is excluded from `pending`. Use the returned identity directly; do not probe unsupported selectors, pipe JSON through shell helpers, or inspect `.gjc/` files. Prepare and apply all bounded scorer evidence in one public command; repeat the `--op ... --path ...` group inside that command for every `RoundResult` field:
+For `greenfield`, send exactly `goal`, `constraints`, and `criteria` scores; never set a `/global_scores/context` or `/component_updates/*/scores/context` path. `context` is mandatory only for `brownfield`. A retained recovery draft may remove an accidentally supplied optional `context` leaf with `draft edit --op remove`.
 ```sh
-gjc deep-interview draft create --for apply-round-result --session-id <id> --round-key <round_key> --json
-gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /global_scores/goal --value 0.8 --json
-gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /component_updates --json
-gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /component_updates/0/component_id --value <component_id> --json
-gjc deep-interview draft check --draft-id <draft_id> --json
-gjc deep-interview apply-round-result --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
+gjc deep-interview prepare-and-apply-round-result --session-id <id> --round-key <round_key> --op set --path /global_scores/goal --value 0.8 --op append --path /component_updates --op set --path /component_updates/0/component_id --value <component_id> --json
 ```
-`RoundResult` remains candidate scores, component updates, triggers, fact operations, ontology input, targeting, and bookkeeping only. The runtime performs one authoritative transaction, returns native-derived scoring and the new revision, and rejects stale, conflicting, malformed, or unrecoverable state. Never enrich a round through `gjc state write`.
+`RoundResult` remains candidate scores, component updates, triggers, fact operations, ontology input, targeting, and bookkeeping only. The runtime creates, validates, and consumes its recovery draft internally, performs one authoritative state transaction, and returns native-derived scoring plus the new revision. Do not issue separate `draft create`, `draft edit`, `draft check`, or `apply-round-result` commands for a normal scored round. If preparation or consumption fails, the structured error exposes the retained `draft_id` and `draft_revision`; only then use `draft show|edit|rebase|discard` for recovery. Never enrich a round through `gjc state write`.
 
 After the typed transaction succeeds, consume `<native>.native_projection` as the version 1 native projection. Render only the paths listed below; do not report candidate values, inspect-state values, locally calculated values, names, weights, gaps, thresholds, ratios, causes, or milestone transitions that the projection does not expose.
 
@@ -454,21 +450,24 @@ Topology: target {<native>.native_projection.targeting.target_component_id}; act
 Ontology: stable {<native>.native_projection.ontology_counts.stable}; changed {<native>.native_projection.ontology_counts.changed}; new {<native>.native_projection.ontology_counts.new}
 Next target: {<native>.native_projection.targeting.target_component_id} / {<native>.native_projection.targeting.target_dimension}
 Auto-answer streak: {<native>.native_projection.transition.auto_answer_streak}
+Next action: {<native>.native_projection.next_action} ({<native>.native_projection.next_action_reason})
 ```
 
 `prior_effective_ambiguity` may be `null` on the first scored round; show that returned value rather than inventing a prior percentage. The transition lifecycle and round identity remain available at `<native>.native_projection.transition.lifecycle` and `<native>.native_projection.transition.round_key` for control flow, but are not progress prose.
 
 Apply `language.instruction` when present before showing this progress report; apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing while preserving the real native projection paths and fixed report structure.
 
-### Step 2e: Check Tiered Confirmation Cadence
+### Step 2e: Follow the Native Continuation Decision
 
-Confirmation cadence is tiered by round, adopted from ouroboros's ooo interview, while the hard safety cap is retained:
+Route mechanically from `<native>.native_projection.next_action` and `.next_action_reason`. You must not calculate the cadence or hard cap from `{n}`, a caller-supplied round number, ambiguity prose, or transcript length:
 
-- **Rounds 1-3 (auto-continue)**: minimum context gathering — proceed to the next question without a "continue?" prompt.
-- **Rounds 4-15 (ask to continue)**: after each round, ask "Continue, or proceed with current clarity ({<native>.native_projection.effective_ambiguity}%)?" so the user controls depth.
-- **Rounds 16+ (diminishing-returns warning)**: keep asking "Continue?" but prefix a diminishing-returns warning: "We're at {n} rounds (ambiguity: {<native>.native_projection.effective_ambiguity}%); each further round yields less. Continue or proceed?"
-- **Round 3+ early exit**: still allow immediate exit if the user says "enough", "let's go", "build it".
-- **Round 100 (hard cap)**: "Maximum interview rounds reached. Proceeding with current clarity level ({<native>.native_projection.effective_ambiguity}%)." The tiered cadence never removes this hard safety cap.
+- `continue_interview / minimum_context`: proceed to the next question without a continuation prompt.
+- `confirm_continuation / tiered_confirmation`: ask "Continue, or proceed with current clarity ({<native>.native_projection.effective_ambiguity}%)?"
+- `confirm_continuation / diminishing_returns`: ask the same choice with a diminishing-returns warning.
+- `begin_closure / ambiguity_threshold_reached`: enter Phase 4; a material closure gap may still return to Phase 2.
+- `begin_closure / hard_cap_reached`: enter Phase 4 and never start another scored interview round. Closure and restatement questions may collect corrections, but they must not create a 101st scoring transaction.
+
+An explicit user early exit still enters Phase 4. Any unknown action/reason pair is a fail-closed runtime-contract error: run `inspect --selector summary`, do not guess a branch, and do not issue another scoring command.
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
@@ -510,13 +509,13 @@ Input safety: user-facing free-text fields (an allowlist including `initial_cont
 
 ## Phase 4: Crystallize Spec
 
-When ambiguity ≤ threshold (or hard cap / early exit):
+When the native action is `begin_closure` (ambiguity threshold or hard cap), or the user explicitly exits early:
 
 **Before generating the spec, two gates must pass, in order:**
 
-**4a. Closure / Acceptance Guard.** Even when ambiguity ≤ threshold, do not treat the math as completion. Run an independent readiness audit from the full main-session perspective (including explore findings, established facts, and triggers the scorer may not have fully weighed). Confirm every active topology component has goal/constraint/criteria coverage, no unresolved or disputed trigger remains on a path that matters, no disputed established fact lacks a `superseded_by` resolution, and no low-confidence auto-answer is standing in for user-confirmed truth above the clarity cap. If a material gap exists, explicitly override the gate to the user — "The math says ready, but I am not accepting it yet because {gap}" — and ask the single highest-impact follow-up, returning to Phase 2. Record any override in `state.closure_overrides`.
+**4a. Closure / Acceptance Guard.** Even when ambiguity ≤ threshold, do not treat the math as completion. Run an independent readiness audit from the full main-session perspective (including explore findings, established facts, and triggers the scorer may not have fully weighed). Confirm every active topology component has goal/constraint/criteria coverage, no unresolved or disputed trigger remains on a path that matters, no disputed established fact lacks a `superseded_by` resolution, and no low-confidence auto-answer is standing in for user-confirmed truth above the clarity cap. If a material gap exists before the hard cap, explicitly override the gate to the user — "The math says ready, but I am not accepting it yet because {gap}" — and ask the single highest-impact follow-up, returning to Phase 2. At `hard_cap_reached`, ask the correction as a closure question and incorporate the answer into the final evidence/spec without returning to scored Phase 2. Record any override in `state.closure_overrides`.
 
-**4b. Restate gate.** Once closure passes, collapse the agreed answers into ONE sentence goal that covers every active component, and confirm it with a single `ask` whose body MUST begin by stating that one-sentence goal verbatim, followed by: "If someone read only this line, would they reach the same outcome you have in mind?" The goal line must be visible inside the `ask` body; never ask the confirmation without first displaying the collapsed goal it refers to. Offer **Yes, crystallize**, **Adjust wording**, and **Missing scope**, plus free-text, applying `language.instruction` when present. Because this gate has options, it MUST go through `ask`: do not print the Restate question and options as assistant prose with `Question:`/`Options:` labels. If the Restate gate was already printed that way, immediately call `ask` with the same question/options before accepting or waiting for any answer. On "Adjust wording" / "Missing scope", collect the exact correction with one follow-up `ask`, route it back through Step 2c scoring and established-facts maintenance (a correction can change ambiguity), then re-run closure and ask the Restate gate again. Cap at two loops; if alignment is not reached, return to Phase 2 with a targeted question instead of forcing a goal line. Persist the confirmed line as `state.restated_goal`.
+**4b. Restate gate.** Once closure passes, collapse the agreed answers into ONE sentence goal that covers every active component, and confirm it with a single `ask` whose body MUST begin by stating that one-sentence goal verbatim, followed by: "If someone read only this line, would they reach the same outcome you have in mind?" The goal line must be visible inside the `ask` body; never ask the confirmation without first displaying the collapsed goal it refers to. Offer **Yes, crystallize**, **Adjust wording**, and **Missing scope**, plus free-text, applying `language.instruction` when present. Because this gate has options, it MUST go through `ask`: do not print the Restate question and options as assistant prose with `Question:`/`Options:` labels. If the Restate gate was already printed that way, immediately call `ask` with the same question/options before accepting or waiting for any answer. On "Adjust wording" / "Missing scope", collect the exact correction with one follow-up `ask`; below the hard cap, route it back through Step 2c scoring and established-facts maintenance, then re-run closure. At `hard_cap_reached`, update the goal/spec evidence directly and repeat only the Restate gate, never scoring again. Cap at two loops; if alignment is not reached below the hard cap, return to Phase 2 with a targeted question instead of forcing a goal line; at the hard cap, preserve the unresolved wording/scope explicitly in the spec. Persist the confirmed line as `state.restated_goal`.
 
 1. **Generate the specification** using opus model with the prompt-safe transcript. If the full interview transcript or initial context is too large, include the summary plus all concrete decisions, acceptance criteria, unresolved gaps, and ontology snapshots; never overflow the prompt with raw oversized context.
    - Apply `language.instruction` when present so user-facing prose in the spec preserves the session language; keep code identifiers, file paths, commands, JSON/settings keys, and quoted source text unchanged.
@@ -747,7 +746,7 @@ Skipping any stage is possible but reduces quality assurance:
   /bookkeeping/round_ids/N: id required
   /component_updates/N/component_id: id required
   /component_updates/N/scores/constraints: score required
-  /component_updates/N/scores/context: score required
+  /component_updates/N/scores/context: score
   /component_updates/N/scores/criteria: score required
   /component_updates/N/scores/goal: score required
   /fact_ops/N/component: text
@@ -758,7 +757,7 @@ Skipping any stage is possible but reduces quality assurance:
   /fact_ops/N/statement: text
   /fact_ops/N/target_id: id
   /global_scores/constraints: score required
-  /global_scores/context: score required
+  /global_scores/context: score
   /global_scores/criteria: score required
   /global_scores/goal: score required
   /ontology/entities/N/fields/N: text required

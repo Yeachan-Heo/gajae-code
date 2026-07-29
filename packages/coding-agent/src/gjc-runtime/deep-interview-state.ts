@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+	type AmbiguityFloorBreakdown,
 	clampReportedAmbiguity,
 	computeAmbiguityFloor,
 	type DeepInterviewAmbiguityMilestone,
@@ -7,6 +8,13 @@ import {
 	scoreToUnits,
 	weightedAmbiguityUnits,
 } from "./deep-interview-ambiguity";
+import {
+	type DeepInterviewContinuationDecision,
+	type DeepInterviewNextAction,
+	type DeepInterviewNextActionReason,
+	DeepInterviewRoundLimitError,
+	decideDeepInterviewContinuation,
+} from "./deep-interview-continuation";
 
 /**
  * Pure, dependency-free foundation for deep-interview state shape.
@@ -902,9 +910,11 @@ export interface DeepInterviewRoundResultProjection {
 	weighted_ambiguity_units: number;
 	floor: number;
 	floor_units: number;
-	floor_cause: ReturnType<typeof computeAmbiguityFloor>;
+	floor_cause: AmbiguityFloorBreakdown;
 	effective_ambiguity: number;
 	effective_ambiguity_units: number;
+	next_action: DeepInterviewNextAction;
+	next_action_reason: DeepInterviewNextActionReason;
 	prior_effective_ambiguity: number | null;
 	direction: "increased" | "decreased" | "unchanged" | "initial";
 	ambiguity_milestone: DeepInterviewAmbiguityMilestone;
@@ -1158,6 +1168,10 @@ export const DEEP_INTERVIEW_STATE_INVARIANTS: readonly { id: string; description
 	{
 		id: "threshold_units_must_match_threshold",
 		description: "state.threshold_units must be a safe integer in [1,10000] equal to scoreToUnits(threshold).",
+	},
+	{
+		id: "scored_round_count_must_not_exceed_hard_cap",
+		description: "Deep-interview scoring permits at most 100 committed non-Round-0 transactions.",
 	},
 	{
 		id: "active_trigger_requires_score_regression",
@@ -1623,7 +1637,27 @@ export function applyDeepInterviewRoundResultV1(
 	)
 		fail("threshold_units_must_match_threshold", "/state/threshold_units", scoreToUnits(threshold), thresholdUnits);
 	const milestone = deriveAmbiguityMilestone(scoreToUnits(effectiveAmbiguity), thresholdUnits);
+	const scoredRoundOrdinal = rounds.filter(round => round.round !== 0 && round.lifecycle === "scored").length + 1;
+	let continuation: DeepInterviewContinuationDecision;
+	try {
+		continuation = decideDeepInterviewContinuation({
+			scoredRoundOrdinal,
+			effectiveAmbiguityUnits: scoreToUnits(effectiveAmbiguity),
+			thresholdUnits,
+		});
+	} catch (error) {
+		if (error instanceof DeepInterviewRoundLimitError)
+			fail(
+				"scored_round_count_must_not_exceed_hard_cap",
+				"/state/rounds",
+				"at most 100 scored interview rounds",
+				scoredRoundOrdinal,
+			);
+		throw error;
+	}
 	nextState.threshold_units = thresholdUnits;
+	nextState.next_action = continuation.next_action;
+	nextState.next_action_reason = continuation.reason;
 	const priorScoredRounds = rounds
 		.filter(
 			round =>
@@ -1701,6 +1735,8 @@ export function applyDeepInterviewRoundResultV1(
 			floor_cause: floorBreakdown,
 			effective_ambiguity: effectiveAmbiguity,
 			effective_ambiguity_units: scoreToUnits(effectiveAmbiguity),
+			next_action: continuation.next_action,
+			next_action_reason: continuation.reason,
 			prior_effective_ambiguity: priorEffectiveAmbiguity,
 			direction:
 				priorEffectiveAmbiguity === null
@@ -1759,6 +1795,15 @@ export function validateDeepInterviewV1Envelope(value: Record<string, unknown>):
 	const factsValue = state.established_facts;
 	const threshold = state.threshold ?? value.threshold;
 	const thresholdUnits = state.threshold_units;
+	const nextAction = state.next_action;
+	const nextActionReason = state.next_action_reason;
+	const validContinuation =
+		(nextAction === undefined && nextActionReason === undefined) ||
+		(nextAction === "continue_interview" && nextActionReason === "minimum_context") ||
+		(nextAction === "confirm_continuation" &&
+			(nextActionReason === "tiered_confirmation" || nextActionReason === "diminishing_returns")) ||
+		(nextAction === "begin_closure" &&
+			(nextActionReason === "ambiguity_threshold_reached" || nextActionReason === "hard_cap_reached"));
 	if (
 		!validScore(threshold) ||
 		typeof thresholdUnits !== "number" ||
@@ -1767,7 +1812,8 @@ export function validateDeepInterviewV1Envelope(value: Record<string, unknown>):
 		thresholdUnits > 10_000 ||
 		scoreToUnits(threshold) !== thresholdUnits ||
 		!Array.isArray(roundsValue) ||
-		!Array.isArray(factsValue)
+		!Array.isArray(factsValue) ||
+		!validContinuation
 	)
 		return invalid();
 	const rounds = roundsValue as unknown[];

@@ -88,6 +88,7 @@ const LEGIT_GJC_FLOWS = [
 	"gjc state read --json || true",
 	'gjc state read --json <<\'EOF\'\nDIFFERENT_DELIMITER\nopen("src/product.ts", "w")\nEOF',
 	"cat <<'A' | gjc state read --json\nfirst heredoc\nA",
+	'gjc deep-interview draft edit --draft-id d --expected-draft-revision 1 --op set --path /initial_idea --value "No concrete project idea was appended; capture the user idea." --json',
 ] as const;
 
 /** Known mutators and syntax forms that the baseline scanner must reject. */

@@ -18,7 +18,11 @@ describe("deep-interview typed repair CLI", () => {
 		const manifestVerbs = WORKFLOW_MANIFEST["deep-interview"].verbs
 			.filter(verb => verb.surface === "command-positional")
 			.map(verb => verb.name);
-		expect(manifestVerbs).toEqual([...DEEP_INTERVIEW_REPAIR_VERBS]);
+		expect(manifestVerbs.filter(verb => verb !== "prepare-and-apply-round-result")).toEqual([
+			...DEEP_INTERVIEW_REPAIR_VERBS,
+		]);
+		expect(manifestVerbs).toContain("prepare-and-apply-round-result");
+		expect(DEEP_INTERVIEW_REPAIR_VERBS).not.toContain("prepare-and-apply-round-result");
 	});
 
 	it("reports legacy receipt-less state as healthy and inspectable", async () => {
@@ -40,6 +44,11 @@ describe("deep-interview typed repair CLI", () => {
 				["inspect", "--session-id", session, "--selector", "summary", "--json"],
 				cwd,
 			);
+			const previousSessionId = process.env.GJC_SESSION_ID;
+			process.env.GJC_SESSION_ID = session;
+			const envInspect = await runDeepInterviewRepairCommand(["inspect", "--selector", "summary", "--json"], cwd);
+			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = previousSessionId;
 
 			expect(JSON.parse(sanity.stdout!)).toEqual({
 				ok: true,
@@ -68,6 +77,10 @@ describe("deep-interview typed repair CLI", () => {
 			expect(view).toMatchObject({
 				ok: true,
 				content_sha256: null,
+				data: { interview_id: "legacy" },
+			});
+			expect(JSON.parse(envInspect.stdout!)).toMatchObject({
+				ok: true,
 				data: { interview_id: "legacy" },
 			});
 		} finally {
@@ -331,7 +344,13 @@ describe("deep-interview typed repair CLI", () => {
 				cwd,
 			);
 
-			expect(JSON.parse(inspect.stdout!).data.resolution).toBe("quick");
+			expect(JSON.parse(inspect.stdout!).data).toMatchObject({
+				resolution: "quick",
+				threshold: 0.6,
+				threshold_units: 6000,
+				threshold_source: { value: "flag:--quick", truncated: false, original_bytes: 12 },
+				setup_status: "unresolved",
+			});
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
@@ -770,6 +789,22 @@ describe("deep-interview typed repair CLI", () => {
 				cwd,
 			);
 			expect(answer.status).toBe(0);
+			const statePath = modeStatePath(cwd, "repair-test", "deep-interview");
+			const envelope = JSON.parse(await Bun.file(statePath).text()) as Record<string, unknown>;
+			const seededState = envelope.state as { rounds: Record<string, unknown>[] };
+			seededState.rounds.unshift({
+				round_key: "round0-topology",
+				round: 0,
+				round_id: "round0-topology",
+				question_id: "topology",
+				question_text: "Is this topology correct?",
+				question_hash: "11111111111111111111111111111111",
+				answer_hash: "2".repeat(64),
+				selected_options: ["Yes"],
+				lifecycle: "answered",
+				answered_at: "2026-01-01T00:00:00.000Z",
+			});
+			await Bun.write(statePath, JSON.stringify(stampWorkflowEnvelopeChecksum(envelope, statePath)));
 			const inspect = await runDeepInterviewRepairCommand(
 				["inspect", "--session-id", "repair-test", "--selector", "pending", "--limit", "25", "--json"],
 				cwd,
@@ -791,6 +826,7 @@ describe("deep-interview typed repair CLI", () => {
 				"truncated",
 				"view_sha256",
 			]);
+			expect(view.total_count).toBe(1);
 			expect(view.data.items[0].question).toEqual({
 				value: "What should this do?",
 				truncated: false,

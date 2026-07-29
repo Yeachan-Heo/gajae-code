@@ -3171,6 +3171,18 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const postTopologyTool = new AskTool(createSession({ getDeepInterviewAskStage: () => "post-topology" }));
 		expect(postTopologyTool.parameters.safeParse(contractQuestion).success).toBe(false);
 		expect(postTopologyTool.parameters.safeParse(reviewQuestion).success).toBe(true);
+		expect(
+			postTopologyTool.parameters.safeParse({
+				questions: [
+					{
+						id: "unrecordable-approval",
+						question: "Approve intent preservation?",
+						options: [{ label: "Approve intent preservation" }],
+						workflowGate: { stage: "deep-interview", kind: "approval" },
+					},
+				],
+			}).success,
+		).toBe(false);
 
 		const inactiveTool = new AskTool(createSession());
 		const inactiveContract = inactiveTool.parameters.parse(contractQuestion);
