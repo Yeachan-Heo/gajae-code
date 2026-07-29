@@ -9,10 +9,10 @@ import deepInterviewSkill from "./gjc/skills/deep-interview/SKILL.md" with { typ
 import ralplanSkill from "./gjc/skills/ralplan/SKILL.md" with { type: "text" };
 import teamSkill from "./gjc/skills/team/SKILL.md" with { type: "text" };
 import aiSlopCleanerFragment from "./gjc/skills/ultragoal/ai-slop-cleaner.md" with { type: "text" };
+import ultragoalSkill from "./gjc/skills/ultragoal/SKILL.md" with { type: "text" };
 import validationBatchContractsFragment from "./gjc/skills/ultragoal/validation-batch-contracts.md" with {
 	type: "text",
 };
-import ultragoalSkill from "./gjc/skills/ultragoal/SKILL.md" with { type: "text" };
 
 export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
 export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
