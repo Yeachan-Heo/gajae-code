@@ -262,6 +262,25 @@ function fileChangesFor(
 	);
 }
 
+/**
+ * `eval` is permission-gated and classified as an execution tool, but its input is `cells`
+ * (`{language, code, ...}[]`), never `command`. Project each cell into an argv-shaped entry so the
+ * approval states honestly what will run; refuse when no usable cell body is present.
+ */
+function evalCommandParts(input: Record<string, unknown> | undefined): string[] {
+	const cells = input?.cells;
+	if (!Array.isArray(cells) || cells.length === 0)
+		throw new PermissionAdapterError("missing_approval_field", "Eval permission supplied no cells to approve.");
+	const parts: string[] = ["eval"];
+	for (const cell of cells) {
+		if (!isRecord(cell) || typeof cell.code !== "string" || cell.code.length === 0)
+			throw new PermissionAdapterError("missing_approval_field", "Eval permission cell omitted its code body.");
+		const language = typeof cell.language === "string" ? cell.language : "unknown";
+		parts.push(`${language}:${cell.code}`);
+	}
+	return parts;
+}
+
 /** Map a child tool call to the only Codex approval method that can represent it. */
 export function mapToolCallToCodexRequest(
 	toolCall: ClientBridgePermissionToolCall,
@@ -278,7 +297,8 @@ export function mapToolCallToCodexRequest(
 	const callId = toolCall.toolCallId;
 	const reason = options.reason ?? (input ? stringField(input, "reason") : undefined);
 	if (kind === "command") {
-		const command = commandParts(input?.command ?? input?.cmd);
+		const command =
+			toolCall.toolName === "eval" ? evalCommandParts(input) : commandParts(input?.command ?? input?.cmd);
 		const cwd = options.cwd ?? (input ? stringField(input, "cwd") : undefined);
 		if (!cwd)
 			throw new PermissionAdapterError(

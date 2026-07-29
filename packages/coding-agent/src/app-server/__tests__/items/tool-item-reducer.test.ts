@@ -375,3 +375,35 @@ test("a tool call that changes identity under one call id fails closed", () => {
 		r.accept({ type: "tool_execution_start", toolCallId: "shared", toolName: "edit", args: { path: "a.ts" } }),
 	).toThrow(/changed identity/u);
 });
+
+test("a summary part is announced before the first delta targeting it", () => {
+	const r = reducer([100, 200, 300]);
+	const summaryContent = [{ type: "thinking", thinking: "" }];
+	const withText = [{ type: "thinking", thinking: "summary text" }];
+	const events: AgentSessionEvent[] = [
+		messageUpdate(
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: partial(summaryContent) },
+			summaryContent,
+		),
+		messageUpdate(
+			{ type: "reasoning_summary_delta", contentIndex: 0, delta: "summary text", partial: partial(withText) },
+			withText,
+		),
+		messageUpdate(
+			{ type: "reasoning_summary_end", contentIndex: 0, content: "summary text", partial: partial(withText) },
+			withText,
+		),
+	];
+	const notifications = events.flatMap(event => r.accept(event));
+	const emitted = methods(notifications);
+
+	// A delta for summary index 0 is meaningless until the client knows that part exists.
+	const partAdded = emitted.indexOf("item/reasoning/summaryPartAdded");
+	const firstDelta = emitted.indexOf("item/reasoning/summaryTextDelta");
+	expect(partAdded).toBeGreaterThanOrEqual(0);
+	expect(firstDelta).toBeGreaterThanOrEqual(0);
+	expect(partAdded).toBeLessThan(firstDelta);
+	// It is announced exactly once, not per delta.
+	expect(emitted.filter(method => method === "item/reasoning/summaryPartAdded")).toHaveLength(1);
+	expectValidNotifications(notifications);
+});

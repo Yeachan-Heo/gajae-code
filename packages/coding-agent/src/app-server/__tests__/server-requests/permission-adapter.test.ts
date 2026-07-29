@@ -224,7 +224,9 @@ test("tool classification follows the canonical ACP kind vocabulary, not invente
 						? { oldPath: "a.ts", newPath: "b.ts" }
 						: toolName === "delete"
 							? { path: "a.ts" }
-							: { command: "echo hi", cwd: "/tmp" },
+							: toolName === "eval"
+								? { cells: [{ language: "py", code: "print(1)" }], cwd: "/tmp" }
+								: { command: "echo hi", cwd: "/tmp" },
 		};
 		if (expected === "unmapped") {
 			expect(() => mapToolCallToCodexRequest(toolCall, { conversationId: "thread-1" }), toolName).toThrow(
@@ -332,4 +334,39 @@ test("ambiguous or reason-less denials fail closed instead of becoming a plain r
 		outcome: "selected",
 		kind: "reject_once",
 	});
+});
+
+test("eval cells project into a protocol-valid command approval", () => {
+	// `eval` is permission-gated and classified as execution, but its input is `cells`, never
+	// `command`. Reading `command` made every eval approval throw before reaching Codex.
+	const mapped = mapToolCallToCodexRequest(
+		{
+			toolCallId: "call-eval",
+			toolName: "eval",
+			title: "eval",
+			rawInput: {
+				cells: [
+					{ language: "py", code: "print(1)" },
+					{ language: "js", code: "1+1" },
+				],
+				cwd: "/tmp",
+			},
+		},
+		{ conversationId: "thread-1" },
+	);
+	expect(mapped.method).toBe("execCommandApproval");
+	const params = mapped.params as { command: string[] };
+	// The approval states honestly what will run, per cell.
+	expect(params.command).toEqual(["eval", "py:print(1)", "js:1+1"]);
+	expect(stableValidators.serverRequestParams.execCommandApproval(mapped.params)).toBe(true);
+
+	// No cells, or a cell without a code body, cannot be represented honestly.
+	for (const rawInput of [{ cwd: "/tmp" }, { cells: [], cwd: "/tmp" }, { cells: [{ language: "py" }], cwd: "/tmp" }]) {
+		expect(() =>
+			mapToolCallToCodexRequest(
+				{ toolCallId: "c", toolName: "eval", title: "eval", rawInput },
+				{ conversationId: "thread-1" },
+			),
+		).toThrow(PermissionAdapterError);
+	}
 });

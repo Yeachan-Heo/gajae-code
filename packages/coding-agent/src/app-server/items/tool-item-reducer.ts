@@ -998,6 +998,22 @@ export class ToolItemReducer {
 				summary: ensured.state.summaryText.length > 0 ? [ensured.state.summaryText] : [],
 			};
 			if (appended.length > 0) {
+				// A client cannot apply a delta to a summary part it has not been told about, so the
+				// one-time part-added notification must precede the first delta for that index.
+				if (!ensured.state.summaryPartAdded) {
+					ensured.state.summaryPartAdded = true;
+					notifications.push(
+						validated({
+							method: "item/reasoning/summaryPartAdded",
+							params: {
+								threadId: this.#threadId,
+								turnId: this.#turnId,
+								itemId: ensured.state.id,
+								summaryIndex,
+							},
+						}),
+					);
+				}
 				notifications.push(
 					validated({
 						method: "item/reasoning/summaryTextDelta",
