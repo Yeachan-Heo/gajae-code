@@ -2305,9 +2305,7 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
 		throw new Error("iteration.reviewCohort.joined must be true: all lane findings must join before checkpoint");
 	const lanes = qualityGateObject(cohort.lanes);
 	if (!lanes) throw new Error("iteration.reviewCohort.lanes is required");
-	const unsupportedLanes = Object.keys(lanes).filter(
-		key => !(COHORT_LANE_KEYS as readonly string[]).includes(key),
-	);
+	const unsupportedLanes = Object.keys(lanes).filter(key => !(COHORT_LANE_KEYS as readonly string[]).includes(key));
 	if (unsupportedLanes.length > 0)
 		throw new Error(`iteration.reviewCohort.lanes contains unsupported lanes: ${unsupportedLanes.join(", ")}`);
 	for (const lane of COHORT_LANE_KEYS) {
@@ -2434,7 +2432,11 @@ async function validateCompletionQualityGate(
 	);
 	const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
 	if (unsupportedKeys.length > 0) {
-		found.add("qualityGate", "unsupported_keys", `qualityGate contains unsupported keys: ${unsupportedKeys.join(", ")}`);
+		found.add(
+			"qualityGate",
+			"unsupported_keys",
+			`qualityGate contains unsupported keys: ${unsupportedKeys.join(", ")}`,
+		);
 	}
 	const architectReview = qualityGateObject(gate.architectReview);
 	const executorQa = qualityGateObject(gate.executorQa);
