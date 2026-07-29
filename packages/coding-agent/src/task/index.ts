@@ -496,6 +496,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (this.#durableArtifactsDir && this.#durableArtifactManager) {
 			return { dir: this.#durableArtifactsDir, manager: this.#durableArtifactManager };
 		}
+		const sessionArtifactsDir = this.session.getArtifactsDir?.() ?? null;
+		if (sessionArtifactsDir) {
+			const manager = this.session.getArtifactManager?.() ?? new ArtifactManager(sessionArtifactsDir);
+			this.#durableArtifactsDir = sessionArtifactsDir;
+			this.#durableArtifactManager = manager;
+			this.#authorizeSessionLifetimeArtifacts(sessionArtifactsDir, manager);
+			return { dir: sessionArtifactsDir, manager };
+		}
 		this.#durableArtifactsEnsurePromise ??= this.#allocateSessionLifetimeArtifacts();
 		const dir = await this.#durableArtifactsEnsurePromise;
 		if (!dir || !this.#durableArtifactManager) return null;
@@ -503,10 +511,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	async #allocateSessionLifetimeArtifacts(): Promise<string | null> {
-		const sessionId = this.session.getSessionId?.()?.trim() || Snowflake.next();
-		const dir = path.join(os.tmpdir(), "gjc-task-session", sessionId);
+		let dir: string;
 		try {
-			await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+			dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-session-"));
 		} catch {
 			this.#durableArtifactsDir = undefined;
 			this.#durableArtifactManager = undefined;

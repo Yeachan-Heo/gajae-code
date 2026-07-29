@@ -167,7 +167,9 @@ describe("task no-session output refs", () => {
 
 		const artifactsDir = session.getArtifactsDir?.();
 		expect(artifactsDir).toBeTruthy();
-		expect(artifactsDir).toContain(path.join("gjc-task-session", sessionId));
+		expect(path.dirname(artifactsDir!)).toBe(path.resolve(os.tmpdir()));
+		expect(path.basename(artifactsDir!)).toStartWith("gjc-task-session-");
+		expect(artifactsDir).not.toContain(sessionId);
 
 		const outputPath = path.join(artifactsDir!, `${outputId}.md`);
 		expect(await Bun.file(outputPath).exists()).toBe(true);
@@ -203,9 +205,9 @@ describe("task no-session output refs", () => {
 		});
 
 		const session = createSession(null, sessionId);
-		const tool = await TaskTool.create(session);
+		const firstTool = await TaskTool.create(session);
 
-		const firstText = await runDetachedTask(tool, {
+		const firstText = await runDetachedTask(firstTool, {
 			id: "Architect",
 			description: "review code",
 			assignment: "Produce findings.",
@@ -213,6 +215,8 @@ describe("task no-session output refs", () => {
 		const firstUriMatch = firstText.match(/agent:\/\/(\d+-Architect)/);
 		expect(firstUriMatch).toBeTruthy();
 		const firstUri = `agent://${firstUriMatch![1]!}`;
+		const firstArtifactsDir = session.getArtifactsDir?.();
+		expect(firstArtifactsDir).toBeTruthy();
 
 		const prior = await InternalUrlRouter.instance().resolve(firstUri, {
 			cwd: session.cwd,
@@ -220,8 +224,9 @@ describe("task no-session output refs", () => {
 			getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
 		});
 		expect(prior.content).toContain(firstOutput);
+		const secondTool = await TaskTool.create(session);
 
-		const secondText = await runDetachedTask(tool, {
+		const secondText = await runDetachedTask(secondTool, {
 			id: "Critic",
 			description: "review prior findings",
 			assignment: `Read ${firstUri} and critique.`,
@@ -232,6 +237,7 @@ describe("task no-session output refs", () => {
 		// Durable root still holds both outputs for same-session descendants
 		const artifactsDir = session.getArtifactsDir?.();
 		expect(artifactsDir).toBeTruthy();
+		expect(artifactsDir).toBe(firstArtifactsDir);
 		expect(await Bun.file(path.join(artifactsDir!, `${firstUriMatch![1]!}.md`)).text()).toContain(firstOutput);
 		expect(await Bun.file(path.join(artifactsDir!, `${secondUriMatch![1]!}.md`)).text()).toContain(secondOutput);
 
@@ -251,23 +257,16 @@ describe("task no-session output refs", () => {
 			createSessionResult(createYieldingSession("output that must not get a dead URI")),
 		);
 
-		const sessionId = `alloc-fail-${Snowflake.next()}`;
-		const blockedArtifactsPath = path.join(os.tmpdir(), "gjc-task-session", sessionId);
-		await fs.mkdir(path.dirname(blockedArtifactsPath), { recursive: true, mode: 0o700 });
-		await Bun.write(blockedArtifactsPath, "blocked");
+		vi.spyOn(fs, "mkdtemp").mockRejectedValue(new Error("EACCES: permission denied"));
 
-		try {
-			const session = createSession(null, sessionId);
-			const tool = await TaskTool.create(session);
-			const resultText = await runDetachedTask(tool);
+		const session = createSession(null, `alloc-fail-${Snowflake.next()}`);
+		const tool = await TaskTool.create(session);
+		const resultText = await runDetachedTask(tool);
 
-			expect(resultText).toContain("Task completed; output artifact unavailable.");
-			expect(resultText).not.toMatch(/agent:\/\/\d+-NoSession/);
-			expect(resultText).not.toContain('ref="agent://');
-			expect(resultText).not.toContain("output stored in agent://");
-			expect(session.getArtifactsDir?.()).toBeNull();
-		} finally {
-			await fs.rm(blockedArtifactsPath, { force: true });
-		}
+		expect(resultText).toContain("Task completed; output artifact unavailable.");
+		expect(resultText).not.toMatch(/agent:\/\/\d+-NoSession/);
+		expect(resultText).not.toContain('ref="agent://');
+		expect(resultText).not.toContain("output stored in agent://");
+		expect(session.getArtifactsDir?.()).toBeNull();
 	});
 });
