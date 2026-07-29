@@ -815,6 +815,35 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	};
 	platform::exact_unlink(Path::new(&path), &identity)
 }
+/// Replace a staged regular file only after deleting the exact expected
+/// destination object. Publication uses a retained source handle and a
+/// no-replace rename, so a successor installed after deletion is preserved.
+#[napi]
+pub fn exact_replace_path(
+	source_path: String,
+	destination_path: String,
+	expected_destination: NativeExactFileIdentity,
+) -> NativeExactUnlinkResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	let Some(expected_destination) = exact_file_identity(&expected_destination) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	#[cfg(windows)]
+	{
+		platform::exact_replace_path(
+			Path::new(&source_path),
+			Path::new(&destination_path),
+			&expected_destination,
+		)
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = (source_path, destination_path, expected_destination);
+		NativeExactUnlinkResult::failure("unsupported_platform")
+	}
+}
 
 /// Restore only the detached object that still has the supplied platform
 #[cfg_attr(clippy, doc = "")]
@@ -4615,6 +4644,50 @@ mod platform {
 				primitive:        "move_file_ex_write_through".to_owned(),
 				phase:            "verify".to_owned(),
 			},
+		}
+	}
+	pub(super) fn exact_replace_path(
+		source_path: &Path,
+		destination_path: &Path,
+		expected_destination: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		let source_path = match lexical_absolute_path(source_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		if source_path.parent() != destination_path.parent() {
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let source = match open_exact(&source_path, "file", FILE_READ_ATTRIBUTES | 0x0001_0000) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+			},
+		};
+		let Some(destination_name) = destination_path.file_name() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let Some(destination_parent) = source.parent() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+
+		// Validation and deletion apply to the same opened destination handle. A
+		// substituted successor fails identity validation before mutation.
+		let removed = exact_unlink(&destination_path, expected_destination);
+		if !removed.ok {
+			return removed;
+		}
+
+		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
+		match rename_handle_no_replace(source.target, destination_parent, &destination_name) {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			// A successor created after exact deletion remains named because this
+			// retained-handle rename never replaces an existing destination.
+			Err(code) => NativeExactUnlinkResult::failure(code),
 		}
 	}
 

@@ -5,8 +5,8 @@ import * as path from "node:path";
 import {
 	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
-	durableReplacePath,
 	exactRemoveDirectoryTree,
+	exactReplacePath,
 	exactUnlink,
 	type NativeDirectoryTreeSnapshot,
 	type NativeOwnerOnlySecurityResult,
@@ -1589,11 +1589,16 @@ export function replaceManagedFileExactSync(
 			fs.closeSync(fd);
 			fd = undefined;
 			lock.assertOwned();
-			const outcome = durableReplacePath(staging, destination);
-			if (!outcome.ok || outcome.mutationState !== "committed" || outcome.durabilityState !== "durable") {
-				publicationUncertain =
-					outcome.mutationState !== "not_committed" || outcome.durabilityState !== "not_attempted";
-				throw new Error(outcome.reason === "none" ? "durability_not_provable" : outcome.reason);
+			const outcome = exactReplacePath(staging, destination, {
+				dev: expected.identity.dev,
+				ino: expected.identity.ino,
+				size: BigInt(expected.identity.size),
+				mtimeNs: expected.identity.mtimeNs,
+				sha256: expected.identity.sha256,
+			});
+			if (!outcome.ok) {
+				publicationUncertain = true;
+				throw new Error(outcome.code ?? "managed_replace_identity_mismatch");
 			}
 			lock.assertOwned();
 			const published = fs.lstatSync(destination, { bigint: true });

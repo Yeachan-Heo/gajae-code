@@ -284,7 +284,7 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 			expect(fs.existsSync(destination)).toBe(false);
 		});
 	});
-	describe("Windows durable managed replacement", () => {
+	describe("Windows identity-bound managed replacement", () => {
 		const useWindowsPlatform = (): void => {
 			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
 			vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
@@ -295,54 +295,44 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 			vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
 		};
 
-		it("uses durable replacement for the real managed caller and rejects a stale writer", () => {
+		it("publishes through the identity-bound native primitive and preserves a successor swapped before commit", () => {
 			useWindowsPlatform();
 			const destination = path.join(tempDir, "managed.jsonl");
 			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
 			const root = managedDirectoryRoot(tempDir);
-			const durable = vi.spyOn(native, "durableReplacePath").mockImplementation((source, target) => {
+			const exactReplace = vi.spyOn(native, "exactReplacePath").mockImplementation((source, target) => {
 				fs.renameSync(source, target);
-				return {
-					ok: true,
-					mutationState: "committed",
-					durabilityState: "durable",
-					reason: "none",
-					primitive: "move_file_ex_write_through",
-					phase: "complete",
-					diagnostic: { schemaVersion: 1, collectionState: "complete" },
-				} as never;
+				return { ok: true } as never;
 			});
 			const store = new ManagedSessionDescendantStore(root, tempDir, undefined, "windows-existing-verify-first");
 			store.replaceSync("managed.jsonl", Buffer.from("replacement\n"));
-			expect(durable).toHaveBeenCalledTimes(1);
+			expect(exactReplace).toHaveBeenCalledTimes(1);
 			expect(fs.readFileSync(destination, "utf8")).toBe("replacement\n");
 
-			const stale = captureManagedFileNoFollow(destination);
-			fs.writeFileSync(destination, "successor\n", { mode: 0o600 });
-			expect(() => replaceManagedFileExactSync(destination, Buffer.from("stale\n"), stale, root)).toThrow(
-				"managed_replace_identity_mismatch",
+			const expected = captureManagedFileNoFollow(destination);
+			exactReplace.mockImplementation(() => {
+				fs.writeFileSync(destination, "successor\n", { mode: 0o600 });
+				return { ok: false, code: "identity_mismatch" } as never;
+			});
+			expect(() => replaceManagedFileExactSync(destination, Buffer.from("stale\n"), expected, root)).toThrow(
+				"identity_mismatch",
 			);
-			expect(durable).toHaveBeenCalledTimes(1);
+			expect(exactReplace).toHaveBeenCalledTimes(2);
 			expect(fs.readFileSync(destination, "utf8")).toBe("successor\n");
 		});
 
-		it("retains staging evidence after an unknown durable replacement outcome", () => {
+		it("retains staging evidence after an identity-bound publication failure", () => {
 			useWindowsPlatform();
 			const destination = path.join(tempDir, "unknown.jsonl");
 			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
 			const root = managedDirectoryRoot(tempDir);
-			vi.spyOn(native, "durableReplacePath").mockReturnValue({
+			vi.spyOn(native, "exactReplacePath").mockReturnValue({
 				ok: false,
-				mutationState: "unknown",
-				durabilityState: "not_provable",
-				reason: "unknown",
-				primitive: "move_file_ex_write_through",
-				phase: "rename",
-				diagnostic: { schemaVersion: 1, collectionState: "partial" },
+				code: "identity_mismatch",
 			} as never);
 			const expected = captureManagedFileNoFollow(destination);
 			expect(() => replaceManagedFileExactSync(destination, Buffer.from("replacement\n"), expected, root)).toThrow(
-				"unknown",
+				"identity_mismatch",
 			);
 			expect(fs.readFileSync(destination, "utf8")).toBe("authorized\n");
 			expect(fs.readdirSync(tempDir).some(name => name.includes(".replacement"))).toBe(true);
