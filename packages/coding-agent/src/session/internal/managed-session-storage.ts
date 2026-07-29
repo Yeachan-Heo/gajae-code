@@ -449,7 +449,6 @@ export function managedSecurityFailureClassification(error: unknown): string | u
 function securityError(pathname: string, result: NativeSecurity): Error {
 	return new ManagedSecurityError(pathname, result);
 }
-}
 
 function secure(pathname: string, kind: "directory" | "file"): void {
 	const applied = validateNativeSecurityResult(applyOwnerOnlyPathSecurity(pathname, kind), "apply", kind);
