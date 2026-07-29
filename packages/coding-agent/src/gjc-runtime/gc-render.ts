@@ -13,6 +13,7 @@ const STORE_HEADINGS: Record<GcStore, string> = {
 	tmux_sessions: "Tmux sessions",
 	registry_entries: "Harness-root registry entries",
 	local_roots: "Session local roots",
+	sessions: "Session transcripts (report only)",
 };
 
 function actionLabel(record: GcRecord): string {

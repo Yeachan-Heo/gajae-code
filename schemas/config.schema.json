@@ -2274,6 +2274,33 @@
 			},
 			"additionalProperties": false
 		},
+		"sessions": {
+			"type": "object",
+			"properties": {
+				"inventory": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Default-OFF, report-only inventory of session transcript age and size.",
+							"default": false
+						},
+						"maxAgeDays": {
+							"type": "number",
+							"description": "Report-only session inventory threshold in days.",
+							"default": 90
+						},
+						"maxTotalSizeMb": {
+							"type": "number",
+							"description": "Report-only session inventory threshold in megabytes.",
+							"default": 2048
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"async": {
 			"type": "object",
 			"properties": {

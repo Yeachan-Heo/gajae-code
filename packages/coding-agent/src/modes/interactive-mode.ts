@@ -901,7 +901,13 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribe(event => {
-				void this.#handleGoalSessionEvent(event);
+				// This subscriber is dispatched with `void`, so an unhandled rejection
+				// here reaches the process-level fatal handler and — under `--tmux`,
+				// where the agent IS the pane command — kills the pane. Contain it here:
+				// this is the single containment owner for goal-session-event failures.
+				void this.#handleGoalSessionEvent(event).catch(error => {
+					this.#handleGoalSessionEventFailure(error);
+				});
 			}),
 		);
 		// Set up theme file watcher
@@ -979,7 +985,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
-		if (this.session.getGoalModeState()?.mode === "exiting") {
+		// First statement: a blocked session must not re-enter the goal-exit path
+		// (`beforeGetUserInput` calls `exit()` again while the goal stays "exiting",
+		// and every retry appends another resident-only entry before the latch
+		// rethrows) and must not schedule a continuation. The promise is still
+		// created and returned, so the composer stays live for inspection and exit.
+		const blocked = this.isPersistenceBlocked;
+		if (!blocked && this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#goalModeController.beforeGetUserInput();
 		}
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
@@ -987,7 +999,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.onInputCallback = undefined;
 			resolve(input);
 		};
-		this.#goalModeController.scheduleContinuation();
+		if (!blocked) this.#goalModeController.scheduleContinuation();
 		return promise;
 	}
 
@@ -1032,6 +1044,16 @@ export class InteractiveMode implements InteractiveModeContext {
 			cancelled: false,
 			started: false,
 		};
+		// Refuse before `onUserSubmission()` and `addMessageToChat` so a blocked
+		// session neither advances goal-mode bookkeeping nor renders a user row for
+		// work that can never be persisted.
+		if (this.isPersistenceBlocked) {
+			submission.cancelled = true;
+			this.#pendingSubmittedInput = undefined;
+			this.updateEditorChrome();
+			this.ui.requestRender();
+			return submission;
+		}
 		this.#pendingSubmittedInput = submission;
 		if (!submission.customType) {
 			this.#goalModeController.onUserSubmission();
@@ -1129,10 +1151,32 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#getComposerPlaceholder(): string {
+		// The quarantine notice must be persistent chrome, not a scrolling status
+		// line: it states that later entries are not saved, so it has to stay
+		// visible for as long as the session is blocked.
+		const blocked = this.getPersistenceBlockedNotice();
+		if (blocked) return blocked;
 		return getComposerPlaceholder(this.keybindings, this.#keyDisplayContext, {
 			busy: this.#isPromptDeliveryBusy(),
 			busyPromptMode: this.settings.get("busyPromptMode"),
 		});
+	}
+
+	/** True once session persistence has failed; the session is read-only until restart. */
+	get isPersistenceBlocked(): boolean {
+		return this.sessionManager.getPersistFailure() !== undefined;
+	}
+
+	/**
+	 * Persistent composer notice for the persistence-blocked quarantine. Names the
+	 * transcript, the errno, that later entries are NOT saved, and the recovery
+	 * action, so a blocked session can never be mistaken for a healthy one.
+	 */
+	getPersistenceBlockedNotice(): string | undefined {
+		const failure = this.sessionManager.getPersistFailure();
+		if (!failure) return undefined;
+		const file = failure.sessionFile ?? this.sessionManager.getSessionFile() ?? "(unknown session file)";
+		return `Session persistence failed (${failure.error.message}) — later entries are not saved. Transcript up to the failure is intact at ${file}. Free space, then restart gjc to resume recording.`;
 	}
 
 	#getWelcomeReservedRows(width: number): number {
@@ -1368,6 +1412,28 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async #handleGoalSessionEvent(event: AgentSessionEvent): Promise<void> {
 		await this.#goalModeController.handleSessionEvent(event);
+	}
+
+	/**
+	 * Single containment point for a failed goal-session event. A persistence
+	 * failure enters the read-only quarantine and renders the persistent notice; any
+	 * other error is an unexpected controller failure and must NOT be mislabeled as
+	 * a persistence problem.
+	 */
+	#handleGoalSessionEventFailure(error: unknown): void {
+		const failure = this.sessionManager.getPersistFailure();
+		if (failure) {
+			logger.error("Session persistence failed while handling a goal session event", {
+				error: String(error),
+				sessionFile: failure.sessionFile,
+			});
+			// Persistent chrome, not a scrolling status line.
+			this.updateEditorChrome();
+			this.ui.requestRender();
+			return;
+		}
+		logger.error("Goal session event handler failed", { error: String(error) });
+		this.showWarning(`Goal mode update failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 
 	/** Restore mode state from session entries on resume. */

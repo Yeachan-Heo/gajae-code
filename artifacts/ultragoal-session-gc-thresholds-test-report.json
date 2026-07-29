@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "kind": "test-report",
+  "name": "ultragoal-session-gc-optin-and-aggregate-redteam",
+  "verdict": "passed",
+  "checks": {
+    "globalEnabledReports": true,
+    "projectOnlyDoesNotEnable": true,
+    "aggregateOldestFirst": true,
+    "aggregateUnderCeilingReportsNone": true
+  },
+  "cases": {
+    "globalOptIn": {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json"
+      ],
+      "exitCode": 0,
+      "sessions": [
+        {
+          "id": "global",
+          "status": "within_thresholds",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=307.375 size_bytes=47"
+        }
+      ]
+    },
+    "projectOptIn": {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json"
+      ],
+      "exitCode": 0,
+      "sessions": [
+        {
+          "id": "project",
+          "status": "retention_disabled",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=322.444580078125 size_bytes=47"
+        }
+      ]
+    },
+    "aggregateOver": {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json"
+      ],
+      "exitCode": 0,
+      "sessions": [
+        {
+          "id": "middle",
+          "status": "over_threshold",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=312.492431640625 size_bytes=106"
+        },
+        {
+          "id": "oldest",
+          "status": "over_threshold",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=313.564453125 size_bytes=106"
+        },
+        {
+          "id": "newest",
+          "status": "within_thresholds",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=313.41650390625 size_bytes=106"
+        }
+      ]
+    },
+    "aggregateUnder": {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json"
+      ],
+      "exitCode": 0,
+      "sessions": [
+        {
+          "id": "middle",
+          "status": "within_thresholds",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=665.492431640625 size_bytes=106"
+        },
+        {
+          "id": "oldest",
+          "status": "within_thresholds",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=666.564453125 size_bytes=106"
+        },
+        {
+          "id": "newest",
+          "status": "within_thresholds",
+          "removable": false,
+          "action": "none",
+          "detail": "age_ms=666.41650390625 size_bytes=106"
+        }
+      ]
+    }
+  }
+}

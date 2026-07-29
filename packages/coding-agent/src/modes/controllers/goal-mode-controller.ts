@@ -342,8 +342,15 @@ export class GoalModeController {
 		if (shouldRestoreTools && this.#previousTools) await this.ctx.session.setActiveToolsByName(this.#previousTools);
 		const currentState = this.ctx.session.getGoalModeState();
 		if (options?.reason === "completed") {
-			this.ctx.session.setGoalModeState(undefined);
+			// Single ordering contract. `mode_change` is resume-critical
+			// (`buildSessionContext` derives the durable mode from the last one), so it
+			// must land BEFORE in-memory goal state is cleared. If it throws, the goal
+			// stays "exiting", no `goal-completed` entry is attempted, and the error
+			// propagates — never report a completion the transcript does not record.
 			this.ctx.sessionManager.appendModeChange("none");
+			this.ctx.session.setGoalModeState(undefined);
+			// If this throws, goal state stays cleared to match the durable
+			// `mode_change("none")` already on disk; the caller enters the quarantine.
 			this.ctx.sessionManager.appendCustomEntry("goal-completed", {
 				objective: currentState?.goal?.objective,
 				tokensUsed: currentState?.goal?.tokensUsed,

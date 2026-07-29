@@ -277,6 +277,8 @@ import {
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
+	rotateCoordinatorRuntimeStateSessionFile,
+	runtimeStateFailureReason,
 } from "../gjc-runtime/session-state-sidecar";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heartbeat";
@@ -2067,6 +2069,17 @@ export class AgentSession {
 		});
 	}
 
+	/** Refuse a new turn while session persistence is latched-failed (read-only quarantine). */
+	#persistenceBlockedError(): AgentBusyError {
+		const failure = this.sessionManager.getPersistFailure();
+		return Object.assign(
+			new AgentBusyError(
+				`Cannot start a turn: session persistence failed and later entries would not be saved (${failure?.error.message ?? "unknown error"}).`,
+			),
+			{ code: "persistence_blocked" },
+		);
+	}
+
 	/**
 	 * Reject a turn start while a handoff transition owns the session. Handoff never
 	 * routes its own generation/injection through these turn-start chokepoints, and
@@ -2080,6 +2093,10 @@ export class AgentSession {
 				code: "busy",
 			});
 		}
+		// Same reasoning for a latched persistence failure: these entrants bypass
+		// prompt admission, and `#appendEntry` commits in memory before `_persist`
+		// throws, so accepting one would present unpersisted work as durable.
+		if (this.sessionManager.getPersistFailure()) throw this.#persistenceBlockedError();
 	}
 
 	/**
@@ -2133,6 +2150,14 @@ export class AgentSession {
 			});
 		}
 
+		// A latched persistence failure means nothing further can reach disk, and
+		// `#appendEntry` commits in memory before `_persist` throws — so accepting a
+		// turn here would present unpersisted work as durable. `selection` stays
+		// admissible so a read-only session can still be inspected.
+		if (kind === "prompt" && this.sessionManager.getPersistFailure()) {
+			throw this.#persistenceBlockedError();
+		}
+
 		const entry: SessionAdmissionEntry = {
 			kind,
 			ready: Promise.withResolvers<void>(),
@@ -2159,6 +2184,14 @@ export class AgentSession {
 			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
 				code: "busy",
 			});
+		}
+		// Re-check after activation: the latch can be set by a queued-behind turn.
+		if (kind === "prompt" && this.sessionManager.getPersistFailure()) {
+			entry.released = true;
+			entry.settled.resolve();
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+			throw this.#persistenceBlockedError();
 		}
 
 		const release = () => {
@@ -3316,12 +3349,56 @@ export class AgentSession {
 	};
 
 	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
+		const stateFile = process.env.GJC_COORDINATOR_SESSION_STATE_FILE?.trim();
 		void persistCoordinatorRuntimeStateFromEvent(event, {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
-		}).catch(() => {
-			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+		}).catch(error => {
+			// Log the discriminant, never the marker bytes or any owner env value:
+			// a permanent failure must be distinguishable from a transient one.
+			logger.warn("Failed to persist coordinator runtime state", {
+				event: event.type,
+				reason: runtimeStateFailureReason(error) ?? "unclassified",
+				errorName: error instanceof Error ? error.name : typeof error,
+				stateFile: stateFile ?? null,
+				liveSessionFile: this.sessionManager.getSessionFile() ?? null,
+				ownerEnvPresent: ownerTerminalContextFromEnvironment() !== null,
+			});
+		});
+	}
+
+	/**
+	 * Re-point the coordinator sidecar marker and the postmortem finalizer at the
+	 * live SessionManager identity. Called only from a committed session switch or
+	 * new-session boundary: before this existed, the marker and the finalizer kept
+	 * the launch-time transcript forever, so every later event failed the sidecar
+	 * identity check (the `--tmux` drift).
+	 */
+	#rotateCoordinatorRuntimeStateIdentity(): void {
+		// Exactly one "coordinator-runtime-state" registration must exist at all
+		// times, and its captured identity must equal the live one. The dispose-time
+		// env condition at #dispose is deliberately not replicated here.
+		this.#unregisterRuntimeStateFinalizer?.();
+		this.#unregisterRuntimeStateFinalizer = undefined;
+		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+		// Rotation failure degrades to today's stale marker; it must never fail an
+		// already-committed switch.
+		void rotateCoordinatorRuntimeStateSessionFile({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		}).catch(error => {
+			logger.warn("Failed to rotate coordinator runtime state session file", {
+				reason: runtimeStateFailureReason(error) ?? "unclassified",
+				errorName: error instanceof Error ? error.name : typeof error,
+				liveSessionFile: this.sessionManager.getSessionFile() ?? null,
+				ownerEnvPresent: ownerTerminalContextFromEnvironment() !== null,
+			});
 		});
 	}
 
@@ -4181,7 +4258,14 @@ export class AgentSession {
 		skipCompactionCheck?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
-		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
+		onSkip?: (
+			reason:
+				| "generation_changed"
+				| "aborted_signal"
+				| "queue_drained"
+				| "handoff_in_progress"
+				| "persistence_blocked",
+		) => void;
 		allowDuringCancelAndSubmit?: boolean;
 		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
@@ -4191,7 +4275,14 @@ export class AgentSession {
 			? this.#reserveDeferredAgentEndForContinuation()
 			: undefined;
 		let terminalized = false;
-		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => {
+		const skip = (
+			reason:
+				| "generation_changed"
+				| "aborted_signal"
+				| "queue_drained"
+				| "handoff_in_progress"
+				| "persistence_blocked",
+		) => {
 			if (terminalized) return;
 			terminalized = true;
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -4226,6 +4317,14 @@ export class AgentSession {
 						}
 						if (options?.shouldContinue && !options.shouldContinue()) {
 							skip("queue_drained");
+							return false;
+						}
+						// A latched persistence failure means no further entry can reach disk,
+						// so a scheduled continuation must not start a turn either. This path
+						// calls `agent.continue()` directly instead of acquiring prompt
+						// admission, so it needs the same fence explicitly.
+						if (this.sessionManager.getPersistFailure()) {
+							skip("persistence_blocked");
 							return false;
 						}
 						return true;
@@ -9673,6 +9772,7 @@ export class AgentSession {
 			}
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
+			this.#rotateCoordinatorRuntimeStateIdentity();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
@@ -9746,6 +9846,7 @@ export class AgentSession {
 			this.agent.reset();
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
+			this.#rotateCoordinatorRuntimeStateIdentity();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
@@ -15802,6 +15903,10 @@ export class AgentSession {
 						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
+				// True commit boundary: every fallible step (model resolution,
+				// ensureOnDisk, the session_switch emit) has passed and the catch below
+				// can no longer roll the identity back.
+				this.#rotateCoordinatorRuntimeStateIdentity();
 				return true;
 			} catch (error) {
 				this.sessionManager.restoreState(previousSessionState);

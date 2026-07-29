@@ -19,7 +19,10 @@ import {
 	persistCoordinatorRuntimeInputReady,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
+	type RuntimeStateFailureReason,
 	readTerminalRuntimeStateMarker,
+	rotateCoordinatorRuntimeStateSessionFile,
+	runtimeStateFailureReason,
 	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
 import {
@@ -32,9 +35,35 @@ import {
 const tempDirs: string[] = [];
 
 type RuntimePayload = Record<string, unknown>;
+const runtimeStateFailureReasons = {
+	identity_incomplete: true,
+	payload_invalid: true,
+	previous_read_failed: true,
+	previous_parse_failed: true,
+	previous_stat_failed: true,
+	previous_not_a_file: true,
+	previous_async_read_or_parse_failed: true,
+	identity_mismatch: true,
+	session_id_mismatch: true,
+	lock_unavailable: true,
+	owner_env_invalid: true,
+	write_failed: true,
+} satisfies Record<RuntimeStateFailureReason, true>;
+
+void runtimeStateFailureReasons;
 
 async function readPayload(stateFile: string): Promise<RuntimePayload> {
 	return JSON.parse(await Bun.file(stateFile).text()) as RuntimePayload;
+}
+
+async function expectFailureReason(operation: Promise<unknown>, reason: RuntimeStateFailureReason): Promise<void> {
+	try {
+		await operation;
+	} catch (error) {
+		expect(runtimeStateFailureReason(error)).toBe(reason);
+		return;
+	}
+	throw new Error(`Expected coordinator runtime-state failure ${reason}`);
 }
 
 function assistantEnd(text: string, stopReason: "stop" | "error" = "stop") {
@@ -318,6 +347,194 @@ describe("coordinator runtime state sidecar", () => {
 		);
 
 		expect(await readPayload(stateFile)).toMatchObject({ session_id: "missing-state", state: "running" });
+	});
+	it("classifies synchronous previous-marker read and parse failures separately", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "reason-sync";
+		const context = { sessionId: "fallback", cwd: root, sessionFile: null };
+
+		const readFailure = Object.assign(new Error("read denied"), { code: "EACCES" });
+		const readFileSync = spyOn(fsSync, "readFileSync").mockImplementation(() => {
+			throw readFailure;
+		});
+		try {
+			await expectFailureReason(
+				persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
+				"previous_read_failed",
+			);
+		} finally {
+			readFileSync.mockRestore();
+		}
+
+		await Bun.write(stateFile, "{ invalid json");
+		await expectFailureReason(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
+			"previous_parse_failed",
+		);
+	});
+
+	it("classifies event identity, payload, and non-file marker failures", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "reason-event";
+		const context = { sessionId: "fallback", cwd: root, sessionFile: null };
+
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "other",
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			}),
+		);
+		await expectFailureReason(
+			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, context),
+			"identity_mismatch",
+		);
+
+		await Bun.write(stateFile, JSON.stringify({ malformed: true }));
+		await expectFailureReason(
+			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, context),
+			"payload_invalid",
+		);
+
+		await fs.rm(stateFile);
+		await fs.mkdir(stateFile);
+		await expectFailureReason(
+			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, context),
+			"previous_not_a_file",
+		);
+	});
+
+	it("classifies invalid owner metadata and state-file write failures", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const ownerKeys = [
+			GJC_TMUX_OWNER_GENERATION_ENV,
+			GJC_TMUX_OWNER_STATE_DIR_ENV,
+			GJC_TMUX_OWNER_SERVER_KEY_ENV,
+		] as const;
+		const previous = new Map(ownerKeys.map(key => [key, process.env[key]]));
+		try {
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "reason-owner";
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = "present-but-incomplete";
+			await expectFailureReason(
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				),
+				"owner_env_invalid",
+			);
+		} finally {
+			for (const key of ownerKeys) {
+				const value = previous.get(key);
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+
+		const originalWrite = Bun.write;
+		const write = spyOn(Bun, "write").mockImplementation((async (target: unknown, ...args: unknown[]) => {
+			if (target === stateFile) throw new Error("write denied");
+			return (originalWrite as (writeTarget: unknown, ...writeArgs: unknown[]) => Promise<number>)(target, ...args);
+		}) as typeof Bun.write);
+		try {
+			await expectFailureReason(
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				),
+				"write_failed",
+			);
+		} finally {
+			write.mockRestore();
+		}
+	});
+
+	it("authorizes only matching coordinator session-file rotations", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const firstSessionFile = path.join(root, "first.jsonl");
+		const successorSessionFile = path.join(root, "successor.jsonl");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "rotation-session";
+		const predecessor = {
+			schema_version: 1,
+			session_id: "rotation-session",
+			state: "running",
+			cwd: root,
+			workdir: root,
+			session_file: firstSessionFile,
+		};
+		await Bun.write(stateFile, `${JSON.stringify(predecessor)}\n`);
+
+		await expectFailureReason(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: successorSessionFile },
+			),
+			"identity_mismatch",
+		);
+		expect(await Bun.file(stateFile).text()).toBe(`${JSON.stringify(predecessor)}\n`);
+
+		await rotateCoordinatorRuntimeStateSessionFile({
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: successorSessionFile,
+		});
+		expect((await readPayload(stateFile)).session_file).toBe(successorSessionFile);
+	});
+
+	it("refuses owner-generation-mismatched rotations without changing the marker", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const generation = "11111111-1111-4111-8111-111111111111";
+		const ownerKeys = [
+			GJC_TMUX_OWNER_GENERATION_ENV,
+			GJC_TMUX_OWNER_STATE_DIR_ENV,
+			GJC_TMUX_OWNER_SERVER_KEY_ENV,
+		] as const;
+		const previous = new Map(ownerKeys.map(key => [key, process.env[key]]));
+		try {
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "owner-rotation";
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = generation;
+			process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = root;
+			process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = "test-socket";
+			const marker = {
+				schema_version: 1,
+				session_id: "owner-rotation",
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: path.join(root, "first.jsonl"),
+				owner_generation: "22222222-2222-4222-8222-222222222222",
+			};
+			const evidence = `${JSON.stringify(marker)}\n`;
+			await Bun.write(stateFile, evidence);
+			await expectFailureReason(
+				rotateCoordinatorRuntimeStateSessionFile({
+					sessionId: "fallback",
+					cwd: root,
+					sessionFile: path.join(root, "second.jsonl"),
+				}),
+				"identity_mismatch",
+			);
+			expect(await Bun.file(stateFile).text()).toBe(evidence);
+		} finally {
+			for (const key of ownerKeys) {
+				const value = previous.get(key);
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 
 	it("preserves malformed runtime-state evidence and refuses event and postmortem writes", async () => {

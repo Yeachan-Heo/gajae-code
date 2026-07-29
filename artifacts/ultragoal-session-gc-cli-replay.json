@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "kind": "cli-replay",
+  "replaySafe": true,
+  "command": [
+    "bun",
+    "-e",
+    "console.log('gc-redteam-replay-safe')"
+  ],
+  "cwd": ".",
+  "env": {},
+  "timeoutMs": 30000,
+  "expectedExitCode": 0,
+  "recordedStdout": "gc-redteam-replay-safe\n",
+  "recordedStderr": "",
+  "invariants": [
+    {
+      "type": "substring",
+      "value": "gc-redteam-replay-safe"
+    },
+    {
+      "type": "not_substring",
+      "value": "ERROR"
+    }
+  ]
+}

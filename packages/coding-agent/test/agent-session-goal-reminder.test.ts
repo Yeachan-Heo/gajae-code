@@ -347,7 +347,24 @@ describe("AgentSession active goal reminders", () => {
 					throw new Error("Timed out waiting for coordinator runtime-state failure containment");
 				}),
 			]);
-			expect(warnSpy).toHaveBeenCalledWith("Failed to persist coordinator runtime state", { event: "turn_start" });
+			// The warn now carries a discriminant so a permanent failure is
+			// distinguishable from a transient one. Keys are exact, and the payload
+			// bytes / owner env values must never appear.
+			expect(warnSpy).toHaveBeenCalledWith("Failed to persist coordinator runtime state", {
+				event: "turn_start",
+				reason: "payload_invalid",
+				errorName: "PreviousRuntimeStateReadError",
+				stateFile,
+				liveSessionFile: session.sessionManager.getSessionFile() ?? null,
+				ownerEnvPresent: false,
+			});
+			const metadata = warnSpy.mock.calls.find(
+				call => call[0] === "Failed to persist coordinator runtime state",
+			)?.[1] as Record<string, unknown>;
+			expect(Object.keys(metadata).sort()).toEqual(
+				["errorName", "event", "liveSessionFile", "ownerEnvPresent", "reason", "stateFile"].sort(),
+			);
+			expect(JSON.stringify(metadata)).not.toContain("must-not-reach-logs");
 		} finally {
 			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;

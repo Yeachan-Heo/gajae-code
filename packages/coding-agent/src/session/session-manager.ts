@@ -7692,6 +7692,15 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
+	/**
+	 * Read-only projection of the latched persistence failure. Set once by
+	 * `#recordPersistError` and cleared only by the existing identity-reset
+	 * sites; this accessor adds no control flow and never clears the latch.
+	 */
+	getPersistFailure(): { error: Error; sessionFile: string | undefined } | undefined {
+		return this.#persistError ? { error: this.#persistError, sessionFile: this.#sessionFile } : undefined;
+	}
+
 	acquireMemoryGuardParticipantIngressLease(): MemoryGuardParticipantIngressLease {
 		if (this.#memoryGuardParticipantIngressToken)
 			throw new Error("memory_guard_participant_ingress_lease_already_held");

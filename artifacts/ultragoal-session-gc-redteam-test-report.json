@@ -1,0 +1,414 @@
+{
+  "schemaVersion": 1,
+  "kind": "test-report",
+  "name": "ultragoal-session-gc-hostile-cli-redteam",
+  "verdict": "passed",
+  "hostileLayout": {
+    "symlinkedTranscript": "present",
+    "symlinkedArtifactDir": "present",
+    "regularArtifactSibling": "present",
+    "jsonlDirectory": "present",
+    "symlinkLoop": "present",
+    "escapeArtifactSymlink": "present",
+    "mode000ArtifactDir": "present",
+    "nestedSubagentJsonl": "present",
+    "zeroByteTranscript": "present",
+    "unparseableFirstLine": "present",
+    "over64KiBFirstLine": "present"
+  },
+  "expectedBehavior": "All four gc modes leave every seeded path and escape target byte-identical by dev/ino/size/mtimeNs; every discovered sessions record remains removable=false/action=none.",
+  "commands": [
+    {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json"
+      ],
+      "exitCode": 0,
+      "stderr": "",
+      "identityUnchanged": true,
+      "outsideUntouched": true,
+      "allSessionRecordsReportOnly": true,
+      "sessionRecords": [
+        {
+          "id": "escape-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=274.534423828125 size_bytes=71"
+        },
+        {
+          "id": "symlinked-transcript",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "directory",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "loop",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "zero",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "overlong",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "live",
+          "status": "over_threshold",
+          "removable": false,
+          "action": "none",
+          "reason": "Exceeds configured inventory threshold",
+          "detail": "age_ms=275.73095703125 size_bytes=140"
+        },
+        {
+          "id": "locked",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=276.1396484375 size_bytes=71"
+        },
+        {
+          "id": "regular-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=276.429931640625 size_bytes=72"
+        },
+        {
+          "id": "unparseable",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "JSON Parse error: Unexpected identifier \"not\"",
+          "detail": null
+        }
+      ],
+      "stdoutBytes": 66606,
+      "stdoutNote": "raw stdout omitted for size; verdict fields below are the assertions"
+    },
+    {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json",
+        "--prune"
+      ],
+      "exitCode": 0,
+      "stderr": "",
+      "identityUnchanged": true,
+      "outsideUntouched": true,
+      "allSessionRecordsReportOnly": true,
+      "sessionRecords": [
+        {
+          "id": "escape-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=556.534423828125 size_bytes=71"
+        },
+        {
+          "id": "symlinked-transcript",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "directory",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "loop",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "zero",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "overlong",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "live",
+          "status": "over_threshold",
+          "removable": false,
+          "action": "none",
+          "reason": "Exceeds configured inventory threshold",
+          "detail": "age_ms=557.73095703125 size_bytes=140"
+        },
+        {
+          "id": "locked",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=557.1396484375 size_bytes=71"
+        },
+        {
+          "id": "regular-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=558.429931640625 size_bytes=72"
+        },
+        {
+          "id": "unparseable",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "JSON Parse error: Unexpected identifier \"not\"",
+          "detail": null
+        }
+      ],
+      "stdoutBytes": 66605,
+      "stdoutNote": "raw stdout omitted for size; verdict fields below are the assertions"
+    },
+    {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json",
+        "--force"
+      ],
+      "exitCode": 0,
+      "stderr": "",
+      "identityUnchanged": true,
+      "outsideUntouched": true,
+      "allSessionRecordsReportOnly": true,
+      "sessionRecords": [
+        {
+          "id": "escape-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=833.534423828125 size_bytes=71"
+        },
+        {
+          "id": "symlinked-transcript",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "directory",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "loop",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "zero",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "overlong",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "live",
+          "status": "over_threshold",
+          "removable": false,
+          "action": "none",
+          "reason": "Exceeds configured inventory threshold",
+          "detail": "age_ms=834.73095703125 size_bytes=140"
+        },
+        {
+          "id": "locked",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=835.1396484375 size_bytes=71"
+        },
+        {
+          "id": "regular-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=835.429931640625 size_bytes=72"
+        },
+        {
+          "id": "unparseable",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "JSON Parse error: Unexpected identifier \"not\"",
+          "detail": null
+        }
+      ],
+      "stdoutBytes": 66605,
+      "stdoutNote": "raw stdout omitted for size; verdict fields below are the assertions"
+    },
+    {
+      "command": [
+        "bun",
+        "packages/coding-agent/src/cli.ts",
+        "gc",
+        "--json",
+        "--dry-run",
+        "--prune"
+      ],
+      "exitCode": 0,
+      "stderr": "",
+      "identityUnchanged": true,
+      "outsideUntouched": true,
+      "allSessionRecordsReportOnly": true,
+      "sessionRecords": [
+        {
+          "id": "escape-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=1111.534423828125 size_bytes=71"
+        },
+        {
+          "id": "symlinked-transcript",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "directory",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "loop",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Transcript is not a regular .jsonl file",
+          "detail": null
+        },
+        {
+          "id": "zero",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "overlong",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "Session header is missing or exceeds 65536 bytes",
+          "detail": null
+        },
+        {
+          "id": "live",
+          "status": "over_threshold",
+          "removable": false,
+          "action": "none",
+          "reason": "Exceeds configured inventory threshold",
+          "detail": "age_ms=1112.73095703125 size_bytes=140"
+        },
+        {
+          "id": "locked",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=1112.1396484375 size_bytes=71"
+        },
+        {
+          "id": "regular-artifact",
+          "status": "ambiguous",
+          "removable": false,
+          "action": "none",
+          "reason": "Artifact tree is not a fully readable directory tree",
+          "detail": "age_ms=1112.429931640625 size_bytes=72"
+        },
+        {
+          "id": "unparseable",
+          "status": "unreadable",
+          "removable": false,
+          "action": "none",
+          "reason": "JSON Parse error: Unexpected identifier \"not\"",
+          "detail": null
+        }
+      ],
+      "stdoutBytes": 66610,
+      "stdoutNote": "raw stdout omitted for size; verdict fields below are the assertions"
+    }
+  ]
+}
