@@ -9,10 +9,11 @@
 
 ### Changed
 
-- Alternate-scroll mode (`DECSET 1007`) is now explicitly disabled at startup, on every mouse-capture toggle, at stop, and during emergency restore, so the host terminal or multiplexer owns mouse-wheel scrollback instead of receiving wheel-to-cursor-key translation. Hosts that never answer a `DECRQM ?1007$p` query (Apple Terminal among them) cannot report this mode, so it is reset unconditionally rather than conditionally on a reported state.
+- Alternate-scroll mode (`DECSET 1007`) is now explicitly disabled at startup, on every mouse-capture toggle, at stop, and during emergency restore, so no host translates wheel input into cursor keys. While mouse capture is off this leaves wheel scrollback to the host terminal or multiplexer; while capture is on GJC consumes SGR wheel reports itself, and the reset removes a conflicting second translation path. Hosts that never answer a `DECRQM ?1007$p` query (Apple Terminal among them) cannot report this mode, so it is reset unconditionally rather than conditionally on a reported state.
 
 ### Fixed
 
+- The renderer's reported cursor column is now clamped to the last real cell, so it always names a column that exists in the current terminal width. On the wire this is unchanged (a terminal already clamps `CHA` to the last column), but the reported value is now truthful for callers reading it through the viewport observation.
 - Kitty/Ghostty inline images no longer remain visually pinned when sticky or semantic viewport repaints move their anchors into application scrollback. The renderer now soft-deletes only the named placement from the old viewport, retains uploaded pixels for history replay, and keeps placement tracking aligned across unresolved-anchor and follow-live transitions.
 
 ## [0.12.0] - 2026-07-28
