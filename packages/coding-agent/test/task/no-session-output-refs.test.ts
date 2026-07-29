@@ -25,6 +25,14 @@ const TEST_AGENT: AgentDefinition = {
 	tools: ["yield"],
 };
 
+function matchAgentOutputId(text: string, taskId: string): RegExpMatchArray | null {
+	return text.match(new RegExp(`agent://((?:\\d+-[A-Za-z0-9][A-Za-z0-9_-]{0,47}\\.)*\\d+-${taskId})`));
+}
+
+function agentOutputIndex(id: string): number {
+	return Number.parseInt(id.split(".").at(-1)!.split("-")[0]!, 10);
+}
+
 function createAssistantMessage(text: string): Message {
 	return {
 		role: "assistant",
@@ -171,7 +179,7 @@ describe("task no-session output refs", () => {
 		const tool = await TaskTool.create(session);
 		const resultText = await runDetachedTask(tool);
 
-		const uriMatch = resultText.match(/agent:\/\/(\d+-NoSession)/);
+		const uriMatch = matchAgentOutputId(resultText, "NoSession");
 		expect(uriMatch).toBeTruthy();
 		const outputId = uriMatch![1]!;
 		const outputUri = `agent://${outputId}`;
@@ -228,9 +236,9 @@ describe("task no-session output refs", () => {
 			description: "review code",
 			assignment: "Produce findings.",
 		});
-		const firstUriMatch = firstText.match(/agent:\/\/(\d+-Architect)/);
+		const firstUriMatch = matchAgentOutputId(firstText, "Architect");
 		expect(firstUriMatch).toBeTruthy();
-		expect(Number(firstUriMatch![1]!.split("-")[0])).toBe(1);
+		expect(agentOutputIndex(firstUriMatch![1]!)).toBe(0);
 		const firstUri = `agent://${firstUriMatch![1]!}`;
 		const firstArtifactsDir = session.getArtifactsDir?.();
 		expect(firstArtifactsDir).toBeTruthy();
@@ -247,10 +255,10 @@ describe("task no-session output refs", () => {
 			description: "review prior findings",
 			assignment: `Read ${firstUri} and critique.`,
 		});
-		const secondUriMatch = secondText.match(/agent:\/\/(\d+-Architect)/);
+		const secondUriMatch = matchAgentOutputId(secondText, "Architect");
 		expect(secondUriMatch).toBeTruthy();
 		expect(secondUriMatch![1]).not.toBe(firstUriMatch![1]);
-		expect(Number(secondUriMatch![1]!.split("-")[0])).toBeGreaterThan(Number(firstUriMatch![1]!.split("-")[0]));
+		expect(agentOutputIndex(secondUriMatch![1]!)).toBeGreaterThan(agentOutputIndex(firstUriMatch![1]!));
 
 		const artifactsDir = session.getArtifactsDir?.();
 		expect(artifactsDir).toBe(firstArtifactsDir);
@@ -285,7 +293,7 @@ describe("task no-session output refs", () => {
 		session.getArtifactManager = () => foreignManager;
 		const tool = await TaskTool.create(session);
 		const resultText = await runDetachedTask(tool);
-		expect(resultText).toMatch(/agent:\/\/\d+-NoSession/);
+		expect(matchAgentOutputId(resultText, "NoSession")).toBeTruthy();
 		const artifactsDir = session.getArtifactsDir?.();
 		expect(artifactsDir).toBeTruthy();
 		expect(path.resolve(session.getArtifactManager?.()?.dir ?? "")).toBe(path.resolve(artifactsDir!));
@@ -309,23 +317,67 @@ describe("task no-session output refs", () => {
 		expect(session.getArtifactsDir?.()).toBeNull();
 	});
 
+	it("namespaces identical task IDs across independent authorized roots", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("independent root output")),
+		);
+		const firstSession = createSession(null, `root-a-${Snowflake.next()}`);
+		const secondSession = createSession(null, `root-b-${Snowflake.next()}`);
+		const firstText = await runDetachedTask(await TaskTool.create(firstSession));
+		const secondText = await runDetachedTask(await TaskTool.create(secondSession));
+		const firstId = matchAgentOutputId(firstText, "NoSession")?.[1];
+		const secondId = matchAgentOutputId(secondText, "NoSession")?.[1];
+		expect(firstId).toBeTruthy();
+		expect(secondId).toBeTruthy();
+		expect(firstId).not.toBe(secondId);
+		const roots = [firstSession.getArtifactsDir?.(), secondSession.getArtifactsDir?.()].filter(
+			(root): root is string => Boolean(root),
+		);
+		expect(roots).toHaveLength(2);
+		for (const id of [firstId!, secondId!]) {
+			const resolved = await InternalUrlRouter.instance().resolve(`agent://${id}`, {
+				cwd: "/tmp",
+				getArtifactsDir: () => null,
+				getAuthorizedArtifactsDirs: () => roots,
+			});
+			expect(resolved.content).toContain("independent root output");
+		}
+		await Promise.all([firstSession.disposeSession(), secondSession.disposeSession()]);
+	});
+
+	it("rolls back durable authorization when cleanup registration throws", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("must not survive cleanup registration failure")),
+		);
+		const session = createSession(null, `cleanup-throw-${Snowflake.next()}`);
+		session.registerSessionCleanup = () => {
+			throw new Error("cleanup registry unavailable");
+		};
+		const resultText = await runDetachedTask(await TaskTool.create(session));
+		expect(resultText).toContain("Task completed; output artifact unavailable.");
+		expect(matchAgentOutputId(resultText, "NoSession")).toBeNull();
+		expect(session.getArtifactsDir?.()).toBeNull();
+		expect(session.getAuthorizedArtifactsDirs?.() ?? []).toEqual([]);
+	});
+
 	it("omits dead URIs after allocation failure and retries a later batch", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
 			createSessionResult(createYieldingSession("output that must remain durable")),
 		);
-		const mkdtempSpy = vi.spyOn(fs, "mkdtemp").mockRejectedValue(new Error("EACCES: permission denied"));
+		vi.spyOn(fs, "mkdtemp").mockRejectedValueOnce(new Error("EACCES: permission denied"));
 
 		const session = createSession(null, `alloc-fail-${Snowflake.next()}`);
 		const tool = await TaskTool.create(session);
 		const failedText = await runDetachedTask(tool);
 		expect(failedText).toContain("Task completed; output artifact unavailable.");
-		expect(failedText).not.toMatch(/agent:\/\/\d+-NoSession/);
+		expect(matchAgentOutputId(failedText, "NoSession")).toBeNull();
 		expect(session.getArtifactsDir?.()).toBeNull();
-		mkdtempSpy.mockRestore();
 
 		const retriedText = await runDetachedTask(tool);
-		expect(retriedText).toMatch(/agent:\/\/\d+-NoSession/);
+		expect(matchAgentOutputId(retriedText, "NoSession")).toBeTruthy();
 		const artifactsDir = session.getArtifactsDir?.();
 		expect(artifactsDir).toBeTruthy();
 		await session.disposeSession();
