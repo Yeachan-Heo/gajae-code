@@ -290,7 +290,22 @@ describe("sticky viewport production evidence verifier", () => {
 		capacityMetadata.state.transcript_capacity = 2;
 		await Bun.write(capacityMetadataPath, `${JSON.stringify(capacityMetadata, null, 2)}\n`);
 		await rehash(capacityRoot, capacityKey, "metadata.json");
-		await expect(verifyStickyViewportShowcase(capacityRoot)).rejects.toThrow("runtime observation mismatch");
+		// The frame-derived capacity oracle rejects this before the downstream
+		// observation check, because the painted status row contradicts the claim.
+		await expect(verifyStickyViewportShowcase(capacityRoot)).rejects.toThrow("capacity metadata/frame mismatch");
+
+		// `pin_boundary.row` is assigned from the same renderer local as
+		// `transcript_capacity`, so mutating it alone is only detectable against the
+		// committed paint. This case fails if that assertion ever becomes tautological.
+		const pinRoot = await cloneBase();
+		const pinKey = "capacity-one/80x24/unicode-color";
+		const pinMetadataPath = path.join(pinRoot, pinKey, "metadata.json");
+		const pinMetadata = JSON.parse(await fs.readFile(pinMetadataPath, "utf8"));
+		pinMetadata.state.pin_boundary.row = (pinMetadata.state.pin_boundary.row as number) + 1;
+		pinMetadata.state.transcript_capacity = pinMetadata.state.pin_boundary.row;
+		await Bun.write(pinMetadataPath, `${JSON.stringify(pinMetadata, null, 2)}\n`);
+		await rehash(pinRoot, pinKey, "metadata.json");
+		await expect(verifyStickyViewportShowcase(pinRoot)).rejects.toThrow("capacity metadata/frame mismatch");
 
 		const cjkRoot = await cloneBase();
 		const cjkKey = "narrow-cjk/48x10/unicode-color";
