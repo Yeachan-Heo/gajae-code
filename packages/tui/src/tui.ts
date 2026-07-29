@@ -641,8 +641,21 @@ type RenderCommitWaiter = {
 	timer: NodeJS.Timeout;
 };
 
+type KittyPlacementOwner = "transcript" | "suffix" | "overlay";
+
 type KittyPlacementSpan = KittyPlacementReference & {
 	row: number;
+	owner: KittyPlacementOwner;
+};
+
+type KittyPlacementRegion = {
+	top: number;
+	bottom: number;
+};
+
+type KittyPlacementDeletePlan = {
+	deletedKeys: Set<string>;
+	output: string;
 };
 
 /**
@@ -652,6 +665,9 @@ export class TUI extends Container {
 	terminal: Terminal;
 	#previousLines: string[] = [];
 	#latestRenderedLines: string[] = [];
+	#latestRenderedTranscriptLineCount = 0;
+	#latestRenderedSuffixLineCount = 0;
+	#latestRenderedPlacementOwners = new Map<string, KittyPlacementOwner>();
 	/**
 	 * Raw (pre-normalization) lines from the previous frame, kept only when the
 	 * virtual-viewport flag is on. Used to detect whether the off-screen prefix is
@@ -660,7 +676,6 @@ export class TUI extends Container {
 	 */
 	#previousRaw: string[] = [];
 	#kittyPlacementSpans: KittyPlacementSpan[] = [];
-	#latestKittyPlacementSpans: KittyPlacementSpan[] = [];
 	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
 	#lineEmitWidthCache = new Map<string, number>();
 	#lineTruncationCache = new Map<string, string>();
@@ -1038,6 +1053,10 @@ export class TUI extends Container {
 		if (!Number.isFinite(deltaRows)) return false;
 		const delta = Math.trunc(deltaRows);
 		if (delta === 0) return false;
+		const previousManualViewportTop = this.#manualViewportTop;
+		const previousManualViewportAnchor = this.#manualViewportAnchor;
+		const previousManualViewportFallbackAnchors = this.#manualViewportFallbackAnchors;
+		const previousReconcileMissingViewportAnchor = this.#reconcileMissingViewportAnchor;
 
 		const direction: -1 | 1 = delta < 0 ? -1 : 1;
 		const pin = options?.pin ?? "stable";
@@ -1128,7 +1147,8 @@ export class TUI extends Container {
 			}
 		}
 		this.#manualViewportTop = targetViewportTop;
-		return this.#repaintViewportFromLines(
+		let contentPainted = false;
+		const painted = this.#repaintViewportFromLines(
 			this.#previousLines,
 			width,
 			height,
@@ -1136,7 +1156,26 @@ export class TUI extends Container {
 			null,
 			"manual viewport scroll",
 			this.#manualViewportAnchor !== null,
+			() => {
+				contentPainted = true;
+				this.#manualTranscriptLineCount = this.#latestRenderedTranscriptLineCount;
+				this.#manualSuffixLineCount = this.#latestRenderedSuffixLineCount;
+			},
+			false,
+			this.#kittyPlacementSpans,
+			this.#kittyPlacementSpansForLines(this.#previousLines, this.#latestRenderedPlacementOwners),
+			{
+				transcriptLineCount: this.#latestRenderedTranscriptLineCount,
+				suffixLineCount: this.#latestRenderedSuffixLineCount,
+			},
 		);
+		if (!contentPainted) {
+			this.#manualViewportTop = previousManualViewportTop;
+			this.#manualViewportAnchor = previousManualViewportAnchor;
+			this.#manualViewportFallbackAnchors = previousManualViewportFallbackAnchors;
+			this.#reconcileMissingViewportAnchor = previousReconcileMissingViewportAnchor;
+		}
+		return painted;
 	}
 
 	scrollViewportPages(direction: -1 | 1): boolean {
@@ -1153,9 +1192,12 @@ export class TUI extends Container {
 		const paddedLiveLines = this.#padBeforeBottomPinnedComponent(
 			this.#latestRenderedLines,
 			height,
-			this.#manualSuffixLineCount,
+			this.#latestRenderedSuffixLineCount,
 		);
 		const liveLines = paddedLiveLines.lines;
+		const liveTranscriptLineCount = this.#latestRenderedTranscriptLineCount;
+		const liveSuffixLineCount = this.#latestRenderedSuffixLineCount + paddedLiveLines.insertedBlankRows;
+		const liveKittyPlacementSpans = this.#kittyPlacementSpansForLines(liveLines, this.#latestRenderedPlacementOwners);
 		let liveCursorPosition = this.#lastCursorPosition;
 		if (liveCursorPosition !== null && liveCursorPosition.row >= paddedLiveLines.insertionRow) {
 			liveCursorPosition = {
@@ -1182,7 +1224,8 @@ export class TUI extends Container {
 				this.#paintedManualOutputNotice = false;
 				this.#lastCursorPosition = liveCursorPosition;
 				this.#previousLines = liveLines;
-				this.#kittyPlacementSpans = this.#latestKittyPlacementSpans;
+				this.#manualTranscriptLineCount = liveTranscriptLineCount;
+				this.#manualSuffixLineCount = liveSuffixLineCount;
 				if (this.#scrollbackResumeViewportTop === undefined) {
 					this.#nativeScrollbackViewportTop = liveViewportTop;
 				}
@@ -1196,6 +1239,9 @@ export class TUI extends Container {
 				}
 			},
 			true,
+			this.#kittyPlacementSpans,
+			liveKittyPlacementSpans,
+			{ transcriptLineCount: liveTranscriptLineCount, suffixLineCount: liveSuffixLineCount },
 		);
 	}
 
@@ -1574,6 +1620,8 @@ export class TUI extends Container {
 
 	stop(): void {
 		this.flushTerminalCleanup();
+		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
+		if (placementCleanup.length > 0 && this.#writeTerminal(placementCleanup)) this.#kittyPlacementSpans = [];
 		this.#clearSixelProbeState();
 		this.#stopped = true;
 		this.#settleRenderCommitWaiters(false);
@@ -1626,7 +1674,6 @@ export class TUI extends Container {
 		this.#latestRenderedLines = [];
 		this.#previousRaw = [];
 		this.#kittyPlacementSpans = [];
-		this.#latestKittyPlacementSpans = [];
 		this.#lineNormalizationCache.clear();
 		this.#lineTruncationCache.clear();
 		this.#lineEmitWidthCache.clear();
@@ -1730,8 +1777,6 @@ export class TUI extends Container {
 		}
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
-			const preserveViewportCursor =
-				useViewportRepaintPath(this.terminal) || shouldPreserveScrollbackOnFullClear(this.terminal);
 			// A forced full redraw supersedes any queued input-priority render.
 			this.#inputRenderPending = false;
 			this.#previousLines = [];
@@ -1744,12 +1789,6 @@ export class TUI extends Container {
 			this.#previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
 			this.#lineNormalizationCacheLimit = 0;
 			this.#lineTruncationCacheLimit = 0;
-			if (!preserveViewportCursor) {
-				this.#cursorRow = 0;
-				this.#hardwareCursorRow = 0;
-				this.#viewportTopRow = 0;
-				this.#maxLinesRendered = 0;
-			}
 			if (this.#renderTimer) {
 				clearTimeout(this.#renderTimer);
 				this.#renderTimer = undefined;
@@ -2241,7 +2280,12 @@ export class TUI extends Container {
 	}
 
 	/** Composite all overlays into content lines (in stack order, later = on top). */
-	#compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
+	#compositeOverlays(
+		lines: string[],
+		termWidth: number,
+		termHeight: number,
+		placementOwners?: Map<string, KittyPlacementOwner>,
+	): string[] {
 		if (this.overlayStack.length === 0) return lines;
 		const result = [...lines];
 		for (const entry of this.overlayStack) entry.mouseBounds = undefined;
@@ -2302,6 +2346,11 @@ export class TUI extends Container {
 					// (components should already respect width, but this ensures it)
 					const truncatedOverlayLine =
 						visibleWidth(overlayLines[i]) > w ? sliceByColumn(overlayLines[i], 0, w, true) : overlayLines[i];
+					if (placementOwners !== undefined) {
+						for (const placement of extractKittyPlacementReferences(truncatedOverlayLine)) {
+							placementOwners.set(this.#kittyPlacementKey(placement), "overlay");
+						}
+					}
 					result[idx] = this.#compositeLineAt(result[idx], truncatedOverlayLine, col, w, termWidth);
 					modifiedLines.add(idx);
 				}
@@ -2519,19 +2568,90 @@ export class TUI extends Container {
 		return lines;
 	}
 
-	#kittyViewportCleanup(placements: KittyPlacementSpan[], viewportTop: number, height: number): string {
-		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty || height <= 0) return "";
-		const viewportBottom = viewportTop + height;
-		const deleted = new Set<string>();
+	#kittyPlacementKey(reference: KittyPlacementReference): string {
+		return `${reference.imageId}:${reference.placementId}`;
+	}
+
+	#kittyPlacementSpansForLines(
+		lines: string[],
+		owners: ReadonlyMap<string, KittyPlacementOwner>,
+	): KittyPlacementSpan[] {
+		const placements: KittyPlacementSpan[] = [];
+		for (let row = 0; row < lines.length; row++) {
+			for (const placement of extractKittyPlacementReferences(lines[row])) {
+				placements.push({
+					...placement,
+					row,
+					owner: owners.get(this.#kittyPlacementKey(placement)) ?? "transcript",
+				});
+			}
+		}
+		return placements;
+	}
+
+	#kittyPlacementIntersectsRegion(placement: KittyPlacementSpan, region: KittyPlacementRegion): boolean {
+		return placement.row < region.bottom && placement.row + placement.rows > region.top;
+	}
+
+	#kittyPlacementDeletePlan(
+		previous: KittyPlacementSpan[],
+		next: KittyPlacementSpan[],
+		overwrittenRegions: KittyPlacementRegion[],
+		deleteAll = false,
+		overwrittenOwners: KittyPlacementOwner[] = [],
+	): KittyPlacementDeletePlan {
+		const deletedKeys = new Set<string>();
+		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return { deletedKeys, output: "" };
+		const nextByKey = new Map(next.map(placement => [this.#kittyPlacementKey(placement), placement]));
 		let output = "";
-		for (const placement of placements) {
-			if (placement.row >= viewportBottom || placement.row + placement.rows <= viewportTop) continue;
-			const key = `${placement.imageId}:${placement.placementId}`;
-			if (deleted.has(key)) continue;
-			deleted.add(key);
+		for (const placement of previous) {
+			const key = this.#kittyPlacementKey(placement);
+			if (deletedKeys.has(key)) continue;
+			const candidate = nextByKey.get(key);
+			const changed =
+				candidate === undefined || candidate.row !== placement.row || candidate.rows !== placement.rows;
+			const overwritten =
+				deleteAll ||
+				overwrittenOwners.includes(placement.owner) ||
+				overwrittenRegions.some(region => this.#kittyPlacementIntersectsRegion(placement, region));
+			if (!changed && !overwritten) continue;
+			deletedKeys.add(key);
 			output += encodeKittyPlacementDelete(placement);
 		}
-		return output;
+		return { deletedKeys, output };
+	}
+
+	#kittyCommittedPlacementsAfterPaint(
+		previous: KittyPlacementSpan[],
+		next: KittyPlacementSpan[],
+		deletePlan: KittyPlacementDeletePlan,
+		emittedRegions: KittyPlacementRegion[],
+	): KittyPlacementSpan[] {
+		const committed = new Map<string, KittyPlacementSpan>();
+		for (const placement of previous) {
+			const key = this.#kittyPlacementKey(placement);
+			if (!deletePlan.deletedKeys.has(key)) committed.set(key, placement);
+		}
+		for (const placement of next) {
+			if (!emittedRegions.some(region => placement.row >= region.top && placement.row < region.bottom)) continue;
+			committed.set(this.#kittyPlacementKey(placement), placement);
+		}
+		return [...committed.values()];
+	}
+
+	#kittyViewportTopIncludingPlacementAnchors(viewportTop: number, placements: KittyPlacementSpan[]): number {
+		let resolvedTop = viewportTop;
+		let changed: boolean;
+		do {
+			const priorTop = resolvedTop;
+			for (const placement of placements) {
+				if (placement.row < resolvedTop && placement.row + placement.rows > resolvedTop) {
+					resolvedTop = placement.row;
+				}
+			}
+			changed = resolvedTop !== priorTop;
+		} while (changed);
+		return resolvedTop;
 	}
 
 	#pinnedChildLines(component: Component, renderedChildren: Map<Component, string[]>): string[] {
@@ -2633,9 +2753,9 @@ export class TUI extends Container {
 		padded.splice(insertionRow, 0, ...Array.from({ length: insertedBlankRows }, () => ""));
 		return { lines: padded, insertionRow, insertedBlankRows };
 	}
-	#manualTranscriptCapacity(height: number): number {
-		const noticeRows = this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
-		return Math.max(0, height - this.#manualSuffixLineCount - noticeRows);
+	#manualTranscriptCapacity(height: number, suffixLineCount = this.#manualSuffixLineCount): number {
+		const noticeRows = this.#manualOutputNotice && height > suffixLineCount ? 1 : 0;
+		return Math.max(0, height - suffixLineCount - noticeRows);
 	}
 	#resolveManualAnchor(frame: ViewportAnchorFrame): number | null {
 		const anchor = this.#manualViewportAnchor;
@@ -2697,8 +2817,12 @@ export class TUI extends Container {
 		onPainted?: () => void,
 		paintLive = false,
 		placementsToClear: KittyPlacementSpan[] = this.#kittyPlacementSpans,
+		placementsToPaint: KittyPlacementSpan[] = placementsToClear,
+		geometry?: { transcriptLineCount: number; suffixLineCount: number },
 	): boolean {
 		const paintManual = this.#manualViewportTop !== undefined && !paintLive;
+		const transcriptLineCount = geometry?.transcriptLineCount ?? this.#manualTranscriptLineCount;
+		const suffixLineCount = geometry?.suffixLineCount ?? this.#manualSuffixLineCount;
 		if (height <= 0 || width <= 0) return false;
 		const maxViewportTop = Math.max(
 			0,
@@ -2706,19 +2830,32 @@ export class TUI extends Container {
 				? lines.length - (allowPastLiveBottom ? 1 : height)
 				: allowPastLiveBottom
 					? lines.length - 1
-					: this.#manualTranscriptLineCount - this.#manualTranscriptCapacity(height),
+					: transcriptLineCount - this.#manualTranscriptCapacity(height, suffixLineCount),
 		);
-		const nextViewportTop = Math.max(0, Math.min(maxViewportTop, viewportTop));
+		let nextViewportTop = Math.max(0, Math.min(maxViewportTop, viewportTop));
+		if (paintManual)
+			nextViewportTop = this.#kittyViewportTopIncludingPlacementAnchors(nextViewportTop, placementsToPaint);
 		const currentScreenRow = Math.max(0, Math.min(height - 1, this.#hardwareCursorRow - this.#viewportTopRow));
-		let buffer = "\x1b[?2026h";
-		buffer += this.#kittyViewportCleanup(placementsToClear, this.#viewportTopRow, height);
+		const transcriptCapacity = paintManual ? this.#manualTranscriptCapacity(height, suffixLineCount) : height;
+		const noticeRows = paintManual && this.#manualOutputNotice && height > suffixLineCount ? 1 : 0;
+		const deletePlan = this.#kittyPlacementDeletePlan(
+			placementsToClear,
+			placementsToPaint,
+			[{ top: this.#viewportTopRow, bottom: this.#viewportTopRow + height }],
+			false,
+			paintManual ? ["suffix", "overlay"] : [],
+		);
+		const emittedRegions: KittyPlacementRegion[] = paintManual
+			? [
+					{ top: nextViewportTop, bottom: nextViewportTop + transcriptCapacity },
+					{ top: transcriptLineCount, bottom: transcriptLineCount + suffixLineCount },
+				]
+			: [{ top: nextViewportTop, bottom: nextViewportTop + height }];
+		let buffer = `\x1b[?2026h${deletePlan.output}`;
 		if (currentScreenRow > 0) {
 			buffer += `\x1b[${currentScreenRow}A`;
 		}
 		buffer += "\r";
-
-		const transcriptCapacity = paintManual ? this.#manualTranscriptCapacity(height) : height;
-		const noticeRows = paintManual && this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
 		const committedTranscriptRows: Array<number | null> = [];
 		for (let screenRow = 0; screenRow < height; screenRow++) {
 			if (screenRow > 0) buffer += "\r\n";
@@ -2729,12 +2866,12 @@ export class TUI extends Container {
 				paintManual && screenRow === transcriptCapacity && noticeRows > 0
 					? "New output — type to follow"
 					: paintManual && suffixRow >= 0
-						? (lines[this.#manualTranscriptLineCount + suffixRow] ?? "")
-						: paintManual && lineIndex >= this.#manualTranscriptLineCount
+						? (lines[transcriptLineCount + suffixRow] ?? "")
+						: paintManual && lineIndex >= transcriptLineCount
 							? ""
 							: (lines[lineIndex] ?? "");
 			committedTranscriptRows.push(
-				screenRow < transcriptCapacity && lineIndex < this.#manualTranscriptLineCount ? lineIndex : null,
+				screenRow < transcriptCapacity && lineIndex < transcriptLineCount ? lineIndex : null,
 			);
 			const isImage = TERMINAL.isImageLine(line);
 			if (!isImage && this.#visibleWidthForDifferentialGuard(line) > width) {
@@ -2756,23 +2893,30 @@ export class TUI extends Container {
 		}
 		buffer += cursorSeq;
 		buffer += "\x1b[?2026l";
-		if (
-			!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length, () => {
-				this.#hardwareCursorRow = cursorToRow;
-				this.#committedTranscriptRows = committedTranscriptRows;
-				this.#cursorRow = Math.max(0, lines.length - 1);
-				this.#maxLinesRendered = lines.length;
-				this.#viewportTopRow = nextViewportTop;
-				onPainted?.();
-			})
-		)
-			return false;
+		let contentWritten = false;
+		const writeSucceeded = this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length, () => {
+			contentWritten = true;
+			this.#hardwareCursorRow = cursorToRow;
+			this.#committedTranscriptRows = committedTranscriptRows;
+			this.#cursorRow = Math.max(0, lines.length - 1);
+			this.#maxLinesRendered = lines.length;
+			this.#viewportTopRow = nextViewportTop;
+			if (paintManual) this.#manualViewportTop = nextViewportTop;
+			this.#kittyPlacementSpans = this.#kittyCommittedPlacementsAfterPaint(
+				placementsToClear,
+				placementsToPaint,
+				deletePlan,
+				emittedRegions,
+			);
+			onPainted?.();
+		});
+		if (!contentWritten) return false;
 
 		if (this.#debugRedraw) {
 			const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (lines=${lines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 			this.#appendDebugRedrawLog(msg);
 		}
-		return true;
+		return writeSucceeded;
 	}
 
 	#doRender(): void {
@@ -2793,8 +2937,8 @@ export class TUI extends Container {
 		const renderedLines: string[] = [];
 		const renderedChildren = new Map<Component, string[]>();
 		let anchorFrame: ViewportAnchorFrame | null = null;
-		const previousKittyPlacementSpans = this.#kittyPlacementSpans;
-		const nextKittyPlacementSpans: KittyPlacementSpan[] = [];
+		let previousKittyPlacementSpans = this.#kittyPlacementSpans;
+		const placementOwners = new Map<string, KittyPlacementOwner>();
 		const pinnedChildIndex =
 			this.#bottomPinnedComponent === null ? -1 : this.children.indexOf(this.#bottomPinnedComponent);
 		const hasStickySuffix = pinnedChildIndex >= 0;
@@ -2806,13 +2950,10 @@ export class TUI extends Container {
 			if (child === this.#viewportAnchorComponent && rendered.anchors.some(anchor => anchor !== null)) {
 				anchorFrame = { startRow: renderedLines.length, anchors: rendered.anchors };
 			}
-			const trackPlacements = !hasStickySuffix || childIndex < pinnedChildIndex;
+			const owner: KittyPlacementOwner = hasStickySuffix && childIndex >= pinnedChildIndex ? "suffix" : "transcript";
 			for (const line of rendered.lines) {
-				if (trackPlacements && line.includes(ImageProtocol.Kitty)) {
-					const row = renderedLines.length;
-					for (const placement of extractKittyPlacementReferences(line)) {
-						nextKittyPlacementSpans.push({ ...placement, row });
-					}
+				for (const placement of extractKittyPlacementReferences(line)) {
+					placementOwners.set(this.#kittyPlacementKey(placement), owner);
 				}
 				renderedLines.push(line);
 			}
@@ -2834,10 +2975,12 @@ export class TUI extends Container {
 				newLines.length - sourceTranscriptLineCount,
 			).lines;
 		}
+		const nextTranscriptLineCount = sourceTranscriptLineCount;
+		const nextSuffixLineCount = hasStickySuffix ? Math.max(0, newLines.length - nextTranscriptLineCount) : 0;
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
-			newLines = this.#compositeOverlays(newLines, width, height);
+			newLines = this.#compositeOverlays(newLines, width, height, placementOwners);
 		}
 
 		// Extract cursor position (marker must be found before diff comparison)
@@ -2905,11 +3048,11 @@ export class TUI extends Container {
 			renderMetrics.recordLineCount("measured", total - diffStart);
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
+		const nextKittyPlacementSpans = this.#kittyPlacementSpansForLines(newLines, placementOwners);
 		this.#latestRenderedLines = newLines;
-		this.#latestKittyPlacementSpans = nextKittyPlacementSpans;
-		this.#kittyPlacementSpans = nextKittyPlacementSpans;
-		this.#manualTranscriptLineCount = sourceTranscriptLineCount;
-		this.#manualSuffixLineCount = Math.max(0, newLines.length - sourceTranscriptLineCount);
+		this.#latestRenderedTranscriptLineCount = nextTranscriptLineCount;
+		this.#latestRenderedSuffixLineCount = nextSuffixLineCount;
+		this.#latestRenderedPlacementOwners = placementOwners;
 		const naturalViewportTop = Math.max(0, newLines.length - height);
 		const priorLogicalLineCount = Math.max(this.#previousLines.length, this.#maxLinesRendered);
 		if (this.#transcriptIdentityResetPending) {
@@ -2925,6 +3068,17 @@ export class TUI extends Container {
 		}
 
 		if (this.#manualViewportTop !== undefined) {
+			const committedManualViewportTop = this.#manualViewportTop;
+			const committedManualViewportAnchor = this.#manualViewportAnchor;
+			const committedManualViewportFallbackAnchors = this.#manualViewportFallbackAnchors;
+			const committedReconcileMissingViewportAnchor = this.#reconcileMissingViewportAnchor;
+			const restoreManualIntent = (): void => {
+				this.#manualViewportTop = committedManualViewportTop;
+				this.#manualViewportAnchor = committedManualViewportAnchor;
+				this.#manualViewportFallbackAnchors = committedManualViewportFallbackAnchors;
+				this.#reconcileMissingViewportAnchor = committedReconcileMissingViewportAnchor;
+			};
+			let contentPainted = false;
 			let resolvedAnchorTop = anchorFrame === null ? null : this.#resolveManualAnchor(anchorFrame);
 			if (
 				this.#manualViewportAnchor !== null &&
@@ -2942,6 +3096,7 @@ export class TUI extends Container {
 				if (anchorRenderFailed) {
 					// Keep semantic intent armed for recovery, but render the diagnostic frame
 					// instead of masking a provider failure behind stale transcript content.
+					contentPainted = false;
 					this.#repaintViewportFromLines(
 						newLines,
 						width,
@@ -2950,37 +3105,44 @@ export class TUI extends Container {
 						null,
 						"failed semantic viewport render",
 						true,
-						undefined,
+						() => {
+							contentPainted = true;
+							this.#previousLines = newLines;
+							this.#previousWidth = width;
+							this.#previousHeight = height;
+							this.#manualTranscriptLineCount = nextTranscriptLineCount;
+							this.#manualSuffixLineCount = nextSuffixLineCount;
+						},
 						false,
 						previousKittyPlacementSpans,
+						nextKittyPlacementSpans,
+						{ transcriptLineCount: nextTranscriptLineCount, suffixLineCount: nextSuffixLineCount },
 					);
-					this.#previousLines = newLines;
-					this.#previousWidth = width;
-					this.#previousHeight = height;
+					if (!contentPainted) restoreManualIntent();
 					return;
 				}
 				// A formerly valid semantic target is temporarily absent (provider removal,
 				// replacement, eviction, or object deletion). Keep the last resolved frame
 				// instead of silently reinterpreting manual intent as a numeric viewport.
 				const retainedLines = this.#previousLines.length > 0 ? this.#previousLines : newLines;
-				if (
-					this.#repaintViewportFromLines(
-						retainedLines,
-						width,
-						height,
-						this.#manualViewportTop,
-						null,
-						"unresolved semantic viewport render",
-						true,
-						undefined,
-						false,
-						previousKittyPlacementSpans,
-					)
-				) {
-					this.#kittyPlacementSpans = previousKittyPlacementSpans;
-				}
-				this.#previousWidth = width;
-				this.#previousHeight = height;
+				contentPainted = false;
+				this.#repaintViewportFromLines(
+					retainedLines,
+					width,
+					height,
+					this.#manualViewportTop,
+					null,
+					"unresolved semantic viewport render",
+					true,
+					() => {
+						contentPainted = true;
+						this.#previousWidth = width;
+						this.#previousHeight = height;
+					},
+					false,
+					previousKittyPlacementSpans,
+				);
+				if (!contentPainted) restoreManualIntent();
 				return;
 			}
 			const nextViewportTop = resolvedAnchorTop ?? this.#manualViewportTop;
@@ -2996,29 +3158,34 @@ export class TUI extends Container {
 			}
 			this.#manualViewportTop = nextViewportTop;
 			this.#reconcileMissingViewportAnchor = false;
-			if (
-				this.#repaintViewportFromLines(
-					newLines,
-					width,
-					height,
-					nextViewportTop,
-					null,
-					"manual viewport render",
-					this.#manualViewportAnchor !== null,
-					undefined,
-					false,
-					previousKittyPlacementSpans,
-				)
-			) {
-				this.#previousLines = newLines;
-				this.#previousWidth = width;
-				this.#previousHeight = height;
-				this.#paintedManualOutputNotice = this.#manualOutputNotice;
-			}
+			contentPainted = false;
+			this.#repaintViewportFromLines(
+				newLines,
+				width,
+				height,
+				nextViewportTop,
+				null,
+				"manual viewport render",
+				this.#manualViewportAnchor !== null,
+				() => {
+					contentPainted = true;
+					this.#previousLines = newLines;
+					this.#previousWidth = width;
+					this.#previousHeight = height;
+					this.#paintedManualOutputNotice = this.#manualOutputNotice;
+					this.#manualTranscriptLineCount = nextTranscriptLineCount;
+					this.#manualSuffixLineCount = nextSuffixLineCount;
+				},
+				false,
+				previousKittyPlacementSpans,
+				nextKittyPlacementSpans,
+				{ transcriptLineCount: nextTranscriptLineCount, suffixLineCount: nextSuffixLineCount },
+			);
+			if (!contentPainted) restoreManualIntent();
 			return;
 		}
 		// Helper to clear scrollback and viewport and render all new lines
-		let viewportRepaint: (reason: string, targetViewportTop?: number) => void;
+		let viewportRepaint: (reason: string, targetViewportTop?: number) => boolean;
 		const fullRender = (clear: boolean, reason = "full render", forceScrollbackClear = false): void => {
 			if (
 				clear &&
@@ -3031,8 +3198,13 @@ export class TUI extends Container {
 			}
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
-			let buffer = "\x1b[?2026h"; // Begin synchronized output
-			if (clear) buffer += this.#kittyViewportCleanup(previousKittyPlacementSpans, prevViewportTop, height);
+			const deletePlan = this.#kittyPlacementDeletePlan(
+				previousKittyPlacementSpans,
+				nextKittyPlacementSpans,
+				[],
+				clear,
+			);
+			let buffer = `\x1b[?2026h${deletePlan.output}`; // Begin synchronized output
 			// Skip clearing scrollback (3J) in hosts where clear/replay can snap the
 			// native viewport away from the live prompt (tmux/screen, Windows ConPTY) —
 			// unless the caller explicitly needs history erased (the settled width
@@ -3068,18 +3240,28 @@ export class TUI extends Container {
 					this.#previousLines = newLines;
 					this.#previousWidth = width;
 					this.#previousHeight = height;
+					this.#kittyPlacementSpans = this.#kittyCommittedPlacementsAfterPaint(
+						previousKittyPlacementSpans,
+						nextKittyPlacementSpans,
+						deletePlan,
+						[{ top: Number.NEGATIVE_INFINITY, bottom: Number.POSITIVE_INFINITY }],
+					);
+					this.#manualTranscriptLineCount = nextTranscriptLineCount;
+					this.#manualSuffixLineCount = nextSuffixLineCount;
 				})
 			)
 				return;
 		};
 
-		viewportRepaint = (reason: string, targetViewportTop = Math.max(0, newLines.length - height)): void => {
+		viewportRepaint = (reason: string, targetViewportTop = Math.max(0, newLines.length - height)): boolean => {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			const nextViewportTop = targetViewportTop;
 			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
-			let buffer = "\x1b[?2026h";
-			buffer += this.#kittyViewportCleanup(previousKittyPlacementSpans, prevViewportTop, height);
+			const deletePlan = this.#kittyPlacementDeletePlan(previousKittyPlacementSpans, nextKittyPlacementSpans, [
+				{ top: prevViewportTop, bottom: prevViewportTop + height },
+			]);
+			let buffer = `\x1b[?2026h${deletePlan.output}`;
 			if (currentScreenRow > 0) {
 				buffer += `\x1b[${currentScreenRow}A`;
 			}
@@ -3110,23 +3292,32 @@ export class TUI extends Container {
 			}
 			buffer += cursorSeq;
 			buffer += "\x1b[?2026l";
-			if (
-				!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
-					this.#hardwareCursorRow = cursorToRow;
-					this.#cursorRow = Math.max(0, newLines.length - 1);
-					this.#maxLinesRendered = newLines.length;
-					this.#viewportTopRow = nextViewportTop;
-					this.#previousLines = newLines;
-					this.#previousWidth = width;
-					this.#previousHeight = height;
-				})
-			)
-				return;
+			let contentWritten = false;
+			this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
+				contentWritten = true;
+				this.#hardwareCursorRow = cursorToRow;
+				this.#cursorRow = Math.max(0, newLines.length - 1);
+				this.#maxLinesRendered = newLines.length;
+				this.#viewportTopRow = nextViewportTop;
+				this.#previousLines = newLines;
+				this.#previousWidth = width;
+				this.#previousHeight = height;
+				this.#kittyPlacementSpans = this.#kittyCommittedPlacementsAfterPaint(
+					previousKittyPlacementSpans,
+					nextKittyPlacementSpans,
+					deletePlan,
+					[{ top: nextViewportTop, bottom: nextViewportTop + height }],
+				);
+				this.#manualTranscriptLineCount = nextTranscriptLineCount;
+				this.#manualSuffixLineCount = nextSuffixLineCount;
+			});
+			if (!contentWritten) return false;
 
 			if (this.#debugRedraw) {
 				const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 				this.#appendDebugRedrawLog(msg);
 			}
+			return true;
 		};
 
 		const debugRedraw = this.#debugRedraw;
@@ -3226,6 +3417,22 @@ export class TUI extends Container {
 			lastChanged = newLines.length - 1;
 		}
 		let appendStart = appendedLines && firstChanged === this.#previousLines.length && firstChanged > 0;
+		if (firstChanged >= 0) {
+			const changedTop = firstChanged;
+			let expanded: boolean;
+			do {
+				const priorTop = firstChanged;
+				const priorBottom = lastChanged + 1;
+				for (const placement of previousKittyPlacementSpans) {
+					const placementBottom = placement.row + placement.rows;
+					if (placement.row >= priorBottom || placementBottom <= priorTop) continue;
+					firstChanged = Math.min(firstChanged, placement.row);
+					lastChanged = Math.max(lastChanged, placementBottom - 1);
+				}
+				expanded = firstChanged !== priorTop || lastChanged + 1 !== priorBottom;
+			} while (expanded);
+			if (firstChanged !== changedTop) appendStart = false;
+		}
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
@@ -3237,6 +3444,21 @@ export class TUI extends Container {
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
 		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
 			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
+			return;
+		}
+		if (
+			appendedLines &&
+			nextLiveViewportTop > prevViewportTop &&
+			previousKittyPlacementSpans.some(placement =>
+				this.#kittyPlacementIntersectsRegion(placement, {
+					top: prevViewportTop,
+					bottom: prevViewportTop + height,
+				}),
+			)
+		) {
+			viewportRepaint(
+				`content append moved a Kitty placement viewport (${prevViewportTop} -> ${nextLiveViewportTop})`,
+			);
 			return;
 		}
 		if (appendedLines && this.#scrollbackResumeViewportTop !== undefined && nextLiveViewportTop > prevViewportTop) {
@@ -3251,10 +3473,15 @@ export class TUI extends Container {
 			const previousLines = this.#previousLines;
 			const previousWidth = this.#previousWidth;
 			const previousHeight = this.#previousHeight;
-			viewportRepaint(
-				`staging committed scrollback frontier before resumed admission (${prevViewportTop} -> ${resumeViewportTop} -> ${nextLiveViewportTop})`,
-				resumeViewportTop,
-			);
+			if (
+				!viewportRepaint(
+					`staging committed scrollback frontier before resumed admission (${prevViewportTop} -> ${resumeViewportTop} -> ${nextLiveViewportTop})`,
+					resumeViewportTop,
+				)
+			) {
+				return;
+			}
+			previousKittyPlacementSpans = this.#kittyPlacementSpans;
 			this.#previousLines = previousLines;
 			this.#previousWidth = previousWidth;
 			this.#previousHeight = previousHeight;
@@ -3268,7 +3495,10 @@ export class TUI extends Container {
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
 			if (this.#previousLines.length > newLines.length) {
-				let buffer = "\x1b[?2026h";
+				const deletePlan = this.#kittyPlacementDeletePlan(previousKittyPlacementSpans, nextKittyPlacementSpans, [
+					{ top: firstChanged, bottom: lastChanged + 1 },
+				]);
+				let buffer = `\x1b[?2026h${deletePlan.output}`;
 				// Move to end of new content (clamp to 0 for empty content)
 				const targetRow = Math.max(0, newLines.length - 1);
 				const lineDiff = computeLineDiff(targetRow);
@@ -3310,6 +3540,14 @@ export class TUI extends Container {
 						this.#previousHeight = height;
 						this.#maxLinesRendered = newLines.length;
 						this.#viewportTopRow = Math.max(0, newLines.length - height);
+						this.#kittyPlacementSpans = this.#kittyCommittedPlacementsAfterPaint(
+							previousKittyPlacementSpans,
+							nextKittyPlacementSpans,
+							deletePlan,
+							[],
+						);
+						this.#manualTranscriptLineCount = nextTranscriptLineCount;
+						this.#manualSuffixLineCount = nextSuffixLineCount;
 					})
 				)
 					return;
@@ -3319,6 +3557,8 @@ export class TUI extends Container {
 			this.#previousHeight = height;
 			this.#maxLinesRendered = newLines.length;
 			this.#viewportTopRow = Math.max(0, newLines.length - height);
+			this.#manualTranscriptLineCount = nextTranscriptLineCount;
+			this.#manualSuffixLineCount = nextSuffixLineCount;
 			return;
 		}
 
@@ -3345,7 +3585,10 @@ export class TUI extends Container {
 
 		// Render from first changed line to end
 		// Build buffer with all updates wrapped in synchronized output
-		let buffer = "\x1b[?2026h"; // Begin synchronized output
+		const deletePlan = this.#kittyPlacementDeletePlan(previousKittyPlacementSpans, nextKittyPlacementSpans, [
+			{ top: firstChanged, bottom: lastChanged + 1 },
+		]);
+		let buffer = `\x1b[?2026h${deletePlan.output}`; // Begin synchronized output
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
 		if (moveTargetRow > prevViewportBottom) {
@@ -3473,6 +3716,14 @@ export class TUI extends Container {
 				this.#previousLines = newLines;
 				this.#previousWidth = width;
 				this.#previousHeight = height;
+				this.#kittyPlacementSpans = this.#kittyCommittedPlacementsAfterPaint(
+					previousKittyPlacementSpans,
+					nextKittyPlacementSpans,
+					deletePlan,
+					[{ top: firstChanged, bottom: renderEnd + 1 }],
+				);
+				this.#manualTranscriptLineCount = nextTranscriptLineCount;
+				this.#manualSuffixLineCount = nextSuffixLineCount;
 			})
 		)
 			return;

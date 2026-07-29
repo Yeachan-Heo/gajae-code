@@ -520,35 +520,53 @@ export interface KittyPlacementReference {
 	rows: number;
 }
 
-/** Extract named kitty placements from a rendered line. */
+const MAX_KITTY_CONTROL_CHARS = 4096;
+const MAX_KITTY_PLACEMENTS_PER_LINE = 1024;
+const MAX_KITTY_PLACEMENT_SCAN_CHARS = 256 * 1024;
+const MAX_KITTY_PLACEMENT_SCAN_BYTES = 256 * 1024;
+const MAX_KITTY_UINT32 = 0xffff_ffff;
+const MAX_KITTY_CONTROL_FIELDS = 64;
+
+function parseKittyUint32(raw: string | undefined): number | null {
+	if (raw === undefined || raw.length === 0 || raw.length > 10 || !/^\d+$/u.test(raw)) return null;
+	const value = Number(raw);
+	return Number.isInteger(value) && value > 0 && value <= MAX_KITTY_UINT32 ? value : null;
+}
+
+/** Extract bounded, named kitty placements from a rendered line. */
 export function extractKittyPlacementReferences(line: string): KittyPlacementReference[] {
-	if (!line.includes(ImageProtocol.Kitty)) return [];
+	if (line.length > MAX_KITTY_PLACEMENT_SCAN_CHARS) return [];
+	if (!line.includes(ImageProtocol.Kitty) || Buffer.byteLength(line) > MAX_KITTY_PLACEMENT_SCAN_BYTES) return [];
 	const placements: KittyPlacementReference[] = [];
-	for (const match of line.matchAll(/\x1b_G([^;\x1b]*)(?:;[^\x1b]*)?\x1b\\/gu)) {
+	for (const match of line.matchAll(/\x1b_G([^;\x1b]*)(?:;([^\x1b]*))?\x1b\\/gu)) {
+		const control = match[1] ?? "";
+		if (control.length === 0 || control.length > MAX_KITTY_CONTROL_CHARS || match[2] !== undefined) continue;
+		const parts = control.split(",");
+		if (parts.length > MAX_KITTY_CONTROL_FIELDS) continue;
+
 		const params = new Map<string, string>();
-		for (const part of (match[1] ?? "").split(",")) {
+		let valid = true;
+		for (const part of parts) {
 			const separator = part.indexOf("=");
-			if (separator > 0) params.set(part.slice(0, separator), part.slice(separator + 1));
+			if (separator !== 1 || part.length === 2) {
+				valid = false;
+				break;
+			}
+			const key = part[0];
+			if (!/[A-Za-z]/u.test(key) || params.has(key)) {
+				valid = false;
+				break;
+			}
+			params.set(key, part.slice(2));
 		}
-		if (params.get("a") !== "p") continue;
-		const imageIdRaw = params.get("i") ?? "";
-		const placementIdRaw = params.get("p") ?? "";
-		const rowsRaw = params.get("r") ?? "1";
-		if (!/^\d+$/u.test(imageIdRaw) || !/^\d+$/u.test(placementIdRaw) || !/^\d+$/u.test(rowsRaw)) continue;
-		const imageId = Number(imageIdRaw);
-		const placementId = Number(placementIdRaw);
-		const rows = Number(rowsRaw);
-		if (
-			!Number.isSafeInteger(imageId) ||
-			imageId <= 0 ||
-			!Number.isSafeInteger(placementId) ||
-			placementId <= 0 ||
-			!Number.isSafeInteger(rows) ||
-			rows <= 0
-		) {
-			continue;
-		}
+		if (!valid || params.get("a") !== "p" || params.get("C") !== "1" || params.has("m")) continue;
+
+		const imageId = parseKittyUint32(params.get("i"));
+		const placementId = parseKittyUint32(params.get("p"));
+		const rows = parseKittyUint32(params.get("r"));
+		if (imageId === null || placementId === null || rows === null) continue;
 		placements.push({ imageId, placementId, rows });
+		if (placements.length > MAX_KITTY_PLACEMENTS_PER_LINE) return [];
 	}
 	return placements;
 }
@@ -799,8 +817,8 @@ export function renderImage(
 		// and ALL of its placements (breaking sibling components showing the
 		// same content) and would re-send multi-MB payloads on every repaint.
 		if (!transmittedKittyImageIds.has(imageId)) {
-			transmittedKittyImageIds.add(imageId);
 			(options.onTransmit ?? kittyTransmitWriter)(encodeKittyTransmit(base64Data, imageId));
+			transmittedKittyImageIds.add(imageId);
 		}
 		const sequence = encodeKittyPlacement({ imageId, placementId, columns: fit.columns, rows: fit.rows });
 		return { sequence, rows: fit.rows, cursorNeutral: true };
