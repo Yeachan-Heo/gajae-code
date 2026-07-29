@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -42,6 +42,43 @@ function getLastAssistantMessage(session: AgentSession): AssistantMessage {
 		throw new Error("Expected final assistant message");
 	}
 	return lastMessage;
+}
+
+function typedRateLimitStream(
+	model: Model,
+	retryAfterMs: number,
+	errorMessage = "Provider returned error: rate_limit_error: organization quota reached",
+): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage,
+			errorStatus: 429,
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after-ms": String(retryAfterMs) },
+			},
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
 }
 
 describe("AgentSession retry fallback", () => {
@@ -445,6 +482,63 @@ describe("AgentSession retry fallback", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+	});
+
+	it("rotates a single-model stored credential after a typed quota failure before prompt completion", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled test model");
+		authStorage.removeRuntimeApiKey("openai");
+		await authStorage.set("openai", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+		]);
+
+		const logicalSessionId = "logical-session";
+		const providerAffinitySessionId = "pool-session";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, providerAffinitySessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls === 1) return typedRateLimitStream(requestedModel, 60_000);
+				return createMockModel({ responses: [{ content: ["Recovered with another account"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: logicalSessionId,
+			providerCacheSessionId: providerAffinitySessionId,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+
+		await session.prompt("retry with another stored credential");
+
+		expect(calls).toBe(2);
+		expect(requestedKeys).toHaveLength(2);
+		expect(new Set(requestedKeys).size).toBe(2);
+		expect(session.isRetrying).toBe(false);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]).toMatchObject({ delayMs: 0 });
+		expect(waitSpy).toHaveBeenCalledWith(0, { signal: expect.any(AbortSignal) });
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 	});
 
 	it("does not replay a Kimi Code first-event timeout through a managed fallback chain", async () => {

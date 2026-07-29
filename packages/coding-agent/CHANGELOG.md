@@ -4,6 +4,7 @@
 ### Fixed
 
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
+- Single-model sessions now rotate immediately to another stored provider credential after a replay-safe quota or rate-limit failure, without requiring a synthetic model fallback chain.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
 
 ### Added

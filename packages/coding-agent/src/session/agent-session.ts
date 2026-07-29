@@ -8270,6 +8270,7 @@ export class AgentSession {
 				await this.#agentEndPublicationPromise;
 			} else {
 				await this.#agentEndHandlingPromise;
+				await this.#waitForPostPromptRecovery();
 				await this.#agentEndPublicationPromise;
 			}
 		}
@@ -14268,25 +14269,25 @@ export class AgentSession {
 		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
 	}
 
-	async #markFailedManagedCredential(trigger: {
-		class: FallbackTriggerClass;
-		retryAfterMs?: number;
-	}): Promise<boolean> {
+	async #markFailedCredential(trigger: { class: FallbackTriggerClass; retryAfterMs?: number }): Promise<boolean> {
 		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
 			return false;
 		}
 		const authStorage = this.#modelRegistry.authStorage;
+		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
 		if (trigger.class === "auth") {
-			const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
+			const apiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
 			if (!isAuthenticated(apiKey)) return false;
-			return authStorage.invalidateCredentialMatching(this.model.provider, apiKey, { sessionId: this.sessionId });
+			return authStorage.invalidateCredentialMatching(this.model.provider, apiKey, {
+				sessionId: providerAffinitySessionId,
+			});
 		}
 		if (authStorage.hasRuntimeApiKey(this.model.provider)) return false;
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
-		const rotated = await authStorage.markUsageLimitReached(this.model.provider, this.sessionId, {
+		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
+		const rotated = await authStorage.markUsageLimitReached(this.model.provider, providerAffinitySessionId, {
 			retryAfterMs: trigger.retryAfterMs,
 		});
-		return rotated && (await this.#modelRegistry.getApiKey(this.model, this.sessionId)) !== activeApiKey;
+		return rotated && (await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) !== activeApiKey;
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -14318,8 +14319,21 @@ export class AgentSession {
 		) {
 			return false;
 		}
-		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures.
-		if (!managedFallback && !legacyRetryConfigured) {
+		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+		if (!trigger) {
+			return managedOutcome
+				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
+				: false;
+		}
+		let credentialRotated =
+			!managedFallback &&
+			!assistantMessageHasVisibleOrToolContent(message) &&
+			(trigger.class === "quota" || trigger.class === "rate_limit") &&
+			(await this.#markFailedCredential(trigger));
+		const canReplayRotatedCredential = credentialRotated && this.#hasCleanRetryReplaySafety;
+		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures
+		// or quota/rate-limit failures that can immediately switch to another stored credential.
+		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			if (
 				(!this.#isTypedFirstEventTimeout(message) &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
@@ -14330,12 +14344,6 @@ export class AgentSession {
 				return false;
 			}
 		}
-		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
-		if (!trigger) {
-			return managedOutcome
-				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
-				: false;
-		}
 		const legacyUnbounded = classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
@@ -14344,12 +14352,10 @@ export class AgentSession {
 			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
 				? "retry"
 				: "exhausted";
-		const credentialRotated =
-			managedFallback &&
-			outcome === "advance" &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
-			(await this.#markFailedManagedCredential(trigger));
-		if (credentialRotated && controller.restorePreviousEntryForRetry()) {
+		if (managedFallback && outcome === "advance" && (trigger.class === "quota" || trigger.class === "rate_limit")) {
+			credentialRotated = await this.#markFailedCredential(trigger);
+		}
+		if (managedFallback && credentialRotated && controller.restorePreviousEntryForRetry()) {
 			outcome = "retry";
 		}
 		if (outcome === "exhausted") {
@@ -14385,7 +14391,7 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
-			if (managedFallback && !credentialRotated) await this.#markFailedManagedCredential(trigger);
+			if (managedFallback && !credentialRotated) await this.#markFailedCredential(trigger);
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
 			if (outcome === "advance") {
