@@ -11,6 +11,7 @@
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 - Managed-session startup now preserves bounded Windows ACL and identity failure classifications in path-redacted recovery guidance without broadening permissions, elevation, or unsafe fallback.
+- Windows Team sessions can use supported psmux aliases through a persisted, generation-scoped provider authority with exact executable identity, private namespace, lifecycle continuity, and typed mutation proofs.
 
 ## [Unreleased]
 ### Fixed

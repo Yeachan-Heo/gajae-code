@@ -36,10 +36,11 @@ import {
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import {
+	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionSlug,
+	buildTmuxProviderCommand,
 	resolveGjcTmuxBinary,
-	resolveGjcTmuxCommand,
 } from "../../gjc-runtime/tmux-common";
 import {
 	captureOwnerGenerationBaseline,
@@ -52,6 +53,15 @@ import {
 	resolveManagedOwnerPredecessorSync,
 	type TmuxServerProof,
 } from "../../gjc-runtime/tmux-owner-isolation";
+import {
+	assertGjcTmuxMutationAuthoritySync,
+	assertGjcTmuxStagedMutationAuthoritySync,
+	bindGjcTmuxProviderAuthority,
+	type ProviderAuthority,
+	persistGjcTmuxProviderAuthoritySync,
+	readGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxProviderContext,
+} from "../../gjc-runtime/tmux-provider-context";
 import {
 	findGjcTmuxSessionByName,
 	forceCloseGjcTmuxSession,
@@ -80,29 +90,7 @@ import {
 } from "./lifecycle-orchestrator";
 import { listRecentSessions } from "./recent-activity";
 
-const directLifecycleManagedOwnerEnvUnsets = [
-	GJC_TMUX_OWNER_GENERATION_ENV,
-	GJC_TMUX_OWNER_STATE_DIR_ENV,
-	GJC_TMUX_OWNER_SERVER_KEY_ENV,
-	MANAGED_OWNER_COMMAND_ENV,
-	MANAGED_OWNER_RUN_ID_ENV,
-	MANAGED_OWNER_INCARNATION_ENV,
-	MANAGED_OWNER_CHILD_TOKEN_ENV,
-	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
-	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
-	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
-	MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
-	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
-] as const;
-const directLifecycleStabilizationMs = 250;
-
-function directLifecycleEnvArguments(env: Record<string, string>): string {
-	return [
-		...directLifecycleManagedOwnerEnvUnsets.flatMap(name => ["-u", shellQuote(name)]),
-		...Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`),
-	].join(" ");
-}
-
+const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 type NativeControlServerConstructor = new (
 	token: string,
 	ownerId: string,
@@ -435,16 +423,30 @@ function isKnownNoServerDiagnostic(stderr: string): boolean {
 	);
 }
 
-function lifecycleOwnerIsolationProbe(tmux: string, env: NodeJS.ProcessEnv): OwnerIsolationProbe {
+function lifecycleOwnerIsolationProbe(
+	authority: ProviderAuthority,
+	env: NodeJS.ProcessEnv,
+	provisional = false,
+): OwnerIsolationProbe {
 	return {
 		readCallerCgroup: async () =>
 			process.platform === "linux" ? await fsPromises.readFile("/proc/self/cgroup", "utf8").catch(() => null) : null,
 		probeServer: async (serverKey: string): Promise<TmuxServerProof> => {
-			const result = Bun.spawnSync([tmux, "-L", serverKey, "list-sessions", "-F", "#{pid}\t#{session_name}"], {
-				stdout: "pipe",
-				stderr: "pipe",
-				env,
-			});
+			(provisional ? assertGjcTmuxStagedMutationAuthoritySync : assertGjcTmuxMutationAuthoritySync)(authority);
+			const expectedServerKey = authority.namespace ?? "default";
+			if (serverKey !== expectedServerKey) return { state: "unverifiable" };
+			const result = Bun.spawnSync(
+				[
+					authority.command,
+					...buildTmuxProviderCommand(authority, "list-sessions", ["-F", "#{pid}\t#{session_name}"]),
+				],
+				{
+					stdout: "pipe",
+					stderr: "pipe",
+					env,
+				},
+			);
+			(provisional ? assertGjcTmuxStagedMutationAuthoritySync : assertGjcTmuxMutationAuthoritySync)(authority);
 			const stderr = result.stderr.toString();
 			if (result.exitCode !== 0)
 				return isKnownNoServerDiagnostic(stderr) ? { state: "absent" } : { state: "unverifiable" };
@@ -492,14 +494,16 @@ function lifecycleRuntimeStateFile(cwd: string, sessionId: string, tmuxSession: 
 }
 
 async function preflightLifecycleTmuxOwner(input: {
-	tmux: string;
+	authority: ProviderAuthority;
 	env: NodeJS.ProcessEnv;
 	ownerIsolationProbe?: OwnerIsolationProbe;
+	provisionalAuthority: boolean;
 }): Promise<void> {
-	const probe = input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.tmux, input.env);
+	const probe =
+		input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.authority, input.env, input.provisionalAuthority);
 	let server: TmuxServerProof;
 	try {
-		server = await probe.probeServer("default");
+		server = await probe.probeServer(input.authority.namespace ?? "default");
 	} catch {
 		throw new Error("gjc_lifecycle_owner_server_unverifiable");
 	}
@@ -537,6 +541,32 @@ function nativeTmuxSessionIdFromSpawn(stdout: string): string | undefined {
 	const value = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
 	return !value.includes("\n") && !value.includes("\r") && /^\$\d+$/.test(value) ? value : undefined;
 }
+function nativeTmuxSessionIdFromExactName(
+	authority: ProviderAuthority,
+	env: NodeJS.ProcessEnv,
+	sessionName: string,
+	provisional = false,
+): string | undefined {
+	(provisional ? assertGjcTmuxStagedMutationAuthoritySync : assertGjcTmuxMutationAuthoritySync)(authority);
+	const result = Bun.spawnSync(
+		[
+			authority.command,
+			...buildTmuxProviderCommand(authority, "display-message", [
+				"-p",
+				"-t",
+				sessionName,
+				"#{session_id}\t#{session_name}",
+			]),
+		],
+		{ stdout: "pipe", stderr: "pipe", env },
+	);
+	(provisional ? assertGjcTmuxStagedMutationAuthoritySync : assertGjcTmuxMutationAuthoritySync)(authority);
+	if (result.exitCode !== 0) return undefined;
+	const output = result.stdout.toString();
+	const line = output.endsWith("\n") ? output.slice(0, -1) : output;
+	const [nativeSessionId, exactName, ...extra] = line.split("\t");
+	return extra.length === 0 && exactName === sessionName && nativeSessionId ? nativeSessionId : undefined;
+}
 
 async function isLifecycleGenerationUnchanged(
 	stateDir: string,
@@ -553,7 +583,7 @@ async function isLifecycleGenerationUnchanged(
 }
 
 async function executeLifecycleTmuxOwnerPlan(input: {
-	tmux: string;
+	authority: ProviderAuthority;
 	env: NodeJS.ProcessEnv;
 	sessionId: string;
 	generation: string;
@@ -562,11 +592,13 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 	argv: string[];
 	sessionName: string;
 	ownerIsolationProbe?: OwnerIsolationProbe;
+	provisionalAuthority: boolean;
 	prepareSpawn?: () => void;
 	onAttemptCreated?: (attempt: LifecycleAttemptExecution) => void;
 	previousBaseline: OwnerGenerationBaseline;
 }): Promise<LifecycleAttemptExecution> {
-	const probe = input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.tmux, input.env);
+	const probe =
+		input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.authority, input.env, input.provisionalAuthority);
 	await preflightLifecycleTmuxOwner(input);
 	if (!(await isLifecycleGenerationUnchanged(input.stateDir, input.sessionId, input.previousBaseline)))
 		throw new Error("gjc_lifecycle_owner_generation_changed");
@@ -580,7 +612,7 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 			baseline: input.previousBaseline,
 			cwd: input.cwd,
 			state_dir: input.stateDir,
-			socket_key: "default",
+			socket_key: input.authority.namespace ?? "default",
 			tmux_argv: input.argv,
 		},
 		probe,
@@ -601,12 +633,14 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 	input.prepareSpawn?.();
 	if (!(await isLifecycleGenerationUnchanged(input.stateDir, input.sessionId, input.previousBaseline)))
 		throw new Error("gjc_lifecycle_owner_generation_changed");
+	assertGjcTmuxStagedMutationAuthoritySync(input.authority);
 	const created = Bun.spawnSync(plan.execution.argv, {
 		stdout: "pipe",
 		stderr: "pipe",
 		env: input.env,
 		...(plan.execution.mode === "scoped" ? { stdin: new TextEncoder().encode(plan.execution.stdin_line) } : {}),
 	});
+	assertGjcTmuxStagedMutationAuthoritySync(input.authority);
 	const rawStdout = created.stdout.toString();
 	const rawScopedReceipt =
 		plan.execution.mode === "scoped" && isExactScopedBootstrapSuccessReceipt(rawStdout)
@@ -623,7 +657,15 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 		attemptCreated: true,
 		serverKey: plan.execution.server_key,
 		nativeSessionId:
-			plan.execution.mode === "scoped" ? scopedReceipt?.native_session_id : nativeTmuxSessionIdFromSpawn(rawStdout),
+			plan.execution.mode === "scoped"
+				? scopedReceipt?.native_session_id
+				: (nativeTmuxSessionIdFromSpawn(rawStdout) ??
+					nativeTmuxSessionIdFromExactName(
+						input.authority,
+						input.env,
+						plan.execution.attempt_session,
+						input.provisionalAuthority,
+					)),
 		attemptSession: plan.execution.attempt_session,
 		...(scopedReceipt
 			? { serverPid: scopedReceipt.server_pid, serverStartTime: scopedReceipt.server_start_time }
@@ -653,7 +695,7 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 	attempt.serverStartTime = proof.startTime;
 	if (
 		!(await reproveLifecycleAttempt({
-			tmux: input.tmux,
+			authority: input.authority,
 			env: input.env,
 			serverKey: attempt.serverKey,
 			nativeSessionId: attempt.nativeSessionId,
@@ -661,6 +703,7 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 			expectedServerPid: attempt.serverPid,
 			expectedServerStartTime: attempt.serverStartTime,
 			ownerIsolationProbe: input.ownerIsolationProbe,
+			provisionalAuthority: input.provisionalAuthority,
 		}))
 	)
 		throw new Error("gjc_lifecycle_owner_server_unverifiable");
@@ -671,25 +714,28 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 }
 
 function hasExactNativeSessionBinding(input: {
-	tmux: string;
+	authority: ProviderAuthority;
 	env: NodeJS.ProcessEnv;
 	serverKey: string;
 	nativeSessionId: string;
 	attemptSession: string;
+	provisionalAuthority: boolean;
 }): boolean {
+	assertGjcTmuxStagedMutationAuthoritySync(input.authority);
+	if (input.serverKey !== (input.authority.namespace ?? "default")) return false;
 	const result = Bun.spawnSync(
 		[
-			input.tmux,
-			"-L",
-			input.serverKey,
-			"display-message",
-			"-p",
-			"-t",
-			input.nativeSessionId,
-			"#{session_id}\t#{session_name}",
+			input.authority.command,
+			...buildTmuxProviderCommand(input.authority, "display-message", [
+				"-p",
+				"-t",
+				input.nativeSessionId,
+				"#{session_id}\t#{session_name}",
+			]),
 		],
 		{ stdout: "pipe", stderr: "pipe", env: input.env },
 	);
+	assertGjcTmuxStagedMutationAuthoritySync(input.authority);
 	if (result.exitCode !== 0) return false;
 	const output = result.stdout.toString();
 	const line = output.endsWith("\n") ? output.slice(0, -1) : output;
@@ -701,7 +747,7 @@ function cleanupUncertain(): Error {
 }
 
 async function reproveLifecycleAttempt(input: {
-	tmux: string;
+	authority: ProviderAuthority;
 	env: NodeJS.ProcessEnv;
 	serverKey: string;
 	nativeSessionId: string;
@@ -709,8 +755,10 @@ async function reproveLifecycleAttempt(input: {
 	expectedServerPid: number;
 	expectedServerStartTime: string;
 	ownerIsolationProbe?: OwnerIsolationProbe;
+	provisionalAuthority: boolean;
 }): Promise<boolean> {
-	const probe = input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.tmux, input.env);
+	const probe =
+		input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.authority, input.env, input.provisionalAuthority);
 	const isExpectedServer = (proof: TmuxServerProof): boolean =>
 		proof.state === "safe" &&
 		proof.pid === input.expectedServerPid &&
@@ -733,7 +781,7 @@ async function reproveLifecycleAttempt(input: {
 }
 
 async function cleanupLifecycleAttempt(input: {
-	tmux: string;
+	authority: ProviderAuthority;
 	env: NodeJS.ProcessEnv;
 	serverKey: string;
 	nativeSessionId?: string;
@@ -741,6 +789,7 @@ async function cleanupLifecycleAttempt(input: {
 	expectedServerPid?: number;
 	expectedServerStartTime?: string;
 	ownerIsolationProbe?: OwnerIsolationProbe;
+	provisionalAuthority: boolean;
 }): Promise<void> {
 	if (!input.nativeSessionId || input.expectedServerPid === undefined || input.expectedServerStartTime === undefined)
 		throw cleanupUncertain();
@@ -748,7 +797,7 @@ async function cleanupLifecycleAttempt(input: {
 	// mutation, but the server evaluates the identity predicate atomically.
 	if (
 		!(await reproveLifecycleAttempt({
-			tmux: input.tmux,
+			authority: input.authority,
 			env: input.env,
 			serverKey: input.serverKey,
 			nativeSessionId: input.nativeSessionId,
@@ -756,36 +805,38 @@ async function cleanupLifecycleAttempt(input: {
 			expectedServerPid: input.expectedServerPid,
 			expectedServerStartTime: input.expectedServerStartTime,
 			ownerIsolationProbe: input.ownerIsolationProbe,
+			provisionalAuthority: input.provisionalAuthority,
 		}))
 	)
 		throw cleanupUncertain();
+	assertGjcTmuxStagedMutationAuthoritySync(input.authority);
 	const guarded = Bun.spawnSync(
 		[
-			input.tmux,
-			"-L",
-			input.serverKey,
-			"if-shell",
-			"-t",
-			input.nativeSessionId,
-			"-F",
-			lifecycleMetadataPredicate(input.expectedServerPid, input.nativeSessionId, input.attemptSession),
-			`kill-session -t '${input.nativeSessionId}' ; display-message -p __gjc_lifecycle_cleanup_ok__`,
-			"display-message -p __gjc_lifecycle_cleanup_refused__",
+			input.authority.command,
+			...buildTmuxProviderCommand(input.authority, "if-shell", [
+				"-t",
+				input.nativeSessionId,
+				"-F",
+				lifecycleMetadataPredicate(input.expectedServerPid, input.nativeSessionId, input.attemptSession),
+				`kill-session -t '${input.nativeSessionId}' ; display-message -p __gjc_lifecycle_cleanup_ok__`,
+				"display-message -p __gjc_lifecycle_cleanup_refused__",
+			]),
 		],
 		{ stdout: "pipe", stderr: "pipe", env: input.env },
 	);
+	assertGjcTmuxStagedMutationAuthoritySync(input.authority);
 	if (guarded.exitCode !== 0 || guarded.stdout.toString().trim() !== "__gjc_lifecycle_cleanup_ok__")
 		throw cleanupUncertain();
 }
 
 async function assertLifecycleTmuxServerSafe(input: {
-	tmux: string;
+	authority?: ProviderAuthority;
 	env: NodeJS.ProcessEnv;
 	ownerIsolationProbe?: OwnerIsolationProbe;
 }): Promise<void> {
-	const proof = await (input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.tmux, input.env)).probeServer(
-		"default",
-	);
+	if (!input.ownerIsolationProbe && !input.authority) throw new Error("gjc_lifecycle_owner_server_unverifiable");
+	const probe = input.ownerIsolationProbe ?? lifecycleOwnerIsolationProbe(input.authority!, input.env);
+	const proof = await probe.probeServer(input.authority?.namespace ?? "default");
 	if (
 		proof.state !== "safe" ||
 		!proof.pid ||
@@ -796,7 +847,7 @@ async function assertLifecycleTmuxServerSafe(input: {
 }
 
 async function completeLifecycleSpawnTransaction(input: {
-	tmux: string;
+	authority: ProviderAuthority;
 	env: NodeJS.ProcessEnv;
 	sessionId: string;
 	generation: string;
@@ -812,10 +863,13 @@ async function completeLifecycleSpawnTransaction(input: {
 	const previousBaseline =
 		input.previousBaseline ?? (await captureOwnerGenerationBaseline(input.stateDir, input.sessionId));
 	let ownerExecution: LifecycleAttemptExecution | undefined;
+	let generationCommitted = false;
+	assertGjcTmuxStagedMutationAuthoritySync(input.authority);
 	try {
 		ownerExecution = await executeLifecycleTmuxOwnerPlan({
 			...input,
 			previousBaseline,
+			provisionalAuthority: true,
 			onAttemptCreated: attempt => {
 				ownerExecution = attempt;
 			},
@@ -826,9 +880,13 @@ async function completeLifecycleSpawnTransaction(input: {
 			ownerExecution.serverStartTime === undefined
 		)
 			throw new Error("gjc_lifecycle_owner_server_unverifiable");
+		const provider = resolveGjcTmuxBinary({
+			env: { ...input.env, GJC_TMUX_COMMAND: input.authority.command },
+		});
+		const psmuxIncarnation = provider.isPsmux ? crypto.randomUUID() : undefined;
 		await applyRequiredLifecycleTmuxMetadata(
-			input.tmux,
-			`${ownerExecution.nativeSessionId}:`,
+			input.authority,
+			buildGjcTmuxExactOptionTarget(ownerExecution.attemptSession, { binary: provider }),
 			input.env,
 			{
 				sessionId: input.sessionId,
@@ -836,6 +894,7 @@ async function completeLifecycleSpawnTransaction(input: {
 				project: input.cwd,
 				ownerGeneration: input.generation,
 				ownerServerKey: ownerExecution.serverKey,
+				psmuxIncarnation,
 			},
 			{
 				nativeSessionId: ownerExecution.nativeSessionId,
@@ -845,7 +904,7 @@ async function completeLifecycleSpawnTransaction(input: {
 		);
 		if (
 			!(await reproveLifecycleAttempt({
-				tmux: input.tmux,
+				authority: input.authority,
 				env: input.env,
 				serverKey: ownerExecution.serverKey,
 				nativeSessionId: ownerExecution.nativeSessionId,
@@ -853,19 +912,22 @@ async function completeLifecycleSpawnTransaction(input: {
 				expectedServerPid: ownerExecution.serverPid,
 				expectedServerStartTime: ownerExecution.serverStartTime,
 				ownerIsolationProbe: input.ownerIsolationProbe,
+				provisionalAuthority: true,
 			}))
 		)
 			throw new Error("gjc_lifecycle_owner_server_unverifiable");
 		if (!(await isLifecycleGenerationUnchanged(input.stateDir, input.sessionId, previousBaseline)))
 			throw new Error("gjc_lifecycle_owner_generation_changed");
-		resolveManagedOwnerPredecessorSync(input.stateDir, input.sessionId, previousBaseline);
 		await replaceOwnerGeneration(input.stateDir, input.sessionId, input.generation, previousBaseline);
+		generationCommitted = true;
+		assertGjcTmuxMutationAuthoritySync(input.authority);
+		resolveManagedOwnerPredecessorSync(input.stateDir, input.sessionId, previousBaseline);
 	} catch (error) {
 		let cleanupFailure: unknown;
-		if (ownerExecution?.attemptCreated) {
+		if (!generationCommitted && ownerExecution?.attemptCreated) {
 			try {
 				await cleanupLifecycleAttempt({
-					tmux: input.tmux,
+					authority: input.authority,
 					env: input.env,
 					serverKey: ownerExecution.serverKey,
 					nativeSessionId: ownerExecution.nativeSessionId,
@@ -873,6 +935,7 @@ async function completeLifecycleSpawnTransaction(input: {
 					expectedServerPid: ownerExecution.serverPid,
 					expectedServerStartTime: ownerExecution.serverStartTime,
 					ownerIsolationProbe: input.ownerIsolationProbe,
+					provisionalAuthority: true,
 				});
 			} catch (cleanupError) {
 				cleanupFailure = cleanupError;
@@ -1145,81 +1208,85 @@ export function daemonSpawnCreate(
 		frame: SessionCreateFrame,
 		ids: { lifecycleRequestId: string; intendedSessionId: string; startupPromptRef?: string },
 	): Promise<CreateEffectResult> => {
-		const tmuxBinary = resolveGjcTmuxBinary({ env, platform: opts.platform });
-		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
-		const tmux = tmuxBinary.command;
+		const tmuxBinary = resolveGjcTmuxBinary({ env });
+		const provider = resolveGjcTmuxProviderContext({ binary: tmuxBinary, env });
+		const tmux = provider.command;
 		const name = tmuxSessionNameFor(ids.intendedSessionId);
 		const { cwd, args } = buildCreateArgv(frame, ids);
 		const sessionStateFile = lifecycleRuntimeStateFile(cwd, ids.intendedSessionId, name);
-		const commonChildEnv: Record<string, string> = {
+		const stateDir = path.dirname(sessionStateFile);
+		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
+		const predecessor = resolveManagedOwnerPredecessorSync(stateDir, ids.intendedSessionId, previousBaseline);
+		const generation = crypto.randomUUID();
+		const authority = bindGjcTmuxProviderAuthority(provider, {
+			stateDir,
+			sessionId: ids.intendedSessionId,
+			generation,
+		});
+		persistGjcTmuxProviderAuthoritySync(authority);
+		const serverKey = authority.namespace ?? "default";
+		const runId = crypto.randomUUID();
+		const incarnation = crypto.randomUUID();
+		// Detached: no interactive TTY needed (daemon-safe). These values contain
+		// only opaque ids and paths needed by the resident sidecar to publish its
+		// exact-owner terminal verdict.
+		const childEnv: Record<string, string> = {
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_NOTIFICATIONS: "1",
 			GJC_SESSION_ID: ids.intendedSessionId,
 			GJC_LIFECYCLE_REQUEST_ID: ids.lifecycleRequestId,
 			[GJC_COORDINATOR_SESSION_ID_ENV]: ids.intendedSessionId,
 			[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
+			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
+			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
+			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: serverKey,
+			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", ...args]),
+			[MANAGED_OWNER_RUN_ID_ENV]: runId,
+			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+			...(predecessor
+				? {
+						[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
+						[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
+						[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
+						[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
+						[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
+					}
+				: {}),
 		};
-		if (ids.startupPromptRef) commonChildEnv.GJC_STARTUP_PROMPT_REF = ids.startupPromptRef;
-		if ((opts.platform ?? process.platform) === "linux") {
-			const stateDir = path.dirname(sessionStateFile);
-			const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
-			const predecessor = resolveManagedOwnerPredecessorSync(stateDir, ids.intendedSessionId, previousBaseline);
-			const generation = crypto.randomUUID();
-			const runId = crypto.randomUUID();
-			const incarnation = crypto.randomUUID();
-			const managedChildEnv: Record<string, string> = {
-				...commonChildEnv,
-				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
-				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
-				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-				[MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(["gjc", ...args]),
-				[MANAGED_OWNER_RUN_ID_ENV]: runId,
-				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
-				...(predecessor
-					? {
-							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
-							[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
-							[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
-							[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
-							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
-						}
-					: {}),
-			};
-			const managedEnvPairs = Object.entries(managedChildEnv)
-				.map(([key, value]) => `${key}=${shellQuote(value)}`)
-				.join(" ");
-			const command = `cd ${shellQuote(cwd)} && exec env ${managedEnvPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
-			await completeLifecycleSpawnTransaction({
+		if (ids.startupPromptRef) childEnv.GJC_STARTUP_PROMPT_REF = ids.startupPromptRef;
+		const envPairs = Object.entries(childEnv)
+			.map(([key, value]) => `${key}=${shellQuote(value)}`)
+			.join(" ");
+		const command = `cd ${shellQuote(cwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+		await completeLifecycleSpawnTransaction({
+			authority,
+			env,
+			sessionId: ids.intendedSessionId,
+			generation,
+			stateDir,
+			cwd,
+			sessionName: name,
+			sessionStateFile,
+			argv: [
 				tmux,
-				env,
-				sessionId: ids.intendedSessionId,
-				generation,
-				stateDir,
-				cwd,
-				sessionName: name,
-				sessionStateFile,
-				argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
-				ownerIsolationProbe: opts.ownerIsolationProbe,
-				prepareSpawn: () => {
-					if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
-				},
-				previousBaseline,
-			});
-		} else {
-			if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
-			const directEnvPairs = directLifecycleEnvArguments(commonChildEnv);
-			const directCommand = `cd ${shellQuote(cwd)} && exec env ${directEnvPairs} gjc ${args.map(shellQuote).join(" ")}`;
-			await completeNonLinuxLifecycleSpawn({
-				tmux,
-				env,
-				sessionId: ids.intendedSessionId,
-				cwd,
-				sessionName: name,
-				sessionStateFile,
-				command: directCommand,
-				readProcessIncarnation: opts.processIncarnation ?? processIncarnation,
-			});
-		}
+				...buildTmuxProviderCommand(authority, "new-session", [
+					"-d",
+					"-P",
+					"-F",
+					"#{session_id}",
+					"-s",
+					name,
+					"sh",
+					"-c",
+					command,
+				]),
+			],
+			ownerIsolationProbe: opts.ownerIsolationProbe,
+			prepareSpawn: () => {
+				if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
+			},
+			previousBaseline,
+		});
 
 		return {
 			sessionId: ids.intendedSessionId,
@@ -1240,7 +1307,7 @@ function lifecycleMetadataPredicate(expectedPid: number, nativeSessionId: string
 }
 
 async function applyRequiredLifecycleTmuxMetadata(
-	tmux: string,
+	authority: ProviderAuthority,
 	target: string,
 	env: NodeJS.ProcessEnv,
 	metadata: {
@@ -1249,6 +1316,7 @@ async function applyRequiredLifecycleTmuxMetadata(
 		project: string;
 		ownerGeneration: string;
 		ownerServerKey: string;
+		psmuxIncarnation?: string;
 	},
 	attempt: { nativeSessionId: string; attemptSession: string; serverPid: number },
 ): Promise<void> {
@@ -1260,26 +1328,55 @@ async function applyRequiredLifecycleTmuxMetadata(
 		!metadata.ownerServerKey.trim()
 	)
 		throw new Error("gjc_lifecycle_metadata_required_missing");
-	const commands = buildGjcTmuxProfileCommands(target, env, metadata)
-		.map(command => command.args.map(tmuxCommandArgument).join(" "))
-		.join(" ; ");
+	if (metadata.ownerServerKey !== (authority.namespace ?? "default"))
+		throw new Error("gjc_lifecycle_metadata_authority_mismatch");
+	const commands = buildGjcTmuxProfileCommands(target, env, metadata);
+	if (metadata.psmuxIncarnation) {
+		commands.push({
+			description: "set psmux incarnation",
+			args: ["set-option", "-t", target, GJC_TMUX_PSMUX_INCARNATION_OPTION, metadata.psmuxIncarnation],
+		});
+	}
+	const commandLine = commands.map(command => command.args.map(tmuxCommandArgument).join(" ")).join(" ; ");
+	assertGjcTmuxStagedMutationAuthoritySync(authority);
 	const result = Bun.spawnSync(
 		[
-			tmux,
-			"-L",
-			metadata.ownerServerKey,
-			"if-shell",
-			"-t",
-			attempt.nativeSessionId,
-			"-F",
-			lifecycleMetadataPredicate(attempt.serverPid, attempt.nativeSessionId, attempt.attemptSession),
-			`${commands} ; display-message -p __gjc_lifecycle_metadata_ok__`,
-			"display-message -p __gjc_lifecycle_metadata_refused__",
+			authority.command,
+			...buildTmuxProviderCommand(authority, "if-shell", [
+				"-t",
+				attempt.nativeSessionId,
+				"-F",
+				lifecycleMetadataPredicate(attempt.serverPid, attempt.nativeSessionId, attempt.attemptSession),
+				`${commandLine} ; display-message -p __gjc_lifecycle_metadata_ok__`,
+				"display-message -p __gjc_lifecycle_metadata_refused__",
+			]),
 		],
 		{ stdout: "pipe", stderr: "pipe", env },
 	);
+	assertGjcTmuxStagedMutationAuthoritySync(authority);
 	if (result.exitCode !== 0 || result.stdout.toString().trim() !== "__gjc_lifecycle_metadata_ok__")
 		throw new Error("gjc_lifecycle_metadata_write_failed");
+	const readback = Bun.spawnSync(
+		[
+			authority.command,
+			...buildTmuxProviderCommand(authority, "display-message", [
+				"-p",
+				"-t",
+				attempt.nativeSessionId,
+				metadata.psmuxIncarnation
+					? "#{@gjc-profile}\t#{@gjc-session-id}\t#{@gjc-session-state-file}\t#{@gjc-project}\t#{@gjc-owner-generation}\t#{@gjc-owner-server-key}\t#{@gjc-psmux-incarnation}"
+					: "#{@gjc-profile}\t#{@gjc-session-id}\t#{@gjc-session-state-file}\t#{@gjc-project}\t#{@gjc-owner-generation}\t#{@gjc-owner-server-key}",
+			]),
+		],
+		{ stdout: "pipe", stderr: "pipe", env },
+	);
+	assertGjcTmuxStagedMutationAuthoritySync(authority);
+	const expected = metadata.psmuxIncarnation
+		? `1\t${metadata.sessionId}\t${metadata.sessionStateFile}\t${metadata.project}\t${metadata.ownerGeneration}\t${metadata.ownerServerKey}\t${metadata.psmuxIncarnation}`
+		: `1\t${metadata.sessionId}\t${metadata.sessionStateFile}\t${metadata.project}\t${metadata.ownerGeneration}\t${metadata.ownerServerKey}`;
+	const output = readback.stdout.toString();
+	const line = output.endsWith("\n") ? output.slice(0, -1) : output;
+	if (readback.exitCode !== 0 || line !== expected) throw new Error("gjc_lifecycle_metadata_readback_failed");
 }
 
 /** Real force-close effect (GJC-managed only, id-matched). */
@@ -1302,6 +1399,19 @@ export function daemonCloseSession(
 	};
 }
 
+function authorityForLiveSession(session: GjcTmuxSessionStatus, env: NodeJS.ProcessEnv): ProviderAuthority {
+	if (session.providerAuthority) return session.providerAuthority;
+	const provider = resolveGjcTmuxProviderContext({ env });
+	if (provider.binary.isPsmux) throw new Error("gjc_tmux_provider_authority_unavailable");
+	if (!session.sessionId || !session.sessionStateFile || !session.ownerGeneration)
+		throw new Error("gjc_lifecycle_owner_server_unverifiable");
+	return bindGjcTmuxProviderAuthority(provider, {
+		stateDir: path.dirname(session.sessionStateFile),
+		sessionId: session.sessionId,
+		generation: session.ownerGeneration,
+	});
+}
+
 /** Real resume effect: reattach if a live GJC session matches; else resolve the
  *  prefix against saved history and fail closed (`ambiguous`/`notFound`) before
  *  cold-restarting exactly one resolved session via the daemon-safe launcher. */
@@ -1321,8 +1431,6 @@ export function daemonResumeSession(
 		sessionIdOrPrefix: string;
 		path?: string;
 	}): Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] } | { notFound: true }> => {
-		const tmuxBinary = resolveGjcTmuxBinary({ env, platform: opts.platform });
-		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
 		const live = (opts.listSessions?.(env) ?? listGjcTmuxSessions(env)).filter(
 			s => s.sessionId === target.sessionIdOrPrefix || s.sessionId?.startsWith(target.sessionIdOrPrefix),
 		);
@@ -1334,7 +1442,7 @@ export function daemonResumeSession(
 		if (live.length === 1) {
 			const s = live[0]!;
 			await assertLifecycleTmuxServerSafe({
-				tmux: resolveGjcTmuxCommand(env),
+				authority: authorityForLiveSession(s, env),
 				env,
 				ownerIsolationProbe: opts.ownerIsolationProbe,
 			});
@@ -1379,71 +1487,84 @@ export function daemonResumeSession(
 		if (typeof resolvedResumeCwd !== "string" || !resumeCwdStat?.isDirectory()) {
 			throw new Error(`gjc_lifecycle_resume_cwd_unavailable: ${resolvedResumeCwd ?? "(missing)"}`);
 		}
-		const tmux = tmuxBinary.command;
+		const tmuxBinary = resolveGjcTmuxBinary({ env });
+		const provider = resolveGjcTmuxProviderContext({ binary: tmuxBinary, env });
 		const name = tmuxSessionNameFor(resumeId);
 		const sessionStateFile = lifecycleRuntimeStateFile(resolvedResumeCwd, resumeId, name);
-		const commonChildEnv: Record<string, string> = {
+		const stateDir = path.dirname(sessionStateFile);
+		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, resumeId);
+		const predecessor = resolveManagedOwnerPredecessorSync(stateDir, resumeId, previousBaseline);
+		const generation = crypto.randomUUID();
+		const authority = provider.binary.isPsmux
+			? previousBaseline.state === "current"
+				? bindGjcTmuxProviderAuthority(
+						readGjcTmuxProviderAuthoritySync({
+							stateDir,
+							sessionId: resumeId,
+							generation: previousBaseline.generation,
+						}),
+						{ stateDir, sessionId: resumeId, generation },
+					)
+				: (() => {
+						throw new Error("gjc_tmux_provider_authority_unavailable");
+					})()
+			: bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId: resumeId, generation });
+		persistGjcTmuxProviderAuthoritySync(authority);
+		const tmux = authority.command;
+		const serverKey = authority.namespace ?? "default";
+		const runId = crypto.randomUUID();
+		const incarnation = crypto.randomUUID();
+		const childEnv: Record<string, string> = {
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_NOTIFICATIONS: "1",
 			[GJC_COORDINATOR_SESSION_ID_ENV]: resumeId,
 			[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
+			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
+			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
+			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: serverKey,
+			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", "--resume", resumeId]),
+			[MANAGED_OWNER_RUN_ID_ENV]: runId,
+			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+			...(predecessor
+				? {
+						[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
+						[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
+						[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
+						[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
+						[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
+					}
+				: {}),
 		};
-		if ((opts.platform ?? process.platform) === "linux") {
-			const stateDir = path.dirname(sessionStateFile);
-			const previousBaseline = await captureOwnerGenerationBaseline(stateDir, resumeId);
-			const predecessor = resolveManagedOwnerPredecessorSync(stateDir, resumeId, previousBaseline);
-			const generation = crypto.randomUUID();
-			const runId = crypto.randomUUID();
-			const incarnation = crypto.randomUUID();
-			const managedChildEnv: Record<string, string> = {
-				...commonChildEnv,
-				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
-				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
-				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-				[MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(["gjc", "--resume", resumeId]),
-				[MANAGED_OWNER_RUN_ID_ENV]: runId,
-				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
-				...(predecessor
-					? {
-							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
-							[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: predecessor.generation,
-							[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: predecessor.runId,
-							[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: predecessor.incarnation,
-							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: env.GJC_SESSION_FILE ?? "",
-						}
-					: {}),
-			};
-			const managedEnvPairs = Object.entries(managedChildEnv)
-				.map(([key, value]) => `${key}=${shellQuote(value)}`)
-				.join(" ");
-			const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${managedEnvPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
-			await completeLifecycleSpawnTransaction({
+		const envPairs = Object.entries(childEnv)
+			.map(([key, value]) => `${key}=${shellQuote(value)}`)
+			.join(" ");
+		const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+		await completeLifecycleSpawnTransaction({
+			authority,
+			env,
+			sessionId: resumeId,
+			generation,
+			stateDir,
+			cwd: resolvedResumeCwd,
+			sessionName: name,
+			sessionStateFile,
+			argv: [
 				tmux,
-				env,
-				sessionId: resumeId,
-				generation,
-				stateDir,
-				cwd: resolvedResumeCwd,
-				sessionName: name,
-				sessionStateFile,
-				argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
-				ownerIsolationProbe: opts.ownerIsolationProbe,
-				previousBaseline,
-			});
-		} else {
-			const directEnvPairs = directLifecycleEnvArguments(commonChildEnv);
-			const directCommand = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${directEnvPairs} gjc ${shellQuote("--resume")} ${shellQuote(resumeId)}`;
-			await completeNonLinuxLifecycleSpawn({
-				tmux,
-				env,
-				sessionId: resumeId,
-				cwd: resolvedResumeCwd,
-				sessionName: name,
-				sessionStateFile,
-				command: directCommand,
-				readProcessIncarnation: opts.processIncarnation ?? processIncarnation,
-			});
-		}
+				...buildTmuxProviderCommand(authority, "new-session", [
+					"-d",
+					"-P",
+					"-F",
+					"#{session_id}",
+					"-s",
+					name,
+					"sh",
+					"-c",
+					command,
+				]),
+			],
+			ownerIsolationProbe: opts.ownerIsolationProbe,
+			previousBaseline,
+		});
 
 		return {
 			sessionId: resumeId,
