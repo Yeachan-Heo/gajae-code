@@ -10,6 +10,7 @@ import { ConnectionRegistry, ThreadSubscriptionIndex } from "./subscriptions";
 import { HandlerRegistry, registerBuiltinHandlers } from "./suites/handlers";
 import type { ChildBridgeOptions } from "./thread-runtime/child-bridge";
 import { type AdmissionConfig, ThreadRuntimeManager } from "./thread-runtime/thread-runtime-manager";
+import { TurnController, type TurnControllerNotification } from "./thread-runtime/turn-controller";
 import { BoundedOutboundQueue } from "./transport/connection";
 import { encodeMessage, type FrameCodecOptions } from "./transport/framing";
 
@@ -30,6 +31,7 @@ export interface AppServerConnection {
 
 export interface AppServerRuntime {
 	readonly manager: ThreadRuntimeManager;
+	readonly turnController: TurnController;
 	readonly registry: HandlerRegistry;
 	readonly subscriptions: ThreadSubscriptionIndex;
 	readonly broker: ServerRequestBroker;
@@ -49,6 +51,7 @@ export interface AppServer {
 
 class Runtime implements AppServerRuntime {
 	readonly manager: ThreadRuntimeManager;
+	readonly turnController: TurnController;
 	readonly registry = new HandlerRegistry();
 	readonly subscriptions = new ThreadSubscriptionIndex();
 	readonly broker = new ServerRequestBroker();
@@ -68,10 +71,47 @@ class Runtime implements AppServerRuntime {
 		options: AppServerRuntimeOptions = {},
 	) {
 		this.manager = new ThreadRuntimeManager(config);
+		this.turnController = new TurnController({
+			manager: this.manager,
+			emit: async (notification: TurnControllerNotification) => {
+				const threadId = notification.params.threadId;
+				const stability = this.#serverNotificationStability.get(notification.method);
+				if (!stability) return;
+				for (const connectionId of this.subscriptions.getSubscribers(threadId)) {
+					const target = this.#connections.get(connectionId);
+					const validators = target?.state.capabilities?.experimentalApi
+						? experimentalValidators
+						: stableValidators;
+					if (!validators.serverNotificationParams[notification.method]?.(notification.params)) {
+						logger.warn("Dropping invalid app-server notification", {
+							connectionId,
+							method: notification.method,
+						});
+						continue;
+					}
+					if (target?.active && shouldEmitNotification(target.state, notification.method, stability))
+						await target.enqueueMessage({ method: notification.method, params: notification.params });
+				}
+			},
+		});
 		this.#frameCodec = frameCodec;
 		const adapter = options.threadStartAdapter;
 		this.#threadStartAdapter =
-			typeof adapter?.create === "function" ? { ...adapter, manager: this.manager } : undefined;
+			typeof adapter?.create === "function"
+				? {
+						...adapter,
+						manager: this.manager,
+						onFrame: (child, frame) => {
+							try {
+								adapter.onFrame?.(child, frame);
+							} finally {
+								this.turnController.acceptFrame(child.sessionId, frame);
+							}
+						},
+						// Reconnect hooks pass through unchanged: projection-cursor reconciliation after a
+						// child reconnect is later work, so the controller has no reconnect ingress to compose.
+					}
+				: undefined;
 		registerBuiltinHandlers(this.registry);
 	}
 
@@ -107,6 +147,7 @@ class Runtime implements AppServerRuntime {
 			connectionId: connection.id,
 			broker: this.broker,
 			threadStartAdapter: this.#threadStartAdapter,
+			turnController: this.turnController,
 			isActive: active,
 			subscribe: threadId => {
 				if (!active()) throw new Error("Connection is inactive.");
@@ -254,6 +295,7 @@ class Connection implements AppServerConnection {
 				await result.rollbackUndeliveredResponse?.();
 				throw error;
 			}
+			await result.responseDelivered?.();
 		}
 		for (const publish of deferred) {
 			if (this.#closed) return;

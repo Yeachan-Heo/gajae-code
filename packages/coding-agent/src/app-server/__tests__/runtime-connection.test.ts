@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createAppServerRuntime } from "../create-app-server";
+import type { ChildCreateResult, SessionClient } from "../thread-runtime/child-bridge";
 import { DEFAULT_OUTBOUND_QUEUE_CAPACITY } from "../transport/connection";
 
 const enc = (value: string) => new TextEncoder().encode(value);
@@ -45,6 +46,58 @@ const effectiveSettings = (sessionId: string, cwd: string) => ({
 		name: null,
 		turns: [],
 	},
+});
+
+type ChildFrameHandler = (frame: Record<string, unknown>) => void;
+
+interface InjectedChild {
+	readonly child: ChildCreateResult;
+	emitFrame(frame: Record<string, unknown>): void;
+}
+
+function injectedChild(sessionId: string): InjectedChild {
+	let frameHandler: ChildFrameHandler = () => {};
+	let revision = 0;
+	const client: SessionClient = {
+		onFrame: handler => {
+			frameHandler = handler;
+			return () => {};
+		},
+		onReconnect: _handler => () => {},
+		onReconnectFailed: _handler => () => {},
+		request: async () => ({}),
+		query: async () => ({}),
+		control: async operation => {
+			if (operation === "turn.prompt") return { accepted: true, commandId: "child-command", turnId: "child-turn" };
+			if (operation === "projection.append") return { revision: ++revision };
+			return {};
+		},
+		close: async () => {},
+	};
+	return {
+		child: {
+			sessionId,
+			cwd: "/tmp",
+			authority: {
+				endpointGeneration: 1,
+				endpointIncarnation: "a".repeat(64),
+				endpointMtimeMs: 1,
+				pid: 1234,
+			},
+			client,
+			awaitReady: async () => {},
+			closeChild: async () => {},
+			effectiveSettings: effectiveSettings(sessionId, "/tmp"),
+		},
+		emitFrame: frame => frameHandler(frame),
+	};
+}
+
+const lifecycleFrame = (type: "agent_start" | "agent_end"): Record<string, unknown> => ({
+	type,
+	commandId: "child-command",
+	turnId: "child-turn",
+	...(type === "agent_end" ? { messages: [], stopReason: "completed" } : {}),
 });
 
 async function initialize(connection: { process(line: Uint8Array): Promise<void> }): Promise<void> {
@@ -480,6 +533,160 @@ test("runtime connection: production assembly forwards thread/start to the injec
 	expect(dec(frames[0]!)).toMatchObject({ id: 2, error: { code: -32603 } });
 	expect(runtime.manager.loadedCount).toBe(0);
 	expect(runtime.manager.pendingCount).toBe(0);
+});
+
+test("runtime connection: injected child frames reach the caller hook and shared turn controller once", async () => {
+	const sessionId = "runtime-turn-hook-session";
+	const child = injectedChild(sessionId);
+	let callerFrameCount = 0;
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: {
+			create: async () => child.child,
+			onFrame: (_child, frame) => {
+				callerFrameCount += 1;
+				expect(frame).toEqual(lifecycleFrame("agent_end"));
+			},
+		},
+	});
+	const frames: Uint8Array[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(frame);
+	});
+	await initialize(connection);
+	await connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	frames.length = 0;
+	await connection.process(
+		enc(
+			'{"id":3,"method":"turn/start","params":{"threadId":"runtime-turn-hook-session","input":[{"type":"text","text":"hello","text_elements":[]}]}}',
+		),
+	);
+	child.emitFrame(lifecycleFrame("agent_end"));
+	await Bun.sleep(0);
+	await Bun.sleep(0);
+
+	const methods = frames
+		.map(dec)
+		.filter(frame => typeof frame.method === "string")
+		.map(frame => frame.method);
+	expect(callerFrameCount).toBe(1);
+	expect(methods.filter(method => method === "turn/completed")).toHaveLength(1);
+	expect(runtime.turnController.activeTurnCount).toBe(0);
+});
+
+test("runtime connection: turn notifications wait behind a blocked turn/start response", async () => {
+	const sessionId = "runtime-turn-order-session";
+	const child = injectedChild(sessionId);
+	const frames: Uint8Array[] = [];
+	const writerEntered = Promise.withResolvers<void>();
+	const releaseWriter = Promise.withResolvers<void>();
+	let blockWriter = false;
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: { create: async () => child.child },
+	});
+	const connection = runtime.createConnection(async frame => {
+		if (blockWriter) {
+			writerEntered.resolve();
+			await releaseWriter.promise;
+		}
+		frames.push(frame);
+	});
+	await initialize(connection);
+	await connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	frames.length = 0;
+	blockWriter = true;
+	const processing = connection.process(
+		enc(
+			'{"id":3,"method":"turn/start","params":{"threadId":"runtime-turn-order-session","input":[{"type":"text","text":"hello","text_elements":[]}]}}',
+		),
+	);
+	await writerEntered.promise;
+	child.emitFrame(lifecycleFrame("agent_end"));
+	expect(frames.map(dec)).not.toContainEqual(expect.objectContaining({ method: "turn/started" }));
+	blockWriter = false;
+	releaseWriter.resolve();
+	await processing;
+
+	const decoded = frames.map(dec);
+	const responseIndex = decoded.findIndex(frame => frame.id === 3);
+	const startedIndex = decoded.findIndex(frame => frame.method === "turn/started");
+	expect(responseIndex).toBeGreaterThanOrEqual(0);
+	expect(startedIndex).toBeGreaterThan(responseIndex);
+});
+
+test("runtime connection: shared turn notifications fan out to subscribers and survive requester close", async () => {
+	const sessionId = "runtime-turn-fanout-session";
+	const child = injectedChild(sessionId);
+	const requesterFrames: Uint8Array[] = [];
+	const observerFrames: Uint8Array[] = [];
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: { create: async () => child.child },
+	});
+	const requester = runtime.createConnection(frame => {
+		requesterFrames.push(frame);
+	});
+	const observer = runtime.createConnection(frame => {
+		observerFrames.push(frame);
+	});
+	await initialize(requester);
+	await initialize(observer);
+	await requester.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	runtime.subscriptions.subscribe(observer.id, sessionId);
+	requesterFrames.length = 0;
+	observerFrames.length = 0;
+	await requester.process(
+		enc(
+			'{"id":3,"method":"turn/start","params":{"threadId":"runtime-turn-fanout-session","input":[{"type":"text","text":"hello","text_elements":[]}]}}',
+		),
+	);
+
+	expect(requesterFrames.map(dec).filter(frame => frame.method === "turn/started")).toHaveLength(1);
+	expect(observerFrames.map(dec).filter(frame => frame.method === "turn/started")).toHaveLength(1);
+	await requester.close();
+	child.emitFrame(lifecycleFrame("agent_end"));
+	await Bun.sleep(0);
+	await Bun.sleep(0);
+
+	expect(requesterFrames.map(dec).filter(frame => frame.method === "turn/completed")).toHaveLength(0);
+	expect(observerFrames.map(dec).filter(frame => frame.method === "turn/completed")).toHaveLength(1);
+});
+
+test("runtime connection: response delivery hook runs after the response writer accepts the frame", async () => {
+	const sessionId = "runtime-turn-delivery-session";
+	const child = injectedChild(sessionId);
+	const events: string[] = [];
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: { create: async () => child.child },
+	});
+	const connection = runtime.createConnection(frame => {
+		const message = dec(frame);
+		if (message.id === 3) events.push("response-written");
+		if (message.method === "turn/started") events.push("turn-started");
+	});
+	await initialize(connection);
+	await connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	await connection.process(
+		enc(
+			'{"id":3,"method":"turn/start","params":{"threadId":"runtime-turn-delivery-session","input":[{"type":"text","text":"hello","text_elements":[]}]}}',
+		),
+	);
+
+	expect(events).toEqual(["response-written", "turn-started"]);
 });
 
 test("runtime connection: requester close during thread/start readiness rolls back the published runtime", async () => {
