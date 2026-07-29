@@ -1,0 +1,48 @@
+{
+  "schema": "gjc.perf-corpus-memory-evidence-manifest/1",
+  "generatedAt": "2026-07-29T14:02:13.624Z",
+  "trustedBindings": {
+    "measurementHead": "ae37704ea58c5181043ef2a325c3aa1878884c25",
+    "measurementTree": "0626d7b5b7045f9de46f9d6a2f4be72dd3202064",
+    "closureDigest": "66a3b6cea055a5d2957d64374c4ba5d5ac4aa5b077aff1df29ed23731182686f",
+    "worktreeFingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "runtimeControlIdentity": "7df448784abaddde38907eddae4bc5bdf76386ad5c0e55d3687d8086e0246e72",
+    "captureIdSha256": "f1bcfc5467d4b0353b86ddde957d4bd50622236186e61efda6225a2493f9bbe4",
+    "scheduleDigest": "bf1d3d666e2ac86ee865763ea34e2f798fbdf347834d0155998dde0fb93da444",
+    "protocolDigest": "edbb1f319a71dfee50dded03500cff066225ae02c09af800c80e39970b85cbab",
+    "templateSha256": "dab587637aa4202c97348dbe2f856df95827598bc8abd87079af8b6e91884d36",
+    "driverSha256": "7d964a4ed05e5d28bd95cf878effcdc26f89e34e2bef7f58fb976960c7cab558",
+    "preregistrationSha256": "ea36305bef0270b4ea7aafe60ff89bdce62c953b286cd7324ba0a2fc272cd9f9",
+    "attemptLedgerSha256": "e46512ff3ddce0092bcbcbc1ca65edc6eeccb9b0dea3e9d6c5daea09961b6be6",
+    "rawManifestSha256": "cd5181d5195d83652ac73eeb0bafaabda7fb87b99e9ec92c997781dcaad36373"
+  },
+  "artifacts": [
+    {
+      "path": "artifacts/perf-corpus-memory-evidence-report.json",
+      "sha256": "738a637828a31eeb4a3c69009b724e34abf7189206393d60ac3658eacc5afd80",
+      "sizeBytes": 3288
+    },
+    {
+      "path": "artifacts/perf-corpus-memory-evidence-notebook.ipynb",
+      "sha256": "5a17a469745ca70c89807b3a7780bf1bef3ee152507a9c5f82b5ae8002444a9c",
+      "sizeBytes": 11987
+    }
+  ],
+  "publicationHeadBinding": {
+    "location": "external-receipt",
+    "reason": "The commit identity is bound after these bytes are committed, avoiding self-reference."
+  },
+  "executionControls": {
+    "network": "OS-enforced deny required",
+    "environment": "allowlist required",
+    "sealedInput": "complete closure read-only and symlink-free",
+    "output": "fresh and bounded"
+  },
+  "retentionAccess": {
+    "rawCorpus": "retained outside git, read-only, access-restricted",
+    "hashBoundByExternalReceipt": true,
+    "externalReceiptGitSha": "ae37704ea58c5181043ef2a325c3aa1878884c25",
+    "externalReceiptTreeSha": "0626d7b5b7045f9de46f9d6a2f4be72dd3202064",
+    "externalReceiptClosureDigest": "66a3b6cea055a5d2957d64374c4ba5d5ac4aa5b077aff1df29ed23731182686f"
+  }
+}

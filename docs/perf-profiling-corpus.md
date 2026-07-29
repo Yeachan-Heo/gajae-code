@@ -141,3 +141,21 @@ Resident-memory retention (hotspots M01–M05) was bounded in Optimization Suite
 This contract is locked by `packages/coding-agent/test/resident-materialization.test.ts`. Retained growth and post-GC return are measured by `packages/coding-agent/bench/session-memory.bench.ts` (emits the corpus `rssMemory` shape).
 
 **Measured deferral:** further memory rewrites beyond these byte-parity-preserving bounds are deferred to corpus prioritization. Per [`native-ffi-optimization-policy.md`](./native-ffi-optimization-policy.md) and the byte-parity principle, speculative memory rewrites wait for profiler/RSS corpus evidence rather than being undertaken on a static-ranking guess.
+
+## Authenticated sealed-corpus result
+
+- Evidence status: `SUFFICIENT_EVIDENCE`
+- Action decision: `ACTION`
+- Action family: `sustained-heap-growth`
+- Measurement head: `ae37704ea58c5181043ef2a325c3aa1878884c25`
+- Admission: short 5/5, soak 24/24
+- `agent-session` endpoint median: 2232879.966 B/s, BCa lower 2198738.248, Theil-Sen median 917654.71
+- `tui` endpoint median: 170829.216 B/s, BCa lower 154600.451, Theil-Sen median 4391.02
+- p95: `OMITTED_IMPOSSIBLE` (24 blocks insufficient for 95% empirical coverage per exact-order-statistic method)
+- All five preregistered limitations preserved
+- JS heap separated from process RSS/external/native; no production leak or causal site claimed
+- Raw corpus retained outside git, read-only, access-restricted, hash-bound by external receipt
+- Published files:
+  - `artifacts/perf-corpus-memory-evidence-report.json`
+  - `artifacts/perf-corpus-memory-evidence-manifest.json`
+  - `artifacts/perf-corpus-memory-evidence-notebook.ipynb`

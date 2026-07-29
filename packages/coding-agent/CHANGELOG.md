@@ -22,6 +22,7 @@
 - The documented `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` environment variable now overrides the OpenAI-code web-search model; it is resolved GJC-first ahead of the legacy `PI_CODEX_WEB_SEARCH_MODEL` name (previously only the legacy name was read, so the documented name was a silent no-op).
 
 ### Added
+- Published bounded, redacted, hash-bound sealed perf-corpus memory evidence and an output-free replay notebook. The authenticated analysis identifies sustained heap growth on the `agent-session` and `tui` surfaces while keeping RSS/native allocation and p95 claims explicitly out of scope.
 
 - Deterministic tests for session_switch await policy (selector defer vs default/branch await), control-drain ordering, host pre-response readiness gating, and resume progress lease-before-switch behavior (#2914).
 - Added schema-v3 isolated Bun memory baselines across seven process-per-surface fixtures: chronological periodic samples alone determine slopes, while four independently observed sampled extrema retain their own values and timestamps. The frozen evidence protocol admits 5 short reports from 7 attempts and 24 `30000` ms soak reports from 30 attempts on a deterministic interleaved, counterbalanced schedule; records complete measurement/runtime/process provenance; keeps non-primary results descriptive; supports trusted offline replay; and omits claim-bearing p95 in favor of an impossibility receipt.
