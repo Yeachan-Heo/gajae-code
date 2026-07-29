@@ -942,3 +942,52 @@ test("runtime connection: outbound backpressure close rolls back an undelivered 
 	await Promise.all([closing, ...queuedNotifications]);
 	expect(frames.some(frame => dec(frame).id === 2)).toBe(false);
 });
+
+test("runtime connection: an approval accept and a deny each settle the awaiting request on the wire", async () => {
+	for (const scenario of [
+		{ name: "accept", response: { decision: "approved" }, expected: "resolved" },
+		{ name: "deny", response: { decision: { denied: { rejection: "not allowed" } } }, expected: "denied" },
+	]) {
+		const runtime = createAppServerRuntime();
+		const frames: Uint8Array[] = [];
+		const connection = runtime.createConnection(frame => {
+			frames.push(frame);
+		});
+		await initialize(connection);
+		runtime.subscriptions.subscribe(connection.id, "thread-a");
+		frames.length = 0;
+
+		// The handler asks the client for an approval; the broker owns the awaitable settlement.
+		let requestId: string | undefined;
+		runtime.registry.register("fs/readFile", (_params, context) => {
+			requestId = context?.requestClient?.("thread-a", "execCommandApproval", {
+				conversationId: "thread-a",
+				callId: "call-1",
+				approvalId: null,
+				command: ["ls"],
+				cwd: "/tmp",
+				reason: null,
+				parsedCmd: [],
+			});
+			return { ok: true, result: { dataBase64: "" } };
+		});
+		await connection.process(enc('{"id":3,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+		await Bun.sleep(0);
+
+		expect(requestId, scenario.name).toBeDefined();
+		const settled = runtime.broker.getPending(requestId!)?.settled;
+		expect(settled, scenario.name).toBeDefined();
+		// The approval request reached the subscribed client on the wire.
+		expect(frames.map(dec), scenario.name).toContainEqual(
+			expect.objectContaining({ id: requestId, method: "execCommandApproval" }),
+		);
+
+		// The client's decision travels back through the real inbound path and settles the waiter.
+		await connection.process(enc(JSON.stringify({ id: requestId, result: scenario.response })));
+		await expect(settled, scenario.name).resolves.toMatchObject({
+			kind: scenario.expected,
+			connectionId: connection.id,
+		});
+		expect(runtime.broker.pendingCount, scenario.name).toBe(0);
+	}
+});
