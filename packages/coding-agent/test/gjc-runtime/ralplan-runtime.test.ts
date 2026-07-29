@@ -652,6 +652,205 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		const writePayload = JSON.parse(write.stdout ?? "{}") as { run_id: string };
 		expect(writePayload.run_id).toBe(handoffPayload.run_id);
 	});
+
+	it("disposition stage fails closed on open conflicts and accepts authoritative same-pass receipts", async () => {
+		const root = await tempDir();
+		const runId = "disp-run";
+		const planner = await writeRalplanArtifact(root, runId, "planner", 1, "# plan");
+		expect(planner.status).toBe(0);
+		const architect = await writeRalplanArtifact(root, runId, "architect", 1, "# architect remove field");
+		expect(architect.status).toBe(0);
+		const critic = await writeRalplanArtifact(root, runId, "critic", 1, "# critic keep field");
+		expect(critic.status).toBe(0);
+		const archReceipt = JSON.parse(architect.stdout ?? "{}") as { path: string; sha256: string };
+		const critReceipt = JSON.parse(critic.stdout ?? "{}") as { path: string; sha256: string };
+
+		const findings = [
+			{
+				findingId: "arch-1",
+				targetId: "contract.field",
+				action: "remove",
+				severity: "block",
+				evidence: "redundant with session identity",
+				sourceRole: "architect",
+				sourceReceipt: {
+					stage: "architect",
+					stageN: 1,
+					path: archReceipt.path,
+					sha256: archReceipt.sha256,
+				},
+			},
+			{
+				findingId: "crit-1",
+				targetId: "contract.field",
+				action: "add",
+				severity: "watch",
+				evidence: "needed for multi-repo binding",
+				sourceRole: "critic",
+				sourceReceipt: {
+					stage: "critic",
+					stageN: 1,
+					path: critReceipt.path,
+					sha256: critReceipt.sha256,
+				},
+			},
+		];
+
+		const openPath = path.join(root, "open-disposition.json");
+		await fs.writeFile(
+			openPath,
+			JSON.stringify({
+				schema: "ralplan.review_conflicts.v1",
+				plannerStageN: 1,
+				findings,
+				dispositions: [],
+			}),
+		);
+		const open = await runNativeRalplanCommand(
+			["--write", "--stage", "disposition", "--stage_n", "1", "--artifact", openPath, "--run-id", runId],
+			root,
+		);
+		expect(open.status).toBe(2);
+		expect(open.stderr).toContain("Join blocked");
+
+		const closedPath = path.join(root, "closed-disposition.json");
+		await fs.writeFile(
+			closedPath,
+			JSON.stringify({
+				schema: "ralplan.review_conflicts.v1",
+				plannerStageN: 1,
+				findings,
+				dispositions: [
+					{
+						conflictId: "conflict:contract.field:arch-1:crit-1",
+						choice: "accept_architect",
+						rationale: "Field duplicates existing session identity.",
+						decisionOwner: "ralplan-leader",
+						affectedSections: ["## Contracts"],
+					},
+				],
+			}),
+		);
+		const closed = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"disposition",
+				"--stage_n",
+				"1",
+				"--artifact",
+				closedPath,
+				"--run-id",
+				runId,
+				"--json",
+			],
+			root,
+		);
+		expect(closed.status).toBe(0);
+		const payload = JSON.parse(closed.stdout ?? "{}") as { path: string; stage: string };
+		expect(payload.stage).toBe("disposition");
+		const body = await fs.readFile(payload.path, "utf-8");
+		expect(body).toContain("ralplan.review_conflicts.v1");
+		expect(body).toContain("dispositioned");
+	});
+
+	it("disposition stage rejects stage_n / plannerStageN mismatch and spoofed receipts", async () => {
+		const root = await tempDir();
+		const runId = "disp-spoof";
+		const architect = await writeRalplanArtifact(root, runId, "architect", 1, "# architect");
+		expect(architect.status).toBe(0);
+		const critic = await writeRalplanArtifact(root, runId, "critic", 1, "# critic");
+		expect(critic.status).toBe(0);
+		const archReceipt = JSON.parse(architect.stdout ?? "{}") as { path: string; sha256: string };
+		const critReceipt = JSON.parse(critic.stdout ?? "{}") as { path: string; sha256: string };
+
+		const findings = [
+			{
+				findingId: "arch-1",
+				targetId: "contract.field",
+				action: "remove",
+				severity: "block",
+				evidence: "evidence",
+				sourceRole: "architect",
+				sourceReceipt: {
+					stage: "architect",
+					stageN: 1,
+					path: archReceipt.path,
+					sha256: archReceipt.sha256,
+				},
+			},
+			{
+				findingId: "crit-1",
+				targetId: "contract.field",
+				action: "add",
+				severity: "watch",
+				evidence: "evidence",
+				sourceRole: "critic",
+				sourceReceipt: {
+					stage: "critic",
+					stageN: 1,
+					path: critReceipt.path,
+					sha256: critReceipt.sha256,
+				},
+			},
+		];
+		const dispositions = [
+			{
+				conflictId: "conflict:contract.field:arch-1:crit-1",
+				choice: "accept_architect",
+				rationale: "ok",
+				decisionOwner: "ralplan-leader",
+				affectedSections: ["## Contracts"],
+			},
+		];
+
+		// CLI --stage_n 2 vs plannerStageN 1 (wrong pass).
+		const mismatchPath = path.join(root, "stage-mismatch.json");
+		await fs.writeFile(
+			mismatchPath,
+			JSON.stringify({
+				schema: "ralplan.review_conflicts.v1",
+				plannerStageN: 1,
+				findings,
+				dispositions,
+			}),
+		);
+		const mismatch = await runNativeRalplanCommand(
+			["--write", "--stage", "disposition", "--stage_n", "2", "--artifact", mismatchPath, "--run-id", runId],
+			root,
+		);
+		expect(mismatch.status).toBe(2);
+		expect(mismatch.stderr).toMatch(/plannerStageN=1 does not match CLI --stage_n=2/);
+
+		// Spoofed receipt path/hash not in index.
+		const spoofPath = path.join(root, "spoofed-receipt.json");
+		await fs.writeFile(
+			spoofPath,
+			JSON.stringify({
+				schema: "ralplan.review_conflicts.v1",
+				plannerStageN: 1,
+				findings: [
+					{
+						...findings[0],
+						sourceReceipt: {
+							stage: "architect",
+							stageN: 1,
+							path: "/tmp/spoofed-architect.md",
+							sha256: "deadbeef",
+						},
+					},
+					findings[1],
+				],
+				dispositions,
+			}),
+		);
+		const spoofed = await runNativeRalplanCommand(
+			["--write", "--stage", "disposition", "--stage_n", "1", "--artifact", spoofPath, "--run-id", runId],
+			root,
+		);
+		expect(spoofed.status).toBe(2);
+		expect(spoofed.stderr).toMatch(/does not match indexed architect stage 1/);
+	});
 });
 
 describe("native gjc ralplan runtime — run-state phase coherence", () => {

@@ -5,6 +5,10 @@
 
 - `gjc ultragoal quality-gate init` scaffolds a multi-surface quality-gate template (`--surface` repeatable, `--out` required) so agents can fill evidence once and use read-only `quality-gate validate` multi-error diagnostics instead of discovering missing fields one checkpoint at a time (#3474).
 
+### Added
+
+- Ralplan can persist a typed `disposition` stage (`ralplan.review_conflicts.v1`) when Architect and Critic prescribe incompatible actions on the same plan target. Writes fail closed until every conflict has an explicit disposition, and source receipts must resolve against the same-pass Architect/Critic rows in the run index (#2902).
+
 ### Fixed
 
 - Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
