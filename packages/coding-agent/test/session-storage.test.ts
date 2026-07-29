@@ -7,6 +7,7 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
 	acquireManagedLock,
+	acquireManagedLockSync,
 	captureManagedFileNoFollow,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -703,7 +704,7 @@ describe("FileSessionStorageWriter path security", () => {
 		const sessionPath = path.join(tempDir, "verify-reject.jsonl");
 		const protectedPath = `${sessionPath}.secure-b`;
 		const close = vi.fn();
-		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
+		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("apply"));
 		const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation(pathname => {
 			fs.renameSync(pathname, protectedPath);
 			fs.writeFileSync(pathname, "attacker replacement\n");
@@ -809,8 +810,15 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			throw new Error("Expected durable artifact-phase receipt");
 
 		expect(artifacts.transcriptIdentity).toEqual(target.transcriptIdentity);
-		expect(fs.existsSync(artifactsDir)).toBe(false);
-		expect(fs.existsSync(plannedArtifactsPath)).toBe(false);
+		if (artifacts.kind === "cleanup_pending") {
+			expect(artifacts.detachedArtifactsPath).toBe(plannedArtifactsPath);
+			expect(artifacts.retainedPlaceholderPath).toBe(artifactsDir);
+			expect(fs.existsSync(artifactsDir)).toBe(true);
+			expect(fs.existsSync(plannedArtifactsPath)).toBe(true);
+		} else {
+			expect(fs.existsSync(artifactsDir)).toBe(false);
+			expect(fs.existsSync(plannedArtifactsPath)).toBe(false);
+		}
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
@@ -920,7 +928,12 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
 			throw new Error("Expected artifact-phase receipt");
 		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
-		expect(await fsp.stat(plannedArtifactsPath).catch(() => undefined)).toBeUndefined();
+		if (receipt.kind === "cleanup_pending") {
+			expect(receipt.detachedArtifactsPath).toBe(plannedArtifactsPath);
+			expect(await fsp.stat(plannedArtifactsPath).catch(() => undefined)).toBeDefined();
+		} else {
+			expect(await fsp.stat(plannedArtifactsPath).catch(() => undefined)).toBeUndefined();
+		}
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
@@ -1618,5 +1631,84 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 		expect(result.failures).toHaveLength(1);
 		expect(result.failures[0].kind).toBe("scan");
 		expect(result.failures[0].message).not.toContain("EIO");
+	});
+});
+describe("managed lock exact retirement boundaries", () => {
+	const successorRecord = (): string =>
+		`${JSON.stringify({
+			attemptId: "successor",
+			pid: process.pid,
+			processStartId: "successor",
+			createdAt: Date.now(),
+			heartbeatAt: Date.now(),
+			leaseExpiresAt: Date.now() + 60_000,
+		})}\n`;
+
+	function substituteBeforeExactUnlink(lockPath: string): void {
+		const unlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (pathname === lockPath) {
+				fs.renameSync(lockPath, `${lockPath}.retired-by-adversary`);
+				fs.writeFileSync(lockPath, successorRecord(), { mode: 0o600 });
+			}
+			return unlink(pathname, identity);
+		});
+	}
+
+	function expectSuccessorStillExcludes(lockPath: string): void {
+		expect(fs.readFileSync(lockPath, "utf8")).toContain('"attemptId":"successor"');
+		expect(() => fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY)).toThrow();
+	}
+
+	afterEach(() => vi.restoreAllMocks());
+
+	it("does not displace a substituted successor during async release", async () => {
+		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-"));
+		try {
+			const lock = await acquireManagedLock(locks, "owner");
+			substituteBeforeExactUnlink(lock.path);
+			await expect(lock.release()).rejects.toThrow("migration_busy");
+			expectSuccessorStillExcludes(lock.path);
+		} finally {
+			fs.rmSync(locks, { recursive: true, force: true });
+		}
+	});
+
+	it("does not displace a substituted successor during sync release", () => {
+		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-"));
+		try {
+			const lock = acquireManagedLockSync(locks, "owner");
+			substituteBeforeExactUnlink(lock.path);
+			expect(() => lock.release()).toThrow("migration_busy");
+			expectSuccessorStillExcludes(lock.path);
+		} finally {
+			fs.rmSync(locks, { recursive: true, force: true });
+		}
+	});
+
+	it("does not displace a substituted successor during stale reclaim", async () => {
+		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-stale-"));
+		const lockPath = path.join(locks, "owner.lock");
+		try {
+			fs.writeFileSync(
+				lockPath,
+				`${JSON.stringify({
+					attemptId: "stale",
+					pid: 2_147_483_647,
+					processStartId: "stale",
+					createdAt: 0,
+					heartbeatAt: 0,
+					leaseExpiresAt: 0,
+				})}\n`,
+				{ mode: 0o600 },
+			);
+			substituteBeforeExactUnlink(lockPath);
+			let calls = 0;
+			vi.spyOn(Date, "now").mockImplementation(() => (calls++ < 3 ? 1_000 : 6_001));
+			await expect(acquireManagedLock(locks, "owner")).rejects.toThrow("migration_busy");
+			expectSuccessorStillExcludes(lockPath);
+		} finally {
+			fs.rmSync(locks, { recursive: true, force: true });
+		}
 	});
 });

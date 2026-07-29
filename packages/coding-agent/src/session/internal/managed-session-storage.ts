@@ -1297,11 +1297,9 @@ function isCtimeOnlyIdentityMismatch(
 	return sameStableIdentityIgnoringCtime(observed, expected) && observed.ctimeNs !== expected.ctimeNs;
 }
 
-function parseLock(pathname: string): LockRecord | undefined {
+function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
 	try {
-		const stat = fs.lstatSync(pathname);
-		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
-		const value: unknown = JSON.parse(fs.readFileSync(pathname, "utf8"));
+		const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
 		if (!value || typeof value !== "object") return undefined;
 		const record = value as Partial<LockRecord>;
 		return typeof record.attemptId === "string" &&
@@ -1312,6 +1310,16 @@ function parseLock(pathname: string): LockRecord | undefined {
 			typeof record.createdAt === "number"
 			? (record as LockRecord)
 			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function parseLock(pathname: string): LockRecord | undefined {
+	try {
+		const stat = fs.lstatSync(pathname);
+		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+		return parseLockBytes(fs.readFileSync(pathname));
 	} catch {
 		return undefined;
 	}
@@ -1336,6 +1344,45 @@ function writeLockDescriptor(fd: number, record: LockRecord): void {
 
 function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
+}
+function retireManagedLockExact(
+	lockPath: string,
+	expected: { lockIdentity?: fs.BigIntStats; attemptId: string },
+): void {
+	let snapshot: ManagedFileSnapshot;
+	try {
+		snapshot = captureManagedFileNoFollow(lockPath);
+	} catch {
+		throw new Error("migration_busy");
+	}
+	const record = parseLockBytes(snapshot.bytes);
+	if (
+		!record ||
+		record.attemptId !== expected.attemptId ||
+		(expected.lockIdentity &&
+			(snapshot.identity.dev !== expected.lockIdentity.dev || snapshot.identity.ino !== expected.lockIdentity.ino))
+	)
+		throw new Error("migration_busy");
+	const removed = exactUnlink(lockPath, {
+		dev: snapshot.identity.dev,
+		ino: snapshot.identity.ino,
+		size: BigInt(snapshot.identity.size),
+		mtimeNs: snapshot.identity.mtimeNs,
+		sha256: snapshot.identity.sha256,
+		quarantineName: `.gjc-lock-retire-${process.pid}-${randomUUID()}`,
+	});
+	if (
+		!removed.ok &&
+		!(
+			removed.code === "cleanup_pending" &&
+			(removed.detachedPath ??
+				removed.retainedSuccessorPath ??
+				removed.retainedPlaceholderPath ??
+				removed.retainedUnknownPath) !== undefined
+		)
+	)
+		throw new Error("migration_busy");
+	fsyncDirectory(path.dirname(lockPath));
 }
 
 /** Create a managed directory and fail closed unless its owner-only mode/ACL verifies. */
@@ -1818,12 +1865,7 @@ export async function acquireManagedLock(
 					try {
 						assertOwned();
 						secureFileDescriptor(lockPath, fd, "verify");
-						const retiredPath = `${lockPath}.${attemptId}.retired`;
-						fs.renameSync(lockPath, retiredPath);
-						const retiredIdentity = fs.lstatSync(retiredPath, { bigint: true });
-						if (!sameFileIdentity(lockIdentity, retiredIdentity)) throw new Error("migration_busy");
-						fs.unlinkSync(retiredPath);
-						fsyncDirectory(locksDirectory);
+						retireManagedLockExact(lockPath, { lockIdentity, attemptId });
 					} finally {
 						released = true;
 						closeDescriptor();
@@ -1834,13 +1876,8 @@ export async function acquireManagedLock(
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			const owner = parseLock(lockPath);
 			if (owner && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner)) {
-				const quarantine = `${lockPath}.${randomUUID()}.stale`;
 				try {
-					fs.renameSync(lockPath, quarantine);
-					const quarantined = parseLock(quarantine);
-					if (!quarantined || quarantined.attemptId !== owner.attemptId) throw new Error("migration_busy");
-					fs.unlinkSync(quarantine);
-					fsyncDirectory(locksDirectory);
+					retireManagedLockExact(lockPath, { attemptId: owner.attemptId });
 				} catch {
 					/* retry owner observation */
 				}
@@ -1912,13 +1949,7 @@ export function acquireManagedLockSync(
 				assertOwned,
 				release(): void {
 					try {
-						assertOwned();
-						const retiredPath = `${lockPath}.${attemptId}.retired`;
-						fs.renameSync(lockPath, retiredPath);
-						const retiredIdentity = fs.lstatSync(retiredPath, { bigint: true });
-						if (!sameFileIdentity(lockIdentity, retiredIdentity)) throw new Error("migration_busy");
-						fs.unlinkSync(retiredPath);
-						fsyncDirectory(locksDirectory);
+						retireManagedLockExact(lockPath, { lockIdentity, attemptId });
 					} finally {
 						released = true;
 						if (!descriptorClosed) {
@@ -1932,13 +1963,8 @@ export function acquireManagedLockSync(
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			const owner = parseLock(lockPath);
 			if (owner && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner)) {
-				const quarantine = `${lockPath}.${randomUUID()}.stale`;
 				try {
-					fs.renameSync(lockPath, quarantine);
-					const quarantined = parseLock(quarantine);
-					if (!quarantined || quarantined.attemptId !== owner.attemptId) throw new Error("migration_busy");
-					fs.unlinkSync(quarantine);
-					fsyncDirectory(locksDirectory);
+					retireManagedLockExact(lockPath, { attemptId: owner.attemptId });
 				} catch {
 					/* Retry owner observation. */
 				}
