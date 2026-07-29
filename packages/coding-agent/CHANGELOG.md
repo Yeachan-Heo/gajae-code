@@ -1,6 +1,10 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+
+- Ralplan can persist a typed `disposition` stage (`ralplan.review_conflicts.v1`) when Architect and Critic prescribe incompatible actions on the same plan target. Writes fail closed until every conflict has an explicit disposition, and source receipts must resolve against the same-pass Architect/Critic rows in the run index (#2902).
+
 ### Fixed
 
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.

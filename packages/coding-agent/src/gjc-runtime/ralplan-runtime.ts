@@ -14,6 +14,12 @@ import {
 	summarizeRalplanIndex,
 } from "./ledger-event-renderer";
 import {
+	type IndexedReviewArtifact,
+	parseReviewConflictDocument,
+	reviewArtifactIndexKey,
+	serializeReviewConflictDocument,
+} from "./ralplan-review-conflicts";
+import {
 	assertCwdMatchesRepositoryBinding,
 	assertPathUnderRepositoryBinding,
 	captureRepositoryBinding,
@@ -37,7 +43,6 @@ import {
 import { probeGjcTeamAvailability } from "./team-runtime";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
-
 /**
  * Native implementation of `gjc ralplan`.
  *
@@ -53,9 +58,11 @@ import { getSkillManifest } from "./workflow-manifest";
  * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N>
  *    (--artifact <path-or-string> | --artifact-env GJC_RALPLAN_ARTIFACT)
  *    [--run-id <id>] [--session-id <id>] [--lane-verdict <token>] [--json]` persists Planner / Architect
- *    / Critic / revision / post-interview / ADR / final markdown under `.gjc/plans/ralplan/<run-id>/`, maintains
- *    an `index.jsonl` audit log, copies `final` stages to `pending-approval.md`, and advances
- *    the HUD chip to reflect the latest persisted stage.
+ *    / Critic / disposition / revision / post-interview / ADR / final artifacts under
+ *    `.gjc/plans/ralplan/<run-id>/`, maintains an `index.jsonl` audit log, copies `final`
+ *    stages to `pending-approval.md`, and advances the HUD chip to reflect the latest
+ *    persisted stage. Disposition stage artifacts are fail-closed JSON documents that
+ *    record typed review conflicts with authoritative same-pass source receipts (#2902).
  */
 
 export interface RalplanCommandResult {
@@ -64,7 +71,16 @@ export interface RalplanCommandResult {
 	stderr?: string;
 }
 
-const KNOWN_STAGES = ["planner", "architect", "critic", "revision", "post-interview", "adr", "final"] as const;
+const KNOWN_STAGES = [
+	"planner",
+	"architect",
+	"critic",
+	"disposition",
+	"revision",
+	"post-interview",
+	"adr",
+	"final",
+] as const;
 type RalplanStage = (typeof KNOWN_STAGES)[number];
 /** Default consensus iterations (planner + revision openers) per run. Matches SKILL.md re-review cap. */
 export const RALPLAN_DEFAULT_MAX_ITERATIONS = 5;
@@ -1851,6 +1867,58 @@ async function buildRalplanHud(options: {
 	});
 }
 
+/**
+ * Disposition-stage artifacts are machine-checkable JSON. Validate, enforce
+ * authoritative same-pass provenance against the run index, and re-serialize to
+ * canonical form so join gates and re-review share one shape (#2902 / #3013).
+ */
+function normalizeDispositionArtifact(
+	raw: string,
+	expectedStageN: number,
+	indexText: string | undefined,
+): string {
+	try {
+		const indexedArtifacts = buildIndexedReviewArtifacts(indexText);
+		const doc = parseReviewConflictDocument(raw, {
+			expectedStageN,
+			indexedArtifacts,
+		});
+		return serializeReviewConflictDocument(doc);
+	} catch (error) {
+		throw new RalplanCommandError(
+			2,
+			`invalid ralplan disposition artifact: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+/** Parse complete path/sha256 rows from a run `index.jsonl` snapshot for provenance. */
+function buildIndexedReviewArtifacts(indexText: string | undefined): Map<string, IndexedReviewArtifact> {
+	const map = new Map<string, IndexedReviewArtifact>();
+	if (indexText === undefined) return map;
+	for (const line of indexText.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let row: unknown;
+		try {
+			row = JSON.parse(trimmed);
+		} catch {
+			continue;
+		}
+		if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+		const record = row as Record<string, unknown>;
+		if (typeof record.stage !== "string") continue;
+		if (typeof record.stage_n !== "number" || !Number.isInteger(record.stage_n)) continue;
+		if (typeof record.path !== "string" || typeof record.sha256 !== "string") continue;
+		// Last complete row for an identity wins (matches findExistingStageArtifact).
+		map.set(reviewArtifactIndexKey(record.stage, record.stage_n), {
+			path: record.path,
+			sha256: record.sha256,
+		});
+	}
+	return map;
+}
+
 async function handleArtifactWrite(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
 	const resolved = await resolveArtifactArgs(args, cwd);
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
@@ -1873,13 +1941,19 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 			// Non-file / missing path is inline content; resolveArtifactContent already handled it.
 		}
 	}
-	const content = resolved.artifact.endsWith("\n") ? resolved.artifact : `${resolved.artifact}\n`;
-	const sha256 = createHash("sha256").update(content).digest("hex");
 
-	// Read the ledger once before persistence. The dedupe guard and both gates
-	// consume this same snapshot so no additional ledger read can slip between gate
-	// evaluation and persistence.
+	// Read the ledger once before persistence. The dedupe guard, both gates, and
+	// disposition provenance consume this same snapshot so no additional ledger
+	// read can slip between gate evaluation and persistence.
 	const indexLoad = await loadRalplanIndexForCap(cwd, resolved.sessionId, resolved.runId);
+
+	// Disposition stage: fail-closed parse/normalize with authoritative receipts (#2902).
+	const normalizedArtifact =
+		resolved.stage === "disposition"
+			? normalizeDispositionArtifact(resolved.artifact, resolved.stageN, indexLoad.rawText)
+			: resolved.artifact;
+	const content = normalizedArtifact.endsWith("\n") ? normalizedArtifact : `${normalizedArtifact}\n`;
+	const sha256 = createHash("sha256").update(content).digest("hex");
 
 	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not
 	// silently clobber the artifact or append a duplicate ledger row. Classify before any

@@ -42,6 +42,10 @@ const ralplanReviewPipelineContractPatterns = [
 	/Review join gate/u,
 	/both Architect and Critic receipts\/verdicts exist for the same Planner artifact\/pass/u,
 	/Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane/u,
+	/Typed conflict gate \(#2902\)/u,
+	/schema `ralplan\.review_conflicts\.v1`/u,
+	/`accept_architect` \| `accept_critic` \| `synthesize` \| `defer_user` \| `reject_both`/u,
+	/--stage disposition/u,
 ] as const;
 
 const staleReviewPipelineContractPatterns = [
