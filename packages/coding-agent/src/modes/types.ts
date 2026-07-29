@@ -64,10 +64,12 @@ export function canApplyComposerSubmission(
 	return options === undefined || (options.ownsComposer && editor === options.editor);
 }
 
+type PartialActivityStatusContainer = Partial<Pick<Container, "children" | "clear" | "detachChild" | "addChild">>;
+
 export function stopInteractiveActivityIndicator(
 	ctx: {
-		loadingAnimation: Loader | undefined;
-		statusContainer: Container;
+		loadingAnimation?: Loader;
+		statusContainer?: PartialActivityStatusContainer;
 		stopLoadingAnimation?: (options?: { restoreBackground?: boolean }) => void;
 	},
 	options?: { restoreBackground?: boolean },
@@ -78,7 +80,7 @@ export function stopInteractiveActivityIndicator(
 	}
 	ctx.loadingAnimation?.stop();
 	ctx.loadingAnimation = undefined;
-	ctx.statusContainer.clear();
+	ctx.statusContainer?.clear?.();
 }
 
 export function clearInteractiveActivityLoaders(
@@ -107,16 +109,22 @@ export function clearInteractiveActivityLoaders(
 }
 
 export function suspendInteractiveActivityIndicator(ctx: {
-	loadingAnimation: Loader | undefined;
-	statusContainer: Container;
+	loadingAnimation?: Loader;
+	statusContainer?: PartialActivityStatusContainer;
 	stopLoadingAnimation?: (options?: { restoreBackground?: boolean }) => void;
 	syncActivityIndicator?: () => void;
 	suspendActivityIndicator?: () => () => void;
 }): () => void {
 	if (ctx.suspendActivityIndicator) return ctx.suspendActivityIndicator();
 	const suspendedLoader = ctx.loadingAnimation;
-	const wasMounted = suspendedLoader !== undefined && ctx.statusContainer.children.includes(suspendedLoader);
-	if (suspendedLoader && wasMounted) ctx.statusContainer.detachChild(suspendedLoader);
+	const statusContainer = ctx.statusContainer;
+	const canTransferMountedLoader =
+		Array.isArray(statusContainer?.children) &&
+		typeof statusContainer.detachChild === "function" &&
+		typeof statusContainer.addChild === "function";
+	const wasMounted =
+		canTransferMountedLoader && suspendedLoader !== undefined && statusContainer.children?.includes(suspendedLoader);
+	if (suspendedLoader && wasMounted) statusContainer.detachChild?.(suspendedLoader);
 	let released = false;
 	return () => {
 		if (released) return;
@@ -125,9 +133,10 @@ export function suspendInteractiveActivityIndicator(ctx: {
 			wasMounted &&
 			suspendedLoader &&
 			ctx.loadingAnimation === suspendedLoader &&
-			!ctx.statusContainer.children.includes(suspendedLoader)
+			Array.isArray(statusContainer?.children) &&
+			!statusContainer.children.includes(suspendedLoader)
 		) {
-			ctx.statusContainer.addChild(suspendedLoader);
+			statusContainer.addChild?.(suspendedLoader);
 		}
 		syncInteractiveActivityIndicator(ctx);
 	};

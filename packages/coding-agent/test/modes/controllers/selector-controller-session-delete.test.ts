@@ -214,6 +214,15 @@ describe("SelectorController session deletion", () => {
 
 		expect(calls).toContain("rebuildInitialMessages:replace-identity");
 	});
+	it("completes resume when a minimal context has no activity status surface", async () => {
+		const { ctx, calls } = createContext("/tmp/project/sessions/a.jsonl");
+		delete (ctx as { statusContainer?: unknown }).statusContainer;
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession("/tmp/project/sessions/b.jsonl");
+
+		expect(calls).toContain("rebuildInitialMessages:replace-identity");
+	});
 
 	it("reconciles manual viewport intent before reloading the same session path", async () => {
 		const sessionPath = "/tmp/project/sessions/a.jsonl";
