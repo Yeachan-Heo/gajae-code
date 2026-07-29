@@ -243,8 +243,18 @@ function passingQualityGate(): Record<string, unknown> {
 				sourceHash: "sha256:test-frozen-source",
 				joined: true,
 				lanes: {
-					cleaner: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "cleaner clean", blockers: [] },
-					architect: { status: "CLEAR", sourceHash: "sha256:test-frozen-source", evidence: "architect clear", blockers: [] },
+					cleaner: {
+						status: "passed",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "cleaner clean",
+						blockers: [],
+					},
+					architect: {
+						status: "CLEAR",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "architect clear",
+						blockers: [],
+					},
 					qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
 				},
 			},
@@ -408,9 +418,24 @@ describe("ultragoal review command", () => {
 							sourceHash: "sha256:test-frozen-source",
 							joined: true,
 							lanes: {
-								cleaner: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "cleaner clean", blockers: [] },
-								architect: { status: "CLEAR", sourceHash: "sha256:test-frozen-source", evidence: "architect clear", blockers: [] },
-								qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
+								cleaner: {
+									status: "passed",
+									sourceHash: "sha256:test-frozen-source",
+									evidence: "cleaner clean",
+									blockers: [],
+								},
+								architect: {
+									status: "CLEAR",
+									sourceHash: "sha256:test-frozen-source",
+									evidence: "architect clear",
+									blockers: [],
+								},
+								qa: {
+									status: "passed",
+									sourceHash: "sha256:test-frozen-source",
+									evidence: "qa passed",
+									blockers: [],
+								},
 							},
 						},
 						rerunCommands: ["bun test:e2e"],
