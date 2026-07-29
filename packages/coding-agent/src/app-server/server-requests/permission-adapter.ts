@@ -14,11 +14,11 @@ import type {
 	ClientBridgePermissionOutcome,
 	ClientBridgePermissionToolCall,
 } from "../../session/client-bridge";
+import { experimentalValidators, stableValidators } from "../protocol-source/schema-validators.generated";
 import type { ReverseLeaseProvider } from "../reverse-lease-controller";
 
 export type CodexApprovalMethod = "execCommandApproval" | "applyPatchApproval";
 export type CodexApprovalParams = ExecCommandApprovalParams | ApplyPatchApprovalParams;
-export type CodexApprovalResult = { readonly decision: ReviewDecision };
 
 export type ChildPermissionRequest = {
 	readonly toolCall: ClientBridgePermissionToolCall;
@@ -45,10 +45,6 @@ export interface PermissionAdapterOptions {
 	readonly approvalId?: string;
 	/** Canonical request seam. */
 	readonly requestApproval?: CodexApprovalRequester;
-	/** Compatibility aliases for callers that name the seam request/requestClient. */
-	readonly request?: CodexApprovalRequester;
-	readonly requestClient?: CodexApprovalRequester;
-	readonly requestServer?: CodexApprovalRequester;
 	readonly logger?: PermissionAdapterLog;
 }
 
@@ -58,8 +54,7 @@ export type PermissionAdapterErrorCode =
 	| "unmappable_tool_call"
 	| "missing_approval_field"
 	| "unmappable_review_decision"
-	| "invalid_codex_response"
-	| "provider_unavailable";
+	| "invalid_codex_response";
 
 export class PermissionAdapterError extends Error {
 	readonly code: PermissionAdapterErrorCode;
@@ -73,19 +68,11 @@ export class PermissionAdapterError extends Error {
 	}
 }
 
-export class PermissionProviderUnavailableError extends PermissionAdapterError {
-	constructor(reason = "Codex approval provider is unavailable.") {
-		super("provider_unavailable", reason);
-		this.name = "PermissionProviderUnavailableError";
-	}
-}
-
 // Tool classification reuses the single existing authority, `mapToolKind`, rather than a second
 // hand-maintained name list that would silently drift from it. Only the ACP kinds that a Codex
 // approval method can honestly represent are mapped; everything else fails closed.
 const COMMAND_TOOL_KINDS: ReadonlySet<string> = new Set(["execute"]);
 const PATCH_TOOL_KINDS: ReadonlySet<string> = new Set(["edit", "delete", "move"]);
-const OPTION_KINDS: ReadonlySet<string> = new Set(["allow_once", "allow_always", "reject_once", "reject_always"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -94,6 +81,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringField(value: Record<string, unknown>, field: string): string | undefined {
 	const candidate = value[field];
 	return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+function optionKind(value: string): ClientBridgePermissionOptionKind | undefined {
+	switch (value) {
+		case "allow_once":
+		case "allow_always":
+		case "reject_once":
+		case "reject_always":
+			return value;
+		default:
+			return undefined;
+	}
 }
 
 function readToolCall(value: unknown): ClientBridgePermissionToolCall {
@@ -120,17 +119,18 @@ function readOptions(value: unknown): readonly ClientBridgePermissionOption[] {
 		const optionId = stringField(candidate, "optionId");
 		const name = stringField(candidate, "name");
 		const kind = stringField(candidate, "kind");
-		if (!optionId || !name || !kind || !OPTION_KINDS.has(kind))
+		const normalizedKind = kind === undefined ? undefined : optionKind(kind);
+		if (!optionId || !name || !normalizedKind)
 			throw new PermissionAdapterError(
 				"invalid_child_options",
 				"Permission option has an invalid id, name, or kind.",
 			);
-		if (kind !== optionId)
+		if (normalizedKind !== optionId)
 			throw new PermissionAdapterError(
 				"invalid_child_options",
-				`Permission option ${optionId} does not honestly advertise kind ${kind}.`,
+				`Permission option ${optionId} does not honestly advertise kind ${normalizedKind}.`,
 			);
-		options.push({ optionId, name, kind: kind as ClientBridgePermissionOptionKind });
+		options.push({ optionId, name, kind: normalizedKind });
 	}
 	return options;
 }
@@ -194,10 +194,72 @@ function parsedCommands(value: unknown, command: readonly string[]): ParsedComma
 	return parsed;
 }
 
-function fileChanges(value: unknown): ApplyPatchApprovalParams["fileChanges"] {
-	if (!isRecord(value))
-		throw new PermissionAdapterError("missing_approval_field", "Patch permission fileChanges must be an object map.");
-	return value as ApplyPatchApprovalParams["fileChanges"];
+/**
+ * Every mapped param object crosses the wire, so it must satisfy the generated server-request
+ * validator here. Without this a malformed projection reaches the child transport and is only
+ * rejected downstream, where the failure is far harder to attribute.
+ */
+function assertApprovalParams<P extends CodexApprovalParams>(method: CodexApprovalMethod, params: P): P {
+	const validate = stableValidators.serverRequestParams[method] ?? experimentalValidators.serverRequestParams[method];
+	if (validate && !validate(params))
+		throw new PermissionAdapterError(
+			"missing_approval_field",
+			`Mapped ${method} params do not satisfy the pinned protocol shape.`,
+		);
+	return params;
+}
+
+/** A pinned `FileChange` member: add/delete carry content, update carries a unified diff. */
+function isFileChange(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	if (value.type === "add" || value.type === "delete") return typeof value.content === "string";
+	if (value.type === "update") return typeof value.unified_diff === "string";
+	return false;
+}
+
+/**
+ * Normalize the REAL child tool arguments into pinned `FileChange` members.
+ *
+ * `AgentSession` forwards raw tool args (`rawInput: args`), so a `write` is `{path, content}`,
+ * a `delete` is `{path}`, and a `move` is `{oldPath, newPath}` — none of which are Codex
+ * `FileChange` maps. Casting them through produced params the generated validator rejects.
+ * Anything that cannot be represented honestly fails closed instead of being coerced.
+ */
+function fileChangesFor(
+	toolName: string,
+	input: Record<string, unknown> | undefined,
+): ApplyPatchApprovalParams["fileChanges"] {
+	// A child that already speaks the Codex shape is passed through, but only after validation.
+	const supplied = input?.fileChanges ?? input?.changes;
+	if (isRecord(supplied)) {
+		for (const [path, change] of Object.entries(supplied)) {
+			if (!isFileChange(change))
+				throw new PermissionAdapterError(
+					"missing_approval_field",
+					`Patch permission fileChanges entry ${path} is not a pinned FileChange.`,
+				);
+		}
+		if (Object.keys(supplied).length === 0)
+			throw new PermissionAdapterError("missing_approval_field", "Patch permission fileChanges map is empty.");
+		return supplied as ApplyPatchApprovalParams["fileChanges"];
+	}
+	const path = input ? stringField(input, "path") : undefined;
+	if (toolName === "write" && path !== undefined && typeof input?.content === "string")
+		return { [path]: { type: "add", content: input.content } } as ApplyPatchApprovalParams["fileChanges"];
+	if (toolName === "delete" && path !== undefined)
+		return { [path]: { type: "delete", content: "" } } as ApplyPatchApprovalParams["fileChanges"];
+	const oldPath = input ? stringField(input, "oldPath") : undefined;
+	const newPath = input ? stringField(input, "newPath") : undefined;
+	if (toolName === "move" && oldPath !== undefined && newPath !== undefined)
+		return {
+			[oldPath]: { type: "update", unified_diff: "", move_path: newPath },
+		} as ApplyPatchApprovalParams["fileChanges"];
+	// `edit`/`apply_patch` arguments are mode-dependent and carry no unified diff at this seam, so
+	// a faithful FileChange cannot be derived. Refuse rather than invent one.
+	throw new PermissionAdapterError(
+		"missing_approval_field",
+		`Patch permission for ${toolName} did not supply a representable file change.`,
+	);
 }
 
 /** Map a child tool call to the only Codex approval method that can represent it. */
@@ -234,10 +296,9 @@ export function mapToolCallToCodexRequest(
 			reason: reason ?? null,
 			parsedCmd,
 		};
-		return { method: "execCommandApproval", params };
+		return { method: "execCommandApproval", params: assertApprovalParams("execCommandApproval", params) };
 	}
-	const rawFileChanges = input?.fileChanges ?? input?.changes ?? toolCall.rawInput ?? toolCall.content;
-	const patchChanges = fileChanges(rawFileChanges);
+	const patchChanges = fileChangesFor(toolCall.toolName, input);
 	const grantRoot = options.grantRoot ?? (input ? stringField(input, "grantRoot") : undefined);
 	const params: ApplyPatchApprovalParams = {
 		conversationId,
@@ -246,7 +307,7 @@ export function mapToolCallToCodexRequest(
 		reason: reason ?? null,
 		grantRoot: grantRoot ?? null,
 	};
-	return { method: "applyPatchApproval", params };
+	return { method: "applyPatchApproval", params: assertApprovalParams("applyPatchApproval", params) };
 }
 
 /** Map every supported Codex ReviewDecision to an offered child option. */
@@ -258,17 +319,8 @@ export function mapReviewDecisionToChildOutcome(
 	if (decision === "approved_for_session") return optionFor(options, "allow_always");
 	if (decision === "timed_out" || decision === "abort") return { outcome: "cancelled" };
 	if (isRecord(decision)) {
-		if (Object.hasOwn(decision, "denied")) {
-			const denied = (decision as Record<string, unknown>).denied;
-			if (!isRecord(denied) || typeof denied.rejection !== "string")
-				throw new PermissionAdapterError(
-					"unmappable_review_decision",
-					"Codex denied decision omitted its rejection reason.",
-				);
-			// The child wire shape has no rejection field; reject_once is the only
-			// honest non-persistent equivalent, so the reason cannot be serialized there.
-			return optionFor(options, "reject_once");
-		}
+		// Check the amendment discriminators first: a denied-plus-amendment object is ambiguous and
+		// must not be silently reduced to a plain rejection.
 		if (Object.hasOwn(decision, "approved_execpolicy_amendment"))
 			throw new PermissionAdapterError(
 				"unmappable_review_decision",
@@ -279,6 +331,22 @@ export function mapReviewDecisionToChildOutcome(
 				"unmappable_review_decision",
 				"Codex network-policy amendments cannot be represented by a child permission choice.",
 			);
+		if (Object.hasOwn(decision, "denied")) {
+			if (Object.keys(decision).length !== 1)
+				throw new PermissionAdapterError(
+					"unmappable_review_decision",
+					"Codex denied decision carried extra discriminators and is ambiguous.",
+				);
+			const denied = (decision as Record<string, unknown>).denied;
+			if (!isRecord(denied) || typeof denied.rejection !== "string" || denied.rejection.trim().length === 0)
+				throw new PermissionAdapterError(
+					"unmappable_review_decision",
+					"Codex denied decision omitted its rejection reason.",
+				);
+			// The child wire shape has no rejection field; reject_once is the only
+			// honest non-persistent equivalent, so the reason cannot be serialized there.
+			return optionFor(options, "reject_once");
+		}
 	}
 	throw new PermissionAdapterError("unmappable_review_decision", "Codex returned an unknown ReviewDecision variant.");
 }
@@ -359,8 +427,7 @@ export class PermissionAdapter {
 
 	constructor(options: PermissionAdapterOptions) {
 		this.#options = options;
-		this.#requestApproval =
-			options.requestApproval ?? options.requestServer ?? options.request ?? options.requestClient;
+		this.#requestApproval = options.requestApproval;
 		this.#logger = options.logger ?? defaultLogger;
 	}
 
@@ -395,11 +462,6 @@ export class PermissionAdapter {
 				`Permission provider does not expose reverse method ${method}.`,
 			);
 		return this.handle(payload);
-	}
-
-	/** Alias used by callers that call providers as request functions. */
-	async request(payload: unknown, signal?: AbortSignal): Promise<ClientBridgePermissionOutcome> {
-		return this.handle(payload, signal);
 	}
 
 	/** Build the provider registration consumed by ReverseLeaseController. */

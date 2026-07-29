@@ -40,7 +40,6 @@ export interface ServerRequest {
 export interface ServerRequestHandle extends ServerRequest {
 	/** The request member is self-referential for compatibility with the pre-awaitable API. */
 	readonly request: ServerRequest;
-	readonly settled: Promise<ServerRequestSettlement>;
 }
 
 type BrokerLogger = {
@@ -60,8 +59,17 @@ const DEFAULT_CANCEL_REASON = "cancelled";
 const THREAD_EVICTION_REASON = "thread evicted";
 const DISCONNECT_REASON = "last eligible connection disconnected";
 const SHUTDOWN_REASON = "shutdown";
-/** Retains enough recent ids to recognise a late reply without growing for the process lifetime. */
+/**
+ * Retains enough recent ids to recognise a late reply without growing for the process lifetime.
+ *
+ * Request ids MUST be unique for the broker's lifetime: the production issuer is a monotonic
+ * `server-N` counter (`create-app-server.ts`), so an id is never reused. This window is only a
+ * late-reply diagnostic, NOT a correctness fence — a caller that recycles ids after eviction can
+ * let a stale reply settle the new request, because a response frame carries only the id.
+ */
 const SETTLED_ID_RETENTION = 1024;
+/** Native timers clamp anything larger, so a bigger deadline could never be honoured. */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
 type SettlementResolver = (settlement: ServerRequestSettlement) => void;
 
@@ -73,10 +81,14 @@ type PendingRequest = {
 };
 
 export class ServerRequestBrokerError extends Error {
-	readonly code: "duplicate_request_id" | "broker_shutdown";
+	readonly code: "duplicate_request_id" | "broker_shutdown" | "invalid_timeout";
 	readonly requestId: string | undefined;
 
-	constructor(code: "duplicate_request_id" | "broker_shutdown", message: string, requestId?: string) {
+	constructor(
+		code: "duplicate_request_id" | "broker_shutdown" | "invalid_timeout",
+		message: string,
+		requestId?: string,
+	) {
 		super(message);
 		this.name = "ServerRequestBrokerError";
 		this.code = code;
@@ -95,9 +107,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function decisionSettlement(connectionId: string, result: unknown): ServerRequestSettlement | undefined {
+/** Methods whose `decision` field uses the legacy `ReviewDecision` union. */
+const LEGACY_APPROVAL_METHODS: ReadonlySet<string> = new Set(["execCommandApproval", "applyPatchApproval"]);
+
+/**
+ * Classify an already schema-valid response. Only the legacy approval methods use
+ * `ReviewDecision`; the v2 `item/*\/requestApproval` methods use their own decision enums, so
+ * classifying every `decision` field as legacy would leave a valid v2 answer pending until timeout.
+ */
+function decisionSettlement(
+	method: string,
+	connectionId: string,
+	result: unknown,
+): ServerRequestSettlement | undefined {
 	if (!isRecord(result) || !Object.hasOwn(result, "decision")) return { kind: "resolved", connectionId, result };
 	const decision = result.decision;
+	if (!LEGACY_APPROVAL_METHODS.has(method)) {
+		// v2 decision enums: accept/acceptForSession and their amendment objects proceed, decline is
+		// a denial, cancel is a cancellation. Anything else is schema-valid but unclassifiable here.
+		if (decision === "accept" || decision === "acceptForSession") return { kind: "resolved", connectionId, result };
+		if (decision === "decline") return { kind: "denied", connectionId, result };
+		if (decision === "cancel") return { kind: "cancelled", reason: "approval cancelled" };
+		if (
+			isRecord(decision) &&
+			(Object.hasOwn(decision, "acceptWithExecpolicyAmendment") ||
+				Object.hasOwn(decision, "applyNetworkPolicyAmendment"))
+		)
+			return { kind: "cancelled", reason: "unsupported approval amendment" };
+		return undefined;
+	}
 	if (decision === "approved" || decision === "approved_for_session")
 		return { kind: "resolved", connectionId, result };
 	if (decision === "timed_out") return { kind: "timedOut" };
@@ -119,7 +157,7 @@ function decisionSettlement(connectionId: string, result: unknown): ServerReques
 export class ServerRequestBroker {
 	readonly #pending = new Map<string, PendingRequest>();
 	readonly #settledIds = new Set<string>();
-	readonly #options: Required<Pick<BrokerOptions, "requestTimeoutMs" | "now">> & BrokerOptions;
+	readonly #requestTimeoutMs: number;
 	readonly #now: () => number;
 	readonly #setTimeout: (callback: () => void, milliseconds: number) => unknown;
 	readonly #clearTimeout: (handle: unknown) => void;
@@ -127,8 +165,16 @@ export class ServerRequestBroker {
 	#shutdown = false;
 
 	constructor(options: BrokerOptions = {}) {
-		const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_TIMEOUT;
-		this.#options = { ...options, requestTimeoutMs, now: options.now ?? Date.now };
+		const requested = options.requestTimeoutMs ?? DEFAULT_TIMEOUT;
+		// A native timer clamps NaN/Infinity/values past 2^31-1 to about 1ms, which would turn a long
+		// deadline into an immediate timeout. Reject those rather than silently mis-scheduling.
+		if (!Number.isFinite(requested) || requested < 0 || requested > MAX_TIMEOUT_MS)
+			throw new ServerRequestBrokerError(
+				"invalid_timeout",
+				`Server request timeout must be a finite value between 0 and ${MAX_TIMEOUT_MS}ms.`,
+			);
+		const requestTimeoutMs = requested;
+		this.#requestTimeoutMs = requestTimeoutMs;
 		this.#now = options.now ?? Date.now;
 		this.#setTimeout = options.setTimeout ?? ((callback, milliseconds) => setTimeout(callback, milliseconds));
 		this.#clearTimeout = options.clearTimeout ?? (handle => clearTimeout(handle as NodeJS.Timeout));
@@ -160,7 +206,7 @@ export class ServerRequestBroker {
 		if (eligibleConnections.size === 0) return undefined;
 
 		const createdAt = this.#now();
-		const timeoutMs = this.#options.requestTimeoutMs;
+		const timeoutMs = this.#requestTimeoutMs;
 		const deadlineAt = createdAt + timeoutMs;
 		let resolveSettlement!: SettlementResolver;
 		const settled = new Promise<ServerRequestSettlement>(resolve => {
@@ -216,7 +262,7 @@ export class ServerRequestBroker {
 			});
 			return false;
 		}
-		const settlement = decisionSettlement(connectionId, result);
+		const settlement = decisionSettlement(pending.request.method, connectionId, result);
 		if (!settlement) {
 			this.#logger.warn("Ignoring unclassifiable app-server client response", {
 				connectionId,
@@ -350,10 +396,7 @@ export class ServerRequestBroker {
 	}
 
 	#settle(pending: PendingRequest, settlement: ServerRequestSettlement): void {
-		// Exactly-once comes from three layers: each public entry point looks the id up in `#pending`
-		// first, this delete removes it synchronously before any observer microtask runs, and a
-		// Promise resolver is idempotent. The early return is a redundant belt-and-braces guard —
-		// no public call sequence currently reaches it, so it carries no dedicated mutation test.
+		// Delete before publishing the settlement so every terminal path is fenced synchronously.
 		if (!this.#pending.delete(pending.request.id)) return;
 		this.#settledIds.add(pending.request.id);
 		// A Set preserves insertion order, so dropping from the front evicts the oldest ids first.
@@ -362,7 +405,18 @@ export class ServerRequestBroker {
 			if (oldest.done) break;
 			this.#settledIds.delete(oldest.value);
 		}
-		if (pending.timer !== undefined) this.#clearTimeout(pending.timer);
+		if (pending.timer !== undefined) {
+			// Cleanup is best effort: an injected timer seam that throws must never prevent the
+			// waiter below from being settled.
+			try {
+				this.#clearTimeout(pending.timer);
+			} catch (error) {
+				this.#logger.warn("Server request timer cleanup failed", {
+					id: pending.request.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		pending.request.settlement = settlement;
 		if ((settlement.kind === "cancelled" || settlement.kind === "timedOut") && pending.request.status === "pending")
 			pending.request.status = "cancelled";

@@ -124,6 +124,9 @@ export function mapToolKind(toolName: string): ToolKind {
 		case "read":
 			return "read";
 		case "write":
+		// `apply_patch` is the wire name the edit tool exposes in its apply_patch mode
+		// (see EditTool.customWireName), so it must classify as an edit like `edit` itself.
+		case "apply_patch":
 		case "edit":
 			return "edit";
 		case "delete":

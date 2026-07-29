@@ -253,3 +253,31 @@ test("a settled id is retained only briefly so late-reply detection cannot grow 
 	// A recently settled id is still recognised, so a genuine late reply is still fenced.
 	expect(() => approval(broker, "retained-1099", new Set(["connection-a"]))).toThrow(DuplicateServerRequestError);
 });
+
+test("a timeout a native timer could not honour is rejected at construction", () => {
+	// Native timers clamp NaN/Infinity/values past 2^31-1 to about 1ms, silently converting a long
+	// deadline into an immediate timeout. Reject rather than mis-schedule.
+	for (const requestTimeoutMs of [Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, 2 ** 53, 1e15, -1]) {
+		expect(() => new ServerRequestBroker({ requestTimeoutMs }), String(requestTimeoutMs)).toThrow(
+			/finite value between/u,
+		);
+	}
+	// The largest value a native timer can actually honour is still accepted.
+	expect(() => new ServerRequestBroker({ requestTimeoutMs: 2 ** 31 - 1 })).not.toThrow();
+});
+
+test("a throwing timer cleanup seam cannot leave a waiter unsettled", async () => {
+	const broker = new ServerRequestBroker({
+		setTimeout: () => "timer-handle",
+		clearTimeout: () => {
+			throw new Error("timer cleanup failed");
+		},
+	});
+	const handle = approval(broker, "throwing-cleanup", new Set(["connection-a"]));
+	const count = await settlementCount(handle.settled);
+
+	expect(broker.cancel(handle.id)).toBe(true);
+	await expect(handle.settled).resolves.toMatchObject({ kind: "cancelled" });
+	expect(count.get()).toBe(1);
+	expect(broker.pendingCount).toBe(0);
+});

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { ReviewDecision } from "../../../../vendor/codex-app-server-schema/stable/typescript/ReviewDecision";
+import { stableValidators } from "../../protocol-source/schema-validators.generated";
 import {
 	mapPermissionRequest,
 	mapReviewDecisionToChildOutcome,
@@ -196,7 +197,8 @@ test("tool classification follows the canonical ACP kind vocabulary, not invente
 		["exec", "execCommandApproval"],
 		["eval", "execCommandApproval"],
 		["write", "applyPatchApproval"],
-		["edit", "applyPatchApproval"],
+		// `edit`/`apply_patch` args carry no unified diff at this seam, so they fail closed.
+		["edit", "unmapped"],
 		["delete", "applyPatchApproval"],
 		["move", "applyPatchApproval"],
 		// Real tool names that map to kinds no Codex approval method represents.
@@ -213,7 +215,16 @@ test("tool classification follows the canonical ACP kind vocabulary, not invente
 			toolCallId: `call-${toolName}`,
 			toolName,
 			title: toolName,
-			rawInput: { command: "echo hi", cwd: "/tmp", fileChanges: { "a.ts": { add: { content: "x" } } } },
+			// Real child args: AgentSession forwards raw tool arguments, so these are the actual
+			// shapes each tool sends rather than a pre-normalized Codex fileChanges map.
+			rawInput:
+				toolName === "write"
+					? { path: "a.ts", content: "x" }
+					: toolName === "move"
+						? { oldPath: "a.ts", newPath: "b.ts" }
+						: toolName === "delete"
+							? { path: "a.ts" }
+							: { command: "echo hi", cwd: "/tmp" },
 		};
 		if (expected === "unmapped") {
 			expect(() => mapToolCallToCodexRequest(toolCall, { conversationId: "thread-1" }), toolName).toThrow(
@@ -237,4 +248,88 @@ test("tool classification follows the canonical ACP kind vocabulary, not invente
 			{ conversationId: "thread-1" },
 		),
 	).toThrow(PermissionAdapterError);
+});
+
+test("real child tool arguments map to protocol-valid approval params", () => {
+	// AgentSession forwards raw tool args (`rawInput: args`), so these are the ACTUAL shapes the
+	// permission-gated tools send. Each mapped param object must satisfy the generated validator.
+	const cases: Array<{
+		readonly toolName: string;
+		readonly rawInput: Record<string, unknown>;
+		readonly method: "execCommandApproval" | "applyPatchApproval";
+	}> = [
+		{ toolName: "bash", rawInput: { command: "ls -la", cwd: "/tmp" }, method: "execCommandApproval" },
+		{ toolName: "write", rawInput: { path: "/tmp/a.ts", content: "hello" }, method: "applyPatchApproval" },
+		{ toolName: "delete", rawInput: { path: "/tmp/a.ts" }, method: "applyPatchApproval" },
+		{ toolName: "move", rawInput: { oldPath: "/tmp/a.ts", newPath: "/tmp/b.ts" }, method: "applyPatchApproval" },
+	];
+
+	for (const { toolName, rawInput, method } of cases) {
+		const mapped = mapToolCallToCodexRequest(
+			{ toolCallId: `call-${toolName}`, toolName, title: toolName, rawInput },
+			{ conversationId: "thread-1" },
+		);
+		expect(mapped.method, toolName).toBe(method);
+		const validate = stableValidators.serverRequestParams[method];
+		expect(validate(mapped.params), `${toolName} -> ${method}`).toBe(true);
+	}
+});
+
+test("patch arguments that cannot yield a pinned FileChange fail closed", () => {
+	for (const [toolName, rawInput] of [
+		// edit/apply_patch args are mode-dependent and carry no unified diff at this seam.
+		["edit", { path: "a.ts", edits: [{ oldText: "a", newText: "b" }] }],
+		["apply_patch", { input: "*** Begin Patch" }],
+		// A supplied map whose members are not pinned FileChange values.
+		["write", { fileChanges: { "a.ts": { content: "x" } } }],
+		// An empty map would approve nothing while looking valid.
+		["write", { fileChanges: {} }],
+		// Missing the content a write needs to become an add.
+		["write", { path: "a.ts" }],
+		// Missing the destination a move needs.
+		["move", { oldPath: "a.ts" }],
+	] as Array<[string, Record<string, unknown>]>) {
+		expect(
+			() =>
+				mapToolCallToCodexRequest(
+					{ toolCallId: "c", toolName, title: toolName, rawInput },
+					{ conversationId: "thread-1" },
+				),
+			`${toolName} ${JSON.stringify(rawInput)}`,
+		).toThrow(PermissionAdapterError);
+	}
+});
+
+test("malformed parsedCmd entries are rejected rather than cast through", () => {
+	expect(() =>
+		mapToolCallToCodexRequest(
+			{
+				toolCallId: "c",
+				toolName: "bash",
+				title: "ls",
+				rawInput: { command: "ls", cwd: "/tmp", parsedCmd: [{ type: "read" }] },
+			},
+			{ conversationId: "thread-1" },
+		),
+	).toThrow(PermissionAdapterError);
+});
+
+test("ambiguous or reason-less denials fail closed instead of becoming a plain rejection", () => {
+	const unmappable: ReviewDecision[] = [
+		// A denial with no usable rejection reason.
+		{ denied: { rejection: "" } } as ReviewDecision,
+		{ denied: { rejection: "   " } } as ReviewDecision,
+		// A denial carrying an extra discriminator is ambiguous: it is not simply a rejection.
+		{ denied: { rejection: "no" }, network_policy_amendment: { network_policy_amendment: {} } } as ReviewDecision,
+	];
+	for (const decision of unmappable) {
+		expect(() => mapReviewDecisionToChildOutcome(decision, options), JSON.stringify(decision)).toThrow(
+			PermissionAdapterError,
+		);
+	}
+	// A well-formed denial still maps to the non-persistent rejection option.
+	expect(mapReviewDecisionToChildOutcome({ denied: { rejection: "not allowed" } }, options)).toMatchObject({
+		outcome: "selected",
+		kind: "reject_once",
+	});
 });

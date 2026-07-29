@@ -318,7 +318,7 @@ test("duplicate and late tool lifecycle events are suppressed and replay orderin
 	expect(late.openItemCount).toBe(0);
 });
 
-test("item timestamps stay in milliseconds while turn timestamps use seconds", () => {
+test("item timestamps are emitted in milliseconds, never converted to turn seconds", () => {
 	const r = reducer([1_000, 2_500]);
 	const notifications = [
 		...r.accept({ type: "tool_execution_start", toolCallId: "clock", toolName: "bash", args: { command: "date" } }),
@@ -328,8 +328,10 @@ test("item timestamps stay in milliseconds while turn timestamps use seconds", (
 	const done = notifications.find(notification => notification.method === "item/completed");
 	expect(started?.params.startedAtMs).toBe(1_000);
 	expect(done?.params.completedAtMs).toBe(2_500);
-	expect(started?.params.startedAtMs).toBeGreaterThan(100);
-	expect(2_500 / 1_000).toBe(2.5);
+	// The reducer must pass the ms clock straight through. A seconds conversion would yield 1 and
+	// 2.5 here, so these equalities are what actually pin the unit.
+	expect(done?.params.completedAtMs).not.toBe(2_500 / 1_000);
+	expect(Number.isInteger(done?.params.completedAtMs)).toBe(true);
 	expectValidNotifications(notifications);
 });
 

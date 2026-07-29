@@ -21,7 +21,6 @@
 		"thinking_level_changed",
 		"goal_updated"
 	],
-	"futureItemFamilies": [],
 	"assistantMessageEvents": [
 		{
 			"discriminator": "start",

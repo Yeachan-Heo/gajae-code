@@ -145,6 +145,7 @@ export class ThreadRuntimeManager {
 	readonly #config: AdmissionConfig;
 	#activeSpawns = 0;
 	#closeOwned: CloseOwnedCallback | undefined;
+	#onThreadGone: ((threadId: string, reason: "removed" | "evicted" | "detached" | "terminated") => void) | undefined;
 
 	constructor(config: Partial<AdmissionConfig> = {}) {
 		this.#config = { ...DEFAULT_CONFIG, ...config };
@@ -165,6 +166,15 @@ export class ThreadRuntimeManager {
 	/** Set the callback invoked when an owned child is evicted/terminated. */
 	onCloseOwned(callback: CloseOwnedCallback): void {
 		this.#closeOwned = callback;
+	}
+
+	/**
+	 * Observe a thread leaving the manager for any reason. The app-server runtime uses this to
+	 * settle every pending approval for that thread, so a removed/evicted child can never leave a
+	 * broker waiter hanging.
+	 */
+	onThreadGone(callback: (threadId: string, reason: "removed" | "evicted" | "detached" | "terminated") => void): void {
+		this.#onThreadGone = callback;
 	}
 
 	/** Add a close callback without replacing an already-installed lifecycle callback. */
@@ -334,6 +344,7 @@ export class ThreadRuntimeManager {
 		if (!thread) return false;
 		this.#threads.delete(threadId);
 		this.#releaseConnectionLoad(thread);
+		this.#onThreadGone?.(threadId, "removed");
 		if (close) this.#invokeClose(thread);
 		return true;
 	}
@@ -382,6 +393,7 @@ export class ThreadRuntimeManager {
 		for (const thread of evictable) {
 			this.#threads.delete(thread.threadId);
 			this.#releaseConnectionLoad(thread);
+			this.#onThreadGone?.(thread.threadId, "evicted");
 			this.#invokeClose(thread);
 		}
 		return evictable.length;
@@ -394,6 +406,7 @@ export class ThreadRuntimeManager {
 		if (thread.ownership !== "attached") throw conflict(`Cannot detach spawned thread ${threadId}; use terminate().`);
 		this.#threads.delete(threadId);
 		this.#releaseConnectionLoad(thread);
+		this.#onThreadGone?.(threadId, "detached");
 		return true;
 	}
 
@@ -404,6 +417,7 @@ export class ThreadRuntimeManager {
 		if (thread.ownership !== "spawned") throw conflict(`Cannot terminate attached thread ${threadId}; use detach().`);
 		this.#threads.delete(threadId);
 		this.#releaseConnectionLoad(thread);
+		this.#onThreadGone?.(threadId, "terminated");
 		this.#invokeClose(thread);
 		return thread.authority;
 	}

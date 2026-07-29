@@ -45,10 +45,6 @@ export const FIXED_UNMAPPED_ITEM_KINDS = Object.freeze([
 	},
 ] as const);
 
-export type FixedUnmappedItemKind = (typeof FIXED_UNMAPPED_ITEM_KINDS)[number]["kind"];
-
-/** Compatibility aliases make the policy easy to discover from coverage tests. */
-
 /**
  * Exhaustive category-to-catalog map. Tool names are intentionally absent from
  * this table; mapToolKind remains the single GJC tool-name authority.
@@ -83,17 +79,6 @@ export const ITEM_KIND_MAP: Readonly<Record<GjcToolKind, ItemKindMapping>> = Obj
 	other: FIXED_UNMAPPED_ITEM_KINDS[2],
 });
 
-/** Alias using the long name used by some catalog consumers. */
-export const GJC_TOOL_ITEM_KIND_MAP = ITEM_KIND_MAP;
-
-/** Names used by coverage and inventory consumers. */
-export const ITEM_KIND_BY_TOOL = ITEM_KIND_MAP;
-export const classifyItemKind = classifyGjcTool;
-
-function unmappedReason(kind: GjcToolKind): string {
-	return ITEM_KIND_MAP[kind].reason;
-}
-
 function mcpToolParts(toolName: string): { server: string; tool: string } | undefined {
 	if (!toolName.startsWith("mcp__")) return undefined;
 	const remainder = toolName.slice("mcp__".length);
@@ -106,14 +91,31 @@ function mcpToolParts(toolName: string): { server: string; tool: string } | unde
 }
 
 /**
- * Classify a concrete GJC tool using the canonical mapToolKind authority. MCP
- * names are the one explicitly proven exception in the `other` bucket: their
- * namespace carries the server/tool identity required by mcpToolCall.
+ * Real GJC tools that `mapToolKind` reports as `other` but which have a genuine pinned
+ * `ThreadItem` type. Listing them by name is what keeps the fixed unmapped list truthful: a family
+ * only stays unmapped when the pinned union really cannot represent it.
+ */
+const NAMED_OTHER_TOOL_ITEMS: Readonly<Record<string, { readonly type: ThreadItem["type"]; readonly reason: string }>> =
+	Object.freeze({
+		generate_image: {
+			type: "imageGeneration",
+			reason: "The stable union has a dedicated imageGeneration item for produced images.",
+		},
+		computer: {
+			type: "dynamicToolCall",
+			reason: "Computer control has no dedicated type; dynamicToolCall is the pinned generic tool-call item.",
+		},
+	});
+
+/**
+ * Classify a concrete GJC tool using the canonical mapToolKind authority. MCP names and the
+ * named-tool table above are the explicitly proven exceptions inside the `other` bucket.
  */
 export function classifyGjcTool(toolName: string): ClassifiedItemKind & {
 	readonly mcp?: { readonly server: string; readonly tool: string };
 } {
-	const kind = mapToolKind(toolName) as GjcToolKind;
+	const mappedKind = mapToolKind(toolName);
+	const kind = mappedKind === "switch_mode" ? "other" : mappedKind;
 	const mapping = ITEM_KIND_MAP[kind];
 	const mcp = kind === "other" ? mcpToolParts(toolName) : undefined;
 	if (mcp) {
@@ -126,12 +128,17 @@ export function classifyGjcTool(toolName: string): ClassifiedItemKind & {
 			mcp,
 		};
 	}
+	// `mapToolKind` collapses every non-file, non-shell tool into `other`, but a few real GJC tools
+	// DO have a dedicated pinned type. Mapping them by name here keeps the unmapped list honest:
+	// `other` stays unmapped as a category, while these named tools are represented faithfully.
+	const named = NAMED_OTHER_TOOL_ITEMS[toolName];
+	if (kind === "other" && named) return { kind, source: "tool", type: named.type, mapped: true, reason: named.reason };
 	return {
 		kind,
 		source: "tool",
 		type: mapping.type,
 		mapped: mapping.type !== null,
-		reason: unmappedReason(kind),
+		reason: mapping.reason,
 	};
 }
 

@@ -802,15 +802,13 @@ export class ToolItemReducer {
 				const delta = suffix(state.lastOutput, output || undefined, undefined);
 				state.lastOutput = nextOutput;
 				const details = asRecord(asRecord(result)?.details);
+				const commandActions = normalizeCommandActions(asRecord(args)?.commandActions);
 				state.item = {
 					...state.item,
 					command: stringProperty(args, "command", "cmd") ?? state.item.command,
 					cwd: stringProperty(args, "cwd", "workingDirectory", "workdir") ?? state.item.cwd,
 					processId: stringProperty(args, "processId", "process_id") ?? state.item.processId,
-					commandActions:
-						normalizeCommandActions(asRecord(args)?.commandActions).length > 0
-							? normalizeCommandActions(asRecord(args)?.commandActions)
-							: state.item.commandActions,
+					commandActions: commandActions.length > 0 ? commandActions : state.item.commandActions,
 					aggregatedOutput: nextOutput.length > 0 ? nextOutput : null,
 					exitCode:
 						numberProperty(details, "exitCode") ?? numberProperty(result, "exitCode") ?? state.item.exitCode,
@@ -1198,6 +1196,3 @@ export class ToolItemReducer {
 		);
 	}
 }
-
-/** Short alias used by callers that refer to all non-agent-message families as item reducers. */
-export const ToolReducer = ToolItemReducer;

@@ -71,6 +71,11 @@ class Runtime implements AppServerRuntime {
 		options: AppServerRuntimeOptions = {},
 	) {
 		this.manager = new ThreadRuntimeManager(config);
+		// A departing thread must never leave an approval waiter hanging: cancelling here settles
+		// every pending request for it, which also releases its pendingApprovals accounting.
+		this.manager.onThreadGone(threadId => {
+			this.broker.cancelAllForThread(threadId, "thread is no longer loaded");
+		});
 		this.turnController = new TurnController({
 			manager: this.manager,
 			emit: async (notification: TurnControllerNotification) => {
@@ -211,6 +216,13 @@ class Runtime implements AppServerRuntime {
 				const id = `server-${this.#nextRequestId++}`;
 				const request = this.broker.create(id, method, params, threadId, eligible);
 				if (!request) return undefined;
+				// A pending approval must protect its thread from idle eviction, so the counter moves up
+				// only after the broker accepted the request and back down exactly once from that
+				// handle's settlement. Without this the manager evicts a child mid-approval.
+				this.manager.adjustPendingApprovals(threadId, 1);
+				void request.settled.then(() => {
+					this.manager.adjustPendingApprovals(threadId, -1);
+				});
 				for (const connectionId of request.eligibleConnections) queueMessage(connectionId, { id, method, params });
 				return id;
 			},
