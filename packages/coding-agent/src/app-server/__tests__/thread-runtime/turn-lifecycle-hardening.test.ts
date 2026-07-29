@@ -183,11 +183,21 @@ test("a canonical failed prompt status materializes the accepted turn before rel
 		},
 	});
 	const manager = managerWith(client);
-	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+	const notifications: string[] = [];
+	const controller = new TurnController({
+		manager,
+		emit: notification => {
+			notifications.push(notification.method);
+		},
+		idFactory: () => APP_TURN_ID,
+	});
 
 	await expect(controller.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
 		code: "internal",
 	});
+	// This turn terminalized before any turn/start response existed, so it must stay durable-only:
+	// publishing turn/completed here would precede both turn/started and the error response.
+	expect(notifications).toEqual([]);
 	// Never resubmitted, and both the created mapping and the failed terminal are durable.
 	expect(client.promptCount()).toBe(1);
 	expect(client.appended.map(record => record.recordKind)).toEqual([

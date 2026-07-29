@@ -584,8 +584,10 @@ export class TurnController {
 			try {
 				await this.#finish(active, "agent_failed", [], undefined, ack.reconciledFailure);
 			} catch (error) {
-				this.#markRecovery(active, this.#asControllerError(error, "internal"));
-				throw active.failure;
+				// `#finish` disposes after a committed terminal, so `active.failure` may already be unset.
+				const classified = this.#asControllerError(error, "internal");
+				this.#markRecovery(active, classified);
+				throw active.failure ?? classified;
 			}
 			throw new TurnControllerError("internal", ack.reconciledFailure.message);
 		}
@@ -770,6 +772,10 @@ export class TurnController {
 		// Dispose in `finally` so a rejecting subscriber cannot retain a phantom active turn and
 		// permanently reject later turns as busy.
 		try {
+			// Lifecycle notifications belong strictly after the turn/start response crossed the wire.
+			// A turn terminalized before its response exists (reconciled failure) must stay durable-only:
+			// publishing turn/completed here would precede both turn/started and the error response.
+			if (!active.barrierDelivered) return;
 			const completed: TurnCompletedNotification = {
 				method: "turn/completed",
 				params: { threadId: active.threadId, turn: cloneTurn(terminal) },
