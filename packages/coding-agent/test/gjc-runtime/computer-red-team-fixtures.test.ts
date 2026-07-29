@@ -205,8 +205,18 @@ function qualityGate(qa: Record<string, unknown>): string {
 				sourceHash: "sha256:test-frozen-source",
 				joined: true,
 				lanes: {
-					cleaner: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "cleaner clean", blockers: [] },
-					architect: { status: "CLEAR", sourceHash: "sha256:test-frozen-source", evidence: "architect clear", blockers: [] },
+					cleaner: {
+						status: "passed",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "cleaner clean",
+						blockers: [],
+					},
+					architect: {
+						status: "CLEAR",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "architect clear",
+						blockers: [],
+					},
 					qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
 				},
 			},
