@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { SlashCommand } from "@gajae-code/tui";
 import { Editor } from "@gajae-code/tui/components/editor";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
@@ -6,10 +9,10 @@ import { KeybindingsManager as AppKeybindingsManager } from "../src/config/keybi
 import { createPromptActionAutocompleteProvider } from "../src/modes/prompt-action-autocomplete";
 
 describe("prompt action autocomplete", () => {
-	function createNoopProvider(commands: SlashCommand[] = []) {
+	function createNoopProvider(commands: SlashCommand[] = [], basePath = "/tmp") {
 		return createPromptActionAutocompleteProvider({
 			commands,
-			basePath: "/tmp",
+			basePath,
 			keybindings: AppKeybindingsManager.inMemory(),
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
@@ -205,6 +208,26 @@ describe("prompt action autocomplete", () => {
 		expect(suggestions?.prefix).toBe("/");
 		expect(suggestions?.items.some(item => item.value.startsWith("/"))).toBe(true);
 		expect(suggestions?.items.map(item => item.value)).not.toContain("model");
+	});
+
+	it("forwards cancellation to the underlying file discovery provider", async () => {
+		const basePath = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-action-autocomplete-cancel-"));
+		try {
+			fs.mkdirSync(path.join(basePath, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(basePath, "nested", "signal-target.txt"), "nested\n");
+			fs.writeFileSync(path.join(basePath, "signaltarget-local.txt"), "fallback\n");
+			const provider = createNoopProvider([], basePath);
+			const line = "@signaltarget";
+
+			const activeResult = await provider.getSuggestions([line], 0, line.length);
+			expect(activeResult?.items.some(item => item.value.includes("signal-target.txt"))).toBe(true);
+
+			const controller = new AbortController();
+			controller.abort();
+			expect(await provider.getSuggestions([line], 0, line.length, controller.signal)).toBeNull();
+		} finally {
+			fs.rmSync(basePath, { recursive: true, force: true });
+		}
 	});
 
 	it("opens the composer autocomplete list from an adjacent inline slash", async () => {

@@ -207,6 +207,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		lines: string[],
 		cursorLine: number,
 		cursorCol: number,
+		signal?: AbortSignal,
 	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
 		const currentLine = lines[cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, cursorCol);
@@ -239,7 +240,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		const slashPrefix = getSlashTokenPrefix(textBeforeCursor);
 		if (slashPrefix) {
 			const baseSuggestions = withoutSkillCommandSuggestions(
-				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
+				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol, signal),
 			);
 			if (isRootPathSuggestionResult(baseSuggestions)) return baseSuggestions;
 			const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor, {
@@ -256,14 +257,15 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			if (emojiSuggestions) return emojiSuggestions;
 		}
 
-		return this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol);
+		return this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol, signal);
 	}
 	getForceFileSuggestions(
 		lines: string[],
 		cursorLine: number,
 		cursorCol: number,
+		signal?: AbortSignal,
 	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
-		return this.#baseProvider.getForceFileSuggestions(lines, cursorLine, cursorCol);
+		return this.#baseProvider.getForceFileSuggestions(lines, cursorLine, cursorCol, signal);
 	}
 
 	applyCompletion(

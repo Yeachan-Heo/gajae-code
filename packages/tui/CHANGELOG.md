@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- File mention autocomplete now cancels superseded searches and completes absolute or home-relative paths one directory segment at a time, preventing broad recursive scans from exhausting memory while typing `@` paths.
+
 ## [0.12.0] - 2026-07-28
 
 ### Changed

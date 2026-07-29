@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -133,6 +133,168 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values).toContain("@../outside/nested/deeper/also-alpha.ts");
 			expect(values).not.toContain("@../outside/nested/deeper/zzz.ts");
 			expect(values.some(value => value.includes("alpha-local.ts"))).toBe(false);
+		});
+
+		it("cancels while resolving a scoped fuzzy-search directory", async () => {
+			const directoryStats = await fs.promises.stat(outsideDir);
+			const statStarted = Promise.withResolvers<void>();
+			const releaseStat = Promise.withResolvers<void>();
+			const statSpy = spyOn(fs.promises, "stat").mockImplementation((async () => {
+				statStarted.resolve();
+				await releaseStat.promise;
+				return directoryStats;
+			}) as unknown as typeof fs.promises.stat);
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@../outside/a";
+			const controller = new AbortController();
+			const pending = provider.getSuggestions([line], 0, line.length, controller.signal);
+
+			try {
+				await statStarted.promise;
+				controller.abort();
+				const timeout = Symbol("timeout");
+				const outcome = await Promise.race([pending, Bun.sleep(100).then(() => timeout)]);
+
+				expect(outcome).not.toBe(timeout);
+				expect(outcome).toBeNull();
+			} finally {
+				releaseStat.resolve();
+				statSpy.mockRestore();
+				await pending.catch(() => null);
+			}
+		});
+
+		describe("bounded absolute and home path completion", () => {
+			let mentionRoot: string;
+
+			beforeEach(() => {
+				mentionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-absolute-test-"));
+				fs.mkdirSync(path.join(mentionRoot, "immediate-dir", "nested"), { recursive: true });
+				fs.writeFileSync(path.join(mentionRoot, "immediate-target.txt"), "immediate\n");
+				fs.writeFileSync(path.join(mentionRoot, "immediate-dir", "nested", "immediate-target.txt"), "nested\n");
+			});
+
+			afterEach(() => {
+				fs.rmSync(mentionRoot, { recursive: true, force: true });
+			});
+
+			it.each([
+				[
+					"absolute",
+					(root: string) => `@${path.join(root, "im")}`,
+					(root: string) => `@${path.join(root, "immediate-target.txt")}`,
+				],
+				[
+					"quoted absolute",
+					(root: string) => `@"${path.join(root, "im")}`,
+					(root: string) => `@"${path.join(root, "immediate-target.txt")}"`,
+				],
+				["home root", (_root: string) => "@~", (_root: string) => "@~/immediate-target.txt"],
+				["home child", (_root: string) => "@~/im", (_root: string) => "@~/immediate-target.txt"],
+				["quoted home child", (_root: string) => '@"~/im', (_root: string) => '@"~/immediate-target.txt"'],
+			])("enumerates only one directory segment for %s mentions", async (_name, inputFor, expectedFor) => {
+				const line = inputFor(mentionRoot);
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const result = await provider.getSuggestions([line], 0, line.length);
+				const values = result?.items.map(item => item.value) ?? [];
+
+				expect(values).toContain(expectedFor(mentionRoot));
+				expect(values.some(value => value.replaceAll("\\", "/").includes("/nested/"))).toBe(false);
+			});
+
+			it("preserves fuzzy matching within a bounded path segment", async () => {
+				fs.mkdirSync(path.join(mentionRoot, "Downloads"));
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const line = "@~/dwn";
+				const result = await provider.getSuggestions([line], 0, line.length);
+
+				expect(result?.items.map(item => item.value)).toContain("@~/Downloads/");
+			});
+
+			it("keeps bounded directory completions inside the mention token", async () => {
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const line = `@${path.join(mentionRoot, "immediate-d")}`;
+				const result = await provider.getSuggestions([line], 0, line.length);
+				const directory = result?.items.find(item => item.label === "immediate-dir/");
+
+				expect(directory).toBeDefined();
+				if (!result || !directory) throw new Error("expected immediate directory completion");
+
+				const applied = provider.applyCompletion([line], 0, line.length, directory, result.prefix);
+				const completedLine = `@${path.join(mentionRoot, "immediate-dir")}/`;
+
+				expect(applied.lines).toEqual([completedLine]);
+				expect(applied.cursorCol).toBe(completedLine.length);
+
+				const childResult = await provider.getSuggestions(applied.lines, applied.cursorLine, applied.cursorCol);
+				expect(childResult?.items.map(item => item.value)).toContain(`${completedLine}nested/`);
+			});
+
+			it("still terminates bounded file mentions with a space", async () => {
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const line = `@${path.join(mentionRoot, "immediate-t")}`;
+				const result = await provider.getSuggestions([line], 0, line.length);
+				const file = result?.items.find(item => item.label === "immediate-target.txt");
+
+				expect(file).toBeDefined();
+				if (!result || !file) throw new Error("expected immediate file completion");
+
+				const applied = provider.applyCompletion([line], 0, line.length, file, result.prefix);
+				const completedLine = `@${path.join(mentionRoot, "immediate-target.txt")} `;
+
+				expect(applied.lines).toEqual([completedLine]);
+				expect(applied.cursorCol).toBe(completedLine.length);
+			});
+
+			it("does not fall back to directory enumeration after native fuzzy cancellation", async () => {
+				fs.mkdirSync(path.join(mentionRoot, "nested"), { recursive: true });
+				fs.writeFileSync(path.join(mentionRoot, "nested", "signal-target.txt"), "signal\n");
+				fs.writeFileSync(path.join(mentionRoot, "signaltarget-local.txt"), "fallback\n");
+				const provider = new CombinedAutocompleteProvider([], mentionRoot, mentionRoot);
+				const line = "@signaltarget";
+
+				const activeResult = await provider.getSuggestions([line], 0, line.length);
+				expect(activeResult?.items.some(item => item.value.includes("signal-target.txt"))).toBe(true);
+
+				const controller = new AbortController();
+				controller.abort();
+				expect(await provider.getSuggestions([line], 0, line.length, controller.signal)).toBeNull();
+			});
+
+			it.each([
+				"regular",
+				"forced",
+			] as const)("cancels %s bounded path completion while directory enumeration is pending", async mode => {
+				const readdirStarted = Promise.withResolvers<void>();
+				const releaseReaddir = Promise.withResolvers<void>();
+				const readdirSpy = spyOn(fs.promises, "readdir").mockImplementation(async () => {
+					readdirStarted.resolve();
+					await releaseReaddir.promise;
+					return [];
+				});
+				const provider = new CombinedAutocompleteProvider([], mentionRoot, mentionRoot);
+				const line =
+					mode === "regular" ? `@${path.join(mentionRoot, "im")}` : `mention ${path.join(mentionRoot, "im")}`;
+				const controller = new AbortController();
+				const pending =
+					mode === "regular"
+						? provider.getSuggestions([line], 0, line.length, controller.signal)
+						: provider.getForceFileSuggestions([line], 0, line.length, controller.signal);
+
+				try {
+					await readdirStarted.promise;
+					controller.abort();
+					const timeout = Symbol("timeout");
+					const outcome = await Promise.race([pending, Bun.sleep(100).then(() => timeout)]);
+
+					expect(outcome).not.toBe(timeout);
+					expect(outcome).toBeNull();
+				} finally {
+					releaseReaddir.resolve();
+					readdirSpy.mockRestore();
+					await pending.catch(() => null);
+				}
+			});
 		});
 	});
 	describe("dot-slash path completion", () => {

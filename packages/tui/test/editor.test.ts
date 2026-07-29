@@ -6,6 +6,7 @@ import { __editorPerfCounters, Editor } from "@gajae-code/tui/components/editor"
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
+import { StdinBuffer } from "../src/stdin-buffer";
 import { defaultEditorTheme } from "./test-themes";
 
 describe("Editor component", () => {
@@ -317,6 +318,135 @@ describe("Editor component", () => {
 			editor.handleInput("@");
 
 			await expect(promise).resolves.toBe("@");
+		});
+
+		it("re-triggers file-reference autocomplete for @~ in one stdin chunk", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const stdin = new StdinBuffer();
+			const calls: string[] = [];
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					calls.push((lines[cursorLine] ?? "").slice(0, cursorCol));
+					return null;
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			stdin.on("data", sequence => editor.handleInput(sequence));
+			stdin.process(Buffer.from("@~"));
+			await Bun.sleep(0);
+
+			expect(calls).toEqual(["@", "@~"]);
+		});
+
+		it("aborts superseded autocomplete requests from a single stdin chunk and on dismissal", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const stdin = new StdinBuffer();
+			let calls = 0;
+			let active = 0;
+			let peakActive = 0;
+			let latestText = "";
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol, signal) {
+					calls += 1;
+					latestText = (lines[cursorLine] ?? "").slice(0, cursorCol);
+					active += 1;
+					peakActive = Math.max(peakActive, active);
+					return new Promise((_resolve, reject) => {
+						signal?.addEventListener(
+							"abort",
+							() => {
+								active -= 1;
+								reject(signal.reason);
+							},
+							{ once: true },
+						);
+					});
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			stdin.on("data", sequence => editor.handleInput(sequence));
+			stdin.process(Buffer.from("@/isolated/path"));
+
+			expect(calls).toBeGreaterThan(1);
+			expect(latestText).toBe("@/isolated/path");
+			expect(peakActive).toBe(1);
+			expect(active).toBe(1);
+
+			editor.handleInput("\x1b");
+			expect(active).toBe(0);
+		});
+
+		it.each([
+			["left-arrow", (editor: Editor) => editor.handleInput("\x1b[D")],
+			["line-start", (editor: Editor) => editor.moveToLineStart()],
+			["word-left", (editor: Editor) => editor.handleInput("\x1bb")],
+		])("aborts an in-flight autocomplete request after %s navigation moves the cursor", async (_name, navigate) => {
+			const editor = new Editor(defaultEditorTheme);
+			const requestStarted = Promise.withResolvers<AbortSignal>();
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(_lines, _cursorLine, _cursorCol, signal) {
+					if (!signal) throw new Error("expected autocomplete cancellation signal");
+					requestStarted.resolve(signal);
+					return new Promise((_resolve, reject) => {
+						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					});
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("@");
+			const signal = await requestStarted.promise;
+
+			try {
+				navigate(editor);
+				expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+				expect(signal.aborted).toBe(true);
+				expect(editor.isShowingAutocomplete()).toBe(false);
+			} finally {
+				editor.handleInput("\x1b");
+				await Bun.sleep(0);
+			}
+		});
+
+		it("keeps an in-flight autocomplete request when navigation is a no-op", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const requestStarted = Promise.withResolvers<AbortSignal>();
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(_lines, _cursorLine, _cursorCol, signal) {
+					if (!signal) throw new Error("expected autocomplete cancellation signal");
+					requestStarted.resolve(signal);
+					return new Promise((_resolve, reject) => {
+						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					});
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("@");
+			const signal = await requestStarted.promise;
+
+			try {
+				editor.handleInput("\x1b[C");
+				expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+				expect(signal.aborted).toBe(false);
+			} finally {
+				editor.handleInput("\x1b");
+				await Bun.sleep(0);
+			}
 		});
 
 		it("triggers prompt-action autocomplete when typing hash", async () => {

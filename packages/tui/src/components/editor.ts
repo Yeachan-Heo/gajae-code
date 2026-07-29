@@ -1,5 +1,6 @@
 import { getProjectDir, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
 import {
+	type AutocompleteItem,
 	type AutocompleteProvider,
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
@@ -460,6 +461,7 @@ export class Editor implements Component, Focusable {
 	#autocompleteState: "regular" | "force" | null = null;
 	#autocompletePrefix: string = "";
 	#autocompleteRequestId: number = 0;
+	#autocompleteRequestController?: AbortController;
 	#autocompleteOrigin?: { docVersion: number; cursorLine: number; cursorCol: number };
 	#autocompleteMaxVisible: number = 5;
 	onAutocompleteUpdate?: () => void;
@@ -520,6 +522,8 @@ export class Editor implements Component, Focusable {
 	dispose(): void {
 		this.#disposeTabWidthListener?.();
 		this.#disposeTabWidthListener = undefined;
+		this.#abortAutocompleteRequest();
+		this.#clearAutocompleteTimeout();
 	}
 
 	setAutocompleteProvider(provider: AutocompleteProvider): void {
@@ -691,6 +695,7 @@ export class Editor implements Component, Focusable {
 	}
 	/** Internal setText that doesn't reset history state - used by navigateHistory */
 	#setTextInternal(text: string, cursorAnchor: HistoryCursorAnchor = "end"): void {
+		this.#cancelAutocomplete();
 		this.#undoStack.length = 0;
 		const lines = sanitizeLoadedText(text).split("\n");
 		this.#state.lines = lines.length === 0 ? [""] : lines;
@@ -1154,6 +1159,10 @@ export class Editor implements Component, Focusable {
 					this.handleInput(paste.remaining);
 				}
 			}
+			return;
+		}
+		if (!this.#autocompleteState && this.#autocompleteRequestController && kb.matches(data, "tui.select.cancel")) {
+			this.#cancelAutocomplete();
 			return;
 		}
 
@@ -1837,6 +1846,7 @@ export class Editor implements Component, Focusable {
 
 	// All the editor methods from before...
 	#insertCharacter(char: string): void {
+		this.#abortAutocompleteRequest();
 		this.#exitHistoryForEditing();
 		this.#resetKillSequence();
 		this.#recordUndoState();
@@ -1901,6 +1911,14 @@ export class Editor implements Component, Focusable {
 			// Auto-trigger for "#" prompt actions anywhere in the current token
 			else if (char === "#") {
 				this.#tryTriggerAutocomplete();
+			}
+			// Continue a home-relative @ mention after the standalone "~" marker.
+			else if (char === "~") {
+				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+				if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+					this.#tryTriggerAutocomplete();
+				}
 			}
 			// Also auto-trigger when typing letters/path chars in a completable context
 			else if (/[a-zA-Z0-9.\-_/]/.test(char)) {
@@ -2037,6 +2055,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	#submitValue(): void {
+		this.#cancelAutocomplete();
 		this.#resetKillSequence();
 
 		const result = this.#expandPasteMarkers(this.#state.lines.join("\n")).trim();
@@ -2055,6 +2074,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	#handleBackspace(): void {
+		this.#abortAutocompleteRequest();
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#resetKillSequence();
 		this.#recordUndoState();
@@ -2088,6 +2108,11 @@ export class Editor implements Component, Focusable {
 
 		if (this.onChange) {
 			this.onChange(this.getText());
+		}
+
+		if (this.#isEditorEmpty()) {
+			this.#cancelAutocomplete();
+			return;
 		}
 
 		// Update or re-trigger autocomplete after backspace
@@ -2193,28 +2218,54 @@ export class Editor implements Component, Focusable {
 		return result;
 	}
 
+	#cancelAutocompleteAfterCursorMove(previousLine: number, previousCol: number): void {
+		if (previousLine === this.#state.cursorLine && previousCol === this.#state.cursorCol) {
+			return;
+		}
+
+		const hadPendingRequest =
+			this.#autocompleteRequestController !== undefined || this.#autocompleteTimeout !== undefined;
+		if (!hadPendingRequest) {
+			return;
+		}
+
+		const hadAutocomplete = this.#autocompleteState !== null;
+		this.#cancelAutocomplete();
+		if (hadAutocomplete) {
+			this.onAutocompleteUpdate?.();
+		}
+	}
+
 	#moveToLineStart(): void {
+		const { cursorLine, cursorCol } = this.#state;
 		this.#resetKillSequence();
 		this.#setCursorCol(0);
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	#moveToLineEnd(): void {
+		const { cursorLine, cursorCol } = this.#state;
 		this.#resetKillSequence();
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		this.#setCursorCol(currentLine.length);
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	#moveToMessageStart(): void {
+		const { cursorLine, cursorCol } = this.#state;
 		this.#resetKillSequence();
 		this.#state.cursorLine = 0;
 		this.#setCursorCol(0);
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	#moveToMessageEnd(): void {
+		const { cursorLine, cursorCol } = this.#state;
 		this.#resetKillSequence();
 		this.#state.cursorLine = this.#state.lines.length - 1;
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		this.#setCursorCol(currentLine.length);
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	#resetKillSequence(): void {
@@ -2535,6 +2586,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	#handleForwardDelete(): void {
+		this.#abortAutocompleteRequest();
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#resetKillSequence();
 		this.#recordUndoState();
@@ -2642,6 +2694,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	#moveCursor(deltaLine: number, deltaCol: number): void {
+		const { cursorLine, cursorCol } = this.#state;
 		this.#resetKillSequence();
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const needsVisualLines = deltaLine !== 0 || (deltaCol > 0 && this.#state.cursorCol >= currentLine.length);
@@ -2700,9 +2753,12 @@ export class Editor implements Component, Focusable {
 				}
 			}
 		}
+
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	#pageScroll(direction: -1 | 1): void {
+		const { cursorLine, cursorCol } = this.#state;
 		this.#resetKillSequence();
 		const visualLines = this.#buildVisualLineMap(this.#lastLayoutWidth);
 		const currentVisualLine = this.#findCurrentVisualLine(visualLines);
@@ -2710,9 +2766,11 @@ export class Editor implements Component, Focusable {
 		const targetVisualLine = Math.max(0, Math.min(visualLines.length - 1, currentVisualLine + direction * step));
 		if (targetVisualLine === currentVisualLine) return;
 		this.#moveToVisualLine(visualLines, currentVisualLine, targetVisualLine);
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	#moveWordBackwards(): void {
+		const { cursorLine, cursorCol } = this.#state;
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 
 		// If at start of line, move to end of previous line
@@ -2722,10 +2780,12 @@ export class Editor implements Component, Focusable {
 				const prevLine = this.#state.lines[this.#state.cursorLine] || "";
 				this.#setCursorCol(prevLine.length);
 			}
+			this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 			return;
 		}
 
 		this.#setCursorCol(moveWordLeft(currentLine, this.#state.cursorCol));
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	/**
@@ -2733,6 +2793,7 @@ export class Editor implements Component, Focusable {
 	 * Multi-line search. Case-sensitive. Skips the current cursor position.
 	 */
 	#jumpToChar(char: string, direction: "forward" | "backward"): void {
+		const { cursorLine, cursorCol } = this.#state;
 		this.#resetKillSequence();
 		const isForward = direction === "forward";
 		const lines = this.#state.lines;
@@ -2762,6 +2823,7 @@ export class Editor implements Component, Focusable {
 			if (idx !== -1) {
 				this.#state.cursorLine = lineIdx;
 				this.#setCursorCol(idx);
+				this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 				return;
 			}
 		}
@@ -2769,6 +2831,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	#moveWordForwards(): void {
+		const { cursorLine, cursorCol } = this.#state;
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 
 		// If at end of line, move to start of next line
@@ -2777,10 +2840,12 @@ export class Editor implements Component, Focusable {
 				this.#state.cursorLine++;
 				this.#setCursorCol(0);
 			}
+			this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 			return;
 		}
 
 		this.#setCursorCol(moveWordRight(currentLine, this.#state.cursorCol));
+		this.#cancelAutocompleteAfterCursorMove(cursorLine, cursorCol);
 	}
 
 	#hasOnlyWhitespaceBeforeCursorLine(): boolean {
@@ -2875,11 +2940,21 @@ export class Editor implements Component, Focusable {
 		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 
-		const suggestions = await this.#autocompleteProvider.getSuggestions(
-			this.#state.lines,
-			this.#state.cursorLine,
-			this.#state.cursorCol,
-		);
+		const signal = this.#newAutocompleteRequestController().signal;
+		let suggestions: { items: AutocompleteItem[]; prefix: string } | null;
+		try {
+			suggestions = await this.#autocompleteProvider.getSuggestions(
+				this.#state.lines,
+				this.#state.cursorLine,
+				this.#state.cursorCol,
+				signal,
+			);
+		} catch (error) {
+			if (signal.aborted) return;
+			throw error;
+		} finally {
+			this.#finishAutocompleteRequest(signal);
+		}
 		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
@@ -2948,11 +3023,21 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 
 		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
-		const suggestions = await provider.getForceFileSuggestions(
-			this.#state.lines,
-			this.#state.cursorLine,
-			this.#state.cursorCol,
-		);
+		const signal = this.#newAutocompleteRequestController().signal;
+		let suggestions: { items: AutocompleteItem[]; prefix: string } | null;
+		try {
+			suggestions = await provider.getForceFileSuggestions(
+				this.#state.lines,
+				this.#state.cursorLine,
+				this.#state.cursorCol,
+				signal,
+			);
+		} catch (error) {
+			if (signal.aborted) return;
+			throw error;
+		} finally {
+			this.#finishAutocompleteRequest(signal);
+		}
 		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
@@ -2992,6 +3077,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 
 	#cancelAutocomplete(notifyCancel: boolean = false): void {
 		const wasAutocompleting = this.#autocompleteState !== null;
+		this.#abortAutocompleteRequest();
 		this.#clearAutocompleteTimeout();
 		this.#autocompleteRequestId += 1;
 		this.#autocompleteState = null;
@@ -3019,11 +3105,21 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 
-		const suggestions = await this.#autocompleteProvider.getSuggestions(
-			this.#state.lines,
-			this.#state.cursorLine,
-			this.#state.cursorCol,
-		);
+		const signal = this.#newAutocompleteRequestController().signal;
+		let suggestions: { items: AutocompleteItem[]; prefix: string } | null;
+		try {
+			suggestions = await this.#autocompleteProvider.getSuggestions(
+				this.#state.lines,
+				this.#state.cursorLine,
+				this.#state.cursorCol,
+				signal,
+			);
+		} catch (error) {
+			if (signal.aborted) return;
+			throw error;
+		} finally {
+			this.#finishAutocompleteRequest(signal);
+		}
 		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
@@ -3053,6 +3149,24 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			clearTimeout(this.#autocompleteTimeout);
 			this.#autocompleteTimeout = undefined;
 		}
+	}
+
+	#abortAutocompleteRequest(): void {
+		this.#autocompleteRequestController?.abort();
+		this.#autocompleteRequestController = undefined;
+	}
+
+	#finishAutocompleteRequest(signal: AbortSignal): void {
+		if (this.#autocompleteRequestController?.signal === signal) {
+			this.#autocompleteRequestController = undefined;
+		}
+	}
+
+	#newAutocompleteRequestController(): AbortController {
+		this.#abortAutocompleteRequest();
+		const controller = new AbortController();
+		this.#autocompleteRequestController = controller;
+		return controller;
 	}
 
 	/**
