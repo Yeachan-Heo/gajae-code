@@ -1,4 +1,5 @@
 import { logger } from "@gajae-code/utils";
+import type { TaskSourceRevision } from "../task/source-revision";
 import type { AgentProgress, AgentSource } from "../task/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
@@ -62,6 +63,11 @@ export interface AsyncJobMetadata {
 		description?: string;
 		assignment?: string;
 	};
+	/**
+	 * Worktree identity captured at spawn for review-capable tasks (#3469).
+	 * Used to mark late deliveries stale when the parent worktree advances.
+	 */
+	sourceRevision?: TaskSourceRevision;
 	/** True when this bash job was started by the `monitor` tool (vs plain async bash). */
 	monitor?: boolean;
 }

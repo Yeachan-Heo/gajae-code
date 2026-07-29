@@ -1,3 +1,4 @@
+import type { TaskSourceRevision, TaskSourceStatus } from "./source-revision";
 import {
 	hasCompleteUsageCostBreakdown,
 	type ReviewFindingsArtifactRef,
@@ -66,6 +67,14 @@ export interface TaskResultReceipt {
 	forkContextAdvisory?: SingleResult["forkContextAdvisory"];
 	/** Resolved repository identity for this delegated lane (#2901). */
 	repositoryBinding?: SingleResult["repositoryBinding"];
+	/**
+	 * Source worktree identity captured when a review-capable task was spawned (#3469).
+	 * Omitted for ordinary executor tasks. When `sourceStatus` is `"stale"`, results
+	 * are advisory only and must not satisfy completion gates.
+	 */
+	sourceRevision?: TaskSourceRevision;
+	sourceStatus?: TaskSourceStatus;
+	sourceGuidance?: string;
 	roi?: TaskRoi;
 }
 
@@ -119,25 +128,26 @@ function normalizeReviewFindingSeverity(severity: unknown, priority: unknown): s
 
 function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
 	const status = getStatus(raw);
+	const stalePrefix = raw.sourceStatus === "stale" ? "STALE source; " : "";
 	if (raw.setupFailure) {
-		return `Task ${status} during setup: ${raw.setupFailure.summary}`;
+		return `${stalePrefix}Task ${status} during setup: ${raw.setupFailure.summary}`;
 	}
 	if (raw.modelSubstitutionWarning) {
-		return `Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
+		return `${stalePrefix}Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
 	}
 	if (raw.retryFailure) {
-		return `Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}.`;
+		return `${stalePrefix}Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}.`;
 	}
 	if (raw.abortReason) {
-		return `Task ${status}; abort reason recorded.`;
+		return `${stalePrefix}Task ${status}; abort reason recorded.`;
 	}
 	if (raw.error) {
-		return `Task ${status}; error recorded.`;
+		return `${stalePrefix}Task ${status}; error recorded.`;
 	}
 	if (outputRef) {
-		return `Task ${status}; output stored in ${outputRef.uri} (${outputRef.lineCount} lines, ${outputRef.sizeBytes} bytes).`;
+		return `${stalePrefix}Task ${status}; output stored in ${outputRef.uri} (${outputRef.lineCount} lines, ${outputRef.sizeBytes} bytes).`;
 	}
-	return `Task ${status}; output artifact unavailable.`;
+	return `${stalePrefix}Task ${status}; output artifact unavailable.`;
 }
 
 function getStatus(raw: SingleResult): TaskResultReceipt["status"] {
@@ -291,6 +301,9 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		forkContext: raw.forkContext,
 		forkContextAdvisory: raw.forkContextAdvisory,
 		repositoryBinding: raw.repositoryBinding,
+		sourceRevision: raw.sourceRevision,
+		sourceStatus: raw.sourceStatus,
+		sourceGuidance: raw.sourceGuidance,
 		roi: buildTaskRoi(raw),
 	};
 }

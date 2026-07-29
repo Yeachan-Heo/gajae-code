@@ -31,6 +31,7 @@
 ### Added
 - Published bounded, redacted, hash-bound sealed perf-corpus memory evidence and an output-free replay notebook. The authenticated analysis identifies sustained heap growth on the `agent-session` and `tui` surfaces while keeping RSS/native allocation and p95 claims explicitly out of scope.
 
+- Review-capable task results (`architect`, `critic`, `planner`, and names containing `review`/`qa`) now capture a source worktree snapshot at spawn and stamp receipts with `sourceRevision` / `sourceStatus`. When the parent worktree advances before delivery, results are marked `stale` with explicit guidance so late review findings cannot silently satisfy completion gates (#3469).
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 - The interactive terminal’s responsive IRC/todo work-lane contract now covers exact narrow/wide geometry, requested versus effective IRC visibility, direct-root pin ordering, todo lane bounds, remapped IRC toggles, and live composer shortcut hints.
 - Managed-session startup now preserves bounded Windows ACL and identity failure classifications in path-redacted recovery guidance without broadening permissions, elevation, or unsafe fallback.

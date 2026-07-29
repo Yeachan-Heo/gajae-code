@@ -885,9 +885,16 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 	if (result.truncated || result.previewTruncated) {
 		statusLine += ` ${theme.fg("warning", "[truncated]")}`;
 	}
+	if (result.sourceStatus === "stale") {
+		statusLine += ` ${theme.fg("warning", "[STALE]")}`;
+	}
 	lines.push(statusLine);
 
 	lines.push(...renderTaskSection(result.assignment ?? result.task, continuePrefix, expanded, theme));
+
+	if (result.sourceStatus === "stale" && result.sourceGuidance) {
+		lines.push(`${continuePrefix}${theme.fg("warning", truncateToWidth(replaceTabs(result.sourceGuidance), 100))}`);
+	}
 
 	if (result.review) {
 		if (result.review.overallCorrectness) {

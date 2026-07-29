@@ -69,6 +69,12 @@ import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary } from "./
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
+import {
+	captureTaskSourceRevision,
+	isReviewCapableAgent,
+	resolveSourceFreshnessFields,
+	type TaskSourceRevision,
+} from "./source-revision";
 import { DEFAULT_SPAWN_THRESHOLD, evaluateSpawnGate } from "./spawn-gate";
 import {
 	applyNestedPatches,
@@ -194,6 +200,17 @@ function repositoryBindingFromTask(task: TaskItem): RepositoryBinding | undefine
 	return task.repositoryBinding ? publicRepositoryBinding(task.repositoryBinding as RepositoryBinding) : undefined;
 }
 
+/** Stamp review-capable results with spawn-time source identity and live freshness (#3469). */
+async function withSourceFreshness(
+	cwd: string,
+	result: SingleResult,
+	reviewed: TaskSourceRevision | undefined,
+): Promise<SingleResult> {
+	if (!reviewed) return result;
+	const fields = await resolveSourceFreshnessFields(cwd, reviewed);
+	return { ...result, ...fields };
+}
+
 function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | undefined {
 	const invalid: string[] = [];
 	for (let i = 0; i < tasks.length; i++) {
@@ -225,6 +242,15 @@ export {
 	findRawTaskLeakKeys,
 	sanitizeTaskToolDetails,
 } from "./receipt";
+export type { TaskSourceRevision, TaskSourceStatus } from "./source-revision";
+export {
+	captureTaskSourceRevision,
+	classifyTaskSourceFreshness,
+	isReviewCapableAgent,
+	resolveSourceFreshnessFields,
+	STALE_SOURCE_GUIDANCE,
+	sourceRevisionsEqual,
+} from "./source-revision";
 export type {
 	AgentDefinition,
 	AgentProgress,
@@ -945,6 +971,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 		const frozenForkSeeds = new Map<string, ForkContextSeed>();
+		// Bind review-capable detached jobs to the worktree identity at spawn (#3469).
+		const frozenSourceRevisions = new Map<string, TaskSourceRevision>();
 
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
@@ -969,6 +997,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				break;
 			}
 			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
+			// Bind review-capable detached jobs to the worktree identity at spawn (#3469).
+			const spawnSourceRevision = isReviewCapableAgent(params.agent, fallbackAgentSource)
+				? await captureTaskSourceRevision(this.session.cwd)
+				: undefined;
+			if (spawnSourceRevision) frozenSourceRevisions.set(uniqueId, spawnSourceRevision);
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;
 			try {
@@ -1014,6 +1047,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 										effectiveArtifactsDir: batchArtifactsDir,
 										parentArtifactManager: asyncParentArtifactManager,
 									},
+									sourceRevisions: frozenSourceRevisions,
 								},
 							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -1103,6 +1137,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								description: taskItem.description,
 								assignment: taskItem.assignment.trim(),
 							},
+							...(spawnSourceRevision ? { sourceRevision: spawnSourceRevision } : {}),
 						},
 						onProgress: (text, details) => {
 							const progressDetails =
@@ -1230,6 +1265,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			 * against a single child's receipts.
 			 */
 			suppressRoiReconciliation?: boolean;
+			/**
+			 * Spawn-time source snapshots for review-capable tasks (#3469).
+			 * Keyed by allocated task id; omitted entries are captured at run start.
+			 */
+			sourceRevisions?: ReadonlyMap<string, TaskSourceRevision>;
 		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
@@ -1662,6 +1702,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					recommendedMode: advisory.recommendedMode,
 					reasons: advisory.reasons,
 				};
+				// Capture source identity at spawn/run-start for review-capable agents (#3469).
+				const sourceRevision = isReviewCapableAgent(agentName, agent.source)
+					? (executionOverrides?.sourceRevisions?.get(task.id) ??
+						(await captureTaskSourceRevision(this.session.cwd)))
+					: undefined;
+				const finish = (result: SingleResult): Promise<SingleResult> =>
+					withSourceFreshness(this.session.cwd, result, sourceRevision);
 				const managedPersistence = parentArtifactManager?.getManagedStore()
 					? createManagedTaskPersistence(parentArtifactManager, task.id)
 					: undefined;
@@ -1727,12 +1774,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					return {
+					return finish({
 						...result,
 						...(forkContext ? { forkContext } : {}),
 						forkContextAdvisory,
 						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
-					};
+					});
 				}
 
 				const taskStart = Date.now();
@@ -1828,18 +1875,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								commitMsg,
 							);
 							const producedChanges = Boolean(commitResult?.branchName || commitResult?.nestedPatches.length);
-							return {
+							return finish({
 								...resultWithForkContext,
 								branchName: commitResult?.branchName,
 								nestedPatches: commitResult?.nestedPatches,
 								producedChanges,
-							};
+							});
 						} catch (mergeErr) {
 							// Agent succeeded but branch commit failed — clean up stale branch
 							const branchName = `gjc/task/${task.id}`;
 							await git.branch.tryDelete(repoRoot, branchName);
 							const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-							return { ...resultWithForkContext, error: `Merge failed: ${msg}` };
+							return finish({ ...resultWithForkContext, error: `Merge failed: ${msg}` });
 						}
 					}
 					if (resultWithForkContext.exitCode === 0) {
@@ -1855,22 +1902,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							await Bun.write(patchPath, delta.rootPatch);
 							isolatedPatchBytes.set(patchPath, Buffer.from(delta.rootPatch, "utf8"));
 							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
-							return {
+							return finish({
 								...resultWithForkContext,
 								patchPath,
 								nestedPatches: delta.nestedPatches,
 								producedChanges,
-							};
+							});
 						} catch (patchErr) {
 							const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
-							return { ...resultWithForkContext, error: `Patch capture failed: ${msg}` };
+							return finish({ ...resultWithForkContext, error: `Patch capture failed: ${msg}` });
 						}
 					}
-					return resultWithForkContext;
+					return finish(resultWithForkContext);
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const assignment = task.assignment.trim();
-					return {
+					return finish({
 						index,
 						id: task.id,
 						agent: agent.name,
@@ -1887,7 +1934,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelOverride,
 						forkContext,
 						error: message,
-					};
+					});
 				} finally {
 					if (isolationHandle) {
 						await cleanupIsolation(isolationHandle);

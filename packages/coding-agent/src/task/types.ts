@@ -6,6 +6,7 @@ import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import type { SpawnRoiReconciliation } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
+import type { TaskSourceRevision, TaskSourceStatus } from "./source-revision";
 import type { SpawnPlanReceipt } from "./spawn-gate";
 import type { NestedRepoPatch } from "./worktree";
 
@@ -506,6 +507,18 @@ export interface SingleResult {
 		head?: string;
 		branch?: string;
 	};
+	/**
+	 * Worktree identity captured when a review-capable task was spawned (#3469).
+	 * Omitted for ordinary executor implementation tasks.
+	 */
+	sourceRevision?: TaskSourceRevision;
+	/**
+	 * Freshness of `sourceRevision` vs the parent worktree at delivery time.
+	 * `"stale"` means the tree advanced after the review started; results are advisory only.
+	 */
+	sourceStatus?: TaskSourceStatus;
+	/** Human guidance when `sourceStatus` is `"stale"`. */
+	sourceGuidance?: string;
 }
 
 /** True only for complete, factual five-bucket cost accounting. */
