@@ -1893,11 +1893,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					for (const message of session.messages) {
 						if (message.role === "assistant") rememberAssistantMessage(message);
 					}
+					const retryProviderCode = session.messages.findLast(
+						(message): message is AssistantMessage =>
+							isProviderAssistantMessage(message) && message.errorMessage === event.errorMessage,
+					)?.transportFailure?.providerCode;
 					progress.retryState = {
 						attempt: event.attempt,
 						maxAttempts: event.maxAttempts,
 						unbounded: event.unbounded,
-						kind: classifyProviderRetry(event.errorMessage),
+						kind: classifyProviderRetry(event.errorMessage, retryProviderCode),
 						provider: providerNameFromModel(
 							activeProviderModelString ?? lastAssistantModelString ?? resolvedModelString,
 						),

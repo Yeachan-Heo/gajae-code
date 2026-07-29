@@ -292,7 +292,13 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 	it("alibaba-token-plan times out at 300s when the source never emits", async () => {
 		vi.useFakeTimers();
 		const source = createHangingSource();
-		setBedrockProviderModule({ streamBedrock: () => source });
+		let providerSignal: AbortSignal | undefined;
+		setBedrockProviderModule({
+			streamBedrock: (_model, _context, options) => {
+				providerSignal = options.signal;
+				return source;
+			},
+		});
 
 		const stream = streamBedrock(createAlibabaModel(), baseContext, {});
 		await flush();
@@ -315,6 +321,10 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		expect(result.errorMessage).toBe("Provider stream timed out while waiting for the first event");
 		expect(result.transportFailure).toMatchObject({
 			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+		});
+		expect(providerSignal?.reason).toMatchObject({
+			name: "FirstEventTimeoutError",
 			providerCode: "stream_first_event_timeout",
 		});
 	});
