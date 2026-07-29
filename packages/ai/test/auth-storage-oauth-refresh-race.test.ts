@@ -171,6 +171,93 @@ describe("AuthStorage OAuth refresh race", () => {
 		});
 	});
 
+	test("disables instead of looping when the CAS misses an unrotated row", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// Production shape (#3054-per-3.5h log flood): the row still holds the
+		// revoked refresh token we just tried, but its serialized `data` no longer
+		// byte-matches our snapshot because an unrelated writer touched identity
+		// metadata. The data-equality CAS can therefore never match, and the old
+		// reload-and-retry path replayed the same invalid_grant refresh on every
+		// request forever without ever disabling the credential.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "expired-access",
+				refresh: "revoked-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+		let refreshCalls = 0;
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
+			refreshCalls += 1;
+			throw new Error('invalid_grant {"error":"invalid_grant"}');
+		});
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+			refreshCalls += 1;
+			throw new Error('invalid_grant {"error":"invalid_grant"}');
+		});
+		// Metadata-only drift: same refresh token, different serialized bytes.
+		const sharedStore = store;
+		vi.spyOn(sharedStore, "tryDisableAuthCredentialIfMatches").mockImplementation(() => false);
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-cas-unrotated");
+
+			expect(apiKey).toBeUndefined();
+			// The revoked credential must be disabled by id, not retried forever.
+			expect(events).toHaveLength(1);
+			expect(events[0]?.disabledCause).toContain("invalid_grant");
+			expect(sharedStore.listAuthCredentials("anthropic")).toHaveLength(0);
+			expect(credentialId).toBeGreaterThan(0);
+			// Bounded work: no unbounded reload/refresh loop.
+			expect(refreshCalls).toBeLessThanOrEqual(4);
+		});
+	});
+
+	test("bounds reload retries when the failing row keeps vanishing", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// An account switcher replaces the provider's rows wholesale, so the id we
+		// attempted no longer exists: the pre-check finds no row (no rotation
+		// evidence) and the CAS can never match. Recovery must terminate.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "expired-access",
+				refresh: "revoked-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+
+		let refreshCalls = 0;
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
+			refreshCalls += 1;
+			throw new Error('invalid_grant {"error":"invalid_grant"}');
+		});
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+			refreshCalls += 1;
+			throw new Error('invalid_grant {"error":"invalid_grant"}');
+		});
+		const sharedStore = store;
+		// Row lookups never surface the attempted id, and the CAS never matches.
+		vi.spyOn(sharedStore, "tryDisableAuthCredentialIfMatches").mockImplementation(() => false);
+		const originalList = sharedStore.listAuthCredentials.bind(sharedStore);
+		vi.spyOn(sharedStore, "listAuthCredentials").mockImplementation((provider?: string) =>
+			originalList(provider).map(row => ({ ...row, id: row.id + 1000 })),
+		);
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-cas-vanished");
+
+			expect(apiKey).toBeUndefined();
+			// Terminates instead of recursing forever on the same revoked token.
+			expect(refreshCalls).toBeLessThanOrEqual(12);
+		});
+	});
+
 	test("still disables when the failure is real (no concurrent rotation)", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

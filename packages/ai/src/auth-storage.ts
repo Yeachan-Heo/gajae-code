@@ -572,6 +572,16 @@ const OAUTH_REFRESH_SKEW_MS = 60_000;
  * pathological detach-without-reattach loops can't grow memory unboundedly.
  */
 const MAX_PENDING_DISABLED_EVENTS = 32;
+/**
+ * Cap on how many times an OAuth resolution may reload the credential store and
+ * re-resolve after a failed refresh. Each retry exists to recover from a peer
+ * process rotating (or replacing) the row under us, which is a bounded event:
+ * the peer either published a usable credential we pick up on the next pass, or
+ * it did not. Without a cap, a credential whose disable can never be applied
+ * (row replaced by an account switcher, CAS predicate that can never match)
+ * makes the recovery path re-issue the same failing token refresh forever.
+ */
+const MAX_OAUTH_RESOLUTION_RELOADS = 3;
 
 type UsageCacheEntry<T> = {
 	value: T;
@@ -1424,6 +1434,34 @@ export class AuthStorage {
 		this.#resetProviderAssignments(provider);
 		this.#emitCredentialDisabled({ provider, disabledCause });
 		return true;
+	}
+
+	/**
+	 * Whether the persisted row `credentialId` is still an OAuth credential holding
+	 * `refreshToken`. Used by the refresh-failure path to tell "a peer rotated this
+	 * row" (retry is worthwhile) apart from "the row is unchanged but the CAS
+	 * predicate cannot match it" (retry replays the same failing refresh).
+	 */
+	#credentialRowHoldsRefreshToken(provider: string, credentialId: number, refreshToken: string): boolean {
+		const row = this.#store.listAuthCredentials(provider).find(entry => entry.id === credentialId);
+		const credential = row?.credential;
+		return credential?.type === "oauth" && credential.refresh === refreshToken;
+	}
+
+	/**
+	 * Soft-deletes a row by id, bypassing the data-equality CAS. Only safe when the
+	 * caller has confirmed the row still holds the credential it attempted to
+	 * refresh, so no peer rotation can be clobbered.
+	 */
+	#disableCredentialById(provider: string, credentialId: number, disabledCause: string): void {
+		this.#store.deleteAuthCredential(credentialId, disabledCause);
+		const entries = this.#getStoredCredentials(provider);
+		this.#setStoredCredentials(
+			provider,
+			entries.filter(entry => entry.id !== credentialId),
+		);
+		this.#resetProviderAssignments(provider);
+		this.#emitCredentialDisabled({ provider, disabledCause });
 	}
 
 	#emitCredentialDisabled(event: CredentialDisabledEvent): void {
@@ -2989,7 +3027,15 @@ export class AuthStorage {
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
+		reloadsUsed = 0,
 	): Promise<OAuthResolutionResult | undefined> {
+		if (reloadsUsed > MAX_OAUTH_RESOLUTION_RELOADS) {
+			logger.warn("OAuth credential resolution exhausted its reload budget", {
+				provider,
+				reloadsUsed,
+			});
+			return undefined;
+		}
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options);
 		const selectedOAuthCredential =
 			selectedCredential?.credential.type === "oauth"
@@ -3087,18 +3133,27 @@ export class AuthStorage {
 					usagePrechecked: candidate.usageChecked,
 					enforceProRequirement,
 				},
+				reloadsUsed,
 			);
 			if (resolved) return resolved;
 		}
 
 		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index)) {
-			return this.#tryOAuthCredential(provider, fallback.selection, providerKey, sessionId, options, {
-				checkUsage,
-				allowBlocked: true,
-				prefetchedUsage: fallback.usage,
-				usagePrechecked: fallback.usageChecked,
-				enforceProRequirement,
-			});
+			return this.#tryOAuthCredential(
+				provider,
+				fallback.selection,
+				providerKey,
+				sessionId,
+				options,
+				{
+					checkUsage,
+					allowBlocked: true,
+					prefetchedUsage: fallback.usage,
+					usagePrechecked: fallback.usageChecked,
+					enforceProRequirement,
+				},
+				reloadsUsed,
+			);
 		}
 
 		return undefined;
@@ -3219,6 +3274,7 @@ export class AuthStorage {
 			usagePrechecked?: boolean;
 			enforceProRequirement?: boolean;
 		},
+		reloadsUsed = 0,
 	): Promise<OAuthResolutionResult | undefined> {
 		const {
 			checkUsage,
@@ -3357,7 +3413,7 @@ export class AuthStorage {
 						credentialId: attemptedCredentialId,
 					});
 					await this.reload();
-					return this.#resolveOAuthSelection(provider, sessionId, options);
+					return this.#resolveOAuthSelection(provider, sessionId, options, reloadsUsed + 1);
 				}
 			}
 			// Only remove credentials for definitive auth failures
@@ -3387,18 +3443,39 @@ export class AuthStorage {
 					`oauth refresh failed: ${errorMsg}`,
 				);
 				if (!disabled) {
-					logger.debug("OAuth refresh disable lost CAS; reloading after peer rotation", {
-						provider,
-						index: selection.index,
-					});
-					await this.reload();
-					return this.#resolveOAuthSelection(provider, sessionId, options);
+					// The CAS predicate compares the row's serialized `data`, so it also
+					// misses when nothing was rotated: the row may have been replaced by
+					// a peer (account switcher rewriting the provider's credentials, so
+					// our snapshot's id no longer exists) or updated with unrelated
+					// identity metadata. Reload-and-retry only makes progress in the
+					// rotation case; otherwise the same revoked token is re-refreshed on
+					// every request forever. When the row is still present with the very
+					// refresh token we just tried, disabling by id is safe — there is no
+					// peer rotation to clobber — so apply it directly instead of looping.
+					const stillHoldsAttemptedToken =
+						attemptedCredentialId !== undefined &&
+						this.#credentialRowHoldsRefreshToken(provider, attemptedCredentialId, selection.credential.refresh);
+					if (stillHoldsAttemptedToken && attemptedCredentialId !== undefined) {
+						logger.warn("OAuth refresh disable CAS mismatched an unrotated row; disabling by id", {
+							provider,
+							index: selection.index,
+							credentialId: attemptedCredentialId,
+						});
+						this.#disableCredentialById(provider, attemptedCredentialId, `oauth refresh failed: ${errorMsg}`);
+					} else {
+						logger.debug("OAuth refresh disable lost CAS; reloading after peer rotation", {
+							provider,
+							index: selection.index,
+						});
+						await this.reload();
+						return this.#resolveOAuthSelection(provider, sessionId, options, reloadsUsed + 1);
+					}
 				}
 				if (
 					!this.#getCredentialSelector(provider, options) &&
 					this.#getCredentialsForProvider(provider).some(credential => credential.type === "oauth")
 				) {
-					return this.#resolveOAuthSelection(provider, sessionId, options);
+					return this.#resolveOAuthSelection(provider, sessionId, options, reloadsUsed);
 				}
 			} else {
 				// Block temporarily for transient failures (5 minutes)
