@@ -1221,7 +1221,10 @@ test("runtime connection: a settled approval releases its abandonment finalizer"
 	// Settle a request BEFORE its deferred publication runs, then tear the connection down. The
 	// release hook is a leak guard rather than a correctness fence (cancelling a settled id is a
 	// no-op), so this asserts the observable invariant: no resurrection and no accounting drift.
-	const second = runtime.createConnection(() => {});
+	const secondFrames: Uint8Array[] = [];
+	const second = runtime.createConnection(frame => {
+		secondFrames.push(frame);
+	});
 	await initialize(second);
 	runtime.subscriptions.subscribe(second.id, "thread-b");
 	runtime.manager.register("thread-b", "spawned", undefined, second.id);
@@ -1245,6 +1248,9 @@ test("runtime connection: a settled approval releases its abandonment finalizer"
 	expect(settledEarly).toBeDefined();
 	expect(runtime.broker.pendingCount).toBe(0);
 	expect(runtime.manager.get("thread-b")?.pendingApprovals ?? 0).toBe(0);
+	// A request settled before publication must NOT emit a ghost approval frame the client could
+	// never answer.
+	expect(secondFrames.map(dec).filter(message => message.method === "execCommandApproval")).toEqual([]);
 	await second.close();
 	expect(runtime.broker.pendingCount).toBe(0);
 });

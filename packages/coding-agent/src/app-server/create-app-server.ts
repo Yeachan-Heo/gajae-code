@@ -263,6 +263,9 @@ class Runtime implements AppServerRuntime {
 					unregister();
 					if (published) return;
 					published = true;
+					// Publishing a request that already settled would send a ghost approval frame the
+					// client can never answer, so skip it once the broker no longer holds the request.
+					if (!this.broker.getPending(id)) return;
 					for (const connectionId of recipients) {
 						const target = active() ? this.#connections.get(connectionId) : undefined;
 						try {
