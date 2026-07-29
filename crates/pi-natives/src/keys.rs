@@ -202,10 +202,8 @@ static LEGACY_SEQUENCES: phf::Map<&'static [u8], &'static str> = phf_map! {
 	b"\x1b[15~" => "f5", b"\x1b[17~" => "f6", b"\x1b[18~" => "f7", b"\x1b[19~" => "f8",
 	b"\x1b[20~" => "f9", b"\x1b[21~" => "f10", b"\x1b[23~" => "f11", b"\x1b[24~" => "f12",
 	// Alt+arrow (legacy Meta navigation aliases)
-	b"\x1bb" => "alt+left", b"\x1bB" => "alt+left",
-	b"\x1bf" => "alt+right", b"\x1bF" => "alt+right",
-	b"\x1bp" => "alt+up", b"\x1bP" => "alt+up",
-	b"\x1bn" => "alt+down", b"\x1bN" => "alt+down",
+	b"\x1bb" => "alt+left",
+	b"\x1bf" => "alt+right",
 };
 
 /// Pre-allocated single ASCII printable characters (33-126)
@@ -553,7 +551,10 @@ fn parse_modify_other_keys(bytes: &[u8]) -> Option<(u32, i32)> {
 	}
 
 	let modifier = mod_value - 1;
-	let keycode = i32::try_from(keycode_u32).ok()?;
+	let mut keycode = i32::try_from(keycode_u32).ok()?;
+	if modifier & MOD_SHIFT != 0 && (i32::from(b'A')..=i32::from(b'Z')).contains(&keycode) {
+		keycode += i32::from(b'a' - b'A');
+	}
 	Some((modifier, keycode))
 }
 
@@ -1089,13 +1090,12 @@ fn parse_esc_pair(code: u8, kitty_protocol_active: bool) -> Option<Cow<'static, 
 		_ => {},
 	}
 
-	// Legacy Meta navigation aliases always retain their navigation meaning;
-	// CSI-u and modifyOtherKeys provide the disambiguated literal Alt-letter path.
+	// Lowercase legacy Meta navigation aliases retain their navigation meaning.
+	// Uppercase escape pairs remain literal Alt+Shift letters so existing
+	// application bindings stay reachable.
 	match code {
-		b'b' | b'B' => Some(Cow::Borrowed("alt+left")),
-		b'f' | b'F' => Some(Cow::Borrowed("alt+right")),
-		b'p' | b'P' => Some(Cow::Borrowed("alt+up")),
-		b'n' | b'N' => Some(Cow::Borrowed("alt+down")),
+		b'b' => Some(Cow::Borrowed("alt+left")),
+		b'f' => Some(Cow::Borrowed("alt+right")),
 		b'a'..=b'z' => Some(Cow::Borrowed(ALT_LETTERS[(code - b'a') as usize])),
 		b'A'..=b'Z' => Some(Cow::Borrowed(ALT_SHIFT_LETTERS[(code - b'A') as usize])),
 		b' ' if !kitty_protocol_active => Some(Cow::Borrowed("alt+space")),
@@ -1108,10 +1108,7 @@ fn parse_esc_pair(code: u8, kitty_protocol_active: bool) -> Option<Cow<'static, 
 
 #[inline]
 const fn is_legacy_meta_navigation_alias(bytes: &[u8]) -> bool {
-	matches!(
-		bytes,
-		b"\x1bb" | b"\x1bB" | b"\x1bf" | b"\x1bF" | b"\x1bp" | b"\x1bP" | b"\x1bn" | b"\x1bN"
-	)
+	matches!(bytes, b"\x1bb" | b"\x1bf")
 }
 
 // =============================================================================
@@ -1526,6 +1523,11 @@ mod tests {
 		assert!(!matches_key_inner(b"\x1b[27;5;27~", "escape", false));
 		assert!(matches_key_inner(b"\x1b[27;5u", "ctrl+escape", true));
 		assert!(matches_key_inner(b"\x1b[27;9u", "super+escape", true));
+		assert!(matches_key_inner(b"\x1b[27;4;78~", "alt+shift+n", false));
+		assert_eq!(
+			parse_key_inner(b"\x1b[27;4;78~", false).as_deref(),
+			Some("alt+shift+n"),
+		);
 	}
 	#[test]
 	fn two_byte_escape_sequences_are_parse_match_symmetric() {
@@ -1550,13 +1552,7 @@ mod tests {
 	fn legacy_meta_navigation_aliases_are_exclusive_under_kitty_on_and_off() {
 		let cases = [
 			(b"\x1bb".as_slice(), "alt+left", "alt+b"),
-			(b"\x1bB".as_slice(), "alt+left", "alt+shift+b"),
 			(b"\x1bf".as_slice(), "alt+right", "alt+f"),
-			(b"\x1bF".as_slice(), "alt+right", "alt+shift+f"),
-			(b"\x1bp".as_slice(), "alt+up", "alt+p"),
-			(b"\x1bP".as_slice(), "alt+up", "alt+shift+p"),
-			(b"\x1bn".as_slice(), "alt+down", "alt+n"),
-			(b"\x1bN".as_slice(), "alt+down", "alt+shift+n"),
 		];
 
 		for (bytes, navigation, literal) in cases {
@@ -1564,6 +1560,23 @@ mod tests {
 				assert_eq!(parse_key_inner(bytes, kitty_active).as_deref(), Some(navigation));
 				assert!(matches_key_inner(bytes, navigation, kitty_active));
 				assert!(!matches_key_inner(bytes, literal, kitty_active));
+			}
+		}
+		for (bytes, literal) in [(b"\x1bp".as_slice(), "alt+p"), (b"\x1bn".as_slice(), "alt+n")] {
+			for kitty in [false, true] {
+				assert_eq!(parse_key_inner(bytes, kitty).as_deref(), Some(literal));
+				assert!(matches_key_inner(bytes, literal, kitty));
+			}
+		}
+		for (bytes, literal) in [
+			(b"\x1bB".as_slice(), "alt+shift+b"),
+			(b"\x1bF".as_slice(), "alt+shift+f"),
+			(b"\x1bP".as_slice(), "alt+shift+p"),
+			(b"\x1bN".as_slice(), "alt+shift+n"),
+		] {
+			for kitty in [false, true] {
+				assert_eq!(parse_key_inner(bytes, kitty).as_deref(), Some(literal));
+				assert!(matches_key_inner(bytes, literal, kitty));
 			}
 		}
 	}
