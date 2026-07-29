@@ -362,7 +362,7 @@ describe("task no-session output refs", () => {
 		expect(session.getAuthorizedArtifactsDirs?.() ?? []).toEqual([]);
 	});
 
-	it("omits dead URIs after allocation failure and retries a later batch", async () => {
+	it("keeps a failed-allocation child and its resume non-durable, then retries a later batch", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
 			createSessionResult(createYieldingSession("output that must remain durable")),
@@ -371,15 +371,39 @@ describe("task no-session output refs", () => {
 
 		const session = createSession(null, `alloc-fail-${Snowflake.next()}`);
 		const tool = await TaskTool.create(session);
-		const failedText = await runDetachedTask(tool);
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		const execute = async () => {
+			const started = await tool.execute("tool-call", {
+				agent: "executor",
+				tasks: [{ id: "NoSession", description: "produce output", assignment: "Return a result." }],
+			} as TaskParams);
+			const jobId = started.details?.async?.jobId;
+			if (!jobId) throw new Error("Expected detached task job id");
+			await manager.waitForAll();
+			return manager.getJob(jobId)?.resultText ?? "";
+		};
+
+		const failedText = await execute();
 		expect(failedText).toContain("Task completed; output artifact unavailable.");
 		expect(matchAgentOutputId(failedText, "NoSession")).toBeNull();
 		expect(session.getArtifactsDir?.()).toBeNull();
 
-		const retriedText = await runDetachedTask(tool);
+		const record = manager.getSubagentRecords()[0];
+		expect(record?.resumable).toBe(true);
+		const resumed = manager.resumeSubagent(record!.subagentId, undefined, "continue");
+		expect(resumed.ok).toBe(true);
+		await manager.waitForAll();
+		const resumedText = manager.getJob(resumed.jobId!)?.resultText ?? "";
+		expect(resumedText).toContain("Task completed; output artifact unavailable.");
+		expect(matchAgentOutputId(resumedText, record!.subagentId)).toBeNull();
+		expect(session.getArtifactsDir?.()).toBeNull();
+
+		const retriedText = await execute();
 		expect(matchAgentOutputId(retriedText, "NoSession")).toBeTruthy();
 		const artifactsDir = session.getArtifactsDir?.();
 		expect(artifactsDir).toBeTruthy();
+		await manager.dispose({ timeoutMs: 100 });
 		await session.disposeSession();
 		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
 	});

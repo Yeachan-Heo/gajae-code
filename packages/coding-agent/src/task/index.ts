@@ -12,6 +12,7 @@
  *   - Progress tracking via JSON events
  *   - Session artifacts for debugging
  */
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
@@ -89,6 +90,7 @@ interface TaskResumeDescriptor {
 	params: TaskParams;
 	task: TaskItem & { id: string };
 	sessionFile: string | null;
+	durableOutputAllowed?: boolean;
 	forkContextSeed?: ForkContextSeed;
 	agentSource: AgentDefinition["source"];
 }
@@ -425,6 +427,7 @@ interface SessionLifetimeArtifactsState {
 	dir?: string;
 	manager?: ArtifactManager;
 	ensurePromise?: Promise<string | null>;
+	outputPrefix: string;
 	authorized: boolean;
 	cleanupRegistered: boolean;
 	originalGetArtifactsDir?: ToolSession["getArtifactsDir"];
@@ -442,19 +445,14 @@ const sessionLifetimeArtifacts = new WeakMap<ToolSession, SessionLifetimeArtifac
 function sessionLifetimeArtifactsState(session: ToolSession): SessionLifetimeArtifactsState {
 	let state = sessionLifetimeArtifacts.get(session);
 	if (!state) {
-		state = { authorized: false, cleanupRegistered: false };
+		state = {
+			authorized: false,
+			cleanupRegistered: false,
+			outputPrefix: `0-Session${randomUUID().replaceAll("-", "")}`,
+		};
 		sessionLifetimeArtifacts.set(session, state);
 	}
 	return state;
-}
-
-function sessionLifetimeOutputPrefix(dir: string): string {
-	const suffix = path
-		.basename(dir)
-		.replace(/^gjc-task-session-/, "")
-		.replace(/[^A-Za-z0-9_-]/g, "")
-		.slice(0, 24);
-	return `0-Session${suffix || "Root"}`;
 }
 
 /**
@@ -525,7 +523,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 */
 	async #ensureSessionLifetimeArtifacts(): Promise<{ dir: string; manager: ArtifactManager } | null> {
 		const state = sessionLifetimeArtifactsState(this.session);
-		if (state.dir && state.manager) return { dir: state.dir, manager: state.manager };
+		if (state.authorized && state.dir && state.manager) return { dir: state.dir, manager: state.manager };
 
 		const sessionArtifactsDir = this.session.getArtifactsDir?.() ?? null;
 		if (sessionArtifactsDir) {
@@ -595,7 +593,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		state.installedGetArtifactManager = () => manager;
 		if (owned || !this.session.agentOutputManager) {
 			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null, {
-				parentPrefix: owned ? sessionLifetimeOutputPrefix(dir) : undefined,
+				parentPrefix: owned ? state.outputPrefix : undefined,
 				getAuthorizedArtifactsDirs: () => this.session.getAuthorizedArtifactsDirs?.() ?? [],
 			});
 		}
@@ -620,18 +618,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (owned) {
 			const registerCleanup = this.session.registerSessionCleanup;
 			if (!registerCleanup) {
-				await fs.rm(dir, { recursive: true, force: true });
+				state.dir = undefined;
+				state.manager = undefined;
+				state.ensurePromise = undefined;
 				sessionLifetimeArtifacts.delete(this.session);
+				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 				return false;
 			}
 			try {
 				registerCleanup(cleanup);
 			} catch {
-				await fs.rm(dir, { recursive: true, force: true });
 				state.dir = undefined;
 				state.manager = undefined;
 				state.ensurePromise = undefined;
 				sessionLifetimeArtifacts.delete(this.session);
+				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 				return false;
 			}
 			if (cleanupRan) return false;
@@ -890,6 +891,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								resumeMessage: message,
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
 								suppressRoiReconciliation: true,
+								...(descriptor.durableOutputAllowed === true
+									? {}
+									: {
+											persistence: {
+												effectiveArtifactsDir: undefined,
+												parentArtifactManager: undefined,
+											},
+										}),
 							},
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -1114,6 +1123,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								params,
 								task: { ...taskItem, id: uniqueId },
 								sessionFile: subtaskSessionFile,
+								durableOutputAllowed: Boolean(batchArtifactsDir),
 								forkContextSeed: frozenForkSeed,
 								agentSource: fallbackAgentSource,
 							} satisfies TaskResumeDescriptor,
