@@ -115,6 +115,7 @@ interface PromptStatus {
 	readonly status: string;
 	readonly commandId?: string;
 	readonly turnId?: string;
+	readonly clientRef?: string;
 	readonly error?: { readonly code: string; readonly message: string };
 }
 
@@ -373,6 +374,7 @@ function promptStatus(value: unknown): PromptStatus | undefined {
 		status: candidate.status,
 		...(commandId === undefined ? {} : { commandId: nonEmptyString(commandId) ? commandId : undefined }),
 		...(turnId === undefined ? {} : { turnId: nonEmptyString(turnId) ? turnId : undefined }),
+		...(nonEmptyString(candidate.clientRef) ? { clientRef: candidate.clientRef } : {}),
 		...(errorCode !== undefined && errorText !== undefined ? { error: { code: errorCode, message: errorText } } : {}),
 	};
 }
@@ -811,6 +813,15 @@ export class TurnController {
 			);
 			return undefined;
 		}
+		// The lookup was keyed by our clientRef, so a returned ref naming a different prompt means the
+		// response does not describe this turn. Never bind another prompt's child identities.
+		if (status.clientRef !== undefined && status.clientRef !== active.clientRef) {
+			this.#markRecovery(
+				active,
+				new TurnControllerError("recovery_required", "Prompt reconciliation returned a foreign clientRef."),
+			);
+			return undefined;
+		}
 		// A canonical Q26 `failed` status carries `acceptedAt`, so the prompt WAS accepted and then
 		// terminalized. It is not proof of non-acceptance: bind the corroborated child identities and
 		// carry the failure so the turn is materialized durably instead of vanishing from history.
@@ -846,8 +857,12 @@ export class TurnController {
 	#projectionFailure(error: unknown): TurnControllerError {
 		if (error instanceof ProjectionCorruptError)
 			return new TurnControllerError("projection_corrupt", error.message, error);
+		// A conflict is a conflict whether the projection helper classified it or the bridge client
+		// threw it straight through; downgrading to recovery_required hides real data divergence.
 		if (error instanceof ProjectionAppendError && error.code === "idempotency_conflict")
 			return new TurnControllerError("idempotency_conflict", error.message, error);
+		if (operationError(error)?.code === "idempotency_conflict")
+			return new TurnControllerError("idempotency_conflict", errorMessage(error, "Projection conflict."), error);
 		return new TurnControllerError("recovery_required", errorMessage(error, "Durable projection failed."), error);
 	}
 

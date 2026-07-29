@@ -160,9 +160,12 @@ function revisionFromAppend(value: unknown): number {
 
 function errorFromOperation(value: unknown): { code?: string; message?: string } | undefined {
 	if (!isRecord(value)) return undefined;
-	const nested = isRecord(value.error) ? value.error : undefined;
-	const code = nested?.code ?? value.code ?? value.errorKey;
-	const message = nested?.message ?? value.message;
+	// Control responses may nest the payload under `result`, so inspect both levels: a nested
+	// idempotency_conflict must keep its typed code instead of degrading to a generic failure.
+	const candidate = appendResultCandidate(value) ?? value;
+	const nested = isRecord(candidate.error) ? candidate.error : isRecord(value.error) ? value.error : undefined;
+	const code = nested?.code ?? candidate.code ?? value.code ?? candidate.errorKey ?? value.errorKey;
+	const message = nested?.message ?? candidate.message ?? value.message;
 	if (typeof code !== "string" && typeof message !== "string") return undefined;
 	return {
 		...(typeof code === "string" ? { code } : {}),

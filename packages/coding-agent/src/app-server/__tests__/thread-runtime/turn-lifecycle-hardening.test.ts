@@ -34,6 +34,7 @@ class FakeClient implements SessionClient {
 	readonly calls: Array<{ operation: string; input: Record<string, unknown> }> = [];
 	readonly appended: ProjectionEnvelope[] = [];
 	appendResponse: unknown;
+	appendThrow: unknown;
 	private revision = 0;
 
 	constructor(private readonly options: FakeOptions = {}) {}
@@ -70,6 +71,7 @@ class FakeClient implements SessionClient {
 			const envelope = input.envelope as ProjectionEnvelope;
 			this.appended.push(envelope);
 			this.revision += 1;
+			if (this.appendThrow !== undefined) throw this.appendThrow;
 			if (this.appendResponse !== undefined) return this.appendResponse;
 			return { entryId: `append-${this.revision}`, revision: this.revision };
 		}
@@ -456,5 +458,77 @@ test("an errorless rejected projection append is never treated as a durable rece
 			code: "recovery_required",
 		});
 		expect(controller.getState(THREAD_ID), JSON.stringify(rejected)).toBe("recovery_required");
+	}
+});
+
+test("a nested or thrown idempotency conflict keeps its typed code", async () => {
+	// Nested under `result`: the code must survive unwrapping.
+	const nested = new FakeClient();
+	nested.appendResponse = { result: { ok: false, revision: 1, error: { code: "idempotency_conflict" } } };
+	const nestedController = new TurnController({
+		manager: managerWith(nested),
+		emit: () => {},
+		idFactory: () => APP_TURN_ID,
+	});
+	await expect(nestedController.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
+		code: "idempotency_conflict",
+	});
+
+	// Thrown straight through by the bridge client: still a conflict, not generic recovery.
+	const thrown = new FakeClient();
+	thrown.appendThrow = Object.assign(new Error("source key conflict"), { code: "idempotency_conflict" });
+	const thrownController = new TurnController({
+		manager: managerWith(thrown),
+		emit: () => {},
+		idFactory: () => APP_TURN_ID,
+	});
+	await expect(thrownController.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
+		code: "idempotency_conflict",
+	});
+});
+
+test("a reconciliation response naming a foreign clientRef never materializes a turn", async () => {
+	const client = new FakeClient({
+		promptError: new Error("request timeout"),
+		promptStatus: {
+			status: "failed",
+			commandId: COMMAND_ID,
+			turnId: CHILD_TURN_ID,
+			clientRef: "other-client-ref",
+			acceptedAt: 1,
+			terminalAt: 2,
+			error: { code: "prompt_failed", message: "child failed" },
+		},
+	});
+	const manager = managerWith(client);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+
+	await expect(controller.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
+		code: "recovery_required",
+	});
+	// It described a different prompt, so no child identities may be bound and nothing persisted.
+	expect(client.appended).toHaveLength(0);
+	expect(controller.getState(THREAD_ID)).toBe("recovery_required");
+});
+
+test("legitimate append receipt shapes are never rejected", async () => {
+	for (const receipt of [
+		{ entryId: "e", revision: 1 },
+		{ revision: 1 },
+		{ ok: true, revision: 1 },
+		{ accepted: true, revision: 1 },
+		{ result: { entryId: "e", revision: 1, reused: true } },
+	]) {
+		const client = new FakeClient();
+		client.appendResponse = receipt;
+		const controller = new TurnController({
+			manager: managerWith(client),
+			emit: () => {},
+			idFactory: () => APP_TURN_ID,
+		});
+		await expect(
+			controller.start({ threadId: THREAD_ID, params: { text: "hi" } }),
+			JSON.stringify(receipt),
+		).resolves.toBeDefined();
 	}
 });
