@@ -1,0 +1,814 @@
+import type { AgentMessage } from "@gajae-code/agent-core";
+import type { ThreadItem } from "../../../vendor/codex-app-server-schema/stable/typescript/v2/ThreadItem";
+import type { Turn } from "../../../vendor/codex-app-server-schema/stable/typescript/v2/Turn";
+import type { AgentSessionEvent } from "../../session/agent-session";
+import { AgentMessageReducer, type WireNotification } from "../items/agent-message-reducer";
+import { stableValidators } from "../protocol-source/schema-validators.generated";
+import type { SessionClient } from "./child-bridge";
+import type { ManagedThread, ThreadRuntimeManager } from "./thread-runtime-manager";
+import {
+	appendProjectionRecord,
+	makeTurnCreatedRecord,
+	makeTurnItemCompletedRecord,
+	makeTurnTerminalRecord,
+	ProjectionAppendError,
+	ProjectionCorruptError,
+	TurnProjectionReducer,
+} from "./turn-projection";
+
+export type TurnControllerState =
+	| "submitting"
+	| "accepted_unpublished"
+	| "durable"
+	| "responded"
+	| "streaming"
+	| "terminal"
+	| "recovery_required";
+
+export type TurnControllerErrorCode =
+	| "busy"
+	| "idempotency_conflict"
+	| "internal"
+	| "projection_corrupt"
+	| "recovery_required";
+
+export class TurnControllerError extends Error {
+	readonly code: TurnControllerErrorCode;
+	readonly cause: unknown;
+
+	constructor(code: TurnControllerErrorCode, message: string, cause?: unknown) {
+		super(message);
+		this.name = "TurnControllerError";
+		this.code = code;
+		this.cause = cause;
+	}
+}
+
+export interface TurnStartInput {
+	readonly threadId: string;
+	readonly params: Readonly<Record<string, unknown>>;
+}
+
+export interface TurnStartedNotification {
+	readonly method: "turn/started";
+	readonly params: { readonly threadId: string; readonly turn: Turn };
+}
+
+export interface TurnCompletedNotification {
+	readonly method: "turn/completed";
+	readonly params: { readonly threadId: string; readonly turn: Turn };
+}
+
+export interface TokenUsageBreakdown {
+	readonly inputTokens: number;
+	readonly outputTokens: number;
+	readonly cachedInputTokens: number;
+	readonly cacheWriteInputTokens: number;
+	readonly reasoningOutputTokens: number;
+	readonly totalTokens: number;
+}
+
+export interface ThreadTokenUsage {
+	readonly last: TokenUsageBreakdown;
+	readonly total: TokenUsageBreakdown;
+	readonly modelContextWindow: number | null;
+}
+
+export interface TokenUsageNotification {
+	readonly method: "thread/tokenUsage/updated";
+	readonly params: { readonly threadId: string; readonly turnId: string; readonly tokenUsage: ThreadTokenUsage };
+}
+
+export type TurnControllerNotification =
+	| WireNotification
+	| TurnStartedNotification
+	| TurnCompletedNotification
+	| TokenUsageNotification;
+export type TurnNotificationEmitter = (notification: TurnControllerNotification) => void | Promise<void>;
+export type TurnClock = () => number;
+export type TurnIdFactory = () => string;
+
+export interface TurnStartHandle {
+	readonly response: { readonly turn: Turn };
+	readonly responseDelivered: () => Promise<void>;
+	readonly rollbackUndelivered: () => Promise<void>;
+}
+
+export interface TurnControllerOptions {
+	readonly manager: ThreadRuntimeManager;
+	readonly emit: TurnNotificationEmitter;
+	readonly clock?: TurnClock;
+	readonly idFactory?: TurnIdFactory;
+	/** Maximum number of correlated child frames retained behind response delivery. */
+	readonly barrierCapacity?: number;
+}
+
+interface PromptAck {
+	readonly commandId: string;
+	readonly turnId: string;
+	readonly replayToken?: string;
+}
+
+interface PromptStatus {
+	readonly status: string;
+	readonly commandId?: string;
+	readonly turnId?: string;
+}
+
+type FailedLifecycle = {
+	readonly type: "agent_failed";
+	readonly messages: readonly AgentMessage[];
+	readonly error?: unknown;
+};
+
+type ParsedLifecycle =
+	| { readonly type: "agent_start" }
+	| { readonly type: "agent_end"; readonly messages: readonly AgentMessage[]; readonly stopReason?: string }
+	| FailedLifecycle;
+
+interface ParsedFrame {
+	readonly commandId: string;
+	readonly turnId: string;
+	readonly lifecycle: ParsedLifecycle | AgentSessionEvent;
+}
+
+type ActiveTurnState = TurnControllerState | "rolled_back";
+
+interface ActiveTurn {
+	readonly threadId: string;
+	readonly client: SessionClient;
+	readonly managed: ManagedThread;
+	readonly turn: Turn;
+	readonly clientRef: string;
+	readonly startedAtMs: number;
+	readonly reducer: AgentMessageReducer;
+	readonly projection: TurnProjectionReducer;
+	commandId?: string;
+	childTurnId?: string;
+	replayToken?: string;
+	state: ActiveTurnState;
+	bufferedFrames: ParsedFrame[];
+	barrierDelivered: boolean;
+	rolledBack: boolean;
+	terminalCommitted: boolean;
+	terminalMessages: readonly AgentMessage[];
+	failure?: TurnControllerError;
+	processingTail: Promise<void>;
+	responseDeliveredPromise?: Promise<void>;
+	rollbackPromise?: Promise<void>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function operationError(value: unknown): { readonly code?: string; readonly message?: string } | undefined {
+	if (!isRecord(value)) return undefined;
+	const nested = isRecord(value.error) ? value.error : undefined;
+	const code = nested?.code ?? value.code ?? value.errorKey;
+	const message = nested?.message ?? value.message;
+	if (typeof code !== "string" && typeof message !== "string") return undefined;
+	return {
+		...(typeof code === "string" ? { code } : {}),
+		...(typeof message === "string" ? { message } : {}),
+	};
+}
+
+function unwrapOperation(value: unknown): Record<string, unknown> | undefined {
+	if (!isRecord(value)) return undefined;
+	const result = value.result;
+	return isRecord(result) ? result : value;
+}
+
+function classifyPreflightCode(value: unknown): TurnControllerErrorCode | undefined {
+	const code = operationError(value)?.code;
+	if (!code) return undefined;
+	if (code === "busy" || code === "preflight_busy" || code === "already_running" || code === "turn_in_progress")
+		return "busy";
+	if (code === "idempotency_conflict" || code === "client_ref_conflict") return "idempotency_conflict";
+	return undefined;
+}
+function isExplicitOperationFailure(value: unknown): boolean {
+	const candidate = unwrapOperation(value);
+	return candidate?.ok === false || candidate?.error !== undefined || candidate?.accepted === false;
+}
+
+function isUncertainAckFailure(value: unknown): boolean {
+	if (value instanceof TurnControllerError && value.code === "recovery_required") return true;
+	const code = operationError(value)?.code;
+	if (
+		code === "timeout" ||
+		code === "request_timeout" ||
+		code === "transport_timeout" ||
+		code === "connection_closed" ||
+		code === "network_error"
+	)
+		return true;
+	if (value instanceof Error)
+		return /timeout|timed out|connection|transport|uncertain|lost|closed/iu.test(value.message);
+	return false;
+}
+
+function errorMessage(value: unknown, fallback: string): string {
+	const operation = operationError(value);
+	if (operation?.message) return operation.message;
+	return value instanceof Error ? value.message : fallback;
+}
+
+function textFromInput(params: Readonly<Record<string, unknown>>): string | undefined {
+	if (typeof params.text === "string" && params.text.trim().length > 0) return params.text;
+	const input = params.input;
+	if (Array.isArray(input)) {
+		const text = input
+			.filter(isRecord)
+			.filter(item => item.type === "text" && typeof item.text === "string")
+			.map(item => item.text as string)
+			.join("");
+		if (text.trim().length > 0) return text;
+	}
+	if (isRecord(input) && input.type === "text" && typeof input.text === "string" && input.text.trim().length > 0)
+		return input.text;
+	return undefined;
+}
+
+function identityFrom(record: Record<string, unknown>, field: "commandId" | "turnId"): string | undefined {
+	const aliases = field === "commandId" ? ["commandId", "command_id"] : ["turnId", "turn_id"];
+	let found: string | undefined;
+	for (const alias of aliases) {
+		if (!Object.hasOwn(record, alias)) continue;
+		const value = record[alias];
+		if (!nonEmptyString(value)) return undefined;
+		if (found !== undefined && found !== value) return undefined;
+		found = value;
+	}
+	return found;
+}
+
+function eventRecordFromFrame(frame: Record<string, unknown>): Record<string, unknown> | undefined {
+	if (frame.type === "agent_start" || frame.type === "agent_end" || frame.type === "agent_failed") return frame;
+	if (frame.type !== "event") return undefined;
+	const payload = isRecord(frame.payload) ? frame.payload : undefined;
+	if (!payload) return undefined;
+	const event = isRecord(payload.event) ? payload.event : undefined;
+	return event;
+}
+
+function messagesFrom(value: unknown): readonly AgentMessage[] {
+	if (!Array.isArray(value)) return [];
+	return value as AgentMessage[];
+}
+
+function parseLifecycle(frame: Record<string, unknown>): ParsedFrame | undefined {
+	const event = eventRecordFromFrame(frame);
+	if (!event || typeof event.type !== "string") return undefined;
+	const payload = isRecord(frame.payload) ? frame.payload : undefined;
+	const commandId =
+		identityFrom(frame, "commandId") ??
+		(payload ? identityFrom(payload, "commandId") : undefined) ??
+		identityFrom(event, "commandId");
+	const turnId =
+		identityFrom(frame, "turnId") ??
+		(payload ? identityFrom(payload, "turnId") : undefined) ??
+		identityFrom(event, "turnId");
+	if (!commandId || !turnId) return undefined;
+	switch (event.type) {
+		case "agent_start":
+			return { commandId, turnId, lifecycle: { type: "agent_start" } };
+		case "agent_end":
+			return {
+				commandId,
+				turnId,
+				lifecycle: {
+					type: "agent_end",
+					messages: messagesFrom(event.messages),
+					...(typeof event.stopReason === "string" ? { stopReason: event.stopReason } : {}),
+				},
+			};
+		case "agent_failed":
+			return {
+				commandId,
+				turnId,
+				lifecycle: {
+					type: "agent_failed",
+					messages: messagesFrom(event.messages),
+					...(Object.hasOwn(event, "error") ? { error: event.error } : {}),
+				},
+			};
+		case "message_start":
+		case "message_update":
+		case "message_end":
+		case "turn_start":
+		case "turn_end":
+		case "tool_execution_start":
+		case "tool_execution_update":
+		case "tool_execution_end":
+		case "auto_compaction_start":
+		case "auto_compaction_end":
+		case "auto_retry_start":
+		case "auto_retry_end":
+		case "model_fallback_switched":
+		case "ttsr_triggered":
+		case "todo_reminder":
+		case "todo_auto_clear":
+		case "irc_message":
+		case "subagent_steer_message":
+		case "notice":
+		case "thinking_level_changed":
+		case "goal_updated":
+			return { commandId, turnId, lifecycle: event as unknown as AgentSessionEvent };
+		default:
+			return undefined;
+	}
+}
+
+function promptAck(value: unknown): PromptAck | undefined {
+	const candidate = unwrapOperation(value);
+	if (candidate?.accepted !== true) return undefined;
+	if (!nonEmptyString(candidate.commandId) || !nonEmptyString(candidate.turnId)) return undefined;
+	if (candidate.replayToken !== undefined && !nonEmptyString(candidate.replayToken)) return undefined;
+	return {
+		commandId: candidate.commandId,
+		turnId: candidate.turnId,
+		...(candidate.replayToken === undefined ? {} : { replayToken: candidate.replayToken }),
+	};
+}
+
+function promptStatus(value: unknown): PromptStatus | undefined {
+	const candidate = unwrapOperation(value);
+	if (candidate?.status === undefined || typeof candidate.status !== "string") return undefined;
+	const commandId = candidate.commandId;
+	const turnId = candidate.turnId;
+	return {
+		status: candidate.status,
+		...(commandId === undefined ? {} : { commandId: nonEmptyString(commandId) ? commandId : undefined }),
+		...(turnId === undefined ? {} : { turnId: nonEmptyString(turnId) ? turnId : undefined }),
+	};
+}
+
+function turnErrorFromFailure(error: unknown): { message: string; codexErrorInfo: null; additionalDetails: null } {
+	return {
+		message: errorMessage(error, "The child agent failed."),
+		codexErrorInfo: null,
+		additionalDetails: null,
+	};
+}
+
+function validateResponse(response: { readonly turn: Turn }): void {
+	const validator = stableValidators.clientRequestResults["turn/start"];
+	if (!validator?.(response)) throw new TurnControllerError("internal", "Turn response failed the stable validator.");
+}
+
+function validateNotification(notification: TurnControllerNotification): void {
+	const validator = stableValidators.serverNotificationParams[notification.method];
+	if (!validator?.(notification.params))
+		throw new TurnControllerError("internal", `${notification.method} notification failed the stable validator.`);
+}
+
+function numericUsage(value: unknown): number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function usageNotification(
+	threadId: string,
+	turnId: string,
+	messages: readonly AgentMessage[],
+): TokenUsageNotification | undefined {
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const candidate = messages[index];
+		if (!isRecord(candidate) || candidate.role !== "assistant" || !isRecord(candidate.usage)) continue;
+		const usage = candidate.usage;
+		const inputTokens = numericUsage(usage.input);
+		const outputTokens = numericUsage(usage.output);
+		const cachedInputTokens = numericUsage(usage.cacheRead);
+		const cacheWriteInputTokens = numericUsage(usage.cacheWrite);
+		const reasoningOutputTokens = numericUsage(usage.reasoningTokens);
+		const observedTotal = numericUsage(usage.totalTokens);
+		const totalTokens =
+			observedTotal > 0 ? observedTotal : inputTokens + outputTokens + cachedInputTokens + cacheWriteInputTokens;
+		const breakdown: TokenUsageBreakdown = {
+			inputTokens,
+			outputTokens,
+			cachedInputTokens,
+			cacheWriteInputTokens,
+			reasoningOutputTokens,
+			totalTokens,
+		};
+		return {
+			method: "thread/tokenUsage/updated",
+			params: {
+				threadId,
+				turnId,
+				tokenUsage: { last: breakdown, total: breakdown, modelContextWindow: null },
+			},
+		};
+	}
+	return undefined;
+}
+
+function initialTurn(turnId: string, clockMs: number): Turn {
+	return {
+		id: turnId,
+		items: [],
+		itemsView: "full",
+		status: "inProgress",
+		error: null,
+		startedAt: Math.floor(clockMs / 1000),
+		completedAt: null,
+		durationMs: null,
+	};
+}
+
+function cloneTurn(turn: Turn): Turn {
+	return structuredClone(turn);
+}
+
+export class TurnController {
+	readonly #manager: ThreadRuntimeManager;
+	readonly #emit: TurnNotificationEmitter;
+	readonly #clock: TurnClock;
+	readonly #idFactory: TurnIdFactory;
+	readonly #barrierCapacity: number;
+	readonly #active = new Map<string, ActiveTurn>();
+	readonly #lastStates = new Map<string, TurnControllerState>();
+
+	constructor(options: TurnControllerOptions) {
+		this.#manager = options.manager;
+		this.#emit = options.emit;
+		this.#clock = options.clock ?? (() => Date.now());
+		this.#idFactory = options.idFactory ?? (() => Bun.randomUUIDv7());
+		this.#barrierCapacity = options.barrierCapacity ?? 128;
+		if (!Number.isSafeInteger(this.#barrierCapacity) || this.#barrierCapacity < 1)
+			throw new Error("Turn barrier capacity must be a positive safe integer.");
+	}
+
+	getState(threadId: string): TurnControllerState | undefined {
+		const active = this.#active.get(threadId);
+		return active?.state === "rolled_back" ? undefined : (active?.state ?? this.#lastStates.get(threadId));
+	}
+
+	get activeTurnCount(): number {
+		return this.#active.size;
+	}
+
+	acceptFrame(threadId: string, frame: Record<string, unknown>): void {
+		const active = this.#active.get(threadId);
+		if (active) this.#ingestFrame(active, frame);
+	}
+
+	async start(input: TurnStartInput): Promise<TurnStartHandle> {
+		const managed = this.#manager.get(input.threadId);
+		if (!managed?.client || managed.lifecycle !== "active")
+			throw new TurnControllerError("internal", `Thread ${input.threadId} is not loaded.`);
+		if (managed.activeTurn || this.#active.has(input.threadId))
+			throw new TurnControllerError("busy", `Thread ${input.threadId} already has an active turn.`);
+		const text = textFromInput(input.params);
+		if (text === undefined) throw new TurnControllerError("internal", "Turn input must contain text-capable input.");
+		const turnId = this.#idFactory();
+		// Mapping B keeps the app-server UUIDv7 turn.id stable across child reincarnation at the cost of one mapping projection.
+		if (!nonEmptyString(turnId)) throw new TurnControllerError("internal", "Turn id factory returned an empty id.");
+		const startedAtMs = this.#clock();
+		const turn = initialTurn(turnId, startedAtMs);
+		const projection = new TurnProjectionReducer();
+		const active: ActiveTurn = {
+			threadId: input.threadId,
+			client: managed.client,
+			managed,
+			turn,
+			clientRef: turnId,
+			startedAtMs,
+			reducer: new AgentMessageReducer({ threadId: input.threadId, turnId, clock: this.#clock }),
+			projection,
+			state: "submitting",
+			bufferedFrames: [],
+			barrierDelivered: false,
+			rolledBack: false,
+			terminalCommitted: false,
+			terminalMessages: [],
+			processingTail: Promise.resolve(),
+		};
+		this.#active.set(input.threadId, active);
+		this.#lastStates.set(input.threadId, "submitting");
+		this.#manager.setActiveTurn(input.threadId, true);
+
+		let ack: PromptAck | undefined;
+		try {
+			const response = await managed.client.control(
+				"turn.prompt",
+				{ text, clientRef: active.clientRef },
+				{ idempotencyKey: active.clientRef, confirm: true },
+			);
+			const preflightCode = classifyPreflightCode(response);
+			if (preflightCode !== undefined)
+				throw new TurnControllerError(preflightCode, errorMessage(response, `turn.prompt ${preflightCode}.`));
+			if (isExplicitOperationFailure(response) && !isUncertainAckFailure(response))
+				throw new TurnControllerError("internal", errorMessage(response, "turn.prompt failed before acceptance."));
+
+			ack = promptAck(response);
+			if (!ack) throw new TurnControllerError("recovery_required", "turn.prompt acknowledgement was uncertain.");
+		} catch (error) {
+			const preflightCode = classifyPreflightCode(error);
+			if (preflightCode !== undefined) {
+				this.#discardBeforeAcceptance(active);
+				throw new TurnControllerError(preflightCode, errorMessage(error, `turn.prompt ${preflightCode}.`), error);
+			}
+			if (!isUncertainAckFailure(error)) {
+				this.#markRecovery(
+					active,
+					new TurnControllerError("internal", errorMessage(error, "turn.prompt failed."), error),
+				);
+				throw active.failure;
+			}
+			const reconciled = await this.#reconcileLostAck(active);
+			if (!reconciled)
+				throw (
+					active.failure ?? new TurnControllerError("recovery_required", "Prompt acceptance is unknown.", error)
+				);
+			ack = reconciled;
+		}
+		if (!ack) throw new TurnControllerError("recovery_required", "Prompt acceptance is unknown.");
+		active.commandId = ack.commandId;
+		active.childTurnId = ack.turnId;
+		active.replayToken = ack.replayToken;
+		active.state = "accepted_unpublished";
+		try {
+			const createdRecord = makeTurnCreatedRecord({
+				turn: cloneTurn(turn),
+				commandId: ack.commandId,
+				turnId: ack.turnId,
+				clientRef: active.clientRef,
+				...(ack.replayToken === undefined ? {} : { replayToken: ack.replayToken }),
+			});
+			const receipt = await appendProjectionRecord(active.client, createdRecord);
+			active.projection.apply(receipt.record);
+			if (active.failure === undefined) active.state = "durable";
+		} catch (error) {
+			this.#markRecovery(active, this.#projectionFailure(error));
+			throw active.failure;
+		}
+		if (active.failure !== undefined) throw active.failure;
+
+		const response = { turn: cloneTurn(turn) } as const;
+		try {
+			validateResponse(response);
+		} catch (error) {
+			this.#markRecovery(active, this.#asControllerError(error, "internal"));
+			throw active.failure;
+		}
+		return {
+			response,
+			responseDelivered: () => this.#deliverResponse(active),
+			rollbackUndelivered: () => this.#rollbackUndelivered(active),
+		};
+	}
+
+	#ingestFrame(active: ActiveTurn, frame: Record<string, unknown>): void {
+		if (this.#active.get(active.threadId) !== active || active.rolledBack || active.state === "terminal") return;
+		const parsed = parseLifecycle(frame);
+		if (!parsed) return;
+		if (active.commandId !== undefined && active.childTurnId !== undefined && !this.#matches(active, parsed)) return;
+		if (!active.barrierDelivered) {
+			if (active.bufferedFrames.length >= this.#barrierCapacity) {
+				this.#markRecovery(
+					active,
+					new TurnControllerError("recovery_required", "Turn response barrier overflowed."),
+				);
+				return;
+			}
+			active.bufferedFrames.push(parsed);
+			return;
+		}
+		active.processingTail = active.processingTail
+			.then(async () => await this.#processFrame(active, parsed))
+			.catch(error => {
+				this.#markRecovery(active, this.#asControllerError(error, "internal"));
+			});
+	}
+
+	#matches(active: ActiveTurn, frame: ParsedFrame): boolean {
+		return active.commandId === frame.commandId && active.childTurnId === frame.turnId;
+	}
+
+	async #deliverResponse(active: ActiveTurn): Promise<void> {
+		if (active.responseDeliveredPromise !== undefined) return await active.responseDeliveredPromise;
+		active.responseDeliveredPromise = (async () => {
+			if (active.rolledBack || active.state === "rolled_back") return;
+			if (active.state === "recovery_required")
+				throw active.failure ?? new TurnControllerError("recovery_required", "Turn cannot be delivered.");
+			active.barrierDelivered = true;
+			active.state = "responded";
+			const buffered = active.bufferedFrames.splice(0, active.bufferedFrames.length);
+			try {
+				const started: TurnStartedNotification = {
+					method: "turn/started",
+					params: { threadId: active.threadId, turn: cloneTurn(active.turn) },
+				};
+				validateNotification(started);
+				await this.#emit(started);
+				for (const frame of buffered) {
+					if (!this.#matches(active, frame)) continue;
+					await this.#processFrame(active, frame);
+				}
+				await active.processingTail;
+			} catch (error) {
+				this.#markRecovery(active, this.#asControllerError(error, "internal"));
+				throw active.failure;
+			}
+		})();
+		return await active.responseDeliveredPromise;
+	}
+
+	async #rollbackUndelivered(active: ActiveTurn): Promise<void> {
+		if (active.rollbackPromise !== undefined) return await active.rollbackPromise;
+		active.rollbackPromise = (async () => {
+			if (active.barrierDelivered || active.rolledBack || active.state === "terminal") return;
+			this.#markRecovery(
+				active,
+				new TurnControllerError(
+					"recovery_required",
+					"Turn was accepted and persisted, but its response was not delivered.",
+				),
+			);
+		})();
+		return await active.rollbackPromise;
+	}
+
+	async #processFrame(active: ActiveTurn, frame: ParsedFrame): Promise<void> {
+		if (active.rolledBack || active.state === "recovery_required" || active.state === "terminal") return;
+		if (!this.#matches(active, frame)) return;
+		const lifecycle = frame.lifecycle;
+		if (lifecycle.type === "agent_start") {
+			active.state = "streaming";
+			return;
+		}
+		if (lifecycle.type === "agent_end") {
+			await this.#finish(active, "agent_end", lifecycle.messages, lifecycle.stopReason, undefined);
+			return;
+		}
+		if (lifecycle.type === "agent_failed") {
+			await this.#finish(active, "agent_failed", lifecycle.messages, undefined, lifecycle.error);
+			return;
+		}
+		const notifications = active.reducer.accept(lifecycle);
+		active.state = "streaming";
+		await this.#publishReducerNotifications(active, notifications);
+	}
+
+	async #publishReducerNotifications(active: ActiveTurn, notifications: readonly WireNotification[]): Promise<void> {
+		for (const notification of notifications) {
+			if (notification.method === "item/completed")
+				await this.#persistCompletedItem(active, notification.params.item, notification.params.completedAtMs);
+
+			validateNotification(notification);
+			await this.#emit(notification);
+		}
+	}
+
+	async #persistCompletedItem(active: ActiveTurn, item: ThreadItem, completedAtMs: number): Promise<void> {
+		if (!active.commandId || !active.childTurnId)
+			throw new TurnControllerError("recovery_required", "Completed item has no child mapping.");
+		const order = active.projection.nextItemOrder(active.turn.id);
+		const record = makeTurnItemCompletedRecord(
+			{ turnId: active.turn.id, item, order, completedAtMs },
+			{ commandId: active.commandId, turnId: active.childTurnId },
+			active.turn.id,
+		);
+		const receipt = await appendProjectionRecord(active.client, record);
+		active.projection.apply(receipt.record);
+		active.turn.items = [...active.projection.snapshot(active.turn.id).items];
+	}
+
+	async #finish(
+		active: ActiveTurn,
+		kind: "agent_end" | "agent_failed",
+		messages: readonly AgentMessage[],
+		stopReason: string | undefined,
+		failure: unknown,
+	): Promise<void> {
+		if (active.terminalCommitted || active.state === "terminal" || active.state === "recovery_required") return;
+		const outcomeKind =
+			kind === "agent_failed"
+				? "failed"
+				: stopReason === undefined || stopReason === "completed"
+					? "completed"
+					: "interrupted";
+		const itemNotifications = active.reducer.completeTurn({ kind: outcomeKind, messages });
+		await this.#publishReducerNotifications(active, itemNotifications);
+		if (!active.commandId || !active.childTurnId)
+			throw new TurnControllerError("recovery_required", "Terminal frame has no child mapping.");
+		const now = this.#clock();
+		const current = active.projection.snapshot(active.turn.id);
+		const terminal: Turn = {
+			...current,
+			status: outcomeKind,
+			error: outcomeKind === "failed" ? turnErrorFromFailure(failure) : null,
+			completedAt: Math.floor(now / 1000),
+			durationMs: Math.max(0, now - active.startedAtMs),
+		};
+		const terminalRecord = makeTurnTerminalRecord(
+			{ turn: terminal },
+			{ commandId: active.commandId, turnId: active.childTurnId },
+		);
+		const receipt = await appendProjectionRecord(active.client, terminalRecord);
+		active.projection.apply(receipt.record);
+		active.turn.items = [...active.projection.snapshot(active.turn.id).items];
+		active.terminalMessages = messages;
+		active.terminalCommitted = true;
+		active.state = "terminal";
+		this.#manager.setActiveTurn(active.threadId, false);
+		const completed: TurnCompletedNotification = {
+			method: "turn/completed",
+			params: { threadId: active.threadId, turn: cloneTurn(terminal) },
+		};
+		validateNotification(completed);
+		await this.#emit(completed);
+		const usage = usageNotification(active.threadId, active.turn.id, messages);
+		if (usage !== undefined) {
+			validateNotification(usage);
+			await this.#emit(usage);
+		}
+		this.#disposeActive(active);
+	}
+
+	async #reconcileLostAck(active: ActiveTurn): Promise<PromptAck | undefined> {
+		let raw: unknown;
+		try {
+			raw = await active.client.query("turn.prompt_status", { clientRef: active.clientRef });
+		} catch (error) {
+			this.#markRecovery(
+				active,
+				new TurnControllerError("recovery_required", "Prompt acknowledgement and reconciliation were lost.", error),
+			);
+			return undefined;
+		}
+		const status = promptStatus(raw);
+		if (!status || status.status === "unknown") {
+			this.#markRecovery(
+				active,
+				new TurnControllerError("recovery_required", "Prompt acceptance is unknown after reconciliation."),
+			);
+			return undefined;
+		}
+		if (status.status === "failed") {
+			this.#markRecovery(active, new TurnControllerError("internal", "Child rejected the prompt after submission."));
+			return undefined;
+		}
+		if (
+			(status.status === "accepted" ||
+				status.status === "in_flight" ||
+				status.status === "terminal_ok" ||
+				status.status === "terminal") &&
+			nonEmptyString(status.commandId) &&
+			nonEmptyString(status.turnId)
+		)
+			return { commandId: status.commandId, turnId: status.turnId };
+		this.#markRecovery(
+			active,
+			new TurnControllerError("recovery_required", "Prompt reconciliation returned malformed child identities."),
+		);
+		return undefined;
+	}
+
+	#projectionFailure(error: unknown): TurnControllerError {
+		if (error instanceof ProjectionCorruptError)
+			return new TurnControllerError("projection_corrupt", error.message, error);
+		if (error instanceof ProjectionAppendError && error.code === "idempotency_conflict")
+			return new TurnControllerError("idempotency_conflict", error.message, error);
+		return new TurnControllerError("recovery_required", errorMessage(error, "Durable projection failed."), error);
+	}
+
+	#asControllerError(error: unknown, fallbackCode: TurnControllerErrorCode): TurnControllerError {
+		if (error instanceof TurnControllerError) return error;
+		if (error instanceof ProjectionCorruptError)
+			return new TurnControllerError("projection_corrupt", error.message, error);
+		if (error instanceof ProjectionAppendError)
+			return new TurnControllerError(
+				error.code === "idempotency_conflict" ? "idempotency_conflict" : "recovery_required",
+				error.message,
+				error,
+			);
+		return new TurnControllerError(fallbackCode, errorMessage(error, "Turn processing failed."), error);
+	}
+
+	#markRecovery(active: ActiveTurn, error: TurnControllerError): void {
+		if (active.state === "terminal" || active.rolledBack) return;
+		active.state = "recovery_required";
+		active.failure ??= error;
+		active.bufferedFrames.length = 0;
+	}
+
+	#discardBeforeAcceptance(active: ActiveTurn): void {
+		active.rolledBack = true;
+		active.state = "rolled_back";
+		this.#disposeActive(active);
+	}
+
+	#disposeActive(active: ActiveTurn): void {
+		if (active.state !== "rolled_back") this.#lastStates.set(active.threadId, active.state);
+		if (this.#active.get(active.threadId) === active) this.#active.delete(active.threadId);
+		this.#manager.setActiveTurn(active.threadId, false);
+	}
+}
