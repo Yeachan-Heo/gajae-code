@@ -10,6 +10,7 @@
 - Managed-session startup failures now include their bounded preparation classification (and path-free native durability diagnostic when available), so Windows launch crashes no longer collapse to an unactionable generic error while filesystem paths and raw OS messages remain redacted (#3383).
 - Single-model sessions now rotate immediately to another stored provider credential after a content-free quota or rate-limit failure, without requiring a synthetic model fallback chain. Credential rotation is replay-safe for content-free failures regardless of extension lifecycle participation, and traverses the full credential pool independent of `retry.maxRetries` (#3491).
 - External credential discovery now follows `CLAUDE_CONFIG_DIR` and `CODEX_HOME` instead of always reading `~/.claude` and `~/.codex`, so importing from an account switcher (or any relocated Claude Code / Codex CLI config root) picks up the account the launching shell selected. Both variables resolve through the credential env trust boundary and must be absolute; redacted summaries name the variable, never the resolved path.
+- The `acp_conformance` CI job runs again. The pinned upstream `acpx` checkout resolves its own imports (`@agentclientprotocol/sdk`, `zod`) from its own tree, but its dependencies were never installed, so the corpus runner aborted with `Cannot find module 'zod/v4'` before executing a single case. The checkout is now installed after provenance verification, and the reused warm cache still skips the reinstall.
 
 ### Added
 

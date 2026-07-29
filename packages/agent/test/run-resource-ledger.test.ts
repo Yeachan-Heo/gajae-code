@@ -65,6 +65,23 @@ describe("run resource ledger", () => {
 		});
 	});
 
+	test("post-prompt work registered after seal still settles the run", async () => {
+		// `agent_end` is published before seal(), so its handlers register their own
+		// post-prompt work while the terminal event is still draining. Treating that
+		// as an escaped resource made every cancel permanently unfenced.
+		const ledger = createRunResourceLedger();
+		const late = Promise.withResolvers<void>();
+		ledger.open("run");
+		ledger.seal("run");
+		ledger.track("run", "post_prompt", "agent-session-event", late.promise);
+
+		const settlement = ledger.waitForSettlement("run", { graceMs: 5_000 });
+		expect(ledger.pending("run")).toMatchObject([{ kind: "post_prompt", label: "agent-session-event" }]);
+		late.resolve();
+		expect(await settlement).toEqual({ status: "settled" });
+		expect(ledger.pending("run")).toEqual([]);
+	});
+
 	test("quarantine resolves existing and future waiters as unfenced", async () => {
 		const ledger = createRunResourceLedger();
 		const resource = Promise.withResolvers<void>();
