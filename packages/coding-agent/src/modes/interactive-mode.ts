@@ -458,6 +458,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#tasksAggregator?: TasksAggregator;
 	#foregroundActivity = false;
 	#activityIndicatorSuspensions = 0;
+	#suspendedActivityIndicator?: Loader;
 	#stopped = false;
 	#initPromise?: Promise<void>;
 	#stopListeners = new Set<() => void>();
@@ -1462,6 +1463,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#stopListeners.clear();
 		this.#stopLoadingAnimation();
+		this.#suspendedActivityIndicator = undefined;
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = undefined;
 		this.#petUnavailableWarningDisposer?.();
@@ -1697,14 +1699,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	syncActivityIndicator(): void {
-		if (
-			this.#stopped ||
-			!this.isInitialized ||
-			this.#activityIndicatorSuspensions > 0 ||
-			this.autoCompactionLoader ||
-			this.retryLoader
-		)
+		if (this.#stopped || this.#activityIndicatorSuspensions > 0 || this.autoCompactionLoader || this.retryLoader)
 			return;
+		const foregroundActive = this.#foregroundActivity || this.session.isStreaming;
+		if (!this.isInitialized && !foregroundActive) {
+			this.#stopLoadingAnimation();
+			return;
+		}
 		const message = resolveActivityIndicatorMessage(
 			this.#foregroundActivity || this.session.isStreaming,
 			this.#activeBackgroundTaskCount(),
@@ -1748,12 +1749,29 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	suspendActivityIndicator(): () => void {
 		const isFirstSuspension = this.#activityIndicatorSuspensions++ === 0;
-		if (isFirstSuspension && !this.autoCompactionLoader && !this.retryLoader) this.#stopLoadingAnimation();
+		if (isFirstSuspension && !this.autoCompactionLoader && !this.retryLoader) {
+			const loadingAnimation = this.loadingAnimation;
+			if (loadingAnimation && this.statusContainer.children.includes(loadingAnimation)) {
+				this.statusContainer.detachChild(loadingAnimation);
+				this.#suspendedActivityIndicator = loadingAnimation;
+			}
+		}
 		let released = false;
 		return () => {
 			if (released) return;
 			released = true;
 			this.#activityIndicatorSuspensions = Math.max(0, this.#activityIndicatorSuspensions - 1);
+			if (this.#activityIndicatorSuspensions > 0) return;
+			const suspended = this.#suspendedActivityIndicator;
+			this.#suspendedActivityIndicator = undefined;
+			if (
+				!this.#stopped &&
+				suspended &&
+				this.loadingAnimation === suspended &&
+				!this.statusContainer.children.includes(suspended)
+			) {
+				this.statusContainer.addChild(suspended);
+			}
 			this.syncActivityIndicator();
 		};
 	}

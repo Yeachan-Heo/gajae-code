@@ -114,11 +114,21 @@ export function suspendInteractiveActivityIndicator(ctx: {
 	suspendActivityIndicator?: () => () => void;
 }): () => void {
 	if (ctx.suspendActivityIndicator) return ctx.suspendActivityIndicator();
-	stopInteractiveActivityIndicator(ctx, { restoreBackground: false });
+	const suspendedLoader = ctx.loadingAnimation;
+	const wasMounted = suspendedLoader !== undefined && ctx.statusContainer.children.includes(suspendedLoader);
+	if (suspendedLoader && wasMounted) ctx.statusContainer.detachChild(suspendedLoader);
 	let released = false;
 	return () => {
 		if (released) return;
 		released = true;
+		if (
+			wasMounted &&
+			suspendedLoader &&
+			ctx.loadingAnimation === suspendedLoader &&
+			!ctx.statusContainer.children.includes(suspendedLoader)
+		) {
+			ctx.statusContainer.addChild(suspendedLoader);
+		}
 		syncInteractiveActivityIndicator(ctx);
 	};
 }

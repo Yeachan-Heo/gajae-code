@@ -135,11 +135,16 @@ describe("interactive background activity indicator", () => {
 		mode.syncActivityIndicator();
 		expect(renderStatus(mode)).toContain("Background: 1 task…");
 
+		const suspendedBackgroundLoader = mode.loadingAnimation;
+		if (!suspendedBackgroundLoader) throw new Error("Expected background loader before suspension");
+		const stopSuspendedBackgroundLoader = vi.spyOn(suspendedBackgroundLoader, "stop");
 		const releaseModalActivity = mode.suspendActivityIndicator();
 		expect(renderStatus(mode)).toBe("");
 		mode.syncActivityIndicator();
 		expect(renderStatus(mode)).toBe("");
 		releaseModalActivity();
+		expect(mode.loadingAnimation).toBe(suspendedBackgroundLoader);
+		expect(stopSuspendedBackgroundLoader).not.toHaveBeenCalled();
 		expect(renderStatus(mode)).toContain("Background: 1 task…");
 
 		mode.ensureLoadingAnimation();

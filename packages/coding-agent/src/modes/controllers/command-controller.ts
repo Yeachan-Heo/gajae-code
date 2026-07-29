@@ -1004,6 +1004,9 @@ export class CommandController {
 	}
 
 	async handleContextClearCommand(): Promise<void> {
+		if (this.ctx.isStopped?.()) return;
+		clearInteractiveActivityLoaders(this.ctx);
+		stopInteractiveActivityIndicator(this.ctx);
 		if (this.ctx.session.isCompacting) {
 			this.ctx.session.abortCompaction();
 			while (this.ctx.session.isCompacting) {
@@ -1013,8 +1016,6 @@ export class CommandController {
 		if (this.ctx.isStopped?.()) return;
 		if (!(await this.ctx.session.clearContext())) return;
 		if (this.ctx.isStopped?.()) return;
-		clearInteractiveActivityLoaders(this.ctx);
-		stopInteractiveActivityIndicator(this.ctx);
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
 		this.ctx.statusLine.invalidate();

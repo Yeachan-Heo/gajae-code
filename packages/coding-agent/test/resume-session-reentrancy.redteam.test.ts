@@ -426,19 +426,28 @@ describe("handleResumeSession adversarial re-entrancy", () => {
 		}
 	});
 
-	it("RT-15 keeps the upstream transient-state outcome when the switch reports false", async () => {
-		// `switchSession` resolves false both for a pre-mutation `session_before_switch`
-		// cancellation and for a rollback that already disconnected agent events and
-		// aborted the previous run. `dev` clears the transient bookkeeping for both cases
-		// (its clear runs before `switchSession`), and this pins that the reordered clear
-		// keeps exactly that outcome: same fields dropped, no success status, no rebuild.
-		// Distinguishing the two phases needs a discriminated `switchSession` outcome and
-		// is tracked as follow-up, not changed here.
-		const switchSession = vi.fn<SwitchSession>().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+	it("RT-15 distinguishes pre-mutation cancellation from post-mutation rollback", async () => {
+		let attempt = 0;
+		const switchSession = vi.fn<SwitchSession>(async (_path, options) => {
+			attempt++;
+			if (attempt === 1) return false;
+			if (attempt === 2) {
+				(options as { onTransitionMutationStarted?: () => void } | undefined)?.onTransitionMutationStarted?.();
+				return false;
+			}
+			return true;
+		});
 		const harness = createResumeHarness({ switchSession });
 		try {
 			const controller = new SelectorController(harness.context);
 			const state = seedTransientSessionUi(harness.context);
+
+			await expect(controller.handleResumeSession("/tmp/pre-hook-cancelled.jsonl")).resolves.toBeUndefined();
+
+			expectTransientSessionUiPreserved(harness.context, state);
+			expect(harness.showStatus).not.toHaveBeenCalledWith("Resumed session");
+			expect(harness.context.rebuildInitialMessages).not.toHaveBeenCalled();
+			expect(harness.statusContainer.children).toHaveLength(0);
 
 			await expect(controller.handleResumeSession("/tmp/rolled-back.jsonl")).resolves.toBeUndefined();
 
@@ -449,14 +458,13 @@ describe("handleResumeSession adversarial re-entrancy", () => {
 			expect(harness.context.compactionQueuedMessages).toHaveLength(0);
 			expect(harness.context.loadingAnimation).toBeUndefined();
 			expect(state.loadingAnimation.stop).toHaveBeenCalledTimes(1);
-			// A rolled-back switch is not a resume: no success status, no transcript rebuild.
 			expect(harness.showStatus).not.toHaveBeenCalledWith("Resumed session");
 			expect(harness.context.rebuildInitialMessages).not.toHaveBeenCalled();
 			expect(harness.statusContainer.children).toHaveLength(0);
 
-			// The guard is still released, so the next resume proceeds normally.
+			// Both cancellation paths release the guard, so a later resume proceeds normally.
 			await expect(controller.handleResumeSession("/tmp/retry.jsonl")).resolves.toBeUndefined();
-			expect(switchSession).toHaveBeenCalledTimes(2);
+			expect(switchSession).toHaveBeenCalledTimes(3);
 			expect(harness.showStatus).toHaveBeenCalledWith("Resumed session");
 		} finally {
 			harness.dispose();
