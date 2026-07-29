@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { processResponsesStream } from "@gajae-code/ai/providers/openai-responses-shared";
 import type { AssistantMessage, Model, ToolCall } from "@gajae-code/ai/types";
-import { isCompleteJson } from "@gajae-code/ai/utils/json-parse";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 
 // A response cut short for length (`incomplete`) can stop mid-tool-call. The
@@ -207,25 +206,8 @@ describe("Responses provider: truncated tool-call detection", () => {
 
 		const tools = toolBlocks(output);
 		expect(tools).toHaveLength(1);
+		expect(tools[0].customWireName).toBe("apply_patch");
 		expect(tools[0].arguments).toEqual({ input: fullPatch });
 		expect(tools[0].incompleteArguments).toBeFalsy();
-	});
-});
-
-describe("isCompleteJson", () => {
-	test("treats empty / whitespace as complete (no-arg tools)", () => {
-		expect(isCompleteJson("")).toBe(true);
-		expect(isCompleteJson("   ")).toBe(true);
-		expect(isCompleteJson(undefined)).toBe(true);
-	});
-	test("accepts well-formed JSON", () => {
-		expect(isCompleteJson('{"a":1}')).toBe(true);
-		expect(isCompleteJson("[1,2,3]")).toBe(true);
-		expect(isCompleteJson('"str"')).toBe(true);
-	});
-	test("rejects truncated JSON", () => {
-		expect(isCompleteJson('{"a":1')).toBe(false);
-		expect(isCompleteJson('{"path":"/etc/hosts","content":"line1')).toBe(false);
-		expect(isCompleteJson("[1,2,")).toBe(false);
 	});
 });

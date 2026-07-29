@@ -8,6 +8,7 @@
 - The documented `GJC_NO_STRICT` environment variable now takes effect. `adaptSchemaForStrict` read only the legacy `PI_NO_STRICT`, so an operator hitting a provider that rejects strict function schemas set the documented name and strict mode stayed on. Both names are honoured, canonical name first, and `GJC_NO_STRICT` is now listed in the environment-variable reference rather than only in the schema-normalisation note.
 - The documented `GJC_AUTH_NO_BORROW` environment variable now takes effect. Only the legacy `PI_AUTH_NO_BORROW` was read, so an operator who followed the documentation to disable macOS native-app token borrowing still had a JWT read out of the Perplexity desktop application during login. Both names are now honoured, and the contract stays presence-based as documented so that setting it to `0` cannot silently re-enable borrowing.
 - The Azure client's `AZURE_OPENAI_API_KEY` fallback is now resolved from trusted environment sources only. It read the merged view that includes the caller's `cwd/.env`, so a repository could supply the credential the client authenticates with; provider credential resolution is documented as excluding the project `.env`, and this fallback now matches. An explicit caller-supplied key still takes precedence, and shell / user-level configuration is unchanged.
+- Anthropic and Ollama tool calls cut off by an output-token limit are now marked incomplete before dispatch, so repaired partial JSON is rejected instead of executing with truncated arguments.
 
 ## [0.12.0] - 2026-07-28
 

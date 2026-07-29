@@ -18,7 +18,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
-import { parseStreamingJson } from "../utils/json-parse";
+import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import {
@@ -26,6 +26,7 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { flagTruncatedToolCalls } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
 
 export interface OllamaChatOptions extends StreamOptions {
@@ -357,8 +358,10 @@ function endToolCallBlock(stream: AssistantMessageEventStream, output: Assistant
 		return;
 	}
 	const toolCall = block as InternalToolCallBlock;
-	if (toolCall.partialJson) {
-		toolCall.arguments = parseStreamingJson<Record<string, unknown>>(toolCall.partialJson);
+	if (toolCall.partialJson !== undefined) {
+		if (toolCall.partialJson.trim()) {
+			toolCall.arguments = parseStreamingJson<Record<string, unknown>>(toolCall.partialJson);
+		}
 		delete toolCall.partialJson;
 	}
 	stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
@@ -393,6 +396,8 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 		let activeThinkingIndex: number | undefined;
 		let activeTextIndex: number | undefined;
 		const activeToolIndices = new Set<number>();
+		const unverifiableArgumentToolCallIds = new Set<string>();
+		let sawTerminalChunk = false;
 		try {
 			const apiKey = options.apiKey || getEnvApiKey(model.provider);
 			if (!apiKey) {
@@ -537,6 +542,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					for (const call of chunk.message.tool_calls) {
 						const name = call.function?.name ?? "unknown_tool";
 						const rawArgs = call.function?.arguments;
+						const unverifiableArguments = typeof rawArgs !== "string";
 						const partialJson = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs ?? {});
 						const toolCall: InternalToolCallBlock = {
 							type: "toolCall",
@@ -545,6 +551,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 							arguments: parseStreamingJson<Record<string, unknown>>(partialJson),
 							partialJson,
 						};
+						if (unverifiableArguments) unverifiableArgumentToolCallIds.add(toolCall.id);
 						output.content.push(toolCall);
 						const index = output.content.length - 1;
 						activeToolIndices.add(index);
@@ -561,6 +568,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					}
 				}
 				if (chunk.done) {
+					sawTerminalChunk = true;
 					if (activeThinkingIndex !== undefined) {
 						endThinkingBlock(stream, output, activeThinkingIndex);
 						activeThinkingIndex = undefined;
@@ -569,15 +577,35 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 						endTextBlock(stream, output, activeTextIndex);
 						activeTextIndex = undefined;
 					}
+					output.stopReason = mapDoneReason(chunk.done_reason, output);
+					// Ollama still owns every partialJson buffer here; use the helper's
+					// finalized-call branch before endToolCallBlock deletes those buffers.
+					// Non-string arguments have no raw completion evidence, so a length stop
+					// must fail closed rather than trusting normalized or re-serialized values.
+					flagTruncatedToolCalls(
+						output,
+						output.stopReason,
+						block => !unverifiableArgumentToolCallIds.has(block.id),
+					);
+					if (chunk.done_reason === undefined) {
+						for (const block of output.content) {
+							if (block.type !== "toolCall") continue;
+							const partialJson = (block as InternalToolCallBlock).partialJson;
+							if (partialJson !== undefined && !isCompleteJson(partialJson)) block.incompleteArguments = true;
+						}
+					}
 					for (const index of activeToolIndices) {
 						endToolCallBlock(stream, output, index);
 					}
 					activeToolIndices.clear();
-					output.stopReason = mapDoneReason(chunk.done_reason, output);
 					output.usage.input = chunk.prompt_eval_count ?? 0;
 					output.usage.output = chunk.eval_count ?? 0;
 					output.usage.totalTokens = output.usage.input + output.usage.output;
+					break;
 				}
+			}
+			if (!sawTerminalChunk) {
+				throw new Error("Ollama stream ended before terminal done chunk");
 			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) {

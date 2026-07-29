@@ -68,7 +68,7 @@ import {
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
+import { isCompleteJson, parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
@@ -1423,6 +1423,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			) & { index: number };
 			const blocks = output.content as Block[];
 			const blocksByAnthropicIndex = new Map<number, Block>();
+			const truncatedToolCalls = new Set<ToolCall>();
+			let sawTerminalStopReason = false;
 			// Derive from the ACTUAL request shape, not the option default: the request
 			// only sends `display: "summarized"` on specific paths (adaptive display is
 			// omitted for models where supportsAdaptiveThinkingDisplay is false). Defaulting
@@ -1440,8 +1442,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				// finalize the orphaned block so no internal stream fields leak into output.
 				const orphaned = blocksByAnthropicIndex.get(anthropicIndex);
 				if (orphaned) {
-					if (orphaned.type === "toolCall" && orphaned.partialJson.trim()) {
-						orphaned.arguments = parseStreamingJson(orphaned.partialJson);
+					if (orphaned.type === "toolCall") {
+						if (!isCompleteJson(orphaned.partialJson)) {
+							orphaned.incompleteArguments = true;
+							truncatedToolCalls.add(orphaned);
+						}
+						if (orphaned.partialJson.trim()) {
+							orphaned.arguments = parseStreamingJson(orphaned.partialJson);
+						}
 					}
 					delete (orphaned as { index?: number }).index;
 					delete (orphaned as { partialJson?: string }).partialJson;
@@ -1458,6 +1466,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 				output.stopReason = "stop";
 				firstTokenTime = undefined;
+				truncatedToolCalls.clear();
+				sawTerminalStopReason = false;
 			};
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
@@ -1472,6 +1482,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			while (true) {
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
+				truncatedToolCalls.clear();
+				sawTerminalStopReason = false;
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
 				const firstEventTimeoutAbortError = new FirstEventTimeoutError(
 					"Anthropic stream timed out while waiting for the first event",
@@ -1496,6 +1508,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					let sawEvent = false;
 					let sawMessageStart = false;
 					let sawTerminalEnvelope = false;
+					let sawMessageStop = false;
 					const isProgressEvent = createAnthropicStreamProgressPredicate();
 
 					for await (const event of iterateWithIdleTimeout(anthropicStream, {
@@ -1509,9 +1522,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						isProgressItem: isProgressEvent,
 					})) {
 						sawEvent = true;
+						if (sawMessageStop) {
+							throw createAnthropicStreamEnvelopeError("received event after message_stop");
+						}
 						if (sawProviderSafetyStop) {
 							if (event.type === "message_stop") {
 								sawTerminalEnvelope = true;
+								sawMessageStop = true;
 							}
 							continue;
 						}
@@ -1699,6 +1716,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "toolCall") {
+									if (!isCompleteJson(block.partialJson)) truncatedToolCalls.add(block);
 									if (block.partialJson.trim()) {
 										block.arguments = parseStreamingJson(block.partialJson);
 									}
@@ -1719,6 +1737,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							if (rawStopReason) {
 								output.stopReason = isProviderSafetyStop ? "error" : mapStopReason(rawStopReason);
 								sawTerminalEnvelope = true;
+								sawTerminalStopReason = true;
 							}
 							if (isProviderSafetyStop) {
 								sawProviderSafetyStop = true;
@@ -1760,6 +1779,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							calculateCost(model, output.usage);
 						} else if (event.type === "message_stop") {
 							sawTerminalEnvelope = true;
+							sawMessageStop = true;
 						}
 					}
 
@@ -1899,6 +1919,24 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				}
 			}
 
+			for (const block of blocksByAnthropicIndex.values()) {
+				delete (block as { index?: number }).index;
+				if (block.type === "toolCall") {
+					truncatedToolCalls.add(block);
+					if (block.partialJson.trim()) {
+						block.arguments = parseStreamingJson(block.partialJson);
+					}
+					delete (block as { partialJson?: string }).partialJson;
+				}
+			}
+			blocksByAnthropicIndex.clear();
+			if (output.stopReason === "length" || !sawTerminalStopReason) {
+				for (const block of output.content) {
+					if (block.type === "toolCall" && truncatedToolCalls.has(block)) {
+						block.incompleteArguments = true;
+					}
+				}
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			if (dropFastMode && resolveServiceTier(options?.serviceTier, model.provider) === "priority") {
