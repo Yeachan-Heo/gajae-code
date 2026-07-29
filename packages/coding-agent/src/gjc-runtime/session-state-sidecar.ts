@@ -226,7 +226,7 @@ function normalizedIdentity(
 	const cwd = context.cwd.trim();
 	const platform = context.platform ?? process.platform;
 	const pathApi = platform === "win32" ? path.win32 : path;
-	if (!sessionId || !cwd) throw new PreviousRuntimeStateReadError();
+	if (!sessionId || !cwd) throw new PreviousRuntimeStateReadError("identity_incomplete");
 	return {
 		sessionId,
 		cwd: pathApi.resolve(cwd),
@@ -372,11 +372,36 @@ export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): b
 	return stateForEvent(event) !== null;
 }
 
+/**
+ * Closed discriminant for every coordinator runtime-state failure branch. All
+ * branches share one message so existing assertions keep passing; the code is
+ * what makes them distinguishable in logs.
+ */
+export type RuntimeStateFailureReason =
+	| "identity_incomplete"
+	| "payload_invalid"
+	| "previous_read_failed"
+	| "previous_parse_failed"
+	| "previous_stat_failed"
+	| "previous_not_a_file"
+	| "previous_async_read_or_parse_failed"
+	| "identity_mismatch"
+	| "session_id_mismatch"
+	| "lock_unavailable"
+	| "owner_env_invalid"
+	| "write_failed";
+
 class PreviousRuntimeStateReadError extends Error {
-	constructor() {
+	readonly reason: RuntimeStateFailureReason;
+	constructor(reason: RuntimeStateFailureReason) {
 		super("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		this.name = "PreviousRuntimeStateReadError";
+		this.reason = reason;
 	}
+}
+
+export function runtimeStateFailureReason(error: unknown): RuntimeStateFailureReason | undefined {
+	return error instanceof PreviousRuntimeStateReadError ? error.reason : undefined;
 }
 
 function isAbsentStateFileError(error: unknown): boolean {
@@ -385,7 +410,7 @@ function isAbsentStateFileError(error: unknown): boolean {
 
 function parsePreviousPayload(raw: string): Record<string, unknown> {
 	const payload: unknown = JSON.parse(raw);
-	if (!validPreviousRuntimeStatePayload(payload)) throw new PreviousRuntimeStateReadError();
+	if (!validPreviousRuntimeStatePayload(payload)) throw new PreviousRuntimeStateReadError("payload_invalid");
 	return payload;
 }
 
@@ -437,14 +462,14 @@ function readPreviousPayload(stateFile: string): Record<string, unknown> {
 	} catch (error) {
 		lastPayloadByStateFile.delete(stateFile);
 		if (isAbsentStateFileError(error)) return {};
-		throw new PreviousRuntimeStateReadError();
+		throw new PreviousRuntimeStateReadError("previous_read_failed");
 	}
 	try {
 		return parsePreviousPayload(raw);
 	} catch (error) {
 		lastPayloadByStateFile.delete(stateFile);
 		if (error instanceof PreviousRuntimeStateReadError) throw error;
-		throw new PreviousRuntimeStateReadError();
+		throw new PreviousRuntimeStateReadError("previous_parse_failed");
 	}
 }
 
@@ -455,11 +480,11 @@ async function readPreviousPayloadForEvent(stateFile: string): Promise<Record<st
 	} catch (error) {
 		lastPayloadByStateFile.delete(stateFile);
 		if (isAbsentStateFileError(error)) return {};
-		throw new PreviousRuntimeStateReadError();
+		throw new PreviousRuntimeStateReadError("previous_stat_failed");
 	}
 	if (!stat.isFile()) {
 		lastPayloadByStateFile.delete(stateFile);
-		throw new PreviousRuntimeStateReadError();
+		throw new PreviousRuntimeStateReadError("previous_not_a_file");
 	}
 	const cached = lastPayloadByStateFile.get(stateFile);
 	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.payload;
@@ -470,7 +495,7 @@ async function readPreviousPayloadForEvent(stateFile: string): Promise<Record<st
 	} catch (error) {
 		lastPayloadByStateFile.delete(stateFile);
 		if (error instanceof PreviousRuntimeStateReadError) throw error;
-		throw new PreviousRuntimeStateReadError();
+		throw new PreviousRuntimeStateReadError("previous_async_read_or_parse_failed");
 	}
 }
 
@@ -532,7 +557,7 @@ function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, i
 				sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
 			))
 	)
-		throw new PreviousRuntimeStateReadError();
+		throw new PreviousRuntimeStateReadError("identity_mismatch");
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
@@ -556,7 +581,7 @@ function basePayload(input: {
 	sessionId: string;
 }): Record<string, unknown> {
 	const identity = normalizedIdentity(input.context);
-	if (identity.sessionId !== input.sessionId) throw new PreviousRuntimeStateReadError();
+	if (identity.sessionId !== input.sessionId) throw new PreviousRuntimeStateReadError("session_id_mismatch");
 	return {
 		schema_version: 1,
 		session_id: identity.sessionId,
@@ -740,7 +765,7 @@ async function withStateFileLock<T>(stateFile: string, operation: () => Promise<
 		return await withFileLock(stateFile, operation, { staleMs: 30_000, retries: 12_000, retryDelayMs: 5 });
 	} catch (error) {
 		if (error instanceof Error && error.message.startsWith("Failed to acquire lock")) {
-			throw new PreviousRuntimeStateReadError();
+			throw new PreviousRuntimeStateReadError("lock_unavailable");
 		}
 		throw error;
 	}
@@ -755,15 +780,21 @@ async function withCoordinatorTransactionLock<T>(stateFile: string, operation: (
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
+	try {
+		await fs.mkdir(path.dirname(stateFile), { recursive: true });
+		await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
+	} catch {
+		// Raw errno failures are indistinguishable from the read/parse branches once
+		// the caller's `.catch` discards them; classify them instead.
+		throw new PreviousRuntimeStateReadError("write_failed");
+	}
 	rememberWrittenPayload(stateFile, payload);
 }
 
 function contextWithManagedOwnerGeneration(context: RuntimeStateContext): RuntimeStateContext {
 	if (context.ownerTerminal) return context;
 	const ownerTerminal = ownerTerminalContextFromEnvironment();
-	if (ownerTerminal === "invalid") throw new PreviousRuntimeStateReadError();
+	if (ownerTerminal === "invalid") throw new PreviousRuntimeStateReadError("owner_env_invalid");
 	return ownerTerminal ? { ...context, ownerTerminal } : context;
 }
 
@@ -807,6 +838,91 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);
+					}),
+			),
+	);
+}
+
+/**
+ * Authorized `session_file` rotation for a committed in-process session switch.
+ *
+ * The event path (`assertPreviousRuntimeStateIdentity`) must keep refusing an
+ * implicit `session_file` change, otherwise a stale marker silently follows a
+ * different transcript. A committed `newSession`/`switchSession` is the one case
+ * where the live transcript legitimately changed, so it gets a separate,
+ * explicitly-called entry point instead of a relaxed assertion.
+ *
+ * Runs under the same transaction + state-file locks as the event path, and
+ * refuses unless the coordinator `session_id`, resolved `cwd`/`workdir`, and
+ * (when present) the owner generation all still match.
+ */
+export async function rotateCoordinatorRuntimeStateSessionFile(context: RuntimeStateContext): Promise<void> {
+	const stateFile = runtimeStateFileForContext(context);
+	if (!stateFile) return;
+	const resolved = contextWithManagedOwnerGeneration(context);
+	const identity = normalizedIdentity(resolved);
+	await serializeStateFileWrite(
+		stateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				stateFile,
+				async () =>
+					await withStateFileLock(stateFile, async () => {
+						const previous = await readPreviousPayloadForEvent(stateFile);
+						// Nothing persisted yet: the next ordinary event writes the live
+						// identity, so there is no stale marker to rotate.
+						if (Object.keys(previous).length === 0) return;
+						if (
+							previous.session_id !== identity.sessionId ||
+							typeof previous.cwd !== "string" ||
+							typeof previous.workdir !== "string" ||
+							!sameResolvedPath(previous.cwd, identity.cwd, identity.platform) ||
+							!sameResolvedPath(previous.workdir, identity.cwd, identity.platform)
+						)
+							throw new PreviousRuntimeStateReadError("identity_mismatch");
+						// Under managed ownership the prior generation must be present, well
+						// typed, and exactly equal. Accepting a missing or non-string value
+						// would let an unowned or malformed marker be relabeled as this
+						// owner's.
+						const previousGeneration = previous.owner_generation;
+						const expectedGeneration = resolved.ownerTerminal?.generation;
+						if (expectedGeneration !== undefined) {
+							if (typeof previousGeneration !== "string" || previousGeneration !== expectedGeneration)
+								throw new PreviousRuntimeStateReadError("identity_mismatch");
+						} else if (previousGeneration !== undefined) {
+							throw new PreviousRuntimeStateReadError("identity_mismatch");
+						}
+						if (
+							identity.sessionFile !== null &&
+							typeof previous.session_file === "string" &&
+							sameResolvedPath(previous.session_file, identity.sessionFile, identity.platform)
+						)
+							return;
+						// Publish a FRESH non-terminal successor marker. Spreading the prior
+						// payload would carry the predecessor's `state`, `ended_at`,
+						// `final_response` and error onto the successor transcript, so a
+						// predecessor that already completed or errored would falsely
+						// terminalize the successor and suppress its real postmortem. Only
+						// identity is inherited; lifecycle fields restart from "running".
+						const now = new Date().toISOString();
+						await writeStateFile(stateFile, {
+							schema_version: 1,
+							session_id: identity.sessionId,
+							state: "running",
+							ready_for_input: false,
+							updated_at: now,
+							current_turn_id: null,
+							last_turn_id: null,
+							live: true,
+							reason: null,
+							source: "session_identity_rotation",
+							event: "session_file_rotated",
+							cwd: identity.cwd,
+							workdir: identity.workdir,
+							branch: branchForContext(resolved),
+							session_file: identity.sessionFile,
+							...(expectedGeneration !== undefined ? { owner_generation: expectedGeneration } : {}),
+						});
 					}),
 			),
 	);

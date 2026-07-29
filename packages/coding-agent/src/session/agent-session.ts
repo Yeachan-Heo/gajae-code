@@ -278,6 +278,8 @@ import {
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
+	rotateCoordinatorRuntimeStateSessionFile,
+	runtimeStateFailureReason,
 } from "../gjc-runtime/session-state-sidecar";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heartbeat";
@@ -3394,12 +3396,56 @@ export class AgentSession {
 	};
 
 	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
+		const stateFile = process.env.GJC_COORDINATOR_SESSION_STATE_FILE?.trim();
 		void persistCoordinatorRuntimeStateFromEvent(event, {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
-		}).catch(() => {
-			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+		}).catch(error => {
+			// Log the discriminant, never the marker bytes or any owner env value:
+			// a permanent failure must be distinguishable from a transient one.
+			logger.warn("Failed to persist coordinator runtime state", {
+				event: event.type,
+				reason: runtimeStateFailureReason(error) ?? "unclassified",
+				errorName: error instanceof Error ? error.name : typeof error,
+				stateFile: stateFile ?? null,
+				liveSessionFile: this.sessionManager.getSessionFile() ?? null,
+				ownerEnvPresent: ownerTerminalContextFromEnvironment() !== null,
+			});
+		});
+	}
+
+	/**
+	 * Re-point the coordinator sidecar marker and the postmortem finalizer at the
+	 * live SessionManager identity. Called only from a committed session switch or
+	 * new-session boundary: before this existed, the marker and the finalizer kept
+	 * the launch-time transcript forever, so every later event failed the sidecar
+	 * identity check (the `--tmux` drift).
+	 */
+	#rotateCoordinatorRuntimeStateIdentity(): void {
+		// Exactly one "coordinator-runtime-state" registration must exist at all
+		// times, and its captured identity must equal the live one. The dispose-time
+		// env condition at #dispose is deliberately not replicated here.
+		this.#unregisterRuntimeStateFinalizer?.();
+		this.#unregisterRuntimeStateFinalizer = undefined;
+		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+		// Rotation failure degrades to today's stale marker; it must never fail an
+		// already-committed switch.
+		void rotateCoordinatorRuntimeStateSessionFile({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		}).catch(error => {
+			logger.warn("Failed to rotate coordinator runtime state session file", {
+				reason: runtimeStateFailureReason(error) ?? "unclassified",
+				errorName: error instanceof Error ? error.name : typeof error,
+				liveSessionFile: this.sessionManager.getSessionFile() ?? null,
+				ownerEnvPresent: ownerTerminalContextFromEnvironment() !== null,
+			});
 		});
 	}
 
@@ -9773,6 +9819,7 @@ export class AgentSession {
 			}
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
+			this.#rotateCoordinatorRuntimeStateIdentity();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
@@ -9846,6 +9893,7 @@ export class AgentSession {
 			this.agent.reset();
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
+			this.#rotateCoordinatorRuntimeStateIdentity();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
@@ -10008,6 +10056,7 @@ export class AgentSession {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#syncAgentSessionId();
+			this.#rotateCoordinatorRuntimeStateIdentity();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
@@ -11752,6 +11801,7 @@ export class AgentSession {
 				committed = true;
 				this.agent.reset();
 				this.#syncAgentSessionId();
+				this.#rotateCoordinatorRuntimeStateIdentity();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				this.#steeringMessages = [];
 				this.#followUpMessages = [];
@@ -15898,6 +15948,10 @@ export class AgentSession {
 						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
+				// True commit boundary: every fallible step (model resolution,
+				// ensureOnDisk, the session_switch emit) has passed and the catch below
+				// can no longer roll the identity back.
+				this.#rotateCoordinatorRuntimeStateIdentity();
 				return true;
 			} catch (error) {
 				this.sessionManager.restoreState(previousSessionState);
@@ -16019,6 +16073,7 @@ export class AgentSession {
 
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();
+			this.#rotateCoordinatorRuntimeStateIdentity();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
