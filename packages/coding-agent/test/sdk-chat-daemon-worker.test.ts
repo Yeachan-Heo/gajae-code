@@ -258,32 +258,25 @@ describe("chat daemon worker", () => {
 		});
 		const provider = new FakeDiscordProvider();
 		const client = new FakeSdkClient();
-		client.request = async frame => {
-			client.requests.push(frame);
-			if (frame.type === "event_replay")
-				return {
-					events: [
-						{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
-						{
-							type: "event",
-							name: "identity_header",
-							payload: {
-								type: "identity_header",
-								sessionId: "session",
-								title: "Replay identity",
-								repo: "replay-repo",
-								branch: "replay-branch",
-							},
-						},
-						{
-							type: "event",
-							name: "turn_stream",
-							payload: { type: "turn_stream", phase: "live", sessionId: "session", text: "replayed live" },
-						},
-					],
-				};
-			return { ok: true, result: { source: "sdk", body: "daemon-result-secret" } };
-		};
+		client.replayEvents = [
+			{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
+			{
+				type: "event",
+				name: "identity_header",
+				payload: {
+					type: "identity_header",
+					sessionId: "session",
+					title: "Replay identity",
+					repo: "replay-repo",
+					branch: "replay-branch",
+				},
+			},
+			{
+				type: "event",
+				name: "turn_stream",
+				payload: { type: "turn_stream", phase: "live", sessionId: "session", text: "replayed live" },
+			},
+		];
 		const startupInbound: DiscordInboundEvent = {
 			id: "startup-query",
 			guildId: "guild",
@@ -328,12 +321,20 @@ describe("chat daemon worker", () => {
 		);
 
 		await runtime.start();
-		await provider.handler?.(startupInbound);
-		expect(provider.started).toBe(true);
-		expect(client.requests).toContainEqual(
-			expect.objectContaining({ type: "query_request", query: "todo.list", input: {} }),
-		);
+		expect(client.requests.filter(frame => frame.type === "event_replay")).toHaveLength(1);
 		expect(provider.threads).toHaveLength(1);
+		const startupQueryDispatched = client.waitForRequest(
+			frame => frame.type === "query_request" && frame.query === "todo.list",
+		);
+		if (!provider.handler) throw new Error("Discord provider did not publish its inbound handler.");
+		await provider.handler(startupInbound);
+		await startupQueryDispatched;
+		expect(provider.started).toBe(true);
+		const startupQueries = client.requests.filter(
+			frame => frame.type === "query_request" && frame.query === "todo.list",
+		);
+		expect(startupQueries).toHaveLength(1);
+		expect(startupQueries[0]).toMatchObject({ type: "query_request", query: "todo.list", input: {} });
 		const turnStreamPosted = provider.waitForMessage(message => message.content === "GJC turn stream\noutbound");
 		expect(provider.messages).toContainEqual({
 			threadId: "thread-1",
@@ -388,14 +389,20 @@ describe("chat daemon worker", () => {
 		});
 		await actionReplySent;
 		expect(client.sent).toContainEqual(expect.objectContaining({ type: "reply", id: "action", answer: 0 }));
+		const secondQueryKey = "discord:app:guild:parent:thread-1:query";
 		const queryRequest = client.waitForRequest(
-			request => request.type === "query_request" && request.query === "todo.list",
+			request =>
+				request.type === "query_request" &&
+				request.query === "todo.list" &&
+				request.idempotencyKey === secondQueryKey,
 		);
+		const queryResultBody = JSON.stringify({ ok: true, result: { operation: "todo.list", status: "completed" } });
+		const queryResultBaseline = provider.messages.filter(message => message.content === queryResultBody).length;
 		const queryResult = provider.waitForMessage(
-			message =>
-				message.content === JSON.stringify({ ok: true, result: { operation: "todo.list", status: "completed" } }),
+			() => provider.messages.filter(message => message.content === queryResultBody).length > queryResultBaseline,
 		);
-		await provider.handler?.({
+		if (!provider.handler) throw new Error("Discord provider lost its inbound handler.");
+		await provider.handler({
 			id: "query",
 			guildId: "guild",
 			parentId: "parent",
@@ -404,10 +411,10 @@ describe("chat daemon worker", () => {
 			content: "/sdk query todo.list {}",
 		});
 		await Promise.all([queryRequest, queryResult]);
-		expect(provider.messages).toContainEqual({
-			threadId: "thread-1",
-			content: JSON.stringify({ ok: true, result: { operation: "todo.list", status: "completed" } }),
-		});
+		expect(client.requests.filter(request => request.idempotencyKey === secondQueryKey)).toHaveLength(1);
+		expect(provider.messages.filter(message => message.content === queryResultBody)).toHaveLength(
+			queryResultBaseline + 1,
+		);
 		expect(JSON.stringify(provider.messages)).not.toContain("daemon-result-secret");
 		const prohibitedResult = provider.waitForMessage(
 			message =>
