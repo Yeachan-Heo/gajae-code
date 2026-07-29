@@ -1,18 +1,22 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { closeSync, fstatSync, openSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
+	durableReplacePath,
 	exactRemoveDirectoryTree,
 	exactRestore,
 	exactUnlink,
 	renameNoReplacePath,
 	repairOwnerOnlyPathSecurityExpected,
 	snapshotDirectoryTree,
+	verifyOwnerOnlyFdSecurity,
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "../native/index.js";
@@ -122,13 +126,118 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await fs.mkdir(directory);
 		await fs.writeFile(file, contents);
 
-		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "acl_verify_failed" });
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "owner_mismatch" });
+		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "owner_mismatch" });
 		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
 		expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
+	});
+	it("durably replaces a Windows destination with staged bytes", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.json");
+		const destination = path.join(root, "current.json");
+		await fs.writeFile(source, "new");
+		await fs.writeFile(destination, "old");
+
+		expect(durableReplacePath(source, destination)).toMatchObject({
+			ok: true,
+			mutationState: "committed",
+			durabilityState: "durable",
+		});
+		expect(await fs.readFile(destination, "utf8")).toBe("new");
+		expect(
+			await fs.stat(source).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+	it("preserves an existing destination when durable replacement fails", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "missing-staged.json");
+		const destination = path.join(root, "current.json");
+		await fs.writeFile(destination, "old");
+
+		expect(durableReplacePath(source, destination)).toMatchObject({
+			ok: false,
+			mutationState: "not_committed",
+		});
+		expect(await fs.readFile(destination, "utf8")).toBe("old");
+	});
+	it("smokes caller-fd security with fs.openSync and rejects arbitrary fds without terminating", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "caller-fd.json");
+		await fs.writeFile(file, "preserve");
+		const fd = openSync(file, "r+");
+		try {
+			expect(applyOwnerOnlyFdSecurity(file, "file", fd)).toEqual({ ok: true });
+			expect(verifyOwnerOnlyFdSecurity(file, "file", fd)).toEqual({ ok: true });
+			expect(fstatSync(fd).isFile()).toBe(true);
+			expect(await fs.readFile(file, "utf8")).toBe("preserve");
+			expect(verifyOwnerOnlyFdSecurity(file, "file", 2_147_483_647)).toEqual({
+				ok: false,
+				code: "identity_unavailable",
+			});
+		} finally {
+			closeSync(fd);
+		}
+	});
+
+	it("fails closed when the pathname is replaced after opening the caller fd", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "caller-fd.json");
+		const retained = path.join(root, "retained.json");
+		await fs.writeFile(file, "authorized");
+		const fd = openSync(file, "r+");
+		try {
+			await fs.rename(file, retained);
+			await fs.writeFile(file, "replacement");
+			expect(applyOwnerOnlyFdSecurity(file, "file", fd)).toEqual({
+				ok: false,
+				code: "identity_mismatch",
+			});
+			expect(verifyOwnerOnlyFdSecurity(file, "file", fd)).toEqual({
+				ok: false,
+				code: "identity_mismatch",
+			});
+			expect(await fs.readFile(file, "utf8")).toBe("replacement");
+			expect(await fs.readFile(retained, "utf8")).toBe("authorized");
+		} finally {
+			closeSync(fd);
+		}
+	});
+
+	it("rejects mismatched and reused caller fds without mutating the pathname", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "caller-fd.json");
+		const other = path.join(root, "other.json");
+		await fs.writeFile(file, "authorized");
+		await fs.writeFile(other, "other");
+		const mismatch = openSync(other, "r+");
+		try {
+			expect(applyOwnerOnlyFdSecurity(file, "file", mismatch)).toEqual({
+				ok: false,
+				code: "identity_mismatch",
+			});
+		} finally {
+			closeSync(mismatch);
+		}
+
+		const stale = openSync(file, "r+");
+		closeSync(stale);
+		const reused = openSync(other, "r+");
+		try {
+			expect(reused).toBe(stale);
+			expect(verifyOwnerOnlyFdSecurity(file, "file", stale)).toEqual({
+				ok: false,
+				code: "identity_mismatch",
+			});
+			expect(await fs.readFile(file, "utf8")).toBe("authorized");
+		} finally {
+			closeSync(reused);
+		}
 	});
 	it("repairs a legacy inherited ACL only for the captured directory and file identities", async () => {
 		const root = await temporaryDirectory();
@@ -140,8 +249,8 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const directoryStat = await fs.stat(directory, { bigint: true });
 		const fileStat = await fs.stat(file, { bigint: true });
 
-		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "acl_verify_failed" });
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "owner_mismatch" });
+		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "owner_mismatch" });
 		expect(repairOwnerOnlyPathSecurityExpected(file, "directory", fileStat.dev, fileStat.ino)).toMatchObject({
 			ok: false,
 		});
@@ -169,7 +278,7 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			ok: false,
 			code: "identity_mismatch",
 		});
-		expect(verifyOwnerOnlyPathSecurity(target, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expect(verifyOwnerOnlyPathSecurity(target, "file")).toEqual({ ok: false, code: "owner_mismatch" });
 		expect(await fs.readFile(target, "utf8")).toBe("replacement");
 		expect(await fs.readFile(retained, "utf8")).toBe("authorized");
 	});

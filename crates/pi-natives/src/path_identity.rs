@@ -161,6 +161,8 @@ struct ExactFileIdentity {
 pub struct NativeExactUnlinkResult {
 	pub ok: bool,
 	pub code: Option<String>,
+	/// On Windows this is returned in the caller's namespace; retained handle
+	/// operations continue to use the volume-GUID canonical path internally.
 	pub detached_path: Option<String>,
 	pub retained_successor_path: Option<String>,
 	/// An internal exchange-placeholder cleanup entry retained after cleanup
@@ -201,6 +203,60 @@ pub struct NativeNoReplaceResult {
 	pub primitive:        String,
 	pub phase:            String,
 	pub diagnostic:       NativePublishDiagnostic,
+}
+/// Result of a Windows write-through replacement.
+#[napi(object)]
+pub struct NativeDurableReplaceResult {
+	pub ok:               bool,
+	pub code:             Option<String>,
+	pub os_code:          Option<i32>,
+	pub mutation_state:   String,
+	pub durability_state: String,
+	pub reason:           String,
+	pub primitive:        String,
+	pub phase:            String,
+}
+
+impl NativeDurableReplaceResult {
+	#[cfg(not(windows))]
+	fn unsupported() -> Self {
+		Self {
+			ok:               false,
+			code:             Some("unsupported_platform".to_owned()),
+			os_code:          None,
+			mutation_state:   "not_committed".to_owned(),
+			durability_state: "not_attempted".to_owned(),
+			reason:           "unsupported_platform".to_owned(),
+			primitive:        "unsupported".to_owned(),
+			phase:            "preflight".to_owned(),
+		}
+	}
+
+	fn failure(code: &str, os_code: Option<i32>, mutation_state: &str, phase: &str) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			os_code,
+			mutation_state: mutation_state.to_owned(),
+			durability_state: "not_attempted".to_owned(),
+			reason: code.to_owned(),
+			primitive: "move_file_ex_write_through".to_owned(),
+			phase: phase.to_owned(),
+		}
+	}
+
+	fn success() -> Self {
+		Self {
+			ok:               true,
+			code:             None,
+			os_code:          None,
+			mutation_state:   "committed".to_owned(),
+			durability_state: "durable".to_owned(),
+			reason:           "none".to_owned(),
+			primitive:        "move_file_ex_write_through".to_owned(),
+			phase:            "complete".to_owned(),
+		}
+	}
 }
 
 impl NativeNoReplaceResult {
@@ -793,6 +849,31 @@ pub fn rename_no_replace_path(
 		Path::new(&source_path),
 		Path::new(&destination_path),
 	))
+}
+/// Replace a staged file using Windows `MoveFileExW` with `REPLACE_EXISTING`
+/// and `WRITE_THROUGH`. The staged file's bytes must already have been flushed.
+#[napi]
+pub fn durable_replace_path(
+	source_path: String,
+	destination_path: String,
+) -> NativeDurableReplaceResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeDurableReplaceResult::failure(
+			"invalid_request",
+			None,
+			"not_committed",
+			"preflight",
+		);
+	}
+	#[cfg(windows)]
+	{
+		platform::durable_replace_path(Path::new(&source_path), Path::new(&destination_path))
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = (source_path, destination_path);
+		NativeDurableReplaceResult::unsupported()
+	}
 }
 
 /// Capture a deterministic, descriptor-relative snapshot of a regular-file and
@@ -3747,9 +3828,34 @@ mod platform {
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, sha256,
+		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeDurableReplaceResult,
+		NativeExactUnlinkResult, NativeOwnerOnlySecurityResult, sha256,
 	};
+
+	type InvalidParameterHandler = Option<
+		unsafe extern "C" fn(
+			expression: *const u16,
+			function: *const u16,
+			file: *const u16,
+			line: u32,
+			reserved: usize,
+		),
+	>;
+	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
+
+	#[link(name = "kernel32")]
+	unsafe extern "system" {
+		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
+		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+	}
+
+	#[link(name = "msvcrt")]
+	unsafe extern "C" {
+		fn _get_osfhandle(fd: i32) -> isize;
+		fn _set_thread_local_invalid_parameter_handler(
+			handler: InvalidParameterHandler,
+		) -> InvalidParameterHandler;
+	}
 
 	const SECURITY_OWNER_DACL: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
 	const SECURITY_OWNER_DACL_PROTECTED: u32 =
@@ -4319,20 +4425,13 @@ mod platform {
 		parent_handle: HANDLE,
 		source_name: &std::ffi::OsStr,
 		quarantine_name: &str,
+		detached_path: String,
 		identity: &ExactFileIdentity,
 	) -> NativeExactUnlinkResult {
-		let detached_parent = match final_path(parent_handle) {
-			Ok(path) => path,
-			Err(code) => return NativeExactUnlinkResult::failure(code),
-		};
 		let name_wide: Vec<u16> = quarantine_name.encode_utf16().collect();
 		let original_name_wide: Vec<u16> = source_name.encode_wide().collect();
 		let result = match rename_handle_no_replace(handle, parent_handle, &name_wide) {
 			Ok(()) => {
-				let detached_path = Path::new(&detached_parent)
-					.join(quarantine_name)
-					.to_string_lossy()
-					.into_owned();
 				let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 				let matches = unsafe { GetFileInformationByHandle(handle, &mut information) } != 0
 					&& handle_identity_matches(&information, identity)
@@ -4397,6 +4496,57 @@ mod platform {
 			Ok(normalized)
 		} else {
 			Err("io_error")
+		}
+	}
+	pub(super) fn durable_replace_path(
+		source_path: &Path,
+		destination_path: &Path,
+	) -> NativeDurableReplaceResult {
+		let source_path = match lexical_absolute_path(source_path) {
+			Ok(path) => path,
+			Err(code) => {
+				return NativeDurableReplaceResult::failure(code, None, "not_committed", "preflight");
+			},
+		};
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => {
+				return NativeDurableReplaceResult::failure(code, None, "not_committed", "preflight");
+			},
+		};
+		let mut source_wide: Vec<u16> = source_path.as_os_str().encode_wide().collect();
+		let mut destination_wide: Vec<u16> = destination_path.as_os_str().encode_wide().collect();
+		source_wide.push(0);
+		destination_wide.push(0);
+		const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+		const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+		let moved = unsafe {
+			windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+				source_wide.as_ptr(),
+				destination_wide.as_ptr(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+			)
+		};
+		if moved == 0 {
+			return NativeDurableReplaceResult::failure(
+				"move_file_ex_failed",
+				Some(unsafe { GetLastError() } as i32),
+				"not_committed",
+				"replace",
+			);
+		}
+		match std::fs::symlink_metadata(&destination_path) {
+			Ok(metadata) if metadata.is_file() => NativeDurableReplaceResult::success(),
+			_ => NativeDurableReplaceResult {
+				ok: false,
+				code: Some("destination_verification_failed".to_owned()),
+				os_code: None,
+				mutation_state: "unknown".to_owned(),
+				durability_state: "not_provable".to_owned(),
+				reason: "destination_verification_failed".to_owned(),
+				primitive: "move_file_ex_write_through".to_owned(),
+				phase: "verify".to_owned(),
+			},
 		}
 	}
 
@@ -4502,11 +4652,16 @@ mod platform {
 			let Some(original_name) = path.file_name() else {
 				return NativeExactUnlinkResult::failure("io_error");
 			};
+			let Some(parent_path) = path.parent() else {
+				return NativeExactUnlinkResult::failure("io_error");
+			};
+			let detached_path = parent_path.join(quarantine_name).to_string_lossy().into_owned();
 			return detach_directory(
 				handle.target,
 				parent_handle,
 				original_name,
 				quarantine_name,
+				detached_path,
 				identity,
 			);
 		}
@@ -4583,6 +4738,7 @@ mod platform {
 			original_parent.target,
 			source_name,
 			quarantine_name,
+			original_path.to_string_lossy().into_owned(),
 			identity,
 		);
 		match result {
@@ -5032,7 +5188,7 @@ mod platform {
 		expected_dev: u64,
 		expected_ino: u64,
 	) -> NativeOwnerOnlySecurityResult {
-		let handle = match open_exact(path, kind, WRITE_DAC | READ_CONTROL) {
+		let handle = match open_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -5050,9 +5206,7 @@ mod platform {
 		};
 		match inspect_owner_only_acl(handle.target, kind, &sid) {
 			Ok(OwnerOnlyAclState::Clean) => return NativeOwnerOnlySecurityResult::success(),
-			Ok(OwnerOnlyAclState::OwnerMismatch) => {
-				return NativeOwnerOnlySecurityResult::failure("owner_mismatch");
-			},
+			Ok(OwnerOnlyAclState::OwnerMismatch) => {},
 			Ok(OwnerOnlyAclState::UnsafeMismatch) => {
 				return NativeOwnerOnlySecurityResult::failure("acl_verify_failed");
 			},
@@ -5063,14 +5217,15 @@ mod platform {
 			Ok(dacl) => dacl,
 			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_apply_failed"),
 		};
-		// SAFETY: the retained handle identifies the prechecked object; `dacl` contains
-		// a validated, live Windows security structure for this synchronous call.
+		// SAFETY: the retained handle identifies the prechecked object; `sid` and
+		// `dacl` contain validated, live Windows security structures for this
+		// synchronous call.
 		let status = unsafe {
 			SetSecurityInfo(
 				handle.target,
 				SE_FILE_OBJECT,
-				DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-				null_mut(),
+				SECURITY_OWNER_DACL_PROTECTED,
+				sid.as_ptr().cast_mut().cast(),
 				null_mut(),
 				dacl.as_ptr().cast(),
 				null_mut(),
@@ -5099,20 +5254,179 @@ mod platform {
 		}
 	}
 
+	unsafe extern "C" fn ignore_invalid_parameter(
+		_expression: *const u16,
+		_function: *const u16,
+		_file: *const u16,
+		_line: u32,
+		_reserved: usize,
+	) {
+	}
+
+	fn uv_osfhandle(caller_fd: i32) -> Option<isize> {
+		let module = unsafe { GetModuleHandleW(null()) };
+		if module.is_null() {
+			return None;
+		}
+		let procedure = unsafe { GetProcAddress(module, b"uv_get_osfhandle\0".as_ptr()) };
+		if procedure.is_null() {
+			return None;
+		}
+		// SAFETY: `uv_get_osfhandle` is libuv's C ABI descriptor conversion exported
+		// by Node-compatible hosts. Its descriptor table belongs to the host that
+		// supplied `caller_fd`, unlike this addon's CRT table.
+		let conversion: UvGetOsfhandle = unsafe { std::mem::transmute(procedure) };
+		Some(unsafe { conversion(caller_fd) })
+	}
+
+	fn borrowed_caller_handle(caller_fd: i32) -> Result<HANDLE, NativeOwnerOnlySecurityResult> {
+		if caller_fd < 0 {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		let raw_handle = match uv_osfhandle(caller_fd) {
+			Some(handle) => handle,
+			None => {
+				// `_get_osfhandle` is a guarded fallback for hosts that do not export
+				// libuv's conversion. Arbitrary integers can invoke the CRT
+				// invalid-parameter handler instead of returning -1, so scope a no-op
+				// handler to this thread and return a typed validation failure instead.
+				let previous_handler =
+					unsafe { _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter)) };
+				let handle = unsafe { _get_osfhandle(caller_fd) };
+				unsafe {
+					_set_thread_local_invalid_parameter_handler(previous_handler);
+				}
+				handle
+			},
+		};
+		if raw_handle == -1 {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		let handle = raw_handle as HANDLE;
+		if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		Ok(handle)
+	}
+
+	fn same_file_identity(left: HANDLE, right: HANDLE) -> Result<bool, NativeOwnerOnlySecurityResult> {
+		let mut left_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let mut right_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(left, &mut left_information) } == 0
+			|| unsafe { GetFileInformationByHandle(right, &mut right_information) } == 0
+		{
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		Ok(
+			left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
+				&& left_information.nFileIndexHigh == right_information.nFileIndexHigh
+				&& left_information.nFileIndexLow == right_information.nFileIndexLow,
+		)
+	}
+
+	fn checked_caller_handle(
+		path: &Path,
+		kind: &str,
+		caller_fd: i32,
+		desired_access: u32,
+	) -> Result<(HeldExact, HANDLE), NativeOwnerOnlySecurityResult> {
+		let caller = borrowed_caller_handle(caller_fd)?;
+		let path_handle = open_exact(path, kind, desired_access)?;
+		if !same_file_identity(path_handle.target, caller)? {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
+		}
+		Ok((path_handle, caller))
+	}
+
 	pub(super) fn apply_owner_only_fd_security(
-		_: &Path,
-		_: &str,
-		_: i32,
+		path: &Path,
+		kind: &str,
+		caller_fd: i32,
 	) -> NativeOwnerOnlySecurityResult {
-		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+		let (path_handle, caller) = match checked_caller_handle(
+			path,
+			kind,
+			caller_fd,
+			READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+		) {
+			Ok(handles) => handles,
+			Err(result) => return result,
+		};
+		let sid = match current_user_sid() {
+			Ok(sid) => sid,
+			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
+		};
+		let requires_apply = match inspect_owner_only_acl(path_handle.target, kind, &sid) {
+			Ok(OwnerOnlyAclState::Clean) => false,
+			Ok(OwnerOnlyAclState::OwnerMismatch) => true,
+			Ok(OwnerOnlyAclState::UnsafeMismatch) => {
+				return NativeOwnerOnlySecurityResult::failure("acl_verify_failed");
+			},
+			Ok(OwnerOnlyAclState::RepairableMismatch) => true,
+			Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
+		};
+		if requires_apply {
+			let dacl = match owner_only_dacl(&sid, kind) {
+				Ok(dacl) => dacl,
+				Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_apply_failed"),
+			};
+			// SAFETY: `path_handle` was opened with WRITE_DAC/WRITE_OWNER only after
+			// proving it names the same file object as the borrowed caller HANDLE.
+			if unsafe {
+				SetSecurityInfo(
+					path_handle.target,
+					SE_FILE_OBJECT,
+					SECURITY_OWNER_DACL_PROTECTED,
+					sid.as_ptr().cast_mut().cast(),
+					null_mut(),
+					dacl.as_ptr().cast(),
+					null_mut(),
+				)
+			} != 0
+			{
+				return NativeOwnerOnlySecurityResult::failure("acl_apply_failed");
+			}
+		}
+		match same_file_identity(path_handle.target, caller) {
+			Ok(true) => {},
+			Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => return result,
+		}
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		match same_file_identity(reopened.target, caller) {
+			Ok(true) => verify_owner_only_handle(path_handle.target, kind),
+			Ok(false) => NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => result,
+		}
 	}
 
 	pub(super) fn verify_owner_only_fd_security(
-		_: &Path,
-		_: &str,
-		_: i32,
+		path: &Path,
+		kind: &str,
+		caller_fd: i32,
 	) -> NativeOwnerOnlySecurityResult {
-		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+		let (path_handle, caller) = match checked_caller_handle(path, kind, caller_fd, READ_CONTROL) {
+			Ok(handles) => handles,
+			Err(result) => return result,
+		};
+		let verified = verify_owner_only_handle(path_handle.target, kind);
+		match same_file_identity(path_handle.target, caller) {
+			Ok(true) => {},
+			Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => return result,
+		}
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		match same_file_identity(reopened.target, caller) {
+			Ok(true) => verified,
+			Ok(false) => NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => result,
+		}
 	}
 	#[cfg(test)]
 	mod tests {
