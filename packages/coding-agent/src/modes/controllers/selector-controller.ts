@@ -2379,19 +2379,21 @@ export class SelectorController {
 					this.ctx.showStatus("Another session operation is already in progress");
 					return;
 				}
-				// Any other rejection still propagates, but it can arrive after
-				// `switchSession` already disconnected agent events, aborted the previous
-				// run, and rolled back, so reconcile this call's transient UI first instead
-				// of leaving an aborted run mounted as if it were live. Reconciliation is
-				// best-effort: a failure while tearing down UI must not replace the switch
-				// failure the caller needs to see.
-				try {
-					progressLease.clear();
-					this.#clearTransientSessionUi({ restoreBackground: false, clearSpecializedLoaders: true });
-				} catch {
-					logger.warn("Resume transient-UI reconciliation failed after a session switch error", {
-						classification: "resume-cleanup-failed",
-					});
+				// A rejection can occur either before the transition mutates the live session
+				// (for example, a rejecting `session_before_switch` hook) or after disconnect/
+				// abort has begun. Preserve the current session's transient UI in the former
+				// case; reconcile only state invalidated by a transition that actually mutated.
+				// Reconciliation stays best-effort so cleanup failure never replaces the
+				// original switch failure.
+				if (transitionMutationStarted) {
+					try {
+						progressLease.clear();
+						this.#clearTransientSessionUi({ restoreBackground: false, clearSpecializedLoaders: true });
+					} catch {
+						logger.warn("Resume transient-UI reconciliation failed after a session switch error", {
+							classification: "resume-cleanup-failed",
+						});
+					}
 				}
 				throw error;
 			}
