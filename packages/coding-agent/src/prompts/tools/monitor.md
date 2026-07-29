@@ -20,10 +20,14 @@ Pick by how many notifications you need:
 - `description` (required): short human-readable description of what is being monitored. Appears in task listings.
 - `timeout` (optional): maximum wall-clock seconds the monitor may run before automatic shutdown. Omit for the session lifetime.
 - `persistent` (optional, default `false`): keep the monitor running past the current turn. Persistent monitors survive until session end or until cancelled via `job`.
+- `notify` (optional): delivery policy for **persistent** monitors. Default when omitted and `persistent: true` is `on_change`.
+  - `on_change` — coalesce lines within a ~2s debounce window; enqueue only when the normalized line changes; intermediate notifications do **not** start a model turn; process exit still wakes the agent.
+  - `every_line` — legacy behavior: same-tick coalesce only and `triggerTurn` on each flush.
+  - `display_only` — intermediate notifications are display/queue only (no model turn); process exit still wakes the agent.
 
 ## Output
 
-Returns `Monitor started · task <task_id>` plus a task entry visible via `job({list: true})`. Each stdout line of the monitored command becomes a `<task-notification>` event delivered between turns.
+Returns `Monitor started · task <task_id>` plus a task entry visible via `job({list: true})`. For non-persistent monitors, the first stdout line becomes a `<task-notification>` and the monitor cancels. For persistent monitors, lines are latest-biased and rate-limited per `notify` (default `on_change`); process exit always delivers the final pending line and wakes the agent.
 
 ## Cancellation
 

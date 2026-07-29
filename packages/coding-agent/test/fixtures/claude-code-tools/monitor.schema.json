@@ -28,6 +28,11 @@
       "persistent": {
         "type": "boolean",
         "description": "Whether to keep the monitor running past the originating turn. Persistent monitors survive until session end or explicit kill via the background-task stop tool."
+      },
+      "notify": {
+        "type": "string",
+        "enum": ["on_change", "every_line", "display_only"],
+        "description": "How persistent monitors deliver stdout lines. 'on_change' (default when persistent) coalesces within a debounce window and only enqueues when the normalized line changes, without starting a model turn for intermediate updates; process exit still wakes the agent. 'every_line' preserves legacy behavior (same-tick coalesce only, triggerTurn each flush). 'display_only' enqueues intermediate notifications without starting a turn; process exit still wakes the agent."
       }
     },
     "required": ["command", "kind", "description"],

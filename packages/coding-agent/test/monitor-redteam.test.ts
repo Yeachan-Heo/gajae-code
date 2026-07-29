@@ -6,7 +6,7 @@ import type { ToolSession } from "../src/tools/index";
 import { JobTool } from "../src/tools/job";
 import { MonitorTool } from "../src/tools/monitor";
 
-type QueuedMessage = { customType: string; content: string; details?: unknown };
+type QueuedMessage = { customType: string; content: string; details?: unknown; triggerTurn?: boolean };
 
 function detailsOf(entry: QueuedMessage): { taskId?: string; notificationId?: string; coalescedCount?: number } {
 	return (entry.details ?? {}) as { taskId?: string; notificationId?: string; coalescedCount?: number };
@@ -21,9 +21,18 @@ function makeSession(ownerId: string, queue: QueuedMessage[], settings: Settings
 		getSessionSpawns: () => null,
 		getSessionId: () => `session-${ownerId}`,
 		getAgentId: () => ownerId,
-		steer: (msg: { customType: string; content: string; details?: unknown }) => queue.push(msg as QueuedMessage),
-		sendCustomMessage: async (msg: { customType: string; content: string; details?: unknown }) => {
-			queue.push(msg as QueuedMessage);
+		steer: (msg: { customType: string; content: string; details?: unknown }) =>
+			queue.push({ ...msg, triggerTurn: true } as QueuedMessage),
+		sendCustomMessage: async (
+			msg: { customType: string; content: string; details?: unknown },
+			options?: { triggerTurn?: boolean },
+		) => {
+			queue.push({
+				customType: msg.customType,
+				content: msg.content,
+				details: msg.details,
+				triggerTurn: options?.triggerTurn,
+			});
 		},
 		purgeQueuedCustomMessages: (predicate: (message: CustomMessage) => boolean) => {
 			let removed = 0;
@@ -81,7 +90,8 @@ describe("monitor backlog red-team public surfaces", () => {
 		const taskId = result.details?.taskId;
 		expect(taskId).toBeString();
 
-		const deadline = Date.now() + 2_000;
+		// Persistent default uses a ~2s debounce; wait past the window with margin.
+		const deadline = Date.now() + 3_500;
 		while (!queue.some(entry => detailsOf(entry).taskId === taskId)) {
 			if (Date.now() >= deadline) throw new Error("Timed out waiting for initial monitor notification");
 			await Bun.sleep(5);

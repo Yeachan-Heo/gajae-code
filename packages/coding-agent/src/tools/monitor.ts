@@ -9,6 +9,7 @@ import type { ToolSession } from "./index";
 import { ToolError } from "./tool-errors";
 
 const monitorKindEnum = z.enum(["log", "poll", "watch", "other"]);
+const monitorNotifyEnum = z.enum(["on_change", "every_line", "display_only"]);
 
 const monitorSchema = z.object({
 	command: z
@@ -35,6 +36,11 @@ const monitorSchema = z.object({
 		.describe(
 			"Whether to keep the monitor running past the originating turn. Persistent monitors survive until session end or explicit kill via the background-task stop tool.",
 		),
+	notify: monitorNotifyEnum
+		.optional()
+		.describe(
+			"How persistent monitors deliver stdout lines. 'on_change' (default when persistent) coalesces within a debounce window and only enqueues when the normalized line changes, without starting a model turn for intermediate updates; process exit still wakes the agent. 'every_line' preserves legacy behavior (same-tick coalesce only, triggerTurn each flush). 'display_only' enqueues intermediate notifications without starting a turn; process exit still wakes the agent.",
+		),
 });
 
 export type MonitorParams = z.infer<typeof monitorSchema>;
@@ -51,6 +57,8 @@ const MONITOR_LABEL_MAX = 120;
 const MAX_PENDING_MONITOR_NOTIFICATIONS = 3;
 const MONITOR_NOTIFICATION_LINE_MAX_BYTES = 16 * 1024;
 const MONITOR_NOTIFICATION_LINE_MAX_LINES = 20;
+/** Debounce window for persistent monitor intermediate flushes (on_change / display_only). */
+const PERSISTENT_MONITOR_DEBOUNCE_MS = 2000;
 
 function buildMonitorLabel(params: MonitorParams): string {
 	const base = `[monitor:${params.kind}] ${params.description}`;
@@ -117,6 +125,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		}
 
 		const persistent = params.persistent ?? false;
+		// Omitted + persistent → on_change (rate-limited, no intermediate turns). Non-persistent
+		// one-shots still wake on their single delivery; notify only shapes persistent delivery.
+		const notifyMode = params.notify ?? (persistent ? "on_change" : "every_line");
 		const label = buildMonitorLabel(params);
 		const ownerId = this.session.getAgentId?.() ?? undefined;
 		const bash = new BashTool(this.session);
@@ -127,6 +138,11 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		let latestLine: string | undefined;
 		let coalescedCount = 0;
 		let flushScheduled = false;
+		let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+		let lastDeliveredNormalized: string | undefined;
+		let lastDeliveredLine: string | undefined;
+		// Intermediate display-only deliveries do not start a turn; exit must still wake.
+		let needsTerminalWake = false;
 		// Count of notification *sends* (not live queue depth): once it exceeds the
 		// cap, each new send first purges older queued notifications for this task,
 		// keeping the queue bounded and latest-biased.
@@ -134,30 +150,12 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		const isMonitorMessage = (message: { customType?: string; details?: unknown }) =>
 			message.customType === "task-notification" &&
 			(message.details as { taskId?: string } | undefined)?.taskId === currentJobId;
-		const flushLatest = () => {
-			if (!persistent || latestLine === undefined) return;
-			const line = latestLine;
-			const count = coalescedCount;
-			latestLine = undefined;
-			coalescedCount = 0;
-			flushScheduled = false;
-			sendNotification(line, currentJobId, count);
+		const clearDebounceTimer = () => {
+			if (debounceTimer === undefined) return;
+			clearTimeout(debounceTimer);
+			debounceTimer = undefined;
 		};
-		const closeMonitor = (mode: "purge" | "flush") => {
-			// "flush" (natural process exit): deliver the newest pending line so the
-			// final state is never lost, then stop. "purge" (explicit cancel / registry
-			// eviction): drop the queued backlog. Non-persistent monitors keep their one
-			// notification, so they never purge.
-			if (mode === "flush") {
-				flushLatest();
-				controller.closed = true;
-				return;
-			}
-			controller.closed = true;
-			if (!persistent) return;
-			return this.session.purgeQueuedCustomMessages?.(isMonitorMessage);
-		};
-		const sendNotification = (line: string, jobId: string, count: number) => {
+		const sendNotification = (line: string, jobId: string, count: number, triggerTurn: boolean) => {
 			if (controller.closed) return;
 			const notificationId = `${jobId}:${sequence}`;
 			const suffix = count > 0 ? `\n(+${count} earlier lines)` : "";
@@ -187,7 +185,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			}
 			const sendPromise = this.session.sendCustomMessage?.(
 				{ customType: "task-notification", content, display: false, attribution: "agent", details },
-				{ triggerTurn: true, deliverAs: "followUp" },
+				{ triggerTurn, deliverAs: "followUp" },
 			);
 			if (sendPromise) {
 				void sendPromise.catch(error => {
@@ -198,6 +196,67 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			} else {
 				this.session.steer?.({ customType: "task-notification", content, details });
 			}
+			if (triggerTurn) {
+				needsTerminalWake = false;
+			} else {
+				needsTerminalWake = true;
+			}
+		};
+		const flushLatest = (terminal: boolean) => {
+			clearDebounceTimer();
+			flushScheduled = false;
+			if (!persistent || latestLine === undefined) return;
+			const line = latestLine;
+			const count = coalescedCount;
+			latestLine = undefined;
+			coalescedCount = 0;
+			const normalized = line.trim();
+			// on_change: skip intermediate enqueue when content is unchanged after normalize/trim.
+			// Terminal flush always delivers so process exit still wakes the agent.
+			if (
+				!terminal &&
+				notifyMode === "on_change" &&
+				lastDeliveredNormalized !== undefined &&
+				normalized === lastDeliveredNormalized
+			) {
+				return;
+			}
+			lastDeliveredNormalized = normalized;
+			lastDeliveredLine = line;
+			// Intermediate: every_line wakes; on_change / display_only are display/queue only.
+			// Terminal: always wake (including display_only) so exit/error transitions are prompt.
+			const triggerTurn = terminal || notifyMode === "every_line";
+			sendNotification(line, currentJobId, count, triggerTurn);
+		};
+		const closeMonitor = (mode: "purge" | "flush") => {
+			// "flush" (natural process exit): deliver the newest pending line so the
+			// final state is never lost, then stop. "purge" (explicit cancel / registry
+			// eviction): drop the queued backlog. Non-persistent monitors keep their one
+			// notification, so they never purge.
+			if (mode === "flush") {
+				if (latestLine !== undefined) {
+					flushLatest(true);
+				} else if (needsTerminalWake && lastDeliveredLine !== undefined) {
+					// Debounce already delivered display-only intermediate state; still wake on exit.
+					clearDebounceTimer();
+					flushScheduled = false;
+					sequence += 1;
+					sendNotification(lastDeliveredLine, currentJobId, 0, true);
+				} else {
+					clearDebounceTimer();
+					flushScheduled = false;
+				}
+				controller.closed = true;
+				return;
+			}
+			clearDebounceTimer();
+			flushScheduled = false;
+			latestLine = undefined;
+			coalescedCount = 0;
+			needsTerminalWake = false;
+			controller.closed = true;
+			if (!persistent) return;
+			return this.session.purgeQueuedCustomMessages?.(isMonitorMessage);
 		};
 		const schedulePersistentNotification = (line: string) => {
 			latestLine = line;
@@ -205,7 +264,15 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			coalescedCount += flushScheduled ? 1 : 0;
 			if (flushScheduled) return;
 			flushScheduled = true;
-			queueMicrotask(flushLatest);
+			// every_line: same-tick microtask coalesce only (legacy). Otherwise debounce.
+			if (notifyMode === "every_line") {
+				queueMicrotask(() => flushLatest(false));
+				return;
+			}
+			debounceTimer = setTimeout(() => {
+				debounceTimer = undefined;
+				flushLatest(false);
+			}, PERSISTENT_MONITOR_DEBOUNCE_MS);
 		};
 		const monitorJob = await bash.startMonitorJob(
 			{ command: params.command, timeout: params.timeout },
@@ -229,7 +296,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 						schedulePersistentNotification(line);
 						return;
 					}
-					sendNotification(line, jobId, 0);
+					sendNotification(line, jobId, 0, true);
 					manager.cancel(jobId, ownerId ? { ownerId } : undefined);
 				},
 			},
