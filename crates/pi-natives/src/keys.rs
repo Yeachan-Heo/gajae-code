@@ -1524,10 +1524,7 @@ mod tests {
 		assert!(matches_key_inner(b"\x1b[27;5u", "ctrl+escape", true));
 		assert!(matches_key_inner(b"\x1b[27;9u", "super+escape", true));
 		assert!(matches_key_inner(b"\x1b[27;4;78~", "alt+shift+n", false));
-		assert_eq!(
-			parse_key_inner(b"\x1b[27;4;78~", false).as_deref(),
-			Some("alt+shift+n"),
-		);
+		assert_eq!(parse_key_inner(b"\x1b[27;4;78~", false).as_deref(), Some("alt+shift+n"),);
 	}
 	#[test]
 	fn two_byte_escape_sequences_are_parse_match_symmetric() {
@@ -1550,10 +1547,8 @@ mod tests {
 	}
 	#[test]
 	fn legacy_meta_navigation_aliases_are_exclusive_under_kitty_on_and_off() {
-		let cases = [
-			(b"\x1bb".as_slice(), "alt+left", "alt+b"),
-			(b"\x1bf".as_slice(), "alt+right", "alt+f"),
-		];
+		let cases =
+			[(b"\x1bb".as_slice(), "alt+left", "alt+b"), (b"\x1bf".as_slice(), "alt+right", "alt+f")];
 
 		for (bytes, navigation, literal) in cases {
 			for kitty_active in [false, true] {
