@@ -5,6 +5,9 @@
 ## [0.12.2] - 2026-07-30
 
 ## [0.12.1] - 2026-07-29
+### Added
+
+- Added first-class support for **Kiro**, reached through a self-hosted relay (`kiro-go`, `kiro2api`) that exposes a paid Kiro subscription over the Anthropic Messages API. Registers the `kiro` provider descriptor (default base URL `http://127.0.0.1:8080/v1`, overridable via `KIRO_BASE_URL` or `providers.kiro.baseUrl`), `KIRO_API_KEY` environment resolution, and a `/login kiro` entry that validates the pasted relay key against that relay's `/v1/models`. Discovery is credential-gated because the default port is shared with llama.cpp, and nothing is bundled because entitlements follow the user's subscription tier: token limits and reasoning support come from the bundled catalog entry for the upstream vendor id, the relay's own modality flags decide vision, `-thinking` twins are marked reasoning-capable, per-token cost is reported as zero because Kiro meters subscription credits per request, `compat.disableStrictTools` is set because the Bedrock/CodeWhisperer path behind the relay rejects strict tool schemas with `400 TOOL_SCHEMA_INVALID`, and the relay's hardcoded `gpt-4o`/`gpt-4` aliases are dropped because they resolve to a Claude model upstream.
 
 ### Fixed
 

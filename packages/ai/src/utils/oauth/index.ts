@@ -46,6 +46,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "kiro",
+		name: "Kiro (kiro-go / kiro2api relay)",
+		available: true,
+	},
+	{
 		id: "kagi",
 		name: "Kagi",
 		available: true,
@@ -399,6 +404,7 @@ export async function refreshOAuthToken(
 		case "bizrouter":
 		case "opengateway":
 		case "vllm":
+		case "kiro":
 			// API keys / static bearer tokens don't expire, return as-is
 			newCredentials = credentials;
 			break;

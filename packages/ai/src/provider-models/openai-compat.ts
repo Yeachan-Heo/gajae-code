@@ -1205,6 +1205,144 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 }
 
 // ---------------------------------------------------------------------------
+// 10.7 Kiro (local kiro-go / kiro2api relay)
+// ---------------------------------------------------------------------------
+
+/**
+ * A paid Kiro subscription is reachable through a self-hosted relay
+ * (`kiro-go`, `kiro2api`) that speaks the Anthropic Messages API on
+ * `/v1/messages` and lists the account's entitled models on `/v1/models`.
+ * Both relays listen on port 8080 by default; point `KIRO_BASE_URL` (or
+ * `providers.kiro.baseUrl`) at the relay when it runs elsewhere.
+ */
+const KIRO_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1";
+
+/**
+ * kiro-go publishes a `<id>-thinking` twin for every entitled model and turns
+ * thinking on when that id is selected, so the twins are always reasoning
+ * models regardless of what the base id resolves to.
+ */
+const KIRO_THINKING_MODEL_SUFFIX_RE = /-thinking$/;
+
+/**
+ * Reasoning fallback for entitled ids that have no bundled counterpart (for
+ * example `deepseek-3.2`). `/v1/models` carries no reasoning flag, and the
+ * router alias (`auto`) plus the coder-only lanes reject thinking, so gate the
+ * fallback on the families Kiro serves with extended thinking.
+ */
+const KIRO_REASONING_MODEL_PREFIXES = ["claude-opus", "claude-sonnet", "gpt-5", "deepseek", "glm-"] as const;
+
+/**
+ * Aliases kiro-go appends for clients that hardcode OpenAI ids. They resolve to
+ * a Claude model upstream, so surfacing them would misreport which model ran.
+ */
+const KIRO_ALIAS_OWNER = "kiro-proxy";
+
+/**
+ * Kiro's own router lane. OpenRouter publishes an unrelated model under the same
+ * id, so bundled-reference resolution would import a foreign model's limits
+ * (2M context / 30K output) for a lane whose real ceilings are unknown.
+ */
+const KIRO_ROUTER_MODEL_IDS = new Set(["auto"]);
+
+/**
+ * Bundled counterpart for an entitled Kiro id.
+ *
+ * Kiro serves upstream vendor ids, but spells the Claude ones with dots
+ * (`claude-opus-4.6`) while the bundled Anthropic catalog uses dashes
+ * (`claude-opus-4-6`). Resolve the dashed form first so Claude lanes land on
+ * Anthropic's own limits instead of a reseller's clamped copy (GitHub Copilot
+ * publishes `claude-opus-4.6` with a 168K window). Vendors that keep the dots
+ * (`gpt-5.6-sol`, `minimax-m2.1`) then match on the id as published.
+ */
+function resolveKiroReference(
+	resolveReference: (modelId: string) => Model<"anthropic-messages"> | undefined,
+	modelId: string,
+): Model<"anthropic-messages"> | undefined {
+	const baseId = modelId.replace(KIRO_THINKING_MODEL_SUFFIX_RE, "");
+	if (KIRO_ROUTER_MODEL_IDS.has(baseId)) {
+		return undefined;
+	}
+	return resolveReference(baseId.replaceAll(".", "-")) ?? resolveReference(baseId);
+}
+
+function isKiroReasoningModelId(modelId: string, reference: Model<"anthropic-messages"> | undefined): boolean {
+	if (KIRO_THINKING_MODEL_SUFFIX_RE.test(modelId)) {
+		return true;
+	}
+	if (reference) {
+		return reference.reasoning;
+	}
+	const normalized = modelId.toLowerCase();
+	return KIRO_REASONING_MODEL_PREFIXES.some(prefix => normalized.startsWith(prefix));
+}
+
+/**
+ * Relay-reported modalities win because entitlement differs per model
+ * (`glm-5` is text-only while every Claude lane accepts images).
+ */
+function kiroInputCapabilities(
+	entry: OpenAICompatibleModelRecord,
+	reference: Model<"anthropic-messages"> | undefined,
+): ("text" | "image")[] {
+	if (Array.isArray(entry.input_modalities)) {
+		return toInputCapabilities(entry.input_modalities);
+	}
+	if (toBoolean(entry.supports_image) === true) {
+		return ["text", "image"];
+	}
+	return reference ? [...reference.input] : ["text"];
+}
+
+export interface KiroModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function kiroModelManagerOptions(config?: KiroModelManagerConfig): ModelManagerOptions<"anthropic-messages"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = toAnthropicDiscoveryBaseUrl(normalizeAnthropicBaseUrl(config?.baseUrl, KIRO_DEFAULT_BASE_URL));
+	// Entitled ids are upstream vendor ids, so bundled metadata carries the token
+	// limits the relay never reports. Anthropic first, then any bundled provider.
+	const resolveReference = createReferenceResolver(createBundledReferenceMap<"anthropic-messages">("anthropic"));
+	return {
+		providerId: "kiro",
+		// Discovery is credential-gated even though a relay can be configured to
+		// accept unauthenticated calls: probing `127.0.0.1:8080` unconditionally
+		// would collide with whatever else listens there (llama.cpp defaults to the
+		// same port). Any non-empty `KIRO_API_KEY` opts an open relay in, exactly
+		// like the vLLM integration.
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "anthropic-messages",
+					provider: "kiro",
+					baseUrl,
+					apiKey,
+					filterModel: entry => entry.owned_by !== KIRO_ALIAS_OWNER,
+					mapModel: (entry, defaults) => {
+						const reference = resolveKiroReference(resolveReference, defaults.id);
+						return {
+							...defaults,
+							name: toModelName(entry.display_name, defaults.name),
+							reasoning: isKiroReasoningModelId(defaults.id, reference),
+							input: kiroInputCapabilities(entry, reference),
+							contextWindow: reference?.contextWindow ?? defaults.contextWindow,
+							maxTokens: reference?.maxTokens ?? defaults.maxTokens,
+							// Kiro meters subscription credits per request (`rateMultiplier`),
+							// never per token, so upstream per-token pricing would be fiction.
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							// The relay forwards to Bedrock/CodeWhisperer, which rejects strict
+							// tool schemas with `400 TOOL_SCHEMA_INVALID`.
+							compat: { disableStrictTools: true },
+						};
+					},
+				}),
+		}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Alibaba Token Plan
 // ---------------------------------------------------------------------------
 

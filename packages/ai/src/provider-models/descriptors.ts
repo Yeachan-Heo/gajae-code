@@ -24,6 +24,7 @@ import {
 	huggingfaceModelManagerOptions,
 	kiloModelManagerOptions,
 	kimiCodeModelManagerOptions,
+	kiroModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
 	mistralModelManagerOptions,
@@ -204,6 +205,9 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => kiloModelManagerOptions(config),
 		catalog("Kilo Gateway", ["KILO_API_KEY"], { allowUnauthenticated: true }),
 	),
+	// Kiro is a self-hosted relay: entitlements follow the user's subscription, so
+	// there is nothing to bundle and nothing to generate a catalog from.
+	descriptor("kiro", "claude-sonnet-5", config => kiroModelManagerOptions(config)),
 	catalogDescriptor(
 		"vercel-ai-gateway",
 		"anthropic/claude-sonnet-4-6",

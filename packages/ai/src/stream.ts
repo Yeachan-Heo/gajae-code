@@ -96,6 +96,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	fugu: "FUGU_API_KEY",
 	openrouter: "OPENROUTER_API_KEY",
 	kilo: "KILO_API_KEY",
+	kiro: "KIRO_API_KEY",
 	"vercel-ai-gateway": "AI_GATEWAY_API_KEY",
 	zai: "ZAI_API_KEY",
 	"glm-zcode": "GLM_ZCODE_API_KEY",

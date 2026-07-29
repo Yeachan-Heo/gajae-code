@@ -106,6 +106,7 @@ Providers:
   openai-codex      OpenAI code provider (ChatGPT Plus/Pro)
   kimi-code         Kimi Code
   kilo              Kilo Gateway
+  kiro              Kiro (kiro-go / kiro2api relay)
   kagi              Kagi
   tavily            Tavily
   zai               Z.AI (GLM Coding Plan)

@@ -140,6 +140,7 @@ export type KnownProvider =
 	| "cerebras"
 	| "openrouter"
 	| "kilo"
+	| "kiro"
 	| "vercel-ai-gateway"
 	| "zai"
 	| "glm-zcode"

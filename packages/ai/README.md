@@ -77,6 +77,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **Ollama Cloud** (hosted native Ollama API; requires `OLLAMA_CLOUD_API_KEY`)
 - **llama.cpp** (local OpenAI and Anthropic compatible inference server)
 - **vLLM** (OpenAI-compatible server; `VLLM_API_KEY` for secured deployments)
+- **Kiro** (self-hosted `kiro-go` / `kiro2api` relay; requires `KIRO_API_KEY`, endpoint via `KIRO_BASE_URL`)
 - **GitHub Copilot** (requires OAuth, see below)
 - **Google Gemini CLI** (requires OAuth, see below)
 - **Antigravity** (requires OAuth, see below)
@@ -959,6 +960,7 @@ In Node.js environments, you can set environment variables to avoid passing API 
 | OpenGateway    | `OPENGATEWAY_API_KEY`                                                        |
 | BizRouter      | `BIZROUTER_API_KEY`                                                          |
 | vLLM           | `VLLM_API_KEY`                                                               |
+| Kiro           | `KIRO_API_KEY` (optional; relay endpoint via `KIRO_BASE_URL`)                |
 | Cloudflare AI Gateway | `CLOUDFLARE_AI_GATEWAY_API_KEY`                                      |
 | GitHub Copilot | `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` or `GITHUB_TOKEN`                      |
 
@@ -984,6 +986,7 @@ Provider endpoint defaults for the current OpenAI-compatible integrations:
 - OpenGateway by Sionic AI: `https://apis.opengateway.ai/v1`
 - BizRouter: `https://api.bizrouter.ai/v1`
 - vLLM: `http://127.0.0.1:8000/v1`
+- Kiro (Anthropic Messages API on a self-hosted `kiro-go` / `kiro2api` relay): `http://127.0.0.1:8080/v1`
 - Ollama: local OpenAI-compatible runtime (`http://127.0.0.1:11434/v1`)
 - Ollama Cloud: native Ollama API host (`https://ollama.com/api`, configured here as base URL `https://ollama.com`)
 - LiteLLM: `http://localhost:4000/v1`
