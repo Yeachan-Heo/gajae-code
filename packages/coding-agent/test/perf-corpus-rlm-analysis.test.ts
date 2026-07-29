@@ -1281,12 +1281,18 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 	});
 
 	test("rejects report/ledger host platform and arch binding drift", async () => {
-		for (const [name, field, ledgerValue] of [
-			["platform", "platform", "linux"],
-			["arch", "arch", "x64"],
+		// The driver raises both messages from one loop, but recovers the finding code from message
+		// text: it matches "platform"/"architecture", so `arch` drift falls through to
+		// REPORT_VALIDATION_FAILED instead of PLATFORM_DRIFT. That asymmetry is a driver defect, and
+		// the driver is SHA-256-bound into every publication receipt, so it cannot be corrected here.
+		// These expectations pin the observed codes so a classifier change is caught rather than
+		// silently absorbed; they record current behavior and do not endorse the split.
+		for (const [field, ledgerValue, expectedCode] of [
+			["platform", "linux", "PLATFORM_DRIFT"],
+			["arch", "x64", "REPORT_VALIDATION_FAILED"],
 		] as const) {
-			const input = path.join(temporaryRoot, `host-binding-${name}-input`);
-			const output = path.join(temporaryRoot, `host-binding-${name}-output`);
+			const input = path.join(temporaryRoot, `host-binding-${field}-input`);
+			const output = path.join(temporaryRoot, `host-binding-${field}-output`);
 			await writeCorpus(input);
 			// Keep ledger host and every attempt internally consistent so the earlier host/power
 			// equality gate still passes; only the report/ledger binding may disagree.
@@ -1296,11 +1302,12 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			});
 			expect(invoke(input, output).exitCode).toBe(3);
 			const result = await readResult(output);
-			expect(
-				result.diagnostics.validationErrors.some(
-					error => error.message?.includes(`host ${field} binding mismatch`) === true,
-				),
-			).toBe(true);
+			expect(result.diagnostics.validationErrors).toContainEqual(
+				expect.objectContaining({
+					code: expectedCode,
+					message: `short-01.json: report/ledger host ${field} binding mismatch`,
+				}),
+			);
 			expect(result.admission.short.admittedBlocks).toBe(0);
 			expect(result.admission.soak.admittedBlocks).toBe(0);
 		}
