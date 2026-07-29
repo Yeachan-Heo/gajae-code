@@ -2045,9 +2045,24 @@ describe("native GJC ultragoal runtime", () => {
 		await createUltragoalPlan({ cwd: root, brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc" });
 		await startNextUltragoalGoal({ cwd: root });
 
+		// Shape-valid forgeries, so the deferred-gate rule itself must reject them rather than the
+		// generic per-section field allowlist firing first.
+		const forgeries: Record<string, unknown> = {
+			architectReview: {
+				architectureStatus: "CLEAR",
+				productStatus: "CLEAR",
+				codeStatus: "CLEAR",
+				recommendation: "APPROVE",
+				evidence: "forged",
+				commands: ["forged"],
+				blockers: [],
+			},
+			executorQa: { status: "passed", e2eStatus: "passed", redTeamStatus: "passed", evidence: "forged" },
+			validationBatchClose: { status: "passed" },
+		};
 		for (const forged of ["architectReview", "executorQa", "validationBatchClose"]) {
 			const gate = JSON.parse(implicitDeferredGate("G001", ["targetedVerification"]));
-			gate[forged] = { status: "passed" };
+			gate[forged] = forgeries[forged];
 			await expect(
 				checkpointUltragoalGoal({
 					cwd: root,

@@ -440,7 +440,7 @@ function assertCompletionQualityGateSectionFields(gate: JsonObject): void {
 			"changedPaths",
 			"computerTouching",
 		],
-		iteration: ["status", "evidence", "fullRerun", "rerunCommands", "blockers"],
+		iteration: ["status", "evidence", "fullRerun", "rerunCommands", "blockers", "reviewCohort"],
 	};
 	for (const [field, allowed] of Object.entries(allowedFields)) {
 		const section = qualityGateObject(gate[field]);
