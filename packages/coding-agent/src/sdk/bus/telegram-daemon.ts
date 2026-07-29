@@ -4,6 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { durableReplacePath, type NativeDurableReplaceResult } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
@@ -106,8 +107,14 @@ import {
 	telegramDisableNotification,
 } from "./telegram-reference";
 import { decideThreadedInbound, type InboundAttachment } from "./threaded-inbound";
-import { renderThreadedFrame, supportsTelegramPhotoUpload, type ThreadedSend } from "./threaded-render";
-import { type TopicEndpointBinding, TopicRegistry, type TopicRegistryState } from "./topic-registry";
+import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
+import {
+	parseTopicRegistryState,
+	type TopicEndpointBinding,
+	TopicRegistry,
+	type TopicRegistryCasAuthority,
+	type TopicRegistryState,
+} from "./topic-registry";
 
 export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled" | "blocked";
 /** Detailed result for orchestration that must distinguish a #2028 handoff from a fresh spawn. */
@@ -152,17 +159,13 @@ export interface TelegramDaemonFs {
 	writeFile(path: string, data: string, opts?: fs.WriteFileOptions): Promise<void>;
 	rename(oldPath: string, newPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
-	open(path: string, flags: string, mode?: number): Promise<{ close(): Promise<void> }>;
+	open(path: string, flags: string, mode?: number): Promise<{ close(): Promise<void>; sync?(): Promise<void> }>;
 	readdir(path: string): Promise<string[]>;
 	chmod(path: string, mode: number): Promise<void>;
-	stat?(path: string): Promise<{
-		mtimeMs: number;
-		size?: number;
-		dev?: number;
-		ino?: number;
-		ctimeMs?: number;
-		isDirectory?: () => boolean;
-	}>;
+	/** Crash-atomic persistence seams. Implementations without them fail closed. */
+	fsyncFile?(path: string): Promise<void>;
+	fsyncDirectory?(path: string): Promise<void>;
+	stat?(path: string): Promise<{ mtimeMs: number; size?: number; dev?: number; ino?: number; ctimeMs?: number }>;
 	readEndpointFile?(path: string): Promise<NotificationEndpointFile>;
 	exactUnlink?(path: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 }
@@ -227,6 +230,22 @@ function negotiateToolActivityCapability(
 
 const nodeFs: TelegramDaemonFs = {
 	...(fs.promises as unknown as TelegramDaemonFs),
+	fsyncFile: async file => {
+		const handle = await fs.promises.open(file, "r+");
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	},
+	fsyncDirectory: async directory => {
+		const handle = await fs.promises.open(directory, "r");
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	},
 	readEndpointFile: readNotificationEndpointFile,
 	exactUnlink: async (file, identity) =>
 		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
@@ -469,12 +488,13 @@ function endpointGenerationKey(url: string, token: string): string {
 function topicRenameApplied(response: unknown): boolean {
 	return !!response && typeof response === "object" && (response as { ok?: unknown }).ok === true;
 }
-function topicDeleteSettled(response: unknown): boolean {
-	if (!response || typeof response !== "object") return false;
-	const result = response as { ok?: unknown; description?: unknown };
-	if (result.ok === true) return true;
-	if (typeof result.description !== "string") return false;
-	return /(?:TOPIC_ID_INVALID|message thread not found)/i.test(result.description);
+function topicArchiveSettled(response: unknown): boolean {
+	return (
+		!!response &&
+		typeof response === "object" &&
+		(response as { ok?: unknown; result?: unknown }).ok === true &&
+		(response as { result?: unknown }).result === true
+	);
 }
 
 /**
@@ -584,6 +604,206 @@ async function writeJsonAtomic(fsImpl: TelegramDaemonFs, file: string, data: unk
 	await fsImpl.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
 	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
 	await fsImpl.rename(tmp, file);
+}
+
+export class TopicRegistryDurabilityUnavailableError extends Error {
+	readonly code = "durability_unavailable";
+
+	constructor(cause: unknown) {
+		super("topic registry durability is unavailable", { cause });
+		this.name = "TopicRegistryDurabilityUnavailableError";
+	}
+}
+
+/** Publish topic authority only after its staged bytes and replacement are durable. */
+export async function writeTopicRegistryAtomic(
+	fsImpl: TelegramDaemonFs,
+	file: string,
+	data: unknown,
+	platform: NodeJS.Platform = process.platform,
+	durableReplace: (sourcePath: string, destinationPath: string) => NativeDurableReplaceResult = durableReplacePath,
+): Promise<void> {
+	if (!fsImpl.fsyncFile)
+		throw new TopicRegistryDurabilityUnavailableError(
+			new Error("topic registry persistence requires file fsync crash-atomicity"),
+		);
+	if (platform !== "win32" && !fsImpl.fsyncDirectory)
+		throw new TopicRegistryDurabilityUnavailableError(
+			new Error("topic registry persistence requires directory fsync crash-atomicity"),
+		);
+	const parent = path.dirname(file);
+	const serialized = `${JSON.stringify(data, null, 2)}\n`;
+	const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+	try {
+		await fsImpl.writeFile(tmp, serialized, { mode: 0o600 });
+		await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
+		await fsImpl.fsyncFile(tmp);
+		if (platform === "win32") {
+			if (typeof durableReplace !== "function")
+				throw new TopicRegistryDurabilityUnavailableError(
+					new Error("native Windows write-through replacement is unavailable"),
+				);
+			const outcome = durableReplace(tmp, file);
+			if (!outcome.ok || outcome.mutationState !== "committed" || outcome.durabilityState !== "durable")
+				throw new TopicRegistryDurabilityUnavailableError(
+					new Error(`native Windows topic replacement failed: ${outcome.code ?? outcome.reason}`),
+				);
+			const written = await fsImpl.readFile(file, "utf8");
+			if (written !== serialized)
+				throw new TopicRegistryDurabilityUnavailableError(
+					new Error("native Windows topic replacement verification failed"),
+				);
+		} else {
+			await fsImpl.rename(tmp, file);
+			await fsImpl.fsyncDirectory!(parent);
+		}
+	} catch (error) {
+		await fsImpl.unlink(tmp).catch(() => undefined);
+		throw error;
+	}
+}
+/**
+ * Shared-volume topic authority backed by the existing cross-process file lock.
+ * A missing authority is the only valid bootstrap state; malformed and future
+ * snapshots are never interpreted as empty state.
+ */
+export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuthority {
+	private readonly fsImpl: TelegramDaemonFs;
+	private readonly platform: NodeJS.Platform;
+	private readonly durableReplace: (sourcePath: string, destinationPath: string) => NativeDurableReplaceResult;
+	private readonly installationHostId: string;
+
+	constructor(
+		private readonly file: string,
+		input: {
+			installationHostId: string;
+			fs?: TelegramDaemonFs;
+			platform?: NodeJS.Platform;
+			durableReplace?: (sourcePath: string, destinationPath: string) => NativeDurableReplaceResult;
+		},
+	) {
+		if (!input.installationHostId) throw new Error("installationHostId must be non-empty");
+		this.installationHostId = input.installationHostId;
+		this.fsImpl = input.fs ?? nodeFs;
+		this.platform = input.platform ?? process.platform;
+		this.durableReplace = input.durableReplace ?? durableReplacePath;
+	}
+
+	async read(): Promise<TopicRegistryState> {
+		return await withFileLock(this.file, async () => await this.readLocked(), {
+			staleMs: 10_000,
+			ownerHostId: this.installationHostId,
+		});
+	}
+
+	async compareAndSet(expectedGeneration: number, next: TopicRegistryState): Promise<boolean> {
+		if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0)
+			throw new Error("invalid expected topic registry generation");
+		if (
+			next.version !== 2 ||
+			next.registryGeneration !== expectedGeneration + 1 ||
+			parseTopicRegistryState(next) === undefined
+		)
+			throw new Error("invalid next topic registry generation");
+		return await withFileLock(
+			this.file,
+			async () => {
+				const current = await this.readLocked();
+				if (current.registryGeneration !== expectedGeneration) return false;
+				await ensureDir(this.fsImpl, path.dirname(this.file));
+				await writeTopicRegistryAtomic(this.fsImpl, this.file, next, this.platform, this.durableReplace);
+				return true;
+			},
+			{ staleMs: 10_000, ownerHostId: this.installationHostId },
+		);
+	}
+
+	private async readLocked(): Promise<TopicRegistryState> {
+		let raw: unknown;
+		try {
+			raw = JSON.parse(await this.fsImpl.readFile(this.file, "utf8"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				return { version: 2, registryGeneration: 0, topics: {} };
+			throw new Error("shared topic authority is malformed or unavailable");
+		}
+		const state = parseTopicRegistryState(raw);
+		const generation = state?.registryGeneration;
+		if (state?.version !== 2 || generation === undefined || !Number.isSafeInteger(generation) || generation < 0)
+			throw new Error("shared topic authority is malformed or unsupported");
+		return { ...state, registryGeneration: generation };
+	}
+}
+
+export interface MachineIdentityDeps {
+	platform?: NodeJS.Platform;
+	readFile?: (file: string) => Promise<string>;
+	runCommand?: (command: string, args: readonly string[]) => { exitCode: number; stdout: Uint8Array };
+}
+
+function normalizedMachineIdentity(value: string, pattern: RegExp): string | undefined {
+	const normalized = value.trim().toLowerCase();
+	if (!pattern.test(normalized) || /^0+$/.test(normalized.replace(/-/g, ""))) return undefined;
+	return normalized;
+}
+
+/** @internal */
+export function parseWindowsMachineGuid(output: string): string | undefined {
+	const match = /^\s*MachineGuid\s+REG_\w+\s+(\S+)\s*$/im.exec(output);
+	return match
+		? normalizedMachineIdentity(match[1], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+		: undefined;
+}
+
+/** @internal */
+export function parseMacPlatformUuid(output: string): string | undefined {
+	const match = /"IOPlatformUUID"\s*=\s*"([^"]+)"/.exec(output);
+	return match
+		? normalizedMachineIdentity(match[1], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+		: undefined;
+}
+
+function hashMachineIdentity(rawId: string): string {
+	return crypto
+		.createHash("sha256")
+		.update("gajae-code:telegram-daemon:machine-identity:v1\0")
+		.update(rawId)
+		.digest("hex");
+}
+
+/** Loads a verified machine-local identity without persisting the underlying machine ID. */
+export async function loadInstallationHostId(deps: MachineIdentityDeps = {}): Promise<string> {
+	const platform = deps.platform ?? process.platform;
+	const readFile = deps.readFile ?? (async (file: string) => await fs.promises.readFile(file, "utf8"));
+	const runCommand =
+		deps.runCommand ??
+		((command: string, args: readonly string[]) =>
+			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore" }));
+
+	let rawId: string | undefined;
+	if (platform === "linux") {
+		for (const file of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+			try {
+				const value = normalizedMachineIdentity(await readFile(file), /^[0-9a-f]{32}$/);
+				if (!value) throw new Error("machine-local identity is unavailable or malformed");
+				rawId = value;
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+	} else if (platform === "win32") {
+		const result = runCommand("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
+		if (result.exitCode === 0) rawId = parseWindowsMachineGuid(new TextDecoder().decode(result.stdout));
+	} else if (platform === "darwin") {
+		const result = runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
+		if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
+	} else {
+		throw new Error(`machine-local identity is unsupported on ${platform}`);
+	}
+
+	if (!rawId) throw new Error("machine-local identity is unavailable or malformed");
+	return hashMachineIdentity(rawId);
 }
 
 function validDaemonPid(pid: unknown): pid is number {
@@ -1983,7 +2203,8 @@ export function isCurrentCompatibleOwner(input: {
 			state?.ownershipPhase === "ready" &&
 			typeof state.acquisitionId === "string" &&
 			state.acquisitionId.length > 0 &&
-			(state.servingEpoch === undefined ? 1 : state.servingEpoch) >= SERVING_EPOCH,
+			state.generation === DAEMON_GENERATION &&
+			state.servingEpoch === SERVING_EPOCH,
 	);
 }
 
@@ -2921,6 +3142,8 @@ export interface TelegramSpawnOwnerInput {
 	roots?: string[];
 	tokenFingerprint: string;
 	chatId: string;
+	/** Ephemeral outbound-only validation destination for this owner launch. */
+	validationTestSupergroupChatId?: string;
 }
 
 export interface TelegramSpawnAcquisition {
@@ -2948,7 +3171,12 @@ export type TelegramSpawnOwnerResult =
  * Source mode prepends the entry script so the respawn loads edited source;
  * a compiled binary self-spawns its own subcommand directly.
  */
-export function buildTelegramDaemonSpawnArgs(input: { execPath?: string; ownerId: string; agentDir: string }): {
+export function buildTelegramDaemonSpawnArgs(input: {
+	execPath?: string;
+	ownerId: string;
+	agentDir: string;
+	validationTestSupergroupChatId?: string;
+}): {
 	command: string;
 	args: string[];
 	runtime: DaemonRuntimeInfo;
@@ -2962,6 +3190,9 @@ export function buildTelegramDaemonSpawnArgs(input: { execPath?: string; ownerId
 		input.ownerId,
 		"--agent-dir",
 		input.agentDir,
+		...(input.validationTestSupergroupChatId !== undefined
+			? ["--validation-test-supergroup-chat-id", input.validationTestSupergroupChatId]
+			: []),
 	];
 	const runtime: DaemonRuntimeInfo = {
 		mode: rt.mode,
@@ -3037,6 +3268,7 @@ export async function spawnTelegramDaemonOwner(
 		execPath,
 		ownerId: provisionalAcquisition.ownerId,
 		agentDir,
+		validationTestSupergroupChatId: input.validationTestSupergroupChatId,
 	});
 	const spawnImpl = deps.spawn ?? defaultDaemonSpawn;
 	const child = spawnImpl(command, args, {
@@ -3218,13 +3450,17 @@ async function ensureTelegramDaemonRunningDetailedOnce(
 	// unproven cooperative handoff into destructive cleanup or a replacement spawn.
 	if ((deps.platform ?? process.platform) === "win32") {
 		const parentState: unknown = await readDaemonState(input.settings, deps.fs);
-		if (isParentDaemonState(parentState) && (deps.pidAlive ?? defaultPidAlive)(parentState.pid))
+		if (
+			isParentDaemonState(parentState) &&
+			(deps.pidAlive ?? defaultPidAlive)(parentState.pid) &&
+			(!hasSafeDaemonStateShape(parentState) || ownerProvenanceMatches(parentState, deps.pidIncarnation))
+		)
 			return "blocked_identity";
 	}
 	// Windows can retain dead launcher metadata without an ownership lock; reclaim
 	// its dead discovery records before the replacement can publish a new owner.
 	if ((deps.platform ?? process.platform) === "win32" && !deps.fs) {
-		const preflight = await reclaimDeadDaemonOwner({
+		let preflight = await reclaimDeadDaemonOwner({
 			settings: input.settings,
 			endpointDir: path.join(root, "sdk"),
 			fs: deps.fs,
@@ -3232,6 +3468,28 @@ async function ensureTelegramDaemonRunningDetailedOnce(
 			pidAlive: deps.pidAlive,
 			pidIncarnation: deps.pidIncarnation,
 		});
+		// A just-reused PID can be reported alive for the first probe. Recheck once
+		// before acquisition only when stale discovery records need fenced cleanup.
+		// reclaimDeadDaemonOwner still requires exact state, lock, incarnation,
+		// transition-lock, and endpoint-identity proofs before deleting anything.
+		const endpointNames =
+			preflight.reason === "not-confirmed-dead"
+				? await (deps.fs ?? nodeFs).readdir(path.join(root, "sdk")).catch(() => undefined)
+				: undefined;
+		if (
+			!preflight.recovered &&
+			preflight.reason === "not-confirmed-dead" &&
+			endpointNames?.some(name => name.endsWith(".json"))
+		) {
+			preflight = await reclaimDeadDaemonOwner({
+				settings: input.settings,
+				endpointDir: path.join(root, "sdk"),
+				fs: deps.fs,
+				now: deps.now,
+				pidAlive: deps.pidAlive,
+				pidIncarnation: deps.pidIncarnation,
+			});
+		}
 		if (!preflight.recovered && preflight.reason !== "not-confirmed-dead") {
 			logger.warn(
 				`notifications: startup recovery unsafe (${preflight.reason}); run \`gjc notify recovery\` for diagnostics`,
@@ -3648,7 +3906,7 @@ export class TelegramBotTransport implements BotApi {
 	}
 }
 
-type PairedChatPrivacy = "private" | "non-private" | "indeterminate";
+type PairedChatPrivacy = "private" | "validation-forum" | "non-private" | "indeterminate";
 
 export type TelegramUpdateOutcome = "consumed" | "retry";
 
@@ -3864,6 +4122,12 @@ export interface TelegramDaemonOptions {
 	ownerId: string;
 	botToken: string;
 	chatId: string;
+	/**
+	 * Exact ephemeral forum destination supplied to the daemon-internal validation
+	 * command. Production ownership, pairing, and durable topic authority remain
+	 * bound to `chatId`.
+	 */
+	validationTestSupergroupChatId?: string;
 	apiBase?: string;
 	fetchImpl?: typeof fetch;
 	fs?: TelegramDaemonFs;
@@ -3915,6 +4179,13 @@ export interface TelegramDaemonOptions {
 	 * built-in `{repo}/{branch} - {title}` composition and its fallbacks.
 	 */
 	topics?: { nameTemplate?: string };
+	/**
+	 * Optional compare-and-set store for installations that share topic state
+	 * across hosts. When configured, every publication is fenced by it.
+	 */
+	topicRegistryAuthority?: TopicRegistryCasAuthority;
+	/** Stable host-local identity. Required whenever a shared authority is configured. */
+	installationHostId?: string;
 }
 
 interface SessionSocket {
@@ -4025,7 +4296,8 @@ interface PendingThreadedFrame {
 	send: ThreadedSend;
 	msg: Record<string, unknown>;
 	logicalSessionId: string;
-	socketLease: { session: SessionSocket; token: number; logicalSessionId: string };
+	session: SessionSocket;
+	socketLease?: { session: SessionSocket; token: number; logicalSessionId: string };
 	toolActivity?: ToolActivityOwner;
 }
 
@@ -4231,6 +4503,8 @@ export class TelegramNotificationDaemon {
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor();
 	private readonly topics = new TopicRegistry();
+	/** Stable host-local identity; never persisted in shared topic authority. */
+	private installationHostId: string;
 	/**
 	 * Telegram may accept createForumTopic while returning an unusable success
 	 * payload. Remember that ambiguity per endpoint so later frames cannot repeat
@@ -4245,6 +4519,11 @@ export class TelegramNotificationDaemon {
 	private recoveryBindingClaimQueue: Promise<void> = Promise.resolve();
 	/** Durable compensation fences retry under supervision until persistence succeeds. */
 	private readonly compensationFenceRetries = new Map<string, Promise<void>>();
+	/** All archive paths for one session share one durable fence and remote dispatch. */
+	private readonly archiveFlights = new Map<
+		string,
+		Promise<"pre_dispatch_cancelled" | "post_dispatch_pending" | "settled">
+	>();
 
 	/** Daemon edit attempts that can race an accepted user service message. */
 	private readonly daemonRenameAttempts = new Map<string, number>();
@@ -4285,8 +4564,8 @@ export class TelegramNotificationDaemon {
 	private threadedFallbackNoticeSent = false;
 	/** Sessions whose identity header was already sent flat (Threaded Mode off). */
 	private readonly flatIdentitySent = new Set<string>();
-	/** Cached result of whether the paired chat is a private chat (flat-fallback gate). */
-	private pairedChatPrivate: boolean | undefined;
+	/** Cached delivery boundary for the private owner chat or validation forum. */
+	private pairedChatPrivacy: PairedChatPrivacy | undefined;
 	/** Bot username from getMe, cached once at owner startup for group/forum command targeting. */
 	private botUsername: string | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
@@ -4718,7 +4997,8 @@ export class TelegramNotificationDaemon {
 			const outcome = classifyBotApiCallOutcome(undefined, true);
 			return { response: undefined, outcome };
 		}
-		const response = await this.effects.call(rawBotApi, method, body, callOpts);
+		const outboundBody = this.validationTopicDestination(method, body);
+		const response = await this.effects.call(rawBotApi, method, outboundBody, callOpts);
 		const outcome = classifyBotApiCallOutcome(response);
 		if (outcome.kind === "retryable")
 			this.botCooldownUntil = Math.max(
@@ -4726,6 +5006,27 @@ export class TelegramNotificationDaemon {
 				(this.opts.now?.() ?? Date.now()) + outcome.retryAfterMs,
 			);
 		return { response, outcome };
+	}
+	private validationTopicDestination(method: string, body: unknown): unknown {
+		if (
+			!this.validationMode() ||
+			method === "getChat" ||
+			!body ||
+			typeof body !== "object" ||
+			String((body as { chat_id?: unknown }).chat_id) !== String(this.opts.chatId)
+		)
+			return body;
+		const outbound = body as Record<string, unknown>;
+		const topicScopedMethod =
+			method === "createForumTopic" ||
+			method === "editForumTopic" ||
+			method === "closeForumTopic" ||
+			method === "editMessageText" ||
+			method === "editMessageCaption" ||
+			method === "editMessageMedia" ||
+			outbound.message_thread_id !== undefined;
+		if (!topicScopedMethod) return body;
+		return { ...outbound, chat_id: this.opts.validationTestSupergroupChatId! };
 	}
 
 	private readonly callBotApiClassified: (
@@ -4747,6 +5048,9 @@ export class TelegramNotificationDaemon {
 	constructor(private readonly opts: TelegramDaemonOptions) {
 		this.fsImpl = opts.fs ?? nodeFs;
 		this.replyStore = new ReplySentStore({ agentDir: opts.settings.getAgentDir(), fs: opts.fs });
+		if (opts.topicRegistryAuthority && !opts.installationHostId)
+			throw new Error("shared topic authority requires a host-local installation identity");
+		this.installationHostId = opts.installationHostId ?? crypto.randomUUID();
 		this.aliasTable = createAliasTable();
 		this.#adoptionIntentTtlMs = opts.adoptionIntentTtlMs ?? DEFAULT_ADOPTION_INTENT_TTL_MS;
 		const adoptionFs: AdoptionIntentFs = {
@@ -4857,7 +5161,6 @@ export class TelegramNotificationDaemon {
 					if (!socketLease) return;
 					const topicLease = this.topicAuthorityLeaseFromRegistry(logicalSessionId);
 					if (
-						this.topics.get(logicalSessionId)?.authorityState === "delete_pending" ||
 						this.topics.get(logicalSessionId)?.bindingMalformed ||
 						(mode === "recovery" && (!topicLease || msg.sessionId !== logicalSessionId))
 					) {
@@ -5016,40 +5319,49 @@ export class TelegramNotificationDaemon {
 						if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
 
 						const closedBinding = this.#endpointBinding(session);
-						const closeTopicAuthority = this.topics.captureDeleteAuthority(logicalSessionId);
+						const closedBindingMatches = () => {
+							const current = this.closedEndpointKeys.get(session.sessionId);
+							return (
+								current?.chatId === closedBinding.chatId &&
+								current.endpointKey === closedBinding.endpointKey &&
+								current.endpointDigest === closedBinding.endpointDigest &&
+								current.endpointGeneration === closedBinding.endpointGeneration
+							);
+						};
+						const closeTopicAuthority = this.topics.captureArchiveAuthority(logicalSessionId);
 						const previousClosedBinding = this.closedEndpointKeys.get(session.sessionId);
 						await this.#persistTopicMutation(
 							() => {
 								this.closedEndpointKeys.set(session.sessionId, closedBinding);
-								this.topics.beginDelete(logicalSessionId);
+								this.topics.beginArchive(logicalSessionId);
 							},
 							() => {
-								this.topics.restoreDeleteAuthority(closeTopicAuthority);
+								this.topics.restoreArchiveAuthority(closeTopicAuthority);
 								if (previousClosedBinding === undefined) this.closedEndpointKeys.delete(session.sessionId);
-								else if (this.closedEndpointKeys.get(session.sessionId) === closedBinding)
+								else if (closedBindingMatches())
 									this.closedEndpointKeys.set(session.sessionId, previousClosedBinding);
 							},
 						);
 						if (
-							socketLease &&
-							(this.sessions.get(session.sessionId) !== session ||
-								session.recoveryLease?.token !== socketLease.token ||
-								session.recoveryLease.state !== "authorized" ||
-								this.logicalSessionOwners.get(logicalSessionId) !== session)
+							this.sessions.get(session.sessionId) !== session ||
+							(socketLease &&
+								(session.recoveryLease?.token !== socketLease.token ||
+									session.recoveryLease.state !== "authorized" ||
+									this.logicalSessionOwners.get(logicalSessionId) !== session))
 						) {
 							// A replacement won after the close fence committed. Restore the exact
 							// pre-close authority and remove the predecessor tombstone together.
 							const restoreCloseAuthority = (): Promise<boolean> =>
 								this.#persistTopicMutation(
 									() => {
-										const restored = this.topics.restoreDeleteAuthority(closeTopicAuthority);
-										if (!restored) throw new Error("close authority changed before compensation");
-										this.closedEndpointKeys.delete(session.sessionId);
+										this.topics.restoreArchiveAuthority(closeTopicAuthority);
+										if (closedBindingMatches()) this.closedEndpointKeys.delete(session.sessionId);
 										return true;
 									},
 									() => {
-										this.topics.restoreDeleteFence(closeTopicAuthority);
-										this.closedEndpointKeys.set(session.sessionId, closedBinding);
+										this.topics.restoreArchiveFence(closeTopicAuthority);
+										if (this.sessions.get(session.sessionId) === session)
+											this.closedEndpointKeys.set(session.sessionId, closedBinding);
 									},
 								);
 							try {
@@ -5059,7 +5371,7 @@ export class TelegramNotificationDaemon {
 							}
 							return;
 						}
-						const deleteOutcome = await this.deleteTopic(logicalSessionId, socketLease, true);
+						const deleteOutcome = await this.archiveTopic(logicalSessionId, socketLease, true);
 						if (
 							deleteOutcome === "pre_dispatch_cancelled" &&
 							socketLease &&
@@ -5067,12 +5379,12 @@ export class TelegramNotificationDaemon {
 						) {
 							await this.#persistTopicMutation(
 								() => {
-									if (!this.topics.restoreDeleteAuthority(closeTopicAuthority))
+									if (!this.topics.restoreArchiveAuthority(closeTopicAuthority))
 										throw new Error("close authority changed before compensation");
 									this.closedEndpointKeys.delete(session.sessionId);
 								},
 								() => {
-									this.topics.restoreDeleteFence(closeTopicAuthority);
+									this.topics.restoreArchiveFence(closeTopicAuthority);
 									this.closedEndpointKeys.set(session.sessionId, closedBinding);
 								},
 							);
@@ -5085,17 +5397,20 @@ export class TelegramNotificationDaemon {
 	}
 
 	async loadAliases(): Promise<void> {
+		if (this.validationMode()) return;
 		const raw = await readJson<unknown>(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).aliases);
 		if (raw) this.aliasTable.load(raw);
 	}
 
 	async persistAliases(): Promise<void> {
+		if (this.validationMode()) return;
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		await ensureDir(this.fsImpl, paths.dir);
 		await writeJsonAtomic(this.fsImpl, paths.aliases, this.aliasTable.serialize());
 	}
 
 	async loadSeenUpdateIds(): Promise<void> {
+		if (this.validationMode()) return;
 		const raw = await readJson<{ updateIds?: unknown }>(
 			this.fsImpl,
 			daemonPaths(this.opts.settings.getAgentDir()).seenUpdates,
@@ -5111,6 +5426,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	async persistSeenUpdateIds(): Promise<void> {
+		if (this.validationMode()) return;
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		await ensureDir(this.fsImpl, paths.dir);
 		await writeJsonAtomic(this.fsImpl, paths.seenUpdates, {
@@ -5140,6 +5456,12 @@ export class TelegramNotificationDaemon {
 		}
 	}
 	private async reserveSeenUpdateId(updateId: number): Promise<boolean> {
+		if (this.validationMode()) {
+			if (this.dispatchState.seenUpdateIds.has(updateId)) return false;
+			this.dispatchState.seenUpdateIds.add(updateId);
+			this.pruneSeenUpdateIds();
+			return true;
+		}
 		if (!Number.isSafeInteger(updateId) || updateId < 0) return false;
 		const candidate = new Set(this.dispatchState.seenUpdateIds);
 		candidate.add(updateId);
@@ -5161,6 +5483,10 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async releaseSeenUpdateId(updateId: number): Promise<void> {
+		if (this.validationMode()) {
+			this.dispatchState.seenUpdateIds.delete(updateId);
+			return;
+		}
 		if (!this.dispatchState.seenUpdateIds.has(updateId)) return;
 		const candidate = new Set(this.dispatchState.seenUpdateIds);
 		candidate.delete(updateId);
@@ -5246,26 +5572,28 @@ export class TelegramNotificationDaemon {
 				} catch {}
 			}
 		}
-		if (permanentlyMissingRoots.length > 0) {
+		if (!this.validationMode()) {
+			if (permanentlyMissingRoots.length > 0) {
+				try {
+					await pruneMissingNotificationRoots({
+						settings: this.opts.settings,
+						fs: this.fsImpl,
+						candidates: permanentlyMissingRoots,
+					});
+				} catch (error) {
+					logger.warn(`notifications: dead-root prune failed: ${sanitizeDiagnostic(String(error))}`);
+				}
+			}
+			// Best-effort periodic reap of retained exact-unlink quarantines (#2956).
 			try {
-				await pruneMissingNotificationRoots({
+				await reapStaleNotificationArtifacts({
 					settings: this.opts.settings,
 					fs: this.fsImpl,
-					candidates: permanentlyMissingRoots,
+					now: this.opts.now,
 				});
 			} catch (error) {
-				logger.warn(`notifications: dead-root prune failed: ${sanitizeDiagnostic(String(error))}`);
+				logger.warn(`notifications: leak-artifact reap failed: ${sanitizeDiagnostic(String(error))}`);
 			}
-		}
-		// Best-effort periodic reap of retained exact-unlink quarantines (#2956).
-		try {
-			await reapStaleNotificationArtifacts({
-				settings: this.opts.settings,
-				fs: this.fsImpl,
-				now: this.opts.now,
-			});
-		} catch (error) {
-			logger.warn(`notifications: leak-artifact reap failed: ${sanitizeDiagnostic(String(error))}`);
 		}
 		if (allRootsReadable) {
 			for (const sessionId of this.topics.sessionIds()) {
@@ -5319,7 +5647,7 @@ export class TelegramNotificationDaemon {
 			replayQueue: [],
 		};
 		this.sessions.set(sessionId, session);
-		if (this.topics.get(sessionId)) this.preservedInitiatorTopics.add(sessionId);
+		if (this.topics.get(sessionId)?.authorityState === "active") this.preservedInitiatorTopics.add(sessionId);
 
 		// Bidirectional capability advertisement: announce client_ping_pong once the
 		// socket is open. Sent on "open" only — a real WHATWG WebSocket cannot send
@@ -5364,7 +5692,9 @@ export class TelegramNotificationDaemon {
 			void (async () => {
 				if (this.#logicalSessionId(session) !== sessionId) return;
 				const topic = this.topics.get(sessionId);
-				if (!topic || topic.authorityState === "delete_pending" || topic.bindingMalformed) return;
+				if (!topic || topic.bindingMalformed) return;
+				if (topic.authorityState === "disconnect_grace" && !(await this.#renewTopicLease(sessionId))) return;
+				if (topic.authorityState !== "active") return;
 				const topicLease = this.topicAuthorityLeaseFromRegistry(sessionId);
 				if (topicLease?.topicId === topic.topicId) await this.flushPendingThreadedFrames(sessionId, topicLease);
 			})().catch(err =>
@@ -5408,6 +5738,11 @@ export class TelegramNotificationDaemon {
 				this.dropSession(session, "liveness_timeout");
 				return;
 			}
+			const logicalSessionId = this.#logicalSessionId(session);
+			if (session.logicalSessionIdTrusted)
+				void this.#renewTopicLease(logicalSessionId).then(renewed => {
+					if (!renewed) this.dropSession(session, "topic_lease_lost");
+				});
 			if (session.ws.readyState === WebSocket.OPEN) {
 				const nonce = `${session.sessionId}:${t}:${Math.random().toString(36).slice(2)}`;
 				session.awaitingNonce = nonce;
@@ -5569,6 +5904,7 @@ export class TelegramNotificationDaemon {
 		} else {
 			void this.#terminalizeBtwTurnsForSession(session).catch(() => undefined);
 		}
+		if (isCurrentSession && session.logicalSessionIdTrusted) this.#releaseTopicLease(this.#logicalSessionId(session));
 		if (isCurrentSession || reason === "session_closed") {
 			this.deleteMessageRoutes(session.sessionId);
 		}
@@ -5921,8 +6257,10 @@ export class TelegramNotificationDaemon {
 			lease.binding.endpointDigest === session.endpointDigest &&
 			lease.binding.endpointGeneration === session.hostGeneration &&
 			(!record ||
-				(record.authorityState !== "delete_pending" &&
+				(record.authorityState === "active" &&
 					!record.bindingMalformed &&
+					record.leaseOwner === this.installationHostId &&
+					(record.leaseExpiresAt ?? 0) > this.runtime.now() &&
 					record.chatId === lease.binding.chatId &&
 					record.endpointKey === lease.binding.endpointKey &&
 					record.endpointDigest === lease.binding.endpointDigest &&
@@ -6005,6 +6343,71 @@ export class TelegramNotificationDaemon {
 			: session.logicalSessionIdTrusted
 				? undefined
 				: { session, token: 0, logicalSessionId };
+	}
+	async #renewTopicLease(sessionId: string): Promise<boolean> {
+		const record = this.topics.get(sessionId);
+		if (!record) return true;
+		const previous = {
+			leaseOwner: record.leaseOwner,
+			leaseHeartbeatAt: record.leaseHeartbeatAt,
+			leaseExpiresAt: record.leaseExpiresAt,
+			authorityState: record.authorityState,
+			orphanedAt: record.orphanedAt,
+			disconnectGraceExpiresAt: record.disconnectGraceExpiresAt,
+		};
+		return this.#persistTopicMutation(
+			() =>
+				this.topics.acquireLease(
+					sessionId,
+					this.installationHostId,
+					this.runtime.now(),
+					HEARTBEAT_TTL_MS,
+					ORPHAN_TOPIC_GRACE_MS,
+				),
+			() => {
+				const current = this.topics.get(sessionId);
+				if (!current) return;
+				Object.assign(current, previous);
+				if (previous.leaseOwner === undefined) delete current.leaseOwner;
+				if (previous.leaseHeartbeatAt === undefined) delete current.leaseHeartbeatAt;
+				if (previous.leaseExpiresAt === undefined) delete current.leaseExpiresAt;
+				if (previous.orphanedAt === undefined) delete current.orphanedAt;
+				if (previous.disconnectGraceExpiresAt === undefined) delete current.disconnectGraceExpiresAt;
+			},
+		);
+	}
+	#releaseTopicLease(sessionId: string): void {
+		const record = this.topics.get(sessionId);
+		if (!record) return;
+		const previous = {
+			leaseHeartbeatAt: record.leaseHeartbeatAt,
+			leaseExpiresAt: record.leaseExpiresAt,
+			authorityState: record.authorityState,
+			orphanedAt: record.orphanedAt,
+			disconnectGraceExpiresAt: record.disconnectGraceExpiresAt,
+		};
+		void this.#persistTopicMutation(
+			() => {
+				const owner = this.logicalSessionOwners.get(sessionId);
+				return owner === undefined
+					? this.topics.releaseLeaseToGrace(
+							sessionId,
+							this.installationHostId,
+							this.runtime.now(),
+							ORPHAN_TOPIC_GRACE_MS,
+						)
+					: false;
+			},
+			() => {
+				const current = this.topics.get(sessionId);
+				if (!current) return;
+				Object.assign(current, previous);
+				if (previous.leaseHeartbeatAt === undefined) delete current.leaseHeartbeatAt;
+				if (previous.leaseExpiresAt === undefined) delete current.leaseExpiresAt;
+				if (previous.orphanedAt === undefined) delete current.orphanedAt;
+				if (previous.disconnectGraceExpiresAt === undefined) delete current.disconnectGraceExpiresAt;
+			},
+		).catch(() => undefined);
 	}
 
 	#authorizeLease(session: SessionSocket, logicalSessionId: string, binding: TopicEndpointBinding): void {
@@ -6176,84 +6579,123 @@ export class TelegramNotificationDaemon {
 		const binding = this.#endpointBinding(session);
 		const pendingToken = this.nextSocketLeaseToken++;
 		session.recoveryLease = { state: "pending", logicalSessionId: candidateSessionId, binding, token: pendingToken };
-		const claim = await this.#withRecoveryBindingClaim(async () => {
-			const existing = this.topics.get(candidateSessionId);
-			const hadDurableTopic = existing !== undefined;
-			const previousBinding = existing
-				? {
-						chatId: existing.chatId,
-						endpointKey: existing.endpointKey,
-						endpointDigest: existing.endpointDigest,
-						endpointGeneration: existing.endpointGeneration,
-						endpointIncarnation: existing.endpointIncarnation,
-					}
-				: undefined;
-			const outcome = await this.#persistTopicMutation(
-				() =>
-					this.topics.get(candidateSessionId)
-						? this.topics.bindEndpoint(
-								candidateSessionId,
-								binding,
-								this.#activeEndpointKeysFor(candidateSessionId, session),
-								allowEndpointRotation,
-							)
-						: "unchanged",
-				() => {
-					if (previousBinding) this.topics.restoreEndpointBinding(candidateSessionId, binding, previousBinding);
-				},
-			).catch(() => "rejected" as const);
-			if (outcome === "rejected") {
-				if (session.recoveryLease?.token === pendingToken)
-					session.recoveryLease = {
-						state: "rejected",
-						logicalSessionId: candidateSessionId,
-						binding,
-						token: pendingToken,
-					};
-				return undefined;
-			}
-			const endpointAuthority = this.#endpointAuthority(binding, session);
-			const identitylessAdmissionAllows =
-				identitylessAdmission === undefined ||
-				(identitylessAdmission === "bootstrap"
-					? (endpointAuthority.state === "none" && !this.topics.get(candidateSessionId)) ||
-						(endpointAuthority.state === "unique" &&
+		let claim: { previousSessionId: string; hadDurableTopic: boolean } | undefined;
+		try {
+			claim = await this.#withRecoveryBindingClaim(async () => {
+				const existing = this.topics.get(candidateSessionId);
+				const hadDurableTopic = existing !== undefined;
+				const previousBinding = existing
+					? {
+							chatId: existing.chatId,
+							endpointKey: existing.endpointKey,
+							endpointDigest: existing.endpointDigest,
+							endpointGeneration: existing.endpointGeneration,
+							endpointIncarnation: existing.endpointIncarnation,
+						}
+					: undefined;
+				let retiredTopicState: TopicRegistryState | undefined;
+				const outcome = await this.#persistTopicMutation(
+					() => {
+						if (allowEndpointRotation && this.topics.get(candidateSessionId)?.authorityState === "inactive") {
+							retiredTopicState = this.topics.serialize();
+							this.topics.retireInactiveEndpointForSuccessor(candidateSessionId, binding);
+						}
+						return this.topics.get(candidateSessionId)
+							? this.topics.bindEndpoint(
+									candidateSessionId,
+									binding,
+									this.#activeEndpointKeysFor(candidateSessionId, session),
+									allowEndpointRotation,
+								)
+							: "unchanged";
+					},
+					() => {
+						if (retiredTopicState) this.topics.replace(retiredTopicState);
+						else if (previousBinding)
+							this.topics.restoreEndpointBinding(candidateSessionId, binding, previousBinding);
+					},
+				).catch(() => "rejected" as const);
+				if (outcome === "rejected") {
+					if (session.recoveryLease?.token === pendingToken)
+						session.recoveryLease = {
+							state: "rejected",
+							logicalSessionId: candidateSessionId,
+							binding,
+							token: pendingToken,
+						};
+					return undefined;
+				}
+				if (!(await this.#renewTopicLease(candidateSessionId))) {
+					if (session.recoveryLease?.token === pendingToken)
+						session.recoveryLease = {
+							state: "rejected",
+							logicalSessionId: candidateSessionId,
+							binding,
+							token: pendingToken,
+						};
+					return undefined;
+				}
+				const endpointAuthority = this.#endpointAuthority(binding, session);
+				const identitylessAdmissionAllows =
+					identitylessAdmission === undefined ||
+					(identitylessAdmission === "bootstrap"
+						? (endpointAuthority.state === "none" && !this.topics.get(candidateSessionId)) ||
+							(endpointAuthority.state === "unique" &&
+								endpointAuthority.sessionId === candidateSessionId &&
+								this.topics.matchesEndpoint(candidateSessionId, binding))
+						: endpointAuthority.state === "unique" &&
 							endpointAuthority.sessionId === candidateSessionId &&
-							this.topics.matchesEndpoint(candidateSessionId, binding))
-					: endpointAuthority.state === "unique" &&
-						endpointAuthority.sessionId === candidateSessionId &&
-						this.topics.matchesEndpoint(candidateSessionId, binding));
-			if (
-				session.recoveryLease?.token !== pendingToken ||
-				session.recoveryLease.state !== "pending" ||
-				!this.#ownsLiveOpenEndpoint(session, binding) ||
-				!identitylessAdmissionAllows
-			) {
-				if (session.recoveryLease?.token === pendingToken)
-					session.recoveryLease = {
-						state: "rejected",
-						logicalSessionId: candidateSessionId,
-						binding,
-						token: pendingToken,
-					};
-				return undefined;
-			}
-			const previousSessionId = this.#logicalSessionId(session);
-			if (previousSessionId !== candidateSessionId) await this.#terminalizeBtwTurnsForSession(session, true);
-			if (!this.#ownsLiveOpenEndpoint(session, binding)) {
-				if (session.recoveryLease?.token === pendingToken)
-					session.recoveryLease = {
-						state: "rejected",
-						logicalSessionId: candidateSessionId,
-						binding,
-						token: pendingToken,
-					};
-				return undefined;
-			}
-			this.#authorizeLease(session, candidateSessionId, binding);
-			return { previousSessionId, hadDurableTopic };
-		});
-		if (!claim) return false;
+							this.topics.matchesEndpoint(candidateSessionId, binding));
+				if (
+					session.recoveryLease?.token !== pendingToken ||
+					session.recoveryLease.state !== "pending" ||
+					!this.#ownsLiveOpenEndpoint(session, binding) ||
+					!identitylessAdmissionAllows
+				) {
+					if (session.recoveryLease?.token === pendingToken)
+						session.recoveryLease = {
+							state: "rejected",
+							logicalSessionId: candidateSessionId,
+							binding,
+							token: pendingToken,
+						};
+					return undefined;
+				}
+				const previousSessionId = this.#logicalSessionId(session);
+				if (previousSessionId !== candidateSessionId) await this.#terminalizeBtwTurnsForSession(session, true);
+				if (!this.#ownsLiveOpenEndpoint(session, binding)) {
+					if (session.recoveryLease?.token === pendingToken)
+						session.recoveryLease = {
+							state: "rejected",
+							logicalSessionId: candidateSessionId,
+							binding,
+							token: pendingToken,
+						};
+					return undefined;
+				}
+				this.#authorizeLease(session, candidateSessionId, binding);
+				return { previousSessionId, hadDurableTopic };
+			});
+		} catch {
+			if (session.recoveryLease?.token === pendingToken)
+				session.recoveryLease = {
+					state: "rejected",
+					logicalSessionId: candidateSessionId,
+					binding,
+					token: pendingToken,
+				};
+			return false;
+		}
+		if (!claim) {
+			if (session.recoveryLease?.token === pendingToken)
+				session.recoveryLease = {
+					state: "rejected",
+					logicalSessionId: candidateSessionId,
+					binding,
+					token: pendingToken,
+				};
+			return false;
+		}
 		const { previousSessionId } = claim;
 		if (preserveTransportTopic && previousSessionId !== candidateSessionId) {
 			this.legacyTopicOwners.set(previousSessionId, session);
@@ -6262,7 +6704,7 @@ export class TelegramNotificationDaemon {
 		if (candidateSessionId === session.sessionId)
 			void (async () => {
 				const topic = this.topics.get(candidateSessionId);
-				if (!topic || topic.authorityState === "delete_pending" || topic.bindingMalformed) return;
+				if (topic?.authorityState !== "active" || topic.bindingMalformed) return;
 				const topicLease = this.topicAuthorityLeaseFromRegistry(candidateSessionId);
 				if (topicLease?.topicId === topic.topicId)
 					await this.flushPendingThreadedFrames(candidateSessionId, topicLease);
@@ -6337,12 +6779,12 @@ export class TelegramNotificationDaemon {
 		const identityKey = this.topicIdentityKey(msg);
 		const remembered = identityKey ? this.topicOwnerByIdentity.get(identityKey) : undefined;
 		const rememberedTopic = remembered ? this.topics.get(remembered) : undefined;
-		if (remembered && rememberedTopic && rememberedTopic.authorityState !== "delete_pending") return remembered;
+		if (remembered && rememberedTopic && rememberedTopic.authorityState === "active") return remembered;
 		if (!identityKey) return undefined;
 		const base = this.topicIdentityBase(msg);
 		for (const sessionId of this.topics.sessionIds()) {
 			const topic = this.topics.get(sessionId);
-			if (topic?.authorityState === "delete_pending") continue;
+			if (topic?.authorityState !== "active") continue;
 			const nameMatchesLegacyIdentity =
 				base !== undefined && (topic?.name === base || topic?.name?.startsWith(`${base} - `));
 			if (topic?.identityKey === identityKey || nameMatchesLegacyIdentity) {
@@ -6621,21 +7063,29 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async topicAuthorityLease(sessionId: string): Promise<TopicAuthorityLease | undefined> {
-		if (!(await this.pairedChatIsPrivate())) return undefined;
+		if (!(await this.pairedChatAllowsTopics())) return undefined;
 		return this.topicAuthorityLeaseFromRegistry(sessionId);
 	}
 
 	private topicAuthorityLeaseFromRegistry(sessionId: string): TopicAuthorityLease | undefined {
 		const topic = this.topics.get(sessionId);
-		if (!topic || !this.topics.isActiveUnambiguous(sessionId) || topic.bindingMalformed) return undefined;
+		if (
+			!topic ||
+			!this.topics.isActiveUnambiguous(sessionId) ||
+			topic.bindingMalformed ||
+			topic.leaseOwner !== this.installationHostId ||
+			(topic.leaseExpiresAt ?? 0) <= this.runtime.now()
+		)
+			return undefined;
 		return { sessionId, topicId: topic.topicId, authorityEpoch: topic.authorityEpoch ?? 0 };
 	}
-
 	private topicLeaseIsCurrent(lease: TopicAuthorityLease): boolean {
 		const topic = this.topics.get(lease.sessionId);
 		return (
 			this.topics.isActiveUnambiguous(lease.sessionId) &&
 			!topic?.bindingMalformed &&
+			topic?.leaseOwner === this.installationHostId &&
+			(topic.leaseExpiresAt ?? 0) > this.runtime.now() &&
 			topic?.topicId === lease.topicId &&
 			(topic.authorityEpoch ?? 0) === lease.authorityEpoch
 		);
@@ -6682,7 +7132,7 @@ export class TelegramNotificationDaemon {
 	): void {
 		const logicalSessionId = this.#logicalSessionId(session);
 		const socketLease = this.#socketLease(session, logicalSessionId);
-		if (!socketLease) {
+		if (!socketLease && !session.logicalSessionIdTrusted) {
 			this.failLegacyToolStart(toolActivity);
 			return;
 		}
@@ -6696,6 +7146,7 @@ export class TelegramNotificationDaemon {
 			send,
 			msg,
 			logicalSessionId,
+			session,
 			socketLease,
 			...(toolActivity ? { toolActivity } : {}),
 		});
@@ -6711,15 +7162,17 @@ export class TelegramNotificationDaemon {
 		if (!frames || frames.length === 0) return;
 		this.pendingThreadedFrames.delete(sessionId);
 		for (const frame of frames) {
+			const socketLease = frame.socketLease ?? this.#socketLease(frame.session, sessionId);
 			if (
 				frame.logicalSessionId !== sessionId ||
-				!this.#leaseTokenAllows(frame.socketLease) ||
+				!socketLease ||
+				!this.#leaseTokenAllows(socketLease) ||
 				(frame.msg.type === "tool_activity" && this.opts.toolActivity?.enabled !== true)
 			) {
 				this.failLegacyToolStart(frame.toolActivity);
 				continue;
 			}
-			await this.submitThreadedFrame(sessionId, frame.send, topicLease, frame.toolActivity, frame.socketLease);
+			await this.submitThreadedFrame(sessionId, frame.send, topicLease, frame.toolActivity, socketLease);
 		}
 	}
 
@@ -6735,15 +7188,16 @@ export class TelegramNotificationDaemon {
 		session?: SessionSocket,
 		creationLease?: { session: SessionSocket; token: number; logicalSessionId: string },
 	): Promise<string | undefined> {
-		if (!(await this.pairedChatIsPrivate())) return undefined;
+		if (!(await this.pairedChatAllowsTopics())) return undefined;
 		if (session && sessionId === session.sessionId && this.#logicalSessionId(session) !== sessionId) return undefined;
 		const capturedCreationLease = creationLease ?? (session ? this.#socketLease(session, sessionId) : undefined);
 		if (session?.logicalSessionIdTrusted && !capturedCreationLease) return undefined;
 		const creationEndpointKey = session?.endpointDigest ?? session?.endpointKey ?? "unbound";
-		if (this.#malformedTopicCreateEndpoints.get(sessionId) === creationEndpointKey)
+		const malformedCreateEndpoint = this.#malformedTopicCreateEndpoints.get(sessionId);
+		if (malformedCreateEndpoint === "unbound" || malformedCreateEndpoint === creationEndpointKey)
 			throw new Error("createForumTopic: invalid message_thread_id");
 		const existing = this.topics.get(sessionId);
-		if (existing?.authorityState === "delete_pending" || existing?.bindingMalformed) return undefined;
+		if (existing && (existing.authorityState !== "active" || existing.bindingMalformed)) return undefined;
 		if (existing) return existing.topicId;
 		if (
 			session &&
@@ -6756,11 +7210,9 @@ export class TelegramNotificationDaemon {
 		const creationLeaseEpoch = this.topics.authorityEpoch(sessionId);
 		let acceptedTopicId: string | undefined;
 		let acceptedTopicCompensated = false;
-		let acceptedTopicDeleteAttempted = false;
+		let acceptedTopicArchiveAttempted = false;
 		let creationSuppressed = false;
-		/** User-created topicId adopted in this callback, if any (for sidecar reconciliation). */
-		let adoptedTopicId: number | undefined;
-		const adoptionIntentCandidate = this.#adoptionIntents.bySession(sessionId);
+		let creationRejected = false;
 		try {
 			const rec = await this.topics.getOrCreateTopic(
 				sessionId,
@@ -6808,7 +7260,8 @@ export class TelegramNotificationDaemon {
 					};
 					const tid = response.result?.message_thread_id;
 					if (typeof tid !== "number" || !Number.isSafeInteger(tid) || tid <= 0) {
-						if (response.ok === true) this.#malformedTopicCreateEndpoints.set(sessionId, creationEndpointKey);
+						creationRejected = response.ok === false;
+						if (!creationRejected) this.#malformedTopicCreateEndpoints.set(sessionId, creationEndpointKey);
 						throw new Error("createForumTopic: invalid message_thread_id");
 					}
 					acceptedTopicId = String(tid);
@@ -6827,22 +7280,21 @@ export class TelegramNotificationDaemon {
 							throw new Error("topic authority was revoked during creation");
 						try {
 							await this.persistTopics();
-						} finally {
-							acceptedTopicDeleteAttempted = true;
-							const deletion = await this.botApi.call("deleteForumTopic", {
-								chat_id: this.opts.chatId,
-								message_thread_id: tid,
-							});
-							acceptedTopicCompensated = topicDeleteSettled(deletion);
-
-							if (topicDeleteSettled(deletion)) {
-								this.topics.settleDelete(sessionId, acceptedTopicId);
-								await this.persistTopics();
-							} else {
-								this.#superviseCompensationFence(sessionId);
-								await this.#persistTopicsWithRetry().catch(() => undefined);
+						} catch (error) {
+							this.topics.scheduleArchiveRetry(
+								sessionId,
+								this.runtime.now(),
+								"archive fence persistence failed",
+							);
+							try {
+								await this.#persistTopicsWithRetry();
+							} catch {
+								await this.#superviseCompensationFence(sessionId);
 							}
+							throw error;
 						}
+						acceptedTopicArchiveAttempted = true;
+						acceptedTopicCompensated = (await this.archiveTopic(sessionId, undefined, true)) === "settled";
 						throw new Error("topic authority was revoked during creation");
 					}
 					return acceptedTopicId;
@@ -6854,23 +7306,10 @@ export class TelegramNotificationDaemon {
 				session,
 				adoptionIntentCandidate ? "user_created" : undefined,
 			);
-			// Adoption commit success: remove the durable sidecar. A cleanup failure
-			// cannot roll back the committed record; topic success is retained and the
-			// stale sidecar is left for startup reconciliation to remove safely.
-			if (adoptedTopicId !== undefined) {
-				if (adoptionIntentCandidate)
-					logger.info(
-						`notifications: topic-adoption committed age_ms=${Math.max(0, this.runtime.now() - adoptionIntentCandidate.createdAt)}`,
-					);
-				try {
-					await this.#adoptionIntents.remove(sessionId);
-					await this.#adoptionIntents.removePendingTopic(adoptedTopicId);
-				} catch (error) {
-					logger.warn(
-						`notifications: topic-adoption sidecar cleanup failed; retained for reconciliation: ${sanitizeDiagnostic(String(error))}`,
-					);
-				}
-			}
+			// Publish the durable host lease before rechecking the captured socket
+			// lease. The recheck consults the registry once a record exists, so the
+			// newly-created record must already authorize this host.
+			if (!(await this.#renewTopicLease(sessionId))) return undefined;
 			// getOrCreateTopic deduplicates callers, so an accepted create can be
 			// observed by a successor after its initiating socket was revoked. Check
 			// the immutable lease again before exposing that record to frame delivery.
@@ -6896,23 +7335,28 @@ export class TelegramNotificationDaemon {
 						name,
 						creationBinding,
 					)
-				)
-					await this.deleteTopic(sessionId, undefined, true);
+				) {
+					try {
+						await this.persistTopics();
+					} catch {
+						this.#superviseCompensationFence(sessionId);
+						return undefined;
+					}
+					await this.archiveTopic(sessionId, undefined, true);
+				}
 				return undefined;
 			}
 			return rec.topicId;
 		} catch (err) {
-			if (creationSuppressed || err instanceof ThreadedModeCapabilityRefusal) return undefined;
-			// Adoption commit failure: release the in-memory claim so a retry can
-			// re-claim, and retain the durable sidecar (never delete the user topic).
-			if (adoptedTopicId !== undefined) {
-				this.#adoptionIntents.releaseClaim(adoptedTopicId, sessionId);
+			if (creationSuppressed || creationRejected || err instanceof ThreadedModeCapabilityRefusal) {
+				if (this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch)) await this.persistTopics();
+				return undefined;
 			}
 			if (
 				acceptedTopicId &&
 				!acceptedTopicCompensated &&
-				!acceptedTopicDeleteAttempted &&
-				this.topics.get(sessionId)?.authorityState !== "delete_pending"
+				!acceptedTopicArchiveAttempted &&
+				this.topics.get(sessionId)?.authorityState !== "archive_pending"
 			) {
 				// A failed initial commit must never make compensation conditional on
 				// successfully publishing its fence.
@@ -6929,28 +7373,18 @@ export class TelegramNotificationDaemon {
 					try {
 						await this.#persistTopicsWithRetry();
 					} catch {
-						this.#superviseCompensationFence(sessionId);
+						await this.#superviseCompensationFence(sessionId);
 					}
 
 					try {
-						const deletion = await this.botApi.call("deleteForumTopic", {
-							chat_id: this.opts.chatId,
-							message_thread_id: Number(acceptedTopicId),
-						});
-						if (topicDeleteSettled(deletion)) {
-							this.topics.settleDelete(sessionId, acceptedTopicId);
-							await this.persistTopics();
-						} else {
-							this.#superviseCompensationFence(sessionId);
-							await this.#persistTopicsWithRetry().catch(() => undefined);
-						}
+						acceptedTopicCompensated = (await this.archiveTopic(sessionId, undefined, true)) === "settled";
 					} catch {
 						this.#superviseCompensationFence(sessionId);
 						await this.#persistTopicsWithRetry().catch(() => undefined);
 					}
 				}
 			}
-			if (acceptedTopicId && !acceptedTopicCompensated && acceptedTopicDeleteAttempted) {
+			if (acceptedTopicId && !acceptedTopicCompensated && acceptedTopicArchiveAttempted) {
 				this.#superviseCompensationFence(sessionId);
 				await this.#persistTopicsWithRetry().catch(() => undefined);
 			}
@@ -6979,20 +7413,47 @@ export class TelegramNotificationDaemon {
 			if (!this.topicPastOrphanGrace(sessionId)) return;
 			const currentOwner = this.logicalSessionOwners.get(sessionId);
 			if (currentOwner && this.#leaseAllows(currentOwner, sessionId)) return;
-			await this.deleteTopic(sessionId);
+			await this.archiveTopic(sessionId);
 		});
 	}
 
 	/** Best-effort delete of a session topic once its local notification endpoint shuts down. */
-	private async deleteTopic(
+	/** Join all close, compensation, orphan, and restart callers for one session. */
+	private archiveTopic(
 		sessionId: string,
 		socketLease?: { session: SessionSocket; token: number; logicalSessionId: string },
-		deleteFenceAlreadyPublished = false,
+		archiveFenceAlreadyPublished = false,
 	): Promise<"pre_dispatch_cancelled" | "post_dispatch_pending" | "settled"> {
-		const deleteSnapshot = this.topics.captureDeleteAuthority(sessionId);
-		let record = deleteFenceAlreadyPublished ? this.topics.get(sessionId) : this.topics.beginDelete(sessionId);
+		const active = this.archiveFlights.get(sessionId);
+		if (active) return active;
+		const flight = this.#archiveTopicOnce(sessionId, socketLease, archiveFenceAlreadyPublished);
+		this.archiveFlights.set(sessionId, flight);
+		void flight.then(
+			() => {
+				if (this.archiveFlights.get(sessionId) === flight) this.archiveFlights.delete(sessionId);
+			},
+			() => {
+				if (this.archiveFlights.get(sessionId) === flight) this.archiveFlights.delete(sessionId);
+			},
+		);
+		return flight;
+	}
+
+	/** One durable archive fence and at most one remote close dispatch per flight. */
+	async #archiveTopicOnce(
+		sessionId: string,
+		socketLease?: { session: SessionSocket; token: number; logicalSessionId: string },
+		archiveFenceAlreadyPublished = false,
+	): Promise<"pre_dispatch_cancelled" | "post_dispatch_pending" | "settled"> {
+		if (!(await this.pairedChatAllowsTopics())) return "pre_dispatch_cancelled";
+		const existing = this.topics.get(sessionId);
+		// A completed archive retains an inactive record as historical evidence.
+		// Re-archiving it would duplicate the irreversible remote close request.
+		if (existing?.authorityState === "inactive") return "settled";
+		const archiveSnapshot = this.topics.captureArchiveAuthority(sessionId);
+		let record = archiveFenceAlreadyPublished ? existing : this.topics.beginArchive(sessionId);
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
-		await this.persistTopics();
+		if (!archiveFenceAlreadyPublished) await this.persistTopics();
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
 		await this.#revokeAskAuthority(sessionId);
 		this.deleteMessageRoutes(sessionId);
@@ -7012,32 +7473,16 @@ export class TelegramNotificationDaemon {
 		try {
 			await this.flushPool();
 			if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
-			if (record.topicOrigin === "user_created") {
-				this.topics.settleDelete(sessionId, record.topicId);
-				for (const k of [...this.liveMessages.keys()])
-					if (k.startsWith(`${sessionId}:`)) {
-						this.liveMessages.delete(k);
-						this.toolActivityOwners.delete(k);
-					}
-				this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
-					if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
-				});
-				this.pendingThreadedFrames.delete(sessionId);
-				try {
-					await this.persistTopics();
-					return "settled";
-				} catch {
-					this.topics.restoreDeleteFence(deleteSnapshot);
-					await this.#persistTopicsWithRetry().catch(() => undefined);
-					return "post_dispatch_pending";
-				}
-			}
-			const res = (await this.botApi.call("deleteForumTopic", {
+			const res = (await this.botApi.call("closeForumTopic", {
 				chat_id: this.opts.chatId,
 				message_thread_id: Number(record.topicId),
 			})) as { ok?: boolean };
-			if (!topicDeleteSettled(res)) return "post_dispatch_pending";
-			this.topics.settleDelete(sessionId, record.topicId);
+			if (!topicArchiveSettled(res)) {
+				this.topics.scheduleArchiveRetry(sessionId, this.runtime.now(), "archive result was not definitive");
+				await this.persistTopics();
+				return "post_dispatch_pending";
+			}
+			this.topics.settleArchive(sessionId, record.topicId);
 			for (const k of [...this.liveMessages.keys()])
 				if (k.startsWith(`${sessionId}:`)) {
 					this.liveMessages.delete(k);
@@ -7051,29 +7496,61 @@ export class TelegramNotificationDaemon {
 				await this.persistTopics();
 				return "settled";
 			} catch {
-				this.topics.restoreDeleteFence(deleteSnapshot);
+				this.topics.restoreArchiveFence(archiveSnapshot);
 				await this.#persistTopicsWithRetry().catch(() => undefined);
 				return "post_dispatch_pending";
 			}
 		} catch {
 			// Once Telegram dispatch starts, retain the persisted deletion fence: the
 			// remote result is ambiguous and may not restore stale routing authority.
+			this.topics.scheduleArchiveRetry(sessionId, this.runtime.now(), "archive transport failed");
+			await this.persistTopics().catch(() => undefined);
 			return "post_dispatch_pending";
 		}
 	}
 
 	/** Serialize a mutation and its durable snapshot so rollback precedes later writers. */
 	#persistTopicMutation<T>(mutation: () => T, rollback: () => void): Promise<T> {
+		if (this.validationMode()) return Promise.resolve().then(mutation);
 		const pending = this.topicsPersistQueue.then(async () => {
 			const result = mutation();
+			const authority = this.opts.topicRegistryAuthority;
+			let sharedCommitted = false;
 			try {
 				const snapshot = this.#topicStateForPersistence();
-				const paths = daemonPaths(this.opts.settings.getAgentDir());
-				await ensureDir(this.fsImpl, paths.dir);
-				await writeJsonAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), snapshot);
+				if (authority) {
+					const expectedGeneration = this.topics.registryVersion();
+					const nextGeneration = expectedGeneration + 1;
+					snapshot.registryGeneration = nextGeneration;
+					let accepted = false;
+					try {
+						accepted = await authority.compareAndSet(expectedGeneration, snapshot);
+					} catch {
+						throw new Error("shared topic authority unavailable");
+					}
+					if (!accepted) throw new Error("shared topic authority unavailable");
+					this.topics.markRegistryPublished(nextGeneration);
+					sharedCommitted = true;
+				}
+				if (!authority) {
+					const paths = daemonPaths(this.opts.settings.getAgentDir());
+					await ensureDir(this.fsImpl, paths.dir);
+					await writeTopicRegistryAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), snapshot);
+				}
 				return result;
 			} catch (error) {
-				rollback();
+				if (sharedCommitted && authority) {
+					const committed = await authority.read().catch(() => undefined);
+					const state = parseTopicRegistryState(committed);
+					if (state) {
+						this.topics.replace(state);
+						this.closedEndpointKeys.clear();
+						for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {}))
+							if (binding) this.closedEndpointKeys.set(sessionId, binding);
+					}
+				} else {
+					rollback();
+				}
 				throw error;
 			}
 		});
@@ -7092,8 +7569,9 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	#superviseCompensationFence(sessionId: string): void {
-		if (this.compensationFenceRetries.has(sessionId)) return;
+	async #superviseCompensationFence(sessionId: string): Promise<void> {
+		const existing = this.compensationFenceRetries.get(sessionId);
+		if (existing) return await existing;
 		const retry = this.effects.track(
 			(async () => {
 				for (;;) {
@@ -7107,35 +7585,94 @@ export class TelegramNotificationDaemon {
 			})(),
 		);
 		this.compensationFenceRetries.set(sessionId, retry);
-		void retry.finally(() => this.compensationFenceRetries.delete(sessionId));
+		try {
+			await retry;
+		} finally {
+			if (this.compensationFenceRetries.get(sessionId) === retry) this.compensationFenceRetries.delete(sessionId);
+		}
 	}
 
 	private persistTopics(): Promise<void> {
+		if (this.validationMode()) return Promise.resolve();
 		const pending = this.topicsPersistQueue.then(async () => {
 			// Resolve implicit snapshots inside the serialization queue. Callers that
 			// mutate the registry before waiting cannot overwrite a newer authority
 			// binding with an invocation-time snapshot.
 			const snapshot = this.#topicStateForPersistence();
-			const paths = daemonPaths(this.opts.settings.getAgentDir());
-			await ensureDir(this.fsImpl, paths.dir);
-			await writeJsonAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), snapshot);
+			const authority = this.opts.topicRegistryAuthority;
+			if (authority) {
+				const expectedGeneration = this.topics.registryVersion();
+				const nextGeneration = expectedGeneration + 1;
+				snapshot.registryGeneration = nextGeneration;
+				let accepted = false;
+				try {
+					accepted = await authority.compareAndSet(expectedGeneration, snapshot);
+				} catch {
+					throw new Error("shared topic authority unavailable");
+				}
+				if (!accepted) throw new Error("shared topic authority unavailable");
+				this.topics.markRegistryPublished(nextGeneration);
+			}
+			if (!authority) {
+				const paths = daemonPaths(this.opts.settings.getAgentDir());
+				await ensureDir(this.fsImpl, paths.dir);
+				await writeTopicRegistryAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), snapshot);
+			}
 		});
 		this.topicsPersistQueue = pending.catch(() => undefined);
 		return pending;
 	}
 
 	#topicStateForPersistence(): TopicRegistryState {
-		return { ...this.topics.serialize(), closedEndpoints: Object.fromEntries(this.closedEndpointKeys) };
+		return {
+			...this.topics.serialize(),
+			closedEndpoints: Object.fromEntries(this.closedEndpointKeys),
+			...(this.opts.topicRegistryAuthority ? {} : { installationHostId: this.installationHostId }),
+		};
 	}
 
 	async loadTopics(): Promise<void> {
+		if (this.validationMode()) return;
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		const raw = await readJson<TopicRegistryState>(this.fsImpl, path.join(paths.dir, "telegram-topics.json"));
+		const topicPath = path.join(paths.dir, "telegram-topics.json");
+		let raw = await readJson<unknown>(this.fsImpl, topicPath);
+		if (this.opts.topicRegistryAuthority) {
+			try {
+				raw = await this.opts.topicRegistryAuthority.read();
+			} catch {
+				throw new Error("shared topic authority unavailable");
+			}
+			if (!raw) throw new Error("shared topic authority unavailable");
+		}
+		const legacySnapshot =
+			!!raw && typeof raw === "object" && !Array.isArray(raw) && !Object.hasOwn(raw as object, "version");
+		if (legacySnapshot && raw !== undefined) {
+			const legacyDigest = crypto.createHash("sha256").update(JSON.stringify(raw)).digest("hex");
+			const quarantinePath = path.join(paths.dir, `telegram-topics.legacy-quarantine.${legacyDigest}.json`);
+			if ((await readJson<unknown>(this.fsImpl, quarantinePath)) === undefined) {
+				await ensureDir(this.fsImpl, paths.dir);
+				await writeTopicRegistryAtomic(this.fsImpl, quarantinePath, raw);
+			}
+		}
+		const state = parseTopicRegistryState(raw);
 		// Restore the full serialized registry (topicId + identitySent + name) so a
 		// fresh daemon after reload does not resend identity headers or lose renames.
-		if (raw && typeof raw === "object") {
-			this.topics.load(raw);
-			for (const [sessionId, binding] of Object.entries(raw.closedEndpoints ?? {})) {
+		if (state) {
+			const missingHostId =
+				!this.opts.topicRegistryAuthority &&
+				(typeof state.installationHostId !== "string" || state.installationHostId.length === 0);
+			const missingSessionUuid = Object.values(state.topics).some(
+				record => !!record && typeof record === "object" && typeof record.sessionUuid !== "string",
+			);
+			this.topics.load(state);
+			if (!this.opts.topicRegistryAuthority && typeof state.installationHostId === "string")
+				this.installationHostId = state.installationHostId;
+			let reconciledCreateClaim = false;
+			for (const claim of this.topics.pendingCreateClaims()) {
+				const topic = this.topics.get(claim.sessionId);
+				reconciledCreateClaim = this.topics.reconcileCreateClaim(claim.sessionId, topic) || reconciledCreateClaim;
+			}
+			for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {})) {
 				if (
 					binding &&
 					typeof binding.chatId === "string" &&
@@ -7146,62 +7683,14 @@ export class TelegramNotificationDaemon {
 				)
 					this.closedEndpointKeys.set(sessionId, binding);
 			}
+			if (legacySnapshot || missingHostId || missingSessionUuid || reconciledCreateClaim) await this.persistTopics();
 		}
 	}
 
-	/**
-	 * Rehydrate durable adoption intents after restart, then reconcile: a
-	 * non-expired sidecar whose target session already has a committed topic
-	 * record is a stale leftover (commit succeeded but sidecar cleanup failed)
-	 * and is removed safely without touching the user topic.
-	 */
-	async loadAdoptionIntents(): Promise<void> {
-		await this.#adoptionIntents.rehydrate();
-		const expired = await this.#adoptionIntents.sweepExpired();
-		if (expired > 0) logger.info(`notifications: topic-adoption expired count=${expired}`);
-		for (const sessionId of this.topics.sessionIds()) {
-			const intent = this.#adoptionIntents.bySession(sessionId);
-			if (!intent) continue;
-			const record = this.topics.get(sessionId);
-			if (record && record.topicId === String(intent.topicId)) {
-				try {
-					await this.#adoptionIntents.remove(sessionId);
-					await this.#adoptionIntents.removePendingTopic(intent.topicId);
-				} catch (error) {
-					logger.warn(
-						`notifications: stale topic-adoption sidecar cleanup failed: ${sanitizeDiagnostic(String(error))}`,
-					);
-				}
-			}
-		}
-	}
-
-	/** Periodic sweep of expired adoption-intent sidecars (files only; no Telegram API). */
-	private startAdoptionSweepTimer(): void {
-		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
-		this.#adoptionSweepTimer = setIntervalImpl(() => {
-			this.#sweepExpiredAdoptionPickerAliases();
-			void this.#adoptionIntents
-				.sweepExpired()
-				.then(expired => {
-					if (expired > 0) logger.info(`notifications: topic-adoption expired count=${expired}`);
-				})
-				.catch(error => {
-					logger.warn(`notifications: adoption-intent sweep failed: ${sanitizeDiagnostic(String(error))}`);
-				});
-		}, ADOPTION_INTENT_SWEEP_INTERVAL_MS);
-	}
-
-	private stopAdoptionSweepTimer(): void {
-		if (this.#adoptionSweepTimer !== undefined) {
-			(this.opts.clearIntervalImpl ?? clearInterval)(this.#adoptionSweepTimer);
-			this.#adoptionSweepTimer = undefined;
-		}
-	}
-
-	/** Retry crash-interrupted topic deletes; only a definite Telegram result clears the durable fence. */
+	/** Retry crash-interrupted topic archives only when the durable backoff permits it. */
 	private async reconcilePendingTopicDeletes(): Promise<void> {
-		for (const sessionId of this.topics.deletePendingSessionIds()) await this.deleteTopic(sessionId);
+		for (const sessionId of this.topics.archivePendingSessionIds(this.runtime.now()))
+			await this.archiveTopic(sessionId);
 	}
 
 	/** Download one Telegram file with the Bot API's 20 MiB ceiling and one end-to-end deadline. */
@@ -7645,7 +8134,7 @@ export class TelegramNotificationDaemon {
 				continue;
 			}
 			const topicId = topicLease?.topicId;
-			if (topicId && !(await this.pairedChatIsPrivate())) {
+			if (topicId && !(await this.pairedChatAllowsTopics())) {
 				this.pool.settle(item.itemId!, "rejected");
 				this.failLegacyToolStart(toolActivity);
 				continue;
@@ -7808,7 +8297,7 @@ export class TelegramNotificationDaemon {
 						);
 						// Index the sent rich message so an inbound reply to it can restore
 						// the original markdown as context (Telegram does not echo it back).
-						if (richMessageId !== undefined) {
+						if (richMessageId !== undefined && !this.validationMode()) {
 							await this.replyStore.record({
 								chatId: this.opts.chatId,
 								messageId: richMessageId,
@@ -8115,29 +8604,41 @@ export class TelegramNotificationDaemon {
 	}
 
 	/**
-	 * Resolve (and cache definitive resolution of) whether the paired `chatId` is
-	 * a private chat. Topic and flat delivery are only safe in a private DM; an
-	 * indeterminate `getChat` result fails closed for this attempt and is retried
-	 * later.
+	 * Resolve and cache the outbound delivery boundary. The validation forum is
+	 * explicit and topic-only; all inbound and flat paths remain private-only.
 	 */
+	private validationMode(): boolean {
+		return this.opts.validationTestSupergroupChatId !== undefined;
+	}
+
 	private async resolvePairedChatPrivacy(): Promise<PairedChatPrivacy> {
-		if (this.pairedChatPrivate !== undefined) return this.pairedChatPrivate ? "private" : "non-private";
+		if (this.pairedChatPrivacy !== undefined) return this.pairedChatPrivacy;
+		const chatId = this.opts.validationTestSupergroupChatId ?? this.opts.chatId;
 		try {
-			const res = (await this.botApi.call("getChat", { chat_id: this.opts.chatId })) as {
+			const res = (await this.botApi.call("getChat", { chat_id: chatId })) as {
 				ok?: unknown;
-				result?: { type?: unknown };
+				result?: { id?: unknown; type?: unknown; is_forum?: unknown };
 			};
 			if (res === undefined) return "indeterminate";
 			if (res?.ok !== true) {
 				logger.warn("notifications: getChat privacy check indeterminate (non-success response)");
 				return "indeterminate";
 			}
-			if (res.result?.type === "private") {
-				this.pairedChatPrivate = true;
+			if (
+				this.validationMode() &&
+				String(res.result?.id) === this.opts.validationTestSupergroupChatId &&
+				res.result?.type === "supergroup" &&
+				res.result.is_forum === true
+			) {
+				this.pairedChatPrivacy = "validation-forum";
+				return "validation-forum";
+			}
+			if (!this.validationMode() && res.result?.type === "private") {
+				this.pairedChatPrivacy = "private";
 				return "private";
 			}
 			if (res.result?.type === "group" || res.result?.type === "supergroup" || res.result?.type === "channel") {
-				this.pairedChatPrivate = false;
+				this.pairedChatPrivacy = "non-private";
 				return "non-private";
 			}
 			logger.warn("notifications: getChat privacy check indeterminate (missing or invalid chat type)");
@@ -8148,7 +8649,12 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	/** Keep existing outbound callers fail-closed for indeterminate privacy. */
+	private async pairedChatAllowsTopics(): Promise<boolean> {
+		const privacy = await this.resolvePairedChatPrivacy();
+		return privacy === "private" || privacy === "validation-forum";
+	}
+
+	/** Keep all flat delivery and inbound control paths private-only. */
 	private async pairedChatIsPrivate(): Promise<boolean> {
 		return (await this.resolvePairedChatPrivacy()) === "private";
 	}
@@ -8442,10 +8948,13 @@ export class TelegramNotificationDaemon {
 				endpointAuthority.sessionId === session.sessionId &&
 				ownsLiveOpenEndpoint &&
 				this.topics.matchesEndpoint(session.sessionId, endpointBinding);
+			const inactiveSuccessor =
+				this.topics.get(session.sessionId)?.authorityState === "inactive" &&
+				this.topics.get(session.sessionId)?.endpointDigest !== endpointBinding.endpointDigest;
 			const canBootstrapTransport =
-				endpointAuthority.state === "none" &&
+				(endpointAuthority.state === "none" || inactiveSuccessor) &&
 				ownsLiveOpenEndpoint &&
-				!this.topics.get(session.sessionId) &&
+				(!this.topics.get(session.sessionId) || inactiveSuccessor) &&
 				!this.preservedInitiatorTopics.has(session.sessionId);
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
@@ -8457,6 +8966,7 @@ export class TelegramNotificationDaemon {
 				true,
 				replayIdentitySessionId ? undefined : canBootstrapTransport ? "bootstrap" : "resume",
 			);
+			if (this.sessions.get(session.sessionId) !== session) return;
 			if (!recovered) {
 				if (session.hostGeneration === msg.generation && session.recoveryLease?.state !== "pending")
 					this.dropSession(session, "recovery_rejected");
@@ -8869,10 +9379,8 @@ export class TelegramNotificationDaemon {
 				abandonStaleToolStart();
 				return;
 			}
-			if (
-				this.topics.get(logicalSessionId)?.authorityState === "delete_pending" ||
-				this.topics.get(logicalSessionId)?.bindingMalformed
-			) {
+			const topicRecord = this.topics.get(logicalSessionId);
+			if (topicRecord && (topicRecord.authorityState !== "active" || topicRecord.bindingMalformed)) {
 				this.failLegacyToolStart(toolActivity);
 				return;
 			}
@@ -8885,10 +9393,8 @@ export class TelegramNotificationDaemon {
 				(await this.ensureTopic(logicalSessionId, this.topicNameFor(logicalSessionId, msg), session));
 			const topicLease = await this.topicAuthorityLease(logicalSessionId);
 			if (!topicId || !topicLease || topicLease.topicId !== topicId) {
-				if (
-					this.topics.get(logicalSessionId)?.authorityState === "delete_pending" ||
-					this.topics.get(logicalSessionId)?.bindingMalformed
-				) {
+				const topicRecord = this.topics.get(logicalSessionId);
+				if (topicRecord && (topicRecord.authorityState !== "active" || topicRecord.bindingMalformed)) {
 					this.failLegacyToolStart(toolActivity);
 					return;
 				}
@@ -8949,11 +9455,8 @@ export class TelegramNotificationDaemon {
 			const socketLease = this.#socketLease(session, logicalSessionId);
 			if (!socketLease) return;
 			if (msg.kind === "ask") session.pending.set(msg.id, { sessionId: logicalSessionId, actionId: msg.id });
-			if (
-				this.topics.get(logicalSessionId)?.authorityState === "delete_pending" ||
-				this.topics.get(logicalSessionId)?.bindingMalformed
-			)
-				return;
+			const topicRecord = this.topics.get(logicalSessionId);
+			if (topicRecord && (topicRecord.authorityState !== "active" || topicRecord.bindingMalformed)) return;
 			const topicId = await this.ensureTopic(logicalSessionId, this.topicNameFor(logicalSessionId, msg), session);
 			const topicLease = topicId ? this.topicAuthorityLeaseFromRegistry(logicalSessionId) : undefined;
 			if (topicId && (!topicLease || topicLease.topicId !== topicId)) return;
@@ -9833,8 +10336,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async processTelegramUpdate(update: unknown): Promise<TelegramUpdateOutcome> {
-		const createdOutcome = await this.handleForumTopicCreatedUpdate(update);
-		if (createdOutcome !== "not-topic") return createdOutcome;
+		if (this.validationMode()) return "consumed";
 		const topicOutcome = await this.handleForumTopicEdited(update);
 		if (topicOutcome !== "not-topic") return topicOutcome;
 		try {
@@ -9846,12 +10348,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleTelegramUpdate(update: unknown): Promise<void> {
-		// A user-created forum topic (`forum_topic_created`) is consumed first: it
-		// authenticates the chat/user, shows the folder-source picker, and emits the
-		// "already starting" dedup notice for a topic with a live adoption intent.
-		// This mirrors the poll-loop ordering in processTelegramUpdate so direct
-		// (test/orchestration) callers observe identical created-topic handling.
-		if ((await this.handleForumTopicCreatedUpdate(update)) !== "not-topic") return;
+		if (this.validationMode()) return;
 		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
 		// A raw path is accepted only after the explicit direct-entry choice. The exact
 		// `/session_create path <dir>` form remains available in any pending topic.
@@ -10012,7 +10509,17 @@ export class TelegramNotificationDaemon {
 		// update_id dedupe are all enforced by decideThreadedInbound.
 		const raw = update as {
 			callback_query?: unknown;
-			message?: { text?: unknown; reply_to_message?: { message_id?: unknown } };
+			message?: {
+				text?: unknown;
+				reply_to_message?: { message_id?: unknown };
+				photo?: unknown;
+				document?: unknown;
+				video?: unknown;
+				audio?: unknown;
+				chat?: { id?: unknown };
+				message_thread_id?: unknown;
+				message_id?: unknown;
+			};
 		};
 		// A reply to a known ask message routes to that ask (below). Any OTHER
 		// message in a topic (plain text, or a reply to a non-ask message) is a
@@ -10022,6 +10529,23 @@ export class TelegramNotificationDaemon {
 			typeof raw.message?.text === "string" ? parseBtwCommand(raw.message.text, this.botUsername) : undefined;
 		const isAskReply =
 			replyTo !== undefined && (this.messageRoutes.has(String(replyTo)) || this.messageRoutes.has(Number(replyTo)));
+		if (
+			reservedBtw?.kind === "question" &&
+			(raw.message?.photo || raw.message?.document || raw.message?.video || raw.message?.audio) &&
+			typeof raw.message?.message_thread_id === "number" &&
+			typeof raw.message.message_id === "number" &&
+			String(raw.message.chat?.id) === this.opts.chatId &&
+			(await this.pairedChatIsPrivate())
+		) {
+			if (!(await this.reserveSeenUpdateId((update as { update_id?: number }).update_id!))) return;
+			await this.#sendBtwMessage({
+				threadId: String(raw.message.message_thread_id),
+				messageId: raw.message.message_id,
+				text: BTW_USAGE_TEXT,
+				isAuthoritative: () => true,
+			});
+			return;
+		}
 		const directControl =
 			typeof raw.message?.text === "string"
 				? parseTelegramControlCommand(raw.message.text, this.botUsername)
@@ -10055,11 +10579,17 @@ export class TelegramNotificationDaemon {
 							return undefined;
 						return transportOwner.logicalSessionId;
 					}
+					if (
+						reservedBtw?.kind === "question" &&
+						(raw.message?.photo || raw.message?.document || raw.message?.video || raw.message?.audio)
+					)
+						return topicSessionId;
 					return [...this.sessions.values()].some(
 						session =>
-							session.sessionId === topicSessionId ||
-							this.#logicalSessionId(session) === topicSessionId ||
-							session.recoveryLease?.logicalSessionId === topicSessionId,
+							(session.sessionId === topicSessionId ||
+								this.#logicalSessionId(session) === topicSessionId ||
+								session.recoveryLease?.logicalSessionId === topicSessionId) &&
+							session.ws.readyState !== WebSocket.CLOSED,
 					)
 						? undefined
 						: topicSessionId;
@@ -10072,6 +10602,7 @@ export class TelegramNotificationDaemon {
 				const preliminaryControl = inbound.attachment
 					? { kind: "none" as const }
 					: parseTelegramControlCommand(inbound.text, this.botUsername);
+				const reservedBtw = parseBtwCommand(inbound.text, this.botUsername);
 				if (preliminaryControl.kind === "ignored") return;
 				const session =
 					this.logicalSessionOwners.get(inbound.sessionId) ??
@@ -10101,6 +10632,20 @@ export class TelegramNotificationDaemon {
 					topicLeaseAllows();
 				const routeLeaseAllows = (): boolean =>
 					topicLeaseAllows() && (!session || (!!routeLease && this.#leaseTokenAllows(routeLease)));
+				if (
+					/^\/btw(?:\s|$)/i.test(inbound.text) &&
+					inbound.attachment &&
+					(!session || session.ws.readyState !== WebSocket.OPEN || !routeLease)
+				) {
+					if (!(await this.reserveSeenUpdateId(inbound.updateId))) return;
+					await this.#sendBtwMessage({
+						threadId: inbound.threadId,
+						messageId: inbound.messageId,
+						text: BTW_USAGE_TEXT,
+						isAuthoritative: () => true,
+					});
+					return;
+				}
 				const reserveRouteUpdate = async (): Promise<boolean> => {
 					if (!(await this.reserveSeenUpdateId(inbound.updateId))) return false;
 					if (routeLeaseAllows()) return true;
@@ -10108,9 +10653,18 @@ export class TelegramNotificationDaemon {
 					return false;
 				};
 
-				if (session && !routeLease) return;
-				if (preliminaryControl.kind === "invalid" && session?.ws.readyState !== WebSocket.OPEN) return;
-				if (preliminaryControl.kind === "command" && session?.ws.readyState !== WebSocket.OPEN) {
+				if (session && !routeLease && !(reservedBtw?.kind === "question" && inbound.attachment)) return;
+				if (
+					preliminaryControl.kind === "invalid" &&
+					session?.ws.readyState !== WebSocket.OPEN &&
+					!(reservedBtw?.kind === "question" && inbound.attachment)
+				)
+					return;
+				if (
+					preliminaryControl.kind === "command" &&
+					session?.ws.readyState !== WebSocket.OPEN &&
+					!(reservedBtw?.kind === "question" && inbound.attachment)
+				) {
 					if (await reserveRouteUpdate()) {
 						try {
 							await this.botApi.call("sendMessage", {
@@ -10127,18 +10681,22 @@ export class TelegramNotificationDaemon {
 					}
 					return;
 				}
-				const reservedBtw = parseBtwCommand(inbound.text, this.botUsername);
 				if (reservedBtw?.kind === "ignored") {
 					await this.rememberSeenUpdateId(inbound.updateId);
 					return;
 				}
 				if (reservedBtw?.kind === "question" && (!reservedBtw.question || inbound.attachment)) {
-					if (!(await reserveRouteUpdate())) return;
+					const reserved =
+						session?.ws.readyState === WebSocket.OPEN
+							? await reserveRouteUpdate()
+							: await this.reserveSeenUpdateId(inbound.updateId);
+					if (!reserved) return;
+					if (session?.ws.readyState !== WebSocket.OPEN) await this.flushPool();
 					await this.#sendBtwMessage({
 						threadId: inbound.threadId,
 						messageId: inbound.messageId,
 						text: BTW_USAGE_TEXT,
-						isAuthoritative: routeLeaseAllows,
+						isAuthoritative: session?.ws.readyState === WebSocket.OPEN ? routeLeaseAllows : () => true,
 					});
 					return;
 				}
@@ -10447,6 +11005,12 @@ export class TelegramNotificationDaemon {
 		// Runtime callers can bypass TypeScript's option type. Without a valid bot
 		// token, there is no authenticated daemon identity or lifecycle authority.
 		if (!validBotToken(this.opts.botToken)) return;
+		if (this.validationMode()) {
+			if (!/^-100\d+$/.test(this.opts.validationTestSupergroupChatId!))
+				throw new Error("validation forum destination must be a negative -100... chat ID");
+			if ((await this.resolvePairedChatPrivacy()) !== "validation-forum")
+				throw new Error("validation forum destination must be the exact supergroup forum returned by getChat");
+		}
 		let ownershipProved = false;
 		try {
 			const renewed = await renewDaemonHeartbeat({
@@ -10466,19 +11030,21 @@ export class TelegramNotificationDaemon {
 			if (!this.running) return;
 			// Self-heal durable notification state before any scan/poll work so
 			// `daemon reload` recovers dead roots + leak artifacts (#2956).
-			try {
-				await healTelegramDaemonNotificationState({
-					settings: this.opts.settings,
-					fs: this.fsImpl,
-					now: this.opts.now,
-				});
-			} catch (error) {
-				logger.warn(`notifications: startup self-heal failed: ${sanitizeDiagnostic(String(error))}`);
+			if (!this.validationMode()) {
+				try {
+					await healTelegramDaemonNotificationState({
+						settings: this.opts.settings,
+						fs: this.fsImpl,
+						now: this.opts.now,
+					});
+				} catch (error) {
+					logger.warn(`notifications: startup self-heal failed: ${sanitizeDiagnostic(String(error))}`);
+				}
 			}
 			// Owner-only: start lifecycle control immediately after ownership proof,
 			// before timers or pre-poll startup work can invalidate this run.
 			// Best-effort; notification delivery remains available on failure.
-			await this.startLifecycleControl();
+			if (!this.validationMode()) await this.startLifecycleControl();
 			// A stop may arrive while lifecycle startup awaits its control endpoint.
 			// Do not re-enable runtime work after that stop; close the partial server.
 			if (!this.running) return;
@@ -10487,14 +11053,16 @@ export class TelegramNotificationDaemon {
 			this.startFlushTimer();
 			this.startScanTimer();
 			this.startTypingTimer();
-			await this.refreshBotIdentity();
-			await this.registerBotCommands();
-			await this.loadAliases();
+			if (!this.validationMode()) {
+				await this.refreshBotIdentity();
+				await this.registerBotCommands();
+				await this.loadAliases();
+			}
 			await this.loadTopics();
-			await this.loadAdoptionIntents();
-			this.startAdoptionSweepTimer();
-			await this.loadSeenUpdateIds();
-			await this.replyStore.load();
+			if (!this.validationMode()) {
+				await this.loadSeenUpdateIds();
+				await this.replyStore.load();
+			}
 			await this.runScan();
 			let idleSince = this.runtime.now();
 			while (this.running) {
@@ -10571,10 +11139,12 @@ export class TelegramNotificationDaemon {
 					this.stopAdoptionSweepTimer();
 					this.stopLifecycleControl();
 					await this.cleanupAllAttachmentDirs();
-					await this.persistAliases();
+					if (!this.validationMode()) {
+						await this.persistAliases();
+						await this.persistSeenUpdateIds();
+						await this.opts.control?.clear?.(this.opts.ownerId);
+					}
 					await this.persistTopics();
-					await this.persistSeenUpdateIds();
-					await this.opts.control?.clear?.(this.opts.ownerId);
 					persisted = true;
 				});
 				const deadline = Promise.withResolvers<boolean>();

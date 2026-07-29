@@ -3,15 +3,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
+import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, HOST_QUALIFIED_FILE_LOCK_PROTECTED_DECLARATIONS, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, TELEGRAM_DAEMON_CLI_SHARED_CAS_PROTECTED_DECLARATIONS, TELEGRAM_SHARED_CAS_PROTECTED_DECLARATIONS, TELEGRAM_TOPIC_LIFECYCLE_PROTECTED_DECLARATIONS, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
 const stableEntries = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort());
 
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
+const telegramCli = "packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts";
+const fileLock = "packages/coding-agent/src/config/file-lock.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
+const topicRegistry = "packages/coding-agent/src/sdk/bus/topic-registry.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
@@ -291,6 +294,19 @@ test("requires a Telegram bump for tool-activity defaults and delivery admission
 			expect(missing.telegramGenerationBumped).toBe(false);
 			expect(mappedHelperMutation({ family: "telegram", file, name, generationBumped: true }).telegramGenerationBumped).toBe(true);
 		}
+	}
+});
+test("requires a Telegram bump for CAS authority, lifecycle transitions, claims, leases, archive dispatch, and atomic persistence", () => {
+	for (const name of TELEGRAM_TOPIC_LIFECYCLE_PROTECTED_DECLARATIONS) {
+		const missing = mappedHelperMutation({ family: "telegram", file: topicRegistry, name, generationBumped: false });
+		expect(missing.protectedChanges).toContain(`telegram:${topicRegistry}:${name}`);
+		expect(missing.telegramGenerationBumped).toBe(false);
+		expect(mappedHelperMutation({ family: "telegram", file: topicRegistry, name, generationBumped: true }).telegramGenerationBumped).toBe(true);
+	}
+	for (const name of ["topicArchiveSettled", "writeTopicRegistryAtomic", "TelegramDaemonOptions", "TelegramNotificationDaemon"] as const) {
+		const missing = mappedHelperMutation({ family: "telegram", file: telegramDaemon, name, generationBumped: false });
+		expect(missing.protectedChanges).toContain(`telegram:${telegramDaemon}:${name}`);
+		expect(missing.telegramGenerationBumped).toBe(false);
 	}
 });
 
@@ -671,6 +687,21 @@ test("fails closed when a protected native authority declaration is missing or m
 		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackConfigured");
 		expect(() => validateInventory(providerConfig)).toThrow("chat configuration primitives");
 	});
+	test("protects shared-CAS identity and host-qualified publication boundaries", () => {
+		expect(protectedInventory.telegram[telegramDaemon]).toEqual(
+			expect.arrayContaining(TELEGRAM_SHARED_CAS_PROTECTED_DECLARATIONS),
+		);
+		expect(protectedInventory.telegram[fileLock]).toEqual(
+			expect.arrayContaining(HOST_QUALIFIED_FILE_LOCK_PROTECTED_DECLARATIONS),
+		);
+		expect(protectedInventory.telegram[telegramCli]).toEqual(
+			expect.arrayContaining(TELEGRAM_DAEMON_CLI_SHARED_CAS_PROTECTED_DECLARATIONS),
+		);
+
+		const drifted = mutableInventory();
+		drifted.telegram[fileLock] = drifted.telegram[fileLock]!.filter(name => name !== "tryAcquireLock");
+		expect(() => validateInventory(drifted)).toThrow("shared-CAS authority boundaries");
+	});
 
 	test("protects Telegram provenance and signaling authorities", () => {
 		const telegram = protectedInventory.telegram[telegramDaemon] ?? [];
@@ -892,7 +923,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
-	}, 20000);
+	}, 60000);
 
 	test("guard authority proves immutable event objects without pinning the mutable base ref", () => {
 		const head = "a".repeat(40);

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { TopicRegistry, type TopicRegistryState } from "../src/sdk/bus/topic-registry";
+import { DAEMON_GENERATION, SERVING_EPOCH } from "../src/sdk/bus/telegram-daemon-contract";
+import { parseTopicRegistryState, TopicRegistry, type TopicRegistryState } from "../src/sdk/bus/topic-registry";
 
 describe("TopicRegistry", () => {
 	test("creates a topic once and reuses it on resume", async () => {
@@ -300,24 +301,69 @@ describe("TopicRegistry", () => {
 		expect(results.map(r => r.topicId)).toEqual(["1", "1", "1"]);
 		expect(reg.sessionForTopic("1")).toBe("s1");
 	});
+	test("restored durable create claim blocks a second remote create", async () => {
+		const state: TopicRegistryState = {
+			version: 2,
+			topics: {},
+			createClaims: {
+				s1: { sessionId: "s1", authorityEpoch: 0, createdAt: 1 },
+			},
+		};
+		const reg = new TopicRegistry(state);
+		let creates = 0;
+		await expect(
+			reg.getOrCreateTopic("s1", async () => {
+				creates++;
+				return "2";
+			}),
+		).rejects.toThrow("topic create claim requires reconciliation");
+		expect(creates).toBe(0);
+		expect(reg.pendingCreateClaims()).toEqual([{ sessionId: "s1", authorityEpoch: 0, createdAt: 1 }]);
+	});
+	test("restored create claim rejects different active binding evidence", () => {
+		const claimBinding = {
+			chatId: "42",
+			endpointKey: "old-key",
+			endpointDigest: "old-digest",
+			endpointGeneration: 1,
+		};
+		const reg = new TopicRegistry({
+			version: 2,
+			topics: {
+				s1: {
+					topicId: "9",
+					sessionUuid: "00000000-0000-4000-8000-000000000009",
+					identitySent: false,
+					createdAt: 1,
+					authorityEpoch: 0,
+					authorityState: "active",
+					chatId: "42",
+					endpointKey: "new-key",
+					endpointDigest: "new-digest",
+					endpointGeneration: 1,
+					endpointIncarnation: 0,
+				},
+			},
+			createClaims: {
+				s1: { sessionId: "s1", authorityEpoch: 0, createdAt: 1, binding: claimBinding },
+			},
+		});
+		expect(reg.reconcileCreateClaim("s1", reg.get("s1"))).toBe(false);
+		expect(reg.pendingCreateClaims()).toEqual([
+			{ sessionId: "s1", authorityEpoch: 0, createdAt: 1, binding: claimBinding },
+		]);
+	});
 
-	test("deletes topic records so later use creates a fresh topic", async () => {
+	test("retains archived topic records and never recreates physical topics", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");
 
-		expect(reg.delete("s1")).toBe(true);
-		expect(reg.delete("s1")).toBe(false);
-		expect(reg.get("s1")).toBeUndefined();
+		reg.beginArchive("s1");
+		expect(reg.get("s1")?.authorityState).toBe("archive_pending");
 		expect(reg.sessionForTopic("1")).toBeUndefined();
 
-		let created = false;
-		const rec = await reg.getOrCreateTopic("s1", async () => {
-			created = true;
-			return "2";
-		});
-		expect(created).toBe(true);
-		expect(rec.topicId).toBe("2");
-		expect(reg.sessionForTopic("2")).toBe("s1");
+		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
+		expect(reg.get("s1")?.topicId).toBe("1");
 	});
 	test.each([
 		["empty", ""],
@@ -353,12 +399,12 @@ describe("TopicRegistry", () => {
 		const reg = new TopicRegistry();
 		const created = Promise.withResolvers<string>();
 		const create = reg.getOrCreateTopic("s1", () => created.promise);
-		expect(reg.beginDelete("s1")).toBeUndefined();
+		expect(reg.beginArchive("s1")).toBeUndefined();
 		created.resolve("42");
 		await expect(create).rejects.toThrow("topic authority was revoked during creation");
-		expect(reg.get("s1")).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+		expect(reg.get("s1")).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
 		expect(reg.sessionForTopic("42")).toBeUndefined();
-		expect(reg.serialize().topics.s1).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+		expect(reg.serialize().topics.s1).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
 	});
 	test("never activates a staged topic whose authority is revoked during durable commit", async () => {
 		const reg = new TopicRegistry();
@@ -370,13 +416,13 @@ describe("TopicRegistry", () => {
 				undefined,
 				undefined,
 				async () => {
-					reg.beginDelete("s1");
+					reg.beginArchive("s1");
 				},
 			),
 		).rejects.toThrow("topic authority was revoked during creation");
 		expect(reg.sessionForTopic("42")).toBeUndefined();
-		expect(reg.get("s1")).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
-		expect(reg.serialize().topics.s1).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+		expect(reg.get("s1")).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
+		expect(reg.serialize().topics.s1).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
 	});
 	test("retains a delete-pending record and epoch without restoring its inbound route", async () => {
 		const reg = new TopicRegistry();
@@ -386,14 +432,14 @@ describe("TopicRegistry", () => {
 			endpointDigest: "digest-s1",
 			endpointGeneration: 1,
 		});
-		reg.beginDelete("s1");
+		reg.beginArchive("s1");
 
 		const reloaded = new TopicRegistry(reg.serialize());
 
-		expect(reloaded.get("s1")).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+		expect(reloaded.get("s1")).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
 		expect(reloaded.sessionForTopic("42")).toBeUndefined();
 		await expect(reloaded.getOrCreateTopic("s1", async () => "43")).rejects.toThrow(
-			"topic authority is deletion-fenced",
+			"topic authority is archive-fenced",
 		);
 	});
 	test("fails closed after restart when a durable fence supersedes an active record epoch", async () => {
@@ -409,7 +455,7 @@ describe("TopicRegistry", () => {
 
 		const reloaded = new TopicRegistry(snapshot);
 
-		expect(reloaded.get("s1")).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+		expect(reloaded.get("s1")).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
 		expect(reloaded.sessionForTopic("42")).toBeUndefined();
 	});
 	test("rebuilds inbound routes from merged records on repeated load", async () => {
@@ -437,7 +483,7 @@ describe("TopicRegistry", () => {
 			},
 		});
 
-		expect(reg.get("s1")).toMatchObject({ authorityState: "delete_pending" });
+		expect(reg.get("s1")).toMatchObject({ authorityState: "archive_pending" });
 		expect(reg.sessionForTopic("42")).toBeUndefined();
 	});
 	test.each([
@@ -462,8 +508,8 @@ describe("TopicRegistry", () => {
 			});
 		}
 
-		expect(reg.get("active")?.authorityState).toBeUndefined();
-		expect(reg.get("fenced")).toMatchObject({ authorityState: "delete_pending" });
+		expect(reg.get("active")?.authorityState).toBe("active");
+		expect(reg.get("fenced")).toMatchObject({ authorityState: "archive_pending" });
 		expect(reg.sessionForTopic("42")).toBeUndefined();
 	});
 	test("failed close restore retains a topic-id collision quarantine", async () => {
@@ -475,11 +521,11 @@ describe("TopicRegistry", () => {
 			endpointGeneration: 1,
 		});
 		await reg.getOrCreateTopic("A", async () => "42", Date.now, undefined, binding("A"));
-		const snapshot = reg.captureDeleteAuthority("A");
-		reg.beginDelete("A");
+		const snapshot = reg.captureArchiveAuthority("A");
+		reg.beginArchive("A");
 		await reg.getOrCreateTopic("B", async () => "42", Date.now, undefined, binding("B"));
 
-		expect(reg.restoreDeleteAuthority(snapshot)).toBe(true);
+		expect(reg.restoreArchiveAuthority(snapshot)).toBe(true);
 		expect(reg.sessionForTopic("42")).toBeUndefined();
 	});
 });
@@ -506,114 +552,124 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-describe("isTopicIdAvailable (user-topic adoption)", () => {
-	test.each([
-		["empty", ""],
-		["non-decimal", "1e2"],
-		["zero", "0"],
-		["negative", "-1"],
-		["non-safe", "9007199254740992"],
-		["non-string numeric", 123 as unknown as string],
-		["null", null as unknown as string],
-	])("rejects invalid topic ids without mutation (%s)", (_name, topicId) => {
-		const reg = new TopicRegistry();
-		expect(reg.isTopicIdAvailable(topicId)).toBe(false);
-		expect(reg.serialize()).toEqual({ topics: {}, fences: {} });
+test("publishes generation 31 at serving epoch 4", () => {
+	expect(DAEMON_GENERATION).toBe(31);
+	expect(SERVING_EPOCH).toBe(4);
+});
+test("archives pending topics into retained inactive records", async () => {
+	const registry = new TopicRegistry();
+	await registry.getOrCreateTopic("session", async () => "42", Date.now, undefined, {
+		chatId: "42",
+		endpointKey: "endpoint",
+		endpointDigest: "digest",
+		endpointGeneration: 1,
 	});
 
-	test("reports an id available when no record, route, or stage claims it", () => {
-		const reg = new TopicRegistry();
-		expect(reg.isTopicIdAvailable("42")).toBe(true);
-	});
+	registry.beginArchive("session");
+	expect(registry.get("session")?.authorityState).toBe("archive_pending");
+	expect(registry.settleArchive("session", "42")).toBe(true);
+	expect(registry.get("session")?.authorityState).toBe("inactive");
+	expect(registry.serialize().topics.session?.topicId).toBe("42");
+});
 
-	test("rejects an id once an active topic is committed for it", async () => {
-		const reg = new TopicRegistry();
-		await reg.getOrCreateTopic("s1", async () => "42");
-		expect(reg.isTopicIdAvailable("42")).toBe(false);
-		expect(reg.isTopicIdAvailable("43")).toBe(true);
-	});
+test("rejects future topic registry versions and quarantines retained legacy records", () => {
+	expect(() => parseTopicRegistryState({ version: 3, topics: {} })).toThrow("unsupported future Telegram topic state");
 
-	test("rejects an id held by a delete-pending (fenced) record", async () => {
-		const reg = new TopicRegistry();
-		await reg.getOrCreateTopic("s1", async () => "42", Date.now, undefined, {
-			chatId: "42",
-			endpointKey: "ws://s1",
-			endpointDigest: "digest-s1",
-			endpointGeneration: 1,
-		});
-		reg.beginDelete("s1");
-		expect(reg.get("s1")?.authorityState).toBe("delete_pending");
-		expect(reg.isTopicIdAvailable("42")).toBe(false);
-	});
-
-	test("rejects an id that is ambiguous across two records", async () => {
-		const reg = new TopicRegistry();
-		const binding = (sessionId: string) => ({
-			chatId: "42",
-			endpointKey: `ws://${sessionId}`,
-			endpointDigest: `digest-${sessionId}`,
-			endpointGeneration: 1,
-		});
-		await reg.getOrCreateTopic("A", async () => "42", Date.now, undefined, binding("A"));
-		await reg.getOrCreateTopic("B", async () => "42", Date.now, undefined, binding("B"));
-		expect(reg.sessionForTopic("42")).toBeUndefined();
-		expect(reg.isTopicIdAvailable("42")).toBe(false);
-	});
-
-	test("rejects an id held by a staged (not-yet-committed) create without mutating state", async () => {
-		const reg = new TopicRegistry();
-		const commitGate = Promise.withResolvers<void>();
-		const creating = reg.getOrCreateTopic(
-			"s1",
-			async () => "42",
-			Date.now,
-			undefined,
-			undefined,
-			async () => {
-				// During the durable commit the record is staged-but-uncommitted;
-				// adoption must refuse the topic id to avoid a duplicate authority.
-				expect(reg.isTopicIdAvailable("42")).toBe(false);
-				await commitGate.promise;
+	const state = parseTopicRegistryState({
+		topics: {
+			legacy: {
+				topicId: "42",
+				identitySent: true,
+				createdAt: 1,
+				chatId: "42",
+				endpointKey: "endpoint",
+				endpointDigest: "digest",
 			},
-		);
-		commitGate.resolve();
-		await creating;
-		expect(reg.isTopicIdAvailable("42")).toBe(false);
-		expect(reg.sessionForTopic("42")).toBe("s1");
-	});
+		},
+	})!;
+	const registry = new TopicRegistry(state);
 
-	test("adoption via getOrCreateTopic create callback commits exactly once with the user topic id", async () => {
-		const reg = new TopicRegistry();
-		const binding = {
-			chatId: "42",
-			endpointKey: "ws://s1",
-			endpointDigest: "digest-s1",
-			endpointGeneration: 1,
-		};
-		// The create callback returns a user-created topicId only after confirming
-		// pure availability; getOrCreateTopic then commits the full record once.
-		const record = await reg.getOrCreateTopic(
-			"s1",
-			async () => {
-				expect(reg.isTopicIdAvailable("77")).toBe(true);
-				return "77";
-			},
-			() => 1000,
-			"repo/main",
-			binding,
-			undefined,
-			undefined,
-			"user_created",
-		);
-		expect(record.topicId).toBe("77");
-		expect(record.creationLeaseEpoch).toBe(0);
-		expect(record.chatId).toBe("42");
-		expect(reg.sessionForTopic("77")).toBe("s1");
-		expect(reg.get("s1")?.endpointDigest).toBe("digest-s1");
-		expect(reg.isTopicIdAvailable("77")).toBe(false);
-		expect(record.topicOrigin).toBe("user_created");
-		const reloaded = new TopicRegistry();
-		reloaded.load(reg.serialize());
-		expect(reloaded.get("s1")?.topicOrigin).toBe("user_created");
+	expect(registry.get("legacy")).toMatchObject({ topicId: "42", authorityState: "legacy_quarantined" });
+	expect(registry.sessionForTopic("42")).toBeUndefined();
+});
+test("fences a concurrent host and permits same-topic resume only before grace expiry", async () => {
+	const registry = new TopicRegistry();
+	await registry.getOrCreateTopic(
+		"session",
+		async () => "42",
+		() => 100,
+	);
+	expect(registry.acquireLease("session", "host-a", 100, 1_000, 500)).toBe(true);
+	expect(registry.acquireLease("session", "host-b", 200, 1_000, 500)).toBe(false);
+	expect(registry.releaseLeaseToGrace("session", "host-a", 300, 500)).toBe(true);
+	expect(registry.acquireLease("session", "host-a", 700, 1_000, 500)).toBe(true);
+	expect(registry.releaseLeaseToGrace("session", "host-a", 800, 500)).toBe(true);
+	expect(registry.acquireLease("session", "host-a", 1_301, 1_000, 500)).toBe(false);
+});
+
+test("retains lease identity and registry generation across serialization", async () => {
+	const registry = new TopicRegistry();
+	await registry.getOrCreateTopic("session", async () => "42", Date.now, undefined, {
+		chatId: "42",
+		endpointKey: "endpoint",
+		endpointDigest: "digest",
 	});
+	expect(registry.acquireLease("session", "host-a", 100, 1_000, 500)).toBe(true);
+	registry.markRegistryPublished(4);
+	const restored = new TopicRegistry(registry.serialize());
+	expect(restored.registryVersion()).toBe(4);
+	expect(restored.get("session")).toMatchObject({
+		sessionUuid: expect.any(String),
+		leaseOwner: "host-a",
+		leaseHeartbeatAt: 100,
+		leaseExpiresAt: 1_100,
+	});
+});
+test("terminal archive states cannot be revived by lease or orphan transitions", async () => {
+	const registry = new TopicRegistry();
+	await registry.getOrCreateTopic(
+		"session",
+		async () => "42",
+		() => 0,
+		undefined,
+		{
+			chatId: "42",
+			endpointKey: "endpoint",
+			endpointDigest: "digest",
+		},
+	);
+	registry.beginArchive("session");
+	for (let attempt = 0; attempt < 9; attempt++) registry.scheduleArchiveRetry("session", attempt);
+	expect(registry.get("session")?.authorityState).toBe("archive_exhausted");
+	expect(registry.acquireLease("session", "host", 10, 1_000, 500)).toBe(false);
+	expect(registry.markOrphaned("session", 10)).toBe(false);
+	expect(registry.clearOrphaned("session")).toBe(false);
+	await expect(registry.getOrCreateTopic("session", async () => "43")).rejects.toThrow("archive-fenced");
+});
+test("durably publishes a pre-create claim before invoking the remote creator", async () => {
+	const registry = new TopicRegistry();
+	const commit = Promise.withResolvers<void>();
+	let createCalled = false;
+	const creating = registry.getOrCreateTopic(
+		"session",
+		async () => {
+			createCalled = true;
+			return "42";
+		},
+		() => 100,
+		"topic",
+		{ chatId: "42", endpointKey: "endpoint", endpointDigest: "digest" },
+		() => commit.promise,
+	);
+	await Promise.resolve();
+	expect(createCalled).toBe(false);
+	expect(registry.serialize().createClaims?.session).toMatchObject({
+		sessionId: "session",
+		authorityEpoch: 0,
+		createdAt: 100,
+	});
+	commit.resolve();
+	await creating;
+	expect(createCalled).toBe(true);
+	expect(registry.serialize().createClaims?.session).toBeUndefined();
 });

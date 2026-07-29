@@ -79,6 +79,16 @@ The setup pairing flow is private-chat only. If setup sees a `group`,
 DM. This is intentional for safe local discovery: group chats must not receive
 session names, action ids, or pending status by accident.
 
+### Isolated validation-supergroup invocation
+
+Production pairing is private-DM only. The daemon's explicit validation path may target one isolated Telegram forum-capable supergroup without changing the configured paired chat:
+
+```sh
+gjc notify daemon-internal --agent-dir <agent-dir> --validation-test-supergroup-chat-id <-100…>
+```
+
+This invocation accepts only an exact negative `-100…` supergroup ID and proves the target with Telegram `getChat` forum capability before use. It overrides the delivery target for that invocation only; it neither saves nor pairs the group. Ordinary group chats are not a supported pairing or delivery fallback.
+
 Telegram private-chat topics: the managed daemon's per-session delivery uses
 Telegram forum topics (`createForumTopic` + `message_thread_id`). Telegram now
 supports forum topics in **private chats** when the bot owner enables **Threaded

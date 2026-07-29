@@ -546,6 +546,8 @@ revalidates the complete bot-token/chat identity immediately before polling and
 again before activation. A foreign or unknown owner is never killed, reloaded, or taken over;
 setup fails closed without saving or exposing the raw token.
 
+Telegram production pairing remains private-DM only. For isolated integration validation, `gjc notify daemon-internal --agent-dir <agent-dir> --validation-test-supergroup-chat-id <-100…>` acquires the normal private-chat daemon owner and temporarily targets only the supplied exact `-100…` forum-capable supergroup after `getChat` proof; it does not alter the persisted paired chat. Ordinary groups are never a pairing or delivery fallback.
+
 - [Telegram notification onboarding](./telegram-onboarding.md) documents
   `gjc notify setup` and private-chat pairing.
 - [Discord notification onboarding](./discord-onboarding.md) documents

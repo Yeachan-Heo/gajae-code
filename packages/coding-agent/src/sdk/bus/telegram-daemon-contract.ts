@@ -40,20 +40,15 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 29 adds serving-epoch compatibility, sidecar heartbeat, root GC,
  * and Bot API cooldown structural fixes (#2956, #2960, #3048).
  * Generation 30 adds opt-in tool activity delivery, closed lifecycle phases,
- * and capability-versioned mixed-host compatibility. Generation 31 rolls out
- * non-Linux direct tmux lifecycle cleanup semantics. Generation 32 applies
- * Telegram sound-notification policy across daemon delivery paths. Generation
- * 33 adds action-bound multi-select state rendering and replay-safe option
- * snapshots. Generation 34 converts non-photo image formats (including WebP)
- * into Telegram-compatible photo uploads when possible. Generation 35 adds
- * user-created topic adoption (forum-topic folder picker).
+ * and capability-versioned mixed-host compatibility. Generation 31 makes
+ * forum-topic lifecycle convergence non-destructive and requires lease fencing
+ * before topic mutations.
  */
-export const DAEMON_GENERATION = 35;
+export const DAEMON_GENERATION = 31;
 
 /**
- * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
- * all builds published before this field existed; epoch 2 covered generation 29;
- * epoch 3 covered generation 30; bump this to force serving convergence and
- * reload of compatible live predecessors.
+ * Serving-compatibility boundary for daemon lifecycle requests. Epoch 4
+ * requires active-topic lease convergence before any topic write, archive, or
+ * endpoint rebind.
  */
 export const SERVING_EPOCH = 4;

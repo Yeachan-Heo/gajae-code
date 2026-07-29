@@ -11,6 +11,7 @@
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 - Managed-session startup now preserves bounded Windows ACL and identity failure classifications in path-redacted recovery guidance without broadening permissions, elevation, or unsafe fallback.
+- Telegram topic synchronization now uses generation-CAS shared authority, durable pre-create claims, lease-fenced effects, bounded single-flight archive retries, and an isolated owner-backed validation-supergroup mode without deleting topics.
 
 ## [Unreleased]
 ### Fixed

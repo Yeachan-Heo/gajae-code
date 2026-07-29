@@ -3,18 +3,24 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
-import type { Settings } from "../../config/settings";
+import { Settings, type Settings as SettingsInstance } from "../../config/settings";
 import {
 	getNotificationConfig,
 	isTelegramConfigured,
 	type NotificationSettingsReader,
 	parseNotificationSettingsSnapshot,
+	tokenFingerprint,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
+	confirmTelegramDaemonSpawn,
 	type DaemonState,
+	FilesystemTopicRegistryCasAuthority,
+	loadInstallationHostId,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
+	spawnTelegramDaemonOwner,
+	type TelegramDaemonDeps,
 	type TelegramDaemonOptions,
 	TelegramNotificationDaemon,
 } from "./telegram-daemon";
@@ -35,6 +41,12 @@ export interface RunDaemonInternalDeps {
 		init: (options?: { agentDir?: string }) => Promise<LightweightDaemonSettings>;
 	};
 	DaemonImpl?: TelegramDaemonConstructor;
+	/** Full settings loader used only by the owner-backed validation launcher. */
+	OwnerSettingsImpl?: {
+		init: (options?: { agentDir?: string }) => Promise<SettingsInstance>;
+	};
+	/** Spawn/readiness seams for the owner-backed validation launcher. */
+	telegramDaemonDeps?: TelegramDaemonDeps;
 	processPid?: number;
 	pidAlive?: (pid: number) => boolean;
 	/** Clock used by the ownership-progress watchdog; defaults to `Date.now`. */
@@ -44,6 +56,8 @@ export interface RunDaemonInternalDeps {
 	clearInterval?: (timer: Timer) => void;
 	/** Reads persisted daemon ownership state; defaults to the real reader. */
 	readDaemonState?: (settings: Settings) => Promise<DaemonState | undefined>;
+	/** Loads the verified machine-local identity; injectable so daemon tests do not touch the host. */
+	loadInstallationHostId?: () => Promise<string>;
 }
 
 /** Ownership-watchdog cadence while the daemon process is running. */
@@ -53,6 +67,18 @@ const OWNER_STALL_MS = 3 * HEARTBEAT_TTL_MS;
 function argValue(argv: string[], name: string): string | undefined {
 	const i = argv.indexOf(name);
 	return i >= 0 ? argv[i + 1] : undefined;
+}
+const VALIDATION_TEST_SUPERGROUP_CHAT_ID = /^-100\d+$/;
+
+function validationTestSupergroupChatId(argv: string[]): string | undefined {
+	const flag = "--validation-test-supergroup-chat-id";
+	const positions = argv.flatMap((value, index) => (value === flag ? [index] : []));
+	if (positions.length === 0) return undefined;
+	if (positions.length !== 1) throw new Error("--validation-test-supergroup-chat-id may be supplied only once");
+	const chatId = argv[positions[0]! + 1];
+	if (chatId === undefined || chatId.startsWith("--") || !VALIDATION_TEST_SUPERGROUP_CHAT_ID.test(chatId))
+		throw new Error("--validation-test-supergroup-chat-id requires a negative -100... chat ID");
+	return chatId;
 }
 const DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT = 1;
 let daemonCompatibilityDiagnosticCount = 0;
@@ -213,17 +239,57 @@ export async function runDaemonSmoke(opts: { agentDir?: string } = {}): Promise<
 export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalDeps = {}): Promise<void> {
 	const smoke = argv.includes("--smoke");
 	const agentDir = argValue(argv, "--agent-dir");
+	const validationChatId = validationTestSupergroupChatId(argv);
 	if (smoke) return runDaemonSmoke({ agentDir });
 	const ownerId = argValue(argv, "--owner-id");
-	if (!ownerId) throw new Error("missing --owner-id");
+	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
+	if (!ownerId) {
+		if (validationChatId === undefined) throw new Error("missing --owner-id");
+		const ownerSettings = await (deps.OwnerSettingsImpl ?? Settings).init({ agentDir: resolvedAgentDir });
+		const ownerCfg = getNotificationConfig(ownerSettings);
+		if (!isTelegramConfigured(ownerCfg)) throw new Error("Telegram notifications are not configured");
+		const spawned = await spawnTelegramDaemonOwner(
+			{
+				settings: ownerSettings,
+				tokenFingerprint: tokenFingerprint(ownerCfg.botToken),
+				chatId: ownerCfg.chatId,
+				validationTestSupergroupChatId: validationChatId,
+			},
+			deps.telegramDaemonDeps,
+		);
+		if (spawned.result !== "owner_spawned")
+			throw new Error(
+				spawned.result === "blocked"
+					? (spawned.warnings[0] ?? "Telegram daemon ownership is unavailable")
+					: "Telegram daemon is already owned; refusing validation attach",
+			);
+		const ready = await confirmTelegramDaemonSpawn({
+			settings: ownerSettings,
+			spawned,
+			tokenFingerprint: tokenFingerprint(ownerCfg.botToken),
+			chatId: ownerCfg.chatId,
+			pid: deps.processPid ?? process.pid,
+			fs: deps.telegramDaemonDeps?.fs,
+			now: deps.telegramDaemonDeps?.now,
+			pidAlive: deps.telegramDaemonDeps?.pidAlive,
+			pidIncarnation: deps.telegramDaemonDeps?.pidIncarnation,
+			sleep: deps.telegramDaemonDeps?.sleep,
+		});
+		if (!ready) throw new Error("Telegram validation daemon did not become ready");
+		return;
+	}
 	if (!ownerProcessIsAlive(ownerId, deps)) {
 		recordDaemonCompatibilityDiagnostic("GJC notify daemon exiting because its owner is not alive");
 		return;
 	}
-	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
 	if (!isTelegramConfigured(cfg)) return;
+	const installationHostId = await (deps.loadInstallationHostId ?? loadInstallationHostId)();
+	const topicRegistryAuthority = new FilesystemTopicRegistryCasAuthority(
+		path.join(daemonPaths(resolvedAgentDir).dir, "telegram-topics.json"),
+		{ installationHostId },
+	);
 	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? TelegramNotificationDaemon;
 	const readState = deps.readDaemonState ?? readDaemonState;
 	const daemon = new Daemon({
@@ -231,6 +297,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		ownerId,
 		botToken: cfg.botToken,
 		chatId: cfg.chatId,
+		...(validationChatId !== undefined ? { validationTestSupergroupChatId: validationChatId } : {}),
 		idleTimeoutMs: cfg.idleTimeoutMs,
 		sound: cfg.sound,
 		rich: cfg.rich,
@@ -240,6 +307,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
 		control: createDaemonControlHooks(settings as Settings),
+		topicRegistryAuthority,
+		installationHostId,
 	});
 	// Signals are a process concern: install them at the daemon-internal boundary,
 	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.
