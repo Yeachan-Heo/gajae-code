@@ -397,6 +397,23 @@ test("an entry-only terminal snapshot stays fail-closed when multiple live respo
 	expect(r.openItemCount).toBe(2);
 });
 
+test("an entry-only terminal cannot close one mapped item while another response item is open", () => {
+	const r = reducer([1, 2]);
+	const mapped = assistant("mapped", "response-mapped", 10);
+	associateSessionMessageEntryId(mapped, "entry-mapped-open");
+	const live = assistant("live", "response-live", 11);
+	const conflictingFinal = assistant("conflicting final", undefined, 11);
+	associateSessionMessageEntryId(conflictingFinal, "entry-mapped-open");
+
+	r.accept(messageStart(mapped));
+	r.accept(messageStart(live));
+	expect(r.accept(messageEnd(conflictingFinal))).toEqual([]);
+	expect(() => r.completeTurn({ kind: "completed", messages: [conflictingFinal] })).toThrow(
+		"Cannot correlate authoritative agent-message state",
+	);
+	expect(r.openItemCount).toBe(2);
+});
+
 test("two assistant messages use distinct deterministic fallback ids and replay identically", () => {
 	const first = assistant("first", undefined, 1);
 	const second = assistant("second", undefined, 2);

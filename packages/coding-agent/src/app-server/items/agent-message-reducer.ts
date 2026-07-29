@@ -213,6 +213,7 @@ export class AgentMessageReducer {
 
 	#acceptMessageEnd(message: AgentMessage): readonly WireNotification[] {
 		if (!isAssistantMessage(message)) return [];
+		if (this.#isAmbiguousMappedEntryTerminal(message)) return [];
 		const item = this.#findItem(message, false) ?? this.#adoptPersistedTerminalIdentity(message);
 		if (!item || item.state === "completed") return [];
 		this.#setAuthoritative(item, message);
@@ -332,6 +333,30 @@ export class AgentMessageReducer {
 		this.#messageToItem.set(message, itemId);
 	}
 
+	#isAmbiguousMappedEntryTerminal(message: AssistantMessage): boolean {
+		const sources = sourceIdentities(message);
+		if (
+			!sources.some(source => source.startsWith("entry:")) ||
+			sources.some(source => source.startsWith("response:"))
+		)
+			return false;
+		const mappedItemIds = new Set(
+			sources
+				.map(source => this.#sourceToItem.get(source))
+				.filter((itemId): itemId is string => itemId !== undefined),
+		);
+		if (mappedItemIds.size !== 1) return false;
+		const mappedItemId = mappedItemIds.values().next().value;
+		const mappedItem = mappedItemId ? this.#items.get(mappedItemId) : undefined;
+		if (mappedItem?.state !== "open") return false;
+		let openCount = 0;
+		for (const item of this.#items.values()) {
+			if (item.state === "open") openCount += 1;
+			if (openCount > 1) return true;
+		}
+		return false;
+	}
+
 	#adoptPersistedTerminalIdentity(message: AssistantMessage): ItemState | undefined {
 		const sources = sourceIdentities(message);
 		if (
@@ -441,6 +466,8 @@ export class AgentMessageReducer {
 		const assignments = new Map<string, AssistantMessage>();
 		const openItems = Array.from(this.#items.values()).filter(item => item.state === "open");
 		for (const message of messages) {
+			if (this.#isAmbiguousMappedEntryTerminal(message))
+				throw new Error(`Cannot correlate authoritative agent-message state for turn ${this.#turnId}`);
 			const known = this.#findItem(message, false);
 			if (known) {
 				if (known.state === "open" && !assignments.has(known.id)) assignments.set(known.id, message);
