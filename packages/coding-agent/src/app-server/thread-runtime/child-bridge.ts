@@ -153,12 +153,34 @@ function readProperty(record: Record<string, unknown>, key: string): PropertyRea
 	}
 }
 
+interface RecordValueRead {
+	readonly record: Record<string, unknown> | undefined;
+	readonly failure: PropertyRead | undefined;
+	readonly malformed: boolean;
+}
+
+function readRecordValue(value: unknown): RecordValueRead {
+	try {
+		return isRecord(value)
+			? { record: value, failure: undefined, malformed: false }
+			: { record: undefined, failure: undefined, malformed: true };
+	} catch (error) {
+		return {
+			record: undefined,
+			failure: { value: undefined, failed: true, error },
+			malformed: false,
+		};
+	}
+}
+
 function firstReadFailure(reads: readonly PropertyRead[]): PropertyRead | undefined {
 	return reads.find(read => read.failed);
 }
 
-function assertSessionClient(value: unknown): asserts value is SessionClient {
-	if (!isRecord(value)) throw new Error("Child adapter did not retain a session client.");
+function assertSessionClient(
+	value: Record<string, unknown>,
+	closeRead: PropertyRead,
+): asserts value is Record<string, unknown> & SessionClient {
 	for (const method of [
 		"onFrame",
 		"onReconnect",
@@ -168,7 +190,7 @@ function assertSessionClient(value: unknown): asserts value is SessionClient {
 		"control",
 		"close",
 	] as const) {
-		const read = readProperty(value, method);
+		const read = method === "close" ? closeRead : readProperty(value, method);
 		if (read.failed) throw read.error;
 		if (typeof read.value !== "function") throw new Error(`Child session client is missing ${method}().`);
 	}
@@ -187,17 +209,10 @@ interface EndpointAuthorityRead {
 
 function readEndpointAuthority(value: unknown): EndpointAuthorityRead {
 	if (value === undefined) return { authority: undefined, failure: undefined, malformed: false };
-	let record: Record<string, unknown>;
-	try {
-		if (!isRecord(value)) return { authority: undefined, failure: undefined, malformed: true };
-		record = value;
-	} catch (error) {
-		return {
-			authority: undefined,
-			failure: { value: undefined, failed: true, error },
-			malformed: false,
-		};
-	}
+	const recordRead = readRecordValue(value);
+	if (recordRead.failure) return { authority: undefined, failure: recordRead.failure, malformed: false };
+	if (!recordRead.record) return { authority: undefined, failure: undefined, malformed: true };
+	const record = recordRead.record;
 	const generation = readProperty(record, "endpointGeneration");
 	const incarnation = readProperty(record, "endpointIncarnation");
 	const mtime = readProperty(record, "endpointMtimeMs");
@@ -450,7 +465,8 @@ export async function loadThread(
 				: undefined;
 		const authoritySnapshot = readEndpointAuthority(authorityRead.value);
 		const childAuthority = authoritySnapshot.authority;
-		const clientRecord = isRecord(clientRead.value) ? clientRead.value : undefined;
+		const clientRecordRead = readRecordValue(clientRead.value);
+		const clientRecord = clientRecordRead.record;
 		const clientCloseRead = clientRecord ? readProperty(clientRecord, "close") : undefined;
 		let cleanupThreadId = createRequest.threadId;
 		if (clientRecord && typeof clientCloseRead?.value === "function") {
@@ -476,6 +492,8 @@ export async function loadThread(
 			...(clientCloseRead ? [clientCloseRead] : []),
 		]);
 		if (propertyFailure) throw propertyFailure.error;
+		if (clientRecordRead.failure) throw clientRecordRead.failure.error;
+		if (clientRecordRead.malformed) throw new Error("Child adapter did not retain a session client.");
 		if (authoritySnapshot.failure) throw authoritySnapshot.failure.error;
 		if (authoritySnapshot.malformed) throw new Error("Child adapter provided malformed endpoint authority.");
 		if (childCloseRead.value !== undefined && !childCloseHook)
@@ -484,9 +502,9 @@ export async function loadThread(
 		const sessionId = requiredString(sessionIdRead.value, "sessionId");
 		cleanupThreadId = sessionId;
 		const actualCwd = requiredString(cwdRead.value, "cwd");
-		const clientValue = clientRead.value;
-		assertSessionClient(clientValue);
-		const client = clientValue;
+		if (!clientRecord || !clientCloseRead) throw new Error("Child adapter did not retain a session client.");
+		assertSessionClient(clientRecord, clientCloseRead);
+		const client = clientRecord;
 		const authority = childAuthority;
 		if (ownership === "spawned" && !authority) throw new Error("Spawned child did not provide endpoint authority.");
 		if (ownership === "spawned" && !childCloseHook && typeof opts.close !== "function")

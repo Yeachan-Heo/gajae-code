@@ -367,6 +367,36 @@ test("a persisted entry identity aliases the existing response identity across l
 	expect(replay.openItemCount).toBe(0);
 });
 
+test("an entry-only final snapshot adopts the sole live response item at the terminal boundary", () => {
+	const r = reducer([1, 2]);
+	const liveStart = assistant("partial", "response-live", 10);
+	const persistedFinal = assistant("persisted final", undefined, 10);
+	associateSessionMessageEntryId(persistedFinal, "entry-only-final");
+
+	const notifications = [...r.accept(messageStart(liveStart)), ...r.accept(messageEnd(persistedFinal))];
+	expect(methods(notifications)).toEqual(["item/started", "item/completed"]);
+	expect(started(notifications).params.item.id).toBe("agent-message:response:response-live");
+	expect(completed(notifications).params.item.text).toBe("persisted final");
+	expect(r.openItemCount).toBe(0);
+	expectValidNotifications(notifications);
+});
+
+test("an entry-only terminal snapshot stays fail-closed when multiple live responses are open", () => {
+	const r = reducer([1, 2]);
+	const first = assistant("first", "response-first", 10);
+	const second = assistant("second", "response-second", 11);
+	const persistedFinal = assistant("persisted final", undefined, 11);
+	associateSessionMessageEntryId(persistedFinal, "entry-ambiguous-final");
+
+	r.accept(messageStart(first));
+	r.accept(messageStart(second));
+	expect(r.accept(messageEnd(persistedFinal))).toEqual([]);
+	expect(() => r.completeTurn({ kind: "completed", messages: [persistedFinal] })).toThrow(
+		"Cannot correlate authoritative agent-message state",
+	);
+	expect(r.openItemCount).toBe(2);
+});
+
 test("two assistant messages use distinct deterministic fallback ids and replay identically", () => {
 	const first = assistant("first", undefined, 1);
 	const second = assistant("second", undefined, 2);

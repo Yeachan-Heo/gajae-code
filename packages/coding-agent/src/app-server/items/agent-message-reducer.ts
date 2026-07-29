@@ -213,7 +213,7 @@ export class AgentMessageReducer {
 
 	#acceptMessageEnd(message: AgentMessage): readonly WireNotification[] {
 		if (!isAssistantMessage(message)) return [];
-		const item = this.#findItem(message, false);
+		const item = this.#findItem(message, false) ?? this.#adoptPersistedTerminalIdentity(message);
 		if (!item || item.state === "completed") return [];
 		this.#setAuthoritative(item, message);
 		return this.#closeItem(item);
@@ -332,6 +332,29 @@ export class AgentMessageReducer {
 		this.#messageToItem.set(message, itemId);
 	}
 
+	#adoptPersistedTerminalIdentity(message: AssistantMessage): ItemState | undefined {
+		const sources = sourceIdentities(message);
+		if (
+			!sources.some(source => source.startsWith("entry:")) ||
+			sources.some(source => source.startsWith("response:"))
+		)
+			return undefined;
+		const openItems = Array.from(this.#items.values()).filter(item => item.state === "open");
+		if (openItems.length !== 1) return undefined;
+		const item = openItems[0];
+		if (!Array.from(item.sources).some(source => source.startsWith("response:"))) return undefined;
+		for (const source of sources) {
+			const existingItemId = this.#sourceToItem.get(source);
+			if (existingItemId !== undefined && existingItemId !== item.id) return undefined;
+		}
+		for (const source of sources) {
+			item.sources.add(source);
+			this.#sourceToItem.set(source, item.id);
+		}
+		this.#messageToItem.set(message, item.id);
+		return item;
+	}
+
 	#setObserved(item: ItemState, message: AssistantMessage): void {
 		const sources = sourceIdentities(message);
 		if (!this.#isSourceCompatible(item, sources))
@@ -421,6 +444,11 @@ export class AgentMessageReducer {
 			const known = this.#findItem(message, false);
 			if (known) {
 				if (known.state === "open" && !assignments.has(known.id)) assignments.set(known.id, message);
+				continue;
+			}
+			const transitioned = this.#adoptPersistedTerminalIdentity(message);
+			if (transitioned) {
+				if (!assignments.has(transitioned.id)) assignments.set(transitioned.id, message);
 				continue;
 			}
 			if (openItems.length === 0) continue;

@@ -835,6 +835,84 @@ test("transactional load: revoked authority proxies cannot bypass captured clean
 	expect(manager.pendingCount).toBe(0);
 });
 
+test("transactional load: revoked client proxies still invoke captured child cleanup", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	const revocable = Proxy.revocable(fakeClient(counters), {});
+	revocable.revoke();
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-revoked-client",
+			cwd: path.resolve("cwd"),
+			authority: authority(39),
+			client: revocable.proxy,
+			awaitReady: async () => {},
+			closeChild: async () => {
+				counters.childClose += 1;
+			},
+		}),
+	};
+	let rejection: unknown;
+	try {
+		await loadThread(opts, { cwd: "cwd" });
+	} catch (error) {
+		rejection = error;
+	}
+
+	expect(rejection).toBeInstanceOf(TypeError);
+	expect(counters.close).toBe(0);
+	expect(counters.childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
+
+test("transactional load: client close getter is captured once and never re-read", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	let closeGetterReads = 0;
+	let clientClose = 0;
+	let childClose = 0;
+	const client: Record<string, unknown> = {
+		onFrame: () => () => {},
+		onReconnect: () => () => {},
+		onReconnectFailed: () => () => {},
+		request: async () => ({}),
+		query: async () => ({}),
+		control: async () => ({}),
+	};
+	Object.defineProperty(client, "close", {
+		get: () => {
+			closeGetterReads += 1;
+			if (closeGetterReads > 1) throw new Error("close getter re-read");
+			return async () => {
+				clientClose += 1;
+			};
+		},
+	});
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-close-getter-once",
+			cwd: path.resolve("cwd"),
+			authority: authority(40),
+			client: client as unknown as SessionClient,
+			awaitReady: async () => {},
+			closeChild: async () => {
+				childClose += 1;
+			},
+		}),
+		readEffectiveSettings: async () => {
+			throw new Error("settings failed");
+		},
+	};
+
+	await expect(loadThread(opts, { cwd: "cwd" })).rejects.toThrow("settings failed");
+	expect(closeGetterReads).toBe(1);
+	expect(clientClose).toBe(1);
+	expect(childClose).toBe(1);
+	expect(manager.loadedCount).toBe(0);
+});
+
 test("transactional load: spawned child without authority-fenced cleanup fails before readiness", async () => {
 	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
 	const counters = { close: 0 };

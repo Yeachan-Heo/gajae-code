@@ -2413,6 +2413,8 @@ async function streamAssistantResponse(
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(await finishResponse(), config.model)
 								: await finishResponse();
+							if (!finalMessage.responseId && partialMessage?.responseId)
+								finalMessage.responseId = partialMessage.responseId;
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {

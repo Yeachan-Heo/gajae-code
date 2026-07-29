@@ -92,6 +92,42 @@ describe("agentLoop with AgentMessage", () => {
 		expect(eventTypes).toContain("agent_end");
 	});
 
+	it("preserves a streamed response id on the final assistant message", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel();
+		const partial = createAssistantMessage([{ type: "text", text: "partial" }]);
+		partial.responseId = "response-stable";
+		const final = createAssistantMessage([{ type: "text", text: "final" }]);
+		const streamFn = () => {
+			const response = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				response.push({ type: "start", partial });
+				response.push({ type: "done", reason: "stop", message: final });
+			});
+			return response;
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			streamFn,
+		);
+		for await (const event of stream) events.push(event);
+
+		const start = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_start" }> & { message: AssistantMessage } =>
+				event.type === "message_start" && event.message.role === "assistant",
+		);
+		const end = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> & { message: AssistantMessage } =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(start?.message.responseId).toBe("response-stable");
+		expect(end?.message.responseId).toBe("response-stable");
+	});
+
 	it("emits an aborted assistant message when cancellation happens before provider events", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],
