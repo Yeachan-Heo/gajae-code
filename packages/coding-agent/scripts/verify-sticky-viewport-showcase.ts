@@ -392,18 +392,6 @@ const hasColorSgr = (ansi: string) =>
 				code === 48,
 		);
 	});
-const hasIndexedOrBasicColorSgr = (ansi: string) =>
-	[...ansi.matchAll(/\x1b\[([0-9;]*)m/g)].some(match => {
-		const codes = (match[1] || "0").split(";").map(Number);
-		for (let index = 0; index < codes.length; index += 1) {
-			const code = codes[index]!;
-			if ((code >= 30 && code <= 37) || (code >= 40 && code <= 47) || (code >= 90 && code <= 107)) return true;
-			if (code !== 38 && code !== 48) continue;
-			if (codes[index + 1] === 5) return true;
-			if (codes[index + 1] === 2) index += 4;
-		}
-		return false;
-	});
 export async function verifyStickyViewportShowcase(rootInput: string, requireIndependentReview = false): Promise<void> {
 	const root = path.resolve(rootInput);
 	const manifestText = await fs.readFile(path.join(root, "manifest.json"), "utf8");
@@ -480,7 +468,11 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		)
 			fail(`entry ${key} ANSI/HTML style-run mismatch`);
 		if (text.split("\n").length - 1 !== rows) fail(`entry ${key} terminal row count mismatch`);
-		if (mode === "ascii-no-color" ? hasIndexedOrBasicColorSgr(ansi) : !hasColorSgr(ansi))
+		// `ascii-no-color` artifacts must contain no escape sequence at all, which is
+		// host-independent. The color branch keeps the widened check below because the
+		// prior `3[0-9]|38;` regex missed background (40-47/100-107) and bright (90-97)
+		// color, so a frame carrying only those would have passed as "no color".
+		if (mode === "ascii-no-color" ? /\x1b\[/.test(ansi) : !hasColorSgr(ansi))
 			fail(`entry ${key} ANSI mode/color mismatch`);
 		const metadata = await readJson(path.join(root, key, "metadata.json"), `metadata ${key}`);
 		exactKeys(
