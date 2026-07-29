@@ -2,6 +2,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Terminal input now normalizes Option/Meta navigation and psmux modified-Enter encodings through the native key parser, keeping legacy, Kitty CSI-u, and modifyOtherKeys behavior consistent.
 
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 - Kitty/Ghostty inline images no longer remain visually pinned when the sticky live viewport repaints past their anchor. The TUI now soft-deletes its named placements from the old viewport before repainting, retains transmitted pixels, and restores the placement when application scrollback revisits the image row.
