@@ -13,7 +13,7 @@ import {
 	Text,
 	TUI,
 } from "@gajae-code/tui";
-import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem } from "@gajae-code/utils";
+import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem, sanitizeText } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import {
@@ -61,7 +61,12 @@ import { GajaePetWidget, type PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import { computeIrcSplitWidths, getIrcSidebarSemanticToken, IrcSplitViewComponent } from "./components/irc-sidebar";
+import {
+	computeIrcSplitWidths,
+	getIrcSidebarSemanticToken,
+	IrcLeftLaneComponent,
+	IrcSplitViewComponent,
+} from "./components/irc-sidebar";
 import {
 	getPetUnavailableWarning,
 	isPetAvailable,
@@ -118,8 +123,9 @@ import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-he
 function buildComposerPlaceholder(
 	keybindings: Pick<KeybindingsManager, "getDisplayString">,
 	context: KeyDisplayContext,
-	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue" },
+	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue"; readonly showActionHints: boolean },
 ): string {
+	if (!options.showActionHints) return "Type your message...";
 	const parts: string[] = [];
 	const submitKey = options.busy ? keybindings.getDisplayString("tui.input.submit", context) : "";
 	if (submitKey) {
@@ -155,7 +161,11 @@ export function getDefaultComposerPlaceholder(
 		KeybindingsManager.inMemory({
 			"app.message.queue": defaultMessageQueueKeysForPlatform(context.platform),
 		});
-	return buildComposerPlaceholder(effectiveKeybindings, context, { busy: false, busyPromptMode: "steer" });
+	return buildComposerPlaceholder(effectiveKeybindings, context, {
+		busy: false,
+		busyPromptMode: "steer",
+		showActionHints: true,
+	});
 }
 
 export const DEFAULT_COMPOSER_PLACEHOLDER = getDefaultComposerPlaceholder();
@@ -163,7 +173,7 @@ export const DEFAULT_COMPOSER_PLACEHOLDER = getDefaultComposerPlaceholder();
 export function getComposerPlaceholder(
 	keybindings: Pick<KeybindingsManager, "getDisplayString">,
 	context: KeyDisplayContext,
-	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue" },
+	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue"; readonly showActionHints: boolean },
 ): string {
 	return buildComposerPlaceholder(keybindings, context, options);
 }
@@ -646,7 +656,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#todoCommandController = new TodoCommandController(this);
 		this.#selectorController = new SelectorController(this);
 		this.#inputController = new InputController(this);
-		this.statusLine.setActionRegistry(this.#inputController.actionRegistry, () => this.keybindings);
+		// Composer shortcut discovery owns contextual action hints; retain only status telemetry in the rail.
 		this.promptSuggestion = new PromptSuggestionController(this);
 		this.#observerRegistry = new SessionObserverRegistry();
 	}
@@ -1132,6 +1142,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return getComposerPlaceholder(this.keybindings, this.#keyDisplayContext, {
 			busy: this.#isPromptDeliveryBusy(),
 			busyPromptMode: this.settings.get("busyPromptMode"),
+			showActionHints: this.settings.get("statusLine.showActionHints"),
 		});
 	}
 
@@ -1280,18 +1291,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.renderSessionContext(context);
 	}
 
+	#sanitizeTodoText(text: string): string {
+		return sanitizeText(text).replaceAll("\t", "    ");
+	}
+
 	#formatTodoLine(todo: TodoItem, prefix: string): string {
 		const checkbox = theme.checkbox;
 		const marker = formatHudNoteMarker(todo.notes?.length ?? 0);
+		const content = this.#sanitizeTodoText(todo.content);
 		switch (todo.status) {
 			case "completed":
-				return theme.fg("success", `${prefix}${checkbox.checked} ${chalk.strikethrough(todo.content)}`) + marker;
+				return theme.fg("success", `${prefix}${checkbox.checked} ${chalk.strikethrough(content)}`) + marker;
 			case "in_progress":
-				return theme.fg("accent", `${prefix}${checkbox.unchecked} ${todo.content}`) + marker;
+				return theme.fg("accent", `${prefix}${checkbox.unchecked} ${content}`) + marker;
 			case "abandoned":
-				return theme.fg("error", `${prefix}${checkbox.unchecked} ${chalk.strikethrough(todo.content)}`) + marker;
+				return theme.fg("error", `${prefix}${checkbox.unchecked} ${chalk.strikethrough(content)}`) + marker;
 			default:
-				return theme.fg("dim", `${prefix}${checkbox.unchecked} ${todo.content}`) + marker;
+				return theme.fg("dim", `${prefix}${checkbox.unchecked} ${content}`) + marker;
 		}
 	}
 
@@ -1301,6 +1317,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"),
 		);
 		return active ?? nonEmpty[nonEmpty.length - 1];
+	}
+
+	#addTodoContent(lines: string[]): void {
+		const content = new Text(lines.join("\n"), 1, 0);
+		this.todoContainer.addChild(
+			new IrcLeftLaneComponent(content, width => this.#ircSplitView.effectiveSidebarVisible(width)),
+		);
 	}
 
 	#renderTodoList(): void {
@@ -1319,7 +1342,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const activePhase = phases[activeIdx];
 			if (!activePhase) return;
 			lines.push(
-				`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(activePhase.name, activeIdx + 1)}`)}`,
+				`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(this.#sanitizeTodoText(activePhase.name), activeIdx + 1)}`)}`,
 			);
 			const visibleTasks = activePhase.tasks.slice(0, 5);
 			visibleTasks.forEach((todo, index) => {
@@ -1330,19 +1353,21 @@ export class InteractiveMode implements InteractiveModeContext {
 				const remaining = activePhase.tasks.length - visibleTasks.length;
 				lines.push(theme.fg("muted", `${indent}  ${hook} +${remaining} more`));
 			}
-			this.todoContainer.addChild(new Text(lines.join("\n"), 1, 0));
+			this.#addTodoContent(lines);
 			return;
 		}
 
 		phases.forEach((phase, phaseIndex) => {
-			lines.push(`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(phase.name, phaseIndex + 1)}`)}`);
+			lines.push(
+				`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(this.#sanitizeTodoText(phase.name), phaseIndex + 1)}`)}`,
+			);
 			phase.tasks.forEach((todo, index) => {
 				const prefix = `${indent}${index === 0 ? hook : " "} `;
 				lines.push(this.#formatTodoLine(todo, prefix));
 			});
 		});
 
-		this.todoContainer.addChild(new Text(lines.join("\n"), 1, 0));
+		this.#addTodoContent(lines);
 	}
 
 	async #loadTodoList(): Promise<void> {

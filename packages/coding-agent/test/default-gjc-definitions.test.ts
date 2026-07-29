@@ -372,7 +372,7 @@ Project executor override body.
 
 			expect(executor?.source).toBe("project");
 			expect(executor?.systemPrompt).toContain("Project executor override body");
-			expect(agents.projectAgentsDir).toBe(agentsDir);
+			expect(agents.projectAgentsDir).toBe(path.resolve(agentsDir));
 		});
 	});
 

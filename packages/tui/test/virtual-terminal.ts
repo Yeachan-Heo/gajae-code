@@ -260,6 +260,11 @@ export class VirtualTerminal implements Terminal {
 		}
 		return `${rows.join("\n")}\n`;
 	}
+	/** Returns the hardware cursor position from the emulated terminal's active viewport. */
+	getCursorPosition(): { row: number; col: number } {
+		const buffer = this.xterm.buffer.active;
+		return { row: buffer.cursorY, col: buffer.cursorX };
+	}
 
 	/**
 	 * Get the entire scroll buffer

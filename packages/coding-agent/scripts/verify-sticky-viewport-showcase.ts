@@ -64,6 +64,34 @@ const INDEPENDENT_REVIEW_KEYS = [
 const INDEPENDENT_REVIEW_RESULT_KEYS = ["key", "result", "notes", "artifact_checks"] as const;
 const INDEPENDENT_REVIEW_DEFECT_KEYS = ["description", "accepted"] as const;
 const ARTIFACT_CHECK_KEYS = ["terminal_txt", "terminal_ansi_txt", "terminal_html", "metadata_json"] as const;
+const SEMANTIC_ROOT_IDS = [
+	"irc-split",
+	"pending-messages",
+	"status-container",
+	"todos",
+	"btw",
+	"status-line",
+	"hooks-above",
+	"editor-container",
+	"pet-floor",
+	"hooks-below",
+] as const;
+const STATE_KEYS = [
+	"manual",
+	"notice",
+	"transcript_capacity",
+	"composer_visible",
+	"resize_probes",
+	"visible_empty_irc_frame",
+	"root_order",
+	"pin_boundary",
+	"focused_component",
+	"cursor",
+	"selection",
+	"semantic_anchor",
+	"cjk_contiguous_semantics",
+	"coverage",
+] as const;
 type Style = {
 	foreground: string;
 	background: string;
@@ -78,7 +106,77 @@ type Style = {
 	overline: boolean;
 };
 type Run = { text: string; style: Style };
-const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const hash = (value: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const PROVENANCE_SOURCES = [
+	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+	"packages/coding-agent/src/modes/interactive-mode.ts",
+	"packages/coding-agent/src/modes/components/irc-sidebar.ts",
+	"packages/tui/src/tui.ts",
+] as const;
+async function git(args: string[]): Promise<Uint8Array> {
+	const result = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+	if ((await result.exited) !== 0) fail(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
+	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
+}
+async function currentProvenance() {
+	const sourceSha256 = Object.fromEntries(
+		await Promise.all(
+			PROVENANCE_SOURCES.map(async source => [source, hash(new Uint8Array(await Bun.file(source).arrayBuffer()))]),
+		),
+	);
+	return {
+		git_head: new TextDecoder().decode(await git(["rev-parse", "HEAD"])).trim(),
+		git_diff_binary_sha256: hash(await git(["diff", "--binary", "HEAD", "--"])),
+		source_sha256: sourceSha256,
+	};
+}
+const cellWidth = (grapheme: string) => {
+	const scalar = grapheme.codePointAt(0)!;
+	if (scalar === 0x200d || (scalar >= 0x300 && scalar <= 0x36f) || (scalar >= 0xfe00 && scalar <= 0xfe0f)) return 0;
+	return (scalar >= 0x1100 && scalar <= 0x115f) ||
+		(scalar >= 0x2e80 && scalar <= 0xa4cf) ||
+		(scalar >= 0xac00 && scalar <= 0xd7a3) ||
+		(scalar >= 0xf900 && scalar <= 0xfaff) ||
+		(scalar >= 0xff01 && scalar <= 0xff60) ||
+		(scalar >= 0xffe0 && scalar <= 0xffe6)
+		? 2
+		: 1;
+};
+const terminalRows = (text: string, columns: number) =>
+	text
+		.slice(0, -1)
+		.split("\n")
+		.map(text => {
+			const cells = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].map(item => ({
+				grapheme: item.segment,
+				width: cellWidth(item.segment),
+			}));
+			const width = cells.reduce((total, cell) => total + cell.width, 0);
+			if (width > columns) fail(`terminal row exceeds ${columns} cells`);
+			return { text, cells, width };
+		});
+const verifyCjkCellOracle = (text: string, columns: number, pinRow: unknown, cursorRow: unknown) => {
+	if (!Number.isInteger(pinRow) || !Number.isInteger(cursorRow)) fail("narrow CJK lane geometry missing");
+	const pinnedRow = pinRow as number;
+	const editorRow = cursorRow as number;
+	const rows = terminalRows(text, columns);
+	const phrase = CJK[1];
+	const row = rows.findIndex(candidate => candidate.text.includes(phrase));
+	if (row < 0) fail("narrow CJK cell oracle missing canonical phrase");
+	const candidate = rows[row]!;
+	const phraseIndex = candidate.text.indexOf(phrase);
+	const prefix = candidate.text.slice(0, phraseIndex);
+	const phraseCells = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(phrase)];
+	const phraseStart = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(prefix)].reduce(
+		(total, item) => total + cellWidth(item.segment),
+		0,
+	);
+	const phraseWidth = phraseCells.reduce((total, item) => total + cellWidth(item.segment), 0);
+	if (phraseStart + phraseWidth > columns || row >= pinnedRow || row === editorRow)
+		fail("narrow CJK cell oracle lane overlap");
+};
 const fail = (message: string): never => {
 	throw new Error(`Sticky viewport evidence invalid: ${message}`);
 };
@@ -281,79 +379,30 @@ const normalized = (runs: Run[]) => {
 	return merged;
 };
 const equalRuns = (left: Run[], right: Run[]) => JSON.stringify(normalized(left)) === JSON.stringify(normalized(right));
-const transcriptCapacity = (text: string) => {
-	const row = text.split("\n").findIndex(line => line.includes("status:"));
-	return row < 0 ? fail("frame omits pinned status row") : row;
-};
-const expectedState = (state: string) => ({
-	manual: state !== "live-overflow",
-	notice: state === "manual-new-output",
-	status: state === "live-overflow" ? "status: live follow" : "status: manual history · composer pinned",
-	multiline: state === "multiline-editor-hooks-pet",
-});
-function validateOracle(
-	key: string,
-	text: string,
-	metadata: Record<string, unknown>,
-	stateEvidence: Record<string, unknown>,
-) {
-	const state = key.split("/")[0]!;
-	const expected = expectedState(state);
-	const lines = text.split("\n");
-	if (stateEvidence.manual !== expected.manual || stateEvidence.notice !== expected.notice)
-		fail(`immutable state oracle mismatch for ${key}`);
-	if (lines.filter(line => line.includes(expected.status)).length !== 1)
-		fail(`exact status oracle mismatch for ${key}`);
-	const markers = [
-		expected.status,
-		...(expected.multiline
-			? ["hook: ready", "completed: visual proof", "pet: ◕‿◕", "> ", "first composer line", "second composer line"]
-			: ["> "]),
-	];
-	let position = -1;
-	for (const marker of markers) {
-		const next = text.indexOf(marker, position + 1);
-		if (next < 0) fail(`ordered suffix oracle missing ${marker} for ${key}`);
-		position = next;
-	}
-	if (text.split("New output — type to follow").length - 1 !== (expected.notice ? 1 : 0))
-		fail(`notice cardinality oracle mismatch for ${key}`);
-	if (
-		expected.multiline !==
-		(text.includes("hook: ready") &&
-			text.includes("pet: ◕‿◕") &&
-			text.includes("first composer line") &&
-			text.includes("second composer line"))
-	)
-		fail(`multiline editor/hooks/pet oracle mismatch for ${key}`);
-	if (metadata.output_revision !== (expected.notice ? "1" : "0")) fail(`manual notice invariant mismatch for ${key}`);
-	if (state === "selection-boundary") {
-		const copied = stateEvidence.selection_copied_text;
-		if (
-			stateEvidence.selection_scope !== "transcript" ||
-			typeof copied !== "string" ||
-			!copied.trim() ||
-			copied.includes("status:") ||
-			copied.includes("> ") ||
-			!lines.some(line => line.includes(copied.trim()))
-		)
-			fail(`selection oracle mismatch for ${key}`);
-	} else if (stateEvidence.selection_scope !== "none" || stateEvidence.selection_copied_text !== "")
-		fail(`selection oracle mismatch for ${key}`);
-	const historicalRows = stateEvidence.manual_historical_rows;
-	const preOutputCapacity = stateEvidence.manual_pre_output_capacity;
-	if (expected.manual) {
-		if (
-			!Number.isInteger(preOutputCapacity) ||
-			(preOutputCapacity as number) < 0 ||
-			!Array.isArray(historicalRows) ||
-			historicalRows.length !== ((preOutputCapacity as number) > 0 ? 1 : 0) ||
-			historicalRows.some(row => typeof row !== "string" || !row.trim() || !lines.includes(row))
-		)
-			fail(`manual historical transcript evidence mismatch for ${key}`);
-	} else if (preOutputCapacity !== 0 || !Array.isArray(historicalRows) || historicalRows.length !== 0)
-		fail(`manual historical transcript evidence mismatch for ${key}`);
-}
+const hasColorSgr = (ansi: string) =>
+	[...ansi.matchAll(/\x1b\[([0-9;]*)m/g)].some(match => {
+		const codes = (match[1] || "0").split(";").map(Number);
+		return codes.some(
+			code =>
+				(code >= 30 && code <= 37) ||
+				(code >= 40 && code <= 47) ||
+				(code >= 90 && code <= 107) ||
+				code === 38 ||
+				code === 48,
+		);
+	});
+const hasIndexedOrBasicColorSgr = (ansi: string) =>
+	[...ansi.matchAll(/\x1b\[([0-9;]*)m/g)].some(match => {
+		const codes = (match[1] || "0").split(";").map(Number);
+		for (let index = 0; index < codes.length; index += 1) {
+			const code = codes[index]!;
+			if ((code >= 30 && code <= 37) || (code >= 40 && code <= 47) || (code >= 90 && code <= 107)) return true;
+			if (code !== 38 && code !== 48) continue;
+			if (codes[index + 1] === 5) return true;
+			if (codes[index + 1] === 2) index += 4;
+		}
+		return false;
+	});
 export async function verifyStickyViewportShowcase(rootInput: string, requireIndependentReview = false): Promise<void> {
 	const root = path.resolve(rootInput);
 	const manifestText = await fs.readFile(path.join(root, "manifest.json"), "utf8");
@@ -370,6 +419,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		fail("manifest schema or provenance literals mismatch");
 	strings(manifest.ordered_keys, KEYS, "manifest ordered_keys");
 	const provenance = object(manifest.provenance, "manifest provenance");
+	const expectedProvenance = await currentProvenance();
 	if (
 		provenance.capture_mode !== "production-tui-virtual-terminal" ||
 		provenance.live_pty !== false ||
@@ -381,6 +431,12 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		!provenance.executor_identity.trim()
 	)
 		fail("manifest provenance mismatch");
+	if (
+		provenance.git_head !== expectedProvenance.git_head ||
+		provenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
+		JSON.stringify(provenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256)
+	)
+		fail("manifest capture provenance is stale");
 	const entries = array(manifest.entries, "manifest entries");
 	if (entries.length !== KEYS.length) fail("manifest entries must contain exactly 20 entries");
 	for (let index = 0; index < KEYS.length; index += 1) {
@@ -422,21 +478,8 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			!equalRuns(ansiStyleRuns, htmlStyleRuns)
 		)
 			fail(`entry ${key} ANSI/HTML style-run mismatch`);
-		if (state === "multiline-editor-hooks-pet" && (!ansi.includes("\x1b[9m") || !html.includes("line-through")))
-			fail(`entry ${key} strikethrough evidence missing`);
-		if (state === "selection-boundary" && !ansi.includes("\x1b[7m"))
-			fail(`entry ${key} inverse selection evidence missing`);
-		if (state === "narrow-cjk" && CJK.some(boundary => !text.includes(boundary)))
-			fail("narrow CJK visible terminal evidence missing");
-		if (
-			text
-				.split("\n")
-				.slice(0, -1)
-				.some(row => Bun.stringWidth(row) !== columns) ||
-			text.split("\n").length - 1 !== rows
-		)
-			fail(`entry ${key} terminal dimensions mismatch`);
-		if (mode === "ascii-no-color" ? /\x1b\[/.test(ansi) : !/\x1b\[[0-9;]*(?:3[0-9]|38;)/.test(ansi))
+		if (text.split("\n").length - 1 !== rows) fail(`entry ${key} terminal row count mismatch`);
+		if (mode === "ascii-no-color" ? hasIndexedOrBasicColorSgr(ansi) : !hasColorSgr(ansi))
 			fail(`entry ${key} ANSI mode/color mismatch`);
 		const metadata = await readJson(path.join(root, key, "metadata.json"), `metadata ${key}`);
 		exactKeys(
@@ -476,7 +519,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			metadata.fixture_source !== FIXTURE ||
 			metadata.render_mode !== mode ||
 			metadata.ansi_mode !== (mode === "unicode-color") ||
-			metadata.source_revision !== "production-tui-virtual-terminal-v2" ||
+			metadata.source_revision !== "production-tui-virtual-terminal-v3" ||
 			terminal.id !== id ||
 			terminal.columns !== columns ||
 			terminal.rows !== rows ||
@@ -488,21 +531,150 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			metaProvenance.fixed_clock !== true ||
 			metaProvenance.author_identity !== provenance.author_identity ||
 			metaProvenance.executor_identity !== provenance.executor_identity ||
+			metaProvenance.git_head !== expectedProvenance.git_head ||
+			metaProvenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
+			JSON.stringify(metaProvenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256) ||
 			stateEvidence.composer_visible !== true
 		)
 			fail(`metadata schema mismatch for ${key}`);
-		if (stateEvidence.transcript_capacity !== transcriptCapacity(text))
-			fail(`capacity metadata/frame mismatch for ${key}`);
-		validateOracle(key, text, metadata, stateEvidence);
-		if (state === "capacity-zero" && transcriptCapacity(text) !== 0)
-			fail(`zero capacity frame invariant mismatch for ${key}`);
-		if (state === "capacity-one" && transcriptCapacity(text) !== 1)
-			fail(`one capacity frame invariant mismatch for ${key}`);
-		if (state === "capacity-many" && transcriptCapacity(text) < 2)
-			fail(`many capacity frame invariant mismatch for ${key}`);
+		if (!Number.isInteger(stateEvidence.transcript_capacity)) fail(`capacity metadata/frame mismatch for ${key}`);
+		const observations = array(stateEvidence.resize_probes, `metadata ${key} resize observations`);
+		const probeWidths = [64, 65, 80, 120, 160, 120, 80, 65, 64];
+		const rootOrder = array(stateEvidence.root_order, `metadata ${key} root order`);
+		const pinBoundary = object(stateEvidence.pin_boundary, `metadata ${key} pin boundary`);
+		const cursor = object(stateEvidence.cursor, `metadata ${key} cursor`);
+		const selection = stateEvidence.selection;
+		const semanticAnchor =
+			state === "capacity-zero"
+				? stateEvidence.semantic_anchor
+				: object(stateEvidence.semantic_anchor, `metadata ${key} semantic anchor`);
+		const semanticAnchorValid =
+			state === "capacity-zero"
+				? semanticAnchor === null && stateEvidence.transcript_capacity === 0
+				: typeof (semanticAnchor as Record<string, unknown>).id === "string" &&
+					((semanticAnchor as Record<string, unknown>).id as string).length > 0 &&
+					Number.isInteger((semanticAnchor as Record<string, unknown>).grapheme_start) &&
+					((semanticAnchor as Record<string, unknown>).grapheme_start as number) >= 0 &&
+					Number.isInteger((semanticAnchor as Record<string, unknown>).cell_start) &&
+					((semanticAnchor as Record<string, unknown>).cell_start as number) >= 0 &&
+					Number.isInteger((semanticAnchor as Record<string, unknown>).frame_start_row) &&
+					((semanticAnchor as Record<string, unknown>).frame_start_row as number) >= 0;
+		const visibleEmpty = object(stateEvidence.visible_empty_irc_frame, `metadata ${key} visible empty IRC frame`);
+		exactKeys(stateEvidence, STATE_KEYS, `metadata ${key} state`);
+		strings(rootOrder, SEMANTIC_ROOT_IDS, `metadata ${key} semantic root IDs`);
+		const coverage = object(stateEvidence.coverage, `metadata ${key} coverage`);
+		exactKeys(
+			coverage,
+			["irc", "todo", "widths", "heights", "viewport", "chrome", "evidence"],
+			`metadata ${key} coverage`,
+		);
+		strings(coverage.irc, ["empty", "streaming", "long"], `metadata ${key} IRC coverage`);
+		strings(
+			coverage.todo,
+			["empty", "populated", "long", "multi-phase", "collapsed", "expanded"],
+			`metadata ${key} todo coverage`,
+		);
+		const emptyText = visibleEmpty.text as string;
+		const capacityConstrained = state === "capacity-one" || state === "capacity-zero";
+		if (
+			JSON.stringify(coverage.widths) !== JSON.stringify(probeWidths) ||
+			emptyText.includes("worker → you") ||
+			emptyText.includes("long IRC observation") ||
+			observations.length !== probeWidths.length ||
+			observations.some((value, index) => {
+				const probe = object(value, `metadata ${key} resize observation`);
+				const frame = object(probe.frame, `metadata ${key} resize frame`);
+				const split = probeWidths[index]! >= 65;
+				return (
+					probe.columns !== probeWidths[index] ||
+					probe.effective_lane !== (split ? "split" : "transcript") ||
+					probe.separator_width !== (split ? 3 : 0) ||
+					(probe.left_width as number) + (probe.separator_width as number) + (probe.right_width as number) !==
+						probeWidths[index] ||
+					probe.irc_records !== (split ? 1 : 0) ||
+					probe.todo_rows !== (split ? 1 : 0) ||
+					probe.todo_expanded !== (probe.columns as number) >= 80 ||
+					typeof frame.ansi !== "string" ||
+					frame.text !== Bun.stripANSI(frame.ansi) ||
+					frame.sha256 !== hash(frame.ansi) ||
+					(!capacityConstrained && split && !frame.text.includes("│")) ||
+					(!capacityConstrained &&
+						!split &&
+						(frame.text.includes("worker → you") || frame.text.includes("Todos"))) ||
+					(!capacityConstrained &&
+						(probe.columns as number) >= 80 &&
+						(!frame.text.includes("long IRC observation") ||
+							!frame.text.includes("☑ verify production todo") ||
+							!frame.text.includes("☐ expanded production todo"))) ||
+					(!capacityConstrained && (probe.columns as number) >= 120 && !frame.text.includes("worker → you"))
+				);
+			}) ||
+			typeof visibleEmpty.ansi !== "string" ||
+			visibleEmpty.text !== Bun.stripANSI(visibleEmpty.ansi) ||
+			visibleEmpty.sha256 !== hash(visibleEmpty.ansi) ||
+			JSON.stringify(rootOrder) !==
+				JSON.stringify([
+					"irc-split",
+					"pending-messages",
+					"status-container",
+					"todos",
+					"btw",
+					"status-line",
+					"hooks-above",
+					"editor-container",
+					"pet-floor",
+					"hooks-below",
+				]) ||
+			pinBoundary.component !== "status-line" ||
+			pinBoundary.index !== 5 ||
+			pinBoundary.row !== stateEvidence.transcript_capacity ||
+			pinBoundary.pinned !== true ||
+			stateEvidence.focused_component !== "editor" ||
+			!Number.isInteger(cursor.row) ||
+			(cursor.row as number) < 0 ||
+			(cursor.row as number) >= rows ||
+			!Number.isInteger(cursor.col) ||
+			(cursor.col as number) < 0 ||
+			(cursor.col as number) >= columns ||
+			!semanticAnchorValid ||
+			cursor.frame_sha256 !== hash(ansi) ||
+			cursor.blink !== true
+		)
+			fail(`runtime observation mismatch for ${key}`);
+		if (
+			(state === "capacity-many" && (stateEvidence.transcript_capacity as number) <= 1) ||
+			(state === "capacity-one" && stateEvidence.transcript_capacity !== 1) ||
+			(state === "capacity-zero" && stateEvidence.transcript_capacity !== 0)
+		)
+			fail(`capacity scenario mismatch for ${key}`);
+		if (state === "selection-boundary") {
+			const selected = object(selection, `metadata ${key} selection`);
+			const start = object(selected.start, `metadata ${key} selection start`);
+			const end = object(selected.end, `metadata ${key} selection end`);
+			if (
+				!Number.isInteger(start.row) ||
+				!Number.isInteger(start.col) ||
+				!Number.isInteger(end.row) ||
+				!Number.isInteger(end.col) ||
+				(start.row as number) < 0 ||
+				(end.row as number) >= (stateEvidence.transcript_capacity as number) ||
+				((start.row as number) === (end.row as number) && (start.col as number) >= (end.col as number))
+			)
+				fail(`selection boundary evidence missing for ${key}`);
+		} else if (selection !== null) fail(`unexpected selection evidence for ${key}`);
 		if (state === "narrow-cjk") {
 			strings(metadata.cjk_phrase_boundaries, CJK, "narrow CJK boundaries");
-			if (CJK.some(boundary => !text.includes(boundary))) fail("narrow CJK visible terminal evidence missing");
+			const probeTexts = observations.map(value => {
+				const probe = object(value, `metadata ${key} resize observation`);
+				return object(probe.frame, `metadata ${key} resize frame`).text;
+			});
+			if (
+				CJK.some(
+					boundary => ![text, ...probeTexts].some(frame => typeof frame === "string" && frame.includes(boundary)),
+				)
+			)
+				fail("narrow CJK visible terminal evidence missing");
+			verifyCjkCellOracle(text, columns, pinBoundary.row, cursor.row);
 		} else strings(metadata.cjk_phrase_boundaries, [], `non-narrow CJK boundaries for ${key}`);
 	}
 	const required = new Set([
@@ -513,6 +685,13 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 	]);
 	for (const file of await allFiles(root)) if (!required.has(file)) fail(`unexpected file ${file}`);
 	const reviewInput = await readJson(path.join(root, "review-input.json"), "review input");
+	const reviewProvenance = object(reviewInput.provenance, "review input provenance");
+	if (
+		reviewProvenance.git_head !== expectedProvenance.git_head ||
+		reviewProvenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
+		JSON.stringify(reviewProvenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256)
+	)
+		fail("review input capture provenance is stale");
 	if (
 		reviewInput.schema_version !== 2 ||
 		reviewInput.manifest_sha256 !== hash(manifestText) ||

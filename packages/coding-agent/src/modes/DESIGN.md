@@ -291,6 +291,60 @@ textual state without SGR. Korean, Japanese, Chinese, and mixed CJK/Latin prose
 must wrap at semantic phrase boundaries, never through an action/status label or
 short identifier; a semantic CJK break is a visual-QA failure.
 
+### Direct-root anatomy, IRC lane, and pin boundary
+
+The production root has one ordered, direct-child anatomy. Do not wrap, reorder,
+or independently pin these regions:
+
+1. `ircSplitView` is the viewport anchor and owns the transcript (and the IRC
+   sidebar when effective);
+2. `pendingMessagesContainer`, `statusContainer`, `todoContainer`, and
+   `btwContainer` follow the anchor **before** the pin boundary;
+3. `statusLine` is the pin boundary; and
+4. `hookWidgetContainerAbove`, `editorContainer`, `petFloorContainer`, and
+   `hookWidgetContainerBelow` are the later direct composer children in that
+   order.
+
+`statusContainer` is transient operation/status content in the pre-boundary
+application flow; it is not the persistent `statusLine` telemetry rail. The
+status line begins the fixed suffix. The focused editor, its cursor, and every
+later direct composer child remain below that boundary during manual history,
+streaming, and reflow. Pending messages, todo, and BTW therefore remain
+transcript-adjacent rather than becoming accidental fixed chrome.
+
+IRC has one shared work-lane geometry. At **64 cells or narrower** the IRC lane
+is ineffective and transcript/todo use the full width. At **65 cells** it is
+exactly **32 / 3 / 30** cells (left work lane / separator / IRC lane). At wider
+sizes the same split calculation applies; todo uses the left work lane whenever
+IRC is effective, including empty, streaming, and long IRC histories. Todo
+does not create a second sidebar, a separately rounded width, or a different
+collapse rule.
+
+Todo is absent when empty. Populated todos support long text, multiple phases,
+and collapsed/expanded views without crossing the separator or overflowing
+their work lane. The active phase is retained in collapsed view; expanded view
+keeps phase/task order. IRC empty, streaming, and long states preserve the
+same root order and pin boundary.
+
+Row reservation is content-priority based: reserve the focused composer and
+status line first, then normal hooks; when height is constrained, drop the
+manual-output notice first, then the decorative pet, then low-priority hooks.
+A zero-row transcript capacity is valid. Neither reservation nor degradation
+may hide focus/cursor geometry, move an anchor into pinned chrome, or turn a
+resize into a follow/manual state change. Manual and follow paths, streaming
+updates, width growth/shrink, and height growth/shrink preserve the anchor
+semantics; resize must recompute the shared IRC/todo lane before rendering.
+
+All lane measurement, clipping, and wrapping is ANSI-aware terminal-cell
+measurement. Terminal graphics may be shown only where the effective layout
+permits them and must degrade to the textual graphics fallback without changing
+row ownership. ANSI/color output preserves visible cursor/focus state; ASCII
+and no-color output retains textual selection/status affordances. CJK and mixed
+CJK/Latin todo, IRC, status, and BTW text break at semantic phrase boundaries,
+not inside a phase/action/status label, short identifier, or grapheme cluster.
+Those defects, width overflow, overlap, hidden focus/cursor, and lost anchors
+are blocking visual-QA failures.
+
 ### Sticky viewport deterministic visual QA
 
 `test/fixtures/tui/sticky-viewport-showcase.ts` is a fixed-clock, no-network,
@@ -306,6 +360,16 @@ The immutable matrix has exactly 20 keys: `live-overflow`, `manual-history`,
 `capacity-zero/48x10/ascii-no-color`,
 `multiline-editor-hooks-pet/48x10/unicode-color`, and
 `narrow-cjk/48x10/unicode-color`. Do not add or replace a manual-follow case.
+Every immutable-key render also probes `64`, `65`, `80`, `120`, and `160`
+columns in both resize directions (with short-height probes) before returning
+to its manifest viewport. The first-party fixture records requested/effective
+IRC coverage; todo empty/populated/long/multi-phase/collapsed/expanded
+coverage; IRC empty/streaming/long coverage; manual/follow coverage; and
+nonempty pending, transient `statusContainer`, BTW, persistent `statusLine`,
+hooks, editor, and pet coverage where the harness supports them. Probe
+assertions reject width overflow and a hidden focused composer; the existing
+manual-selection, history, notice, capacity, and CJK assertions reject overlap
+across the pin boundary, anchor loss, and semantic CJK break regressions.
 
 Each key has only `terminal.txt`, ANSI-preserving `terminal-ansi.txt`, `terminal.html`, and `metadata.json`; the manifest records SHA-256 and byte length. Per-key metadata binds immutable font/render assumptions and the ANSI-aware wrapping/truncation policy. `VirtualTerminal` reconstructs ANSI from visible xterm cells, including cell padding, palette/RGB colors, attributes, and inverse video; plain text is always the stripped reconstruction. The verifier owns an independent literal 20-key oracle and fails closed unless stripped ANSI equals text, `terminal.html` equals the exported canonical `ansiToHtml(terminal-ansi.txt)` byte-for-byte (including its complete document envelope and global CSS), HTML independently preserves the ANSI style-run text, every retained row has the exact `Bun.stringWidth` cell width (including trailing spaces), and `ansi_mode` agrees with required Unicode color SGR or ASCII/no-color output. Every metadata entry has exact CJK phrase-boundary metadata: the narrow-CJK key has only the three canonical boundaries in order and every other key has `[]`. Manual captures prove successful production wheel and PageUp paths and retain observable historical transcript-row evidence. It validates exact payload paths (no duplicates or traversal), immutable source/output revisions, state/status/suffix order, notice cardinality, capacity, actual mouse-copied transcript-only selection, composer, CJK, and provenance invariants. `review-input.json` binds the exact manifest digest, capture author/executor identity, acceptance/design versions, required artifacts, narrow-CJK boundaries, and deterministic host matrix. `--require-independent-review` requires an attestation with an exact root key set; exact per-key result and artifact-check key sets; exact defect `{ description, accepted }` keys with a trimmed, nonblank description; canonical trimmed reviewer identity distinct from both bound identities; the independent-terminal-reviewer role; fixture revision; expected and observed counts of 20; exact checked keys; accepted per-key artifact-check/notes results; accepted artifact/CJK/host decisions; bound digest; and final `accept`. Any malformed, incomplete, or extra attestation content fails closed.
 ## GJC Bundles
