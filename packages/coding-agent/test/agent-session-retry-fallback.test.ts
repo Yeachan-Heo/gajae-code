@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
 import {
 	AgentSession,
 	type AgentSessionEvent,
@@ -42,6 +44,95 @@ function getLastAssistantMessage(session: AgentSession): AssistantMessage {
 		throw new Error("Expected final assistant message");
 	}
 	return lastMessage;
+}
+
+function typedRateLimitStream(
+	model: Model,
+	retryAfterMs: number,
+	errorMessage = "Provider returned error: rate_limit_error: organization quota reached",
+): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage,
+			errorStatus: 429,
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after-ms": String(retryAfterMs) },
+			},
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
+function typedUsageLimitStream(model: Model, retryAfterMs = 60_000): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage:
+				'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}',
+			errorStatus: 429,
+			transportFailure: { kind: "transport", status: 429, headers: { "retry-after-ms": String(retryAfterMs) } },
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
+function makeExtensionRunner(handlers: string[], cwd: string, sm: SessionManager, mr: ModelRegistry): ExtensionRunner {
+	const handlerMap = new Map<string, Array<() => Promise<void>>>();
+	for (const h of handlers) handlerMap.set(h, [async () => {}]);
+	const extension: Extension = {
+		path: "test-extension",
+		resolvedPath: "test-extension",
+		handlers: handlerMap as Extension["handlers"],
+		tools: new Map(),
+		messageRenderers: new Map(),
+		commands: new Map(),
+		flags: new Map(),
+		shortcuts: new Map(),
+	};
+	return new ExtensionRunner(
+		handlerMap.size === 0 ? [] : [extension],
+		{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+		cwd,
+		sm,
+		mr,
+	);
 }
 
 describe("AgentSession retry fallback", () => {
@@ -445,6 +536,172 @@ describe("AgentSession retry fallback", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+	});
+
+	it("rotates a single-model stored credential after a typed quota failure before prompt completion", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled test model");
+		authStorage.removeRuntimeApiKey("openai");
+		await authStorage.set("openai", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+		]);
+
+		const logicalSessionId = "logical-session";
+		const providerAffinitySessionId = "pool-session";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, providerAffinitySessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls === 1) return typedRateLimitStream(requestedModel, 60_000);
+				return createMockModel({ responses: [{ content: ["Recovered with another account"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: logicalSessionId,
+			providerCacheSessionId: providerAffinitySessionId,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+
+		await session.prompt("retry with another stored credential");
+
+		expect(calls).toBe(2);
+		expect(requestedKeys).toHaveLength(2);
+		expect(new Set(requestedKeys).size).toBe(2);
+		expect(session.isRetrying).toBe(false);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]).toMatchObject({ delayMs: 0 });
+		expect(waitSpy).toHaveBeenCalledWith(0, { signal: expect.any(AbortSignal) });
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
+	});
+
+	it("rotates a single-model credential through an extension-loaded session (#3491 claim 1)", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled test model");
+		authStorage.removeRuntimeApiKey("openai");
+		await authStorage.set("openai", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+		]);
+
+		const poolSessionId = "pool-session";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, poolSessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls === 1) return typedRateLimitStream(requestedModel, 60_000);
+				return createMockModel({ responses: [{ content: ["Recovered"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const extensionRunner = makeExtensionRunner(
+			["context"],
+			tempDir.path(),
+			SessionManager.inMemory(),
+			modelRegistry,
+		);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "logical-session",
+			providerCacheSessionId: poolSessionId,
+			extensionRunner,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = trackRetryEvents(session);
+
+		await session.prompt("retry with another stored credential under extensions");
+
+		expect(calls).toBe(2);
+		expect(new Set(requestedKeys).size).toBe(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
+	});
+
+	it("traverses the full credential pool independent of retry.maxRetries (#3491 claim 3)", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled test model");
+		authStorage.removeRuntimeApiKey("openai");
+		await authStorage.set("openai", [
+			{ type: "api_key", key: "acct-1" },
+			{ type: "api_key", key: "acct-2" },
+			{ type: "api_key", key: "acct-3" },
+			{ type: "api_key", key: "acct-4" },
+			{ type: "api_key", key: "acct-5" },
+			{ type: "api_key", key: "acct-6" },
+		]);
+
+		const poolSessionId = "pool-session";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, poolSessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls < 6) return typedUsageLimitStream(requestedModel);
+				return createMockModel({ responses: [{ content: ["Recovered on 6th credential"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "retry.maxRetries": 2 });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "logical-session",
+			providerCacheSessionId: poolSessionId,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("exhaust the pool");
+
+		expect(calls).toBe(6);
+		expect(new Set(requestedKeys).size).toBe(6);
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 	});
 
 	it("does not replay a Kimi Code first-event timeout through a managed fallback chain", async () => {

@@ -7,6 +7,7 @@
 - Kitty/Ghostty inline images no longer remain visually pinned when transcript, pinned, or overlay rows are replaced, removed, scrolled, resized, or fully repainted. The TUI now parses only bounded named placements, soft-deletes overwritten placements from the previously committed physical frame, retains transmitted pixels, and restores placements from application scrollback without retransmitting image data.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
 - Managed-session startup failures now include their bounded preparation classification (and path-free native durability diagnostic when available), so Windows launch crashes no longer collapse to an unactionable generic error while filesystem paths and raw OS messages remain redacted (#3383).
+- Single-model sessions now rotate immediately to another stored provider credential after a content-free quota or rate-limit failure, without requiring a synthetic model fallback chain. Credential rotation is replay-safe for content-free failures regardless of extension lifecycle participation, and traverses the full credential pool independent of `retry.maxRetries` (#3491).
 
 ### Added
 
