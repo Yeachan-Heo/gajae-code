@@ -1145,10 +1145,14 @@ test("runtime connection: an approval whose publication never runs is still sett
 test("runtime connection: a recipient that closes mid-publication never becomes eligible", async () => {
 	const runtime = createAppServerRuntime();
 	const requester = runtime.createConnection(() => {});
-	// This peer closes itself while its own approval frame is being written, so the enqueue resolves
-	// but the connection is gone by the time eligibility would be granted.
+	// This peer closes itself from inside its own writer while the approval enqueue is pending.
+	// `handleDisconnect` then runs while the eligible set is still empty, and the queue lets the
+	// accepted frame finish, so the enqueue resolves for a connection that is already gone.
 	let closing: Promise<void> | undefined;
-	const peer = runtime.createConnection(() => {
+	let approvalFrames = 0;
+	const peer = runtime.createConnection(frame => {
+		if (dec(frame).method !== "execCommandApproval") return;
+		approvalFrames += 1;
 		closing ??= peer.close();
 	});
 	await initialize(requester);
@@ -1174,6 +1178,44 @@ test("runtime connection: a recipient that closes mid-publication never becomes 
 	await Bun.sleep(5);
 
 	expect(requestId).toBeDefined();
+	expect(approvalFrames).toBe(1);
 	// A departed connection must not be able to answer, even though its enqueue itself succeeded.
 	expect(runtime.broker.resolve(requestId!, peer.id, { decision: "approved" })).toBe(false);
+});
+
+test("runtime connection: a settled approval releases its abandonment finalizer", async () => {
+	const runtime = createAppServerRuntime();
+	const connection = runtime.createConnection(() => {});
+	await initialize(connection);
+	runtime.subscriptions.subscribe(connection.id, "thread-a");
+	runtime.manager.register("thread-a", "spawned", undefined, connection.id);
+
+	const ids: string[] = [];
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		const id = context?.requestClient?.("thread-a", "execCommandApproval", {
+			conversationId: "thread-a",
+			callId: "call-1",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		if (id) ids.push(id);
+		return { ok: true, result: { dataBase64: "" } };
+	});
+
+	// Settle each approval normally; none should leave a retained finalizer behind.
+	for (let index = 0; index < 3; index += 1) {
+		await connection.process(enc(`{"id":${10 + index},"method":"fs/readFile","params":{"path":"/tmp/test"}}`));
+		expect(runtime.broker.resolve(ids[index]!, connection.id, { decision: "approved" })).toBe(true);
+		await Bun.sleep(0);
+	}
+	expect(ids).toHaveLength(3);
+	expect(runtime.broker.pendingCount).toBe(0);
+	expect(runtime.manager.get("thread-a")?.pendingApprovals ?? 0).toBe(0);
+
+	// Closing the connection now must not cancel anything: every finalizer was already released.
+	await connection.close();
+	expect(runtime.broker.pendingCount).toBe(0);
 });

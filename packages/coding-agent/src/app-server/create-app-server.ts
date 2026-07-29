@@ -255,6 +255,9 @@ class Runtime implements AppServerRuntime {
 					this.broker.cancel(id, "request publication was abandoned");
 				};
 				const unregister = this.#registerUnpublished(connection.id, finalizeUnpublished);
+				// A settled request needs no abandonment finalizer; releasing it keeps the registry from
+				// retaining entries for the lifetime of a long-lived connection.
+				void request.settled.then(unregister, unregister);
 				deferred.push(async () => {
 					unregister();
 					if (published) return;
@@ -264,9 +267,12 @@ class Runtime implements AppServerRuntime {
 						try {
 							if (!target) throw new Error("connection is gone");
 							await target.enqueueMessage({ id, method, params });
-							// A recipient that disconnects after this point is pruned by
-							// `removeConnection` -> `broker.handleDisconnect`, so no post-await recheck is
-							// needed here; adding one would be untestable dead code.
+							// Recheck AFTER the await. A recipient can close from inside its own writer while
+							// this enqueue is pending: `handleDisconnect` then runs while the eligible set is
+							// still empty, and the queue deliberately lets the accepted frame finish, so
+							// adding it here would make an already-departed peer an eligible responder.
+							if (this.#connections.get(connectionId) !== target || !target.active)
+								throw new Error("connection closed during publication");
 							request.eligibleConnections.add(connectionId);
 						} catch (error) {
 							logger.warn("Dropping unreachable app-server server-request recipient", {
