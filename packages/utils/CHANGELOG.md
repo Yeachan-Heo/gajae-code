@@ -5,6 +5,7 @@
 ### Fixed
 
 - The crash-log credential scrubber recognizes GitHub fine-grained PATs (`github_pat_`) and complete AWS STS credentials. It already had rules for both vendors, but matched only the classic `gh[opsur]_` and long-term `AKIA` shapes. It now also covers the temporary `ASIA` key id and, critically, the `SecretAccessKey` / `SessionToken` values that ship alongside it — the id alone is not the credential, and neither canonical field name matched the existing labeled-value rule. All of these previously survived into a file the module keeps indefinitely.
+- `$inheritedEnv` (and therefore `$credentialEnv` / `$pickCredentialEnv`) honours the removal of an inherited variable. The inherited snapshot is taken once, at module load, and was consulted first and unconditionally, so a provider credential exported by the launching shell could never be suppressed afterwards: deleting it from the live environment left every credential lookup still returning the snapshot value. Tests that clear provider env vars before exercising credential resolution therefore ran against the developer's real credential — and printed it when the assertion failed. Deletion is now honoured while the snapshot value stays pinned, so a later in-process write still cannot swap the credential a request authenticates with.
 
 ## [0.12.0] - 2026-07-28
 

@@ -52,7 +52,17 @@ const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
 const inheritedEnv = filterCredentialInheritedEnv(Bun.env);
 
 export function $inheritedEnv(name: string): string | undefined {
-	return resolveFileEnvValue(inheritedEnv, name);
+	const snapshotValue = resolveFileEnvValue(inheritedEnv, name);
+	if (snapshotValue === undefined) return undefined;
+	// The snapshot records provenance — this key was inherited from the launching
+	// shell rather than the caller's cwd/.env — and pins the value so a later
+	// in-process write cannot swap the credential we authenticate with. It is not
+	// a cache that outlives the variable: once the key is removed from the live
+	// environment it is no longer inherited, so deletion is honoured. Without
+	// this, a credential present at import time can never be suppressed (tests
+	// that clear provider env vars silently keep resolving the real credential).
+	if (Bun.env[name] === undefined) return undefined;
+	return snapshotValue;
 }
 
 function resolveLiveCredentialEnvValue(name: string): string | undefined {

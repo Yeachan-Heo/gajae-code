@@ -120,6 +120,9 @@ assertEqual($env.GJC_ENV_TEST_INHERITED_ONLY, "overlay-after-import", "live $env
 Bun.env.GJC_ENV_TEST_FALLBACK_ONLY = "fallback-after-import";
 assertEqual($inheritedEnv("GJC_ENV_TEST_FALLBACK_ONLY"), undefined, "absent inherited value");
 assertEqual($env.GJC_ENV_TEST_FALLBACK_ONLY, "fallback-after-import", "fallback remains available through $env");
+delete Bun.env.GJC_ENV_TEST_INHERITED_ONLY;
+assertEqual($inheritedEnv("GJC_ENV_TEST_INHERITED_ONLY"), undefined, "deleted key is no longer inherited");
+assertEqual($env.GJC_ENV_TEST_INHERITED_ONLY, undefined, "deleted key is gone from merged env");
 `,
 			{ GJC_ENV_TEST_INHERITED_ONLY: "shell-from-parent" },
 			dir,
