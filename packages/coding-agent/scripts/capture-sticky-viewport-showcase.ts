@@ -206,11 +206,7 @@ function out(args: string[]): string {
 	if (args.length !== 2 || args[0] !== "--out" || !args[1]) throw new Error(`Usage: ${COMMAND}`);
 	return args[1];
 }
-async function capture(
-	entry: StickyViewportShowcaseEntry,
-	root: string,
-	sourceProvenance: CaptureProvenance,
-) {
+async function capture(entry: StickyViewportShowcaseEntry, root: string, sourceProvenance: CaptureProvenance) {
 	const rendered = await renderStickyViewportShowcase(entry);
 	if (!rendered.state.composer_visible)
 		throw new Error(`${entry.key}: focused composer was not visible in production frame`);
