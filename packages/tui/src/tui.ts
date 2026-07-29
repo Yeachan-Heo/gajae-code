@@ -189,7 +189,6 @@ export interface TuiViewportObservation {
 	semanticAnchor: (ViewportAnchorRow & { frameRow: number }) | null;
 }
 
-
 export interface ViewportAnchorRow {
 	id: ViewportAnchorId;
 	graphemeStart: number;
