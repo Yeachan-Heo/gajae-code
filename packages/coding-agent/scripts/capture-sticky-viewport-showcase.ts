@@ -183,7 +183,13 @@ async function git(args: string[]): Promise<Uint8Array> {
 		throw new Error(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
 	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
 }
-async function captureProvenance() {
+type CaptureProvenance = {
+	git_head: string;
+	git_diff_binary_sha256: string;
+	source_sha256: Record<string, string>;
+};
+
+async function captureProvenance(): Promise<CaptureProvenance> {
 	const gitHead = new TextDecoder().decode(await git(["rev-parse", "HEAD"])).trim();
 	const sourceSha256 = Object.fromEntries(
 		await Promise.all(
@@ -203,7 +209,7 @@ function out(args: string[]): string {
 async function capture(
 	entry: StickyViewportShowcaseEntry,
 	root: string,
-	sourceProvenance: Awaited<ReturnType<typeof captureProvenance>>,
+	sourceProvenance: CaptureProvenance,
 ) {
 	const rendered = await renderStickyViewportShowcase(entry);
 	if (!rendered.state.composer_visible)
