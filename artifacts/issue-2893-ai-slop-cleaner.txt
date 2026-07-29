@@ -1,0 +1,27 @@
+AI SLOP CLEANUP REPORT
+======================
+
+Scope: packages/coding-agent/CHANGELOG.md; src/task/executor.ts; src/task/receipt.ts; src/task/types.ts; src/tools/review.ts; test/task/executor-review-findings.test.ts; test/task/executor-warnings.test.ts; test/task/receipt.test.ts; test/tools/review.test.ts
+Mode: read-only detector/report; no edits performed
+Blocking Findings: none
+Advisory Findings: none
+Fallback Findings: `withArtifactManagerFinalizationTurn` intentionally catches only a failed prior queue tail so later finalizations can proceed; the failing operation still rejects, task failure evidence is preserved, and the failure-then-success regression covers this grounded fail-safe behavior. Advisory/no action.
+UI/Design Findings: N/A; no UI files changed
+Missing Test Findings: none; strict explicit-yield and real subprocess fallback separation, full artifact resolution, receipt bounds/leaks, fixed publication failure, aborted-yield failure dominance, exact byte ceiling, same-manager uniqueness/recovery, persistence-owned locking, mixed managed selector/output finalization, and different-manager independence are covered
+Recursion Guard: confirmed no nested ralplan/team/deep-interview/ultragoal spawned; broad findings handed to leader
+Changed Files Reviewed:
+- packages/coding-agent/CHANGELOG.md - reviewed
+- packages/coding-agent/src/task/executor.ts - reviewed
+- packages/coding-agent/src/task/receipt.ts - reviewed
+- packages/coding-agent/src/task/types.ts - reviewed
+- packages/coding-agent/src/tools/review.ts - reviewed
+- packages/coding-agent/test/task/executor-review-findings.test.ts - reviewed
+- packages/coding-agent/test/task/executor-warnings.test.ts - reviewed
+- packages/coding-agent/test/task/receipt.test.ts - reviewed
+- packages/coding-agent/test/tools/review.test.ts - reviewed
+
+Gate Result: PASS
+Leader Action:
+- PASS: continue to verification, architect review, and executor red-team QA.
+Remaining Risks:
+- none

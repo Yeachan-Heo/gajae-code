@@ -21,6 +21,8 @@ export interface PruneConfig {
 	minimumSavings: number;
 	/** Tool names that should never be pruned. */
 	protectedTools: string[];
+	/** Number of newest user turns whose tool outputs must remain intact. Defaults to 2. */
+	protectRecentTurns?: number;
 	/**
 	 * Tools in `protectedTools` whose protection is waived once the result is
 	 * superseded (a later result for the same target, or a later successful
@@ -34,12 +36,23 @@ export const DEFAULT_PRUNE_CONFIG: PruneConfig = {
 	protectTokens: 40_000,
 	minimumSavings: 20_000,
 	protectedTools: ["skill", "read"],
+	protectRecentTurns: 2,
 	staleOverridableTools: ["read"],
 };
+
+export interface PrunedOriginal {
+	entryId: string;
+	toolName?: string;
+	originalText: string;
+	tokens: number;
+	/** Whether originalText captures all-text result content without omission. */
+	complete?: boolean;
+}
 
 export interface PruneResult {
 	prunedCount: number;
 	tokensSaved: number;
+	originals: PrunedOriginal[];
 	/**
 	 * The mutated message entries. Callers whose entry source returns
 	 * materialized copies (not live references) must write these back into
@@ -48,17 +61,33 @@ export interface PruneResult {
 	prunedEntries: SessionMessageEntry[];
 }
 
-const DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER = 1.25;
-const ERROR_DIGEST_NOTICE_MIN_CHARS = 240;
+const ERROR_DIGEST_MAX_CHARS = 240;
+const TAIL_DIGEST_MAX_CHARS = 160;
+const PATH_DIGEST_MAX_CHARS = 120;
+/**
+ * Absolute budget for the assembled digest (~64 tokens). Fields are ordered
+ * error-first, so truncating the assembled digest drops tail/counts before it
+ * ever touches the error signal.
+ */
+const DIGEST_TOTAL_MAX_CHARS = 256;
 
 function createGenericPrunedNotice(tokens: number): string {
 	return `[Output truncated - ${tokens} tokens]`;
 }
 
+function capturedTextContent(message: ToolResultMessage): { text: string; complete: boolean } {
+	if (typeof message.content === "string") return { text: message.content, complete: true };
+	const textBlocks: string[] = [];
+	let complete = true;
+	for (const block of message.content) {
+		if (block.type === "text") textBlocks.push(block.text);
+		else complete = false;
+	}
+	return { text: textBlocks.join("\n"), complete };
+}
+
 function firstTextContent(message: ToolResultMessage): string {
-	if (typeof message.content === "string") return message.content;
-	const block = message.content.find(part => part.type === "text");
-	return block?.type === "text" ? block.text : "";
+	return capturedTextContent(message).text;
 }
 
 function firstErrorLine(text: string): string | undefined {
@@ -85,28 +114,39 @@ function truncateField(value: string, maxLength: number): string {
 	return `${value.slice(0, maxLength - 1)}…`;
 }
 
-function resultDigest(message: ToolResultMessage): string | undefined {
+function resultPathHint(message: ToolResultMessage, call?: ToolCall): string | undefined {
+	return (call && toolCallPath(call)) ?? readResolvedPath(message);
+}
+
+function resultDigest(message: ToolResultMessage, call?: ToolCall): string | undefined {
 	const toolName = message.toolName.toLowerCase();
 	const text = sanitizeText(firstTextContent(message));
+	const error = firstErrorLine(text);
+	const path = resultPathHint(message, call);
+	const pathPart = path ? `path=${truncateField(path, PATH_DIGEST_MAX_CHARS)}` : undefined;
 	if (toolName === "bash") {
 		const details = message as { details?: { exitCode?: unknown } };
 		const exitCode =
 			typeof details.details?.exitCode === "number" ? details.details.exitCode : message.isError ? 1 : 0;
 		const tail = text.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? "";
-		const error = firstErrorLine(text);
-		return [`exit=${exitCode}`, tail ? `tail=${tail}` : undefined, error ? `error=${error}` : undefined]
+		return [
+			`exit=${exitCode}`,
+			error ? `error=${truncateField(error, ERROR_DIGEST_MAX_CHARS)}` : undefined,
+			pathPart,
+			tail ? `tail=${truncateField(tail, TAIL_DIGEST_MAX_CHARS)}` : undefined,
+		]
 			.filter((part): part is string => part !== undefined)
 			.join("; ");
 	}
 	if (toolName === "search" || toolName === "grep") {
 		const match = text.match(/(\d+)\s+matches?/i) ?? text.match(/totalMatches["']?:\s*(\d+)/i);
 		const files = text.match(/(\d+)\s+files?/i) ?? text.match(/filesWithMatches["']?:\s*(\d+)/i);
-		const error = firstErrorLine(text);
 		return (
 			[
+				error ? `error=${truncateField(error, ERROR_DIGEST_MAX_CHARS)}` : undefined,
+				pathPart,
 				match ? `matches=${match[1]}` : undefined,
 				files ? `files=${files[1]}` : undefined,
-				error ? `error=${error}` : undefined,
 			]
 				.filter((part): part is string => part !== undefined)
 				.join("; ") || "search digest unavailable"
@@ -114,24 +154,20 @@ function resultDigest(message: ToolResultMessage): string | undefined {
 	}
 	if (message.isError !== true) return undefined;
 	if (text.trim().length === 0) return "error=tool result failed without text";
-	const error = firstErrorLine(text);
-	if (error) return `error=${error}`;
+	if (error) return [`error=${truncateField(error, ERROR_DIGEST_MAX_CHARS)}`, pathPart].filter(Boolean).join("; ");
 	const summary = firstNonEmptyLine(text) ?? lastNonEmptyLine(text);
-	return summary ? `summary=${summary}` : undefined;
+	return summary ? `summary=${truncateField(summary, ERROR_DIGEST_MAX_CHARS)}` : undefined;
 }
 
-function createPrunedNotice(tokens: number, message?: ToolResultMessage): string {
+function createPrunedNotice(tokens: number, message?: ToolResultMessage, call?: ToolCall, artifact?: string): string {
 	const generic = createGenericPrunedNotice(tokens);
-	const digest = message ? resultDigest(message) : undefined;
-	if (!digest) return generic;
-	const genericTokens = Math.ceil(generic.length / 4);
-	const maxTokens = Math.max(genericTokens, Math.floor(genericTokens * DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER));
-	const prefix = `[Output truncated - ${tokens} tokens; `;
-	const suffix = "]";
-	const digestChars = maxTokens * 4 - prefix.length - suffix.length;
-	const maxChars =
-		message?.isError === true ? Math.max(ERROR_DIGEST_NOTICE_MIN_CHARS, digestChars) : Math.max(0, digestChars);
-	return `${prefix}${truncateField(digest, maxChars)}${suffix}`;
+	const digest =
+		truncateField(message ? (resultDigest(message, call) ?? "") : "", DIGEST_TOTAL_MAX_CHARS) || undefined;
+	if (!digest && !artifact) return generic;
+	if (artifact) {
+		return `[Output truncated - ${tokens} tokens; full output: ${artifact}]${digest ? ` ${digest}` : ""}`;
+	}
+	return `[Output truncated - ${tokens} tokens; ${digest}]`;
 }
 
 function getToolResultMessage(entry: SessionEntry): ToolResultMessage | undefined {
@@ -258,10 +294,10 @@ function buildAssistantArgumentStalenessIndex(entries: SessionEntry[]): Assistan
 			failedCallIds.add(call.id);
 			continue;
 		}
-		const failed = failedEditPaths(message);
+		const successfulPaths = successfulEditPaths(message);
 		let mutated = false;
 		for (const group of groups) {
-			if (group.some(groupPath => failed.has(groupPath))) continue;
+			if (successfulPaths !== undefined && !group.some(groupPath => successfulPaths.has(groupPath))) continue;
 			latestSuccessfulMutationByPathGroup.set(pathGroupKey(group), { index: i, callId: call.id });
 			mutated = true;
 		}
@@ -270,46 +306,51 @@ function buildAssistantArgumentStalenessIndex(entries: SessionEntry[]): Assistan
 	return { latestSuccessfulMutationByPathGroup, failedCallIds };
 }
 
-/**
- * Trailing read selectors (`:50`, `:50-200`, `:50+150`, `:5-16,960-973`,
- * `:raw`, `:conflicts`), possibly stacked (`:2-4:raw`). Stripped to resolve
- * the underlying file for edit invalidation.
- */
-const READ_SELECTOR_SUFFIX = /:(?:raw|conflicts|\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/;
+/** Exact read selector grammar mirrored from the read tool without importing its package layer. */
+const READ_SELECTOR_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
+const READ_RANGE_SELECTOR_RE = /^L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*$/i;
+const READ_RAW_SELECTOR_RE = /^raw$/i;
 
-/** Base file path of a read target with any line/mode selectors stripped. */
-function readBasePath(path: string): string {
-	let base = path;
-	while (READ_SELECTOR_SUFFIX.test(base)) {
-		base = base.replace(READ_SELECTOR_SUFFIX, "");
+type ReadTarget = { basePath: string; selector?: string };
+
+function splitReadTarget(path: string): ReadTarget {
+	const outerColon = path.lastIndexOf(":");
+	if (outerColon <= 0) return { basePath: path };
+	const outer = path.slice(outerColon + 1);
+	if (!READ_SELECTOR_RE.test(outer)) return { basePath: path };
+
+	let basePath = path.slice(0, outerColon);
+	let selector = outer;
+	const innerColon = basePath.lastIndexOf(":");
+	if (innerColon > 0) {
+		const inner = basePath.slice(innerColon + 1);
+		const compoundRawRange =
+			(READ_RAW_SELECTOR_RE.test(inner) && READ_RANGE_SELECTOR_RE.test(outer)) ||
+			(READ_RANGE_SELECTOR_RE.test(inner) && READ_RAW_SELECTOR_RE.test(outer));
+		if (compoundRawRange) {
+			selector = `${inner}:${outer}`;
+			basePath = basePath.slice(0, innerColon);
+		}
 	}
-	return base;
+	return { basePath, selector };
+}
+
+/** Base file path of a read target with its one valid selector stripped. */
+function readBasePath(path: string): string {
+	return splitReadTarget(path).basePath;
 }
 
 type ReadLineRange = { start: number; end: number };
 
-const DEFAULT_READ_LINE_LIMIT = 500;
-
-/** Parse trailing read selectors using the read tool's actual bounded default. */
+/** Parse only one explicit, provably bounded trailing read range. */
 function readLineRanges(path: string): ReadLineRange[] {
-	let target = path;
-	let raw = false;
-	while (/:(?:raw|conflicts)$/.test(target)) {
-		raw ||= target.endsWith(":raw");
-		target = target.replace(/:(?:raw|conflicts)$/, "");
-	}
-	const match = target.match(/:(\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/);
-	if (!match) return raw ? [{ start: 1, end: Number.POSITIVE_INFINITY }] : [];
-	return match[1].split(",").flatMap(part => {
-		const range = part.match(/^(\d+)(?:([-+])(\d+))?$/);
+	const selector = splitReadTarget(path).selector;
+	if (!selector || /(?:^|:)raw(?:$|:)/i.test(selector) || /^conflicts$/i.test(selector)) return [];
+	return selector.split(",").flatMap(part => {
+		const range = part.match(/^L?(\d+)([-+])L?(\d+)$/i);
 		if (!range) return [];
 		const start = Number(range[1]);
-		const end =
-			range[2] === "+"
-				? start + Number(range[3]) - 1
-				: range[2] === "-"
-					? Number(range[3])
-					: start + DEFAULT_READ_LINE_LIMIT - 1;
+		const end = range[2] === "+" ? start + Number(range[3]) - 1 : Number(range[3]);
 		return start > 0 && end >= start ? [{ start, end }] : [];
 	});
 }
@@ -394,32 +435,26 @@ function resultDetailFiles(message: ToolResultMessage): string[] {
 }
 
 /**
- * Paths that FAILED in a per-file edit result (`details.perFileResults`) and
- * were NOT mutated by any same-path entry. Multi-file apply_patch catches
- * per-file failures and still returns a non-error result; a purely-failed
- * path was not mutated and must not stale reads. But apply_patch can emit
- * multiple entries for the same path (e.g. several hunks): if any same-path
- * entry succeeded the file still mutated, so it must NOT be suppressed.
- * Conservative: only an entry explicitly marked `isError === true` counts as
- * a failure; anything else (including ambiguous/malformed entries) counts as
- * a success and keeps the path out of the suppression set.
+ * Paths that a per-file edit result proves were mutated. Multi-file
+ * `apply_patch` can return a non-error envelope while individual files fail, so
+ * only explicit success (`isError === false`) or the normal successful result
+ * shape (a string `diff` with no error flag) counts. Ambiguous/malformed rows
+ * fail closed. If no per-file result array exists, return undefined so ordinary
+ * single-file successful tool results retain their established behavior.
  */
-function failedEditPaths(message: ToolResultMessage): Set<string> {
+function successfulEditPaths(message: ToolResultMessage): Set<string> | undefined {
 	const details = message.details as { perFileResults?: unknown } | undefined;
 	const perFile = details?.perFileResults;
-	if (!Array.isArray(perFile)) return new Set();
-	const failed = new Set<string>();
+	if (!Array.isArray(perFile)) return undefined;
 	const succeeded = new Set<string>();
 	for (const item of perFile) {
-		const entry = item as { path?: unknown; isError?: unknown };
+		const entry = item as { path?: unknown; isError?: unknown; diff?: unknown };
 		if (typeof entry?.path !== "string") continue;
-		if (entry.isError === true) failed.add(entry.path);
-		else succeeded.add(entry.path);
+		if (entry.isError === false || (entry.isError === undefined && typeof entry.diff === "string")) {
+			succeeded.add(entry.path);
+		}
 	}
-	// A path mutated if any same-path entry succeeded, even when another
-	// same-path entry failed; drop those from the suppression set.
-	for (const path of succeeded) failed.delete(path);
-	return failed;
+	return succeeded;
 }
 
 /**
@@ -482,12 +517,11 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		resultMeta.set(i, { key, call, message });
 		if (key !== undefined) lastResultIndexByKey.set(key, i);
 		if (EDIT_TOOL_NAMES.has(call.name)) {
-			// Per-file edit results record failures in details.perFileResults;
-			// a failed hunk mutated nothing, so exclude its whole path group
-			// (rename destination included) from touched paths.
-			const failed = failedEditPaths(message);
+			// Per-file edit results prove which path groups actually mutated. A
+			// malformed or ambiguous row cannot invalidate earlier read evidence.
+			const successfulPaths = successfulEditPaths(message);
 			for (const group of editToolPathGroups(call)) {
-				if (group.some(groupPath => failed.has(groupPath))) continue;
+				if (successfulPaths !== undefined && !group.some(groupPath => successfulPaths.has(groupPath))) continue;
 				for (const editPath of group) {
 					lastEditIndexByPath.set(editPath, i);
 				}
@@ -555,19 +589,22 @@ export function pruneAssistantToolArguments(
 	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
 ): AssistantArgumentPruneResult {
 	let accumulatedTokens = 0;
-	let argumentTokensSaved = 0;
 	const { latestSuccessfulMutationByPathGroup, failedCallIds } = buildAssistantArgumentStalenessIndex(entries);
+	const argumentFenceStart = recentTurnFenceStart(entries, config.protectRecentTurns ?? 2);
 	const candidates: Array<{
 		entry: SessionMessageEntry;
 		call: ToolCall;
 		pathHints: string[];
 		originalChars: number;
-		savings: number;
 	}> = [];
 
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type !== "message") continue;
+		// Same newest-turn fence as tool-output pruning: edit/apply_patch
+		// arguments in the active (or otherwise protected) turn are live
+		// context, even when a later call in that turn superseded their path.
+		if (argumentFenceStart !== undefined && i >= argumentFenceStart) continue;
 		const message = entry.message as AgentMessage;
 		if (message.role !== "assistant") continue;
 		const entryTokens = estimateEntryTokens(entry);
@@ -586,61 +623,107 @@ export function pruneAssistantToolArguments(
 			// concrete path group to be stale from a later successful mutation.
 			// A group with no later success (failed/unknown/ambiguous) protects the
 			// whole call rather than dropping non-stale multi-file patch evidence.
-			const isStale =
-				groups.length > 0 &&
-				groups.every(group => {
-					const latest = latestSuccessfulMutationByPathGroup.get(pathGroupKey(group));
-					return latest !== undefined && latest.index > i && latest.callId !== content.id;
-				});
+			const isStale = groups.every(group => {
+				const latest = latestSuccessfulMutationByPathGroup.get(pathGroupKey(group));
+				return latest !== undefined && latest.index > i && latest.callId !== content.id;
+			});
 			if (!isStale) continue;
-			const sentinelChars = JSON.stringify({
-				pruned: true,
-				reason: "stale_tool_arguments",
-				pathHints: pathHintsForGroups(groups),
-				originalChars,
-				prunedAt: 0,
-			} satisfies PrunedToolArgumentsSentinel).length;
 			candidates.push({
 				entry: entry as SessionMessageEntry,
 				call: content,
 				pathHints: pathHintsForGroups(groups),
 				originalChars,
-				savings: Math.max(0, Math.ceil((originalChars - sentinelChars) / 4)),
 			});
 		}
 	}
 
-	for (const candidate of candidates) {
-		argumentTokensSaved += candidate.savings;
-	}
-	if (argumentTokensSaved < config.minimumSavings || candidates.length === 0) {
+	if (candidates.length === 0) {
 		return { argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] };
 	}
 
 	const prunedAt = Date.now();
-	const prunedEntries: SessionMessageEntry[] = [];
-	const prunedEntryIds = new Set<string>();
+	const candidatesByEntry = new Map<SessionMessageEntry, typeof candidates>();
 	for (const candidate of candidates) {
-		candidate.call.arguments = {
-			pruned: true,
-			reason: "stale_tool_arguments",
-			pathHints: candidate.pathHints,
-			originalChars: candidate.originalChars,
-			prunedAt,
-		};
-		if (!prunedEntryIds.has(candidate.entry.id)) {
-			prunedEntries.push(candidate.entry);
-			prunedEntryIds.add(candidate.entry.id);
-		}
+		const group = candidatesByEntry.get(candidate.entry);
+		if (group) group.push(candidate);
+		else candidatesByEntry.set(candidate.entry, [candidate]);
 	}
-	return { argumentPrunedCount: candidates.length, argumentTokensSaved, prunedEntries };
+
+	let argumentTokensSaved = 0;
+	const admittedGroups: Array<{ entry: SessionMessageEntry; candidates: typeof candidates }> = [];
+	for (const [entry, entryCandidates] of candidatesByEntry) {
+		const candidateByCallId = new Map(entryCandidates.map(candidate => [candidate.call.id, candidate]));
+		const message = entry.message as AgentMessage;
+		if (message.role !== "assistant") continue;
+		const stagedEntry = {
+			...entry,
+			message: {
+				...message,
+				content: message.content.map(content => {
+					if (content.type !== "toolCall") return content;
+					const candidate = candidateByCallId.get(content.id);
+					if (!candidate) return content;
+					return {
+						...content,
+						arguments: {
+							pruned: true,
+							reason: "stale_tool_arguments",
+							pathHints: candidate.pathHints,
+							originalChars: candidate.originalChars,
+							prunedAt,
+						} satisfies PrunedToolArgumentsSentinel,
+					};
+				}),
+			},
+		} as SessionMessageEntry;
+		const savings = Math.max(0, estimateEntryTokens(entry) - estimateEntryTokens(stagedEntry));
+		if (savings === 0) continue;
+		argumentTokensSaved += savings;
+		admittedGroups.push({ entry, candidates: entryCandidates });
+	}
+
+	if (argumentTokensSaved < config.minimumSavings || admittedGroups.length === 0) {
+		return { argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] };
+	}
+
+	let argumentPrunedCount = 0;
+	const prunedEntries: SessionMessageEntry[] = [];
+	for (const group of admittedGroups) {
+		for (const candidate of group.candidates) {
+			candidate.call.arguments = {
+				pruned: true,
+				reason: "stale_tool_arguments",
+				pathHints: candidate.pathHints,
+				originalChars: candidate.originalChars,
+				prunedAt,
+			};
+			argumentPrunedCount++;
+		}
+		prunedEntries.push(group.entry);
+	}
+	return { argumentPrunedCount, argumentTokensSaved, prunedEntries };
 }
 
 interface ToolOutputPruneCandidate {
 	entry: SessionMessageEntry;
+	call?: ToolCall;
 	tokens: number;
+	originalText: string;
+	complete: boolean;
 	notice: string;
 	savings: number;
+}
+
+function recentTurnFenceStart(entries: SessionEntry[], protectRecentTurns: number): number | undefined {
+	if (protectRecentTurns <= 0) return undefined;
+	const starts: number[] = [];
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		if (entry.type !== "message") continue;
+		const role = entry.message.role as string;
+		if (role === "user" || role === "bashExecution") starts.push(i);
+	}
+	return starts.length === 0 ? undefined : starts[Math.max(0, starts.length - protectRecentTurns)];
 }
 
 /**
@@ -657,6 +740,14 @@ function collectToolOutputPruneCandidates(
 	let accumulatedTokens = 0;
 
 	const { staleResultIndices } = buildStalenessIndex(entries);
+	const callsById = new Map<string, ToolCall>();
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		for (const content of entry.message.content) {
+			if (content.type === "toolCall") callsById.set(content.id, content);
+		}
+	}
+	const fenceStart = recentTurnFenceStart(entries, config.protectRecentTurns ?? 2);
 	const staleOverridable = new Set(config.staleOverridableTools ?? []);
 	const candidates: ToolOutputPruneCandidate[] = [];
 
@@ -673,7 +764,7 @@ function collectToolOutputPruneCandidates(
 		const isProtected =
 			config.protectedTools.includes(message.toolName) && !(isStale && staleOverridable.has(message.toolName));
 
-		if (message.prunedAt !== undefined) {
+		if (message.prunedAt !== undefined || (fenceStart !== undefined && i >= fenceStart)) {
 			accumulatedTokens += tokens;
 			continue;
 		}
@@ -688,19 +779,25 @@ function collectToolOutputPruneCandidates(
 			continue;
 		}
 
-		const notice = createPrunedNotice(tokens, message);
+		const call = callsById.get(message.toolCallId);
+		const captured = capturedTextContent(message);
+		const notice = createPrunedNotice(tokens, message, call);
 		const savings = estimatePrunedSavings(tokens, notice);
-		const errorNoticeGrows = message.isError === true && notice.length > firstTextContent(message).length;
+		const errorNoticeGrows = message.isError === true && notice.length > captured.text.length;
 		if (savings <= 0 || errorNoticeGrows) {
 			accumulatedTokens += tokens;
 			continue;
 		}
 		candidates.push({
 			entry: entry as SessionMessageEntry,
+			call,
 			tokens,
+			originalText: captured.text,
+			complete: captured.complete,
 			notice,
 			savings,
 		});
+
 		accumulatedTokens += tokens;
 	}
 
@@ -719,20 +816,24 @@ function minimumSavings(config: PruneConfig, options: PruneToolOutputsOptions = 
 }
 
 /**
- * Estimate the token savings {@link pruneToolOutputs} would achieve, without
- * mutating any entry. Returns 0 savings when below the configured minimum so the
- * caller sees the same gate the real prune enforces.
+ * Estimate the conservative final token savings {@link pruneToolOutputs} would
+ * achieve, without mutating entries or invoking the artifact-reference planner.
+ * When `artifactRefMaxChars` is present, the estimate budgets that full length
+ * for every complete candidate so the real artifact-backed prune cannot save
+ * less than the estimate.
  */
 export function estimateToolOutputPruneSavings(
 	entries: SessionEntry[],
 	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
 	options: PruneToolOutputsOptions = {},
 ): { prunableCount: number; tokensSaved: number } {
-	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
-	if (tokensSaved < minimumSavings(config, options) || candidates.length === 0) {
-		return { prunableCount: 0, tokensSaved: 0 };
-	}
-	return { prunableCount: candidates.length, tokensSaved };
+	const { candidates, tokensSaved: baseTokensSaved } = collectToolOutputPruneCandidates(entries, config);
+	const minimum = minimumSavings(config, options);
+	if (baseTokensSaved < minimum || candidates.length === 0) return { prunableCount: 0, tokensSaved: 0 };
+	const planned = planToolOutputPruneCandidates(candidates, options);
+	const tokensSaved = planned.reduce((total, candidate) => total + candidate.savings, 0);
+	if (tokensSaved < minimum || planned.length === 0) return { prunableCount: 0, tokensSaved: 0 };
+	return { prunableCount: planned.length, tokensSaved };
 }
 
 /**
@@ -753,9 +854,73 @@ export function shouldRunMaintenancePrune(args: {
 	return args.estimatedSavings > args.cacheEpochResetCost;
 }
 
+const MAX_ARTIFACT_REF_CHARS = 16_384;
+const ARTIFACT_REF_PREFIX_PATTERN = /^artifact:\/\/\d+/;
+
+function isValidArtifactRef(value: string): boolean {
+	return ARTIFACT_REF_PREFIX_PATTERN.exec(value)?.[0] === value;
+}
+
 export interface PruneToolOutputsOptions {
 	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
 	relaxedMinimum?: number;
+	/**
+	 * Conservative maximum ASCII length of every planned artifact reference.
+	 * Required when `artifactRef` is provided so estimation and final admission
+	 * use the same worst-case notice size.
+	 */
+	artifactRefMaxChars?: number;
+	/**
+	 * Plan a numeric `artifact://<id>` reference for a candidate's original
+	 * text. The callback may reserve an in-memory identifier, but MUST NOT publish
+	 * files or mutate session entries; publish only the originals returned by a
+	 * successful {@link pruneToolOutputs} result.
+	 */
+	artifactRef?: (candidate: PrunedOriginal) => string | undefined;
+}
+
+interface PlannedToolOutputPruneCandidate extends ToolOutputPruneCandidate {
+	original: PrunedOriginal;
+}
+
+function artifactRefMaxChars(options: PruneToolOutputsOptions): number {
+	const maxChars = options.artifactRefMaxChars;
+	if (maxChars === undefined) {
+		if (options.artifactRef) throw new Error("artifactRefMaxChars is required when artifactRef is provided");
+		return 0;
+	}
+	if (!Number.isSafeInteger(maxChars) || maxChars <= 0 || maxChars > MAX_ARTIFACT_REF_CHARS) {
+		throw new RangeError(`artifactRefMaxChars must be an integer between 1 and ${MAX_ARTIFACT_REF_CHARS}`);
+	}
+	return maxChars;
+}
+
+function planToolOutputPruneCandidates(
+	candidates: ToolOutputPruneCandidate[],
+	options: PruneToolOutputsOptions,
+): PlannedToolOutputPruneCandidate[] {
+	const maxArtifactChars = artifactRefMaxChars(options);
+	const artifactBudget = maxArtifactChars > 0 ? "x".repeat(maxArtifactChars) : undefined;
+	return candidates.flatMap(candidate => {
+		const original: PrunedOriginal = {
+			entryId: candidate.entry.id,
+			toolName: (candidate.entry.message as ToolResultMessage).toolName,
+			originalText: candidate.originalText,
+			tokens: candidate.tokens,
+			complete: candidate.complete,
+		};
+		const notice = createPrunedNotice(
+			candidate.tokens,
+			candidate.entry.message as ToolResultMessage,
+			candidate.call,
+			candidate.complete ? artifactBudget : undefined,
+		);
+		const savings = estimatePrunedSavings(candidate.tokens, notice);
+		const errorNoticeGrows =
+			(candidate.entry.message as ToolResultMessage).isError === true &&
+			notice.length > original.originalText.length;
+		return savings > 0 && !errorNoticeGrows ? [{ ...candidate, notice, savings, original }] : [];
+	});
 }
 
 export function pruneToolOutputs(
@@ -763,24 +928,53 @@ export function pruneToolOutputs(
 	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
 	options: PruneToolOutputsOptions = {},
 ): PruneResult {
-	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
+	const { candidates, tokensSaved: baseTokensSaved } = collectToolOutputPruneCandidates(entries, config);
 	const minimum = minimumSavings(config, options);
 
-	if (tokensSaved < minimum || candidates.length === 0) {
-		return { prunedCount: 0, tokensSaved: 0, prunedEntries: [] };
+	if (baseTokensSaved < minimum || candidates.length === 0) {
+		return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
 	}
 
-	let prunedCount = 0;
+	const plannedCandidates = planToolOutputPruneCandidates(candidates, options);
+	const plannedTokensSaved = plannedCandidates.reduce((total, candidate) => total + candidate.savings, 0);
+	if (plannedTokensSaved < minimum || plannedCandidates.length === 0) {
+		return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
+	}
+
+	const maxArtifactChars = artifactRefMaxChars(options);
+	const candidatesWithArtifacts = plannedCandidates.map(candidate => {
+		const artifact = candidate.complete ? options.artifactRef?.(candidate.original) : undefined;
+		if (artifact !== undefined && !isValidArtifactRef(artifact)) {
+			throw new Error(
+				`artifactRef must be a numeric artifact://<id> reference for entry ${candidate.original.entryId}`,
+			);
+		}
+		if (artifact !== undefined && artifact.length > maxArtifactChars) {
+			throw new Error(`artifactRef exceeded artifactRefMaxChars for entry ${candidate.original.entryId}`);
+		}
+		const notice = createPrunedNotice(
+			candidate.tokens,
+			candidate.entry.message as ToolResultMessage,
+			candidate.call,
+			artifact,
+		);
+		return { ...candidate, notice, savings: estimatePrunedSavings(candidate.tokens, notice) };
+	});
+	const tokensSaved = candidatesWithArtifacts.reduce((total, candidate) => total + candidate.savings, 0);
+	if (tokensSaved < minimum) {
+		throw new Error("artifact-backed prune savings fell below the conservative admission estimate");
+	}
 
 	const prunedAt = Date.now();
 	const prunedEntries: SessionMessageEntry[] = [];
-	for (const candidate of candidates) {
+	const originals: PrunedOriginal[] = [];
+	for (const candidate of candidatesWithArtifacts) {
 		const message = candidate.entry.message as ToolResultMessage;
 		message.content = [{ type: "text", text: candidate.notice }];
 		message.prunedAt = prunedAt;
 		prunedEntries.push(candidate.entry);
-		prunedCount++;
+		originals.push(candidate.original);
 	}
 
-	return { prunedCount, tokensSaved, prunedEntries };
+	return { prunedCount: candidatesWithArtifacts.length, tokensSaved, originals, prunedEntries };
 }

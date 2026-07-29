@@ -4,8 +4,6 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const originalStructuredClone = globalThis.structuredClone;
-const originalJsonStringify = JSON.stringify;
 const originalStateFileEnv = process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
 const originalSessionIdEnv = process.env.GJC_COORDINATOR_SESSION_ID;
 
@@ -17,8 +15,6 @@ let gitUtils: typeof import("../src/modes/components/status-line/git-utils");
 let ToolExecutionComponent: typeof import("../src/modes/components/tool-execution").ToolExecutionComponent;
 let EventController: typeof import("../src/modes/controllers/event-controller").EventController;
 let eventControllerPerfCounters: typeof import("../src/modes/controllers/event-controller").__eventControllerPerfCounters;
-let AgentWireFrameSequencer: typeof import("../src/modes/shared/agent-wire/event-envelope").AgentWireFrameSequencer;
-let toAgentWireEventFrame: typeof import("../src/modes/shared/agent-wire/event-envelope").toAgentWireEventFrame;
 let persistCoordinatorRuntimeStateFromEvent: typeof import("../src/gjc-runtime/session-state-sidecar").persistCoordinatorRuntimeStateFromEvent;
 
 beforeAll(async () => {
@@ -34,7 +30,6 @@ beforeAll(async () => {
 	({ EventController, __eventControllerPerfCounters: eventControllerPerfCounters } = await import(
 		"../src/modes/controllers/event-controller"
 	));
-	({ AgentWireFrameSequencer, toAgentWireEventFrame } = await import("../src/modes/shared/agent-wire/event-envelope"));
 	({ persistCoordinatorRuntimeStateFromEvent } = await import("../src/gjc-runtime/session-state-sidecar"));
 	const { initTheme } = await import("../src/modes/theme/theme");
 	await initTheme();
@@ -42,8 +37,6 @@ beforeAll(async () => {
 
 afterEach(() => {
 	if (setProjectDir && originalProjectDir) setProjectDir(originalProjectDir);
-	globalThis.structuredClone = originalStructuredClone;
-	JSON.stringify = originalJsonStringify;
 	if (originalStateFileEnv === undefined) delete process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
 	else process.env.GJC_COORDINATOR_SESSION_STATE_FILE = originalStateFileEnv;
 	if (originalSessionIdEnv === undefined) delete process.env.GJC_COORDINATOR_SESSION_ID;
@@ -53,7 +46,7 @@ afterEach(() => {
 });
 
 function logBaseline(name: string, data: Record<string, unknown>): void {
-	console.log(`[perf-baseline] ${name} ${originalJsonStringify(data)}`);
+	console.log(`[perf-baseline] ${name} ${JSON.stringify(data)}`);
 }
 
 function expectFiniteNonNegative(value: number): void {
@@ -64,6 +57,19 @@ function expectFiniteNonNegative(value: number): void {
 function expectPositiveFinite(value: number): void {
 	expect(Number.isFinite(value)).toBe(true);
 	expect(value).toBeGreaterThan(0);
+}
+
+async function withEventControllerPerfCounters(run: () => Promise<void>): Promise<void> {
+	const countersWereEnabled = eventControllerPerfCounters.enabled;
+	eventControllerPerfCounters.enable();
+	eventControllerPerfCounters.reset();
+	try {
+		await run();
+	} finally {
+		eventControllerPerfCounters.reset();
+		if (countersWereEnabled) eventControllerPerfCounters.enable();
+		else eventControllerPerfCounters.disable();
+	}
 }
 
 function createStatusSession() {
@@ -113,52 +119,6 @@ describe("advisory performance baselines", () => {
 		expectPositiveFinite(count);
 	});
 
-	it("records streamed tool arg clone/stringify counts during large edit updates", async () => {
-		const tempDir = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-perf-tool-"));
-		await Bun.write(path.join(tempDir, "sample.txt"), "old line 0\n".repeat(512));
-		let structuredCloneCalls = 0;
-		let jsonStringifyCalls = 0;
-		globalThis.structuredClone = ((value: unknown) => {
-			structuredCloneCalls += 1;
-			return originalStructuredClone(value);
-		}) as typeof structuredClone;
-		JSON.stringify = ((value: unknown, replacer?: any, space?: any) => {
-			jsonStringifyCalls += 1;
-			return originalJsonStringify(value, replacer, space);
-		}) as typeof JSON.stringify;
-
-		try {
-			const component = new ToolExecutionComponent(
-				"apply_patch",
-				{ path: "sample.txt", diff: "" },
-				{},
-				undefined,
-				{ requestRender: () => {} } as any,
-				tempDir,
-			);
-			const deltas = Array.from({ length: 16 }, (_, index) => ({
-				path: "sample.txt",
-				diff: largeDiff((index + 1) * 16),
-				__partialJson: originalJsonStringify({ path: "sample.txt", diff: largeDiff((index + 1) * 16) }),
-			}));
-			for (const args of deltas) component.updateArgs(args);
-			await Bun.sleep(20);
-
-			logBaseline("tool-execution.streamed-edit-args", {
-				deltas: deltas.length,
-				finalArgBytes: deltas.at(-1)?.diff.length ?? 0,
-				structuredCloneCalls,
-				jsonStringifyCalls,
-			});
-			// Value may legitimately drop to 0 when the corresponding REPORT.md fix lands.
-			expectFiniteNonNegative(structuredCloneCalls);
-			// Value may legitimately drop to 0 when the corresponding REPORT.md fix lands.
-			expectFiniteNonNegative(jsonStringifyCalls);
-		} finally {
-			fsSync.rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
 	it("keeps custom tool renderers on conservative cloned args", () => {
 		const sourceArgs = { nested: { value: "original" } };
 		const received: unknown[] = [];
@@ -183,145 +143,111 @@ describe("advisory performance baselines", () => {
 	});
 
 	it("records event-controller full content scan counts for streamed tool updates", async () => {
-		const toolCallCount = 9;
-		const updates = 10;
-		let updateArgsCalls = 0;
-		const pendingTools = new Map<string, { updateArgs: () => void }>();
-		for (let i = 0; i < toolCallCount; i++)
-			pendingTools.set(`call_${i}`, {
-				updateArgs: () => {
-					updateArgsCalls += 1;
-				},
+		await withEventControllerPerfCounters(async () => {
+			const toolCallCount = 9;
+			const updates = 10;
+			let updateArgsCalls = 0;
+			const pendingTools = new Map<string, { updateArgs: () => void }>();
+			for (let i = 0; i < toolCallCount; i++)
+				pendingTools.set(`call_${i}`, {
+					updateArgs: () => {
+						updateArgsCalls += 1;
+					},
+				});
+			const ctx = {
+				isInitialized: true,
+				init: async () => {},
+				streamingComponent: { updateContent: () => {} },
+				statusLine: { invalidate: () => {} },
+				updateEditorTopBorder: () => {},
+				pendingTools,
+				session: { getToolByName: () => undefined },
+				ui: { requestRender: () => {} },
+				chatContainer: { addChild: () => {} },
+				settings: { get: () => false },
+				sessionManager: { getCwd: () => os.tmpdir() },
+				toolOutputExpanded: false,
+				setWorkingMessage: () => {},
+			} as any;
+			const controller = new EventController(ctx);
+			eventControllerPerfCounters.reset();
+			for (let i = 0; i < updates; i++) {
+				await controller.handleEvent({
+					type: "message_update",
+					message: {
+						role: "assistant",
+						content: Array.from({ length: toolCallCount }, (_, index) => ({
+							type: "toolCall",
+							id: `call_${index}`,
+							name: "edit",
+							arguments: { path: "sample.txt", diff: largeDiff(i + index + 1) },
+						})),
+					},
+				} as any);
+			}
+			const fullContentScanVisits = eventControllerPerfCounters.messageUpdateContentVisits;
+			logBaseline("event-controller.message-update-full-scan", {
+				updates,
+				toolCallCount,
+				fullContentScanVisits,
+				updateArgsCalls,
 			});
-		const ctx = {
-			isInitialized: true,
-			init: async () => {},
-			streamingComponent: { updateContent: () => {} },
-			statusLine: { invalidate: () => {} },
-			updateEditorTopBorder: () => {},
-			pendingTools,
-			session: { getToolByName: () => undefined },
-			ui: { requestRender: () => {} },
-			chatContainer: { addChild: () => {} },
-			settings: { get: () => false },
-			sessionManager: { getCwd: () => os.tmpdir() },
-			toolOutputExpanded: false,
-			setWorkingMessage: () => {},
-		} as any;
-		const controller = new EventController(ctx);
-		eventControllerPerfCounters.reset();
-		for (let i = 0; i < updates; i++) {
-			await controller.handleEvent({
-				type: "message_update",
-				message: {
-					role: "assistant",
-					content: Array.from({ length: toolCallCount }, (_, index) => ({
-						type: "toolCall",
-						id: `call_${index}`,
-						name: "edit",
-						arguments: { path: "sample.txt", diff: largeDiff(i + index + 1) },
-					})),
-				},
-			} as any);
-		}
-		const fullContentScanVisits = eventControllerPerfCounters.messageUpdateContentVisits;
-		logBaseline("event-controller.message-update-full-scan", {
-			updates,
-			toolCallCount,
-			fullContentScanVisits,
-			updateArgsCalls,
+			expectFiniteNonNegative(fullContentScanVisits);
+			expectPositiveFinite(updateArgsCalls);
 		});
-		expectFiniteNonNegative(fullContentScanVisits);
-		expectPositiveFinite(updateArgsCalls);
 	});
 
 	it("uses contentIndex metadata to avoid full content rescans during streamed tool updates", async () => {
-		const toolCallCount = 9;
-		const updates = 10;
-		let updateArgsCalls = 0;
-		const pendingTools = new Map<string, { updateArgs: () => void }>();
-		for (let i = 0; i < toolCallCount; i++)
-			pendingTools.set(`call_${i}`, {
-				updateArgs: () => {
-					updateArgsCalls += 1;
-				},
-			});
-		const content = Array.from({ length: toolCallCount }, (_, index) => ({
-			type: "toolCall",
-			id: `call_${index}`,
-			name: "edit",
-			arguments: { path: "sample.txt", diff: "" },
-		}));
-		const ctx = {
-			isInitialized: true,
-			init: async () => {},
-			streamingComponent: { updateContent: () => {} },
-			statusLine: { invalidate: () => {} },
-			updateEditorTopBorder: () => {},
-			pendingTools,
-			session: { getToolByName: () => undefined },
-			ui: { requestRender: () => {} },
-			chatContainer: { addChild: () => {} },
-			settings: { get: () => false },
-			sessionManager: { getCwd: () => os.tmpdir() },
-			toolOutputExpanded: false,
-			setWorkingMessage: () => {},
-		} as any;
-		const controller = new EventController(ctx);
-		eventControllerPerfCounters.reset();
-		for (let i = 0; i < updates; i++) {
-			content[4].arguments = { path: "sample.txt", diff: largeDiff(i + 1) };
-			await controller.handleEvent({
-				type: "message_update",
-				message: { role: "assistant", content },
-				assistantMessageEvent: {
-					type: "toolcall_delta",
-					contentIndex: 4,
-					delta: "x",
-					partial: { role: "assistant", content },
-				},
-			} as any);
-		}
-		expect(eventControllerPerfCounters.messageUpdateContentVisits).toBe(updates);
-		expect(updateArgsCalls).toBe(updates);
-	});
-
-	it("records rpc wire stringify invocations and serialized bytes for long message_update stream", () => {
-		const events = 40;
-		let stringifyCalls = 0;
-		let serializedBytes = 0;
-		const sequencer = new AgentWireFrameSequencer("session-perf-baseline");
-		for (let i = 0; i < events; i++) {
-			const frame = toAgentWireEventFrame(
-				{
+		await withEventControllerPerfCounters(async () => {
+			const toolCallCount = 9;
+			const updates = 10;
+			let updateArgsCalls = 0;
+			const pendingTools = new Map<string, { updateArgs: () => void }>();
+			for (let i = 0; i < toolCallCount; i++)
+				pendingTools.set(`call_${i}`, {
+					updateArgs: () => {
+						updateArgsCalls += 1;
+					},
+				});
+			const content = Array.from({ length: toolCallCount }, (_, index) => ({
+				type: "toolCall",
+				id: `call_${index}`,
+				name: "edit",
+				arguments: { path: "sample.txt", diff: "" },
+			}));
+			const ctx = {
+				isInitialized: true,
+				init: async () => {},
+				streamingComponent: { updateContent: () => {} },
+				statusLine: { invalidate: () => {} },
+				updateEditorTopBorder: () => {},
+				pendingTools,
+				session: { getToolByName: () => undefined },
+				ui: { requestRender: () => {} },
+				chatContainer: { addChild: () => {} },
+				settings: { get: () => false },
+				sessionManager: { getCwd: () => os.tmpdir() },
+				toolOutputExpanded: false,
+				setWorkingMessage: () => {},
+			} as any;
+			const controller = new EventController(ctx);
+			eventControllerPerfCounters.reset();
+			for (let i = 0; i < updates; i++) {
+				content[4].arguments = { path: "sample.txt", diff: largeDiff(i + 1) };
+				await controller.handleEvent({
 					type: "message_update",
-					message: { role: "assistant", content: [{ type: "text", text: `chunk-${i}-${"x".repeat(512)}` }] },
-				} as any,
-				sequencer,
-			);
-			const serialized = originalJsonStringify(frame);
-			stringifyCalls += 1;
-			serializedBytes += Buffer.byteLength(serialized, "utf8");
-		}
-		logBaseline("rpc-wire.message-update-stream", { events, stringifyCalls, serializedBytes });
-		// stringifyCalls is fixture-derived; serializedBytes observes real product frame output.
-		expectFiniteNonNegative(stringifyCalls);
-		expectPositiveFinite(serializedBytes);
-	});
-
-	it("records streaming-edit guard processed characters and lines per append-only delta", () => {
-		const deltas = Array.from({ length: 20 }, (_, index) => largeDiff(index + 1));
-		const processedCharacters = deltas.reduce((sum, diff) => sum + diff.length, 0);
-		const processedLines = deltas.reduce((sum, diff) => sum + diff.split("\n").length, 0);
-		// This baseline is fixture-derived, not product-instrumented.
-		logBaseline("agent-session.streaming-edit-guard.fixture-derived", {
-			deltas: deltas.length,
-			processedCharacters,
-			processedLines,
-			finalDeltaBytes: deltas.at(-1)?.length ?? 0,
+					message: { role: "assistant", content },
+					assistantMessageEvent: {
+						type: "toolcall_delta",
+						contentIndex: 4,
+						delta: "x",
+						partial: { role: "assistant", content },
+					},
+				} as any);
+			}
+			expect(eventControllerPerfCounters.messageUpdateContentVisits).toBe(updates);
+			expect(updateArgsCalls).toBe(updates);
 		});
-		expectPositiveFinite(processedCharacters);
-		expectPositiveFinite(processedLines);
 	});
 
 	it("records sidecar sync readFileSync invocations per state-mapped event", async () => {

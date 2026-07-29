@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "kind": "dev-ci-green-recovery-receipt",
+  "generatedAt": "2026-07-28",
+  "status": "terminal-green",
+  "lane": "dev-CI recovery (exclusive shared-CI mutation owner)",
+  "doctrine": "root-fix shared CI blockers as separate single-purpose PRs, each exact-head green and adversarially reviewed before merge; never raise timeouts, add retries, skip, or weaken assertions to make red go away",
+  "greenProof": {
+    "devHeadSha": "a92c4dd2d97504f22370e323c291899119519baf",
+    "devHeadSubject": "chore(artifacts): record #3422/#3429 CI-wait lane retirement receipt (#3442)",
+    "runId": 30389689932,
+    "workflow": "Dev CI",
+    "status": "completed",
+    "conclusion": "success",
+    "jobTally": { "success": 17, "skipped": 5, "failure": 0, "cancelled": 0 },
+    "freezeAction": "lifted"
+  },
+  "mergedRepairs": [
+    {
+      "pr": 3419,
+      "title": "fix(ai): drop the unused $env import from the Vertex provider",
+      "mergeCommitSha": "333c28a01",
+      "blocker": "root-check red: packages/ai/src/providers/google-vertex.ts:1 lint/correctness/noUnusedImports",
+      "rootCause": "semantic merge conflict in merge 53deba2a1 (PR #3291): parents 77cd61734 and 43bba0dd2 each removed a different subset of the $env uses while the merged import line kept the union of imported symbols; textual merge was clean so no pre-merge CI observed the combined tree, and the last $env use disappeared only in the merge result ($env code uses went 2 -> 1 -> 0)",
+      "fix": "removed only the genuinely unused $env symbol; $credentialEnv and $pickCredentialEnv remain used and untouched",
+      "verification": "biome check . clean across 3216 files; 154 pass / 0 fail across 18 vertex/google/credential suites",
+      "affectedLanes": [3422, 3429, 3325, 3423]
+    },
+    {
+      "pr": 3430,
+      "title": "fix(ci): address workflow bun test files by explicit relative path",
+      "mergeCommitSha": "a7e790ad2535",
+      "blocker": "every windows-dev-doctor-gated PR red on `bun test packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts`",
+      "rootCause": "bun test treats its argument as a path only when it resolves; otherwise it silently degrades to a test-name filter, matches zero files, and exits 1. On Windows runners the bare relative form did not resolve. Surfaced when #3344 (1439fd109) added both the test and the workflow line that runs it. The test itself is correct and skipIf-gated on win32; only the invocation was wrong.",
+      "fix": "prefixed all six workflow bun test invocations with ./ (not only the one that broke: the rest carry the identical latent fault, and the failure mode is silent-wrong -- a filter matching nothing passes on Linux and fails only on Windows)",
+      "regressionCoverage": "scripts/dev-ci-guard-topology.test.ts asserts every bun test line in dev-ci.yml uses a ./-prefixed path; proven non-vacuous (reverting line 238 alone yields 4 pass / 1 fail naming the offending line, restoring yields 5 pass / 0 fail)",
+      "verification": "workflow-contract suites 100 pass / 0 fail across 3 files; check-workflow-yaml.ts all parse; verified again on merge preview against dev e38700db (0 conflicts, 85 pass / 0 fail)",
+      "affectedLanes": [3423, 3422, 3325, 3424, 3425, 3426, 3428]
+    },
+    {
+      "pr": 3431,
+      "title": "chore(schemas): regenerate config schema for session.resumeModelBehavior",
+      "mergeCommitSha": "fbb43434ea5a",
+      "blocker": "root-check red: generate-json-schemas.ts --check reported schemas/config.schema.json out of date",
+      "rootCause": "PR #3293 (86241e304, 6bb42286f, merged via dae17134c) added session.resumeModelBehavior to packages/coding-agent/src/config/settings-schema.ts but never regenerated the committed JSON Schema; neither commit touches schemas/ at all",
+      "fix": "generator output only, no hand edits; added block mirrors settings-schema.ts:501-502 exactly (enum keepSessionModel/useCurrentDefault/ask, default keepSessionModel)",
+      "verification": "only schemas/config.schema.json changed, additive +10/-0; --check exits 0; regeneration idempotent; valid JSON; generate-json-schemas.test.ts 6 pass / 0 fail"
+    },
+    {
+      "pr": 3438,
+      "title": "fix(sdk): classify resolveConfiguredDefaultModel as an internal seam",
+      "mergeCommitSha": "ed7dcae79a52",
+      "blocker": "shard-1/shard-2 red: SDK operation inventory > accepts the committed generated matrix; 'Pending review source seam: agent_session:resolveConfiguredDefaultModel'",
+      "rootCause": "PR #3293 commit 6bb42286f added AgentSession.resolveConfiguredDefaultModel() without classifying it; the generator fails closed on any unreviewed seam, so the committed artifact drifted from OPERATIONS",
+      "fix": "classified as a locked exclusion with rationale byte-identical to its two siblings from the same feature (getSessionDefaultModelSelector, recordResumeDefaultModel); zero-arg non-mutating read over the already-reviewed model-role resolution path, sole caller is the TUI resume prompt at selector-controller.ts:2350",
+      "verification": "include stays 176 (no seam newly exposed to the public SDK), exclude 155 -> 156, pending 1 -> 0; artifact additive +11/-0 and idempotent; sdk-operation-inventory 17 pass / 0 fail (was 16 pass / 1 fail); sdk-operation-matrix 4 pass / 0 fail",
+      "affectedLanes": [3325]
+    },
+    {
+      "pr": 3443,
+      "title": "fix(test): realign two goldens with the contracts their producers changed",
+      "mergeCommitSha": "e2811c648c1d",
+      "blocker": "shard-1 CONSUMER/KEY-FIELD MATRIX for compact handoff payloads; shard-4 does not replay exported Alibaba lazy-stream timeouts",
+      "rootCause": "shard-1: PR #3428 (33dbf1e7c) added an auto_handoff admission block to the final-stage ralplan receipt payload (ralplan-runtime.ts:1444) without extending the consumer key matrix or inline snapshot -- producer is correct and correctly final-stage-gated, the golden was stale. shard-4: the test pinned one literal 'Provider stream timed out while waiting for the first event' for both models, but #3046 gave each transport its own wording, so qwen3.8-max-preview (openai-responses) and deepseek-v4-pro (openai-completions) emit different messages -- the pinned string is a pre-#3046 value no provider emits any more, so the assertion had silently gone vacuous.",
+      "fix": "shard-1: added auto_handoff to the assertKeys allowlist and regenerated the snapshot with --update-snapshots (additive only). shard-4: replaced the stale literal with a per-api helper so each case asserts its own transport's exact message.",
+      "notWeakened": "no product code changed; both sites remain exact-equality assertions and the key matrix still fails closed on any unexpected key; in shard-4 the change restores a live assertion rather than relaxing one",
+      "verification": "state-handoff-thrift 2 pass / 0 fail (was 1 fail); agent-session-fallback-upstream-count 20 pass / 0 fail (was 1 fail)"
+    }
+  ],
+  "rejectedApproaches": [
+    {
+      "prs": [3409, 3410, 3412],
+      "proposal": "raise the team memory-guard selector-replacement test timeout to 20s",
+      "action": "not merged; #3410 and #3412 CLOSED, #3409 still OPEN as of this receipt and should be closed or converted",
+      "reason": "violates the deterministic-test directive; a timeout increase hides the race instead of removing the timing dependency. The deterministic replacement is implemented and validated (see outstandingWork) and supersedes all three."
+    },
+    {
+      "pr": 3420,
+      "proposal": "identical one-line Vertex $env import fix",
+      "action": "closed as exact duplicate of #3419",
+      "evidence": "identical resulting tree SHA 04535c4fc50f and blob SHA 781beaa827d1, identical parent 34cd145c, 1 commit each; `git diff --stat 6620b1286 1c3b2432d` empty. Identical tree SHAs prove no hidden commit, stray file, or whitespace difference anywhere in the working tree."
+    }
+  ],
+  "falseRedFinding": {
+    "observation": "11 of 12 consecutive dev runs ended `cancelled`, presenting as red, with zero failing test shards",
+    "mechanism": "concurrency.cancel-in-progress: true cancels the in-flight dev run on every new merge. native-build needs ~5-6 min while merges arrived every 0.1-8.5 min (median ~5.5). The evidence producer asserts `native === \"success\"`, so a cancelled native-build is indistinguishable from a failed one and the aggregate goes red.",
+    "proof": "the same tree passed unchanged (17 success / 5 skipped / 0 failure) on the very next run once the merge cadence paused; native-build cancellations landed 17s after an unrelated merge (PR #3391 at 18:53:25 vs cancellation at 18:53:42)",
+    "classification": "CI throughput/topology condition, not a product defect; no repair merged for it",
+    "recommendation": "either exempt native-build from cancel-in-progress, or have the evidence producer treat `cancelled` distinctly from `failure` so supersession does not read as product red"
+  },
+  "outstandingWork": [
+    {
+      "item": "deterministic conversion of recovery/time-based tests (the originally assigned mandatory task)",
+      "status": "implemented and validated on current dev, NOT landed -- no PR opened",
+      "branch": "fix/dev-deterministic-recovery-sync2",
+      "baseSha": "a92c4dd2d97504f22370e323c291899119519baf",
+      "scope": "1 commit, 4 files, +184/-127",
+      "content": [
+        "team memory-guard replacement: added the memoryGuardBeforeStartupAckWait seam so the successor startup ACK is published at an explicit barrier instead of racing Bun.sleep(50); removes the timing dependency behind the ~5012ms shard-2 timeout",
+        "Discord recovery: replaced the merged 10s polling loop (#3406) with the daemon's own injectable leaseRecoveryScheduler, driving real recovery passes via drainUntil/drainToQuiescence instead of waiting out its backoff",
+        "/btw strict terminal dispatch: converted the deadline-polled ephemeral-turn wait to event completion and made the identity-mismatch negative assertions run through the daemon's own frame handler instead of sampling after a fixed sleep"
+      ],
+      "verification": "team-runtime 109 pass / 0 fail; sdk-discord-daemon + notifications-telegram-btw-e2e 56 pass / 0 fail; memory-guard test passes in ~0.5s under 8-way CPU contention (vs the 5012ms CI timeout it replaced), and 10/10 repeated focused runs green",
+      "note": "no timeout increases, retries, skips, or weakened assertions. Repeatedly preempted by the shared-CI blockers above; ready to open as a single PR when a lane is authorized."
+    }
+  ],
+  "notifiedLanes": [3325, 3422, 3423, 3424, 3425, 3426, 3428, 3429]
+}

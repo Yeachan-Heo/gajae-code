@@ -1,7 +1,7 @@
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent } from "@gajae-code/utils/fs-error";
+import { hasFsCode, isEnoent } from "@gajae-code/utils/fs-error";
 
 export interface FileLockOptions {
 	staleMs?: number;
@@ -185,7 +185,16 @@ async function staleLockSnapshot(
 	staleMs: number,
 	startTimeCache?: Map<string, string | null>,
 ): Promise<LockStaleSnapshot> {
-	const info = await readLockInfo(lockPath);
+	let info: LockInfo | null;
+	try {
+		info = await readLockInfo(lockPath);
+	} catch (error) {
+		// Windows can transiently deny reads of a just-created lock metadata file
+		// while another contender is publishing it. Treat that as active
+		// contention and retry rather than failing the caller or reaping by path.
+		if (hasFsCode(error, "EPERM")) return { stale: false };
+		throw error;
+	}
 	if (!info) {
 		try {
 			const stats = await fs.stat(lockPath);

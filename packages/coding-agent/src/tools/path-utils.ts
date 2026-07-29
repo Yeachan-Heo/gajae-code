@@ -637,6 +637,7 @@ export interface ToolScopeOptions {
 	rawPaths: string[];
 	cwd: string;
 	getArtifactsDir?: () => string | null;
+	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Verb used in the "Cannot {action} internal URL without a backing file: …" message. */
 	internalUrlAction: string;
 	/** Collect absolute paths flagged immutable by their internal-URL handler. */
@@ -667,7 +668,7 @@ export interface ToolScopeResolution {
  *  5. stat the resolved base path so callers can branch on directory vs file scope.
  */
 export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<ToolScopeResolution> {
-	const { rawPaths: inputs, cwd, internalUrlAction, getArtifactsDir } = opts;
+	const { rawPaths: inputs, cwd, internalUrlAction, getArtifactsDir, getAuthorizedArtifactsDirs } = opts;
 	const rawPaths = inputs.map(normalizePathLikeInput);
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("`paths` must contain non-empty paths or globs");
@@ -683,7 +684,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		if (hasGlobPathChars(rawPath)) {
 			throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
 		}
-		const resource = await internalRouter.resolve(rawPath, { cwd, getArtifactsDir });
+		const resource = await internalRouter.resolve(rawPath, { cwd, getArtifactsDir, getAuthorizedArtifactsDirs });
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);
 		}

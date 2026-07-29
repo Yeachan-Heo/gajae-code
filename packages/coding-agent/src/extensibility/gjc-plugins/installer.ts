@@ -6,16 +6,12 @@ import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { compileGjcPluginBundle } from "./compiler";
 import { gjcPluginProjectRoot, gjcPluginUserRoot } from "./paths";
-import {
-	readRegistry,
-	registryEntryFingerprint,
-	sortRegistryEntries,
-	withRegistryLock,
-	writeRegistryUnlocked,
-} from "./registry";
+import { readRegistry, sortRegistryEntries, withRegistryLock, writeRegistryUnlocked } from "./registry";
 import {
 	GJC_PLUGIN_MANIFEST_FILENAME,
+	type GjcLifecycleError,
 	GjcPluginLoadError,
+	type GjcPluginRegistry,
 	type GjcPluginRegistryEntry,
 	type GjcPluginRegistrySource,
 	type GjcPluginScope,
@@ -23,16 +19,36 @@ import {
 } from "./types";
 import { validateInstallPlan } from "./validation";
 
-export interface InstallGjcPluginOptions {
+export interface GjcBundleTransactionOptions {
 	scope: GjcPluginScope;
 	cwd: string;
-	force?: boolean;
+	/**
+	 * Policy hook evaluated while both scope locks are held. It decides whether
+	 * to commit the candidate, report an already-satisfied no-op, or abort with
+	 * a typed lifecycle error. Only the lifecycle service supplies this.
+	 */
+	decide: (input: GjcBundleTransactionContext) => Promise<GjcBundleTransactionDecision>;
 }
 
-export interface InstallGjcPluginResult {
-	status: "installed" | "updated" | "unchanged";
-	entry: GjcPluginRegistryEntry;
+export interface GjcBundleTransactionContext {
+	targetRegistry: GjcPluginRegistry;
+	/** Both scopes, deterministically sorted, for cross-scope decisions. */
+	effective: GjcPluginRegistryEntry[];
+	existing: GjcPluginRegistryEntry | undefined;
+	bundle: NormalizedGjcPluginBundle;
+	/** Entry the candidate would produce if committed as-is. */
+	candidate: GjcPluginRegistryEntry;
 }
+
+export type GjcBundleTransactionDecision =
+	| { kind: "commit"; entry: GjcPluginRegistryEntry }
+	| { kind: "noop"; entry: GjcPluginRegistryEntry }
+	| { kind: "abort"; error: GjcLifecycleError };
+
+export type GjcBundleTransactionResult =
+	| { status: "committed"; entry: GjcPluginRegistryEntry; remnants: string[] }
+	| { status: "noop"; entry: GjcPluginRegistryEntry; remnants: string[] }
+	| { status: "aborted"; error: GjcLifecycleError; remnants: string[] };
 
 // Resource limits for the in-house tar extractor (third-party security boundary).
 const TAR_MAX_FILES = 8192;
@@ -113,8 +129,21 @@ function tarHeaderChecksumOk(header: Uint8Array): boolean {
 
 /** Minimal, traversal/symlink-safe, resource-bounded extraction of a tar(.gz). */
 async function extractTarball(tarPath: string, destRoot: string): Promise<void> {
-	const raw = await fs.readFile(tarPath);
-	const buf = /\.(tgz|tar\.gz)$/i.test(tarPath) ? gunzipSync(raw) : raw;
+	// A missing or corrupt archive surfaces as a native fs/zlib error. Translate
+	// it here so callers see the same typed source failure they get for every
+	// other unreachable source, instead of a raw errno escaping the lifecycle.
+	let raw: Buffer;
+	try {
+		raw = await fs.readFile(tarPath);
+	} catch {
+		throw new GjcPluginLoadError("missing_file", "GJC plugin tarball could not be read");
+	}
+	let buf: Buffer;
+	try {
+		buf = /\.(tgz|tar\.gz)$/i.test(tarPath) ? gunzipSync(raw) : raw;
+	} catch {
+		throw new GjcPluginLoadError("invalid_manifest", "GJC plugin tarball could not be decompressed");
+	}
 	const resolvedRoot = path.resolve(destRoot);
 	const decoder = new TextDecoder();
 	let offset = 0;
@@ -215,17 +244,23 @@ function runGit(args: string[], cwd?: string): Promise<string> {
 	// argv array (no shell) — repo/ref are passed as discrete args, not interpolated.
 	const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
 	let stdout = "";
-	let stderr = "";
 	child.stdout.on("data", d => {
 		stdout += d;
 	});
-	child.stderr.on("data", d => {
-		stderr += d;
+	// stderr is drained but never surfaced: git writes the remote URL into it,
+	// which can carry credentials.
+	child.stderr.resume();
+	// A spawn failure (git missing, ENOENT, EACCES) arrives as a raw system
+	// error. Convert it so the lifecycle can report a typed, sanitized source
+	// failure instead of letting an errno escape to the CLI.
+	child.on("error", () => {
+		reject(new GjcPluginLoadError("missing_file", "git is unavailable or could not be started"));
 	});
-	child.on("error", reject);
 	child.on("close", code => {
 		if (code === 0) resolve(stdout.trim());
-		else reject(new GjcPluginLoadError("install_conflict", `git ${args[0]} failed: ${stderr.trim()}`));
+		// git writes the remote URL into stderr, which can carry credentials, so
+		// the operation is named without echoing the underlying output.
+		else reject(new GjcPluginLoadError("install_conflict", `git ${args[0]} failed`));
 	});
 	return promise;
 }
@@ -334,29 +369,61 @@ async function cleanupOrphans(root: string, dirName: string): Promise<void> {
 	}
 }
 
-export async function installGjcPluginBundle(
+/**
+ * Serialized bundle transaction: prepare outside the locks, then hold the
+ * user->project locks in a fixed order so the decision sees a consistent
+ * cross-scope view. Only the target scope is ever committed.
+ */
+export async function runGjcBundleTransaction(
 	source: string,
-	options: InstallGjcPluginOptions,
-): Promise<InstallGjcPluginResult> {
+	options: GjcBundleTransactionOptions,
+): Promise<GjcBundleTransactionResult> {
 	const resolved = await resolveSource(source);
 	try {
-		// 1. Compile + validate (never imports plugin code).
+		// Compile + validate outside every lock (never imports plugin code).
 		const bundle = await compileGjcPluginBundle(resolved.dir);
 		const dirName = safeDirSegment(bundle.name);
 		const root = scopeRoot(options.scope, options.cwd);
 		const finalDir = path.join(root, dirName);
 
-		// 2-4. Conflict check, atomic swap, and registry write are one serialized
-		// transaction per scope so concurrent installs cannot race or lose updates.
-		return await withRegistryLock(options.scope, options.cwd, async () => {
-			await fs.mkdir(root, { recursive: true });
-			await cleanupOrphans(root, dirName);
+		// Lock-free refusal preflight. Acquiring a scope lock creates the scope
+		// root and mutates directory metadata, so a create-only refusal must be
+		// decided before any lock is taken; otherwise "zero mutation" is false.
+		// The locked decision below re-checks, so this is an early-out only.
+		const preflightTarget = await readRegistry(options.scope, options.cwd);
+		const preexisting = preflightTarget.plugins.find(p => p.name === bundle.name);
+		if (preexisting) {
+			// The decision may compare a cross-scope fingerprint, so it must see the
+			// same complete universe the locked decision sees.
+			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd);
+			const early = await options.decide({
+				targetRegistry: preflightTarget,
+				effective: sortRegistryEntries([...preflightTarget.plugins, ...preflightOther.plugins]),
+				existing: preexisting,
+				bundle,
+				candidate: bundleToRegistryEntry(
+					bundle,
+					finalDir,
+					options.scope,
+					resolved.source,
+					new Date().toISOString(),
+				),
+			});
+			// Only an abort is honoured here; everything else is re-decided under
+			// the lock, so this can never short-circuit a commit.
+			if (early.kind === "abort") return { status: "aborted", error: early.error, remnants: [] };
+		}
 
-			const registry = await readRegistry(options.scope, options.cwd);
-			const existing = registry.plugins.find(p => p.name === bundle.name);
-			// Hard install-time collision + MCP security validation against the
-			// effective installed registry (registry is the collision authority).
-			validateInstallPlan(bundle, registry.plugins);
+		const critical = async (): Promise<GjcBundleTransactionResult> => {
+			// Read-only until the policy decision resolves. A refusal must not create
+			// the scope root or sweep orphans, so an existing-target refusal leaves
+			// the filesystem byte-for-byte untouched.
+
+			const targetRegistry = await readRegistry(options.scope, options.cwd);
+			const otherScope: GjcPluginScope = options.scope === "user" ? "project" : "user";
+			const otherRegistry = await readRegistry(otherScope, options.cwd);
+			const effective = sortRegistryEntries([...targetRegistry.plugins, ...otherRegistry.plugins]);
+			const existing = targetRegistry.plugins.find(p => p.name === bundle.name);
 			const candidate = bundleToRegistryEntry(
 				bundle,
 				finalDir,
@@ -364,18 +431,21 @@ export async function installGjcPluginBundle(
 				resolved.source,
 				new Date().toISOString(),
 			);
-			if (existing) {
-				const sameContent = registryEntryFingerprint(existing) === registryEntryFingerprint(candidate);
-				if (sameContent && (await isDirectory(finalDir))) {
-					return { status: "unchanged" as const, entry: existing };
-				}
-				if (!options.force) {
-					throw new GjcPluginLoadError(
-						"install_conflict",
-						`GJC plugin "${bundle.name}" is already installed with different content; pass --force to replace it`,
-					);
-				}
-			}
+
+			const decision = await options.decide({ targetRegistry, effective, existing, bundle, candidate });
+			if (decision.kind === "abort") return { status: "aborted", error: decision.error, remnants: [] };
+			if (decision.kind === "noop") return { status: "noop", entry: decision.entry, remnants: [] };
+
+			// The decision committed, so mutation may begin.
+			await fs.mkdir(root, { recursive: true });
+			await cleanupOrphans(root, dirName);
+
+			// Hard install-time collision + MCP security validation against the
+			// effective registry across BOTH scopes. Surface IDs derive from the
+			// surface name, not the bundle name, so a differently named bundle in
+			// the opposite scope can claim the same ID; only the exact target
+			// identity is excluded, since that is the entry being replaced.
+			validateInstallPlan(bundle, effective);
 
 			const unique = `${process.pid}-${randomBytes(6).toString("hex")}`;
 			const stagingDir = `${finalDir}.installing-${unique}`;
@@ -394,8 +464,8 @@ export async function installGjcPluginBundle(
 				// Registry write last; on failure, roll the filesystem back.
 				try {
 					const next = sortRegistryEntries([
-						...registry.plugins.filter(p => p.name !== bundle.name),
-						{ ...candidate, installedAt: existing?.installedAt ?? candidate.installedAt },
+						...targetRegistry.plugins.filter(p => p.name !== bundle.name),
+						decision.entry,
 					]);
 					await writeRegistryUnlocked({ version: 1, scope: options.scope, plugins: next }, options.cwd);
 				} catch (error) {
@@ -403,15 +473,84 @@ export async function installGjcPluginBundle(
 					if (hadFinal) await fs.rename(backupDir, finalDir);
 					throw error;
 				}
-				if (hadFinal) await fs.rm(backupDir, { recursive: true, force: true });
-				return { status: existing ? ("updated" as const) : ("installed" as const), entry: candidate };
+				const remnants: string[] = [];
+				if (hadFinal) {
+					try {
+						await fs.rm(backupDir, { recursive: true, force: true });
+					} catch {
+						remnants.push(backupDir);
+					}
+				}
+				return { status: "committed", entry: decision.entry, remnants };
 			} finally {
 				await fs.rm(stagingDir, { recursive: true, force: true });
 			}
-		});
+		};
+
+		// Surface IDs are globally unique, so the collision decision spans both
+		// scopes and must be serialized against every other writer. Both locks are
+		// therefore held, in a fixed user->project order to avoid deadlock,
+		// regardless of which scope commits. Refusal purity is preserved by the
+		// pre-lock preflight above, which returns before any lock is acquired.
+		return await withRegistryLock("user", options.cwd, () => withRegistryLock("project", options.cwd, critical));
 	} finally {
 		await resolved.cleanup();
 	}
+}
+
+/** Compile a source into a validated candidate bundle without touching disk state. */
+export async function resolveGjcBundleCandidate<T>(
+	source: string,
+	fn: (input: { bundle: NormalizedGjcPluginBundle; source: GjcPluginRegistrySource }) => Promise<T>,
+): Promise<T> {
+	const resolved = await resolveSource(source);
+	try {
+		const bundle = await compileGjcPluginBundle(resolved.dir);
+		return await fn({ bundle, source: resolved.source });
+	} finally {
+		await resolved.cleanup();
+	}
+}
+
+/** Build the registry entry a candidate bundle would produce at a target path. */
+export function candidateRegistryEntry(
+	bundle: NormalizedGjcPluginBundle,
+	scope: GjcPluginScope,
+	cwd: string,
+	source: GjcPluginRegistrySource,
+	now: string,
+): GjcPluginRegistryEntry {
+	const finalDir = path.join(scopeRoot(scope, cwd), safeDirSegment(bundle.name));
+	return bundleToRegistryEntry(bundle, finalDir, scope, source, now);
+}
+
+/**
+ * True when a spec has the SHAPE of a GJC bundle source: a filesystem path, a
+ * git locator, or a tarball. This is a pure string test that never touches the
+ * filesystem or the network, so a deleted or unreachable source is still
+ * recognised as GJC-intent and can reach the lifecycle's typed refusal instead
+ * of falling through to npm.
+ *
+ * npm and marketplace specs are never path/git/tarball shaped, so this cleanly
+ * separates the two install worlds.
+ */
+export function isGjcPluginSourceShape(source: string): boolean {
+	if (looksLikeGit(source)) return true;
+	// Explicit path forms, POSIX and Windows.
+	const isPathShaped =
+		source.startsWith("/") ||
+		source.startsWith("./") ||
+		source.startsWith("../") ||
+		source.startsWith("~/") ||
+		source.startsWith(".\\") ||
+		source.startsWith("..\\") ||
+		/^[a-zA-Z]:[\\/]/.test(source) ||
+		source.startsWith("\\\\");
+	if (isPathShaped) return true;
+	// A tarball SUFFIX alone is not enough: npm package names may contain dots,
+	// so `foo.tgz` and `@scope/foo.tar.gz` are legal npm specs. Only claim an
+	// archive when the locator is also path- or URL-shaped.
+	return isTarball(source) && /^[a-z][a-z0-9+.-]*:\/\//i.test(source);
 }
 
 /** True only when the source actually resolves to a GJC plugin bundle (root gajae-plugin.json). */

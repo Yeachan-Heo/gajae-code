@@ -77,10 +77,7 @@ describe("toReviewFinding", () => {
 		expect(toReviewFinding({ ...base, priority: "P3" }).priority).toBe(3);
 	});
 
-	it("passes JTD validation against the reviewer agent's numeric priority schema (#1350)", () => {
-		// Mirrors the bundled reviewer agent's output schema. Before the fix the
-		// string priority from `report_finding` short-circuited every successful
-		// review run with `findings.0.priority: expected number, received string`.
+	it("supports explicitly caller-owned numeric findings in a declared reviewer schema", () => {
 		const reviewerSchema = {
 			properties: {
 				overall_correctness: { enum: ["correct", "incorrect"] },
@@ -117,10 +114,10 @@ describe("toReviewFinding", () => {
 						overall_correctness: "incorrect",
 						explanation: "Found one bug",
 						confidence: 0.9,
+						findings: [toReviewFinding({ ...base, priority: "P2" })],
 					},
 				},
 			],
-			reportFindings: [toReviewFinding({ ...base, priority: "P2" })],
 			outputSchema: reviewerSchema,
 		});
 

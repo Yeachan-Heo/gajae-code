@@ -44,6 +44,18 @@ Artifact types share this directory:
 - truncated tool output files: `<numericId>.<toolType>.log` (for `artifact://`)
 - subagent output files: `<outputId>.md` (for `agent://`)
 
+## Resident-text cache boundary (profile-local, not an artifact)
+
+Resident text that is externalized only to keep a live session's memory bounded is not a durable blob and is never part of a session artifact directory, copy manifest, fork, or move.
+
+On supported POSIX hosts, its private root is derived from the session destination's logical profile agent directory (`getResidentCacheRootDir(profileAgentDir)`). The default profile retains the normal XDG cache routing; SDK/custom profiles receive an isolated `<agentDir>/resident-cache` root. The cache-owned root and all active instance directories are owner-only and verified before use.
+
+Each disk-backed resident-store candidate receives a new `i-<nonce>` directory beneath that root. Before its first blob write, it receives a 0600 `owner.json` lease containing its owning PID, process start time (`startTimeMs` when obtainable), and nonce; the directory is 0700. `SessionManager` owns this directory through the resident-store transition seam: `#prepareResidentTextStoreTransition` creates and populates a candidate without changing the installed session, then `#commitResidentTextStoreTransition` swaps the completed store and disposes the predecessor last.
+
+Windows deliberately takes no disk-backed resident-cache path: it installs `MemoryBlobStore`, increments `residentCacheWin32FallbackCount`, and does not create the profile cache root or an instance directory.
+
+Opening a verified POSIX cache root schedules a fire-and-forget lease sweep. A pass re-verifies the root, examines at most 64 `i-*` siblings for no more than 250 ms, and only reaps a dead PID or a provably PID-reused lease. It re-reads the exact owner token before action, quarantine-renames the stale directory with a fresh nonce, then removes that quarantined tree with an `lstat`/no-follow walk so planted symlinks cannot escape the cache boundary.
+
 ## ID and name allocation schemes
 
 ## Blob IDs: content hash
@@ -221,10 +233,10 @@ The two systems intersect only indirectly (both reduce session JSONL bloat) but 
 
 ## Implementation files
 
-- [`src/session/blob-store.ts`](../packages/coding-agent/src/session/blob-store.ts) — blob reference format, hashing, put/get, externalize/resolve helpers.
+- [`src/session/blob-store.ts`](../packages/coding-agent/src/session/blob-store.ts) — blob references, verified resident-cache instance leases, bounded GC, hashing, put/get, and externalize/resolve helpers.
 - [`src/session/artifacts.ts`](../packages/coding-agent/src/session/artifacts.ts) — session artifact directory model and numeric artifact ID/path allocation.
 - [`src/session/streaming-output.ts`](../packages/coding-agent/src/session/streaming-output.ts) — `OutputSink` truncation/spill-to-file behavior and summary metadata.
-- [`src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts) — persistence transforms, blob rehydration on load, session fork/move interactions.
+- [`src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts) — persistence transforms, resident-store prepare/commit ownership, blob rehydration on load, and session fork/move interactions.
 - [`src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts) — artifact directory copy during interactive fork.
 - [`src/internal-urls/artifact-protocol.ts`](../packages/coding-agent/src/internal-urls/artifact-protocol.ts) — `artifact://` resolver.
 - [`src/internal-urls/agent-protocol.ts`](../packages/coding-agent/src/internal-urls/agent-protocol.ts) — `agent://` resolver + JSON extraction.

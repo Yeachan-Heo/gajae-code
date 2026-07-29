@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentContext } from "@gajae-code/agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -23,7 +22,7 @@ import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
  * at/above the threshold pruning may fire as part of context maintenance.
  */
 
-function assistantMessage(totalTokens: number): AssistantMessage {
+function assistantMessage(totalTokens: number, cacheRead = 0): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -34,7 +33,7 @@ function assistantMessage(totalTokens: number): AssistantMessage {
 		usage: {
 			input: totalTokens - 1000,
 			output: 1000,
-			cacheRead: 0,
+			cacheRead,
 			cacheWrite: 0,
 			totalTokens,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -60,13 +59,11 @@ describe("pruning cache-epoch invariant", () => {
 	let sessionManager: SessionManager;
 	let authStorage: AuthStorage;
 
-	async function createSession(): Promise<void> {
+	async function createSession(maintenancePruningEnabled = false): Promise<void> {
 		tempDir = TempDir.createSync("@pi-prune-epoch-");
 		// Extension short-circuits compaction so no LLM calls happen.
-		const extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
-		fs.mkdirSync(extensionsDir, { recursive: true });
-		const extensionPath = path.join(extensionsDir, "compaction-short-circuit.ts");
-		fs.writeFileSync(
+		const extensionPath = path.join(getProjectAgentDir(tempDir.path()), "extensions", "compaction-short-circuit.ts");
+		await Bun.write(
 			extensionPath,
 			[
 				"export default function(pi) {",
@@ -99,6 +96,7 @@ describe("pruning cache-epoch invariant", () => {
 				"compaction.autoContinue": false,
 				"contextPromotion.enabled": false,
 				"todo.reminders": false,
+				"compaction.maintenancePruningEnabled": maintenancePruningEnabled,
 			}),
 			modelRegistry,
 			extensionRunner,
@@ -113,17 +111,36 @@ describe("pruning cache-epoch invariant", () => {
 	});
 
 	function seedPrunableHistory(): void {
+		// Spread the output across three user turns: the newest two turns are
+		// protected by the recent-turn fence (protectRecentTurns=2), so the
+		// prunable mass must live in an older turn.
 		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
 		// ~75k tokens of toolResult output: well past the 40k protect window and
 		// 20k minimum-savings hysteresis, so pruning WOULD fire if invoked.
 		for (let i = 0; i < 25; i++) {
 			sessionManager.appendMessage(toolResultMessage(i, 12_000));
 		}
+		sessionManager.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		sessionManager.appendMessage(toolResultMessage(100, 100));
+		sessionManager.appendMessage({ role: "user", content: "latest", timestamp: Date.now() });
 	}
 
 	function seedSubMinimumPrunableHistory(): void {
 		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
 		for (let i = 0; i < 18; i++) sessionManager.appendMessage(toolResultMessage(i, 12_000));
+		sessionManager.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		sessionManager.appendMessage({ role: "user", content: "latest", timestamp: Date.now() });
+	}
+
+	function seedTransactionalPrunableHistory(): void {
+		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		// Candidates publish newest-to-oldest, so the small output publishes first
+		// and the BIG output's publication fails afterward (matched by payload size).
+		sessionManager.appendMessage(toolResultMessage(0, 24 * 12_000));
+		sessionManager.appendMessage(toolResultMessage(1, 12_000));
+		sessionManager.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		sessionManager.appendMessage(toolResultMessage(100, 200_000));
+		sessionManager.appendMessage({ role: "user", content: "latest", timestamp: Date.now() });
 	}
 
 	function prunedEntryCount(): number {
@@ -140,7 +157,7 @@ describe("pruning cache-epoch invariant", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
 		for (let i = 0; i < 20; i++) await Promise.resolve();
 		await session.waitForIdle();
-		await new Promise(resolve => setTimeout(resolve, 100));
+		await Bun.sleep(100);
 		await session.waitForIdle();
 	}
 
@@ -173,5 +190,91 @@ describe("pruning cache-epoch invariant", () => {
 		await driveTurnEnd(assistantMessage(188_000));
 		expect(prunedEntryCount()).toBeGreaterThan(0);
 		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
+	});
+
+	it("stages but does not commit maintenance pruning when artifact rollback drops savings below the cache-epoch cost", async () => {
+		await createSession(true);
+		seedTransactionalPrunableHistory();
+		const branchBefore = sessionManager.getBranch();
+		const branchBeforeJson = JSON.stringify(branchBefore);
+		await driveTurnEnd(assistantMessage(50_000, 30_000));
+
+		// Real artifact manager with a call-through spy: the small output publishes
+		// for real, then the BIG publish fails by payload size; when the gate
+		// rejects the staged prune the published artifact must be rolled back on disk.
+		const artifactManager = sessionManager.getArtifactManager();
+		if (!artifactManager) throw new Error("expected a managed artifact manager for this session");
+		const publish = artifactManager.publishNamedNoReplace.bind(artifactManager);
+		vi.spyOn(artifactManager, "publishNamedNoReplace").mockImplementation((filename, bytes) =>
+			bytes.byteLength > 100_000 ? Promise.reject(new Error("publish failed")) : publish(filename, bytes),
+		);
+		const applyMessageSpy = vi.spyOn(sessionManager, "applyEntryMessageUpdates");
+		const applyCustomSpy = vi.spyOn(sessionManager, "applyCustomMessageEntryUpdates");
+		const rewriteSpy = vi.spyOn(sessionManager, "rewriteEntries");
+		const replaceMessagesSpy = vi.spyOn(session.agent, "replaceMessages");
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+		await session.prompt("continue");
+
+		expect(prunedEntryCount()).toBe(0);
+		expect(JSON.stringify(sessionManager.getBranch().slice(0, branchBefore.length))).toBe(branchBeforeJson);
+		expect(notices.some(message => message.includes("Maintenance pruning skipped: actual savings"))).toBe(true);
+		// No canonical write-back or provider-context reset ran for the rejected prune.
+		expect(applyMessageSpy).not.toHaveBeenCalled();
+		expect(applyCustomSpy).not.toHaveBeenCalled();
+		expect(rewriteSpy).not.toHaveBeenCalled();
+		expect(replaceMessagesSpy).not.toHaveBeenCalled();
+		// The one successfully staged artifact publication was rolled back on disk.
+		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log"))).toEqual([]);
+	});
+
+	it("rolls back staged artifacts when pruning aborts during publication", async () => {
+		await createSession();
+		seedPrunableHistory();
+		const artifactManager = sessionManager.getArtifactManager();
+		if (!artifactManager) throw new Error("expected a managed artifact manager for this session");
+		const publish = artifactManager.publishNamedNoReplace.bind(artifactManager);
+		const abortController = new AbortController();
+		let aborted = false;
+		vi.spyOn(artifactManager, "publishNamedNoReplace").mockImplementation(async (filename, bytes) => {
+			await publish(filename, bytes);
+			if (!aborted) {
+				aborted = true;
+				abortController.abort();
+			}
+		});
+
+		const context: AgentContext = {
+			systemPrompt: session.state.systemPrompt,
+			messages: [...session.messages, assistantMessage(190_000)],
+			tools: [],
+		};
+		const result = await session.runMidRunMaintenanceForTests(context, {
+			signal: abortController.signal,
+			awaitEventDrain: async () => {},
+		});
+
+		expect(aborted).toBe(true);
+		expect(result).toBe("aborted");
+		expect(prunedEntryCount()).toBe(0);
+		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log"))).toEqual([]);
+	});
+
+	it("commits maintenance pruning when actual savings clear the cache-epoch cost", async () => {
+		await createSession(true);
+		seedTransactionalPrunableHistory();
+		await driveTurnEnd(assistantMessage(50_000, 0));
+
+		const artifactManager = sessionManager.getArtifactManager();
+		if (!artifactManager) throw new Error("expected a managed artifact manager for this session");
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		await session.prompt("continue");
+
+		expect(prunedEntryCount()).toBeGreaterThan(0);
+		// Committed prune keeps its published artifacts referenced.
+		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log")).length).toBeGreaterThan(0);
 	});
 });

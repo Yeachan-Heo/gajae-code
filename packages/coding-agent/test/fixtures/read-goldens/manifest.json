@@ -1,0 +1,345 @@
+[
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "summary-ts",
+    "request": { "path": "{FIXTURE}/summary.ts" },
+    "settings": { "read.summarize.enabled": true },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "range-50-200",
+    "request": { "path": "{FIXTURE}/prose.txt:50-200" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "range-50-plus-150",
+    "request": { "path": "{FIXTURE}/prose.txt:50+150" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "raw-small",
+    "request": { "path": "{FIXTURE}/raw-small.txt:raw" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "raw-range",
+    "request": { "path": "{FIXTURE}/prose.txt:2-4:raw" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "multi-range",
+    "request": { "path": "{FIXTURE}/prose.txt:5-16,60-73" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "conflicts-index",
+    "request": { "path": "{FIXTURE}/conflicts.txt:conflicts" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "out-of-bounds",
+    "request": { "path": "{FIXTURE}/ten-lines.txt:900-999" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "local-bare-head",
+    "request": { "path": "{FIXTURE}/prose.txt", "truncation": "head" },
+    "capturedAs": { "path": "{FIXTURE}/prose.txt" },
+    "settings": { "read.summarize.enabled": false, "read.truncation": "head" },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "url-page",
+    "request": { "path": "https://8.8.8.8/read-goldens" },
+    "settings": { "read.summarize.enabled": false, "fetch.enabled": true },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "dir-local",
+    "request": { "path": "{FIXTURE}/local-tree" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "dir-archive",
+    "request": { "path": "{FIXTURE}/bundle.tar.gz" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "markit-bare",
+    "request": { "path": "{FIXTURE}/markit.pdf" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "markit-ranged",
+    "request": { "path": "{FIXTURE}/markit.pdf:2-4" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "notebook-bare",
+    "request": { "path": "{FIXTURE}/notebook.ipynb" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "notebook-ranged",
+    "request": { "path": "{FIXTURE}/notebook.ipynb:2-6" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "internal-artifact",
+    "request": { "path": "artifact://0" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "internal-artifact-ranged",
+    "request": { "path": "artifact://0:2-4" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "sqlite-list",
+    "request": { "path": "{FIXTURE}/app.sqlite" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "sqlite-schema",
+    "request": { "path": "{FIXTURE}/app.sqlite:users" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "sqlite-row",
+    "request": { "path": "{FIXTURE}/app.sqlite:users:2" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "sqlite-query",
+    "request": { "path": "{FIXTURE}/app.sqlite:users?limit=2&offset=1" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "sqlite-raw",
+    "request": { "path": "{FIXTURE}/app.sqlite?q=SELECT+name+FROM+users+ORDER+BY+id" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "archive-member-ranged",
+    "request": { "path": "{FIXTURE}/bundle.tar.gz:docs/poem.txt:2-4" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "archive-large-ranged",
+    "request": { "path": "{FIXTURE}/bundle.tar.gz:docs/large-lines.txt:1-3200" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "archive-bytes-ranged",
+    "request": { "path": "{FIXTURE}/bundle.tar.gz:docs/bytes.txt:1-120" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "archive-dir-nested",
+    "request": { "path": "{FIXTURE}/bundle.tar.gz:nested" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "empty-file",
+    "request": { "path": "{FIXTURE}/empty.txt" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "invariant",
+    "phase": 0,
+    "name": "single-line-no-newline",
+    "request": { "path": "{FIXTURE}/single-line.txt" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "local-bare-tail",
+    "request": { "path": "{FIXTURE}/prose.txt" },
+
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "The default bare-read window changes from the first lines to the last lines."
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "archive-member-bare-tail",
+    "request": { "path": "{FIXTURE}/bundle.tar.gz:docs/large-lines.txt" },
+
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "Archive member bare reads adopt tail truncation and a new recovery footer."
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "acp-bare-parity",
+    "request": { "path": "{FIXTURE}/prose.txt" },
+
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "ACP-backed bare reads use the baseline 3000-line/50 KiB directional budget; disk receipts retain their 50-line/10 KiB budget."
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "local-bare-notice-owner",
+    "request": { "path": "{FIXTURE}/prose.txt" },
+
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "The wrapper no longer owns the bare-read truncation notice."
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "giant-single-line",
+    "request": { "path": "{FIXTURE}/giant-single-line.txt" },
+
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "A 6000-emoji single line changes to a tail snippet instead of a head snippet."
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "local-bare-both",
+    "request": { "path": "{FIXTURE}/prose.txt", "truncation": "both" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "Bare reads gain the new both-direction truncation mode."
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "giant-last-partial",
+    "request": { "path": "{FIXTURE}/giant-single-line.txt", "truncation": "last" },
+
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "Tail-partial mode changes oversized single-line output semantics."
+  },
+  {
+    "bucket": "changed",
+    "phase": 1,
+    "name": "range-tail",
+    "request": { "path": "{FIXTURE}/range-tail.txt:1-120", "truncation": "last" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false],
+    "reason": "An explicit range with truncation=last retains the end of the selected window."
+  },
+  {
+    "bucket": "surface",
+    "phase": 1,
+    "name": "prompt-read-default",
+    "request": { "path": "{FIXTURE}/prose.txt" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "surface",
+    "phase": 1,
+    "name": "prompt-read-head",
+    "request": { "path": "{FIXTURE}/prose.txt", "truncation": "head" },
+    "settings": { "read.summarize.enabled": false, "read.truncation": "head" },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "surface",
+    "phase": 1,
+    "name": "docs-read-flow-line",
+    "request": { "path": "{FIXTURE}/docs-read-flow.md:50" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  },
+  {
+    "bucket": "surface",
+    "phase": 1,
+    "name": "cli-read-help",
+    "request": { "path": "{FIXTURE}/cli-read-help.txt" },
+    "settings": { "read.summarize.enabled": false },
+    "hashLines": [true, false]
+  }
+]

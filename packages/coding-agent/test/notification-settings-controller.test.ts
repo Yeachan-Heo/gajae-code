@@ -6,6 +6,7 @@ import type { CasReceipt } from "@gajae-code/coding-agent/config/atomic-yaml-pat
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import type {
 	NotificationsEditorOperations,
+	NotificationsEditorPreferences,
 	NotificationsEditorState,
 	NotificationsMutationResult,
 	NotificationsPreflightResult,
@@ -52,6 +53,7 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 		telegram: {
 			botToken: "stored-token",
 			chatId: "stored-chat",
+			sound: "important",
 			rich: { enabled: true },
 			btw: { enabled: true },
 			richDraft: { enabled: false },
@@ -153,6 +155,7 @@ function editorState(): NotificationsEditorState {
 			richDraftEnabled: false,
 			toolActivityEnabled: true,
 			streamingEnabled: true,
+			sound: "all",
 		},
 	};
 }
@@ -161,6 +164,7 @@ function selectorOperations(
 	input: {
 		preflight?: (signal: AbortSignal) => Promise<NotificationsPreflightResult>;
 		enableGlobally?: () => Promise<NotificationsMutationResult>;
+		commitPreferences?: (preferences: NotificationsEditorPreferences) => Promise<NotificationsMutationResult>;
 	} = {},
 ): NotificationsEditorOperations {
 	return {
@@ -179,7 +183,8 @@ function selectorOperations(
 		disableGlobally: async () => ({ message: "disabled" }),
 		removeTelegram: async () => ({ message: "removed" }),
 		setSessionLocal: async () => sessionResult(),
-		commitPreferences: async () => ({ message: "saved" }),
+		commitPreferences: async preferences =>
+			await (input.commitPreferences?.(preferences) ?? Promise.resolve({ message: "saved" })),
 		reconcileCurrentSession: async () => sessionResult(),
 	};
 }
@@ -201,6 +206,18 @@ function selector(operations: NotificationsEditorOperations): SettingsSelectorCo
 function selectNotifications(component: SettingsSelectorComponent): void {
 	// SETTING_TABS: appearance(0)…providers(8), notifications(9) — advance to the last tab.
 	for (let index = 0; index < 9; index += 1) component.handleInput("\t");
+}
+function selectActionWithDescription(component: SettingsSelectorComponent, description: string): void {
+	for (let index = 0; index < 20; index += 1) {
+		if (component.render(120).join("\n").includes(description)) return;
+		component.handleInput("\x1b[B");
+	}
+	throw new Error(`Could not select notification action: ${description}`);
+}
+
+function activateActionWithDescription(component: SettingsSelectorComponent, description: string): void {
+	selectActionWithDescription(component, description);
+	component.handleInput("\n");
 }
 
 beforeAll(async () => {
@@ -487,11 +504,13 @@ describe("notification settings controller adapter", () => {
 			richDraftEnabled: true,
 			toolActivityEnabled: false,
 			streamingEnabled: false,
+			sound: "none",
 		});
 		expect(batches.at(-1)).toEqual([
 			{ path: "notifications.redact", op: "set", value: true },
 			{ path: "notifications.verbosity", op: "set", value: "verbose" },
 			{ path: "notifications.sessionScope", op: "set", value: "primary" },
+			{ path: "notifications.telegram.sound", op: "set", value: "none" },
 			{ path: "notifications.telegram.rich.enabled", op: "set", value: false },
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.streaming.enabled", op: "set", value: false },
@@ -546,6 +565,7 @@ describe("notification settings controller adapter", () => {
 		await expect(
 			operations.commitPreferences({
 				redact: true,
+				sound: "all",
 				verbosity: "verbose",
 				sessionScope: "primary",
 				richEnabled: false,
@@ -585,6 +605,7 @@ describe("notification settings controller adapter", () => {
 		await expect(
 			operations.commitPreferences({
 				redact: true,
+				sound: "all",
 				verbosity: "verbose",
 				sessionScope: "primary",
 				richEnabled: false,
@@ -845,5 +866,33 @@ describe("notification settings selector lifecycle", () => {
 		gate.resolve({ message: "enabled" });
 		await flush();
 		component.dispose();
+	});
+	it("cycles and persists the Telegram sound preference", async () => {
+		const commits: NotificationsEditorPreferences[] = [];
+		const component = selector(
+			selectorOperations({
+				commitPreferences: async preferences => {
+					commits.push(preferences);
+					return { message: "saved" };
+				},
+			}),
+		);
+		selectNotifications(component);
+		await flush();
+
+		activateActionWithDescription(component, "Draft safe scalar preferences, then save them atomically.");
+		selectActionWithDescription(component, "Cycle between all, important, and none notification sounds.");
+		expect(component.render(120).join("\n")).toContain("Telegram notification sound: all");
+
+		component.handleInput("\n");
+		expect(component.render(120).join("\n")).toContain("Telegram notification sound: important");
+		component.handleInput("\n");
+		expect(component.render(120).join("\n")).toContain("Telegram notification sound: none");
+
+		activateActionWithDescription(component, "Atomically persist this preference draft.");
+		await flush();
+
+		expect(commits).toHaveLength(1);
+		expect(commits[0]?.sound).toBe("none");
 	});
 });

@@ -75,6 +75,7 @@ const STARTUP_TIMEOUT_GRACE_MS = 500;
  * budget derived from the readiness deadline (see `maxStartupTimeoutMs`).
  */
 const MAX_STARTUP_TIMEOUT_MS = 1_750;
+const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
 
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
 	const ceiling =
@@ -86,6 +87,17 @@ export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTi
 		.filter((timeout): timeout is number => typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0);
 	if (configuredTimeouts.length === 0) return STARTUP_TIMEOUT_MS;
 	return Math.min(ceiling, Math.max(STARTUP_TIMEOUT_MS, Math.max(...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS));
+}
+
+export function resolveExactConfigStartupTimeoutMs(configs: MCPServerConfig[]): number {
+	const effectiveTimeouts = configs.map(config => {
+		const timeout = config.timeout;
+		return typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0
+			? timeout
+			: DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS;
+	});
+	if (effectiveTimeouts.length === 0) return STARTUP_TIMEOUT_MS;
+	return Math.max(...effectiveTimeouts) + STARTUP_TIMEOUT_GRACE_MS;
 }
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
@@ -650,10 +662,13 @@ export class MCPManager {
 		}
 
 		if (connectionTasks.length > 0) {
-			const startupTimeoutMs = resolveStartupTimeoutMs(
-				connectionTasks.map(task => task.config),
-				this.#maxStartupTimeoutMs,
-			);
+			const configs = connectionTasks.map(task => task.config);
+			// An exact config is explicit operator intent, so its declared connection
+			// windows govern startup. Ordinary discovery keeps the short ceiling.
+			const startupTimeoutMs =
+				this.#toolsOnly && this.#maxStartupTimeoutMs === undefined
+					? resolveExactConfigStartupTimeoutMs(configs)
+					: resolveStartupTimeoutMs(configs, this.#maxStartupTimeoutMs);
 			const firstUnexpectedFailure = Promise.withResolvers<{ reason: unknown }>();
 			if (this.#toolsOnly) {
 				for (const task of connectionTasks) {

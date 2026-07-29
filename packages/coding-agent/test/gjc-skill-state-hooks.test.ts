@@ -192,6 +192,31 @@ describe("GJC native skill-state hooks", () => {
 				status: "passed",
 				evidence: "full verification reran cleanly after the implementation pass",
 				fullRerun: true,
+				reviewCohort: {
+					reviewGeneration: 1,
+					sourceHash: "sha256:test-frozen-source",
+					joined: true,
+					lanes: {
+						cleaner: {
+							status: "passed",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "cleaner clean",
+							blockers: [],
+						},
+						architect: {
+							status: "CLEAR",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "architect clear",
+							blockers: [],
+						},
+						qa: {
+							status: "passed",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "qa passed",
+							blockers: [],
+						},
+					},
+				},
 				rerunCommands: ["bun test:e2e", "bun test:red-team"],
 				blockers: [],
 			},

@@ -12,7 +12,6 @@ This document describes how `crates/pi-natives` schedules native work and how ca
 - `crates/pi-natives/src/shell.rs`
 - `crates/pi-natives/src/pty.rs`
 - `crates/pi-natives/src/html.rs`
-- `crates/pi-natives/src/image.rs`
 - `crates/pi-natives/src/clipboard.rs`
 - `crates/pi-natives/src/text.rs`
 - `crates/pi-natives/src/ps.rs`
@@ -84,10 +83,9 @@ Behavior:
 | `executeShell(options, onChunk?)`       | `execute_shell`                      | `task::future(env, "shell.execute", ...)`                      | same cancel race and 2s graceful window                                                  |
 | `PtySession#start(options, onChunk?)`   | `PtySession::start`                  | `task::future(env, "pty.start", ...)` + inner `spawn_blocking` | `CancelToken` checked in sync PTY loop via `heartbeat()`                                 |
 | `htmlToMarkdown(html, options?)`        | `html_to_markdown`                   | `task::blocking("html_to_markdown", (), ...)`                  | none (`()` token)                                                                        |
-| `PhotonImage.parse/encode/resize`       | `PhotonImage::{parse,encode,resize}` | `task::blocking(...)`                                          | none (`()` token)                                                                        |
 | `readImageFromClipboard()`              | `read_image_from_clipboard`          | `task::blocking("clipboard.read_image", (), ...)`              | none (`()` token)                                                                        |
 
-`text.rs`, `tokens.rs`, `keys.rs`, most `ps.rs` functions, and synchronous utility exports do not use `task::blocking`/`task::future` and therefore do not participate in this cancellation path.
+`text.rs`, `keys.rs`, most `ps.rs` functions, and synchronous utility exports do not use `task::blocking`/`task::future` and therefore do not participate in this cancellation path.
 
 ## Cancellation lifecycle and state transitions
 

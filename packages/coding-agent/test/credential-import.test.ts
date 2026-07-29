@@ -333,6 +333,98 @@ describe("discoverExternalCredentials", () => {
 		const result = await discover();
 		expect(result.skipped[0]!.reason).toBe("malformed credential file (SyntaxError)");
 	});
+
+	// Claude Code and Codex both relocate their own credential file through the
+	// environment, and Orca-style account switchers rely on that redirect. gjc
+	// used to read `~/.claude` / `~/.codex` unconditionally, so it imported the
+	// wrong account whenever the launching shell selected another one.
+	describe("relocated external CLI config roots", () => {
+		let redirectDir = "";
+
+		beforeEach(async () => {
+			redirectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cred-redirect-"));
+		});
+
+		afterEach(async () => {
+			await fs.rm(redirectDir, { recursive: true, force: true });
+		});
+
+		test("CLAUDE_CONFIG_DIR redirects Claude discovery", async () => {
+			await writeClaude({ claudeAiOauth: { accessToken: "sk-ant-oat01-home-account", refreshToken: "r" } });
+			await fs.writeFile(path.join(redirectDir, ".credentials.json"), JSON.stringify(validClaude));
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CLAUDE_CONFIG_DIR: redirectDir },
+			});
+			expect(result.importable).toHaveLength(1);
+			const cred = result.importable[0]!;
+			expect(cred.origin).toBe("claude-code-file");
+			expect(cred.credential.type === "oauth" && cred.credential.access).toBe(CLAUDE_ACCESS);
+			expect(cred.source).toBe("Claude Code ($CLAUDE_CONFIG_DIR/.credentials.json)");
+			expect(cred.source).not.toContain(redirectDir);
+		});
+
+		test("CODEX_HOME redirects Codex discovery", async () => {
+			await writeCodex({ tokens: { access_token: "stale", refresh_token: "stale-refresh" } });
+			await fs.writeFile(path.join(redirectDir, "auth.json"), JSON.stringify(validCodexOAuth));
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: redirectDir },
+			});
+			const codex = result.importable.find(c => c.origin === "codex-file");
+			expect(codex).toBeDefined();
+			expect(codex!.credential.type === "oauth" && codex!.credential.refresh).toBe(CODEX_REFRESH);
+			expect(codex!.source).toBe("Codex CLI ($CODEX_HOME/auth.json)");
+			expect(codex!.source).not.toContain(redirectDir);
+		});
+
+		test("an unreadable redirected root is reported without the resolved path", async () => {
+			// A directory where the credential file is expected keeps read() from
+			// returning ENOENT, so the failure reaches `skipped`.
+			await fs.mkdir(path.join(redirectDir, "auth.json"), { recursive: true });
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: redirectDir },
+			});
+			expect(result.skipped).toHaveLength(1);
+			expect(result.skipped[0]!.source).toBe("Codex CLI ($CODEX_HOME/auth.json)");
+			expect(result.skipped[0]!.reason).not.toContain(redirectDir);
+		});
+
+		test.each([
+			["relative", "relative/codex-home"],
+			["blank", "   "],
+			["empty", ""],
+		])("a %s CODEX_HOME falls back to the home default", async (_label, value) => {
+			await writeCodex(validCodexOAuth);
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: value },
+			});
+			const codex = result.importable.find(c => c.origin === "codex-file");
+			expect(codex).toBeDefined();
+			expect(codex!.source).toBe("Codex CLI (~/.codex/auth.json)");
+		});
+
+		test("explicit options win over the environment", async () => {
+			await fs.mkdir(path.join(redirectDir, "codex"), { recursive: true });
+			await fs.writeFile(path.join(redirectDir, "codex", "auth.json"), JSON.stringify(validCodexOAuth));
+			await writeCodex({ tokens: { access_token: "stale", refresh_token: "stale-refresh" } });
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: path.join(redirectDir, "missing") },
+				codexHome: path.join(redirectDir, "codex"),
+			});
+			const codex = result.importable.find(c => c.origin === "codex-file");
+			expect(codex).toBeDefined();
+			expect(codex!.credential.type === "oauth" && codex!.credential.refresh).toBe(CODEX_REFRESH);
+		});
+	});
 });
 
 describe("importCredentials", () => {

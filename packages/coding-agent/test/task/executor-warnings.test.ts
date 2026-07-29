@@ -55,6 +55,22 @@ describe("subagent warning injection", () => {
 		expect(result.rawOutput.includes("SYSTEM WARNING")).toBe(false);
 	});
 
+	it("recovers strict JTD fallback data without synthesizing findings", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: '{"data":{"accepted":true}}',
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: undefined,
+			outputSchema: { properties: { accepted: { type: "boolean" } } },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toBe("");
+		expect(JSON.parse(result.rawOutput)).toEqual({ accepted: true });
+	});
+
 	it("prefixes missing-submit warning on stop outputs", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "agent stopped after writing analysis",
@@ -118,6 +134,41 @@ describe("subagent warning injection", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.stderr).toBe("");
 		expect(result.rawOutput.includes("SYSTEM WARNING")).toBe(false);
+	});
+
+	it("validates strict reviewer output without synthesizing findings", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "ignored",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [
+				{
+					status: "success",
+					data: {
+						overall_correctness: "incorrect",
+						explanation: "Found one bug",
+						confidence: 0.9,
+					},
+				},
+			],
+			outputSchema: {
+				properties: {
+					overall_correctness: { enum: ["correct", "incorrect"] },
+					explanation: { type: "string" },
+					confidence: { type: "float64" },
+				},
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toBe("");
+		expect(JSON.parse(result.rawOutput)).toEqual({
+			overall_correctness: "incorrect",
+			explanation: "Found one bug",
+			confidence: 0.9,
+		});
 	});
 
 	it("rejects placeholder yield data that points at omitted message body", () => {
@@ -206,7 +257,7 @@ describe("subagent warning injection", () => {
 	});
 
 	describe("rejected payload persistence", () => {
-		function rejectedEnvelope(result: ReturnType<typeof finalizeSubprocessOutput>) {
+		function rejectedEnvelope(result: { rawOutput: string }) {
 			return JSON.parse(result.rawOutput) as { error: string; data: unknown };
 		}
 
@@ -250,7 +301,7 @@ describe("subagent warning injection", () => {
 			expect(result.rawOutput).toContain("REJECTED-PAYLOAD-TAIL-SENTINEL");
 		});
 
-		it("preserves long findings in explicit yields, fallback completions, and placeholder rejections", () => {
+		it("keeps rejected caller data complete without injecting wrapper findings into fallback output", () => {
 			const data = {
 				findings: Array.from({ length: 20 }, (_, index) => ({
 					title: `finding ${index}`,
@@ -284,7 +335,6 @@ describe("subagent warning injection", () => {
 				doneAborted: false,
 				signalAborted: false,
 				yieldItems: undefined,
-				reportFindings: data.findings,
 				outputSchema: { ...invalidSchema, additionalProperties: false },
 			});
 			const placeholder = finalizeSubprocessOutput({
@@ -297,13 +347,15 @@ describe("subagent warning injection", () => {
 				outputSchema: undefined,
 			});
 
-			for (const result of [explicit, fallback, placeholder]) {
+			for (const result of [explicit, placeholder]) {
 				expect(result.exitCode).toBe(1);
 				expect(result.rawOutput).toContain("LONG-FINDINGS-TAIL-SENTINEL");
 			}
 			expect(rejectedEnvelope(explicit).data).toEqual(data);
-			expect(rejectedEnvelope(fallback).data).toEqual({ accepted: true, findings: data.findings });
 			expect(rejectedEnvelope(placeholder).data).toEqual({ ...data, plan_markdown: placeholderPlanText });
+			expect(fallback.exitCode).toBe(0);
+			expect(JSON.parse(fallback.rawOutput)).toEqual({ accepted: true });
+			expect(fallback.rawOutput).not.toContain("LONG-FINDINGS-TAIL-SENTINEL");
 		});
 
 		it("preserves rejected data when the output schema itself is invalid", () => {

@@ -1,11 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.12.0] - 2026-07-28
 ### Fixed
 
 - `SdkClient` no longer drops a `server_hello`/`hello` frame that arrives while the transport is still in the `opening` phase. Early hellos are buffered and applied when the open handler advances to `hello`, preventing load-raced `protocol_error` / failed query connects (CI AD-L-G02 flake).
-
-## [0.11.11] - 2026-07-26
 
 ## [0.11.0] - 2026-07-15
 

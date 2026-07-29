@@ -69,7 +69,7 @@ On macOS, Option+Q queues a message for the next turn; on native Windows termina
 
 When messages are queued, use Option+Up/Down on macOS (Alt+Up/Down on Windows) to open the queue and select a message. In the queue, Return edits the selected message, Forward Delete (`⌦`; Fn+Delete on compact Mac keyboards) removes it, Control+Up/Down reorders it within its delivery group, and Escape closes the queue. Reordering does not convert compaction, steer, and follow-up messages into one another.
 
-In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcript viewport instead of browsing prompt history; use `Up` / `Down` or `Ctrl+R` for prompt history. Autocomplete and selector surfaces still use `PageUp` / `PageDown` for list paging while they have focus.
+In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcript lane instead of browsing prompt history; the status line and composer remain fixed at the bottom while manually scrolled. When GJC owns mouse input (`mouse.enabled: true`), the wheel moves the transcript by three rows per notch. Ordinary typing or paste keeps editor focus and returns to live output before editing; use `Up` / `Down` or `Ctrl+R` for prompt history. Autocomplete and selector surfaces still use `PageUp` / `PageDown` for list paging while they have focus.
 
 ## Auditing default-key collisions
 

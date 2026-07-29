@@ -162,6 +162,7 @@ process.exitCode = await child.exited;`;
 			"migrate",
 			"rlm",
 			"update",
+			"read",
 			"plugin",
 			"completion",
 			"launch",

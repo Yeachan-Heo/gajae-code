@@ -188,15 +188,13 @@ export interface SubmitReviewDetails {
 // Re-export types for external use
 export type { ReportFindingDetails };
 /**
- * Coerce a tool-side `ReportFindingDetails` into the cross-boundary
- * `ReviewFinding` shape consumed by the reviewer agent's JTD output schema.
+ * Convert tool-side `ReportFindingDetails` into the numeric-priority
+ * `ReviewFinding` shape used by caller-owned reviewer payloads.
  *
  * The `report_finding` tool exposes `priority` as a string enum (`"P0".."P3"`)
- * for ergonomics, but the bundled reviewer schema (and every custom review
- * agent that mirrors it) declares `priority: number`. Without this coercion
- * the auto-populated `findings[]` fails JTD validation and every review run
- * that surfaces a finding is rejected with `findings.0.priority: expected
- * number, received string`.
+ * for ergonomics, while reviewer schemas may explicitly declare numeric
+ * priorities. This pure conversion does not add findings to completion data;
+ * callers that include `findings` own both that field and its output schema.
  */
 export function toReviewFinding(details: ReportFindingDetails): ReviewFinding {
 	return {

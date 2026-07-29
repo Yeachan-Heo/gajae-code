@@ -7,7 +7,19 @@
 import { APP_NAME, getProjectDir } from "@gajae-code/utils";
 import chalk from "chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
-import { installGjcPluginBundle, isGjcPluginBundleSource, readRegistry } from "../extensibility/gjc-plugins";
+import {
+	applyGjcBundleUpdate,
+	bundleIdentity,
+	type GjcBundleIdentity,
+	type GjcBundleSummary,
+	GjcPluginLoadError,
+	getGjcBundle,
+	installGjcBundle,
+	isGjcPluginBundleSource,
+	isGjcPluginSourceShape,
+	listGjcBundles,
+	previewGjcBundleUpdate,
+} from "../extensibility/gjc-plugins";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
 import {
 	getInstalledPluginsRegistryPath,
@@ -312,9 +324,118 @@ async function handleDiscover(args: string[], _flags: PluginCommandArgs["flags"]
 	}
 }
 
+/**
+ * Scope-qualified GJC bundle upgrade: re-resolve the stored source, review the
+ * candidate, then apply it as a compare-and-swap. `--dry-run` stops after the
+ * preview. Requires exactly one of `--user` / `--project` because (scope, name)
+ * is the canonical target.
+ */
+async function handleGjcUpgrade(name: string, flags: PluginCommandArgs["flags"]): Promise<void> {
+	if (flags.user === flags.project) {
+		console.error(chalk.red(`GJC bundle upgrade requires exactly one of --user or --project for "${name}".`));
+		process.exit(1);
+	}
+	const scope: "user" | "project" = flags.user ? "user" : "project";
+	const ctx = { cwd: getProjectDir() };
+	const identity = bundleIdentity(scope, name);
+
+	const emitError = (error: { code: string; message: string; recovery?: string }): never => {
+		if (flags.json) console.log(JSON.stringify({ error }, null, 2));
+		else {
+			console.error(chalk.red(`${theme.status.error} ${error.message}`));
+			if (error.recovery) console.error(chalk.dim(`  Try: ${error.recovery}`));
+		}
+		process.exit(3);
+	};
+
+	// Source re-resolution can throw with a cause carrying the raw locator, so
+	// the whole flow reports a stable code instead of the underlying error.
+	try {
+		await runGjcUpgrade(ctx, identity, name, scope, flags, emitError);
+	} catch (err) {
+		const reason = err instanceof GjcPluginLoadError ? err.code : "upgrade_failed";
+		console.error(chalk.red(`${theme.status.error} Failed to upgrade GJC bundle ${name} (${reason})`));
+		process.exit(1);
+	}
+}
+
+async function runGjcUpgrade(
+	ctx: { cwd: string },
+	identity: GjcBundleIdentity,
+	name: string,
+	scope: "user" | "project",
+	flags: PluginCommandArgs["flags"],
+	emitError: (error: { code: string; message: string; recovery?: string }) => never,
+): Promise<void> {
+	const preview = await previewGjcBundleUpdate(ctx, identity);
+	if (!preview.ok) emitError(preview.error);
+	else if (flags.dryRun || !preview.value.changed) {
+		const { changed, candidateVersion, addedSurfaceIds, removedSurfaceIds } = preview.value;
+		if (flags.json) {
+			console.log(
+				JSON.stringify(
+					{
+						status: changed ? "update-available" : "up-to-date",
+						identity,
+						currentVersion: preview.value.current.version,
+						candidateVersion,
+						addedSurfaceIds,
+						removedSurfaceIds,
+					},
+					null,
+					2,
+				),
+			);
+		} else if (!changed) {
+			console.log(chalk.dim(`GJC bundle ${name} (${scope}) is up to date at ${preview.value.current.version}`));
+		} else {
+			console.log(
+				chalk.cyan(`[dry-run] ${name} (${scope}): ${preview.value.current.version} -> ${candidateVersion}`),
+			);
+			if (addedSurfaceIds.length > 0) console.log(chalk.dim(`  + ${addedSurfaceIds.join(", ")}`));
+			if (removedSurfaceIds.length > 0) console.log(chalk.dim(`  - ${removedSurfaceIds.join(", ")}`));
+		}
+	} else {
+		const applied = await applyGjcBundleUpdate(ctx, preview.value.token);
+		if (!applied.ok) emitError(applied.error);
+		else if (flags.json) {
+			console.log(
+				JSON.stringify(
+					{
+						status: applied.value.status,
+						bundle: applied.value.summary,
+						remnantCount: applied.value.remnantCount,
+					},
+					null,
+					2,
+				),
+			);
+		} else {
+			console.log(
+				chalk.green(
+					`${theme.status.success} ${applied.value.status} GJC bundle ${name}@${applied.value.summary.version} (${scope})`,
+				),
+			);
+			if (applied.value.remnantCount > 0) {
+				console.error(chalk.yellow(`  ${applied.value.remnantCount} leftover directory could not be removed`));
+			}
+		}
+	}
+}
+
 async function handleUpgrade(args: string[], flags: PluginCommandArgs["flags"]): Promise<void> {
-	const manager = await makeMarketplaceManager();
 	const pluginId = args[0];
+	// Scope-qualified GJC bundles upgrade through the lifecycle service, never
+	// through the marketplace manager.
+	if (pluginId && (flags.user || flags.project)) {
+		const scope: "user" | "project" = flags.user ? "user" : "project";
+		const existing = await getGjcBundle({ cwd: getProjectDir() }, bundleIdentity(scope, pluginId));
+		if (existing.ok) {
+			await handleGjcUpgrade(pluginId, flags);
+			return;
+		}
+	}
+	const manager = await makeMarketplaceManager();
 	try {
 		if (pluginId) {
 			if (flags.scope) {
@@ -349,6 +470,15 @@ async function handleUpgrade(args: string[], flags: PluginCommandArgs["flags"]):
 	}
 }
 
+/**
+ * Stable, non-identifying reason for an install failure. The raw spec and the
+ * underlying cause can both carry credentials, a query string, or an absolute
+ * home path, so neither is ever printed.
+ */
+function describeInstallFailure(error: unknown): string {
+	return error instanceof GjcPluginLoadError ? error.code : "install_failed";
+}
+
 async function handleInstall(
 	manager: PluginManager,
 	packages: string[],
@@ -374,27 +504,52 @@ async function handleInstall(
 	const knownMarketplaces = new Set((await mktMgr.listMarketplaces()).map(m => m.name));
 
 	for (const spec of packages) {
-		// GJC plugin bundle classifier: a source containing gajae-plugin.json (or a
-		// git/tarball source) routes to the bundle installer BEFORE marketplace/npm.
-		if (await isGjcPluginBundleSource(spec)) {
+		// A GJC bundle is identified by the SHAPE of its source: a filesystem path,
+		// a git locator, or a tarball. npm and marketplace specs are never any of
+		// those, so shape alone separates the two worlds without resolving.
+		//
+		// Shape is checked BEFORE `isGjcPluginBundleSource`, which resolves the
+		// source: a deleted or unreachable GJC source fails that probe and would
+		// otherwise fall through to npm, losing the create-only refusal the
+		// lifecycle owes for an already-installed target.
+		if (isGjcPluginSourceShape(spec) || (await isGjcPluginBundleSource(spec))) {
 			if (flags.user === flags.project) {
 				console.error(
-					chalk.red(`GJC plugin bundle install requires exactly one of --user or --project for "${spec}".`),
+					// The spec can carry credentials or an absolute home path, so name
+					// the missing flag instead of echoing it back.
+					chalk.red("GJC plugin bundle install requires exactly one of --user or --project."),
 				);
 				process.exit(1);
 			}
 			const scope: "user" | "project" = flags.user ? "user" : "project";
 			try {
-				const res = await installGjcPluginBundle(spec, { scope, cwd: process.cwd(), force: flags.force });
+				const res = await installGjcBundle({ cwd: getProjectDir() }, scope, spec);
+				if (!res.ok) {
+					const doc = {
+						error: { code: res.error.code, message: res.error.message, recovery: res.error.recovery },
+					};
+					if (flags.json) console.log(JSON.stringify(doc, null, 2));
+					else {
+						console.error(chalk.red(`${theme.status.error} ${res.error.message}`));
+						if (res.error.recovery) console.error(chalk.dim(`  Try: ${res.error.recovery}`));
+					}
+					process.exit(3);
+				}
+				const { summary } = res.value;
 				if (flags.json) {
-					console.log(JSON.stringify({ name: res.entry.name, status: res.status, scope }, null, 2));
+					console.log(JSON.stringify({ status: res.value.status, bundle: summary }, null, 2));
 				} else {
 					console.log(
-						chalk.green(`${theme.status.success} ${res.status} GJC plugin ${res.entry.name} (${scope})`),
+						chalk.green(
+							`${theme.status.success} installed GJC plugin ${summary.identity.name}@${summary.version} (${scope})`,
+						),
 					);
 				}
 			} catch (err) {
-				console.error(chalk.red(`${theme.status.error} Failed to install GJC plugin ${spec}: ${err}`));
+				// Never echo the raw spec or the underlying cause: either can carry
+				// credentials, a query string, or an absolute home path.
+				const reason = err instanceof GjcPluginLoadError ? err.code : "install_failed";
+				console.error(chalk.red(`${theme.status.error} Failed to install GJC bundle (${reason})`));
 				process.exit(1);
 			}
 			continue;
@@ -414,7 +569,9 @@ async function handleInstall(
 					),
 				);
 			} catch (err) {
-				console.error(chalk.red(`${theme.status.error} Failed to install ${spec}: ${err}`));
+				// The spec can carry credentials, a query string, or an absolute home
+				// path, so report the failure without echoing it or the raw cause.
+				console.error(chalk.red(`${theme.status.error} Failed to install plugin (${describeInstallFailure(err)})`));
 				process.exit(1);
 			}
 			continue;
@@ -449,7 +606,9 @@ async function handleInstall(
 				}
 			}
 		} catch (err) {
-			console.error(chalk.red(`${theme.status.error} Failed to install ${spec}: ${err}`));
+			// The spec can carry credentials, a query string, or an absolute home
+			// path, so report the failure without echoing it or the raw cause.
+			console.error(chalk.red(`${theme.status.error} Failed to install plugin (${describeInstallFailure(err)})`));
 			process.exit(1);
 		}
 	}
@@ -503,8 +662,7 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 	const mktMgr = await makeMarketplaceManager();
 	const mktPlugins = await mktMgr.listInstalledPlugins();
 	const cwd = getProjectDir();
-	const [gjcUser, gjcProject] = await Promise.all([readRegistry("user", cwd), readRegistry("project", cwd)]);
-	const gjcBundles = [...gjcUser.plugins, ...gjcProject.plugins];
+	const gjcBundles: GjcBundleSummary[] = await listGjcBundles({ cwd });
 
 	if (flags.json) {
 		console.log(JSON.stringify({ npm: npmPlugins, marketplace: mktPlugins, gjc: gjcBundles }, null, 2));
@@ -559,9 +717,9 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 		console.log(chalk.bold("GJC Plugin Bundles:\n"));
 		for (const plugin of gjcBundles) {
 			const status = plugin.enabled ? chalk.green(theme.status.enabled) : chalk.dim(theme.status.disabled);
-			const scopeLabel = chalk.dim(` (${plugin.scope})`);
-			const disabledCount = plugin.disabledSurfaceIds.length;
-			const quarantineCount = plugin.quarantine?.length ?? 0;
+			const scopeLabel = chalk.dim(` (${plugin.identity.scope})`);
+			const disabledCount = plugin.surfaces.filter(s => !s.enabled).length;
+			const quarantineCount = plugin.surfaces.filter(s => s.quarantined).length;
 			const detail = [
 				disabledCount > 0 ? `${disabledCount} disabled` : null,
 				quarantineCount > 0 ? `${quarantineCount} quarantined` : null,
@@ -569,7 +727,7 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 				.filter((v): v is string => Boolean(v))
 				.join(", ");
 			console.log(
-				`${status} ${plugin.name}@${plugin.version}${scopeLabel}${detail ? chalk.dim(` — ${detail}`) : ""}`,
+				`${status} ${plugin.identity.name}@${plugin.version}${scopeLabel}${detail ? chalk.dim(` — ${detail}`) : ""}`,
 			);
 		}
 	}

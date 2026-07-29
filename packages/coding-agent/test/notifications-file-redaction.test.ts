@@ -24,7 +24,7 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 }
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
-type Frame = { type: string; redact?: boolean };
+type Frame = { type: string; redact?: boolean; name?: string; mime?: string };
 
 const cleanupRoots: FixtureRootCleanup[] = [];
 const openSockets: WebSocket[] = [];
@@ -121,6 +121,31 @@ function expectRedactionBlocked(result: { ok: boolean; error?: string }) {
 	expect(result.ok).toBe(false);
 	expect(result.error).toContain("redaction is on");
 }
+
+test("telegram file sink routes image files through image attachments", async () => {
+	await withNotifications(async () => {
+		const harness = await createHarness(false);
+		const { frames } = await startAndConnect(harness);
+		const imagePath = path.join(harness.cwd, "image.webp");
+		fs.writeFileSync(imagePath, "WEBP");
+
+		const sink = getTelegramFileSink(harness.sid);
+		expect(sink).toBeDefined();
+		const result = await sink!({ path: imagePath, mime: "image/webp" });
+
+		expect(result.ok).toBe(true);
+		await waitFor(
+			() => frames.some(frame => frame.type === "image_attachment" && frame.mime === "image/webp"),
+			3000,
+			"WebP image attachment",
+		);
+		expect(frames.find(frame => frame.type === "image_attachment")).toMatchObject({
+			mime: "image/webp",
+		});
+
+		await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+	});
+}, 20000);
 
 test("runtime redaction blocks telegram_send file attachments before reading or forwarding", async () => {
 	await withNotifications(async () => {

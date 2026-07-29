@@ -124,6 +124,77 @@ fn renameat2_no_replace(
 }
 
 #[cfg(target_os = "linux")]
+/// Errno values proving the filesystem does not implement `renameat2` rename
+/// flags, rather than reporting a malformed request. NFS (and some FUSE and
+/// overlay backends) reject every `renameat2` flag with `EINVAL`, and kernels
+/// older than 3.15 answer `ENOSYS`. The no-replace syscall always passes fixed,
+/// validated descriptors, names, and the single `RENAME_NOREPLACE` flag, so
+/// neither errno can mean an invalid invocation here — only that the atomic
+/// primitive is unavailable on this mount.
+const fn rename_flags_unsupported(errno: Option<i32>) -> bool {
+	matches!(errno, Some(libc::EINVAL | libc::ENOSYS))
+}
+
+#[cfg(target_os = "linux")]
+/// Atomic no-overwrite publish of a regular file for filesystems that do not
+/// implement `renameat2(RENAME_NOREPLACE)`. `linkat(2)` fails with `EEXIST`
+/// when the destination name already exists, giving the identical no-overwrite
+/// guarantee on every POSIX filesystem (including NFS); the fallback therefore
+/// preserves — never weakens — no-replace authority. The staging source link is
+/// then removed so the destination is the sole link, matching a successful
+/// rename (`st_nlink == 1`).
+fn linkat_no_replace(
+	source_parent: &File,
+	source_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+) -> std::io::Result<()> {
+	// SAFETY: both parents own valid fds and both names are live NUL-terminated
+	// strings for this syscall; flags are 0, so a symlink source is linked as-is.
+	let linked = unsafe {
+		libc::linkat(
+			source_parent.as_raw_fd(),
+			source_name.as_ptr(),
+			destination_parent.as_raw_fd(),
+			destination_name.as_ptr(),
+			0,
+		)
+	};
+	if linked != 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	// SAFETY: the source parent fd and name remain valid; the destination now
+	// owns an independent hard link to the same inode.
+	let unlinked = unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name.as_ptr(), 0) };
+	if unlinked != 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// No-overwrite publish of a regular file. Prefers the atomic
+/// `renameat2(RENAME_NOREPLACE)` primitive and falls back to `linkat(2)` when
+/// the filesystem does not implement rename flags (see
+/// `rename_flags_unsupported`). Directory publishes must not use this helper:
+/// `linkat` cannot hard-link a directory, so tree renames keep calling
+/// `renameat2_no_replace` directly.
+fn rename_file_no_replace(
+	source_parent: &File,
+	source_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+) -> std::io::Result<()> {
+	match renameat2_no_replace(source_parent, source_name, destination_parent, destination_name) {
+		Ok(()) => Ok(()),
+		Err(error) if rename_flags_unsupported(error.raw_os_error()) => {
+			linkat_no_replace(source_parent, source_name, destination_parent, destination_name)
+		},
+		Err(error) => Err(error),
+	}
+}
+
+#[cfg(target_os = "linux")]
 fn sync_parent(parent: &File) -> std::io::Result<()> {
 	#[cfg(test)]
 	if let Some(code) = take_retained_publish_fault(false) {
@@ -1753,15 +1824,15 @@ fn rename_managed_file_no_replace_inner(
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
 	let result =
-		renameat2_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
+		rename_file_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
 	if let Err(error) = result {
 		return Err(
 			match error.raw_os_error() {
 				Some(libc::EEXIST) => "already_exists",
 				Some(libc::ENOSYS) => "atomic_unavailable",
-				// The retained syscall uses fixed, validated descriptors, names, and flags.
-				// EINVAL still cannot prove that this filesystem lacks RENAME_NOREPLACE;
-				// retain it as an invalid request rather than weakening no-overwrite authority.
+				// renameat2 rename flags are unavailable on this filesystem and the
+				// linkat(2) fallback in rename_file_no_replace also failed, so classify
+				// the residual errno instead of weakening no-overwrite authority.
 				Some(libc::EINVAL) => "invalid_request",
 				Some(libc::EXDEV) => "cross_device",
 				Some(libc::EACCES | libc::EPERM) => "permission_denied",
@@ -1832,7 +1903,6 @@ fn remove_managed(
 	expected_ctime_ns: &str,
 	expected_sha256: &str,
 ) -> Result<RecoveryFsRetainedCleanupResult, &'static str> {
-	use std::os::fd::AsRawFd;
 	let (source_parent, name) = open_parent(root, relative_path)?;
 	let authorized = open_existing(root, relative_path, false)?;
 	if !same_expected(
@@ -1854,20 +1924,12 @@ fn remove_managed(
 	))
 	.map_err(|_| "io_error")?;
 	let recovery_parent = recovery_directory(root, recovery)?;
-	// SAFETY: parent is retained, names are validated, and quarantine rename is
-	// no-replace atomic.
-	if unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			source_parent.as_raw_fd(),
-			name.as_ptr(),
-			recovery_parent.as_raw_fd(),
-			quarantine.as_ptr(),
-			libc::RENAME_NOREPLACE,
-		)
-	} != 0
+	// The parent is retained, the names are validated, and the quarantine publish
+	// is atomic no-replace: renameat2(RENAME_NOREPLACE) where supported, else a
+	// linkat(2) fallback for filesystems (e.g. NFS) that reject rename flags.
+	if let Err(error) = rename_file_no_replace(&source_parent, &name, &recovery_parent, &quarantine)
 	{
-		return Err(match std::io::Error::last_os_error().raw_os_error() {
+		return Err(match error.raw_os_error() {
 			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
 			_ => "io_error",
 		});
@@ -2164,7 +2226,7 @@ fn install_inner(
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
 	let result =
-		renameat2_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
+		rename_file_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
 	if let Err(error) = result {
 		return Err(
 			match error.raw_os_error() {
@@ -3031,5 +3093,144 @@ mod tests {
 			second.join().expect("second install thread"),
 			(Some(libc::EACCES), b"second".to_vec())
 		);
+	}
+
+	#[test]
+	fn rename_flags_unsupported_classifies_only_the_missing_primitive_errnos() {
+		assert!(rename_flags_unsupported(Some(libc::EINVAL)));
+		assert!(rename_flags_unsupported(Some(libc::ENOSYS)));
+		assert!(!rename_flags_unsupported(Some(libc::EEXIST)));
+		assert!(!rename_flags_unsupported(Some(libc::EXDEV)));
+		assert!(!rename_flags_unsupported(Some(libc::EACCES)));
+		assert!(!rename_flags_unsupported(None));
+	}
+
+	#[test]
+	fn file_publish_falls_back_to_linkat_when_rename_flags_unsupported() {
+		for unsupported in [libc::EINVAL, libc::ENOSYS] {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			ensure_managed_directory(&root, "source-parent").expect("create source parent");
+			ensure_managed_directory(&root, "destination-parent").expect("create destination parent");
+			let contents = b"nfs-published-binding";
+			let identity = managed_file(&root, "source-parent/source", contents);
+			// Force the renameat2(RENAME_NOREPLACE) primitive to report the flag as
+			// unavailable, exactly as an NFS mount does with EINVAL.
+			set_retained_publish_faults([RetainedPublishFault::Rename(unsupported)]);
+			let result = rename_managed_file_no_replace(
+				&root,
+				"source-parent/source",
+				"destination-parent/destination",
+				&identity.dev,
+				&identity.ino,
+				&identity.size,
+				&identity.mtime_ns,
+				&identity.ctime_ns,
+				&file_digest(contents),
+			);
+			assert!(
+				result.ok,
+				"linkat fallback must publish (errno {unsupported}): {:?}",
+				result.code
+			);
+			assert!(
+				!temporary.0.join("source-parent/source").exists(),
+				"staging source is removed after the link fallback"
+			);
+			assert_eq!(
+				fs::read(temporary.0.join("destination-parent/destination"))
+					.expect("published destination"),
+				contents
+			);
+			let published = fs::metadata(temporary.0.join("destination-parent/destination"))
+				.expect("published destination metadata");
+			assert_eq!(
+				std::os::unix::fs::MetadataExt::nlink(&published),
+				1,
+				"published file is single-linked, matching a rename"
+			);
+		}
+	}
+
+	#[test]
+	fn linkat_fallback_still_refuses_to_overwrite_an_existing_destination() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		ensure_managed_directory(&root, "source-parent").expect("create source parent");
+		ensure_managed_directory(&root, "destination-parent").expect("create destination parent");
+		let contents = b"candidate";
+		let identity = managed_file(&root, "source-parent/source", contents);
+		// A distinct committed transcript already owns the destination name.
+		fs::write(temporary.0.join("destination-parent/destination"), b"committed")
+			.expect("seed committed destination");
+		set_retained_publish_faults([RetainedPublishFault::Rename(libc::EINVAL)]);
+		let result = rename_managed_file_no_replace(
+			&root,
+			"source-parent/source",
+			"destination-parent/destination",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(contents),
+		);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("already_exists"));
+		assert_eq!(result.reason, "destination_exists");
+		assert_eq!(result.mutation_state, "not_committed");
+		// Neither the staging source nor the committed destination is disturbed.
+		assert_eq!(
+			fs::read(temporary.0.join("source-parent/source")).expect("source retained"),
+			contents
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("destination-parent/destination"))
+				.expect("committed destination untouched"),
+			b"committed"
+		);
+	}
+
+	/// Opt-in check that the `linkat(2)` no-replace fallback is atomic on a real
+	/// filesystem whose `renameat2` rejects `RENAME_NOREPLACE` (e.g. an `NFSv4`
+	/// home directory). Point `GJC_TEST_NFS_DIR` at a writable directory on such
+	/// a mount. Exercises the raw fallback helper directly so it is independent
+	/// of the owner-only ACL probe.
+	#[test]
+	fn linkat_no_replace_is_atomic_on_a_real_filesystem() {
+		let Some(base) = std::env::var_os("GJC_TEST_NFS_DIR") else {
+			return;
+		};
+		let dir = PathBuf::from(base).join(format!(
+			"pi-recovery-fs-linkat-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("clock before epoch")
+				.as_nanos(),
+		));
+		fs::create_dir(&dir).expect("create real-filesystem test root");
+		let parent = File::open(&dir).expect("open real-filesystem root");
+		let source_name = CString::new("source").expect("source name");
+		let destination_name = CString::new("destination").expect("destination name");
+
+		fs::write(dir.join("source"), b"payload").expect("seed source");
+		linkat_no_replace(&parent, &source_name, &parent, &destination_name)
+			.expect("link publish on the real filesystem");
+		assert_eq!(fs::read(dir.join("destination")).expect("published destination"), b"payload");
+		assert!(!dir.join("source").exists(), "staging source removed after publish");
+
+		fs::write(dir.join("collision"), b"other").expect("seed collision source");
+		let collision_name = CString::new("collision").expect("collision name");
+		let error = linkat_no_replace(&parent, &collision_name, &parent, &destination_name)
+			.expect_err("no-replace must refuse an existing destination");
+		assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+		assert!(dir.join("collision").exists(), "source is untouched on collision");
+		assert_eq!(
+			fs::read(dir.join("destination")).expect("destination unchanged on collision"),
+			b"payload"
+		);
+
+		let _ = fs::remove_dir_all(&dir);
 	}
 }

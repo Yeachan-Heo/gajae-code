@@ -79,6 +79,7 @@ function state(): NotificationsEditorState {
 			richDraftEnabled: false,
 			toolActivityEnabled: true,
 			streamingEnabled: true,
+			sound: "all",
 		},
 		health: health(),
 	};
@@ -310,7 +311,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("Telegram streaming: on");
 		component.handleInput("\n"); // streaming off in the editor-only preference draft
 		expect(render(component)).toContain("Telegram streaming: off");
-		select(component, 1);
+		select(component, 2);
 		component.handleInput("\n");
 		await flush();
 		expect(operations.committedPreferences).toEqual([
@@ -322,6 +323,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 				richDraftEnabled: false,
 				toolActivityEnabled: true,
 				streamingEnabled: false,
+				sound: "all",
 			},
 		]);
 	});

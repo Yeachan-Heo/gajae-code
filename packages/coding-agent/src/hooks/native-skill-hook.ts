@@ -1,6 +1,6 @@
 import { appendFile, mkdir, stat } from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, getConfigDirName } from "@gajae-code/utils";
 import { YAML } from "bun";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
@@ -153,11 +153,24 @@ async function readRawConfig(filePath: string): Promise<Record<string, unknown> 
 	}
 }
 
+/**
+ * Config files that decide skill discovery, resolved through the trusted helpers.
+ *
+ * These paths pick the `config.yml` whose `skills.customDirectories` the agent
+ * then loads skills from, so the directory they are built from is a trust
+ * boundary. Bun loads `cwd/.env` into `process.env` before any module runs, so
+ * reading `GJC_CODING_AGENT_DIR` / `GJC_CONFIG_DIR` directly let a repository
+ * point this at a directory it ships and inject its own skill directories.
+ *
+ * `getAgentDir()` and `getConfigDirName()` apply the escalation guards that
+ * already exist for exactly this (`trustedAgentDirOverride`,
+ * `trustedConfigDirName`), and resolve to the same locations this used to build
+ * by hand: `dirs.agentDir` is `path.join(os.homedir(), getConfigDirName(), "agent")`
+ * when no trusted override is present.
+ */
 function resolveConfigPaths(cwd: string, override?: string[]): string[] {
 	if (override) return override;
-	const configDirName = process.env.GJC_CONFIG_DIR ?? process.env.PI_CONFIG_DIR ?? ".gjc";
-	const userAgentDir = process.env.GJC_CODING_AGENT_DIR ?? path.join(os.homedir(), configDirName, "agent");
-	return [path.join(userAgentDir, "config.yml"), path.join(cwd, configDirName, "config.yml")];
+	return [path.join(getAgentDir(), "config.yml"), path.join(cwd, getConfigDirName(), "config.yml")];
 }
 
 async function resolveEffectiveSkillConfig(

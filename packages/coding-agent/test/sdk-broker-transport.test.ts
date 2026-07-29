@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { brokerShutdownSendAction } from "../src/sdk/broker/transport";
 
 async function nextFrame(ws: WebSocket): Promise<Record<string, unknown>> {
 	return await new Promise((resolve, reject) => {
@@ -41,6 +42,11 @@ async function connect(url: string): Promise<WebSocket> {
 	return ws;
 }
 describe("SDK broker WebSocket transport", () => {
+	it("fails closed for dropped shutdown acknowledgements and waits for backpressure drain", () => {
+		expect(brokerShutdownSendAction(0)).toBe("dropped");
+		expect(brokerShutdownSendAction(-1)).toBe("wait_for_drain");
+		expect(brokerShutdownSendAction(1)).toBe("close");
+	});
 	it("uses Rust-compatible request and response frames", async () => {
 		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-transport-"));
 		const broker = new Broker({ agentDir, packageGeneration: "test" });
@@ -91,6 +97,24 @@ describe("SDK broker WebSocket transport", () => {
 		} finally {
 			await broker.stop();
 		}
+	});
+	it("accepts authenticated shutdown and removes discovery before completion", async () => {
+		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-shutdown-"));
+		const broker = new Broker({ agentDir, packageGeneration: "test" });
+		const discovery = await broker.start();
+
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		expect(await nextFrame(ws)).toEqual({ type: "broker_hello", protocolVersion: 3 });
+		ws.send(JSON.stringify({ type: "broker_request", id: "shutdown", operation: "broker.shutdown", input: {} }));
+		expect(await nextFrame(ws)).toEqual({
+			type: "broker_response",
+			id: "shutdown",
+			ok: true,
+			result: { accepted: true },
+		});
+
+		await broker.completion;
+		expect(await Bun.file(path.join(agentDir, "sdk", "broker.json")).exists()).toBe(false);
 	});
 	it("rejects oversized frames without disrupting other authenticated clients", async () => {
 		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-transport-"));

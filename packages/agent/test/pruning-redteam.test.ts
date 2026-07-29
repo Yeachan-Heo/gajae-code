@@ -206,6 +206,44 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		}
 		expect(result.prunedEntries.every(entry => textOf(entry).startsWith("[Output truncated - "))).toBe(true);
 	});
+
+	test("captures originals and appends artifact references to pruning notices", () => {
+		const output = toolEntry("artifact", "edit", textForTokens("artifact", 80));
+		const originalText = textOf(output);
+		const originalTokens = tokens(output);
+
+		const result = pruneToolOutputs([output], config(), {
+			artifactRefMaxChars: 64,
+			artifactRef: candidate => {
+				expect(candidate).toEqual({
+					entryId: "artifact",
+					toolName: "edit",
+					originalText,
+					tokens: originalTokens,
+					complete: true,
+				});
+
+				return "artifact://12";
+			},
+		});
+
+		expect(result.originals).toEqual([
+			{ entryId: "artifact", toolName: "edit", originalText, tokens: originalTokens, complete: true },
+		]);
+
+		expect(textOf(output)).toBe(`[Output truncated - ${originalTokens} tokens; full output: artifact://12]`);
+	});
+
+	test("error-first digest retains the error before a long tail", () => {
+		const failure = toolEntry("long-tail", "bash", `command failed\n${"tail ".repeat(200)}`);
+		(failure.message as ToolResultMessage).isError = true;
+		(failure.message as ToolResultMessage & { details: { exitCode: number } }).details = { exitCode: 1 };
+
+		pruneToolOutputs([failure], config());
+		const notice = textOf(failure);
+		expect(notice).toContain("exit=1; error=command failed");
+		expect(notice).toContain("tail=");
+	});
 	test("pruned error results preserve actionable evidence for non-digested tools", () => {
 		const failure = toolEntry(
 			"edit-failure",
@@ -287,7 +325,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 
 			const result = pruneToolOutputs([failure], config({ minimumSavings: 0 }));
 
-			expect(result).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
+			expect(result).toEqual({ prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] });
 			expect(textOf(failure)).toBe(text);
 			expect(tokens(failure)).toBe(beforeTokens);
 			expect((failure.message as ToolResultMessage).prunedAt).toBeUndefined();
@@ -339,7 +377,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		expect(textOf(search)).toContain("error=error: engine failed");
 	});
 
-	test("multi-block results keep first-text evidence and exact whole-entry savings", () => {
+	test("multi-block results retain error evidence and complete text captures", () => {
 		const failure = toolEntry("multi-block", "edit", "placeholder");
 		failure.message = {
 			...(failure.message as ToolResultMessage),
@@ -351,15 +389,16 @@ describe("pruneToolOutputs red-team boundaries", () => {
 			],
 		};
 		const beforeTokens = tokens(failure);
-		const firstTextLength = (
-			(failure.message as ToolResultMessage).content as Array<{ type: string; text?: string }>
-		).find(block => block.type === "text")?.text?.length;
+		const originalText = [`Patch failed.\n${textForTokens("first-text", 40)}`, textForTokens("later-text", 80)].join(
+			"\n",
+		);
 
 		const result = pruneToolOutputs([failure], config({ minimumSavings: 0 }));
 
 		expect(result.prunedEntries).toEqual([failure]);
 		expect(textOf(failure)).toContain("error=Patch failed.");
-		expect(textOf(failure).length).toBeLessThanOrEqual(firstTextLength ?? 0);
+		expect(result.originals[0]).toMatchObject({ originalText, complete: false });
+
 		expect(result.tokensSaved).toBe(beforeTokens - tokens(failure));
 
 		const emptyFirst = toolEntry("empty-first", "edit", "placeholder");
@@ -371,15 +410,68 @@ describe("pruneToolOutputs red-team boundaries", () => {
 				{ type: "text", text: textForTokens("later-error", 80) },
 			],
 		};
-		const emptyFirstContent = (emptyFirst.message as ToolResultMessage).content;
-		const excluded = pruneToolOutputs([emptyFirst], config({ minimumSavings: 0 }));
-		expect(excluded).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
-		expect((emptyFirst.message as ToolResultMessage).content).toEqual(emptyFirstContent);
-		expect((emptyFirst.message as ToolResultMessage).prunedAt).toBeUndefined();
+		const laterText = textForTokens("later-error", 80);
+		const pruned = pruneToolOutputs([emptyFirst], config({ minimumSavings: 0 }));
+		expect(pruned.prunedEntries).toEqual([emptyFirst]);
+		expect(pruned.originals[0]).toMatchObject({ originalText: `\n${laterText}`, complete: true });
+		expect(textOf(emptyFirst)).toContain("error=later-error-0");
+		expect((emptyFirst.message as ToolResultMessage).prunedAt).toBeNumber();
 	});
 
+	test("captures all text blocks for complete tool results", () => {
+		const output = toolEntry("all-text", "edit", "placeholder");
+		(output.message as ToolResultMessage).content = [
+			{ type: "text", text: textForTokens("first", 40) },
+			{ type: "text", text: textForTokens("second", 40) },
+		];
+		const originalText = (output.message as ToolResultMessage).content
+			.filter((block): block is { type: "text"; text: string } => block.type === "text")
+			.map(block => block.text)
+			.join("\n");
+
+		const result = pruneToolOutputs([output], config(), {
+			artifactRefMaxChars: 64,
+			artifactRef: () => "artifact://13",
+		});
+
+		expect(result.originals).toHaveLength(1);
+		expect(result.originals[0]).toMatchObject({ originalText, complete: true });
+		expect(textOf(output)).toContain("full output: artifact://13");
+	});
+
+	test("does not publish incomplete multi-modal tool results as artifacts", () => {
+		const output = toolEntry("mixed", "edit", "placeholder");
+		(output.message as ToolResultMessage).content = [
+			{ type: "text", text: textForTokens("before-image", 40) },
+			{ type: "image", data: "a".repeat(400), mimeType: "image/png" },
+			{ type: "text", text: textForTokens("after-image", 40) },
+		];
+		let artifactCalls = 0;
+
+		const result = pruneToolOutputs([output], config(), {
+			artifactRefMaxChars: 64,
+			artifactRef: () => {
+				artifactCalls++;
+				return "artifact://must-not-publish";
+			},
+		});
+
+		expect(artifactCalls).toBe(0);
+		expect(result.originals).toHaveLength(1);
+		expect(result.originals[0]).toMatchObject({
+			originalText: `${textForTokens("before-image", 40)}\n${textForTokens("after-image", 40)}`,
+			complete: false,
+		});
+		expect(textOf(output)).not.toContain("full output:");
+		expect(textOf(output)).toStartWith("[Output truncated - ");
+	});
 	test("adversarial inputs: empty entries, non-messages, empty content, zero thresholds, and duplicate outputs", () => {
-		expect(pruneToolOutputs([], config())).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
+		expect(pruneToolOutputs([], config())).toEqual({
+			prunedCount: 0,
+			tokensSaved: 0,
+			originals: [],
+			prunedEntries: [],
+		});
 
 		const empty = toolEntry("empty", "bash", "");
 		const duplicateA = toolEntry("dup-a", "bash", textForTokens("duplicate", 40));
@@ -414,7 +506,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		];
 
 		const second = pruneToolOutputs(entries, config({ protectTokens: tokens(newest), minimumSavings: 0 }));
-		expect(second).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
+		expect(second).toEqual({ prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] });
 		expect((old.message as ToolResultMessage).prunedAt).toBeNumber();
 	});
 });

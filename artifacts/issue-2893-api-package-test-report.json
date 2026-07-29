@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "issue": 2893,
+  "branch": "fix/issue-2893-review-findings-contract",
+  "implementationBase": "dfe8285c0563e51a2745c67dbc37b2ebd93582f4",
+  "verification": [
+    {
+      "command": "bun test packages/coding-agent/test/task/executor-review-findings.test.ts packages/coding-agent/test/task/executor-warnings.test.ts packages/coding-agent/test/task/receipt.test.ts packages/coding-agent/test/tools/review.test.ts",
+      "result": "52 pass, 0 fail, 223 expect calls"
+    },
+    {
+      "command": "bun test packages/coding-agent/test/task packages/coding-agent/test/tools/review.test.ts",
+      "result": "306 pass, 0 fail, 958 expect calls"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run check",
+      "result": "Biome checked 2477 files with no fixes; TypeScript noEmit passed"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run build",
+      "result": "compiled packages/coding-agent/dist/gjc successfully",
+      "binarySha256": "152fe9d249a58f430d0eba7f65fb665c794a01122804b69b2c4d22b5cb772202"
+    }
+  ],
+  "compiledDogfood": {
+    "mode": "json",
+    "sessionId": "019face3-1558-7000-bc5f-9a50350bc99c",
+    "taskId": "0-ReviewFixture",
+    "model": "layofflabs/gpt-5.6-luna",
+    "taskTranscript": "/tmp/gjc-2893-dogfood-019fac2e/run8.jsonl",
+    "taskTranscriptSha256": "a9b56b4a41bb7b15338b68db6ef933af716195dd9ce6f309a9ffa025ae1a65fc",
+    "resolverTranscript": "/tmp/gjc-2893-dogfood-019fac2e/run9.jsonl",
+    "resolverTranscriptSha256": "4240b9681705b2a9549b3554e568345ecfd94d665f3ef320f8656ec4336bbf16",
+    "callerOutput": {
+      "uri": "agent://0-ReviewFixture",
+      "sizeBytes": 162,
+      "sha256": "08ebe1acab26dd689141f0ad42e77aff204c1ade8b5c43e4452d2c5e262b3d41",
+      "contract": "exact strict three-field completion; no findings field"
+    },
+    "reviewEvidence": {
+      "uri": "artifact://0",
+      "sizeBytes": 461,
+      "sha256": "77fdeb2d8cb28f8d92591d6f8fdf1d34cca387507accd78194f3b242b7f68c71",
+      "contract": "version 1 review-findings payload; taskId 0-ReviewFixture; findingCount 1; full finding retained"
+    },
+    "resolverResult": "compiled read resolved both internal URIs from the resumed session"
+  },
+  "boundedSuiteAttribution": {
+    "fullCodingAgentSuite": "not used as a green gate because unrelated replay/midrun/sdk-host tests timed out at fixed 5 second limits under full-suite contention",
+    "q17Branch": "1 pass, 74 filtered, 0 fail in 2.33s",
+    "q17CurrentDev": "1 pass, 74 filtered, 0 fail in 3.03s at origin/dev 27e26c2e9ccbb464f2fade636692efbff4de594f",
+    "conclusion": "Q17 timeout is baseline/contention, not caused by issue #2893"
+  }
+}

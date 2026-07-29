@@ -8,7 +8,13 @@
  * - Interact with the user via UI primitives
  */
 
-import type { AgentMessage, AgentToolResult, AgentToolUpdateCallback, ThinkingLevel } from "@gajae-code/agent-core";
+import type {
+	AgentMessage,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	RunSettlementProof,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
 import type {
 	Api,
@@ -38,6 +44,7 @@ import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
 import type {
+	ClientBridge,
 	ClientBridgePermissionOption,
 	ClientBridgePermissionOutcome,
 	ClientBridgePermissionToolCall,
@@ -355,8 +362,12 @@ export interface ExtensionContext {
 	model: Model | undefined;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
+	/** Stable resource ownership identifier for the active prompt run. */
+	getActivePromptHandle(): string | undefined;
 	/** Abort the current agent operation */
 	abort(): void;
+	/** Abort and prove whether resources for a specific prompt settled. */
+	abortPromptAndWait?(handle: string, options: { graceMs: number }): Promise<RunSettlementProof>;
 	/** Whether there are queued messages waiting */
 	hasPendingMessages(): boolean;
 	/** Typed pending-message counts per queue (steering, follow-up, next-turn). */
@@ -416,6 +427,8 @@ export interface ExtensionContext {
 			  ) => Promise<ClientBridgePermissionOutcome>)
 			| undefined,
 	): void;
+	/** Install a client bridge backed by a live SDK reverse provider lease. */
+	setSdkClientBridge?(bridge: ClientBridge | undefined): void;
 	/** Names of session SDK seams actually installed by the active runtime. */
 	sdkBindings?(): readonly string[];
 
@@ -1436,7 +1449,10 @@ export interface ExtensionActions {
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
+	/** Stable resource ownership identifier for the active prompt run. */
+	getActivePromptHandle?: () => string | undefined;
 	abort: () => void;
+	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 	hasPendingMessages: () => boolean;
 	/** Typed pending-message counts per queue; optional for embedders without a counted queue. */
 	getPendingMessageCounts?: () => { steering: number; followUp: number; nextTurn: number };
@@ -1484,6 +1500,7 @@ export interface ExtensionContextActions {
 			  ) => Promise<ClientBridgePermissionOutcome>)
 			| undefined,
 	) => void;
+	setSdkClientBridge?: (bridge: ClientBridge | undefined) => void;
 	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
 	invokeSkill?: (
 		name: string,

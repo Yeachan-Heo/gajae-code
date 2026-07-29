@@ -19,8 +19,13 @@ Most runtime lookups use `$env` from `@gajae-code/utils` (`packages/utils/src/en
 3. Agent `.env` (`~/.gjc/agent/.env`, respecting `GJC_CONFIG_DIR` / `GJC_CODING_AGENT_DIR`) for keys not already set
 4. Config-root `.env` (`~/.gjc/.env`, respecting `GJC_CONFIG_DIR`) for keys not already set
 5. Home `.env` (`~/.env`) for keys not already set
+6. Login shell rc files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.bash_profile`, `~/.bashrc`) for keys not already set
 
-Additional rule inside each `.env` file: `GJC_*` keys are mirrored to `GJC_*` keys in that parsed file.
+Step 6 does not execute those files. Each is scanned line by line for literal `export NAME=value` or `NAME=value` assignments, and surrounding quotes are stripped. Values that are not literal are dropped rather than resolved: a command substitution such as `export FOO=$(...)` is discarded.
+
+Because the scan is per line and has no notion of shell block structure, it does not reflect whether an assignment would actually run. An assignment nested in an `if` or a function body is read exactly like a top-level one, so a value you guarded behind something like `if [ -n "$CI" ]` in `~/.zshrc` still reaches `$env` unconditionally. Only assignments that do not start their own line — for example one packed after `case ... in` on the same line — are missed.
+
+Keys are used exactly as written. A `PI_`-prefixed key in a `.env` file is not mirrored to its `GJC_` counterpart, or the reverse — where both spellings are accepted it is because the reading code asks for both names.
 
 ---
 
@@ -106,6 +111,17 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 | Variable                      | Used for                                          | Required when  | Notes / precedence                                                                                                                                                                                                                                                                                            |
 | ----------------------------- | ------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GJC_CREDENTIAL_RANKING_MODE` | Multi-account OAuth credential selection strategy | Never (opt-in) | `balanced` (default) prefers the least-drained account (spreads load, keeps burst headroom). `earliest-reset` prefers the soonest-to-reset non-blocked account (earliest-expiry-first) so perishable tumbling-window quota (e.g. Claude 5h/7d) is drained before reset. Unset/unknown → `balanced`. Only affects session-start ranking; blocked/exhausted accounts still sort last. |
+
+### External CLI credential import roots
+
+`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code and Codex CLI credentials on disk. Both CLIs relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. This is what makes an account selected by an external account switcher (which launches the shell with these variables set) the account gjc imports.
+
+| Variable             | Used for                                                              | Required when                                        | Notes / precedence                                                                                                                                     |
+| -------------------- | --------------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLAUDE_CONFIG_DIR`  | Directory holding Claude Code's `.credentials.json`                   | Claude Code's config root is not `~/.claude`         | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.claude`.                 |
+| `CODEX_HOME`         | Directory holding Codex CLI's `auth.json`                             | Codex CLI's home is not `~/.codex`                   | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.codex`.                  |
+
+Redacted summaries name the variable (`Claude Code ($CLAUDE_CONFIG_DIR/.credentials.json)`), never the resolved path. macOS Keychain discovery is unaffected: it is still only consulted when no credential file is found.
 
 ---
 
@@ -243,7 +259,7 @@ providers:
 
 This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support is disabled by default, so the host terminal or tmux retains wheel and selection behavior. Add `set -g mouse on` to your own `~/.tmux.conf` when you want tmux copy-mode scrolling.
 
-Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling. When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release.
+Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release.
 
 | Variable | Behavior |
 | --- | --- |
@@ -274,7 +290,7 @@ GJC does not currently expose a supported `GJC_TMUX_NAMESPACE` runtime knob or p
 
 GJC's SGR mouse support is disabled by default, so tmux or Windows Terminal retains wheel ownership. In a GJC-managed tmux session, the default profile's `mouse on` enters tmux copy-mode and scrolls pane history.
 
-Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewport, including inside `gjc --tmux`. Set `GJC_MOUSE=off` as well as leaving GJC mouse support disabled to skip tmux mouse capture and let Windows Terminal handle its native scrollback. Keyboard fallback for tmux copy-mode remains `Ctrl-b [`, followed by `PgUp`/arrows; press `q` to exit.
+Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewport three rows at a time, including inside `gjc --tmux`. PageUp/PageDown page the visible transcript lane, moving by its height minus one row. Set `GJC_MOUSE=off` as well as leaving GJC mouse support disabled to skip tmux mouse capture and let Windows Terminal handle its native scrollback. Keyboard fallback for tmux copy-mode remains `Ctrl-b [`, followed by `PgUp`/arrows; press `q` to exit.
 
 ### Team tmux backend, dry-run, and state paths
 
@@ -290,7 +306,7 @@ Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewpor
 | `GJC_TEAM_WORKER_CLI` | Team worker CLI selector; accepted values are `auto` or `gjc` |
 | `GJC_TEAM_WORKER_CLI_MAP` | Comma-separated worker CLI selector map; entries must be `auto` or `gjc` |
 | `GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS` | Default-off stalled-worker continuation for the mutating `gjc team monitor` path; only exact value `1` enables it. A nudge is fenced to a running non-dry-run team, stale heartbeat, live recorded non-leader pane in the recorded tmux target, a proven-absent shutdown authority record, `ready`/`working` lifecycle with a valid non-terminal worker status, one current matching in-progress claim, and a lease that covers the hold. Valid-present or invalid/unreadable shutdown authority vetoes continuation but does not suppress normal stale-claim recovery. It uses at most two immutable journaled attempts (30s, then 120s) and fails closed on restart/unknown outcome. It sends a fixed prompt only to that pane on verified native tmux transport; psmux and native Windows send-keys fallback transports record a skipped outcome and send no continuation input. It does not replay providers, inspect/inject dynamic pane content or cross panes, kill/relaunch/split workers, or alter claims. |
-| `GJC_TEAM_HEARTBEAT_STALE_MS` | Stale-heartbeat threshold in milliseconds. Defaults to `120000`; a non-numeric value falls back to that default, and a non-positive value disables stale-heartbeat detection. |
+| `GJC_TEAM_HEARTBEAT_STALE_MS` | Stale-heartbeat threshold in milliseconds. Defaults to `120000`; a non-numeric value falls back to that default, a positive value below `3` is clamped to `3`, and a non-positive value disables stale-heartbeat detection (and with it the worker's own heartbeat publishing). A GJC worker session publishes a runtime-owned heartbeat every third of this window (minimum 1ms, capped at 30s) while an agent turn or owned background job is active, and `gjc team` exports the configured value into worker panes, which do not inherit the launching shell's environment. |
 
 ### Hermes MCP bridge
 
@@ -343,6 +359,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | Variable                             | Behavior                                             |
 | ------------------------------------ | ---------------------------------------------------- |
 | `GJC_OPENAI_CODE_DEBUG`                     | `1`/`true` enables OpenAI code provider debug logging      |
+| `GJC_NO_STRICT`                       | Global bypass for OpenAI-style strict schema enforcement (`adaptSchemaForStrict`); legacy alias `PI_NO_STRICT` |
 | `GJC_OPENAI_CODE_WEBSOCKET`                 | `1`/`true` enables websocket transport preference    |
 | `GJC_OPENAI_CODE_WEBSOCKET_V2`              | `1`/`true` enables websocket v2 path                 |
 | `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS` | Positive integer override (default 300000)           |
@@ -592,5 +609,6 @@ Treat these as secrets; do not log or commit them:
 - Cloud credentials (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS` path may expose service-account material)
 - Search/provider auth vars (`EXA_API_KEY`, `BRAVE_API_KEY`, `PERPLEXITY_API_KEY`, Anthropic search keys)
 - Foundry mTLS material (`CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
+- Credential-root redirects (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) — not secrets themselves, but they select which account's credential file the import path reads
 
 Python runtime also explicitly strips many common key vars before spawning kernel subprocesses (`packages/coding-agent/src/eval/py/runtime.ts`).

@@ -1,0 +1,6 @@
+{
+  "text": "## Flow\n1. `ReadTool.execute()` accepts `{ path, truncation? }`. `file://...` inputs are expanded first with `expandPath()`.\n   - `gjc read <path> --truncation head|last|both` passes the explicit direction through to the same tool payload.",
+  "displayContent": null,
+  "truncation": null,
+  "meta": null
+}

@@ -21,6 +21,7 @@ import {
 	type ToolResultMessage,
 } from "@gajae-code/ai";
 import {
+	codexToolWireName,
 	getOpenAICodexTransportDetails,
 	prewarmOpenAICodexResponses,
 } from "@gajae-code/ai/providers/openai-codex-responses";
@@ -81,11 +82,18 @@ import {
 import { ExtensionRuntime } from "../extensibility/extensions/loader";
 import { type ConstrainedPluginHook, loadConstrainedPluginHooks } from "../extensibility/gjc-plugins/constrained-hooks";
 import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injection";
+import { currentActivationFingerprint } from "../extensibility/gjc-plugins/lifecycle";
 import {
 	buildPluginMcpConfigs,
 	loadAlwaysOnPluginTools,
 	renderAlwaysOnSystemAppendices,
 } from "../extensibility/gjc-plugins/runtime-adapters";
+import {
+	GjcRuntimeFindingAccumulator,
+	type GjcRuntimeSnapshotProvider,
+	GjcRuntimeSnapshotStore,
+	gjcActivationGenerationFor,
+} from "../extensibility/gjc-plugins/runtime-quarantine";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
@@ -493,6 +501,11 @@ export interface CreateAgentSessionResult {
 	lspServers?: LspStartupServerInfo[];
 	/** Shared event bus for tool/extension communication */
 	eventBus: EventBus;
+	/**
+	 * Read-only view of GJC bundle runtime evidence for the activation generation
+	 * this session published. Undefined when no GJC bundles participated.
+	 */
+	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
 }
 
 // Re-exports
@@ -1069,6 +1082,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+
 	let agent: Agent;
 	let session!: AgentSession;
 	let hasSession = false;
@@ -1280,13 +1294,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		let model = options.model;
 		let modelFallbackMessage: string | undefined;
+		const resumeModelBehavior = settings.get("session.resumeModelBehavior");
 		const persistedDefaultChain = existingSession.configuredModelChains.default?.entries;
 		const defaultModelEntries =
-			persistedDefaultChain && persistedDefaultChain.length > 0
-				? persistedDefaultChain
-				: existingSession.models.default
-					? [existingSession.models.default]
-					: [];
+			resumeModelBehavior === "useCurrentDefault"
+				? []
+				: persistedDefaultChain && persistedDefaultChain.length > 0
+					? persistedDefaultChain
+					: existingSession.models.default
+						? [existingSession.models.default]
+						: [];
 		// If session has data, restore its configured default chain rather than the
 		// scalar runtime model, which may be a stale fallback from the prior run.
 		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
@@ -1615,10 +1632,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
-		// Artifact and agent-output URLs resolve via `AgentRegistry.global()` —
-		// the protocol handlers walk each ref's `sessionManager.getArtifactsDir()`,
-		// which collapses to the parent's dir for subagents (they adopt the
-		// parent's ArtifactManager) so one lookup hits everything.
+		// Artifact and agent-output URLs resolve against explicitly authorized
+		// directories only (see `authorizedArtifactsDirsFromContext`): the
+		// caller's own `sessionManager.getArtifactsDir()` plus, when this session
+		// adopted a shared `ArtifactManager` (subagent tree membership),
+		// `getAuthorizedArtifactsDirs` below. There is no registry-wide lookup.
 		const getArtifactsDir = () => sessionManager.getArtifactsDir();
 		const localProtocolOptions = options.localProtocolOptions ?? {
 			getArtifactsDir,
@@ -1636,6 +1654,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
+		toolSession.getAuthorizedArtifactsDirs = () => {
+			const manager = sessionManager.getArtifactManager();
+			return manager ? [manager.dir] : [];
+		};
 		toolSession.agentOutputManager = new AgentOutputManager(
 			getArtifactsDir,
 			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
@@ -1708,6 +1730,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
+		// GJC bundle runtime evidence for this activation. Producers below return
+		// findings into this caller-owned accumulator and never publish; exactly one
+		// complete snapshot is published once every producer has run.
+		const gjcRuntimeStore = new GjcRuntimeSnapshotStore();
+		let gjcProducersComplete = true;
+		let gjcActivationGeneration = 0;
+		try {
+			gjcActivationGeneration = gjcActivationGenerationFor(await currentActivationFingerprint({ cwd }));
+		} catch (error) {
+			// Without a readable activation generation no snapshot can be proven
+			// current, so publish nothing rather than a snapshot consumers cannot
+			// validate against.
+			gjcProducersComplete = false;
+			logger.warn("Failed to derive GJC bundle activation generation", { error });
+		}
+		const gjcFindings = new GjcRuntimeFindingAccumulator(gjcActivationGeneration);
+
 		// Always-on GJC plugin bundle tools (validated registry surfaces). This is
 		// additive and a no-op when no plugins are installed for the cwd. Surfaces
 		// are hash-verified and collision-checked; declared names are authoritative.
@@ -1718,9 +1757,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 			if (pluginToolResult.tools.length > 0) customTools.push(...pluginToolResult.tools);
 			for (const q of pluginToolResult.quarantine) {
+				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 				logger.warn("Quarantined GJC plugin surface", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 			}
 		} catch (error) {
+			gjcProducersComplete = false;
 			logger.warn("Failed to load always-on GJC plugin tools", { error });
 		}
 
@@ -1752,6 +1793,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 				for (const q of quarantine) {
+					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
 				if (Object.keys(configs).length > 0) {
@@ -1765,6 +1807,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						);
 						const result = await owned.connectServers(configs, sources as never);
 						for (const [server, err] of result.errors) {
+							// A server that failed to connect leaves this generation
+							// incomplete: its surfaces produced no evidence, so publishing
+							// would present a partial pass as a clear one.
+							gjcProducersComplete = false;
 							logger.warn("GJC plugin MCP connect failed", { path: `mcp:${server}`, error: err });
 						}
 						if (result.connectedServers.length > 0) {
@@ -1784,6 +1830,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				}
 			} catch (error) {
+				gjcProducersComplete = false;
 				logger.warn("Failed to wire GJC plugin MCP servers", { error });
 			}
 		} else if (isCanonicalSubSession) {
@@ -1833,11 +1880,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				inlineExtensions.push(createPluginHooksExtension(pluginHookResult.hooks));
 			}
 			for (const q of pluginHookResult.quarantine) {
+				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 				logger.warn("Quarantined GJC plugin hook", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 			}
 		} catch (error) {
+			gjcProducersComplete = false;
 			logger.warn("Failed to load constrained GJC plugin hooks", { error });
 		}
+
 		let notificationCfg: NotificationConfig | undefined;
 		try {
 			notificationCfg = getNotificationConfig(settings);
@@ -2183,12 +2233,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			tools: Map<string, AgentTool>,
 			candidateModel?: Model,
 		): Promise<BuildSystemPromptResult> => {
+			// This callback is reused for later prompt/tool/model rebuilds. Retire
+			// the previous generation's evidence up front: from here until a
+			// complete pass republishes, consumers must read `unavailable` rather
+			// than a snapshot describing a generation that no longer applies.
+			// Invalidating at entry (not beside the publish) means an await or a
+			// throw in between cannot leave stale evidence readable. The reserved
+			// epoch additionally fences overlapping rebuilds, so a slower earlier
+			// pass cannot publish over a newer one.
+			const gjcPassEpoch = gjcRuntimeStore.beginPass();
 			toolContextStore.setToolNames(toolNames);
 			const promptTools = (() => {
 				const previousPromptMetadataModel = promptMetadataModel;
 				promptMetadataModel = candidateModel;
 				try {
-					return buildSystemPromptToolMetadata(tools);
+					const activeModel = candidateModel ?? agent?.state.model ?? model;
+					// Codex renames reserved tool names on the wire; the prompt must
+					// refer to the tools by the names the model actually receives.
+					const overrides =
+						activeModel?.api === "openai-codex-responses"
+							? Object.fromEntries(
+									Array.from(tools.keys())
+										.filter(name => codexToolWireName(name) !== name)
+										.map(name => [name, { wireName: codexToolWireName(name) }]),
+								)
+							: {};
+					return buildSystemPromptToolMetadata(tools, overrides);
 				} finally {
 					promptMetadataModel = previousPromptMetadataModel;
 				}
@@ -2204,8 +2274,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd });
 			} catch (error) {
+				gjcProducersComplete = false;
 				logger.warn("Failed to render GJC plugin system appendices", { error });
 			}
+
+			// Publication point for GJC bundle runtime evidence. Appendix rendering
+			// is the last producer, so only here is the generation complete.
+			//
+			// The previous generation was already retired at callback entry, so a
+			// partial pass simply never republishes and consumers keep reading
+			// `unavailable` rather than a stale generation.
+			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot(), gjcPassEpoch);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,
 				skills,
@@ -2352,6 +2431,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				(options.alwaysActiveToolNames ?? []).map(name => name.toLowerCase()),
 			);
 			const essentialBuiltinNames = new Set(computeEssentialBuiltinNames(settings));
+			// `task.eager` promises delegation preference. In discovery mode the task tool
+			// would otherwise be hidden, making the matching prompt instruction unreachable.
+			if (eagerTasks) essentialBuiltinNames.add("task");
 			const allowedDiscoveredBuiltinNames = options.discoverableToolAllowedNames
 				? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
 				: undefined;
@@ -2556,6 +2638,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			maxRetryDelayMs: retrySettings.maxDelayMs,
 			requestMaxRetries: retrySettings.requestMaxRetries,
 			streamMaxRetries: retrySettings.streamMaxRetries,
+			streamFirstEventTimeoutMs: settings.has("retry.streamFirstEventTimeoutMs")
+				? retrySettings.streamFirstEventTimeoutMs
+				: undefined,
 			kimiApiFormat: settings.get("providers.kimiApiFormat") ?? "anthropic",
 			shouldPause: options.shouldPause,
 			preferWebsockets: preferOpenAICodexWebsockets,
@@ -2841,6 +2926,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// microtask (the ToolSession closure needs `session` assigned). Await it
 		// so a resumed canonical workflow session returns with `ask` resident.
 		await session.workflowGateToolRestoration;
+		// Expose the published evidence on the session itself so UI surfaces that
+		// only hold a session (Settings) can consume it without threading the
+		// creation result through every controller.
+		session.gjcRuntimeSnapshot = gjcRuntimeStore;
+		session.gjcActivationGeneration = gjcActivationGeneration;
 		return {
 			session,
 			extensionsResult,
@@ -2849,6 +2939,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelFallbackMessage,
 			lspServers,
 			eventBus,
+			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
 	} catch (error) {
 		// Release the subscription if the throw happened after install but before the

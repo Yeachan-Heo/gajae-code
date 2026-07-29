@@ -287,6 +287,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					rawPaths: resolvedPaths,
 					cwd: this.session.cwd,
 					getArtifactsDir: this.session.getArtifactsDir,
+					getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 					internalUrlAction: "search",
 					trackImmutableSources: true,
 					surfaceExactFilePaths: true,

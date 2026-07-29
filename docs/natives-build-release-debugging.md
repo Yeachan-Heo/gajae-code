@@ -165,9 +165,9 @@ Generated declarations currently include exports from these Rust modules:
 | ---------------------- | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | Search                 | `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `invalidateFsScanCache`                        | `grep.rs`, `fd.rs`, `glob.rs`, `fs_cache.rs`                                            |
 | AST                    | `astGrep`, `astEdit`                                                                              | `ast.rs`                                                                                |
-| Text/highlight/tokens  | `visibleWidth`, `truncateToWidth`, `highlightCode`, `countTokens`                                 | `text.rs`, `highlight.rs`, `tokens.rs`                                                  |
+| Text/highlight         | `visibleWidth`, `truncateToWidth`, `highlightCode`                                                | `text.rs`, `highlight.rs`                                                               |
 | Shell/PTY/process/keys | `executeShell`, `Shell`, `PtySession`, `killTree`, `parseKey`                                     | `shell.rs`, `pty.rs`, `ps.rs`, `keys.rs`                                                |
-| Media/system           | `PhotonImage`, `encodeSixel`, clipboard, macOS appearance/power, `getWorkProfile`, ProjFS helpers | `image.rs`, `clipboard.rs`, `appearance.rs`, `power.rs`, `prof.rs`, `projfs_overlay.rs` |
+| Media/system           | `encodeSixel`, clipboard, macOS appearance/power, `getWorkProfile`, iso overlay    | `sixel.rs`, `clipboard.rs`, `appearance.rs`, `power.rs`, `prof.rs`, `iso.rs`            |
 
 ## Failure behavior and diagnostics
 

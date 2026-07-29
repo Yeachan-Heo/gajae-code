@@ -1,11 +1,4 @@
-import {
-	$credentialEnv,
-	$env,
-	$inheritedEnv,
-	extractHttpStatusFromError,
-	logger,
-	structuredCloneJSON,
-} from "@gajae-code/utils";
+import { $credentialEnv, extractHttpStatusFromError, logger, structuredCloneJSON } from "@gajae-code/utils";
 import OpenAI from "openai";
 import type {
 	Tool as OpenAITool,
@@ -44,7 +37,6 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import {
-	createWatchdog,
 	getOpenAIStreamIdleTimeoutMs,
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
@@ -159,12 +151,23 @@ function resolveOpenAIProviderBaseUrl(
 	authCredentialType: "api_key" | "oauth" | undefined,
 ): string {
 	if (authCredentialType === "oauth") return OPENAI_DEFAULT_BASE_URL;
-	const envBaseUrl = $inheritedEnv("OPENAI_BASE_URL") ?? $env.OPENAI_BASE_URL?.trim();
+	// Trusted sources only: this base URL becomes the request endpoint that carries
+	// the OpenAI credential, and `$env` merges the caller's `cwd/.env`, so reading it
+	// there would let repository content redirect authenticated traffic.
+	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
 	const configuredBaseUrl = baseUrl?.trim();
 	if (envBaseUrl && (!configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl))) {
 		return envBaseUrl;
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
+}
+
+/** Test seam: the provider base URL as resolved from trusted env. */
+export function resolveOpenAIProviderBaseUrlForTest(
+	baseUrl: string | undefined,
+	authCredentialType: "api_key" | "oauth" | undefined,
+): string {
+	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
 }
 
 const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
@@ -261,7 +264,6 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 		);
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		const abortTracker = createAbortSourceTracker(options?.signal);
-		const firstEventTimeoutAbortError = new Error(OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE);
 		const { requestAbortController, requestSignal } = abortTracker;
 
 		try {
@@ -333,10 +335,8 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			});
 			const firstEventFallbackMs =
 				model.provider === "alibaba-token-plan" ? ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS : undefined;
-			const firstEventWatchdog = createWatchdog(
-				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs),
-				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
-			);
+			const firstEventTimeoutMs =
+				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			if (premiumRequestsTotal !== undefined) output.usage.premiumRequests = premiumRequestsTotal;
 			stream.push({ type: "start", partial: output });
 
@@ -344,9 +344,11 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			await processResponsesStream(
 				iterateWithIdleTimeout(openaiStream, {
 					idleTimeoutMs,
-					watchdog: firstEventWatchdog,
+					firstItemTimeoutMs: firstEventTimeoutMs,
+					firstItemErrorMessage: OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE,
 					errorMessage: "OpenAI responses stream stalled while waiting for the next event",
 					onIdle: () => requestAbortController.abort(),
+					onFirstItemTimeout: () => requestAbortController.abort(),
 					abortSignal: options?.signal,
 					isProgressItem: isOpenAIResponsesProgressEvent,
 				}),
@@ -385,11 +387,11 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as { index?: number }).index;
-			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
+			const localAbortReason = abortTracker.getLocalAbortReason();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.transportFailure = transportFailureFacts(error);
-			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? error);
+			output.transportFailure = transportFailureFacts(localAbortReason ?? error);
+			output.errorMessage = localAbortReason?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			// Explicitly mark the poisoned-history rejection so the shared
 			// `invalid_prompt` contract is present even when the SDK error surfaces

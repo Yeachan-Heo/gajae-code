@@ -92,6 +92,26 @@ function passingQualityGate(): string {
 			status: "passed",
 			evidence: "complete",
 			fullRerun: true,
+			reviewCohort: {
+				reviewGeneration: 1,
+				sourceHash: "sha256:test-frozen-source",
+				joined: true,
+				lanes: {
+					cleaner: {
+						status: "passed",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "cleaner clean",
+						blockers: [],
+					},
+					architect: {
+						status: "CLEAR",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "architect clear",
+						blockers: [],
+					},
+					qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
+				},
+			},
 			rerunCommands: ["bun test:e2e"],
 			blockers: [],
 		},
@@ -124,6 +144,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			displayPath: root,
 		});
 		assertKeys(ralplanReceiptPayload, [
+			"session_id",
 			"run_id",
 			"path",
 			"stage",
@@ -132,9 +153,13 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			"repository_binding",
 			"created_at",
 			"pending_approval_path",
+			// #3428 (33dbf1e7c) added the configured auto-handoff admission to the
+			// final-stage receipt payload without extending this consumer key matrix.
+			"auto_handoff",
 		]);
 		expect(scrub(ralplanReceipt.stdout ?? "")).toMatchInlineSnapshot(`
 			"{
+			  "session_id": "test-session",
 			  "run_id": "run-b",
 			  "path": "/tmp/SCRUBBED",
 			  "stage": "final",
@@ -147,7 +172,13 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			    "displayPath": "/tmp/SCRUBBED"
 			  },
 			  "created_at": "<iso>",
-			  "pending_approval_path": "/tmp/SCRUBBED"
+			  "pending_approval_path": "/tmp/SCRUBBED",
+			  "auto_handoff": {
+			    "configuredTarget": "off",
+			    "effectiveTarget": "off",
+			    "degradationReason": null,
+			    "source": "default"
+			  }
 			}
 			"
 			`);
@@ -163,6 +194,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		expect(deduplicatedPayload.deduplicated).toBe(true);
 		expect(deduplicatedPayload.repository_binding).toEqual(ralplanReceiptBinding);
 		assertKeys(deduplicatedPayload, [
+			"session_id",
 			"run_id",
 			"path",
 			"stage",
@@ -178,7 +210,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		const ralplanSeedPayload = parseRequiredJson(ralplanSeed.stdout, "ralplan seed stdout");
 		expect(ralplanSeedPayload.repository_binding).toEqual(ralplanReceiptBinding);
 		expect(scrub(ralplanSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"ok":true,"skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan","repository_binding":{"schema":"gjc.repository_binding.v1","worktreeRoot":"/tmp/SCRUBBED","commonDir":null,"displayPath":"/tmp/SCRUBBED"}}
+			"{"ok":true,"session_id":"test-session","skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan","repository_binding":{"schema":"gjc.repository_binding.v1","worktreeRoot":"/tmp/SCRUBBED","commonDir":null,"displayPath":"/tmp/SCRUBBED"}}
 			"
 			`);
 
@@ -191,7 +223,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		assertKeys(deepSeedPayload, ["state_path", "handoff"]);
 		expect(deepSeedPayload.handoff).toBe("/skill:deep-interview");
 		expect(scrub(deepSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"skill":"deep-interview","resolution":"standard","threshold":0.05,"threshold_source":"flag:explicit","idea":"clarify this idea","state_path":"/tmp/SCRUBBED","warnings":[],"handoff":"/skill:deep-interview"}
+			"{"skill":"deep-interview","resolution":"standard","threshold":0.05,"threshold_source":"flag:explicit","idea":"clarify this idea","state_path":"/tmp/SCRUBBED","handoff":"/skill:deep-interview"}
 			"
 			`);
 		const blockedDeepWrite = await runNativeDeepInterviewCommand(

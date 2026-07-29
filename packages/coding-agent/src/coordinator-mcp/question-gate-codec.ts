@@ -147,7 +147,7 @@ function askSchema(labels: string[], multi: boolean, allowEmpty: boolean): JsonS
 }
 export function decodeAskGateV1(gate: WorkflowGate): PrivateAskGateCodecV1 | null {
 	if (
-		gate.stage !== "deep-interview" ||
+		(gate.stage !== "deep-interview" && gate.stage !== "ralplan" && gate.stage !== "ultragoal") ||
 		gate.kind !== "question" ||
 		!isRecord(gate.context) ||
 		!boundedText(gate.context.prompt, MAX_TEXT) ||

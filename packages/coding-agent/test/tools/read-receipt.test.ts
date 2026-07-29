@@ -39,7 +39,7 @@ const { ReadTool } = await import("@gajae-code/coding-agent/tools/read");
 
 let artifactCounter = 0;
 
-function createSession(cwd: string): ToolSession {
+function createSession(cwd: string, settings: Settings = Settings.isolated()): ToolSession {
 	const sessionDir = path.join(cwd, "session");
 	return {
 		cwd,
@@ -53,7 +53,7 @@ function createSession(cwd: string): ToolSession {
 			const id = `artifact-${++artifactCounter}`;
 			return { id, path: path.join(sessionDir, `${id}.${toolType}.log`) };
 		},
-		settings: Settings.isolated(),
+		settings,
 	} as unknown as ToolSession;
 }
 
@@ -101,9 +101,9 @@ describe("read receipt by default", () => {
 
 	afterEach(() => fs.rmSync(testDir, { recursive: true, force: true }));
 
-	async function read(filePath: string, settings = receiptSettings()) {
-		const tool = wrapToolWithMetaNotice(new ReadTool(createSession(testDir)));
-		return tool.execute("read-receipt", { path: filePath }, undefined, undefined, createContext(settings));
+	async function read(filePath: string, settings = receiptSettings(), params: Record<string, unknown> = {}) {
+		const tool = wrapToolWithMetaNotice(new ReadTool(createSession(testDir, settings)));
+		return tool.execute("read-receipt", { path: filePath, ...params }, undefined, undefined, createContext(settings));
 	}
 
 	it("returns a bounded, non-spillable receipt for a large prose file", async () => {
@@ -331,5 +331,22 @@ describe("read receipt by default", () => {
 		// The read-level threshold cannot spill a bare receipt; the separately universal backstop can.
 		expect(result.details?.meta?.truncation?.artifactId).toBeDefined();
 		expect(Buffer.byteLength(textOf(result), "utf8")).toBeLessThanOrEqual(1 * 1024);
+	});
+
+	it("backstop supersedes a body-owned directional footer instead of duplicating the model notice", async () => {
+		const file = path.join(testDir, "directional-backstop.txt");
+		fs.writeFileSync(file, Array.from({ length: 120 }, (_, i) => `${i + 1} ${"x".repeat(200)}`).join("\n"));
+		const settings = receiptSettings({
+			"read.truncation": "both",
+			"read.receiptBudgetLines": 50,
+			"read.receiptBudgetBytes": 10,
+			"tools.maxInlineResultBytes": 1,
+		});
+
+		const result = await read(file, settings, { truncation: "both" });
+		const text = textOf(result);
+
+		expect((text.match(/\[Showing/g) ?? []).length).toBe(1);
+		expect(result.details?.meta?.truncation?.noticeOwner).toBeUndefined();
 	});
 });

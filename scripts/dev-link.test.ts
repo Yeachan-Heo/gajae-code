@@ -6,6 +6,7 @@ import {
 	commandExtensions,
 	findGjcOnPath,
 	isApprovedWorkspaceSource,
+	isRemovableWorkspaceShadow,
 	isLocalWindowsBunShim,
 	pathDirs,
 	smokeTest,
@@ -107,7 +108,32 @@ describe("dev:link command discovery", () => {
 		expect(commandExtensions("linux", ".EXE")).toEqual([""]);
 	});
 });
+describe("dev:link workspace shadow cleanup", () => {
+	test("accepts only launchers resolving to this checkout wrapper", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-shadow-provenance-"));
+		tempRoots.push(root);
+		const wrapper = path.join(root, "packages", "coding-agent", "bin", "gjc.js");
+		const repoBinShadow = path.join(root, "node_modules", ".bin", "gjc");
+		const bunGlobalShadow = path.join(root, "bun-bin", "gjc");
+		const foreignShadow = path.join(root, "foreign-bin", "gjc");
+		await makeExecutable(wrapper, "#!/usr/bin/env bun\n");
+		await fs.mkdir(path.dirname(repoBinShadow), { recursive: true });
+		await fs.mkdir(path.dirname(bunGlobalShadow), { recursive: true });
+		await makeExecutable(foreignShadow, "#!/usr/bin/env bun\n");
+		await fs.symlink(wrapper, repoBinShadow);
+		await fs.symlink(wrapper, bunGlobalShadow);
 
+		expect(isRemovableWorkspaceShadow({ dir: path.dirname(repoBinShadow), file: repoBinShadow, real: wrapper }, root)).toBe(
+			true,
+		);
+		expect(
+			isRemovableWorkspaceShadow({ dir: path.dirname(bunGlobalShadow), file: bunGlobalShadow, real: wrapper }, root),
+		).toBe(true);
+		expect(
+			isRemovableWorkspaceShadow({ dir: path.dirname(foreignShadow), file: foreignShadow, real: foreignShadow }, root),
+		).toBe(false);
+	});
+});
 
 describe.skipIf(process.platform === "win32")("dev:link Windows Bun workspace shim provenance", () => {
 	test("accepts a direct canonical source link and the exact valid Bun workspace shim", async () => {
@@ -238,8 +264,28 @@ describe.skipIf(process.platform === "win32")("dev:link Windows Bun workspace sh
 	});
 });
 
-
 describe("dev:link", () => {
+	test.skipIf(process.platform === "win32")("removes Bun global links that resolve to this checkout wrapper", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-bun-shadow-"));
+		tempRoots.push(root);
+		const shadowDir = path.join(root, "bun-bin");
+		const targetDir = path.join(root, "managed-bin");
+		const shadow = path.join(shadowDir, "gjc");
+		const workspaceWrapper = path.join(import.meta.dir, "..", "packages", "coding-agent", "bin", "gjc.js");
+		await fs.mkdir(shadowDir, { recursive: true });
+		await fs.symlink(workspaceWrapper, shadow);
+
+		const result = Bun.spawnSync([process.execPath, "scripts/dev-link.ts"], {
+			env: { ...process.env, GJC_DEV_LINK_DIR: targetDir, PATH: `${shadowDir}:${targetDir}:${process.env.PATH ?? ""}` },
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.stderr.toString()).not.toContain("still resolves to a different command earlier on PATH");
+		expect(result.stdout.toString()).toContain(`Removed workspace shadow: ${shadow}`);
+		expect(await Bun.file(shadow).exists()).toBe(false);
+		expect(await Bun.file(path.join(targetDir, "gjc")).exists()).toBe(true);
+	});
 	test.skipIf(process.platform === "win32")("fails when a shadow gjc earlier on PATH would make smoke-test validate the wrong command", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-shadow-"));
 		tempRoots.push(root);

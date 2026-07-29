@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { APP_NAME, extractHttpStatusFromError, getLogsDir } from "@gajae-code/utils";
 import { isCopilotTransientModelError } from "./retry.js";
@@ -94,6 +95,49 @@ export function formatModelUnavailableGuidance(dump: RawHttpRequestDump | undefi
 	].join("\n");
 }
 
+/**
+ * Cap on retained HTTP 400 request dumps.
+ *
+ * Each dump carries the full sanitized request body, so they are large: a
+ * developer machine accumulated 27,249 files totalling 7.0 GB, averaging 264 KB
+ * each, because nothing ever removed them. The rotating application log already
+ * bounds itself (`maxSize: 10m`, `maxFiles: 5`); these diagnostics get the same
+ * treatment so the newest failures stay available without unbounded growth.
+ */
+const MAX_RETAINED_DUMPS = 50;
+
+/** Directory holding the retained HTTP 400 dumps. */
+export function httpRequestDumpDir(): string {
+	return path.join(getLogsDir(), "http-400-requests");
+}
+
+/**
+ * Drop the oldest dumps beyond the cap. Best-effort: diagnostics must never turn
+ * a request failure into a second failure, so every step swallows its error.
+ *
+ * File names are `${Date.now()}-${hash}.json`, so a lexical sort is chronological
+ * for the millisecond timestamps this writer produces.
+ */
+export async function pruneHttpRequestDumps(dir: string = httpRequestDumpDir()): Promise<number> {
+	const entries = await fs.readdir(dir).catch(() => undefined);
+	if (!entries) return 0;
+
+	const dumps = entries.filter(name => name.endsWith(".json")).sort();
+	if (dumps.length <= MAX_RETAINED_DUMPS) return 0;
+
+	let removed = 0;
+	for (const name of dumps.slice(0, dumps.length - MAX_RETAINED_DUMPS)) {
+		if (
+			await fs.rm(path.join(dir, name), { force: true }).then(
+				() => true,
+				() => false,
+			)
+		)
+			removed++;
+	}
+	return removed;
+}
+
 export async function appendRawHttpRequestDumpFor400(
 	message: string,
 	error: unknown,
@@ -105,10 +149,12 @@ export async function appendRawHttpRequestDumpFor400(
 
 	const sanitizedDump = sanitizeDump(dump);
 	const fileName = `${Date.now()}-${Bun.hash(JSON.stringify(sanitizedDump)).toString(36)}.json`;
-	const filePath = path.join(getLogsDir(), "http-400-requests", fileName);
+	const dumpDir = httpRequestDumpDir();
+	const filePath = path.join(dumpDir, fileName);
 
 	try {
 		await Bun.write(filePath, `${JSON.stringify(sanitizedDump, null, 2)}\n`);
+		await pruneHttpRequestDumps(dumpDir);
 		return `${message}\nraw-http-request=${filePath}\n${RAW_HTTP_REQUEST_PRIVACY_NOTE}`;
 	} catch (writeError) {
 		const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);

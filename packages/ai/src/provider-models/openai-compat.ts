@@ -1,4 +1,4 @@
-import { $env, $inheritedEnv } from "@gajae-code/utils";
+import { $credentialEnv } from "@gajae-code/utils";
 import type { ModelManagerOptions } from "../model-manager";
 import { Effort } from "../model-thinking";
 import { getBundledModels } from "../models";
@@ -553,13 +553,19 @@ export interface OpenAIModelManagerConfig {
 	baseUrl?: string;
 }
 
+/** Base URL for the OpenAI model manager, from trusted env only (`$env` merges the caller's `cwd/.env`). */
+function resolveOpenAIModelManagerBaseUrl(config?: OpenAIModelManagerConfig): string {
+	return config?.baseUrl?.trim() || $credentialEnv("OPENAI_BASE_URL") || OPENAI_DEFAULT_BASE_URL;
+}
+
+/** Test seam: the model-manager base URL as resolved from trusted env. */
+export function resolveOpenAIModelManagerBaseUrlForTest(config?: OpenAIModelManagerConfig): string {
+	return resolveOpenAIModelManagerBaseUrl(config);
+}
+
 export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): ModelManagerOptions<"openai-responses"> {
 	const apiKey = config?.apiKey;
-	const baseUrl =
-		config?.baseUrl?.trim() ||
-		$inheritedEnv("OPENAI_BASE_URL") ||
-		$env.OPENAI_BASE_URL?.trim() ||
-		OPENAI_DEFAULT_BASE_URL;
+	const baseUrl = resolveOpenAIModelManagerBaseUrl(config);
 	const references = createBundledReferenceMap<"openai-responses">("openai");
 	return {
 		providerId: "openai",

@@ -1,0 +1,11 @@
+{
+  "text": "id: 2\nname: Bob\nemail: bob@example.test\nstatus: inactive",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/app.sqlite"
+    }
+  }
+}

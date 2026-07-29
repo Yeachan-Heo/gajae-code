@@ -5,7 +5,11 @@
  */
 
 /** Delivers a local file to the session's Telegram chat. */
-export type TelegramFileSink = (file: { path: string; caption?: string }) => Promise<{ ok: boolean; error?: string }>;
+export type TelegramFileSink = (file: {
+	path: string;
+	caption?: string;
+	mime?: string;
+}) => Promise<{ ok: boolean; error?: string }>;
 
 const sinks = new Map<string, TelegramFileSink>();
 

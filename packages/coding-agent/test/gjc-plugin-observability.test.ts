@@ -1,21 +1,31 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	type GjcPluginRegistryEntry,
-	installGjcPluginBundle,
+	installGjcBundle,
 	type NormalizedGjcPluginSurfaces,
 	summarizeGjcPluginObservability,
-	writeRegistry,
 } from "../src/extensibility/gjc-plugins";
+import { writeRegistry } from "../src/extensibility/gjc-plugins/registry";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
 const tempDirs: string[] = [];
+const originalAgentDir = getAgentDir();
+let agentDir: string;
+
+beforeEach(async () => {
+	agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-observability-agent-"));
+	setAgentDir(agentDir);
+});
 
 afterEach(async () => {
+	setAgentDir(originalAgentDir);
 	for (const d of tempDirs.splice(0)) await fs.rm(d, { recursive: true, force: true });
+	await fs.rm(agentDir, { recursive: true, force: true });
 });
 
 async function mkCwd(): Promise<string> {
@@ -27,7 +37,8 @@ async function mkCwd(): Promise<string> {
 describe("plugin observability summary", () => {
 	test("lists every surface with stable extension ids and enabled status", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const summary = await summarizeGjcPluginObservability(cwd);
 		expect(summary.plugins).toBe(1);
 		const ids = summary.surfaces.map(s => s.extensionId);
@@ -47,7 +58,8 @@ describe("plugin observability summary", () => {
 
 	test("marks surfaces quarantined on hash drift", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(r.ok).toBe(true);
 		const installed = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "tools", "domain-note.ts");
 		await fs.appendFile(installed, "\n// tampered\n");
 		const summary = await summarizeGjcPluginObservability(cwd);

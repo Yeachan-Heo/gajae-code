@@ -18,7 +18,7 @@ function makeSession(cwd: string): ToolSession {
 
 describe("telegram_send egress containment", () => {
 	const created: string[] = [];
-	const sinkCalls: string[] = [];
+	const sinkCalls: Array<{ path: string; caption?: string; mime?: string }> = [];
 	let disposeSink: (() => void) | undefined;
 
 	afterEach(() => {
@@ -35,7 +35,7 @@ describe("telegram_send egress containment", () => {
 		fs.writeFileSync(path.join(root, "inside.txt"), "hello");
 		fs.writeFileSync(path.join(outside, "secret.txt"), "secret");
 		disposeSink = registerTelegramFileSink("S", async f => {
-			sinkCalls.push(f.path);
+			sinkCalls.push({ ...f });
 			return { ok: true };
 		});
 		return { root, outside, tool: new TelegramSendTool(makeSession(root)) };
@@ -46,7 +46,24 @@ describe("telegram_send egress containment", () => {
 		const res = await tool.execute("c", { path: "inside.txt" });
 		expect(res.isError).toBeFalsy();
 		expect(sinkCalls).toHaveLength(1);
-		expect(sinkCalls[0]).toBe(fs.realpathSync(path.join(root, "inside.txt")));
+		expect(sinkCalls[0]?.path).toBe(fs.realpathSync(path.join(root, "inside.txt")));
+	});
+
+	it("preserves common image MIME types for Telegram uploads", async () => {
+		const { root, tool } = setup();
+		for (const [name, mime] of [
+			["image.webp", "image/webp"],
+			["image.png", "image/png"],
+			["image.jpg", "image/jpeg"],
+			["image.gif", "image/gif"],
+			["image.svg", "image/svg+xml"],
+			["image.avif", "image/avif"],
+		] as const) {
+			fs.writeFileSync(path.join(root, name), "image");
+			const res = await tool.execute("c", { path: name });
+			expect(res.isError).toBeFalsy();
+			expect(sinkCalls.at(-1)).toMatchObject({ mime });
+		}
 	});
 
 	it("rejects an absolute path outside the workspace", async () => {

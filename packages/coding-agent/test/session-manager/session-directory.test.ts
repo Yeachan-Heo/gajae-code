@@ -7,6 +7,7 @@ import * as native from "@gajae-code/natives";
 import {
 	deleteManagedSessionCandidate,
 	listManagedCandidates,
+	MANAGED_SESSION_BINDING_FILE,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
 	resolveManagedScope,
@@ -18,6 +19,7 @@ import {
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
+import { classifyNativePublishOutcome } from "../../src/session/internal/native-publish-outcome";
 import { SessionArtifactCapacityError, SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
@@ -150,6 +152,145 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		expect(startupError.message).not.toContain(external);
 		expect(JSON.stringify(startupError.cause)).not.toContain(external);
 		expect(startupError.cause).toEqual({ classification: "sessions_root_unavailable" });
+	});
+
+	it("surfaces a bounded classification for managed scope preparation failures", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+		const readExpected = managedSessionStorage.ManagedSessionDescendantStore.prototype.readExpected;
+		const readSpy = vi
+			.spyOn(managedSessionStorage.ManagedSessionDescendantStore.prototype, "readExpected")
+			.mockImplementation(function (
+				this: managedSessionStorage.ManagedSessionDescendantStore,
+				relativePath: string,
+			) {
+				const snapshot = readExpected.call(this, relativePath);
+				return relativePath === MANAGED_SESSION_BINDING_FILE && snapshot
+					? { ...snapshot, bytes: Buffer.from("not-json\n") }
+					: snapshot;
+			});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			readSpy.mockRestore();
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (binding_invalid: prepare:binding_validate).",
+		);
+		expect(startupError.message).not.toContain(cwd);
+		expect(startupError.message).not.toContain(scope.directoryPath);
+		expect(JSON.stringify(startupError.cause)).not.toContain(cwd);
+		expect(startupError.cause).toEqual({ classification: "binding_invalid", diagnostic: "prepare:binding_validate" });
+	});
+
+	it("preserves native security failure classification without exposing the rejected path", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		const verify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({
+			ok: false,
+			code: "acl_denied",
+			operation: "query",
+			attribute: "access",
+		});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			verify.mockRestore();
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (acl_denied: prepare:root_authority).",
+		);
+		expect(startupError.message).not.toContain(cwd);
+		expect(startupError.message).not.toContain(scope.directoryPath);
+		expect(JSON.stringify(startupError.cause)).not.toContain(cwd);
+		expect(startupError.cause).toEqual({ classification: "acl_denied", diagnostic: "prepare:root_authority" });
+	});
+
+	it("surfaces bounded native durability diagnostics without raw path detail", async () => {
+		const { cwd, sessionsRoot } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		const secretPath = path.join(cwd, "private-session-path");
+		const outcome = classifyNativePublishOutcome({
+			ok: false,
+			code: "fsync_failed",
+			mutationState: "committed",
+			durabilityState: "not_provable",
+			reason: "durability_not_provable",
+			primitive: "renameat2_noreplace",
+			phase: "destination_parent_sync",
+			diagnostic: {
+				schemaVersion: 1,
+				collectionState: "partial",
+				syncFailures: [{ phase: "destination_parent_sync", parentRole: "destination", osCode: 5, kind: "io" }],
+			},
+		});
+		const publishSpy = vi
+			.spyOn(managedSessionStorage.ManagedSessionDescendantStore.prototype, "publishNoReplaceSync")
+			.mockImplementation(() => {
+				const error = new managedSessionStorage.ManagedPublishError("durability_not_provable", outcome);
+				error.message = `raw OS failure at ${secretPath}`;
+				throw error;
+			});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			publishSpy.mockRestore();
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toContain("Could not prepare managed session scope (durability_not_provable:");
+		expect(startupError.message).toContain("destination:destination_parent_sync:io:5");
+		expect(startupError.message).not.toContain(secretPath);
+		expect(startupError.message).not.toContain("raw OS failure");
+		expect(JSON.stringify(startupError.cause)).not.toContain(secretPath);
+	});
+
+	it("identifies the failing managed protocol directory without leaking its path", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+		await fs.rm(tombstones, { recursive: true, force: true });
+		await fs.writeFile(tombstones, "not-a-directory\n", { mode: 0o600 });
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (binding_invalid: prepare:tombstones_directory).",
+		);
+		expect(startupError.message).not.toContain(tombstones);
+		expect(JSON.stringify(startupError.cause)).not.toContain(scope.directoryPath);
+		expect(startupError.cause).toEqual({
+			classification: "binding_invalid",
+			diagnostic: "prepare:tombstones_directory",
+		});
 	});
 
 	it("redacts startup scope failures from the default session-directory wrapper", async () => {

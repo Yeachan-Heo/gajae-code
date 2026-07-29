@@ -88,6 +88,15 @@ export function validateInstallPlan(
 	bundle: NormalizedGjcPluginBundle,
 	effectiveEntries: readonly GjcPluginRegistryEntry[],
 ): void {
+	// Collision universe: the caller passes the effective registry across BOTH
+	// scopes, because surface IDs derive from the SURFACE name
+	// (`tool:<toolName>`, `mcp:<mcpName>`), not the bundle name. A differently
+	// named bundle in the opposite scope can therefore claim the same ID.
+	//
+	// Entries sharing this bundle's name are excluded in every scope: they are
+	// the same logical bundle being installed or replaced, and installing one
+	// bundle into both scopes is supported, so its own surfaces must not count
+	// as collisions against itself.
 	const others = effectiveEntries.filter(e => e.name !== bundle.name);
 
 	const toolNames = new Set<string>();

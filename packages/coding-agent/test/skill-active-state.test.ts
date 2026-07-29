@@ -754,6 +754,33 @@ describe("GJC skill-active state", () => {
 		});
 	});
 
+	it("cache-bypassed visible reads observe same-stat external replacements", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "team",
+				phase: "running",
+				active: true,
+				sessionId: "sess-bypass-cache",
+			});
+			const teamPath = path.join(activeStateDir(cwd, "sess-bypass-cache"), "team.json");
+			const original = await fs.readFile(teamPath, "utf8");
+			const replacement = original.replace('"running"', '"stopped"');
+			expect(replacement).not.toBe(original);
+			expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(original));
+			const stat = await fs.stat(teamPath);
+			await fs.writeFile(teamPath, replacement);
+			await fs.utimes(teamPath, stat.atime, stat.mtime);
+
+			const visible = await readVisibleSkillActiveState(cwd, "sess-bypass-cache", {
+				tier: "security",
+				bypassCache: true,
+			});
+			expect(visible?.active_skills?.[0]?.phase).toBe("stopped");
+		});
+	});
+
 	it("local active-entry writes invalidate the visible-state cache immediately", async () => {
 		await withTempCwd(async cwd => {
 			invalidateVisibleSkillActiveStateCache();

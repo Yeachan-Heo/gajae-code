@@ -172,7 +172,7 @@ export interface TmuxLaunchPlan {
 	/** Native tmux session identity emitted atomically by `new-session -P -F`. */
 	createdSessionId?: string;
 	/** Safe server identity proven immediately after creation. */
-	createdServerIdentity?: { pid: number; startTime: string };
+	createdServerIdentity?: { pid: number; startTime: string; pidProven?: boolean };
 	isPsmux: boolean;
 	platform: NodeJS.Platform;
 }
@@ -793,7 +793,12 @@ function cleanupCreatedTmuxSession(
 	if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, options, probe))
 		throw new Error("gjc_tmux_exact_cleanup_uncertain");
 	const nativeSessionId = plan.createdSessionId!;
-	const expectedPid = plan.createdServerIdentity!.pid;
+	// Emit the `#{pid}` clause only when the server proof proved a PID. Non-Linux
+	// probes report a placeholder PID, and pinning `#{pid}` to it yields a
+	// predicate no live tmux server can satisfy, which turns every guarded
+	// cleanup on those platforms into `gjc_tmux_exact_cleanup_uncertain`.
+	const createdServer = plan.createdServerIdentity!;
+	const serverPidPredicate = createdServer.pidProven === false ? "1" : `#{==:#{pid},${createdServer.pid}}`;
 	const guarded = spawnSync(
 		plan.tmuxCommand,
 		[
@@ -801,7 +806,7 @@ function cleanupCreatedTmuxSession(
 			"-t",
 			nativeSessionId,
 			"-F",
-			`#{&&:#{==:#{pid},${expectedPid}},#{&&:#{==:#{session_id},${nativeSessionId}},#{==:#{session_name},${plan.sessionName}}}}`,
+			`#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${nativeSessionId}},#{==:#{session_name},${plan.sessionName}}}}`,
 			`kill-session -t ${nativeSessionId} \\; display-message -p __gjc_tmux_guarded_cleanup_ok__`,
 			"display-message -p __gjc_tmux_guarded_cleanup_refused__",
 		],
@@ -1141,7 +1146,13 @@ function defaultOwnerIsolationProbe(
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
 	const probeServer = (): TmuxServerProof => {
 		if (plan.platform !== "linux") {
-			return { state: "safe", pid: 1, startTime: "not-applicable", cgroup: { classification: "not_applicable" } };
+			return {
+				state: "safe",
+				pid: 1,
+				startTime: "not-applicable",
+				cgroup: { classification: "not_applicable" },
+				pidProven: false,
+			};
 		}
 		const probe = spawn(plan.tmuxCommand, ["display-message", "-p", "#{pid}"], {
 			cwd: plan.cwd,
@@ -1268,7 +1279,11 @@ function createIsolatedTmuxSession(
 		isCurrentGeneration: () => isOwnerGenerationBaselineCurrentSync(stateDir, sessionId, baseline),
 		cleanupSpawned: ({ nativeSessionId, server }) => {
 			plan.createdSessionId = nativeSessionId;
-			plan.createdServerIdentity = { pid: server.pid!, startTime: server.startTime! };
+			plan.createdServerIdentity = {
+				pid: server.pid!,
+				startTime: server.startTime!,
+				pidProven: server.pidProven,
+			};
 			cleanupCreatedTmuxSessionAfterFailure(plan, spawn, options, probe, new Error("owner_generation_stale"));
 		},
 	});
@@ -1281,7 +1296,11 @@ function createIsolatedTmuxSession(
 		return { exitCode: 1, stderr: outcome.diagnostic };
 	}
 	if (!plan.isPsmux && outcome.native_session_id) plan.createdSessionId = outcome.native_session_id;
-	plan.createdServerIdentity = { pid: outcome.server_pid, startTime: outcome.server_start_time };
+	plan.createdServerIdentity = {
+		pid: outcome.server_pid,
+		startTime: outcome.server_start_time,
+		pidProven: plan.platform === "linux" ? undefined : false,
+	};
 	return executed ?? { exitCode: 1, stderr: "tmux owner isolation did not execute" };
 }
 

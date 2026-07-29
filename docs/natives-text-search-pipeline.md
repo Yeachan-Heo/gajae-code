@@ -19,7 +19,6 @@ Terminology follows `docs/natives-architecture.md`:
 - `crates/pi-natives/src/ast.rs`
 - `crates/pi-natives/src/text.rs`
 - `crates/pi-natives/src/highlight.rs`
-- `crates/pi-natives/src/tokens.rs`
 
 ## JS API ↔ Rust export mapping
 
@@ -41,7 +40,6 @@ Terminology follows `docs/natives-architecture.md`:
 | `highlightCode(code, lang, colors)`                                             | `highlightCode`                                  | `highlight.rs` |
 | `supportsLanguage(lang)`                                                        | `supportsLanguage`                               | `highlight.rs` |
 | `getSupportedLanguages()`                                                       | `getSupportedLanguages`                          | `highlight.rs` |
-| `countTokens(input, encoding?)`                                                 | `countTokens`                                    | `tokens.rs`    |
 
 ## Pipeline overview by subsystem
 
@@ -228,15 +226,6 @@ Text functions generally return deterministic transformed output; errors are lim
 - Per-line parse failure does not fail the call: that line is appended unhighlighted and processing continues.
 - Unknown/unsupported language falls back to plain text syntax.
 
-## 7) Token counting (`tokens`)
-
-`countTokens(input, encoding?)` is an in-memory utility.
-
-- `input` may be a single string or an array of strings.
-- Arrays return one aggregate count and are encoded in parallel in Rust.
-- Default encoding is `O200kBase`; `Cl100kBase` remains available as a compatibility alias routing to `o200k_base` in default builds.
-- The implementation uses ordinary tokenization, not special-token handling.
-
 ## Pure utility vs filesystem-dependent flows
 
 | Flow                         | Filesystem access | Shared cache         | Notes                                         |
@@ -244,7 +233,6 @@ Text functions generally return deterministic transformed output; errors are lim
 | `search` / `hasMatch`        | No                | No                   | regex on provided bytes/string only           |
 | `text` module functions      | No                | No                   | ANSI/width/sanitization only                  |
 | `highlight` module functions | No                | No                   | syntax + ANSI coloring only                   |
-| `countTokens`                | No                | No                   | tokenization only                             |
 | `astGrep` / `astEdit`        | Yes               | No                   | syntax-aware file search/edit                 |
 | `glob`                       | Yes               | Optional             | directory scans + glob filtering              |
 | `fuzzyFind`                  | Yes               | Optional             | directory scans + fuzzy scoring               |

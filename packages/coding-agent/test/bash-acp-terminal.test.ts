@@ -1,9 +1,16 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "../src/session/client-bridge";
+import { truncateHeadBytes, truncateTailBytes } from "../src/session/streaming-output";
 import type { ToolSession } from "../src/tools";
 import { BashTool } from "../src/tools/bash";
 
-function makeSession(bridge: ClientBridge): ToolSession {
+interface SessionOptions {
+	tailKiB?: number;
+	headKiB?: number;
+	saveArtifact?: (content: string, type: string) => Promise<string>;
+}
+
+function makeSession(bridge: ClientBridge, options: SessionOptions = {}): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
@@ -19,13 +26,21 @@ function makeSession(bridge: ClientBridge): ToolSession {
 				if (key === "astEdit.enabled") return false;
 				if (key === "search.enabled") return false;
 				if (key === "find.enabled") return false;
+				if (key === "tools.artifactTailBytes") return options.tailKiB;
+				if (key === "tools.artifactHeadBytes") return options.headKiB;
 				return undefined;
+			},
+			has(key: string) {
+				if (key === "tools.artifactTailBytes") return options.tailKiB !== undefined;
+				if (key === "tools.artifactHeadBytes") return options.headKiB !== undefined;
+				return false;
 			},
 			getBashInterceptorRules() {
 				return [];
 			},
 		},
 		getClientBridge: () => bridge,
+		getArtifactManager: options.saveArtifact ? () => ({ save: options.saveArtifact }) : undefined,
 	} as unknown as ToolSession;
 }
 
@@ -64,6 +79,7 @@ describe("BashTool ACP terminal routing", () => {
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		const params = createSpy.mock.calls[0]![0];
 		expect(params.command).toBe("echo hi");
+		expect(params.outputByteLimit).toBe(1024);
 
 		// The first onUpdate must carry the terminalId so the editor can embed it
 		expect(updates.length).toBeGreaterThanOrEqual(1);
@@ -78,6 +94,259 @@ describe("BashTool ACP terminal routing", () => {
 
 		// The handle must always be released
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("bounds client-terminal output to the default 1 KiB tail", async () => {
+		const stubText = `HEAD\n${"middle\n".repeat(400)}TAIL\n`;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-tail",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		const result = await new BashTool(makeSession(bridge)).execute("call-tail", { command: "wide-output" });
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(text).not.toContain("HEAD");
+		expect(text).toContain("TAIL");
+		expect(result.details?.meta?.truncation?.direction).toBe("tail");
+		expect(result.details?.meta?.truncation?.outputBytes).toBeGreaterThan(1000);
+		expect(result.details?.meta?.truncation?.outputBytes).toBeLessThanOrEqual(1024);
+	});
+
+	it("honors an explicit ACP tail budget", async () => {
+		const stubText = `HEAD\n${"middle\n".repeat(800)}TAIL\n`;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-explicit-tail",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+		const createSpy = spyOn(bridge, "createTerminal");
+
+		const result = await new BashTool(makeSession(bridge, { tailKiB: 2 })).execute("call-explicit-tail", {
+			command: "wide-output",
+		});
+
+		expect(createSpy.mock.calls[0]?.[0].outputByteLimit).toBe(2048);
+		expect(result.details?.meta?.truncation?.direction).toBe("tail");
+		expect(result.details?.meta?.truncation?.outputBytes).toBeGreaterThan(2000);
+		expect(result.details?.meta?.truncation?.outputBytes).toBeLessThanOrEqual(2048);
+	});
+
+	it("honors explicit ACP head retention and artifacts the full returned output", async () => {
+		const stubText = `HEAD\n${"middle\n".repeat(800)}TAIL\n`;
+		const saveArtifact = mock(async () => "acp-full-output");
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-head-tail",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+		const createSpy = spyOn(bridge, "createTerminal");
+
+		const result = await new BashTool(makeSession(bridge, { tailKiB: 1, headKiB: 1, saveArtifact })).execute(
+			"call-head-tail",
+			{ command: "wide-output" },
+		);
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(createSpy.mock.calls[0]?.[0].outputByteLimit).toBeUndefined();
+		expect(text).toContain("HEAD");
+		expect(text).toContain("TAIL");
+		expect(text).toContain("elided");
+		expect(result.details?.meta?.truncation?.direction).toBe("middle");
+		expect(result.details?.meta?.truncation?.artifactId).toBe("acp-full-output");
+		expect(saveArtifact).toHaveBeenCalledWith(stubText, "bash-original");
+		expect(text).toContain("[raw output: artifact://acp-full-output]");
+		expect(result.details?.meta?.truncation?.artifactTruncatedBytes).toBeUndefined();
+	});
+
+	it("uses UTF-8-safe byte windows for explicit ACP head and tail on one line", async () => {
+		const stubText = "界".repeat(2_000);
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-multibyte-head-tail",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		const result = await new BashTool(makeSession(bridge, { tailKiB: 1, headKiB: 1 })).execute("call-multibyte", {
+			command: "wide-output",
+		});
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(text).toContain(truncateHeadBytes(stubText, 1024).text);
+		expect(text).toContain(truncateTailBytes(stubText, 1024).text);
+		expect(text).not.toContain("�");
+		expect(result.details?.meta?.truncation?.direction).toBe("middle");
+	});
+
+	it("surfaces bounded artifact-save diagnostics without inventing a URI", async () => {
+		const stubText = `HEAD\n${"middle\n".repeat(800)}TAIL\n`;
+		const saveArtifact = mock(async (_content: string, _type: string): Promise<string> => {
+			throw new Error("disk full while publishing bash output");
+		});
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-save-failure",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		const result = await new BashTool(makeSession(bridge, { saveArtifact })).execute("call-save-failure", {
+			command: "wide-output",
+		});
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(text).toContain("Bash output artifact save failed");
+		expect(text).toContain("disk full while publishing bash output");
+		expect(text).not.toContain("artifact://");
+		expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
+	});
+	it("discloses unavailable original-output recovery without inventing a URI", async () => {
+		const stubText = `HEAD\n${"middle\n".repeat(800)}TAIL\n`;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-save-unavailable",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		const result = await new BashTool(makeSession(bridge, { tailKiB: 1 })).execute("call-save-unavailable", {
+			command: "wide-output",
+		});
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(text).toContain("Bash output artifact unavailable");
+		expect(text).toContain("artifact storage is unavailable");
+		expect(text).not.toContain("artifact://");
+		expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
+	});
+
+	it("does not label already-truncated client output as a full artifact", async () => {
+		const stubText = `REMOTE-PARTIAL\n${"middle\n".repeat(400)}TAIL\n`;
+		const saveArtifact = mock(async () => "must-not-save");
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-remote-truncated",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: true }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		const result = await new BashTool(makeSession(bridge, { saveArtifact })).execute("call-remote-truncated", {
+			command: "wide-output",
+		});
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(saveArtifact).not.toHaveBeenCalled();
+		expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
+		expect(text).toContain("(output truncated)");
+	});
+
+	it("discloses client-reported partial output on ACP poll updates", async () => {
+		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+		let reads = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-poll-truncated",
+			waitForExit: async () => pendingExit.promise,
+			currentOutput: async () => {
+				reads++;
+				if (reads === 1) queueMicrotask(() => pendingExit.resolve({ exitCode: 0, signal: null }));
+				return { output: "REMOTE-PARTIAL\n", truncated: true };
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+		const updates: Array<{ content?: Array<{ text?: string }> }> = [];
+
+		await new BashTool(makeSession(bridge)).execute(
+			"call-poll-truncated",
+			{ command: "stream" },
+			undefined,
+			update => {
+				updates.push(update as { content?: Array<{ text?: string }> });
+			},
+		);
+
+		expect(updates.some(update => update.content?.some(block => block.text?.includes("(output truncated)")))).toBe(
+			true,
+		);
+	});
+
+	it("discloses locally truncated output on ACP poll updates", async () => {
+		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+		const stubText = `HEAD\n${"middle\n".repeat(400)}TAIL\n`;
+		let reads = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-poll-local-truncated",
+			waitForExit: async () => pendingExit.promise,
+			currentOutput: async () => {
+				reads++;
+				if (reads === 2) queueMicrotask(() => pendingExit.resolve({ exitCode: 0, signal: null }));
+				return { output: stubText, truncated: false };
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+		const updates: Array<{ content?: Array<{ text?: string }> }> = [];
+
+		await new BashTool(makeSession(bridge)).execute(
+			"call-poll-local-truncated",
+			{ command: "stream" },
+			undefined,
+			update => {
+				updates.push(update as { content?: Array<{ text?: string }> });
+			},
+		);
+
+		expect(updates.some(update => update.content?.some(block => block.text?.includes("(output truncated)")))).toBe(
+			true,
+		);
 	});
 
 	it("releases the client terminal when final output retrieval fails", async () => {
@@ -152,6 +421,112 @@ describe("BashTool ACP terminal routing", () => {
 			/Command timed out after 1 seconds/,
 		);
 
+		expect(killSpy).toHaveBeenCalledTimes(1);
+		expect(releaseSpy).toHaveBeenCalledTimes(1);
+		pendingExit.resolve({ exitCode: null, signal: "TERM" });
+	});
+
+	it("discloses client-reported partial output on ACP timeout", async () => {
+		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-timeout-truncated",
+			waitForExit: async () => pendingExit.promise,
+			currentOutput: async () => ({ output: "REMOTE-PARTIAL\n", truncated: true }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		spyOn(Bun, "sleep").mockImplementation(async () => {});
+		const tool = new BashTool(makeSession(bridge));
+		await expect(tool.execute("call-timeout-truncated", { command: "sleep 60", timeout: 1 })).rejects.toThrow(
+			/output truncated/,
+		);
+		pendingExit.resolve({ exitCode: null, signal: "TERM" });
+	});
+
+	it("artifacts oversized client output before surfacing a timeout", async () => {
+		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+		const stubText = `HEAD\n${"middle\n".repeat(400)}TAIL\n`;
+		const saveArtifact = mock(async () => "timeout-full-output");
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-timeout-output",
+			waitForExit: async () => pendingExit.promise,
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+		spyOn(Bun, "sleep").mockImplementation(async () => {});
+
+		const tool = new BashTool(makeSession(bridge, { saveArtifact }));
+		let caught: unknown;
+		try {
+			await tool.execute("call-timeout-output", { command: "sleep 60", timeout: 1 });
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		const message = caught instanceof Error ? caught.message : "";
+		expect(message).toContain("Command timed out after 1 seconds");
+		expect(message).toContain("artifact://timeout-full-output");
+
+		expect(saveArtifact).toHaveBeenCalledWith(stubText, "bash-original");
+		pendingExit.resolve({ exitCode: null, signal: "TERM" });
+	});
+
+	it("recovers and artifacts oversized ACP output when aborted", async () => {
+		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+		const killGate = Promise.withResolvers<void>();
+		let killSettled = false;
+		const stubText = `HEAD\n${"middle\n".repeat(400)}TAIL\n`;
+		const saveArtifact = mock(async () => "abort-full-output");
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-abort-output",
+			waitForExit: async () => pendingExit.promise,
+			currentOutput: async () => {
+				expect(killSettled).toBe(true);
+				return { output: stubText, truncated: false };
+			},
+			kill: async () => {
+				await killGate.promise;
+				killSettled = true;
+			},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+		const killSpy = spyOn(handle, "kill");
+		const releaseSpy = spyOn(handle, "release");
+		const controller = new AbortController();
+		const tool = new BashTool(makeSession(bridge, { saveArtifact }));
+
+		let caught: unknown;
+		try {
+			await tool.execute("call-abort-output", { command: "sleep 60" }, controller.signal, update => {
+				if (update.details?.terminalId === handle.terminalId) {
+					controller.abort();
+					setTimeout(() => killGate.resolve(), 25);
+				}
+			});
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		const message = caught instanceof Error ? caught.message : "";
+		expect(message).toContain("Command aborted");
+		expect(message).toContain("TAIL");
+		expect(message).toContain("artifact://abort-full-output");
+		expect(saveArtifact).toHaveBeenCalledWith(stubText, "bash-original");
 		expect(killSpy).toHaveBeenCalledTimes(1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
 		pendingExit.resolve({ exitCode: null, signal: "TERM" });

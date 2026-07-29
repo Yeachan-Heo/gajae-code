@@ -6,7 +6,7 @@ import { logger } from "@gajae-code/utils";
 import * as configValue from "../../src/config/resolve-config-value";
 import { loadMCPJsonFile } from "../../src/discovery/mcp-json";
 import * as mcpClient from "../../src/runtime-mcp/client";
-import { createMCPManager, MCPManager } from "../../src/runtime-mcp/manager";
+import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from "../../src/runtime-mcp/manager";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
 import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
 import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
@@ -130,6 +130,69 @@ setInterval(() => {}, 1000);
 			expect(result.connectedServers).toEqual(["slow-gateway"]);
 		} finally {
 			await manager.disconnectAll();
+		}
+	});
+
+	test("uses the 30-second default only for exact-config servers that omit timeout", () => {
+		expect(
+			resolveExactConfigStartupTimeoutMs([
+				{ command: "configured-long", timeout: 5_000 },
+				{ command: "configured-short", timeout: 1_000 },
+			]),
+		).toBe(5_500);
+		expect(
+			resolveExactConfigStartupTimeoutMs([{ command: "configured", timeout: 5_000 }, { command: "default" }]),
+		).toBe(30_500);
+		expect(resolveExactConfigStartupTimeoutMs([{ command: "configured-long", timeout: 35_000 }])).toBe(35_500);
+		expect(resolveExactConfigStartupTimeoutMs([{ command: "invalid", timeout: 0 }])).toBe(30_500);
+		expect(resolveExactConfigStartupTimeoutMs([])).toBe(250);
+	});
+
+	test("honors default and configured connection timeouts for an explicit tools-only config", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-explicit-timeout-");
+		const configPath = join(cwd, "mcp.json");
+		const delayedServer = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-exact', version: '1' } } }) + '\\n');
+    }, 2200);
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [] } }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						"slow-exact": {
+							command: process.execPath,
+							args: ["-e", delayedServer],
+							timeout: 5_000,
+						},
+						"slow-default": {
+							command: process.execPath,
+							args: ["-e", delayedServer],
+						},
+					},
+				}),
+			);
+
+			const result = await manager.discoverAndConnect({ configPath });
+
+			expect(result.errors).toEqual(new Map());
+			expect(result.connectedServers).toEqual(["slow-exact", "slow-default"]);
+		} finally {
+			await manager.disconnectAll();
+			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 

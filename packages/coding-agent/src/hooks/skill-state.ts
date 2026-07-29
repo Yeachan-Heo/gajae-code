@@ -3,7 +3,6 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
-import { scoreToUnits } from "../gjc-runtime/deep-interview-ambiguity";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
@@ -411,29 +410,8 @@ async function seedSkillActivationState(
 		...(input.turnId ? { turn_id: input.turnId } : {}),
 	};
 	if (skill === "deep-interview") {
-		const threshold = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
-		const thresholdUnits = scoreToUnits(threshold);
-		modeState.schema_version = 1;
-		modeState.resolution = "standard";
-		modeState.threshold = threshold;
-		modeState.threshold_units = thresholdUnits;
+		modeState.threshold = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
 		modeState.threshold_source = "default";
-		modeState.state = {
-			setup: { status: "unresolved" },
-			type: "greenfield",
-			intent_contract_required: true,
-			rounds: [],
-			established_facts: [],
-			topology: { status: "pending", components: [], deferred_components: [] },
-			ontology_snapshots: [],
-			auto_researched_rounds: [],
-			auto_answered_rounds: [],
-			architect_failures: 0,
-			current_ambiguity: 1.0,
-			threshold,
-			threshold_units: thresholdUnits,
-			threshold_source: "default",
-		};
 	}
 
 	await readExistingStateForMutation(initializedStatePath);

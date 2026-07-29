@@ -71,8 +71,6 @@ export interface SkillActiveEntry {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	source_state_revision?: number;
-	/** Durable ordering token from the source workflow mode-state, not this cache file's revision. */
-	committed_mode_state_revision?: number;
 }
 
 export interface SkillActiveState {
@@ -116,8 +114,6 @@ export interface SyncSkillActiveStateOptions {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	sourceRevision?: number;
-	/** Durable ordering token from the source workflow mode-state, not this cache file's revision. */
-	committedModeRevision?: number;
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -304,6 +300,32 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 
 export function isCanonicalGjcWorkflowSkill(skill: string): skill is CanonicalGjcWorkflowSkill {
 	return (CANONICAL_GJC_WORKFLOW_SKILLS as readonly string[]).includes(skill);
+}
+
+/**
+ * Nonterminal phases that intentionally await workflow-specific integration
+ * rather than a generic synthetic compaction continuation.
+ */
+const CONTINUATION_INERT_WORKFLOW_PHASES: Readonly<Partial<Record<CanonicalGjcWorkflowSkill, ReadonlySet<string>>>> = {
+	team: new Set(["awaiting_integration"]),
+};
+
+/**
+ * Continuation inertness for compaction auto-continue, derived from each
+ * workflow's manifest contract: manifest-terminal and explicitly inert phases
+ * are inert; unknown skills or phases unknown to the skill's manifest are
+ * conservatively inert so a synthetic continuation never wakes an unrecognized
+ * workflow. Generic Ultragoal `blocked` remains continuation-active because its
+ * blocker may be autonomously resolvable; verified human pauses are represented
+ * by the inline goal's `paused` status instead.
+ */
+export function isWorkflowContinuationInert(skill: string, phase: string): boolean {
+	const normalizedPhase = phase.trim().toLowerCase();
+	if (!isCanonicalGjcWorkflowSkill(skill)) return true;
+	const manifest = getSkillManifest(skill);
+	if (manifest.terminalStates.some(terminal => terminal.toLowerCase() === normalizedPhase)) return true;
+	if (CONTINUATION_INERT_WORKFLOW_PHASES[skill]?.has(normalizedPhase)) return true;
+	return !manifest.states.some(state => state.id.toLowerCase() === normalizedPhase);
 }
 
 export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
@@ -619,6 +641,8 @@ async function mergeVisibleEntries(
 export type VisibleSkillActiveStateCacheTier = "security" | "hud";
 export interface ReadVisibleSkillActiveStateOptions {
 	tier?: VisibleSkillActiveStateCacheTier;
+	/** Bypass all signature/TTL caches for authorization decisions. */
+	bypassCache?: boolean;
 }
 
 interface ActiveStateStatSignature {
@@ -751,6 +775,10 @@ export async function readVisibleSkillActiveState(
 	}
 	const resolvedCwd = path.resolve(cwd);
 	const cacheKey = visibleActiveStateCacheKey(resolvedCwd, resolvedSessionId);
+	if (opts?.bypassCache) {
+		visibleSkillActiveStateCache.delete(cacheKey);
+		return await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId);
+	}
 	const tier = opts?.tier ?? "security";
 	const now = Date.now();
 	const cached = visibleSkillActiveStateCache.get(cacheKey);
@@ -789,9 +817,6 @@ async function persistActiveEntry(
 		await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
 			cwd,
 			audit: activeStateWriterAudit("write-active-entry", sessionScope),
-			...(typeof entry.committed_mode_state_revision === "number"
-				? { orderingRevision: entry.committed_mode_state_revision }
-				: {}),
 		});
 	}
 }
@@ -870,9 +895,6 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 				? { active_subskills: preservedActiveSubskills }
 				: {}),
 		...(typeof options.sourceRevision === "number" ? { source_state_revision: options.sourceRevision } : {}),
-		...(typeof options.committedModeRevision === "number"
-			? { committed_mode_state_revision: options.committedModeRevision }
-			: {}),
 	};
 	const sessionScope = { sessionId: options.sessionId };
 	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);

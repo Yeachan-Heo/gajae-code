@@ -1221,3 +1221,90 @@ describe("OpenAI responses history payload", () => {
 		expect(note?.content).toContain(orphanOutput);
 	});
 });
+
+describe("codex reserved tool namespace history replay", () => {
+	const model = getBundledModel("openai-codex", "gpt-5.2-codex") as Model<"openai-codex-responses">;
+
+	it("keeps raw provider payload tool names untouched", async () => {
+		const payload = (await captureCodexPayload(model, {
+			messages: [
+				{ role: "user", content: "prior question", timestamp: Date.now() },
+				makeAssistantMessage(
+					[
+						{
+							type: "function_call",
+							id: "fc_replay",
+							call_id: "call_replay",
+							name: "computer_tool",
+							arguments: '{"action":"screenshot"}',
+						},
+					],
+					false,
+					"openai-codex",
+					"gpt-5.2-codex",
+				),
+				{
+					role: "toolResult",
+					toolCallId: "call_replay",
+					toolName: "computer",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "follow-up user", timestamp: Date.now() },
+			],
+		})) as { input?: Array<Record<string, unknown>> };
+
+		const call = payload.input?.find(item => item.type === "function_call");
+		expect(call?.name).toBe("computer_tool");
+	});
+
+	it("renames canonical tool names when rebuilding assistant history", async () => {
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5.2-codex",
+			stopReason: "toolUse",
+			content: [
+				{ type: "toolCall", id: "call_live", name: "computer", arguments: { action: "screenshot" } },
+				{ type: "toolCall", id: "call_read", name: "read_file", arguments: { path: "a.ts" } },
+			],
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		const payload = (await captureCodexPayload(model, {
+			messages: [
+				{ role: "user", content: "question", timestamp: Date.now() },
+				assistant,
+				{
+					role: "toolResult",
+					toolCallId: "call_live",
+					toolName: "computer",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_read",
+					toolName: "read_file",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "follow-up user", timestamp: Date.now() },
+			],
+		})) as { input?: Array<Record<string, unknown>> };
+
+		const callNames = (payload.input ?? []).filter(item => item.type === "function_call").map(item => item.name);
+		expect(callNames).toEqual(["computer_tool", "read_file"]);
+	});
+});

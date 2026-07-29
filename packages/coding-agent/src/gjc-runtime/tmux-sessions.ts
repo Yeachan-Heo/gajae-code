@@ -407,6 +407,7 @@ export function createGjcTmuxSession(
 				pid: 1,
 				startTime: "not-applicable",
 				cgroup: { classification: "not_applicable" },
+				pidProven: false,
 			};
 		}
 		const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
@@ -534,6 +535,7 @@ export function createGjcTmuxSession(
 				env,
 				server.pid,
 				server.startTime,
+				server.pidProven,
 			);
 		},
 	});
@@ -551,7 +553,7 @@ export function createGjcTmuxSession(
 		tagCreatedTmuxSession(
 			nativeSessionId,
 			sessionName,
-			outcome.server_pid,
+			{ pid: outcome.server_pid, pidProven: server.pidProven },
 			env,
 			{
 				sessionId,
@@ -571,6 +573,7 @@ export function createGjcTmuxSession(
 				env,
 				outcome.server_pid,
 				outcome.server_start_time,
+				server.pidProven,
 			);
 		} catch (cleanupError) {
 			throw new AggregateError([tagError, cleanupError], "gjc_tmux_profile_tag_failed_cleanup_failed");
@@ -597,6 +600,7 @@ export function createGjcTmuxSession(
 					env,
 					outcome.server_pid,
 					outcome.server_start_time,
+					finalServer.pidProven,
 				);
 			} catch (cleanupError) {
 				throw new AggregateError(
@@ -619,6 +623,7 @@ export function createGjcTmuxSession(
 				env,
 				outcome.server_pid,
 				outcome.server_start_time,
+				server.pidProven,
 			);
 		} catch (cleanupError) {
 			throw new AggregateError(
@@ -645,8 +650,18 @@ function tmuxCommandArgument(value: string): string {
 	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("$", "\\$").replaceAll("`", "\\`")}"`;
 }
 
+/**
+ * Build the guard predicate for an exact tmux session mutation.
+ *
+ * The `#{pid}` clause is emitted only when the server proof actually proved a
+ * PID. Non-Linux probes report a placeholder PID (see {@link TmuxServerProof}),
+ * and pinning `#{pid}` to a placeholder produces a predicate no live tmux
+ * server can satisfy, which refuses every mutation on those platforms. The
+ * remaining clauses still pin the exact session id, session name and owner
+ * generation.
+ */
 function guardedTmuxSessionPredicate(
-	expectedPid: number,
+	expectedServer: { pid: number; pidProven?: boolean },
 	nativeSessionId: string,
 	sessionName: string,
 	expectedOwnerGeneration?: string,
@@ -654,13 +669,14 @@ function guardedTmuxSessionPredicate(
 	const ownerGenerationPredicate = expectedOwnerGeneration
 		? `#{==:#{${GJC_TMUX_OWNER_GENERATION_OPTION}},${expectedOwnerGeneration}}`
 		: "1";
-	return `#{&&:#{==:#{pid},${expectedPid}},#{&&:#{==:#{session_id},${nativeSessionId}},#{&&:#{==:#{session_name},${sessionName}},${ownerGenerationPredicate}}}}`;
+	const serverPidPredicate = expectedServer.pidProven === false ? "1" : `#{==:#{pid},${expectedServer.pid}}`;
+	return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${nativeSessionId}},#{&&:#{==:#{session_name},${sessionName}},${ownerGenerationPredicate}}}}`;
 }
 
 function runGuardedTmuxSessionCommand(
 	nativeSessionId: string,
 	sessionName: string,
-	expectedPid: number,
+	expectedServer: { pid: number; pidProven?: boolean },
 	env: NodeJS.ProcessEnv,
 	thenCommand: string,
 	expectedOwnerGeneration?: string,
@@ -671,7 +687,7 @@ function runGuardedTmuxSessionCommand(
 			"-t",
 			normalizeExactTmuxTarget(nativeSessionId, env, "session"),
 			"-F",
-			guardedTmuxSessionPredicate(expectedPid, nativeSessionId, sessionName, expectedOwnerGeneration),
+			guardedTmuxSessionPredicate(expectedServer, nativeSessionId, sessionName, expectedOwnerGeneration),
 			`${thenCommand} ; display-message -p __gjc_tmux_guarded_mutation_ok__`,
 			"display-message -p __gjc_tmux_guarded_mutation_refused__",
 		],
@@ -683,7 +699,7 @@ function runGuardedTmuxSessionCommand(
 function tagCreatedTmuxSession(
 	nativeSessionId: string,
 	sessionName: string,
-	expectedPid: number,
+	expectedServer: { pid: number; pidProven?: boolean },
 	env: NodeJS.ProcessEnv,
 	metadata: {
 		branch?: string | null;
@@ -701,7 +717,7 @@ function tagCreatedTmuxSession(
 	const commands = buildGjcTmuxProfileCommands(target, env, metadata, { tmuxCommand })
 		.map(command => command.args.map(tmuxCommandArgument).join(" "))
 		.join(" ; ");
-	runGuardedTmuxSessionCommand(nativeSessionId, sessionName, expectedPid, env, commands);
+	runGuardedTmuxSessionCommand(nativeSessionId, sessionName, expectedServer, env, commands);
 }
 
 function cleanupExactCreatedTmuxSession(
@@ -711,6 +727,7 @@ function cleanupExactCreatedTmuxSession(
 	env: NodeJS.ProcessEnv,
 	expectedPid: number,
 	expectedStartTime: string,
+	expectedPidProven?: boolean,
 ): void {
 	const server = requireSafeTmuxServerForMutation(tmuxCommand, env);
 	if (server.pid !== expectedPid || server.startTime !== expectedStartTime)
@@ -718,7 +735,7 @@ function cleanupExactCreatedTmuxSession(
 	runGuardedTmuxSessionCommand(
 		nativeSessionId,
 		sessionName,
-		expectedPid,
+		{ pid: expectedPid, pidProven: expectedPidProven ?? server.pidProven },
 		env,
 		`kill-session -t ${tmuxCommandArgument(normalizeExactTmuxTarget(nativeSessionId, env, "session"))}`,
 	);
@@ -727,7 +744,7 @@ function cleanupExactCreatedTmuxSession(
 function requireSafeTmuxServerForMutation(
 	tmuxCommand: string,
 	env: NodeJS.ProcessEnv,
-): { pid: number; startTime: string } {
+): { pid: number; startTime: string; pidProven?: boolean } {
 	if (mutationServerProofTestDependency) {
 		const proof = mutationServerProofTestDependency(tmuxCommand, env);
 		if (
@@ -739,7 +756,7 @@ function requireSafeTmuxServerForMutation(
 			return proof as { pid: number; startTime: string };
 		return { pid: 1, startTime: "test" };
 	}
-	if (process.platform !== "linux") return { pid: 1, startTime: "not-applicable" };
+	if (process.platform !== "linux") return { pid: 1, startTime: "not-applicable", pidProven: false };
 	const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
 		stdout: "pipe",
 		stderr: "pipe",
@@ -953,7 +970,7 @@ export function removeGjcTmuxSession(
 	runGuardedTmuxSessionCommand(
 		nativeSessionId,
 		session.name,
-		finalServer.pid,
+		finalServer,
 		env,
 		`kill-session -t '${nativeSessionId}'`,
 		expectedIdentity?.ownerGeneration,
@@ -962,6 +979,13 @@ export function removeGjcTmuxSession(
 }
 
 async function readProcessStartTime(pid: number): Promise<string | null> {
+	// `/proc/<pid>/stat` only exists on Linux. Everywhere else the natives
+	// process reference carries the same kernel-derived start identity (macOS
+	// reports `darwin:<start_tvsec>:<start_tvusec>` from the BSD proc info), and
+	// callers only ever compare these values for equality against another value
+	// produced here. Returning null off Linux made every owner-identity proof
+	// unverifiable, so no session could be closed there.
+	if (process.platform !== "linux") return Process.fromPid(pid)?.incarnation ?? null;
 	return readLinuxProcStartTime(pid);
 }
 
@@ -971,6 +995,27 @@ function exactManagedOwnerSupervisor(supervisorPid: number, supervisorStartTime:
 	if (process.platform === "linux" && supervisor.incarnation !== `linux:${supervisorStartTime}`)
 		throw new Error("managed_owner_supervisor_incarnation_mismatch");
 	return supervisor;
+}
+
+/**
+ * Deliver SIGTERM to exactly one already-proved owner PID.
+ *
+ * `Process.signalRoot` routes through the owned pidfd on Linux and the owned
+ * process handle on Windows, so PID reuse cannot redirect the signal. macOS has
+ * no equivalent kernel authority and the native binding deliberately fails
+ * closed there, which would leave every macOS force-close unable to signal its
+ * owner at all. On that platform the caller has already re-proved the PID's
+ * start-time incarnation immediately before this call — the same evidence the
+ * native macOS signal path re-validates — so deliver to that exact PID.
+ */
+function signalManagedOwnerTerm(supervisor: Process, pid: number): boolean {
+	if (process.platform !== "darwin") return supervisor.signalRoot(15);
+	try {
+		process.kill(pid, "SIGTERM");
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 async function readCurrentGeneration(stateDir: string, sessionId: string): Promise<string | null> {
@@ -1185,7 +1230,7 @@ export async function forceCloseGjcTmuxSession(
 					deps.signalTerm(pid);
 				} else {
 					const supervisor = exactManagedOwnerSupervisor(pid, identity.startTime);
-					if (!supervisor.signalRoot(15)) throw new Error("managed_owner_supervisor_signal_failed");
+					if (!signalManagedOwnerTerm(supervisor, pid)) throw new Error("managed_owner_supervisor_signal_failed");
 					operatorVerdict = supervisor
 						.waitForExit({ timeoutMs: FORCE_CLOSE_VERDICT_TIMEOUT_MS - 500 })
 						.then(async exited => {
@@ -1227,7 +1272,7 @@ export async function forceCloseGjcTmuxSession(
 					runGuardedTmuxSessionCommand(
 						nativeSessionId,
 						session.name,
-						initialServer.pid,
+						initialServer,
 						env,
 						`kill-session -t '${nativeSessionId}'`,
 						identity.generation,

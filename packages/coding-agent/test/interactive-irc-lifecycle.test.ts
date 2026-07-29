@@ -4,7 +4,11 @@ import { IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { getWelcomeTranscriptReservedRows } from "@gajae-code/coding-agent/modes/interactive-mode";
-import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
+import {
+	IRC_OBSERVATION_LEDGER_MAX_RECORDS,
+	IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES,
+	IrcObservationLedger,
+} from "@gajae-code/coding-agent/modes/irc-observation-ledger";
 import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
@@ -29,6 +33,11 @@ function createForkContext(fork: () => Promise<boolean>) {
 		updateEditorTopBorder: vi.fn(),
 		chatContainer,
 		pendingTools: new Map<string, never>(),
+		pendingBashComponents: [],
+		pendingPythonComponents: [],
+		bashComponent: undefined,
+		pythonComponent: undefined,
+		streamingComponent: undefined,
 
 		ircLedger: ledger,
 		ui: { requestRender: vi.fn() },
@@ -48,7 +57,7 @@ function createForkContext(fork: () => Promise<boolean>) {
 	ctx.resetRenderedIrcInlineComponents = () => helpers.resetRenderedIrcInlineComponents();
 	let controller: EventController;
 	ctx.resetIrcSidebarSession = () => {
-		ledger.reset();
+		ledger.reset({ retireCurrentSessionIdentities: true });
 		controller.resetIrcObservations();
 		sidebarRequestedVisible = false;
 		helpers.resetIrcSidebarHint();
@@ -142,6 +151,20 @@ describe("IRC lifecycle resets", () => {
 		fixture.helpers.renderSessionContext({ messages: [] } as never);
 		fixture.controller.reconcileIrcExpiryTimers(fixture.helpers.getRenderedIrcInlineComponents());
 		expect(fixture.helpers.getRenderedIrcInlineComponents().has("before-fork")).toBe(true);
+		for (let index = 0; index < IRC_OBSERVATION_LEDGER_MAX_RECORDS; index++) {
+			fixture.ledger.observe(
+				{
+					observationId: `fork-filler-${index}`,
+					kind: "incoming",
+					from: "peer",
+					to: "you",
+					text: "filler",
+					timestamp: index + 1,
+				},
+				false,
+			);
+		}
+		expect(fixture.ledger.getSidebarRecords().some(record => record.observationId === "before-fork")).toBe(false);
 
 		await new CommandController(fixture.ctx).handleForkCommand();
 		expect(fixture.ledger.getSidebarRecords()).toEqual([]);
@@ -154,6 +177,16 @@ describe("IRC lifecycle resets", () => {
 		expect(fixture.ledger.getSidebarRecords()).toEqual([]);
 		expect(fixture.chatContainer.children).toHaveLength(postForkChildCount);
 		expect(Bun.stripANSI(fixture.chatContainer.render(100).join("\n"))).not.toContain("before fork");
+
+		await fixture.controller.handleEvent({
+			type: "irc_message",
+			message: {
+				...message,
+				content: "after fork",
+				details: { ...message.details, observationId: "after-fork", message: "after fork" },
+			},
+		});
+		expect(fixture.ledger.getSidebarRecords().map(record => record.observationId)).toEqual(["after-fork"]);
 	});
 
 	it("preserves real IRC ownership when a fork is cancelled or fails", async () => {
@@ -306,6 +339,61 @@ describe("IRC lifecycle resets", () => {
 			),
 		).toBeUndefined();
 		expect(ledger.getSidebarRecords().at(-1)?.observationId).toBe("capacity-99999");
+
+		ledger.reset({ retireCurrentSessionIdentities: true });
+		expect(
+			ledger.observe(
+				{ observationId: "capacity-0", kind: "incoming", from: "peer", to: "you", text: "old", timestamp: 0 },
+				false,
+			),
+		).toBeUndefined();
+		expect(
+			ledger.observe(
+				{
+					observationId: "capacity-current-session",
+					kind: "incoming",
+					from: "peer",
+					to: "you",
+					text: "current",
+					timestamp: 100_001,
+				},
+				false,
+			),
+		).toBeDefined();
+		ledger.reset({ retireCurrentSessionIdentities: true });
+		expect(
+			ledger.observe(
+				{ observationId: "capacity-0", kind: "incoming", from: "peer", to: "you", text: "rolled", timestamp: 0 },
+				false,
+			),
+		).toBeDefined();
+		expect(
+			ledger.observe(
+				{
+					observationId: `capacity-${IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES - 1}`,
+					kind: "incoming",
+					from: "peer",
+					to: "you",
+					text: "recent",
+					timestamp: 100_002,
+				},
+				false,
+			),
+		).toBeUndefined();
+		ledger.reset();
+		expect(
+			ledger.observe(
+				{
+					observationId: "capacity-recovered",
+					kind: "incoming",
+					from: "peer",
+					to: "you",
+					text: "recovered",
+					timestamp: 100_003,
+				},
+				false,
+			),
+		).toBeDefined();
 	});
 
 	it("bounds the ledger by retained UTF-8 payload bytes with deterministic eviction", () => {

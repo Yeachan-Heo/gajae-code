@@ -1,0 +1,14 @@
+{
+  "text": "single line without a trailing newline",
+  "displayContent": {
+    "text": "single line without a trailing newline",
+    "startLine": 1
+  },
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/single-line.txt"
+    }
+  }
+}

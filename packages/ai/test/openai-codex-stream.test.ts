@@ -19,7 +19,6 @@ const originalWebSocket = global.WebSocket;
 const originalCodexWebSocketRetryBudget = Bun.env.PI_CODEX_WEBSOCKET_RETRY_BUDGET;
 const originalCodexWebSocketRetryDelayMs = Bun.env.PI_CODEX_WEBSOCKET_RETRY_DELAY_MS;
 const originalCodexWebSocketIdleTimeoutMs = Bun.env.PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS;
-const originalCodexWebSocketFirstEventTimeoutMs = Bun.env.PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS;
 const originalCodexWebSocketV2 = Bun.env.PI_CODEX_WEBSOCKET_V2;
 
 function restoreEnv(name: string, value: string | undefined): void {
@@ -37,7 +36,6 @@ afterEach(() => {
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_BUDGET", originalCodexWebSocketRetryBudget);
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_DELAY_MS", originalCodexWebSocketRetryDelayMs);
 	restoreEnv("PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", originalCodexWebSocketIdleTimeoutMs);
-	restoreEnv("PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS", originalCodexWebSocketFirstEventTimeoutMs);
 	restoreEnv("PI_CODEX_WEBSOCKET_V2", originalCodexWebSocketV2);
 	vi.restoreAllMocks();
 });
@@ -274,6 +272,50 @@ describe("openai-codex streaming", () => {
 			"https://chatgpt.com/backend-api/codex/responses",
 			"https://chatgpt.com/backend-api/codex/responses",
 		]);
+	});
+
+	it("maps reserved tool wire names back to canonical tool names", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sse = `${[
+			`data: ${JSON.stringify({
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "computer_tool",
+					arguments: "",
+				},
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.function_call_arguments.done",
+				item_id: "fc_1",
+				arguments: '{"action":"screenshot"}',
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "computer_tool",
+					arguments: '{"action":"screenshot"}',
+				},
+			})}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed" } })}`,
+		].join("\n\n")}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), { apiKey: token }).result();
+
+		const toolCalls = result.content.filter(block => block.type === "toolCall");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0]).toMatchObject({ name: "computer", arguments: { action: "screenshot" } });
 	});
 
 	it.each([
@@ -2261,10 +2303,9 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("falls back to SSE when a prewarmed websocket never produces a first event", async () => {
+	it("discards a timed-out prewarmed websocket before the outer retry", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
-		Bun.env.PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS = "10";
 		Bun.env.PI_CODEX_WEBSOCKET_RETRY_BUDGET = "0";
 
 		const payload = Buffer.from(
@@ -2273,27 +2314,43 @@ describe("openai-codex streaming", () => {
 		).toBase64();
 		const token = `aaa.${payload}.bbb`;
 
-		const sse = `${[
-			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_sse_first_event", role: "assistant", status: "in_progress", content: [] } })}`,
-			`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
-			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello fallback" })}`,
-			`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_sse_first_event", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello fallback" }] } })}`,
-			`data: ${JSON.stringify({ type: "response.done", response: { id: "resp_sse_first_event", status: "completed", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
-		].join("\n\n")}\n\n`;
 		const fetchMock = vi.fn(async () => {
-			return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+			throw new Error("SSE fallback must not run for a typed first-event timeout");
 		});
 		global.fetch = fetchMock as unknown as typeof fetch;
 
 		let sendCount = 0;
+		const sockets: IdleWebSocket[] = [];
 		class IdleWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
 				super(url, options);
+				sockets.push(this);
 				this.scheduleOpen();
 			}
 
 			send(): void {
 				sendCount += 1;
+				if (sendCount === 1) {
+					setTimeout(() => {
+						this.emitCodexResponse({
+							messageId: "msg_stale",
+							responseId: "resp_stale",
+							text: "Stale response",
+						});
+					}, 25);
+					return;
+				}
+				if (sendCount === 2) {
+					setTimeout(() => {
+						this.emitCodexResponse({
+							messageId: "msg_fresh",
+							responseId: "resp_fresh",
+							text: "Fresh response",
+						});
+					}, 30);
+					return;
+				}
+				throw new Error(`Unexpected websocket send ${sendCount}`);
 			}
 		}
 
@@ -2322,22 +2379,49 @@ describe("openai-codex streaming", () => {
 			sessionId: "ws-idle-timeout-session",
 			providerSessionState,
 		});
-		const result = await streamOpenAICodexResponses(model, context, {
+
+		const first = await streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			sessionId: "ws-idle-timeout-session",
 			providerSessionState,
+			streamFirstEventTimeoutMs: 10,
 		}).result();
-		expect(sendCount).toBeGreaterThanOrEqual(1);
-		expect(result.stopReason).toBe("stop");
-		expect(result.errorMessage).toBeUndefined();
-		expect(fetchMock).toHaveBeenCalledTimes(1);
-		const transportDetails = getOpenAICodexTransportDetails(model, {
+		expect(first.stopReason).toBe("error");
+		expect(first.errorMessage).toBe("Codex websocket transport error: timeout waiting for first websocket event");
+		expect(first.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+		});
+		expect(sockets).toHaveLength(1);
+		expect(sockets[0]?.readyState).toBe(MockWebSocket.CLOSED);
+		const afterTimeout = getOpenAICodexTransportDetails(model, {
 			sessionId: "ws-idle-timeout-session",
 			providerSessionState,
 		});
-		expect(transportDetails.lastTransport).toBe("sse");
-		expect(transportDetails.websocketDisabled).toBe(true);
-		expect(transportDetails.fallbackCount).toBe(1);
+		expect(afterTimeout.websocketConnected).toBe(false);
+		expect(afterTimeout.websocketDisabled).toBe(false);
+		expect(afterTimeout.fallbackCount).toBe(0);
+
+		const second = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			sessionId: "ws-idle-timeout-session",
+			providerSessionState,
+			streamFirstEventTimeoutMs: 100,
+		}).result();
+		expect(sendCount).toBe(2);
+		expect(sockets).toHaveLength(2);
+		expect(second.stopReason).toBe("stop");
+		expect(second.content.find(block => block.type === "text")?.text).toBe("Fresh response");
+		expect(second.content.find(block => block.type === "text")?.text).not.toContain("Stale response");
+		expect(fetchMock).not.toHaveBeenCalled();
+		const afterRetry = getOpenAICodexTransportDetails(model, {
+			sessionId: "ws-idle-timeout-session",
+			providerSessionState,
+		});
+		expect(afterRetry.lastTransport).toBe("websocket");
+		expect(afterRetry.websocketConnected).toBe(true);
+		expect(afterRetry.websocketDisabled).toBe(false);
+		expect(afterRetry.fallbackCount).toBe(0);
 	});
 
 	it("falls back to SSE when websocket status events do not make semantic progress", async () => {

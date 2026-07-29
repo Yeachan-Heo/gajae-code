@@ -105,29 +105,34 @@ describe("OpenAI Codex responses tool choice capability", () => {
 		expect(payload?.tools).toEqual(expect.any(Array));
 	});
 
-	it("retries once without forced tool_choice on semantic 400 and records runtime incapability", async () => {
+	it("retries once when Codex rejects a named tool choice missing from its tool list", async () => {
 		const bodies: Record<string, unknown>[] = [];
 		const testModel = model({ id: "runtime-codex" });
+		const todoContext = {
+			...testContext,
+			tools: [{ ...testContext.tools![0]!, name: "todo_write" }],
+		};
 		global.fetch = Object.assign(
 			async (_input: string | URL | Request, init?: RequestInit) => {
 				bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
 				return bodies.length === 1
-					? createErrorResponse("tool_choice forces tool use is not compatible with this model")
+					? createErrorResponse("Tool choice 'todo_write' not found in 'tools' parameter.")
 					: okResponse(testModel.id);
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
-		const stream = streamOpenAICodexResponses(testModel, testContext, {
+		const stream = streamOpenAICodexResponses(testModel, todoContext, {
 			apiKey: codexToken,
 			preferWebsockets: false,
-			toolChoice: { type: "function", function: { name: "search" } },
+			toolChoice: { type: "function", function: { name: "todo_write" } },
 			sessionId: "session-a",
 		});
 		const events = await collectEvents(stream);
 		const result = await stream.result();
 		expect(result.stopReason).toBe("stop");
 		expect(bodies).toHaveLength(2);
-		expect(bodies[0]?.tool_choice).toEqual({ type: "function", name: "search" });
+		expect(bodies[0]?.tool_choice).toEqual({ type: "function", name: "todo_write" });
+		expect(bodies[0]?.tools).toEqual([expect.objectContaining({ type: "function", name: "todo_write" })]);
 		expect(bodies[1]?.tool_choice).toBeUndefined();
 		expect(bodies[1]?.tools).toEqual(expect.any(Array));
 		expect(bodies[1]?.prompt_cache_key).toBe(bodies[0]?.prompt_cache_key);

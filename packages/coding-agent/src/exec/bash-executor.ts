@@ -8,12 +8,125 @@ import { executeShell, type MinimizerOptions, Shell } from "@gajae-code/natives"
 import { postmortem } from "@gajae-code/utils";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
-import { OutputSink } from "../session/streaming-output";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
+import {
+	DEFAULT_ARTIFACT_MAX_BYTES,
+	DEFAULT_MAX_BYTES,
+	OutputSink,
+	type TerminalArtifactPublisher,
+	truncateHeadBytes,
+} from "../session/streaming-output";
+import { formatArtifactReference, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
 
+export interface BashArtifactSaveSummary {
+	artifactId: string;
+	complete: boolean;
+	omittedBytes?: number;
+}
+
+export type BashMinimizedSaveReturn = BashArtifactSaveResult | BashArtifactSaveSummary | string | undefined;
+
+export type BashArtifactSaveResult =
+	| { status: "saved"; artifactId: string; complete: true; omittedBytes?: undefined }
+	| { status: "saved"; artifactId: string; complete: false; omittedBytes: number }
+	| { status: "unavailable" }
+	| { status: "failed"; diagnostic: string };
+
+function summarizeLegacyArtifactSave(artifactId: string, originalText: string): BashArtifactSaveResult {
+	const inputBytes = Buffer.byteLength(originalText, "utf-8");
+	if (inputBytes <= DEFAULT_ARTIFACT_MAX_BYTES) {
+		return { status: "saved", artifactId, complete: true };
+	}
+	const retainedBytes = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES).bytes;
+	return {
+		status: "saved",
+		artifactId,
+		complete: false,
+		omittedBytes: inputBytes - retainedBytes,
+	};
+}
+
+function normalizeExplicitSavedArtifact(
+	artifactId: string,
+	complete: boolean,
+	omittedBytes: number | undefined,
+): BashArtifactSaveResult {
+	if (complete) {
+		return (omittedBytes ?? 0) > 0
+			? { status: "failed", diagnostic: "artifact save reported complete output with omitted bytes" }
+			: { status: "saved", artifactId, complete: true };
+	}
+	return typeof omittedBytes === "number" && omittedBytes > 0
+		? { status: "saved", artifactId, complete: false, omittedBytes }
+		: { status: "failed", diagnostic: "artifact save reported incomplete output without omitted bytes" };
+}
+
+function normalizeMinimizedSaveResult(value: BashMinimizedSaveReturn, originalText: string): BashArtifactSaveResult {
+	if (typeof value === "string") return summarizeLegacyArtifactSave(value, originalText);
+	if (!value) return { status: "unavailable" };
+	if (!("status" in value)) {
+		return normalizeExplicitSavedArtifact(value.artifactId, value.complete, value.omittedBytes);
+	}
+	if (value.status !== "saved") return value;
+	return normalizeExplicitSavedArtifact(value.artifactId, value.complete, value.omittedBytes);
+}
+
+export function normalizeMinimizedSaveResultForTests(
+	value: BashMinimizedSaveReturn,
+	originalText: string,
+): BashArtifactSaveResult {
+	return normalizeMinimizedSaveResult(value, originalText);
+}
+
+function completeRawArtifactAvailable(summary: {
+	artifactId?: string;
+	artifactTruncatedBytes?: number;
+	artifactFailureDiagnostic?: string;
+}): boolean {
+	return (
+		summary.artifactId !== undefined &&
+		(summary.artifactTruncatedBytes ?? 0) <= 0 &&
+		summary.artifactFailureDiagnostic === undefined
+	);
+}
+
+function appendModelNotice(output: string, notice: string): string {
+	const separator = output.length > 0 && !output.endsWith("\n") ? "\n" : "";
+	return `${output}${separator}${notice}\n`;
+}
+
+function minimizedSaveNotice(
+	result: BashArtifactSaveResult,
+	summary: { artifactId?: string; artifactTruncatedBytes?: number; artifactFailureDiagnostic?: string },
+): string | undefined {
+	if (result.status === "failed") return `Bash output artifact save failed: ${result.diagnostic}`;
+	if (result.status === "unavailable" && !completeRawArtifactAvailable(summary)) {
+		return "Bash output artifact unavailable: full original output could not be stored because artifact storage is unavailable.";
+	}
+	return undefined;
+}
+
+function minimizedArtifactFooter(result: Extract<BashArtifactSaveResult, { status: "saved" }>): string {
+	const reference = result.complete
+		? `artifact://${result.artifactId}`
+		: formatArtifactReference(result.artifactId, result.omittedBytes);
+	return `[raw output: ${reference}]`;
+}
+
 export interface BashExecutorOptions {
+	/**
+	 * Invoked when the native minimizer rewrote the command's output, giving
+	 * the caller a chance to persist the lossless original capture (typically
+	 * via the session's `ArtifactManager`). Complete saves preserve the
+	 * historical `[raw output: artifact://<id>]` footer; capped saves carry an
+	 * honest retained/omitted reference. A legacy string id is still accepted
+	 * for non-tool callers and is classified from the original UTF-8 byte count.
+	 */
+	onMinimizedSave?: (
+		originalText: string,
+		info: { filter: string; inputBytes: number; outputBytes: number },
+	) => Promise<BashMinimizedSaveReturn>;
 	cwd?: string;
 	timeout?: number | null;
 	onChunk?: (chunk: string) => void;
@@ -32,23 +145,18 @@ export interface BashExecutorOptions {
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
+	/** Optional terminal publisher for managed artifacts without writable paths. */
+	artifactPublisher?: TerminalArtifactPublisher;
+	/** Optional Bash-specific retained tail budget in bytes. */
+	spillThreshold?: number;
+	/** Optional Bash-specific retained head budget in bytes. */
+	headBytes?: number;
 	/** Execute without retaining a native Shell in the persistent session registry. */
 	oneShot?: boolean;
 	/** Ignore user-configured shell command prefixes. Used by constrained read-only shells. */
 	ignoreShellPrefix?: boolean;
 	/** Skip sourced shell snapshots. Used by constrained read-only shells. */
 	disableShellSnapshot?: boolean;
-	/**
-	 * Invoked when the native minimizer rewrote the command's output, giving
-	 * the caller a chance to persist the lossless original capture (typically
-	 * via the session's `ArtifactManager`). The returned id is spliced into
-	 * the sink output as `artifact://<id>` so the agent can retrieve the raw
-	 * bytes. Return `undefined` to skip the footer.
-	 */
-	onMinimizedSave?: (
-		originalText: string,
-		info: { filter: string; inputBytes: number; outputBytes: number },
-	) => Promise<string | undefined>;
 }
 
 export interface BashResult {
@@ -61,6 +169,8 @@ export interface BashResult {
 	outputLines: number;
 	outputBytes: number;
 	artifactId?: string;
+	artifactTruncatedBytes?: number;
+	artifactFailureDiagnostic?: string;
 }
 
 const shellSessions = new Map<string, Shell>();
@@ -144,7 +254,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		onRawChunk: options?.onRawChunk,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
-		headBytes: resolveOutputSinkHeadBytes(settings),
+		artifactPublisher: options?.artifactPublisher,
+		spillThreshold: options?.spillThreshold ?? DEFAULT_MAX_BYTES,
+		headBytes: options?.headBytes ?? resolveOutputSinkHeadBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 		// Throttle the streaming preview callback to avoid saturating the
 		// event loop when commands produce massive output (e.g. seq 1 50M).
@@ -332,21 +444,23 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 		// When the native minimizer rewrote the output, swap the sink's accumulated
 		// raw stream for the minimized text, persist the original as a session
-		// artifact, and splice an `artifact://<id>` footer into the visible text so
-		// the agent can retrieve the raw bytes losslessly.
+		// artifact, and splice an artifact footer into the visible text so the agent
+		// can retrieve retained raw bytes without a false completeness claim.
 		const minimized = winner.result.minimized;
+		let minimizedSaveResult: BashArtifactSaveResult | undefined;
 		if (minimized && minimized.text !== minimized.originalText) {
 			sink.replace(minimized.text);
-			if (options?.onMinimizedSave) {
-				const artifactId = await options.onMinimizedSave(minimized.originalText, {
-					filter: minimized.filter,
-					inputBytes: minimized.inputBytes,
-					outputBytes: minimized.outputBytes,
-				});
-				if (artifactId) {
-					const sep = minimized.text.endsWith("\n") ? "" : "\n";
-					sink.push(`${sep}[raw output: artifact://${artifactId}]\n`);
-				}
+			const saved = options?.onMinimizedSave
+				? await options.onMinimizedSave(minimized.originalText, {
+						filter: minimized.filter,
+						inputBytes: minimized.inputBytes,
+						outputBytes: minimized.outputBytes,
+					})
+				: undefined;
+			minimizedSaveResult = normalizeMinimizedSaveResult(saved, minimized.originalText);
+			if (minimizedSaveResult.status === "saved") {
+				const sep = minimized.text.endsWith("\n") ? "" : "\n";
+				sink.push(`${sep}${minimizedArtifactFooter(minimizedSaveResult)}\n`);
 			}
 		}
 
@@ -366,10 +480,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 
 		// Normal completion
+		const summary = await sink.dump();
+		const saveNotice = minimizedSaveResult ? minimizedSaveNotice(minimizedSaveResult, summary) : undefined;
 		return {
 			exitCode: winner.result.exitCode,
 			cancelled: false,
-			...(await sink.dump()),
+			...summary,
+			...(saveNotice ? { output: appendModelNotice(summary.output, saveNotice) } : {}),
 		};
 	} catch (err) {
 		resetSession = true;

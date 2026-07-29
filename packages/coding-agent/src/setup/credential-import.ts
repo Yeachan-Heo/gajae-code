@@ -7,16 +7,17 @@
  * {@link AuthCredential} payloads that go straight into the store.
  *
  * Sources:
- *   - Claude Code: `~/.claude/.credentials.json` (Linux/WSL/Windows native),
- *     the macOS Keychain (`Claude Code-credentials`), and env vars.
- *   - Codex CLI: `~/.codex/auth.json` (OAuth `tokens` block or stored
- *     `OPENAI_API_KEY`), and env vars.
+ *   - Claude Code: `$CLAUDE_CONFIG_DIR/.credentials.json` (defaults to
+ *     `~/.claude/.credentials.json`) on Linux/WSL/Windows native, the macOS
+ *     Keychain (`Claude Code-credentials`), and env vars.
+ *   - Codex CLI: `$CODEX_HOME/auth.json` (defaults to `~/.codex/auth.json`;
+ *     OAuth `tokens` block or stored `OPENAI_API_KEY`), and env vars.
  */
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AuthCredential, OAuthCredential } from "@gajae-code/ai";
-import { isEnoent } from "@gajae-code/utils";
+import { $credentialEnv, isEnoent } from "@gajae-code/utils";
 import { redactSecret } from "./provider-onboarding";
 
 /** gjc provider ids that external credentials map onto. */
@@ -79,6 +80,18 @@ export interface DiscoveryOptions {
 	env?: Record<string, string | undefined>;
 	/** Override the platform (defaults to `process.platform`). */
 	platform?: NodeJS.Platform;
+	/**
+	 * Claude Code config directory holding `.credentials.json`.
+	 *
+	 * Defaults to the trusted `CLAUDE_CONFIG_DIR` value, else `<homeDir>/.claude`.
+	 */
+	claudeConfigDir?: string;
+	/**
+	 * Codex CLI home directory holding `auth.json`.
+	 *
+	 * Defaults to the trusted `CODEX_HOME` value, else `<homeDir>/.codex`.
+	 */
+	codexHome?: string;
 	/**
 	 * Reader for the macOS Keychain `Claude Code-credentials` entry. Defaults to
 	 * shelling out to `security`; injected in tests. Returns the raw JSON string,
@@ -206,12 +219,24 @@ function parseClaudeCredentials(
 	};
 }
 
+/**
+ * A discovery root plus the leak-free label used in redacted summaries.
+ *
+ * `display` never contains a resolved filesystem path: it is either the
+ * home-relative default or the env-var spelling that redirected the lookup.
+ */
+interface ResolvedExternalDir {
+	dir: string;
+	display: string;
+}
+
 async function discoverClaudeCode(
-	opts: Required<Pick<DiscoveryOptions, "homeDir" | "platform">> & Pick<DiscoveryOptions, "readClaudeKeychain">,
+	opts: Required<Pick<DiscoveryOptions, "platform">> &
+		Pick<DiscoveryOptions, "readClaudeKeychain"> & { configDir: ResolvedExternalDir },
 	result: CredentialDiscoveryResult,
 ): Promise<void> {
-	const filePath = path.join(opts.homeDir, ".claude", ".credentials.json");
-	const displayPath = `~/.claude/.credentials.json`;
+	const filePath = path.join(opts.configDir.dir, ".credentials.json");
+	const displayPath = `${opts.configDir.display}/.credentials.json`;
 	let fileRaw: string | null = null;
 	try {
 		fileRaw = await fs.readFile(filePath, "utf-8");
@@ -324,9 +349,9 @@ function parseCodexAuth(raw: string, source: string): ImportableCredential | Ski
 	return { origin: "codex-file", source, reason: "no OAuth tokens or OPENAI_API_KEY present (unsupported shape)" };
 }
 
-async function discoverCodex(homeDir: string, result: CredentialDiscoveryResult): Promise<void> {
-	const filePath = path.join(homeDir, ".codex", "auth.json");
-	const displayPath = "~/.codex/auth.json";
+async function discoverCodex(home: ResolvedExternalDir, result: CredentialDiscoveryResult): Promise<void> {
+	const filePath = path.join(home.dir, "auth.json");
+	const displayPath = `${home.display}/auth.json`;
 	let raw: string | null = null;
 	try {
 		raw = await fs.readFile(filePath, "utf-8");
@@ -368,6 +393,34 @@ function pushOutcome(result: CredentialDiscoveryResult, outcome: ImportableCrede
 }
 
 /**
+ * Resolve a discovery root that the external CLI itself relocates through the
+ * environment (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`).
+ *
+ * Both variables are read through `$credentialEnv`, so the caller's project
+ * `.env` cannot redirect discovery at a credential file a repository ships —
+ * the same boundary provider authentication already uses.
+ *
+ * Relative values are rejected. Claude Code and Codex resolve them against the
+ * process cwd, which for gjc is the user's project directory; honouring that
+ * would reintroduce the project-controlled redirect the trust boundary exists
+ * to prevent. An explicit `options.env` (tests, embedders) is consulted verbatim
+ * instead of the ambient environment.
+ */
+function resolveExternalDir(
+	name: "CLAUDE_CONFIG_DIR" | "CODEX_HOME",
+	envOverride: Record<string, string | undefined> | undefined,
+	fallbackDir: string,
+	fallbackDisplay: string,
+): ResolvedExternalDir {
+	const raw = envOverride ? envOverride[name] : $credentialEnv(name);
+	const trimmed = raw?.trim();
+	if (trimmed && path.isAbsolute(trimmed)) {
+		return { dir: trimmed, display: `$${name}` };
+	}
+	return { dir: fallbackDir, display: fallbackDisplay };
+}
+
+/**
  * Discover Claude Code and Codex CLI credentials across files, the macOS
  * Keychain, and environment variables. Never throws for individual unreadable or
  * malformed sources — those land in {@link CredentialDiscoveryResult.skipped}.
@@ -376,9 +429,18 @@ export async function discoverExternalCredentials(options: DiscoveryOptions = {}
 	const homeDir = options.homeDir ?? os.homedir();
 	const env = options.env ?? process.env;
 	const platform = options.platform ?? process.platform;
+	const claudeConfigDir: ResolvedExternalDir = options.claudeConfigDir
+		? { dir: options.claudeConfigDir, display: "$CLAUDE_CONFIG_DIR" }
+		: resolveExternalDir("CLAUDE_CONFIG_DIR", options.env, path.join(homeDir, ".claude"), "~/.claude");
+	const codexHome: ResolvedExternalDir = options.codexHome
+		? { dir: options.codexHome, display: "$CODEX_HOME" }
+		: resolveExternalDir("CODEX_HOME", options.env, path.join(homeDir, ".codex"), "~/.codex");
 	const result: CredentialDiscoveryResult = { importable: [], skipped: [], environment: [] };
-	await discoverClaudeCode({ homeDir, platform, readClaudeKeychain: options.readClaudeKeychain }, result);
-	await discoverCodex(homeDir, result);
+	await discoverClaudeCode(
+		{ configDir: claudeConfigDir, platform, readClaudeKeychain: options.readClaudeKeychain },
+		result,
+	);
+	await discoverCodex(codexHome, result);
 	discoverEnvironment(env, result);
 	return result;
 }

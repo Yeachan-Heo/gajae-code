@@ -5,7 +5,7 @@
  * Endpoint: POST https://api.x.ai/v1/responses
  */
 import type { AuthStorage } from "@gajae-code/ai";
-import { $env } from "@gajae-code/utils";
+import { $credentialEnv, $env } from "@gajae-code/utils";
 import type { SearchCitation, SearchResponse, SearchSource, SearchUsage } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { SearchParams } from "./base";
@@ -71,8 +71,13 @@ function getModel(): string {
 	return asTrimmed($env.PI_XAI_WEB_SEARCH_MODEL) ?? asTrimmed($env.XAI_WEB_SEARCH_MODEL) ?? DEFAULT_MODEL;
 }
 
+/** Test seam: the xAI search base URL as resolved from trusted env. */
+export function resolveXaiSearchBaseUrlForTest(): string {
+	return getBaseUrl();
+}
+
 function getBaseUrl(): string {
-	return asTrimmed($env.XAI_SEARCH_BASE_URL) ?? DEFAULT_BASE_URL;
+	return asTrimmed($credentialEnv("XAI_SEARCH_BASE_URL")) ?? DEFAULT_BASE_URL;
 }
 
 function responsesEndpoint(): string {

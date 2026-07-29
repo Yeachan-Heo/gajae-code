@@ -44,23 +44,25 @@ import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import type { ContextFileEntry } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
-import { type ReportFindingDetails, toReviewFinding } from "../tools/review";
+import type { ReportFindingDetails } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { validateAllocatedTaskId } from "./id";
-import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-status";
+import { classifyProviderRetryFromTransport, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	createSetupFailureSummary,
 	hasCompleteUsageCostBreakdown,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type ModelSubstitutionWarning,
-	type ReviewFinding,
+	type ReviewFindingsArtifactRef,
+	type SetupFailureSummary,
 	type SingleResult,
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -241,6 +243,8 @@ export interface ExecutorOptions {
 	 * subagents, and a main-model fast-mode auto-disable does not clobber it.
 	 */
 	inheritedServiceTier?: ServiceTier;
+	/** Resolve whether the effective subagent tier grants fast mode for the selected provider. */
+	isFastForSubagentProvider?: (provider?: string) => boolean;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -291,17 +295,72 @@ export class ManagedTaskPersistence {
 	}
 
 	async publishOutput(rawOutput: string, metadata: Uint8Array): Promise<void> {
-		await this.#artifacts.publishManagedOutputGeneration(
-			`${this.#taskId}.md.selector.json`,
-			`${this.#taskId}.md`,
-			Buffer.from(rawOutput, "utf8"),
-			metadata,
+		await withArtifactManagerFinalizationTurn(this.#artifacts, () =>
+			this.#artifacts.publishManagedOutputGeneration(
+				`${this.#taskId}.md.selector.json`,
+				`${this.#taskId}.md`,
+				Buffer.from(rawOutput, "utf8"),
+				metadata,
+			),
 		);
 	}
 }
 
 export function createManagedTaskPersistence(artifacts: ArtifactManager, taskId: string): ManagedTaskPersistence {
 	return new ManagedTaskPersistence(artifacts, taskId);
+}
+
+const MAX_REVIEW_FINDINGS_ARTIFACT_BYTES = 16 * 1024 * 1024;
+const REVIEW_FINDINGS_ARTIFACT_FAILURE = "Review findings artifact publication failed.";
+const artifactManagerFinalizationTails = new WeakMap<ArtifactManager, Promise<void>>();
+
+interface ReviewFindingsArtifactPayload {
+	version: 1;
+	kind: "review-findings";
+	taskId: string;
+	findingCount: number;
+	findings: ReportFindingDetails[];
+}
+
+async function withArtifactManagerFinalizationTurn<T>(
+	manager: ArtifactManager,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const priorTail = artifactManagerFinalizationTails.get(manager);
+	const turn = Promise.withResolvers<void>();
+	artifactManagerFinalizationTails.set(manager, turn.promise);
+
+	try {
+		await priorTail?.catch(() => undefined);
+		return await operation();
+	} finally {
+		turn.resolve();
+		if (artifactManagerFinalizationTails.get(manager) === turn.promise) {
+			artifactManagerFinalizationTails.delete(manager);
+		}
+	}
+}
+
+async function publishReviewFindingsArtifact(
+	manager: ArtifactManager,
+	taskId: string,
+	findings: ReportFindingDetails[],
+): Promise<ReviewFindingsArtifactRef> {
+	const payload: ReviewFindingsArtifactPayload = {
+		version: 1,
+		kind: "review-findings",
+		taskId,
+		findingCount: findings.length,
+		findings,
+	};
+	const serialized = JSON.stringify(payload, null, 2);
+	const sizeBytes = Buffer.byteLength(serialized, "utf8");
+	if (sizeBytes > MAX_REVIEW_FINDINGS_ARTIFACT_BYTES) throw new Error("review findings artifact exceeds limit");
+	const sha256 = createHash("sha256").update(serialized).digest("hex");
+	const artifactId = await withArtifactManagerFinalizationTurn(manager, () =>
+		manager.save(serialized, "review-findings", { maxBytes: sizeBytes }),
+	);
+	return { uri: `artifact://${artifactId}`, sizeBytes, sha256, findingCount: findings.length };
 }
 
 export function renderSubagentUserPrompt(assignment: string, independentMode: boolean): string {
@@ -439,21 +498,8 @@ function extractCompletionData(parsed: unknown): unknown {
 	return parsed;
 }
 
-function normalizeCompleteData(data: unknown, reportFindings?: ReviewFinding[]): unknown {
-	let normalized = parseStringifiedJson(data ?? null);
-	if (
-		Array.isArray(reportFindings) &&
-		reportFindings.length > 0 &&
-		normalized &&
-		typeof normalized === "object" &&
-		!Array.isArray(normalized)
-	) {
-		const record = normalized as Record<string, unknown>;
-		if (!("findings" in record)) {
-			normalized = { ...record, findings: reportFindings };
-		}
-	}
-	return normalized;
+function normalizeCompleteData(data: unknown): unknown {
+	return parseStringifiedJson(data ?? null);
 }
 
 function resolveFallbackCompletion(rawOutput: string, outputSchema: unknown): { data: unknown } | null {
@@ -480,7 +526,6 @@ interface FinalizeSubprocessOutputArgs {
 	doneAborted: boolean;
 	signalAborted: boolean;
 	yieldItems?: YieldItem[];
-	reportFindings?: ReviewFinding[];
 	outputSchema: unknown;
 }
 
@@ -541,7 +586,7 @@ function buildPlaceholderYieldOutcome(
 
 export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): FinalizeSubprocessOutputResult {
 	let { rawOutput, exitCode, stderr } = args;
-	const { yieldItems, reportFindings, doneAborted, signalAborted, outputSchema } = args;
+	const { yieldItems, doneAborted, signalAborted, outputSchema } = args;
 	let abortedViaYield = false;
 	const hasYield = Array.isArray(yieldItems) && yieldItems.length > 0;
 
@@ -561,7 +606,7 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 			if (submitData === null || submitData === undefined) {
 				rawOutput = rawOutput ? `${SUBAGENT_WARNING_NULL_YIELD}\n\n${rawOutput}` : SUBAGENT_WARNING_NULL_YIELD;
 			} else {
-				const completeData = normalizeCompleteData(submitData, reportFindings);
+				const completeData = normalizeCompleteData(submitData);
 				const { validator, error: schemaError } = buildOutputValidator(outputSchema);
 				if (schemaError) {
 					const outcome = buildSchemaViolationOutcome(
@@ -608,7 +653,7 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 		const hasOutputSchema = normalizedSchema !== undefined && !schemaError;
 		const fallback = allowFallback ? resolveFallbackCompletion(rawOutput, outputSchema) : null;
 		if (fallback) {
-			const completeData = normalizeCompleteData(fallback.data, reportFindings);
+			const completeData = normalizeCompleteData(fallback.data);
 			const { validator } = buildOutputValidator(outputSchema);
 			const placeholderPath = findPlaceholderYieldPath(completeData);
 			if (placeholderPath) {
@@ -873,6 +918,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let sessionEventOrdinal = 0;
 	let retryStartOrdinal = 0;
 	const seenAssistantMessages = new WeakSet<AgentMessage>();
+	let llmRequestStarted = false;
 	const seenAssistantMessageIdentities = new Set<string>();
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
@@ -965,7 +1011,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				task,
 				assignment,
 				progress: progressSnapshot,
-				sessionFile: null,
+				sessionFile: sessionFile ?? undefined,
 			});
 		}
 		lastProgressEmitMs = Date.now();
@@ -1380,6 +1426,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		error?: string;
 		aborted?: boolean;
 		abortReason?: string;
+		setupFailure?: SetupFailureSummary;
 		durationMs: number;
 	}> => {
 		const sessionAbortController = new AbortController();
@@ -1387,6 +1434,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let error: string | undefined;
 		let aborted = false;
 		let abortReasonText: string | undefined;
+		let setupFailure: SetupFailureSummary | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
 				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
@@ -1463,6 +1511,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				resolvedModelString = formatModelString(model);
 				activeProviderModelString = resolvedModelString;
 			}
+			progress.fastMode = model ? (options.isFastForSubagentProvider?.(model.provider) ?? false) : false;
 			if (authFallbackUsed && model && requestedModel) {
 				modelSubstitutionWarning = {
 					requested: formatModelString(requestedModel),
@@ -1706,7 +1755,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					agentSource: agent.source,
 					description: options.description,
 					status: "started",
-					sessionFile: null,
+					sessionFile: sessionFile ?? undefined,
 					index,
 				});
 			}
@@ -1801,7 +1850,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					{
 						getModel: () => session.model,
 						isIdle: () => !session.isStreaming,
+						getActivePromptHandle: () => session.activePromptHandle,
 						abort: () => session.abort(),
+						abortPromptAndWait: (handle, options) => session.abortPromptAndWait(handle, options),
 						hasPendingMessages: () => session.queuedMessageCount > 0,
 						getPendingMessageCounts: () => session.pendingMessageCounts,
 						getTranscript: () => session.getTranscript(),
@@ -1842,11 +1893,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					for (const message of session.messages) {
 						if (message.role === "assistant") rememberAssistantMessage(message);
 					}
+					const failedAssistant = session.getLastAssistantMessage();
 					progress.retryState = {
 						attempt: event.attempt,
 						maxAttempts: event.maxAttempts,
 						unbounded: event.unbounded,
-						kind: classifyProviderRetry(event.errorMessage),
+						kind: classifyProviderRetryFromTransport({
+							providerCode: failedAssistant?.transportFailure?.providerCode,
+							errorMessage: event.errorMessage,
+						}),
 						provider: providerNameFromModel(
 							activeProviderModelString ?? lastAssistantModelString ?? resolvedModelString,
 						),
@@ -1905,16 +1960,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 			const runMode = options.runMode ?? "initial";
+			const markLlmRequestStarted = () => {
+				llmRequestStarted = true;
+			};
+			const promptOptions = {
+				attribution: "agent" as const,
+				// A prompt is an LLM request only after AgentSession accepts its
+				// preflight fence. Rejections remain setup failures.
+				onPreflightAccepted: markLlmRequestStarted,
+				onPreflightAcceptCommit: markLlmRequestStarted,
+			};
 			if (runMode === "message") {
-				await awaitAbortable(session.prompt(options.resumeMessage ?? "", { attribution: "agent" }));
+				await awaitAbortable(session.prompt(options.resumeMessage ?? "", promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			} else if (runMode === "resume") {
-				await awaitAbortable(
-					session.prompt("Continue from the paused subagent session state.", { attribution: "agent" }),
-				);
+				await awaitAbortable(session.prompt("Continue from the paused subagent session state.", promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			} else {
-				await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+				await awaitAbortable(session.prompt(task, promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			}
 
@@ -1991,6 +2054,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			exitCode = 1;
 			if (!abortSignal.aborted) {
 				error = err instanceof Error ? err.stack || err.message : String(err);
+				if (!llmRequestStarted) setupFailure = createSetupFailureSummary(err);
 			}
 		} finally {
 			if (abortSignal.aborted) {
@@ -2026,6 +2090,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			error,
 			aborted,
 			abortReason: aborted ? abortReasonText : undefined,
+			setupFailure,
 			durationMs: Date.now() - startTime,
 		};
 	};
@@ -2052,7 +2117,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let rawOutput = finalOutputChunks.length > 0 ? finalOutputChunks.join("") : outputChunks.join("");
 	const yieldItems = progress.extractedToolData?.yield as YieldItem[] | undefined;
 	const reportFindingDetails = progress.extractedToolData?.report_finding as ReportFindingDetails[] | undefined;
-	const reportFindings: ReviewFinding[] | undefined = reportFindingDetails?.map(toReviewFinding);
 	const finalized = finalizeSubprocessOutput({
 		rawOutput,
 		exitCode,
@@ -2060,12 +2124,25 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		doneAborted: Boolean(done.aborted),
 		signalAborted: Boolean(signal?.aborted),
 		yieldItems,
-		reportFindings,
 		outputSchema,
 	});
 	rawOutput = finalized.rawOutput;
 	exitCode = finalized.exitCode;
 	stderr = finalized.stderr;
+	let reviewFindingsRef: ReviewFindingsArtifactRef | undefined;
+	let reviewFindingsPublicationFailed = false;
+	if (reportFindingDetails && reportFindingDetails.length > 0) {
+		try {
+			const manager = options.parentArtifactManager;
+			if (!manager) throw new Error("review findings artifact authority unavailable");
+			reviewFindingsRef = await publishReviewFindingsArtifact(manager, id, reportFindingDetails);
+		} catch {
+			reviewFindingsPublicationFailed = true;
+			exitCode = 1;
+			stderr = REVIEW_FINDINGS_ARTIFACT_FAILURE;
+			paused = false;
+		}
+	}
 	const lastYield = yieldItems?.[yieldItems.length - 1];
 	const yieldAbortReason = lastYield?.status === "aborted" ? lastYield.error || "Subagent aborted task" : undefined;
 	const { abortedViaYield, hasYield } = finalized;
@@ -2122,7 +2199,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		exitCode = 1;
 	}
 	const wasAborted =
-		runtimeLimitExceeded || abortedViaYield || (!hasYield && (done.aborted || signal?.aborted || false));
+		runtimeLimitExceeded ||
+		(!reviewFindingsPublicationFailed &&
+			(abortedViaYield || (!hasYield && (done.aborted || signal?.aborted || false))));
 	const finalAbortReason = wasAborted
 		? runtimeLimitExceeded
 			? resolveAbortReasonText()
@@ -2130,6 +2209,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? yieldAbortReason
 				: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : resolveAbortReasonText()))
 		: undefined;
+	progress.setupFailure = done.setupFailure;
 	progress.status = paused ? "paused" : wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
 
@@ -2141,7 +2221,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			agentSource: agent.source,
 			description: options.description,
 			status: progress.status as "completed" | "failed" | "aborted" | "paused",
-			sessionFile: null,
+			sessionFile: sessionFile ?? undefined,
 			index,
 		});
 	}
@@ -2165,7 +2245,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		contextWindow: progress.contextWindow,
 		modelOverride,
 		modelSubstitutionWarning,
+		fastMode: progress.fastMode,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
+		setupFailure: done.setupFailure,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
 		paused,
@@ -2175,5 +2257,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,
 		outputMeta,
+		reviewFindingsRef,
 	};
 }

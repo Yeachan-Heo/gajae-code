@@ -28,6 +28,36 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 describe("agentLoop with AgentMessage", () => {
+	it("forwards first-event timeout overrides to provider stream options", async () => {
+		for (const testCase of [
+			{ name: "absent", timeout: undefined },
+			{ name: "zero", timeout: 0 },
+			{ name: "positive", timeout: 12_345 },
+		]) {
+			const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+			const receivedTimeouts: Array<number | undefined> = [];
+			const stream = agentLoop(
+				[createUserMessage("Hello")],
+				{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+				{
+					model: mock.model,
+					convertToLlm: identityConverter,
+					...(testCase.timeout === undefined ? {} : { streamFirstEventTimeoutMs: testCase.timeout }),
+				},
+				undefined,
+				(model, context, options) => {
+					receivedTimeouts.push(options?.streamFirstEventTimeoutMs);
+					return mock.stream(model, context, options);
+				},
+			);
+
+			for await (const _event of stream) {
+				// drain
+			}
+
+			expect(receivedTimeouts, testCase.name).toEqual([testCase.timeout]);
+		}
+	});
 	it("should emit events with AgentMessage types", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,23 +6,34 @@ import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { installGjcPluginBundle } from "../src/extensibility/gjc-plugins";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { buildPluginMcpConfigs } from "../src/extensibility/gjc-plugins/runtime-adapters";
 import { MCPManager } from "../src/runtime-mcp";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const mcpBundle = path.join(fixturesRoot, "valid-mcp-bundle");
 const tempDirs: string[] = [];
+const originalAgentDir = getAgentDir();
+let agentDir: string;
+
+beforeEach(() => {
+	agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-agent-"));
+	setAgentDir(agentDir);
+});
 
 afterEach(() => {
+	setAgentDir(originalAgentDir);
 	for (const d of tempDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+	fs.rmSync(agentDir, { recursive: true, force: true });
 });
 
 describe("always-on plugin-bundle MCP in a live session", () => {
 	test("connects an installed bundle MCP server and surfaces its tools as always-on", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
 
 		const sessionManager = SessionManager.inMemory(cwd);
 		sessionManager.appendMCPToolSelection(["mcp__domain_docs_lookup"]);
@@ -83,7 +94,8 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	test("keeps always-on plugin MCP tools active across newSession and switchSession resume", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-resume-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
 
 		// File-backed manager so switchSession can resume a real session file. Generic
 		// discovery is fully enabled to prove the plugin tool is mandatory, not selectable.
@@ -141,7 +153,8 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	test("filters an explicitly requested mandatory plugin tool from persisted selection authority", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-explicit-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const sessionSettings = Settings.isolated();
 		sessionSettings.set("tools.discoveryMode", "all");
@@ -205,7 +218,8 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	test("subagent inherits the parent's always-on MCP tools and never tears down the parent manager", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-sub-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
 
 		// Top-level session owns the manager and installs it as the global instance.
 		const parent = await createAgentSession({
@@ -268,7 +282,8 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	])("does not inherit caller-owned MCP tools with %s source metadata as mandatory", async provider => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-forged-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
 		const { configs } = await buildPluginMcpConfigs({ cwd });
 		const callerManager = new MCPManager(cwd);
 		const sources = {

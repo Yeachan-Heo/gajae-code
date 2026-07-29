@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { parseArgs } from "../src/cli/args";
 import { resolveAcpStartupOptions } from "../src/main";
 import {
@@ -6,6 +7,7 @@ import {
 	acpSessionStateFromConfig,
 	applyAcpPermissionMode,
 	applyAcpStartupOptions,
+	createAcpReverseConnection,
 	paginateAcpSessions,
 } from "../src/modes/acp/acp-agent";
 import type { CreateAgentSessionOptions } from "../src/sdk";
@@ -29,6 +31,65 @@ test("ACP registers a permission provider only for prompt handling", () => {
 	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "prompt" })).toContain("permission");
 	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "auto" })).not.toContain("permission");
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "invalid" } } })).toContain("permission");
+});
+
+test("ACP registers the SDK UI provider only for clients with form elicitation", () => {
+	expect(providerNames({ elicitation: { form: {} } })).toContain("ui");
+	expect(providerNames({ elicitation: {} })).not.toContain("ui");
+	expect(providerNames(undefined)).not.toContain("ui");
+});
+
+test("ACP reverse requests use canonical names, session scope, and cancellation", async () => {
+	const calls: unknown[][] = [];
+	const typedCalls: string[] = [];
+	const connection = {
+		request: async (...args: unknown[]) => {
+			calls.push(args);
+			return { action: "cancel" };
+		},
+		requestPermission: async () => {
+			typedCalls.push("requestPermission");
+			return {};
+		},
+		readTextFile: async () => {
+			typedCalls.push("readTextFile");
+			return {};
+		},
+		writeTextFile: async () => {
+			typedCalls.push("writeTextFile");
+		},
+		createTerminal: async () => {
+			typedCalls.push("createTerminal");
+			return {};
+		},
+	} as unknown as AgentSideConnection;
+	const signal = new AbortController().signal;
+	const reverse = createAcpReverseConnection(connection, "session-1");
+	const requests = [
+		["request", { toolCallId: "call-1", sessionId: "spoofed-session" }],
+		["fs.readTextFile", { path: "/workspace/README.md" }],
+		["fs.writeTextFile", { path: "/workspace/README.md", content: "updated" }],
+		["terminal.create", { command: "printf", args: ["ok"] }],
+		["ui.elicit", { mode: "form", message: "Choose" }],
+	] as const;
+	for (const [method, params] of requests) await reverse.request?.(method, params, { cancellationSignal: signal });
+
+	expect(calls).toEqual([
+		["session/request_permission", { toolCallId: "call-1", sessionId: "session-1" }, { cancellationSignal: signal }],
+		["fs/read_text_file", { path: "/workspace/README.md", sessionId: "session-1" }, { cancellationSignal: signal }],
+		[
+			"fs/write_text_file",
+			{ path: "/workspace/README.md", content: "updated", sessionId: "session-1" },
+			{ cancellationSignal: signal },
+		],
+		["terminal/create", { command: "printf", args: ["ok"], sessionId: "session-1" }, { cancellationSignal: signal }],
+		[
+			"elicitation/create",
+			{ mode: "form", message: "Choose", sessionId: "session-1" },
+			{ cancellationSignal: signal },
+		],
+	]);
+	expect(typedCalls).toEqual([]);
 });
 
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {

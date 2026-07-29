@@ -96,6 +96,30 @@ export function injectManagedTreeSnapshot(failure: { ok: false; code: string }):
 }
 
 /**
+ * Inject managed tree REMOVE failures (fork publication cleanup boundary).
+ *
+ * Used to separate an authorized POSIX quarantine (`cleanup_pending`, which is a
+ * successful cleanup and must NOT supersede the primary error) from an
+ * independently real cleanup failure (which must supersede it, with the primary
+ * failure attached as `cause`).
+ */
+export function injectManagedTreeRemove(failure: { ok: false; code: string }): ManagedInjectionHandle {
+	const hits = { n: 0 };
+	if (process.platform === "linux") {
+		const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree").mockImplementation(() => {
+			hits.n += 1;
+			return failure as never;
+		});
+		return handle(hits, () => spy.mockRestore());
+	}
+	const spy = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(() => {
+		hits.n += 1;
+		return failure as never;
+	});
+	return handle(hits, () => spy.mockRestore());
+}
+
+/**
  * Inject retained-tree fsync identity failures.
  * Linux: RecoveryFsRoot.fsyncExpected. Other hosts: fs.fsyncSync during tree fsync.
  */

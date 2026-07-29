@@ -1,0 +1,11 @@
+{
+  "text": "alpha.txt (13B)\ndeeper/",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/bundle.tar.gz"
+    }
+  }
+}

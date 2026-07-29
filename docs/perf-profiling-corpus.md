@@ -33,7 +33,7 @@ Optimization **status vocabulary** for a hotspot:
 
 A v1–v3 win is **never** called "confirmed" from current-only coverage. `validatePerfCorpusReport()` enforces this: a `CPU-self-time confirmed` classification is rejected unless the report carries profiler self-time evidence.
 
-## Schema (`gjc.perf-corpus/3`)
+## Schema (gjc.perf-corpus/2)
 
 `PerfCorpusReport` keeps the evidence classes as **separate named fields** per fixture:
 
@@ -42,13 +42,10 @@ A v1–v3 win is **never** called "confirmed" from current-only coverage. `valid
 - `profilerSelfTime: { profiler, artifactPath?, samples? }`
 - `rssMemory: { baselineBytes, peakBytes?, growthBytes, returnBytes, ... }`
 - `byteParity: { renderedGolden?, persistedJsonlGolden?, providerPayloadGolden?, materializedSessionGolden? }`
-- `memoryBaseline?: { surface, profile, ordinal, childPid, parentPid, captureSemanticsId, iterations, operations, operationsPerSecond, periodicSamples, observedExtrema, sampling, postTeardown, rssSlopeBytesPerSecond, heapSlopeBytesPerSecond, processTreeBaselineRssBytes, processTreePostTeardownRssBytes, processTreeSampler }`
-- `runner` records command/argv, sanitized environment controls, platform/architecture, profile targets, requested surface order, process isolation, and parent/child GC flags together with complete runtime provenance: `runtimeCommand`, `runtimeControlIdentity`, `closureDigest`, `closureManifest`, `bunVersion`, `bunExecutable`, and `worktreeFingerprint`.
-- `gitSha` is the full checked-out measurement commit. Capture fails closed when Git checkout provenance is unavailable; `gitDirty` and the before/after worktree fingerprint prevent changed source from being presented as clean evidence.
-
-V3 structurally separates chronological `periodicSamples` from `observedExtrema`. The latter contains exactly `rssBytes`, `heapUsedBytes`, `externalBytes`, and `arrayBuffersBytes`, each as `{ valueBytes, elapsedMs }`; equal values retain the earliest observation. Baseline and periodic observations can update both structures, but throttled or forced high-water observations update extrema only. `postTeardown` belongs to neither structure. Repository and replay slopes are derived only from chronological post-warm-up periodic samples; RSS peak and growth use only the RSS observed extremum.
-
-An observed extremum is a sampled maximum, not a true process peak. The sampling metadata exposes cadence, missed deadlines, throttled callbacks, and forced probes, but scheduler delay and uninstrumented transients can still hide a higher value. Historical v1/v2 reports retain their original semantics and are never converted to, or pooled with, v3 evidence.
+- `memoryBaseline?: { surface, profile, iterations, operations, operationsPerSecond, samples, postTeardown, rssSlopeBytesPerSecond, heapSlopeBytesPerSecond, processTreeBaselineRssBytes, processTreePostTeardownRssBytes, processTreeSampler }`
+- `runner: { command, argv, environment, platform, arch, bunVersion?, ci?, profile, durationTargetMs?, memoryIsolation, iterationsTarget, gcExposed, memoryChildGcExposed, memoryChildExecArgv }` pins the actual parent argv, normalized workload controls, isolation, parent GC availability, and the fixed isolated-child runtime flags separately.
+- `gitSha` is the full checked-out `HEAD` when Git is available, with `GITHUB_SHA` used only as a fallback; `gitDirty` explicitly marks tracked or untracked worktree changes so local evidence cannot silently masquerade as a clean commit. The runner captures SHA and the complete porcelain worktree fingerprint before and after the workloads and rejects any in-flight source-state change.
+- Every detailed sample separates `rssBytes`, `heapUsedBytes`, `heapTotalBytes`, `externalBytes`, `arrayBuffersBytes`, and `activeResourceCount`.
 
 `hotspotClassifications: HotspotClassification[]` carry `{ hotspotId, status, evidenceClass, artifactRefs, notes }`. The current v1–v3 reclassification lives in `V1_V3_RECLASSIFICATION`; no entry is `CPU-self-time confirmed` because no profiler artifacts have been captured yet.
 
@@ -72,8 +69,11 @@ bun test packages/coding-agent/test/perf-corpus.test.ts
 # Emit the detailed short memory profile with explicit GC return samples
 bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts
 
-# Emit one 30000 ms soak report for an admitted measurement slot
-GJC_MEMORY_PROFILE=soak GJC_MEMORY_DURATION_MS=30000 bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts
+# Opt into the longer bounded soak profile
+GJC_MEMORY_PROFILE=soak bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts
+
+# Override the per-surface duration (250–60000 ms) and minimum iterations
+GJC_MEMORY_PROFILE=soak GJC_MEMORY_DURATION_MS=10000 GJC_MEMORY_ITERATIONS=100000 bun --smol --expose-gc packages/coding-agent/bench/perf-corpus.bench.ts
 ```
 
 ## Profiler-artifact expectations
@@ -97,39 +97,20 @@ Held thresholds (`HELD_PERF_THRESHOLDS`) name candidates that need variance char
 
 ## Memory baseline protocol
 
-Detailed memory fixtures cover seven explicit surfaces: CLI startup/configuration, AgentSession message/context lifecycle, blob/external buffers, worker generations, Telegram reconnect/queue settlement, TUI render/dispose churn, and shared/native transfer boundaries. `agent-session` and `tui` use the named production-backed lifecycle adapters; the other five surfaces are descriptive proxies. None of these measurements alone proves a production leak, causal effect, memory budget, or authorized optimization.
+Detailed memory fixtures cover seven explicit surfaces: CLI startup/configuration, AgentSession-style message/context lifecycle, blob/external buffers, worker generations, Telegram reconnect/queue settlement, TUI render/dispose churn, and shared/native transfer boundaries. The fixtures are synthetic lifecycle proxies: they establish a reproducible allocation and teardown envelope but do not by themselves prove a production leak. A production optimization claim still requires a workload adapter that exercises the implicated owner and a same-host before/after artifact.
+The command-line runner executes each memory surface in a fresh Bun subprocess and records `runner.memoryIsolation: "process-per-surface"` so allocator high-water state from one fixture cannot contaminate the next surface's baseline. Programmatic `runPerfCorpusBenchmark()` defaults to in-process fixtures and records `"in-process"` for focused contract tests; pass `{ isolatedMemory: true }` for acceptance-equivalent evidence. Process-tree RSS snapshots exclude the `ps` sampler process and degrade both endpoints to `"unavailable"` when either snapshot fails. The process-tree baseline is captured after GC, followed by another GC that clears sampler allocations before the local baseline and workload begin. Soak workloads use single-iteration batches so approximately 50 ms sampling cannot be hidden behind a large synchronous chunk. Post-teardown return fields remain `null` when GC is unavailable.
 
-Every command-line report runs one fresh Bun subprocess per surface and records `runner.memoryIsolation: "process-per-surface"`. The requested and actual order, ordinal, one common parent PID, and distinct child PID identify each surface process. The stable `captureSemanticsId` is `gjc.memory-baseline.capture/3`; in particular, TUI forced sampling occurs immediately after each render and before disposal. Programmatic `runPerfCorpusBenchmark()` defaults to in-process fixtures for focused contract use; pass `{ isolatedMemory: true }` for measurement-equivalent process isolation. Process-tree RSS snapshots exclude the `ps` sampler process and degrade both endpoints to `"unavailable"` when either snapshot fails.
+Use the `short` profile for deterministic contract and shape checks; its bounded iteration window intentionally reports `null` slopes when less than 250 ms is observed. Use `soak` for repeated sampling and slope characterization. For decision evidence:
+The soak default runs each surface for at least one second and samples at approximately 50 ms intervals. `GJC_MEMORY_DURATION_MS` accepts 250–60000 ms and `GJC_MEMORY_ITERATIONS` accepts 1–10000000; record overrides with the artifact.
 
-The frozen measurement design is:
-
-1. Admit exactly 5 independent short reports from at most 7 attempts and exactly 24 independent `30000` ms soak reports from at most 30 attempts. Invalid attempts consume their cap, remain immutable, and are replaced only in the same preallocated slot. Reaching a cap without the target count yields `INSUFFICIENT_EVIDENCE`, descriptive output, and no action.
-2. Use seed `0x3279B4E7` for a deterministic, preallocated schedule that interleaves short attempts through the soak sequence. The first 21 admitted soak slots use three complete cyclic/Latin seven-surface blocks; slots 22–24 use the three frozen residual rows and disclose their imbalance. Replacement attempts reuse the slot's surface order.
-3. Treat one report launch as the independent block and its seven surfaces as correlated outcomes. Do not pool short with soak, v1/v2 with v3, surfaces, platforms, or source heads. Reports run sequentially in the global preregistered short/soak interleave on one pinned host. Intervals may not overlap, every launch after the first starts at least 60 seconds after the prior launch ends, and AC power, fixed power mode, host identity, telemetry, interruption state, and parent/child process closure must remain within the frozen controls.
-4. Soak periodic observations target 50 ms monotonic deadlines without fabricated backfill; short observations occur at iteration boundaries. Baseline and the final loop-completion periodic observation delimit slope data. High-water callbacks are at most once per 10 ms during soak unless forced, update extrema only, and never enter `periodicSamples`.
-5. Calculate repository endpoint and Theil–Sen sensitivity slopes from post-warm-up `periodicSamples` only. The predeclared, non-confirmatory all-members follow-up screen is limited to endpoint heap-used slopes for `agent-session` and `tui`. Every other metric or surface, teardown delta, observed growth, throughput, process-tree result, and drift/order/time/telemetry sensitivity is descriptive.
-6. Report median, MAD, IQR, min/max, every run-level point, and descriptive order, time, host-telemetry, and drift diagnostics. Do not exclude an attempt because it is slow, large, an outlier, or disagrees with a sensitivity estimator.
+1. Pin the source SHA, Bun version, platform/architecture, profile, fixture inputs, and command.
+2. Run at least five short repetitions and three independent soak repetitions on an otherwise idle runner.
+3. Exclude warm-up from slope decisions and report the raw samples, median, p95, variance/confidence interval, peak, and post-teardown values. The runner discards the first quarter of the observed window, capped at 250 ms, before calculating a slope and requires at least 250 ms of steady-state samples.
+4. Interpret heap, external/array-buffer, RSS, and process-tree evidence separately. A high post-GC RSS with a returned heap may be allocator high-water residency, not a reachability leak.
+5. Do not enforce a numeric threshold until variance is characterized and recorded in the threshold ledger. A claimed optimization needs either a statistically supported improvement on the same workload or removal of a reproducible unbounded slope.
+6. Treat active handles and post-teardown residue as lifecycle signals, not byte-parity proof. Behavior, transcript/blob integrity, throughput, and latency remain independent gates.
 
 The default fixtures contain no user or provider data. Raw private transcripts remain prohibited.
-
-## Measurement provenance and trusted offline replay
-
-Fresh reports are captured from one clean immutable `measurementHead`; the later evidence-only `publicationHead` is a different identity and must never be substituted into raw report provenance. Each report binds the full measurement SHA, closure digest and path manifest, exact per-report runtime-control identity, Bun version and executable, worktree fingerprint, actual surface order and ordinals, parent/child PIDs, and capture-semantics identifier. Analysis fails closed on a dirty or moved tree, mismatched closure or toolchain, missing/duplicate surface, changed order, or invalid process identity.
-
-The raw input directory is a flat, immutable, read-only set with no symlinks or unexpected entries. In addition to the ordered report JSON files, it contains exactly:
-
-- `perf-corpus-attempt-ledger.json` (`gjc.perf-corpus-attempt-ledger/1`, version `1`): an exact-key, canonical-JSON-sealed object binding capture ID; M and measurement tree; C; worktree fingerprint; capture runtime-control identity; schedule/protocol digests; sealed timestamp; fixed opaque host ID/platform/architecture/AC power/power mode; and every attempt in global chronological order. Each exact-key attempt records allocation and admission slot, expected and actual seven-surface orders, interval and prior cooldown, sequential/interruption/process-closure flags, host/power identity, before/after supported telemetry with timestamps, report filename/size/SHA-256, and matching M/tree/C/fingerprint plus its per-report runtime-control identity.
-- `perf-corpus-raw-manifest.json` (`gjc.perf-corpus-raw-manifest/1`, version `1`): an exact-key, canonical-JSON-sealed object binding the same capture, M/tree/C/fingerprint/capture-control/schedule/protocol identities, the exact ledger filename/size/SHA-256, and one ordered exact filename/size/SHA-256 entry for every ledger attempt report. `complete=true` and the shared sealed timestamp are mandatory.
-
-The externally authenticated notebook input contract is exact and outcome-independent: `GJC_PERF_CORPUS_EXPECTED_GIT_SHA`, `GJC_PERF_CORPUS_EXPECTED_TREE_SHA`, `GJC_PERF_CORPUS_EXPECTED_CLOSURE_DIGEST`, `GJC_PERF_CORPUS_EXPECTED_WORKTREE_FINGERPRINT`, `GJC_PERF_CORPUS_EXPECTED_RUNTIME_CONTROL_IDENTITY`, `GJC_PERF_CORPUS_EXPECTED_CAPTURE_ID`, `GJC_PERF_CORPUS_EXPECTED_SCHEDULE_DIGEST`, `GJC_PERF_CORPUS_EXPECTED_PROTOCOL_DIGEST`, `GJC_PERF_CORPUS_ATTEMPT_LEDGER_SHA256`, and `GJC_PERF_CORPUS_RAW_MANIFEST_SHA256`, in addition to the authenticated driver/preregistration/template digests and immutable-mount attestation. All bindings are checked before report admission. The canonical JSON and terminal notebook receipt retain both sealed-file digests, every ordered raw report hash, and an admitted-report traceability row containing ledger sequence, attempt, admission slot, profile, filename, and SHA-256.
-
-Telemetry uses exact `{ availability, value }` records with the explicit `supported`/`unavailable` taxonomy. This protocol requires supported nominal thermal state, normal memory pressure, bounded one-minute load, and bounded free memory before and after each launch. Ambient one-minute load drift is the one-sided upward increase in each later `telemetryBefore.loadAverage1m` from the first attempt's pre-launch baseline: later minus baseline must be at most `1`, so an increase of exactly `1` passes and every lower later value passes this drift gate. An intended within-attempt workload rise in `telemetryAfter` is not ambient drift. Every before and after snapshot remains required and subject to the absolute load maximum of `4` plus every thermal, memory-pressure, power, and free-memory control, and is retained in diagnostics. The external operator separately requires each pre-launch load to be at most `2.5`. The free-memory fraction drift limit is unchanged: every before and after free-memory value is compared with the first attempt's pre-launch value. Missing/unavailable controls, an absolute telemetry bound violation, excessive upward pre-attempt ambient drift, critical state, host or power drift, overlap, cooldown under 60 seconds, documented interruption, or a surviving parent/child process invalidates the sealed input before outcomes are parsed. Invalid report structure may consume a frozen attempt and use only its preallocated replacement; the sealed schedule, caps, and slot row never change.
-
-The committed evidence manifest records the measurement head, closure/protocol/trusted-code digests, bundle content digest, and static receipt-discovery rules. Post-publication values do not self-reference committed bytes: an external signed required-check receipt binds the measurement and publication heads, committed report/manifest hashes, immutable bundle hash and object identity, access/expiry, workflow identity, and signature. Publication requires downloading the referenced bundle and re-verifying its size, hash, access, and retention.
-
-Offline replay uses independently reviewed driver and notebook-template digests frozen in a pre-outcome external receipt. Before analysis and again before replay, it verifies those exact code and environment digests plus the authenticated ledger/raw-manifest bytes, report provenance and raw hashes, process identity, capture semantics, and recursive exact-key/type/privacy allowlists. Raw inputs are mounted data-only, read-only, and no-exec; parsing is bounded and allowlisted; provider/private/transcript/secret/credential/token fields are rejected outside the fixed negative privacy attestation. Execution uses a sanitized environment, dedicated output directory, disabled network, and a fresh output-free template. Replay must reproduce the canonical tables, summary, figures, ordered report hashes, and admission traceability without modifying raw evidence.
-
-Claim-bearing output omits p95. With 24 independent blocks there is no finite two-sided distribution-free exact 95% upper endpoint for a population p95, so the trusted notebook emits only a deterministic method/impossibility receipt for that endpoint. Tail description is limited to every individual point, min/max, and the sampling and sample-size limitations; a tail claim requires a separately preregistered larger study.
 
 ## Memory retention & fail-closed materialization
 

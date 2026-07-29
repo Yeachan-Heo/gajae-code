@@ -19,7 +19,7 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae
 import type { Model, Usage } from "@gajae-code/ai";
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
-import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner } from "../async";
+import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner, type SubagentRunOutcome } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -97,6 +97,23 @@ function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
 }
 function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
 	return renderSubagentUserPrompt(assignment, simpleMode === "independent");
+}
+
+export function subagentRunOutcomeFromSingleResult(
+	finalText: string,
+	singleResult: Pick<SingleResult, "aborted" | "exitCode" | "paused" | "setupFailure"> | undefined,
+): string | SubagentRunOutcome {
+	if (singleResult?.paused) return { kind: "paused" };
+	if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
+		return {
+			kind: "failed",
+			text: finalText,
+			...(singleResult.setupFailure && !singleResult.aborted
+				? { setupFailureSummary: singleResult.setupFailure.summary }
+				: {}),
+		};
+	}
+	return finalText;
 }
 function createUsageTotals(): Usage {
 	return {
@@ -655,15 +672,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 						const singleResult = result.details?.results[0];
-						if (singleResult?.paused) return { kind: "paused" };
-						// A resumed subprocess that aborted or exited non-zero is a failed
-						// resume, not a completed one. Throw the rendered failure summary
-						// (finalText) so the leg is reported failed instead of being
-						// returned as successful continuation.
-						if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
-							throw new Error(finalText);
-						}
-						return finalText;
+						return subagentRunOutcomeFromSingleResult(finalText, singleResult);
 					},
 					{
 						id: `${descriptor.task.id}-resume-${Snowflake.next()}`,
@@ -809,6 +818,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 										}
 									: undefined;
 								progress.retryState = undefined;
+								progress.setupFailure = singleResult?.setupFailure;
 							}
 							completedJobs += 1;
 							if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
@@ -831,10 +841,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									`Background task batch complete: ${completedJobs}/${taskItems.length} finished.`,
 								);
 							}
-							if (singleResult?.paused) {
-								return { kind: "paused" };
-							}
-							return finalText;
+							return subagentRunOutcomeFromSingleResult(finalText, singleResult);
 						} catch (error) {
 							if (progress) {
 								progress.status = "failed";
@@ -1481,6 +1488,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
 						inheritedServiceTier: this.session.serviceTier,
+						isFastForSubagentProvider: provider => this.session.isFastForSubagentProvider?.(provider) ?? false,
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
@@ -1554,6 +1562,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
 						inheritedServiceTier: this.session.serviceTier,
+						isFastForSubagentProvider: provider => this.session.isFastForSubagentProvider?.(provider) ?? false,
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,

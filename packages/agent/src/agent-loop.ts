@@ -305,6 +305,7 @@ export function agentLoop(
 			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
+		openResourceRun(config);
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
 		attemptStream.push({ type: "turn_start" });
 		for (const prompt of prompts) {
@@ -315,6 +316,7 @@ export function agentLoop(
 		try {
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
+			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
 			stream.fail(err);
 		}
 	})();
@@ -354,12 +356,14 @@ export function agentLoopContinue(
 			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
+		openResourceRun(config);
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
 		attemptStream.push({ type: "turn_start" });
 
 		try {
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
+			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
 			stream.fail(err);
 		}
 	})();
@@ -372,6 +376,21 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+function openResourceRun(config: AgentLoopConfig): void {
+	if (config.resourceLedger && config.resourceRunId) config.resourceLedger.open(config.resourceRunId);
+}
+
+function publishAgentEnd(
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	config: AgentLoopConfig,
+	event: Extract<AgentEvent, { type: "agent_end" }>,
+): void {
+	stream.push(event);
+	if (event.stopReason !== "maintenance" && config.resourceLedger && config.resourceRunId) {
+		config.resourceLedger.seal(config.resourceRunId);
+	}
 }
 
 /**
@@ -1475,7 +1494,19 @@ async function runLoopBody(
 				isInvalidPromptError(message)
 			) {
 				invalidPromptRepairAttempted = true;
-				if (repairInvalidPromptHistory(currentContext.messages)) {
+				// The rejected turn was already committed to the context by the
+				// streaming path. Repair (and resend) only the history that
+				// preceded it: replaying an errored assistant turn re-poisons the
+				// request and leaves a second assistant tail behind, which no
+				// continuation can resume from.
+				const rejectedIndex = currentContext.messages.length - 1;
+				const rejectedCommitted =
+					rejectedIndex >= 0 && currentContext.messages[rejectedIndex]?.role === "assistant";
+				const retained = rejectedCommitted
+					? currentContext.messages.slice(0, rejectedIndex)
+					: currentContext.messages;
+				if (repairInvalidPromptHistory(retained)) {
+					if (rejectedCommitted) currentContext.messages.splice(rejectedIndex, 1);
 					continue;
 				}
 			}
@@ -1558,7 +1589,7 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults });
-				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
 				stream.end(newMessages);
 				return;
 			}
@@ -1638,7 +1669,7 @@ async function runLoopBody(
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 			if (pendingMessages.length > 0) continue;
 			if (config.shouldPause?.()) {
-				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
 				stream.end(newMessages);
 				return;
 			}
@@ -1659,7 +1690,7 @@ async function runLoopBody(
 				message.errorMessage = message.errorMessage
 					? `${message.errorMessage} | ${breakerMessage}`
 					: breakerMessage;
-				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
 				stream.end(newMessages);
 				return;
 			}
@@ -1668,7 +1699,7 @@ async function runLoopBody(
 		// Agent would stop here. Check for follow-up messages.
 		await config.onBeforeYield?.();
 		if (config.shouldPause?.()) {
-			stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+			publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
 			stream.end(newMessages);
 			return;
 		}
@@ -1683,7 +1714,7 @@ async function runLoopBody(
 		break;
 	}
 
-	stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+	publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
 	stream.end(newMessages);
 }
 
@@ -1831,24 +1862,64 @@ async function streamAssistantResponse(
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			const fallbackAttempt = config.fallbackManaged ? config.nextFallbackAttempt?.(config.model) : undefined;
-			const response = await streamFunction(config.model, llmContext, {
-				...config,
-				fallbackAttempt,
-				apiKey: resolvedApiKey,
-				authCredentialType,
-				metadata: resolvedMetadata,
-				sessionId: config.providerSessionId ?? config.sessionId,
-				toolChoice: effectiveToolChoice,
-				reasoning: effectiveReasoning,
-				temperature: effectiveTemperature,
-				signal: requestSignal,
-				onResponse: captureOnResponse,
+			const responsePromise = Promise.resolve().then(() =>
+				streamFunction(config.model, llmContext, {
+					...config,
+					fallbackAttempt,
+					apiKey: resolvedApiKey,
+					authCredentialType,
+					metadata: resolvedMetadata,
+					sessionId: config.providerSessionId ?? config.sessionId,
+					toolChoice: effectiveToolChoice,
+					reasoning: effectiveReasoning,
+					temperature: effectiveTemperature,
+					signal: requestSignal,
+					onResponse: captureOnResponse,
+				}),
+			);
+			const { promise: iteratorSettled, resolve: settleIterator } = Promise.withResolvers<void>();
+			let responseResultPromise: Promise<AssistantMessage> | undefined;
+			let responseForResult: { result(): Promise<AssistantMessage> } | undefined;
+			const getResponseResult = (): Promise<AssistantMessage> =>
+				(responseResultPromise ??= Promise.resolve().then(() => responseForResult!.result()));
+			const providerLifecycle = responsePromise.then(async response => {
+				responseForResult = response;
+				await iteratorSettled;
+				await Promise.allSettled([getResponseResult()]);
 			});
+			if (config.resourceLedger && config.resourceRunId) {
+				// One ownership spans factory creation, iterator close, and trailing result.
+				config.resourceLedger.track(
+					config.resourceRunId,
+					"provider_factory",
+					`${config.model.provider}/${config.model.id}`,
+					providerLifecycle,
+				);
+			}
+			const response = await responsePromise;
+			responseForResult = response;
 
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;
 
 			const responseIterator = response[Symbol.asyncIterator]();
+			let iteratorClosed = false;
+			const closeIterator = (): void => {
+				if (iteratorClosed) return;
+				iteratorClosed = true;
+
+				void Promise.resolve()
+					.then(() => responseIterator.return?.())
+					.then(
+						() => settleIterator(),
+						() => settleIterator(),
+					);
+			};
+			const finishResponse = async (): Promise<AssistantMessage> => {
+				closeIterator();
+				await iteratorSettled;
+				return getResponseResult();
+			};
 
 			// Set up a single abort race: register the abort listener once for the whole
 			// stream and reuse the same race promise for every iterator.next() instead of
@@ -1857,6 +1928,7 @@ async function streamAssistantResponse(
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
+					closeIterator();
 					const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
 					await finishChat(aborted);
 					return aborted;
@@ -1874,7 +1946,7 @@ async function streamAssistantResponse(
 					if (abortRacePromise) {
 						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
 						if (result === ABORTED) {
-							responseIterator.return?.()?.catch(() => {});
+							closeIterator();
 							const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
 							await finishChat(aborted);
 							return aborted;
@@ -1888,7 +1960,11 @@ async function streamAssistantResponse(
 						await finishChat(aborted);
 						return aborted;
 					}
-					if (next.done) break;
+					if (next.done) {
+						iteratorClosed = true;
+						settleIterator();
+						break;
+					}
 
 					const event = next.value;
 
@@ -1937,8 +2013,8 @@ async function streamAssistantResponse(
 						case "done":
 						case "error": {
 							const finalMessage = config.fallbackManaged
-								? managedAssistantShell(await response.result(), config.model)
-								: await response.result();
+								? managedAssistantShell(await finishResponse(), config.model)
+								: await finishResponse();
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {
@@ -1955,11 +2031,12 @@ async function streamAssistantResponse(
 				}
 			} finally {
 				detachAbortListener?.();
+				closeIterator();
 			}
 
 			const trailing = config.fallbackManaged
-				? managedAssistantShell(await response.result(), config.model)
-				: await response.result();
+				? managedAssistantShell(await finishResponse(), config.model)
+				: await finishResponse();
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -2142,10 +2219,8 @@ async function executeToolCalls(
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
 		if (interruptState.triggered) {
 			// Skip both span emission and the collector orphan record here. The
-			// tail sweep below (after `Promise.allSettled`) is the single path
-			// that handles "no result message was produced" — it calls
-			// `recordSkippedTool` and `emitToolResult` once per record, so any
-			// work we did here would double-count.
+			// scheduler-task finalizer emits the skipped result and collector record;
+			// the tail sweep below remains a defensive fallback for unexpected throws.
 			record.skipped = true;
 			return;
 		}
@@ -2261,7 +2336,7 @@ async function executeToolCalls(
 							toolCalls: toolCallInfos,
 						})
 					: undefined;
-				const rawResult = await tool.execute(
+				const execution = tool.execute(
 					toolCall.id,
 					transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs,
 					tool.nonAbortable ? undefined : toolSignal,
@@ -2276,6 +2351,7 @@ async function executeToolCalls(
 					},
 					toolContext,
 				);
+				const rawResult = await execution;
 				const coerced = coerceToolResult(rawResult);
 				result = coerced.result;
 				if (coerced.malformed || result.isError) isError = true;
@@ -2359,8 +2435,30 @@ async function executeToolCalls(
 		const record = records[index];
 		const concurrency = record.tool?.concurrency ?? "shared";
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
-		const task = start.then(() => runTool(record, index));
+		const task = start
+			.then(() => runTool(record, index))
+			.finally(() => {
+				// Scheduler ownership includes dependency waits and the fallback skip
+				// emission, not only tool.execute().
+				if (!record.toolResultMessage) {
+					record.skipped = true;
+					recordSkippedTool(telemetry, {
+						toolCallId: record.toolCall.id,
+						toolName: record.toolCall.name,
+						status: "skipped",
+					});
+					emitToolResult(record, createSkippedToolResult(), true);
+				}
+			});
 		tasks.push(task);
+		if (config.resourceLedger && config.resourceRunId) {
+			config.resourceLedger.track(
+				config.resourceRunId,
+				"tool",
+				`${record.toolCall.name}:${record.toolCall.id}`,
+				task,
+			);
+		}
 		if (concurrency === "exclusive") {
 			lastExclusive = task;
 			sharedTasks = [];

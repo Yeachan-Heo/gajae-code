@@ -11,7 +11,7 @@ const originalAgentDir = getAgentDir();
 let tempDir: TempDir | null = null;
 
 beforeEach(() => {
-	tempDir = TempDir.createSync("@pi-stats-db-range-");
+	tempDir = TempDir.createSync(path.join(os.homedir(), "pi-stats-db-range-"));
 	const configDir = path.relative(os.homedir(), tempDir.join("config"));
 	process.env.PI_CONFIG_DIR = configDir;
 	setAgentDir(path.join(os.homedir(), configDir, "agent"));

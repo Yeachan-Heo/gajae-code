@@ -18,6 +18,12 @@ const PREFIX_KEYS = ["PI_SHELL_PREFIX", "CLAUDE_CODE_SHELL_PREFIX"] as const;
 
 const tempDirs: string[] = [];
 
+function tempDir(): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-trust-iso-"));
+	tempDirs.push(dir);
+	return dir;
+}
+
 function projectDir(dotenv?: string): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-shell-prefix-trust-"));
 	tempDirs.push(dir);
@@ -36,6 +42,12 @@ async function resolvePrefixIn(cwd: string, overrides: Record<string, string> = 
 	}
 	// Never let the outer environment leak a prefix into the child.
 	for (const key of PREFIX_KEYS) delete env[key];
+	// `$credentialEnv` also consults file sources the child env cannot mask:
+	// the agent `.env`, the GJC config `.env`, `~/.env` and the login shell rc
+	// files. Point HOME and the agent dir at empty temp dirs so a contributor who
+	// exports one of these names from a shell rc still sees a hermetic result.
+	env.HOME = tempDir();
+	env.GJC_CODING_AGENT_DIR = tempDir();
 	Object.assign(env, overrides);
 
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });

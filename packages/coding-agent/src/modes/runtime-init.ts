@@ -94,7 +94,9 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getModel: () => session.model,
 			isIdle: () => !session.isStreaming,
+			getActivePromptHandle: () => session.activePromptHandle,
 			abort: () => session.abort(),
+			abortPromptAndWait: (handle, abortOptions) => session.abortPromptAndWait(handle, abortOptions),
 			hasPendingMessages: () => session.queuedMessageCount > 0,
 			getPendingMessageCounts: () => session.pendingMessageCounts,
 			getTranscript: () => session.getTranscript(),
@@ -168,6 +170,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			},
 			getJobs: () => session.getAsyncJobSnapshot(),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
+			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
 				switch (operation) {
 					case "model.set": {

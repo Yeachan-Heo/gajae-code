@@ -9,7 +9,11 @@
 
 import { $credentialEnv, $env, $flag, extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
 import type { Effort } from "../model-thinking";
-import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "../model-thinking";
+import {
+	mapEffortToAnthropicAdaptiveEffort,
+	requireSupportedEffort,
+	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
+} from "../model-thinking";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -905,25 +909,6 @@ function buildAdditionalModelRequestFields(
 	}
 
 	return result;
-}
-
-/**
- * Adaptive thinking `display` is supported starting with Anthropic model Opus 4.7.
- * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
- * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
- * "omitted" — thinking tokens are billed but no content streams back — so it
- * must opt in like Opus 4.7+ (issue #2791).
- * Bedrock model ids are prefixed with region/inference-profile slugs (e.g.
- * `eu.anthropic.Anthropic model-opus-4-7-...`); the regex matches the `Anthropic model-opus-X-Y`
- * fragment regardless of prefix.
- */
-function supportsAdaptiveThinkingDisplay(modelId: string): boolean {
-	if (/claude-fable-\d/.test(modelId)) return true;
-	const match = /claude-opus-(\d+)-(\d+)/.exec(modelId);
-	if (!match) return false;
-	const major = Number(match[1]);
-	const minor = Number(match[2]);
-	return major > 4 || (major === 4 && minor >= 7);
 }
 
 /**

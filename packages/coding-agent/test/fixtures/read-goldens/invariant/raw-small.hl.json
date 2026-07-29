@@ -1,0 +1,14 @@
+{
+  "text": "raw small α\nsecond 😀\nthird",
+  "displayContent": {
+    "text": "raw small α\nsecond 😀\nthird",
+    "startLine": 1
+  },
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/raw-small.txt"
+    }
+  }
+}

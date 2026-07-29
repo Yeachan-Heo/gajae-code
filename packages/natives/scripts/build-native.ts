@@ -4,6 +4,7 @@ import { $ } from "bun";
 import { detectHostAvx2Support } from "../../../scripts/host-detect";
 import { assertRequiredSymbols } from "./embed-guard";
 import { generateEnumExports } from "./gen-enums";
+import { resolveCargoToolchainPath } from "./rust-toolchain-path";
 
 const repoRoot = path.join(import.meta.dir, "../../..");
 const rustDir = path.join(repoRoot, "crates/pi-natives");
@@ -249,12 +250,6 @@ const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
 console.log(`Building pi-natives for ${targetPlatform}-${targetArch}${variantSuffix}${profileSuffix}…`);
 
-await fs.mkdir(nativeDir, { recursive: true });
-await cleanupStaleTemps(nativeDir);
-await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
-const buildOutputDir = await fs.mkdtemp(buildOutputDirPrefix);
-napiArgs[10] = buildOutputDir;
-
 // Resolve napi bin directly: `bunx @napi-rs/cli` can pick up the wrong bin on
 // systems where `cli` exists on PATH (e.g. Mono's /usr/bin/cli on Ubuntu).
 const napiBin = Bun.which("napi", {
@@ -264,11 +259,30 @@ if (!napiBin) {
 	throw new Error("Could not locate @napi-rs/cli `napi` binary in node_modules/.bin");
 }
 
+const cargoPathResolution = await resolveCargoToolchainPath({
+	cwd: repoRoot,
+	currentPath: Bun.env.PATH ?? "",
+});
+if (!cargoPathResolution) {
+	throw new Error(
+		"Could not locate Cargo for native addon build. Install Rust with rustup, or ensure `cargo` is available on PATH.",
+	);
+}
+Bun.env.PATH = cargoPathResolution.pathValue;
+
+await fs.mkdir(nativeDir, { recursive: true });
+await cleanupStaleTemps(nativeDir);
+await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
+const buildOutputDir = await fs.mkdtemp(buildOutputDirPrefix);
+napiArgs[10] = buildOutputDir;
+
 try {
 	const buildResult = await $`${napiBin} ${napiArgs}`.nothrow();
 	if (buildResult.exitCode !== 0) {
-		const stderr = buildResult.stderr?.toString("utf-8") ?? "";
-		throw new Error(`napi build failed${stderr ? `:\n${stderr}` : ""}`);
+		const stderr = buildResult.stderr?.toString("utf-8").trim() ?? "";
+		const stdout = buildResult.stdout?.toString("utf-8").trim() ?? "";
+		const details = [stderr, stdout].filter(detail => detail !== "").join("\n");
+		throw new Error(`napi build failed${details ? `:\n${details}` : ""}`);
 	}
 
 	const builtAddonPath = await resolveBuiltAddonPath(buildOutputDir, canonicalAddonFilename);

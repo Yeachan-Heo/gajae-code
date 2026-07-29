@@ -47,6 +47,17 @@ describe("resizeImage defaults", () => {
 		expect(result.mimeType).toBe("image/png");
 	});
 
+	it("forceReencode bypasses the compact-image fast path", async () => {
+		const data = await makeRedPng(200, 200);
+		const result = await resizeImage(
+			{ type: "image", data, mimeType: "image/png" },
+			{ forceReencode: true, excludeWebP: true },
+		);
+
+		expect(result.wasResized).toBe(true);
+		expect(["image/png", "image/jpeg"]).toContain(result.mimeType);
+	});
+
 	it("respects custom maxWidth/maxHeight overrides (browser-tool case)", async () => {
 		// 1600x1200 — exceeds the 1024 cap from the browser screenshot override
 		const data = await makeRedPng(1600, 1200);

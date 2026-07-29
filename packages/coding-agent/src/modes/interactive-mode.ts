@@ -61,7 +61,7 @@ import { GajaePetWidget, type PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import { IrcSplitViewComponent } from "./components/irc-sidebar";
+import { computeIrcSplitWidths, getIrcSidebarSemanticToken, IrcSplitViewComponent } from "./components/irc-sidebar";
 import {
 	getPetUnavailableWarning,
 	isPetAvailable,
@@ -416,6 +416,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	#sttController: SttModeController | undefined;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
+	#viewportOutputRevision = 0n;
+	#viewportOutputIdentity: string;
+
 	#transcriptRegistry = new TranscriptItemRegistry();
 
 	/** Direct controller capabilities for consumers that coordinate mode transitions. */
@@ -484,6 +487,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.mcpManager = mcpManager;
 		this.#eventBus = eventBus;
 		this.#keyDisplayContext = keyDisplayContext;
+		this.#viewportOutputIdentity = `session:${this.sessionManager.getSessionId()}`;
+
 		this.keybindings.setDisplayContext(this.#keyDisplayContext);
 		const thisMode = this;
 		this.#goalModeController = new GoalModeController({
@@ -738,6 +743,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setBottomPinnedComponent(this.statusLine);
 		this.ui.setFocus(this.editor);
+		this.ui.setViewportOutputSource({
+			identity: this.#viewportOutputIdentity,
+			revision: this.#viewportOutputRevision,
+		});
+
 		this.petWidget?.dispose();
 		this.petWidget = this.#createPetWidget(this.editor);
 		const configuredPetMode = settings.get("pet.mode");
@@ -770,6 +780,12 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
+		this.editor.onViewportPageScroll = direction => {
+			this.ui.scrollViewportPages(direction);
+		};
+		this.editor.onViewportFollowLive = () => {
+			this.ui.followLiveViewport();
+		};
 
 		// Wire observer registry to EventBus
 		if (this.#eventBus) {
@@ -891,6 +907,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Set up theme file watcher
 		onThemeChange(() => {
 			clearRenderCache();
+			this.#ircSplitView.invalidateTheme();
 			configureDefaultComposerChrome(this.editor);
 			this.editor.setPlaceholder(this.#getComposerPlaceholder());
 			this.ui.invalidate();
@@ -1132,6 +1149,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.statusLine,
 			this.hookWidgetContainerAbove,
 			this.editorContainer,
+			this.petFloorContainer,
 			this.hookWidgetContainerBelow,
 		].reduce((rows, component) => rows + component.render(width).length, 0);
 
@@ -1513,6 +1531,12 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
+		this.editor.onViewportPageScroll = direction => {
+			this.ui.scrollViewportPages(direction);
+		};
+		this.editor.onViewportFollowLive = () => {
+			this.ui.followLiveViewport();
+		};
 
 		void this.refreshSlashCommandState().catch(error => {
 			logger.warn("Failed to refresh slash command state for custom editor", { error: String(error) });
@@ -1661,6 +1685,21 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	isKnownSlashCommand(text: string): boolean {
 		return this.#uiHelpers.isKnownSlashCommand(text);
+	}
+
+	/** Advances the sticky-viewport source only for semantic transcript output. */
+	recordVisibleTranscriptMutation(): void {
+		const identity = `session:${this.sessionManager.getSessionId()}`;
+		if (identity !== this.#viewportOutputIdentity) {
+			this.#viewportOutputIdentity = identity;
+			this.#viewportOutputRevision = 0n;
+		} else {
+			this.#viewportOutputRevision += 1n;
+		}
+		this.ui.setViewportOutputSource({
+			identity: this.#viewportOutputIdentity,
+			revision: this.#viewportOutputRevision,
+		});
 	}
 
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[] {
@@ -2190,12 +2229,18 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	resetIrcSidebarSession(): void {
-		this.ircLedger.reset();
+		const sidebarVisible = this.#ircSplitView.effectiveSidebarVisible(this.ui.terminal.columns);
+		const rightWidth = computeIrcSplitWidths(this.ui.terminal.columns).rightWidth;
+		const beforeToken = sidebarVisible ? getIrcSidebarSemanticToken(this.ircLedger, rightWidth) : "";
+		this.ircLedger.reset({ retireCurrentSessionIdentities: true });
+		this.#ircSplitView.resetSource();
+		const afterToken = sidebarVisible ? getIrcSidebarSemanticToken(this.ircLedger, rightWidth) : "";
 		this.#eventController.resetIrcObservations();
 		this.#ircSidebarRequestedVisible = false;
 		this.#ircSplitView.setVisible(false);
 		this.#uiHelpers.resetIrcSidebarHint();
 		this.#syncIrcSidebarAvailabilityFromSettings();
+		if (sidebarVisible && beforeToken !== afterToken) this.recordVisibleTranscriptMutation();
 	}
 
 	#invalidateIrcSidebarRender(): void {

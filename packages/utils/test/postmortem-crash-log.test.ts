@@ -125,6 +125,72 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('"refresh_token": "«redacted»');
 	});
 
+	it("redacts current vendor token formats, not just the legacy prefixes", () => {
+		const target = tempCrashLog();
+		// GitHub fine-grained PATs use `github_pat_`, not the classic `gh[opsur]_`.
+		const fineGrained = "github_pat_11ABCDEFG0hijklmnopq_RSTUVWXYZ0123456789abcdefghijklmnopqr";
+		// ASIA is the temporary/STS access key id; AKIA is the long-term one.
+		const temporaryAws = "ASIA1234567890ABCDEF";
+		const err = new Error(`upload failed: ${fineGrained}-tail ${temporaryAws}-tail`);
+
+		recordFatalCrash("Uncaught Exception", err, { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("upload failed");
+		expect(contents).not.toContain(fineGrained);
+		expect(contents).not.toContain(temporaryAws);
+		expect(contents).toContain("«redacted-github-token»");
+		expect(contents).toContain("«redacted-aws-key»");
+		expect(contents).toContain("«redacted-github-token»-tail");
+		expect(contents).toContain("«redacted-aws-key»-tail");
+	});
+
+	it("preserves credential lookalikes outside the supported token boundaries", () => {
+		const target = tempCrashLog();
+		const lookalikes = [
+			"github_pat_short",
+			`github_pat_${"A".repeat(19)}`,
+			`prefixgithub_pat_${"B".repeat(24)}`,
+			`ASIA${"C".repeat(15)}`,
+			"SecretAccessKeyId=diagnostic-identifier",
+			"SessionTokenCount=12345678",
+			"mySecretAccessKey=diagnostic-value",
+			"xSessionToken=diagnosticvalue",
+			"_SecretAccessKey=diagnostic-value",
+		];
+
+		recordFatalCrash("Uncaught Exception", new Error(`diagnostic context: ${lookalikes.join(" ")}`), {
+			path: target,
+		});
+
+		const contents = fs.readFileSync(target, "utf8");
+		for (const lookalike of lookalikes) expect(contents).toContain(lookalike);
+	});
+
+	it("redacts every field of a complete STS credential payload, not just the key id", () => {
+		const target = tempCrashLog();
+		// A real STS response carries three fields. The `ASIA` id is the least
+		// sensitive of them: it is an identifier, while the other two are the
+		// actual credential. `secret_key` does not match `SecretAccessKey`
+		// (the canonical name has `Access` in the middle) and `access_token`
+		// does not match `SessionToken`, so both used to survive verbatim.
+		const accessKeyId = "ASIAIOSFODNN7EXAMPLE";
+		const secretAccessKey = "wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY";
+		const sessionToken = "FwoGZXIvYXdzEBYaDEXAMPLESESSIONTOKENVALUE1234567890";
+		const payload = `{"AccessKeyId":"${accessKeyId}","SecretAccessKey":"${secretAccessKey}","SessionToken":"${sessionToken}"}`;
+
+		recordFatalCrash("Uncaught Exception", new Error(`assume-role failed: ${payload}`), { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("assume-role failed");
+		expect(contents).not.toContain(accessKeyId);
+		expect(contents).not.toContain(secretAccessKey);
+		expect(contents).not.toContain(sessionToken);
+		// The field names survive so the record still says which call failed.
+		expect(contents).toContain("SecretAccessKey");
+		expect(contents).toContain("SessionToken");
+	});
+
 	it("enforces owner-only permissions on a pre-existing file", () => {
 		if (process.platform === "win32") return;
 		const target = tempCrashLog();

@@ -101,6 +101,33 @@ describe("renderThreadedFrame", () => {
 		});
 	});
 
+	test("non-photo image formats render as named documents", () => {
+		for (const [mime, fileName] of [
+			["image/webp", "image.webp"],
+			["image/gif", "image.gif"],
+			["image/svg+xml", "image.svg"],
+			["image/avif", "image.avif"],
+		] as const) {
+			expect(
+				renderThreadedFrame({
+					type: "image_attachment",
+					sessionId: "s",
+					source: "agent",
+					mime,
+					data: "AAAA",
+					caption: "image",
+				}),
+			).toMatchObject({
+				method: "sendDocument",
+				lane: "finalized",
+				documentBase64: "AAAA",
+				fileName,
+				mime,
+				text: "image",
+			});
+		}
+	});
+
 	test("image_attachment without data renders nothing", () => {
 		expect(renderThreadedFrame({ type: "image_attachment", sessionId: "s", mime: "image/png" })).toBeUndefined();
 	});

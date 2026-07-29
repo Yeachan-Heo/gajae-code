@@ -1145,6 +1145,35 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.output_config).toEqual({ effort: "high" });
 	});
 
+	// A single-component alias (`claude-opus-5`) and its dated snapshot describe the
+	// same API generation. The provider-local `claude-opus-(\d+)-(\d+)` regex matched
+	// only the dated form, so the alias silently sent adaptive thinking WITHOUT
+	// `display` (and picked up the interleaved-thinking beta), producing a thinking
+	// shape the model was never asked for.
+	it("requests summarized adaptive thinking for single-component Opus aliases", async () => {
+		for (const id of ["claude-opus-5", "claude-opus-5-20260101"]) {
+			const payload = (await captureAnthropicPayload(
+				{
+					...ANTHROPIC_MODEL,
+					id,
+					name: id,
+					thinking: {
+						mode: "anthropic-adaptive",
+						minLevel: Effort.Minimal,
+						maxLevel: Effort.Max,
+					},
+				},
+				{
+					systemPrompt: ["Stay concise."],
+					messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+				},
+				{ thinkingEnabled: true, reasoning: Effort.High },
+			)) as { thinking?: { type?: string; display?: string } };
+
+			expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		}
+	});
+
 	it("requests summarized adaptive thinking for Fable 5 (issue #2791)", async () => {
 		const payload = (await captureAnthropicPayload(
 			{

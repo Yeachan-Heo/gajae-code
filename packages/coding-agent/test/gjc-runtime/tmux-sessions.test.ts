@@ -756,6 +756,70 @@ describe("GJC tmux session management", () => {
 		expect(calls[1]?.[7]).toBe("display-message -p __gjc_tmux_guarded_mutation_refused__");
 	});
 
+	it("omits the server PID guard clause when the platform cannot prove a tmux server PID", () => {
+		// Non-Linux probes report a placeholder PID. Pinning `#{pid}` to it builds a
+		// predicate no live tmux server can satisfy, which used to refuse profile
+		// tagging (and its cleanup) on every non-Linux host.
+		// Force `platform: "darwin"` so planTmuxOwnerIsolationSync accepts the
+		// not_applicable cgroup proof (isSafeServerProof rejects that shape on linux)
+		// and the create path reaches the guarded tag/cleanup contract under test.
+		__setMutationServerProofForTests(() => ({ pid: 1, startTime: "not-applicable", pidProven: false }));
+		__setCreateOwnerIsolationForTests({
+			probe: {
+				readCallerCgroup: () => null,
+				probeServer: () => ({
+					state: "safe",
+					pid: 1,
+					startTime: "not-applicable",
+					cgroup: { classification: "not_applicable" },
+					pidProven: false,
+				}),
+			},
+			execute: plan => ({
+				ok: true,
+				code: "executed",
+				execution: plan.ok ? plan.execution : (undefined as never),
+				server: {
+					state: "safe",
+					pid: 1,
+					startTime: "not-applicable",
+					cgroup: { classification: "not_applicable" },
+					pidProven: false,
+				},
+				server_key: "tmux",
+				server_pid: 1,
+				server_start_time: "not-applicable",
+				server_session: "managed",
+				native_session_id: "$1",
+			}),
+		});
+		const calls: string[][] = [];
+		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation(command => {
+			calls.push(command);
+			if (command.includes("if-shell")) return spawnResult(0, "__gjc_tmux_guarded_mutation_refused__\n");
+			if (command.includes("display-message")) {
+				if (command.includes("#{session_id}\t#{session_name}")) return spawnResult(0, "$1\tmanaged\n");
+				return spawnResult(0, command.includes("#{session_name}") ? "managed\n" : "$1\n");
+			}
+			return spawnResult(0, "");
+		});
+		expect(() =>
+			createGjcTmuxSession(
+				{
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_TMUX_SESSION: "managed",
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(os.tmpdir(), `gjc-unproven-${crypto.randomUUID()}.json`),
+				},
+				{ platform: "darwin" },
+			),
+		).toThrow("gjc_tmux_profile_tag_failed_cleanup_failed");
+		const guarded = calls.find(command => command[1] === "if-shell");
+		expect(guarded?.slice(0, 5)).toEqual(["tmux", "if-shell", "-t", "$1", "-F"]);
+		expect(guarded?.[5]).not.toContain("#{pid}");
+		expect(guarded?.[5]).toContain("#{session_id},$1");
+		expect(guarded?.[5]).toContain("#{session_name},managed");
+	});
+
 	it("rejects psmux force-close before signal or cleanup", async () => {
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
 		const signalTerm = vi.fn();
@@ -891,6 +955,65 @@ describe("GJC tmux session management", () => {
 		);
 		await fs.rm(stateDir, { recursive: true, force: true });
 	});
+
+	it("terminates a real owner process through the default signal and start-time proofs", async () => {
+		// Exercises the *default* owner dependencies rather than the injected test
+		// seams: `readProcessStartTime` must prove the owner PID off Linux (where
+		// there is no /proc), and the SIGTERM dispatch must actually reach the
+		// owner on macOS (where the pidfd-backed native `signalRoot` fails closed).
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-default-deps-"));
+		fixtureDirectories.push(stateDir);
+		const sessionId = "session";
+		const generation = "generation";
+		const marker = path.join(stateDir, "marker");
+		await fs.mkdir(path.join(stateDir, sessionId, "owner-lifecycle"), { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, sessionId, "owner-lifecycle", "generation.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				generation,
+				published_at: new Date().toISOString(),
+			}),
+		);
+		// A real child process so the start-time proof and the signal are real.
+		const owner = Bun.spawn(["sh", "-c", "while :; do sleep 1; done"], { stdout: "ignore", stderr: "ignore" });
+		const ownerPid = owner.pid;
+		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation((cmd: string[]) => {
+			if (cmd.includes("if-shell")) return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+			if (cmd.includes("list-sessions"))
+				return spawnResult(
+					0,
+					`managed\t1\t0\t1770000000\t1\troot\t1\t${ownerPid}\t\t\t\t${sessionId}\t${marker}\t${generation}\t\n`,
+				);
+			if (cmd.includes("list-panes")) return spawnResult(0, `${ownerPid}\n`);
+			if (cmd.includes("display-message")) return spawnResult(0, "$0\n");
+			if (cmd.includes("show-options")) {
+				const option = cmd.at(-1);
+				return spawnResult(
+					0,
+					option === "@gjc-profile"
+						? "1\n"
+						: option === "@gjc-session-id"
+							? `${sessionId}\n`
+							: option === "@gjc-owner-generation"
+								? `${generation}\n`
+								: option === "@gjc-owner-server-key"
+									? "managed\n"
+									: `${marker}\n`,
+				);
+			}
+			return spawnResult(0, "");
+		});
+		injectSafeMutationProof();
+		try {
+			await forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker);
+			await owner.exited;
+			expect(owner.signalCode).toBe("SIGTERM");
+		} finally {
+			owner.kill("SIGKILL");
+		}
+	}, 15_000);
 
 	it("surfaces an exact compatibility cleanup failure after a matching SIGTERM verdict", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-cleanup-failure-"));

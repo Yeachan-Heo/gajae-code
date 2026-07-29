@@ -44,13 +44,13 @@ Use it only for sanctioned GJC workflow CLI persistence or state read/write/cont
 {{else}}
 - Use bash only for terminal operations that dedicated tools do not cover.
 {{/when}}
-- Never pipe through `| head -n N` or `| tail -n N` — output is already truncated with the full result available via `artifact://<id>`.
+- Never pipe through `| head -n N` or `| tail -n N` — output is already truncated. Recover omitted output only when the result includes an `artifact://<id>` footer or metadata reference; truncation without a reference leaves the visible output incomplete with no recoverable artifact.
 - Never redirect with `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
 </critical>
 
 <output>
 - Returns output and exit code.
-- Truncated output is retrievable from `artifact://<id>` (linked in metadata)
+- Truncated output is recoverable only when the result includes an `artifact://<id>` footer or metadata reference; truncation evidence without such a reference means the visible output is incomplete and no artifact is recoverable.
 - Exit codes shown on non-zero exit
 </output>
 
@@ -64,6 +64,6 @@ Use it only for sanctioned GJC workflow CLI persistence or state read/write/cont
 
 # Output minimizer
 
-- Bash stdout/stderr may be rewritten before you see it: long output is head/tail truncated, and test/lint runners (e.g. `bun test`, `cargo test`, ESLint) are passed through heuristic filters that drop noise and keep failures.
-- When the minimizer changes the visible text, the tool appends a `[raw output: artifact://<id>]` footer pointing at the **full untouched capture**. If a run looks suspicious (e.g. only a version banner) or you need the exact bytes, read that artifact.
-- If no footer is present, what you see is what the command actually emitted.
+- Bash stdout/stderr may be rewritten before you see it: long output keeps only the last 1 KiB by default to reduce noise and input-token use. Explicit `tools.artifactTailBytes` / `tools.artifactHeadBytes` settings can set the tail budget or retain both ends. Prefer focused commands and dedicated `search`/`find` tools over producing broad output. Test/lint runners (e.g. `bun test`, `cargo test`, ESLint) are also passed through heuristic filters that drop noise and keep failures.
+- When the local minimizer changes visible text, successful artifact storage appends a footer containing an `artifact://<id>` reference. Complete artifacts are labeled as full output; hard-capped artifacts report omitted bytes instead. If artifact allocation/storage is unavailable before a writer/save operation is attempted, truncation may have no reference or diagnostic. If an artifact writer/save operation is attempted and fails, a bounded diagnostic is emitted without inventing an artifact URI.
+- ACP/client-terminal output can arrive already truncated from the beginning. Treat any truncation notice or metadata as evidence that the visible tail is incomplete. Recover omitted output only when an `artifact://` footer or metadata reference is present; truncation evidence without a reference means the visible output is incomplete and no artifact is recoverable. Output with neither truncation evidence nor an artifact reference is the complete emitted output.

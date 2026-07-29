@@ -1,0 +1,91 @@
+{
+  "schema": "gjc.pr-telegram-generation-evidence.v1",
+  "pr": {
+    "number": 3298,
+    "url": "https://github.com/Yeachan-Heo/gajae-code/pull/3298",
+    "title": "fix(telegram): preserve multi-select state in remote prompts",
+    "state": "closed_without_merge",
+    "replacement_pr": "pending",
+    "remote_head": "ede367a4197e24c53d3ac513471298a438973d29",
+    "local_rebased_head": "ede367a4197e24c53d3ac513471298a438973d29",
+    "base_branch": "dev",
+    "base_commit": "f3d96dd2ebe04616ecd872a7dfa1eaa58a825ef1"
+  },
+  "ci_failure": {
+    "run": 30255988384,
+    "primary_job": "Telegram daemon generation guard",
+    "primary_job_id": 89944691621,
+    "message": "protected Telegram lifecycle change requires a strictly higher DAEMON_GENERATION: telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:handleSessionMessage",
+    "root_cause": "The PR changed the protected handleSessionMessage symbol and refreshed its manifest digest, but the PR head still advertised DAEMON_GENERATION 30, equal to its base.",
+    "downstream_failures": [
+      "Affected path validation / evidence producer",
+      "Affected path validation"
+    ],
+    "downstream_explanation": "Affected-path validation failed closed because the required Telegram generation guard result was failure; this was not a separate product-test defect."
+  },
+  "generation_update": {
+    "contract": "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts",
+    "before": 30,
+    "after": 31,
+    "history": "Generation 31 adds action-bound multi-select state rendering and replay-safe option snapshots.",
+    "protocol_version": 3,
+    "serving_epoch_changed": false,
+    "reason": "The behavioral change is generation-scoped daemon lifecycle behavior; it does not change the wire protocol or serving compatibility boundary."
+  },
+  "manifest": {
+    "path": "scripts/telegram-daemon-generation-manifest.json",
+    "regenerated_with": "bun scripts/telegram-daemon-generation-guard.ts --write-manifest",
+    "current_tree_validation": "pass",
+    "generation_digest_before": "9d09da087722f9557bb50f49007b7a3230a0f3df8d89bbad104b8373b9633a5c",
+    "generation_digest_after": "2422f78e1f8ad409cf640ccd7aa8fd94a8f899549c5d974a901911bb69e23c89"
+  },
+  "base_head_guard_replay": {
+    "method": "Compared the committed replacement-branch HEAD directly against the latest upstream/dev base using the same GITHUB_BASE_SHA/GITHUB_HEAD_SHA inputs as CI.",
+    "base": "f3d96dd2ebe04616ecd872a7dfa1eaa58a825ef1",
+    "head": "ede367a4197e24c53d3ac513471298a438973d29",
+    "command_shape": "GITHUB_BASE_SHA=<dev> GITHUB_HEAD_SHA=<branch-head> bun scripts/telegram-daemon-generation-guard.ts",
+    "result": "pass: telegram-daemon-generation-guard: v28 required generation bump verified"
+  },
+  "verification": [
+    {
+      "command": "LANG=C LC_ALL=C bun test packages/coding-agent/test/sdk-host-wiring.test.ts packages/coding-agent/test/notifications-telegram-daemon.test.ts",
+      "result": "pass: 557 tests, 0 failures, 2273 assertions"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run check:types",
+      "result": "pass"
+    },
+    {
+      "command": "bunx biome check packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts packages/coding-agent/test/notifications-telegram-daemon.test.ts scripts/telegram-daemon-generation-manifest.json",
+      "result": "pass"
+    },
+    {
+      "command": "bun run build",
+      "result": "pass: native, stats, coding-agent, and dist/gjc build completed"
+    },
+    {
+      "command": "bun run check:rs",
+      "result": "pass"
+    },
+    {
+      "command": "bun run ci:test:smoke",
+      "result": "pass: CLI version/help/stats-help and --smoke-test"
+    },
+    {
+      "command": "git diff --check",
+      "result": "pass"
+    }
+  ],
+  "known_local_only_result": {
+    "command": "bun test scripts/telegram-daemon-generation-guard.test.ts",
+    "result": "40 pass, 1 fixed-budget timeout",
+    "detail": "The atomic current-tree manifest test exceeded its explicit 20-second budget at 20.35 seconds on this WSL workstation. The actual current-tree manifest validation passed, and the exact base/head PR guard replay passed."
+  },
+  "repository_state": {
+    "committed": true,
+    "pushed": true,
+    "generation_commit": "ede367a4197e24c53d3ac513471298a438973d29",
+    "modified_tracked_files": [],
+    "untracked_evidence": "artifacts/pr3298-telegram-generation-evidence.json"
+  }
+}

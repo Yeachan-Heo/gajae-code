@@ -1175,6 +1175,10 @@ export class CommandController {
 			}
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
+		const bashComponent = this.ctx.bashComponent;
+		if (isDeferred && bashComponent && this.ctx.pendingBashComponents.includes(bashComponent)) {
+			this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+		}
 
 		this.ctx.bashComponent = undefined;
 		this.ctx.ui.requestRender();

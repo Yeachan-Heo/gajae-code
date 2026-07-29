@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { parseJsonWithRepair, parseStreamingJson, repairJson } from "@gajae-code/ai/utils/json-parse";
+import { isCompleteJson, parseJsonWithRepair, parseStreamingJson, repairJson } from "@gajae-code/ai/utils/json-parse";
 
 describe("JSON repair", () => {
 	it("leaves valid string escapes unchanged", () => {
@@ -25,5 +25,25 @@ describe("JSON repair", () => {
 	});
 	it("returns an empty object for whitespace-only streaming JSON", () => {
 		expect(parseStreamingJson<Record<string, unknown>>(" \t\n\r")).toEqual({});
+	});
+});
+
+describe("isCompleteJson", () => {
+	it("treats empty and whitespace-only inputs as complete", () => {
+		expect(isCompleteJson("")).toBe(true);
+		expect(isCompleteJson("   ")).toBe(true);
+		expect(isCompleteJson(undefined)).toBe(true);
+	});
+
+	it("accepts complete JSON", () => {
+		expect(isCompleteJson('{"a":1}')).toBe(true);
+		expect(isCompleteJson("[1,2,3]")).toBe(true);
+		expect(isCompleteJson('"str"')).toBe(true);
+	});
+
+	it("rejects truncated JSON", () => {
+		expect(isCompleteJson('{"a":1')).toBe(false);
+		expect(isCompleteJson('{"path":"/etc/hosts","content":"line1')).toBe(false);
+		expect(isCompleteJson("[1,2,")).toBe(false);
 	});
 });

@@ -13,6 +13,7 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 } from "../src/sdk/bus/html-format";
+import type { SessionLifecycleRequest, SessionLifecycleResponse } from "../src/sdk/bus/index";
 import {
 	acquireDaemonTransitionLock,
 	classifyNotificationEndpoint,
@@ -20,7 +21,9 @@ import {
 	releaseDaemonTransitionLock,
 } from "../src/sdk/bus/notification-service";
 import { RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
+import * as recentActivity from "../src/sdk/bus/recent-activity";
 import { deliverRichWithFallback } from "../src/sdk/bus/rich-render";
+import { TelegramAdoptionIntentStore } from "../src/sdk/bus/telegram-adoption-intent";
 import {
 	acquireDaemonOwnership,
 	type BotApi,
@@ -76,6 +79,16 @@ interface AttachmentTestAccess {
 }
 function attachmentAccess(daemon: TelegramNotificationDaemon): AttachmentTestAccess {
 	return daemon as unknown as AttachmentTestAccess;
+}
+interface TopicTestAccess {
+	topics: {
+		sessionForTopic(topicId: string): string | undefined;
+		get(sessionId: string): { topicId: string } | undefined;
+	};
+}
+
+function topicAccess(daemon: TelegramNotificationDaemon): TopicTestAccess {
+	return daemon as unknown as TopicTestAccess;
 }
 
 test("steady ownership heartbeat advances only the owner-tagged sidecar", async () => {
@@ -760,6 +773,7 @@ function topicStateFs(onTopicStateWrite: () => Promise<void>): TelegramDaemonFs 
 		open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
 		readdir: file => fs.promises.readdir(file),
 		chmod: (file, mode) => fs.promises.chmod(file, mode),
+		stat: file => fs.promises.stat(file),
 	};
 }
 
@@ -1271,6 +1285,7 @@ describe("telegram daemon", () => {
 			ensureTelegramDaemonRunningDetailed(
 				{ settings: s, cwd, sessionId: "session" },
 				{
+					platform: "linux",
 					now: () => now,
 					pidAlive: pid => pid === 999,
 					pidIncarnation: () => "linux:100",
@@ -2896,11 +2911,17 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 30 adds capability-versioned tool activity", () => {
+	test("keeps wire protocol 3 while generation 34 converts non-photo images to photos", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 29 adds structural serving safeguards; generation 30 adds
-		// capability-versioned tool activity without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(30);
+		// Generation 33 adds replay-safe multi-select state; generation 34 converts
+		// non-photo image formats into Telegram photo uploads when possible.
+		expect(DAEMON_GENERATION).toBe(35);
+	});
+	test("keeps wire protocol 3 while generation 35 adds topic-adoption folder picker", () => {
+		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
+		// Generation 34 converts non-photo images to photos; generation 35 adds
+		// the user-topic adoption folder picker without changing the wire protocol.
+		expect(DAEMON_GENERATION).toBe(35);
 	});
 	test.each([
 		"1",
@@ -4795,6 +4816,7 @@ describe("telegram daemon", () => {
 			ensureTelegramDaemonRunningDetailed(
 				{ settings: s, cwd: agentDir, sessionId: "reconciled" },
 				{
+					platform: "linux",
 					pid: 4242,
 					now: () => now,
 					pidAlive: pid => (pid === 111 ? staleProbes++ === 0 : pid === 4243),
@@ -6009,6 +6031,57 @@ describe("telegram daemon", () => {
 		expect(bot.calls.some(c => c.method === "answerCallbackQuery")).toBe(true);
 	});
 
+	test("multi-select state decorates Telegram labels without changing callback values", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "initial",
+			question: "Pick all",
+			options: ["Alpha", "Beta"],
+			selectedOptionIndices: [],
+		});
+		const initial = bot.calls.find(call => call.method === "sendMessage")!.body;
+		expect(initial.text).toContain("☐ Alpha");
+		expect(initial.text).toContain("☐ Beta");
+
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Pick all",
+			options: ["Alpha", "Beta"],
+			selectedOptionIndices: [1],
+		});
+		const sent = bot.calls.find(call => call.method === "sendMessage")!.body;
+		expect(sent.text).toContain("☐ Alpha");
+		expect(sent.text).toContain("☑ Beta");
+		const alias = sent.reply_markup.inline_keyboard.flat()[1].callback_data;
+		await daemon.handleTelegramUpdate({
+			update_id: 1,
+			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
+		});
+		expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toEqual({
+			type: "reply",
+			id: "ask",
+			answer: 1,
+			token: "ts",
+		});
+	});
+
 	test("callback alias reply is delivered when Telegram callback ack fails", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
@@ -6055,6 +6128,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "important",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -6082,6 +6156,7 @@ describe("telegram daemon", () => {
 			buttons.every((button: { callback_data: string }) => Buffer.byteLength(button.callback_data, "utf8") <= 64),
 		).toBe(true);
 		expect(buttons.every((button: { callback_data: string }) => button.callback_data.startsWith("m:"))).toBe(true);
+		expect(Object.hasOwn(sent, "disable_notification")).toBe(false);
 	});
 
 	test("model choice callbacks are chat-authorized and forward one session-bound control command", async () => {
@@ -6232,6 +6307,7 @@ describe("telegram daemon", () => {
 			now: () => now,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -6255,6 +6331,9 @@ describe("telegram daemon", () => {
 				call => call.method === "answerCallbackQuery" && call.body.text === "Button is stale. Run /model again.",
 			),
 		).toBe(true);
+		expect(
+			bot.calls.find(c => c.method === "sendMessage" && String(c.body.text).includes("Run /model again"))!.body,
+		).toMatchObject({ disable_notification: true });
 	});
 
 	test("a fresh model menu replaces every prior alias for its logical session", async () => {
@@ -6701,6 +6780,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("A", "ws://a", "ta");
 		await daemon.handleTelegramUpdate({
@@ -6708,6 +6788,9 @@ describe("telegram daemon", () => {
 		});
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))).toBe(true);
+		expect(
+			bot.calls.find(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))!.body,
+		).toMatchObject({ disable_notification: true });
 		await daemon.handleTelegramUpdate({
 			callback_query: { id: "cb2", data: "expired", message: { chat: { id: 42 } } },
 		});
@@ -6756,6 +6839,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -6772,6 +6856,9 @@ describe("telegram daemon", () => {
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 		expect(bot.calls.some(c => c.method === "answerCallbackQuery" && c.body.text === "Button is stale")).toBe(true);
 		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))).toBe(true);
+		expect(
+			bot.calls.find(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))!.body,
+		).toMatchObject({ disable_notification: true });
 
 		bot.calls = [];
 		daemon.sessions.delete("S");
@@ -7092,6 +7179,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
+			sound: "important",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
@@ -7121,6 +7209,7 @@ describe("telegram daemon", () => {
 		const selectedCalls = bot.calls.filter(call => call.method === "sendMessage" && call.body.text === "Selected!");
 		expect(selectedCalls).toHaveLength(1);
 		expect(selectedCalls[0]?.body.parse_mode).toBeUndefined();
+		expect(Object.hasOwn(selectedCalls[0]!.body, "disable_notification")).toBe(false);
 		const results = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).filter(
 			frame => frame.type === "ask_selected_ack_result",
 		);
@@ -7251,6 +7340,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
@@ -7272,7 +7362,7 @@ describe("telegram daemon", () => {
 		});
 
 		const selected = bot.calls.find(call => call.method === "sendMessage" && call.body.text === "Selected!");
-		expect(selected?.body).toEqual({ chat_id: "42", text: "Selected!" });
+		expect(selected?.body).toEqual({ chat_id: "42", text: "Selected!", disable_notification: true });
 		expect(FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame))).toContainEqual({
 			type: "ask_selected_ack_result",
 			requestId: "ack-flat",
@@ -8010,6 +8100,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
+			sound: "none",
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
@@ -8030,6 +8121,7 @@ describe("telegram daemon", () => {
 		expect(bot.calls.filter(call => call.method === "sendMessage").map(call => call.body.text)).toEqual([
 			"Session control unavailable: this local GJC session is disconnected.",
 		]);
+		expect(bot.calls.filter(call => call.method === "sendMessage")[0]?.body.disable_notification).toBe(true);
 	});
 	test.each([
 		"writeFile",
@@ -9054,7 +9146,7 @@ test("ensureTelegramDaemonRunning spawns the daemon subcommand with owner-id and
 	expect(ai).toBeGreaterThanOrEqual(0);
 	expect(captured!.args[ai + 1]).toBe(agentDir);
 });
-test("image_attachment frame uploads via sendPhoto into an identified session topic", async () => {
+test("image_attachment converts WebP to photo and falls back safely", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
@@ -9076,6 +9168,11 @@ test("image_attachment frame uploads via sendPhoto into an identified session to
 		repo: "gajae-code",
 		branch: "dev",
 	});
+	const seed = Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+		"base64",
+	);
+	const webpData = await new Bun.Image(seed).resize(32, 32, { filter: "nearest" }).webp({ quality: 90 }).toBase64();
 	await daemon.handleSessionMessage(session as any, {
 		type: "image_attachment",
 		sessionId: "S",
@@ -9083,13 +9180,37 @@ test("image_attachment frame uploads via sendPhoto into an identified session to
 		mime: "image/png",
 		data: "AAAA",
 	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "image_attachment",
+		sessionId: "S",
+		source: "agent",
+		mime: "image/webp",
+		data: webpData,
+	});
 	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
-	const photo = bot.calls.find(c => c.method === "sendPhoto");
+	const photos = bot.calls.filter(c => c.method === "sendPhoto");
 	expect(createTopic).toBeTruthy();
 	expect(createTopic!.body.name).toBe("gajae-code/dev");
-	expect(photo).toBeTruthy();
-	expect(photo!.body.photo).toBe("AAAA");
-	expect(Number(photo!.body.message_thread_id)).toBeGreaterThan(0);
+	expect(photos).toHaveLength(2);
+	expect(photos[0]!.body.photo).toBe("AAAA");
+	expect(Number(photos[0]!.body.message_thread_id)).toBeGreaterThan(0);
+	const convertedPhoto = photos[1]!;
+	expect(convertedPhoto.body.photo).not.toBe(webpData);
+	expect(["image/jpeg", "image/png"]).toContain(convertedPhoto.body.mime);
+	expect(convertedPhoto.body.message_thread_id).toBe(photos[0]!.body.message_thread_id);
+	expect(bot.calls.find(c => c.method === "sendDocument")).toBeUndefined();
+	await daemon.handleSessionMessage(session as any, {
+		type: "image_attachment",
+		sessionId: "S",
+		source: "agent",
+		mime: "image/webp",
+		data: "V0VCUA==",
+	});
+	const fallbackDocument = bot.calls.find(c => c.method === "sendDocument");
+	expect(fallbackDocument).toBeTruthy();
+	expect(fallbackDocument!.body.document).toBe("V0VCUA==");
+	expect(fallbackDocument!.body.mime).toBe("image/webp");
+	expect(fallbackDocument!.body.fileName).toBe("image.webp");
 });
 
 describe("telegram topic name template (#1909)", () => {
@@ -10183,6 +10304,7 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 		chatId: "42",
 		botApi: bot,
 		rich: { enabled: false },
+		sound: "none",
 	});
 	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
 
@@ -10213,6 +10335,7 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 	// The nudge is sent exactly once with the requested copy.
 	const notices = sends.filter(c => String(c.body.text).includes(THREADED_FALLBACK_NOTICE));
 	expect(notices).toHaveLength(1);
+	expect(notices[0]!.body.disable_notification).toBe(true);
 	// The ask still carries its inline keyboard in flat mode.
 	const ask = sends.find(c => String(c.body.text).includes("Proceed?"));
 	expect(ask).toBeTruthy();
@@ -13084,7 +13207,11 @@ function richSession(id = "S"): any {
 	return { sessionId: id, token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
 }
 
-function makeRichDaemon(bot: FakeBotApi, rich?: { enabled: boolean }): TelegramNotificationDaemon {
+function makeRichDaemon(
+	bot: FakeBotApi,
+	rich?: { enabled: boolean },
+	sound?: "all" | "important" | "none",
+): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: settings(tempAgentDir()),
 		ownerId: "owner",
@@ -13092,6 +13219,7 @@ function makeRichDaemon(bot: FakeBotApi, rich?: { enabled: boolean }): TelegramN
 		chatId: "42",
 		botApi: bot as any,
 		...(rich ? { rich } : {}),
+		...(sound ? { sound } : {}),
 	});
 }
 
@@ -13197,6 +13325,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			mime: "image/png",
 			caption: "shot",
 			parse_mode: "HTML",
+			disable_notification: true,
 		});
 		await transport.call("sendDocument", {
 			chat_id: "42",
@@ -13206,6 +13335,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			fileName: "notes.pdf",
 			caption: "doc",
 			parse_mode: "HTML",
+			disable_notification: true,
 		});
 		// Defaults: no mime -> image/png; no mime/fileName -> octet-stream/"file"; no thread -> field omitted.
 		await transport.call("sendPhoto", { chat_id: "42", photo: Buffer.from("Z").toString("base64") });
@@ -13218,6 +13348,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(photo.get("message_thread_id")).toBe("7");
 		expect(photo.get("caption")).toBe("shot");
 		expect(photo.get("parse_mode")).toBe("HTML");
+		expect(photo.get("disable_notification")).toBe("true");
 		const photoFile = photo.get("photo") as File;
 		expect(photoFile).toBeInstanceOf(Blob);
 		expect(photoFile.name).toBe("image");
@@ -13230,6 +13361,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(doc.get("message_thread_id")).toBe("9");
 		expect(doc.get("caption")).toBe("doc");
 		expect(doc.get("parse_mode")).toBe("HTML");
+		expect(doc.get("disable_notification")).toBe("true");
 		const docFile = doc.get("document") as File;
 		expect(docFile).toBeInstanceOf(Blob);
 		expect(docFile.name).toBe("notes.pdf");
@@ -13238,17 +13370,19 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 
 		const photoDefaults = requests[2].init.body as FormData;
 		expect((photoDefaults.get("photo") as File).type).toBe("image/png");
+		expect(photoDefaults.has("disable_notification")).toBe(false);
 		const docDefaults = requests[3].init.body as FormData;
 		expect(docDefaults.has("message_thread_id")).toBe(false);
 		expect(docDefaults.has("caption")).toBe(false);
 		expect(docDefaults.has("parse_mode")).toBe(false);
+		expect(docDefaults.has("disable_notification")).toBe(false);
 		const docDefaultFile = docDefaults.get("document") as File;
 		expect(docDefaultFile.name).toBe("file");
 		expect(docDefaultFile.type).toBe("application/octet-stream");
 	});
 
-	// (c) off-state fake BotApi: no rich, byte-identical HTML body -----------
-	test("(c) off states never call sendRichMessage and emit a byte-identical HTML body", async () => {
+	// (c) default all policy preserves audible finalized HTML delivery ----------
+	test("(c) default all policy omits disable_notification from finalized HTML delivery", async () => {
 		const raw = "Just plain final answer text";
 		const goldenBody =
 			'{"chat_id":"42","message_thread_id":555,"text":"Just plain final answer text","parse_mode":"HTML"}';
@@ -13262,7 +13396,6 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			expect(countMethod(bot, "sendRichMessage")).toBe(0);
 			expect(countMethod(bot, "sendMessage")).toBe(1);
 			const body = findMethod(bot, "sendMessage")!.body;
-			// Byte-identical to the pre-rich HTML path (field order included).
 			expect(JSON.stringify(body)).toBe(goldenBody);
 			expect(body.text).toBe(markdownToTelegramHtml(raw));
 			expect(body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
@@ -13379,6 +13512,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		const first = bot.calls.filter(c => c.method === "sendMessage");
 		expect(first).toHaveLength(1);
 		expect(first[0]!.body.text).toBe(chunks[0]);
+		expect(Object.hasOwn(first[0]!.body, "disable_notification")).toBe(false);
 		// A follow-up flush drains the requeued continuations (ahead of the newer frame).
 		bot.calls.length = 0;
 		await daemon.handleSessionMessage(session, {
@@ -13390,6 +13524,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		const rest = bot.calls.filter(c => c.method === "sendMessage");
 		expect(rest.map(c => c.body.text)).toEqual([...chunks.slice(1), markdownToTelegramHtml("tail")]);
 		expect(rest.every(c => c.body.message_thread_id === 555 && c.body.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
+		expect(rest.every(c => !Object.hasOwn(c.body, "disable_notification"))).toBe(true);
 	});
 
 	test("(d) sendRichMessage ok:false falls back to a single HTML chunk", async () => {
@@ -13401,6 +13536,8 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(countMethod(bot, "sendRichMessage")).toBe(1);
 		expect(countMethod(bot, "sendMessage")).toBe(1);
 		expect(findMethod(bot, "sendMessage")!.body.text).toBe(markdownToTelegramHtml(raw));
+		expect(Object.hasOwn(findMethod(bot, "sendRichMessage")!.body, "disable_notification")).toBe(false);
+		expect(Object.hasOwn(findMethod(bot, "sendMessage")!.body, "disable_notification")).toBe(false);
 	});
 
 	test("(d) deliverRichWithFallback warns exactly once per explicit rejection and never on success", async () => {
@@ -13630,7 +13767,7 @@ describe("telegram daemon rich overflow boundary (G006)", () => {
 });
 
 describe("telegram daemon action-needed rich delivery (G004)", () => {
-	function makeAskDaemon(bot: FakeBotApi, rich: { enabled: boolean }) {
+	function makeAskDaemon(bot: FakeBotApi, rich?: { enabled: boolean }, sound?: "all" | "important" | "none") {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const daemon = new TelegramNotificationDaemon({
@@ -13640,21 +13777,29 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			chatId: "42",
 			botApi: bot as any,
 			WebSocketImpl: FakeWs as any,
-			rich,
+			...(rich ? { rich } : {}),
+			...(sound ? { sound } : {}),
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		return daemon;
 	}
 
-	test("ask rich success: one sendRichMessage with reply_markup, route registered, callback + free-text reply route", async () => {
+	test("default-on ask rich success preserves multiline payload, keyboard, callback, and free-text routing", async () => {
 		FakeWs.instances = [];
 		const bot = new RichFakeBotApi();
-		const daemon = makeAskDaemon(bot, { enabled: true });
+		const daemon = makeAskDaemon(bot);
+		const question = [
+			"Deep Interview · Round 4 · Ambiguity 39.5%",
+			"Component: 칸반·이슈 관리",
+			"Target: 제약 명확성",
+			"Why now: 동시 수정 규칙이 필요해요.",
+			"동일 이슈의 충돌은 어떻게 처리할까요?",
+		].join("\n");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
 			id: "ask",
-			question: "Q",
+			question,
 			options: ["Y", "N"],
 			recommendedIndex: 1,
 		});
@@ -13665,8 +13810,18 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			signal: expect.any(AbortSignal),
 		});
 		expect(countMethod(bot, "sendMessage")).toBe(0);
-		expect(rich[0]!.body.rich_message.markdown).toContain("Q");
-		expect(rich[0]!.body.rich_message.markdown).toContain("2. N (Recommended)");
+		expect(rich[0]!.body.rich_message.markdown).toBe(
+			[
+				"❓ **Deep Interview · Round 4 · Ambiguity 39.5%**  ",
+				"**Component: 칸반·이슈 관리**  ",
+				"**Target: 제약 명확성**  ",
+				"**Why now: 동시 수정 규칙이 필요해요.**  ",
+				"**동일 이슈의 충돌은 어떻게 처리할까요?**",
+				"",
+				"1. Y",
+				"2. N (Recommended)",
+			].join("\n"),
+		);
 		expect(rich[0]!.body.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text)).toEqual([
 			"1",
 			"2",
@@ -13748,6 +13903,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		const rich = findMethod(bot, "sendRichMessage")!;
 		expect(rich.body.rich_message.markdown).toContain("Agent idle");
 		expect(rich.body.reply_markup).toBeUndefined();
+		expect(Object.hasOwn(rich.body, "disable_notification")).toBe(false);
 		expect(daemon.messageRoutes.size).toBe(0);
 	});
 
@@ -13767,6 +13923,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		expect(sends).toHaveLength(1);
 		expect(sends[0]!.body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
 		expect(sends[0]!.body.reply_markup.inline_keyboard).toBeTruthy();
+		expect(Object.hasOwn(sends[0]!.body, "disable_notification")).toBe(false);
 		const askEntry = [...daemon.messageRoutes.entries()].find(
 			([, route]) => route.sessionId === "S" && route.actionId === "ask",
 		);
@@ -13790,10 +13947,62 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		expect(countMethod(bot, "sendMessage")).toBe(0);
 		expect(daemon.messageRoutes.size).toBe(0);
 	});
+	test("important sound silences split ask chunks before the keyboard-bearing final chunk", async () => {
+		FakeWs.instances = [];
+		const bot = new RichFakeBotApi();
+		const daemon = makeAskDaemon(bot, { enabled: false }, "important");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "x".repeat(9_000),
+			options: ["Y"],
+		});
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		expect(sends.length).toBeGreaterThan(1);
+		expect(sends.slice(0, -1).every(call => call.body.disable_notification === true)).toBe(true);
+		expect(sends.at(-1)!.body.reply_markup.inline_keyboard).toBeTruthy();
+		expect(Object.hasOwn(sends.at(-1)!.body, "disable_notification")).toBe(false);
+	});
+	test("sound all omits the flag from direct and rich finalized delivery", async () => {
+		const directBot = new RichFakeBotApi();
+		await driveFinalizedTurn(makeRichDaemon(directBot, { enabled: false }, "all"), directBot, richSession(), "final");
+		expect(Object.hasOwn(findMethod(directBot, "sendMessage")!.body, "disable_notification")).toBe(false);
+
+		const richBot = new RichFakeBotApi();
+		await driveFinalizedTurn(makeRichDaemon(richBot, { enabled: true }, "all"), richBot, richSession(), "final");
+		expect(Object.hasOwn(findMethod(richBot, "sendRichMessage")!.body, "disable_notification")).toBe(false);
+	});
+
+	test("sound none silences photo and document delivery", async () => {
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, undefined, "none");
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "image_attachment",
+			sessionId: "S",
+			data: Buffer.from("image").toString("base64"),
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "file_attachment",
+			sessionId: "S",
+			data: Buffer.from("document").toString("base64"),
+			name: "document.txt",
+		});
+		expect(findMethod(bot, "sendPhoto")!.body.disable_notification).toBe(true);
+		expect(findMethod(bot, "sendDocument")!.body.disable_notification).toBe(true);
+	});
 });
 
 describe("telegram daemon /rich toggle (G005)", () => {
-	function richDaemonWithSettings(bot: FakeBotApi, s: Settings, enabled: boolean) {
+	function richDaemonWithSettings(
+		bot: FakeBotApi,
+		s: Settings,
+		enabled: boolean,
+		sound?: "all" | "important" | "none",
+	) {
 		return new TelegramNotificationDaemon({
 			settings: s,
 			ownerId: "owner",
@@ -13801,6 +14010,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 			chatId: "42",
 			botApi: bot as any,
 			rich: { enabled },
+			sound,
 		});
 	}
 
@@ -13808,7 +14018,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const bot = new RichFakeBotApi();
-		const daemon = richDaemonWithSettings(bot, s, true);
+		const daemon = richDaemonWithSettings(bot, s, true, "none");
 
 		await daemon.handleTelegramUpdate({
 			update_id: 501,
@@ -13817,6 +14027,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 		const confirm = bot.calls.find(c => c.method === "sendMessage" && c.body.text === "Rich messages: off");
 		expect(confirm).toBeDefined();
 		expect(confirm!.body.message_thread_id).toBe(555);
+		expect(confirm!.body.disable_notification).toBe(true);
 		expect(s.get("notifications.telegram.rich.enabled")).toBe(false);
 
 		// Runtime is toggled immediately: the next finalized final is HTML, not rich.
@@ -19116,9 +19327,9 @@ test("Telegram Bot API 429 cooldown clamps malformed retry_after values and does
 // ---------------------------------------------------------------------------
 
 describe("PR #3186 blockers", () => {
-	test("serving epoch 3 replaces pre-policy (epoch 1 and 2) daemons via isCurrentCompatibleOwner", () => {
+	test("serving epoch 4 replaces pre-policy (epochs 1 through 3) daemons via isCurrentCompatibleOwner", () => {
 		// Epoch 1: legacy daemon states that never published servingEpoch.
-		expect(SERVING_EPOCH).toBe(3);
+		expect(SERVING_EPOCH).toBe(4);
 		const freshInput = (servingEpoch?: number) => {
 			const state: DaemonState = {
 				pid: 999,
@@ -19146,12 +19357,14 @@ describe("PR #3186 blockers", () => {
 		};
 		// Epoch undefined (epoch 1) — not compatible.
 		expect(isCurrentCompatibleOwner(freshInput(undefined))).toBe(false);
-		// Epoch 2 — not compatible with epoch 3.
+		// Epoch 2 — not compatible with epoch 4.
 		expect(isCurrentCompatibleOwner(freshInput(2))).toBe(false);
-		// Epoch 3 — compatible.
-		expect(isCurrentCompatibleOwner(freshInput(3))).toBe(true);
-		// Future epoch 4 — still compatible (>= check).
+		// Epoch 3 — not compatible with epoch 4.
+		expect(isCurrentCompatibleOwner(freshInput(3))).toBe(false);
+		// Epoch 4 — compatible.
 		expect(isCurrentCompatibleOwner(freshInput(4))).toBe(true);
+		// Future epoch 5 — still compatible (>= check).
+		expect(isCurrentCompatibleOwner(freshInput(5))).toBe(true);
 	});
 
 	test("visible v1 starts are terminated with terminalization on policy transition", async () => {
@@ -19477,5 +19690,816 @@ describe("PR #3186 blockers", () => {
 		const edits = bot.calls.filter(c => c.method === "editMessageText");
 		expect(sends.length).toBeGreaterThanOrEqual(1);
 		expect(edits.length).toBeGreaterThanOrEqual(1);
+	});
+});
+function forumTopicCreatedUpdate(
+	updateId: number,
+	threadId: number,
+	{
+		chat = { id: 42 },
+		from = { id: 42, is_bot: false },
+		name = "New topic",
+	}: {
+		chat?: { id: number | string };
+		from?: { id: number; is_bot?: boolean } | null;
+		name?: string;
+	} = {},
+) {
+	return {
+		update_id: updateId,
+		message: {
+			chat,
+			...(from === null ? {} : { from }),
+			message_thread_id: threadId,
+			forum_topic_created: { name },
+		},
+	};
+}
+
+async function authorizePendingTopic(
+	daemon: TelegramNotificationDaemon,
+	updateId: number,
+	topicId: number,
+): Promise<void> {
+	await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(updateId, topicId));
+}
+
+async function seedAdoptionIntent(
+	agentDir: string,
+	intent: {
+		intendedSessionId: string;
+		topicId: number;
+		path?: string;
+	},
+): Promise<void> {
+	const store = new TelegramAdoptionIntentStore({ agentDir });
+	await store.put({
+		intendedSessionId: intent.intendedSessionId,
+		topicId: intent.topicId,
+		chatId: "42",
+		target: { kind: "existing_path", path: intent.path ?? agentDir },
+		createdAt: Date.now(),
+		expiresAt: Date.now() + 600_000,
+	});
+}
+
+interface AdoptionLifecycleHarness {
+	daemon: TelegramNotificationDaemon;
+	bot: FakeBotApi;
+	agentDir: string;
+	frames: SessionLifecycleRequest[];
+}
+
+async function adoptionLifecycleHarness({
+	agentDir = tempAgentDir(),
+	lifecycleResponse,
+	bot = new FakeBotApi(),
+	fs: fsImpl,
+}: {
+	agentDir?: string;
+	lifecycleResponse?: SessionLifecycleResponse;
+	bot?: FakeBotApi;
+	fs?: TelegramDaemonFs;
+} = {}): Promise<AdoptionLifecycleHarness> {
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		WebSocketImpl: FakeWs as any,
+		fs: fsImpl,
+	});
+	Object.assign(daemon, { lifecycleControlActive: true, controlToken: "ctrl" });
+	const frames: SessionLifecycleRequest[] = [];
+	const pending = Promise.withResolvers<SessionLifecycleResponse>();
+	// Default to a successful create response so the adoption submit completes and
+	// the durable sidecar is retained (status "ok" keeps it). Tests that exercise
+	// the spawn_failed / readiness_timeout paths override lifecycleResponse.
+	pending.resolve(
+		lifecycleResponse ?? ({ type: "session_create_response", requestId: "adoption-default", status: "ok" } as any),
+	);
+	// Stub the private lifecycle submit so tests control the response without a
+	// real control endpoint. The adoption path writes the durable intent before submit.
+	(daemon as any).submitLifecycleFrame = async (frame: SessionLifecycleRequest) => {
+		frames.push(frame);
+		return pending.promise;
+	};
+	return { daemon, bot, agentDir, frames };
+}
+
+function adoptionIntentFiles(agentDir: string): string[] {
+	const dir = daemonPaths(agentDir).dir;
+	try {
+		return fs.readdirSync(dir).filter(f => f.endsWith(".adoption-intent.json"));
+	} catch {
+		return [];
+	}
+}
+
+describe("forum_topic_created user-topic adoption", () => {
+	test("forged chat/from/bot update is rejected with no side effect", async () => {
+		const { daemon, bot } = await adoptionLifecycleHarness();
+		await daemon.handleTelegramUpdate(
+			forumTopicCreatedUpdate(10, 500, { chat: { id: 999 }, from: { id: 42, is_bot: false } }),
+		);
+		await daemon.handleTelegramUpdate(
+			forumTopicCreatedUpdate(11, 501, { chat: { id: 42 }, from: { id: 999, is_bot: false } }),
+		);
+		await daemon.handleTelegramUpdate(
+			forumTopicCreatedUpdate(12, 502, { chat: { id: 42 }, from: { id: 42, is_bot: true } }),
+		);
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+		expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(false);
+	});
+
+	test("dedupes a replayed created update (handler runs once)", async () => {
+		const { daemon, bot } = await adoptionLifecycleHarness();
+		const update = forumTopicCreatedUpdate(20, 510);
+		await daemon.handleTelegramUpdate(update);
+		const firstNotices = bot.calls.filter(
+			c => c.method === "sendMessage" && typeof c.body.message_thread_id === "number",
+		);
+		await daemon.handleTelegramUpdate(update);
+		const secondNotices = bot.calls.filter(
+			c => c.method === "sendMessage" && typeof c.body.message_thread_id === "number",
+		);
+		// The created update is consumed exactly once; the replay is a no-op.
+		expect(firstNotices).toHaveLength(secondNotices.length);
+	});
+
+	test("retries a created update when picker delivery fails before marking it seen", async () => {
+		class FailFirstPickerBot extends FakeBotApi {
+			failures = 1;
+			override async call(
+				method: string,
+				body: unknown,
+				options?: { noRetry?: boolean; signal?: AbortSignal },
+			): Promise<unknown> {
+				if (method === "sendMessage" && this.failures-- > 0) {
+					this.calls.push({ method, body, options });
+					throw new Error("temporary send failure");
+				}
+				return super.call(method, body, options);
+			}
+		}
+		const bot = new FailFirstPickerBot();
+		const { daemon } = await adoptionLifecycleHarness({ bot });
+		const update = forumTopicCreatedUpdate(21, 511);
+		await daemon.handleTelegramUpdate(update);
+		await daemon.handleTelegramUpdate(update);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(2);
+	});
+
+	test("picker callback creates one adoption intent and is one-shot", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "picker-workspace");
+		fs.mkdirSync(workspace);
+		const recentSpy = spyOn(recentActivity, "listRecentSessions").mockResolvedValue({
+			kind: "complete",
+			entries: [
+				{
+					sessionId: "recent",
+					path: workspace,
+					sessionStateFile: path.join(agentDir, "recent.jsonl"),
+					mtimeMs: 1,
+				},
+			],
+			warnings: [],
+		});
+		try {
+			const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+			await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(22, 512));
+			const rootPicker = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup);
+			const rootButtons = rootPicker?.body.reply_markup.inline_keyboard.flat() ?? [];
+			expect(rootButtons.map((button: { text: string }) => button.text)).toEqual([
+				"1. Home (~)",
+				"2. Recent work folders",
+				"3. Enter a path",
+			]);
+			const recentAlias = rootButtons.find((button: { text: string }) =>
+				button.text.startsWith("2."),
+			)?.callback_data;
+			expect(typeof recentAlias).toBe("string");
+
+			await daemon.handleTelegramUpdate({
+				update_id: 23,
+				callback_query: {
+					id: "picker-recent",
+					data: recentAlias,
+					from: { id: 42, is_bot: false },
+					message: { chat: { id: 42 }, message_thread_id: 512 },
+				},
+			});
+			const recentPicker = bot.calls.find(
+				call => call.method === "sendMessage" && String(call.body.text).includes("Pick a recent work folder"),
+			);
+			const alias = recentPicker?.body.reply_markup.inline_keyboard[0][0].callback_data;
+			expect(typeof alias).toBe("string");
+
+			const callback = {
+				update_id: 24,
+				callback_query: {
+					id: "picker-folder",
+					data: alias,
+					from: { id: 42, is_bot: false },
+					message: { chat: { id: 42 }, message_thread_id: 512 },
+				},
+			};
+			await daemon.handleTelegramUpdate(callback);
+			await daemon.handleTelegramUpdate({ ...callback, update_id: 25 });
+			expect(frames).toHaveLength(1);
+			expect((frames[0] as { target?: unknown }).target).toEqual({ kind: "existing_path", path: workspace });
+			expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		} finally {
+			recentSpy.mockRestore();
+		}
+	});
+
+	test("home picker choice starts the session in ~", async () => {
+		const { daemon, bot, frames } = await adoptionLifecycleHarness();
+		await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(26, 513));
+		const picker = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup);
+		const homeAlias = picker?.body.reply_markup.inline_keyboard[0][0].callback_data;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 27,
+			callback_query: {
+				id: "picker-home",
+				data: homeAlias,
+				from: { id: 42, is_bot: false },
+				message: { chat: { id: 42 }, message_thread_id: 513 },
+			},
+		});
+
+		expect(frames).toHaveLength(1);
+		expect((frames[0] as { target?: unknown }).target).toEqual({
+			kind: "existing_path",
+			path: os.homedir(),
+		});
+	});
+
+	test("direct-entry choice accepts the next message as a folder path", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace with spaces");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(28, 514));
+		const picker = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup);
+		const directAlias = picker?.body.reply_markup.inline_keyboard[2][0].callback_data;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 29,
+			callback_query: {
+				id: "picker-direct",
+				data: directAlias,
+				from: { id: 42, is_bot: false },
+				message: { chat: { id: 42 }, message_thread_id: 514 },
+			},
+		});
+		expect(
+			bot.calls.some(
+				call => call.method === "sendMessage" && String(call.body.text).includes("Send the folder path"),
+			),
+		).toBe(true);
+
+		await daemon.handleTelegramUpdate({
+			update_id: 30,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 514,
+				text: workspace,
+			},
+		});
+
+		expect(frames).toHaveLength(1);
+		expect((frames[0] as { target?: unknown }).target).toEqual({
+			kind: "existing_path",
+			path: workspace,
+		});
+	});
+
+	test("exact /session_create path <dir> in a pending topic submits an adoption frame", async () => {
+		const agentDir = tempAgentDir();
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		const { daemon, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 49, 540);
+		await daemon.handleTelegramUpdate({
+			update_id: 50,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 540,
+				text: `/session_create path ${dir}`,
+			},
+		});
+		expect(frames).toHaveLength(1);
+		const frame = frames[0]! as SessionLifecycleRequest;
+		expect(frame.type).toBe("session_create");
+		expect((frame as any).target).toEqual({ kind: "existing_path", path: dir });
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+	});
+
+	test("direct path cannot adopt an unobserved topic", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await daemon.handleTelegramUpdate({
+			update_id: 57,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 999,
+				text: `/session_create path ${workspace}`,
+			},
+		});
+		expect(frames).toHaveLength(0);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect(
+			bot.calls.some(
+				call =>
+					call.method === "sendMessage" && String(call.body.text).includes("was not opened for a new GJC session"),
+			),
+		).toBe(true);
+	});
+	test("pending topics reject dir and worktree creates instead of spawning duplicate topics", async () => {
+		const { daemon, bot, frames } = await adoptionLifecycleHarness();
+		await authorizePendingTopic(daemon, 58, 998);
+		for (const [updateId, text] of [
+			[59, "/session_create dir /tmp/new-session"],
+			[60, "/session_create worktree /tmp/repo feature"],
+		] as const) {
+			await daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from: { id: 42, is_bot: false },
+					message_thread_id: 998,
+					text,
+				},
+			});
+		}
+		expect(frames).toHaveLength(0);
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendMessage" && String(call.body.text).includes("only with /session_create path <dir>"),
+			),
+		).toHaveLength(2);
+	});
+	test("direct adoption rejects forged senders and bot messages", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 51, 542);
+		for (const [updateId, from] of [
+			[52, { id: 999, is_bot: false }],
+			[53, { id: 42, is_bot: true }],
+		] as const) {
+			await daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from,
+					message_thread_id: 542,
+					text: `/session_create path ${workspace}`,
+				},
+			});
+		}
+		expect(frames).toHaveLength(0);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+	});
+
+	test("concurrent direct commands start only one session for a topic", async () => {
+		const agentDir = tempAgentDir();
+		const workspace = path.join(agentDir, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 53, 543);
+		const direct = (updateId: number) =>
+			daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from: { id: 42, is_bot: false },
+					message_thread_id: 543,
+					text: `/session_create path ${workspace}`,
+				},
+			});
+		await Promise.all([direct(54), direct(55)]);
+		expect(frames).toHaveLength(1);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		expect(
+			bot.calls.some(
+				c => c.method === "sendMessage" && c.body.text === "A session is already starting in this topic.",
+			),
+		).toBe(true);
+	});
+	test("durable intent persistence failure is reported in-topic without submitting", async () => {
+		const root = tempAgentDir();
+		const agentDir = path.join(root, "agent");
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 50, 541);
+		fs.rmSync(agentDir, { recursive: true, force: true });
+		fs.writeFileSync(agentDir, "not a directory");
+		await daemon.handleTelegramUpdate({
+			update_id: 51,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 541,
+				text: `/session_create path ${workspace}`,
+			},
+		});
+		expect(frames).toHaveLength(0);
+		expect(
+			bot.calls.some(
+				c =>
+					c.method === "sendMessage" &&
+					c.body.message_thread_id === 541 &&
+					String(c.body.text).includes("durable topic binding could not be saved"),
+			),
+		).toBe(true);
+	});
+	test("a missing folder is rejected immediately before lifecycle submit", async () => {
+		const agentDir = tempAgentDir();
+		const missing = path.join(agentDir, "deleted-before-submit");
+		const { daemon, bot, frames } = await adoptionLifecycleHarness({ agentDir });
+		await authorizePendingTopic(daemon, 55, 544);
+		await daemon.handleTelegramUpdate({
+			update_id: 56,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 544,
+				text: `/session_create path ${missing}`,
+			},
+		});
+		expect(frames).toHaveLength(0);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect(
+			bot.calls.some(
+				c =>
+					c.method === "sendMessage" &&
+					c.body.message_thread_id === 544 &&
+					c.body.text === "That folder is no longer available.",
+			),
+		).toBe(true);
+	});
+
+	test("free text in a pending topic is never treated as a path", async () => {
+		const { daemon, frames } = await adoptionLifecycleHarness();
+		await authorizePendingTopic(daemon, 59, 560);
+		await daemon.handleTelegramUpdate({
+			update_id: 60,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 560,
+				text: "just some arbitrary sentence",
+			},
+		});
+		expect(frames).toHaveLength(0);
+	});
+
+	test("happy adoption: ensureTopic adopts the user topicId with zero createForumTopic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		// Seed the durable intent directly (picker wiring is covered by the store's
+		// own tests); the daemon's own store reads it after rehydrate.
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 570, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopted", "ts");
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "adopter",
+			repo: "r",
+			branch: "b",
+		});
+		expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.message_thread_id === 570)).toBe(true);
+		// Sidecar removed after the registry commit.
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect((topicAccess(daemon).topics.get("adopter") as { topicOrigin?: string } | undefined)?.topicOrigin).toBe(
+			"user_created",
+		);
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "adopter" });
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(0);
+		expect(topicAccess(daemon).topics.get("adopter")).toBeUndefined();
+	});
+
+	test("restart reconciliation settles adopted delete fences locally without deleting the user topic", async () => {
+		const { daemon, bot } = await adoptionLifecycleHarness();
+		(topicAccess(daemon).topics as unknown as { load(state: unknown): void }).load({
+			topics: {
+				adopter: {
+					topicId: "571",
+					identitySent: true,
+					createdAt: 1,
+					authorityEpoch: 2,
+					authorityState: "delete_pending",
+					topicOrigin: "user_created",
+					chatId: "42",
+					endpointKey: "ws://adopted",
+					endpointDigest: "digest",
+					endpointIncarnation: 0,
+				},
+			},
+			fences: { adopter: 2 },
+		});
+		await (daemon as unknown as { reconcilePendingTopicDeletes(): Promise<void> }).reconcilePendingTopicDeletes();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(0);
+		expect(topicAccess(daemon).topics.get("adopter")).toBeUndefined();
+	});
+
+	test("registry commit failure releases the adoption claim so the same topic can retry", async () => {
+		const agentDir = tempAgentDir();
+		let failTopicWrite = true;
+		const fsImpl = topicStateFs(async () => {
+			if (failTopicWrite) throw new Error("injected adoption registry write failure");
+		});
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir, fs: fsImpl });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "retry-adopter", topicId: 572, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("retry-adopter", "ws://adopted", "ts");
+		const identity = {
+			type: "identity_header" as const,
+			sessionId: "retry-adopter",
+			repo: "r",
+			branch: "b",
+		};
+		await expect(daemon.handleSessionMessage(session, identity)).rejects.toThrow(
+			"injected adoption registry write failure",
+		);
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		expect(topicAccess(daemon).topics.get("retry-adopter")).toBeUndefined();
+
+		failTopicWrite = false;
+		await daemon.handleSessionMessage(session, identity);
+		expect(topicAccess(daemon).topics.get("retry-adopter")?.topicId).toBe("572");
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+	});
+
+	test("post-commit sidecar cleanup failure is reconciled on restart", async () => {
+		const agentDir = tempAgentDir();
+		const fsImpl = topicStateFs(async () => {});
+		const unlink = fsImpl.unlink.bind(fsImpl);
+		let failCleanup = true;
+		fsImpl.unlink = async file => {
+			if (failCleanup && file.endsWith(".adoption-intent.json")) {
+				throw new Error("injected adoption cleanup failure");
+			}
+			await unlink(file);
+		};
+		const first = await adoptionLifecycleHarness({ agentDir, fs: fsImpl });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "cleanup-adopter", topicId: 573, path: agentDir });
+		await first.daemon.loadAdoptionIntents();
+		const session = first.daemon.connectSession("cleanup-adopter", "ws://adopted", "ts");
+		await first.daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "cleanup-adopter",
+			repo: "r",
+			branch: "b",
+		});
+		expect(topicAccess(first.daemon).topics.get("cleanup-adopter")?.topicId).toBe("573");
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+
+		failCleanup = false;
+		const restarted = await adoptionLifecycleHarness({ agentDir, fs: fsImpl });
+		await restarted.daemon.loadTopics();
+		await restarted.daemon.loadAdoptionIntents();
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		expect(topicAccess(restarted.daemon).topics.get("cleanup-adopter")?.topicId).toBe("573");
+		expect(restarted.bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
+	});
+
+	test("same-session concurrent first frames adopt once with zero createForumTopic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 580, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopted", "ts");
+		// Concurrent first frames: getOrCreateTopic's inflight promise joins them.
+		await Promise.all([
+			daemon.handleSessionMessage(session, {
+				type: "identity_header",
+				sessionId: "adopter",
+				repo: "r",
+				branch: "b",
+			}),
+			daemon.handleSessionMessage(session, { type: "turn_stream", sessionId: "adopter", text: "hi" }),
+			daemon.handleSessionMessage(session, { type: "context_update", sessionId: "adopter", text: "ctx" }),
+		]);
+		expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
+	});
+
+	test("definite spawn_failed removes the intent; readiness_timeout retains it", async () => {
+		// spawn_failed path: the adoption submit returns spawn_failed and the
+		// daemon removes the durable sidecar.
+		const agentDir = tempAgentDir();
+		const { daemon } = await adoptionLifecycleHarness({
+			agentDir,
+			lifecycleResponse: {
+				type: "session_lifecycle_error",
+				requestId: "x",
+				status: "error",
+				reason: "spawn_failed",
+				message: "spawn refused",
+			} as any,
+		});
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		await authorizePendingTopic(daemon, 89, 590);
+		// Drive the submit via the direct-path handler (writes intent + submits).
+		await daemon.handleTelegramUpdate({
+			update_id: 90,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 590,
+				text: `/session_create path ${dir}`,
+			},
+		});
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+	});
+	test("control-unavailable create removes the intent so the same topic can retry", async () => {
+		const agentDir = tempAgentDir();
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		const daemonRuntime = daemon as unknown as {
+			submitLifecycleFrame: (frame: SessionLifecycleRequest) => Promise<SessionLifecycleResponse>;
+		};
+		const daemonPrototype = Object.getPrototypeOf(daemon) as typeof daemonRuntime;
+		daemonRuntime.submitLifecycleFrame = daemonPrototype.submitLifecycleFrame.bind(daemon);
+		await authorizePendingTopic(daemon, 93, 593);
+
+		for (const updateId of [94, 95]) {
+			await daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					from: { id: 42, is_bot: false },
+					message_thread_id: 593,
+					text: `/session_create path ${dir}`,
+				},
+			});
+			expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+		}
+
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.message_thread_id === 593 &&
+					String(call.body.text).includes("Nothing was left running"),
+			),
+		).toHaveLength(2);
+	});
+
+	test("readiness_timeout retains the durable intent (late spawn within TTL)", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon } = await adoptionLifecycleHarness({
+			agentDir,
+			lifecycleResponse: {
+				type: "session_lifecycle_error",
+				requestId: "y",
+				status: "error",
+				reason: "readiness_timeout",
+				message: "timed out",
+			} as any,
+		});
+		const dir = path.join(agentDir, "workspace");
+		fs.mkdirSync(dir, { recursive: true });
+		await authorizePendingTopic(daemon, 91, 592);
+		await daemon.handleTelegramUpdate({
+			update_id: 92,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 592,
+				text: `/session_create path ${dir}`,
+			},
+		});
+		// Timeout is not a definite spawn failure: the sidecar is retained so a late
+		// socket can still adopt the original topic.
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		expect(topicAccess(daemon).topics.sessionForTopic("592")).toBeUndefined();
+	});
+
+	test("restart reconciliation removes a stale sidecar whose record already committed", async () => {
+		const agentDir = tempAgentDir();
+		// Commit a topic record for "adopter" on topic 600, then leave a stale sidecar.
+		const first = await adoptionLifecycleHarness({ agentDir });
+		await first.daemon.loadAdoptionIntents();
+		const session = first.daemon.connectSession("adopter", "ws://adopted", "ts");
+		// Commit a daemon-created topic record (not adoption) so a record exists.
+		await first.daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "adopter",
+			repo: "r",
+			branch: "b",
+		});
+		// Now drop a stale adoption sidecar targeting the same session/topic.
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 600 });
+		// Re-point the seeded sidecar at the actually-committed topic id.
+		const committed = topicAccess(first.daemon).topics.get("adopter")!;
+		const fix = new TelegramAdoptionIntentStore({ agentDir });
+		await fix.remove("adopter");
+		await fix.put({
+			intendedSessionId: "adopter",
+			topicId: Number(committed.topicId),
+			chatId: "42",
+			target: { kind: "existing_path", path: agentDir },
+			createdAt: Date.now(),
+			expiresAt: Date.now() + 600_000,
+		});
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(1);
+		const restarted = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner-2",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		await restarted.loadTopics();
+		await restarted.loadAdoptionIntents();
+		expect(adoptionIntentFiles(agentDir)).toHaveLength(0);
+	});
+
+	test("a bound topic refuses adoption without deleting the user topic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		// Pre-bind a topic to another session via a daemon-created record.
+		const other = daemon.connectSession("other-session", "ws://other", "to");
+		await daemon.handleSessionMessage(other, {
+			type: "identity_header",
+			sessionId: "other-session",
+			repo: "r",
+			branch: "b",
+		});
+		const otherRecord = topicAccess(daemon).topics.get("other-session")!;
+		// Seed an intent targeting the already-bound topic; adoption must fail closed.
+		await seedAdoptionIntent(agentDir, {
+			intendedSessionId: "adopter",
+			topicId: Number(otherRecord.topicId),
+			path: agentDir,
+		});
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopter", "ta");
+		await expect(
+			daemon.handleSessionMessage(session, {
+				type: "identity_header",
+				sessionId: "adopter",
+				repo: "r",
+				branch: "b",
+			}),
+		).rejects.toThrow("topic adoption refused");
+		// The user topic was never deleted.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	});
+
+	test("lease revocation during adoption does not delete the user topic", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 620, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		const session = daemon.connectSession("adopter", "ws://adopted", "ts");
+		const identity = daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "adopter",
+			repo: "r",
+			branch: "b",
+		});
+		// Revoke the creation lease mid-flight by dropping the session.
+		daemon.sessions.delete("adopter");
+		await identity.catch(() => undefined);
+		// No compensation delete of the user topic ever fires for an adoption.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic" && c.body.message_thread_id === 620)).toBe(false);
+	});
+
+	test("same-topic TTL dedup: a created update with a live intent shows 'already starting'", async () => {
+		const agentDir = tempAgentDir();
+		const { daemon, bot } = await adoptionLifecycleHarness({ agentDir });
+		await seedAdoptionIntent(agentDir, { intendedSessionId: "adopter", topicId: 610, path: agentDir });
+		await daemon.loadAdoptionIntents();
+		bot.calls = [];
+		await daemon.handleTelegramUpdate(forumTopicCreatedUpdate(110, 610));
+		const notices = bot.calls.filter(
+			c => c.method === "sendMessage" && c.body.text === "A session is already starting in this topic.",
+		);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]!.body.message_thread_id).toBe(610);
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.reply_markup)).toBe(false);
 	});
 });

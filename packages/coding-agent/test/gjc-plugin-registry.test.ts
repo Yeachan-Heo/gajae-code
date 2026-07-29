@@ -7,9 +7,8 @@ import {
 	loadEffectiveGjcPluginRegistry,
 	readRegistry,
 	sortRegistryEntries,
-	updateRegistry,
-	writeRegistry,
 } from "../src/extensibility/gjc-plugins";
+import { updateRegistry, writeRegistry } from "../src/extensibility/gjc-plugins/registry";
 
 const tempDirs: string[] = [];
 

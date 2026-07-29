@@ -1309,6 +1309,48 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
+	it("omits the server PID guard clause when cleaning up on a platform that cannot prove it", () => {
+		// The non-Linux server probe reports a placeholder PID, so a `#{pid}` clause
+		// built from it can never match the live tmux server and the guarded cleanup
+		// is refused with gjc_tmux_exact_cleanup_uncertain instead of removing the
+		// session it just created.
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
+		const previousIsTTY = stdout.isTTY;
+		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
+		Object.defineProperty(stdout, "isTTY", { configurable: true, value: true });
+
+		try {
+			launchDefaultTmuxIfNeeded({
+				parsed: args({ tmux: true }),
+				rawArgs: [],
+				cwd: "/repo",
+				env: {},
+				argv: ["/usr/local/bin/gjc"],
+				execPath: "/bin/bun",
+				platform: "darwin",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "",
+				existingBranchSessionName: null,
+				diagnosticWriter: () => undefined,
+				spawnSync: (command, spawnArgs, options) => {
+					calls.push({ command, args: spawnArgs, options });
+					if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+
+			const guarded = calls.find(call => call.args[0] === "if-shell");
+			expect(guarded?.args.slice(0, 4)).toEqual(["if-shell", "-t", NATIVE_SESSION_ID, "-F"]);
+			expect(guarded?.args[4]).not.toContain("#{pid}");
+			expect(guarded?.args[4]).toContain(`#{==:#{session_id},${NATIVE_SESSION_ID}}`);
+			expect(writeSpy).not.toHaveBeenCalled();
+		} finally {
+			Object.defineProperty(stdout, "isTTY", { configurable: true, value: previousIsTTY });
+		}
+	});
+
 	it("builds a session-scoped tmux profile without global tmux mutation", () => {
 		const commands = buildGjcTmuxProfileCommands("gjc-session:0", {});
 		const args = commands.map(command => command.args);

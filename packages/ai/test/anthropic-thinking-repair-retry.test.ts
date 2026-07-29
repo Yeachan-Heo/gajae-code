@@ -176,6 +176,71 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(JSON.stringify(requestBodies[1])).toContain("visible answer");
 	});
 
+	// Real captured session failure (2026-07-29): the mutation 400 says "latest
+	// assistant message" but cites `messages.1.content.1` — a HISTORICAL turn — so the
+	// latest-only repair is rejected identically and the turn used to die.
+	it("escalates to a full-history repair when the mutation 400 survives the latest-only repair", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("early", "early answer"),
+				{ ...user, content: "second", timestamp: Date.now() + 1 },
+				makeSignedAssistant("late", "late answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 2 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt <= 2 ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(3);
+		// Attempt 2: latest-only repair keeps the historical signature.
+		const secondBody = JSON.stringify(requestBodies[1]);
+		expect(secondBody).toContain("sig_early");
+		expect(secondBody).not.toContain("sig_late");
+		// Attempt 3: escalated full-history repair drops every replayed signature.
+		const thirdBody = JSON.stringify(requestBodies[2]);
+		expect(thirdBody).not.toContain("sig_early");
+		expect(thirdBody).not.toContain("sig_late");
+		expect(thirdBody).toContain("early answer");
+	});
+
+	it("stops after exactly three requests when the mutation 400 persists through both repair scopes", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [user, makeSignedAssistant("history", "history answer"), { ...user, content: "next prompt" }],
+		};
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createAnthropicThinking400() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(400);
+		expect(requestBodies).toHaveLength(3);
+	});
+
 	it("retries once with thinking dropped from EVERY assistant turn after the invalid-signature 400", async () => {
 		const user: UserMessage = {
 			role: "user",
@@ -243,6 +308,79 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(result.errorStatus).toBe(400);
 		expect(result.errorMessage).toContain("Invalid `signature`");
 		expect(requestBodies).toHaveLength(2);
+	});
+
+	// A forced tool choice makes the request drop `thinking`; replaying signed thinking
+	// blocks against a request that never enabled thinking is the shape Anthropic rejects
+	// with "blocks in the latest assistant message cannot be modified".
+	it("drops replayed native thinking when a forced tool choice disables thinking", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("history", "history answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 1 },
+			],
+			tools: [
+				{
+					name: "todo_write",
+					description: "Write todos",
+					parameters: { type: "object", properties: {}, additionalProperties: false },
+				},
+			],
+		};
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createSuccessfulRequest() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, {
+			client,
+			thinkingEnabled: true,
+			toolChoice: { type: "tool", name: "todo_write" },
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(1);
+		const body = requestBodies[0] as { thinking?: unknown; tool_choice?: unknown };
+		expect(body.tool_choice).toEqual({ type: "tool", name: "todo_write" });
+		expect(body.thinking).toBeUndefined();
+		const serialized = JSON.stringify(body);
+		expect(serialized).not.toContain("sig_history");
+		expect(serialized).not.toContain('"thinking"');
+		// Reasoning text survives as context; only the signed native block is dropped.
+		expect(serialized).toContain("history answer");
+	});
+
+	it("keeps replayed native thinking when the tool choice is not forced", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("history", "history answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 1 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createSuccessfulRequest() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		await streamAnthropic(model, context, { client, thinkingEnabled: true, toolChoice: "auto" }).result();
+
+		expect(JSON.stringify(requestBodies[0])).toContain("sig_history");
 	});
 
 	it("does not retry or scrub history for non-matching Anthropic 400 errors", async () => {

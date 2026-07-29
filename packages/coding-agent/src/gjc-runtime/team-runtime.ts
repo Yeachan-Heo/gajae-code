@@ -551,6 +551,40 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-task-approval",
 ] as const;
 
+export type GjcTeamApiOperation = (typeof GJC_TEAM_API_OPERATIONS)[number];
+
+export class UnknownGjcTeamApiOperationError extends Error {
+	readonly code = "unknown_team_api_operation";
+	readonly operation: string;
+	readonly suggestions: readonly string[];
+
+	constructor(operation: string, suggestions: readonly string[]) {
+		const guidance =
+			suggestions.length > 0
+				? `did you mean ${suggestions.join(" or ")}?`
+				: "run gjc team api --help for supported operations";
+		super(`unknown_team_api_operation:${operation}; ${guidance}`);
+		this.name = "UnknownGjcTeamApiOperationError";
+		this.operation = operation;
+		this.suggestions = suggestions;
+	}
+}
+
+function isGjcTeamApiOperation(operation: string): operation is GjcTeamApiOperation {
+	return (GJC_TEAM_API_OPERATIONS as readonly string[]).includes(operation);
+}
+
+function unknownGjcTeamApiOperationSuggestions(operation: string): readonly string[] {
+	if (operation === "heartbeat") return ["read-worker-heartbeat", "update-worker-heartbeat"];
+	if (operation === "get-task") return ["read-task"];
+	return [];
+}
+
+function resolveGjcTeamApiOperation(operation: string): GjcTeamApiOperation {
+	if (isGjcTeamApiOperation(operation)) return operation;
+	throw new UnknownGjcTeamApiOperationError(operation, unknownGjcTeamApiOperationSuggestions(operation));
+}
+
 function currentTimeMs(): number {
 	return gjcTeamRuntimeTestSeams?.nowMs?.() ?? Date.now();
 }
@@ -1494,6 +1528,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 	startupAckPath: string;
 	replacementToken: string;
 	startupAckTimeoutMs: number;
+	env: NodeJS.ProcessEnv;
 }): Promise<string> {
 	if (input.config.dry_run)
 		return `%memory-guard-${input.worker.id}-${stableHash(`${input.worker.id}:${now()}`).slice(0, 8)}`;
@@ -1502,6 +1537,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 		input.worker,
 		input.platform,
 		`Send startup ACK before resuming: gjc team api worker-startup-ack --input '{"team_name":"${input.config.team_name}","worker_id":"${input.worker.id}","protocol_version":"1","replacement_token":"${input.replacementToken}"}' --json. ${GJC_TEAM_CONTINUATION_PROMPT}`,
+		input.env,
 	);
 	const workerCwd = input.worker.worktree_path ?? input.config.leader.cwd;
 	const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(input.config.tmux_command, input.platform);
@@ -1602,7 +1638,12 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	allowAutomaticAction?: boolean;
 	replacementToken?: string;
 	dir: string;
-	taskMutation: GjcTeamTaskMutationCapability;
+	/**
+	 * Acquire the team task-mutation fence only for the blocked-state transition.
+	 * Must not be held across the successor startup-ack wait: concurrent
+	 * `worker-startup-ack` must publish while replacement is in flight.
+	 */
+	withTaskMutation: <T>(fn: (capability: GjcTeamTaskMutationCapability) => Promise<T>) => Promise<T>;
 }): Promise<Record<string, unknown>> {
 	const dir = input.dir;
 	const config = await readConfig(dir);
@@ -1782,16 +1823,18 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		ledger = retried.ledger;
 		await writeWorkerMemoryGuardLedger(dir, ledger);
 		if (retried.finalBlocked)
-			await finalizeWorkerMemoryGuardBlockedState({
-				teamName: input.teamName,
-				dir,
-				worker,
-				task,
-				taskMutation: input.taskMutation,
-				reason: checkpoint.reason,
-				cwd: input.cwd,
-				env: input.env,
-			});
+			await input.withTaskMutation(taskMutation =>
+				finalizeWorkerMemoryGuardBlockedState({
+					teamName: input.teamName,
+					dir,
+					worker,
+					task,
+					taskMutation,
+					reason: checkpoint.reason,
+					cwd: input.cwd,
+					env: input.env,
+				}),
+			);
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
@@ -1853,6 +1896,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			startupAckPath,
 			replacementToken,
 			startupAckTimeoutMs,
+			env: input.env,
 		});
 	} catch (error) {
 		await restorePredecessorStartupState();
@@ -1868,16 +1912,18 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		ledger = retried.ledger;
 		await writeWorkerMemoryGuardLedger(dir, ledger);
 		if (retried.finalBlocked)
-			await finalizeWorkerMemoryGuardBlockedState({
-				teamName: input.teamName,
-				dir,
-				worker,
-				task,
-				taskMutation: input.taskMutation,
-				reason,
-				cwd: input.cwd,
-				env: input.env,
-			});
+			await input.withTaskMutation(taskMutation =>
+				finalizeWorkerMemoryGuardBlockedState({
+					teamName: input.teamName,
+					dir,
+					worker,
+					task,
+					taskMutation,
+					reason,
+					cwd: input.cwd,
+					env: input.env,
+				}),
+			);
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
@@ -2043,12 +2089,17 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 }
 
 async function applyWorkerMemoryGuard(
-	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "taskMutation">,
+	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "withTaskMutation">,
 ): Promise<Record<string, unknown>> {
 	const dir = await findTeamDir(input.teamName, input.cwd, input.env);
-	return withGjcTeamTaskMutation(taskStore(dir), taskMutation =>
-		applyWorkerMemoryGuardUnlocked({ ...input, dir, taskMutation }),
-	);
+	// Do not hold withGjcTeamTaskMutation across relaunchWorkerPaneForMemoryGuard's
+	// startup-ack poll (default 120s). That fence would serialize concurrent
+	// worker-startup-ack publication and hang selector-replacement under CI load.
+	return applyWorkerMemoryGuardUnlocked({
+		...input,
+		dir,
+		withTaskMutation: fn => withGjcTeamTaskMutation(taskStore(dir), fn),
+	});
 }
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
 	try {
@@ -2484,7 +2535,11 @@ function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): bo
 	return result.exitCode === 0;
 }
 
-function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
+function readCurrentTmuxLeaderContext(
+	tmuxCommand: string,
+	env: NodeJS.ProcessEnv,
+	adoptUnmanagedSession = true,
+): GjcTmuxLeaderContext {
 	if (Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
 	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
@@ -2517,7 +2572,7 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
-	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
+	if (adoptUnmanagedSession && readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
 		// Adopt any real tmux leader as a GJC team leader — including a session
 		// the user created outside `gjc --tmux` — by writing GJC's @gjc-profile
 		// ownership tag and reading it back. A provider that round-trips tmux
@@ -2539,6 +2594,20 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 		leaderPaneId,
 		target: `${sessionName}:${windowIndex}`,
 	};
+}
+/**
+ * Check whether the current process can launch a team without changing tmux state.
+ * Unlike the launch path, this never adopts or tags an unmanaged tmux session.
+ */
+export function probeGjcTeamAvailability(
+	env: NodeJS.ProcessEnv = process.env,
+): { available: true } | { available: false; reason: string } {
+	try {
+		readCurrentTmuxLeaderContext(resolveGjcTmuxCommand(env), env, false);
+		return { available: true };
+	} catch (error) {
+		return { available: false, reason: error instanceof Error ? error.message : String(error) };
+	}
 }
 function isBunVirtualPath(candidate: string | undefined): boolean {
 	const normalized = candidate?.trim().replace(/\\/g, "/").toLowerCase();
@@ -2718,7 +2787,7 @@ async function startTmuxSession(
 			const splitDirection: string = worker.index === 1 ? "-h" : "-v";
 			const splitTarget: string =
 				worker.index === 1 ? config.tmux_target : (rightStackRootPaneId ?? config.tmux_target);
-			const workerCommand = buildWorkerCommand(config, worker);
+			const workerCommand = buildWorkerCommand(config, worker, process.platform, undefined, env);
 			const workerCwd = worker.worktree_path ?? config.leader.cwd;
 			const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);
 			const splitArgs = [
@@ -4247,11 +4316,13 @@ function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: numb
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallbackMs;
 }
 
-function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
+/** Positive stale windows are clamped so a worker can publish strictly before expiry. */
+export function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
 	const raw = env.GJC_TEAM_HEARTBEAT_STALE_MS?.trim();
 	if (!raw) return 120_000;
 	const parsed = Number(raw);
-	return Number.isFinite(parsed) ? parsed : 120_000;
+	if (!Number.isFinite(parsed)) return 120_000;
+	return parsed > 0 ? Math.max(3, parsed) : parsed;
 }
 async function writeLifecycleNudge(
 	dir: string,
@@ -4751,6 +4822,41 @@ export async function updateGjcWorkerHeartbeat(
 		updateWorkerHeartbeat(workerRuntime, teamName, worker, heartbeat, cwd, env),
 	);
 }
+/**
+ * Refresh liveness without discarding metadata written by other heartbeat
+ * producers. The read/merge/write sequence shares the team mutation fence with
+ * CLI heartbeat updates, so a runtime tick cannot overwrite a newer turn count.
+ */
+export async function refreshGjcWorkerHeartbeat(
+	teamName: string,
+	worker: string,
+	pid: number,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<WorkerHeartbeatFile> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, async () => {
+		const current = await readWorkerHeartbeat(workerRuntime, teamName, worker, cwd, env);
+		const processStartTime = await readLinuxProcessStartTime(pid);
+		const turnCount = current?.turn_count;
+		return updateWorkerHeartbeat(
+			workerRuntime,
+			teamName,
+			worker,
+			{
+				...current,
+				pid,
+				last_turn_at: now(),
+				turn_count: Number.isSafeInteger(turnCount) && (turnCount ?? -1) >= 0 ? (turnCount ?? 0) : 0,
+				alive: true,
+				// Never carry another process's incarnation across a pid change.
+				process_start_time: processStartTime ?? (current?.pid === pid ? current.process_start_time : undefined),
+			},
+			cwd,
+			env,
+		);
+	});
+}
 export async function writeGjcWorkerInbox(
 	teamName: string,
 	worker: string,
@@ -4896,12 +5002,13 @@ export async function executeGjcTeamApiOperation(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<unknown> {
+	const resolvedOperation = resolveGjcTeamApiOperation(operation);
 	const teamName = String(input.team_name ?? input.teamName ?? "").trim();
 	if (!teamName) throw new Error("missing_team_name");
 	const workerInput = input.worker ?? input.worker_id ?? input.workerId;
 	const worker = String(workerInput ?? "worker-1");
 	const explicitWorker = workerInput == null ? undefined : String(workerInput);
-	switch (operation) {
+	switch (resolvedOperation) {
 		case "list-tasks":
 			return { tasks: await listGjcTeamTasks(teamName, cwd, env) };
 		case "read-task":
@@ -5247,7 +5354,8 @@ export async function executeGjcTeamApiOperation(
 		case "read-shutdown-ack":
 			return readGjcShutdownAck(teamName, worker, cwd, env);
 		default:
-			throw new Error(`unknown_team_api_operation:${operation}`);
+			resolvedOperation satisfies never;
+			throw new UnknownGjcTeamApiOperationError(operation, []);
 	}
 }
 

@@ -1,4 +1,4 @@
-import { $credentialEnv, $env, $inheritedEnv, extractHttpStatusFromError, logger } from "@gajae-code/utils";
+import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
 import OpenAI from "openai";
 import type {
 	ChatCompletionAssistantMessageParam,
@@ -47,7 +47,6 @@ import {
 	rewriteCopilotError,
 } from "../utils/http-inspector";
 import {
-	createWatchdog,
 	getOpenAIStreamIdleTimeoutMs,
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
@@ -102,12 +101,22 @@ function resolveOpenAIProviderBaseUrl(
 	authCredentialType: "api_key" | "oauth" | undefined,
 ): string {
 	if (authCredentialType === "oauth") return OPENAI_DEFAULT_BASE_URL;
-	const envBaseUrl = $inheritedEnv("OPENAI_BASE_URL") ?? $env.OPENAI_BASE_URL?.trim();
+	// Trusted sources only: this base URL becomes the request endpoint that carries
+	// the OpenAI credential, and `$env` merges the caller's `cwd/.env`.
+	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
 	const configuredBaseUrl = baseUrl?.trim();
 	if (envBaseUrl && (!configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl))) {
 		return envBaseUrl;
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
+}
+
+/** Test seam: the provider base URL as resolved from trusted env. */
+export function resolveOpenAICompletionsBaseUrlForTest(
+	baseUrl: string | undefined,
+	authCredentialType: "api_key" | "oauth" | undefined,
+): string {
+	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
 }
 
 /**
@@ -447,7 +456,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		const output: AssistantMessage = createInitialResponsesAssistantMessage(model.api, model.provider, model.id);
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		const abortTracker = createAbortSourceTracker(options?.signal);
-		const firstEventTimeoutAbortError = new Error(OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE);
 		const { requestAbortController, requestSignal } = abortTracker;
 
 		try {
@@ -569,10 +577,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				model.provider === "alibaba-token-plan"
 					? ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS
 					: getProviderFirstEventTimeoutFallbackMs(model.provider);
-			const firstEventWatchdog = createWatchdog(
-				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs),
-				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
-			);
+			const firstEventTimeoutMs =
+				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			if (premiumRequestsTotal !== undefined) {
 				output.usage.premiumRequests = premiumRequestsTotal;
 			}
@@ -759,10 +765,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			};
 
 			for await (const chunk of iterateWithIdleTimeout(openaiStream, {
-				watchdog: firstEventWatchdog,
+				firstItemTimeoutMs: firstEventTimeoutMs,
+				firstItemErrorMessage: OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE,
 				idleTimeoutMs,
 				errorMessage: "OpenAI completions stream stalled while waiting for the next event",
 				onIdle: () => requestAbortController.abort(),
+				onFirstItemTimeout: () => requestAbortController.abort(),
 				abortSignal: options?.signal,
 				isProgressItem: isOpenAICompletionsProgressChunk,
 			})) {
@@ -973,14 +981,17 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
-			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
+			const localAbortReason = abortTracker.getLocalAbortReason();
 			const capturedErrorResponse = getCapturedErrorResponse?.();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
-			output.transportFailure = transportFailureFacts(error, capturedErrorResponse);
+			output.errorStatus =
+				extractHttpStatusFromError(localAbortReason ?? error) ??
+				(localAbortReason ? undefined : capturedErrorResponse?.status);
+			output.transportFailure = localAbortReason
+				? transportFailureFacts(localAbortReason)
+				: transportFailureFacts(error, capturedErrorResponse);
 			output.errorMessage =
-				firstEventTimeoutError?.message ??
-				(await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse));
+				localAbortReason?.message ?? (await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse));
 			// Some providers via OpenRouter include extra details here.
 			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;

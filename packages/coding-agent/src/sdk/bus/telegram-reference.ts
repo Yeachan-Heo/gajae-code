@@ -209,12 +209,37 @@ export function buildActionMarkdown(action: {
 	if (action.kind === "idle") {
 		return action.summary ? `🟢 Agent idle\n${action.summary}` : "🟢 Agent idle";
 	}
-	const heading = `❓ **${action.question ?? "Question"}**`;
+	const question = (action.question ?? "Question")
+		.split(/\r\n|\r|\n/)
+		.map(line => line.trimEnd())
+		.map(line => (line ? `**${line}**` : ""))
+		.join("  \n");
+	const heading = `❓ ${question}`;
 	const options = action.options ?? [];
 	const displayOptions = withRecommendedOptionLabel(options, action.recommendedIndex);
 	if (options.length === 0) return `${heading}\n\n(reply with text)`;
 	const list = displayOptions.map((label, i) => `${i + 1}. ${label.replace(/^\s*\d+[.)]\s+/, "")}`).join("\n");
 	return `${heading}\n\n${list}`;
+}
+
+export type TelegramNotificationSound = "all" | "important" | "none";
+
+export type TelegramDeliveryLane = "ask" | "idle" | "live" | "finalized";
+
+/**
+ * Resolve Telegram's optional silent-delivery flag. `finalChunk` silences
+ * non-final actionable chunks under the `important` policy; `undefined`
+ * intentionally omits the field so Telegram uses its normal audible delivery
+ * behavior.
+ */
+export function telegramDisableNotification(
+	sound: TelegramNotificationSound | undefined,
+	lane: TelegramDeliveryLane,
+	finalChunk = true,
+): true | undefined {
+	if (sound === "none") return true;
+	if (sound !== "important") return undefined;
+	return (lane === "ask" || lane === "idle") && finalChunk ? undefined : true;
 }
 
 /** Send Telegram HTML text chunks sequentially so long messages preserve order. */
@@ -223,13 +248,17 @@ export async function sendTelegramHtmlChunks(
 	chatId: string,
 	text: string,
 	inlineKeyboard?: InlineButton[][],
+	sound?: TelegramNotificationSound,
+	lane: TelegramDeliveryLane = "ask",
 ): Promise<void> {
 	const chunks = splitTelegramHtml(text);
 	for (let i = 0; i < chunks.length; i++) {
+		const disableNotification = telegramDisableNotification(sound, lane, i === chunks.length - 1);
 		await send("sendMessage", {
 			chat_id: chatId,
 			text: chunks[i]!,
 			parse_mode: TELEGRAM_PARSE_MODE,
+			...(disableNotification === true ? { disable_notification: true } : {}),
 			...(i === chunks.length - 1 && inlineKeyboard ? { reply_markup: { inline_keyboard: inlineKeyboard } } : {}),
 		});
 	}
@@ -348,6 +377,7 @@ export interface TelegramReferenceOptions {
 	endpointFile: string;
 	apiBase?: string;
 	fetchImpl?: typeof fetch;
+	sound?: TelegramNotificationSound;
 }
 
 /**
@@ -395,7 +425,14 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 				controls: msg.controls,
 				summary: msg.summary,
 			});
-			await sendTelegramHtmlChunks(send, opts.chatId, rendered.text, rendered.inline_keyboard);
+			await sendTelegramHtmlChunks(
+				send,
+				opts.chatId,
+				rendered.text,
+				rendered.inline_keyboard,
+				opts.sound,
+				msg.kind ?? "ask",
+			);
 		} else if (msg.type === "action_unavailable") {
 			const requiredCapabilities = Array.isArray(msg.requiredCapabilities)
 				? msg.requiredCapabilities
@@ -416,7 +453,7 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 			// session's forum topic; this reference shows the minimal handling.
 			const threaded = renderThreadedFrame(msg as never);
 			if (threaded?.text) {
-				await sendTelegramHtmlChunks(send, opts.chatId, threaded.text);
+				await sendTelegramHtmlChunks(send, opts.chatId, threaded.text, undefined, opts.sound, threaded.lane);
 			}
 		}
 	};

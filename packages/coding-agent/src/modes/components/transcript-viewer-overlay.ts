@@ -54,6 +54,34 @@ export type TranscriptViewerOverlayOptions = {
 
 type RenderedEntry = { lineStart: number; lineCount: number };
 
+export const __transcriptViewerPerfCounters = {
+	enabled: false,
+	layoutCacheHits: 0,
+	layoutCacheMisses: 0,
+	refreshRuns: 0,
+	rebuildRuns: 0,
+	snapshot() {
+		return {
+			layoutCacheHits: this.layoutCacheHits,
+			layoutCacheMisses: this.layoutCacheMisses,
+			refreshRuns: this.refreshRuns,
+			rebuildRuns: this.rebuildRuns,
+		};
+	},
+	enable(): void {
+		this.enabled = true;
+	},
+	disable(): void {
+		this.enabled = false;
+	},
+	reset(): void {
+		this.layoutCacheHits = 0;
+		this.layoutCacheMisses = 0;
+		this.refreshRuns = 0;
+		this.rebuildRuns = 0;
+	},
+};
+
 /** Message-agnostic, modal transcript browser over resolved projection entries. */
 export class TranscriptViewerOverlay extends Container {
 	#options: TranscriptViewerOverlayOptions;
@@ -73,6 +101,7 @@ export class TranscriptViewerOverlay extends Container {
 	#followTailPending = false;
 	#skipFollowTailOnce = false;
 	#followTailActive = false;
+	#layoutCache = new Map<string, Map<string, string[]>>();
 
 	constructor(options: TranscriptViewerOverlayOptions) {
 		super();
@@ -87,7 +116,11 @@ export class TranscriptViewerOverlay extends Container {
 	get isFullscreen(): boolean {
 		return this.#fullscreen;
 	}
-	refresh(identityMap?: ReadonlyMap<string, string>): void {
+	refresh(identityMap?: ReadonlyMap<string, string>, preserveLayoutCache = false): void {
+		if (__transcriptViewerPerfCounters.enabled) __transcriptViewerPerfCounters.refreshRuns++;
+		// Incremental sources explicitly invalidate same-id payload patches before requesting a
+		// preserving refresh. Other source changes conservatively drop all layout variants.
+		if (!preserveLayoutCache) this.#layoutCache.clear();
 		const previous = this.selectedEntryId;
 		const previousPosition = this.#selected;
 		const reconciledPrevious = previous ? (identityMap?.get(previous) ?? previous) : undefined;
@@ -109,9 +142,15 @@ export class TranscriptViewerOverlay extends Container {
 		this.#initialized = true;
 		this.#rebuild();
 	}
+	invalidateLayoutEntries(entryIds: readonly string[]): void {
+		for (const id of entryIds) this.#layoutCache.delete(id);
+	}
 	override render(width: number): string[] {
-		this.#width = Math.max(1, width);
-		this.refresh();
+		const nextWidth = Math.max(1, width);
+		const widthChanged = nextWidth !== this.#width;
+		this.#width = nextWidth;
+		if (widthChanged) this.#layoutCache.clear();
+		if (widthChanged || getMarkdownTheme() !== this.#mdTheme) this.#rebuild();
 		const defaultHeader = this.#fullscreen
 			? [theme.fg("accent", "Transcript block")]
 			: [theme.fg("accent", sanitizeText(this.#options.title ?? "Transcript"))];
@@ -179,6 +218,7 @@ export class TranscriptViewerOverlay extends Container {
 			if (this.#fullscreen) {
 				this.#fullscreen = false;
 				this.#scrollOffset = 0;
+				this.#rebuild();
 				this.#requestRender();
 			} else this.#options.onClose();
 			return;
@@ -208,6 +248,7 @@ export class TranscriptViewerOverlay extends Container {
 			this.#followTailActive = false;
 			this.#followTailPending = false;
 			this.#selected = 0;
+			this.#rebuild();
 			this.#scrollOffset = 0;
 			this.#requestRender();
 			return;
@@ -216,6 +257,7 @@ export class TranscriptViewerOverlay extends Container {
 			this.#followTailActive = true;
 			this.#followTailPending = true;
 			this.#selected = Math.max(0, count - 1);
+			this.#rebuild();
 			this.#scrollOffset = this.#lines.length;
 			this.#requestRender();
 			return;
@@ -228,6 +270,7 @@ export class TranscriptViewerOverlay extends Container {
 			this.#followTailActive = false;
 			this.#fullscreen = true;
 			this.#scrollOffset = 0;
+			this.#rebuild();
 			this.#requestRender();
 			return;
 		}
@@ -243,6 +286,7 @@ export class TranscriptViewerOverlay extends Container {
 			const entry = this.#entries[this.#selected];
 			if (entry?.rawViewable !== false) {
 				this.#raw.has(entry.id) ? this.#raw.delete(entry.id) : this.#raw.add(entry.id);
+				this.#rebuild();
 				this.#requestRender();
 			}
 		}
@@ -284,6 +328,7 @@ export class TranscriptViewerOverlay extends Container {
 		this.#followTailActive = false;
 		this.#followTailPending = false;
 		this.#selected = Math.max(0, Math.min(this.#selected + direction * 5, this.#entries.length - 1));
+		this.#rebuild();
 		this.#scrollOffset += direction * PAGE_SIZE;
 		this.#requestRender();
 	}
@@ -327,32 +372,58 @@ export class TranscriptViewerOverlay extends Container {
 		this.#options.requestRender?.();
 	}
 	#rebuild(): void {
+		if (__transcriptViewerPerfCounters.enabled) __transcriptViewerPerfCounters.rebuildRuns++;
+		// Theme is tracked by reference outside the variant key; a reference change clears
+		// the whole cache so plain and markdown layouts pick up new markdown colors.
+		const currentMdTheme = getMarkdownTheme();
+		if (currentMdTheme !== this.#mdTheme) {
+			this.#mdTheme = currentMdTheme;
+			this.#layoutCache.clear();
+		}
 		const lines: string[] = [];
 		this.#renderedEntries = [];
 		const display = this.#fullscreen ? this.#entries.slice(this.#selected, this.#selected + 1) : this.#entries;
 		const contentWidth = Math.max(1, this.#width - INDENT.length - 1);
 		for (const entry of display) {
 			const start = lines.length;
-			const selected = entry.id === this.selectedEntryId;
-			const expanded = this.#fullscreen || this.#expanded.has(entry.id);
-			const raw = this.#raw.has(entry.id);
-			lines.push("");
-			lines.push(
-				`${selected ? theme.fg("accent", "▶") : " "} ${theme.fg("muted", `[${sanitizeText(entry.label ?? entry.kind)}]`)}`,
-			);
-			if (
-				!raw &&
-				expanded &&
-				selected &&
-				entry.kind === "tool" &&
-				entry.richRenderEligible === true &&
-				entry.renderDescriptor
-			) {
-				for (const line of renderToolDisplayLines(entry.renderDescriptor, contentWidth, theme))
-					lines.push(`${INDENT}${line}`);
-				this.#renderedEntries.push({ lineStart: start, lineCount: lines.length - start });
-				continue;
+			const entryLines = this.#renderEntryLines(entry, contentWidth);
+			lines.push(...entryLines);
+			// Cumulative positions are recomputed from cached line lengths on every rebuild
+			// so PR2c can later separate virtual coordinates from materialized lines.
+			this.#renderedEntries.push({ lineStart: start, lineCount: entryLines.length });
+		}
+		this.#lines = lines.length ? lines : [theme.fg("dim", "No transcript entries yet.")];
+	}
+	#renderEntryLines(entry: TranscriptViewerEntry, contentWidth: number): string[] {
+		const selected = entry.id === this.selectedEntryId;
+		const expanded = this.#fullscreen || this.#expanded.has(entry.id);
+		const raw = this.#raw.has(entry.id);
+		const variantKey = `${expanded ? 1 : 0}|${raw ? 1 : 0}|${selected ? 1 : 0}|${contentWidth}`;
+		let variants = this.#layoutCache.get(entry.id);
+		if (variants) {
+			const cached = variants.get(variantKey);
+			if (cached) {
+				if (__transcriptViewerPerfCounters.enabled) __transcriptViewerPerfCounters.layoutCacheHits++;
+				return cached;
 			}
+		}
+		if (__transcriptViewerPerfCounters.enabled) __transcriptViewerPerfCounters.layoutCacheMisses++;
+		const lines: string[] = [];
+		lines.push("");
+		lines.push(
+			`${selected ? theme.fg("accent", "▶") : " "} ${theme.fg("muted", `[${sanitizeText(entry.label ?? entry.kind)}]`)}`,
+		);
+		if (
+			!raw &&
+			expanded &&
+			selected &&
+			entry.kind === "tool" &&
+			entry.richRenderEligible === true &&
+			entry.renderDescriptor
+		) {
+			for (const line of renderToolDisplayLines(entry.renderDescriptor, contentWidth, theme))
+				lines.push(`${INDENT}${line}`);
+		} else {
 			const text = sanitizeText(
 				(raw
 					? entry.payload.text
@@ -375,9 +446,13 @@ export class TranscriptViewerOverlay extends Container {
 				for (const line of preview) lines.push(`${INDENT}${truncateToWidth(line, contentWidth)}`);
 				if (text.split("\n").length > PREVIEW_LINES) lines.push(`${INDENT}${theme.fg("dim", "... more (Space)")}`);
 			}
-			this.#renderedEntries.push({ lineStart: start, lineCount: lines.length - start });
 		}
-		this.#lines = lines.length ? lines : [theme.fg("dim", "No transcript entries yet.")];
+		if (!variants) {
+			variants = new Map();
+			this.#layoutCache.set(entry.id, variants);
+		}
+		variants.set(variantKey, lines);
+		return lines;
 	}
 	#markdown(text: string, width: number): string[] {
 		return new Markdown(text, 0, 0, this.#mdTheme).render(width).map(line => `${INDENT}${line.trimEnd()}`);

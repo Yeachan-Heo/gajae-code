@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { type RequestBody, transformRequestBody } from "@gajae-code/ai/providers/openai-codex/request-transformer";
 import { parseCodexError } from "@gajae-code/ai/providers/openai-codex/response-handler";
-import { convertOpenAICodexResponsesTools } from "@gajae-code/ai/providers/openai-codex-responses";
+import {
+	codexToolCanonicalName,
+	codexToolWireName,
+	convertOpenAICodexResponsesTools,
+	normalizeCodexToolChoice,
+} from "@gajae-code/ai/providers/openai-codex-responses";
 import type { Tool } from "@gajae-code/ai/types";
 import { createCodexModel } from "./helpers";
 
@@ -26,6 +31,41 @@ describe("openai-codex tool schemas", () => {
 			description: "List outgoing messages",
 			parameters: { type: "object", properties: {} },
 		});
+	});
+});
+
+describe("openai-codex reserved tool namespaces", () => {
+	const reservedTools: Tool[] = [
+		{ name: "browser", description: "Control a browser", parameters: { type: "object", properties: {} } },
+		{ name: "computer", description: "Control the desktop", parameters: { type: "object", properties: {} } },
+		{ name: "read_file", description: "Read a file", parameters: { type: "object", properties: {} } },
+	];
+
+	it("renames reserved tool names on the wire and leaves others untouched", () => {
+		const converted = convertOpenAICodexResponsesTools(reservedTools, createCodexModel("gpt-5.1-codex"));
+
+		expect(converted.map(tool => tool.name)).toEqual(["browser_tool", "computer_tool", "read_file"]);
+		expect(converted.every(tool => tool.type === "function")).toBe(true);
+	});
+
+	it("renames reserved names in pinned tool choices", () => {
+		const model = createCodexModel("gpt-5.1-codex");
+
+		expect(normalizeCodexToolChoice({ type: "tool", name: "computer" }, reservedTools, model)).toEqual({
+			type: "function",
+			name: "computer_tool",
+		});
+		expect(normalizeCodexToolChoice({ type: "tool", name: "read_file" }, reservedTools, model)).toEqual({
+			type: "function",
+			name: "read_file",
+		});
+	});
+
+	it("maps wire names back to canonical names", () => {
+		expect(codexToolCanonicalName("browser_tool")).toBe("browser");
+		expect(codexToolCanonicalName("computer_tool")).toBe("computer");
+		expect(codexToolCanonicalName("read_file")).toBe("read_file");
+		expect(codexToolWireName("read_file")).toBe("read_file");
 	});
 });
 

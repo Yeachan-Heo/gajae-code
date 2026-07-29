@@ -73,18 +73,17 @@ Consumers in `packages/coding-agent` and `packages/tui` import directly from `@g
 | Text              | `wrapTextWithAnsi`, `truncateToWidth`, `sliceWithWidth`, `extractSegments`, `visibleWidth`                 | `text.rs`                                                   | sync                          |
 | Highlight         | `highlightCode`, `supportsLanguage`, `getSupportedLanguages`                                               | `highlight.rs`                                              | sync                          |
 | HTML              | `htmlToMarkdown(html, options?)`                                                                           | `html.rs`                                                   | `Promise<string>`             |
-| Image             | `PhotonImage`, `encodeSixel`                                                                               | `image.rs`                                                  | class / sync / promises       |
+| Image             | `encodeSixel`                                                                                             | `sixel.rs`                                                  | sync                          |
 | Clipboard         | `copyToClipboard`, `readImageFromClipboard`                                                                | `clipboard.rs`                                              | sync / promise                |
-| Tokens            | `countTokens(input, encoding?)`                                                                            | `tokens.rs`                                                 | sync                          |
-| System            | `detectMacOSAppearance`, `MacAppearanceObserver`, `MacOSPowerAssertion`, `getWorkProfile`, ProjFS helpers  | `appearance.rs`, `power.rs`, `prof.rs`, `projfs_overlay.rs` | mixed                         |
+| System            | `detectMacOSAppearance`, `MacAppearanceObserver`, `MacOSPowerAssertion`, `getWorkProfile`, iso overlay      | `appearance.rs`, `power.rs`, `prof.rs`, `iso.rs`            | mixed                         |
 
 ## Sync vs async contract differences
 
 The contract preserves Rust/N-API call style:
 
 - **Promise-returning exports** for worker-thread or async runtime work (`grep`, `glob`, `fuzzyFind`, `astGrep`, `astEdit`, `htmlToMarkdown`, shell/PTY runs, image parse/resize/encode, clipboard image read).
-- **Synchronous exports** for deterministic in-memory transforms/parsers or direct system calls (`search`, `hasMatch`, highlighting, text utilities, token counting, process queries, `copyToClipboard`, `encodeSixel`).
-- **Constructor exports** for stateful runtime objects (`Shell`, `PtySession`, `PhotonImage`, macOS observer/power handles).
+- **Synchronous exports** for deterministic in-memory transforms/parsers or direct system calls (`search`, `hasMatch`, highlighting, text utilities, process queries, `copyToClipboard`, `encodeSixel`).
+- **Constructor exports** for stateful runtime objects (`Shell`, `PtySession`, macOS observer/power handles).
 
 Changing sync ↔ async for an existing export is a breaking public API change because consumers call these exports directly.
 

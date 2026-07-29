@@ -111,7 +111,7 @@ The automatic paths are intentionally different:
   - Context promotion is tried before compaction.
   - If promotion is unavailable, auto maintenance runs with `reason: "threshold"` and `willRetry: false`.
   - With `compaction.strategy: "handoff"`, threshold maintenance starts a new handoff session instead of writing a compaction entry; if handoff returns no document without aborting, it falls back to context-full compaction.
-  - On success, if `compaction.autoContinue !== false`, schedules an agent-authored developer auto-continue prompt from `prompts/system/auto-continue.md`.
+  - On success, if `compaction.autoContinue !== false`, schedules an agent-authored developer prompt from `prompts/system/auto-continue.md`; immediately before that prompt executes, live enabled goal/todo/queue/length/workflow state is re-read and the prompt is skipped if no unfinished work remains.
 
 - **Idle maintenance**
   - Trigger: `runIdleCompaction()` when not streaming or already compacting.
@@ -124,14 +124,26 @@ Before compaction checks, tool-result pruning may run (`pruneToolOutputs`).
 Default prune policy:
 
 - Protect newest `40_000` tool-output tokens.
+- Protect the newest `2` real user turns (`protectRecentTurns`; user or bashExecution boundaries) — nothing in those turns is pruned, including stale-classified entries.
 - Require at least `20_000` total estimated savings.
-- Never prune tool results from `skill` or `read`.
+- Never prune tool results from `skill` or `read` (a `read` result loses immunity only when a later read provably covers it — exact same-target repeats or explicit bounded ranges that contain the earlier explicit ranges; open-ended, `:raw`, `:conflicts`, and multi-range selectors never claim range coverage).
 
-Pruned tool results are replaced with:
+Pruned tool results are replaced with a notice that keeps the highest-signal fields, error-first (exit status, error line, path hint, then tail/counts), under an absolute digest budget:
 
-- `[Output truncated - N tokens]`
+- `[Output truncated - N tokens; exit=1; error=...]` (digest form)
+- `[Output truncated - N tokens; full output: artifact://<id>] exit=1; error=...` (when the session artifact manager is available, the original output is spilled to a session artifact so pruning is reversible — the agent can re-read the full output via `artifact://<id>` instead of re-running the tool)
+
+Pruning also returns the pruned originals (`PruneResult.originals`) so callers can persist them; `AgentSession` writes them as `<id>.<toolName>.log` artifact files and only commits a pruned entry that claims an artifact after its artifact write succeeds.
 
 If pruning changes entries, session storage is rewritten and agent message state is refreshed before compaction decisions.
+
+### State-aware summary context
+
+Auto and manual compaction append best-effort session-state lines to the summarization request's `<additional-context>` (after extension-provided context): the active goal (objective + status), up to 5 active workflow skills with phases, and up to 10 open todos. This makes work-in-progress state survive compaction deterministically instead of relying on the summarizer inferring it from the transcript.
+
+### Unfinished-work-gated auto-continue
+
+When `compaction.autoContinue` is enabled, the post-compaction synthetic continue prompt is only scheduled when there is evidence of unfinished work: a goal whose status is exactly `active`, pending/in-progress todos, queued messages, the most recent assistant turn stopping on `length`, or a recognized workflow skill in an active nonterminal phase. Paused goals, terminal phases, explicitly continuation-inert integration phases, and unknown skills/phases do not qualify. Generic Ultragoal `blocked` remains active because blockers may be autonomously resolvable; a verified human wait is represented by a paused inline goal. When no qualifying evidence remains, continuation is skipped with an info notice, avoiding a full cold-context request after already-completed work.
 
 ### Boundary and cut-point logic
 
@@ -365,11 +377,11 @@ From `settings-schema.ts`:
 - `compaction.strategy` = `"context-full"` (`"handoff"` and `"off"` are also supported)
 - `compaction.reserveTokens` = `16384`
 - `compaction.keepRecentTokens` = `20000`
-- `compaction.autoContinue` = `true`
+- `compaction.autoContinue` = `true` (gated on unfinished work; see above)
 - `compaction.remoteEnabled` = `true`
 - `compaction.remoteEndpoint` = `undefined`
 - `compaction.thresholdPercent` = `-1` and `compaction.thresholdTokens` = `-1`; when no positive override is set, the threshold is `contextWindow - max(15% of contextWindow, reserveTokens)`
-- `compaction.idleEnabled` = `true`
+- `compaction.idleEnabled` = `false` (when enabled, idle maintenance rewrites history with reason `"idle"` and never auto-continues)
 - `branchSummary.enabled` = `false`
 - `branchSummary.reserveTokens` = `16384`
 

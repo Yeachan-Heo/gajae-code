@@ -4,8 +4,24 @@ export type ProviderRetryKind = NonNullable<AgentProgress["retryState"]>["kind"]
 
 const FIRST_EVENT_TIMEOUT_PATTERN = /stream timed out while waiting for the first event/i;
 const IDLE_STREAM_STALL_PATTERN = /stream stalled while waiting for the next event/i;
+const STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE = "stream_first_event_timeout";
 
 export function classifyProviderRetry(errorMessage: string): ProviderRetryKind {
+	return classifyProviderRetryFromTransport({ errorMessage });
+}
+
+/**
+ * Prefer typed transport facts when present; fall back to message regex for
+ * message-only callers that never received `transportFailure.providerCode`.
+ */
+export function classifyProviderRetryFromTransport(facts: {
+	providerCode?: string;
+	errorMessage?: string;
+}): ProviderRetryKind {
+	if (facts.providerCode?.toLowerCase() === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE) {
+		return "first_event_timeout";
+	}
+	const errorMessage = facts.errorMessage ?? "";
 	if (FIRST_EVENT_TIMEOUT_PATTERN.test(errorMessage)) return "first_event_timeout";
 	if (IDLE_STREAM_STALL_PATTERN.test(errorMessage)) return "idle_stream_stall";
 	return "provider_error";

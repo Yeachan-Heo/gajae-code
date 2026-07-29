@@ -149,6 +149,26 @@ export function setProjectDir(dir: string): void {
 	process.chdir(projectDir);
 }
 
+/**
+ * Reject a configured config-directory name that would escape the home-relative
+ * root it is documented to stay under.
+ *
+ * The configured value names a directory beneath `<home>` — the discovery docs
+ * state that "even an absolute-looking configured name is joined beneath
+ * `<home>`", which `path.join` delivers for a leading separator but not for
+ * `..` segments. Consumers join this name with `<home>` (and with project
+ * ancestors) to locate user-level `mcp.json`, `SYSTEM.md`, skills, agents and
+ * installed plugins, so a `..` segment would point that discovery at a
+ * directory outside the config root entirely. Fall back to the default name
+ * instead of honoring an escaping value.
+ */
+function sanitizeConfigDirName(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) return undefined;
+	if (path.normalize(trimmed).split(/[\\/]/).includes("..")) return undefined;
+	return trimmed;
+}
+
 /** Get the config directory name relative to home (e.g. ".gjc" or PI_CONFIG_DIR override). */
 /**
  * Config-directory name, rejected when it comes from the caller's project `.env`.
@@ -172,7 +192,14 @@ function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string 
 }
 
 export function getConfigDirName(): string {
-	return trustedConfigDirName("GJC_CONFIG_DIR") ?? trustedConfigDirName("PI_CONFIG_DIR") ?? CONFIG_DIR_NAME;
+	// Both guards apply: the value must come from a trusted source (not the
+	// caller's project `.env`), and it must still be a single name that stays
+	// beneath home once joined.
+	return (
+		sanitizeConfigDirName(trustedConfigDirName("GJC_CONFIG_DIR")) ??
+		sanitizeConfigDirName(trustedConfigDirName("PI_CONFIG_DIR")) ??
+		CONFIG_DIR_NAME
+	);
 }
 
 /** Get the config agent directory name relative to home (e.g. ".gjc/agent" or PI_CONFIG_DIR + "/agent"). */
@@ -517,6 +544,11 @@ export function getSessionsDir(agentDir?: string): string {
 /** Get the content-addressed blob store directory (~/.gjc/agent/blobs). */
 export function getBlobsDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "blobs", "data");
+}
+
+/** Get the resident-text cache root for a profile agent directory. */
+export function getResidentCacheRootDir(profileAgentDir: string): string {
+	return dirs.agentSubdir(profileAgentDir, "resident-cache", "cache");
 }
 
 /** Get the custom themes directory (~/.gjc/agent/themes). */

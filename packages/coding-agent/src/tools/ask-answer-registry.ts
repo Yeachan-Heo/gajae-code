@@ -11,21 +11,27 @@ import { logger } from "@gajae-code/utils";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { AskAnswerSource } from "./index";
 
-const sources = new Map<string, AskAnswerSource>();
+const sources = new Map<string, AskAnswerSource[]>();
 const workflowGateEmitters = new Map<string, WorkflowGateEmitter>();
 const workflowGateListeners = new Map<string, Set<(emitter: WorkflowGateEmitter | undefined) => void>>();
 
-/** Register `source` for `sessionId`. Returns a disposer that clears it. */
+/** Register `source` for `sessionId`. Returns a disposer that restores the prior source. */
 export function registerAskAnswerSource(sessionId: string, source: AskAnswerSource): () => void {
-	sources.set(sessionId, source);
+	const stack = sources.get(sessionId) ?? [];
+	stack.push(source);
+	sources.set(sessionId, stack);
 	return () => {
-		if (sources.get(sessionId) === source) sources.delete(sessionId);
+		const current = sources.get(sessionId);
+		if (!current) return;
+		const index = current.lastIndexOf(source);
+		if (index >= 0) current.splice(index, 1);
+		if (current.length === 0) sources.delete(sessionId);
 	};
 }
 
-/** The answer source for `sessionId`, if one is registered. */
+/** The highest-priority answer source for `sessionId`, if one is registered. */
 export function getAskAnswerSource(sessionId: string): AskAnswerSource | undefined {
-	return sources.get(sessionId);
+	return sources.get(sessionId)?.at(-1);
 }
 
 /** Publish a session's current workflow-gate emitter after mode initialization. */

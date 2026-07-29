@@ -281,6 +281,15 @@ export function isApprovedWorkspaceSource(
 	return real === (realpath(source) ?? source) || (platform === "win32" && isLocalWindowsBunShim(file, root, bunExecutable));
 }
 
+export function isRemovableWorkspaceShadow(hit: GjcHit, root = repoRoot): boolean {
+	const repoBinShadow = path.join(root, "node_modules", ".bin", "gjc");
+	if (hit.file === repoBinShadow) return true;
+	if (!hit.real) return false;
+	const repoBinShadowReal = realpath(repoBinShadow);
+	const workspaceWrapperReal = realpath(path.join(root, "packages", "coding-agent", "bin", "gjc.js"));
+	return hit.real === repoBinShadowReal || hit.real === workspaceWrapperReal;
+}
+
 function isApprovedSource(winner: GjcHit): boolean {
 	return isApprovedWorkspaceSource(winner.file, winner.real);
 }
@@ -383,13 +392,12 @@ function link(): never {
 		console.warn(`! ${targetDir} is not on your PATH — add it so \`gjc\` resolves:`);
 		console.warn(`    export PATH="${targetDir}:$PATH"`);
 	}
-	const repoBinShadow = path.join(repoRoot, "node_modules", ".bin", "gjc");
 	for (const hit of findGjcOnPath()) {
 		if (hit.file === target) break;
 		if (hit.real === cliSourceReal) continue;
-		if (realpath(hit.file) === realpath(repoBinShadow) || hit.file === repoBinShadow) {
+		if (isRemovableWorkspaceShadow(hit)) {
 			fs.rmSync(hit.file, { force: true });
-			console.log(`✓ Removed in-repo shadow: ${hit.file}`);
+			console.log(`✓ Removed workspace shadow: ${hit.file}`);
 			continue;
 		}
 		console.warn("");

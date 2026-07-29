@@ -221,6 +221,28 @@ export class ArtifactManager {
 	}
 
 	/**
+	 * Best-effort removal of a previously published named artifact. Used to roll
+	 * back staged publications when a transactional operation (e.g. gated
+	 * maintenance pruning) is rejected after publication succeeded. Returns false
+	 * when the artifact could not be removed so callers can log the failure
+	 * instead of silently treating the rollback as complete.
+	 */
+	async removeNamedBestEffort(filename: string): Promise<boolean> {
+		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) return false;
+		try {
+			if (this.#store) {
+				const staged = this.#store.readExpected(filename);
+				if (staged) this.#store.removeExpected(filename, staged);
+			} else {
+				await fs.unlink(path.join(this.#dir, filename));
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
 	 * Scan existing artifact files to find the next available ID.
 	 * This ensures we don't overwrite artifacts when resuming a session.
 	 */

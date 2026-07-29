@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildPluginMcpConfigs, installGjcPluginBundle } from "../src/extensibility/gjc-plugins";
+import { buildPluginMcpConfigs, installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { MCPManager } from "../src/runtime-mcp";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
@@ -19,7 +19,8 @@ describe("plugin MCP live connection", () => {
 	test("installs and connects a bundled stdio MCP server, exposing its tools", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-connect-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
 
 		const { configs } = await buildPluginMcpConfigs({ cwd });
 		expect(Object.keys(configs)).toEqual(["domain_docs"]);
@@ -39,7 +40,8 @@ describe("plugin MCP live connection", () => {
 	test("plugin stdio configs request no-env isolation and the child cannot read host secrets", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-noenv-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
 
 		const { configs } = await buildPluginMcpConfigs({ cwd });
 		// Adapter boundary: stdio plugin MCP must opt out of host env inheritance

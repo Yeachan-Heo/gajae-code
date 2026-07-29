@@ -1,4 +1,5 @@
 import { $env } from "@gajae-code/utils";
+import { STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE } from "./fallback-transport";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 100_000;
@@ -66,6 +67,14 @@ export function getStreamFirstEventTimeoutMs(
 }
 
 export type Watchdog = NodeJS.Timeout | undefined;
+export class FirstEventTimeoutError extends Error {
+	readonly providerCode = STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
+
+	constructor(message: string) {
+		super(message);
+		this.name = "FirstEventTimeoutError";
+	}
+}
 
 const dummyWatchdog = setTimeout(() => {}, 1);
 clearTimeout(dummyWatchdog);
@@ -228,9 +237,9 @@ export async function* iterateWithIdleTimeout<T>(
 					options.onFirstItemTimeout?.();
 				}
 				closeIterator();
-				throw new Error(
-					!awaitingFirstItem ? options.errorMessage : (options.firstItemErrorMessage ?? options.errorMessage),
-				);
+				throw awaitingFirstItem
+					? new FirstEventTimeoutError(options.firstItemErrorMessage ?? options.errorMessage)
+					: new Error(options.errorMessage);
 			}
 			if (outcome.kind === "error") {
 				throw outcome.error;

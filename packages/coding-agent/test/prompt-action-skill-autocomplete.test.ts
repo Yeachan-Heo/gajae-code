@@ -90,6 +90,13 @@ describe("prompt action skill autocomplete", () => {
 		expect(suggestions?.items.map(item => item.value)).not.toContain("model");
 	});
 
+	it("does not rewrite a nested filesystem path as a skill command", async () => {
+		const provider = createProvider();
+		const line = "/chromium/src";
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+		expect(provider.trySyncSlashCompletion(line)).toBeNull();
+	});
+
 	it("does not let direct-name normalization shadow an exact non-skill command", async () => {
 		const provider = createProvider();
 		const suggestions = await provider.getSuggestions(["/fast"], 0, 5);

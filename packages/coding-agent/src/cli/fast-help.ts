@@ -93,7 +93,7 @@ Available Tools (default-enabled unless noted):
   bash          - Execute bash commands
   edit          - Edit files with find/replace
   write         - Write files (creates/overwrites)
-  grep          - Search file contents
+  search        - Search file contents
   find          - Find files by glob pattern
   lsp           - Language server protocol (code intelligence)
   python        - Execute Python code (requires: ${APP_NAME} setup python)

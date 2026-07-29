@@ -1,6 +1,6 @@
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProviderInfo } from "@gajae-code/ai/utils/oauth/types";
-import { Container, matchesKey, Spacer, TruncatedText } from "@gajae-code/tui";
+import { Container, fuzzyFilter, Input, matchesKey, Spacer, TruncatedText } from "@gajae-code/tui";
 import { recordProviderAuthHealth } from "../../config/provider-auth-health";
 import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import { theme } from "../../modes/theme/theme";
@@ -17,6 +17,8 @@ export class OAuthSelectorComponent extends Container {
 	#listContainer: Container;
 	#allProviders: OAuthProviderInfo[] = [];
 	#sortedProviders: OAuthProviderInfo[] = [];
+	#filteredProviders: OAuthProviderInfo[] = [];
+	#searchInput: Input;
 	#selectedIndex: number = 0;
 	#mode: "login" | "logout";
 	#authStorage: AuthStorage;
@@ -56,6 +58,14 @@ export class OAuthSelectorComponent extends Container {
 		// Add title
 		const title = mode === "login" ? "Select provider to login:" : "Select provider to logout:";
 		this.addChild(new TruncatedText(theme.bold(title)));
+		this.addChild(new Spacer(1));
+		// Filter box: the provider list is long enough that arrow-key-only
+		// navigation buries entries below the visible window.
+		this.#searchInput = new Input();
+		this.#searchInput.onSubmit = () => {
+			this.#selectCurrentProvider();
+		};
+		this.addChild(this.#searchInput);
 		this.addChild(new Spacer(1));
 		// Create list container
 		this.#listContainer = new Container();
@@ -166,7 +176,7 @@ export class OAuthSelectorComponent extends Container {
 		return this.#authStorage.hasAuth(providerId) ? theme.fg("success", ` ${theme.status.success} logged in`) : "";
 	}
 	#updateList(): void {
-		const selectedProviderId = this.#sortedProviders[this.#selectedIndex]?.id;
+		const selectedProviderId = this.#filteredProviders[this.#selectedIndex]?.id;
 		const rankedProviders = this.#allProviders.map(provider => ({
 			provider,
 			id: provider.id,
@@ -175,16 +185,23 @@ export class OAuthSelectorComponent extends Container {
 		}));
 		rankedProviders.sort(compareRankedProviders);
 		this.#sortedProviders = rankedProviders.map(({ provider }) => provider);
+		// Filter after ranking so an empty query preserves the curated order and a
+		// query still surfaces matches in that same order of preference.
+		this.#filteredProviders = fuzzyFilter(
+			this.#sortedProviders,
+			this.#searchInput.getValue(),
+			provider => `${provider.name} ${provider.id}`,
+		);
 		if (selectedProviderId !== undefined) {
-			const selectedIndex = this.#sortedProviders.findIndex(provider => provider.id === selectedProviderId);
+			const selectedIndex = this.#filteredProviders.findIndex(provider => provider.id === selectedProviderId);
 			if (selectedIndex >= 0) this.#selectedIndex = selectedIndex;
 		}
-		if (this.#selectedIndex >= this.#sortedProviders.length) {
-			this.#selectedIndex = Math.max(0, this.#sortedProviders.length - 1);
+		if (this.#selectedIndex >= this.#filteredProviders.length) {
+			this.#selectedIndex = Math.max(0, this.#filteredProviders.length - 1);
 		}
 		this.#listContainer.clear();
 
-		const total = this.#sortedProviders.length;
+		const total = this.#filteredProviders.length;
 		const maxVisible = OAUTH_SELECTOR_MAX_VISIBLE;
 		const startIndex =
 			total <= maxVisible
@@ -193,7 +210,7 @@ export class OAuthSelectorComponent extends Container {
 		const endIndex = Math.min(startIndex + maxVisible, total);
 
 		for (let i = startIndex; i < endIndex; i++) {
-			const provider = this.#sortedProviders[i];
+			const provider = this.#filteredProviders[i];
 			if (!provider) continue;
 			const isSelected = i === this.#selectedIndex;
 			const isAvailable = provider.available;
@@ -219,8 +236,11 @@ export class OAuthSelectorComponent extends Container {
 
 		// Show "no providers" if empty
 		if (total === 0) {
-			const message =
-				this.#mode === "login" ? "No OAuth providers available" : "No OAuth providers logged in. Use /login first.";
+			const message = this.#searchInput.getValue().trim()
+				? "No providers match the filter"
+				: this.#mode === "login"
+					? "No OAuth providers available"
+					: "No OAuth providers logged in. Use /login first.";
 			this.#listContainer.addChild(new TruncatedText(theme.fg("muted", `  ${message}`), 0, 0));
 		}
 		if (this.#statusMessage) {
@@ -243,60 +263,78 @@ export class OAuthSelectorComponent extends Container {
 			}
 		}
 	}
+	#selectCurrentProvider(): void {
+		const selectedProvider = this.#filteredProviders[this.#selectedIndex];
+		if (selectedProvider?.available) {
+			this.#statusMessage = undefined;
+			this.stopValidation();
+			this.#onSelectCallback(selectedProvider.id);
+		} else if (selectedProvider) {
+			this.#statusMessage = "Provider unavailable in this environment.";
+			this.#updateList();
+		}
+	}
 	handleInput(keyData: string): void {
 		// Up arrow
 		if (matchesKey(keyData, "up")) {
-			if (this.#sortedProviders.length > 0) {
+			if (this.#filteredProviders.length > 0) {
 				this.#selectedIndex =
-					this.#selectedIndex === 0 ? this.#sortedProviders.length - 1 : this.#selectedIndex - 1;
+					this.#selectedIndex === 0 ? this.#filteredProviders.length - 1 : this.#selectedIndex - 1;
 			}
 			this.#statusMessage = undefined;
 			this.#updateList();
+			return;
 		}
 		// Down arrow
-		else if (matchesKey(keyData, "down")) {
-			if (this.#sortedProviders.length > 0) {
+		if (matchesKey(keyData, "down")) {
+			if (this.#filteredProviders.length > 0) {
 				this.#selectedIndex =
-					this.#selectedIndex === this.#sortedProviders.length - 1 ? 0 : this.#selectedIndex + 1;
+					this.#selectedIndex === this.#filteredProviders.length - 1 ? 0 : this.#selectedIndex + 1;
 			}
 			this.#statusMessage = undefined;
 			this.#updateList();
+			return;
 		}
 		// Page up - jump up by one visible page
-		else if (matchesKey(keyData, "pageUp")) {
-			if (this.#sortedProviders.length > 0) {
+		if (matchesKey(keyData, "pageUp")) {
+			if (this.#filteredProviders.length > 0) {
 				this.#selectedIndex = Math.max(0, this.#selectedIndex - OAUTH_SELECTOR_MAX_VISIBLE);
 			}
 			this.#statusMessage = undefined;
 			this.#updateList();
+			return;
 		}
 		// Page down - jump down by one visible page
-		else if (matchesKey(keyData, "pageDown")) {
-			if (this.#sortedProviders.length > 0) {
+		if (matchesKey(keyData, "pageDown")) {
+			if (this.#filteredProviders.length > 0) {
 				this.#selectedIndex = Math.min(
-					this.#sortedProviders.length - 1,
+					this.#filteredProviders.length - 1,
 					this.#selectedIndex + OAUTH_SELECTOR_MAX_VISIBLE,
 				);
 			}
 			this.#statusMessage = undefined;
 			this.#updateList();
+			return;
 		}
 		// Enter
-		else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
-			const selectedProvider = this.#sortedProviders[this.#selectedIndex];
-			if (selectedProvider?.available) {
-				this.#statusMessage = undefined;
-				this.stopValidation();
-				this.#onSelectCallback(selectedProvider.id);
-			} else if (selectedProvider) {
-				this.#statusMessage = "Provider unavailable in this environment.";
-				this.#updateList();
-			}
+		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+			this.#selectCurrentProvider();
+			return;
 		}
 		// Escape or Ctrl+C
-		else if (matchesSelectCancel(keyData)) {
+		if (matchesSelectCancel(keyData)) {
 			this.stopValidation();
 			this.#onCancelCallback();
+			return;
+		}
+		// Everything else edits the filter. A changed query invalidates the current
+		// position, so selection restarts at the best match.
+		const previousQuery = this.#searchInput.getValue();
+		this.#searchInput.handleInput(keyData);
+		if (this.#searchInput.getValue() !== previousQuery) {
+			this.#selectedIndex = 0;
+			this.#statusMessage = undefined;
+			this.#updateList();
 		}
 	}
 }

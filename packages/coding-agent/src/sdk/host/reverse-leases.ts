@@ -41,6 +41,8 @@ interface Outstanding {
 	leaseId: string;
 	resolve: (value: unknown) => void;
 	reject: (reason: Error) => void;
+	signal?: AbortSignal;
+	onAbort?: () => void;
 }
 
 export interface ReverseLeaseOptions {
@@ -188,7 +190,7 @@ export class ReverseLeaseRuntime {
 		this.#cancelForConnection(connectionId, "provider_disconnected");
 	}
 
-	request(capability: string, method: string, payload: unknown): Promise<unknown> {
+	request(capability: string, method: string, payload: unknown, signal?: AbortSignal): Promise<unknown> {
 		if (this.#disposing) throw new Error("reverse runtime is disposing");
 		this.#assertPayload(payload);
 		const lease = this.#liveLease(capability);
@@ -198,16 +200,42 @@ export class ReverseLeaseRuntime {
 				throw new ReverseLeaseError("lease_unavailable");
 			throw new ReverseLeaseError("provider_required");
 		}
+		if (signal?.aborted)
+			return Promise.reject(Object.assign(new Error("request_cancelled"), { name: "request_cancelled" }));
 		if (this.#outstanding.size >= MAX_REVERSE_OUTSTANDING) throw new ReverseLeaseError("too_many_outstanding");
 		const id = randomUUID();
 		return new Promise((resolve, reject) => {
-			this.#outstanding.set(id, {
+			const outstanding: Outstanding = {
 				connectionId: lease.connectionId,
 				capability,
 				leaseId: lease.leaseId,
 				resolve,
 				reject,
-			});
+				...(signal ? { signal } : {}),
+			};
+			this.#outstanding.set(id, outstanding);
+			if (signal) {
+				outstanding.onAbort = () => {
+					if (this.#takeOutstanding(id) !== outstanding) return;
+					try {
+						const cancellation = this.#sendFrame(lease.connectionId, {
+							type: "reverse_cancel",
+							id,
+							connectionId: lease.connectionId,
+							leaseId: lease.leaseId,
+						});
+						void Promise.resolve(cancellation).catch(() => {});
+					} catch {
+						// Cancellation is best effort; the caller is already settled locally.
+					}
+					reject(Object.assign(new Error("request_cancelled"), { name: "request_cancelled" }));
+				};
+				signal.addEventListener("abort", outstanding.onAbort, { once: true });
+				if (signal.aborted) {
+					outstanding.onAbort();
+					return;
+				}
+			}
 			let delivery: void | Promise<void>;
 			try {
 				delivery = this.#sendFrame(lease.connectionId, {
@@ -219,12 +247,12 @@ export class ReverseLeaseRuntime {
 					payload: { method, payload },
 				});
 			} catch (error) {
-				this.#outstanding.delete(id);
+				this.#takeOutstanding(id);
 				reject(error instanceof Error ? error : new Error(String(error)));
 				return;
 			}
 			Promise.resolve(delivery).catch(error => {
-				this.#outstanding.delete(id);
+				if (this.#takeOutstanding(id) !== outstanding) return;
 				reject(error instanceof Error ? error : new Error(String(error)));
 			});
 		});
@@ -242,7 +270,7 @@ export class ReverseLeaseRuntime {
 		if (!request) throw new ReverseLeaseError("unknown_request");
 		if (request.connectionId !== connectionId || request.leaseId !== leaseId)
 			throw new ReverseLeaseError("not_lease_owner");
-		this.#outstanding.delete(id);
+		this.#takeOutstanding(id);
 		if (error) {
 			const rejection = new Error(error.message);
 			rejection.name = error.code;
@@ -270,6 +298,8 @@ export class ReverseLeaseRuntime {
 		this.#installedCapabilities.clear();
 		this.#leases.clear();
 		this.#idempotency.clear();
+		for (const request of outstanding.map(([, request]) => request))
+			if (request.signal && request.onAbort) request.signal.removeEventListener("abort", request.onAbort);
 		for (const [id, request] of outstanding) {
 			request.reject(new Error("request_cancelled"));
 			try {
@@ -304,10 +334,17 @@ export class ReverseLeaseRuntime {
 	#cancelForConnection(connectionId: string, reason: "provider_disconnected" | "lease_released"): void {
 		for (const [id, request] of this.#outstanding)
 			if (request.connectionId === connectionId) {
-				this.#outstanding.delete(id);
+				this.#takeOutstanding(id);
 				request.reject(new Error("request_cancelled"));
 				this.#onCancel?.(id, reason);
 			}
+	}
+	#takeOutstanding(id: string): Outstanding | undefined {
+		const request = this.#outstanding.get(id);
+		if (!request) return undefined;
+		this.#outstanding.delete(id);
+		if (request.signal && request.onAbort) request.signal.removeEventListener("abort", request.onAbort);
+		return request;
 	}
 	#installDefinitionsFor(capability: string, definitions: unknown): void {
 		this.#installDefinitions?.(capability, definitions);

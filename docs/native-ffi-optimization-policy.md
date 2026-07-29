@@ -57,7 +57,7 @@ If any box is unchecked, keep the work in TypeScript or hold it as a tracked can
 
 This policy targets **speculative algorithmic ports**, not the established native surface. The following are **already native** by design and are explicitly out of scope (see `alreadyNativeExcluded` in [`cpu-hotspot-map.json`](./cpu-hotspot-map.json)):
 
-`grep`, `fd`/`glob`, text width/wrap/truncate/slice, syntax highlighting, HTML→Markdown, token counting, AST, summary, process/PTY/shell, SIXEL, clipboard, `Bun.hash.xxHash32/64`, and `JSON.parse`/`JSON.stringify`.
+`grep`, `fd`/`glob`, text width/wrap/truncate/slice, syntax highlighting, HTML→Markdown, AST, summary, process/PTY/shell, SIXEL, clipboard, `Bun.hash.xxHash32/64`, and `JSON.parse`/`JSON.stringify`.
 
 These are native because they are I/O, OS/process integration, or platform primitives — the criteria in [`porting-to-natives.md`](./porting-to-natives.md#when-to-port). Distinguishing them from algorithmic ports matters: a leftover algorithmic hotspot must clear gates 1–6, whereas adding a new OS/process/native-primitive binding follows the standard porting guide.
 

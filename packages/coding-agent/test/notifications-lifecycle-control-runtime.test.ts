@@ -1467,6 +1467,7 @@ describe("lifecycle control runtime", () => {
 			},
 			{
 				sessionsRoot: root,
+				platform: "linux",
 				ownerIsolationProbe: {
 					readCallerCgroup: async () =>
 						"0::/user.slice/user-1000.slice/user@1000.service/app.slice/gjc-lifecycle-test.scope\n",
@@ -1528,6 +1529,7 @@ describe("lifecycle control runtime", () => {
 				{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
 				{
 					listSessions: () => [liveSession],
+					platform: "linux",
 					ownerIsolationProbe: {
 						readCallerCgroup: async () => null,
 						probeServer: async () => ({ state: "unverifiable" }),
@@ -1543,6 +1545,7 @@ describe("lifecycle control runtime", () => {
 		await expect(
 			daemonResumeSession(process.env, {
 				listSessions: () => [liveSession],
+				platform: "linux",
 				ownerIsolationProbe: {
 					readCallerCgroup: async () => null,
 					probeServer: async () => ({ state: "unsafe" }),
@@ -1609,6 +1612,7 @@ describe("lifecycle control runtime", () => {
 			const result = await daemonSpawnCreate(
 				{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
 				{
+					platform: "linux",
 					ownerIsolationProbe: {
 						readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 						probeServer: async () =>
@@ -1702,6 +1706,7 @@ describe("lifecycle control runtime", () => {
 						GENERATION_FILE: generationFile,
 					},
 					{
+						platform: "linux",
 						ownerIsolationProbe: {
 							readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 							probeServer: async () =>
@@ -1760,6 +1765,7 @@ describe("lifecycle control runtime", () => {
 			daemonSpawnCreate(
 				{ ...process.env, GJC_TMUX_COMMAND: tmux },
 				{
+					platform: "linux",
 					ownerIsolationProbe: {
 						readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 						probeServer: async () =>
@@ -1804,7 +1810,7 @@ describe("lifecycle control runtime", () => {
 					await expect(
 						daemonSpawnCreate(
 							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-							{ ownerIsolationProbe: probe },
+							{ platform: "linux", ownerIsolationProbe: probe },
 						)(createFrame({ target: { kind: "existing_path", path: project } }), {
 							lifecycleRequestId: `create-${state}`,
 							intendedSessionId: `create-${state}`,
@@ -1814,7 +1820,7 @@ describe("lifecycle control runtime", () => {
 					await expect(
 						daemonSpawnCreate(
 							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-							{ ownerIsolationProbe: probe },
+							{ platform: "linux", ownerIsolationProbe: probe },
 						)(createFrame({ target: { kind: "plain_dir", path: uncreatedPlainDir } }), {
 							lifecycleRequestId: `plain-${state}`,
 							intendedSessionId: `plain-${state}`,
@@ -1824,7 +1830,7 @@ describe("lifecycle control runtime", () => {
 					await expect(
 						daemonResumeSession(
 							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-							{ sessionsRoot: root, listSessions: () => [], ownerIsolationProbe: probe },
+							{ platform: "linux", sessionsRoot: root, listSessions: () => [], ownerIsolationProbe: probe },
 						)({ sessionIdOrPrefix: "resume-123", path: project }),
 					).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
 				}
@@ -1862,6 +1868,7 @@ describe("lifecycle control runtime", () => {
 					daemonSpawnCreate(
 						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
 						{
+							platform: "linux",
 							ownerIsolationProbe: {
 								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 								probeServer: async () => {
@@ -1926,6 +1933,7 @@ describe("lifecycle control runtime", () => {
 						{
 							sessionsRoot: root,
 							listSessions: () => [],
+							platform: "linux",
 							ownerIsolationProbe: {
 								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 								probeServer: async () => {
@@ -2034,6 +2042,7 @@ describe("lifecycle control runtime", () => {
 						daemonSpawnCreate(
 							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls, RECEIPT: receipt },
 							{
+								platform: "linux",
 								ownerIsolationProbe: {
 									readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 									probeServer: async () => ({
@@ -2095,6 +2104,7 @@ describe("lifecycle control runtime", () => {
 							KILL_FAIL: cleanup === "kill" ? "1" : "0",
 						},
 						{
+							platform: "linux",
 							ownerIsolationProbe: {
 								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 								probeServer: async () => {
@@ -2157,6 +2167,7 @@ describe("lifecycle control runtime", () => {
 					daemonSpawnCreate(
 						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls },
 						{
+							platform: "linux",
 							ownerIsolationProbe: {
 								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 								probeServer: async () => ({
@@ -2210,6 +2221,7 @@ describe("lifecycle control runtime", () => {
 				daemonSpawnCreate(
 					{ ...process.env, GJC_TMUX_COMMAND: tmux },
 					{
+						platform: "linux",
 						ownerIsolationProbe: {
 							readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 							probeServer: async () => {
@@ -2258,5 +2270,496 @@ describe("lifecycle control runtime", () => {
 			findSession: () => undefined,
 		})({ sessionId: "exact-id", tmuxSession: "gjc_lc_exact-id", sessionStateFile: "/private/exact.json" });
 		expect(received).toEqual([["gjc_lc_exact-id", env, "exact-id", "/private/exact.json"]]);
+	});
+	posixTmuxIt("uses direct tagged tmux launch for injected non-Linux lifecycle creates", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-create-");
+		const calls = path.join(root, "tmux-calls.log");
+		const session = path.join(root, "tmux-session");
+		const tmux = path.join(root, "fake-tmux.sh");
+		const retainedOwnerEvidence = path.join(
+			root,
+			".gjc",
+			"_session-darwin-session",
+			"runtime",
+			"tmux-sessions",
+			"darwin-session",
+			"owner-lifecycle",
+			"generation.json",
+		);
+		fs.mkdirSync(path.dirname(retainedOwnerEvidence), { recursive: true });
+		fs.writeFileSync(retainedOwnerEvidence, "{corrupt");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+				'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_darwin-session\\n\'; exit 0; fi',
+				'if [ "$1" = "display-message" ]; then test -f "$TMUX_SESSION" || exit 1; printf \'4242\t$42\tgjc_lc_darwin-session\t4343\t0\t\n\'; exit 0; fi',
+				'if [ "$1" = "if-shell" ]; then',
+				'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then rm -f "$TMUX_SESSION"; printf "__gjc_lifecycle_cleanup_ok__\\n"; else printf "__gjc_lifecycle_metadata_ok__\\n"; fi',
+				"  exit 0",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			const result = await daemonSpawnCreate(
+				{
+					...process.env,
+					GJC_TMUX_COMMAND: tmux,
+					TMUX_CALLS: calls,
+					TMUX_SESSION: session,
+					GJC_TMUX_OWNER_GENERATION: "stale-generation",
+					GJC_TMUX_OWNER_STATE_DIR: "/stale/state",
+					GJC_TMUX_OWNER_SERVER_KEY: "stale-server",
+					GJC_MANAGED_OWNER_COMMAND_JSON: '["stale"]',
+					GJC_MANAGED_OWNER_RUN_ID: "stale-run",
+					GJC_MANAGED_OWNER_INCARNATION: "stale-incarnation",
+					GJC_MANAGED_OWNER_CHILD_TOKEN: "stale-child",
+					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: "stale-predecessor",
+					GJC_MANAGED_OWNER_PREDECESSOR_GENERATION: "stale-predecessor-generation",
+					GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID: "stale-predecessor-run",
+					GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION: "stale-predecessor-incarnation",
+					GJC_MANAGED_OWNER_TRANSCRIPT_PATH: "/stale/transcript",
+				},
+				{
+					platform: "darwin",
+					processIncarnation: pid => (pid === 4242 ? "darwin:server" : pid === 4343 ? "darwin:pane" : undefined),
+				},
+			)(createFrame({ target: { kind: "existing_path", path: root } }), {
+				lifecycleRequestId: "darwin-request",
+				intendedSessionId: "darwin-session",
+				startupPromptRef: "darwin-prompt",
+			});
+
+			expect(result.sessionId).toBe("darwin-session");
+			const recorded = fs.readFileSync(calls, "utf8");
+			expect(recorded).toContain("new-session -d -P -F #{session_id}");
+			expect(recorded).toContain("gjc_lc_darwin-session sh -c");
+			expect(recorded).toContain("display-message -p -t $42 #{pid}");
+			expect(recorded).toContain("if-shell -t $42 -F");
+			expect(recorded).toContain("GJC_SESSION_ID='darwin-session'");
+			expect(recorded).toContain("GJC_LIFECYCLE_REQUEST_ID='darwin-request'");
+			expect(recorded).toContain("GJC_COORDINATOR_SESSION_STATE_FILE=");
+			expect(recorded).toContain("GJC_STARTUP_PROMPT_REF='darwin-prompt'");
+			expect(recorded).toContain("@gjc-session-id");
+			expect(recorded).not.toContain("@gjc-owner-generation");
+			expect(recorded).not.toContain("@gjc-owner-server-key");
+			for (const name of [
+				"GJC_TMUX_OWNER_GENERATION",
+				"GJC_TMUX_OWNER_STATE_DIR",
+				"GJC_TMUX_OWNER_SERVER_KEY",
+				"GJC_MANAGED_OWNER_COMMAND_JSON",
+				"GJC_MANAGED_OWNER_RUN_ID",
+				"GJC_MANAGED_OWNER_INCARNATION",
+				"GJC_MANAGED_OWNER_CHILD_TOKEN",
+				"GJC_MANAGED_OWNER_PREDECESSOR_TOKEN",
+				"GJC_MANAGED_OWNER_PREDECESSOR_GENERATION",
+				"GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID",
+				"GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION",
+				"GJC_MANAGED_OWNER_TRANSCRIPT_PATH",
+			])
+				expect(recorded).toContain(`-u '${name}'`);
+			expect(recorded).not.toContain("--internal-managed-owner-supervisor");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	posixTmuxIt("uses direct tagged tmux launch for injected non-Linux cold resumes", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-resume-");
+		const calls = path.join(root, "tmux-calls.log");
+		const session = path.join(root, "tmux-session");
+		const tmux = path.join(root, "fake-tmux.sh");
+		const retainedOwnerEvidence = path.join(
+			root,
+			".gjc",
+			"_session-darwin-resume",
+			"runtime",
+			"tmux-sessions",
+			"darwin-resume",
+			"owner-lifecycle",
+			"generation.json",
+		);
+		fs.mkdirSync(path.dirname(retainedOwnerEvidence), { recursive: true });
+		fs.writeFileSync(retainedOwnerEvidence, "{corrupt");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+				'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_darwin-resume\\n\'; exit 0; fi',
+				'if [ "$1" = "display-message" ]; then test -f "$TMUX_SESSION" || exit 1; printf \'4242\t$42\tgjc_lc_darwin-resume\t4343\t0\t\n\'; exit 0; fi',
+				'if [ "$1" = "if-shell" ]; then',
+				'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then rm -f "$TMUX_SESSION"; printf "__gjc_lifecycle_cleanup_ok__\\n"; else printf "__gjc_lifecycle_metadata_ok__\\n"; fi',
+				"  exit 0",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			await writeManagedSession(root, root, "darwin-resume");
+			const result = await daemonResumeSession(
+				{
+					...process.env,
+					GJC_TMUX_COMMAND: tmux,
+					TMUX_CALLS: calls,
+					TMUX_SESSION: session,
+					GJC_TMUX_OWNER_GENERATION: "stale-generation",
+					GJC_TMUX_OWNER_STATE_DIR: "/stale/state",
+					GJC_TMUX_OWNER_SERVER_KEY: "stale-server",
+					GJC_MANAGED_OWNER_COMMAND_JSON: '["stale"]',
+					GJC_MANAGED_OWNER_RUN_ID: "stale-run",
+					GJC_MANAGED_OWNER_INCARNATION: "stale-incarnation",
+					GJC_MANAGED_OWNER_CHILD_TOKEN: "stale-child",
+					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: "stale-predecessor",
+					GJC_MANAGED_OWNER_PREDECESSOR_GENERATION: "stale-predecessor-generation",
+					GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID: "stale-predecessor-run",
+					GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION: "stale-predecessor-incarnation",
+					GJC_MANAGED_OWNER_TRANSCRIPT_PATH: "/stale/transcript",
+				},
+				{
+					platform: "darwin",
+					sessionsRoot: root,
+					listSessions: () => [],
+					processIncarnation: pid => (pid === 4242 ? "darwin:server" : pid === 4343 ? "darwin:pane" : undefined),
+				},
+			)({ sessionIdOrPrefix: "darwin-resume" });
+
+			expect("mode" in result && result.mode).toBe("cold_restarted");
+			const recorded = fs.readFileSync(calls, "utf8");
+			expect(recorded).toContain("display-message -p -t $42");
+			expect(recorded).toContain("if-shell -t $42 -F");
+			expect(recorded).toContain("GJC_COORDINATOR_SESSION_ID='darwin-resume'");
+			expect(recorded).toContain("gjc '--resume' 'darwin-resume'");
+			for (const name of [
+				"GJC_TMUX_OWNER_GENERATION",
+				"GJC_TMUX_OWNER_STATE_DIR",
+				"GJC_TMUX_OWNER_SERVER_KEY",
+				"GJC_MANAGED_OWNER_COMMAND_JSON",
+				"GJC_MANAGED_OWNER_RUN_ID",
+				"GJC_MANAGED_OWNER_INCARNATION",
+				"GJC_MANAGED_OWNER_CHILD_TOKEN",
+				"GJC_MANAGED_OWNER_PREDECESSOR_TOKEN",
+				"GJC_MANAGED_OWNER_PREDECESSOR_GENERATION",
+				"GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID",
+				"GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION",
+				"GJC_MANAGED_OWNER_TRANSCRIPT_PATH",
+			])
+				expect(recorded).toContain(`-u '${name}'`);
+			expect(recorded).not.toContain("--internal-managed-owner-supervisor");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	posixTmuxIt(
+		"rejects an injected non-Linux create when its session disappears during launch stabilization",
+		async () => {
+			const root = managedFixtureRoot("gjc-nonlinux-launch-liveness-");
+			const calls = path.join(root, "tmux-calls.log");
+			const session = path.join(root, "tmux-session");
+			const tmux = path.join(root, "fake-tmux.sh");
+			fs.writeFileSync(
+				tmux,
+				[
+					"#!/usr/bin/env bash",
+					'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+					'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_launch-liveness\\n\'; exit 0; fi',
+					'if [ "$1" = "display-message" ]; then test -f "$TMUX_SESSION" || { echo "can\'t find session" >&2; exit 1; }; printf \'4242\t$42\tgjc_lc_launch-liveness\t4343\t0\t\n\'; exit 0; fi',
+					'if [ "$1" = "if-shell" ]; then',
+					'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then rm -f "$TMUX_SESSION"; printf "__gjc_lifecycle_cleanup_ok__\\n"; else (sleep 0.01; rm -f "$TMUX_SESSION") >/dev/null 2>&1 & printf "__gjc_lifecycle_metadata_ok__\\n"; fi',
+					"  exit 0",
+					"fi",
+					"exit 0",
+					"",
+				].join("\n"),
+			);
+			fs.chmodSync(tmux, 0o755);
+			try {
+				try {
+					await daemonSpawnCreate(
+						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls, TMUX_SESSION: session },
+						{
+							platform: "darwin",
+							processIncarnation: pid =>
+								pid === 4242 ? "darwin:server" : pid === 4343 ? "darwin:pane" : undefined,
+						},
+					)(createFrame({ target: { kind: "existing_path", path: root } }), {
+						lifecycleRequestId: "launch-liveness-request",
+						intendedSessionId: "launch-liveness",
+					});
+					throw new Error("expected lifecycle launch liveness failure");
+				} catch (error) {
+					expect(error).toBeInstanceOf(AggregateError);
+					if (!(error instanceof AggregateError)) throw error;
+					expect(error.message).toBe("gjc_lifecycle_cleanup_uncertain");
+					expect(error.errors[0]).toMatchObject({ message: "gjc_lifecycle_tmux_launch_liveness_failed" });
+					expect(error.errors[1]).toMatchObject({ message: "gjc_lifecycle_cleanup_uncertain" });
+				}
+				expect(fs.existsSync(session)).toBe(false);
+				expect(fs.readFileSync(calls, "utf8")).toContain("if-shell -t $42 -F");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+	posixTmuxIt("rejects an injected non-Linux create when immediate exit retains a dead pane", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-dead-pane-");
+		const session = path.join(root, "tmux-session");
+		const tmux = path.join(root, "fake-tmux.sh");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_dead-pane\\n\'; exit 0; fi',
+				'if [ "$1" = "display-message" ]; then',
+				'  test -f "$TMUX_SESSION" || { echo "can\'t find session" >&2; exit 1; }',
+				"  printf '4242\\t$42\\tgjc_lc_dead-pane\\t4343\\t1\\t0\\n'",
+				"  exit 0",
+				"fi",
+				'if [ "$1" = "if-shell" ]; then',
+				'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then rm -f "$TMUX_SESSION"; printf "__gjc_lifecycle_cleanup_ok__\\n"; else printf "__gjc_lifecycle_metadata_ok__\\n"; fi',
+				"  exit 0",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			await expect(
+				daemonSpawnCreate(
+					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_SESSION: session },
+					{
+						platform: "darwin",
+						processIncarnation: pid =>
+							pid === 4242 ? "darwin:server" : pid === 4343 ? "darwin:pane" : undefined,
+					},
+				)(createFrame({ target: { kind: "existing_path", path: root } }), {
+					lifecycleRequestId: "dead-pane-request",
+					intendedSessionId: "dead-pane",
+				}),
+			).rejects.toThrow("gjc_lifecycle_tmux_launch_liveness_failed");
+			expect(fs.existsSync(session)).toBe(false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	posixTmuxIt("rejects an injected non-Linux create when its pane PID incarnation changes", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-pane-replacement-");
+		const session = path.join(root, "tmux-session");
+		const probes = path.join(root, "tmux-probes");
+		const tmux = path.join(root, "fake-tmux.sh");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_pane-replacement\\n\'; exit 0; fi',
+				'if [ "$1" = "display-message" ]; then',
+				'  test -f "$TMUX_SESSION" || { echo "can\'t find session" >&2; exit 1; }',
+				'  count=$(cat "$TMUX_PROBES" 2>/dev/null || echo 0); count=$((count + 1)); printf "%s" "$count" > "$TMUX_PROBES"',
+				"  printf '4242\\t$42\\tgjc_lc_pane-replacement\\t4343\\t0\\t\\n'",
+				"  exit 0",
+				"fi",
+				'if [ "$1" = "if-shell" ]; then',
+				'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then rm -f "$TMUX_SESSION"; printf "__gjc_lifecycle_cleanup_ok__\\n"; else printf "__gjc_lifecycle_metadata_ok__\\n"; fi',
+				"  exit 0",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			await expect(
+				daemonSpawnCreate(
+					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_SESSION: session, TMUX_PROBES: probes },
+					{
+						platform: "darwin",
+						processIncarnation: pid =>
+							pid === 4242
+								? "darwin:server"
+								: pid === 4343
+									? Number(fs.readFileSync(probes, "utf8")) >= 5
+										? "darwin:pane:replacement"
+										: "darwin:pane"
+									: undefined,
+					},
+				)(createFrame({ target: { kind: "existing_path", path: root } }), {
+					lifecycleRequestId: "pane-replacement-request",
+					intendedSessionId: "pane-replacement",
+				}),
+			).rejects.toThrow("gjc_lifecycle_tmux_launch_liveness_failed");
+			expect(fs.existsSync(session)).toBe(false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	posixTmuxIt("cleans up the exact injected non-Linux session when profile metadata fails", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-metadata-cleanup-");
+		const calls = path.join(root, "tmux-calls.log");
+		const session = path.join(root, "tmux-session");
+		const tmux = path.join(root, "fake-tmux.sh");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+				'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_metadata-cleanup\\n\'; exit 0; fi',
+				'if [ "$1" = "display-message" ]; then test -f "$TMUX_SESSION" || { echo "can\'t find session" >&2; exit 1; }; printf \'4242\t$42\tgjc_lc_metadata-cleanup\t4343\t0\t\n\'; exit 0; fi',
+				'if [ "$1" = "if-shell" ]; then',
+				'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then rm -f "$TMUX_SESSION"; printf "__gjc_lifecycle_cleanup_ok__\\n"; else printf "__gjc_lifecycle_metadata_refused__\\n"; fi',
+				"  exit 0",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			await expect(
+				daemonSpawnCreate(
+					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls, TMUX_SESSION: session },
+					{
+						platform: "darwin",
+						processIncarnation: pid =>
+							pid === 4242 ? "darwin:server" : pid === 4343 ? "darwin:pane" : undefined,
+					},
+				)(createFrame({ target: { kind: "existing_path", path: root } }), {
+					lifecycleRequestId: "metadata-cleanup-request",
+					intendedSessionId: "metadata-cleanup",
+				}),
+			).rejects.toThrow("gjc_lifecycle_metadata_write_failed");
+
+			expect(fs.existsSync(session)).toBe(false);
+			expect(fs.readFileSync(calls, "utf8")).toContain("if-shell -t $42 -F");
+			expect(fs.readFileSync(calls, "utf8")).toContain("kill-session -t '$42'");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	posixTmuxIt("fails closed when the post-kill direct tmux probe is unverifiable", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-post-kill-probe-");
+		const session = path.join(root, "tmux-session");
+		const tmux = path.join(root, "fake-tmux.sh");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_post-kill-probe\\n\'; exit 0; fi',
+				'if [ "$1" = "display-message" ]; then',
+				"  test -f \"$TMUX_SESSION\" && { printf '4242\t$42\tgjc_lc_post-kill-probe\t4343\t0\t\n'; exit 0; }",
+				'  echo "connection refused" >&2; exit 1',
+				"fi",
+				'if [ "$1" = "if-shell" ]; then',
+				'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then rm -f "$TMUX_SESSION"; printf "__gjc_lifecycle_cleanup_ok__\\n"; else printf "__gjc_lifecycle_metadata_refused__\\n"; fi',
+				"  exit 0",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			await expect(
+				daemonSpawnCreate(
+					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_SESSION: session },
+					{
+						platform: "darwin",
+						processIncarnation: pid =>
+							pid === 4242 ? "darwin:server" : pid === 4343 ? "darwin:pane" : undefined,
+					},
+				)(createFrame({ target: { kind: "existing_path", path: root } }), {
+					lifecycleRequestId: "post-kill-probe-request",
+					intendedSessionId: "post-kill-probe",
+				}),
+			).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
+			expect(fs.existsSync(session)).toBe(false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	posixTmuxIt("surfaces injected non-Linux profile cleanup failure", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-metadata-cleanup-failure-");
+		const calls = path.join(root, "tmux-calls.log");
+		const session = path.join(root, "tmux-session");
+		const tmux = path.join(root, "fake-tmux.sh");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+				'if [ "$1" = "new-session" ]; then : > "$TMUX_SESSION"; printf \'$42\\tgjc_lc_metadata-cleanup-failure\\n\'; exit 0; fi',
+				'if [ "$1" = "display-message" ]; then test -f "$TMUX_SESSION" || exit 1; printf \'4242\t$42\tgjc_lc_metadata-cleanup-failure\t4343\t0\t\n\'; exit 0; fi',
+				'if [ "$1" = "if-shell" ]; then',
+				'  if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then printf "__gjc_lifecycle_cleanup_refused__\\n"; else printf "__gjc_lifecycle_metadata_refused__\\n"; fi',
+				"  exit 0",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			try {
+				await daemonSpawnCreate(
+					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls, TMUX_SESSION: session },
+					{
+						platform: "darwin",
+						processIncarnation: pid =>
+							pid === 4242 ? "darwin:server" : pid === 4343 ? "darwin:pane" : undefined,
+					},
+				)(createFrame({ target: { kind: "existing_path", path: root } }), {
+					lifecycleRequestId: "metadata-cleanup-failure-request",
+					intendedSessionId: "metadata-cleanup-failure",
+				});
+				throw new Error("expected lifecycle metadata cleanup failure");
+			} catch (error) {
+				expect(error).toBeInstanceOf(AggregateError);
+				if (!(error instanceof AggregateError)) throw error;
+				expect(error.message).toBe("gjc_lifecycle_cleanup_uncertain");
+				expect(error.errors).toHaveLength(2);
+				expect(error.errors[0]).toMatchObject({ message: "gjc_lifecycle_metadata_write_failed" });
+				expect(error.errors[1]).toMatchObject({ message: "gjc_lifecycle_cleanup_uncertain" });
+			}
+
+			expect(fs.existsSync(session)).toBe(true);
+			expect(fs.readFileSync(calls, "utf8")).toContain("if-shell -t $42 -F");
+			expect(fs.readFileSync(calls, "utf8")).toContain("kill-session -t '$42'");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	posixTmuxIt("rejects injected non-Linux lifecycle creates when tmux does not retain the new session", async () => {
+		const root = managedFixtureRoot("gjc-nonlinux-launch-failure-");
+		const tmux = path.join(root, "fake-tmux.sh");
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'if [ "$1" = "new-session" ]; then exit 0; fi',
+				'if [ "$1" = "has-session" ]; then exit 1; fi',
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+		try {
+			await expect(
+				daemonSpawnCreate(
+					{ ...process.env, GJC_TMUX_COMMAND: tmux },
+					{ platform: "darwin", processIncarnation: pid => (pid === 4242 ? "darwin:server" : undefined) },
+				)(createFrame({ target: { kind: "existing_path", path: root } }), {
+					lifecycleRequestId: "failed-request",
+					intendedSessionId: "failed-session",
+				}),
+			).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

@@ -109,6 +109,42 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(acquired).toBe(true);
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
+	test("retries when Windows transiently denies reading a contended lock info file", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockInfoPath = path.join(`${lockedFile}.lock`, "info");
+		let contenderEntered = false;
+		let deniedInfoRead = false;
+		let contender: Promise<void> | undefined;
+
+		await withFileLock(
+			lockedFile,
+			async () => {
+				const realReadFile = fs.readFile;
+				vi.spyOn(fs, "readFile").mockImplementation((async (target, options) => {
+					if (!deniedInfoRead && String(target) === lockInfoPath) {
+						deniedInfoRead = true;
+						throw Object.assign(new Error("metadata temporarily locked"), { code: "EPERM" });
+					}
+					return await realReadFile(target, options);
+				}) as typeof fs.readFile);
+				contender = withFileLock(
+					lockedFile,
+					async () => {
+						contenderEntered = true;
+					},
+					{ staleMs: 1, retries: 10, retryDelayMs: 1 },
+				);
+				await Bun.sleep(5);
+				expect(contenderEntered).toBe(false);
+			},
+			{ staleMs: 1, retries: 1, retryDelayMs: 1 },
+		);
+		await contender;
+
+		expect(deniedInfoRead).toBe(true);
+		expect(contenderEntered).toBe(true);
+	});
 
 	test("preserves a live old-format holder without start_time", async () => {
 		const base = await makeTemp();

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,10 +7,19 @@ import type { AssistantMessage, UserMessage } from "@gajae-code/ai";
 import { exportFromFile, exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { BlobStore, EphemeralBlobStore, externalizeImageDataSync } from "@gajae-code/coding-agent/session/blob-store";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import { getAgentDir, getResidentCacheRootDir, setAgentDir } from "@gajae-code/utils";
 
+const originalAgentDir = getAgentDir();
+const originalAgentDirOverride = process.env.GJC_CODING_AGENT_DIR;
 const tempDirs: string[] = [];
+beforeEach(() => {
+	setAgentDir(path.join(makeTempDir(), "agent"));
+});
 afterEach(async () => {
 	vi.restoreAllMocks();
+	setAgentDir(originalAgentDir);
+	if (originalAgentDirOverride === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+	else process.env.GJC_CODING_AGENT_DIR = originalAgentDirOverride;
 	for (const dir of tempDirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
 
@@ -46,19 +55,22 @@ function firstMessageEntry(sm: SessionManager): SessionMessageEntry {
 	return entry;
 }
 
-function residentCacheRoot(sm: SessionManager): string {
-	const artifactsDir = sm.getArtifactsDir();
-	if (!artifactsDir) throw new Error("Expected artifacts dir");
-	return path.join(artifactsDir, "resident-cache");
+function residentCacheRoot(): string {
+	return getResidentCacheRootDir(getAgentDir());
 }
 
-function residentCacheDirs(sm: SessionManager): string[] {
-	const root = residentCacheRoot(sm);
-	return fs.existsSync(root) ? fs.readdirSync(root).map(name => path.join(root, name)) : [];
+function residentCacheDirs(): string[] {
+	const root = residentCacheRoot();
+	return fs.existsSync(root)
+		? fs
+				.readdirSync(root)
+				.map(name => path.join(root, name))
+				.filter(dir => path.basename(dir).startsWith("i-") && fs.statSync(dir).isDirectory())
+		: [];
 }
 
-function activeResidentCacheDir(sm: SessionManager): string {
-	const dirs = residentCacheDirs(sm).filter(dir => path.basename(dir).startsWith(sm.getSessionId()));
+function activeResidentCacheDir(): string {
+	const dirs = residentCacheDirs();
 	if (dirs.length !== 1) throw new Error(`Expected one active resident cache dir, got ${dirs.length}`);
 	return dirs[0]!;
 }
@@ -74,7 +86,7 @@ async function createPersistedLargeTextSession(
 	const sessionFile = sm.getSessionFile();
 	const artifactsDir = sm.getArtifactsDir();
 	if (!sessionFile || !artifactsDir) throw new Error("Expected persisted session paths");
-	const cacheDir = activeResidentCacheDir(sm);
+	const cacheDir = activeResidentCacheDir();
 	expect(fs.existsSync(cacheDir)).toBe(true);
 
 	return { sm, sessionFile, artifactsDir, cacheDir, entryId };
@@ -112,7 +124,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		expect(fs.existsSync(cacheDir)).toBe(false);
 
 		const reopened = await SessionManager.open(sessionFile);
-		const reopenedCacheDir = activeResidentCacheDir(reopened);
+		const reopenedCacheDir = activeResidentCacheDir();
 		await fs.promises.rm(reopenedCacheDir, { recursive: true, force: true });
 
 		vi.spyOn(EphemeralBlobStore.prototype, "getSync").mockImplementation(function (
@@ -156,7 +168,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 	it("exports and rewrites a public-safe placeholder after disk cache deletion", async () => {
 		const sentinel = `corrupt resident text ${"z".repeat(2048)}`;
 		const { sm, sessionFile } = await createPersistedLargeTextSession(sentinel);
-		const liveCacheDir = activeResidentCacheDir(sm);
+		const liveCacheDir = activeResidentCacheDir();
 		await fs.promises.rm(liveCacheDir, { recursive: true, force: true });
 		vi.spyOn(EphemeralBlobStore.prototype, "getSync").mockImplementation(function (
 			this: EphemeralBlobStore,
@@ -171,7 +183,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await sm.close();
 
 		const standalone = await SessionManager.open(sessionFile);
-		const standaloneCacheDir = activeResidentCacheDir(standalone);
+		const standaloneCacheDir = activeResidentCacheDir();
 		await fs.promises.rm(standaloneCacheDir, { recursive: true, force: true });
 		const standaloneHtml = path.join(makeTempDir(), "standalone-corrupt.html");
 		await exportSessionToHtml(standalone, undefined, {
@@ -181,7 +193,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await standalone.close();
 		const fromFileHtml = path.join(makeTempDir(), "from-file-corrupt.html");
 		const exportManager = await SessionManager.open(sessionFile);
-		const exportCacheDir = activeResidentCacheDir(exportManager);
+		const exportCacheDir = activeResidentCacheDir();
 		await fs.promises.rm(exportCacheDir, { recursive: true, force: true });
 		await exportSessionToHtml(exportManager, undefined, {
 			outputPath: fromFileHtml,
@@ -190,7 +202,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await expectFileContainsResidentPlaceholder(fromFileHtml);
 
 		const rewrite = await SessionManager.open(sessionFile);
-		const rewriteCacheDir = activeResidentCacheDir(rewrite);
+		const rewriteCacheDir = activeResidentCacheDir();
 		await fs.promises.rm(rewriteCacheDir, { recursive: true, force: true });
 		await rewrite.rewriteEntries();
 		await rewrite.close().catch(() => {});
@@ -210,7 +222,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		const warmEntries = sm.getEntries();
 		expect(JSON.stringify(warmEntries)).toContain(sentinel);
 
-		await fs.promises.rm(residentCacheRoot(sm), { recursive: true, force: true });
+		await fs.promises.rm(residentCacheRoot(), { recursive: true, force: true });
 		Bun.gc(true);
 		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
 
@@ -233,7 +245,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 			});
 
 			expect(JSON.stringify(sm.getEntries())).toContain(encryptedContent);
-			await fs.promises.rm(residentCacheRoot(sm), { recursive: true, force: true });
+			await fs.promises.rm(residentCacheRoot(), { recursive: true, force: true });
 			Bun.gc(true);
 			sm.appendMessage(assistantMessage(`invalidate encrypted replay materialization ${replayKey}`));
 			expect(JSON.stringify(sm.getEntries())).toContain(encryptedContent);

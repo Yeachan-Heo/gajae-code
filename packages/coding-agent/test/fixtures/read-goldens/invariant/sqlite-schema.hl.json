@@ -1,0 +1,11 @@
+{
+  "text": "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, status TEXT NOT NULL)\n\nSample rows:\n| id | name  | email              | status   |\n| -- | ----- | ------------------ | -------- |\n| 1  | Alice | alice@example.test | active   |\n| 2  | Bob   | bob@example.test   | inactive |\n| 3  | Carol | carol@example.test | active   |\n| 4  | Dave  | dave@example.test  | inactive |",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/app.sqlite"
+    }
+  }
+}

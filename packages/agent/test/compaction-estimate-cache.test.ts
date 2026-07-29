@@ -95,7 +95,7 @@ describe("entry token cache", () => {
 		expect(beforeTotal).toBe(estimateEntriesTokens(entries, 0, entries.length));
 		expect(findCutPoint(entries, 0, entries.length, 1).firstKeptEntryIndex).toBeGreaterThanOrEqual(0);
 
-		const result = pruneToolOutputs(entries, config({ minimumSavings: 0 }));
+		const result = pruneToolOutputs(entries, config({ minimumSavings: 0, protectRecentTurns: 0 }));
 		expect(result.prunedEntries.map(entry => entry.id)).toContain("old");
 		const afterEntryTokens = estimateEntryTokens(old);
 		expect(afterEntryTokens).toBe(estimateEntryTokens(old));
@@ -328,7 +328,7 @@ describe("digest pruning notices", () => {
 		expect(at.tokensSaved).toBe(Math.max(0, estimateEntryTokens(old) - Math.ceil(textOf(atEntries[0]).length / 4)));
 	});
 
-	test("digest notice is capped near generic size and generic already-pruned notices replay stably", () => {
+	test("digest notice is bounded by the absolute digest budget and keeps the error signal", () => {
 		const long = toolEntry(
 			"long",
 			"search",
@@ -337,7 +337,10 @@ describe("digest pruning notices", () => {
 		pruneToolOutputs([long], config());
 		const notice = textOf(long);
 		const generic = `[Output truncated - ${estimateEntryTokens(toolEntry("fresh", "search", `${textForTokens("search", 100)}\n120 matches in 45 files\nError: ${"x".repeat(1000)}`))} tokens]`;
-		expect(Math.ceil(notice.length / 4)).toBeLessThanOrEqual(Math.floor(Math.ceil(generic.length / 4) * 1.25));
+		// Error-first digest fields with an absolute budget (~256 chars) on top of
+		// the generic marker; a long error line may be truncated but never evicted.
+		expect(notice).toContain("error=");
+		expect(notice.length).toBeLessThanOrEqual(generic.length + 300);
 
 		const already = toolEntry("already", "bash", "[Output truncated - 400 tokens]");
 		(already.message as ToolResultMessage).prunedAt = 123;

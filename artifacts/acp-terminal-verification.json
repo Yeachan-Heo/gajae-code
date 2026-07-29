@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "goal": "G001",
+  "subject": "ACP v1 prompt termination correction",
+  "gjcCommit": "69faa20d38d39f0b08ae4694c81946b7cfd631eb",
+  "branch": "dev",
+  "generatedAt": "2026-07-27T21:39:56.647869+00:00",
+  "suites": [
+    {
+      "name": "acp-and-sdk-prompt-termination",
+      "command": "bun --cwd=packages/coding-agent test <ACP/SDK focused suites incl. conformance wrapper, deadline settings, fs capabilities, read/write ACP fs>",
+      "passed": 214,
+      "failed": 0
+    },
+    {
+      "name": "agent-package",
+      "command": "bun --cwd=packages/agent test",
+      "passed": 601,
+      "failed": 0
+    }
+  ],
+  "gates": [
+    {
+      "name": "types",
+      "command": "bun --cwd=packages/coding-agent run check:types",
+      "status": "passed"
+    },
+    {
+      "name": "lint",
+      "command": "bun run lint:ts",
+      "status": "passed"
+    },
+    {
+      "name": "schemas",
+      "command": "bun run check:schemas",
+      "status": "passed"
+    },
+    {
+      "name": "conformance",
+      "command": "bun run conformance:run -- --agent-command \"bun packages/coding-agent/scripts/acp-conformance-agent.ts\" --format json --report <real-path>/report.json --cwd <real-path>",
+      "status": "passed"
+    }
+  ],
+  "contract": {
+    "stopReasons": [
+      "end_turn",
+      "max_tokens",
+      "max_turn_requests",
+      "refusal",
+      "cancelled"
+    ],
+    "failureCodes": [
+      "prompt_failed",
+      "prompt_deadline_exceeded"
+    ],
+    "jsonRpcCode": -32603,
+    "deadline": {
+      "setting": "sdk.promptDeadlineMs",
+      "default": 1800000,
+      "min": 60000,
+      "max": 86400000,
+      "graceMs": 10000
+    }
+  },
+  "deferred": {
+    "scope": "JetBrains Air manual smoke remains a human-only release gate; template at artifacts/acp-jetbrains-air-smoke.md"
+  },
+  "conformance": {
+    "profile": "acp-core-v1",
+    "cases": 21,
+    "passed": 21,
+    "acpx": {
+      "version": "0.13.0",
+      "gitHead": "47dc1c56b20da3c248a4a1b5c5106f52e65e6594"
+    },
+    "baseline": "artifacts/acp-core-v1-conformance-baseline.json"
+  }
+}

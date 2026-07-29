@@ -28,7 +28,7 @@ import {
 	neutralizeResponsesInputControlTokens,
 	normalizeResponsesToolCallId,
 } from "@gajae-code/ai/utils";
-import { $env, logger } from "@gajae-code/utils";
+import { $credentialEnv, logger } from "@gajae-code/utils";
 
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
@@ -81,7 +81,8 @@ function resolveOpenAiCompactEndpoint(model: Model, authCredentialType?: "api_ke
 		return resolveOpenAiCodexCompactEndpoint(model.baseUrl);
 	}
 
-	const envBaseUrl = $env.OPENAI_BASE_URL?.trim();
+	// Trusted sources only: the compaction endpoint carries the OpenAI credential.
+	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
 	const configuredBaseUrl = model.baseUrl?.trim();
 	const rawBase =
 		authCredentialType === "oauth"
@@ -92,6 +93,11 @@ function resolveOpenAiCompactEndpoint(model: Model, authCredentialType?: "api_ke
 	const normalizedBase = rawBase.endsWith("/") ? rawBase.slice(0, -1) : rawBase;
 	if (normalizedBase.endsWith("/v1")) return `${normalizedBase}/responses/compact`;
 	return `${normalizedBase}/v1/responses/compact`;
+}
+
+/** Test seam: the compaction endpoint as resolved from trusted env. */
+export function resolveOpenAiCompactEndpointForTest(model: Model, authCredentialType?: "api_key" | "oauth"): string {
+	return resolveOpenAiCompactEndpoint(model, authCredentialType);
 }
 
 function resolveOpenAiCodexCompactEndpoint(baseUrl: string | undefined): string {

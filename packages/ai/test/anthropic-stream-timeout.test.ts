@@ -136,14 +136,14 @@ afterEach(() => {
 	// No shared globals to restore; keep hook so the suite stays explicit.
 });
 
-describe("anthropic first-event timeout retries", () => {
-	it("retries when the provider never sends the first stream event", async () => {
+describe("anthropic first-event timeouts", () => {
+	it("surfaces the canonical first-event timeout without an internal provider replay", async () => {
 		let attempt = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			attempt += 1;
 			return createAnthropicMockStream({
 				signal: requestOptions?.signal,
-				events: attempt === 1 ? undefined : createSuccessfulAnthropicEvents("retry recovered"),
+				events: attempt === 1 ? undefined : createSuccessfulAnthropicEvents("must not replay"),
 			}) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
@@ -155,11 +155,11 @@ describe("anthropic first-event timeout retries", () => {
 			providerRetryWait,
 		}).result();
 
-		expect(attempt).toBe(2);
-		expect(providerRetryWait).toHaveBeenCalledWith(2000, undefined);
-		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "retry recovered" }]);
-		expect(result.responseId).toBe("msg_retry_success");
+		expect(attempt).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic stream timed out while waiting for the first event");
+		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
 	});
 
 	it("surfaces large retry-after Anthropic 429s instead of first-event timeouts", async () => {

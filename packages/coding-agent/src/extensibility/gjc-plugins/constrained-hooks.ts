@@ -1,8 +1,8 @@
 import { logger } from "@gajae-code/utils";
-
+import { bundleIdentity } from "./lifecycle-reconciliation";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { type SessionQuarantine, validateSessionBundles, verifyEntryHashes } from "./session-validation";
-import { GjcPluginLoadError, type GjcPluginRegistryEntry } from "./types";
+import { GjcPluginLoadError, type GjcPluginRegistryEntry, type GjcPluginScope } from "./types";
 
 /**
  * Constrained plugin-hook loader.
@@ -37,6 +37,7 @@ const DENIED_API_METHODS = [
 
 interface DeclaredHook {
 	plugin: string;
+	scope: GjcPluginScope;
 	event: string;
 	target?: string;
 	phase?: "before" | "after";
@@ -52,6 +53,7 @@ function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[]): Decla
 			if (disabled.has(h.extensionId)) continue;
 			out.push({
 				plugin: entry.name,
+				scope: entry.scope,
 				event: h.event,
 				target: h.target,
 				phase: h.phase,
@@ -88,6 +90,7 @@ async function loadOneHook(
 		return {
 			hook: null,
 			quarantine: {
+				identity: bundleIdentity(declared.scope, declared.plugin),
 				plugin: declared.plugin,
 				surfaceId: `hook:${declared.event}:${declared.target ?? ""}`,
 				code: "invalid_hook",
@@ -99,6 +102,7 @@ async function loadOneHook(
 		return {
 			hook: null,
 			quarantine: {
+				identity: bundleIdentity(declared.scope, declared.plugin),
 				plugin: declared.plugin,
 				surfaceId: `hook:${declared.event}`,
 				code: "invalid_hook",
@@ -113,6 +117,7 @@ async function loadOneHook(
 		return {
 			hook: null,
 			quarantine: {
+				identity: bundleIdentity(declared.scope, declared.plugin),
 				plugin: declared.plugin,
 				surfaceId: `hook:${declared.event}`,
 				code,
@@ -125,6 +130,7 @@ async function loadOneHook(
 		return {
 			hook: null,
 			quarantine: {
+				identity: bundleIdentity(declared.scope, declared.plugin),
 				plugin: declared.plugin,
 				surfaceId: `hook:${declared.event}`,
 				code: "runtime_mismatch",

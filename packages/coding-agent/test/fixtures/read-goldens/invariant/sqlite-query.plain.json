@@ -1,0 +1,11 @@
+{
+  "text": "| id | name  | email              | status   |\n| -- | ----- | ------------------ | -------- |\n| 2  | Bob   | bob@example.test   | inactive |\n| 3  | Carol | carol@example.test | active   |\n[1 more rows; append :users?limit=2&offset=3 to the database path to continue]",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/app.sqlite"
+    }
+  }
+}

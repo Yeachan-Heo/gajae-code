@@ -1421,13 +1421,107 @@ function braceBlockRange(contents: string, openingBrace: number): ShellRange | u
 	return undefined;
 }
 
-function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
-	const guardMatches = [...contents.matchAll(/if\s*\(\s*useSendKeysFallback\s*\)\s*\{/g)];
+function scopeMatches<T extends RegExpMatchArray>(matches: T[], range: ShellRange): T[] {
+	return matches.filter(match => {
+		const index = match.index ?? -1;
+		return index >= range.start && index < range.end;
+	});
+}
+
+function findFunctionRange(contents: string, headerPattern: RegExp): ShellRange | undefined {
+	const header = headerPattern.exec(contents);
+	if (!header) return undefined;
+	const openingBrace = (header.index ?? 0) + header[0].lastIndexOf("{");
+	return braceBlockRange(contents, openingBrace);
+}
+
+/**
+ * `relaunchWorkerPaneForMemoryGuard` intentionally re-runs the same sanctioned
+ * tmux send-keys fallback shape as `startTmuxSession` (see
+ * `exactTeamRuntimeSendKeysRanges` below) but through `input.config` /
+ * `newPaneId` instead of `config` / `paneId`, since it dispatches a single
+ * successor pane rather than looping over `config.workers`. Exact-match its
+ * shape the same way so a second legitimate call site does not get treated as
+ * an unsanctioned duplicate.
+ */
+function exactMemoryGuardSendKeysRanges(contents: string): ShellRange[] {
+	const fnRange = findFunctionRange(
+		contents,
+		/async\s+function\s+relaunchWorkerPaneForMemoryGuard\s*\([\s\S]{0,600}?\)\s*:\s*Promise<string>\s*\{/,
+	);
+	if (!fnRange) return [];
+	const body = contents.slice(fnRange.start, fnRange.end);
+	const guardMatches = [...body.matchAll(/if\s*\(\s*useSendKeysFallback\s*\)\s*\{/g)];
 	const payloadMatches = [
-		...contents.matchAll(
-			/Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*workerCommand\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
+		...body.matchAll(
+			/Bun\.spawnSync\(\s*\[\s*input\.config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*newPaneId\s*,\s*workerCommand\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
 		),
 	];
+	const enterMatches = [
+		...body.matchAll(
+			/Bun\.spawnSync\(\s*\[\s*input\.config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*newPaneId\s*,\s*["']Enter["']\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
+		),
+	];
+	const useFallbackMatches = [
+		...body.matchAll(
+			/const\s+useSendKeysFallback\s*=\s*shouldDispatchWorkerWithSendKeys\(input\.config\.tmux_command\s*,\s*input\.platform\)\s*;/g,
+		),
+	];
+	const splitWorkerCommandMatches = [
+		...body.matchAll(/\.\.\.\(useSendKeysFallback\s*\?\s*\[\]\s*:\s*\[workerCommand\]\)\s*,/g),
+	];
+	if (
+		guardMatches.length !== 1 ||
+		payloadMatches.length !== 1 ||
+		enterMatches.length !== 1 ||
+		useFallbackMatches.length !== 1 ||
+		splitWorkerCommandMatches.length !== 1
+	)
+		return [];
+	const guardStart = guardMatches[0].index ?? 0;
+	const payloadStart = payloadMatches[0].index ?? 0;
+	const enterStart = enterMatches[0].index ?? 0;
+	if (
+		(useFallbackMatches[0].index ?? 0) >= (splitWorkerCommandMatches[0].index ?? 0) ||
+		(splitWorkerCommandMatches[0].index ?? 0) >= guardStart ||
+		payloadStart >= enterStart
+	)
+		return [];
+	const guard = guardMatches[0];
+	const openingBrace = (guard.index ?? 0) + guard[0].lastIndexOf("{");
+	const range = braceBlockRange(body, openingBrace);
+	if (
+		!range ||
+		payloadStart < range.start ||
+		payloadStart >= range.end ||
+		enterStart < range.start ||
+		enterStart >= range.end
+	)
+		return [];
+	return [
+		{ start: fnRange.start + payloadStart, end: fnRange.start + payloadStart + payloadMatches[0][0].length },
+		{ start: fnRange.start + enterStart, end: fnRange.start + enterStart + enterMatches[0][0].length },
+	];
+}
+function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
+	// Scope the loop-dispatch counts to `startTmuxSession` so the second
+	// sanctioned call site (`relaunchWorkerPaneForMemoryGuard`, matched by
+	// `exactMemoryGuardSendKeysRanges`) does not read as a duplicate. Fixtures
+	// that carry the canonical shape without the enclosing function keep the
+	// original whole-file scope, so exact-match strictness is unchanged.
+	const mainFnRange = findFunctionRange(
+		contents,
+		/async\s+function\s+startTmuxSession\s*\([\s\S]{0,600}?\)\s*:\s*Promise<GjcTeamWorker\[\]>\s*\{/,
+	) ?? { start: 0, end: contents.length };
+	const guardMatches = scopeMatches([...contents.matchAll(/if\s*\(\s*useSendKeysFallback\s*\)\s*\{/g)], mainFnRange);
+	const payloadMatches = scopeMatches(
+		[
+			...contents.matchAll(
+				/Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*workerCommand\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
+			),
+		],
+		mainFnRange,
+	);
 	const continuationPromptMatches = [
 		...contents.matchAll(
 			/(?:const\s+GJC_TEAM_CONTINUATION_PROMPT\s*=\s*["']Continue only your current claimed GJC team task\. Re-read current GJC team state; do not replay prior output; report status\.["']\s*;|import\s*\{[\s\S]{0,1000}?\bGJC_TEAM_CONTINUATION_PROMPT\b[\s\S]{0,1000}?\}\s*from\s*["']\.\/team-workers["']\s*;)/g,
@@ -1438,24 +1532,31 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 			/const\s+args\s*=\s*Object\.freeze\(\s*\[\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*GJC_TEAM_CONTINUATION_PROMPT\s*,\s*["'];["']\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*["']Enter["']\s*,?\s*\]\s*\)\s*;\s*const\s+dispatch\s*=\s*gjcTeamRuntimeTestSeams\?\.continuationTmuxDispatch\s*\?\s*gjcTeamRuntimeTestSeams\.continuationTmuxDispatch\(config\.tmux_command\s*,\s*args\)\s*:\s*Bun\.spawnSync\(\[config\.tmux_command\s*,\s*\.\.\.args\]\s*,\s*\{\s*stdout\s*:\s*["']ignore["']\s*,\s*stderr\s*:\s*["']ignore["']\s*,\s*timeout\s*:\s*GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS\s*,?\s*\}\s*\)\s*;/g,
 		),
 	];
-	const enterMatches = [
-		...contents.matchAll(
-			/const\s+sendKeys\s*=\s*Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*["']Enter["']\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
-		),
-	];
+	const enterMatches = scopeMatches(
+		[
+			...contents.matchAll(
+				/const\s+sendKeys\s*=\s*Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*["']Enter["']\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
+			),
+		],
+		mainFnRange,
+	);
 	const fallbackPredicateMatches = [
 		...contents.matchAll(
 			/function\s+shouldDispatchWorkerWithSendKeys\([^)]*\)\s*:\s*boolean\s*\{\s*return\s+platform\s*===\s*["']win32["']\s*\|\|\s*path\.basename\(tmuxCommand\)\.toLowerCase\(\)\s*===\s*["']psmux["']\s*;\s*\}/g,
 		),
 	];
-	const useFallbackMatches = [
-		...contents.matchAll(
-			/const\s+useSendKeysFallback\s*=\s*shouldDispatchWorkerWithSendKeys\(config\.tmux_command\)\s*;/g,
-		),
-	];
-	const splitWorkerCommandMatches = [
-		...contents.matchAll(/\.\.\.\(useSendKeysFallback\s*\?\s*\[\]\s*:\s*\[workerCommand\]\)\s*,/g),
-	];
+	const useFallbackMatches = scopeMatches(
+		[
+			...contents.matchAll(
+				/const\s+useSendKeysFallback\s*=\s*shouldDispatchWorkerWithSendKeys\(config\.tmux_command\)\s*;/g,
+			),
+		],
+		mainFnRange,
+	);
+	const splitWorkerCommandMatches = scopeMatches(
+		[...contents.matchAll(/\.\.\.\(useSendKeysFallback\s*\?\s*\[\]\s*:\s*\[workerCommand\]\)\s*,/g)],
+		mainFnRange,
+	);
 	if (
 		guardMatches.length !== 1 ||
 		payloadMatches.length !== 1 ||
@@ -1543,7 +1644,10 @@ function isTypeOnlyTmuxPrimitiveOccurrence(contents: string, occurrence: TmuxPri
 
 function tmuxMachineBusViolations(file: string, contents: string): string[] {
 	if (isGeneratedDocumentationIndex(file)) return [];
-	const allowedTeamFallbackRanges = file === teamRuntimeTmuxPath ? exactTeamRuntimeSendKeysRanges(contents) : [];
+	const allowedTeamFallbackRanges =
+		file === teamRuntimeTmuxPath
+			? [...exactTeamRuntimeSendKeysRanges(contents), ...exactMemoryGuardSendKeysRanges(contents)]
+			: [];
 	const violations: string[] = [];
 	for (const occurrence of tmuxPrimitiveOccurrences(contents)) {
 		const isExactTeamFallback =

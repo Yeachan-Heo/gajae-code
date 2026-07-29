@@ -34,6 +34,17 @@ The SDK host, broker, and session endpoint are the authority boundary:
 - `src/sdk/client/` is the only client connection surface used by adapters and coordinators.
 
 Do not add a listener, direct `AgentSession` mutation path, or a second machine protocol to an adapter. Register a protocol operation and route it through the SDK instead.
+### Prompt termination authority
+
+The SDK is the sole semantic authority for prompt termination. ACP is
+projection-only: it must never infer a terminal outcome from `activity`, prose,
+`paused`, `exhausted`, or local cancel flags.
+
+The SDK durably claims a pending prompt outcome before cleanup, finalizes that
+claim exactly once, and fences terminalization to the prompt handle. An ACP
+adapter may project only that finalized SDK outcome. If a resource remains
+unsettled after the fixed terminalization grace, the endpoint fails closed; it
+must not fabricate a terminal result.
 
 ## Coordinator MCP routing
 

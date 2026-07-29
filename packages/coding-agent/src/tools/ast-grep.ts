@@ -152,6 +152,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
 				getArtifactsDir: this.session.getArtifactsDir,
+				getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 				internalUrlAction: "search",
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;

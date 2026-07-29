@@ -5,7 +5,8 @@ import { ImageProtocol, TERMINAL, Text } from "@gajae-code/tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
-import { type BashResult, executeBash } from "../exec/bash-executor";
+import { type BashArtifactSaveResult, type BashResult, executeBash } from "../exec/bash-executor";
+
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { buildGjcRuntimeSessionEnv } from "../gjc-runtime/goal-mode-request";
 import {
@@ -16,8 +17,20 @@ import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
-import { DEFAULT_MAX_BYTES, streamTailUpdates, TailBuffer } from "../session/streaming-output";
+import {
+	DEFAULT_ARTIFACT_MAX_BYTES,
+	OutputSink,
+	type OutputSummary,
+	streamTailUpdates,
+	TailBuffer,
+	type TerminalArtifactPublisher,
+	type TerminalArtifactPublishResult,
+	truncateHeadBytes,
+	truncateTailBytes,
+} from "../session/streaming-output";
+
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
@@ -29,7 +42,14 @@ import { checkBashInterception } from "./bash-interceptor";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
 import { checkComposerBashPolicy } from "./composer-bash-policy";
-import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
+import {
+	formatArtifactReference,
+	formatStyledTruncationWarning,
+	type OutputMeta,
+	resolveBashOutputSinkHeadBytes,
+	resolveBashOutputSinkTailBytes,
+	stripOutputNotice,
+} from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
@@ -38,6 +58,8 @@ import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
 
+const BASH_ERROR_MAX_BYTES = 4096;
+const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
@@ -47,20 +69,301 @@ const READ_ONLY_BASH_ENV: Record<string, string> = {
 	RIPGREP_CONFIG_PATH: "",
 };
 
+export type BashOriginalArtifactSaveResult = BashArtifactSaveResult;
+
+function boundArtifactSaveDiagnostic(error: unknown): string {
+	const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
+	const normalized = message || "unknown storage error";
+	return truncateHeadBytes(normalized, ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
+}
+
+function summarizeOriginalArtifactSave(
+	artifactId: string,
+	originalText: string,
+): Extract<BashOriginalArtifactSaveResult, { status: "saved" }> {
+	const originalBytes = Buffer.byteLength(originalText, "utf-8");
+	if (originalBytes <= DEFAULT_ARTIFACT_MAX_BYTES) {
+		return { status: "saved", artifactId, complete: true };
+	}
+	const retainedBytes = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES).bytes;
+	return {
+		status: "saved",
+		artifactId,
+		complete: false,
+		omittedBytes: originalBytes - retainedBytes,
+	};
+}
+
+function artifactSaveResultNotice(
+	result: BashOriginalArtifactSaveResult,
+	hasAlternateCompleteArtifact = false,
+): string | undefined {
+	if (result.status === "failed") return `Bash output artifact save failed: ${result.diagnostic}`;
+	if (result.status === "unavailable" && !hasAlternateCompleteArtifact) {
+		return "Bash output artifact unavailable: full original output could not be stored because artifact storage is unavailable.";
+	}
+	return undefined;
+}
+
+function artifactTruncatedBytesForResult(result: BashResult | BashInteractiveResult): number | undefined {
+	const bytes = (result as OutputSummary).artifactTruncatedBytes;
+	return typeof bytes === "number" && bytes > 0 ? bytes : undefined;
+}
+
+function artifactReferenceForResult(result: BashResult | BashInteractiveResult): string | undefined {
+	return result.artifactId
+		? formatArtifactReference(result.artifactId, artifactTruncatedBytesForResult(result))
+		: undefined;
+}
+
+function rawArtifactReferenceForSavedResult(
+	result: Extract<BashOriginalArtifactSaveResult, { status: "saved" }>,
+): string {
+	return result.complete
+		? `artifact://${result.artifactId}`
+		: formatArtifactReference(result.artifactId, result.omittedBytes);
+}
+
+function appendRawArtifactFooter(
+	summary: OutputSummary,
+	result: Extract<BashOriginalArtifactSaveResult, { status: "saved" }>,
+): void {
+	summary.artifactId = result.artifactId;
+	if (!result.complete) summary.artifactTruncatedBytes = result.omittedBytes;
+	const separator = summary.output.endsWith("\n") ? "" : "\n";
+	summary.output = `${summary.output}${separator}[raw output: ${rawArtifactReferenceForSavedResult(result)}]`;
+}
+
+function artifactReferenceIsReachable(text: string, result: BashResult | BashInteractiveResult): boolean {
+	if (!result.artifactId || !text.includes(`artifact://${result.artifactId}`)) return false;
+	const artifactTruncatedBytes = artifactTruncatedBytesForResult(result);
+	return (
+		artifactTruncatedBytes === undefined ||
+		text.includes(formatArtifactReference(result.artifactId, artifactTruncatedBytes))
+	);
+}
+
+function artifactFailureDiagnosticForResult(result: BashResult | BashInteractiveResult): string | undefined {
+	const diagnostic = (result as OutputSummary).artifactFailureDiagnostic;
+	return typeof diagnostic === "string" && diagnostic.length > 0 ? diagnostic : undefined;
+}
+
+function artifactWriterFailureNotice(result: BashResult | BashInteractiveResult): string | undefined {
+	const diagnostic = artifactFailureDiagnosticForResult(result);
+	if (!diagnostic) return undefined;
+	if (diagnostic.startsWith("unavailable:")) {
+		return `Bash output artifact unavailable: ${diagnostic.slice("unavailable:".length).trim()}`;
+	}
+	const normalized = diagnostic.startsWith("failed:") ? diagnostic.slice("failed:".length).trim() : diagnostic;
+	return `Bash output artifact writer failed: ${normalized}`;
+}
+
+function completeOutputArtifactAvailable(
+	result: Pick<OutputSummary, "artifactId" | "artifactTruncatedBytes" | "artifactFailureDiagnostic">,
+): boolean {
+	return (
+		result.artifactId !== undefined &&
+		(typeof result.artifactTruncatedBytes !== "number" || result.artifactTruncatedBytes <= 0) &&
+		(typeof result.artifactFailureDiagnostic !== "string" || result.artifactFailureDiagnostic.length === 0)
+	);
+}
+
+function failureStatusCause(
+	result: BashResult | BashInteractiveResult,
+	text: string,
+	explicitCause?: string,
+): string | undefined {
+	if (explicitCause) return explicitCause;
+	const leadingStatus = /^\[(Command (?:timed out(?: after \d+ seconds?)?|cancelled))\]/u.exec(text)?.[1];
+	const statusMatches = Array.from(text.matchAll(/Command (?:timed out(?: after \d+ seconds?)?|cancelled|aborted)/gu));
+	const lastStatus = statusMatches[statusMatches.length - 1]?.[0];
+	if (result.cancelled) return leadingStatus ?? lastStatus ?? "Command cancelled";
+	if (isInteractiveResult(result) && result.timedOut) return lastStatus ?? "Command timed out";
+	if (result.exitCode === undefined) return "Command failed: missing exit status";
+	if (result.exitCode !== 0) return `Command exited with code ${result.exitCode}`;
+	return undefined;
+}
+
+function removeTrailingFailureCause(text: string, cause: string | undefined): string {
+	if (!cause) return text;
+	for (const suffix of [`\n\n${cause}`, `\n${cause}`, cause]) {
+		if (text.endsWith(suffix)) return text.slice(0, -suffix.length);
+	}
+	return text;
+}
+
+function formatBashFailureMessage(
+	result: BashResult | BashInteractiveResult,
+	text: string,
+	explicitCause?: string,
+): string {
+	const statusCause = failureStatusCause(result, text, explicitCause);
+	const bodyText = removeTrailingFailureCause(text, statusCause);
+	const suffixParts: string[] = [];
+	const reference = artifactReferenceForResult(result);
+	if (reference) suffixParts.push(reference);
+	const writerNotice = artifactWriterFailureNotice(result);
+	if (writerNotice) suffixParts.push(writerNotice);
+	if (statusCause) suffixParts.push(statusCause);
+	const suffix = suffixParts.join("\n\n");
+	const separator = bodyText.length > 0 && suffix.length > 0 ? "\n\n" : "";
+	const bodyBudget = Math.max(
+		0,
+		BASH_ERROR_MAX_BYTES - Buffer.byteLength(suffix, "utf-8") - Buffer.byteLength(separator, "utf-8"),
+	);
+	const body = truncateTailBytes(bodyText, bodyBudget).text;
+	return `${body}${body.length > 0 ? separator : ""}${suffix}`;
+}
+
+async function boundClientTerminalOutput(
+	output: string,
+	alreadyTruncated: boolean,
+	settings: ToolSession["settings"],
+): Promise<{ summary: OutputSummary; locallyTruncated: boolean }> {
+	const tailBytes = resolveBashOutputSinkTailBytes(settings);
+	const headBytes = resolveBashOutputSinkHeadBytes(settings);
+	const sink = new OutputSink({ spillThreshold: tailBytes, headBytes });
+	sink.push(output);
+	const bounded = await sink.dump();
+	return {
+		summary: {
+			...bounded,
+			truncated: alreadyTruncated || bounded.truncated,
+		},
+		locallyTruncated: bounded.truncated,
+	};
+}
+
+interface PreparedClientTerminalOutput {
+	current: ClientBridgeTerminalOutput;
+	summary: OutputSummary;
+	locallyTruncated: boolean;
+	artifactSaveResult?: BashOriginalArtifactSaveResult;
+	artifactSaveNotice?: string;
+}
+
+async function prepareClientTerminalOutput(
+	session: ToolSession,
+	current: ClientBridgeTerminalOutput,
+): Promise<PreparedClientTerminalOutput> {
+	const { summary, locallyTruncated } = await boundClientTerminalOutput(
+		current.output,
+		current.truncated,
+		session.settings,
+	);
+	let artifactSaveResult: BashOriginalArtifactSaveResult | undefined;
+	if (locallyTruncated && !current.truncated) {
+		artifactSaveResult = await saveBashOriginalArtifact(session, current.output);
+		if (artifactSaveResult.status === "saved") appendRawArtifactFooter(summary, artifactSaveResult);
+	}
+	const artifactSaveNotice = artifactSaveResult
+		? artifactSaveResultNotice(artifactSaveResult, completeOutputArtifactAvailable(summary))
+		: undefined;
+	return { current, summary, locallyTruncated, artifactSaveResult, artifactSaveNotice };
+}
+
+function formatClientTerminalAbortFailure(
+	prepared: PreparedClientTerminalOutput,
+	readDiagnostic?: string,
+	pendingNotices: readonly string[] = [],
+): string {
+	const notices = [
+		...pendingNotices,
+		...(prepared.current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
+		...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
+		...(readDiagnostic ? [`Terminal output recovery failed: ${readDiagnostic}`] : []),
+	];
+	const outputLines = [prepared.summary.output || "(no output)", ...notices].filter(Boolean);
+	const outputText = outputLines.join("\n");
+	const result: BashResult = {
+		...prepared.summary,
+		exitCode: undefined,
+		cancelled: true,
+	};
+	return formatBashFailureMessage(result, outputText, "Command aborted");
+}
+
+function appendArtifactDetails(text: string, result: BashResult | BashInteractiveResult): string {
+	const suffixParts: string[] = [];
+	const reference = artifactReferenceForResult(result);
+	if (reference && !artifactReferenceIsReachable(text, result)) suffixParts.push(reference);
+	const writerNotice = artifactWriterFailureNotice(result);
+	if (writerNotice && !text.includes(writerNotice)) suffixParts.push(writerNotice);
+	return suffixParts.length > 0 ? `${text}${text.endsWith("\n") ? "" : "\n"}${suffixParts.join("\n\n")}` : text;
+}
+
+async function saveBashOriginalArtifact(
+	session: ToolSession,
+	originalText: string,
+): Promise<BashOriginalArtifactSaveResult> {
+	let manager: ArtifactManager | null | undefined;
+	try {
+		manager = session.getArtifactManager?.();
+	} catch (error) {
+		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+	}
+	if (manager) {
+		try {
+			const artifactId = await manager.save(originalText, "bash-original");
+			return artifactId
+				? summarizeOriginalArtifactSave(artifactId, originalText)
+				: { status: "failed", diagnostic: "storage returned no artifact id" };
+		} catch (error) {
+			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+		}
+	}
+
+	if (!session.allocateOutputArtifact) return { status: "unavailable" };
+	let alloc: { id?: string; path?: string } | undefined;
+	try {
+		alloc = await session.allocateOutputArtifact("bash-original");
+	} catch (error) {
+		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+	}
+	if (!alloc?.path || !alloc.id) return { status: "unavailable" };
+	try {
+		const saveResult = summarizeOriginalArtifactSave(alloc.id, originalText);
+		const payload = saveResult.complete
+			? originalText
+			: (() => {
+					const retained = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES);
+					return `${retained.text}\n[artifact truncated after ${retained.bytes} bytes; omitted at least ${saveResult.omittedBytes} bytes]\n`;
+				})();
+		await Bun.write(alloc.path, payload);
+		return saveResult;
+	} catch (error) {
+		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+	}
+}
+
+function createBashArtifactPublisher(session: ToolSession): TerminalArtifactPublisher {
+	return async (content, _info): Promise<TerminalArtifactPublishResult> => {
+		let manager: ArtifactManager | null | undefined;
+		try {
+			manager = session.getArtifactManager?.();
+		} catch (error) {
+			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+		}
+		if (!manager) return { status: "unavailable" };
+		try {
+			const artifactId = await manager.save(content, "bash");
+			return artifactId
+				? { status: "published", artifactId }
+				: { status: "failed", diagnostic: "storage returned no artifact id" };
+		} catch (error) {
+			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+		}
+	};
+}
+
 export async function saveBashOriginalArtifactForTests(
 	session: ToolSession,
 	originalText: string,
+	onResult?: (result: BashOriginalArtifactSaveResult) => void,
 ): Promise<string | undefined> {
-	try {
-		const manager = session.getArtifactManager?.();
-		if (manager) return await manager.save(originalText, "bash-original");
-		const alloc = await session.allocateOutputArtifact?.("bash-original");
-		if (!alloc?.path || !alloc.id) return undefined;
-		await Bun.write(alloc.path, originalText);
-		return alloc.id;
-	} catch {
-		return undefined;
-	}
+	const result = await saveBashOriginalArtifact(session, originalText);
+	onResult?.(result);
+	return result.status === "saved" ? result.artifactId : undefined;
 }
 
 const bashSchemaBase = z.object({
@@ -146,6 +449,7 @@ type ManagedBashJobCompletion =
 	| {
 			kind: "failed";
 			error: unknown;
+			result?: BashResult | BashInteractiveResult;
 	  };
 
 interface ManagedBashJobHandle {
@@ -162,6 +466,22 @@ function normalizeResultOutput(result: BashResult | BashInteractiveResult): stri
 
 function isInteractiveResult(result: BashResult | BashInteractiveResult): result is BashInteractiveResult {
 	return "timedOut" in result;
+}
+
+function formatManagedAbortFailure(
+	error: unknown,
+	result: BashResult | BashInteractiveResult | undefined,
+	latestText: string,
+): string {
+	if (result) {
+		const output = normalizeResultOutput(result).replace(/\[Command (?:cancelled|aborted)\]\n?/gu, "");
+		return formatBashFailureMessage(result, output || "Command aborted", "Command aborted");
+	}
+	const raw = error instanceof Error ? error.message : String(error);
+	const bodyText = raw.replace(/Command cancelled(?: after \d+ seconds?)?/gu, "").trim() || latestText.trim();
+	const bodyBudget = Math.max(0, BASH_ERROR_MAX_BYTES - Buffer.byteLength("Command aborted", "utf-8") - 2);
+	const body = truncateTailBytes(bodyText, bodyBudget).text;
+	return body.length > 0 ? `${body}\n\nCommand aborted` : "Command aborted";
 }
 
 function normalizeBashEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
@@ -319,17 +639,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	#buildResultText(result: BashResult | BashInteractiveResult, timeoutSec: number, outputText: string): string {
+		const trimmedOutput = outputText.trim();
+		const renderedOutput =
+			trimmedOutput && trimmedOutput !== "(no output)" ? outputText : normalizeResultOutput(result);
 		if (result.cancelled) {
-			throw new ToolError(normalizeResultOutput(result) || "Command aborted");
+			throw new ToolError(formatBashFailureMessage(result, renderedOutput || "Command aborted"));
 		}
 		if (isInteractiveResult(result) && result.timedOut) {
-			throw new ToolError(normalizeResultOutput(result) || `Command timed out after ${timeoutSec} seconds`);
+			const timeoutMessage = `Command timed out after ${timeoutSec} seconds`;
+			const message = renderedOutput ? `${renderedOutput}\n\n${timeoutMessage}` : timeoutMessage;
+			throw new ToolError(formatBashFailureMessage(result, message));
 		}
 		if (result.exitCode === undefined) {
-			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status`);
+			throw new ToolError(formatBashFailureMessage(result, `${outputText}\n\nCommand failed: missing exit status`));
 		}
 		if (result.exitCode !== 0) {
-			throw new ToolError(`${outputText}\n\nCommand exited with code ${result.exitCode}`);
+			throw new ToolError(
+				formatBashFailureMessage(result, `${outputText}\n\nCommand exited with code ${result.exitCode}`),
+			);
 		}
 		return outputText;
 	}
@@ -337,9 +664,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	#buildCompletedResult(
 		result: BashResult | BashInteractiveResult,
 		timeoutSec: number,
-		options: { requestedTimeoutSec?: number; notices?: readonly string[]; terminalId?: string } = {},
+		options: {
+			requestedTimeoutSec?: number;
+			notices?: readonly string[];
+			terminalId?: string;
+			artifactReferenceInBody?: boolean;
+		} = {},
 	): AgentToolResult<BashToolDetails> {
-		const outputLines = [this.#formatResultOutput(result)];
+		const shortArtifactInBody = !result.truncated && result.artifactId !== undefined;
+		const baseBody =
+			options.artifactReferenceInBody || shortArtifactInBody
+				? appendArtifactDetails(this.#formatResultOutput(result), result)
+				: this.#formatResultOutput(result);
+		const writerNotice = artifactWriterFailureNotice(result);
+		const body =
+			writerNotice && !baseBody.includes(writerNotice)
+				? `${baseBody}${baseBody.endsWith("\n") ? "" : "\n"}${writerNotice}`
+				: baseBody;
+		const outputLines = [body];
 		const notices = options.notices?.filter(Boolean) ?? [];
 		if (notices.length > 0) outputLines.push("", ...notices);
 		const outputText = outputLines.join("\n");
@@ -350,7 +692,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (options.terminalId !== undefined) {
 			details.terminalId = options.terminalId;
 		}
-		const resultBuilder = toolResult(details).text(outputText).truncationFromSummary(result, { direction: "tail" });
+		const resultBuilder = toolResult(details)
+			.text(outputText)
+			.truncationFromSummary(result, {
+				direction: "tail",
+				...(shortArtifactInBody ? { noticeOwner: "body" } : {}),
+			});
 		this.#buildResultText(result, timeoutSec, outputText);
 		return resultBuilder.done();
 	}
@@ -425,7 +772,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
+				const artifactPublisher = createBashArtifactPublisher(this.session);
+				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
+				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
+				const tailBuffer = new TailBuffer(spillThreshold);
+
+				let executionResult: BashResult | BashInteractiveResult | undefined;
 				try {
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
@@ -435,6 +787,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						env: options.resolvedEnv,
 						artifactPath,
 						artifactId,
+						artifactPublisher,
+						spillThreshold,
+						headBytes,
 						oneShot: true,
 						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
 						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
@@ -450,11 +805,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							// path above.
 							manager.appendOutput(jobId, chunk);
 						},
-						onMinimizedSave: originalText => saveBashOriginalArtifactForTests(this.session, originalText),
+						onMinimizedSave: async originalText => {
+							return saveBashOriginalArtifact(this.session, originalText);
+						},
 					});
+					executionResult = result;
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
-						notices: options.notices ?? [],
+						notices: options.notices,
+						artifactReferenceInBody: true,
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -464,7 +823,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
-					completion.resolve({ kind: "failed", error });
+					completion.resolve({ kind: "failed", error, result: executionResult });
 					await reportProgress(message, failedDetails(jobId));
 					throw error;
 				}
@@ -771,7 +1130,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			label,
 			async ({ jobId: id, signal, reportProgress }) => {
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
+				const artifactPublisher = createBashArtifactPublisher(this.session);
+				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
+				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
+				const tailBuffer = new TailBuffer(spillThreshold);
+
 				try {
 					const result = await executeBash(prepared.command, {
 						cwd: prepared.commandCwd,
@@ -781,6 +1144,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						env: prepared.resolvedEnv,
 						artifactPath,
 						artifactId,
+						artifactPublisher,
+						spillThreshold,
+						headBytes,
 						oneShot: true,
 						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
 						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
@@ -797,11 +1163,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							cursorOffset = slice.nextOffset;
 							dispatchLines(slice.text);
 						},
-						onMinimizedSave: originalText => saveBashOriginalArtifactForTests(this.session, originalText),
+						onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
 					flushTrailingLine();
-					this.#buildResultText(result, prepared.timeoutSec, result.output || "(no output)");
-					return result.output;
+					const resultText = appendArtifactDetails(result.output || "(no output)", result);
+					this.#buildResultText(result, prepared.timeoutSec, resultText);
+					return resultText;
 				} catch (error) {
 					flushTrailingLine();
 					throw error instanceof Error ? error : new Error(String(error));
@@ -932,8 +1299,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			if (waitResult.kind === "aborted") {
 				autoBgManager.cancel(job.jobId);
+				const terminal = await job.completion;
 				autoBgManager.acknowledgeDeliveries([job.jobId]);
-				throw new ToolAbortError(job.getLatestText() || "Command aborted");
+				if (terminal.kind === "failed") {
+					throw new ToolAbortError(
+						formatManagedAbortFailure(terminal.error, terminal.result, job.getLatestText()),
+					);
+				}
+				throw new ToolAbortError(formatManagedAbortFailure(undefined, undefined, job.getLatestText()));
 			}
 			job.setBackgrounded(true);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, job.getLatestText(), timeoutSec, {
@@ -943,13 +1316,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
+			const clientHeadBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
+			const clientTailBytes = resolveBashOutputSinkTailBytes(this.session.settings);
 			const handle = await clientBridge.createTerminal({
 				command,
 				cwd: commandCwd,
 				env: resolvedEnv
 					? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
 					: undefined,
-				outputByteLimit: DEFAULT_MAX_BYTES,
+				outputByteLimit: clientHeadBytes > 0 ? undefined : clientTailBytes,
 			});
 
 			// Emit partial update so the editor can embed the live terminal card.
@@ -969,13 +1344,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// arriving mid-poll terminates the remote command immediately,
 			// instead of waiting for the next `currentOutput()` to return.
 			const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
-			let killStarted = false;
+			let killPromise: Promise<void> | undefined;
 			const fireKill = (): Promise<void> => {
-				if (killStarted) return Promise.resolve();
-				killStarted = true;
-				return handle.kill().catch((error: unknown) => {
+				if (killPromise) return killPromise;
+				killPromise = handle.kill().catch((error: unknown) => {
 					logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
 				});
+				return killPromise;
 			};
 			const onAbortSignal = () => {
 				resolveAborted();
@@ -987,7 +1362,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				try {
 					if (signal?.aborted) {
 						await fireKill();
-						throw new ToolAbortError("Command aborted");
+						let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+						let readDiagnostic: string | undefined;
+						try {
+							current = await handle.currentOutput();
+						} catch (error) {
+							readDiagnostic = boundArtifactSaveDiagnostic(error);
+							logger.warn("ACP terminal aborted output read failed", {
+								terminalId: handle.terminalId,
+								error,
+							});
+						}
+						const prepared = await prepareClientTerminalOutput(this.session, current);
+						throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 					}
 
 					const timeoutPromise = Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const }));
@@ -1005,7 +1392,21 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 						if (raced.kind === "aborted" || signal?.aborted) {
 							await fireKill();
-							throw new ToolAbortError("Command aborted");
+							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+							let readDiagnostic: string | undefined;
+							try {
+								current = await handle.currentOutput();
+							} catch (error) {
+								readDiagnostic = boundArtifactSaveDiagnostic(error);
+								logger.warn("ACP terminal aborted output read failed", {
+									terminalId: handle.terminalId,
+									error,
+								});
+							}
+							const prepared = await prepareClientTerminalOutput(this.session, current);
+							throw new ToolAbortError(
+								formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices),
+							);
 						}
 
 						if (raced.kind === "timeout") {
@@ -1014,29 +1415,33 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							// enforced timeout. The handle stays valid post-kill so the
 							// buffered output is still readable.
 							await fireKill();
-							let current = { output: "", truncated: false };
+							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+							let readDiagnostic: string | undefined;
 							try {
 								current = await handle.currentOutput();
 							} catch (error) {
+								readDiagnostic = boundArtifactSaveDiagnostic(error);
 								logger.warn("ACP terminal final output read failed", {
 									terminalId: handle.terminalId,
 									error,
 								});
 							}
+							const prepared = await prepareClientTerminalOutput(this.session, current);
+							const timeoutNotices = [
+								...pendingNotices,
+								...(current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
+								...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
+								...(readDiagnostic ? [`Terminal output recovery failed: ${readDiagnostic}`] : []),
+							];
 							const timedOutResult: BashInteractiveResult = {
-								output: current.output,
+								...prepared.summary,
 								exitCode: undefined,
 								cancelled: false,
 								timedOut: true,
-								truncated: current.truncated,
-								totalLines: current.output.length > 0 ? current.output.split("\n").length : 0,
-								totalBytes: current.output.length,
-								outputLines: current.output.length > 0 ? current.output.split("\n").length : 0,
-								outputBytes: current.output.length,
 							};
 							return this.#buildCompletedResult(timedOutResult, timeoutSec, {
 								requestedTimeoutSec,
-								notices: pendingNotices,
+								notices: timeoutNotices,
 								terminalId: handle.terminalId,
 							});
 						}
@@ -1058,13 +1463,39 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							// observe `signal?.aborted` and exit via the abort branch.
 							continue;
 						}
+						const { summary, locallyTruncated } = await boundClientTerminalOutput(
+							pollOutput.output,
+							pollOutput.truncated,
+							this.session.settings,
+						);
+						const pollText =
+							pollOutput.truncated || locallyTruncated
+								? `${summary.output}${summary.output.endsWith("\n") ? "" : "\n"}(output truncated)`
+								: summary.output;
 						onUpdate?.({
-							content: [{ type: "text", text: pollOutput.output }],
+							content: [{ type: "text", text: pollText }],
 							details: { terminalId: handle.terminalId },
 						});
 					}
 				} finally {
 					signal?.removeEventListener("abort", onAbortSignal);
+				}
+
+				if (signal?.aborted) {
+					await fireKill();
+					let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+					let readDiagnostic: string | undefined;
+					try {
+						current = await handle.currentOutput();
+					} catch (error) {
+						readDiagnostic = boundArtifactSaveDiagnostic(error);
+						logger.warn("ACP terminal aborted output read failed", {
+							terminalId: handle.terminalId,
+							error,
+						});
+					}
+					const prepared = await prepareClientTerminalOutput(this.session, current);
+					throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 				}
 
 				// Fetch final output; the terminal is released in the outer finally.
@@ -1075,24 +1506,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const exitCode: number | undefined =
 					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
 
-				const outputText = finalOutput.output;
-				const outputByteLen = outputText.length;
-				const outputLineCount = outputText.length > 0 ? outputText.split("\n").length : 0;
+				const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
 
 				const bridgeResult: BashResult = {
-					output: outputText,
+					...prepared.summary,
 					exitCode,
 					cancelled: false,
-					truncated: finalOutput.truncated,
-					totalLines: outputLineCount,
-					totalBytes: outputByteLen,
-					outputLines: outputLineCount,
-					outputBytes: outputByteLen,
 				};
 
 				const bridgeNotices: string[] = [];
-				if (finalOutput.truncated) bridgeNotices.push("(output truncated)");
+				if (finalOutput.truncated || prepared.locallyTruncated) bridgeNotices.push("(output truncated)");
 				for (const notice of pendingNotices) bridgeNotices.push(notice);
+				if (prepared.artifactSaveNotice) bridgeNotices.push(prepared.artifactSaveNotice);
 
 				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
 					requestedTimeoutSec,
@@ -1108,11 +1533,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 		}
 
+		const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
+		const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
+
 		// Track output for streaming updates (tail only)
-		const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
+		const tailBuffer = new TailBuffer(spillThreshold);
 
 		// Allocate artifact for truncated output storage
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+		const artifactPublisher = createBashArtifactPublisher(this.session);
 
 		const interactiveUi =
 			this.session.bashRestrictionProfile === "read-only"
@@ -1129,6 +1558,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					env: resolvedEnv,
 					artifactPath,
 					artifactId,
+					artifactPublisher,
+					spillThreshold,
+					headBytes,
 				})
 			: await executeBash(command, {
 					cwd: commandCwd,
@@ -1139,19 +1571,30 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					env: resolvedEnv,
 					artifactPath,
 					artifactId,
+					artifactPublisher,
+					spillThreshold,
+					headBytes,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: originalText => saveBashOriginalArtifactForTests(this.session, originalText),
+					onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
 					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
 					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 				});
 		if (result.cancelled) {
+			const failureText = formatBashFailureMessage(
+				result,
+				normalizeResultOutput(result) || "Command aborted",
+				signal?.aborted ? "Command aborted" : undefined,
+			);
 			if (signal?.aborted) {
-				throw new ToolAbortError(normalizeResultOutput(result) || "Command aborted");
+				throw new ToolAbortError(failureText);
 			}
-			throw new ToolError(normalizeResultOutput(result) || "Command aborted");
+			throw new ToolError(failureText);
 		}
 		if (isInteractiveResult(result) && result.timedOut) {
-			throw new ToolError(normalizeResultOutput(result) || `Command timed out after ${timeoutSec} seconds`);
+			const timeoutMessage = `Command timed out after ${timeoutSec} seconds`;
+			const output = normalizeResultOutput(result);
+			const failureText = output ? `${output}\n\n${timeoutMessage}` : timeoutMessage;
+			throw new ToolError(formatBashFailureMessage(result, failureText, timeoutMessage));
 		}
 		return this.#buildCompletedResult(result, timeoutSec, {
 			requestedTimeoutSec,

@@ -5,6 +5,9 @@ export interface FallbackTrigger {
 	retryAfterMs?: number;
 }
 
+/** Stable code for streams that time out before producing semantic progress. */
+export const STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE = "stream_first_event_timeout";
+
 export type TransportHeaders = Headers | Record<string, string | undefined>;
 
 /**
@@ -185,7 +188,8 @@ export function transportFailureFacts(
 		!isQuotaCode(normalizedCode) &&
 		!isAuthCode(normalizedCode) &&
 		!isRateLimitCode(normalizedCode) &&
-		!isContextOverflowCode(normalizedCode)
+		!isContextOverflowCode(normalizedCode) &&
+		normalizedCode !== STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE
 	) {
 		return undefined;
 	}
@@ -256,14 +260,17 @@ export function classifyFallbackTrigger(
 		parseRetryAfterMilliseconds(headers?.get("retry-after-ms") ?? null) ??
 		parseRetryAfterSeconds(headers?.get("retry-after") ?? null);
 	const code = (facts.openaiErrorCode ?? facts.anthropicErrorType ?? facts.providerCode)?.toLowerCase();
-	const triggerClass: FallbackTriggerClass = isQuotaCode(code)
-		? "quota"
-		: facts.status === 401 || facts.status === 403 || isAuthCode(code)
-			? "auth"
-			: facts.status === 429 || isRateLimitCode(code)
-				? "rate_limit"
-				: facts.status !== undefined && facts.status >= 500 && facts.status <= 599
-					? "server"
-					: "other";
+	const triggerClass: FallbackTriggerClass =
+		code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE
+			? "server"
+			: isQuotaCode(code)
+				? "quota"
+				: facts.status === 401 || facts.status === 403 || isAuthCode(code)
+					? "auth"
+					: facts.status === 429 || isRateLimitCode(code)
+						? "rate_limit"
+						: facts.status !== undefined && facts.status >= 500 && facts.status <= 599
+							? "server"
+							: "other";
 	return retryAfterMs === undefined ? { class: triggerClass } : { class: triggerClass, retryAfterMs };
 }

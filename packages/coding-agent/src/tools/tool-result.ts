@@ -1,6 +1,6 @@
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent } from "@gajae-code/ai";
-import type { OutputSummary, TruncationResult } from "../session/streaming-output";
+import type { OutputSummary, ReadWindow, TruncationResult } from "../session/streaming-output";
 import type { OutputMeta, TruncationOptions, TruncationSummaryOptions, TruncationTextOptions } from "./output-meta";
 import { outputMeta } from "./output-meta";
 
@@ -29,6 +29,19 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 
 	truncation(result: TruncationResult, options: TruncationOptions): this {
 		this.#meta.truncation(result, options);
+		return this;
+	}
+
+	truncationWindows(
+		windows: ReadWindow,
+		options?: {
+			artifactId?: string;
+			noticeOwner?: "body";
+			maxBytes?: number;
+			rangeBase?: "file" | "window";
+		},
+	): this {
+		this.#meta.truncationWindows(windows, options);
 		return this;
 	}
 

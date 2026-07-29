@@ -186,6 +186,16 @@ describe("inline backtick slash classification", () => {
 		expect(extractSlashCommandTokenPrefix("/mo")).toBe("/mo");
 	});
 
+	it.each([
+		["top-level command", "/he", "/he"],
+		["inline command token", "please use /he", "/he"],
+		["nested absolute path", "/chromium/src", null],
+		["multi-segment relative path", "chromium/lib/src", null],
+		["URL path", "https://example.com/he", null],
+	])("classifies %s with nested slash boundaries", (_name, text, expected) => {
+		expect(extractSlashCommandTokenPrefix(text)).toBe(expected);
+	});
+
 	it("preserves path suggestions inside an open inline-code span", async () => {
 		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-backtick-test-"));
 		try {

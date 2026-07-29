@@ -1,0 +1,11 @@
+{
+  "text": "| name  |\n| ----- |\n| Alice |\n| Bob   |\n| Carol |\n| Dave  |",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "path",
+      "value": "{TMP}/app.sqlite"
+    }
+  }
+}

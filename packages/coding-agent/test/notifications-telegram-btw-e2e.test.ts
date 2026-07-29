@@ -258,6 +258,7 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 			fs: fs.promises as unknown as TelegramDaemonFs,
 			pidAlive: () => true,
 			btw: { enabled: true },
+			sound: "all",
 		});
 		try {
 			await daemon.scanRoots();
@@ -373,6 +374,7 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 			expect(terminalDispatchCount()).toBe(before + 1);
 			const reply = bot.calls.at(-1)!;
 			expect(reply.body).toMatchObject({ chat_id: "42", message_thread_id: THREAD_ID });
+			expect(reply.body.disable_notification).toBeUndefined();
 			sessionRouter.dispatch = originalDispatch;
 		} finally {
 			daemon.requestStop();

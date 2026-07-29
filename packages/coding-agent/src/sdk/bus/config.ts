@@ -55,6 +55,7 @@ export interface NotificationSettingsSnapshot {
 		botToken?: string;
 		chatId?: string;
 		activation?: Record<string, unknown>;
+		sound: "all" | "important" | "none";
 		btw: {
 			enabled: boolean;
 		};
@@ -160,6 +161,11 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 			botToken: notificationSettingsString(telegram.botToken),
 			chatId: notificationSettingsString(telegram.chatId),
 			...(Object.keys(activation).length === 0 ? {} : { activation }),
+			sound: notificationSettingsChoice<"all" | "important" | "none">(telegram.sound, "all", [
+				"all",
+				"important",
+				"none",
+			]),
 			btw: {
 				enabled: notificationSettingsBoolean(btw.enabled, true),
 			},
@@ -228,6 +234,7 @@ export interface NotificationConfig {
 	 * (those carrying {@link SPAWN_PROVENANCE_ENV}) unless they explicitly opt in.
 	 */
 	sessionScope: "all" | "primary";
+	sound: "all" | "important" | "none";
 	idleTimeoutMs: number;
 	btw: {
 		enabled: boolean;
@@ -270,6 +277,7 @@ export function getNotificationConfig(settings: NotificationSettingsReader): Not
 		verbosity: snapshot.verbosity,
 		sessionScope: snapshot.sessionScope,
 		idleTimeoutMs: snapshot.idleTimeoutMs,
+		sound: snapshot.telegram.sound,
 		rich: snapshot.telegram.rich,
 		btw: snapshot.telegram.btw,
 		richDraft: snapshot.telegram.richDraft,
@@ -358,7 +366,10 @@ export function isTelegramConfigured(
 }
 
 /** Is Discord configured with all credentials and routing identifiers required by its daemon. */
-export function isDiscordConfigured(cfg: NotificationConfig): cfg is NotificationConfig & {
+export function isDiscordConfigured(cfg: Pick<NotificationConfig, "enabled" | "discord">): cfg is Pick<
+	NotificationConfig,
+	"enabled"
+> & {
 	discord: { botToken: string; applicationId: string; guildId: string; parentChannelId: string };
 } {
 	return (
@@ -371,7 +382,10 @@ export function isDiscordConfigured(cfg: NotificationConfig): cfg is Notificatio
 }
 
 /** Is Slack configured with both SDK tokens and its workspace/channel routing identifiers. */
-export function isSlackConfigured(cfg: NotificationConfig): cfg is NotificationConfig & {
+export function isSlackConfigured(cfg: Pick<NotificationConfig, "enabled" | "slack">): cfg is Pick<
+	NotificationConfig,
+	"enabled"
+> & {
 	slack: { botToken: string; appToken: string; workspaceId: string; channelId: string };
 } {
 	return (
@@ -539,6 +553,8 @@ export interface RedactableAction {
 	workflowGateId?: string;
 	question?: string;
 	options?: string[];
+	/** Selected zero-based option positions for transport-specific multi-select rendering. */
+	selectedOptionIndices?: number[];
 	summary?: string;
 	/** Optional zero-based recommendation into the authoritative raw options. */
 	recommendedIndex?: number;

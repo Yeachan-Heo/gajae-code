@@ -15,6 +15,7 @@ import { renderError } from "../tools/tool-errors";
 
 export interface ReadCommandArgs {
 	path: string;
+	truncation?: "head" | "last" | "both";
 }
 
 export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
@@ -37,7 +38,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 	const tool = wrapToolWithMetaNotice(new ReadTool(session));
 
 	try {
-		const result = await tool.execute("gjc-read", { path: cmd.path });
+		const result = await tool.execute("gjc-read", { path: cmd.path, truncation: cmd.truncation });
 
 		for (const block of result.content) {
 			if (block.type === "text") {

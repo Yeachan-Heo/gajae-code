@@ -372,6 +372,8 @@ describe("CLI help single source of truth", () => {
 		expect(fastHelpSource).toContain("Environment Variables:");
 		expect(fastHelpSource).toContain("Available Tools (default-enabled unless noted):");
 		expect(fastHelpSource).toContain("Useful Commands:");
+		expect(fastHelpSource).toContain("search        - Search file contents");
+		expect(fastHelpSource).not.toContain("grep          - Search file contents");
 	});
 
 	it("fast-help.ts never emits the stale pre-rebrand tagline", async () => {

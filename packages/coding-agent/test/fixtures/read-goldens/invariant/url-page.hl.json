@@ -1,0 +1,11 @@
+{
+  "text": "<untrusted-content>\nURL: https://8.8.8.8/read-goldens\nContent-Type: text/plain\nMethod: text\n\n---\n\nurl fixture line 1\nurl fixture line 2\nurl fixture line 3\n</untrusted-content>",
+  "displayContent": null,
+  "truncation": null,
+  "meta": {
+    "source": {
+      "type": "url",
+      "value": "https://8.8.8.8/read-goldens"
+    }
+  }
+}

@@ -28,7 +28,7 @@ Subagents have no conversation history. Every fact, file path, and direction the
 {{#if independentMode}}- `.inheritContext`: independent mode cannot inherit parent conversation. Omit it or set `"none"`; any non-`none` value is rejected before scheduling.{{/if}}
 {{#if customSchemaEnabled}}- `schema`: JTD schema for expected structured output (do not put format rules in assignments){{/if}}
 - `spawnPlan` (optional): required before any batch with more than 4 tasks; include whyParallel, whyNotLocal, independence, expectedReceiptShape, and maxInlineTokens.
-{{#if isolationEnabled}}- `isolated`: run in isolated env; use when tasks edit overlapping files{{/if}}
+{{#if isolationEnabled}}- `isolated`: run in an isolated environment; REQUIRED when the user explicitly requests a worktree (for example, "use worktree"), and use when tasks edit overlapping files{{/if}}
 </parameters>
 
 <rules>

@@ -186,13 +186,32 @@ async function httpEmailLogin(ctrl: OAuthController): Promise<OAuthCredentials> 
  *
  * No browser/manual token paste fallback is used.
  */
+/**
+ * Whether the operator disabled borrowing a token from the native macOS app.
+ *
+ * `GJC_AUTH_NO_BORROW` is the documented name; `PI_AUTH_NO_BORROW` is the legacy
+ * one that was the only name actually read.
+ */
+function authBorrowDisabled(): boolean {
+	return Boolean($env.GJC_AUTH_NO_BORROW || $env.PI_AUTH_NO_BORROW);
+}
+
+/** Test seam: the resolved native-app borrowing opt-out. */
+export function authBorrowDisabledForTest(): boolean {
+	return authBorrowDisabled();
+}
+
 export async function loginPerplexity(ctrl: OAuthController): Promise<OAuthCredentials> {
 	if (!ctrl.onPrompt) {
 		throw new Error("Perplexity login requires onPrompt callback");
 	}
 
-	// Path 1: Native macOS app JWT (skip if PI_AUTH_NO_BORROW=1)
-	if (!$env.PI_AUTH_NO_BORROW) {
+	// Path 1: Native macOS app JWT, skipped when the operator opts out.
+	//
+	// Presence-based on purpose: this is a privacy opt-out, so any set value must
+	// disable borrowing. A boolean contract would let `GJC_AUTH_NO_BORROW=0`
+	// silently re-enable reading a token out of another application.
+	if (!authBorrowDisabled()) {
 		ctrl.onProgress?.("Checking for Perplexity desktop app...");
 		const nativeJwt = await extractFromNativeApp();
 		if (nativeJwt) {

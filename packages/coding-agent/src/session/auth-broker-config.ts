@@ -16,7 +16,7 @@
  * boot without forcing a startup reorder.
  */
 import * as path from "node:path";
-import { getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
+import { $credentialEnv, getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { resolveConfigValue } from "../config/resolve-config-value";
 
@@ -72,8 +72,15 @@ async function readConfigYaml(): Promise<ConfigSnapshot> {
  * user explicitly asked to use the broker.
  */
 export async function resolveAuthBrokerConfig(): Promise<AuthBrokerClientConfig | null> {
-	const envUrl = process.env.GJC_AUTH_BROKER_URL;
-	const envToken = process.env.GJC_AUTH_BROKER_TOKEN;
+	// Trusted sources only: this URL and token select the credential store the
+	// agent uses for every provider, so whatever can set them can serve the
+	// credentials the agent authenticates with and receive the ones it writes
+	// back. `$env` merges the caller's `cwd/.env`, so reading them there would let
+	// repository content replace the store wholesale. Resolve them the same way
+	// the credentials themselves are: launching shell plus GJC/user-owned `.env`
+	// files, never the project `.env`.
+	const envUrl = $credentialEnv("GJC_AUTH_BROKER_URL");
+	const envToken = $credentialEnv("GJC_AUTH_BROKER_TOKEN");
 
 	let url = envUrl && envUrl.length > 0 ? envUrl : undefined;
 	let configToken: string | undefined;

@@ -56,6 +56,14 @@ tui.requestRender(); // Request a re-render
 tui.onDebug = () => console.log("Debug triggered");
 ```
 
+### Manual viewport and pinned suffix
+
+`setBottomPinnedComponent(component)` marks a direct-child boundary. During manual viewport ownership, that child and all later direct children remain fixed at the bottom while rows before it form the scrollable lane; this does not require an output source. `scrollViewportPages()` moves by the lane height minus one; `scrollViewportBy()` supports smaller row steps and rejects non-finite deltas.
+
+`setViewportOutputSource({ identity, revision })` reports semantic output changes without coupling the TUI to message types. A same-identity revision advance while manually scrolled displays the exact notice `New output — type to follow`; following live or changing/removing the identity clears it, while a stale same-identity revision rollback does not.
+
+Pinned rows and the notice are excluded from transcript mouse-selection coordinates. When the terminal is too short, the focused direct-child suffix component is retained before decorative or lower-priority suffix rows.
+
 ### Component Interface
 
 All components implement:

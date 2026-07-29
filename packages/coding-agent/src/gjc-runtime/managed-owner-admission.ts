@@ -51,7 +51,7 @@ function ownerEnvironment(): {
 	const generation = process.env[MANAGED_OWNER_GENERATION_ENV]?.trim();
 	const runId = process.env[MANAGED_OWNER_RUN_ID_ENV]?.trim();
 	const incarnation = process.env[MANAGED_OWNER_INCARNATION_ENV]?.trim();
-	if (!stateDir && !sessionId && !generation && !runId && !incarnation) return null;
+	if (!stateDir && !generation && !runId && !incarnation) return null;
 	if (!stateDir || !sessionId || !generation || !runId || !incarnation || !path.isAbsolute(stateDir))
 		throw new Error("managed_owner_admission_metadata_invalid");
 	for (const [value, label] of [

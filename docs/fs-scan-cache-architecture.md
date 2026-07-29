@@ -20,9 +20,8 @@ Primary goals:
   - `crates/pi-natives/src/fd.rs` (`fuzzyFind`)
   - `crates/pi-natives/src/grep.rs`
 - JS binding/export:
-  - `packages/natives/src/glob/index.ts` (`invalidateFsScanCache`)
-  - `packages/natives/src/glob/types.ts`
-  - `packages/natives/src/grep/types.ts`
+  - `packages/natives/native/index.js` (`invalidateFsScanCache`)
+  - `packages/natives/native/index.d.ts` (glob and grep option/result types)
 - Coding-agent mutation invalidation helpers:
   - `packages/coding-agent/src/tools/fs-cache-invalidation.ts`
 
@@ -108,7 +107,7 @@ Coding-agent callers today:
   - `packages/coding-agent/src/utils/file-mentions.ts`
   - profile: `hidden=true`, `gitignore=true`, `includeNodeModules=true`, `cache=true`
 - Tool-level `grep` integration currently disables scan cache (`cache: false`):
-  - `packages/coding-agent/src/tools/grep.ts`
+  - `packages/coding-agent/src/tools/search.ts`
 
 ## Invalidation contract
 
@@ -138,7 +137,9 @@ Central helpers:
 Current mutation tool callsites:
 
 - `packages/coding-agent/src/tools/write.ts`
-- `packages/coding-agent/src/patch/index.ts` (hashline/patch/replace flows)
+- `packages/coding-agent/src/edit/modes/patch.ts` (patch flow; uses all three helpers)
+- `packages/coding-agent/src/edit/modes/replace.ts` (replace flow)
+- `packages/coding-agent/src/hashline/execute.ts` (hashline flow)
 
 Rule: if a flow mutates filesystem content or location and bypasses these helpers, cache staleness bugs are expected.
 

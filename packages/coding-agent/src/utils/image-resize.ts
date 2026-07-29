@@ -6,6 +6,7 @@ export interface ImageResizeOptions {
 	maxBytes?: number;
 	jpegQuality?: number;
 	excludeWebP?: boolean;
+	forceReencode?: boolean;
 }
 
 export interface ResizedImage {
@@ -30,6 +31,7 @@ const DEFAULT_OPTIONS: Required<Omit<ImageResizeOptions, "excludeWebP">> = {
 	maxHeight: 1568,
 	maxBytes: DEFAULT_IMAGE_RESIZE_MAX_BYTES,
 	jpegQuality: 80,
+	forceReencode: false,
 };
 
 /**
@@ -94,6 +96,7 @@ export async function resizeImageBuffer(
 			originalWidth <= opts.maxWidth &&
 			originalHeight <= opts.maxHeight &&
 			originalSize <= comfortableSize &&
+			!opts.forceReencode &&
 			!(opts.excludeWebP && sourceMime === "image/webp")
 		) {
 			return {

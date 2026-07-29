@@ -19,6 +19,9 @@ afterEach(async () => {
 function createBashTool(rules: BashInterceptorRule[]): BashTool {
 	const session = {
 		settings: {
+			has(key: string) {
+				return this.get(key) !== undefined;
+			},
 			get(key: string) {
 				if (key === "bashInterceptor.enabled") return true;
 				if (key === "async.enabled") return false;
@@ -92,6 +95,9 @@ describe("BashTool head/tail stripping", () => {
 			getSessionFile: () => null,
 			getSessionId: () => undefined,
 			settings: {
+				has(key: string) {
+					return this.get(key) !== undefined;
+				},
 				get(key: string) {
 					if (key === "bashInterceptor.enabled") return false;
 					if (key === "async.enabled") return false;
@@ -144,6 +150,9 @@ describe("BashTool restricted role-agent allowlist", () => {
 			bashAllowedPrefixes,
 			bashRestrictionProfile,
 			settings: {
+				has(key: string) {
+					return this.get(key) !== undefined;
+				},
 				get(key: string) {
 					if (key === "bashInterceptor.enabled") return false;
 					if (key === "async.enabled") return false;

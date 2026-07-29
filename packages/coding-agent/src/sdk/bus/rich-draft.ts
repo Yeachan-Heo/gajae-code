@@ -88,7 +88,7 @@ export class DraftStreamState {
  */
 export async function deliverDraft(
 	botApi: BotApi,
-	base: { chat_id: string | number; message_thread_id?: number },
+	base: { chat_id: string | number; message_thread_id?: number; disable_notification?: true },
 	draftId: number,
 	raw: string,
 	log?: { warn(msg: string): void },

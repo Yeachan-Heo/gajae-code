@@ -377,12 +377,31 @@ function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): read
 
 const PROCESS_START_ID = randomUUID();
 
+class ManagedSecurityError extends Error {
+	readonly #classification: string;
+
+	constructor(pathname: string, result: NativeSecurity) {
+		const classification = result.ok ? "unexpected_security_state" : result.code;
+		super(
+			result.ok
+				? `Unexpected security state for ${pathname}`
+				: `Owner-only security rejected ${pathname}: ${classification}`,
+		);
+		this.name = "ManagedSecurityError";
+		this.#classification = classification;
+	}
+
+	getClassification(): string {
+		return this.#classification;
+	}
+}
+
+export function managedSecurityFailureClassification(error: unknown): string | undefined {
+	return error instanceof ManagedSecurityError ? error.getClassification() : undefined;
+}
+
 function securityError(pathname: string, result: NativeSecurity): Error {
-	return new Error(
-		result.ok
-			? `Unexpected security state for ${pathname}`
-			: `Owner-only security rejected ${pathname}: ${result.code}`,
-	);
+	return new ManagedSecurityError(pathname, result);
 }
 
 function secure(pathname: string, kind: "directory" | "file"): void {
@@ -453,7 +472,11 @@ export class ManagedSessionDescendantStore {
 	readonly #baseDir: string;
 	readonly #policy: ManagedSessionSecurityPolicy;
 	readonly #authority: RecoveryFsRoot | undefined;
+	#ownsAuthority = false;
+	#closed = false;
 	readonly #authorityBaseDir: string;
+	/** Logical profile root inherited by nested managed session destinations. */
+	readonly #profileAgentDir: string;
 	readonly #subtreeRoot: ManagedDirectoryRoot;
 
 	constructor(
@@ -461,12 +484,14 @@ export class ManagedSessionDescendantStore {
 		baseDir: string,
 		retained?: { authority: RecoveryFsRoot; authorityBaseDir: string },
 		policy?: ManagedSessionSecurityPolicy,
+		profileAgentDir?: string,
 	) {
 		managedRelativePath(root, baseDir);
 
 		this.#root = root;
 		this.#baseDir = path.resolve(baseDir);
 		this.#policy = policy ?? "default";
+		this.#profileAgentDir = profileAgentDir ?? root.canonicalPath;
 		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
 		if (retained) {
 			const relative = path.relative(retained.authorityBaseDir, this.#baseDir).split(path.sep).join("/");
@@ -501,6 +526,7 @@ export class ManagedSessionDescendantStore {
 				throw new Error("Managed descendant root identity changed");
 			}
 			this.#authority = authority;
+			this.#ownsAuthority = true;
 		}
 	}
 
@@ -520,10 +546,15 @@ export class ManagedSessionDescendantStore {
 		return this.#policy;
 	}
 
+	get profileAgentDir(): string {
+		return this.#profileAgentDir;
+	}
+
 	deriveSubtree(relativePath: string): ManagedSessionDescendantStore {
 		const child = this.ensureDirectory(relativePath);
 		const resolved = this.#resolve(relativePath);
-		if (!this.#authority) return new ManagedSessionDescendantStore(this.#root, resolved, undefined, this.#policy);
+		if (!this.#authority)
+			return new ManagedSessionDescendantStore(this.#root, resolved, undefined, this.#policy, this.#profileAgentDir);
 		const retainedChild = this.#authority.retainManagedDirectory(
 			this.#relative(resolved),
 			child.dev.toString(),
@@ -537,6 +568,7 @@ export class ManagedSessionDescendantStore {
 				authorityBaseDir: resolved,
 			},
 			this.#policy,
+			this.#profileAgentDir,
 		);
 	}
 
@@ -547,6 +579,16 @@ export class ManagedSessionDescendantStore {
 			this.#subtreeRoot.dev.toString(),
 			this.#subtreeRoot.ino.toString(),
 		);
+	}
+
+	/**
+	 * Release an authority this store opened itself. Retained authorities are owned by
+	 * the security context that supplied them and are never closed here. Idempotent.
+	 */
+	close(): void {
+		if (this.#closed || !this.#ownsAuthority || !this.#authority) return;
+		this.#closed = true;
+		this.#authority.close();
 	}
 
 	assertBound(): void {

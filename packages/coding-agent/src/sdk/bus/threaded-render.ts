@@ -18,13 +18,13 @@ export interface ThreadedSend {
 	method: "sendMessage" | "sendPhoto" | "sendDocument";
 	/** Rate-limit lane for prioritisation/fairness. */
 	lane: RateLimitLane;
-	/** Message text (sendMessage) or photo caption (sendPhoto). */
+	/** Message text (sendMessage) or media caption (sendPhoto/sendDocument). */
 	text?: string;
 	/** Base64 image bytes for sendPhoto. */
 	photoBase64?: string;
 	/** Base64 file bytes for sendDocument. */
 	documentBase64?: string;
-	/** Image MIME type for sendPhoto. */
+	/** Uploaded media MIME type. */
 	mime?: string;
 	/** Suggested document filename. */
 	fileName?: string;
@@ -98,6 +98,40 @@ interface ThreadedFrame {
 
 function str(v: unknown): string | undefined {
 	return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+function baseMimeType(mime: string): string {
+	return mime.split(";", 1)[0]!.trim().toLowerCase();
+}
+
+export function supportsTelegramPhotoUpload(mime: string | undefined): boolean {
+	if (mime === undefined) return true;
+	const normalized = baseMimeType(mime);
+	return normalized === "image/jpeg" || normalized === "image/png";
+}
+
+function imageDocumentFileName(mime: string | undefined): string {
+	switch (mime === undefined ? "" : baseMimeType(mime)) {
+		case "image/webp":
+			return "image.webp";
+		case "image/gif":
+			return "image.gif";
+		case "image/svg+xml":
+			return "image.svg";
+		case "image/avif":
+			return "image.avif";
+		case "image/bmp":
+		case "image/x-ms-bmp":
+			return "image.bmp";
+		case "image/tiff":
+			return "image.tiff";
+		case "image/heic":
+			return "image.heic";
+		case "image/heif":
+			return "image.heif";
+		default:
+			return "image";
+	}
 }
 
 function isDotOnlyText(value: string): boolean {
@@ -244,11 +278,22 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 			const data = str(frame.data);
 			if (!data) return undefined;
 			const caption = str(frame.caption);
+			const mime = str(frame.mime);
+			if (!supportsTelegramPhotoUpload(mime)) {
+				return {
+					method: "sendDocument",
+					lane: "finalized",
+					documentBase64: data,
+					mime,
+					fileName: imageDocumentFileName(mime),
+					text: finalizeTelegramHtml(caption === undefined ? undefined : escapeHtml(caption)),
+				};
+			}
 			return {
 				method: "sendPhoto",
 				lane: "finalized",
 				photoBase64: data,
-				mime: str(frame.mime),
+				mime,
 				text: finalizeTelegramHtml(caption === undefined ? undefined : escapeHtml(caption)),
 			};
 		}

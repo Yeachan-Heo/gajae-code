@@ -1,0 +1,190 @@
+{
+  "schema": "gjc.deep_interview_telegram_linebreak_evidence.v1",
+  "title": "Deep Interview Telegram multiline ask rendering: PR evidence and adversarial QA",
+  "date": "2026-07-27",
+  "repository_state": {
+    "base_branch": "upstream/dev",
+    "base_commit": "b853f15d7167a49173bc03ef7efe99c5bae8f234",
+    "change_branch": "fix/deep-interview-telegram-linebreaks",
+    "worktree": "../gajae-code-deep-interview-telegram-linebreaks"
+  },
+  "generation_guard": {
+    "base_generation": 30,
+    "generation_bump_required": false,
+    "reason": "The patch changes the rich action Markdown builder in telegram-reference.ts, not a protected Telegram daemon lifecycle symbol.",
+    "current_tree_validation": "pass",
+    "base_head_replay": "pass: telegram-daemon-generation-guard v28 no protected changes",
+    "synthetic_head": "5e692dd4827987cf1966bd00eed6799cb251d22f"
+  },
+  "reported_input": "Deep Interview · Round 4 · Ambiguity 39.5%\nComponent: 칸반·이슈 관리\nTarget: 제약 명확성\nWhy now: 두 사용자가 같은 이슈를 이동하거나 편집할 때 덮어쓰기 규칙이 없으면 상태와 에이전트 실행이 어긋날 수 있어요.\n동일 이슈의 동시 수정 충돌은 어떻게 처리할까요?",
+  "source_trace": [
+    {
+      "location": "packages/coding-agent/src/deep-interview/render-middleware.ts:428-437",
+      "observation": "formatDeepInterviewSelectorPrompt joins title, Component, Target, Why now, and question with literal LF characters. The Deep Interview producer preserves line boundaries."
+    },
+    {
+      "location": "packages/coding-agent/src/tools/ask.ts:1531-1561",
+      "observation": "The formatted question is assigned to displayQuestion and copied into the remote selector request without whitespace flattening."
+    },
+    {
+      "location": "packages/coding-agent/src/sdk/bus/telegram-daemon.ts:8757-8777",
+      "observation": "Default-on rich action delivery sends buildActionMarkdown output through sendRichMessage. HTML is only the explicit-rejection fallback."
+    },
+    {
+      "location": "packages/coding-agent/src/sdk/bus/telegram-reference.ts at base commit",
+      "observation": "The entire multiline question was enclosed in one Markdown strong span with ordinary source newlines: `❓ **${question}**`. Those are Markdown soft breaks, which a rich renderer may display as spaces."
+    }
+  ],
+  "before_after": {
+    "before_markdown": "❓ **Deep Interview · Round 4 · Ambiguity 39.5%\nComponent: 칸반·이슈 관리\nTarget: 제약 명확성\nWhy now: …\n동일 이슈의 동시 수정 충돌은 어떻게 처리할까요?**",
+    "before_commonmark_replay": "Marked 18.0.6 parsed the source newlines inside one paragraph without <br> elements.",
+    "after_markdown": "❓ **Deep Interview · Round 4 · Ambiguity 39.5%**  \n**Component: 칸반·이슈 관리**  \n**Target: 제약 명확성**  \n**Why now: …**  \n**동일 이슈의 동시 수정 충돌은 어떻게 처리할까요?**",
+    "after_commonmark_replay": "Marked 18.0.6 parsed each two-space newline as <br> while retaining strong emphasis per logical line.",
+    "implementation": "Normalize LF, CRLF, and lone CR into logical lines; trim trailing horizontal whitespace so emphasis delimiters remain valid; emphasize nonblank lines independently; join lines with Markdown hard-break syntax.",
+    "scope": "Only rich ask Markdown generation changes. buildActionMessage, HTML escaping/chunking, reply markup, callback routing, protocol frames, and fallback policy are unchanged."
+  },
+  "adversarial_matrix": [
+    {
+      "case": "LF / CRLF / lone CR",
+      "status": "covered",
+      "evidence": "Table-driven exact-output unit test requires all three inputs to produce the same LF hard-break wire output."
+    },
+    {
+      "case": "Blank and whitespace-only lines; trailing tab/space",
+      "status": "covered",
+      "evidence": "Exact-output unit test verifies trailing whitespace is removed before closing emphasis and blank logical lines do not create malformed `**  **` spans."
+    },
+    {
+      "case": "Single-line compatibility",
+      "status": "covered",
+      "evidence": "Exact assertion preserves `❓ **Proceed?**\\n\\n(reply with text)`."
+    },
+    {
+      "case": "Default-on rich accepted path with Korean Deep Interview text, options, recommendation, keyboard, and reply routing",
+      "status": "covered",
+      "evidence": "Daemon integration test asserts one exact sendRichMessage Markdown payload, zero sendMessage calls, unchanged two-button keyboard, thread id, callback route, and free-text reply route."
+    },
+    {
+      "case": "Explicit rich rejection and HTML fallback",
+      "status": "covered by unchanged existing suite",
+      "evidence": "Existing G004 tests assert one rich attempt, HTML fallback, final-chunk keyboard, and reply routing. No duplicate multiline-only test was added."
+    },
+    {
+      "case": "Ambiguous rich transport outcome",
+      "status": "covered by unchanged existing suite",
+      "evidence": "Existing rich-render tests enforce no duplicate HTML fallback after an uncertain outcome."
+    },
+    {
+      "case": "Embedded Markdown controls",
+      "status": "not expanded",
+      "evidence": "Questions were already raw Markdown before this change. Escaping remains a separate contract; delimiter-sensitive inputs such as leading indentation or a trailing backslash were not evaluated and are outside this fix."
+    },
+    {
+      "case": "Long-message and HTML chunk limits",
+      "status": "not directly affected",
+      "evidence": "Rich eligibility/fallback and splitTelegramHtml are unchanged and retain their existing stress coverage."
+    }
+  ],
+  "independent_reviews": [
+    {
+      "review": "adversarial red-team",
+      "initial_verdict": "BLOCK",
+      "blocking_findings": [
+        "lone CR was not normalized",
+        "blank/whitespace-only lines and trailing whitespace could produce invalid per-line emphasis",
+        "single-line and daemon accepted-path evidence was missing"
+      ],
+      "resolution": "All three findings were addressed with line-ending normalization, trimEnd plus blank-line handling, exact boundary tests, and an exact daemon sendRichMessage integration assertion."
+    },
+    {
+      "review": "architecture review",
+      "initial_verdict": "BLOCK",
+      "blocking_findings": [
+        "daemon expectation needed to match the independently emphasized payload",
+        "artifact overstated Telegram-client rendering certainty",
+        "boundary evidence was incomplete"
+      ],
+      "resolution": "Daemon expectation is exact, boundary tests were added, and this report now distinguishes GFM/Marked evidence from unobserved real-client rendering."
+    },
+    {
+      "review": "final PR critic",
+      "initial_verdict": "REQUEST_CHANGES",
+      "blocking_findings": [
+        "the multiline daemon test explicitly enabled rich mode instead of proving the default-unset configuration"
+      ],
+      "resolution": "The daemon helper now permits an omitted rich option, and the exact multiline accepted-path scenario leaves rich unset while retaining payload, keyboard, callback, and free-text routing assertions."
+    },
+    {
+      "review": "post-fix critic",
+      "verdict": "APPROVE",
+      "blocking_findings": [],
+      "resolution": "Confirmed the default-unset rich branch and all exact payload, keyboard, callback, thread, message-route, and free-text routing assertions match the final diff."
+    },
+    {
+      "review": "latest-dev adversarial critic",
+      "initial_verdict": "REQUEST_CHANGES",
+      "blocking_findings": [
+        "the artifact overstated unevaluated embedded Markdown delimiter behavior"
+      ],
+      "resolution": "Removed the no-worsening claim and explicitly scoped leading indentation and trailing backslash as unevaluated."
+    },
+    {
+      "review": "latest-dev evidence recheck",
+      "verdict": "APPROVE",
+      "blocking_findings": [],
+      "resolution": "Confirmed the corrected delimiter scope, exact production delta, and no remaining source, test, or evidence blocker."
+    }
+  ],
+  "verification": [
+    {
+      "command": "bun test packages/coding-agent/test/notifications-telegram-reference.test.ts packages/coding-agent/test/notifications-rich-render.test.ts packages/coding-agent/test/notifications-telegram-daemon.test.ts packages/coding-agent/test/modes/components/deep-interview-render-middleware.test.ts",
+      "result": "pass: 564 tests, 0 failures, 2116 assertions"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run check:types",
+      "result": "pass"
+    },
+    {
+      "command": "bunx biome check packages/coding-agent/src/sdk/bus/telegram-reference.ts packages/coding-agent/test/notifications-telegram-reference.test.ts packages/coding-agent/test/notifications-telegram-daemon.test.ts",
+      "result": "pass"
+    },
+    {
+      "command": "git diff --check",
+      "result": "pass"
+    },
+    {
+      "command": "bun run build",
+      "result": "pass on the rebased latest dev: all workspace builds completed, including native 0.11.11 and dist/gjc"
+    },
+    {
+      "command": "bun run check:rs",
+      "result": "pass"
+    },
+    {
+      "command": "LANG=C LC_ALL=C bun run ci:check:full",
+      "result": "pass: tool lint/types, publish declarations, Node 20 baseline, public version sync, schemas, Docker context, GJC UI/rebrand, and all workspace checks"
+    },
+    {
+      "command": "bun run ci:test:smoke",
+      "result": "pass: CLI version, help, stats help, and --smoke-test"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent scripts/generate-telegram-baseline-manifest.ts --check",
+      "result": "pass"
+    },
+    {
+      "command": "LANG=C LC_ALL=C bun run check:ts",
+      "result": "failed after all 570 SDK adapter manifest rows completed because notifications-config.test.ts expected a subagent SDK endpoint not to exist; the exact test also fails on an unmodified dev worktree"
+    }
+  ],
+  "limitations": [
+    "No live bot token or Telegram client was used, so visual retention in a real Telegram client is not claimed as directly observed.",
+    "Telegram documents Rich Markdown as GFM-compatible where possible but does not explicitly specify this exact hard-break rendering case. The fix is supported by emitted-wire assertions and a Marked 18.0.6 CommonMark/GFM replay, not by a screenshot from Telegram production.",
+    "The current Bot API documentation is 10.2, while the repository pins its outgoing rich-message contract fixture to 10.1. The new 10.2 block API was deliberately not adopted because that would broaden this bug fix and change the pinned wire contract."
+  ],
+  "pr_readiness": {
+    "status": "ready after final rerun",
+    "production_delta": "one line replaced by six lines in the existing rich ask builder; no new runtime module or abstraction",
+    "review_delta": "boundary unit tests, one strengthened existing daemon integration test, and this evidence artifact"
+  }
+}

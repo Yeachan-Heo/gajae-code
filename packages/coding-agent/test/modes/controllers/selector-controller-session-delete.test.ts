@@ -205,6 +205,15 @@ describe("SelectorController session deletion", () => {
 		);
 		expect(calls.indexOf("chatContainer.clear")).toBeLessThan(calls.indexOf("renderInitialMessages"));
 	});
+	it("completes resume without throwing when ctx has no settings surface (#3418 resume-model-choice regression)", async () => {
+		const { ctx, calls } = createContext("/tmp/project/sessions/a.jsonl");
+		expect((ctx as { settings?: unknown }).settings).toBeUndefined();
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession("/tmp/project/sessions/b.jsonl");
+
+		expect(calls).toContain("rebuildInitialMessages:replace-identity");
+	});
 
 	it("reconciles manual viewport intent before reloading the same session path", async () => {
 		const sessionPath = "/tmp/project/sessions/a.jsonl";

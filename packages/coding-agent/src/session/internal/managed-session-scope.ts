@@ -33,6 +33,7 @@ import {
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
+	managedSecurityFailureClassification,
 	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedTombstone,
@@ -873,21 +874,44 @@ function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
 	return message === "mode_mismatch" || message.endsWith(": mode_mismatch");
 }
 
+type ManagedScopePrepareStage =
+	| "retained_identity"
+	| "root_authority"
+	| "sessions_root"
+	| "scope_directory"
+	| "scope_identity"
+	| "retained_authority"
+	| "store"
+	| "binding_publish"
+	| "binding_read"
+	| "binding_validate"
+	| "scope_revalidate"
+	| "internal_directory"
+	| "locks_directory"
+	| "receipts_directory"
+	| "tombstones_directory";
+
 /** Synchronously create and validate the v2 binding before a default session writer exists. */
 export function prepareManagedSessionScopeForWriteSync(
 	scope: ManagedScope,
 	policy: ManagedSessionSecurityPolicy = "default",
 	authority?: ManagedCandidateWriteAuthority,
 ): ManagedScopeResolution {
+	let stage: ManagedScopePrepareStage = "retained_identity";
 	try {
 		assertRetainedManagedDirectoryIdentity(scope);
+		stage = "root_authority";
 		const root = authority?.rootAuthority ?? scopeRoot(scope, policy);
 		if (authority) bindManagedWriteAuthority(scope, authority);
+		stage = "sessions_root";
 		ensureManagedDirectory(scope.sessionsRoot, root, policy);
+		stage = "scope_directory";
 		ensureManagedDirectory(scope.directoryPath, root, policy);
+		stage = "scope_identity";
 		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink())
 			throw new Error("Managed session directory changed");
+		stage = "retained_authority";
 		const retainedAuthority =
 			authority?.retainedAuthority &&
 			authority.retainedDirectory !== undefined &&
@@ -904,6 +928,7 @@ export function prepareManagedSessionScopeForWriteSync(
 				retainedAuthority ? { authority: retainedAuthority, authorityBaseDir: scope.directoryPath } : undefined,
 				policy,
 			);
+		stage = "store";
 		let store: ManagedSessionDescendantStore;
 		try {
 			store = buildStore();
@@ -917,15 +942,19 @@ export function prepareManagedSessionScopeForWriteSync(
 			store = buildStore();
 		}
 		const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
+		stage = "binding_publish";
 		try {
 			store.publishNoReplaceSync(MANAGED_SESSION_BINDING_FILE, binding);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
+		stage = "binding_read";
 		const capturedBinding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
 		if (!capturedBinding) throw new Error("Managed scope binding is unavailable");
+		stage = "binding_validate";
 		const validated = validateBindingRaw(scope, capturedBinding.bytes.toString("utf8"));
 		managedDirectoryAuthorities.set(scope, retainedAuthority);
+		stage = "scope_revalidate";
 		const directoryStat = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (
 			!directoryStat.isDirectory() ||
@@ -935,11 +964,21 @@ export function prepareManagedSessionScopeForWriteSync(
 		)
 			throw new Error("Managed session directory changed");
 		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
-		if (validated) return validated;
+		if (validated) {
+			if (validated.kind !== "error") throw new Error("Unexpected managed scope binding result");
+			return {
+				...validated,
+				cause: { classification: validated.code, diagnostic: "prepare:binding_validate" },
+			};
+		}
 		const internal = managedInternalDirectory(scope);
+		stage = "internal_directory";
 		ensureManagedDirectory(internal, root, policy);
+		stage = "locks_directory";
 		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root, policy);
+		stage = "receipts_directory";
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
+		stage = "tombstones_directory";
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		return { kind: "resolved", scope };
 	} catch (error) {
@@ -954,15 +993,14 @@ export function prepareManagedSessionScopeForWriteSync(
 			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
+		const securityClassification = managedSecurityFailureClassification(error);
 		return {
 			kind: "error",
 			code,
 			message,
-			...(publication
-				? { cause: { classification: publication.classification, diagnostic: publication.diagnostic } }
-				: code === "binding_invalid"
-					? {}
-					: { cause: { classification: code } }),
+			cause: publication
+				? { classification: publication.classification, diagnostic: publication.diagnostic }
+				: { classification: securityClassification ?? code, diagnostic: `prepare:${stage}` },
 		};
 	}
 }

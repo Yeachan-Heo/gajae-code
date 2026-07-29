@@ -214,8 +214,11 @@ function createOpenAICompletionsSuccessResponse(modelId: string): Response {
 }
 
 async function expectFirstEventTimeout(
-	run: (streamFirstEventTimeoutMs: number) => Promise<{ stopReason: string; errorMessage?: string }>,
+	run: (
+		streamFirstEventTimeoutMs: number,
+	) => Promise<{ stopReason: string; errorMessage?: string; transportFailure?: { providerCode?: string } }>,
 	expectedMessage: string,
+	expectedProviderCode?: string,
 ): Promise<void> {
 	global.fetch = createHangingFetch();
 
@@ -223,6 +226,7 @@ async function expectFirstEventTimeout(
 
 	expect(result.stopReason).toBe("error");
 	expect(result.errorMessage).toBe(expectedMessage);
+	if (expectedProviderCode) expect(result.transportFailure?.providerCode).toBe(expectedProviderCode);
 }
 
 async function expectCallerAbort(
@@ -274,6 +278,7 @@ describe("OpenAI-family first-event timeouts", () => {
 					streamFirstEventTimeoutMs,
 				}).result(),
 			"OpenAI responses stream timed out while waiting for the first event",
+			"stream_first_event_timeout",
 		);
 	});
 
@@ -308,6 +313,7 @@ describe("OpenAI-family first-event timeouts", () => {
 					streamFirstEventTimeoutMs,
 				}).result(),
 			"OpenAI completions stream timed out while waiting for the first event",
+			"stream_first_event_timeout",
 		);
 	});
 
@@ -321,6 +327,7 @@ describe("OpenAI-family first-event timeouts", () => {
 					streamFirstEventTimeoutMs,
 				}).result(),
 			"Azure OpenAI responses stream timed out while waiting for the first event",
+			"stream_first_event_timeout",
 		);
 	});
 

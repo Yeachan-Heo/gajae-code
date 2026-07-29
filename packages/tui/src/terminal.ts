@@ -9,6 +9,33 @@ const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 
 /**
+ * Capability-probe reply shapes that only this layer solicits (OSC 11 background
+ * color, the Mode 2031 appearance DSR, and the Kitty keyboard-flags report).
+ * These are terminal-to-host replies and are NEVER legitimate user input, so a
+ * reply that arrives outside its pending-query window is dropped defensively.
+ *
+ * DA1 is deliberately absent: `Tui` issues its own DA1 request for the sixel
+ * probe and consumes that reply downstream.
+ */
+export const PROBE_REPLY_PATTERNS: ReadonlyArray<{ name: string; issuedProbe: string; pattern: RegExp }> = [
+	{
+		name: "osc11-background",
+		issuedProbe: "\x1b]11;?\x07",
+		pattern: /^\x1b\]11;rgba?:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}(?:\x07|\x1b\\)$/,
+	},
+	{ name: "mode2031-dsr", issuedProbe: "\x1b[?2031h", pattern: /^\x1b\[\?997;[12]n$/ },
+	{ name: "kitty-flags", issuedProbe: "\x1b[?u", pattern: /^\x1b\[\?\d+u$/ },
+];
+
+/** True when `sequence` is one of the probe replies above. */
+export function isUnsolicitedProbeReply(sequence: string): boolean {
+	for (const entry of PROBE_REPLY_PATTERNS) {
+		if (entry.pattern.test(sequence)) return true;
+	}
+	return false;
+}
+
+/**
  * Whether GJC may reprogram the keyboard with enhanced input protocols
  * (the Kitty keyboard protocol and the xterm modifyOtherKeys fallback).
  *
@@ -222,6 +249,10 @@ export class ProcessTerminal implements Terminal {
 	#privateCsiResponseBuffer = "";
 	#pendingDa1Sentinels = 0;
 	#osc11PollTimer?: Timer;
+	// Bounds the OSC 11 / DA1 pending-query window so a dropped or mangled reply
+	// (multiplexer, TERM=dumb host) cannot latch #osc11Pending forever and freeze
+	// stdin.
+	#osc11QueryWatchdog?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
 	#mouseEnabled = false;
@@ -318,6 +349,7 @@ export class ProcessTerminal implements Terminal {
 		// When the terminal reports a change, we re-query OSC 11 to get the
 		// actual background color (following Neovim convention) with 100ms debounce.
 		this.#safeWrite("\x1b[?2031h");
+		this.#stdinBuffer?.noteProbeIssued();
 
 		// Start periodic OSC 11 re-query for terminals without Mode 2031
 		// (Warp, Alacritty, WezTerm, iTerm2). Self-disables once Mode 2031 fires.
@@ -415,10 +447,11 @@ export class ProcessTerminal implements Terminal {
 			// flush timeout elapses mid-sequence, the prefix `\x1b[?<digits>` arrives as
 			// one event and the tail `;...<terminator>` arrives as individual character
 			// events that would otherwise leak into the prompt as keystrokes. See #1238.
-			if (
-				this.#privateCsiResponseBuffer ||
-				(privateCsiPartialPattern.test(sequence) && this.#pendingDa1Sentinels > 0)
-			) {
+			// Reassembly is keyed on the reply's shape, not on `#pendingDa1Sentinels`:
+			// replies the terminal still owed after a counter reset (stop()/start()
+			// around a foreground command) otherwise leaked into the editor one
+			// character at a time. No keystroke can produce this prefix.
+			if (this.#privateCsiResponseBuffer || privateCsiPartialPattern.test(sequence)) {
 				if (this.#privateCsiResponseBuffer && sequence.startsWith("\x1b")) {
 					// New escape arrived mid-reassembly — abandon partial and re-process the new sequence.
 					this.#privateCsiResponseBuffer = "";
@@ -491,7 +524,7 @@ export class ProcessTerminal implements Terminal {
 			// Accumulate fragments until the BEL/ST terminator arrives, then parse once.
 			// If a new escape sequence arrives (not the ST terminator), abort buffering
 			// and forward it as normal input so user keystrokes are never swallowed.
-			if (this.#osc11Pending && (this.#osc11ResponseBuffer || sequence.startsWith("\x1b]11;"))) {
+			if (this.#osc11ResponseBuffer || sequence.startsWith("\x1b]11;")) {
 				if (this.#osc11ResponseBuffer && sequence.startsWith("\x1b") && sequence !== "\x1b\\") {
 					// New escape sequence arrived mid-buffer — not an OSC 11 continuation.
 					this.#osc11ResponseBuffer = "";
@@ -499,12 +532,25 @@ export class ProcessTerminal implements Terminal {
 				} else {
 					this.#osc11ResponseBuffer += sequence;
 					const osc11Match = this.#osc11ResponseBuffer.match(osc11ResponsePattern);
-					if (!osc11Match) return;
-					const [, rHex, gHex, bHex] = osc11Match;
-					this.#osc11Pending = false;
-					this.#osc11ResponseBuffer = "";
-					this.#handleOsc11Response(rHex!, gHex!, bHex!);
-					return;
+					if (osc11Match) {
+						const [, rHex, gHex, bHex] = osc11Match;
+						this.#osc11Pending = false;
+						this.#osc11ResponseBuffer = "";
+						this.#clearOsc11QueryWatchdog();
+						this.#handleOsc11Response(rHex!, gHex!, bHex!);
+						return;
+					}
+					// Bound the reassembly buffer. A real reply is <= ~25 bytes; if the
+					// terminator is dropped or mangled (multiplexer, TERM=dumb) an unbounded
+					// buffer swallows every following keystroke and freezes input. Past the
+					// cap, abandon reassembly and let the sequence fall through as input.
+					if (this.#osc11ResponseBuffer.length > 64) {
+						this.#osc11Pending = false;
+						this.#osc11ResponseBuffer = "";
+						this.#clearOsc11QueryWatchdog();
+					} else {
+						return;
+					}
 				}
 			}
 
@@ -518,6 +564,13 @@ export class ProcessTerminal implements Terminal {
 					this.#mode2031DebounceTimer = undefined;
 					this.#queryBackgroundColor();
 				}, 100);
+				return;
+			}
+			// Defensive backstop. A capability-probe reply reaching this point arrived
+			// outside its pending-query window, so none of the handlers above consumed
+			// it. These shapes are never user input, and paste content never reaches
+			// this handler, so dropping is always safe.
+			if (isUnsolicitedProbeReply(sequence)) {
 				return;
 			}
 			if (this.#inputHandler) {
@@ -562,6 +615,39 @@ export class ProcessTerminal implements Terminal {
 		this.#pendingDa1Sentinels++;
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
+		this.#stdinBuffer?.noteProbeIssued();
+		this.#armOsc11QueryWatchdog();
+	}
+
+	/**
+	 * OSC 11 pending-query watchdog. If neither the OSC 11 reply nor its DA1
+	 * sentinel comes back (dropped by a multiplexer or a TERM=dumb host),
+	 * #osc11Pending / #pendingDa1Sentinels latch forever: #queryBackgroundColor
+	 * stops re-querying and the reassembly branch swallows keystrokes.
+	 * Force-resolve the cycle after a bounded wait so the state machine self-heals.
+	 */
+	#armOsc11QueryWatchdog(): void {
+		this.#clearOsc11QueryWatchdog();
+		this.#osc11QueryWatchdog = setTimeout(() => {
+			this.#osc11QueryWatchdog = undefined;
+			if (this.#dead) return;
+			if (!this.#osc11Pending && this.#pendingDa1Sentinels === 0) return;
+			this.#osc11Pending = false;
+			this.#osc11ResponseBuffer = "";
+			this.#pendingDa1Sentinels = 0;
+			if (this.#osc11QueryQueued && !this.#dead) {
+				this.#osc11QueryQueued = false;
+				this.#startOsc11Query();
+			}
+		}, 1000);
+		this.#osc11QueryWatchdog.unref?.();
+	}
+
+	#clearOsc11QueryWatchdog(): void {
+		if (this.#osc11QueryWatchdog) {
+			clearTimeout(this.#osc11QueryWatchdog);
+			this.#osc11QueryWatchdog = undefined;
+		}
 	}
 	/**
 	 * Parse an OSC 11 background color response and compute BT.601 luminance.
@@ -631,6 +717,7 @@ export class ProcessTerminal implements Terminal {
 			return;
 		}
 		this.#safeWrite("\x1b[?u");
+		this.#stdinBuffer?.noteProbeIssued();
 		// Windows Terminal and conhost do not implement the Kitty keyboard
 		// protocol, so the query above never activates it there. They do honor the
 		// modifyOtherKeys fallback below — but that mode breaks Windows CJK/Hangul

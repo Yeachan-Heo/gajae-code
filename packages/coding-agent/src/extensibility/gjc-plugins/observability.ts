@@ -33,8 +33,8 @@ function statusFor(
 	quarantinedIds: Map<string, string>,
 ): { status: PluginSurfaceStatus; quarantineCode?: string } {
 	const q =
-		quarantinedIds.get(`${entry.name}\u0000${extensionId}`) ??
-		quarantinedIds.get(`${entry.name}\u0000plugin:${entry.name}`);
+		quarantinedIds.get(`${entry.scope}\u0000${entry.name}\u0000${extensionId}`) ??
+		quarantinedIds.get(`${entry.scope}\u0000${entry.name}\u0000plugin:${entry.name}`);
 	if (q) return { status: "quarantined", quarantineCode: q };
 	if (!entry.enabled || entry.disabledSurfaceIds.includes(extensionId)) return { status: "disabled" };
 	return { status: "enabled" };
@@ -76,7 +76,7 @@ export async function summarizeGjcPluginObservability(cwd: string): Promise<Plug
 	}
 	const { quarantine } = validateSessionBundles(effective, {}, preQuarantine);
 	const quarantinedIds = new Map<string, string>();
-	for (const q of quarantine) quarantinedIds.set(`${q.plugin}\u0000${q.surfaceId}`, q.code);
+	for (const q of quarantine) quarantinedIds.set(`${q.identity.scope}\u0000${q.plugin}\u0000${q.surfaceId}`, q.code);
 
 	const surfaces: PluginSurfaceRow[] = [];
 	for (const entry of effective) surfaces.push(...rowsForEntry(entry, quarantinedIds));

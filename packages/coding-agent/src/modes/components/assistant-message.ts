@@ -84,8 +84,10 @@ export class AssistantMessageComponent extends Container {
 	#lastMessage?: AssistantMessage;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
 	#usageInfo?: Usage;
-	#convertedKittyImages = new Map<string, ImageContent>();
-	#kittyConversionsInFlight = new Set<string>();
+	#convertedKittyImages = new Map<string, ImageContent & { source: string }>();
+	#kittyConversionsInFlight = new Map<string, string>();
+	#toolImageGenerations = new Map<string, number>();
+
 	#responseHeader = new Text(theme.bold(theme.fg("statusLineModel", "gajae")), 1, 0);
 	#contentBlocksCache = new WeakMap<object, { source: string; component: Component }>();
 	#lastStreaming = false;
@@ -94,11 +96,17 @@ export class AssistantMessageComponent extends Container {
 	#nextContentBlockKey = 0;
 	#reusableChildren = new WeakSet<Component>();
 	#viewportAnchorId?: string;
+	#visibleSignature = "";
+	#visibleSignatureInitialized = false;
+	#toolImagesRevision = 0;
+	#convertedToolImagesRevision = 0;
+	#disposed = false;
 	constructor(
 		message?: AssistantMessage,
 		private hideThinkingBlock = false,
 		private readonly onImageUpdate?: () => void,
 		viewportAnchorId?: string,
+		private readonly onVisibleMutation?: () => void,
 	) {
 		super();
 		this.#viewportAnchorId = viewportAnchorId;
@@ -109,6 +117,56 @@ export class AssistantMessageComponent extends Container {
 		if (message) {
 			this.updateContent(message);
 		}
+		this.#visibleSignature = this.#visibleContentSignature();
+		this.#visibleSignatureInitialized = true;
+	}
+
+	#visibleContentSignature(): string {
+		const message = this.#lastMessage;
+		const content: string[] = [];
+		let hasMarkdownContent = false;
+		for (const block of message?.content ?? []) {
+			if (block.type === "text" && block.text.trim()) {
+				content.push(`text:${block.text.trim()}`);
+				hasMarkdownContent = true;
+			} else if (block.type === "thinking" && block.thinking.trim()) {
+				content.push(
+					this.hideThinkingBlock
+						? "thinking"
+						: `thinking:${elideRunawayThinkingRepetition(block.thinking.trim())}`,
+				);
+				if (!this.hideThinkingBlock) hasMarkdownContent = true;
+			}
+		}
+		if (hasMarkdownContent) {
+			content.unshift(this.#lastStreaming ? "streaming" : "final");
+		}
+		const hasToolCalls = message?.content.some(block => block.type === "toolCall") ?? false;
+		if (!hasToolCalls && message?.stopReason === "aborted" && !isSilentAbort(message.errorMessage)) {
+			content.push(`aborted:${message.errorMessage ?? ""}`);
+		} else if (!hasToolCalls && message?.stopReason === "error") {
+			content.push(`error:${message.errorMessage ?? ""}`);
+		} else if (
+			message?.errorMessage &&
+			!isSilentAbort(message.errorMessage) &&
+			message.stopReason !== "aborted" &&
+			message.stopReason !== "error"
+		) {
+			content.push(`message-error:${message.errorMessage}`);
+		}
+		if (settings.get("display.showTokenUsage") && this.#usageInfo) {
+			const usage = this.#usageInfo;
+			content.push(`usage:${usage.input}:${usage.cacheWrite}:${usage.output}:${usage.cacheRead}`);
+		}
+		content.push(`images:${this.#toolImagesRevision}:${this.#convertedToolImagesRevision}`);
+		return content.join("\u0000");
+	}
+
+	#notifyVisibleMutation(): void {
+		const after = this.#visibleContentSignature();
+		if (after === this.#visibleSignature) return;
+		this.#visibleSignature = after;
+		if (this.#visibleSignatureInitialized) this.onVisibleMutation?.();
 	}
 
 	#contentAnchorSource(
@@ -126,22 +184,36 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	setHideThinkingBlock(hide: boolean): void {
+		if (this.hideThinkingBlock === hide) return;
 		this.hideThinkingBlock = hide;
+		this.#notifyVisibleMutation();
 	}
 
 	setToolResultImages(toolCallId: string, images: ImageContent[]): void {
 		if (!toolCallId) return;
 		const validImages = images.filter(img => img.type === "image" && img.data && img.mimeType);
+		const previousImages = this.#toolImagesByCallId.get(toolCallId);
+		if (
+			(previousImages?.length ?? 0) === validImages.length &&
+			(previousImages?.every(
+				(image, index) =>
+					image.type === validImages[index]?.type &&
+					image.data === validImages[index]?.data &&
+					image.mimeType === validImages[index]?.mimeType,
+			) ??
+				true)
+		) {
+			return;
+		}
 		for (const key of Array.from(this.#convertedKittyImages.keys())) {
-			if (key.startsWith(`${toolCallId}:`)) {
-				this.#convertedKittyImages.delete(key);
-			}
+			if (key.startsWith(`${toolCallId}:`)) this.#convertedKittyImages.delete(key);
 		}
-		for (const key of Array.from(this.#kittyConversionsInFlight)) {
-			if (key.startsWith(`${toolCallId}:`)) {
-				this.#kittyConversionsInFlight.delete(key);
-			}
+		for (const key of Array.from(this.#kittyConversionsInFlight.keys())) {
+			if (key.startsWith(`${toolCallId}:`)) this.#kittyConversionsInFlight.delete(key);
 		}
+		this.#toolImageGenerations.set(toolCallId, (this.#toolImageGenerations.get(toolCallId) ?? 0) + 1);
+
+		this.#toolImagesRevision += 1;
 		if (validImages.length === 0) {
 			this.#toolImagesByCallId.delete(toolCallId);
 		} else {
@@ -153,30 +225,49 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
+	#toolImageSource(image: ImageContent): string {
+		return `${image.mimeType}\u0000${image.data}`;
+	}
+
 	#convertToolImagesForKitty(toolCallId: string, images: ImageContent[]): void {
 		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return;
-		for (let index = 0; index < images.length; index++) {
-			const image = images[index];
-			if (!image || image.mimeType === "image/png") continue;
+		const generation = this.#toolImageGenerations.get(toolCallId) ?? 0;
+		for (const [index, image] of images.entries()) {
+			if (image.mimeType === "image/png") continue;
 			const key = `${toolCallId}:${index}`;
-			if (this.#convertedKittyImages.has(key) || this.#kittyConversionsInFlight.has(key)) continue;
-			this.#kittyConversionsInFlight.add(key);
+			const source = this.#toolImageSource(image);
+			if (
+				this.#convertedKittyImages.get(key)?.source === source ||
+				this.#kittyConversionsInFlight.get(key) === source
+			)
+				continue;
+			this.#kittyConversionsInFlight.set(key, source);
 			new Bun.Image(Buffer.from(image.data, "base64"))
 				.png()
 				.toBase64()
 				.then(data => {
+					const currentImage = this.#toolImagesByCallId.get(toolCallId)?.[index];
+					if (
+						this.#disposed ||
+						this.#toolImageGenerations.get(toolCallId) !== generation ||
+						this.#kittyConversionsInFlight.get(key) !== source ||
+						!currentImage ||
+						this.#toolImageSource(currentImage) !== source
+					)
+						return;
 					this.#kittyConversionsInFlight.delete(key);
-					this.#convertedKittyImages.set(key, {
-						type: "image",
-						data,
-						mimeType: "image/png",
-					});
-					if (this.#lastMessage) {
-						this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
-					}
+					this.#convertedKittyImages.set(key, { type: "image", data, mimeType: "image/png", source });
+					this.#convertedToolImagesRevision += 1;
+					if (this.#lastMessage) this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
 					this.onImageUpdate?.();
 				})
 				.catch(() => {
+					if (
+						this.#disposed ||
+						this.#toolImageGenerations.get(toolCallId) !== generation ||
+						this.#kittyConversionsInFlight.get(key) !== source
+					)
+						return;
 					this.#kittyConversionsInFlight.delete(key);
 				});
 		}
@@ -487,5 +578,15 @@ export class AssistantMessageComponent extends Container {
 		}
 
 		this.#reconcileChildren(descriptors);
+		this.#notifyVisibleMutation();
+	}
+
+	override dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#toolImageGenerations.clear();
+		this.#kittyConversionsInFlight.clear();
+		this.#convertedKittyImages.clear();
+		super.dispose();
 	}
 }

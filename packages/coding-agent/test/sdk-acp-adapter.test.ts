@@ -6,6 +6,7 @@ class FakeSdkClient {
 	frames: Record<string, unknown>[] = [];
 	listeners = new Set<(frame: Record<string, unknown>) => void>();
 	reconnectFailedListeners = new Set<(error: Error) => void>();
+	reconnectListeners = new Set<() => void>();
 	async control(operation: string, input: Record<string, unknown>) {
 		this.frames.push({ type: "control_request", operation, input });
 		return { ok: true };
@@ -29,8 +30,9 @@ class FakeSdkClient {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
 	}
-	onReconnect(_listener: () => void) {
-		return () => {};
+	onReconnect(listener: () => void) {
+		this.reconnectListeners.add(listener);
+		return () => this.reconnectListeners.delete(listener);
 	}
 	onReconnectFailed(listener: (error: Error) => void) {
 		this.reconnectFailedListeners.add(listener);
@@ -39,6 +41,9 @@ class FakeSdkClient {
 	async connect() {}
 	emit(frame: Record<string, unknown>) {
 		for (const listener of this.listeners) listener(frame);
+	}
+	emitReconnect() {
+		for (const listener of this.reconnectListeners) listener();
 	}
 	emitReconnectFailure(error: Error) {
 		for (const listener of this.reconnectFailedListeners) listener(error);
@@ -232,13 +237,19 @@ test("ACP reverse dispatch requires exact current lease ownership and rejects in
 test("ACP reverse cancellation remains terminal after its tombstone TTL while the callback is still running", async () => {
 	const sdk = new FakeSdkClient();
 	const callback = Promise.withResolvers<unknown>();
+	let cancellationSignal: AbortSignal | undefined;
 	const adapter = new AcpSdkAdapter({
 		url: "ws://unused",
 		token: "secret",
 		client: sdk as never,
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		reverseCancelTtlMs: 5,
-		connection: { request: async () => await callback.promise },
+		connection: {
+			request: async (_method, _params, options) => {
+				cancellationSignal = options?.cancellationSignal;
+				return await callback.promise;
+			},
+		},
 	});
 	await adapter.start();
 	try {
@@ -251,6 +262,7 @@ test("ACP reverse cancellation remains terminal after its tombstone TTL while th
 			payload: { method: "ui.select", payload: {} },
 		});
 		sdk.emit({ type: "reverse_cancel", id: "slow-cancelled" });
+		expect(cancellationSignal?.aborted).toBe(true);
 		await Bun.sleep(10);
 		callback.resolve({ selected: "yes" });
 		await Bun.sleep(0);
@@ -260,6 +272,40 @@ test("ACP reverse cancellation remains terminal after its tombstone TTL while th
 	}
 });
 
+test("ACP provider reclaim aborts reverse requests owned by the previous SDK connection", async () => {
+	const sdk = new FakeSdkClient();
+	let cancellationSignal: AbortSignal | undefined;
+	const adapter = new AcpSdkAdapter({
+		url: "ws://unused",
+		token: "secret",
+		client: sdk as never,
+		providers: [{ capability: "ui", definitions: [] }],
+		connection: {
+			request: async (_method, _params, options) => {
+				cancellationSignal = options?.cancellationSignal;
+				return await new Promise<never>(() => {});
+			},
+		},
+	});
+	await adapter.start();
+	try {
+		sdk.emit({
+			type: "reverse_request",
+			id: "reconnect-abort",
+			connectionId: sdk.connectionId,
+			capability: "ui",
+			leaseId: "lease-1",
+			payload: { method: "ui.elicit", payload: {} },
+		});
+		await waitFor(() => cancellationSignal !== undefined, "reverse cancellation signal");
+		sdk.connectionId = "acp-reconnected";
+		sdk.emitReconnect();
+		await waitFor(() => cancellationSignal?.aborted === true, "reconnect reverse abort");
+		expect(sdk.frames.some(frame => frame.type === "reverse_response" && frame.id === "reconnect-abort")).toBe(false);
+	} finally {
+		await adapter.close();
+	}
+});
 test("ACP reverse cancellation and stale failures suppress responses over the real WebSocket transport", async () => {
 	let server!: ReturnType<typeof Bun.serve>;
 

@@ -10,7 +10,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
 import type { ToolSession } from "../sdk";
 import type { AgentStorage } from "../session/agent-storage";
-import { DEFAULT_MAX_BYTES, truncateHead } from "../session/streaming-output";
+import { DEFAULT_MAX_BYTES, type TruncationDirection, truncateContent } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
@@ -1146,7 +1146,12 @@ interface ReadUrlCacheEntry {
 	artifactId?: string;
 	details: ReadUrlToolDetails;
 	image?: FetchImagePayload;
+	/** Complete URL output, including its preamble and body. */
 	output: string;
+	/** UTF-16 code-unit offset of the preamble in `output`. */
+	preambleChars: number;
+	/** Offset of the preamble after `wrapUntrustedContent(output)` is persisted. */
+	wrappedPreambleChars?: number;
 }
 
 const readUrlCache = new Map<string, ReadUrlCacheEntry>();
@@ -1178,7 +1183,13 @@ async function materializeReadUrlCacheEntry(
 	if (entry.artifactId) {
 		const artifactOutput = await readArtifactOutput(session, entry.artifactId);
 		if (artifactOutput !== null) {
-			return { ...entry, output: artifactOutput };
+			// Artifacts retain their trust-boundary wrapper. Keep the raw preamble
+			// coordinate alongside the escaped coordinate for live/rehydrated parity.
+			return {
+				...entry,
+				output: artifactOutput,
+				...(entry.wrappedPreambleChars !== undefined ? { wrappedPreambleChars: entry.wrappedPreambleChars } : {}),
+			};
 		}
 	}
 	return null;
@@ -1218,8 +1229,8 @@ async function buildReadUrlCacheEntry(
 
 	const storage = session.settings.getStorage();
 	const result = await renderUrl(url, effectiveTimeout, raw, session.settings, signal, storage);
-	const output = buildUrlReadOutput(result, result.content);
-	const artifactId = options?.ensureArtifact ? await persistReadUrlArtifact(session, output) : undefined;
+	const built = buildUrlReadOutput(result, result.content);
+	const artifactId = options?.ensureArtifact ? await persistReadUrlArtifact(session, built.output) : undefined;
 
 	return {
 		artifactId,
@@ -1233,7 +1244,9 @@ async function buildReadUrlCacheEntry(
 			notes: result.notes,
 		},
 		image: result.image,
-		output,
+		output: built.output,
+		preambleChars: built.preambleChars,
+		wrappedPreambleChars: built.wrappedPreambleChars,
 	};
 }
 
@@ -1263,60 +1276,138 @@ export async function loadReadUrlCacheEntry(
 
 const UNTRUSTED_CONTENT_OPEN = "<untrusted-content>";
 const UNTRUSTED_CONTENT_CLOSE = "</untrusted-content>";
+export const WRAP_PREFIX_CHARS = `${UNTRUSTED_CONTENT_OPEN}\n`.length;
+const WRAP_SUFFIX = `\n${UNTRUSTED_CONTENT_CLOSE}`;
 
-export function wrapUntrustedContent(content: string): string {
-	return `${UNTRUSTED_CONTENT_OPEN}\n${content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")}\n${UNTRUSTED_CONTENT_CLOSE}`;
+export function escapeUntrustedContent(content: string): string {
+	return content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
 }
 
-function buildUrlReadOutput(result: FetchRenderResult, content: string): string {
-	let output = "";
-	output += `URL: ${result.finalUrl}\n`;
-	output += `Content-Type: ${result.contentType}\n`;
-	output += `Method: ${result.method}\n`;
+export function wrapUntrustedContent(content: string): string {
+	return `${UNTRUSTED_CONTENT_OPEN}\n${escapeUntrustedContent(content)}${WRAP_SUFFIX}`;
+}
+
+function isWrappedReadUrlOutput(output: string): boolean {
+	return output.startsWith(`${UNTRUSTED_CONTENT_OPEN}\n`) && output.endsWith(WRAP_SUFFIX);
+}
+
+/**
+ * Remove only the outer URL-output wrapper before line pagination. The content
+ * remains escaped exactly as persisted; it is deliberately never unescaped.
+ */
+export function prepareReadUrlSelectorInput(
+	output: string,
+	preambleChars: number,
+	wrappedPreambleChars?: number,
+): { text: string; preambleChars: number } {
+	if (!isWrappedReadUrlOutput(output)) return { text: output, preambleChars };
+	const bodyEnd = output.length - WRAP_SUFFIX.length;
+	return {
+		text: output.slice(WRAP_PREFIX_CHARS, Math.max(WRAP_PREFIX_CHARS, bodyEnd)),
+		preambleChars: Math.max(0, (wrappedPreambleChars ?? preambleChars) - WRAP_PREFIX_CHARS),
+	};
+}
+interface BuiltUrlReadOutput {
+	output: string;
+	preambleChars: number;
+	wrappedPreambleChars: number;
+}
+
+function buildReadUrlPreamble(
+	result: Pick<FetchRenderResult, "finalUrl" | "contentType" | "method" | "notes">,
+): string {
+	let preamble = "";
+	preamble += `URL: ${result.finalUrl}\n`;
+	preamble += `Content-Type: ${result.contentType}\n`;
+	preamble += `Method: ${result.method}\n`;
 	if (result.notes.length > 0) {
-		output += `Notes: ${result.notes.join("; ")}\n`;
+		preamble += `Notes: ${result.notes.join("; ")}\n`;
 	}
-	output += `\n---\n\n`;
-	output += content;
-	return output;
+	preamble += "\n---\n\n";
+	return preamble;
+}
+
+function buildUrlReadOutput(result: FetchRenderResult, content: string): BuiltUrlReadOutput {
+	const preamble = buildReadUrlPreamble(result);
+	const preambleChars = preamble.length;
+	const output = `${preamble}${content}`;
+	return {
+		output,
+		preambleChars,
+		wrappedPreambleChars: WRAP_PREFIX_CHARS + escapeUntrustedContent(preamble).length,
+	};
 }
 
 export async function executeReadUrl(
 	session: ToolSession,
 	params: { path: string; raw?: boolean },
 	signal?: AbortSignal,
+	direction: TruncationDirection = "head",
 ): Promise<AgentToolResult<ReadUrlToolDetails>> {
 	let cacheEntry = await loadReadUrlCacheEntry(session, params, signal, { preferCached: true });
-	const truncation = truncateHead(cacheEntry.output, {
+	// `head` intentionally retains the historical whole-output accounting so the
+	// existing URL golden remains byte-identical. Non-head directions account for
+	// and truncate only the body; preamble bytes/chars are never part of that cap.
+	const effectiveDirection =
+		direction !== "head" && cacheEntry.wrappedPreambleChars === undefined ? "head" : direction;
+	const isWrappedOutput = isWrappedReadUrlOutput(cacheEntry.output);
+	const preambleChars = isWrappedOutput
+		? (cacheEntry.wrappedPreambleChars ??
+			WRAP_PREFIX_CHARS + escapeUntrustedContent(buildReadUrlPreamble(cacheEntry.details)).length)
+		: cacheEntry.preambleChars;
+	const wrappedPrefix = isWrappedOutput ? WRAP_PREFIX_CHARS : 0;
+	const wrappedSuffix = isWrappedOutput ? `\n${UNTRUSTED_CONTENT_CLOSE}` : "";
+	const bodyEnd = cacheEntry.output.length - wrappedSuffix.length;
+	const unwrappedOutput = isWrappedOutput
+		? cacheEntry.output.slice(wrappedPrefix, Math.max(wrappedPrefix, bodyEnd))
+		: cacheEntry.output;
+	const truncationInput =
+		effectiveDirection === "head"
+			? unwrappedOutput
+			: cacheEntry.output.slice(preambleChars, Math.max(preambleChars, bodyEnd));
+	const truncation = truncateContent(truncationInput, {
 		maxBytes: DEFAULT_MAX_BYTES,
 		maxLines: FETCH_DEFAULT_MAX_LINES,
+		direction: effectiveDirection,
 	});
 	const needsArtifact = truncation.truncated;
 	if (needsArtifact && !cacheEntry.artifactId) {
 		cacheEntry = await ensureReadUrlCacheArtifact(session, cacheEntry);
 		cacheReadUrlEntry(session, params.path, params.raw ?? false, cacheEntry);
 	}
-	const output = needsArtifact ? truncation.content : cacheEntry.output;
+	const output =
+		effectiveDirection !== "head"
+			? needsArtifact
+				? `${cacheEntry.output.slice(0, preambleChars)}${truncation.content}${wrappedSuffix}`
+				: cacheEntry.output
+			: truncation.content;
 	const details: ReadUrlToolDetails = {
 		...cacheEntry.details,
 		truncated: Boolean(cacheEntry.details.truncated || needsArtifact),
 	};
 
-	const contentBlocks: Array<TextContent | ImageContent> = [{ type: "text", text: wrapUntrustedContent(output) }];
+	const contentBlocks: Array<TextContent | ImageContent> = [
+		{ type: "text", text: isWrappedOutput && effectiveDirection !== "head" ? output : wrapUntrustedContent(output) },
+	];
 	if (cacheEntry.image) {
 		contentBlocks.push({ type: "image", data: cacheEntry.image.data, mimeType: cacheEntry.image.mimeType });
 	}
 
 	const resultBuilder = toolResult(details).content(contentBlocks).sourceUrl(details.finalUrl);
 	if (needsArtifact) {
-		resultBuilder.truncation(truncation, { direction: "head", artifactId: cacheEntry.artifactId });
+		resultBuilder.truncation(truncation, {
+			direction: effectiveDirection === "both" ? "middle" : effectiveDirection === "last" ? "tail" : "head",
+			artifactId: cacheEntry.artifactId,
+			...(effectiveDirection !== "head" ? { maxBytes: DEFAULT_MAX_BYTES } : {}),
+		});
 	} else if (cacheEntry.details.truncated) {
-		const outputLines = cacheEntry.output.split("\n").length;
-		const outputBytes = Buffer.byteLength(cacheEntry.output, "utf-8");
+		const reportedText = effectiveDirection === "head" ? cacheEntry.output : truncationInput;
+		const outputLines = reportedText.split("\n").length;
+		const outputBytes = Buffer.byteLength(reportedText, "utf-8");
 		const totalBytes = Math.max(outputBytes + 1, MAX_OUTPUT_CHARS + 1);
 		const totalLines = outputLines + 1;
-		resultBuilder.truncationFromText(cacheEntry.output, {
-			direction: "tail",
+		resultBuilder.truncationFromText(reportedText, {
+			direction: effectiveDirection === "both" ? "middle" : effectiveDirection === "last" ? "tail" : "head",
 			totalLines,
 			totalBytes,
 			maxBytes: MAX_OUTPUT_CHARS,

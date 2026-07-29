@@ -28,6 +28,27 @@ const NL = "\n";
 
 const ELLIPSIS = "…";
 
+const ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES = 256;
+
+/**
+ * Terminal publisher used when managed artifact storage exposes an ID but no
+ * writable pathname. The sink supplies raw content retained up to its artifact
+ * hard cap; `omittedBytes` is the source-byte count already omitted by that cap.
+ * A successful publisher may report additional omitted bytes (for example, a
+ * downstream storage cap); those counts are added to the sink summary. Failed
+ * and unavailable results are surfaced through the bounded artifact diagnostic
+ * without exposing an unresolvable artifact URL.
+ */
+export type TerminalArtifactPublishResult =
+	| { status: "published"; artifactId: string; omittedBytes?: number }
+	| { status: "unavailable" }
+	| { status: "failed"; diagnostic: string };
+
+export type TerminalArtifactPublisher = (
+	content: string,
+	info: { totalBytes: number; omittedBytes: number },
+) => Promise<TerminalArtifactPublishResult>;
+
 // =============================================================================
 // Interfaces
 // =============================================================================
@@ -47,10 +68,12 @@ export interface OutputSummary {
 	columnDroppedBytes?: number;
 	/** Number of distinct lines that hit the per-line column cap. */
 	columnTruncatedLines?: number;
-	/** Artifact ID for internal URL access (artifact://<id>) when truncated */
+	/** Artifact ID for internal URL access (artifact://<id>) when output was persisted. */
 	artifactId?: string;
 	/** Bytes omitted from artifact storage after the artifact hard cap was reached. */
 	artifactTruncatedBytes?: number;
+	/** Bounded diagnostic when artifact writer or terminal publisher creation, write, finalization, or publication failed. */
+	artifactFailureDiagnostic?: string;
 }
 
 export interface OutputSinkOptions {
@@ -60,6 +83,12 @@ export interface OutputSinkOptions {
 	 */
 	artifactPath?: string;
 	artifactId?: string;
+	/**
+	 * Optional terminal publisher for managed artifact stores that do not expose a
+	 * writable path. It is invoked only when visible spill/truncation requires an
+	 * artifact, and receives raw content bounded by `artifactMaxBytes`.
+	 */
+	artifactPublisher?: TerminalArtifactPublisher;
 	/** Tail buffer budget (bytes). Default DEFAULT_MAX_BYTES. */
 	spillThreshold?: number;
 	/**
@@ -114,7 +143,11 @@ export interface TruncationResult {
 	elidedLines?: number;
 	lastLinePartial?: boolean;
 	firstLineExceedsLimit?: boolean;
+	lastLineExceedsLimit?: boolean;
 }
+
+/** Direction vocabulary used by callers that select which end of content to retain. */
+export type TruncationDirection = "head" | "last" | "both";
 
 export interface TruncationOptions {
 	/** Maximum number of lines (default: 3000) */
@@ -131,6 +164,8 @@ export interface TruncationOptions {
 	 * window receives `maxLines - maxHeadLines`. Default `floor(maxLines/2)`.
 	 */
 	maxHeadLines?: number;
+	/** Direction to dispatch through truncateContent (head, last, or both). */
+	direction?: TruncationDirection;
 }
 
 /** Result from byte-level truncation helpers. */
@@ -452,6 +487,7 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 					outputBytes: tail.bytes,
 					lastLinePartial: true,
 					firstLineExceedsLimit: false,
+					lastLineExceedsLimit: true,
 				};
 			}
 			break;
@@ -474,6 +510,7 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 					outputBytes: tail.bytes,
 					lastLinePartial: true,
 					firstLineExceedsLimit: false,
+					lastLineExceedsLimit: true,
 				};
 			}
 			break;
@@ -516,14 +553,129 @@ export function formatMiddleElisionMarker(elidedLines: number, elidedBytes: numb
 }
 
 /**
- * Truncate content keeping a head window and a tail window, eliding the middle.
- *
- * The combined output is `<head>\n<marker>\n<tail>` when truncation is needed.
- * `maxHeadBytes` defaults to `floor(maxBytes / 2)`; the tail receives the
- * remainder. Falls back to `truncateTail` / `truncateHead` if either side's
- * budget is empty or the content already fits.
+ * A retained source segment returned by {@link truncateMiddleWindows}.
+ * Line coordinates are 1-indexed and inclusive.
  */
-export function truncateMiddle(content: string, options: TruncationOptions = {}): TruncationResult {
+export type ReadSegment =
+	| {
+			kind: "lines";
+			content: string;
+			lines: number;
+			bytes: number;
+			origin: { startLine: number; endLine: number };
+			lastLinePartial: false;
+	  }
+	| {
+			kind: "partial-line";
+			content: string;
+			lines: 1;
+			bytes: number;
+			origin: { startLine: number; endLine: number };
+			sourceLineBytes: number;
+			lastLinePartial: true;
+	  };
+
+/** The actual windows retained by middle truncation. */
+export interface ReadWindow {
+	kind: "full" | "head-only" | "tail-only" | "middle";
+	head?: ReadSegment;
+	tail?: ReadSegment;
+	// With normalized head/tail line budgets, an overlap cannot occur: a
+	// source that can fit both windows returns `full`, otherwise their kept
+	// line counts sum to less than the source. Retain this defensive value for
+	// custom/future budgets and wire compatibility.
+	overlap: "disjoint" | "adjacent" | "overlapping";
+	elidedLines: number;
+	elidedBytes: number;
+	totalLines: number;
+	totalBytes: number;
+	/** @deprecated Non-enumerable compatibility reason for older consumers. */
+	truncatedBy?: "lines" | "bytes" | "middle";
+}
+
+function outputLineCount(result: TruncationResult): number {
+	return result.outputLines ?? (result.content.length === 0 ? 0 : countNewlines(result.content) + 1);
+}
+
+function outputByteCount(result: TruncationResult): number {
+	return result.outputBytes ?? Buffer.byteLength(result.content, "utf-8");
+}
+
+function lastSourceLineBytes(content: string): number {
+	const lineStart = content.lastIndexOf(NL) + 1;
+	return Buffer.byteLength(content.slice(lineStart), "utf-8");
+}
+
+function makeReadSegment(
+	result: TruncationResult,
+	startLine: number,
+	totalLines: number,
+	sourceContent: string = result.content,
+): ReadSegment | undefined {
+	const lines = outputLineCount(result);
+	if (lines <= 0) return undefined;
+	const bytes = outputByteCount(result);
+	const endLine = Math.min(totalLines, startLine + lines - 1);
+	if (result.lastLinePartial) {
+		const partialLine = endLine;
+		return {
+			kind: "partial-line",
+			content: result.content,
+			lines: 1,
+			bytes,
+			origin: { startLine: partialLine, endLine: partialLine },
+			sourceLineBytes: lastSourceLineBytes(sourceContent),
+			lastLinePartial: true,
+		};
+	}
+	return {
+		kind: "lines",
+		content: result.content,
+		lines,
+		bytes,
+		origin: { startLine, endLine },
+		lastLinePartial: false,
+	};
+}
+
+function withMiddleWindowReason(windows: ReadWindow, truncatedBy: "lines" | "bytes" | "middle"): ReadWindow {
+	Object.defineProperty(windows, "truncatedBy", { value: truncatedBy, enumerable: false });
+	return windows;
+}
+
+function fullReadWindow(
+	content: string,
+	totalLines: number,
+	totalBytes: number,
+	overlap: ReadWindow["overlap"] = "disjoint",
+): ReadWindow {
+	return {
+		kind: "full",
+		head: {
+			kind: "lines",
+			content,
+			lines: totalLines,
+			bytes: totalBytes,
+			origin: { startLine: 1, endLine: totalLines },
+			lastLinePartial: false,
+		},
+		overlap,
+		elidedLines: 0,
+		elidedBytes: 0,
+		totalLines,
+		totalBytes,
+	};
+}
+
+/**
+ * Truncate content while exposing the exact retained head/tail windows.
+ *
+ * The budget split and fallback ordering intentionally mirror truncateMiddle.
+ * The overlap classification is performed before resolving an overlap to a
+ * full window, so callers can distinguish disjoint, adjacent and overlapping
+ * candidate windows even when no marker is needed.
+ */
+export function truncateMiddleWindows(content: string, options: TruncationOptions = {}): ReadWindow {
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
 	const headBytes = options.maxHeadBytes ?? Math.floor(maxBytes / 2);
@@ -533,57 +685,153 @@ export function truncateMiddle(content: string, options: TruncationOptions = {})
 
 	const totalBytes = Buffer.byteLength(content, "utf-8");
 	const totalLines = countNewlines(content) + 1;
+	if (totalBytes <= maxBytes && totalLines <= maxLines) return fullReadWindow(content, totalLines, totalBytes);
 
-	if (totalBytes <= maxBytes && totalLines <= maxLines) {
-		return noTruncResult(content, totalLines, totalBytes);
-	}
+	const oneSided = (kind: "head-only" | "tail-only", result: TruncationResult, startLine: number): ReadWindow => {
+		const lines = outputLineCount(result);
+		const bytes = outputByteCount(result);
+		const segment = makeReadSegment(result, startLine, totalLines, content);
 
-	// Degenerate budgets → fall back to one-sided truncation.
+		const windows: ReadWindow = {
+			kind,
+			...(kind === "head-only" ? (segment ? { head: segment } : {}) : segment ? { tail: segment } : {}),
+			overlap: "disjoint",
+			elidedLines: Math.max(0, totalLines - lines),
+			elidedBytes: Math.max(0, totalBytes - bytes),
+			totalLines,
+			totalBytes,
+		};
+		return withMiddleWindowReason(windows, result.truncatedBy === "lines" ? "lines" : "bytes");
+	};
+
+	// Keep this order identical to truncateMiddle: degenerate budgets are
+	// resolved before either one-sided truncator is called.
 	if (headBytes <= 0 || headLines <= 0) {
-		return truncateTail(content, { maxBytes: tailBytes || maxBytes, maxLines: tailLines || maxLines });
+		const tail = truncateTail(content, { maxBytes: tailBytes || maxBytes, maxLines: tailLines || maxLines });
+		return oneSided("tail-only", tail, totalLines - outputLineCount(tail) + 1);
 	}
 	if (tailBytes <= 0 || tailLines <= 0) {
-		return truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
+		const head = truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
+		return oneSided("head-only", head, 1);
 	}
 
 	const head = truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
 	const tail = truncateTail(content, { maxBytes: tailBytes, maxLines: tailLines });
-
-	const headLinesKept = head.outputLines ?? 0;
-	const tailLinesKept = tail.outputLines ?? 0;
-	const headBytesKept = head.outputBytes ?? Buffer.byteLength(head.content, "utf-8");
-	const tailBytesKept = tail.outputBytes ?? Buffer.byteLength(tail.content, "utf-8");
+	const headLinesKept = outputLineCount(head);
+	const tailLinesKept = outputLineCount(tail);
+	const headBytesKept = outputByteCount(head);
+	const tailBytesKept = outputByteCount(tail);
 
 	// Head unusable (first line exceeds budget) → tail-only.
-	if (headLinesKept === 0 || head.firstLineExceedsLimit) return tail;
+	if (headLinesKept === 0 || head.firstLineExceedsLimit) {
+		return oneSided("tail-only", tail, totalLines - tailLinesKept + 1);
+	}
 	// Tail unusable → head-only.
-	if (tailLinesKept === 0) return head;
-	// Windows overlap → no meaningful elision; return content untruncated.
-	if (headLinesKept + tailLinesKept >= totalLines) {
-		return noTruncResult(content, totalLines, totalBytes);
+	if (tailLinesKept === 0) return oneSided("head-only", head, 1);
+
+	const headEnd = headLinesKept;
+	const tailStart = totalLines - tailLinesKept + 1;
+	const overlap: ReadWindow["overlap"] =
+		headEnd + 1 < tailStart ? "disjoint" : headEnd + 1 === tailStart ? "adjacent" : "overlapping";
+	const tailPartial = tail.lastLinePartial === true;
+
+	// Adjacent/overlapping complete windows cover the whole source. Return one
+	// full segment so renderers never insert a marker for an overlap.
+	if (headLinesKept + tailLinesKept >= totalLines && !tailPartial) {
+		return fullReadWindow(content, totalLines, totalBytes, overlap);
 	}
 
-	const elidedLines = totalLines - headLinesKept - tailLinesKept;
-	// `totalBytes - headBytesKept - tailBytesKept` includes newline separators
-	// between the kept windows and the elided region; close enough for a notice.
-	const elidedBytes = Math.max(0, totalBytes - headBytesKept - tailBytesKept);
-	const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
-	const composed = `${head.content}\n${marker}\n${tail.content}`;
-	const markerBytes = Buffer.byteLength(marker, "utf-8");
+	const headWindow = makeReadSegment(head, 1, totalLines, content);
+	const tailWindow = makeReadSegment(tail, tailStart, totalLines, content);
+	if (!headWindow || !tailWindow) return fullReadWindow(content, totalLines, totalBytes, overlap);
 
-	return {
-		content: composed,
-		truncated: true,
-		truncatedBy: "middle",
-		totalLines,
-		totalBytes,
-		outputLines: headLinesKept + tailLinesKept + 1,
-		outputBytes: headBytesKept + tailBytesKept + markerBytes + 2,
-		elidedLines,
-		elidedBytes,
-		lastLinePartial: tail.lastLinePartial,
-		firstLineExceedsLimit: false,
-	};
+	const partialSourceBytes = tailWindow.kind === "partial-line" ? tailWindow.sourceLineBytes : tailWindow.bytes;
+	const elidedLines = tailPartial
+		? Math.max(0, tailStart - headEnd - 1)
+		: Math.max(0, totalLines - headLinesKept - tailLinesKept);
+	const elidedBytes = tailPartial
+		? Math.max(0, totalBytes - headBytesKept - partialSourceBytes)
+		: Math.max(0, totalBytes - headBytesKept - tailBytesKept);
+	return withMiddleWindowReason(
+		{
+			kind: "middle",
+			head: headWindow,
+			tail: tailWindow,
+			overlap,
+			elidedLines,
+			elidedBytes,
+			totalLines,
+			totalBytes,
+		},
+		"middle",
+	);
+}
+
+/**
+ * Truncate content keeping a head window and a tail window, eliding the middle.
+ * The composed return shape remains field-for-field compatible with the
+ * historical implementation; callers that need coordinates use
+ * truncateMiddleWindows directly.
+ */
+export function truncateMiddle(content: string, options: TruncationOptions = {}): TruncationResult {
+	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+	const headBytes = options.maxHeadBytes ?? Math.floor(maxBytes / 2);
+	const tailBytes = Math.max(0, maxBytes - headBytes);
+	const headLines = options.maxHeadLines ?? Math.max(1, Math.floor(maxLines / 2));
+	const tailLines = Math.max(0, maxLines - headLines);
+	const windows = truncateMiddleWindows(content, options);
+
+	switch (windows.kind) {
+		case "full":
+			return noTruncResult(content, windows.totalLines, windows.totalBytes);
+		case "tail-only":
+			return truncateTail(content, { maxBytes: tailBytes || maxBytes, maxLines: tailLines || maxLines });
+		case "head-only":
+			return truncateHead(content, { maxBytes: headBytes, maxLines: headLines });
+		case "middle": {
+			const head = windows.head;
+			const tail = windows.tail;
+			if (!head || !tail) return noTruncResult(content, windows.totalLines, windows.totalBytes);
+			if (head.lines + tail.lines >= windows.totalLines)
+				return noTruncResult(content, windows.totalLines, windows.totalBytes);
+			const legacyElidedLines = Math.max(0, windows.totalLines - head.lines - tail.lines);
+			const legacyElidedBytes =
+				tail.kind === "partial-line"
+					? Math.max(0, windows.totalBytes - head.bytes - tail.bytes)
+					: windows.elidedBytes;
+			const marker = formatMiddleElisionMarker(legacyElidedLines, legacyElidedBytes);
+			const markerBytes = Buffer.byteLength(marker, "utf-8");
+			return {
+				content: `${head.content}\n${marker}\n${tail.content}`,
+				truncated: true,
+				truncatedBy: "middle",
+				totalLines: windows.totalLines,
+				totalBytes: windows.totalBytes,
+				outputLines: head.lines + tail.lines + 1,
+				outputBytes: head.bytes + tail.bytes + markerBytes + 2,
+				elidedLines: legacyElidedLines,
+				elidedBytes: legacyElidedBytes,
+				lastLinePartial: tail.lastLinePartial,
+				firstLineExceedsLimit: false,
+				...(tail.lastLinePartial ? { lastLineExceedsLimit: true } : {}),
+			};
+		}
+	}
+}
+
+/**
+ * Dispatch truncation using the caller-facing direction vocabulary.
+ */
+export function truncateContent(content: string, options: TruncationOptions = {}): TruncationResult {
+	switch (options.direction) {
+		case "last":
+			return truncateTail(content, options);
+		case "both":
+			return truncateMiddle(content, options);
+		default:
+			return truncateHead(content, options);
+	}
 }
 
 // =============================================================================
@@ -694,6 +942,9 @@ export class OutputSink {
 	#artifactBytes = 0;
 	#artifactTruncatedBytes = 0;
 	#artifactTruncationNoticeWritten = false;
+	#artifactFailureDiagnostic?: string;
+	#publishedArtifactId?: string;
+	#artifactFinalizationFailed = false;
 
 	// Per-line column cap streaming state (persists across `push` calls so a
 	// long line split across chunks still trips the same trigger).
@@ -708,9 +959,13 @@ export class OutputSink {
 	};
 
 	// Raw prefix chunks not yet confirmed written to the file sink. This queue is
-	// the only artifact replay source; retained head/tail windows are lossy views.
+	// the pathname-backed artifact replay source; retained head/tail windows are lossy views.
 	#pendingFileWrites?: string[];
 	#pendingFileWriteBytes = 0;
+	// Raw chunks retained for a terminal publisher. This queue is capped by
+	// `#artifactMaxBytes` and is never used by pathname-backed sinks.
+	#pendingArtifactContent?: string[];
+	#artifactPublishAttempted = false;
 	#finalized = false;
 
 	#fileReady = false;
@@ -724,6 +979,7 @@ export class OutputSink {
 	readonly #chunkThrottleMs: number;
 	readonly #maxColumns: number;
 	readonly #artifactMaxBytes: number;
+	readonly #artifactPublisher?: TerminalArtifactPublisher;
 	readonly #coalesceSanitize: boolean;
 	#coalesceBuf = "";
 
@@ -738,6 +994,7 @@ export class OutputSink {
 			chunkThrottleMs = 0,
 			onRawChunk,
 			artifactMaxBytes = DEFAULT_ARTIFACT_MAX_BYTES,
+			artifactPublisher,
 			coalesceSanitize = process.env.PI_OUTPUT_SANITIZE_COALESCE === "1",
 		} = options ?? {};
 		// Managed callers omit artifactPath at the allocation boundary; explicit callers
@@ -751,6 +1008,7 @@ export class OutputSink {
 		this.#onRawChunk = onRawChunk;
 		this.#chunkThrottleMs = chunkThrottleMs;
 		this.#artifactMaxBytes = Math.max(0, artifactMaxBytes);
+		this.#artifactPublisher = artifactPublisher;
 		this.#coalesceSanitize = coalesceSanitize;
 	}
 
@@ -841,11 +1099,14 @@ export class OutputSink {
 		// open, keep an independent raw replay prefix because retained head/tail
 		// windows are trimmed and cannot reconstruct byte-correct artifacts.
 		if (this.#artifactPath && this.#maxColumns === 0) this.#enqueueFileWrite(rawChunk, rawBytes);
+		else if (this.#artifactPublisher && this.#maxColumns === 0)
+			this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
 
 		if (rawBytes === 0) return;
 
 		const visibleChunk = this.#maxColumns > 0 ? this.#applyColumnCap(sanitizedChunk) : sanitizedChunk;
 		if (this.#artifactPath && this.#maxColumns > 0) this.#enqueueFileWrite(rawChunk, rawBytes);
+		else if (this.#artifactPublisher && this.#maxColumns > 0) this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
 		if (this.#columnDroppedBytes > 0) this.#createFileSink();
 		const visibleBytes = Buffer.byteLength(visibleChunk, "utf-8");
 		if (visibleChunk.length > 0) {
@@ -967,6 +1228,45 @@ export class OutputSink {
 		return `\n[artifact truncated after ${this.#artifactBytes} bytes; omitted at least ${droppedBytes} bytes]\n`;
 	}
 
+	#recordArtifactFailure(phase: "create" | "write" | "end", error: unknown): void {
+		if (this.#artifactFailureDiagnostic) return;
+		const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
+		const normalized = message || "unknown storage error";
+		this.#artifactFailureDiagnostic = truncateHeadBytes(
+			`${phase}: ${normalized}`,
+			ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES,
+		).text;
+	}
+
+	#recordTerminalArtifactDiagnostic(kind: "unavailable" | "failed", error?: unknown): void {
+		if (this.#artifactFailureDiagnostic) return;
+		const message =
+			error === undefined
+				? "terminal artifact publisher unavailable"
+				: (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim() ||
+					"unknown publication error";
+		this.#artifactFailureDiagnostic = truncateHeadBytes(
+			`${kind}: ${message}`,
+			ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES,
+		).text;
+	}
+
+	// A failed write may have committed only a prefix, so the replay queue is no longer trustworthy.
+	#failArtifact(phase: "create" | "write" | "end", error: unknown, sink?: Bun.FileSink): void {
+		this.#recordArtifactFailure(phase, error);
+		this.#artifactFinalizationFailed = true;
+		this.#file = undefined;
+		this.#fileReady = false;
+		this.#pendingFileWrites = undefined;
+		this.#pendingFileWriteBytes = 0;
+		if (!sink) return;
+		try {
+			void Promise.resolve(sink.end()).catch(endError => this.#recordArtifactFailure("end", endError));
+		} catch (endError) {
+			this.#recordArtifactFailure("end", endError);
+		}
+	}
+
 	#capArtifactChunk(chunk: string, bytes: number): { chunk: string; bytes: number } | null {
 		if (bytes === 0) return null;
 		if (this.#artifactMaxBytes <= 0 || this.#artifactBytes >= this.#artifactMaxBytes) {
@@ -982,18 +1282,23 @@ export class OutputSink {
 		return kept.bytes > 0 ? { chunk: kept.text, bytes: kept.bytes } : null;
 	}
 
-	#writeArtifactTruncationNotice(): void {
-		if (this.#artifactTruncatedBytes <= 0 || this.#artifactTruncationNoticeWritten) return;
+	async #writeArtifactTruncationNotice(): Promise<void> {
+		if (
+			this.#artifactFinalizationFailed ||
+			this.#artifactTruncatedBytes <= 0 ||
+			this.#artifactTruncationNoticeWritten
+		)
+			return;
 		const notice = this.#artifactTruncationNotice(this.#artifactTruncatedBytes);
 		try {
 			if (this.#fileReady && this.#file) {
-				this.#file.sink.write(notice);
+				await this.#file.sink.write(notice);
 			} else {
 				this.#queuePendingFileWrite(notice, Buffer.byteLength(notice, "utf-8"));
 			}
 			this.#artifactTruncationNoticeWritten = true;
-		} catch {
-			/* ignore */
+		} catch (error) {
+			this.#failArtifact("write", error, this.#file?.sink);
 		}
 	}
 
@@ -1005,6 +1310,7 @@ export class OutputSink {
 	}
 
 	#enqueueFileWrite(chunk: string, bytes: number): void {
+		if (this.#artifactFinalizationFailed || this.#finalized) return;
 		const capped = this.#capArtifactChunk(chunk, bytes);
 		if (!capped) return;
 		this.#artifactBytes += capped.bytes;
@@ -1016,51 +1322,113 @@ export class OutputSink {
 
 		try {
 			this.#file.sink.write(capped.chunk);
-		} catch {
-			try {
-				void this.#file.sink.end();
-			} catch {
-				/* ignore */
-			}
-			this.#file = undefined;
-			this.#fileReady = false;
-			this.#queuePendingFileWrite(capped.chunk, capped.bytes);
-			this.#createFileSink();
+		} catch (error) {
+			this.#failArtifact("write", error, this.#file.sink);
+		}
+	}
+
+	#enqueueTerminalArtifactChunk(chunk: string, bytes: number): void {
+		if (this.#artifactFinalizationFailed || this.#finalized) return;
+		const capped = this.#capArtifactChunk(chunk, bytes);
+		if (!capped) return;
+		this.#artifactBytes += capped.bytes;
+		if (!this.#pendingArtifactContent) this.#pendingArtifactContent = [capped.chunk];
+		else this.#pendingArtifactContent.push(capped.chunk);
+		const pending = this.#pendingArtifactContent;
+		if (!pending) return;
+		if (pending.length > MAX_PENDING) {
+			pending[0] = pending.join("");
+			pending.length = 1;
 		}
 	}
 
 	#createFileSink(): boolean {
-		if (this.#finalized) return false;
+		if (this.#finalized || this.#artifactFinalizationFailed) return false;
 
 		if (!this.#artifactPath) return false;
 		if (this.#fileReady) return this.#file != null;
-		try {
-			const sink = Bun.file(this.#artifactPath).writer();
-			this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
 
+		let sink: Bun.FileSink;
+		try {
+			sink = Bun.file(this.#artifactPath).writer();
+		} catch (error) {
+			this.#recordArtifactFailure("create", error);
+			return false;
+		}
+		this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
+
+		try {
 			const pending = this.#pendingFileWrites;
 			if (pending) {
 				for (const chunk of pending) sink.write(chunk);
 			}
-
-			this.#fileReady = true;
-			this.#pendingFileWrites = undefined;
-			this.#pendingFileWriteBytes = 0;
-
-			return true;
-		} catch {
-			try {
-				void this.#file?.sink?.end();
-			} catch {
-				/* ignore */
-			}
-			this.#file = undefined;
-			// Keep #pendingFileWriteBytes in sync with the preserved queue so
-			// later retry/threshold decisions don't undercount retained bytes.
-			this.#pendingFileWriteBytes = this.#pendingFileWrites
-				? this.#pendingFileWrites.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0)
-				: 0;
+		} catch (error) {
+			this.#failArtifact("write", error, sink);
 			return false;
+		}
+
+		this.#fileReady = true;
+		this.#pendingFileWrites = undefined;
+		this.#pendingFileWriteBytes = 0;
+		return true;
+	}
+
+	#shouldPublishTerminalArtifact(): boolean {
+		return (
+			this.#artifactPublisher !== undefined &&
+			this.#artifactPath === undefined &&
+			(this.#truncated || this.#columnDroppedBytes > 0 || this.#artifactTruncatedBytes > 0)
+		);
+	}
+
+	async #publishTerminalArtifact(): Promise<string | undefined> {
+		if (
+			!this.#shouldPublishTerminalArtifact() ||
+			this.#artifactPublishAttempted ||
+			this.#artifactFinalizationFailed
+		) {
+			return this.#publishedArtifactId;
+		}
+		this.#artifactPublishAttempted = true;
+		const content = this.#pendingArtifactContent?.join("") ?? "";
+		const omittedBytes = this.#artifactTruncatedBytes;
+		try {
+			const published = await this.#artifactPublisher!(content, {
+				totalBytes: this.#totalBytes,
+				omittedBytes,
+			});
+			if (published.status === "unavailable") {
+				this.#recordTerminalArtifactDiagnostic("unavailable");
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
+			if (published.status === "failed") {
+				this.#recordTerminalArtifactDiagnostic("failed", published.diagnostic);
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
+			if (published.artifactId.length === 0) {
+				this.#recordTerminalArtifactDiagnostic("failed", "storage returned no artifact id");
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
+			if (published.omittedBytes !== undefined) {
+				if (!Number.isSafeInteger(published.omittedBytes) || published.omittedBytes < 0) {
+					this.#recordTerminalArtifactDiagnostic("failed", "publisher returned invalid omitted-byte accounting");
+					this.#artifactFinalizationFailed = true;
+					return undefined;
+				}
+				this.#artifactTruncatedBytes += published.omittedBytes;
+			}
+			this.#publishedArtifactId = published.artifactId;
+			this.#finalized = true;
+			return this.#publishedArtifactId;
+		} catch (error) {
+			this.#recordTerminalArtifactDiagnostic("failed", error);
+			this.#artifactFinalizationFailed = true;
+			return undefined;
+		} finally {
+			this.#pendingArtifactContent = undefined;
 		}
 	}
 
@@ -1083,25 +1451,34 @@ export class OutputSink {
 	 * minimizer rewrites the captured output after the raw bytes have already
 	 * been streamed.
 	 *
-	 * After this call the buffer is authoritative: streaming counters realign
-	 * to the replacement, the retained head window is cleared, and head
-	 * retention is disabled so subsequent `push()` calls append directly to the
-	 * tail buffer instead of repopulating the (now meaningless) head window
-	 * — which would otherwise reorder content and trip the middle-elision
-	 * branch in `dump()` against stale totals.
+	 * After this call the replacement is authoritative: counters reflect its full
+	 * size, the configured head+tail byte windows are retained with UTF-8-safe
+	 * boundaries, and future head accumulation is disabled so later `push()` calls
+	 * append directly to the tail without reordering the replacement.
 	 */
 	replace(text: string): void {
 		this.#coalesceBuf = "";
-		this.#setTail(text);
+		const replacementBytes = Buffer.byteLength(text, "utf-8");
 		this.#head = "";
 		this.#headBytes = 0;
+		this.#setTail("");
+
+		if (this.#headLimit > 0) {
+			const head = truncateHeadBytes(text, this.#headLimit);
+			this.#appendHead(head.text, head.bytes);
+			const tailText = text.substring(head.text.length);
+			this.#setTail(tailText, replacementBytes - head.bytes);
+		} else {
+			this.#setTail(text, replacementBytes);
+		}
+		this.#trimTailTo(this.#spillThreshold);
 		this.#headRetentionDisabled = true;
-		this.#totalBytes = this.#bufferBytes;
-		this.#processedBytes = this.#bufferBytes;
+		this.#totalBytes = replacementBytes;
+		this.#processedBytes = replacementBytes;
 		this.#totalLines = countNewlines(text);
 		this.#processedLines = this.#totalLines;
 		this.#sawData = text.length > 0;
-		this.#truncated = false;
+		this.#truncated = replacementBytes > this.#headBytes + this.#bufferBytes;
 		this.#currentLineBytes = 0;
 		this.#columnEllipsisAdded = false;
 		this.#columnDroppedBytes = 0;
@@ -1114,18 +1491,35 @@ export class OutputSink {
 		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
 
 		let artifactId: string | undefined;
-		if (this.#artifactTruncatedBytes > 0) this.#createFileSink();
-		this.#writeArtifactTruncationNotice();
-		if (this.#file) {
-			artifactId = this.#file.artifactId;
-			await this.#file.sink.end();
-			this.#finalized = true;
+		if (this.#finalized) {
+			artifactId = this.#publishedArtifactId ?? this.#artifactId;
+		} else if (!this.#artifactFinalizationFailed) {
+			if (this.#artifactPublisher && !this.#artifactPath) {
+				artifactId = await this.#publishTerminalArtifact();
+			}
+			if (!this.#artifactFinalizationFailed && this.#artifactPath) {
+				if (this.#artifactTruncatedBytes > 0) this.#createFileSink();
+				await this.#writeArtifactTruncationNotice();
+				if (this.#file) {
+					try {
+						await this.#file.sink.end();
+						artifactId = this.#file.artifactId;
+						this.#finalized = true;
+					} catch (error) {
+						this.#recordArtifactFailure("end", error);
+						this.#artifactFinalizationFailed = true;
+						this.#file = undefined;
+						this.#fileReady = false;
+					}
+				}
+			}
 		}
 		if (this.#finalized) {
 			// Terminal: the artifact is closed; replay state is no longer needed.
 			this.#pendingFileWrites = undefined;
 			this.#pendingFileWriteBytes = 0;
 			this.#fileReady = false;
+			this.#pendingArtifactContent = undefined;
 		}
 		// Non-finalized dumps (no artifact sink ever opened) keep the raw replay
 		// queue so a later post-dump push that spills produces a CUMULATIVE
@@ -1151,24 +1545,18 @@ export class OutputSink {
 		let elidedLines: number | undefined;
 
 		if (headBytes > 0 && effectiveTotalBytes > headBytes + tailBytes) {
-			// Middle was elided. Emit head + marker + tail.
+			// Middle was elided. Emit both explicit windows, including when they are
+			// fragments of one source line (the marker still carries byte evidence).
 			elidedBytes = Math.max(0, effectiveTotalBytes - headBytes - tailBytes);
 			elidedLines = Math.max(0, processedTotalLines - headLines - tailLines);
-			if (elidedLines === 0) {
-				body = headText;
-				outputBytes = headBytes;
-				outputLines = headLines;
-				this.#truncated = true;
-			} else {
-				const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
-				const markerBytes = Buffer.byteLength(marker, "utf-8");
-				const headSep = headText.endsWith("\n") ? "" : "\n";
-				const tailSep = tailBuf.startsWith("\n") ? "" : "\n";
-				body = `${headText}${headSep}${marker}${tailSep}${tailBuf}`;
-				outputBytes = headBytes + markerBytes + tailBytes + headSep.length + tailSep.length;
-				outputLines = headLines + 1 + tailLines;
-				this.#truncated = true;
-			}
+			const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
+			const markerBytes = Buffer.byteLength(marker, "utf-8");
+			const headSep = headText.endsWith("\n") ? "" : "\n";
+			const tailSep = tailBuf.startsWith("\n") ? "" : "\n";
+			body = `${headText}${headSep}${marker}${tailSep}${tailBuf}`;
+			outputBytes = headBytes + markerBytes + tailBytes + headSep.length + tailSep.length;
+			outputLines = headLines + 1 + tailLines;
+			this.#truncated = true;
 		} else if (headBytes > 0) {
 			// Head + tail combine into the full buffered output (no overlap or elision).
 			body = `${headText}${tailBuf}`;
@@ -1193,6 +1581,7 @@ export class OutputSink {
 			columnDroppedBytes: this.#columnDroppedBytes > 0 ? this.#columnDroppedBytes : undefined,
 			columnTruncatedLines: this.#columnTruncatedLines > 0 ? this.#columnTruncatedLines : undefined,
 			artifactTruncatedBytes: this.#artifactTruncatedBytes > 0 ? this.#artifactTruncatedBytes : undefined,
+			artifactFailureDiagnostic: this.#artifactFailureDiagnostic,
 			artifactId,
 		};
 	}

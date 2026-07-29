@@ -26,6 +26,25 @@ const BRACKETED_PASTE_END = "\x1b[201~";
 const SGR_QUARANTINE_MAX_BYTES = 256;
 const SGR_QUARANTINE_TIMEOUT_MS = 100;
 
+// Bounds for holding an incomplete terminal capability-probe reply instead of
+// flushing its fragments into the input stream.
+const PROBE_FRAGMENT_HOLD_MAX_MS = 500;
+const PROBE_FRAGMENT_MAX_BYTES = 256;
+const PROBE_ESCAPE_HOLD_MAX_MS = 150;
+const PROBE_REPLY_WINDOW_MS = 2500;
+
+/**
+ * True when the buffer is an escape sequence that only a terminal reply can
+ * complete: an OSC without its BEL/ST terminator (OSC 11 background color) or a
+ * private CSI without its final byte (DA1, kitty flags, Mode 2031 DSR).
+ * SGR mouse prefixes are excluded; they have their own quarantine.
+ */
+function isIncompleteProbeReplyPrefix(buffer: string): boolean {
+	if (buffer.length > PROBE_FRAGMENT_MAX_BYTES) return false;
+	if (/^\x1b\][^\x07\x1b]*$/.test(buffer)) return true;
+	return /^\x1b\[\??[\d;]*$/.test(buffer);
+}
+
 /** True for complete SGR mouse CSI reports. These remain control input, never text. */
 export function isSgrMouseSequence(sequence: string): boolean {
 	return /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(sequence);
@@ -238,6 +257,19 @@ function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | unde
 	return codepoint >= 32 ? codepoint : undefined;
 }
 
+/**
+ * True when the ESC at `index` can still continue the escape sequence that
+ * started at offset 0, i.e. it is (or may become) the ST terminator `ESC \` of
+ * an OSC/DCS/APC string. Anywhere else an ESC cancels the sequence in progress.
+ */
+function continuesAsStringTerminator(remaining: string, index: number): boolean {
+	const introducer = remaining[1];
+	if (introducer !== "]" && introducer !== "P" && introducer !== "_") return false;
+	const afterEsc = remaining[index + 1];
+	// Terminator not fully delivered yet: keep buffering rather than guessing.
+	return afterEsc === undefined || afterEsc === "\\";
+}
+
 function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
 	const sequences: string[] = [];
 	let pos = 0;
@@ -270,6 +302,15 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 					pos += seqEnd;
 					break;
 				} else if (status === "incomplete") {
+					// An ESC cancels an escape sequence already in progress; it can only
+					// continue one as the ST terminator of an OSC/DCS/APC string. Cutting
+					// here keeps an unterminated sequence from swallowing the next key.
+					// seqEnd === 1 is excluded so Meta sequences (ESC ESC) still parse.
+					if (remaining[seqEnd] === ESC && seqEnd >= 2 && !continuesAsStringTerminator(remaining, seqEnd)) {
+						sequences.push(candidate);
+						pos += seqEnd;
+						break;
+					}
 					seqEnd++;
 				} else {
 					// Should not happen when starting with ESC
@@ -346,6 +387,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	#sgrQuarantineBytes = 0;
 	#sgrQuarantineSemicolons = 0;
 	#sgrQuarantineHasDigit = false;
+	// Probe-reply fragment hold.
+	#probeHoldStartedAt: number | undefined;
+	#probeHoldBuffer = "";
+	#probeReplyWindowUntil = 0;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -497,17 +542,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#emitDataSequence(sequence);
 		}
 
-		if (this.#buffer.length > 0) {
-			this.#timeout = setTimeout(() => {
-				if (isSgrMousePrefix(this.#buffer)) {
-					this.#beginSgrQuarantine();
-					return;
-				}
-				const flushed = this.flush();
-				for (const sequence of flushed) {
-					this.#emitDataSequence(sequence);
-				}
-			}, this.#timeoutMs);
+		if (this.#buffer.length === 0) {
+			this.#probeHoldStartedAt = undefined;
+		} else {
+			this.#timeout = setTimeout(() => this.#onFlushTimeout(), this.#timeoutMs);
 		}
 	}
 
@@ -599,12 +637,61 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.emit("data", sequence);
 	}
 
+	/**
+	 * ProcessTerminal calls this right after writing a capability probe so a lone
+	 * ESC arriving inside the reply window is treated as a possible reply fragment
+	 * rather than a keypress.
+	 */
+	noteProbeIssued(windowMs: number = PROBE_REPLY_WINDOW_MS): void {
+		this.#probeReplyWindowUntil = Date.now() + windowMs;
+	}
+
+	#onFlushTimeout(): void {
+		if (isSgrMousePrefix(this.#buffer)) {
+			this.#beginSgrQuarantine();
+			return;
+		}
+		if (this.#shouldHoldProbeFragment()) {
+			this.#timeout = setTimeout(() => this.#onFlushTimeout(), this.#timeoutMs);
+			return;
+		}
+		this.#probeHoldStartedAt = undefined;
+		const flushed = this.flush();
+		for (const sequence of flushed) {
+			this.#emitDataSequence(sequence);
+		}
+	}
+
+	#shouldHoldProbeFragment(): boolean {
+		const buffer = this.#buffer;
+		if (buffer.length === 0) return false;
+		const now = Date.now();
+		const bareEscape = buffer === "\x1b";
+		if (bareEscape) {
+			// A lone ESC is a real key press: only hold it while a probe reply is
+			// still expected, and only briefly.
+			if (now >= this.#probeReplyWindowUntil) return false;
+		} else if (!isIncompleteProbeReplyPrefix(buffer)) {
+			return false;
+		}
+		if (this.#probeHoldStartedAt === undefined || this.#probeHoldBuffer !== buffer) {
+			// Restart the clock whenever the fragment makes progress. A start stamp left
+			// over from an earlier fragment expired every later hold instantly, so a
+			// reply split across many reads still leaked character by character.
+			this.#probeHoldStartedAt = now;
+			this.#probeHoldBuffer = buffer;
+		}
+		const limit = bareEscape ? PROBE_ESCAPE_HOLD_MAX_MS : PROBE_FRAGMENT_HOLD_MAX_MS;
+		return now - this.#probeHoldStartedAt < limit;
+	}
+
 	flush(): string[] {
 		if (this.#timeout) {
 			clearTimeout(this.#timeout);
 			this.#timeout = undefined;
 		}
 		if (this.#sgrQuarantine) this.#endSgrQuarantine();
+		this.#probeHoldStartedAt = undefined;
 
 		const pendingMeta = this.#consumePendingSingleUtf8LeadAsMeta();
 
@@ -637,6 +724,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#sgrQuarantineBytes = 0;
 		this.#sgrQuarantineSemicolons = 0;
 		this.#sgrQuarantineHasDigit = false;
+		this.#probeHoldStartedAt = undefined;
 		// Drop any incomplete multi-byte sequence the decoder is holding so a
 		// stale partial prefix cannot combine with future input. destroy()
 		// resets the decoder by calling clear().

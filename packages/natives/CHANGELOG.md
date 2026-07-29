@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-28
+### Fixed
+
+- Native addon builds now prepend the active `rustup` toolchain's Cargo directory before invoking `napi`, so non-interactive shells without `~/.cargo/bin` on `PATH` no longer fail with opaque `cargo metadata failed to run` errors.
+- Retained managed session publication no longer fails closed on filesystems that do not implement `renameat2` rename flags (NFS and some FUSE/overlay mounts reject them with `EINVAL`; kernels older than 3.15 answer `ENOSYS`), which crashed every launch with a session store on an NFS home directory (`Could not prepare managed session scope: … durability_failed`). The no-replace **file** publish paths (binding, receipt/install, and tombstone) now fall back to an atomic `linkat(2)` create — which fails with `EEXIST` when the destination already exists — so the no-overwrite guarantee is preserved rather than weakened, and the staging link is unlinked so the published file stays single-linked. Directory/tree no-replace still requires kernel `renameat2` flag support.
+
 ## [0.11.11] - 2026-07-26
 ### Added
 

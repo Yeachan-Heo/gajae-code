@@ -43,6 +43,8 @@ export interface TopicRecord {
 	creationLeaseEpoch?: number;
 	/** An uncertain delete fences future creation and inbound routing. */
 	authorityState?: "active" | "delete_pending";
+	/** Provenance for topics created by the user and adopted by GJC. Missing means daemon-created. */
+	topicOrigin?: "user_created";
 	/** Telegram chat and endpoint authority last proven to use this topic. */
 	chatId?: string;
 	/** Canonical endpoint tuple (URL + token) that currently holds the lease. */
@@ -234,6 +236,7 @@ export class TopicRegistry {
 				...(raw.authorityState === "delete_pending" || fenceSupersedesRecord
 					? { authorityState: "delete_pending" as const }
 					: {}),
+				...(raw.topicOrigin === "user_created" ? { topicOrigin: "user_created" as const } : {}),
 				...(isValidBindingString(raw.chatId) ? { chatId: raw.chatId } : {}),
 				...(isValidBindingString(raw.endpointKey) ? { endpointKey: raw.endpointKey } : {}),
 				...(isValidBindingString(raw.endpointDigest) ? { endpointDigest: raw.endpointDigest } : {}),
@@ -306,6 +309,21 @@ export class TopicRegistry {
 	isActiveUnambiguous(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
 		return record?.authorityState !== "delete_pending" && this.byTopic.get(record?.topicId ?? "") === sessionId;
+	}
+	/**
+	 * Pure read-only availability check for user-topic adoption. Rejects invalid
+	 * ids and any id already committed, delete-pending/fenced, staged, or
+	 * ambiguous, without mutating maps, epochs, or persistence. Used inside the
+	 * {@link getOrCreateTopic} create callback to fail-closed before adopting a
+	 * user-created topic id.
+	 */
+	isTopicIdAvailable(topicId: string): boolean {
+		if (!isValidTopicId(topicId)) return false;
+		if (this.#ambiguousTopicIds.has(topicId)) return false;
+		if (this.byTopic.has(topicId)) return false;
+		for (const record of this.topics.values()) if (record.topicId === topicId) return false;
+		for (const record of this.staged.values()) if (record.topicId === topicId) return false;
+		return true;
 	}
 
 	/**
@@ -455,6 +473,7 @@ export class TopicRegistry {
 		binding?: TopicEndpointBinding,
 		commit?: () => Promise<void>,
 		transientClaimant?: object,
+		topicOrigin?: TopicRecord["topicOrigin"],
 	): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
 		if (existing?.authorityState === "delete_pending") throw new Error("topic authority is deletion-fenced");
@@ -491,6 +510,7 @@ export class TopicRegistry {
 						}
 					: {}),
 				...(revoked ? { authorityState: "delete_pending" as const } : {}),
+				...(topicOrigin === "user_created" ? { topicOrigin: "user_created" as const } : {}),
 			};
 			if (revoked) {
 				this.topics.set(sessionId, record);

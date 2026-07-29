@@ -46,6 +46,12 @@ function gate(): WorkflowGate {
 }
 
 describe("coordinator MCP ask-gate codec", () => {
+	it("decodes canonical ask gates for every workflow stage", () => {
+		for (const stage of ["deep-interview", "ralplan", "ultragoal"] as const) {
+			expect(decodeAskGateV1({ ...gate(), stage })).not.toBeNull();
+		}
+	});
+
 	it("projects a pending Q12 ask without exposing the private codec or binding after it is answered", () => {
 		const codec = decodeAskGateV1(gate());
 		if (!codec) throw new Error("expected a valid deep-interview ask gate");

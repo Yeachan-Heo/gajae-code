@@ -130,6 +130,7 @@ import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "
 import { ExtensionDashboard } from "../components/extensions";
 import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
+import { HookSelectorComponent } from "../components/hook-selector";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
 import { ModelSelectorComponent } from "../components/model-selector";
 import type {
@@ -351,6 +352,7 @@ export function createNotificationsEditorOperations(
 					richDraftEnabled: config.richDraft.enabled,
 					toolActivityEnabled: config.toolActivity.enabled,
 					streamingEnabled: config.streaming.enabled,
+					sound: config.sound,
 				},
 			};
 		},
@@ -724,6 +726,7 @@ export function createNotificationsEditorOperations(
 						{ path: "notifications.redact", op: "set", value: preferences.redact },
 						{ path: "notifications.verbosity", op: "set", value: preferences.verbosity },
 						{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
+						{ path: "notifications.telegram.sound", op: "set", value: preferences.sound },
 						{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
 						{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
 						{ path: "notifications.telegram.streaming.enabled", op: "set", value: preferences.streamingEnabled },
@@ -1280,6 +1283,8 @@ export class SelectorController {
 						availableThemes,
 						availableModelProfiles: [...this.ctx.session.modelRegistry.getModelProfiles().keys()],
 						cwd: getProjectDir(),
+						gjcRuntimeSnapshot: this.ctx.session.gjcRuntimeSnapshot,
+						gjcActivationGeneration: this.ctx.session.gjcActivationGeneration,
 					},
 					{
 						onChange: (id, value) => this.handleSettingChange(id, value),
@@ -2327,9 +2332,49 @@ export class SelectorController {
 			);
 			await this.ctx.reloadTodos();
 			this.ctx.showStatus("Resumed session");
+			this.#maybePromptResumeModelChoice();
 		} finally {
 			progressLease.clear();
 		}
+	}
+
+	/**
+	 * When `session.resumeModelBehavior` is "ask", offer a one-shot choice after
+	 * resuming: keep the model the session was last using, or switch to whatever
+	 * `modelRoles.default` currently resolves to. No-op if the setting is unset,
+	 * the two models already match, or either model can't be resolved.
+	 */
+	#maybePromptResumeModelChoice(): void {
+		if (this.ctx.settings?.get("session.resumeModelBehavior") !== "ask") return;
+		const sessionModel = this.ctx.session.model;
+		const currentDefault = this.ctx.session.resolveConfiguredDefaultModel?.();
+		if (!sessionModel || !currentDefault) return;
+		if (sessionModel.provider === currentDefault.provider && sessionModel.id === currentDefault.id) return;
+
+		this.showSelector(done => {
+			const selector = new HookSelectorComponent(
+				`This session last used ${sessionModel.provider}/${sessionModel.id}.\n` +
+					`Current default model is ${currentDefault.provider}/${currentDefault.id}.`,
+				[`Keep ${sessionModel.id}`, `Use ${currentDefault.id}`],
+				async (option: string) => {
+					done();
+					if (option === `Use ${currentDefault.id}`) {
+						try {
+							await this.ctx.session.setModel(currentDefault);
+							this.ctx.showStatus(`Switched to ${currentDefault.provider}/${currentDefault.id}`);
+						} catch (err) {
+							this.ctx.showError(err instanceof Error ? err.message : String(err));
+						}
+					}
+					this.ctx.ui.requestRender();
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector };
+		});
 	}
 
 	async handleSessionDeleteCommand(): Promise<void> {

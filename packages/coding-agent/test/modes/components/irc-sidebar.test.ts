@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
 	computeIrcSplitWidths,
+	getIrcSidebarSemanticToken,
 	IRC_SIDEBAR_MAX_RENDER_ROWS,
 	type IrcSidebarTheme,
 	IrcSplitViewComponent,
 } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
-import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
+import {
+	IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES,
+	IrcObservationLedger,
+} from "@gajae-code/coding-agent/modes/irc-observation-ledger";
 import {
 	type Component,
 	Container,
@@ -74,6 +78,53 @@ function image(): Image {
 	);
 }
 
+describe("IrcObservationLedger sidebar contracts", () => {
+	it("does not consume an identity when its payload is rejected", () => {
+		const ledger = new IrcObservationLedger();
+		const observationId = "rejected-then-accepted";
+		expect(
+			ledger.observe(
+				{
+					observationId,
+					kind: "incoming",
+					from: "alice",
+					to: "bob",
+					text: "x".repeat(IRC_OBSERVATION_LEDGER_MAX_RETAINED_UTF8_BYTES),
+					timestamp: 1,
+				},
+				false,
+			),
+		).toBeUndefined();
+		expect(
+			ledger.observe(
+				{ observationId, kind: "incoming", from: "alice", to: "bob", text: "accepted", timestamp: 2 },
+				false,
+			),
+		).toBeDefined();
+	});
+
+	it("reset releases deduplication state without changing an empty projection epoch", () => {
+		const ledger = new IrcObservationLedger();
+		addRecord(ledger, "first", "reset-identity");
+		ledger.reset();
+		const emptyEpoch = ledger.mutationEpoch;
+		ledger.reset();
+		expect(ledger.mutationEpoch).toBe(emptyEpoch);
+		expect(
+			ledger.observe(
+				{
+					observationId: "reset-identity",
+					kind: "incoming",
+					from: "alice",
+					to: "bob",
+					text: "second",
+					timestamp: 2,
+				},
+				false,
+			),
+		).toBeDefined();
+	});
+});
 describe("computeIrcSplitWidths", () => {
 	it("keeps exact split invariants for every width from 1 through 500", () => {
 		for (let width = 1; width <= 500; width++) {
@@ -410,4 +461,79 @@ describe("IrcSplitViewComponent", () => {
 		const second = split.render(80).join("\n");
 		expect(second).toContain("\x1b[32m\x1b[4malice\x1b[24m\x1b[0m");
 	});
+
+	it("renders ledger mutations without retaining stale sidebar output", () => {
+		const ledger = new IrcObservationLedger();
+		addRecord(ledger, "first entry", "first");
+		const split = new IrcSplitViewComponent(new TestPane("left"), ledger, sidebarTheme);
+		split.setVisible(true);
+
+		expect(Bun.stripANSI(split.render(80).join("\n"))).toContain("first entry");
+		addRecord(ledger, "second entry", "second");
+		const rendered = Bun.stripANSI(split.render(80).join("\n"));
+		expect(rendered).toContain("first entry");
+		expect(rendered).toContain("second entry");
+	});
+
+	it("clears sidebar output after a ledger reset", () => {
+		const ledger = new IrcObservationLedger();
+		addRecord(ledger, "reset entry", "reset");
+		const split = new IrcSplitViewComponent(new TestPane("left"), ledger, sidebarTheme);
+		split.setVisible(true);
+		expect(Bun.stripANSI(split.render(80).join("\n"))).toContain("reset entry");
+
+		ledger.reset();
+		expect(Bun.stripANSI(split.render(80).join("\n"))).not.toContain("reset entry");
+	});
+
+	it("hashes semantic tokens compactly while preserving and changing them with projected semantics", () => {
+		const ledger = new IrcObservationLedger();
+		const width = computeIrcSplitWidths(80).rightWidth;
+		addRecord(ledger, "visible token", "visible");
+		const initial = getIrcSidebarSemanticToken(ledger, width);
+		expect(initial).toMatch(/^[a-f0-9]{64}$/);
+
+		addRecord(ledger, "ignored duplicate", "visible");
+		expect(getIrcSidebarSemanticToken(ledger, width)).toBe(initial);
+		addRecord(ledger, "changed token", "changed");
+		expect(getIrcSidebarSemanticToken(ledger, width)).not.toBe(initial);
+	});
+});
+
+it("keeps a short anchored transcript visible after manual sidebar-history navigation in a pinned TUI frame", async () => {
+	const transcript = new Container();
+	const transcriptRow = new Text("short transcript remains visible", 0, 0);
+	transcript.addChild(transcriptRow);
+	transcript.setViewportAnchorSource(transcriptRow, { id: "short-transcript" });
+	const ledger = new IrcObservationLedger();
+	for (let index = 0; index < 40; index++) addRecord(ledger, `long sidebar history ${index}`, `history-${index}`);
+	const split = new IrcSplitViewComponent(transcript, ledger, sidebarTheme);
+	split.setVisible(true);
+	const status = new Text("status: pinned", 0, 0);
+	const editor = new Text("> editor: pinned", 0, 0);
+	const terminal = new VirtualTerminal(80, 10, { isProcessTerminal: true });
+	const tui = new TUI(terminal);
+	try {
+		tui.addChild(split);
+		tui.setViewportAnchorComponent(split);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.setViewportOutputSource({ identity: "irc-subagent-view", revision: 0n });
+		tui.start();
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("short transcript remains visible");
+
+		expect(tui.scrollViewportBy(-3, { pin: "stable" })).toBe(true);
+		expect(tui.scrollViewportPages(-1)).toBe(true);
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("status: pinned");
+		expect(terminal.getViewport().join("\n")).toContain("> editor: pinned");
+
+		tui.scrollViewportBy(10_000, { pin: "edge" });
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("short transcript remains visible");
+	} finally {
+		tui.stop();
+	}
 });

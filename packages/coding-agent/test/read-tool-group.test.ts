@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { getDefault } from "../src/config/settings-schema";
 import { ReadToolGroupComponent, readArgsTargetInternalUrl } from "../src/modes/components/read-tool-group";
 import { InputController } from "../src/modes/controllers/input-controller";
@@ -6,12 +6,13 @@ import * as themeModule from "../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../src/modes/types";
 
 describe("ReadToolGroupComponent", () => {
-	beforeAll(async () => {
+	beforeEach(async () => {
 		await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await themeModule.initTheme(false);
 	});
 
 	it("keeps inline read previews disabled by default", () => {
@@ -32,6 +33,68 @@ describe("ReadToolGroupComponent", () => {
 		expect(rendered).toContain("Read /tmp/example.ts");
 		expect(rendered).not.toContain("line 1");
 		expect(rendered.toLowerCase()).not.toContain("ctrl+o");
+	});
+
+	it("consumes each semantic visible read mutation exactly once", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+
+		component.updateArgs({ path: "/tmp/example.ts" }, "read-visible");
+		expect(component.consumeVisibleTranscriptChange()).toBe(true);
+		expect(component.consumeVisibleTranscriptChange()).toBe(false);
+
+		component.updateArgs({ path: "/tmp/example.ts" }, "read-visible");
+		expect(component.consumeVisibleTranscriptChange()).toBe(false);
+
+		component.updateResult({ content: [{ type: "text", text: "one\ntwo\nthree\nhidden" }] }, false, "read-visible");
+		expect(component.consumeVisibleTranscriptChange()).toBe(true);
+
+		component.updateResult(
+			{ content: [{ type: "text", text: "one\ntwo\nthree\nchanged-but-collapsed" }] },
+			false,
+			"read-visible",
+		);
+		expect(component.consumeVisibleTranscriptChange()).toBe(false);
+
+		component.setExpanded(true);
+		expect(component.consumeVisibleTranscriptChange()).toBe(true);
+		component.setExpanded(true);
+		expect(component.consumeVisibleTranscriptChange()).toBe(false);
+	});
+
+	it("does not report a visible change when only an unrendered preview conflict count changes", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/example.ts" }, "read-conflict");
+		component.consumeVisibleTranscriptChange();
+		component.updateResult(
+			{ content: [{ type: "text", text: "one\ntwo\nthree" }], details: { conflictCount: 1 } },
+			false,
+			"read-conflict",
+		);
+		expect(component.consumeVisibleTranscriptChange()).toBe(true);
+
+		component.updateResult(
+			{ content: [{ type: "text", text: "one\ntwo\nthree" }], details: { conflictCount: 2 } },
+			false,
+			"read-conflict",
+		);
+		expect(component.consumeVisibleTranscriptChange()).toBe(false);
+	});
+
+	it("reports failures and absent preview text while ignoring identical results", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/example.ts" }, "read-result");
+		component.consumeVisibleTranscriptChange();
+		const result = { content: [{ type: "text", text: "one" }] };
+
+		component.updateResult(result, false, "read-result");
+		expect(component.consumeVisibleTranscriptChange()).toBe(true);
+		component.updateResult(result, false, "read-result");
+		expect(component.consumeVisibleTranscriptChange()).toBe(false);
+
+		component.updateResult({ content: [], isError: true }, false, "read-result");
+		expect(component.consumeVisibleTranscriptChange()).toBe(true);
+		component.updateResult({ content: [], isError: true }, false, "read-result");
+		expect(component.consumeVisibleTranscriptChange()).toBe(false);
 	});
 
 	it("renders warning previews with warning styling instead of success styling", () => {
@@ -176,11 +239,12 @@ describe("ReadToolGroupComponent", () => {
 	it("keeps ToolExecutionHandle source-compatible for legacy structural implementers", () => {
 		// Compile-time compatibility fixture: an implementer written against the
 		// pre-pin interface (no setManuallyExpanded) must keep typechecking.
+		const setExpanded = vi.fn<() => void>();
 		const legacy: import("../src/modes/components/tool-execution").ToolExecutionHandle = {
-			updateArgs: vi.fn(),
-			updateResult: vi.fn(),
-			setArgsComplete: vi.fn(),
-			setExpanded: vi.fn(),
+			updateArgs(): void {},
+			updateResult(): void {},
+			setArgsComplete(): void {},
+			setExpanded,
 		};
 		const ctx = {
 			toolOutputExpanded: false,
@@ -189,7 +253,7 @@ describe("ReadToolGroupComponent", () => {
 		} as unknown as InteractiveModeContext;
 
 		new InputController(ctx).setToolsExpanded(true);
-		expect(legacy.setExpanded).toHaveBeenCalledWith(true);
+		expect(setExpanded).toHaveBeenCalledWith(true);
 	});
 });
 

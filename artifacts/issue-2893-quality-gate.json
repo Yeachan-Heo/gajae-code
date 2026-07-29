@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "goalId": "G001",
+  "goalTitle": "Resolve issue #2893 review-wrapper findings contract",
+  "verdict": "MERGE_READY",
+  "summary": "Strict caller-owned JTD completion data remains untouched; wrapper-owned review findings are published as exact bounded artifact evidence with leak-safe receipt references, serialized shared-manager finalization, and fail-closed publication semantics. Current tests, check, build, compiled workflow dogfood, cleanup, architecture review, red-team QA, and terminal critic are green.",
+  "subchecks": [
+    {
+      "name": "focused-contract-tests",
+      "verdict": "PASS",
+      "evidence": "52 pass, 0 fail, 223 expect calls"
+    },
+    {
+      "name": "task-subsystem-tests",
+      "verdict": "PASS",
+      "evidence": "306 pass, 0 fail, 958 expect calls"
+    },
+    {
+      "name": "package-check",
+      "verdict": "PASS",
+      "evidence": "Biome 2477 files; TypeScript noEmit passed"
+    },
+    {
+      "name": "compiled-workflow-dogfood",
+      "verdict": "PASS",
+      "evidence": "dist/gjc sha256 152fe9d249a58f430d0eba7f65fb665c794a01122804b69b2c4d22b5cb772202; session 019face3-1558-7000-bc5f-9a50350bc99c resolved strict agent:// and separate artifact:// payloads"
+    },
+    {
+      "name": "cleanup-review",
+      "verdict": "PASS",
+      "evidence": "artifacts/issue-2893-ai-slop-cleaner.txt"
+    },
+    {
+      "name": "architecture-review",
+      "verdict": "CLEAR",
+      "evidence": "Exact product snapshot; confidence 0.97"
+    },
+    {
+      "name": "red-team-qa",
+      "verdict": "CLEAR",
+      "evidence": "Exact final test snapshot; confidence 0.99"
+    },
+    {
+      "name": "terminal-critic",
+      "verdict": "MERGE_READY",
+      "evidence": "Exact final snapshot; confidence 0.99"
+    },
+    {
+      "name": "current-dev-overlap",
+      "verdict": "PASS",
+      "evidence": "origin/dev 27e26c2e9ccbb464f2fade636692efbff4de594f changed only packages/utils since frozen base"
+    }
+  ],
+  "remediation": []
+}

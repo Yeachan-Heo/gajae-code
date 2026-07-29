@@ -57,6 +57,38 @@ const BASH_OPAQUE_INTERPRETER_WRITE_RE =
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:<<[-]?\s*['"]?\w+['"]?)[\s\S]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
 const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?dd\b([^;&|\n]*)/gi;
+/** Literal `sh|bash|zsh -c '<script>'` payloads whose nested script must also be scanned. */
+const BASH_NESTED_SHELL_RE =
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:ba|z|da)?sh\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*c\s+(?:(')([^']*)'|(")([^"]*)")/g;
+/** Heredoc opener (`<<`/`<<-` plus an optionally quoted delimiter); `<<<` here-strings excluded. */
+const BASH_HEREDOC_OPEN_RE = /(?<!<)<<(?!<)(-?)\s*(?:'([^'\s]+)'|"([^"\s]+)"|(\\)?([A-Za-z_][\w.-]*))/g;
+/** Consumers whose stdin is inert data: their heredoc bodies are safe to mask. Anything else stays live. */
+const HEREDOC_DATA_CONSUMERS = new Set([
+	"cat",
+	"tee",
+	"head",
+	"tail",
+	"wc",
+	"sort",
+	"uniq",
+	"tr",
+	"cut",
+	"grep",
+	"column",
+	"nl",
+	"fold",
+	"fmt",
+	"base64",
+	"md5sum",
+	"sha1sum",
+	"sha256sum",
+	"sha512sum",
+	"shasum",
+	"jq",
+	"yq",
+]);
+/** Stdin appliers whose heredoc body mutates files in ways no body scan can model. */
+const HEREDOC_MUTATING_CONSUMERS = new Set(["patch", "ed", "ex", "sqlite3"]);
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -77,6 +109,12 @@ export interface WorkflowMutationGuardInput {
 interface ExtractedTargets {
 	paths: string[];
 	unknown: boolean;
+	/**
+	 * Set when a bash command was recognized as performing a filesystem write.
+	 * During a planning phase an unrecognized bash command is allowed (reading
+	 * and inspection must not be blocked); only a recognized mutation blocks.
+	 */
+	explicitMutation?: boolean;
 }
 
 export interface WorkflowMutationDecision {
@@ -382,11 +420,485 @@ function cleanShellWord(value: string): string {
 	return value.replace(/^['"]|['"]$/g, "");
 }
 
+/**
+ * Blank out single-quoted spans so shell metacharacters inside a literal
+ * argument value (e.g. `--value 'uses `x`; a > b'`) are not misread as
+ * redirections or separators. Single quotes suppress every expansion in POSIX
+ * shells, so their contents are always inert data. Double-quoted spans are left
+ * intact because they still expand `$(...)` and backticks.
+ */
+function maskSingleQuotedSpans(command: string): string {
+	let masked = "";
+	let inSingle = false;
+	for (const character of command) {
+		if (character === "'") {
+			inSingle = !inSingle;
+			masked += character;
+			continue;
+		}
+		masked += inSingle && character !== "\n" ? " " : character;
+	}
+	// An unbalanced quote means the parse is unreliable; keep the original text
+	// so the scanner stays fail-closed rather than blind.
+	return inSingle ? command : masked;
+}
+
 function isDeviceSinkPath(value: string): boolean {
 	return DEVICE_SINK_PATHS.has(cleanShellWord(value));
 }
 
-function extractBashTargets(args: unknown): ExtractedTargets {
+interface HeredocMaskResult {
+	masked: string;
+	/** An unquoted-delimiter heredoc body carried `$(…)`/backtick expansion — live code the scanner cannot model. */
+	opaqueExpansion: boolean;
+	/** The heredoc feeds a stdin applier (patch/ed/ex/sqlite3) whose body mutates files no scan can attribute. */
+	mutatingConsumer: boolean;
+}
+
+/** Quote/substitution state carried ACROSS physical lines so multiline constructs cannot fake heredoc openers. */
+interface ShellQuoteState {
+	inSingle: boolean;
+	inDouble: boolean;
+	/** The open single quote is ANSI-C (`$'…'`): backslash escapes inside it decode at runtime. */
+	inAnsiC: boolean;
+	/**
+	 * Paren stack inside substitutions: `true` for a `$(`/`<(`/`>(` opener
+	 * (its `)` is a word character), `false` for a plain nested paren (its `)`
+	 * is an operator, so a following `#` starts a comment).
+	 */
+	parenStack: boolean[];
+}
+
+/**
+ * Mask one physical line for syntax analysis, carrying `state` across lines:
+ * quoted spans and backslash-escaped characters become spaces (they are data,
+ * never syntax), so a `<<` inside `"…"`/`'…'` — even when the quote opened on a
+ * PREVIOUS line — or an escaped separator like `\|` is never misread. An
+ * unquoted `#` at a word boundary starts a comment: the rest of the line is
+ * blanked without touching quote state, so a stray quote inside a comment
+ * cannot poison later lines. A `)` closing a `$(`/`<(`/`>(` substitution is
+ * part of the current word (`x=$(true)#literal`), not a comment boundary.
+ * `masked` is the same length as the input so match offsets stay aligned.
+ * `dequoted` applies bash-like QUOTE REMOVAL instead — quote/backslash marks
+ * drop, quoted word characters stay, quoted metacharacters neutralize to `_` —
+ * so obfuscated spellings (`e\val`, `'ev'al`) reassemble into their real
+ * command word without quoted data ever forming fake command boundaries. A
+ * leading `$` immediately before `'…'` (ANSI-C) or `"…"` (locale-translated)
+ * is stripped during quote removal too, so `$'eval'`/`$"eval"` dequote to
+ * plain `eval`, matching real bash quote-removal semantics for both forms.
+ * `continued` reports an unescaped trailing backslash outside quotes (logical
+ * line continuation).
+ */
+function maskLineForSyntax(
+	line: string,
+	state: ShellQuoteState,
+): { masked: string; dequoted: string; continued: boolean; ansiCEscape: boolean } {
+	let masked = "";
+	let dequoted = "";
+	let escaped = false;
+	let previous = "";
+	let ansiCEscape = false;
+	// Quoted data keeps word characters (so `'ev'al` reassembles to `eval`) but
+	// neutralizes everything else to `_` so it can never form a command boundary.
+	const dequoteData = (character: string): string => (/[\w./-]/.test(character) ? character : "_");
+	for (const character of line) {
+		if (state.inSingle) {
+			if (character === "'") {
+				state.inSingle = false;
+				state.inAnsiC = false;
+			} else {
+				// ANSI-C escapes (`$'\145val'`) decode at runtime into characters the
+				// dequoted view cannot reproduce — flag them so the caller fails closed.
+				if (state.inAnsiC && character === "\\") ansiCEscape = true;
+				masked += " ";
+				dequoted += dequoteData(character);
+				previous = character;
+				continue;
+			}
+			masked += "'";
+			previous = character;
+			continue;
+		}
+		if (escaped) {
+			escaped = false;
+			masked += " ";
+			dequoted += dequoteData(character);
+			previous = character;
+			continue;
+		}
+		if (character === "\\") {
+			escaped = true;
+			masked += " ";
+			previous = character;
+			continue;
+		}
+		if (state.inDouble) {
+			if (character === '"') state.inDouble = false;
+			else {
+				masked += " ";
+				dequoted += dequoteData(character);
+				previous = character;
+				continue;
+			}
+			masked += '"';
+			previous = character;
+			continue;
+		}
+		if (
+			character === "(" &&
+			(previous === "$" || previous === "<" || previous === ">" || state.parenStack.length > 0)
+		) {
+			// Substitution opener, or any paren nested INSIDE one (e.g. `$((1))`,
+			// `$(f (x))`): both must be balanced before the substitution closes.
+			state.parenStack.push(previous === "$" || previous === "<" || previous === ">");
+			masked += character;
+			dequoted += character;
+			previous = character;
+			continue;
+		}
+		if (character === ")" && state.parenStack.length > 0) {
+			const wasSubstitutionOpener = state.parenStack.pop() === true;
+			masked += character;
+			dequoted += character;
+			// A substitution close binds to the surrounding word (`x=$(true)#lit`);
+			// a nested subshell close is an operator, so `#` after it comments.
+			previous = wasSubstitutionOpener ? "x" : ")";
+			continue;
+		}
+		if (
+			character === "#" &&
+			(previous === "" || previous === " " || previous === "\t" || ";|&()".includes(previous))
+		) {
+			// Comment: blank the remainder without evaluating quotes inside it.
+			masked += " ".repeat(line.length - masked.length);
+			return { masked, dequoted, continued: false, ansiCEscape };
+		}
+		if (character === "'") {
+			state.inSingle = true;
+			masked += "'";
+			// ANSI-C quoting `$'…'`: bash strips the `$` during quote removal, and
+			// escapes inside decode at runtime.
+			if (dequoted.endsWith("$")) {
+				dequoted = dequoted.slice(0, -1);
+				state.inAnsiC = true;
+			}
+			previous = character;
+			continue;
+		}
+		if (character === '"') {
+			state.inDouble = true;
+			masked += '"';
+			// `$"…"` locale-translated strings undergo the same quote removal as
+			// ANSI-C `$'…'`: bash drops the `$`, so `$"eval"` dequotes to `eval`.
+			if (dequoted.endsWith("$")) dequoted = dequoted.slice(0, -1);
+			previous = character;
+			continue;
+		}
+		masked += character;
+		dequoted += character;
+		previous = character;
+	}
+	return { masked, dequoted, continued: escaped, ansiCEscape };
+}
+
+const DATA_CONSUMER_NAMES = new Set(HEREDOC_DATA_CONSUMERS);
+/**
+ * Command-position words that force the fail-closed pass. `eval`/`source`/`.`
+ * can install a shadow from data the syntax view has blanked (quoted strings,
+ * /dev/stdin). `case` introduces pattern `)` terminators that desync the
+ * substitution-depth scanner (`$(case x in x) …;; esac)`), making comment
+ * detection unreliable — masking is disabled rather than guessing.
+ */
+const SHELL_EVALUATED_COMMANDS = new Set(["eval", "source", ".", "case"]);
+
+/** Wrappers whose next word is still the effective command (`builtin eval …`, `command cat …`). */
+const SHELL_COMMAND_WRAPPER_WORDS = new Set(["sudo", "builtin", "command", "exec", "nohup", "nice"]);
+
+/** Reserved words that introduce a nested command position (`if eval …`, `while eval …`). */
+const SHELL_RESERVED_PREFIX_WORDS = new Set([
+	"if",
+	"then",
+	"else",
+	"elif",
+	"while",
+	"until",
+	"do",
+	"time",
+	"coproc",
+	"{",
+	"!",
+]);
+
+/** A redirection token (`</dev/null`, `2>err`, `>out`) — not a command word. */
+const SHELL_REDIRECTION_TOKEN_RE = /^\d*[<>]/;
+
+/** Command-position words of one command-list segment: the first real word plus words after reserved prefixes. */
+function commandPositionWords(segment: string): string[] {
+	const words: string[] = [];
+	let expectCommand = true;
+	let afterWrapper = false;
+	let afterBareRedirection = false;
+	for (const word of segment.trim().split(/\s+/)) {
+		if (!word) continue;
+		// A bare redirection operator (`<`, `2>`) consumes the NEXT word as its target.
+		if (afterBareRedirection) {
+			afterBareRedirection = false;
+			continue;
+		}
+		if (expectCommand) {
+			if (/^\w+=/.test(word)) continue;
+			// Leading redirections precede the command word (`</dev/null eval …`).
+			// A bare operator (`<`, `2>`) additionally consumes its separated target.
+			if (SHELL_REDIRECTION_TOKEN_RE.test(word)) {
+				if (/^\d*[<>]+$/.test(word)) afterBareRedirection = true;
+				continue;
+			}
+			if (SHELL_COMMAND_WRAPPER_WORDS.has(word.toLowerCase())) {
+				// The wrapper's effective command follows, possibly after options/`--`.
+				afterWrapper = true;
+				continue;
+			}
+			if (afterWrapper && (word === "--" || word.startsWith("-"))) {
+				// `command -v`/`-V` only DESCRIBES its operand — the rest is data.
+				if (/^-[a-zA-Z]*[vV]/.test(word)) return words;
+				// Other wrapper options (`command -p`, `builtin --`) precede the real command.
+				continue;
+			}
+			afterWrapper = false;
+			if (SHELL_RESERVED_PREFIX_WORDS.has(word.toLowerCase())) {
+				// Reserved word keeps the NEXT word in command position.
+				continue;
+			}
+			words.push(word.split("/").pop()?.toLowerCase() ?? "");
+			expectCommand = false;
+		}
+		// Argument position: only real list operators (handled by the segment
+		// split) restore command position — reserved-word TEXT here is data.
+	}
+	return words;
+}
+
+/** Command-list segments of a dequoted view (split at `;`, `|`, `&`, `(`, backtick, newline). */
+function commandListSegments(dequotedView: string): string[] {
+	return dequotedView.split(/[;|&(`\n]/);
+}
+
+/**
+ * True when any command-position word of the dequoted syntax view is
+ * eval/source/`.` — including nested positions after reserved words
+ * (`if eval …`). `echo eval` and `find .` never match because their
+ * tokens sit in argument position.
+ */
+function hasShellEvaluatedCommand(dequotedView: string): boolean {
+	return commandListSegments(dequotedView).some(segment =>
+		commandPositionWords(segment).some(word => SHELL_EVALUATED_COMMANDS.has(word)),
+	);
+}
+
+/**
+ * True when live syntax actually DECLARES a shadow of an allowlisted
+ * data-consumer name: `name()` at a command-list start, `function name`,
+ * or `alias name=…` — each in command position, so `echo function cat`
+ * (argument position) never matches.
+ */
+function hasDataConsumerShadow(dequotedView: string): boolean {
+	for (const segment of commandListSegments(dequotedView)) {
+		const words = commandPositionWords(segment);
+		for (let index = 0; index < words.length; index++) {
+			const word = words[index] ?? "";
+			if (word === "function") {
+				// commandPositionWords stops after the first non-reserved word, so
+				// re-inspect the raw segment for the name following `function`.
+				const rawWords = segment.trim().split(/\s+/).filter(Boolean);
+				const at = rawWords.findIndex(raw => raw.toLowerCase() === "function");
+				const name = rawWords[at + 1]?.split("/").pop()?.toLowerCase() ?? "";
+				if (DATA_CONSUMER_NAMES.has(name)) return true;
+			}
+			if (word === "alias") {
+				const rawWords = segment.trim().split(/\s+/).filter(Boolean);
+				if (rawWords.some(raw => DATA_CONSUMER_NAMES.has(raw.split("=")[0]?.toLowerCase() ?? ""))) return true;
+			}
+		}
+	}
+	// `name()` / `name ()` in command position — allow reserved-word prefixes
+	// (`then cat() { … }`) before the name (POSIX function definition).
+	const nameGroup = [...DATA_CONSUMER_NAMES].join("|");
+	const reservedGroup = [...SHELL_RESERVED_PREFIX_WORDS].filter(word => /^\w+$/.test(word)).join("|");
+	return new RegExp(
+		`(?:^|[;|&{(\`\\n])\\s*(?:(?:${reservedGroup}|\\{|!)\\s+)*(?:${nameGroup})\\s*\\(\\s*\\)`,
+		"i",
+	).test(dequotedView);
+}
+
+/** First command word of a pipeline-segment slice of a quote-masked opener line. */
+function firstCommandWord(segment: string): string {
+	return commandPositionWords(segment)[0] ?? "";
+}
+
+/**
+ * Classify the command consuming the heredoc at offset `at` of the comment-cut,
+ * quote-masked opener line — including every DOWNSTREAM pipe stage, because
+ * `cat <<'EOF' | bash` hands the body to the interpreter even though `cat` is
+ * inert. Only a pipeline whose every stage is an explicitly inert data consumer
+ * qualifies for body masking; any stdin applier stage fails closed; anything
+ * else (interpreters, awk, unknown binaries) keeps the body live.
+ */
+function heredocConsumerKind(syntaxLine: string, at: number): "data" | "mutating" | "other" {
+	let start = 0;
+	for (let index = at - 1; index >= 0; index--) {
+		const character = syntaxLine[index] ?? "";
+		if (";|&(`".includes(character) || character === "\n") {
+			start = index + 1;
+			break;
+		}
+	}
+	// The heredoc's own simple command plus every downstream `|` stage until the
+	// command list ends (`;`, `&&`, `||`, `&`, backtick, or subshell close).
+	const segments: string[] = [syntaxLine.slice(start, at)];
+	let cursor = at;
+	while (cursor < syntaxLine.length) {
+		const character = syntaxLine[cursor] ?? "";
+		if (character === ";" || character === "&" || character === "`" || character === ")") break;
+		if (character === "|") {
+			if (syntaxLine[cursor + 1] === "|") break;
+			let stageEnd = cursor + 1;
+			while (stageEnd < syntaxLine.length && !";|&`)".includes(syntaxLine[stageEnd] ?? "")) stageEnd++;
+			segments.push(syntaxLine.slice(cursor + 1, stageEnd));
+			cursor = stageEnd;
+			continue;
+		}
+		cursor++;
+	}
+	let kind: "data" | "mutating" | "other" = "data";
+	for (const segment of segments) {
+		const base = firstCommandWord(segment);
+		if (HEREDOC_MUTATING_CONSUMERS.has(base)) return "mutating";
+		if (!HEREDOC_DATA_CONSUMERS.has(base)) kind = "other";
+	}
+	return kind;
+}
+
+/**
+ * Blank out heredoc BODY lines so document payloads (markdown specs, plans,
+ * fixtures) piped to an explicitly inert data consumer (`cat <<'EOF' >
+ * /tmp/spec.md`) are not misread as shell commands: body text like `a > b` or
+ * stray apostrophes must not register redirection targets or unbalance the
+ * quote masker. Bodies stay UNMASKED (scanned as today) for every other
+ * consumer — interpreters, awk, unknown binaries — because there the body may
+ * be live code. Stdin appliers (patch/ed/ex/sqlite3) flag `mutatingConsumer`
+ * and the caller fails closed. Unquoted-delimiter bodies still expand
+ * `$(…)`/backticks in real shells, so masked ones flag `opaqueExpansion`. A
+ * `<<` inside a comment or a quoted span (including a quote opened on a
+ * previous line) is not an opener; a line-continued opener, a shadowed
+ * data-consumer name (`cat() { … }`), and an unterminated heredoc all keep
+ * their bodies live so the scanner stays fail-closed rather than blind.
+ */
+function maskHeredocBodies(command: string): HeredocMaskResult {
+	if (!command.includes("<<")) return { masked: command, opaqueExpansion: false, mutatingConsumer: false };
+	const first = maskHeredocBodiesPass(command, false);
+	// Fail closed on live-syntax constructs that can install a shadow the syntax
+	// view cannot see: a function/alias definition of an allowlisted consumer
+	// name, or a command-position eval/source/`.` whose argument is blanked
+	// quoted data. Both run against the DEQUOTED view so quoting tricks
+	// (`e\val`, `'ev'al`) cannot hide the word, while heredoc bodies and
+	// comments stay excluded — a spec that merely DOCUMENTS `cat() { … }` or
+	// mentions "eval" in prose stays inert.
+	if (first.ansiCEscape || hasDataConsumerShadow(first.dequotedView) || hasShellEvaluatedCommand(first.dequotedView)) {
+		return maskHeredocBodiesPass(command, true).result;
+	}
+	return first.result;
+}
+
+function maskHeredocBodiesPass(
+	command: string,
+	shadowed: boolean,
+): { result: HeredocMaskResult; dequotedView: string; ansiCEscape: boolean } {
+	const lines = command.split("\n");
+	const out: string[] = [];
+	const dequotedLines: string[] = [];
+	const state: ShellQuoteState = { inSingle: false, inDouble: false, inAnsiC: false, parenStack: [] };
+	let previousContinued = false;
+	let opaqueExpansion = false;
+	let mutatingConsumer = false;
+	let sawAnsiCEscape = false;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index] ?? "";
+		out.push(line);
+		// Cross-line quote masking decides whether a `<<` is real syntax or inert
+		// data — even when the enclosing quote opened on a previous line.
+		const { masked, dequoted, continued, ansiCEscape } = maskLineForSyntax(line, state);
+		if (ansiCEscape) sawAnsiCEscape = true;
+		const syntax = masked;
+		const isContinuationLine = previousContinued;
+		// Bash removes a backslash-newline pair entirely: fold a continuation into
+		// the previous dequoted line so split command words (`e\` + `val`)
+		// reassemble for command/shadow detection.
+		if (isContinuationLine && dequotedLines.length > 0) {
+			let previousDequoted = dequotedLines[dequotedLines.length - 1] ?? "";
+			// A continuation can also split ANSI-C/locale quoting (`$\` + `'eval'` or
+			// `$\` + `"eval"`): the rejoined `$'`/`$"` still drops its `$` during
+			// quote removal.
+			if (previousDequoted.endsWith("$") && (line.startsWith("'") || line.startsWith('"'))) {
+				previousDequoted = previousDequoted.slice(0, -1);
+				// The masker already opened this quote as ordinary (it ran before the
+				// fold), so re-check the rejoined ANSI-C span for runtime-decoding
+				// escapes (`$\` + `'\145val'`) it could not have flagged.
+				if (line.startsWith("'") && /^'[^']*\\/.test(line)) sawAnsiCEscape = true;
+			}
+			dequotedLines[dequotedLines.length - 1] = previousDequoted + dequoted;
+		} else {
+			dequotedLines.push(dequoted);
+		}
+		previousContinued = continued;
+		for (const match of line.matchAll(BASH_HEREDOC_OPEN_RE)) {
+			const at = match.index ?? 0;
+			if (syntax.slice(at, at + 2) !== "<<") continue;
+			const delimiter = match[2] ?? match[3] ?? match[5] ?? "";
+			if (!delimiter) continue;
+			let kind = heredocConsumerKind(syntax, at);
+			// A continued/continuation opener line hides part of the pipeline
+			// (`cat <<'EOF' \` / `| bash`); a shadowed consumer name is untrustworthy.
+			// Both downgrade masking eligibility, never block eligibility.
+			if (kind === "data" && (shadowed || continued || isContinuationLine)) kind = "other";
+			if (kind === "mutating") mutatingConsumer = true;
+			const quoted = match[2] !== undefined || match[3] !== undefined || match[4] !== undefined;
+			const stripTabs = match[1] === "-";
+			let end = -1;
+			for (let scan = index + 1; scan < lines.length; scan++) {
+				const candidate = stripTabs ? (lines[scan] ?? "").replace(/^\t+/, "") : (lines[scan] ?? "");
+				if (candidate === delimiter) {
+					end = scan;
+					break;
+				}
+			}
+			if (end === -1) {
+				return {
+					result: { masked: command, opaqueExpansion, mutatingConsumer },
+					dequotedView: dequotedLines.join("\n"),
+					ansiCEscape: sawAnsiCEscape,
+				};
+			}
+			const maskBody = kind === "data" || kind === "mutating";
+			for (let body = index + 1; body < end; body++) {
+				const bodyLine = lines[body] ?? "";
+				if (maskBody && !quoted && /\$\(|`/.test(bodyLine)) opaqueExpansion = true;
+				out.push(maskBody ? "" : bodyLine);
+			}
+			out.push(lines[end] ?? "");
+			index = end;
+			// Heredoc bodies are data: they never affect the shell quote state or
+			// the syntax view used for shadow detection.
+			previousContinued = false;
+		}
+	}
+	return {
+		result: { masked: out.join("\n"), opaqueExpansion, mutatingConsumer },
+		dequotedView: dequotedLines.join("\n"),
+		ansiCEscape: sawAnsiCEscape,
+	};
+}
+
+function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
 	const targets: ExtractedTargets = { paths: [], unknown: false };
@@ -394,19 +906,51 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 		targets.unknown = true;
 		return targets;
 	}
-	if (BASH_OPAQUE_INTERPRETER_WRITE_RE.test(command) || BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(command)) {
+	// A literal `sh|bash|zsh -c '<script>'` payload is a real command list. Its
+	// mutations never match the top-level patterns, so recurse into it; anything
+	// deeper than a bounded depth is not statically analyzable and fails closed.
+	for (const match of command.matchAll(BASH_NESTED_SHELL_RE)) {
+		if (depth >= 2) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			break;
+		}
+		const nested = extractBashTargets({ command: match[2] ?? match[4] ?? "" }, depth + 1);
+		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+		if (nested.unknown) targets.unknown = true;
+		if (nested.explicitMutation) targets.explicitMutation = true;
+	}
+	// Heredoc bodies fed to data consumers are inert document payloads; mask them
+	// so spec/plan text cannot fake redirections. Script-consumer bodies survive
+	// the mask and are still scanned as live code below.
+	const heredoc = maskHeredocBodies(command);
+	if (heredoc.opaqueExpansion || heredoc.mutatingConsumer) {
+		targets.explicitMutation = true;
+		targets.unknown = true;
+	}
+	// Nested scripts were read from the raw text above; every scanner below works
+	// on the masked view so quoted argument data cannot look like a redirection.
+	const scanned = maskSingleQuotedSpans(heredoc.masked);
+	if (
+		BASH_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked) ||
+		BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)
+	) {
+		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
 	// `exec 1<>file` rebinds a descriptor, so a later `>/dev/null` may not reach the device at all.
-	if (BASH_EXEC_REDIRECT_RE.test(command)) {
+	if (BASH_EXEC_REDIRECT_RE.test(scanned)) {
+		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
-	for (const match of command.matchAll(BASH_EXTENDED_WRITE_RE)) {
+	for (const match of scanned.matchAll(BASH_EXTENDED_WRITE_RE)) {
+		targets.explicitMutation = true;
 		const cleaned = cleanShellWord(match[1] ?? "");
 		if (!cleaned) targets.unknown = true;
 		else if (!isDeviceSinkPath(cleaned)) addPath(targets, cleaned);
 	}
-	for (const match of command.matchAll(BASH_DD_OUTPUT_RE)) {
+	for (const match of scanned.matchAll(BASH_DD_OUTPUT_RE)) {
+		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
 		// Every `of=` counts: GNU dd honors the last one, so `of=/dev/null of=real.ts` writes real.ts.
 		const outputs = parts.filter(part => part.startsWith("of="));
@@ -417,15 +961,17 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 			else if (!isDeviceSinkPath(outputPath)) addPath(targets, outputPath);
 		}
 	}
-	for (const match of command.matchAll(BASH_IN_PLACE_MUTATION_COMMAND_RE)) {
+	for (const match of scanned.matchAll(BASH_IN_PLACE_MUTATION_COMMAND_RE)) {
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
 		const hasInPlaceFlag = parts.some(part => /^-.*i/.test(part));
 		if (!hasInPlaceFlag) continue;
+		targets.explicitMutation = true;
 		const target = [...parts].reverse().find(part => part && !part.startsWith("-"));
 		if (target) addPath(targets, target);
 		else targets.unknown = true;
 	}
-	for (const match of command.matchAll(BASH_MUTATION_COMMAND_RE)) {
+	for (const match of scanned.matchAll(BASH_MUTATION_COMMAND_RE)) {
+		targets.explicitMutation = true;
 		const redirected = match[2]?.trim();
 		if (redirected) {
 			const cleaned = cleanShellWord(redirected);
@@ -447,6 +993,9 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
 			if (!cleaned || cleaned.startsWith("-")) continue;
+			// Redirection/heredoc operator words (`>/dev/null`, `<<'DOC'`, `2>&1`) are
+			// not argument paths; their targets are captured by the redirect scanners.
+			if (/^\d*[<>]/.test(cleaned)) continue;
 			addPath(targets, cleaned);
 		}
 	}
@@ -666,7 +1215,10 @@ export async function getWorkflowMutationDecision(
 	}
 	if (input.forceOverride) return { blocked: false, targets: [] };
 	const message = planningPhaseBlockMessage(planning.skill);
-	if (targets.unknown) {
+	// Bash during a planning phase blocks only when a filesystem mutation was
+	// actually recognized. Inspection, reads, and CLI invocations the scanner does
+	// not model stay usable; other tools keep failing closed on unknown targets.
+	if (targets.unknown && (input.tool.name !== "bash" || targets.explicitMutation)) {
 		return {
 			blocked: true,
 			message,

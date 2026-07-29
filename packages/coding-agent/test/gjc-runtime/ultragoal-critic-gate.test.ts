@@ -176,6 +176,26 @@ function passingLiveQualityGate(): Record<string, unknown> {
 			status: "passed",
 			evidence: "no verification findings remain after steering iterations",
 			fullRerun: true,
+			reviewCohort: {
+				reviewGeneration: 1,
+				sourceHash: "sha256:test-frozen-source",
+				joined: true,
+				lanes: {
+					cleaner: {
+						status: "passed",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "cleaner clean",
+						blockers: [],
+					},
+					architect: {
+						status: "CLEAR",
+						sourceHash: "sha256:test-frozen-source",
+						evidence: "architect clear",
+						blockers: [],
+					},
+					qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
+				},
+			},
 			rerunCommands: ["bun test:e2e"],
 			blockers: [],
 		},

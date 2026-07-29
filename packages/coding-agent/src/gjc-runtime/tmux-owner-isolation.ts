@@ -110,6 +110,16 @@ export interface TmuxServerProof {
 	startTime?: string;
 	cgroup?: CgroupInfo;
 	sessionNames?: string[];
+	/**
+	 * Whether `pid` is kernel-proved evidence about the live tmux server.
+	 *
+	 * Only Linux can prove a server PID (`/proc` + cgroup classification), so
+	 * probes on other platforms may report a placeholder PID with this flag set
+	 * to `false`. Guards must not build a `#{pid}` predicate from an unproven
+	 * PID: no live tmux server can ever satisfy it. Omitted means proven, which
+	 * keeps every probe that reads a real `#{pid}` unchanged.
+	 */
+	pidProven?: boolean;
 }
 
 export interface PlanRequest {

@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import DeepInterview from "@gajae-code/coding-agent/commands/deep-interview";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
@@ -15,8 +14,6 @@ import {
 	installDefaultGjcDefinitions,
 } from "@gajae-code/coding-agent/defaults/gjc-defaults";
 import { loadSkills, resetActiveSkillsForTests, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
-import { WORKFLOW_MANIFEST } from "@gajae-code/coding-agent/gjc-runtime/workflow-manifest";
 import { parseInternalUrl } from "@gajae-code/coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@gajae-code/coding-agent/internal-urls/skill-protocol";
 import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
@@ -93,213 +90,13 @@ describe("default GJC definitions", () => {
 			"skill-fragments/deep-interview/auto-research-greenfield.md",
 			"skill-fragments/deep-interview/lateral-review-panel.md",
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
-			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
+			"skill-fragments/ultragoal/validation-batch-contracts.md",
 		]);
 		const team = workflowDefinitions.find(definition => definition.name === "team");
 		expect(team?.content).toContain("supported surfaces only");
 		expect(team?.content).toContain("`planner` for broad context mapping/sequencing");
 		expect(team?.content).toContain("`architect` for architecture or external-doc-risk assessment");
 		expect(team?.content).not.toMatch(/auto-delegate `researcher`|`researcher` as an evidence lane/i);
-	});
-	it("keeps deep-interview normal flow typed and its generated manifest aligned", async () => {
-		const deepInterview = getDefaultGjcDefinitions().find(
-			definition => definition.kind === "skill" && definition.name === "deep-interview",
-		);
-		if (!deepInterview) throw new Error("missing deep-interview skill");
-
-		const phaseFiveIndex = deepInterview.content.indexOf("## Phase 5: Execution Bridge");
-		const normalFlow = deepInterview.content.slice(0, phaseFiveIndex);
-		expect(normalFlow).toContain("initialize-context");
-		expect(normalFlow).toContain("confirm-topology");
-		expect(normalFlow).toContain("record-answer");
-		expect(normalFlow).toContain("apply-round-result");
-		expect(normalFlow).toContain("sanity-check");
-		expect(normalFlow).not.toMatch(/gjc state(?: deep-interview)? write --input/);
-
-		const publicExamples = DeepInterview.examples;
-		expect(publicExamples).toContain(
-			"$ gjc deep-interview initialize-context --draft-id <id> --expected-draft-revision <n> --json",
-		);
-		expect(publicExamples.every(example => /(?:^|\s)--json(?:\s|$)/.test(example))).toBe(true);
-		expect(publicExamples.join("\n")).not.toMatch(
-			/draft consume|--input-json|--question-json|--answer-json|--result-json|\{.*\}/,
-		);
-
-		const verbs = WORKFLOW_MANIFEST["deep-interview"].verbs;
-		expect(verbs.filter(verb => verb.name.startsWith("draft ")).map(verb => verb.name)).toEqual([
-			"draft create",
-			"draft edit",
-			"draft show",
-			"draft check",
-			"draft rebase",
-			"draft discard",
-		]);
-		expect(verbs.find(verb => verb.name === "draft consume")).toBeUndefined();
-		expect(
-			verbs
-				.filter(verb =>
-					["initialize-context", "confirm-topology", "record-answer", "apply-round-result"].includes(verb.name),
-				)
-				.every(verb => !verb.compatibilityOnly),
-		).toBe(true);
-
-		const generated = JSON.parse(
-			await fs.readFile(
-				path.join(repoRoot, "packages/coding-agent/src/gjc-runtime/workflow-manifest.generated.json"),
-				"utf8",
-			),
-		) as Record<string, unknown>;
-		expect(generated["deep-interview"]).toEqual(WORKFLOW_MANIFEST["deep-interview"]);
-	});
-	it("routes draft commands and typed draft consumption before kickoff parsing while preserving --write precedence", async () => {
-		const cwd = await makeTempRoot();
-		const draftRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-root-"));
-		tempRoots.push(draftRoot);
-		const previousRoot = process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
-		process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = draftRoot;
-		try {
-			const kickoff = await runNativeDeepInterviewCommand(
-				["--session-id", "draft-routing", "--json", "draft routing state"],
-				cwd,
-			);
-			expect(kickoff.status).toBe(0);
-			const created = await runNativeDeepInterviewCommand(
-				["draft", "create", "--for", "initialize-context", "--session-id", "draft-routing", "--json"],
-				cwd,
-			);
-			expect(created.status).toBe(0);
-			expect(JSON.parse(created.stdout ?? "{}").draft.kind).toBe("initialize-context");
-			const consumed = await runNativeDeepInterviewCommand(
-				[
-					"initialize-context",
-					"--draft-id",
-					JSON.parse(created.stdout ?? "{}").draft.id,
-					"--expected-draft-revision",
-					"1",
-					"--json",
-				],
-				cwd,
-			);
-			expect(consumed.stderr).toContain("DI_INVALID_INPUT_JSON");
-			expect(await runNativeDeepInterviewCommand(["draft", "create", "--write"], cwd)).toEqual({
-				status: 2,
-				stderr: "--spec is required for deep-interview --write\n",
-			});
-		} finally {
-			if (previousRoot === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
-			else process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = previousRoot;
-		}
-	});
-	it("keeps the public typed deep-interview repair CLI contract documented", async () => {
-		const documentation = await fs.readFile(path.join(repoRoot, "docs/deep-interview-repair-cli.md"), "utf8");
-
-		for (const verb of WORKFLOW_MANIFEST["deep-interview"].verbs.filter(
-			verb => verb.surface === "command-positional",
-		)) {
-			expect(documentation).toContain(`gjc deep-interview ${verb.name}`);
-		}
-		expect(documentation).toContain('"global_scores"');
-		expect(documentation).toContain("greenfield");
-		expect(documentation).toContain("brownfield");
-		expect(documentation).toContain("TextView");
-		expect(documentation).toContain("DI_POST_COMMIT_AUDIT_FAILED");
-		expect(documentation).toContain("Do **not** use `grep`, `sed`, direct `.gjc/` edits");
-	});
-	it("declares the complete typed deep-interview verb argument matrix", () => {
-		const typedArgs = WORKFLOW_MANIFEST["deep-interview"].typedArgs;
-		const argsFor = (verb: string, compatibilityOnly = false) =>
-			typedArgs
-				.filter(arg => (arg.compatibilityOnly ?? false) === compatibilityOnly && arg.appliesToVerbs?.includes(verb))
-				.map(arg => ({ name: arg.name, type: arg.type, required: arg.required ?? false }))
-				.sort((left, right) => left.name.localeCompare(right.name));
-		expect(argsFor("draft create")).toEqual([
-			{ name: "component-id", type: "string", required: false },
-			{ name: "dimension", type: "string", required: false },
-			{ name: "for", type: "enum", required: true },
-			{ name: "json", type: "boolean", required: true },
-			{ name: "question-id", type: "string", required: false },
-			{ name: "round", type: "number", required: false },
-			{ name: "round-id", type: "string", required: false },
-			{ name: "round-key", type: "string", required: false },
-			{ name: "session-id", type: "string", required: true },
-		]);
-		expect(argsFor("draft edit")).toEqual([
-			{ name: "draft-id", type: "string", required: true },
-			{ name: "expected-draft-revision", type: "number", required: true },
-			{ name: "json", type: "boolean", required: true },
-			{ name: "null", type: "boolean", required: false },
-			{ name: "op", type: "enum", required: true },
-			{ name: "path", type: "string", required: true },
-			{ name: "value", type: "string", required: false },
-			{ name: "value-file", type: "string", required: false },
-		]);
-		expect(argsFor("draft rebase")).toEqual([
-			{ name: "draft-id", type: "string", required: true },
-			{ name: "expected-draft-revision", type: "number", required: true },
-			{ name: "json", type: "boolean", required: true },
-			{ name: "to-state-revision", type: "number", required: true },
-		]);
-		for (const verb of ["draft show", "draft check"]) {
-			expect(argsFor(verb)).toEqual([
-				{ name: "draft-id", type: "string", required: true },
-				{ name: "json", type: "boolean", required: true },
-			]);
-		}
-		expect(argsFor("draft discard")).toEqual([
-			{ name: "draft-id", type: "string", required: true },
-			{ name: "expected-draft-revision", type: "number", required: true },
-			{ name: "json", type: "boolean", required: true },
-		]);
-
-		for (const verb of ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"]) {
-			expect(argsFor(verb)).toEqual([
-				{ name: "draft-id", type: "string", required: true },
-				{ name: "expected-draft-revision", type: "number", required: true },
-				{ name: "json", type: "boolean", required: true },
-			]);
-		}
-		expect(argsFor("initialize-context", true)).toEqual([
-			{ name: "expected-revision", type: "number", required: true },
-			{ name: "input-json", type: "object", required: true },
-			{ name: "schema-version", type: "number", required: true },
-			{ name: "session-id", type: "string", required: true },
-		]);
-		expect(argsFor("confirm-topology", true)).toEqual(argsFor("initialize-context", true));
-		expect(argsFor("record-answer", true)).toEqual([
-			{ name: "answer-json", type: "object", required: true },
-			{ name: "component-id", type: "string", required: false },
-			{ name: "dimension", type: "string", required: false },
-			{ name: "expected-revision", type: "number", required: true },
-			{ name: "question-id", type: "string", required: true },
-			{ name: "question-json", type: "string", required: true },
-			{ name: "round", type: "number", required: true },
-			{ name: "round-id", type: "string", required: false },
-			{ name: "schema-version", type: "number", required: true },
-			{ name: "session-id", type: "string", required: true },
-		]);
-		expect(argsFor("apply-round-result", true)).toEqual([
-			{ name: "expected-revision", type: "number", required: true },
-			{ name: "question-id", type: "string", required: true },
-			{ name: "result-json", type: "object", required: true },
-			{ name: "round", type: "number", required: true },
-			{ name: "round-id", type: "string", required: false },
-			{ name: "schema-version", type: "number", required: true },
-			{ name: "session-id", type: "string", required: true },
-		]);
-		expect(argsFor("inspect")).toEqual([
-			{ name: "cursor", type: "string", required: false },
-			{ name: "json", type: "boolean", required: true },
-			{ name: "limit", type: "number", required: false },
-			{ name: "round-key", type: "string", required: false },
-			{ name: "selector", type: "enum", required: true },
-			{ name: "session-id", type: "string", required: true },
-		]);
-		expect(argsFor("sanity-check")).toEqual([
-			{ name: "json", type: "boolean", required: true },
-			{ name: "session-id", type: "string", required: true },
-		]);
-		expect(argsFor("inspect", true)).toEqual([]);
-		expect(argsFor("sanity-check", true)).toEqual([]);
 	});
 
 	it("exposes deep-interview fragments only through the parent-scoped fragment accessor", () => {
@@ -332,12 +129,12 @@ describe("default GJC definitions", () => {
 		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment", "skill-fragment"]);
 		expect(fragments.map(fragment => fragment.relativePath).sort()).toEqual([
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
-			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
+			"skill-fragments/ultragoal/validation-batch-contracts.md",
 		]);
 		const cleaner = fragments.find(fragment => fragment.relativePath.endsWith("ai-slop-cleaner.md"))!;
 		expect(cleaner.content).toContain("AI SLOP CLEANUP REPORT");
 		expect(cleaner.content).toContain("read-only detector");
-		const contracts = fragments.find(fragment => fragment.relativePath.endsWith("pipeline-validation-contracts.md"))!;
+		const contracts = fragments.find(fragment => fragment.relativePath.endsWith("validation-batch-contracts.md"))!;
 		expect(contracts.content).toContain("never user-facing");
 		expect(contracts.content).toContain("fails closed");
 	});
@@ -385,23 +182,31 @@ describe("default GJC definitions", () => {
 		if (!ultragoal) throw new Error("missing bundled ultragoal skill");
 		const content = ultragoal.content;
 
-		const sectionStart = content.indexOf("## Mandatory completion cleanup and review gate");
+		const sectionStart = content.indexOf("## Boundary completion cohort gate");
 		expect(sectionStart).toBeGreaterThanOrEqual(0);
 		const afterStart = content.indexOf("\n## ", sectionStart + 1);
 		const section = content.slice(sectionStart, afterStart === -1 ? undefined : afterStart);
 
-		const cleanerStep = section.indexOf("2. Run the internal ai-slop-cleaner skill fragment");
-		const verifyStep = section.indexOf("3. Rerun verification after the cleaner pass");
+		const verifyStep = section.indexOf("1. Run implementation verification");
+		const freezeStep = section.indexOf("2. **Freeze the change set.**");
+		const cohortStep = section.indexOf("3. **Run the cohort lanes on the frozen snapshot**");
 		const architectStep = section.indexOf("4. Delegate an `architect` review");
 		const redTeamStep = section.indexOf("5. Delegate an `executor` QA/red-team lane");
+		const joinStep = section.indexOf("8. **Join before repairing.**");
 
-		expect(cleanerStep).toBeGreaterThanOrEqual(0);
-		expect(verifyStep).toBeGreaterThan(cleanerStep);
-		expect(architectStep).toBeGreaterThan(verifyStep);
+		// The cleaner is a cohort lane bound to the frozen snapshot, so freezing must
+		// precede it and every lane verdict must join before any repair starts.
+		expect(verifyStep).toBeGreaterThanOrEqual(0);
+		expect(freezeStep).toBeGreaterThan(verifyStep);
+		expect(cohortStep).toBeGreaterThan(freezeStep);
+		expect(architectStep).toBeGreaterThan(cohortStep);
 		expect(redTeamStep).toBeGreaterThan(architectStep);
+		expect(joinStep).toBeGreaterThan(redTeamStep);
 
-		expect(section).toContain("reruns the cleaner until blocking findings are zero");
-		expect(section).toContain("Advisory findings are included in the gate report only");
+		expect(section).toContain("ai-slop-cleaner skill fragment run over the frozen change set");
+		expect(section).toContain("AI SLOP CLEANUP REPORT");
+		expect(section).toContain("join the cohort findings rather than starting their own fix loop");
+		expect(section).toContain("advisory findings are included in the gate report only");
 	});
 
 	it("keeps the four role agents bundled when project .gjc is absent", async () => {
@@ -606,22 +411,37 @@ Project executor override body.
 		expect(ultragoal).toContain("the same final review boundary");
 
 		// B: validation-batch contract summary in the SKILL; full contract in the fragment.
-		expect(ultragoal).toContain("## Validation batches (aggregate-only)");
+		expect(ultragoal).toContain("## Boundary verification (aggregate default)");
+		expect(ultragoal).toContain("### Validation batches (explicit phase/module boundaries)");
+		expect(ultragoal).toContain("## Boundary completion cohort gate");
+		expect(ultragoal).toContain("gjc ultragoal quality-gate validate");
+		expect(ultragoal).toContain(
+			"reports **all** structural, evidence, surface, cohort, and declaration errors in one run",
+		);
+		expect(ultragoal).toContain("strictly read-only");
+		expect(ultragoal).toContain("once per boundary generation");
+		expect(ultragoal).toContain("iteration.reviewCohort");
+		expect(ultragoal).toContain("Join before repairing");
+		expect(ultragoal).toContain("one consolidated blocker batch");
+		expect(ultragoal).toContain("one new generation");
+		expect(ultragoal).toContain("delta-only");
+		expect(ultragoal).toContain("scopeExpansion");
+		expect(ultragoal).toMatch(/advisory.*canonical review is the boundary cohort gate/s);
+		expect(ultragoal).toContain("once per boundary");
+		expect(ultragoal).toContain("deferredToBatch.ranLanes");
 		expect(ultragoal).toContain("--validation-batch-json");
 		expect(ultragoal).toContain("aggregate-only");
 		expect(ultragoal).toContain("fail-closed");
 		expect(ultragoal).toContain("deferredToBatch");
 		expect(ultragoal).toContain("validation-batch-deferred");
 		expect(ultragoal).toContain("validationBatchClose");
-		expect(ultragoal).toContain("mutually exclusive");
-		expect(ultragoal).toContain("no batch/pipeline mixing");
 		expect(ultragoal).toContain("out-of-order close is rejected");
 		expect(ultragoal).toContain("append-only proof");
 		expect(ultragoal).toContain("cumulative-since-base");
-		expect(ultragoal).toContain("skill-fragments/ultragoal/pipeline-validation-contracts.md");
+		expect(ultragoal).toContain("skill-fragments/ultragoal/validation-batch-contracts.md");
 
 		const contracts = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
-			fragment.relativePath.endsWith("pipeline-validation-contracts.md"),
+			fragment.relativePath.endsWith("validation-batch-contracts.md"),
 		)!;
 		expect(contracts.content).toContain("deferredToBatch");
 		expect(contracts.content).toContain("validation-batch-deferred");
@@ -630,6 +450,7 @@ Project executor override body.
 		expect(contracts.content).toContain("append-only proof");
 		expect(contracts.content).toContain("Never stamp");
 		expect(contracts.content).toContain("cumulative-since-base");
+		expect(contracts.content).toContain("Lane declaration is fail-closed");
 		expect(contracts.content).toContain("`cumulativeFromBase: true`");
 		expect(contracts.content).toContain("`memberGoalId` is a label not a per-path attribution");
 		expect(contracts.content).toContain("Batch invalidation is fail-closed");
@@ -641,11 +462,37 @@ Project executor override body.
 
 		// C: intra-goal validation-lane parallelism.
 		expect(ultragoal).toContain("### Intra-goal validation-lane parallelism");
-		expect(ultragoal).toContain("frozen post-cleaner change set");
-		expect(ultragoal).toContain("architect review and the executor QA/red-team lane MAY run in parallel");
+		expect(ultragoal).toContain("Cohort lanes are parallel by construction");
+		expect(ultragoal).toContain(
+			"`cleaner`, `architect`, and `qa` can run concurrently against the identical immutable snapshot",
+		);
 		expect(ultragoal).toContain("join before checkpoint");
 		expect(ultragoal).toContain("Fall back to **sequential** lanes");
 		expect(ultragoal).toContain("red-team lane depends on architect fixes");
+	});
+
+	it("documents same-domain subagent reuse and terminal-critic resumption for token efficiency", async () => {
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
+
+		// Same-domain executor/architect reuse instead of fresh spawns.
+		expect(ultragoal).toContain("### Subagent reuse and resumption (token efficiency)");
+		expect(ultragoal).toContain("resume the prior subagent instead of freshly spawning");
+		expect(ultragoal).toContain("Reuse is domain-scoped");
+		expect(ultragoal).toContain("stale cross-domain context is a liability");
+		expect(ultragoal).toContain("Resumption never weakens gates");
+		expect(ultragoal).toContain("not rubber-stamp its earlier verdict");
+
+		// Fallback routing mirrors the existing subagent resume outcomes.
+		expect(ultragoal).toContain(
+			"`context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback",
+		);
+
+		// Terminal critic resumption on iteration.
+		expect(ultragoal).toContain("resume the prior terminal-critic subagent when resumable");
+		expect(ultragoal).toContain("a prior `ITERATE` is never carried forward as pre-judged");
+		expect(ultragoal).toContain("fall back to a fresh `critic` spawn with the full context bundle");
 	});
 
 	it("routes simple clear implementation requests directly without contradictory workflow escalation", async () => {
@@ -663,29 +510,42 @@ Project executor override body.
 		expect(routing).toContain("Informational questions are answer-only/read-only");
 		expect(routing).toContain("Vague requirements use `/skill:deep-interview`");
 		expect(routing).toContain("requirements-only workflow that must not mutate product code");
-		expect(routing).toContain("Deep-interview state is runtime-owned");
-		expect(routing).toContain("gjc deep-interview sanity-check");
-		expect(routing).toContain("repair through typed operations using CLI-generated/edited drafts");
-		expect(routing).toContain("normal flow must never reconstruct a payload or full envelope");
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
+		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
+		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
 		expect(routing).toContain("read the full skill text and follow it exactly");
+		expect(routing).toContain("Before explicit execution approval or a valid non-off ralplan final runtime receipt");
 		expect(routing).toContain(
-			"Before explicit execution approval, planning and interview workflows NEVER edit product source",
+			"reconciliation must persist its final receipt before choosing approval or an admitted handoff",
 		);
 		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 
-	it("honors explicit ultragoal/team naming as ralplan execution approval", async () => {
+	it("locks ralplan automatic-admission approval and handoff paths", async () => {
 		const ralplan = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
 		).text();
-		expect(ralplan).toContain("explicit-execution exception");
 		expect(ralplan).toContain("counts as opting into execution for that skill");
-		expect(ralplan).toContain("skip the re-ask and proceed to step 9");
+		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
+		expect(ralplan).toContain("`off` (default), `ultragoal`, or `team`");
+		expect(ralplan).toContain("A `team` target degrades to `off`");
+		expect(ralplan).toContain("`team_unavailable:<reason>`");
+		expect(ralplan).toContain("Invalid settings reject the final write before any final artifact is persisted");
+		expect(ralplan).toContain("ledger-backed runtime-owned `auto_handoff.effectiveTarget`");
+		expect(ralplan).toContain("Reconciliation must first reach the successful final receipt");
+		expect(ralplan).toContain("valid non-off receipt is explicit operator admission");
+		expect(ralplan).toContain("do not choose an approval or handoff path before its final receipt exists");
+		expect(ralplan).toContain("planning_stuck");
+		expect(ralplan).toContain("never dispatch");
+		expect(ralplan).toContain("ordinary `off`/degraded approval flow");
+		expect(ralplan).toContain("do not issue an approval `ask`");
+		expect(ralplan).toContain(
+			"mark ralplan ready for handoff so the skill tool's chain guard permits the transition",
+		);
 	});
 
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
@@ -720,13 +580,21 @@ Project executor override body.
 		expect(content).toContain("/skill:team");
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
-		expect(content).toContain("Normal interview persistence uses CLI-owned drafts");
-		expect(content).toContain("gjc state clear --force --mode deep-interview");
+		expect(content).toContain("do not edit `.gjc/_session-{sessionid}/state` directly without force override");
+		expect(content).toContain("gjc deep-interview clear --force");
+		expect(content).toContain("gjc deep-interview read --json");
+		expect(content).toContain("gjc deep-interview write --input");
+		expect(content).toContain("`--reset` only when deliberately replacing state");
+		expect(content).not.toContain("gjc state read");
+		expect(content).not.toContain("gjc state write");
+		expect(content).not.toContain("gjc state clear");
+		expect(content).not.toContain("gjc state deep-interview");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
 		expect(content).toContain(
 			"default to English unless `{{ARGUMENTS}}` makes another user/session language obvious",
 		);
+		expect(content).toContain('"language": "<existing language object from active state, if present>"');
 		expect(content).toContain("progress reports, and spec prose");
 		expect(content).toContain("translated/localized according to `language.instruction`");
 		expect(content).toContain("must not print `Question:`/`Options:` blocks as assistant prose");
@@ -754,13 +622,16 @@ Project executor override body.
 		expect(ralplan).toBeDefined();
 		const content = ralplan?.content ?? "";
 
-		expect(content).toContain("gjc ralplan --write --stage <type> --stage_n <N> --artifact");
+		expect(content).toContain(
+			"gjc ralplan --write --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact",
+		);
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
 		expect(content).toContain("--stage critic");
 		expect(content).toContain("do not directly edit `.gjc/_session-{sessionid}/plans`");
 		expect(content).toContain("gjc state clear --force --mode ralplan");
 		expect(content).toContain('workflowGate: { stage: "ralplan", kind: "approval" }');
+		expect(content).toContain("A role subagent's own session id is transcript/resume identity only");
 		expect(content).toContain("RPC/headless clients receive a `ralplan`/`approval` workflow gate");
 		expect(content).toContain(
 			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",

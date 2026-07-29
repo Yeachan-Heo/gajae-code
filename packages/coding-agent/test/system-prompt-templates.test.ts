@@ -227,8 +227,18 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("<tool-discovery>");
 		expect(rendered).toContain("`search_tool_bm25`");
 		expect(rendered).toContain("Discoverable capabilities include browser automation");
+		expect(rendered).toContain("Activation makes a tool available, but does not perform its action.");
+		expect(rendered).toContain("call `task` before saying agents are running");
+		expect(rendered).toContain("Do not claim a web search, browser action, integration, or subagent ran");
 		expect(rendered).not.toContain("Discoverable tools:");
 		expect(rendered).not.toContain("Control a headless browser");
+
+		const withoutTask = prompt.render(template, {
+			...baseRenderContext,
+			toolDiscoveryActive: true,
+			tools: ["read", "bash", "search_tool_bm25"],
+		});
+		expect(withoutTask).toContain("search for `subagent delegation` before saying agents are running");
 
 		const disabled = prompt.render(template, { ...baseRenderContext, toolDiscoveryActive: false });
 		expect(disabled).not.toContain("<tool-discovery>");
@@ -270,12 +280,16 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("unless the user explicitly requests a change, command, or execution");
 		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
 		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
-		expect(rendered).toContain("gjc deep-interview sanity-check");
-		expect(rendered).toContain("CLI-generated/edited drafts");
-		expect(rendered).toContain("draft create|edit|show|check|rebase|discard");
-		expect(rendered).toContain("consumed with `--draft-id`");
-		expect(rendered).toContain("Inline JSON request flags are compatibility-only");
-		expect(rendered).toContain("never reconstruct a payload or full envelope");
+	});
+	test("system-prompt routes explicit worktree requests through isolated delegation", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, baseRenderContext);
+
+		expect(rendered).toContain('explicit user request to use a worktree (for example, "use worktree")');
+		expect(rendered).toContain("delegate implementation through `task` with `isolated: true`");
+		expect(rendered).toContain("in-session counterpart of launching `gjc --worktree`");
+		expect(rendered).toContain("report that conflict instead of editing in the parent session");
 	});
 
 	test("keeps system and project as separate ordered blocks; volatile facts excluded from stable prefix", async () => {

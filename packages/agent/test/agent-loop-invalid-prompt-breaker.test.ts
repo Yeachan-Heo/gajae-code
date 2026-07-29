@@ -55,6 +55,24 @@ describe("agentLoop invalid_prompt circuit breaker (issue #2282)", () => {
 		expect(poisoned.content).toContain("\u200b"); // zero-width space inserted
 	});
 
+	it("does not replay the rejected assistant turn on the repaired resend", async () => {
+		// The streaming path commits the rejected assistant message to the context
+		// before the breaker runs. Resending it replays a failed turn as if the
+		// model had spoken it (re-triggering the block) and leaves a second
+		// assistant tail behind that no continuation can resume from.
+		const poisoned = createUserMessage(poisonedText());
+		const context: AgentContext = { systemPrompt: ["sys"], messages: [], tools: [] };
+		const mock = createMockModel({
+			responses: [{ throw: INVALID_PROMPT }, { content: ["recovered"] }],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		await drain(agentLoop([poisoned], context, config, undefined, mock.stream));
+
+		expect(mock.calls.length).toBe(2);
+		expect(mock.calls[1].context.messages.map(m => m.role)).toEqual(["user"]);
+	});
+
 	it("fails fast with EXACTLY one request when neutralization cannot change bytes", async () => {
 		const clean = createUserMessage("clean history with no leaked markers");
 		const context: AgentContext = { systemPrompt: ["sys"], messages: [], tools: [] };

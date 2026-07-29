@@ -232,6 +232,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		botToken: cfg.botToken,
 		chatId: cfg.chatId,
 		idleTimeoutMs: cfg.idleTimeoutMs,
+		sound: cfg.sound,
 		rich: cfg.rich,
 		richDraft: cfg.richDraft,
 		toolActivity: cfg.toolActivity,

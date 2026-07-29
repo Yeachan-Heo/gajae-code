@@ -35,7 +35,7 @@ describe("agentLoop: truncated tool-call guard", () => {
 							type: "toolCall",
 							id: "tc-1",
 							name: "write_file",
-							arguments: { path: "a.ts" }, // best-effort partial parse (missing `content`)
+							arguments: { path: "a.ts", content: "partial" }, // schema-valid repaired payload
 							incompleteArguments: true,
 						},
 					],

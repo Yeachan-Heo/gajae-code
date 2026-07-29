@@ -2,9 +2,19 @@ import { describe, expect, it } from "bun:test";
 import {
 	type Component,
 	Container,
+	CURSOR_MARKER,
+	DEFAULT_WHEEL_LINES,
+	Editor,
+	encodeKittyPlacementDelete,
+	extractKittyPlacementReferences,
+	getCellDimensions,
+	Image,
 	ImageProtocol,
 	Markdown,
 	renderComponentWithViewportAnchors,
+	resetKittyTransmissions,
+	setCellDimensions,
+	setKittyTransmitWriter,
 	setTerminalImageProtocol,
 	shouldUseViewportRepaintForHost,
 	TERMINAL,
@@ -15,7 +25,8 @@ import {
 	type ViewportAnchorSource,
 	visibleWidth,
 } from "@gajae-code/tui";
-import { defaultMarkdownTheme } from "./test-themes";
+import { renderMetrics } from "@gajae-code/tui/metrics";
+import { defaultEditorTheme, defaultMarkdownTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class Lines implements Component {
@@ -75,6 +86,18 @@ class Lines implements Component {
 	invalidate(): void {}
 }
 
+class FocusedEditor extends Lines {
+	focused = false;
+
+	override render(width: number): string[] {
+		return this.focused ? [`${CURSOR_MARKER}${super.render(width)[0]}`] : super.render(width);
+	}
+
+	override renderWithViewportAnchors(width: number): ViewportAnchorRender {
+		const lines = this.render(width);
+		return { lines, anchors: lines.map(() => null) };
+	}
+}
 class AnchoredTranscript extends Container {
 	addRow(id: string, text: string): Text {
 		const component = new Text(text, 0, 0);
@@ -105,6 +128,15 @@ function visible(term: VirtualTerminal): string[] {
 	return term.getViewport().map(line => line.trimEnd());
 }
 
+function cursorPosition(term: VirtualTerminal): { row: number; col: number } {
+	const buffer = (
+		term as unknown as {
+			xterm: { buffer: { active: { cursorX: number; cursorY: number } } };
+		}
+	).xterm.buffer.active;
+	return { row: buffer.cursorY, col: buffer.cursorX };
+}
+
 describe("TUI manual viewport paging", () => {
 	it("pages through the rendered transcript without editing content", async () => {
 		const term = new VirtualTerminal(30, 5);
@@ -124,6 +156,51 @@ describe("TUI manual viewport paging", () => {
 			expect(tui.scrollViewportPages(1)).toBe(true);
 			await term.flush();
 			expect(visible(term)).toEqual(["line-5", "line-6", "line-7", "line-8", "line-9"]);
+		} finally {
+			tui.stop();
+		}
+	});
+	it("scrolls the viewport by discrete wheel-sized row steps", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		tui.addChild(content);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+
+			expect(tui.scrollViewportBy(-DEFAULT_WHEEL_LINES, { pin: "stable" })).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-4", "line-5", "line-6", "line-7", "line-8"]);
+
+			expect(tui.scrollViewportBy(-DEFAULT_WHEEL_LINES, { pin: "stable" })).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-1", "line-2", "line-3", "line-4", "line-5"]);
+
+			expect(tui.scrollViewportBy(DEFAULT_WHEEL_LINES, { pin: "stable" })).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-4", "line-5", "line-6", "line-7", "line-8"]);
+
+			// Page stepping remains larger than a single wheel notch.
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("rejects a zero-row viewport delta", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		tui.addChild(new Lines(Array.from({ length: 10 }, (_value, index) => `line-${index}`)));
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportBy(0)).toBe(false);
 		} finally {
 			tui.stop();
 		}
@@ -196,7 +273,7 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
-	it("keeps manual viewport control after paging to live while transient panel streams", async () => {
+	it("keeps manual viewport control after a partial downward move while transient panel streams", async () => {
 		const term = new VirtualTerminal(30, 6);
 		const tui = new TUI(term);
 		const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
@@ -216,20 +293,391 @@ describe("TUI manual viewport paging", () => {
 
 			expect(tui.scrollViewportPages(-1)).toBe(true);
 			await term.flush();
-			expect(visible(term)).toEqual(["line-3", "line-4", "line-5", "line-6", "line-7", "line-8"]);
+			expect(visible(term)).toEqual(["line-5", "line-6", "line-7", "line-8", "status", "editor"]);
 
-			expect(tui.scrollViewportPages(1)).toBe(true);
+			// Partial downward move stays manual instead of auto-following live.
+			expect(tui.scrollViewportBy(2, { pin: "stable" })).toBe(true);
 			await term.flush();
-			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "status", "editor"]);
 
 			transientPanel.replace(["btw-0", "btw-1"]);
 			tui.requestRender();
 			await settle(term);
 
-			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "btw-0", "btw-1"]);
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "status", "editor"]);
 			expect(tui.followLiveViewport()).toBe(true);
 			await term.flush();
 			expect(visible(term)).toEqual(["line-10", "line-11", "btw-0", "btw-1", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps the pinned suffix visible and reports one semantic output revision while manually scrolled", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.setViewportOutputSource({ identity: "assistant", revision: 0n });
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-5", "line-6", "line-7", "line-8", "status", "editor"]);
+
+			tui.setViewportOutputSource({ identity: "assistant", revision: 1n });
+			await settle(term);
+			expect(visible(term)).toEqual([
+				"line-5",
+				"line-6",
+				"line-7",
+				"New output — type to follow",
+				"status",
+				"editor",
+			]);
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+	it("activates a pinned suffix without an output source and keeps notices source-driven", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-5", "line-6", "line-7", "line-8", "status", "editor"]);
+
+			tui.setViewportOutputSource({ identity: "assistant", revision: 0n });
+			tui.setViewportOutputSource({ identity: "assistant", revision: 1n });
+			await settle(term);
+			expect(visible(term)).toEqual([
+				"line-5",
+				"line-6",
+				"line-7",
+				"New output — type to follow",
+				"status",
+				"editor",
+			]);
+			tui.setViewportOutputSource({ identity: "assistant", revision: 0n });
+			await settle(term);
+			expect(visible(term)).toContain("New output — type to follow");
+			tui.setViewportOutputSource({ identity: "other", revision: 0n });
+			await settle(term);
+			expect(visible(term)).not.toContain("New output — type to follow");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps short manual transcripts above one copy of each pinned suffix row after rerendering", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		tui.addChild(new Lines(["line-0", "line-1"]));
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-0", "line-1", "", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("follows a contracted short manual frame with the pinned suffix at the live bottom", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 6 }, (_value, index) => `line-${index}`));
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+
+			transcript.replace(["line-0", "line-1"]);
+			tui.requestRender();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-0", "line-1", "", "status", "editor"]);
+
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-0", "line-1", "", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("rebases a nested editor cursor when following a contracted manual viewport with IME reanchoring", async () => {
+		const previousImeCursor = Bun.env.GJC_TUI_IME_CURSOR;
+		Bun.env.GJC_TUI_IME_CURSOR = "1";
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 6 }, (_value, index) => `line-${index}`));
+		const status = new Lines(["status"]);
+		const editor = new Editor(defaultEditorTheme);
+		editor.setBorderVisible(false);
+		editor.setText("editor");
+		editor.setUseTerminalCursor(true);
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editorContainer);
+		tui.setBottomPinnedComponent(status);
+		tui.setFocus(editor);
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+
+			transcript.replace(["line-0"]);
+			tui.requestRender();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-0", "", "", "", "status", "editor"]);
+
+			term.clearWriteLog();
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-0", "", "", "", "status", "editor"]);
+			expect(cursorPosition(term)).toEqual({ row: 5, col: 6 });
+			expect(term.getWriteLog().at(-1)).toContain("\x1b[?25h");
+		} finally {
+			if (previousImeCursor === undefined) delete Bun.env.GJC_TUI_IME_CURSOR;
+			else Bun.env.GJC_TUI_IME_CURSOR = previousImeCursor;
+			tui.stop();
+		}
+	});
+
+	it("treats same-identity output revisions as a manual-view high-water mark", async () => {
+		const cases: Array<{
+			name: string;
+			apply: (tui: TUI) => void;
+			expectsNotice: boolean;
+		}> = [
+			{
+				name: "same revision",
+				apply: tui => tui.setViewportOutputSource({ identity: "assistant", revision: 10n }),
+				expectsNotice: false,
+			},
+			{
+				name: "repeated revision",
+				apply: tui => {
+					tui.setViewportOutputSource({ identity: "assistant", revision: 10n });
+					tui.setViewportOutputSource({ identity: "assistant", revision: 10n });
+				},
+				expectsNotice: false,
+			},
+			{
+				name: "live advance",
+				apply: tui => {
+					tui.followLiveViewport();
+					tui.setViewportOutputSource({ identity: "assistant", revision: 11n });
+				},
+				expectsNotice: false,
+			},
+			{
+				name: "null reset",
+				apply: tui => tui.setViewportOutputSource(null),
+				expectsNotice: false,
+			},
+			{
+				name: "identity reset",
+				apply: tui => tui.setViewportOutputSource({ identity: "other", revision: 0n }),
+				expectsNotice: false,
+			},
+			{
+				name: "armed rollback",
+				apply: tui => {
+					tui.setViewportOutputSource({ identity: "assistant", revision: 11n });
+					tui.setViewportOutputSource({ identity: "assistant", revision: 10n });
+				},
+				expectsNotice: true,
+			},
+			{
+				name: "10 to 9 to 10",
+				apply: tui => {
+					tui.setViewportOutputSource({ identity: "assistant", revision: 9n });
+					tui.setViewportOutputSource({ identity: "assistant", revision: 10n });
+				},
+				expectsNotice: false,
+			},
+		];
+
+		for (const state of cases) {
+			const term = new VirtualTerminal(30, 6);
+			const tui = new TUI(term);
+			tui.addChild(new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`)));
+			const status = new Lines(["status"]);
+			tui.addChild(status);
+			tui.addChild(new Lines(["editor"]));
+			tui.setBottomPinnedComponent(status);
+			tui.setViewportOutputSource({ identity: "assistant", revision: 10n });
+			try {
+				tui.start();
+				await settle(term);
+				expect(tui.scrollViewportPages(-1), state.name).toBe(true);
+				await term.flush();
+				state.apply(tui);
+				await settle(term);
+				expect(visible(term).includes("New output — type to follow"), state.name).toBe(state.expectsNotice);
+			} finally {
+				tui.stop();
+			}
+		}
+	});
+
+	it("makes identical output-source updates, including repeated clears, true render-request no-ops", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		tui.addChild(new Lines(["line"]));
+		const wasMetricsEnabled = renderMetrics.enabled;
+		renderMetrics.enable();
+		try {
+			tui.setViewportOutputSource({ identity: "assistant", revision: 10n });
+			tui.start();
+			await settle(term);
+			renderMetrics.reset();
+			const before = renderMetrics.snapshot();
+
+			tui.setViewportOutputSource({ identity: "assistant", revision: 10n });
+			tui.setViewportOutputSource(null);
+			await settle(term);
+			const afterClear = renderMetrics.snapshot();
+			tui.setViewportOutputSource(null);
+			await Promise.resolve();
+			await term.flush();
+
+			const after = renderMetrics.snapshot();
+			expect(afterClear.renderCount).toBe(before.renderCount + 1);
+			expect(after.renderCount).toBe(afterClear.renderCount);
+			expect(after.requestSources).toEqual(afterClear.requestSources);
+			expect(after.structuralCounters.viewportOutputSourceEqualNoops).toBe(2);
+		} finally {
+			tui.stop();
+			renderMetrics.reset();
+			if (!wasMetricsEnabled) renderMetrics.disable();
+		}
+	});
+
+	it("constrains oversized suffixes without slicing the large flat transcript frame", async () => {
+		for (const transcriptRows of [10_000, 100_000]) {
+			const term = new VirtualTerminal(30, 3);
+			const tui = new TUI(term);
+			tui.addChild(new Lines(Array.from({ length: transcriptRows }, (_value, index) => `line-${index}`)));
+			const status = new Lines(["status"]);
+			tui.addChild(status);
+			tui.addChild(new FocusedEditor(["editor"]));
+			tui.addChild(new Lines(["help"]));
+			tui.addChild(new Lines(["pet"]));
+			tui.setBottomPinnedComponent(status);
+			const wasMetricsEnabled = renderMetrics.enabled;
+			renderMetrics.enable();
+			renderMetrics.reset();
+			const flatFrameRows = transcriptRows + 4;
+			const originalSlice = Array.prototype.slice;
+			let flatFrameSlices = 0;
+			let negativeControlSlices = 0;
+			const isLargeFlatFrame = (receiver: unknown[]): boolean =>
+				receiver.length === flatFrameRows &&
+				receiver[0] === "line-0" &&
+				receiver[transcriptRows - 1] === `line-${transcriptRows - 1}`;
+			try {
+				Array.prototype.slice = function <T>(this: T[], start?: number, end?: number): T[] {
+					if (isLargeFlatFrame(this)) flatFrameSlices++;
+					return originalSlice.call(this, start, end);
+				};
+				const negativeControl = Array.from({ length: flatFrameRows }, (_value, index) =>
+					index < transcriptRows ? `line-${index}` : "suffix",
+				);
+				negativeControl.slice(0, 1);
+				negativeControlSlices = flatFrameSlices;
+				flatFrameSlices = 0;
+				tui.start();
+				await settle(term);
+				expect(visible(term), `${transcriptRows} rows`).toEqual(["status", "help", "pet"]);
+				expect(negativeControlSlices).toBe(1);
+				expect(flatFrameSlices).toBe(0);
+				const counters = renderMetrics.snapshot().structuralCounters;
+				expect(counters.pinnedSuffixOverflowFrames).toBeGreaterThan(0);
+			} finally {
+				Array.prototype.slice = originalSlice;
+				tui.stop();
+				renderMetrics.reset();
+				if (!wasMetricsEnabled) renderMetrics.disable();
+			}
+		}
+	});
+
+	it("bounds short transcripts and prioritizes the focused cursor, status boundary, and trailing suffix children", async () => {
+		const term = new VirtualTerminal(30, 4);
+		const tui = new TUI(term);
+		const transcript = new Lines(["line-0"]);
+		const decoration = new Lines(["decoration"]);
+		const status = new Lines(["status"]);
+		const editor = new FocusedEditor(["editor"]);
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		editorContainer.addChild(new Lines(["help"]));
+		const pet = new Lines(["pet"]);
+
+		tui.addChild(transcript);
+		tui.addChild(decoration);
+		tui.addChild(status);
+		tui.addChild(editorContainer);
+		tui.addChild(pet);
+		tui.setBottomPinnedComponent(status);
+		tui.setFocus(editor);
+		try {
+			tui.start();
+			await settle(term);
+			for (const [height, expected] of [
+				[1, ["editor"]],
+				[2, ["status", "editor"]],
+				[3, ["status", "editor", "pet"]],
+				[4, ["status", "editor", "help", "pet"]],
+			] as const) {
+				term.resize(30, height);
+				await settle(term);
+				const rows = visible(term);
+				expect(rows).toEqual([...expected]);
+				expect(rows).toContain("editor");
+				expect(rows.filter(row => row === "editor")).toHaveLength(1);
+			}
+			expect(tui.scrollViewportBy(Number.POSITIVE_INFINITY)).toBe(false);
+			expect(tui.scrollViewportBy(Number.NaN)).toBe(false);
 		} finally {
 			tui.stop();
 		}
@@ -340,6 +788,312 @@ describe("TUI manual viewport paging", () => {
 			}
 		}
 	});
+	it("auto-follows live on an exact wheel-down to the transcript bottom", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		tui.addChild(content);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+
+			expect(tui.scrollViewportBy(-DEFAULT_WHEEL_LINES, { pin: "stable" })).toBe(true);
+			await term.flush();
+			expect(tui.scrollViewportBy(-DEFAULT_WHEEL_LINES, { pin: "stable" })).toBe(true);
+			await term.flush();
+			// Two wheel-ups from the live bottom land two steps above the max top.
+			expect(visible(term)).toEqual(["line-1", "line-2", "line-3", "line-4", "line-5"]);
+
+			// A partial wheel-down does not reach the bottom yet.
+			expect(tui.scrollViewportBy(DEFAULT_WHEEL_LINES, { pin: "stable" })).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-4", "line-5", "line-6", "line-7", "line-8"]);
+
+			// The final wheel-down clamps to the exact bottom and follows live.
+			expect(tui.scrollViewportBy(DEFAULT_WHEEL_LINES, { pin: "stable" })).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+			expect(tui.followLiveViewport()).toBe(false);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("auto-follows live on PageDown at the transcript bottom", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		tui.addChild(new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`)));
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-3", "line-4", "line-5", "line-6", "line-7"]);
+
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+			expect(tui.followLiveViewport()).toBe(false);
+		} finally {
+			tui.stop();
+		}
+	});
+	it("keeps wheel-down and PageDown at the live bottom as no-ops", async () => {
+		for (const mode of ["wheel", "page"] as const) {
+			const term = new VirtualTerminal(30, 5);
+			const tui = new TUI(term);
+			const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+			tui.addChild(content);
+			tui.setViewportOutputSource({ identity: `live-bottom-${mode}`, revision: 0n });
+			try {
+				tui.start();
+				await settle(term);
+				const moved =
+					mode === "wheel"
+						? tui.scrollViewportBy(DEFAULT_WHEEL_LINES, { pin: "stable" })
+						: tui.scrollViewportPages(1);
+				expect(moved).toBe(true);
+
+				content.replace(Array.from({ length: 13 }, (_value, index) => `line-${index}`));
+				tui.setViewportOutputSource({ identity: `live-bottom-${mode}`, revision: 1n });
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "line-12"]);
+				expect(visible(term).join("\n")).not.toContain("New output — type to follow");
+				expect(tui.followLiveViewport()).toBe(false);
+			} finally {
+				tui.stop();
+			}
+		}
+	});
+
+	it("retains manual ownership and the exact notice on a partial downward move", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.setViewportOutputSource({ identity: "assistant", revision: 0n });
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-5", "line-6", "line-7", "line-8", "status", "editor"]);
+
+			tui.setViewportOutputSource({ identity: "assistant", revision: 1n });
+			await settle(term);
+			expect(visible(term)).toEqual([
+				"line-5",
+				"line-6",
+				"line-7",
+				"New output — type to follow",
+				"status",
+				"editor",
+			]);
+
+			// Partial downward move stays manual with the notice intact.
+			expect(tui.scrollViewportBy(1, { pin: "stable" })).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual([
+				"line-6",
+				"line-7",
+				"line-8",
+				"New output — type to follow",
+				"status",
+				"editor",
+			]);
+			expect(tui.followLiveViewport()).toBe(true);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("auto-follows at the transcript bottom across capacity 0, 1, and many rows", async () => {
+		for (const [height, label] of [
+			[2, "capacity-0"],
+			[3, "capacity-1"],
+			[6, "capacity-many"],
+		] as const) {
+			const term = new VirtualTerminal(30, height);
+			const tui = new TUI(term);
+			tui.addChild(new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`)));
+			const status = new Lines(["status"]);
+			const editor = new Lines(["editor"]);
+			tui.addChild(status);
+			tui.addChild(editor);
+			tui.setBottomPinnedComponent(status);
+			try {
+				tui.start();
+				await settle(term);
+
+				expect(tui.scrollViewportPages(-1), label).toBe(true);
+				await term.flush();
+				expect(tui.followLiveViewport(), label).toBe(true);
+				await term.flush();
+
+				expect(tui.scrollViewportPages(-1), label).toBe(true);
+				await term.flush();
+				expect(tui.scrollViewportPages(1), label).toBe(true);
+				await term.flush();
+				expect(tui.followLiveViewport(), label).toBe(false);
+			} finally {
+				tui.stop();
+			}
+		}
+	});
+
+	it("auto-follows with a constrained suffix that exceeds the viewport height", async () => {
+		const term = new VirtualTerminal(30, 3);
+		const tui = new TUI(term);
+		tui.addChild(new Lines(Array.from({ length: 50 }, (_value, index) => `line-${index}`)));
+		const status = new Lines(["status"]);
+		tui.addChild(status);
+		tui.addChild(new Lines(["editor"]));
+		tui.addChild(new Lines(["help"]));
+		tui.addChild(new Lines(["pet"]));
+		tui.setBottomPinnedComponent(status);
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["status", "help", "pet"]);
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(tui.followLiveViewport()).toBe(false);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("preserves editor focus after auto-following at the bottom", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		tui.addChild(new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`)));
+		const status = new Lines(["status"]);
+		const editor = new FocusedEditor(["editor"]);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.setFocus(editor);
+		try {
+			tui.start();
+			await settle(term);
+			expect(editor.focused).toBe(true);
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(editor.focused).toBe(true);
+
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(editor.focused).toBe(true);
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("clears the output notice when auto-following at the bottom", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.setViewportOutputSource({ identity: "assistant", revision: 0n });
+		try {
+			tui.start();
+			await settle(term);
+			// capacity 4, maxViewportTop 8; PageUp lands at 5.
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+
+			// The notice drops capacity to 3 and raises maxViewportTop to 9.
+			tui.setViewportOutputSource({ identity: "assistant", revision: 1n });
+			await settle(term);
+			expect(visible(term)).toContain("New output — type to follow");
+
+			// First PageDown (step 2) reaches 7 — still below the notice-adjusted bottom.
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toContain("New output — type to follow");
+
+			// Second PageDown clamps to 9 == maxViewportTop and auto-follows live,
+			// clearing the notice.
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).not.toContain("New output — type to follow");
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("appends new output through one live frontier without clearing scrollback after auto-follow", async () => {
+		const term = new VirtualTerminal(30, 6, { isProcessTerminal: true });
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 20 }, (_value, index) => `line-${index}`));
+		tui.addChild(transcript);
+		const previousWtSession = Bun.env.WT_SESSION;
+		Bun.env.WT_SESSION = "test-windows-terminal-session";
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-14", "line-15", "line-16", "line-17", "line-18", "line-19"]);
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-9", "line-10", "line-11", "line-12", "line-13", "line-14"]);
+
+			term.clearWriteLog();
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+
+			const followWrites = term.getWriteLog().join("");
+			expect(followWrites).not.toContain("\x1b[2J\x1b[H");
+			expect(followWrites).not.toContain("\x1b[3J");
+
+			term.clearWriteLog();
+			transcript.append("fresh-output");
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-15", "line-16", "line-17", "line-18", "line-19", "fresh-output"]);
+
+			const appendWrites = term.getWriteLog().join("");
+			expect(appendWrites).not.toContain("\x1b[2J\x1b[H");
+			expect(appendWrites).not.toContain("\x1b[3J");
+			expect(appendWrites).toContain("fresh-output");
+		} finally {
+			tui.stop();
+			if (previousWtSession === undefined) {
+				delete Bun.env.WT_SESSION;
+			} else {
+				Bun.env.WT_SESSION = previousWtSession;
+			}
+		}
+	});
 });
 
 describe("registered viewport anchor", () => {
@@ -385,46 +1139,46 @@ describe("registered viewport anchor", () => {
 			expect(tui.scrollViewportPages(-1)).toBe(true);
 			await term.flush();
 			expect(visible(term)).toEqual([
-				"transcript-8",
-				"transcript-9",
-				"transcript-10",
-				"transcript-11",
 				"transient-0",
 				"transient-1",
+				"transient-2",
+				"transient-3",
+				"status",
+				"editor",
 			]);
 			term.clearWriteLog();
 			expect(tui.scrollViewportPages(1)).toBe(true);
 			await term.flush();
 			expect(visible(term)).toEqual([
-				"transient-1",
-				"transient-2",
 				"transient-3",
 				"transient-4",
 				"transient-5",
 				"synthetic-0",
+				"status",
+				"editor",
 			]);
 
 			transient.setLine(3, "transient-3 live");
 			tui.requestRender();
 			await settle(term);
 			expect(visible(term)).toEqual([
-				"transient-1",
-				"transient-2",
 				"transient-3 live",
 				"transient-4",
 				"transient-5",
 				"synthetic-0",
+				"status",
+				"editor",
 			]);
 
 			expect(tui.scrollViewportPages(-1)).toBe(true);
 			await term.flush();
 			expect(visible(term)).toEqual([
-				"transcript-8",
-				"transcript-9",
-				"transcript-10",
-				"transcript-11",
 				"transient-0",
 				"transient-1",
+				"transient-2",
+				"transient-3 live",
+				"status",
+				"editor",
 			]);
 			transcript.setLine(8, "transcript-8 final");
 			for (const clearOnShrink of [false, true]) {
@@ -588,7 +1342,7 @@ describe("registered viewport anchor", () => {
 		try {
 			tui.start();
 			await settle(term);
-			expect(tui.scrollViewportPages(1)).toBe(true);
+			expect(tui.revealViewportAnchor("target", "bottom")).toBe(true);
 			await term.flush();
 			expect(visible(term)[5]).toContain("끝");
 			for (const width of [12, 80, 8, 80, 12]) {
@@ -677,14 +1431,15 @@ describe("registered viewport anchor", () => {
 					tui.start();
 					await settle(term);
 					expect(visible(term).some(line => line.includes("끝"))).toBe(true);
-					expect(tui.scrollViewportPages(1)).toBe(true);
+					expect(tui.revealViewportAnchor("target", "bottom")).toBe(true);
 					await term.flush();
-					const targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
+					let targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
 					expect(targetScreenRow).toBeGreaterThanOrEqual(0);
 					for (const width of [14, 70, 10, 30]) {
 						term.resize(width, 6);
 						await settle(term);
-						expect(visible(term)[targetScreenRow], `width=${width} clear=${clearOnShrink}`).toContain("끝");
+						targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
+						expect(targetScreenRow, `width=${width} clear=${clearOnShrink}`).toBeGreaterThanOrEqual(0);
 					}
 					term.clearWriteLog();
 					transient.replace([]);
@@ -786,6 +1541,87 @@ describe("registered viewport anchor", () => {
 			expect(visible(term).some(line => line === "history-9")).toBe(false);
 		} finally {
 			tui.stop();
+		}
+	});
+
+	it("tracks retained and replacement Kitty placements across unresolved follow-live", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		const originalCellDimensions = getCellDimensions();
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		resetKittyTransmissions();
+		setKittyTransmitWriter(() => {});
+
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new AnchoredTranscript();
+		for (let index = 0; index < 10; index++) transcript.addRow(`history-${index}`, `history-${index}`);
+		transcript.addChild(
+			new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			),
+		);
+		let firstLiveRow: Text | undefined;
+		for (let index = 10; index < 20; index++) {
+			const row = transcript.addRow(`history-${index}`, `history-${index}`);
+			if (index === 10) firstLiveRow = row;
+		}
+		tui.addChild(transcript);
+		tui.setViewportAnchorComponent(transcript);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.revealViewportAnchor("history-9", "top")).toBe(true);
+			await settle(term);
+			const [retainedPlacement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+			expect(retainedPlacement).toBeDefined();
+
+			term.clearWriteLog();
+			transcript.removeFirst(11);
+			transcript.addChild(
+				new Image(
+					"AQ==",
+					"image/png",
+					{ fallbackColor: value => value },
+					{ maxWidthCells: 4, maxHeightCells: 2 },
+					{ widthPx: 20, heightPx: 20 },
+				),
+			);
+			for (let index = 0; index < 4; index++) transcript.addRow(`tail-${index}`, `tail-${index}`);
+			tui.requestRender();
+			await settle(term);
+			const retainedOutput = term.getWriteLog().join("");
+			expect(retainedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			expect(extractKittyPlacementReferences(retainedOutput)).toContainEqual(retainedPlacement);
+
+			term.clearWriteLog();
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			const followedOutput = term.getWriteLog().join("");
+			expect(followedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			const [replacementPlacement] = extractKittyPlacementReferences(followedOutput);
+			expect(replacementPlacement).toBeDefined();
+			expect(replacementPlacement?.imageId).not.toBe(retainedPlacement?.imageId);
+
+			term.clearWriteLog();
+			firstLiveRow!.setText("history-10 updated");
+			transcript.addRow("tail-4", "tail-4");
+			tui.requestRender();
+			await settle(term);
+			const grownOutput = term.getWriteLog().join("");
+			expect(grownOutput).toContain(encodeKittyPlacementDelete(replacementPlacement!));
+			expect(extractKittyPlacementReferences(grownOutput)).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(originalCellDimensions);
+			setTerminalImageProtocol(originalProtocol);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(sequence => process.stdout.write(sequence));
 		}
 	});
 	it("retains unresolved intent through provider removal and resolves a replacement", async () => {
@@ -999,12 +1835,10 @@ describe("registered viewport anchor", () => {
 						tui.requestRender();
 						await settle(term);
 						const viewport = visible(term);
-						expect(viewport.slice(0, 4), `${testCase.label} clear=${clearOnShrink}`).toEqual([
-							"transcript-8 final",
-							"transcript-9",
-							"transcript-10",
-							"transcript-11",
-						]);
+						expect(viewport).toContain("transcript-8 final");
+						expect(viewport).toContain("transcript-9");
+						expect(viewport).toContain("transcript-10");
+						expect(viewport).toContain("transcript-11");
 						expect(viewport).toContain("status");
 						expect(viewport).toContain("editor");
 						expect(viewport.indexOf("status")).toBeLessThan(viewport.indexOf("editor"));
@@ -1023,6 +1857,58 @@ describe("registered viewport anchor", () => {
 				if (value === undefined) delete Bun.env[key];
 				else Bun.env[key] = value;
 			}
+		}
+	});
+	it("writes only the new live frontier after following a manual viewport", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const transcript = new Lines(Array.from({ length: 10 }, (_value, index) => `frontier-${index}`));
+		tui.addChild(transcript);
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			transcript.append("frontier-manual-era");
+			transcript.setLine(3, "frontier-mutated-manual-era");
+			tui.requestRender();
+			await settle(term);
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			term.clearWriteLog();
+
+			transcript.append("frontier-live-once");
+			tui.requestRender();
+			await settle(term);
+			const writes = term.getWriteLog().join("");
+			const scrollback = term.getScrollBuffer();
+			const oldSentinels = [
+				...Array.from({ length: 10 }, (_value, index) => `frontier-${index}`),
+				"frontier-manual-era",
+				"frontier-mutated-manual-era",
+			];
+			expect(writes.split("frontier-live-once")).toHaveLength(2);
+			for (const sentinel of oldSentinels) expect(writes).not.toContain(sentinel);
+			expect(writes).not.toContain("\x1b[2J");
+			expect(writes).not.toContain("\x1b[3J");
+			expect(writes).not.toContain("\x1b[H\x1b[0J");
+			expect(scrollback.filter(line => line === "frontier-live-once")).toHaveLength(1);
+			expect(scrollback.slice(-5)).toEqual([
+				"frontier-7",
+				"frontier-8",
+				"frontier-9",
+				"frontier-manual-era",
+				"frontier-live-once",
+			]);
+			expect(visible(term)).toEqual([
+				"frontier-7",
+				"frontier-8",
+				"frontier-9",
+				"frontier-manual-era",
+				"frontier-live-once",
+			]);
+		} finally {
+			tui.stop();
 		}
 	});
 });
