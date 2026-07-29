@@ -179,18 +179,42 @@ function requireDisposer(value: unknown, name: string): () => void {
 	return value as () => void;
 }
 
-function isEndpointAuthority(value: unknown): value is EndpointAuthority {
-	return (
-		isRecord(value) &&
-		typeof value.endpointGeneration === "number" &&
-		Number.isInteger(value.endpointGeneration) &&
-		typeof value.endpointIncarnation === "string" &&
-		value.endpointIncarnation.length > 0 &&
-		typeof value.endpointMtimeMs === "number" &&
-		Number.isFinite(value.endpointMtimeMs) &&
-		typeof value.pid === "number" &&
-		Number.isInteger(value.pid)
-	);
+interface EndpointAuthorityRead {
+	readonly authority: EndpointAuthority | undefined;
+	readonly failure: PropertyRead | undefined;
+	readonly malformed: boolean;
+}
+
+function readEndpointAuthority(value: unknown): EndpointAuthorityRead {
+	if (value === undefined) return { authority: undefined, failure: undefined, malformed: false };
+	if (!isRecord(value)) return { authority: undefined, failure: undefined, malformed: true };
+	const generation = readProperty(value, "endpointGeneration");
+	const incarnation = readProperty(value, "endpointIncarnation");
+	const mtime = readProperty(value, "endpointMtimeMs");
+	const pid = readProperty(value, "pid");
+	const failure = firstReadFailure([generation, incarnation, mtime, pid]);
+	if (failure) return { authority: undefined, failure, malformed: false };
+	if (
+		typeof generation.value !== "number" ||
+		!Number.isInteger(generation.value) ||
+		typeof incarnation.value !== "string" ||
+		incarnation.value.length === 0 ||
+		typeof mtime.value !== "number" ||
+		!Number.isFinite(mtime.value) ||
+		typeof pid.value !== "number" ||
+		!Number.isInteger(pid.value)
+	)
+		return { authority: undefined, failure: undefined, malformed: true };
+	return {
+		authority: {
+			endpointGeneration: generation.value,
+			endpointIncarnation: incarnation.value,
+			endpointMtimeMs: mtime.value,
+			pid: pid.value,
+		},
+		failure: undefined,
+		malformed: false,
+	};
 }
 
 function requiredString(value: unknown, name: string): string {
@@ -414,7 +438,8 @@ export async function loadThread(
 			typeof childCloseRead.value === "function"
 				? (childCloseRead.value as (authority: EndpointAuthority | undefined) => void | Promise<void>)
 				: undefined;
-		const childAuthority = authorityRead.value;
+		const authoritySnapshot = readEndpointAuthority(authorityRead.value);
+		const childAuthority = authoritySnapshot.authority;
 		const clientRecord = isRecord(clientRead.value) ? clientRead.value : undefined;
 		const clientCloseRead = clientRecord ? readProperty(clientRecord, "close") : undefined;
 		let cleanupThreadId = createRequest.threadId;
@@ -426,14 +451,8 @@ export async function loadThread(
 		}
 		if (childCloseHook || typeof opts.close === "function") {
 			childClose = closeOnce(() => {
-				if (childCloseHook)
-					return childCloseHook.call(child, isEndpointAuthority(childAuthority) ? childAuthority : undefined);
-				if (typeof opts.close === "function")
-					return opts.close(
-						cleanupThreadId,
-						ownership,
-						isEndpointAuthority(childAuthority) ? childAuthority : undefined,
-					);
+				if (childCloseHook) return childCloseHook.call(child, childAuthority);
+				if (typeof opts.close === "function") return opts.close(cleanupThreadId, ownership, childAuthority);
 			});
 		}
 		const propertyFailure = firstReadFailure([
@@ -447,6 +466,8 @@ export async function loadThread(
 			...(clientCloseRead ? [clientCloseRead] : []),
 		]);
 		if (propertyFailure) throw propertyFailure.error;
+		if (authoritySnapshot.failure) throw authoritySnapshot.failure.error;
+		if (authoritySnapshot.malformed) throw new Error("Child adapter provided malformed endpoint authority.");
 		if (childCloseRead.value !== undefined && !childCloseHook)
 			throw new Error("Child adapter provided an invalid closeChild callback.");
 
@@ -456,9 +477,7 @@ export async function loadThread(
 		const clientValue = clientRead.value;
 		assertSessionClient(clientValue);
 		const client = clientValue;
-		const authority = authorityRead.value;
-		if (authority !== undefined && !isEndpointAuthority(authority))
-			throw new Error("Child adapter provided malformed endpoint authority.");
+		const authority = childAuthority;
 		if (ownership === "spawned" && !authority) throw new Error("Spawned child did not provide endpoint authority.");
 		if (ownership === "spawned" && !childCloseHook && typeof opts.close !== "function")
 			throw new Error("Spawned child did not provide authority-fenced cleanup.");

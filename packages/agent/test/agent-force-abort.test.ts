@@ -4,6 +4,9 @@ import {
 	type AgentEvent,
 	type AgentTool,
 	getAgentTerminalOwnerContext,
+	type AgentPromptOptions,
+	type AttemptRunHandle,
+	type ManagedLogicalRunId,
 	type StreamFn,
 } from "@gajae-code/agent-core";
 import type { CursorExecHandlers, SimpleStreamOptions } from "@gajae-code/ai";
@@ -157,6 +160,54 @@ describe("Agent.forceAbort", () => {
 
 		expect(reentrantResult).toBe(false);
 		expect(await agent.resourceLedger.waitForSettlement("1", { graceMs: 25 })).toEqual({ status: "settled" });
+	});
+
+	it("retains managed logical identity through retry terminal observers", async () => {
+		for (const listenerType of ["message_end", "agent_end"] as const) {
+			const model = createMockModel();
+			let attempts = 0;
+			const agent = new Agent({
+				initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: () => {
+					attempts += 1;
+					throw Object.assign(new Error("overloaded"), {
+						transportFailure: { kind: "transport", status: 503 },
+					});
+				},
+			});
+			const diagnostic = createAssistantMessage([{ type: "text", text: "fallback exhausted" }]);
+			let decisions = 0;
+			let reentrantResult: boolean | undefined;
+			const terminalEvents: string[] = [];
+			let options: AgentPromptOptions;
+			options = {
+				fallbackManaged: true,
+				onManagedAttemptOutcome: () => {
+					decisions += 1;
+					if (decisions === 1) return { type: "retry", continuation: () => agent.continue(options) };
+					return {
+						type: "terminal",
+						terminal: { stopReason: "exhausted", messages: [diagnostic] },
+					};
+				},
+			};
+			agent.subscribe(event => {
+				if (event.type === "agent_end") terminalEvents.push(event.stopReason ?? "unknown");
+				const isTarget =
+					listenerType === "message_end"
+						? event.type === "message_end" && event.message === diagnostic
+						: event.type === "agent_end";
+				if (isTarget) reentrantResult = agent.forceAbort(`reentrant ${listenerType}`);
+			});
+
+			await agent.prompt("managed retry", options);
+			await agent.waitForIdle();
+
+			expect(attempts).toBe(2);
+			expect(reentrantResult).toBe(false);
+			expect(terminalEvents).toHaveLength(1);
+			expect(await agent.resourceLedger.waitForSettlement("1", { graceMs: 25 })).toEqual({ status: "settled" });
+		}
 	});
 	it("forces an ignored abort back to idle and accepts a following prompt", async () => {
 		const model = createMockModel({ responses: [{ content: ["after force"] }] });

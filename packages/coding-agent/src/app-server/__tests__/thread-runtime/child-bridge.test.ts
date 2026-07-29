@@ -752,6 +752,54 @@ test("transactional load: throwing child accessors do not hide independently rea
 	expect(manager.pendingCount).toBe(0);
 });
 
+test("transactional load: nested authority accessor failures still invoke captured cleanup", async () => {
+	for (const [index, thrown] of [new Error("authority getter failed"), undefined].entries()) {
+		const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+		const counters = { close: 0, childClose: 0 };
+		const capturedAuthorities: Array<EndpointAuthority | undefined> = [];
+		const hostileAuthority: Record<string, unknown> = {
+			endpointIncarnation: "e".repeat(64),
+			endpointMtimeMs: 1,
+			pid: 1234,
+		};
+		Object.defineProperty(hostileAuthority, "endpointGeneration", {
+			get: () => {
+				throw thrown;
+			},
+		});
+		const opts: ChildBridgeOptions = {
+			manager,
+			create: async () => ({
+				sessionId: `session-hostile-authority-${index}`,
+				cwd: path.resolve("cwd"),
+				authority: hostileAuthority as unknown as EndpointAuthority,
+				client: fakeClient(counters),
+				awaitReady: async () => {},
+				closeChild: async captured => {
+					capturedAuthorities.push(captured);
+					counters.childClose += 1;
+				},
+			}),
+		};
+		let rejected = false;
+		let rejection: unknown;
+		try {
+			await loadThread(opts, { cwd: "cwd" });
+		} catch (error) {
+			rejected = true;
+			rejection = error;
+		}
+
+		expect(rejected).toBe(true);
+		expect(rejection).toBe(thrown);
+		expect(counters.close).toBe(1);
+		expect(counters.childClose).toBe(1);
+		expect(capturedAuthorities).toEqual([undefined]);
+		expect(manager.loadedCount).toBe(0);
+		expect(manager.pendingCount).toBe(0);
+	}
+});
+
 test("transactional load: spawned child without authority-fenced cleanup fails before readiness", async () => {
 	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
 	const counters = { close: 0 };

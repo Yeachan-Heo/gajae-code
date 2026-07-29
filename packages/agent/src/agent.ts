@@ -398,6 +398,7 @@ export class Agent {
 	#resolveRunningPrompt?: () => void;
 	#runSequence = 0;
 	#activeRunId?: number;
+	#activeLogicalRunId?: ManagedLogicalRunId;
 	#activeResourceRunId?: string;
 	#activeResourceCancellationDomain?: RunCancellationDomain;
 	#continuationGeneration = 0;
@@ -1218,7 +1219,7 @@ export class Agent {
 		const handle = targetLogicalRunId !== undefined ? this.#runHandles.get(targetLogicalRunId) : undefined;
 		const runId = this.#activeRunId;
 		const managedLogicalRunId = this.#managedLogicalRunOwner;
-		const activeLogicalRunId = managedLogicalRunId ?? runId;
+		const activeLogicalRunId = this.#activeLogicalRunId ?? managedLogicalRunId ?? runId;
 		if (activeLogicalRunId !== undefined && this.#terminalizedLogicalRunIds.has(activeLogicalRunId)) return false;
 		if (
 			targetLogicalRunId !== undefined &&
@@ -1246,6 +1247,7 @@ export class Agent {
 		this.#runningPrompt = undefined;
 		this.#resolveRunningPrompt = undefined;
 		this.#activeRunId = undefined;
+		this.#activeLogicalRunId = undefined;
 		this.#activeResourceRunId = undefined;
 		this.#activeResourceCancellationDomain = undefined;
 		resolve?.();
@@ -1459,12 +1461,14 @@ export class Agent {
 				: undefined;
 		const continuesLogicalRun = fallbackManaged || maintenanceContinuation;
 		const startsManagedLogicalRun = fallbackManaged && this.#managedLogicalRunOwner === undefined;
-		this.#activeResourceRunId = String(managedLogicalRunOwner ?? runId);
+		this.#activeLogicalRunId = managedLogicalRunOwner ?? runId;
+		this.#activeResourceRunId = String(this.#activeLogicalRunId);
 		this.#activeResourceCancellationDomain = this.resourceLedger.open(this.#activeResourceRunId);
 		if (!this.#activeResourceCancellationDomain) {
 			this.#state.isStreaming = false;
 			this.#abortController = undefined;
 			this.#activeRunId = undefined;
+			this.#activeLogicalRunId = undefined;
 			this.#activeResourceRunId = undefined;
 			this.#activeResourceCancellationDomain = undefined;
 			this.#runningPrompt = undefined;
@@ -1472,7 +1476,7 @@ export class Agent {
 			resolve();
 			throw new Error("Prompt resource cancellation domain is unavailable");
 		}
-		const logicalRunId = managedLogicalRunOwner ?? runId;
+		const logicalRunId = this.#activeLogicalRunId;
 		const scope = this.#attemptAuthority.mintMain();
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
@@ -1489,6 +1493,7 @@ export class Agent {
 			this.#state.isStreaming = false;
 			this.#abortController = undefined;
 			this.#activeRunId = undefined;
+			this.#activeLogicalRunId = undefined;
 			this.#activeResourceRunId = undefined;
 			this.#activeResourceCancellationDomain = undefined;
 			this.#runningPrompt = undefined;
@@ -1903,6 +1908,7 @@ export class Agent {
 				this.#state.pendingToolCalls = new Set<string>();
 				this.#abortController = undefined;
 				this.#activeRunId = undefined;
+				this.#activeLogicalRunId = undefined;
 				this.#activeResourceRunId = undefined;
 				this.#activeResourceCancellationDomain = undefined;
 				this.#resolveRunningPrompt?.();
