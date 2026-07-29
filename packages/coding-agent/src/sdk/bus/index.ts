@@ -44,8 +44,8 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import type { ClientBridge } from "../../session/client-bridge";
 import type { AppServerProjectionCapability } from "../../session/app-server-projection";
+import type { ClientBridge } from "../../session/client-bridge";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -3796,7 +3796,6 @@ export function createNotificationsExtension(
 			retainCorrelation: boolean;
 			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
 			fatal?: boolean;
-			terminalAt?: number;
 			deadlineMs: number;
 			deadlineTimer?: Parameters<typeof clearTimeout>[0];
 			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
