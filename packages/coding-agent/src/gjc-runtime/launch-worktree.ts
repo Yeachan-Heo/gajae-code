@@ -138,6 +138,41 @@ function hasBranchInUse(entries: GitWorktreeEntry[], branchName: string, worktre
 	return entries.some(entry => entry.branchRef === expectedRef && path.resolve(entry.path) !== resolvedPath);
 }
 
+function ensureBucketDirUsable(bucketPath: string): void {
+	// fs.existsSync follows symlinks and reports false for a broken symlink,
+	// so a bucket that is a dangling symlink (e.g. offloaded cold storage that
+	// is no longer mounted) looks "missing". Bun's mkdirSync({ recursive: true })
+	// then throws a raw EEXIST because the directory entry exists but resolves
+	// to nothing, which crashes the launch with no actionable guidance. Detect
+	// such entries up front and surface remediation steps instead.
+	let lstat: fs.Stats;
+	try {
+		lstat = fs.lstatSync(bucketPath);
+	} catch {
+		return; // No entry at the bucket path; mkdirSync will create it normally.
+	}
+	if (lstat.isDirectory()) return;
+	if (lstat.isSymbolicLink()) {
+		const target = fs.readlinkSync(bucketPath);
+		throw new Error(
+			[
+				`worktree_bucket_broken_symlink:${bucketPath}`,
+				`The GJC launch worktree bucket is a symbolic link to ${target}, but the target does not exist (it may be unmounted or offloaded cold storage).`,
+				`Path: ${bucketPath}`,
+				`Safe remediation: restore or remount the link target, or remove the dangling symlink with \`rm ${bucketPath}\` and relaunch.`,
+			].join("\n"),
+		);
+	}
+	throw new Error(
+		[
+			`worktree_bucket_not_directory:${bucketPath}`,
+			`The GJC launch worktree bucket path exists but is not a directory.`,
+			`Path: ${bucketPath}`,
+			`Safe remediation: inspect and remove the obstructing entry with \`rm ${bucketPath}\` and relaunch.`,
+		].join("\n"),
+	);
+}
+
 function pruneStaleWorktreePath(repoRoot: string): void {
 	runGit(repoRoot, ["worktree", "prune"]);
 }
@@ -267,6 +302,7 @@ export function ensureLaunchWorktree(
 		throw new Error(`branch_in_use:${plan.branchName}`);
 	}
 
+	ensureBucketDirUsable(path.dirname(plan.worktreePath));
 	fs.mkdirSync(path.dirname(plan.worktreePath), { recursive: true });
 	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
 	const args = ["worktree", "add"];

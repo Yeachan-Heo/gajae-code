@@ -191,6 +191,26 @@ describe("default launch worktrees", () => {
 		expect(run("git", ["branch", "--show-current"], named.cwd)).toBe("feat/hud-ui-alignment");
 	});
 
+	it("reports an actionable error when the worktree bucket is a broken symlink", async () => {
+		const repo = await createRepo("gjc-launch-broken-bucket-symlink-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		await fs.symlink(path.join(path.dirname(repo), "missing-cold-storage-target"), bucket);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+			/worktree_bucket_broken_symlink:[\s\S]*symbolic link[\s\S]*missing-cold-storage-target[\s\S]*rm [^\n]*\.gajae-code-worktrees/,
+		);
+	});
+
+	it("reports an actionable error when the worktree bucket exists but is not a directory", async () => {
+		const repo = await createRepo("gjc-launch-bucket-not-directory-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		await Bun.write(bucket, "not-a-directory\n");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+			/worktree_bucket_not_directory:[\s\S]*not a directory[\s\S]*rm [^\n]*\.gajae-code-worktrees/,
+		);
+	});
+
 	it("creates named launch worktrees from reusable branch names", async () => {
 		const repo = await createRepo("gjc-launch-named-worktree-");
 		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
