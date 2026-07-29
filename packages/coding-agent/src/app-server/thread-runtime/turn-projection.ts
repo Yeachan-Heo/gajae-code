@@ -305,14 +305,27 @@ export async function appendProjectionRecord<P extends ProjectionPayload>(
 	record: ProjectionEnvelope<P>,
 ): Promise<ProjectionAppendReceipt<P>> {
 	const normalized = normalizeEnvelope(record) as ProjectionRecord<P>;
-	const response = await client.control(
-		"projection.append",
-		{ envelope: normalized },
-		{
-			idempotencyKey: normalized.sourceKey,
-			confirm: true,
-		},
-	);
+	// The bridge client rejects an `ok:false` control frame with its typed error, so a raw conflict
+	// is normalized here once. Every append callsite then sees the same typed ProjectionAppendError
+	// instead of each caller re-classifying (or downgrading) the code independently.
+	let response: unknown;
+	try {
+		response = await client.control(
+			"projection.append",
+			{ envelope: normalized },
+			{
+				idempotencyKey: normalized.sourceKey,
+				confirm: true,
+			},
+		);
+	} catch (error) {
+		if (errorFromOperation(error)?.code === "idempotency_conflict")
+			throw new ProjectionAppendError(
+				"idempotency_conflict",
+				errorFromOperation(error)?.message ?? "projection.append conflicted on an existing source key.",
+			);
+		throw error;
+	}
 	const operationError = errorFromOperation(response);
 	const candidate = appendResultCandidate(response);
 	// A definitive rejection is a rejection even when the child omits an error object; a revision

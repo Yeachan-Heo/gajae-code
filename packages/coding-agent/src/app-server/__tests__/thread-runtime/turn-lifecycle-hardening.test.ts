@@ -532,3 +532,70 @@ test("legitimate append receipt shapes are never rejected", async () => {
 		).resolves.toBeDefined();
 	}
 });
+
+test("a present but malformed reconciliation clientRef fails closed", async () => {
+	for (const clientRef of ["", "   ", 42, null]) {
+		const client = new FakeClient({
+			promptError: new Error("request timeout"),
+			promptStatus: {
+				status: "accepted",
+				commandId: "foreign-command",
+				turnId: "foreign-turn",
+				clientRef,
+				acceptedAt: 1,
+			},
+		});
+		const manager = managerWith(client);
+		const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+
+		await expect(controller.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
+			code: "recovery_required",
+		});
+		// A supplied-but-invalid correlation must never bind foreign child identities.
+		expect(client.appended, JSON.stringify(clientRef)).toHaveLength(0);
+		expect(controller.getState(THREAD_ID), JSON.stringify(clientRef)).toBe("recovery_required");
+	}
+});
+
+test("a reconciliation status omitting clientRef is still accepted", async () => {
+	const client = new FakeClient({
+		promptError: new Error("request timeout"),
+		promptStatus: { status: "accepted", commandId: COMMAND_ID, turnId: CHILD_TURN_ID, acceptedAt: 1 },
+	});
+	const manager = managerWith(client);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+
+	await expect(controller.start({ threadId: THREAD_ID, params: { text: "hi" } })).resolves.toBeDefined();
+	expect(client.appended.map(record => record.recordKind)).toEqual(["app-server.turn.created"]);
+});
+
+test("a raw thrown conflict keeps its typed code on item and terminal appends", async () => {
+	// The created append succeeds; the later terminal append throws a raw typed bridge conflict.
+	const client = new FakeClient();
+	const manager = managerWith(client);
+	const notifications: string[] = [];
+	const controller = new TurnController({
+		manager,
+		emit: notification => {
+			notifications.push(notification.method);
+		},
+		idFactory: () => APP_TURN_ID,
+	});
+
+	const handle = await controller.start({ threadId: THREAD_ID, params: { text: "hello" } });
+	client.appendThrow = Object.assign(new Error("source key conflict"), { code: "idempotency_conflict" });
+	controller.acceptFrame(
+		THREAD_ID,
+		lifecycleFrame("agent_end", { messages: [assistant("done")], stopReason: "completed" }),
+	);
+
+	let rejection: unknown;
+	try {
+		await handle.responseDelivered();
+	} catch (error) {
+		rejection = error;
+	}
+	// All three append callsites must classify a raw conflict identically, never as generic internal.
+	expect(rejection).toMatchObject({ code: "idempotency_conflict" });
+	expect(notifications).toEqual(["turn/started"]);
+});

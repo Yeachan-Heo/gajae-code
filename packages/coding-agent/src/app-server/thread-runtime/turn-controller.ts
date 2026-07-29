@@ -374,7 +374,11 @@ function promptStatus(value: unknown): PromptStatus | undefined {
 		status: candidate.status,
 		...(commandId === undefined ? {} : { commandId: nonEmptyString(commandId) ? commandId : undefined }),
 		...(turnId === undefined ? {} : { turnId: nonEmptyString(turnId) ? turnId : undefined }),
-		...(nonEmptyString(candidate.clientRef) ? { clientRef: candidate.clientRef } : {}),
+		// Presence-aware: an absent property stays absent (legacy replies omit it), but a present yet
+		// invalid value must reach the fence as a conflict rather than collapsing to "not supplied".
+		...(Object.hasOwn(candidate, "clientRef")
+			? { clientRef: nonEmptyString(candidate.clientRef) ? candidate.clientRef.trim() : "" }
+			: {}),
 		...(errorCode !== undefined && errorText !== undefined ? { error: { code: errorCode, message: errorText } } : {}),
 	};
 }
