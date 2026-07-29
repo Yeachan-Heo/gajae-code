@@ -45,7 +45,14 @@ export interface TaskResultReceipt {
 	abortSummary?: string;
 	preview: string;
 	previewTruncated: boolean;
-	outputRef?: { uri: string; sizeBytes: number; lineCount: number; sha256?: string };
+	outputRef?: {
+		uri: string;
+		sizeBytes: number;
+		lineCount: number;
+		sha256?: string;
+		/** Output remains readable for the parent session lifetime (and same-session descendants). */
+		durability?: "session";
+	};
 	outputUnavailable?: boolean;
 	review?: {
 		overallCorrectness?: string;
@@ -224,12 +231,15 @@ export function buildTaskRoiSummary(receipts: readonly TaskResultReceipt[]): Tas
 }
 
 export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
+	// Receipts only include outputRef when production code kept outputMeta after a
+	// durable write (file-backed session dir or session-lifetime durable root).
 	const outputRef = raw.outputMeta
 		? {
 				uri: `agent://${raw.id}`,
 				sizeBytes: raw.outputMeta.byteSize ?? Buffer.byteLength(raw.output, "utf8"),
 				lineCount: raw.outputMeta.lineCount,
 				sha256: raw.outputMeta.sha256,
+				durability: "session" as const,
 			}
 		: undefined;
 	const preview = buildSafeSynopsis(raw, outputRef);

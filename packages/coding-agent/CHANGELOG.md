@@ -4,6 +4,7 @@
 ### Fixed
 
 - Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
+- Detached task receipts for in-memory parent sessions no longer advertise dead `agent://` output URIs. TaskTool allocates a session-lifetime durable artifact root under the process temp directory, persists child outputs there, authorizes parent and same-session descendants for scoped resolution, and omits the URI entirely when durable allocation fails (#3471).
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 - Kitty/Ghostty inline images no longer remain visually pinned when transcript, pinned, or overlay rows are replaced, removed, scrolled, resized, or fully repainted. The TUI now parses only bounded named placements, soft-deletes overwritten placements from the previously committed physical frame, retains transmitted pixels, and restores placements from application scrollback without retransmitting image data.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).

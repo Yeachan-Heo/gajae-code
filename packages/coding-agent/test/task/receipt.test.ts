@@ -93,6 +93,7 @@ describe("task result receipts", () => {
 			sizeBytes: Buffer.byteLength(output),
 			lineCount: output.split("\n").length,
 			sha256,
+			durability: "session",
 		});
 		expect(receipt.outputUnavailable).toBeUndefined();
 		expect(receipt.review?.overallCorrectness).toBe("patch is correct");
