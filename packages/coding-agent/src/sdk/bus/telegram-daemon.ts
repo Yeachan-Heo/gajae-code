@@ -107,7 +107,7 @@ import {
 	telegramDisableNotification,
 } from "./telegram-reference";
 import { decideThreadedInbound, type InboundAttachment } from "./threaded-inbound";
-import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
+import { renderThreadedFrame, supportsTelegramPhotoUpload, type ThreadedSend } from "./threaded-render";
 import {
 	parseTopicRegistryState,
 	type TopicEndpointBinding,
@@ -165,7 +165,14 @@ export interface TelegramDaemonFs {
 	/** Crash-atomic persistence seams. Implementations without them fail closed. */
 	fsyncFile?(path: string): Promise<void>;
 	fsyncDirectory?(path: string): Promise<void>;
-	stat?(path: string): Promise<{ mtimeMs: number; size?: number; dev?: number; ino?: number; ctimeMs?: number }>;
+	stat?(path: string): Promise<{
+		mtimeMs: number;
+		size?: number;
+		dev?: number;
+		ino?: number;
+		ctimeMs?: number;
+		isDirectory?(): boolean;
+	}>;
 	readEndpointFile?(path: string): Promise<NotificationEndpointFile>;
 	exactUnlink?(path: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 }
@@ -5333,7 +5340,7 @@ export class TelegramNotificationDaemon {
 						await this.#persistTopicMutation(
 							() => {
 								this.closedEndpointKeys.set(session.sessionId, closedBinding);
-								this.topics.beginArchive(logicalSessionId);
+								this.topics.beginArchive(logicalSessionId, this.installationHostId, this.runtime.now());
 							},
 							() => {
 								this.topics.restoreArchiveAuthority(closeTopicAuthority);
@@ -7308,6 +7315,22 @@ export class TelegramNotificationDaemon {
 				session,
 				adoptionIntentCandidate ? "user_created" : undefined,
 			);
+			// Adoption commit success removes only the sidecar. The committed
+			// user-created topic remains retained even when sidecar cleanup fails.
+			if (adoptedTopicId !== undefined) {
+				if (adoptionIntentCandidate)
+					logger.info(
+						`notifications: topic-adoption committed age_ms=${Math.max(0, this.runtime.now() - adoptionIntentCandidate.createdAt)}`,
+					);
+				try {
+					await this.#adoptionIntents.remove(sessionId);
+					await this.#adoptionIntents.removePendingTopic(adoptedTopicId);
+				} catch (error) {
+					logger.warn(
+						`notifications: topic-adoption sidecar cleanup failed; retained for reconciliation: ${sanitizeDiagnostic(String(error))}`,
+					);
+				}
+			}
 			// Publish the durable host lease before rechecking the captured socket
 			// lease. The recheck consults the registry once a record exists, so the
 			// newly-created record must already authorize this host.
@@ -7350,6 +7373,8 @@ export class TelegramNotificationDaemon {
 			}
 			return rec.topicId;
 		} catch (err) {
+			if (adoptedTopicId !== undefined) this.#adoptionIntents.releaseClaim(adoptedTopicId, sessionId);
+			if (adoptionIntentCandidate) this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch);
 			if (creationSuppressed || creationRejected || err instanceof ThreadedModeCapabilityRefusal) {
 				if (this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch)) await this.persistTopics();
 				return undefined;
@@ -7452,11 +7477,24 @@ export class TelegramNotificationDaemon {
 		// A completed archive retains an inactive record as historical evidence.
 		// Re-archiving it would duplicate the irreversible remote close request.
 		if (existing?.authorityState === "inactive") return "settled";
+		if (existing?.topicOrigin === "user_created") {
+			if (existing.authorityState === "archive_pending") {
+				this.topics.settleArchive(sessionId, existing.topicId);
+				await this.persistTopics();
+			}
+			return "settled";
+		}
 		const archiveSnapshot = this.topics.captureArchiveAuthority(sessionId);
-		let record = archiveFenceAlreadyPublished ? existing : this.topics.beginArchive(sessionId);
+		let record = archiveFenceAlreadyPublished
+			? existing
+			: this.topics.beginArchive(sessionId, this.installationHostId, this.runtime.now());
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
+		if (record && !this.topics.archiveAuthorityAllows(sessionId, this.installationHostId, this.runtime.now()))
+			return "pre_dispatch_cancelled";
 		if (!archiveFenceAlreadyPublished) await this.persistTopics();
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
+		if (!this.topics.archiveAuthorityAllows(sessionId, this.installationHostId, this.runtime.now()))
+			return "pre_dispatch_cancelled";
 		await this.#revokeAskAuthority(sessionId);
 		this.deleteMessageRoutes(sessionId);
 		this.#clearModelChoiceAliases(sessionId);
@@ -7465,6 +7503,8 @@ export class TelegramNotificationDaemon {
 			record = this.topics.get(sessionId);
 			await this.persistTopics();
 			if (!record) return "settled";
+			if (!this.topics.archiveAuthorityAllows(sessionId, this.installationHostId, this.runtime.now()))
+				return "pre_dispatch_cancelled";
 		}
 		const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
 		for (const item of removed) {
@@ -7475,6 +7515,8 @@ export class TelegramNotificationDaemon {
 		try {
 			await this.flushPool();
 			if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
+			if (!this.topics.archiveAuthorityAllows(sessionId, this.installationHostId, this.runtime.now()))
+				return "pre_dispatch_cancelled";
 			const res = (await this.botApi.call("closeForumTopic", {
 				chat_id: this.opts.chatId,
 				message_thread_id: Number(record.topicId),
@@ -7503,7 +7545,7 @@ export class TelegramNotificationDaemon {
 				return "post_dispatch_pending";
 			}
 		} catch {
-			// Once Telegram dispatch starts, retain the persisted deletion fence: the
+			// Once Telegram dispatch starts, retain the persisted archive fence: the
 			// remote result is ambiguous and may not restore stale routing authority.
 			this.topics.scheduleArchiveRetry(sessionId, this.runtime.now(), "archive transport failed");
 			await this.persistTopics().catch(() => undefined);
@@ -7515,24 +7557,33 @@ export class TelegramNotificationDaemon {
 	#persistTopicMutation<T>(mutation: () => T, rollback: () => void): Promise<T> {
 		if (this.validationMode()) return Promise.resolve().then(mutation);
 		const pending = this.topicsPersistQueue.then(async () => {
-			const result = mutation();
+			let result = mutation();
 			const authority = this.opts.topicRegistryAuthority;
 			let sharedCommitted = false;
 			try {
 				const snapshot = this.#topicStateForPersistence();
 				if (authority) {
-					const expectedGeneration = this.topics.registryVersion();
-					const nextGeneration = expectedGeneration + 1;
-					snapshot.registryGeneration = nextGeneration;
-					let accepted = false;
-					try {
-						accepted = await authority.compareAndSet(expectedGeneration, snapshot);
-					} catch {
-						throw new Error("shared topic authority unavailable");
+					for (let attempt = 0; attempt < 3; attempt++) {
+						const expectedGeneration = this.topics.registryVersion();
+						const snapshot = this.#topicStateForPersistence();
+						const nextGeneration = expectedGeneration + 1;
+						snapshot.registryGeneration = nextGeneration;
+						let accepted = false;
+						try {
+							accepted = await authority.compareAndSet(expectedGeneration, snapshot);
+						} catch {
+							throw new Error("shared topic authority unavailable");
+						}
+						if (accepted) {
+							this.topics.markRegistryPublished(nextGeneration);
+							sharedCommitted = true;
+							break;
+						}
+						const winner = parseTopicRegistryState(await authority.read().catch(() => undefined));
+						if (!winner || attempt === 2) throw new Error("shared topic authority conflict");
+						this.#replaceTopicAuthority(winner);
+						result = mutation();
 					}
-					if (!accepted) throw new Error("shared topic authority unavailable");
-					this.topics.markRegistryPublished(nextGeneration);
-					sharedCommitted = true;
 				}
 				if (!authority) {
 					const paths = daemonPaths(this.opts.settings.getAgentDir());
@@ -7625,6 +7676,13 @@ export class TelegramNotificationDaemon {
 		return pending;
 	}
 
+	#replaceTopicAuthority(state: TopicRegistryState): void {
+		this.topics.replace(state);
+		this.closedEndpointKeys.clear();
+		for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {}))
+			if (binding) this.closedEndpointKeys.set(sessionId, binding);
+	}
+
 	#topicStateForPersistence(): TopicRegistryState {
 		return {
 			...this.topics.serialize(),
@@ -7686,6 +7744,54 @@ export class TelegramNotificationDaemon {
 					this.closedEndpointKeys.set(sessionId, binding);
 			}
 			if (legacySnapshot || missingHostId || missingSessionUuid || reconciledCreateClaim) await this.persistTopics();
+		}
+	}
+
+	/**
+	 * Rehydrate durable adoption intents after restart. A sidecar whose topic
+	 * already committed is stale evidence and can be removed without touching
+	 * the retained user-created topic.
+	 */
+	async loadAdoptionIntents(): Promise<void> {
+		await this.#adoptionIntents.rehydrate();
+		const expired = await this.#adoptionIntents.sweepExpired();
+		if (expired > 0) logger.info(`notifications: topic-adoption expired count=${expired}`);
+		for (const sessionId of this.topics.sessionIds()) {
+			const intent = this.#adoptionIntents.bySession(sessionId);
+			if (!intent) continue;
+			const record = this.topics.get(sessionId);
+			if (record && record.topicId === String(intent.topicId)) {
+				try {
+					await this.#adoptionIntents.remove(sessionId);
+					await this.#adoptionIntents.removePendingTopic(intent.topicId);
+				} catch (error) {
+					logger.warn(
+						`notifications: stale topic-adoption sidecar cleanup failed: ${sanitizeDiagnostic(String(error))}`,
+					);
+				}
+			}
+		}
+	}
+
+	private startAdoptionSweepTimer(): void {
+		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
+		this.#adoptionSweepTimer = setIntervalImpl(() => {
+			this.#sweepExpiredAdoptionPickerAliases();
+			void this.#adoptionIntents
+				.sweepExpired()
+				.then(expired => {
+					if (expired > 0) logger.info(`notifications: topic-adoption expired count=${expired}`);
+				})
+				.catch(error => {
+					logger.warn(`notifications: adoption-intent sweep failed: ${sanitizeDiagnostic(String(error))}`);
+				});
+		}, ADOPTION_INTENT_SWEEP_INTERVAL_MS);
+	}
+
+	private stopAdoptionSweepTimer(): void {
+		if (this.#adoptionSweepTimer !== undefined) {
+			(this.opts.clearIntervalImpl ?? clearInterval)(this.#adoptionSweepTimer);
+			this.#adoptionSweepTimer = undefined;
 		}
 	}
 
@@ -10339,6 +10445,8 @@ export class TelegramNotificationDaemon {
 
 	private async processTelegramUpdate(update: unknown): Promise<TelegramUpdateOutcome> {
 		if (this.validationMode()) return "consumed";
+		const createdOutcome = await this.handleForumTopicCreatedUpdate(update);
+		if (createdOutcome !== "not-topic") return createdOutcome;
 		const topicOutcome = await this.handleForumTopicEdited(update);
 		if (topicOutcome !== "not-topic") return topicOutcome;
 		try {
@@ -10351,6 +10459,7 @@ export class TelegramNotificationDaemon {
 
 	async handleTelegramUpdate(update: unknown): Promise<void> {
 		if (this.validationMode()) return;
+		if ((await this.handleForumTopicCreatedUpdate(update)) !== "not-topic") return;
 		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
 		// A raw path is accepted only after the explicit direct-entry choice. The exact
 		// `/session_create path <dir>` form remains available in any pending topic.
@@ -11061,6 +11170,10 @@ export class TelegramNotificationDaemon {
 				await this.loadAliases();
 			}
 			await this.loadTopics();
+			if (!this.validationMode()) {
+				await this.loadAdoptionIntents();
+				this.startAdoptionSweepTimer();
+			}
 			if (!this.validationMode()) {
 				await this.loadSeenUpdateIds();
 				await this.replyStore.load();

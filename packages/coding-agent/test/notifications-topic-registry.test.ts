@@ -94,6 +94,7 @@ describe("TopicRegistry", () => {
 			topics: {
 				bad: {
 					topicId: "1",
+					topicOrigin: "daemon_created",
 					identitySent: false,
 					createdAt: 1,
 					chatId: "42",
@@ -117,6 +118,7 @@ describe("TopicRegistry", () => {
 			topics: {
 				legacy: {
 					topicId: "1",
+					topicOrigin: "daemon_created",
 					identitySent: false,
 					createdAt: 1,
 					chatId: "42",
@@ -137,6 +139,7 @@ describe("TopicRegistry", () => {
 			topics: {
 				legacy: {
 					topicId: "1",
+					topicOrigin: "daemon_created",
 					identitySent: false,
 					createdAt: 1,
 					chatId: "42",
@@ -149,6 +152,7 @@ describe("TopicRegistry", () => {
 				},
 				user: {
 					topicId: "2",
+					topicOrigin: "daemon_created",
 					identitySent: false,
 					createdAt: 1,
 					chatId: "42",
@@ -175,6 +179,7 @@ describe("TopicRegistry", () => {
 			topics: {
 				s1: {
 					topicId: "42",
+					topicOrigin: "daemon_created",
 					identitySent: false,
 					createdAt: 1,
 					chatId: "42",
@@ -191,7 +196,9 @@ describe("TopicRegistry", () => {
 	});
 
 	test("retires an unbound legacy topic without validated chat affinity", async () => {
-		const reg = new TopicRegistry({ topics: { s1: { topicId: "42", identitySent: false, createdAt: 1 } } });
+		const reg = new TopicRegistry({
+			topics: { s1: { topicId: "42", topicOrigin: "daemon_created", identitySent: false, createdAt: 1 } },
+		});
 		expect(reg.get("s1")).toBeUndefined();
 		expect(reg.sessionForTopic("42")).toBeUndefined();
 		expect(
@@ -332,6 +339,7 @@ describe("TopicRegistry", () => {
 			topics: {
 				s1: {
 					topicId: "9",
+					topicOrigin: "daemon_created",
 					sessionUuid: "00000000-0000-4000-8000-000000000009",
 					identitySent: false,
 					createdAt: 1,
@@ -472,6 +480,7 @@ describe("TopicRegistry", () => {
 			topics: {
 				s1: {
 					topicId: "42",
+					topicOrigin: "daemon_created",
 					identitySent: false,
 					createdAt: 1,
 					chatId: "42",
@@ -496,6 +505,7 @@ describe("TopicRegistry", () => {
 				topics: {
 					[sessionId]: {
 						topicId: "42",
+						topicOrigin: "daemon_created",
 						identitySent: false,
 						createdAt: 1,
 						chatId: "42",
@@ -579,6 +589,7 @@ test("rejects future topic registry versions and quarantines retained legacy rec
 		topics: {
 			legacy: {
 				topicId: "42",
+				topicOrigin: "daemon_created",
 				identitySent: true,
 				createdAt: 1,
 				chatId: "42",
@@ -672,4 +683,32 @@ test("durably publishes a pre-create claim before invoking the remote creator", 
 	await creating;
 	expect(createCalled).toBe(true);
 	expect(registry.serialize().createClaims?.session).toBeUndefined();
+});
+test("retains adopted topics and rejects an unexpired foreign archive owner", async () => {
+	const registry = new TopicRegistry();
+	await registry.getOrCreateTopic(
+		"session",
+		async () => "42",
+		() => 100,
+		undefined,
+		{ chatId: "42", endpointKey: "endpoint", endpointDigest: "digest" },
+		undefined,
+		undefined,
+		"user_created",
+	);
+	expect(registry.beginArchive("session", "host-a", 100)).toBeUndefined();
+	expect(registry.serialize().topics.session?.topicOrigin).toBe("user_created");
+
+	const daemonTopic = new TopicRegistry();
+	await daemonTopic.getOrCreateTopic(
+		"daemon",
+		async () => "43",
+		() => 100,
+		undefined,
+		{ chatId: "42", endpointKey: "endpoint-2", endpointDigest: "digest-2" },
+	);
+	expect(daemonTopic.acquireLease("daemon", "host-a", 100, 1_000, 0)).toBe(true);
+	expect(daemonTopic.beginArchive("daemon", "host-b", 101)).toBeUndefined();
+	expect(daemonTopic.beginArchive("daemon", "host-b", 1_101)?.archiveHostId).toBe("host-b");
+	expect(daemonTopic.archiveAuthorityAllows("daemon", "host-b", 1_101)).toBe(true);
 });

@@ -29,6 +29,8 @@ export type TopicLifecycleState =
 export interface TopicRecord {
 	/** Telegram forum topic id (message_thread_id). */
 	topicId: string;
+	/** Whether Telegram created this topic for the daemon or it was explicitly adopted from a user. */
+	topicOrigin: "daemon_created" | "user_created";
 	/** Immutable UUID record identity; never derive authority from a title or PID. */
 	sessionUuid?: string;
 	/** Whether the one-time identity header has been sent/pinned. */
@@ -71,6 +73,10 @@ export interface TopicRecord {
 	leaseOwner?: string;
 	leaseHeartbeatAt?: number;
 	leaseExpiresAt?: number;
+	/** Durable archive initiator; a live foreign owner cannot be displaced. */
+	archiveHostId?: string;
+	/** Authority epoch captured by the archive initiator when it published the fence. */
+	archiveLeaseEpoch?: number;
 	disconnectGraceExpiresAt?: number;
 	/** True when persisted binding fields were present but malformed; recovery must fail closed. */
 	bindingMalformed?: true;
@@ -252,6 +258,7 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			!validOptionalString(raw.sessionUuid) ||
 			(raw.orphanedAt !== undefined && !validTimestamp(raw.orphanedAt)) ||
 			(raw.name !== undefined && typeof raw.name !== "string") ||
+			(raw.topicOrigin !== "daemon_created" && raw.topicOrigin !== "user_created") ||
 			(raw.nameOwner !== undefined && raw.nameOwner !== "user") ||
 			(raw.nameReconcilePending !== undefined && typeof raw.nameReconcilePending !== "boolean") ||
 			(raw.userNameUpdateId !== undefined && !validEpoch(raw.userNameUpdateId)) ||
@@ -274,6 +281,8 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			!validOptionalString(raw.leaseOwner) ||
 			(raw.leaseHeartbeatAt !== undefined && !validTimestamp(raw.leaseHeartbeatAt)) ||
 			(raw.leaseExpiresAt !== undefined && !validTimestamp(raw.leaseExpiresAt)) ||
+			!validOptionalString(raw.archiveHostId) ||
+			(raw.archiveLeaseEpoch !== undefined && !validEpoch(raw.archiveLeaseEpoch)) ||
 			(raw.disconnectGraceExpiresAt !== undefined && !validTimestamp(raw.disconnectGraceExpiresAt)) ||
 			(raw.bindingMalformed !== undefined && raw.bindingMalformed !== true)
 		)
@@ -470,6 +479,7 @@ export class TopicRegistry {
 			const fenceSupersedesRecord = fenceEpoch > rawAuthorityEpoch;
 			const record: TopicRecord = {
 				topicId: raw.topicId,
+				topicOrigin: raw.topicOrigin === "user_created" ? "user_created" : "daemon_created",
 				sessionUuid:
 					typeof raw.sessionUuid === "string" && raw.sessionUuid.length > 0 ? raw.sessionUuid : randomUUID(),
 				identitySent: raw.identitySent === true,
@@ -525,6 +535,8 @@ export class TopicRegistry {
 				...(typeof raw.leaseExpiresAt === "number" && Number.isFinite(raw.leaseExpiresAt)
 					? { leaseExpiresAt: raw.leaseExpiresAt }
 					: {}),
+				...(isValidBindingString(raw.archiveHostId) ? { archiveHostId: raw.archiveHostId } : {}),
+				...(isValidBindingGeneration(raw.archiveLeaseEpoch) ? { archiveLeaseEpoch: raw.archiveLeaseEpoch } : {}),
 				...(typeof raw.disconnectGraceExpiresAt === "number" && Number.isFinite(raw.disconnectGraceExpiresAt)
 					? { disconnectGraceExpiresAt: raw.disconnectGraceExpiresAt }
 					: {}),
@@ -853,6 +865,7 @@ export class TopicRegistry {
 			const revoked = (this.epochs.get(sessionId) ?? 0) !== epoch;
 			const record: TopicRecord = {
 				topicId,
+				topicOrigin: topicOrigin ?? "daemon_created",
 				sessionUuid: randomUUID(),
 				name,
 				identitySent: false,
@@ -871,7 +884,6 @@ export class TopicRegistry {
 								: { endpointGeneration: binding.endpointGeneration }),
 						}
 					: {}),
-
 			};
 			if (revoked) {
 				this.topics.set(sessionId, record);
@@ -1090,7 +1102,7 @@ export class TopicRegistry {
 		record.nameReconcilePending = false;
 	}
 
-	/** Capture only authority fields that a failed delete publication may restore. */
+	/** Capture only authority fields that a failed archive-fence publication may restore. */
 	captureArchiveAuthority(sessionId: string): TopicArchiveAuthoritySnapshot {
 		const record = this.topics.get(sessionId);
 		return {
@@ -1103,7 +1115,7 @@ export class TopicRegistry {
 		};
 	}
 
-	/** Restore a failed delete fence only while its exact authority mutation remains current. */
+	/** Restore a failed archive fence only while its exact authority mutation remains current. */
 	restoreArchiveAuthority(snapshot: TopicArchiveAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
 		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
@@ -1127,7 +1139,7 @@ export class TopicRegistry {
 		return true;
 	}
 
-	/** Restore the exact delete fence after a failed compensation publication. */
+	/** Restore the exact archive fence after a failed compensation publication. */
 	restoreArchiveFence(snapshot: TopicArchiveAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
 		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
@@ -1151,16 +1163,37 @@ export class TopicRegistry {
 		return true;
 	}
 
-	/** Fence new work before the remote delete starts, including an absent in-flight create. */
-	beginArchive(sessionId: string): TopicRecord | undefined {
+	/** Fence new work before the remote archive starts, including an absent in-flight create. */
+	beginArchive(sessionId: string, hostId?: string, now = Date.now()): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
+		if (
+			record?.topicOrigin === "user_created" ||
+			((record?.archiveHostId !== undefined || record?.leaseOwner !== undefined) &&
+				record.archiveHostId !== hostId &&
+				record.leaseOwner !== hostId &&
+				(record.leaseExpiresAt ?? 0) > now)
+		)
+			return undefined;
 		const epoch = Math.max(this.epochs.get(sessionId) ?? 0, record?.authorityEpoch ?? 0) + 1;
 		this.epochs.set(sessionId, epoch);
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
 		record.authorityState = "archive_pending";
+		if (hostId) record.archiveHostId = hostId;
+		record.archiveLeaseEpoch = epoch;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		return record;
+	}
+	/** Verify the durable archive initiator immediately before remote dispatch. */
+	archiveAuthorityAllows(sessionId: string, hostId: string, now: number): boolean {
+		const record = this.topics.get(sessionId);
+		return (
+			record?.topicOrigin === "daemon_created" &&
+			record.authorityState === "archive_pending" &&
+			(record.archiveHostId === hostId || record.archiveHostId === undefined) &&
+			(record.archiveLeaseEpoch === record.authorityEpoch || record.archiveLeaseEpoch === undefined) &&
+			(record.leaseOwner === undefined || record.leaseOwner === hostId || (record.leaseExpiresAt ?? 0) <= now)
+		);
 	}
 
 	/** Retain an accepted create as deletion-fenced before remote compensation can begin. */
@@ -1170,10 +1203,12 @@ export class TopicRegistry {
 		now: () => number = Date.now,
 		name?: string,
 		binding?: TopicEndpointBinding,
+		topicOrigin?: TopicRecord["topicOrigin"],
 	): TopicRecord {
 		const epoch = Math.max(this.epochs.get(sessionId) ?? 0, this.topics.get(sessionId)?.authorityEpoch ?? 0);
 		const record: TopicRecord = {
 			topicId,
+			topicOrigin: topicOrigin ?? this.topics.get(sessionId)?.topicOrigin ?? "daemon_created",
 			sessionUuid: randomUUID(),
 			name,
 			identitySent: false,
@@ -1206,6 +1241,7 @@ export class TopicRegistry {
 		now: () => number = Date.now,
 		name?: string,
 		binding?: TopicEndpointBinding,
+		topicOrigin?: TopicRecord["topicOrigin"],
 	): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
 		const matchesBinding =
@@ -1220,7 +1256,7 @@ export class TopicRegistry {
 		)
 			return undefined;
 		this.beginArchive(sessionId);
-		const fenced = this.fenceAcceptedCreate(sessionId, topicId, now, name, binding);
+		const fenced = this.fenceAcceptedCreate(sessionId, topicId, now, name, binding, topicOrigin);
 		fenced.creationLeaseEpoch = creationLeaseEpoch;
 		return fenced;
 	}
@@ -1230,7 +1266,7 @@ export class TopicRegistry {
 		await this.inflight.get(sessionId)?.catch(() => undefined);
 	}
 
-	/** Remove only after a definite remote deletion; ambiguity deliberately retains its fence. */
+	/** Retain a topic record after a definite remote archive; ambiguity deliberately retains its fence. */
 	settleArchive(sessionId: string, topicId: string): boolean {
 		const record = this.topics.get(sessionId);
 		if (!record || record.topicId !== topicId || record.authorityState !== "archive_pending") return false;
