@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { EMBEDDED_DOCS } from "../src/internal-urls/docs-index.generated";
+import { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS } from "../src/internal-urls/docs-index.generated";
 
 function runBunEval(script: string) {
 	const result = Bun.spawnSync({
@@ -15,7 +15,20 @@ function runBunEval(script: string) {
 	return stdout;
 }
 
-const DOCS_WITH_SOURCE_PARITY = ["gpt-5.6-codex-preset-benchmark.md", "models.md"] as const;
+const DOCS_DIR = path.join(import.meta.dir, "../../../docs");
+const REGENERATE_HINT = "run: bun --cwd=packages/coding-agent run generate-docs-index";
+
+// Mirrors how scripts/generate-docs-index.ts derives the corpus: a recursive .md
+// scan of docs/, POSIX-separated and sorted. Deriving it here rather than pinning
+// a list is what makes the parity assertions below a drift gate instead of a
+// reminder to update two hand-maintained filenames.
+async function scanDocsCorpus(): Promise<string[]> {
+	const entries: string[] = [];
+	for await (const relativePath of new Bun.Glob("**/*.md").scan(DOCS_DIR)) {
+		entries.push(relativePath.split(path.sep).join("/"));
+	}
+	return entries.sort();
+}
 
 describe("internal-urls docs index loading", () => {
 	it("does not load the generated docs corpus when importing the barrel", () => {
@@ -45,9 +58,31 @@ describe("internal-urls docs index loading", () => {
 		expect(result.contentLength).toBeGreaterThan(0);
 	});
 
-	it.each([...DOCS_WITH_SOURCE_PARITY])("matches the source %s document", async fileName => {
-		const source = await Bun.file(path.join(import.meta.dir, "../../../docs", fileName)).text();
+	it("embeds exactly the docs corpus that exists on disk", async () => {
+		const onDisk = await scanDocsCorpus();
 
-		expect(EMBEDDED_DOCS[fileName]).toBe(source);
+		expect(
+			[...EMBEDDED_DOC_FILENAMES],
+			`docs corpus changed without regenerating the index; ${REGENERATE_HINT}`,
+		).toEqual(onDisk);
+		expect(
+			Object.keys(EMBEDDED_DOCS).sort(),
+			`embedded doc keys drifted from the corpus; ${REGENERATE_HINT}`,
+		).toEqual(onDisk);
+	});
+
+	it("keeps every embedded doc byte-identical to its source", async () => {
+		const onDisk = await scanDocsCorpus();
+		const sources = await Promise.all(
+			onDisk.map(async fileName => ({
+				fileName,
+				source: await Bun.file(path.join(DOCS_DIR, fileName)).text(),
+			})),
+		);
+		const stale = sources
+			.filter(({ fileName, source }) => EMBEDDED_DOCS[fileName] !== source)
+			.map(({ fileName }) => fileName);
+
+		expect(stale, `stale embedded docs index for ${stale.join(", ") || "(none)"}; ${REGENERATE_HINT}`).toEqual([]);
 	});
 });
