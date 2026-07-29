@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { KeybindingsManager } from "../src/config/keybindings";
+import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import { getComposerPlaceholder, getDefaultComposerPlaceholder } from "../src/modes/interactive-mode";
 
 describe("composer placeholder", () => {
@@ -29,7 +30,15 @@ describe("composer placeholder", () => {
 			"Type your message... ⌃K: Queue (busy) · ⌃T: Thinking · ⌘M: Model · ⌥H: History · ⇧↩/⌃J: New line · ⌃C: Clear",
 		);
 		expect(
-			getComposerPlaceholder(keybindings, { platform: "darwin" }, { busy: false, busyPromptMode: "steer" }),
+			getComposerPlaceholder(
+				keybindings,
+				{ platform: "darwin" },
+				{
+					busy: false,
+					busyPromptMode: "steer",
+					showActionHints: true,
+				},
+			),
 		).toBe(
 			"Type your message... ⌃K: Queue (busy) · ⌃T: Thinking · ⌘M: Model · ⌥H: History · ⇧↩/⌃J: New line · ⌃C: Clear",
 		);
@@ -43,9 +52,17 @@ describe("composer placeholder", () => {
 			"app.message.queue": [],
 		});
 
-		expect(getComposerPlaceholder(keybindings, { platform: "linux" }, { busy: false, busyPromptMode: "steer" })).toBe(
-			"Type your message... Shift+Enter/Ctrl+J: New line · Ctrl+C: Clear",
-		);
+		expect(
+			getComposerPlaceholder(
+				keybindings,
+				{ platform: "linux" },
+				{
+					busy: false,
+					busyPromptMode: "steer",
+					showActionHints: true,
+				},
+			),
+		).toBe("Type your message... Shift+Enter/Ctrl+J: New line · Ctrl+C: Clear");
 	});
 
 	it("shows distinct submit and queue actions while busy in steer mode", () => {
@@ -54,7 +71,17 @@ describe("composer placeholder", () => {
 			"tui.input.submit": "enter",
 		});
 
-		expect(getComposerPlaceholder(keybindings, { platform: "darwin" }, { busy: true, busyPromptMode: "steer" })).toBe(
+		expect(
+			getComposerPlaceholder(
+				keybindings,
+				{ platform: "darwin" },
+				{
+					busy: true,
+					busyPromptMode: "steer",
+					showActionHints: true,
+				},
+			),
+		).toBe(
 			"Type your message... ↩: Steer · ⌥Q: Queue · ⇧⇥: Thinking · ⌃L: Model · ⌃R: History · ⇧↩/⌃J: New line · ⌃C: Clear",
 		);
 	});
@@ -65,9 +92,17 @@ describe("composer placeholder", () => {
 			"tui.input.submit": "enter",
 		});
 
-		expect(getComposerPlaceholder(keybindings, { platform: "darwin" }, { busy: true, busyPromptMode: "queue" })).toBe(
-			"Type your message... ↩: Queue · ⇧⇥: Thinking · ⌃L: Model · ⌃R: History · ⇧↩/⌃J: New line · ⌃C: Clear",
-		);
+		expect(
+			getComposerPlaceholder(
+				keybindings,
+				{ platform: "darwin" },
+				{
+					busy: true,
+					busyPromptMode: "queue",
+					showActionHints: true,
+				},
+			),
+		).toBe("Type your message... ↩: Queue · ⇧⇥: Thinking · ⌃L: Model · ⌃R: History · ⇧↩/⌃J: New line · ⌃C: Clear");
 	});
 
 	it("falls back to the dedicated queue binding when busy queue submit is unbound", () => {
@@ -76,8 +111,43 @@ describe("composer placeholder", () => {
 			"tui.input.submit": [],
 		});
 
-		expect(getComposerPlaceholder(keybindings, { platform: "win32" }, { busy: true, busyPromptMode: "queue" })).toBe(
+		expect(
+			getComposerPlaceholder(
+				keybindings,
+				{ platform: "win32" },
+				{
+					busy: true,
+					busyPromptMode: "queue",
+					showActionHints: true,
+				},
+			),
+		).toBe(
 			"Type your message... Ctrl+K: Queue · Shift+Tab: Thinking · Ctrl+L: Model · Ctrl+R: History · Alt+Enter/Ctrl+J: New line · Ctrl+C: Clear",
 		);
+	});
+	it("uses the stable action-hints setting for composer shortcut visibility", () => {
+		expect(SETTINGS_SCHEMA["statusLine.showActionHints"]).toMatchObject({
+			default: true,
+			ui: {
+				label: "Composer Shortcut Hints",
+				description: "Show contextual keyboard shortcuts in the composer placeholder",
+			},
+		});
+
+		const keybindings = KeybindingsManager.inMemory({
+			"app.message.queue": "ctrl+k",
+			"app.thinking.cycle": "ctrl+t",
+		});
+		expect(
+			getComposerPlaceholder(
+				keybindings,
+				{ platform: "linux" },
+				{
+					busy: true,
+					busyPromptMode: "queue",
+					showActionHints: false,
+				},
+			),
+		).toBe("Type your message...");
 	});
 });

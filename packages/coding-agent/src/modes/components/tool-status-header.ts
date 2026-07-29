@@ -206,7 +206,6 @@ export class StatusLineComponent implements Component {
 			separator: settings.get("statusLine.separator"),
 			showHookStatus: settings.get("statusLine.showHookStatus"),
 			showSkillHud: settings.get("statusLine.showSkillHud"),
-			showActionHints: settings.get("statusLine.showActionHints"),
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
 			sessionAccent: settings.get("statusLine.sessionAccent"),
 			maxRows: settings.get("statusLine.maxRows"),

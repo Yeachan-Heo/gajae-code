@@ -197,7 +197,6 @@ export function buildStatusLineSettings(settingsInstance: Settings): StatusLineS
 		rightSegments: settingsInstance.get("statusLine.rightSegments"),
 		separator: settingsInstance.get("statusLine.separator"),
 		showHookStatus: settingsInstance.get("statusLine.showHookStatus"),
-		showActionHints: settingsInstance.get("statusLine.showActionHints"),
 		sessionAccent: settingsInstance.get("statusLine.sessionAccent"),
 		maxRows: settingsInstance.get("statusLine.maxRows"),
 		segmentOptions: settingsInstance.get("statusLine.segmentOptions"),
@@ -1626,13 +1625,16 @@ export class SelectorController {
 				this.ctx.session.agent.repetitionPenalty = repetitionPenalty >= 0 ? repetitionPenalty : undefined;
 				break;
 			}
+			case "statusLine.showActionHints": {
+				this.ctx.updateEditorChrome();
+				break;
+			}
 			case "statusLinePreset":
 			case "statusLine.preset":
 			case "statusLineSeparator":
 			case "statusLine.separator":
 			case "statusLineShowHooks":
 			case "statusLine.showHookStatus":
-			case "statusLine.showActionHints":
 			case "statusLine.sessionAccent":
 			case "statusLine.maxRows":
 			case "statusLine.leftSegments":

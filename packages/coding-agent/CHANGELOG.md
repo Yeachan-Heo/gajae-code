@@ -10,6 +10,7 @@
 ### Added
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
+- The interactive terminal adds responsive IRC/todo work lanes, production-shaped narrow/wide layout evidence, canonical cross-platform Meta key decoding, host-owned scrollback, and composer-owned shortcut hints.
 
 ## [Unreleased]
 ### Fixed

@@ -253,6 +253,7 @@ export interface InteractiveModeContext {
 	updateEditorTopBorder(): void;
 	updateEditorBorderColor(): void;
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void;
+	updateEditorChrome(): void;
 	setTodos(todos: TodoItem[] | TodoPhase[]): void;
 	reloadTodos(): Promise<void>;
 	toggleTodoExpansion(): void;

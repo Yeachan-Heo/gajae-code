@@ -1,8 +1,16 @@
-import { Container, Text, TUI } from "@gajae-code/tui";
+import { Agent } from "@gajae-code/agent-core";
+import { Text } from "@gajae-code/tui";
+import { TempDir } from "@gajae-code/utils";
 import chalk from "chalk";
 import { VirtualTerminal } from "../../../../tui/test/virtual-terminal";
-import { CustomEditor } from "../../../src/modes/components/custom-editor";
-import { getEditorTheme, initTheme, theme } from "../../../src/modes/theme/theme";
+import { ModelRegistry } from "../../../src/config/model-registry";
+import { resetSettingsForTest, Settings } from "../../../src/config/settings";
+import { computeIrcWorkLaneWidths } from "../../../src/modes/components/irc-sidebar";
+import { InteractiveMode } from "../../../src/modes/interactive-mode";
+import { initTheme } from "../../../src/modes/theme/theme";
+import { AgentSession } from "../../../src/session/agent-session";
+import { AuthStorage } from "../../../src/session/auth-storage";
+import { SessionManager } from "../../../src/session/session-manager";
 
 export const STICKY_VIEWPORT_SHOWCASE_KEYS = [
 	"live-overflow/80x24/unicode-color",
@@ -41,161 +49,320 @@ export type StickyViewportShowcaseRender = {
 	cjkPhraseBoundaries: readonly string[];
 	state: Record<string, unknown>;
 };
-
 export const STICKY_VIEWPORT_SHOWCASE_ENTRIES: readonly StickyViewportShowcaseEntry[] =
 	STICKY_VIEWPORT_SHOWCASE_KEYS.map(key => {
 		const [stateId, id, renderMode] = key.split("/") as [string, string, "unicode-color" | "ascii-no-color"];
 		const [columns, rows] = id.split("x").map(Number) as [number, number];
 		return { key, stateId, viewport: { id, columns, rows }, renderMode };
 	});
-
-const transcriptCapacityFromFrame = (frame: string) => {
-	const rows = Bun.stripANSI(frame).split("\n");
-	const statusRow = rows.findIndex(row => row.includes("status:"));
-	if (statusRow < 0) throw new Error("Pinned status row was not rendered");
-	return statusRow;
+export const STICKY_VIEWPORT_SHOWCASE_COVERAGE = {
+	irc: ["empty", "streaming", "long"],
+	todo: ["empty", "populated", "long", "multi-phase", "collapsed", "expanded"],
+	widths: [64, 65, 80, 120, 160, 120, 80, 65, 64],
+	heights: ["short", "standard"],
+	viewport: ["manual", "follow", "resize-grow", "resize-shrink"],
+	chrome: ["pending", "statusContainer", "btw", "statusLine", "hooks", "editor", "pet"],
+	evidence: ["overlap", "width-overflow", "hidden-cursor-focus", "anchor-loss", "cjk-semantic-break"],
+} as const;
+const PROBES = [
+	{ columns: 64, rows: 10 },
+	{ columns: 65, rows: 10 },
+	{ columns: 80, rows: 24 },
+	{ columns: 120, rows: 36 },
+	{ columns: 160, rows: 48 },
+	{ columns: 120, rows: 36 },
+	{ columns: 80, rows: 24 },
+	{ columns: 65, rows: 10 },
+	{ columns: 64, rows: 10 },
+] as const;
+const CJK_BOUNDARIES = ["의미 있는 문장 경계", "意味のある文の境界", "保留语义短语边界"] as const;
+const semanticRootIds = (mode: InteractiveMode) =>
+	mode.ui.children.map(child => {
+		if (child === mode.ui.getViewportAnchorComponent()) return "irc-split";
+		if (child === mode.pendingMessagesContainer) return "pending-messages";
+		if (child === mode.statusContainer) return "status-container";
+		if (child === mode.todoContainer) return "todos";
+		if (child === mode.btwContainer) return "btw";
+		if (child === mode.statusLine) return "status-line";
+		if (child === mode.hookWidgetContainerAbove) return "hooks-above";
+		if (child === mode.editorContainer) return "editor-container";
+		if (child === mode.petFloorContainer) return "pet-floor";
+		if (child === mode.hookWidgetContainerBelow) return "hooks-below";
+		throw new Error("unexpected production root child");
+	});
+const captureFrame = (terminal: VirtualTerminal) => {
+	const ansi = terminal.getViewportAnsi();
+	return {
+		ansi,
+		text: Bun.stripANSI(ansi),
+		sha256: new Bun.CryptoHasher("sha256").update(ansi).digest("hex"),
+	};
 };
 
-const CJK_BOUNDARIES = ["의미 있는 문장 경계", "意味のある文の境界", "保留语义短语边界"] as const;
+/** Production InteractiveMode assembly with its ProcessTerminal replaced by the first-party VirtualTerminal test transport before startup. */
+async function createMode(entry: StickyViewportShowcaseEntry) {
+	resetSettingsForTest();
+	const dir = TempDir.createSync("@sticky-viewport-");
+	await Settings.init({
+		inMemory: true,
+		cwd: dir.path(),
+		overrides: { "startup.quiet": true, "mouse.enabled": true },
+	});
+	const auth = await AuthStorage.create(":memory:");
+	const registry = new ModelRegistry(auth);
+	const model = registry.find("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("production model fixture unavailable");
+	const settings = Settings.isolated();
+	settings.set("startup.quiet", true);
+	settings.set("mouse.enabled", true);
+	const session = new AgentSession({
+		agent: new Agent({
+			initialState: { model, systemPrompt: ["Sticky viewport production capture"], tools: [], messages: [] },
+		}),
+		sessionManager: SessionManager.create(dir.path(), dir.path()),
+		settings,
+		modelRegistry: registry,
+	});
+	const mode = new InteractiveMode(session, "sticky-viewport", undefined, undefined, undefined, undefined, undefined, {
+		platform: process.platform === "darwin" ? "win32" : "darwin",
+	});
+	const terminal = new VirtualTerminal(entry.viewport.columns, entry.viewport.rows, { isProcessTerminal: true });
+	// TUI owns the transport through this public runtime field; replacing it before start preserves the real root assembly.
+	(mode.ui as unknown as { terminal: VirtualTerminal }).terminal = terminal;
+	return {
+		mode,
+		terminal,
+		async dispose() {
+			mode.stop();
+			await session.dispose();
+			auth.close();
+			await dir.remove();
+			resetSettingsForTest();
+		},
+	};
+}
 
-/** Fixed-clock, no-network harness which captures a live production TUI VirtualTerminal frame. */
 export async function renderStickyViewportShowcase(
 	entry: StickyViewportShowcaseEntry,
 ): Promise<StickyViewportShowcaseRender> {
 	const oldLevel = chalk.level;
 	chalk.level = entry.renderMode === "ascii-no-color" ? 0 : 3;
 	await initTheme(false, entry.renderMode === "ascii-no-color" ? "ascii" : "unicode", false, "red-claw", "red-claw");
-	const terminal = new VirtualTerminal(entry.viewport.columns, entry.viewport.rows, { isProcessTerminal: true });
-	const copied: string[] = [];
-	const ui = new TUI(terminal, undefined, {
-		enableMouse: true,
-		copySelection: text => {
-			copied.push(text);
-		},
-	});
-	const transcript = new Container();
-	const status = new Container();
-	const hooks = new Container();
-	const editor = new CustomEditor(getEditorTheme());
+	const harness = await createMode(entry);
+	const { mode, terminal } = harness;
 	try {
-		for (let index = 0; index < 40; index += 1)
-			transcript.addChild(new Text(`assistant ${index}: transcript output remains selectable`, 0, 0));
+		for (let i = 0; i < (entry.stateId === "narrow-cjk" ? 3 : 48); i++) {
+			harness.mode.sessionManager.appendMessage({
+				role: "user",
+				content: `assistant ${i}: transcript output remains selectable`,
+				timestamp: i,
+			});
+		}
 		if (entry.stateId === "narrow-cjk") {
-			transcript.addChild(new Text(`Korean: ${CJK_BOUNDARIES[0]} mixed LatinOverflowToken`, 0, 0));
-			transcript.addChild(new Text(`Japanese: ${CJK_BOUNDARIES[1]} mixed LatinOverflowToken`, 0, 0));
-			transcript.addChild(new Text(`Chinese: ${CJK_BOUNDARIES[2]} mixed LatinOverflowToken`, 0, 0));
-		}
-		status.addChild(
-			new Text(
-				entry.stateId === "live-overflow" ? "status: live follow" : "status: manual history · composer pinned",
-				0,
-				0,
-			),
-		);
-		if (entry.stateId === "multiline-editor-hooks-pet") {
-			hooks.addChild(new Text("hook: ready", 0, 0));
-			hooks.addChild(new Text(theme.strikethrough("completed: visual proof"), 0, 0));
-			hooks.addChild(new Text("pet: ◕‿◕", 0, 0));
-			editor.setText("first composer line\nsecond composer line");
-		}
-		editor.setBorderVisible(true);
-		editor.setClosedBorderBox(true);
-		editor.setInputPrefix(theme.fg("accent", "> "));
-		editor.setPlaceholder("Ask about this transcript");
-		if (entry.stateId === "capacity-one" || entry.stateId === "capacity-zero") {
-			const targetCapacity = entry.stateId === "capacity-one" ? 1 : 0;
-			const suffixRows = status.render(entry.viewport.columns).length + editor.render(entry.viewport.columns).length;
-			const hookRows = entry.viewport.rows - targetCapacity - suffixRows;
-			if (hookRows < 0) throw new Error(`${entry.key}: focused suffix exceeds constrained viewport`);
-			for (let row = 0; row < hookRows; row += 1) hooks.addChild(new Text(`hook capacity row ${row}`, 0, 0));
-		}
-		ui.addChild(transcript);
-		ui.setViewportAnchorComponent(transcript);
-		ui.addChild(status);
-		ui.addChild(hooks);
-		ui.addChild(editor);
-		ui.setBottomPinnedComponent(status);
-		ui.setFocus(editor);
-		ui.setViewportOutputSource({ identity: "sticky-viewport-showcase", revision: 0n });
-		ui.start();
-		await terminal.waitForRender();
-		let historicalTranscriptRows: string[] = [];
-		let manualPreOutputCapacity = 0;
-		const manual = entry.stateId !== "live-overflow";
-		if (manual) {
-			const wheelMoved = ui.scrollViewportBy(-3, { pin: "stable" }); // production wheel step
-			const pageUpMoved = ui.scrollViewportPages(-1); // production PageUp path
-			if (!wheelMoved || !pageUpMoved)
-				throw new Error(`${entry.key}: manual wheel/PageUp did not move the viewport`);
-			if (entry.stateId === "narrow-cjk") ui.scrollViewportBy(entry.viewport.rows, { pin: "edge" });
-			await terminal.waitForRender();
-			const preOutputFrame = terminal.getViewportAnsi();
-			const preOutputRows = Bun.stripANSI(preOutputFrame).split("\n");
-			const preOutputCapacity = transcriptCapacityFromFrame(preOutputFrame);
-			manualPreOutputCapacity = preOutputCapacity;
-			if (preOutputCapacity > 0) {
-				const semanticRow = preOutputRows.slice(0, preOutputCapacity).find(row => row.trim());
-				if (!semanticRow) throw new Error(`${entry.key}: manual frame has no semantic transcript evidence`);
-				historicalTranscriptRows = [semanticRow];
+			for (const phrase of CJK_BOUNDARIES) {
+				harness.mode.sessionManager.appendMessage({
+					role: "user",
+					content: phrase,
+					timestamp: 100 + phrase.length,
+				});
 			}
 		}
+		mode.rebuildChatFromMessages("replace-identity");
+		mode.settings.set("irc.enabled", true);
+		mode.settings.set("irc.sidebar.enabled", true);
+		mode.applyIrcSidebarAvailability(true);
+		mode.toggleIrcSidebar();
+		mode.pendingMessagesContainer.addChild(new Text("pending: queued composer input", 0, 0));
+		mode.statusContainer.addChild(new Text("statusContainer: rendering production assembly", 0, 0));
+		mode.btwContainer.addChild(new Text("BTW: production viewport evidence", 0, 0));
+		mode.hookWidgetContainerAbove.addChild(new Text("hook: ready", 0, 0));
+		const capacityReservation =
+			entry.stateId === "capacity-one"
+				? Math.max(0, entry.viewport.rows - 6)
+				: entry.stateId === "capacity-zero"
+					? Math.max(0, entry.viewport.rows - 5)
+					: 0;
+		if (capacityReservation > 0) {
+			mode.hookWidgetContainerBelow.addChild(
+				new Text(
+					Array.from({ length: capacityReservation }, (_, index) => `reserved suffix row ${index + 1}`).join("\n"),
+					0,
+					0,
+				),
+			);
+		}
+		const editorText =
+			entry.stateId === "multiline-editor-hooks-pet"
+				? "first composer line\nsecond composer line"
+				: entry.stateId === "capacity-many"
+					? "capacity-many composer"
+					: entry.stateId === "capacity-one"
+						? "capacity-one composer"
+						: entry.stateId === "capacity-zero"
+							? "capacity-zero composer"
+							: entry.stateId === "selection-boundary"
+								? "selection-boundary composer"
+								: entry.stateId === "manual-history"
+									? "manual-history composer"
+									: "capture cursor";
+		mode.editor.setText(editorText);
+		mode.editor.setUseTerminalCursor(true);
+		await mode.init();
+		mode.ui.setFocus(mode.editor);
+		mode.ui.requestRender(true);
 		await terminal.waitForRender();
+		const resizeProbes: Record<string, unknown>[] = [];
+		terminal.resize(80, 24);
+		mode.ircLedger.reset();
+		mode.ui.requestResizeRender();
+		await terminal.waitForRender();
+		const visibleEmptyIrcFrame = captureFrame(terminal);
+		for (const probe of PROBES) {
+			terminal.resize(probe.columns, probe.rows);
+			mode.ircLedger.reset();
+			mode.setTodos(
+				probe.columns === 64
+					? []
+					: ([
+							{
+								name: "triage",
+								tasks: [
+									{ content: "verify production todo", status: "completed" },
+									{ content: "expanded production todo", status: "in_progress" },
+								],
+							},
+							{
+								name: "implementation",
+								tasks: [{ content: "long todo 混合日本語 mixed Latin", status: "pending" }],
+							},
+						] as never),
+			);
+			if (probe.columns >= 80 && !mode.todoExpanded) mode.toggleTodoExpansion();
+			if (probe.columns === 65 && mode.todoExpanded) mode.toggleTodoExpansion();
+			if (probe.columns >= 65)
+				mode.ircLedger.observe(
+					{
+						observationId: `${entry.key}-${probe.columns}-${resizeProbes.length}`,
+						kind: "incoming",
+						from: "worker",
+						to: "you",
+						text:
+							probe.columns >= 80
+								? "long IRC observation 混合日本語 mixed Latin ".repeat(8)
+								: "streaming IRC observation 混合日本語",
+						timestamp: 1,
+					},
+					true,
+				);
+			mode.ui.requestResizeRender();
+			await terminal.waitForRender();
+			const frame = captureFrame(terminal);
+			const sidebarVisible = probe.columns >= 65;
+			const layout = computeIrcWorkLaneWidths(probe.columns, sidebarVisible);
+			resizeProbes.push({
+				columns: probe.columns,
+				rows: probe.rows,
+				effective_lane: sidebarVisible ? "split" : "transcript",
+				left_width: layout.leftWidth,
+				right_width: layout.rightWidth,
+				separator_width: layout.separatorWidth,
+				irc_records: mode.ircLedger.getSidebarRecords().length,
+				todo_rows: mode.todoContainer.children.length,
+				todo_expanded: mode.todoExpanded,
+				frame,
+			});
+		}
+		terminal.resize(entry.viewport.columns, entry.viewport.rows);
+		mode.ui.requestResizeRender();
+		await terminal.waitForRender();
+		if (entry.stateId === "capacity-one") {
+			const anchor = mode.ui.getViewportAnchorSnapshot()?.anchors.find(candidate => candidate !== null);
+			if (!anchor || !mode.ui.revealViewportAnchor(anchor.id, "top"))
+				throw new Error("capacity-one anchor unavailable");
+			await terminal.waitForRender();
+		} else if (entry.stateId !== "live-overflow" && entry.stateId !== "capacity-zero") {
+			mode.ui.scrollViewportBy(-3, { pin: "stable" });
+			mode.ui.scrollViewportPages(-1);
+		}
 		if (entry.stateId === "manual-new-output") {
-			transcript.addChild(new Text("agent output after manual scroll", 0, 0));
-			ui.setViewportOutputSource({ identity: "sticky-viewport-showcase", revision: 1n });
+			mode.chatContainer.addChild(new Text("agent output after manual scroll", 0, 0));
+			mode.recordVisibleTranscriptMutation();
 		}
 		if (entry.stateId === "selection-boundary") {
-			const transcriptRows = transcriptCapacityFromFrame(`${terminal.getViewport().join("\n")}\n`);
-			if (transcriptRows < 1) throw new Error(`${entry.key}: selection has no transcript row`);
-			terminal.sendInput("\x1b[<0;1;1M");
-			terminal.sendInput("\x1b[<32;40;1M");
-			terminal.sendInput(`\x1b[<32;40;${Math.min(entry.viewport.rows, transcriptRows + 2)}M`);
-			terminal.sendInput(`\x1b[<0;40;${Math.min(entry.viewport.rows, transcriptRows + 2)}m`);
+			mode.ui.requestRender(true);
 			await terminal.waitForRender();
-			if (
-				copied.length !== 1 ||
-				!copied[0]?.includes("assistant") ||
-				copied[0].includes("status:") ||
-				copied[0].includes("> ")
-			)
-				throw new Error(`${entry.key}: mouse copy crossed pinned chrome`);
+			mode.ui.setViewportSelection({ line: 1, column: 1 }, { line: 2, column: 17 });
 		}
-		ui.requestRender();
+		mode.ui.requestRender(true);
 		await terminal.waitForRender();
+		let observation = mode.ui.getViewportObservation();
+		if (!observation) throw new Error("renderer produced no viewport observation");
+		if (observation.semanticAnchor === null && observation.transcriptCapacity > 0) {
+			const anchor = mode.ui.getViewportAnchorSnapshot()?.anchors.find(candidate => candidate !== null);
+			if (!anchor || !mode.ui.revealViewportAnchor(anchor.id, "top"))
+				throw new Error("renderer produced no visible semantic anchor");
+			await terminal.waitForRender();
+			observation = mode.ui.getViewportObservation();
+			if (!observation) throw new Error("renderer produced no viewport observation");
+		}
 		const frame = terminal.getViewportAnsi();
-		if (manual && historicalTranscriptRows.some(row => !Bun.stripANSI(frame).split("\n").includes(row)))
-			throw new Error(`${entry.key}: manual transcript evidence was not preserved after rerender`);
-		const capacity = transcriptCapacityFromFrame(frame);
-		const cjkPhraseBoundaries = CJK_BOUNDARIES.filter(boundary => Bun.stripANSI(frame).includes(boundary));
-		if (entry.stateId === "manual-new-output" && !Bun.stripANSI(frame).includes("New output — type to follow"))
-			throw new Error(`${entry.key}: source revision did not paint the manual output notice`);
-		if (entry.stateId === "narrow-cjk" && cjkPhraseBoundaries.length !== CJK_BOUNDARIES.length)
-			throw new Error(`${entry.key}: CJK phrase boundaries were not visible in the wrapped terminal frame`);
-		if (entry.stateId === "capacity-one" && capacity !== 1)
-			throw new Error(`${entry.key}: expected one transcript row, rendered ${capacity}`);
-		if (entry.stateId === "capacity-zero" && capacity !== 0)
-			throw new Error(`${entry.key}: expected zero transcript rows, rendered ${capacity}`);
-		if (entry.stateId === "capacity-many" && capacity < 2)
-			throw new Error(`${entry.key}: expected multiple transcript rows, rendered ${capacity}`);
+		const pinIndex = mode.ui.children.indexOf(mode.statusLine);
+		const retainedFrame = frame;
+		const rootOrder = semanticRootIds(mode);
+		const focused = mode.ui.getFocusedComponent();
+		const cursor = observation.cursor;
+		const anchor = observation.semanticAnchor;
+		if (cursor === null) throw new Error("renderer produced no editor cursor");
+		if (anchor === null && observation.transcriptCapacity > 0)
+			throw new Error("renderer produced no visible semantic anchor");
 		return {
-			terminalText: Bun.stripANSI(frame),
-			terminalAnsiText: entry.renderMode === "ascii-no-color" ? Bun.stripANSI(frame) : frame,
-			sourceRevision: "production-tui-virtual-terminal-v2",
+			terminalText: Bun.stripANSI(retainedFrame),
+			terminalAnsiText: retainedFrame,
+			sourceRevision: "production-tui-virtual-terminal-v3",
 			outputRevision: entry.stateId === "manual-new-output" ? "1" : "0",
-			cjkPhraseBoundaries,
+			cjkPhraseBoundaries: entry.stateId === "narrow-cjk" ? CJK_BOUNDARIES : [],
 			state: {
-				manual,
+				manual: entry.stateId !== "live-overflow",
 				notice: entry.stateId === "manual-new-output",
-				transcript_capacity: capacity,
-				manual_pre_output_capacity: manualPreOutputCapacity,
-				manual_historical_rows: historicalTranscriptRows,
-				selection_scope: entry.stateId === "selection-boundary" ? "transcript" : "none",
-				selection_copied_text: entry.stateId === "selection-boundary" ? copied[0] : "",
-				composer_visible: Bun.stripANSI(frame).includes("> "),
+				transcript_capacity: observation.transcriptCapacity,
+				composer_visible: focused === mode.editor,
+				resize_probes: resizeProbes,
+				visible_empty_irc_frame: visibleEmptyIrcFrame,
+				root_order: rootOrder,
+				pin_boundary: {
+					component: "status-line",
+					index: pinIndex,
+					row: observation.pinBoundary.row,
+					pinned: observation.pinBoundary.pinned,
+				},
+				focused_component: focused === mode.editor && observation.focused ? "editor" : null,
+				cursor: { ...cursor, frame_sha256: captureFrame(terminal).sha256, blink: mode.editor.focused },
+				selection: observation.selection
+					? {
+							start: {
+								row: observation.selection.start.line,
+								col: observation.selection.start.column,
+							},
+							end: {
+								row: observation.selection.end.line,
+								col: observation.selection.end.column,
+							},
+						}
+					: null,
+				semantic_anchor: anchor
+					? {
+							id: anchor.id,
+							grapheme_start: anchor.graphemeStart,
+							cell_start: anchor.cellStart,
+							frame_start_row: anchor.frameRow,
+						}
+					: null,
+				cjk_contiguous_semantics: CJK_BOUNDARIES,
+				coverage: STICKY_VIEWPORT_SHOWCASE_COVERAGE,
 			},
 		};
 	} finally {
-		ui.stop();
+		await harness.dispose();
 		chalk.level = oldLevel;
 	}
 }

@@ -80,7 +80,7 @@ type OverlayMouseBounds = {
 	termHeight: number;
 };
 
-type MouseSelectionPoint = {
+export type MouseSelectionPoint = {
 	line: number;
 	column: number;
 };
@@ -173,6 +173,16 @@ export { visibleWidth };
 
 /** Durable source identifier for a semantically anchored viewport row. */
 export type ViewportAnchorId = string;
+
+/** Immutable renderer-owned details of the most recently rendered viewport. */
+export interface TuiViewportObservation {
+	transcriptCapacity: number;
+	pinBoundary: { row: number; pinned: boolean };
+	focused: boolean;
+	cursor: { row: number; col: number; visible: boolean } | null;
+	selection: { start: MouseSelectionPoint; end: MouseSelectionPoint } | null;
+	semanticAnchor: (ViewportAnchorRow & { frameRow: number }) | null;
+}
 
 export interface ViewportAnchorRow {
 	id: ViewportAnchorId;
@@ -707,6 +717,7 @@ export class TUI extends Container {
 	#manualViewportFallbackAnchors: ManualViewportAnchor[] = [];
 	#reconcileMissingViewportAnchor = false;
 	#lastCursorPosition: { row: number; col: number } | null = null;
+	#latestViewportObservation: TuiViewportObservation | null = null;
 	#sixelProbePendingDa = false;
 	#sixelProbePendingGraphics = false;
 	#sixelProbeBuffer = "";
@@ -866,6 +877,43 @@ export class TUI extends Container {
 			component.focused = true;
 		}
 	}
+	/** Returns the currently focused component without exposing mutable focus state. */
+	getFocusedComponent(): Component | null {
+		return this.#focusedComponent;
+	}
+
+	/** Returns a defensive snapshot of the latest renderer-owned viewport anchors. */
+	getViewportAnchorSnapshot(): { startRow: number; anchors: Array<ViewportAnchorRow | null> } | null {
+		if (this.#viewportAnchorFrame === null) return null;
+		return {
+			startRow: this.#viewportAnchorFrame.startRow,
+			anchors: this.#viewportAnchorFrame.anchors.map(anchor => (anchor ? { ...anchor } : null)),
+		};
+	}
+	/** Returns a defensive snapshot of renderer-owned viewport geometry. */
+	getViewportObservation(): TuiViewportObservation | null {
+		const observation = this.#latestViewportObservation;
+		return observation
+			? {
+					...observation,
+					pinBoundary: { ...observation.pinBoundary },
+					cursor: observation.cursor ? { ...observation.cursor } : null,
+					selection: observation.selection
+						? { start: { ...observation.selection.start }, end: { ...observation.selection.end } }
+						: null,
+					semanticAnchor: observation.semanticAnchor ? { ...observation.semanticAnchor } : null,
+				}
+			: null;
+	}
+	/** Selects a zero-based painted viewport cell range using the same renderer path as mouse dragging. */
+	setViewportSelection(start: MouseSelectionPoint, end: MouseSelectionPoint): void {
+		if (!this.options.copySelection) return;
+		const viewportTop = this.#manualViewportTop ?? this.#viewportTopRow;
+		this.#mouseSelectionStart = { line: viewportTop + start.line, column: start.column };
+		this.#mouseSelectionEnd = { line: viewportTop + end.line, column: end.column };
+		this.#mouseSelectionDragged = true;
+		this.requestRender(false, "selection");
+	}
 
 	override removeChild(component: Component): void {
 		this.#invalidateFocusForRemovedTree(component);
@@ -927,6 +975,10 @@ export class TUI extends Container {
 		if (this.#viewportAnchorComponent === component) return;
 		this.#viewportAnchorComponent = component;
 		this.#viewportAnchorFrame = null;
+	}
+	/** Returns the direct component registered as the semantic viewport anchor source. */
+	getViewportAnchorComponent(): Component | null {
+		return this.#viewportAnchorComponent;
 	}
 
 	/** Clear manual viewport ownership before replacing the transcript identity namespace. */
@@ -2378,7 +2430,7 @@ export class TUI extends Container {
 			if (markerIndex !== -1) {
 				// Calculate visual column (width of text before marker)
 				const beforeMarker = line.slice(0, markerIndex);
-				const col = visibleWidth(beforeMarker);
+				const col = Math.max(0, Math.min(Math.max(0, this.terminal.columns - 1), visibleWidth(beforeMarker)));
 
 				// Strip marker from the line
 				lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
@@ -2734,6 +2786,7 @@ export class TUI extends Container {
 				this.#cursorRow = Math.max(0, lines.length - 1);
 				this.#maxLinesRendered = lines.length;
 				this.#viewportTopRow = nextViewportTop;
+				this.#recordPaintedViewportObservation(nextViewportTop, height, paintManual);
 				onPainted?.();
 			})
 		)
@@ -2746,6 +2799,51 @@ export class TUI extends Container {
 		return true;
 	}
 
+	#recordPaintedViewportObservation(viewportTop: number, height: number, paintManual: boolean): void {
+		const transcriptCapacity = this.#manualTranscriptCapacity(height);
+		const anchorFrame = this.#viewportAnchorFrame;
+		const semanticAnchor =
+			anchorFrame === null
+				? null
+				: (this.#committedTranscriptRows
+						.map((transcriptRow, screenRow) => {
+							if (transcriptRow === null) return null;
+							const anchor = anchorFrame.anchors[transcriptRow - anchorFrame.startRow];
+							return anchor ? { ...anchor, frameRow: screenRow } : null;
+						})
+						.find(anchor => anchor !== null) ?? null);
+		const cursor = this.#lastCursorPosition;
+		let cursorRow: number | null = null;
+		if (cursor !== null) {
+			if (paintManual && cursor.row >= this.#manualTranscriptLineCount) {
+				const noticeRows = this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
+				cursorRow = transcriptCapacity + noticeRows + (cursor.row - this.#manualTranscriptLineCount);
+			} else if (paintManual) {
+				cursorRow = this.#committedTranscriptRows.indexOf(cursor.row);
+			} else {
+				cursorRow = cursor.row - viewportTop;
+			}
+		}
+		const cursorVisible = cursorRow !== null && cursorRow >= 0 && cursorRow < height;
+		const selectedRange = this.#mouseSelectionDragged ? this.#orderedMouseSelection() : null;
+		const paintedSelection =
+			selectedRange === null
+				? null
+				: {
+						start: { line: selectedRange.start.line - viewportTop, column: selectedRange.start.column },
+						end: { line: selectedRange.end.line - viewportTop, column: selectedRange.end.column },
+					};
+		this.#latestViewportObservation = {
+			transcriptCapacity,
+			pinBoundary: { row: transcriptCapacity, pinned: this.#bottomPinnedComponent !== null },
+			focused: this.#focusedComponent !== null,
+			cursor: cursor
+				? { row: cursorVisible ? cursorRow! : cursor.row, col: cursor.col, visible: cursorVisible }
+				: null,
+			selection: paintedSelection,
+			semanticAnchor,
+		};
+	}
 	#doRender(): void {
 		if (this.#stopped || !this.terminalAvailable) return;
 		const width = this.terminal.columns;
@@ -3016,6 +3114,11 @@ export class TUI extends Container {
 					this.#previousLines = newLines;
 					this.#previousWidth = width;
 					this.#previousHeight = height;
+					this.#committedTranscriptRows = Array.from({ length: height }, (_, screenRow) => {
+						const transcriptRow = this.#viewportTopRow + screenRow;
+						return transcriptRow < this.#manualTranscriptLineCount ? transcriptRow : null;
+					});
+					this.#recordPaintedViewportObservation(this.#viewportTopRow, height, false);
 				})
 			)
 				return;
@@ -3066,6 +3169,11 @@ export class TUI extends Container {
 					this.#previousLines = newLines;
 					this.#previousWidth = width;
 					this.#previousHeight = height;
+					this.#committedTranscriptRows = Array.from({ length: height }, (_, screenRow) => {
+						const transcriptRow = nextViewportTop + screenRow;
+						return transcriptRow < this.#manualTranscriptLineCount ? transcriptRow : null;
+					});
+					this.#recordPaintedViewportObservation(nextViewportTop, height, false);
 				})
 			)
 				return;

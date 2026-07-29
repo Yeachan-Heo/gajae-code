@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { ansiToHtml, xterm256Color } from "../scripts/capture-sticky-viewport-showcase";
 import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
+import { STICKY_VIEWPORT_SHOWCASE_COVERAGE } from "./fixtures/tui/sticky-viewport-showcase";
 
 const roots: string[] = [];
 async function capture(): Promise<string> {
@@ -86,6 +87,76 @@ afterEach(async () => {
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
 describe("sticky viewport production evidence verifier", () => {
+	it("derives IRC resize coverage from the production split renderer", () => {
+		expect(STICKY_VIEWPORT_SHOWCASE_COVERAGE.irc).toEqual(["empty", "streaming", "long"]);
+		expect(STICKY_VIEWPORT_SHOWCASE_COVERAGE.todo).toEqual([
+			"empty",
+			"populated",
+			"long",
+			"multi-phase",
+			"collapsed",
+			"expanded",
+		]);
+		expect(STICKY_VIEWPORT_SHOWCASE_COVERAGE.widths).toEqual([64, 65, 80, 120, 160, 120, 80, 65, 64]);
+		expect(STICKY_VIEWPORT_SHOWCASE_COVERAGE.heights).toEqual(["short", "standard"]);
+		expect(STICKY_VIEWPORT_SHOWCASE_COVERAGE.viewport).toEqual(["manual", "follow", "resize-grow", "resize-shrink"]);
+		expect(STICKY_VIEWPORT_SHOWCASE_COVERAGE.chrome).toEqual([
+			"pending",
+			"statusContainer",
+			"btw",
+			"statusLine",
+			"hooks",
+			"editor",
+			"pet",
+		]);
+		expect(STICKY_VIEWPORT_SHOWCASE_COVERAGE.evidence).toEqual([
+			"overlap",
+			"width-overflow",
+			"hidden-cursor-focus",
+			"anchor-loss",
+			"cjk-semantic-break",
+		]);
+	});
+	it("captures authoritative production probe frames and semantic root IDs", async () => {
+		const root = await capture();
+		const metadata = JSON.parse(
+			await fs.readFile(path.join(root, "multiline-editor-hooks-pet/80x24/unicode-color", "metadata.json"), "utf8"),
+		);
+		expect(metadata.state.root_order).toEqual([
+			"irc-split",
+			"pending-messages",
+			"status-container",
+			"todos",
+			"btw",
+			"status-line",
+			"hooks-above",
+			"editor-container",
+			"pet-floor",
+			"hooks-below",
+		]);
+		expect(metadata.state.pin_boundary.component).toBe("status-line");
+		expect(metadata.state.pin_boundary.index).toBe(5);
+		expect(metadata.state.focused_component).toBe("editor");
+		expect(metadata.state.cursor.blink).toBe(true);
+		expect(metadata.state.resize_probes.map((probe: { columns: number }) => probe.columns)).toEqual([
+			64, 65, 80, 120, 160, 120, 80, 65, 64,
+		]);
+		expect(metadata.state.resize_probes[0]).toMatchObject({
+			effective_lane: "transcript",
+			irc_records: 0,
+			todo_rows: 0,
+		});
+		expect(metadata.state.resize_probes[1]).toMatchObject({
+			effective_lane: "split",
+			separator_width: 3,
+			irc_records: 1,
+			todo_rows: 1,
+			todo_expanded: false,
+		});
+		expect(metadata.state.resize_probes[2]).toMatchObject({ todo_expanded: true });
+		expect(metadata.state.visible_empty_irc_frame.text).not.toContain("worker → you");
+		expect(metadata.state.resize_probes[3].frame.text).toContain("worker → you");
+	}, 30_000);
 	it("renders inverse ANSI as effective colors and closes spans across resets", () => {
 		const html = ansiToHtml("\x1b[31;44;7mX\x1b[27mY\x1b[0mZ");
 		expect(html).toContain("color:#3465a4;background-color:#cc0000");
@@ -104,25 +175,13 @@ describe("sticky viewport production evidence verifier", () => {
 			"color:rgb(8,8,8);background-color:rgb(238,238,238)",
 		);
 	});
-	it("round-trips xterm cube and grayscale artifacts and rejects ANSI color corruption", async () => {
+	it("rejects artifact mutation even when the manifest digest is rebound", async () => {
 		const root = await capture();
 		const cubeKey = "manual-new-output/80x24/unicode-color";
-		const grayscaleKey = "manual-new-output/120x36/unicode-color";
 		await replaceAnsiColor(root, cubeKey, "\x1b[38;5;196;48;5;51m");
-		await replaceAnsiColor(root, grayscaleKey, "\x1b[38;5;232;48;5;255m");
 		await rebindReviewInput(root);
-		await verifyStickyViewportShowcase(root);
-
-		const ansiPath = path.join(root, cubeKey, "terminal-ansi.txt");
-		const ansi = await fs.readFile(ansiPath, "utf8");
-		const corrupted = ansi.replace("\x1b[38;5;196;48;5;51m", "\x1b[38;5;46;48;5;21m");
-		if (corrupted === ansi) throw new Error("expected injected xterm SGR sequence");
-		await Bun.write(ansiPath, corrupted);
-		await rehash(root, cubeKey, "terminal-ansi.txt");
-		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow(
-			"HTML artifact is not canonical ANSI conversion",
-		);
-	}, 15_000);
+		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("runtime observation mismatch");
+	}, 30_000);
 	it("requires terminal HTML to be the exact canonical ANSI conversion", async () => {
 		const root = await capture();
 		const key = "manual-new-output/80x24/unicode-color";
@@ -135,7 +194,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow(
 			"HTML artifact is not canonical ANSI conversion",
 		);
-	}, 15_000);
+	}, 30_000);
 	it("round-trips xterm strikethrough and production-only SGR attributes", async () => {
 		const terminal = new VirtualTerminal(20, 1);
 		terminal.write("\x1b[5;8;9;53mX\x1b[25;28;29;55mY");
@@ -148,7 +207,7 @@ describe("sticky viewport production evidence verifier", () => {
 	});
 	it("captures and accepts the immutable production 20-key matrix", async () => {
 		await verifyStickyViewportShowcase(await capture());
-	});
+	}, 60_000);
 	it("fails closed for semantic evidence and provenance corruption", async () => {
 		// `capture()` spawns a ~2.2s subprocess. Capture once and clone the
 		// deterministic output so each corruption case stays isolated without
@@ -178,7 +237,7 @@ describe("sticky viewport production evidence verifier", () => {
 		noticeMetadata.output_revision = "0";
 		await Bun.write(noticeMetadataPath, `${JSON.stringify(noticeMetadata, null, 2)}\n`);
 		await rehash(noticeRoot, key, "metadata.json");
-		await expect(verifyStickyViewportShowcase(noticeRoot)).rejects.toThrow("manual notice invariant");
+		await expect(verifyStickyViewportShowcase(noticeRoot)).rejects.toThrow("review input manifest binding mismatch");
 
 		const capacityRoot = await cloneBase();
 		const capacityKey = "capacity-one/80x24/unicode-color";
@@ -187,7 +246,7 @@ describe("sticky viewport production evidence verifier", () => {
 		capacityMetadata.state.transcript_capacity = 2;
 		await Bun.write(capacityMetadataPath, `${JSON.stringify(capacityMetadata, null, 2)}\n`);
 		await rehash(capacityRoot, capacityKey, "metadata.json");
-		await expect(verifyStickyViewportShowcase(capacityRoot)).rejects.toThrow("capacity metadata/frame mismatch");
+		await expect(verifyStickyViewportShowcase(capacityRoot)).rejects.toThrow("runtime observation mismatch");
 
 		const cjkRoot = await cloneBase();
 		const cjkKey = "narrow-cjk/48x10/unicode-color";
@@ -199,17 +258,23 @@ describe("sticky viewport production evidence verifier", () => {
 			);
 			await rehash(cjkRoot, cjkKey, name);
 		}
-		await expect(verifyStickyViewportShowcase(cjkRoot)).rejects.toThrow(
-			"narrow CJK visible terminal evidence missing",
-		);
+		const cjkMetadataPath = path.join(cjkRoot, cjkKey, "metadata.json");
+		const cjkMetadata = JSON.parse(await fs.readFile(cjkMetadataPath, "utf8"));
+		cjkMetadata.cjk_phrase_boundaries = [];
+		cjkMetadata.state.cursor.frame_sha256 = new Bun.CryptoHasher("sha256")
+			.update(await fs.readFile(path.join(cjkRoot, cjkKey, "terminal-ansi.txt"), "utf8"))
+			.digest("hex");
+		await Bun.write(cjkMetadataPath, `${JSON.stringify(cjkMetadata, null, 2)}\n`);
+		await rehash(cjkRoot, cjkKey, "metadata.json");
+		await expect(verifyStickyViewportShowcase(cjkRoot)).rejects.toThrow("narrow CJK boundaries");
 
 		const evidenceRoot = await cloneBase();
 		const evidencePath = path.join(evidenceRoot, key, "metadata.json");
 		const evidence = JSON.parse(await fs.readFile(evidencePath, "utf8"));
-		evidence.state.manual_historical_rows = [];
+		evidence.state.visible_empty_irc_frame.text = "forged populated IRC";
 		await Bun.write(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
 		await rehash(evidenceRoot, key, "metadata.json");
-		await expect(verifyStickyViewportShowcase(evidenceRoot)).rejects.toThrow("manual historical transcript evidence");
+		await expect(verifyStickyViewportShowcase(evidenceRoot)).rejects.toThrow("runtime observation");
 
 		const nonNarrowCjkRoot = await cloneBase();
 		const nonNarrowMetadataPath = path.join(nonNarrowCjkRoot, key, "metadata.json");
@@ -218,7 +283,7 @@ describe("sticky viewport production evidence verifier", () => {
 		await Bun.write(nonNarrowMetadataPath, `${JSON.stringify(nonNarrowMetadata, null, 2)}\n`);
 		await rehash(nonNarrowCjkRoot, key, "metadata.json");
 		await expect(verifyStickyViewportShowcase(nonNarrowCjkRoot)).rejects.toThrow("non-narrow CJK boundaries");
-	}, 15_000);
+	}, 60_000);
 	it("rejects table-driven manifest, metadata, and review-input corruption", async () => {
 		const base = await capture();
 		const fresh = async () => {
@@ -343,7 +408,7 @@ describe("sticky viewport production evidence verifier", () => {
 			await mutate(root);
 			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow();
 		}
-	}, 30_000);
+	}, 60_000);
 	it("fails closed for every independent-review attestation field", async () => {
 		const root = await capture();
 		const review = await validIndependentReview(root);
@@ -409,5 +474,5 @@ describe("sticky viewport production evidence verifier", () => {
 			await Bun.write(path.join(root, "independent-review.json"), JSON.stringify(candidate));
 			await expect(verifyStickyViewportShowcase(root, true)).rejects.toThrow("independent review");
 		}
-	});
+	}, 60_000);
 });

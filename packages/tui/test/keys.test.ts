@@ -97,6 +97,77 @@ describe("matchesKey", () => {
 		setKittyProtocolActive(false);
 	});
 });
+describe.each([
+	{ data: "\x1bq", kitty: false, key: "alt+q", expected: "alt+q" },
+	{ data: "\x1bC", kitty: true, key: "alt+shift+c", expected: "alt+shift+c" },
+	{ data: "\x1b[113;3u", kitty: true, key: "alt+q", expected: "alt+q" },
+	{ data: "\x1b[99;4u", kitty: true, key: "alt+shift+c", expected: "alt+shift+c" },
+	{ data: "\x1b[27;3;105~", kitty: false, key: "alt+i", expected: "alt+i" },
+] as const)("normalizes Option input $expected", ({ data, kitty, key, expected }) => {
+	it("matches and parses one canonical KeyId", () => {
+		setKittyProtocolActive(kitty);
+		expect(matchesKey(data, key)).toBe(true);
+		expect(parseKey(data)).toBe(expected);
+		setKittyProtocolActive(false);
+	});
+});
+describe("Alt+I protocol symmetry", () => {
+	it.each([
+		{ data: "\x1bi", kitty: true, expected: "alt+i" },
+		{ data: "\x1b[105;3u", kitty: true, expected: "alt+i" },
+		{ data: "\x1b[27;3;105~", kitty: true, expected: "alt+i" },
+	])("matches and parses $expected", ({ data, kitty, expected }) => {
+		setKittyProtocolActive(kitty);
+		expect(matchesKey(data, expected)).toBe(true);
+		expect(parseKey(data)).toBe(expected);
+		setKittyProtocolActive(false);
+	});
+
+	it("does not parse or match gated legacy space and control forms while Kitty is active", () => {
+		setKittyProtocolActive(true);
+		expect(matchesKey("\x1b ", "alt+space")).toBe(false);
+		expect(parseKey("\x1b ")).toBeUndefined();
+		expect(matchesKey("\x1b\x01", "ctrl+alt+a")).toBe(false);
+		expect(parseKey("\x1b\x01")).toBeUndefined();
+		setKittyProtocolActive(false);
+	});
+
+	it.each([
+		{ data: "\x1bb", navigation: "alt+left", literal: "alt+b" },
+		{ data: "\x1bB", navigation: "alt+left", literal: "alt+shift+b" },
+		{ data: "\x1bf", navigation: "alt+right", literal: "alt+f" },
+		{ data: "\x1bF", navigation: "alt+right", literal: "alt+shift+f" },
+		{ data: "\x1bp", navigation: "alt+up", literal: "alt+p" },
+		{ data: "\x1bP", navigation: "alt+up", literal: "alt+shift+p" },
+		{ data: "\x1bn", navigation: "alt+down", literal: "alt+n" },
+		{ data: "\x1bN", navigation: "alt+down", literal: "alt+shift+n" },
+	])("keeps $data as exclusive $navigation navigation under Kitty on and off", ({ data, navigation, literal }) => {
+		for (const kitty of [false, true]) {
+			setKittyProtocolActive(kitty);
+			expect(parseKey(data)).toBe(navigation);
+			expect(matchesKey(data, navigation)).toBe(true);
+			expect(matchesKey(data, literal)).toBe(false);
+			for (const otherNavigation of ["alt+left", "alt+right", "alt+up", "alt+down"]) {
+				expect(matchesKey(data, otherNavigation)).toBe(otherNavigation === navigation);
+			}
+		}
+		setKittyProtocolActive(false);
+	});
+
+	it.each([
+		{ data: "\x1b[98;3u", expected: "alt+b" },
+		{ data: "\x1b[98;4u", expected: "alt+shift+b" },
+		{ data: "\x1b[27;3;102~", expected: "alt+f" },
+		{ data: "\x1b[27;4;102~", expected: "alt+shift+f" },
+		{ data: "\x1b[112;3u", expected: "alt+p" },
+		{ data: "\x1b[110;4u", expected: "alt+shift+n" },
+	])("uses enhanced encoding for literal $expected", ({ data, expected }) => {
+		setKittyProtocolActive(true);
+		expect(parseKey(data)).toBe(expected);
+		expect(matchesKey(data, expected)).toBe(true);
+		setKittyProtocolActive(false);
+	});
+});
 
 describe("parseKey", () => {
 	it("should prefer codepoint for Latin letters when base layout differs", () => {
