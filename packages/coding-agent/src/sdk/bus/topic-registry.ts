@@ -2,12 +2,11 @@ import { randomUUID } from "node:crypto";
 /**
  * Per-session forum-topic registry for the threaded session surface.
  *
- * Each GJC session owns one active Telegram forum topic in the paired private
- * DM. The topic is created via `createForumTopic`, reused while the session
- * remains active, and removed from the registry when the daemon deletes it on
- * shutdown. The registry also tracks whether the one-time identity header has
- * already been pinned, so it is sent exactly once per active topic, even across
- * reconnects.
+ * Each GJC session owns one active Telegram forum topic. Remote archive closes
+ * daemon-created topics without deleting their durable records; rotated
+ * successors move inactive records into retained history before creating a new
+ * active authority. The registry also tracks whether the one-time identity
+ * header has already been pinned.
  *
  * State is a plain serialisable map persisted beside the daemon state files;
  * topic creation is injected so this module is pure and unit-testable without a
@@ -123,6 +122,8 @@ export interface TopicRegistryState {
 	archiveJobs?: Record<string, ArchiveJob>;
 	/** Durable create claims. A claim fences concurrent creators before remote I/O. */
 	createClaims?: Record<string, TopicCreateClaim>;
+	/** Retained inactive predecessors keyed by logical session id. */
+	retiredTopics?: Record<string, TopicRecord[]>;
 }
 /**
  * Shared registry authority. Filesystem atomic rename is sufficient for a single
@@ -246,7 +247,7 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 	if (
 		(state.registryGeneration !== undefined && !validEpoch(state.registryGeneration)) ||
 		!isObject(state.topics) ||
-		[state.fences, state.closedEndpoints, state.archiveJobs, state.createClaims].some(
+		[state.fences, state.closedEndpoints, state.archiveJobs, state.createClaims, state.retiredTopics].some(
 			nested => nested !== undefined && !isObject(nested),
 		)
 	)
@@ -308,6 +309,16 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 		)
 			malformed();
 	}
+	for (const [sessionId, records] of Object.entries(state.retiredTopics ?? {})) {
+		if (!isValidBindingString(sessionId) || !Array.isArray(records)) malformed();
+		for (const [index, record] of records.entries()) {
+			parseTopicRegistryState({
+				version: 2,
+				registryGeneration: 0,
+				topics: { [`${sessionId}:retired:${index}`]: record },
+			});
+		}
+	}
 	for (const [sessionId, epoch] of Object.entries(state.fences ?? {}))
 		if (!isValidBindingString(sessionId) || !validEpoch(epoch)) malformed();
 	for (const [sessionId, claim] of Object.entries(state.createClaims ?? {})) {
@@ -368,6 +379,8 @@ export class TopicRegistry {
 	private readonly archiveJobs = new Map<string, ArchiveJob>();
 	/** Durable pre-create claims; remote creation is forbidden until published. */
 	private readonly createClaims = new Map<string, TopicCreateClaim>();
+	/** Inactive predecessor evidence retained across successor generations. */
+	private readonly retiredTopics = new Map<string, TopicRecord[]>();
 	/** Generation of the last loaded/published snapshot. */
 	private registryGeneration = 0;
 
@@ -384,11 +397,18 @@ export class TopicRegistry {
 		this.epochs.clear();
 		this.archiveJobs.clear();
 		this.createClaims.clear();
+		this.retiredTopics.clear();
 		this.load(state);
 	}
 
 	/** Merge serialized state and normalize authority fields from older releases. */
 	load(state: TopicRegistryState): void {
+		for (const [sessionId, records] of Object.entries(state.retiredTopics ?? {}))
+			if (Array.isArray(records))
+				this.retiredTopics.set(
+					sessionId,
+					records.map(record => ({ ...record })),
+				);
 		for (const [sessionId, job] of Object.entries(state.archiveJobs ?? {})) {
 			const attempt =
 				job && Number.isSafeInteger(job.attempt) && job.attempt >= 0
@@ -710,9 +730,9 @@ export class TopicRegistry {
 	}
 
 	/**
-	 * Retire a remotely settled inactive topic only when an authenticated successor
-	 * proves a different endpoint authority. The archive remains remote-only; this
-	 * removes the local routing record so the successor can create a new topic.
+	 * Retire a remotely settled inactive topic only when an authenticated
+	 * successor proves a different endpoint authority. The inactive predecessor
+	 * is serialized into retained history before the active slot is released.
 	 */
 	retireInactiveEndpointForSuccessor(sessionId: string, binding: TopicEndpointBinding): boolean {
 		const record = this.topics.get(sessionId);
@@ -724,6 +744,9 @@ export class TopicRegistry {
 			(record.endpointKey === binding.endpointKey && record.endpointDigest === binding.endpointDigest)
 		)
 			return false;
+		const history = this.retiredTopics.get(sessionId) ?? [];
+		history.push({ ...record });
+		this.retiredTopics.set(sessionId, history);
 		this.topics.delete(sessionId);
 		this.byTopic.delete(record.topicId);
 		this.archiveJobs.delete(sessionId);
@@ -1190,8 +1213,8 @@ export class TopicRegistry {
 		return (
 			record?.topicOrigin === "daemon_created" &&
 			record.authorityState === "archive_pending" &&
-			(record.archiveHostId === hostId || record.archiveHostId === undefined) &&
-			(record.archiveLeaseEpoch === record.authorityEpoch || record.archiveLeaseEpoch === undefined) &&
+			record.archiveHostId === hostId &&
+			record.archiveLeaseEpoch === record.authorityEpoch &&
 			(record.leaseOwner === undefined || record.leaseOwner === hostId || (record.leaseExpiresAt ?? 0) <= now)
 		);
 	}
@@ -1238,6 +1261,7 @@ export class TopicRegistry {
 		sessionId: string,
 		topicId: string,
 		creationLeaseEpoch: number,
+		hostId: string,
 		now: () => number = Date.now,
 		name?: string,
 		binding?: TopicEndpointBinding,
@@ -1255,9 +1279,11 @@ export class TopicRegistry {
 				: (this.epochs.get(sessionId) ?? 0) !== creationLeaseEpoch
 		)
 			return undefined;
-		this.beginArchive(sessionId);
+		this.beginArchive(sessionId, hostId, now());
 		const fenced = this.fenceAcceptedCreate(sessionId, topicId, now, name, binding, topicOrigin);
 		fenced.creationLeaseEpoch = creationLeaseEpoch;
+		fenced.archiveHostId = hostId;
+		fenced.archiveLeaseEpoch = fenced.authorityEpoch;
 		return fenced;
 	}
 
@@ -1320,6 +1346,7 @@ export class TopicRegistry {
 			fences: Object.fromEntries(this.epochs),
 			archiveJobs: Object.fromEntries(this.archiveJobs),
 			createClaims: Object.fromEntries(this.createClaims),
+			retiredTopics: Object.fromEntries(this.retiredTopics),
 		};
 	}
 }

@@ -39,16 +39,15 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 28 rejects special files before retained native authority opens.
  * Generation 29 adds serving-epoch compatibility, sidecar heartbeat, root GC,
  * and Bot API cooldown structural fixes (#2956, #2960, #3048).
- * Generation 30 adds opt-in tool activity delivery, closed lifecycle phases,
- * and capability-versioned mixed-host compatibility. Generation 31 makes
- * forum-topic lifecycle convergence non-destructive and requires lease fencing
- * before topic mutations.
+ * Generation 35 adds user-created topic adoption. Generation 36 adds
+ * cross-host CAS convergence, host-and-epoch archive fencing, retained topic
+ * history, and isolated validation-supergroup delivery.
  */
-export const DAEMON_GENERATION = 31;
+export const DAEMON_GENERATION = 36;
 
 /**
- * Serving-compatibility boundary for daemon lifecycle requests. Epoch 4
- * requires active-topic lease convergence before any topic write, archive, or
- * endpoint rebind.
+ * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
+ * requires the complete generation-36 topic authority contract, so older
+ * epoch-4 daemons cannot keep serving across an upgrade.
  */
-export const SERVING_EPOCH = 4;
+export const SERVING_EPOCH = 5;

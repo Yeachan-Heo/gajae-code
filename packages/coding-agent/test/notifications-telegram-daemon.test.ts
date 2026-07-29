@@ -2947,11 +2947,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 31 adds non-destructive topic lifecycle fencing", () => {
+	test("keeps wire protocol 3 while generation 36 adds cross-host topic authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 31 adds archive, lease, and serving-epoch lifecycle fencing
-		// without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(31);
+		expect(DAEMON_GENERATION).toBe(36);
 	});
 	test.each([
 		"1",
@@ -19815,9 +19813,9 @@ test("Telegram Bot API 429 cooldown clamps malformed retry_after values and does
 // ---------------------------------------------------------------------------
 
 describe("PR #3186 blockers", () => {
-	test("serving epoch 4 replaces pre-policy (epoch 1 through 3) daemons via isCurrentCompatibleOwner", () => {
+	test("serving epoch 5 replaces pre-policy (epoch 1 through 4) daemons via isCurrentCompatibleOwner", () => {
 		// Epoch 1: legacy daemon states that never published servingEpoch.
-		expect(SERVING_EPOCH).toBe(4);
+		expect(SERVING_EPOCH).toBe(5);
 		const freshInput = (servingEpoch?: number) => {
 			const state: DaemonState = {
 				pid: 999,
@@ -19846,12 +19844,12 @@ describe("PR #3186 blockers", () => {
 		// Epoch undefined (epoch 1) — not compatible.
 		expect(isCurrentCompatibleOwner(freshInput(undefined))).toBe(false);
 
-		// Epoch 3 — not compatible with epoch 4.
-		expect(isCurrentCompatibleOwner(freshInput(3))).toBe(false);
-		// Epoch 4 — compatible.
-		expect(isCurrentCompatibleOwner(freshInput(4))).toBe(true);
-		// Future epoch 5 — rejected fail-closed.
-		expect(isCurrentCompatibleOwner(freshInput(5))).toBe(false);
+		// Epoch 4 — not compatible with epoch 5.
+		expect(isCurrentCompatibleOwner(freshInput(4))).toBe(false);
+		// Epoch 5 — compatible.
+		expect(isCurrentCompatibleOwner(freshInput(5))).toBe(true);
+		// Future epoch 6 — rejected fail-closed.
+		expect(isCurrentCompatibleOwner(freshInput(6))).toBe(false);
 	});
 
 	test("visible v1 starts are terminated with terminalization on policy transition", async () => {
@@ -21052,5 +21050,71 @@ describe("forum_topic_created user-topic adoption", () => {
 		expect(notices).toHaveLength(1);
 		expect(notices[0]!.body.message_thread_id).toBe(610);
 		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.reply_markup)).toBe(false);
+	});
+});
+
+test("CAS retry exhaustion retains the latest strict shared-authority winner", async () => {
+	FakeWs.instances = [];
+	let readGeneration = 0;
+	let session: ReturnType<TelegramNotificationDaemon["connectSession"]>;
+	const winner = (registryGeneration: number) => ({
+		version: 2 as const,
+		registryGeneration,
+		topics: {
+			S: {
+				topicId: "700",
+				topicOrigin: "daemon_created" as const,
+				sessionUuid: "winner-session",
+				identitySent: true,
+				createdAt: 1,
+				authorityEpoch: 2,
+				authorityState: "disconnect_grace" as const,
+				orphanedAt: 10,
+				disconnectGraceExpiresAt: 500,
+				chatId: "42",
+				endpointKey: session.endpointKey,
+				endpointDigest: session.endpointDigest,
+				endpointGeneration: session.hostGeneration,
+				endpointIncarnation: 0,
+				...(registryGeneration === 1
+					? {}
+					: {
+							leaseOwner: "winner-host",
+							leaseHeartbeatAt: 100,
+							leaseExpiresAt: 10_000,
+						}),
+			},
+		},
+	});
+	const authority = {
+		read: async () => winner(++readGeneration),
+		compareAndSet: async () => false,
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "token",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		WebSocketImpl: FakeWs as never,
+		now: () => 100,
+		installationHostId: "local-host",
+		topicRegistryAuthority: authority,
+	});
+	session = daemon.connectSession("S", "ws://winner", "token");
+	await daemon.loadTopics();
+	session = daemon.connectSession("S", "ws://winner", "token");
+	FakeWs.instances.at(-1)!.dispatchEvent(new Event("open"));
+	for (let attempt = 0; attempt < 100 && readGeneration < 4; attempt++) await Bun.sleep(10);
+	expect(readGeneration).toBe(4);
+	expect((daemon as unknown as { topics: { serialize(): unknown } }).topics.serialize()).toMatchObject({
+		registryGeneration: 4,
+		topics: {
+			S: {
+				topicId: "700",
+				leaseOwner: "winner-host",
+				leaseExpiresAt: 10_000,
+			},
+		},
 	});
 });

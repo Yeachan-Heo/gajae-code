@@ -562,9 +562,9 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generation 31 at serving epoch 4", () => {
-	expect(DAEMON_GENERATION).toBe(31);
-	expect(SERVING_EPOCH).toBe(4);
+test("publishes generation 36 at serving epoch 5", () => {
+	expect(DAEMON_GENERATION).toBe(36);
+	expect(SERVING_EPOCH).toBe(5);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
@@ -711,4 +711,58 @@ test("retains adopted topics and rejects an unexpired foreign archive owner", as
 	expect(daemonTopic.beginArchive("daemon", "host-b", 101)).toBeUndefined();
 	expect(daemonTopic.beginArchive("daemon", "host-b", 1_101)?.archiveHostId).toBe("host-b");
 	expect(daemonTopic.archiveAuthorityAllows("daemon", "host-b", 1_101)).toBe(true);
+});
+test("accepted-create compensation publishes exact host and archive epoch authority", async () => {
+	const registry = new TopicRegistry();
+	const binding = { chatId: "42", endpointKey: "endpoint", endpointDigest: "digest", endpointGeneration: 1 };
+	await registry.getOrCreateTopic(
+		"session",
+		async () => "44",
+		() => 100,
+		undefined,
+		binding,
+	);
+	const fenced = registry.fenceAcceptedCreateForLease("session", "44", 0, "host-a", () => 101, undefined, binding);
+	expect(fenced).toMatchObject({
+		topicId: "44",
+		authorityState: "archive_pending",
+		archiveHostId: "host-a",
+		archiveLeaseEpoch: 1,
+		authorityEpoch: 1,
+	});
+	expect(registry.archiveAuthorityAllows("session", "host-a", 101)).toBe(true);
+	expect(registry.archiveAuthorityAllows("session", "host-b", 101)).toBe(false);
+});
+
+test("retains inactive predecessor evidence when an authenticated successor rotates", async () => {
+	const registry = new TopicRegistry();
+	const original = { chatId: "42", endpointKey: "old", endpointDigest: "old-digest", endpointGeneration: 1 };
+	await registry.getOrCreateTopic(
+		"session",
+		async () => "45",
+		() => 100,
+		undefined,
+		original,
+	);
+	expect(registry.beginArchive("session", "host-a", 101)).toBeDefined();
+	expect(registry.settleArchive("session", "45")).toBe(true);
+	expect(
+		registry.retireInactiveEndpointForSuccessor("session", {
+			chatId: "42",
+			endpointKey: "new",
+			endpointDigest: "new-digest",
+			endpointGeneration: 2,
+		}),
+	).toBe(true);
+	const serialized = registry.serialize();
+	expect(serialized.topics.session).toBeUndefined();
+	expect(serialized.retiredTopics?.session).toEqual([
+		expect.objectContaining({
+			topicId: "45",
+			topicOrigin: "daemon_created",
+			authorityState: "inactive",
+			archiveHostId: "host-a",
+		}),
+	]);
+	expect(new TopicRegistry(serialized).serialize().retiredTopics).toEqual(serialized.retiredTopics);
 });

@@ -7281,6 +7281,7 @@ export class TelegramNotificationDaemon {
 								sessionId,
 								acceptedTopicId,
 								creationLeaseEpoch,
+								this.installationHostId,
 								this.opts.now,
 								name,
 								creationBinding,
@@ -7356,6 +7357,7 @@ export class TelegramNotificationDaemon {
 						sessionId,
 						rec.topicId,
 						creationLeaseEpoch,
+						this.installationHostId,
 						this.opts.now,
 						name,
 						creationBinding,
@@ -7379,6 +7381,16 @@ export class TelegramNotificationDaemon {
 				if (this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch)) await this.persistTopics();
 				return undefined;
 			}
+			const revokedAcceptedRecord = acceptedTopicId ? this.topics.get(sessionId) : undefined;
+			if (
+				revokedAcceptedRecord !== undefined &&
+				revokedAcceptedRecord.topicId === acceptedTopicId &&
+				revokedAcceptedRecord.authorityState === "archive_pending" &&
+				!this.topics.archiveAuthorityAllows(sessionId, this.installationHostId, this.runtime.now())
+			) {
+				this.topics.beginArchive(sessionId, this.installationHostId, this.runtime.now());
+				await this.persistTopics();
+			}
 			if (
 				acceptedTopicId &&
 				!acceptedTopicCompensated &&
@@ -7392,6 +7404,7 @@ export class TelegramNotificationDaemon {
 						sessionId,
 						acceptedTopicId,
 						creationLeaseEpoch,
+						this.installationHostId,
 						this.opts.now,
 						name,
 						creationBinding,
@@ -7493,7 +7506,7 @@ export class TelegramNotificationDaemon {
 			return "pre_dispatch_cancelled";
 		if (!archiveFenceAlreadyPublished) await this.persistTopics();
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
-		if (!this.topics.archiveAuthorityAllows(sessionId, this.installationHostId, this.runtime.now()))
+		if (record && !this.topics.archiveAuthorityAllows(sessionId, this.installationHostId, this.runtime.now()))
 			return "pre_dispatch_cancelled";
 		await this.#revokeAskAuthority(sessionId);
 		this.deleteMessageRoutes(sessionId);
@@ -7560,6 +7573,7 @@ export class TelegramNotificationDaemon {
 			let result = mutation();
 			const authority = this.opts.topicRegistryAuthority;
 			let sharedCommitted = false;
+			let latestWinner: TopicRegistryState | undefined;
 			try {
 				const snapshot = this.#topicStateForPersistence();
 				if (authority) {
@@ -7580,8 +7594,10 @@ export class TelegramNotificationDaemon {
 							break;
 						}
 						const winner = parseTopicRegistryState(await authority.read().catch(() => undefined));
-						if (!winner || attempt === 2) throw new Error("shared topic authority conflict");
+						if (!winner) throw new Error("shared topic authority conflict");
+						latestWinner = winner;
 						this.#replaceTopicAuthority(winner);
+						if (attempt === 2) throw new Error("shared topic authority conflict");
 						result = mutation();
 					}
 				}
@@ -7601,6 +7617,8 @@ export class TelegramNotificationDaemon {
 						for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {}))
 							if (binding) this.closedEndpointKeys.set(sessionId, binding);
 					}
+				} else if (latestWinner) {
+					this.#replaceTopicAuthority(latestWinner);
 				} else {
 					rollback();
 				}
