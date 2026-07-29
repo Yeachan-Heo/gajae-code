@@ -196,10 +196,10 @@ test("tool classification follows the canonical ACP kind vocabulary, not invente
 		["shell", "execCommandApproval"],
 		["exec", "execCommandApproval"],
 		["eval", "execCommandApproval"],
-		["write", "applyPatchApproval"],
+		["write", "unmapped"],
 		// `edit`/`apply_patch` args carry no unified diff at this seam, so they fail closed.
 		["edit", "unmapped"],
-		["delete", "applyPatchApproval"],
+		["delete", "unmapped"],
 		["move", "applyPatchApproval"],
 		// Real tool names that map to kinds no Codex approval method represents.
 		["read", "unmapped"],
@@ -261,8 +261,7 @@ test("real child tool arguments map to protocol-valid approval params", () => {
 		readonly method: "execCommandApproval" | "applyPatchApproval";
 	}> = [
 		{ toolName: "bash", rawInput: { command: "ls -la", cwd: "/tmp" }, method: "execCommandApproval" },
-		{ toolName: "write", rawInput: { path: "/tmp/a.ts", content: "hello" }, method: "applyPatchApproval" },
-		{ toolName: "delete", rawInput: { path: "/tmp/a.ts" }, method: "applyPatchApproval" },
+		// A move is fully described by its own arguments, so it is representable from raw input.
 		{ toolName: "move", rawInput: { oldPath: "/tmp/a.ts", newPath: "/tmp/b.ts" }, method: "applyPatchApproval" },
 	];
 
@@ -371,17 +370,34 @@ test("eval cells project into a protocol-valid command approval", () => {
 	}
 });
 
-test("a write is never described as an add, because existence is unknown at this seam", () => {
-	// WriteTool creates OR overwrites, and its schema is only {path, content}. Claiming `add` would
-	// tell the approving human the file does not exist — a materially different decision we have no
-	// evidence for. Both cases report the full replacement as an update.
-	for (const path of ["/tmp/a.ts", "/tmp/new.ts"]) {
-		const mapped = mapToolCallToCodexRequest(
-			{ toolCallId: "c", toolName: "write", title: "write", rawInput: { path, content: "next" } },
-			{ conversationId: "thread-1" },
-		);
-		const changes = (mapped.params as { fileChanges: Record<string, { type: string }> }).fileChanges;
-		expect(changes[path], path).toMatchObject({ type: "update" });
-		expect(stableValidators.serverRequestParams.applyPatchApproval(mapped.params), path).toBe(true);
+test("write and delete fail closed without faithful file-change evidence", () => {
+	// A write supplies a raw file body, not a unified diff; a delete supplies only a path with no
+	// preimage. Labelling either as a pinned FileChange would show an approving human fabricated
+	// evidence about a destructive change, so both refuse until a real fileChanges map is supplied.
+	for (const [toolName, rawInput] of [
+		["write", { path: "/tmp/a.ts", content: "next" }],
+		["delete", { path: "/tmp/a.ts" }],
+	] as Array<[string, Record<string, unknown>]>) {
+		expect(
+			() =>
+				mapToolCallToCodexRequest(
+					{ toolCallId: "c", toolName, title: toolName, rawInput },
+					{ conversationId: "thread-1" },
+				),
+			toolName,
+		).toThrow(/faithful file change/u);
 	}
+	// A caller that supplies a genuine pinned map is still accepted.
+	const supplied = mapToolCallToCodexRequest(
+		{
+			toolCallId: "c",
+			toolName: "write",
+			title: "write",
+			rawInput: {
+				fileChanges: { "/tmp/a.ts": { type: "update", unified_diff: "@@ -1 +1 @@\n-a\n+b", move_path: null } },
+			},
+		},
+		{ conversationId: "thread-1" },
+	);
+	expect(stableValidators.serverRequestParams.applyPatchApproval(supplied.params)).toBe(true);
 });

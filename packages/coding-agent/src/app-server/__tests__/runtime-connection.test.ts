@@ -1108,3 +1108,72 @@ test("runtime connection: a subscriber cannot answer before the request is deliv
 	expect(runtime.broker.resolve(requestId!, peer.id, { decision: "approved" })).toBe(true);
 	await expect(pending!.settled).resolves.toMatchObject({ kind: "resolved" });
 });
+
+test("runtime connection: an approval whose publication never runs is still settled", async () => {
+	const runtime = createAppServerRuntime();
+	const connection = runtime.createConnection(() => {});
+	await initialize(connection);
+	runtime.subscriptions.subscribe(connection.id, "thread-a");
+	runtime.manager.register("thread-a", "spawned", undefined, connection.id);
+
+	let requestId: string | undefined;
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		requestId = context?.requestClient?.("thread-a", "execCommandApproval", {
+			conversationId: "thread-a",
+			callId: "call-1",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		// Close the originating connection inside the handler, so its deferred publication is
+		// abandoned. An unpublished request has an empty eligible set, so the disconnect sweep
+		// cannot reach it and only its finalizer can settle it.
+		void connection.close();
+		return { ok: true, result: { dataBase64: "" } };
+	});
+	await connection.process(enc('{"id":3,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+	await Bun.sleep(5);
+
+	expect(requestId).toBeDefined();
+	// Nothing is left pending, and the thread's approval accounting was released.
+	expect(runtime.broker.pendingCount).toBe(0);
+	expect(runtime.manager.get("thread-a")?.pendingApprovals ?? 0).toBe(0);
+});
+
+test("runtime connection: a recipient that closes mid-publication never becomes eligible", async () => {
+	const runtime = createAppServerRuntime();
+	const requester = runtime.createConnection(() => {});
+	// This peer closes itself while its own approval frame is being written, so the enqueue resolves
+	// but the connection is gone by the time eligibility would be granted.
+	let closing: Promise<void> | undefined;
+	const peer = runtime.createConnection(() => {
+		closing ??= peer.close();
+	});
+	await initialize(requester);
+	await initialize(peer);
+	runtime.subscriptions.subscribe(requester.id, "thread-a");
+	runtime.subscriptions.subscribe(peer.id, "thread-a");
+
+	let requestId: string | undefined;
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		requestId = context?.requestClient?.("thread-a", "execCommandApproval", {
+			conversationId: "thread-a",
+			callId: "call-1",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		return { ok: true, result: { dataBase64: "" } };
+	});
+	await requester.process(enc('{"id":3,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+	await closing;
+	await Bun.sleep(5);
+
+	expect(requestId).toBeDefined();
+	// A departed connection must not be able to answer, even though its enqueue itself succeeded.
+	expect(runtime.broker.resolve(requestId!, peer.id, { decision: "approved" })).toBe(false);
+});

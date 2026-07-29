@@ -243,34 +243,22 @@ function fileChangesFor(
 			throw new PermissionAdapterError("missing_approval_field", "Patch permission fileChanges map is empty.");
 		return supplied as ApplyPatchApprovalParams["fileChanges"];
 	}
-	const path = input ? stringField(input, "path") : undefined;
-	if (toolName === "write" && path !== undefined && typeof input?.content === "string") {
-		// WriteTool creates OR overwrites and its schema is only `{path, content}`, so nothing at this
-		// seam reveals whether the file already exists. `add` would assert it does not, which we have
-		// not established. Report the full replacement as an update whose diff is the new content:
-		// that is true for both a create and an overwrite.
-		return {
-			[path]: { type: "update", unified_diff: input.content, move_path: null },
-		} as ApplyPatchApprovalParams["fileChanges"];
-	}
-	if (toolName === "delete" && path !== undefined) {
-		// A delete event carries only a path. `content` is required by the pinned union, and we do not
-		// know the file's contents here, so pass through a caller-supplied body and otherwise state
-		// the empty string rather than inventing one.
-		const content = typeof input?.content === "string" ? input.content : "";
-		return { [path]: { type: "delete", content } } as ApplyPatchApprovalParams["fileChanges"];
-	}
+	// A move is the one raw form that IS fully described by its arguments: both endpoints are
+	// present, so the pinned `update` with `move_path` is faithful.
 	const oldPath = input ? stringField(input, "oldPath") : undefined;
 	const newPath = input ? stringField(input, "newPath") : undefined;
 	if (toolName === "move" && oldPath !== undefined && newPath !== undefined)
 		return {
 			[oldPath]: { type: "update", unified_diff: "", move_path: newPath },
 		} as ApplyPatchApprovalParams["fileChanges"];
-	// `edit`/`apply_patch` arguments are mode-dependent and carry no unified diff at this seam, so
-	// a faithful FileChange cannot be derived. Refuse rather than invent one.
+	// Everything else fails closed. A `write` supplies a raw file body, not a unified diff, and a
+	// `delete` supplies only a path with no preimage; labelling those as `update.unified_diff` or
+	// `delete.content: ""` would show an approving human fabricated evidence about a destructive
+	// change. `edit`/`apply_patch` arguments are likewise mode-dependent with no diff at this seam.
+	// The honest fix is upstream: supply a pinned `fileChanges` map or a genuine diff.
 	throw new PermissionAdapterError(
 		"missing_approval_field",
-		`Patch permission for ${toolName} did not supply a representable file change.`,
+		`Patch permission for ${toolName} did not supply a faithful file change; a pinned fileChanges map is required.`,
 	);
 }
 

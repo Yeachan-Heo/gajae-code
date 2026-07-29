@@ -56,6 +56,7 @@ class Runtime implements AppServerRuntime {
 	readonly subscriptions = new ThreadSubscriptionIndex();
 	readonly broker = new ServerRequestBroker();
 	readonly #connections = new Map<string, Connection>();
+	readonly #unpublished = new Map<string, Set<() => void>>();
 	readonly #connectionRegistry = new ConnectionRegistry();
 	readonly #frameCodec: FrameCodecOptions | undefined;
 	readonly #threadStartAdapter: ChildBridgeOptions | undefined;
@@ -137,6 +138,22 @@ class Runtime implements AppServerRuntime {
 		this.#connectionRegistry.unregister(id);
 		this.subscriptions.handleDisconnect(id);
 		this.broker.handleDisconnect(id);
+		// An unpublished request has an EMPTY eligible set, so handleDisconnect above cannot reach it.
+		// Its finalizer settles it rather than leaving it pending until timeout.
+		const finalizers = this.#unpublished.get(id);
+		this.#unpublished.delete(id);
+		if (finalizers) for (const finalize of finalizers) finalize();
+	}
+
+	/** Cancellation finalizers for requests whose deferred publication has not run yet. */
+	#registerUnpublished(connectionId: string, finalize: () => void): () => void {
+		const existing = this.#unpublished.get(connectionId) ?? new Set<() => void>();
+		existing.add(finalize);
+		this.#unpublished.set(connectionId, existing);
+		return () => {
+			existing.delete(finalize);
+			if (existing.size === 0) this.#unpublished.delete(connectionId);
+		};
 	}
 
 	contextFor(connection: Connection, deferred: Array<() => Promise<void>>): InboundContext {
@@ -229,12 +246,27 @@ class Runtime implements AppServerRuntime {
 				void request.settled.then(() => {
 					this.manager.adjustPendingApprovals(threadId, -1);
 				});
+				// The publisher may never run at all (the originating connection closes before the
+				// deferred queue drains), so a finalizer guarantees the request is settled either way.
+				let published = false;
+				const finalizeUnpublished = (): void => {
+					if (published) return;
+					published = true;
+					this.broker.cancel(id, "request publication was abandoned");
+				};
+				const unregister = this.#registerUnpublished(connection.id, finalizeUnpublished);
 				deferred.push(async () => {
+					unregister();
+					if (published) return;
+					published = true;
 					for (const connectionId of recipients) {
 						const target = active() ? this.#connections.get(connectionId) : undefined;
 						try {
 							if (!target) throw new Error("connection is gone");
 							await target.enqueueMessage({ id, method, params });
+							// A recipient that disconnects after this point is pruned by
+							// `removeConnection` -> `broker.handleDisconnect`, so no post-await recheck is
+							// needed here; adding one would be untestable dead code.
 							request.eligibleConnections.add(connectionId);
 						} catch (error) {
 							logger.warn("Dropping unreachable app-server server-request recipient", {
