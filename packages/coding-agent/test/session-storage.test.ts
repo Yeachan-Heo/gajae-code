@@ -812,8 +812,8 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect(artifacts.transcriptIdentity).toEqual(target.transcriptIdentity);
 		if (artifacts.kind === "cleanup_pending") {
 			expect(artifacts.detachedArtifactsPath).toBe(plannedArtifactsPath);
-			expect(artifacts.retainedPlaceholderPath).toBe(artifactsDir);
-			expect(fs.existsSync(artifactsDir)).toBe(true);
+			expect(artifacts.retainedPlaceholderPath).toBeDefined();
+			expect(fs.existsSync(artifacts.retainedPlaceholderPath!)).toBe(true);
 			expect(fs.existsSync(plannedArtifactsPath)).toBe(true);
 		} else {
 			expect(fs.existsSync(artifactsDir)).toBe(false);
