@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { type Agent, type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
@@ -901,7 +902,13 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribe(event => {
-				void this.#handleGoalSessionEvent(event);
+				// This subscriber is dispatched with `void`, so an unhandled rejection
+				// here reaches the process-level fatal handler and — under `--tmux`,
+				// where the agent IS the pane command — kills the pane. Contain it here:
+				// this is the single containment owner for goal-session-event failures.
+				void this.#handleGoalSessionEvent(event).catch(error => {
+					this.#handleGoalSessionEventFailure(error);
+				});
 			}),
 		);
 		// Set up theme file watcher
@@ -979,7 +986,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
-		if (this.session.getGoalModeState()?.mode === "exiting") {
+		// First statement: a blocked session must not re-enter the goal-exit path
+		// (`beforeGetUserInput` calls `exit()` again while the goal stays "exiting",
+		// and every retry appends another resident-only entry before the latch
+		// rethrows) and must not schedule a continuation. The promise is still
+		// created and returned, so the composer stays live for inspection and exit.
+		const blocked = this.isPersistenceBlocked;
+		if (!blocked && this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#goalModeController.beforeGetUserInput();
 		}
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
@@ -987,7 +1000,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.onInputCallback = undefined;
 			resolve(input);
 		};
-		this.#goalModeController.scheduleContinuation();
+		if (!blocked) this.#goalModeController.scheduleContinuation();
 		return promise;
 	}
 
@@ -1032,6 +1045,16 @@ export class InteractiveMode implements InteractiveModeContext {
 			cancelled: false,
 			started: false,
 		};
+		// Refuse before `onUserSubmission()` and `addMessageToChat` so a blocked
+		// session neither advances goal-mode bookkeeping nor renders a user row for
+		// work that can never be persisted.
+		if (this.isPersistenceBlocked) {
+			submission.cancelled = true;
+			this.#pendingSubmittedInput = undefined;
+			this.updateEditorChrome();
+			this.ui.requestRender();
+			return submission;
+		}
 		this.#pendingSubmittedInput = submission;
 		if (!submission.customType) {
 			this.#goalModeController.onUserSubmission();
@@ -1129,10 +1152,36 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#getComposerPlaceholder(): string {
+		// The quarantine notice must be persistent chrome, not a scrolling status
+		// line: it states that later entries are not saved, so it has to stay
+		// visible for as long as the session is blocked.
+		const blocked = this.getPersistenceBlockedNotice();
+		if (blocked) return blocked;
 		return getComposerPlaceholder(this.keybindings, this.#keyDisplayContext, {
 			busy: this.#isPromptDeliveryBusy(),
 			busyPromptMode: this.settings.get("busyPromptMode"),
 		});
+	}
+
+	/** True once session persistence has failed; the session is read-only until restart. */
+	get isPersistenceBlocked(): boolean {
+		return this.sessionManager.getPersistFailure() !== undefined;
+	}
+
+	/**
+	 * Persistent composer notice for the persistence-blocked quarantine. Names the
+	 * transcript, the errno, that later entries are NOT saved, and the recovery
+	 * action, so a blocked session can never be mistaken for a healthy one.
+	 */
+	getPersistenceBlockedNotice(): string | undefined {
+		const failure = this.sessionManager.getPersistFailure();
+		if (!failure) return undefined;
+		// Composer chrome is a public surface: show the bounded sanitized detail and
+		// the transcript's basename only. The full cause and absolute path stay in
+		// the protected log written once by `#recordPersistError`.
+		const file = failure.sessionFile ?? this.sessionManager.getSessionFile();
+		const name = file ? path.basename(file) : "(unknown session file)";
+		return `Session persistence failed (${failure.publicDetail}) — later entries are not saved. Transcript up to the failure is intact at ${name}. Free space, then restart gjc to resume recording.`;
 	}
 
 	#getWelcomeReservedRows(width: number): number {
@@ -1370,6 +1419,28 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#goalModeController.handleSessionEvent(event);
 	}
 
+	/**
+	 * Single containment point for a failed goal-session event. A persistence
+	 * failure enters the read-only quarantine and renders the persistent notice; any
+	 * other error is an unexpected controller failure and must NOT be mislabeled as
+	 * a persistence problem.
+	 */
+	#handleGoalSessionEventFailure(error: unknown): void {
+		const failure = this.sessionManager.getPersistFailure();
+		if (failure) {
+			logger.error("Session persistence failed while handling a goal session event", {
+				error: String(error),
+				sessionFile: failure.sessionFile,
+			});
+			// Persistent chrome, not a scrolling status line.
+			this.updateEditorChrome();
+			this.ui.requestRender();
+			return;
+		}
+		logger.error("Goal session event handler failed", { error: String(error) });
+		this.showWarning(`Goal mode update failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
 	/** Restore mode state from session entries on resume. */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
@@ -1437,17 +1508,33 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (hadActiveBtw) this.pendingImages = [];
 		this.#btwController.dispose();
 
-		// Flush pending session writes before shutdown.
-		await this.sessionManager.flush();
+		// Flush pending session writes before shutdown. Both callers dispatch
+		// shutdown fire-and-forget (`void this.ctx.shutdown()` from Ctrl-D and the
+		// second Ctrl-C), so a latched writer error rethrown here would escape as an
+		// unhandled rejection and kill the process on the way out — exactly the
+		// crash this quarantine exists to prevent. The failure is already latched,
+		// surfaced in the composer, and logged once by `#recordPersistError`.
+		try {
+			await this.sessionManager.flush();
+		} catch (err) {
+			logger.warn("Session flush failed during shutdown", { error: String(err) });
+		}
 		try {
 			await this.sessionManager.saveDraft(draftText);
 		} catch (err) {
 			logger.warn("Failed to save session draft", { error: String(err) });
 		}
 
-		// Emit shutdown event to hooks
+		// Emit shutdown event to hooks. `dispose()` drains subscribers, and a final
+		// goal-mode event can re-enter `GoalModeController.exit()` — which appends and
+		// therefore rethrows a latched persistence failure. Shutdown is dispatched
+		// fire-and-forget from Ctrl-D / the second Ctrl-C, so that must not escape.
 		this.session.setSdkPlanModeHandler(null);
-		await this.session.dispose();
+		try {
+			await this.session.dispose();
+		} catch (err) {
+			logger.warn("Session dispose failed during shutdown", { error: String(err) });
+		}
 
 		if (this.isInitialized) {
 			this.ui.requestRender(true);

@@ -4721,6 +4721,18 @@ type ManagedDestinationTransition = {
 	dispose(): void;
 };
 
+/**
+ * Bounded, sanitized description of a persistence failure for user-visible and
+ * API-facing surfaces. Emits the errno token when the platform supplied one and
+ * a generic label otherwise, so raw writer messages (which can embed absolute
+ * paths, syscall arguments, or provider text) never leave protected diagnostics.
+ */
+function publicPersistFailureDetail(error: Error): string {
+	const code = (error as NodeJS.ErrnoException).code;
+	if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(code)) return code;
+	return "write_failed";
+}
+
 export class SessionManager {
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
@@ -7697,6 +7709,28 @@ export class SessionManager {
 
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
+	}
+
+	/**
+	 * Read-only projection of the latched persistence failure. Set once by
+	 * `#recordPersistError` and cleared only by the existing identity-reset
+	 * sites; this accessor adds no control flow and never clears the latch.
+	 *
+	 * `publicCode` and `publicDetail` are the only fields safe to put on a
+	 * user-visible or API-facing surface: the code is a closed token and the
+	 * detail is a bounded errno-shaped string. The raw `error` and the absolute
+	 * `sessionFile` stay for protected diagnostics (logs) only.
+	 */
+	getPersistFailure():
+		| { error: Error; sessionFile: string | undefined; publicCode: string; publicDetail: string }
+		| undefined {
+		if (!this.#persistError) return undefined;
+		return {
+			error: this.#persistError,
+			sessionFile: this.#sessionFile,
+			publicCode: "session_persistence_failed",
+			publicDetail: publicPersistFailureDetail(this.#persistError),
+		};
 	}
 
 	acquireMemoryGuardParticipantIngressLease(): MemoryGuardParticipantIngressLease {

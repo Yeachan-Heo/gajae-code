@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -10,8 +11,39 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	FileSessionStorage,
+	type SessionStorageWriter,
+	type SessionStorageWriterOpenOptions,
+} from "@gajae-code/coding-agent/session/session-storage";
 import { createTools, type Tool, type ToolSession } from "@gajae-code/coding-agent/tools";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
+
+class AppendFailureStorage extends FileSessionStorage {
+	syncWrites = 0;
+	failFromOrdinal = Infinity;
+
+	override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+		const writer = super.openWriter(filePath, options);
+		return {
+			writeLine: line => writer.writeLine(line),
+			writeLineSync: line => {
+				this.syncWrites++;
+				if (this.syncWrites >= this.failFromOrdinal) {
+					throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+				}
+				writer.writeLineSync(line);
+			},
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: () => writer.close(),
+			closeSync: () => writer.closeSync(),
+			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
+}
 
 function createToolSession(cwd: string, settings: Settings, overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -28,13 +60,16 @@ type GoalHarness = {
 	tempDir: TempDir;
 	authStorage: AuthStorage;
 	settings: Settings;
+	storage: AppendFailureStorage;
 	session: AgentSession;
 	mode: InteractiveMode;
 	toolSession: ToolSession;
 	cleanup: () => Promise<void>;
 };
 
-async function createGoalHarness(options: { extensionRunner?: ExtensionRunner } = {}): Promise<GoalHarness> {
+async function createGoalHarness(
+	options: { extensionRunner?: ExtensionRunner; storage?: AppendFailureStorage } = {},
+): Promise<GoalHarness> {
 	resetSettingsForTest();
 	const tempDir = TempDir.createSync("@pi-goal-mode-");
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
@@ -54,6 +89,7 @@ async function createGoalHarness(options: { extensionRunner?: ExtensionRunner } 
 	const initialTools = await createTools(bootstrapToolSession, ["read"]);
 	const toolRegistry = new Map<string, Tool>(initialTools.map(tool => [tool.name, tool] as const));
 
+	const storage = options.storage ?? new AppendFailureStorage();
 	const session = new AgentSession({
 		agent: new Agent({
 			initialState: {
@@ -63,7 +99,7 @@ async function createGoalHarness(options: { extensionRunner?: ExtensionRunner } 
 				messages: [],
 			},
 		}),
-		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+		sessionManager: SessionManager.create(tempDir.path(), tempDir.path(), storage),
 		settings,
 		modelRegistry,
 		toolRegistry,
@@ -81,6 +117,7 @@ async function createGoalHarness(options: { extensionRunner?: ExtensionRunner } 
 		tempDir,
 		authStorage,
 		settings,
+		storage,
 		session,
 		mode,
 		toolSession,
@@ -98,20 +135,69 @@ async function toolNamesFor(harness: GoalHarness): Promise<string[]> {
 	return (await createTools(harness.toolSession, harness.session.getActiveToolNames())).map(tool => tool.name);
 }
 
+async function prepareExitingGoal(harness: GoalHarness): Promise<number> {
+	await harness.mode.init();
+	harness.mode.ui.stop();
+	await harness.session.sessionManager.ensureOnDisk();
+	harness.session.sessionManager.appendCustomEntry("test-hot-path", { marker: "hot writer" });
+	await harness.mode.goalModeController.handleCommand("Ship the release");
+	await new GoalTool(harness.toolSession).execute("complete-goal", { op: "complete" });
+	expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
+	expect(harness.storage.syncWrites).toBeGreaterThan(0);
+	expect(harness.session.sessionManager.isManagedDestination()).toBe(false);
+	return harness.storage.syncWrites;
+}
+
+let containmentLogs: string[] = [];
+
+async function triggerPersistenceFailure(harness: GoalHarness): Promise<number> {
+	const base = await prepareExitingGoal(harness);
+	// Capture (not merely mute) the containment log so a bare `.catch(() => {})`
+	// that swallows the failure silently can be distinguished from real handling.
+	containmentLogs = [];
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation((message: unknown) => {
+		containmentLogs.push(String(message));
+	});
+	harness.storage.failFromOrdinal = base + 1;
+	harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [] } as never);
+	for (let index = 0; index < 20; index++) await Promise.resolve();
+	// The `unhandledRejection` hook fires on a macrotask, so a microtask-only drain
+	// would let an escaped rejection slip past the collector assertion.
+	await new Promise(resolve => setTimeout(resolve, 0));
+	errorSpy.mockRestore();
+	return base;
+}
+
 describe("InteractiveMode goal mode integration", () => {
 	let harness: GoalHarness;
+	let unhandledRejections: unknown[];
+	const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
 
 	beforeAll(() => {
 		initTheme();
 	});
 
 	beforeEach(async () => {
+		unhandledRejections = [];
+		process.on("unhandledRejection", onUnhandledRejection);
 		harness = await createGoalHarness();
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		await harness.cleanup();
+		// Assert the TEST BODY produced no unhandled rejection. Teardown is scored
+		// separately: once `#persistError` is latched, `dispose()` -> `flush()`
+		// legitimately rethrows it (fail-closed durability), and that expected
+		// teardown rejection must not be confused with an escaped runtime rejection.
+		const bodyRejections = [...unhandledRejections];
+		harness.storage.failFromOrdinal = Infinity;
+		try {
+			await harness.cleanup();
+		} catch (error) {
+			if (!String(error).includes("ENOSPC")) throw error;
+		}
+		process.off("unhandledRejection", onUnhandledRejection);
+		expect(bodyRejections).toEqual([]);
 	});
 
 	it("keeps the unified goal tool exposed across inactive, active, and paused states", async () => {
@@ -471,6 +557,225 @@ describe("InteractiveMode goal mode integration", () => {
 			expect(afterCompactionCalls.length).toBeGreaterThan(0);
 		} finally {
 			vi.useRealTimers();
+		}
+	});
+	it("AC1 contains a real synchronous persistence failure from the live goal-event subscriber", async () => {
+		const exitCode = process.exitCode;
+		const exit = vi.spyOn(process, "exit");
+		await triggerPersistenceFailure(harness);
+
+		expect(unhandledRejections).toEqual([]);
+		expect(process.exitCode).toBe(exitCode);
+		expect(exit).not.toHaveBeenCalled();
+		expect(harness.session.sessionManager.getPersistFailure()).toBeDefined();
+	});
+
+	it("AC2 renders the persistent, latch-backed persistence notice", async () => {
+		await triggerPersistenceFailure(harness);
+		const sessionManager = harness.session.sessionManager;
+		expect(sessionManager.getPersistFailure()?.error.message).toContain("ENOSPC");
+		expect(harness.mode.isPersistenceBlocked).toBe(true);
+		// Rejects the named `.catch(() => {})` counterfactual: containment must
+		// ACT on the failure (log + render) before any manual chrome refresh, not
+		// merely swallow the rejection and leave the latch to be noticed later.
+		expect(containmentLogs).toContain("Session persistence failed while handling a goal session event");
+		expect(harness.mode.editor.render(1000).join("\n").toLowerCase()).toContain("not saved");
+
+		harness.mode.ui.requestRender();
+		harness.mode.showStatus("unrelated");
+		expect(harness.mode.isPersistenceBlocked).toBe(true);
+		harness.mode.updateEditorChrome();
+		const renderedComposer = harness.mode.editor.render(1000).join("\n").toLowerCase();
+		expect(renderedComposer).toContain("persistence");
+		expect(renderedComposer).toContain("not saved");
+		// Public chrome carries the transcript BASENAME and the sanitized errno token
+		// only: the absolute path and the raw writer message stay in the protected log.
+		expect(renderedComposer).toContain(path.basename(sessionManager.getSessionFile()!).toLowerCase());
+		expect(renderedComposer).not.toContain(path.dirname(sessionManager.getSessionFile()!).toLowerCase());
+		expect(renderedComposer).toContain("enospc");
+		expect(renderedComposer).not.toContain("no space left on device");
+		expect(renderedComposer).toContain("free space");
+		expect(renderedComposer).not.toContain("ship the release");
+	});
+
+	it("AC3 rejects new work while keeping blocked input cycles inert and inspectable", async () => {
+		await triggerPersistenceFailure(harness);
+		const sessionManager = harness.session.sessionManager;
+		const entriesBefore = sessionManager.getEntries().length;
+		const chatRowsBefore = harness.mode.chatContainer.children.length;
+		const rejectedSubmission = harness.mode.startPendingSubmission({ text: "next turn" });
+		expect(rejectedSubmission.cancelled).toBe(true);
+		expect(harness.mode.chatContainer.children.length).toBe(chatRowsBefore);
+		expect(sessionManager.getEntries()).toHaveLength(entriesBefore);
+
+		const beforeGetUserInput = vi.spyOn(harness.mode.goalModeController, "beforeGetUserInput");
+		const scheduleContinuation = vi.spyOn(harness.mode.goalModeController, "scheduleContinuation");
+		const writesBefore = harness.storage.syncWrites;
+		const pendingInputs = [];
+		for (let index = 0; index < 3; index++) {
+			expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
+			pendingInputs.push(harness.mode.getUserInput());
+			await Promise.resolve();
+		}
+		expect(beforeGetUserInput).not.toHaveBeenCalled();
+		expect(scheduleContinuation).not.toHaveBeenCalled();
+		expect(sessionManager.getEntries()).toHaveLength(entriesBefore);
+		expect(harness.storage.syncWrites).toBe(writesBefore);
+		expect(unhandledRejections).toEqual([]);
+		for (const input of pendingInputs) {
+			expect(input).toBeInstanceOf(Promise);
+			expect(await Promise.race([input.then(() => false), Promise.resolve(true)])).toBe(true);
+		}
+		await expect(harness.session.prompt("blocked provider turn")).rejects.toMatchObject({
+			code: "persistence_blocked",
+		});
+	});
+
+	it("AC2b contains the latched failure on the shutdown teardown path", async () => {
+		await triggerPersistenceFailure(harness);
+		const sessionManager = harness.session.sessionManager;
+		expect(sessionManager.getPersistFailure()).toBeDefined();
+		// Ctrl-D and the second Ctrl-C both dispatch `void ctx.shutdown()`, so every
+		// awaited teardown step that can rethrow the latch must be contained or the
+		// rejection kills the process on the way out. Drive the two steps shutdown
+		// awaits (flush, then dispose's subscriber drain) with the fixture re-armed.
+		harness.storage.failFromOrdinal = harness.storage.syncWrites + 1;
+		await expect(sessionManager.flush()).rejects.toThrow("ENOSPC");
+		await expect(harness.session.dispose()).rejects.toThrow("ENOSPC");
+		await new Promise(resolve => setTimeout(resolve, 0));
+		// Both are awaited inside try/catch in `shutdown()`, so neither escapes.
+		expect(unhandledRejections).toEqual([]);
+		const shutdownSource = await Bun.file(
+			path.join(import.meta.dir, "..", "..", "src", "modes", "interactive-mode.ts"),
+		).text();
+		const shutdownBody = shutdownSource.slice(shutdownSource.indexOf("async shutdown()"));
+		expect(shutdownBody.slice(0, shutdownBody.indexOf("await this.sessionManager.flush()"))).toContain("try {");
+		expect(shutdownBody.slice(0, shutdownBody.indexOf("await this.session.dispose()"))).toContain("try {");
+	});
+
+	it("AC4c repairs a stale durable goal mode entry for an already-finished goal", async () => {
+		await harness.mode.init();
+		harness.mode.ui.stop();
+		// Reproduce the real post-crash disk state: the durable mode entry still says
+		// `goal` because the terminal `mode_change("none")` append failed, while the
+		// goal itself already recorded `complete`.
+		const finishedGoal = {
+			id: "g-finished",
+			objective: "already finished",
+			status: "complete" as const,
+			createdAt: new Date().toISOString(),
+		};
+		await harness.session.sessionManager.ensureOnDisk();
+		harness.session.sessionManager.appendModeChange("goal", { goal: finishedGoal });
+		expect(harness.session.sessionManager.buildSessionContext().mode).toBe("goal");
+		const restored = await harness.mode.goalModeController.restoreFromSession({
+			mode: "goal",
+			modeData: { goal: finishedGoal },
+		} as never);
+		expect(restored).toBe(true);
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.mode.goalModeController.enabled).toBe(false);
+		// Regression pin on existing behavior: the `goal_updated` emitted by
+		// `onThreadResumed` must repair the stale entry, so a crash that lost the
+		// terminal `mode_change("none")` cannot resurrect finished work on resume.
+		const modeChanges = harness.session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "mode_change")
+			.map(entry => (entry as { mode: string }).mode);
+		expect(modeChanges.at(-1)).toBe("none");
+		// And the repair must be durable: the next resume reads the transcript, so a
+		// stale `goal` entry left on disk resurrects the finished goal again.
+		expect(harness.session.sessionManager.buildSessionContext().mode).toBe("none");
+	});
+
+	it("AC3d refuses every turn entrant that bypasses prompt admission while blocked", async () => {
+		await triggerPersistenceFailure(harness);
+		const sessionManager = harness.session.sessionManager;
+		const entriesBefore = sessionManager.getEntries().length;
+		const writesBefore = harness.storage.syncWrites;
+
+		// steer / followUp / sendUserMessage reach the agent through
+		// #queueSteer / #queueFollowUp, NOT through #withSessionAdmission, so they
+		// need the shared fence. Each must refuse with the same discriminant.
+		await expect(harness.session.steer("steer while blocked")).rejects.toMatchObject({
+			code: "persistence_blocked",
+		});
+		await expect(harness.session.followUp("follow up while blocked")).rejects.toMatchObject({
+			code: "persistence_blocked",
+		});
+		await expect(harness.session.sendUserMessage("send while blocked")).rejects.toMatchObject({
+			code: "persistence_blocked",
+		});
+
+		// No entrant may append, and none may escape as an unhandled rejection.
+		expect(sessionManager.getEntries()).toHaveLength(entriesBefore);
+		expect(harness.storage.syncWrites).toBe(writesBefore);
+		expect(unhandledRejections).toEqual([]);
+	});
+
+	it("AC4 preserves the durable completion ordering across first and second append failures", async () => {
+		const firstBase = await prepareExitingGoal(harness);
+		const firstAppendCustom = vi.spyOn(harness.session.sessionManager, "appendCustomEntry");
+		const firstStatus = vi.spyOn(harness.mode, "showStatus");
+		const firstEntries = harness.session.sessionManager.getEntries().length;
+		harness.storage.failFromOrdinal = firstBase + 1;
+		await expect(harness.mode.goalModeController.exit({ reason: "completed" })).rejects.toThrow("ENOSPC");
+		expect(firstAppendCustom).not.toHaveBeenCalled();
+		expect(harness.storage.syncWrites).toBe(firstBase + 1);
+		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
+		expect(firstStatus.mock.calls.flat().join(" ").toLowerCase()).not.toContain("completed");
+		expect(harness.session.sessionManager.getEntries()).toHaveLength(firstEntries + 1);
+
+		// The latch is set, so cleanup's flush legitimately rethrows it (fail-closed).
+		harness.storage.failFromOrdinal = Infinity;
+		try {
+			await harness.cleanup();
+		} catch (error) {
+			if (!String(error).includes("ENOSPC")) throw error;
+		}
+		harness = await createGoalHarness();
+		const secondBase = await prepareExitingGoal(harness);
+		const secondStatus = vi.spyOn(harness.mode, "showStatus");
+		harness.storage.failFromOrdinal = secondBase + 2;
+		await expect(harness.mode.goalModeController.exit({ reason: "completed" })).rejects.toThrow("ENOSPC");
+		const modeChange = harness.session.sessionManager
+			.getEntries()
+			.find(entry => entry.type === "mode_change" && entry.mode === "none");
+		expect(modeChange).toBeDefined();
+		const sessionFile = harness.session.sessionManager.getSessionFile();
+		expect(fs.readFileSync(sessionFile!, "utf8")).toContain('"type":"mode_change"');
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.mode.isPersistenceBlocked).toBe(true);
+		expect(secondStatus.mock.calls.flat().join(" ").toLowerCase()).not.toContain("completed");
+	});
+
+	it("AC5 leaves controller failures visible, quarantines only persistence failures, and rethrows the latch", async () => {
+		await prepareExitingGoal(harness);
+		const unexpectedControllerFailure = vi.spyOn(logger, "error");
+		vi.spyOn(harness.session, "setActiveToolsByName").mockRejectedValue(new Error("programmer error"));
+		harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [] } as never);
+		for (let index = 0; index < 20; index++) await Promise.resolve();
+		expect(unexpectedControllerFailure).toHaveBeenCalledWith(
+			"Goal session event handler failed",
+			expect.objectContaining({ error: expect.stringContaining("programmer error") }),
+		);
+		expect(harness.mode.isPersistenceBlocked).toBe(false);
+		expect(harness.mode.getPersistenceBlockedNotice()).toBeUndefined();
+		harness.mode.updateEditorChrome();
+		expect(harness.mode.editor.render(1000).join("\n").toLowerCase()).not.toContain("persistence failed");
+
+		await harness.cleanup();
+		harness = await createGoalHarness();
+		const base = await prepareExitingGoal(harness);
+		harness.storage.failFromOrdinal = base + 1;
+		await expect(harness.mode.goalModeController.exit({ reason: "completed" })).rejects.toThrow("ENOSPC");
+		const failure = harness.session.sessionManager.getPersistFailure()?.error;
+		expect(failure).toBeDefined();
+		try {
+			harness.session.sessionManager.appendModeChange("goal");
+			expect.unreachable("appendModeChange should rethrow the latched persistence error");
+		} catch (error) {
+			expect(error).toBe(failure);
 		}
 	});
 });

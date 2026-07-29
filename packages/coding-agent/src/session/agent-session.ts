@@ -2112,6 +2112,19 @@ export class AgentSession {
 		});
 	}
 
+	/** Refuse a new turn while session persistence is latched-failed (read-only quarantine). */
+	#persistenceBlockedError(): AgentBusyError {
+		const failure = this.sessionManager.getPersistFailure();
+		// API-facing: carry only the bounded sanitized detail, never the raw writer
+		// message or the absolute transcript path.
+		return Object.assign(
+			new AgentBusyError(
+				`Cannot start a turn: session persistence failed and later entries would not be saved (${failure?.publicDetail ?? "write_failed"}).`,
+			),
+			{ code: "persistence_blocked" },
+		);
+	}
+
 	/**
 	 * Reject a turn start while a handoff transition owns the session. Handoff never
 	 * routes its own generation/injection through these turn-start chokepoints, and
@@ -2125,6 +2138,10 @@ export class AgentSession {
 				code: "busy",
 			});
 		}
+		// Same reasoning for a latched persistence failure: these entrants bypass
+		// prompt admission, and `#appendEntry` commits in memory before `_persist`
+		// throws, so accepting one would present unpersisted work as durable.
+		if (this.sessionManager.getPersistFailure()) throw this.#persistenceBlockedError();
 	}
 
 	/**
@@ -2178,6 +2195,14 @@ export class AgentSession {
 			});
 		}
 
+		// A latched persistence failure means nothing further can reach disk, and
+		// `#appendEntry` commits in memory before `_persist` throws — so accepting a
+		// turn here would present unpersisted work as durable. `selection` stays
+		// admissible so a read-only session can still be inspected.
+		if (kind === "prompt" && this.sessionManager.getPersistFailure()) {
+			throw this.#persistenceBlockedError();
+		}
+
 		const entry: SessionAdmissionEntry = {
 			kind,
 			ready: Promise.withResolvers<void>(),
@@ -2204,6 +2229,14 @@ export class AgentSession {
 			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
 				code: "busy",
 			});
+		}
+		// Re-check after activation: the latch can be set by a queued-behind turn.
+		if (kind === "prompt" && this.sessionManager.getPersistFailure()) {
+			entry.released = true;
+			entry.settled.resolve();
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+			throw this.#persistenceBlockedError();
 		}
 
 		const release = () => {
@@ -4226,7 +4259,14 @@ export class AgentSession {
 		skipCompactionCheck?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
-		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
+		onSkip?: (
+			reason:
+				| "generation_changed"
+				| "aborted_signal"
+				| "queue_drained"
+				| "handoff_in_progress"
+				| "persistence_blocked",
+		) => void;
 		allowDuringCancelAndSubmit?: boolean;
 		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
@@ -4236,7 +4276,14 @@ export class AgentSession {
 			? this.#reserveDeferredAgentEndForContinuation()
 			: undefined;
 		let terminalized = false;
-		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => {
+		const skip = (
+			reason:
+				| "generation_changed"
+				| "aborted_signal"
+				| "queue_drained"
+				| "handoff_in_progress"
+				| "persistence_blocked",
+		) => {
 			if (terminalized) return;
 			terminalized = true;
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -4271,6 +4318,14 @@ export class AgentSession {
 						}
 						if (options?.shouldContinue && !options.shouldContinue()) {
 							skip("queue_drained");
+							return false;
+						}
+						// A latched persistence failure means no further entry can reach disk,
+						// so a scheduled continuation must not start a turn either. This path
+						// calls `agent.continue()` directly instead of acquiring prompt
+						// admission, so it needs the same fence explicitly.
+						if (this.sessionManager.getPersistFailure()) {
+							skip("persistence_blocked");
 							return false;
 						}
 						return true;
