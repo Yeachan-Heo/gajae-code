@@ -3,6 +3,8 @@
 
 ### Fixed
 
+- Prevent `gjc ultragoal status` from reactivating a session that was explicitly cleared with `gjc state clear --force --mode ultragoal`; execution commands can still resume its durable ledger.
+
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 
 ### Added

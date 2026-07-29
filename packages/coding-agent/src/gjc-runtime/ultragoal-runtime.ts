@@ -53,7 +53,7 @@ import {
 	writeSessionActivityMarker,
 } from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
-import { reconcileWorkflowSkillState } from "./state-runtime";
+import { readWorkflowStateJson, reconcileWorkflowSkillState } from "./state-runtime";
 import {
 	appendJsonl,
 	persistedStateRevision,
@@ -4878,8 +4878,9 @@ const RECONCILE_COMMANDS = new Set([
  * follows `gjc state` (`GJC_SESSION_ID`). This is a derived repair: it never changes
  * the triggering command's status/stdout, but a failure is surfaced (stderr + a
  * `reconcile_failed` ledger audit event) rather than silently swallowed. `status` is
- * therefore a read PLUS a derived repair; it never mutates goals.json/ledger.jsonl
- * beyond that reconcile-failure audit event.
+ * therefore a read PLUS a derived repair unless the operator explicitly cleared the
+ * workflow state; it never mutates goals.json/ledger.jsonl beyond that
+ * reconcile-failure audit event.
  */
 async function reconcileUltragoalState(cwd: string): Promise<void> {
 	const sessionId = currentUltragoalSessionId(cwd);
@@ -4958,11 +4959,26 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 	}
 }
 
+async function isExplicitlyClearedUltragoalState(cwd: string): Promise<boolean> {
+	const sessionId = currentUltragoalSessionId(cwd);
+	const state = await readWorkflowStateJson(cwd, "ultragoal", sessionId);
+	const receipt = qualityGateObject(state.receipt);
+	return (
+		state.active === false &&
+		state.current_phase === "complete" &&
+		receipt?.skill === "ultragoal" &&
+		receipt.owner === "gjc-state-cli" &&
+		receipt.command === "gjc state ultragoal clear"
+	);
+}
+
 export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
 	const command = commandName(args);
 	const result = await dispatchUltragoalCommand(args, cwd);
 	const isHelp = args.some(isHelpArg) || args[0] === "help";
-	if (!isHelp && result.status === 0 && RECONCILE_COMMANDS.has(command)) {
+	const explicitClearBlocksStatusRepair =
+		!isHelp && command === "status" && result.status === 0 && (await isExplicitlyClearedUltragoalState(cwd));
+	if (!isHelp && result.status === 0 && RECONCILE_COMMANDS.has(command) && !explicitClearBlocksStatusRepair) {
 		await reconcileUltragoalState(cwd);
 	}
 	return result;

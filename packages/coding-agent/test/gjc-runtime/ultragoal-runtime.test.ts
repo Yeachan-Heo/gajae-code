@@ -10,7 +10,7 @@ import {
 	sessionStateDir,
 	sessionUltragoalDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { reconcileWorkflowSkillState, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
 	validateCompletionReceipt,
 	verifyUltragoalDurableCompletionState,
@@ -5169,6 +5169,56 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 			expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")).text()).toBe(
 				beforeLedger,
 			);
+		});
+	});
+
+	it("does not let status resurrect an explicitly cleared failed run", async () => {
+		const root = await tempDir();
+		await withSessionId(TEST_SESSION_ID, async () => {
+			await runNativeUltragoalCommand(["create-goals", "--brief", "Recover a stuck run"], root);
+			await runNativeUltragoalCommand(["complete-goals"], root);
+			await runNativeUltragoalCommand(
+				[
+					"checkpoint",
+					"--goal-id",
+					"G001",
+					"--status",
+					"failed",
+					"--evidence",
+					"goal tool rejected malformed model arguments",
+				],
+				root,
+			);
+
+			const clear = await runNativeStateCommand(
+				["clear", "--mode", "ultragoal", "--session-id", TEST_SESSION_ID, "--force", "--json"],
+				root,
+			);
+			expect(clear.status).toBe(0);
+			const justClearedMode = await readModeState(root);
+			expect(justClearedMode).toMatchObject({ active: false, current_phase: "complete" });
+			expect(justClearedMode.receipt).toMatchObject({
+				owner: "gjc-state-cli",
+				command: "gjc state ultragoal clear",
+			});
+
+			const status = await runNativeUltragoalCommand(["status"], root);
+			expect(status.status).toBe(0);
+			expect(status.stdout).toContain("status: failed");
+			const clearedMode = await readModeState(root);
+			expect(clearedMode).toMatchObject({ active: false, current_phase: "complete" });
+			expect(clearedMode.receipt).toMatchObject({
+				owner: "gjc-state-cli",
+				command: "gjc state ultragoal clear",
+			});
+			const clearedActive = await readVisibleSkillActiveState(root, TEST_SESSION_ID);
+			expect(clearedActive?.active_skills?.some(entry => entry.skill === "ultragoal")).not.toBe(true);
+
+			const retry = await runNativeUltragoalCommand(["complete-goals", "--retry-failed"], root);
+			expect(retry.status).toBe(0);
+			const resumedMode = await readModeState(root);
+			expect(resumedMode).toMatchObject({ active: true, current_phase: "active" });
+			expect(resumedMode.receipt).toMatchObject({ owner: "gjc-runtime", verb: "reconcile" });
 		});
 	});
 
