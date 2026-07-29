@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { ConnectionState } from "../../router/connection-state";
 import { type InboundContext, processInbound } from "../../server";
-import { type ServerRequest, ServerRequestBroker } from "../../server-requests/broker";
+import { ServerRequestBroker, type ServerRequestHandle } from "../../server-requests/broker";
 import { ThreadSubscriptionIndex } from "../../subscriptions";
 import { HandlerRegistry } from "../../suites/handlers";
 import {
@@ -37,7 +37,7 @@ class CountingBroker extends ServerRequestBroker {
 		params: unknown,
 		threadId: string,
 		eligibleConnections: Set<string>,
-	): ServerRequest | undefined {
+	): ServerRequestHandle | undefined {
 		this.creates++;
 		return super.create(id, method, params, threadId, eligibleConnections);
 	}
