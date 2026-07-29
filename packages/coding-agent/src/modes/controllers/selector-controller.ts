@@ -43,7 +43,13 @@ import {
 	setTheme,
 	theme,
 } from "../../modes/theme/theme";
-import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/types";
+import {
+	clearInteractiveActivityLoaders,
+	type InteractiveModeContext,
+	type OAuthSelectorOptions,
+	stopInteractiveActivityIndicator,
+	suspendInteractiveActivityIndicator,
+} from "../../modes/types";
 import { getNotificationConfig, isTelegramConfigured, maskToken } from "../../sdk/bus/config";
 import {
 	clearTelegramActivationMarker,
@@ -820,7 +826,9 @@ export class SelectorController {
 	 * @param create Factory that receives a `done` callback and returns the component and focus target
 	 */
 	showSelector(create: (done: () => void) => { component: Component; focus: Component }): void {
+		if (this.ctx.isStopped?.()) return;
 		const done = () => {
+			if (this.ctx.isStopped?.()) return;
 			// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer); fall back
 			// to a plain editor swap for contexts that predate it (e.g. lightweight test doubles).
 			if (typeof this.ctx.restoreComposer === "function") {
@@ -1565,7 +1573,8 @@ export class SelectorController {
 				this.ctx.rebuildChatFromMessages("reconcile-same-transcript");
 				break;
 			case "theme": {
-				setTheme(value as string, true).then(result => {
+				setTheme(value as string, true, { shouldApply: () => !this.ctx.isStopped?.() }).then(result => {
+					if (this.ctx.isStopped?.()) return;
 					this.ctx.statusLine.invalidate();
 					this.ctx.updateEditorTopBorder();
 					this.ctx.ui.invalidate();
@@ -2140,12 +2149,14 @@ export class SelectorController {
 
 					// Set up escape handler and loader if summarizing
 					let summaryLoader: Loader | undefined;
+					let releaseActivityIndicator: (() => void) | undefined;
 					const originalOnEscape = this.ctx.editor.onEscape;
 
 					if (wantsSummary) {
 						this.ctx.editor.onEscape = () => {
 							this.ctx.session.abortBranchSummary();
 						};
+						releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						summaryLoader = new Loader(
 							this.ctx.ui,
@@ -2163,6 +2174,7 @@ export class SelectorController {
 							summarize: wantsSummary,
 							customInstructions,
 						});
+						if (this.ctx.isStopped?.()) return;
 
 						if (result.aborted) {
 							// Summarization aborted - re-show tree selector
@@ -2178,18 +2190,21 @@ export class SelectorController {
 						// Update UI — pass the context built by navigateTree to skip a second O(N) walk.
 						this.ctx.rebuildInitialMessages("reconcile-same-transcript", result.sessionContext);
 						await this.ctx.reloadTodos();
+						if (this.ctx.isStopped?.()) return;
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
 							this.ctx.editor.setText(result.editorText);
 						}
 						this.ctx.showStatus("Navigated to selected point");
 					} catch (error) {
+						if (this.ctx.isStopped?.()) return;
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					} finally {
 						if (summaryLoader) {
 							summaryLoader.stop();
-							this.ctx.statusContainer.clear();
+							if (!this.ctx.isStopped?.()) this.ctx.statusContainer.clear();
 						}
-						this.ctx.editor.onEscape = originalOnEscape;
+						if (!this.ctx.isStopped?.()) this.ctx.editor.onEscape = originalOnEscape;
+						releaseActivityIndicator?.();
 					}
 				},
 				() => {
@@ -2208,6 +2223,7 @@ export class SelectorController {
 
 	async showSessionSelector(): Promise<void> {
 		const sessions = await this.ctx.sessionManager.listForResumePickerReadOnly();
+		if (this.ctx.isStopped?.()) return;
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
@@ -2242,12 +2258,9 @@ export class SelectorController {
 		});
 	}
 
-	#clearTransientSessionUi(): void {
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-		}
-		this.ctx.statusContainer.clear();
+	#clearTransientSessionUi(options?: { restoreBackground?: boolean; clearSpecializedLoaders?: boolean }): void {
+		if (options?.clearSpecializedLoaders) clearInteractiveActivityLoaders(this.ctx);
+		stopInteractiveActivityIndicator(this.ctx, options);
 		this.ctx.pendingMessagesContainer.clear();
 		this.ctx.compactionQueuedMessages = [];
 		this.ctx.streamingComponent = undefined;
@@ -2280,6 +2293,7 @@ export class SelectorController {
 		}
 
 		const detached = await this.ctx.session.newSession();
+		if (this.ctx.isStopped?.()) return false;
 		if (!detached) {
 			return false;
 		}
@@ -2287,13 +2301,14 @@ export class SelectorController {
 
 		this.#refreshSessionTerminalTitle();
 
-		this.#clearTransientSessionUi();
+		this.#clearTransientSessionUi({ clearSpecializedLoaders: true });
 		this.ctx.statusLine.invalidate();
 		this.ctx.statusLine.setSessionStartTime(Date.now());
 		this.ctx.updateEditorTopBorder();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.rebuildInitialMessages("replace-identity");
 		await this.ctx.reloadTodos();
+		if (this.ctx.isStopped?.()) return false;
 		this.ctx.ui.requestRender();
 		return true;
 	}
@@ -2314,6 +2329,7 @@ export class SelectorController {
 			return;
 		}
 		this.#resumeInFlight = true;
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		// Everything below runs inside the try so a synchronous failure (a throwing
 		// session-manager accessor, an unavailable status rail) can never strand the
 		// guard and silently disable every later resume.
@@ -2322,11 +2338,13 @@ export class SelectorController {
 			const previousSessionId = this.ctx.sessionManager.getSessionId();
 			progressLease = acquireResumeProgressLease(this.ctx);
 			await progressLease.committed;
+			if (this.ctx.isStopped?.()) return;
 			const migrationPolicy =
 				this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 			let writableSessionPath = sessionPath;
 			if (this.ctx.sessionManager.isManagedDestination()) {
 				const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
+				if (this.ctx.isStopped?.()) return;
 				if (inspection.kind === "error")
 					throw new Error(`Could not inspect selected session: ${inspection.reason}`);
 				writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
@@ -2334,14 +2352,21 @@ export class SelectorController {
 					migrationPolicy,
 					inspection.identity,
 				);
+				if (this.ctx.isStopped?.()) return;
 			}
 			// Switch session via AgentSession (emits hook and tool session events)
 			let switched: boolean;
+			let transitionMutationStarted = false;
 			try {
 				switched = await this.ctx.session.switchSession(writableSessionPath, {
 					transition: { origin: INTERACTIVE_SELECTOR_RESUME_ORIGIN },
+					onTransitionMutationStarted: () => {
+						transitionMutationStarted = true;
+					},
 				});
+				if (this.ctx.isStopped?.()) return;
 			} catch (error) {
+				if (this.ctx.isStopped?.()) return;
 				// `switchSession` opens with `#beginSessionTransition`, which throws
 				// `{ code: "busy" }` while another transition (compaction, handoff, fork,
 				// another switch, …) owns the session. Resume is a UI action dispatched
@@ -2362,7 +2387,7 @@ export class SelectorController {
 				// failure the caller needs to see.
 				try {
 					progressLease.clear();
-					this.#clearTransientSessionUi();
+					this.#clearTransientSessionUi({ restoreBackground: false, clearSpecializedLoaders: true });
 				} catch {
 					logger.warn("Resume transient-UI reconciliation failed after a session switch error", {
 						classification: "resume-cleanup-failed",
@@ -2374,15 +2399,17 @@ export class SelectorController {
 			// untouched on the paths that never acquired the session-transition lease:
 			// admission-busy above and managed-candidate preparation before it.
 			//
-			// Reaching this point means this call *did* acquire the lease, so no other
-			// transition's queued work is at risk. `switchSession` resolves `false` both for
-			// a pre-mutation `session_before_switch` cancellation and for a rollback that
-			// already aborted the previous run, and both cleared here before this change, so
-			// clear either way. Release the spinner first so the status-rail clear cannot
-			// orphan it.
+			// A pre-mutation hook cancellation preserves the current session and all of
+			// its foreground/retry UI. A rollback after disconnect/abort must clear it.
+			if (!switched) {
+				if (transitionMutationStarted) {
+					progressLease.clear();
+					this.#clearTransientSessionUi({ restoreBackground: false, clearSpecializedLoaders: true });
+				}
+				return;
+			}
 			progressLease.clear();
-			this.#clearTransientSessionUi();
-			if (!switched) return;
+			this.#clearTransientSessionUi({ restoreBackground: false, clearSpecializedLoaders: true });
 			const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
 			if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 			this.#refreshSessionTerminalTitle();
@@ -2392,11 +2419,13 @@ export class SelectorController {
 				switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript",
 			);
 			await this.ctx.reloadTodos();
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showStatus("Resumed session");
 			this.#maybePromptResumeModelChoice();
 		} finally {
 			progressLease?.clear();
 			this.#resumeInFlight = false;
+			releaseActivityIndicator();
 		}
 	}
 

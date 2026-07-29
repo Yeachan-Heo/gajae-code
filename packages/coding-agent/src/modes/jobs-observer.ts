@@ -178,7 +178,7 @@ export class JobsObserver {
 
 	/** Cancel a running monitor job. Returns true when the job was cancelled. */
 	cancelMonitor(id: string): boolean {
-		return this.#manager.cancel(id);
+		return this.#manager.cancel(id, this.#ownerId ? { ownerId: this.#ownerId } : undefined);
 	}
 
 	/** Delete a visible scheduled cron job. Returns true when removed. */

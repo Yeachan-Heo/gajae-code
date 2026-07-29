@@ -200,4 +200,14 @@ describe("theme auto-detection", () => {
 		expect(themeModule.getCurrentThemeName()).toBe("blue-crab");
 		expect(detectSpy).not.toHaveBeenCalled();
 	});
+
+	it("does not apply a theme after the owning UI stops", async () => {
+		using _globals = withThemeTestGlobals();
+		const previousTheme = themeModule.getCurrentThemeName();
+
+		const result = await themeModule.setTheme("blue-crab", false, { shouldApply: () => false });
+
+		expect(result).toEqual({ success: false, error: "Theme change cancelled" });
+		expect(themeModule.getCurrentThemeName()).toBe(previousTheme);
+	});
 });

@@ -63,6 +63,21 @@ describe("JobsObserver", () => {
 		await manager.dispose();
 	});
 
+	test("cancelMonitor rejects a foreign owner's monitor id", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+		const ownedId = registerMonitor(manager, "owned", OWNER);
+		const foreignId = registerMonitor(manager, "foreign", "other-owner");
+
+		expect(observer.cancelMonitor(foreignId)).toBe(false);
+		expect(manager.getJob(foreignId)?.status).toBe("running");
+		expect(observer.cancelMonitor(ownedId)).toBe(true);
+		expect(manager.getJob(ownedId)?.status).toBe("cancelled");
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
 	test("AC2/AC3 failure latches red until acknowledged; completed/failed not counted active", async () => {
 		const manager = makeManager();
 		const observer = new JobsObserver(manager, OWNER);

@@ -15,7 +15,12 @@ import { TodoReminderComponent } from "../../modes/components/todo-reminder";
 import { ToolExecutionComponent, type ToolExecutionHandle } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
-import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
+import {
+	type InteractiveModeContext,
+	stopInteractiveActivityIndicator,
+	syncInteractiveActivityIndicator,
+	type TodoPhase,
+} from "../../modes/types";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import { completionNotifyDisabledByEnv } from "../../sdk/bus/config";
 import { summaryFromMessage } from "../../sdk/bus/helpers";
@@ -166,6 +171,14 @@ export class EventController {
 			this.ctx.retryEscapeHandler = undefined;
 		}
 		this.ctx.retryEscapePrimed = false;
+		if (this.ctx.autoCompactionEscapeHandler) {
+			this.ctx.editor.onEscape = this.ctx.autoCompactionEscapeHandler;
+			this.ctx.autoCompactionEscapeHandler = undefined;
+		}
+		if (this.ctx.autoCompactionLoader) {
+			this.ctx.autoCompactionLoader.stop();
+			this.ctx.autoCompactionLoader = undefined;
+		}
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
@@ -266,7 +279,9 @@ export class EventController {
 	}
 
 	async #dispatchEvent(event: AgentSessionEvent): Promise<void> {
+		if (this.ctx.isStopped?.()) return;
 		if (!this.ctx.isInitialized) await this.ctx.init();
+		if (this.ctx.isStopped?.()) return;
 		this.#visibleTranscriptChanged = false;
 		this.#handlingEvent = true;
 		try {
@@ -274,6 +289,7 @@ export class EventController {
 			this.ctx.updateEditorTopBorder();
 			const run = this.#handlers[event.type] as (e: AgentSessionEvent) => Promise<void>;
 			await run(event);
+			if (this.ctx.isStopped?.()) return;
 			if (this.#visibleTranscriptChanged) this.ctx.recordVisibleTranscriptMutation?.();
 			if (this.ctx.isTranscriptViewerOpen?.()) this.ctx.refreshTranscriptViewer?.();
 		} finally {
@@ -878,23 +894,22 @@ export class EventController {
 				const planDetails = details.sourceResultDetails as PlanApprovalDetails | undefined;
 				if (planDetails) {
 					await this.ctx.planModeController.handleApproval(planDetails);
+					if (this.ctx.isStopped?.()) return;
 				}
 			}
 		}
 	}
 
 	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-			this.ctx.statusContainer.clear();
-		}
+		this.ctx.setWorkingMessage(undefined);
+		stopInteractiveActivityIndicator(this.ctx);
 		if (this.ctx.streamingComponent) {
 			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
 		}
 		await this.ctx.planModeController.flushPendingModelSwitch();
+		if (this.ctx.isStopped?.()) return;
 		for (const toolCallId of Array.from(this.ctx.pendingTools.keys())) {
 			if (!this.#backgroundToolCallIds.has(toolCallId)) {
 				this.ctx.pendingTools.delete(toolCallId);
@@ -922,11 +937,7 @@ export class EventController {
 		this.ctx.editor.onEscape = () => {
 			this.ctx.session.abortCompaction();
 		};
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-		}
-		this.ctx.statusContainer.clear();
+		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false });
 		const reasonText =
 			event.reason === "overflow" ? "Context overflow detected, " : event.reason === "idle" ? "Idle " : "";
 		const actionLabel = event.action === "handoff" ? "Auto-handoff" : "Auto context-full maintenance";
@@ -982,6 +993,7 @@ export class EventController {
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
 			await this.ctx.reloadTodos();
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showStatus("Auto-handoff completed");
 		} else if (event.skipped) {
 			// Benign skip: no model selected, no candidate models available, or nothing
@@ -995,6 +1007,8 @@ export class EventController {
 			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
 		}
 		await this.ctx.flushCompactionQueue({ willRetry: event.willRetry });
+		if (this.ctx.isStopped?.()) return;
+		syncInteractiveActivityIndicator(this.ctx);
 		this.ctx.ui.requestRender();
 	}
 
@@ -1024,11 +1038,7 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-		}
-		this.ctx.statusContainer.clear();
+		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false });
 		// Stop any prior retry loader/timer before installing a new one.
 		this.ctx.retryLoader?.stop();
 		this.#clearRetryCountdown();
@@ -1071,6 +1081,7 @@ export class EventController {
 		if (!event.success) {
 			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 		}
+		syncInteractiveActivityIndicator(this.ctx);
 		this.ctx.ui.requestRender();
 	}
 

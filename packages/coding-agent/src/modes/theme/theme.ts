@@ -1826,32 +1826,34 @@ export async function initTheme(
 export async function setTheme(
 	name: string,
 	enableWatcher: boolean = false,
+	options?: { shouldApply?: () => boolean },
 ): Promise<{ success: boolean; error?: string }> {
-	autoDetectedTheme = false;
-	previewThemeActive = false;
-	currentThemeName = name;
 	const requestId = ++themeLoadRequestId;
+	const shouldApply = options?.shouldApply ?? (() => true);
 	try {
 		const loadedTheme = await loadTheme(name, getCurrentThemeOptions());
 		if (requestId !== themeLoadRequestId) {
 			return { success: false, error: "Theme change superseded by a newer request" };
 		}
+		if (!shouldApply()) return { success: false, error: "Theme change cancelled" };
+		autoDetectedTheme = false;
+		previewThemeActive = false;
+		currentThemeName = name;
 		theme = loadedTheme;
 		if (enableWatcher) {
 			await startThemeWatcher();
 		}
-		if (onThemeChangeCallback) {
-			onThemeChangeCallback();
-		}
+		if (!shouldApply()) return { success: false, error: "Theme change cancelled" };
+		onThemeChangeCallback?.();
 		return { success: true };
 	} catch (error) {
 		if (requestId !== themeLoadRequestId) {
 			return { success: false, error: "Theme change superseded by a newer request" };
 		}
-		// Theme is invalid - fall back to red-claw theme
+		const fallbackTheme = await loadTheme("red-claw", getCurrentThemeOptions());
+		if (!shouldApply()) return { success: false, error: "Theme change cancelled" };
 		currentThemeName = "red-claw";
-		theme = await loadTheme("red-claw", getCurrentThemeOptions());
-		// Don't start watcher for fallback theme
+		theme = fallbackTheme;
 		return {
 			success: false,
 			error: error instanceof Error ? error.message : String(error),

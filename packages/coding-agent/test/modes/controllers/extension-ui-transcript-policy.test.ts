@@ -15,6 +15,9 @@ type Fixture = {
 	getActions: () => ExtensionActions;
 	getCommandActions: () => ExtensionCommandContextActions;
 	setNextSessionId: (id: string) => void;
+	getUiContext: () => ExtensionUIContext;
+	setStopped: (stopped: boolean) => void;
+	emitError: () => void;
 	rebuildInitialMessages: Mock<(policy: TranscriptRebuildPolicy) => void>;
 	rebuildChatFromMessages: Mock<(policy: TranscriptRebuildPolicy) => void>;
 	resetIrcSidebarSession: Mock<() => void>;
@@ -23,6 +26,9 @@ type Fixture = {
 function createFixture(initialSessionId = "session-a"): Fixture {
 	let actions: ExtensionActions | undefined;
 	let commandActions: ExtensionCommandContextActions | undefined;
+	let uiContext: ExtensionUIContext | undefined;
+	let stopped = false;
+	let errorListener: ((error: { extensionPath: string; error: string }) => void) | undefined;
 	let sessionId = initialSessionId;
 	let nextSessionId = initialSessionId;
 	const rebuildInitialMessages = vi.fn<(policy: TranscriptRebuildPolicy) => void>();
@@ -33,20 +39,28 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			capturedActions: ExtensionActions,
 			_contextActions: ExtensionContextActions,
 			capturedCommandActions?: ExtensionCommandContextActions,
-			_uiContext?: ExtensionUIContext,
+			capturedUiContext?: ExtensionUIContext,
 		): void {
 			actions = capturedActions;
 			commandActions = capturedCommandActions;
+			uiContext = capturedUiContext;
 		},
-		onError: vi.fn(),
+		onError: (listener: (error: { extensionPath: string; error: string }) => void) => {
+			errorListener = listener;
+			return () => {
+				errorListener = undefined;
+			};
+		},
 		emit: vi.fn(async () => undefined),
 	};
 	const ctx = {
 		isBackgrounded: false,
+		isStopped: () => stopped,
 		session: {
 			extensionRunner,
 			isStreaming: false,
 			sendCustomMessage: vi.fn(async () => undefined),
+			sendUserMessage: vi.fn(async () => undefined),
 			switchSession: vi.fn(async () => {
 				sessionId = nextSessionId;
 				return true;
@@ -88,6 +102,14 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			if (!commandActions) throw new Error("Extension command actions were not initialized");
 			return commandActions;
 		},
+		getUiContext: () => {
+			if (!uiContext) throw new Error("Extension UI context was not initialized");
+			return uiContext;
+		},
+		setStopped: value => {
+			stopped = value;
+		},
+		emitError: () => errorListener?.({ extensionPath: "/tmp/late.ts", error: "late failure" }),
 		setNextSessionId: id => {
 			nextSessionId = id;
 		},
@@ -159,5 +181,38 @@ describe("ExtensionUiController transcript rebuild policy", () => {
 		uiContext.setToolsExpanded(true);
 
 		expect(fixture.ctx.setToolsExpanded).toHaveBeenCalledWith(true);
+	});
+	it("makes captured extension UI callbacks inert after final stop", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+		const ui = fixture.getUiContext();
+		fixture.setStopped(true);
+
+		ui.setWorkingMessage("late");
+		ui.setEditorText("late");
+		ui.pasteToEditor("late");
+		ui.setToolsExpanded(true);
+		ui.setStatus("late", "value");
+		ui.setWidget("late", ["value"]);
+		ui.notify("late");
+		ui.onTerminalInput(() => {});
+		expect(() => fixture.getActions().sendUserMessage("late")).toThrow("Interactive mode stopped");
+		expect(() => fixture.getActions().appendEntry("late", {})).toThrow("Interactive mode stopped");
+		fixture.emitError();
+
+		expect(await ui.select("late", ["value"])).toBeUndefined();
+		expect(await ui.confirm("late", "value")).toBe(false);
+		expect(await ui.input("late")).toBeUndefined();
+		expect(await ui.editor("late")).toBeUndefined();
+		expect(await ui.custom(() => new Container())).toBeUndefined();
+		expect(await ui.setTheme("dark")).toEqual({ success: false, error: "Interactive mode stopped" });
+		expect(fixture.ctx.setWorkingMessage).not.toHaveBeenCalled();
+		expect(fixture.ctx.editor.setText).not.toHaveBeenCalled();
+		expect(fixture.ctx.editor.handleInput).not.toHaveBeenCalled();
+		expect(fixture.ctx.setToolsExpanded).not.toHaveBeenCalled();
+		expect(fixture.ctx.session.sendUserMessage).not.toHaveBeenCalled();
+		expect(fixture.ctx.ui.requestRender).not.toHaveBeenCalled();
+		fixture.controller.dispose();
+		fixture.emitError();
 	});
 });

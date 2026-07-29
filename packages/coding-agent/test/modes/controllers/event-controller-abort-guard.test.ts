@@ -18,6 +18,7 @@ import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-age
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import type { AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { TERMINAL } from "@gajae-code/tui";
 
 beforeAll(() => {
@@ -205,5 +206,55 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 
 		expect(terminalSpy).toHaveBeenCalledTimes(1);
 		expect(spawnSpy).toHaveBeenCalledTimes(0);
+	});
+});
+
+describe("stopped interactive lifecycle", () => {
+	it("does not reinitialize for an event queued before final stop", async () => {
+		let stopped = false;
+		const init = vi.fn(async () => {});
+		const ctx = {
+			isStopped: () => stopped,
+			isInitialized: false,
+			init,
+		} as unknown as InteractiveModeContext;
+		const controller = new EventController(ctx);
+		const dispatch = controller.handleEvent({ type: "agent_start" } as AgentSessionEvent);
+		stopped = true;
+		await dispatch;
+		expect(init).not.toHaveBeenCalled();
+	});
+
+	it("does not resume agent-end UI work after final stop", async () => {
+		let stopped = false;
+		const pendingSwitch = Promise.withResolvers<void>();
+		const flushPendingModelSwitch = vi.fn(() => pendingSwitch.promise);
+		const updateEditorBorderColor = vi.fn();
+		const requestRender = vi.fn();
+		const onAgentEnd = vi.fn();
+		const ctx = {
+			isStopped: () => stopped,
+			isInitialized: true,
+			statusLine: { invalidate: vi.fn() },
+			updateEditorTopBorder: vi.fn(),
+			setWorkingMessage: vi.fn(),
+			stopLoadingAnimation: vi.fn(),
+			streamingComponent: undefined,
+			pendingTools: new Map(),
+			planModeController: { flushPendingModelSwitch },
+			updateEditorBorderColor,
+			ui: { requestRender },
+			promptSuggestion: { onAgentEnd },
+		} as unknown as InteractiveModeContext;
+		const controller = new EventController(ctx);
+		const dispatch = controller.handleEvent({ type: "agent_end", messages: [] } as AgentSessionEvent);
+		for (let tick = 0; tick < 5 && flushPendingModelSwitch.mock.calls.length === 0; tick++) await Promise.resolve();
+		expect(flushPendingModelSwitch).toHaveBeenCalledTimes(1);
+		stopped = true;
+		pendingSwitch.resolve();
+		await dispatch;
+		expect(updateEditorBorderColor).not.toHaveBeenCalled();
+		expect(requestRender).not.toHaveBeenCalled();
+		expect(onAgentEnd).not.toHaveBeenCalled();
 	});
 });

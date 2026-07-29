@@ -525,9 +525,9 @@ export class AsyncJobManager {
 
 				if (job.status === "cancelled") {
 					job.resultText = outcome.kind === "paused" ? outcome.note : outcome.text;
+					this.#markRecordTerminal(id, "cancelled");
 					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
-					this.#markRecordTerminal(id, "cancelled");
 					this.#drainResumeQueue();
 					return;
 				}
@@ -539,6 +539,7 @@ export class AsyncJobManager {
 					this.#freezeEndTime(job);
 					if (outcome.note) job.resultText = outcome.note;
 					this.#markRecordPaused(id);
+					this.#notifyChange();
 					this.#drainResumeQueue();
 					return;
 				}
@@ -547,10 +548,10 @@ export class AsyncJobManager {
 					job.setupFailureSummary = outcome.setupFailureSummary;
 					this.#freezeEndTime(job);
 					job.errorText = outcome.text;
+					this.#markRecordTerminal(id, "failed");
 					this.#enqueueDelivery(id, outcome.text);
 					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
-					this.#markRecordTerminal(id, "failed");
 					this.#drainResumeQueue();
 					return;
 				}
@@ -558,28 +559,28 @@ export class AsyncJobManager {
 				job.status = "completed";
 				this.#freezeEndTime(job);
 				job.resultText = outcome.text;
+				this.#markRecordTerminal(id, "completed");
 				this.#enqueueDelivery(id, outcome.text);
 				this.#runLifecycle(id, "terminal", job);
 				this.#scheduleEviction(id);
-				this.#markRecordTerminal(id, "completed");
 				this.#drainResumeQueue();
 			} catch (error) {
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
+					this.#markRecordTerminal(id, "cancelled");
 					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
-					this.#markRecordTerminal(id, "cancelled");
 					this.#drainResumeQueue();
 					return;
 				}
-				this.#runLifecycle(id, "terminal", job);
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
 				this.#freezeEndTime(job);
 				job.errorText = errorText;
-				this.#enqueueDelivery(id, errorText);
-				this.#scheduleEviction(id);
 				this.#markRecordTerminal(id, "failed");
+				this.#enqueueDelivery(id, errorText);
+				this.#runLifecycle(id, "terminal", job);
+				this.#scheduleEviction(id);
 				this.#drainResumeQueue();
 			}
 		})();
@@ -599,20 +600,22 @@ export class AsyncJobManager {
 		if (!job) return false;
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
 		if (job.status === "paused") {
-			this.#runLifecycle(id, "cancel");
 			// Paused jobs have no running promise to abort; transition directly.
 			// The session file is kept, so the record stays resumable by id.
 			job.status = "cancelled";
 			this.#markRecordTerminal(id, "cancelled");
+			this.#runLifecycle(id, "cancel");
 			this.#scheduleEviction(id);
 			this.#drainResumeQueue();
 			return true;
 		}
 		if (job.status !== "running") return false;
-		this.#runLifecycle(id, "cancel");
 		job.status = "cancelled";
 		this.#freezeEndTime(job);
+		this.#markRecordTerminal(id, "cancelled");
+		this.#runLifecycle(id, "cancel");
 		job.abortController.abort();
+		this.#notifyChange();
 		return true;
 	}
 
@@ -696,6 +699,7 @@ export class AsyncJobManager {
 	/** Register or replace the canonical record for a subagent. */
 	registerSubagentRecord(record: SubagentRecord): void {
 		this.#subagentRecords.set(record.subagentId, record);
+		this.#notifyChange();
 	}
 
 	/** Patch model metadata onto an existing subagent record (best-effort; no-op if unknown). */
@@ -1136,6 +1140,7 @@ export class AsyncJobManager {
 				message,
 				createdAt: rec.queued.createdAt,
 			});
+			this.#notifyChange();
 			return { ok: true, queued: true, status: "queued" };
 		}
 		return this.#startResume(rec, message, descriptor);
@@ -1160,6 +1165,7 @@ export class AsyncJobManager {
 		rec.currentJobId = newJobId;
 		rec.status = this.#jobs.get(newJobId)?.status ?? "running";
 		rec.queued = undefined;
+		this.#notifyChange();
 		return { ok: true, status: rec.status, jobId: newJobId };
 	}
 
@@ -1202,16 +1208,15 @@ export class AsyncJobManager {
 		if (!rec) return false;
 		if (rec.status === "running" && rec.currentJobId) return this.cancel(rec.currentJobId, filter);
 		if (rec.status === "paused") {
-			if (rec.currentJobId) {
-				const job = this.#jobs.get(rec.currentJobId);
-				if (job && job.status === "paused") {
-					job.status = "cancelled";
-					this.#scheduleEviction(rec.currentJobId);
-				}
-			}
+			const currentJobId = rec.currentJobId;
+			const job = currentJobId ? this.#jobs.get(currentJobId) : undefined;
+			const shouldScheduleEviction = job?.status === "paused";
+			if (shouldScheduleEviction) job.status = "cancelled";
 			rec.status = "cancelled";
 			this.#liveHandles.delete(rec.subagentId);
 			this.#subagentProgress.delete(rec.subagentId);
+			if (shouldScheduleEviction && currentJobId) this.#scheduleEviction(currentJobId);
+			else this.#notifyChange();
 			this.#drainResumeQueue();
 			return true;
 		}
@@ -1221,6 +1226,7 @@ export class AsyncJobManager {
 			rec.status = "cancelled";
 			rec.queued = undefined;
 			this.#subagentProgress.delete(rec.subagentId);
+			this.#notifyChange();
 			return true;
 		}
 		return false;
@@ -1471,11 +1477,7 @@ export class AsyncJobManager {
 	 */
 	cancelAll(filter?: AsyncJobFilter): void {
 		for (const job of this.getRunningJobs(filter)) {
-			this.#runLifecycle(job.id, "cancel");
-			job.status = "cancelled";
-			this.#freezeEndTime(job);
-			job.abortController.abort();
-			this.#scheduleEviction(job.id);
+			if (this.cancel(job.id, filter)) this.#scheduleEviction(job.id);
 		}
 	}
 

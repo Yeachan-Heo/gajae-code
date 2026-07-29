@@ -110,6 +110,14 @@ async function runEndEvent(event: AutoCompactionEndEvent): Promise<AutoCompactio
 }
 
 describe("EventController auto-compaction overflow status", () => {
+	it("stops an active compaction loader during final disposal", () => {
+		const fixture = createFixture();
+		fixture.controller.dispose();
+		expect(fixture.loaderStop).toHaveBeenCalledTimes(1);
+		expect(fixture.ctx.autoCompactionLoader).toBeUndefined();
+		fixture.ctx.editor.onEscape?.();
+		expect(fixture.order).toContain("originalEscape");
+	});
 	it("releases the working loader before replacing it with the compaction loader", async () => {
 		const fixture = createFixture();
 		fixture.ctx.autoCompactionLoader = undefined;

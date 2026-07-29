@@ -50,6 +50,7 @@ describe("EventController idle compaction teardown", () => {
 			isInitialized: true,
 			isBackgrounded: false,
 			loadingAnimation: undefined,
+			setWorkingMessage: vi.fn(),
 			streamingComponent: undefined,
 			streamingMessage: undefined,
 			pendingTools: new Map<string, unknown>(),

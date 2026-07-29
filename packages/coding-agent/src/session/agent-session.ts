@@ -15720,7 +15720,10 @@ export class AgentSession {
 	 */
 	async switchSession(
 		sessionPath: string,
-		options?: { transition?: SessionSwitchEvent["transition"] },
+		options?: {
+			transition?: SessionSwitchEvent["transition"];
+			onTransitionMutationStarted?: () => void;
+		},
 	): Promise<boolean> {
 		this.#beginSessionTransition("switch-session");
 		try {
@@ -15740,6 +15743,7 @@ export class AgentSession {
 					return false;
 				}
 			}
+			options?.onTransitionMutationStarted?.();
 
 			this.#disconnectFromAgent();
 			await this.abort();

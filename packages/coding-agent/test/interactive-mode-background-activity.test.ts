@@ -1,0 +1,323 @@
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
+import { Agent } from "@gajae-code/agent-core";
+import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { InteractiveMode, resolveActivityIndicatorMessage } from "@gajae-code/coding-agent/modes/interactive-mode";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { Container, Loader } from "@gajae-code/tui";
+import { TempDir } from "@gajae-code/utils";
+import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
+import { SelectorController } from "../src/modes/controllers/selector-controller";
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (predicate()) return;
+		await Bun.sleep(5);
+	}
+	throw new Error("Timed out waiting for activity lifecycle transition");
+}
+
+function renderStatus(mode: InteractiveMode): string {
+	return stripVTControlCharacters(mode.statusContainer.render(120).join("\n"));
+}
+
+describe("interactive background activity indicator", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let session: AgentSession;
+	let manager: AsyncJobManager;
+	let mode: InteractiveMode;
+	const pendingJobs: Array<ReturnType<typeof Promise.withResolvers<string>>> = [];
+
+	beforeAll(() => {
+		initTheme();
+	});
+
+	beforeEach(async () => {
+		resetSettingsForTest();
+		tempDir = TempDir.createSync("@interactive-background-activity-");
+		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			agentId: "0-Main",
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 60_000 });
+		AsyncJobManager.setInstance(manager);
+		mode = new InteractiveMode(session, "test");
+		await mode.init();
+	});
+
+	afterEach(async () => {
+		for (const pending of pendingJobs.splice(0)) pending.resolve("done");
+		await Bun.sleep(0);
+		mode?.stop();
+		await session?.dispose();
+		await manager?.dispose();
+		AsyncJobManager.resetForTests();
+		authStorage?.close();
+		tempDir?.removeSync();
+		resetSettingsForTest();
+	});
+
+	it("distinguishes foreground and background activity messages", () => {
+		expect(resolveActivityIndicatorMessage(false, 0, "Working…")).toBeUndefined();
+		expect(resolveActivityIndicatorMessage(false, 1, "Working…")).toBe("Background: 1 task…");
+		expect(resolveActivityIndicatorMessage(false, 2, "Working…")).toBe("Background: 2 tasks…");
+		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
+	});
+
+	it("keeps owned work visible across foreground end, errors, aborts, completion, and disposal", async () => {
+		const ownerId = session.getAgentId();
+		if (!ownerId) throw new Error("Expected an owner id");
+
+		const foreign = Promise.withResolvers<string>();
+		pendingJobs.push(foreign);
+		const foreignJobId = manager.register("task", "foreign activity", () => foreign.promise, {
+			ownerId: "foreign-owner",
+		});
+		manager.registerSubagentRecord({
+			subagentId: "foreign-subagent",
+			ownerId: "foreign-owner",
+			currentJobId: foreignJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		await Bun.sleep(10);
+		expect(mode.loadingAnimation).toBeUndefined();
+		foreign.resolve("done");
+		pendingJobs.pop();
+		await waitFor(() => manager.getAllJobs({ ownerId: "foreign-owner" })[0]?.status === "completed");
+
+		const background = Promise.withResolvers<string>();
+		pendingJobs.push(background);
+		const jobId = manager.register("task", "background activity", () => background.promise, { ownerId });
+		expect(mode.loadingAnimation).toBeUndefined();
+		manager.registerSubagentRecord({
+			subagentId: "owned-subagent",
+			ownerId,
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+
+		await waitFor(() => mode.loadingAnimation !== undefined);
+		expect(manager.getAllJobs({ ownerId }).find(job => job.id === jobId)?.status).toBe("running");
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		mode.ensureLoadingAnimation();
+		expect(renderStatus(mode)).toContain("Working…");
+		expect(renderStatus(mode)).toContain("1 background task");
+
+		mode.stopLoadingAnimation();
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		mode.stopLoadingAnimation({ restoreBackground: false });
+		expect(renderStatus(mode)).toBe("");
+		mode.syncActivityIndicator();
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		const releaseModalActivity = mode.suspendActivityIndicator();
+		expect(renderStatus(mode)).toBe("");
+		mode.syncActivityIndicator();
+		expect(renderStatus(mode)).toBe("");
+		releaseModalActivity();
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		mode.ensureLoadingAnimation();
+		let streaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		mode.showError("nonterminal deferred tool error");
+		expect(renderStatus(mode)).toContain("Working…");
+		streaming = false;
+		mode.showError("provider failed");
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		const submission = mode.startPendingSubmission({ text: "cancelled", customType: "test" });
+		expect(mode.cancelPendingSubmission()).toBe(true);
+		expect(submission.cancelled).toBe(true);
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		background.resolve("done");
+		pendingJobs.pop();
+		await waitFor(() => manager.getAllJobs({ ownerId }).find(job => job.id === jobId)?.status === "completed");
+		await waitFor(() => mode.loadingAnimation === undefined);
+		expect(renderStatus(mode)).toBe("");
+
+		const cancelled = Promise.withResolvers<string>();
+		pendingJobs.push(cancelled);
+		const cancelledJobId = manager.register("task", "cancelled activity", () => cancelled.promise, { ownerId });
+		await waitFor(() => mode.loadingAnimation !== undefined);
+		expect(manager.cancel(cancelledJobId, { ownerId })).toBe(true);
+		await waitFor(() => mode.loadingAnimation === undefined);
+		expect(manager.getAllJobs({ ownerId }).find(job => job.id === cancelledJobId)?.status).toBe("cancelled");
+		cancelled.resolve("done");
+		pendingJobs.pop();
+
+		mode.stop();
+		const afterStop = Promise.withResolvers<string>();
+		pendingJobs.push(afterStop);
+		const afterStopJobId = manager.register("task", "must not resurrect", () => afterStop.promise, { ownerId });
+		manager.registerSubagentRecord({
+			subagentId: "after-stop-subagent",
+			ownerId,
+			currentJobId: afterStopJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		await Bun.sleep(10);
+		expect(mode.loadingAnimation).toBeUndefined();
+	});
+
+	it("preserves specialized and nested custom loaders across suspend, release, and stop", async () => {
+		const ownerId = session.getAgentId();
+		if (!ownerId) throw new Error("Expected an owner id");
+		const background = Promise.withResolvers<string>();
+		pendingJobs.push(background);
+		const jobId = manager.register("task", "lease activity", () => background.promise, { ownerId });
+		manager.registerSubagentRecord({
+			subagentId: "lease-subagent",
+			ownerId,
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		await waitFor(() => mode.loadingAnimation !== undefined);
+
+		const retryLoader = mode.loadingAnimation!;
+		retryLoader.setMessage("Retrying specialized operation");
+		mode.loadingAnimation = undefined;
+		mode.retryLoader = retryLoader;
+		const releaseRetryOuter = mode.suspendActivityIndicator();
+		const releaseRetryInner = mode.suspendActivityIndicator();
+		mode.syncActivityIndicator();
+		expect(mode.retryLoader).toBe(retryLoader);
+		expect(renderStatus(mode)).toContain("Retrying specialized operation");
+		releaseRetryInner();
+		expect(renderStatus(mode)).toContain("Retrying specialized operation");
+		releaseRetryOuter();
+		expect(renderStatus(mode)).toContain("Retrying specialized operation");
+
+		mode.retryLoader = undefined;
+		retryLoader.stop();
+		mode.statusContainer.clear();
+		mode.syncActivityIndicator();
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		const releaseCustomOuter = mode.suspendActivityIndicator();
+		const customLoader = new Loader(
+			mode.ui,
+			value => value,
+			value => value,
+			"Custom modal activity",
+			["."],
+		);
+		mode.statusContainer.addChild(customLoader);
+		const releaseCustomInner = mode.suspendActivityIndicator();
+		mode.syncActivityIndicator();
+		expect(renderStatus(mode)).toContain("Custom modal activity");
+		releaseCustomInner();
+		expect(renderStatus(mode)).toContain("Custom modal activity");
+		customLoader.stop();
+		mode.statusContainer.clear();
+		releaseCustomOuter();
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		const releaseAfterStop = mode.suspendActivityIndicator();
+		const stoppedLoader = new Loader(
+			mode.ui,
+			value => value,
+			value => value,
+			"Must not survive stop",
+			["."],
+		);
+		mode.statusContainer.addChild(stoppedLoader);
+		mode.stop();
+		releaseAfterStop();
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(renderStatus(mode)).toBe("");
+	});
+
+	it("settles open hook dialogs and custom UI during final disposal", async () => {
+		const selection = mode.showHookSelector("Choose", ["one"]);
+		const customController = new ExtensionUiController(mode);
+		const custom = customController.showHookCustom(() => new Container());
+
+		mode.stop();
+		customController.dispose();
+
+		expect(await selection).toBeUndefined();
+		expect(await custom).toBeUndefined();
+	});
+
+	it("does not remount async selectors or refresh slash state after final stop", async () => {
+		const sessions = Promise.withResolvers<[]>();
+		const listSessions = vi
+			.spyOn(mode.sessionManager, "listForResumePickerReadOnly")
+			.mockImplementation(() => sessions.promise);
+		const selectorController = new SelectorController(mode);
+		const showSelector = vi.spyOn(selectorController, "showSelector");
+		const selecting = selectorController.showSessionSelector();
+		await waitFor(() => listSessions.mock.calls.length === 1);
+		const setAutocompleteProvider = vi.spyOn(mode.editor, "setAutocompleteProvider");
+
+		mode.stop();
+		sessions.resolve([]);
+		await selecting;
+		await mode.refreshSlashCommandState();
+
+		expect(showSelector).not.toHaveBeenCalled();
+		expect(setAutocompleteProvider).not.toHaveBeenCalled();
+	});
+
+	it("does not finish initialization after final stop wins an awaited setup race", async () => {
+		mode.stop();
+		mode = new InteractiveMode(session, "test");
+		const setup = Promise.withResolvers<void>();
+		const refresh = vi.spyOn(mode, "refreshSlashCommandState").mockImplementation(() => setup.promise);
+		const initializing = mode.init();
+		const concurrentInitialization = mode.init();
+		expect(concurrentInitialization).toBe(initializing);
+		await waitFor(() => refresh.mock.calls.length === 1);
+		mode.stop();
+		setup.resolve();
+		await initializing;
+		expect(mode.isInitialized).toBe(false);
+	});
+
+	it("does not resume subscriptions after stop wins post-start hook initialization", async () => {
+		mode.stop();
+		mode = new InteractiveMode(session, "test");
+		const hooks = Promise.withResolvers<void>();
+		const initializeHooks = vi.spyOn(mode, "initHooksAndCustomTools").mockImplementation(() => hooks.promise);
+		const initializing = mode.init();
+		await waitFor(() => initializeHooks.mock.calls.length === 1);
+		expect(mode.isInitialized).toBe(true);
+		mode.stop();
+		hooks.resolve();
+		await initializing;
+		expect(mode.isInitialized).toBe(false);
+	});
+});

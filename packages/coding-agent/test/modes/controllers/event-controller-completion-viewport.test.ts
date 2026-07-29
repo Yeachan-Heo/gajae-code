@@ -150,6 +150,7 @@ describe("EventController completion viewport", () => {
 						streamingComponent,
 						streamingMessage: startMessage,
 						loadingAnimation: { stop: stopLoading },
+						setWorkingMessage: vi.fn(),
 						pendingTools: new Map(),
 						planModeController: { flushPendingModelSwitch: async () => {} },
 						updateEditorTopBorder: () => {},

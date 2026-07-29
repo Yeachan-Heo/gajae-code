@@ -358,11 +358,21 @@ describe("AsyncJobManager", () => {
 			},
 			{ ownerId: "3-AuthLoader" },
 		);
+		manager.registerSubagentRecord({
+			subagentId: "3-AuthLoader",
+			ownerId: "3-AuthLoader",
+			currentJobId: subagentJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
 
 		manager.cancelAll({ ownerId: "3-AuthLoader" });
 
 		expect(manager.getJob(parentJobId)?.status).toBe("running");
 		expect(manager.getJob(subagentJobId)?.status).toBe("cancelled");
+		expect(manager.getSubagentRecord("3-AuthLoader")?.status).toBe("cancelled");
 
 		// Filtered query mirrors filtered cancel.
 		expect(manager.getRunningJobs({ ownerId: "0-Main" }).map(j => j.id)).toEqual([parentJobId]);

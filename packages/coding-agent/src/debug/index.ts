@@ -11,6 +11,7 @@ import { getSessionsDir } from "@gajae-code/utils";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getSelectListTheme, getSymbolTheme, theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
+import { suspendInteractiveActivityIndicator } from "../modes/types";
 import { formatBytes } from "../tools/render-utils";
 import { openPath } from "../utils/open";
 import { DebugLogViewerComponent } from "./log-viewer";
@@ -77,10 +78,12 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.ctx.isStopped?.()) return;
 		this.#selectList.handleInput(keyData);
 	}
 
 	async #handleSelection(value: string): Promise<void> {
+		if (this.ctx.isStopped?.()) return;
 		switch (value) {
 			case "open-artifacts":
 				await this.#handleOpenArtifacts();
@@ -115,12 +118,23 @@ export class DebugSelectorComponent extends Container {
 		}
 	}
 
+	#finishStatusLoader(loader: Loader, releaseActivityIndicator: () => void): void {
+		loader.stop();
+		if (!this.ctx.isStopped?.()) this.ctx.statusContainer.clear();
+		releaseActivityIndicator();
+	}
+
 	async #handlePerformanceReport(): Promise<void> {
 		// Start profiling
 		let session: ProfilerSession;
 		try {
 			session = await startCpuProfile();
+			if (this.ctx.isStopped?.()) {
+				await session.stop().catch(() => {});
+				return;
+			}
 		} catch (err) {
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to start profiler: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
@@ -151,9 +165,17 @@ export class DebugSelectorComponent extends Container {
 			resolve();
 		};
 
-		await promise;
+		const stopped = Promise.withResolvers<void>();
+		const unsubscribeStop = this.ctx.onStop?.(() => stopped.resolve());
+		const stopWon = await Promise.race([promise.then(() => false), stopped.promise.then(() => true)]);
+		unsubscribeStop?.();
+		if (stopWon || this.ctx.isStopped?.()) {
+			await session.stop().catch(() => {});
+			return;
+		}
 
 		// Stop profiling and create report
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -174,8 +196,8 @@ export class DebugSelectorComponent extends Container {
 				workProfile,
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -184,8 +206,8 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -219,6 +241,7 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	async #handleDumpReport(): Promise<void> {
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -235,8 +258,8 @@ export class DebugSelectorComponent extends Container {
 				settings: this.#getResolvedSettings(),
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -245,8 +268,8 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -254,6 +277,7 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	async #handleMemoryReport(): Promise<void> {
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -274,8 +298,8 @@ export class DebugSelectorComponent extends Container {
 				heapSnapshot,
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -284,8 +308,8 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -405,6 +429,7 @@ export class DebugSelectorComponent extends Container {
 		}
 
 		// Clear cache
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -418,8 +443,8 @@ export class DebugSelectorComponent extends Container {
 		try {
 			const result = await clearArtifactCache(sessionsDir, 30);
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -430,8 +455,8 @@ export class DebugSelectorComponent extends Container {
 				),
 			);
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to clear cache: ${err instanceof Error ? err.message : String(err)}`);
 		}
 

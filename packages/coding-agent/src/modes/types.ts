@@ -63,6 +63,69 @@ export function canApplyComposerSubmission(
 ): boolean {
 	return options === undefined || (options.ownsComposer && editor === options.editor);
 }
+
+export function stopInteractiveActivityIndicator(
+	ctx: {
+		loadingAnimation: Loader | undefined;
+		statusContainer: Container;
+		stopLoadingAnimation?: (options?: { restoreBackground?: boolean }) => void;
+	},
+	options?: { restoreBackground?: boolean },
+): void {
+	if (ctx.stopLoadingAnimation) {
+		ctx.stopLoadingAnimation(options);
+		return;
+	}
+	ctx.loadingAnimation?.stop();
+	ctx.loadingAnimation = undefined;
+	ctx.statusContainer.clear();
+}
+
+export function clearInteractiveActivityLoaders(
+	ctx: Pick<
+		InteractiveModeContext,
+		| "autoCompactionLoader"
+		| "autoCompactionEscapeHandler"
+		| "retryLoader"
+		| "retryCountdownTimer"
+		| "retryEscapeHandler"
+		| "retryEscapePrimed"
+		| "editor"
+	>,
+): void {
+	ctx.autoCompactionLoader?.stop();
+	ctx.autoCompactionLoader = undefined;
+	if (ctx.autoCompactionEscapeHandler) ctx.editor.onEscape = ctx.autoCompactionEscapeHandler;
+	ctx.autoCompactionEscapeHandler = undefined;
+	ctx.retryLoader?.stop();
+	ctx.retryLoader = undefined;
+	if (ctx.retryCountdownTimer) clearInterval(ctx.retryCountdownTimer);
+	ctx.retryCountdownTimer = undefined;
+	if (ctx.retryEscapeHandler) ctx.editor.onEscape = ctx.retryEscapeHandler;
+	ctx.retryEscapeHandler = undefined;
+	ctx.retryEscapePrimed = false;
+}
+
+export function suspendInteractiveActivityIndicator(ctx: {
+	loadingAnimation: Loader | undefined;
+	statusContainer: Container;
+	stopLoadingAnimation?: (options?: { restoreBackground?: boolean }) => void;
+	syncActivityIndicator?: () => void;
+	suspendActivityIndicator?: () => () => void;
+}): () => void {
+	if (ctx.suspendActivityIndicator) return ctx.suspendActivityIndicator();
+	stopInteractiveActivityIndicator(ctx, { restoreBackground: false });
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		syncInteractiveActivityIndicator(ctx);
+	};
+}
+
+export function syncInteractiveActivityIndicator(ctx: { syncActivityIndicator?: () => void }): void {
+	ctx.syncActivityIndicator?.();
+}
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
 
 export type TodoItem = {
@@ -164,6 +227,8 @@ export interface InteractiveModeContext {
 	init(): Promise<void>;
 	shutdown(): Promise<void>;
 	checkShutdownRequested(): Promise<void>;
+	isStopped?(): boolean;
+	onStop(callback: () => void): () => void;
 
 	// Extension UI integration
 	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void;
@@ -190,6 +255,9 @@ export interface InteractiveModeContext {
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
+	syncActivityIndicator(): void;
+	suspendActivityIndicator(): () => void;
+	stopLoadingAnimation(options?: { restoreBackground?: boolean }): void;
 	/**
 	 * Commit a pet mode through the shared result-returning policy: capability
 	 * is rechecked immediately before mutation and the preference persists only

@@ -59,6 +59,8 @@ function createContext(options: {
 		streamingMessage: undefined,
 		pendingTools: { clear: vi.fn() },
 		loadingAnimation: undefined,
+		stopLoadingAnimation: vi.fn(),
+		syncActivityIndicator: vi.fn(),
 		statusLine: { invalidate: vi.fn(), setSessionStartTime: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
@@ -99,6 +101,8 @@ describe("SelectorController resume model choice", () => {
 		// Only the (no-op) editor restore path runs — no confirm dialog mounted.
 		expect(ctx.editorContainer.children).toHaveLength(0);
 		expect(setModel).not.toHaveBeenCalled();
+		expect(ctx.stopLoadingAnimation).toHaveBeenCalledWith({ restoreBackground: false });
+		expect(ctx.syncActivityIndicator).toHaveBeenCalledTimes(1);
 	});
 
 	it("prompts and switches when resumeModelBehavior is ask and models differ", async () => {
@@ -133,5 +137,75 @@ describe("SelectorController resume model choice", () => {
 
 		expect(ctx.editorContainer.children).toHaveLength(0);
 		expect(setModel).not.toHaveBeenCalled();
+	});
+
+	it("preserves retry UI when a pre-mutation switch hook cancels", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const { ctx } = createContext({
+			sessionModel: sonnet,
+			settings: Settings.isolated(),
+			setModel: vi.fn(async () => {}),
+		});
+		(ctx.session.switchSession as unknown as { mockResolvedValue(value: boolean): void }).mockResolvedValue(false);
+		const retryLoader = { stop: vi.fn() };
+		const typedRetryLoader = retryLoader as unknown as TestContext["retryLoader"];
+		ctx.retryLoader = typedRetryLoader;
+		const retryTimer = setInterval(() => {}, 60_000);
+		ctx.retryCountdownTimer = retryTimer;
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession("/tmp/project/sessions/active.jsonl");
+
+		expect(ctx.retryLoader).toBe(typedRetryLoader);
+		expect(ctx.retryCountdownTimer).toBe(retryTimer);
+		expect(retryLoader.stop).not.toHaveBeenCalled();
+		clearInterval(retryTimer);
+	});
+
+	it("clears retry UI when switch rollback follows mutation start", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const { ctx } = createContext({
+			sessionModel: sonnet,
+			settings: Settings.isolated(),
+			setModel: vi.fn(async () => {}),
+		});
+		const switchSession = ctx.session.switchSession as unknown as {
+			mockImplementation(
+				implementation: (path: string, options?: { onTransitionMutationStarted?: () => void }) => Promise<boolean>,
+			): void;
+		};
+		switchSession.mockImplementation(async (_path, options) => {
+			options?.onTransitionMutationStarted?.();
+			return false;
+		});
+		const retryLoader = { stop: vi.fn() };
+		ctx.retryLoader = retryLoader as unknown as TestContext["retryLoader"];
+		ctx.retryCountdownTimer = setInterval(() => {}, 60_000);
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession("/tmp/project/sessions/active.jsonl");
+
+		expect(retryLoader.stop).toHaveBeenCalledTimes(1);
+		expect(ctx.retryLoader).toBeUndefined();
+		expect(ctx.retryCountdownTimer).toBeUndefined();
+	});
+
+	it("clears retry UI after a committed session switch", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const { ctx } = createContext({
+			sessionModel: sonnet,
+			settings: Settings.isolated(),
+			setModel: vi.fn(async () => {}),
+		});
+		const retryLoader = { stop: vi.fn() };
+		ctx.retryLoader = retryLoader as unknown as TestContext["retryLoader"];
+		ctx.retryCountdownTimer = setInterval(() => {}, 60_000);
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession("/tmp/project/sessions/active.jsonl");
+
+		expect(retryLoader.stop).toHaveBeenCalledTimes(1);
+		expect(ctx.retryLoader).toBeUndefined();
+		expect(ctx.retryCountdownTimer).toBeUndefined();
 	});
 });
