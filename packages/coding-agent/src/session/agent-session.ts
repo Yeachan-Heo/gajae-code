@@ -869,6 +869,7 @@ type RetryErrorClassification =
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
+const BARE_DEFAULT_CODEX_OVERLOAD_ERROR = /^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"anthropic-messages": new Set([
 		"Provider stream timed out while waiting for the first event",
@@ -903,6 +904,14 @@ function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boole
 		facts.anthropicErrorType !== undefined ||
 		facts.openaiErrorCode !== undefined ||
 		(facts.headers !== undefined && Object.keys(facts.headers).length > 0)
+	);
+}
+function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
+	return (
+		message.api === "openai-codex-responses" &&
+		BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
+		!hasBareDefaultRetryDisqualifyingFacts(message) &&
+		!assistantMessageHasVisibleOrToolContent(message)
 	);
 }
 
@@ -14384,15 +14393,21 @@ export class AgentSession {
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
 		// content-free check is the replay-safety guarantee for credential rotation.
 		const canReplayRotatedCredential = credentialRotated;
-		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures
-		// or content-free quota/rate-limit failures that switched to another stored credential.
+		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures,
+		// content-free quota/rate-limit credential rotations, and the explicit Codex
+		// capacity-overload event.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
+			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
+			// Content-free Codex overload is replay-safe by the same reasoning as
+			// credential rotation: no partial output means no observable state.
+			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
-				(!this.#isTypedFirstEventTimeout(message) &&
+				(!canReplayCodexOverload &&
+					!this.#isTypedFirstEventTimeout(message) &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
-				!this.#hasCleanRetryReplaySafety
+				(!canReplayCodexOverload && !this.#hasCleanRetryReplaySafety)
 			) {
 				return false;
 			}
