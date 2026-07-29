@@ -184,6 +184,30 @@ describe("executeBash", () => {
 		expect(seenChunk ?? "").toContain("hello");
 	});
 
+	it("marks native callback loss as source truncation", async () => {
+		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
+			onChunk?.(null, "retained-tail\n");
+			return Promise.resolve({
+				exitCode: 0,
+				cancelled: false,
+				timedOut: false,
+				droppedOutputChunks: 2,
+				droppedOutputBytes: 17,
+			});
+		});
+
+		const result = await executeBash("ignored", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey: "native-callback-loss",
+		});
+
+		expect(result.output).toContain("retained-tail");
+		expect(result.truncated).toBe(true);
+		expect(result.sourceTruncatedBytes).toBe(17);
+		await disposeAllShellSessions();
+	});
+
 	it("returns even if command spawns a background job", async () => {
 		if (process.platform === "win32") {
 			return;

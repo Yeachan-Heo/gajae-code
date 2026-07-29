@@ -151,30 +151,63 @@ impl From<CoreMinimizerResult> for MinimizerResult {
 	}
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ShellCallbackLoss {
+	dropped_chunks: usize,
+	dropped_bytes:  usize,
+}
+
+impl ShellCallbackLoss {
+	fn record_drop(&mut self, bytes: usize) {
+		self.dropped_chunks = self.dropped_chunks.saturating_add(1);
+		self.dropped_bytes = self.dropped_bytes.saturating_add(bytes);
+	}
+
+	fn chunks_u32(self) -> Option<u32> {
+		(self.dropped_chunks > 0).then(|| u32::try_from(self.dropped_chunks).unwrap_or(u32::MAX))
+	}
+
+	fn bytes_u32(self) -> Option<u32> {
+		(self.dropped_bytes > 0).then(|| u32::try_from(self.dropped_bytes).unwrap_or(u32::MAX))
+	}
+}
+
 /// Result of running a shell command.
 #[napi(object)]
 pub struct ShellRunResult {
 	/// Exit code when the command completes normally.
-	pub exit_code: Option<i32>,
+	pub exit_code:             Option<i32>,
 	/// Whether the command was cancelled via abort.
-	pub cancelled: bool,
+	pub cancelled:             bool,
 	/// Whether the command timed out before completion.
-	pub timed_out: bool,
+	pub timed_out:             bool,
+	/// Chunks dropped before the JavaScript output callback could receive them.
+	pub dropped_output_chunks: Option<u32>,
+	/// Bytes dropped before the JavaScript output callback could receive them.
+	pub dropped_output_bytes:  Option<u32>,
 	/// When the minimizer rewrote the captured output, this carries the
 	/// original buffer + telemetry so the session layer can persist it as
 	/// an artifact and splice an `artifact://<id>` reference into the
 	/// minimized text shown to the agent. `None` when nothing was rewritten.
-	pub minimized: Option<MinimizerResult>,
+	pub minimized:             Option<MinimizerResult>,
+}
+
+impl ShellRunResult {
+	fn from_core(value: CoreShellRunResult, callback_loss: ShellCallbackLoss) -> Self {
+		Self {
+			exit_code:             value.exit_code,
+			cancelled:             value.cancelled,
+			timed_out:             value.timed_out,
+			dropped_output_chunks: callback_loss.chunks_u32(),
+			dropped_output_bytes:  callback_loss.bytes_u32(),
+			minimized:             value.minimized.map(Into::into),
+		}
+	}
 }
 
 impl From<CoreShellRunResult> for ShellRunResult {
 	fn from(value: CoreShellRunResult) -> Self {
-		Self {
-			exit_code: value.exit_code,
-			cancelled: value.cancelled,
-			timed_out: value.timed_out,
-			minimized: value.minimized.map(Into::into),
-		}
+		Self::from_core(value, ShellCallbackLoss::default())
 	}
 }
 
@@ -220,12 +253,12 @@ impl Shell {
 			let result = inner
 				.run(run_options, chunk_tx, cancel_token.into_core())
 				.await
-				.map(Into::into)
 				.map_err(|err| Error::from_reason(err.to_string()));
-			if let Some(handle) = drain_handle {
-				let _ = handle.await;
-			}
-			result
+			let callback_loss = match drain_handle {
+				Some(handle) => handle.await.unwrap_or_default(),
+				None => ShellCallbackLoss::default(),
+			};
+			result.map(|value| ShellRunResult::from_core(value, callback_loss))
 		})
 	}
 
@@ -265,12 +298,12 @@ pub fn execute_shell<'env>(
 		let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
 		let result = core_execute_shell(exec_options, chunk_tx, cancel_token.into_core())
 			.await
-			.map(Into::into)
 			.map_err(|err| Error::from_reason(err.to_string()));
-		if let Some(handle) = drain_handle {
-			let _ = handle.await;
-		}
-		result
+		let callback_loss = match drain_handle {
+			Some(handle) => handle.await.unwrap_or_default(),
+			None => ShellCallbackLoss::default(),
+		};
+		result.map(|value| ShellRunResult::from_core(value, callback_loss))
 	})
 }
 
@@ -280,7 +313,8 @@ fn shell_loss_marker(dropped_chunks: usize, dropped_bytes: usize) -> String {
 
 fn bridge_chunks(
 	on_chunk: Option<ThreadsafeFunction<String>>,
-) -> (Option<mpsc::UnboundedSender<String>>, Option<napi::tokio::task::JoinHandle<()>>) {
+) -> (Option<mpsc::UnboundedSender<String>>, Option<napi::tokio::task::JoinHandle<ShellCallbackLoss>>)
+{
 	let Some(on_chunk) = on_chunk else {
 		return (None, None);
 	};
@@ -288,18 +322,18 @@ fn bridge_chunks(
 	let (bounded_tx, mut bounded_rx) = mpsc::channel::<String>(SHELL_CALLBACK_QUEUE_CAPACITY);
 	let handle = napi::tokio::spawn(async move {
 		let forwarder = napi::tokio::spawn(async move {
-			let mut dropped_chunks = 0usize;
-			let mut dropped_bytes = 0usize;
+			let mut pending_loss = ShellCallbackLoss::default();
+			let mut total_loss = ShellCallbackLoss::default();
 			// The upstream pi_shell sender is unbounded; this bridge re-bounds it and
 			// marks dropped output at the N-API callback boundary instead of silently
 			// losing it, so truncation is always observable to the caller.
 			while let Some(chunk) = rx.recv().await {
-				if dropped_chunks > 0 {
-					match bounded_tx.try_send(shell_loss_marker(dropped_chunks, dropped_bytes)) {
-						Ok(()) => {
-							dropped_chunks = 0;
-							dropped_bytes = 0;
-						},
+				if pending_loss.dropped_chunks > 0 {
+					match bounded_tx.try_send(shell_loss_marker(
+						pending_loss.dropped_chunks,
+						pending_loss.dropped_bytes,
+					)) {
+						Ok(()) => pending_loss = ShellCallbackLoss::default(),
 						Err(mpsc::error::TrySendError::Full(_)) => {},
 						Err(mpsc::error::TrySendError::Closed(_)) => break,
 					}
@@ -308,17 +342,18 @@ fn bridge_chunks(
 				match bounded_tx.try_send(chunk) {
 					Ok(()) => {},
 					Err(mpsc::error::TrySendError::Full(_)) => {
-						dropped_chunks = dropped_chunks.saturating_add(1);
-						dropped_bytes = dropped_bytes.saturating_add(chunk_len);
+						pending_loss.record_drop(chunk_len);
+						total_loss.record_drop(chunk_len);
 					},
 					Err(mpsc::error::TrySendError::Closed(_)) => break,
 				}
 			}
-			if dropped_chunks > 0 {
+			if pending_loss.dropped_chunks > 0 {
 				let _ = bounded_tx
-					.send(shell_loss_marker(dropped_chunks, dropped_bytes))
+					.send(shell_loss_marker(pending_loss.dropped_chunks, pending_loss.dropped_bytes))
 					.await;
 			}
+			total_loss
 		});
 		while let Some(chunk) = bounded_rx.recv().await {
 			if on_chunk.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking) != napi::Status::Ok {
@@ -326,7 +361,7 @@ fn bridge_chunks(
 				break;
 			}
 		}
-		let _ = forwarder.await;
+		forwarder.await.unwrap_or_default()
 	});
 	(Some(tx), Some(handle))
 }
@@ -368,7 +403,8 @@ mod tests {
 	use tokio::{sync::mpsc, task::yield_now, time};
 
 	use super::{
-		CoreShell, SHELL_CALLBACK_QUEUE_CAPACITY, SHELL_LOSS_MARKER_PREFIX, shell_loss_marker,
+		CoreShell, SHELL_CALLBACK_QUEUE_CAPACITY, SHELL_LOSS_MARKER_PREFIX, ShellCallbackLoss,
+		shell_loss_marker,
 	};
 
 	mod child_session_action_tests {
@@ -480,6 +516,15 @@ mod tests {
 		assert!(result.cancelled);
 	}
 
+	#[test]
+	fn callback_loss_reports_cumulative_dropped_chunks_and_bytes() {
+		let mut loss = ShellCallbackLoss::default();
+		loss.record_drop(5);
+		loss.record_drop(7);
+
+		assert_eq!(loss.chunks_u32(), Some(2));
+		assert_eq!(loss.bytes_u32(), Some(12));
+	}
 	#[tokio::test]
 	async fn final_shell_loss_marker_is_delivered_when_callback_queue_is_full() {
 		let (tx, mut rx) = mpsc::channel::<String>(SHELL_CALLBACK_QUEUE_CAPACITY);

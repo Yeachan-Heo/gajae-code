@@ -55,6 +55,17 @@ function hasInteriorMiddleLine(content: string, minimum = 1_000, maximum = 5_000
 	});
 }
 
+const WRITE_BASH_TEST_PAYLOAD_COMMAND = `${JSON.stringify(process.execPath)} -e 'process.stdout.write(process.env.BASH_TEST_PAYLOAD ?? "")'`;
+
+function buildMiddlePayload(count: number, includeTail = true): string {
+	return [
+		"HEAD",
+		...Array.from({ length: count }, (_, index) => `middle-${String(index + 1).padStart(5, "0")}`),
+		...(includeTail ? ["TAIL"] : []),
+		"",
+	].join("\n");
+}
+
 function writeFileWithMtime(filePath: string, content: string, mtimeMs: number): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(filePath, content);
@@ -1111,8 +1122,11 @@ function b() {
 		});
 
 		it("should keep only the tail of truncated output by default and write the full artifact", async () => {
+			const payload = buildMiddlePayload(6_000);
+			const command = WRITE_BASH_TEST_PAYLOAD_COMMAND;
 			const result = await bashTool.execute("test-call-8-artifact", {
-				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'",
+				command,
+				env: { BASH_TEST_PAYLOAD: payload },
 			});
 			const output = getTextOutput(result);
 			const truncation = result.details?.meta?.truncation;
@@ -1145,7 +1159,8 @@ function b() {
 				),
 			);
 			const result = await tool.execute("test-call-managed-artifact", {
-				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..400}; printf 'TAIL\\n'",
+				command: WRITE_BASH_TEST_PAYLOAD_COMMAND,
+				env: { BASH_TEST_PAYLOAD: buildMiddlePayload(400) },
 			});
 			const truncation = result.details?.meta?.truncation;
 			const artifactId = truncation?.artifactId;
@@ -1289,7 +1304,8 @@ function b() {
 				),
 			);
 			const result = await failingTool.execute("test-writer-failure", {
-				command: "printf 'x%.0s' {1..2000}",
+				command: WRITE_BASH_TEST_PAYLOAD_COMMAND,
+				env: { BASH_TEST_PAYLOAD: "x".repeat(2_000) },
 			});
 			const text = getTextOutput(result);
 
@@ -1311,7 +1327,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await failingTool.execute("test-writer-failure-command", {
-					command: "printf 'x%.0s' {1..2000}; exit 7",
+					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; exit 7`,
+					env: { BASH_TEST_PAYLOAD: "x".repeat(2_000) },
 				});
 			} catch (error) {
 				caught = error;
@@ -1371,7 +1388,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-noisy-exit", {
-					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 7",
+					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; exit 7`,
+					env: { BASH_TEST_PAYLOAD: buildMiddlePayload(6_000) },
 				});
 			} catch (error) {
 				caught = error;
@@ -1401,7 +1419,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await configuredTool.execute("test-call-9-configured-noisy-exit", {
-					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 23",
+					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; exit 23`,
+					env: { BASH_TEST_PAYLOAD: buildMiddlePayload(6_000) },
 				});
 			} catch (error) {
 				caught = error;
@@ -1418,7 +1437,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-timeout-status-precedence", {
-					command: "printf 'x%.0s' {1..6000}; printf '\nCommand aborted\n'; sleep 5",
+					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; sleep 5`,
+					env: { BASH_TEST_PAYLOAD: `${"x".repeat(6_000)}\nCommand aborted\n` },
 					timeout: 1,
 				});
 			} catch (error) {
@@ -1437,7 +1457,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-noisy-timeout", {
-					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; sleep 5",
+					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; sleep 5`,
+					env: { BASH_TEST_PAYLOAD: buildMiddlePayload(6_000, false) },
 					timeout: 1,
 				});
 			} catch (error) {
@@ -1555,12 +1576,11 @@ function b() {
 					{ getSessionId: () => "test-session" },
 				),
 			);
-			const middle = Array.from({ length: 400 }, (_, index) => `middle-${String(index).padStart(5, "0")}`).join(
-				"\\n",
-			);
-			const command = `printf 'HEAD\\n${middle}\\nTAIL\\n'`;
+			const payload = buildMiddlePayload(400);
+			const command = WRITE_BASH_TEST_PAYLOAD_COMMAND;
+			const env = { BASH_TEST_PAYLOAD: payload };
 
-			const asyncStarted = await tool.execute("test-call-async-tail", { command, async: true });
+			const asyncStarted = await tool.execute("test-call-async-tail", { command, env, async: true });
 			const asyncJobId = asyncStarted.details?.async?.jobId;
 			expect(asyncJobId).toBeDefined();
 			await asyncJobManager.getJob(asyncJobId!)?.promise;
@@ -1581,7 +1601,10 @@ function b() {
 			).filter((id): id is string => id !== undefined);
 			expect(asyncArtifactIds).toHaveLength(1);
 
-			const monitorStarted = await tool.startMonitorJob({ command }, { onRawLine: line => monitorLines.push(line) });
+			const monitorStarted = await tool.startMonitorJob(
+				{ command, env },
+				{ onRawLine: line => monitorLines.push(line) },
+			);
 			await asyncJobManager.getJob(monitorStarted.jobId)?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			const monitorDelivery = deliveries.find(delivery => delivery.jobId === monitorStarted.jobId)?.text ?? "";
@@ -1814,23 +1837,33 @@ function b() {
 			AsyncJobManager.setInstance(manager);
 			try {
 				const controller = new AbortController();
+				const ready = Promise.withResolvers<void>();
 				const promise = bashTool.execute(
 					"test-call-10-abort",
 					{
-						command: "printf 'x%.0s' {1..2000}; printf '\nREADY\n'; sleep 60",
+						command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; sleep 60`,
+						env: { BASH_TEST_PAYLOAD: `${"x".repeat(2_000)}\nREADY\n` },
 						timeout: 30,
 					},
 					controller.signal,
+					update => {
+						const text = update.content?.find(part => part.type === "text")?.text ?? "";
+						if (text.includes("READY")) ready.resolve();
+					},
 				);
-				const abortTimer = setTimeout(() => controller.abort("test abort"), 100);
+				await Promise.race([
+					ready.promise,
+					Bun.sleep(2_000).then(() => {
+						throw new Error("timed out waiting for Bash abort fixture output");
+					}),
+				]);
+				controller.abort("test abort");
 
 				let caught: unknown;
 				try {
 					await promise;
 				} catch (error) {
 					caught = error;
-				} finally {
-					clearTimeout(abortTimer);
 				}
 				expect(caught).toBeInstanceOf(Error);
 				const message = caught instanceof Error ? caught.message : "";

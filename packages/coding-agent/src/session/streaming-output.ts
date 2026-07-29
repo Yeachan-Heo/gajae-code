@@ -72,6 +72,8 @@ export interface OutputSummary {
 	artifactId?: string;
 	/** Bytes omitted from artifact storage after the artifact hard cap was reached. */
 	artifactTruncatedBytes?: number;
+	/** Bytes dropped before the Bash executor received the native output stream. */
+	sourceTruncatedBytes?: number;
 	/** Bounded diagnostic when artifact writer or terminal publisher creation, write, finalization, or publication failed. */
 	artifactFailureDiagnostic?: string;
 }

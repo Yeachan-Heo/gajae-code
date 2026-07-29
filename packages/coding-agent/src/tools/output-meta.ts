@@ -57,6 +57,8 @@ export interface TruncationMeta {
 	artifactId?: string;
 	/** Bytes omitted from an artifact after its hard storage cap was reached. */
 	artifactTruncatedBytes?: number;
+	/** Bytes dropped before Bash received the native output stream. */
+	sourceTruncatedBytes?: number;
 	/** Bounded diagnostic when artifact writer creation, write, or finalization failed. */
 	artifactFailureDiagnostic?: string;
 	/** Next offset for pagination (head truncation only) */
@@ -334,10 +336,15 @@ export class OutputMetaBuilder {
 			summary.artifactTruncatedBytes != null && summary.artifactTruncatedBytes > 0
 				? summary.artifactTruncatedBytes
 				: undefined;
+		const sourceTruncatedBytes =
+			summary.sourceTruncatedBytes != null && summary.sourceTruncatedBytes > 0
+				? summary.sourceTruncatedBytes
+				: undefined;
 		const hasArtifactEvidence =
 			summary.artifactId !== undefined ||
 			artifactFailureDiagnostic !== undefined ||
-			artifactTruncatedBytes !== undefined;
+			artifactTruncatedBytes !== undefined ||
+			sourceTruncatedBytes !== undefined;
 		if (!summary.truncated && !hasArtifactEvidence) return this;
 
 		const { direction, startLine = 1, totalFileLines, noticeOwner } = options;
@@ -346,9 +353,12 @@ export class OutputMetaBuilder {
 			summary.artifactId !== undefined && summary.output.includes(`artifact://${summary.artifactId}`);
 		const bodyOwnsArtifact =
 			bodyHasArtifact &&
-			(artifactTruncatedBytes === undefined ||
-				(summary.artifactId !== undefined &&
-					summary.output.includes(formatArtifactReference(summary.artifactId, artifactTruncatedBytes))));
+			(artifactTruncatedBytes === undefined && sourceTruncatedBytes === undefined
+				? true
+				: summary.artifactId !== undefined &&
+					summary.output.includes(
+						formatArtifactReference(summary.artifactId, artifactTruncatedBytes, sourceTruncatedBytes),
+					));
 		const owner =
 			noticeOwner !== undefined ? { noticeOwner } : bodyOwnsArtifact ? { noticeOwner: "body" as const } : {};
 
@@ -372,6 +382,7 @@ export class OutputMetaBuilder {
 				elidedLines,
 				artifactId: summary.artifactId,
 				artifactTruncatedBytes,
+				sourceTruncatedBytes,
 				artifactFailureDiagnostic,
 			};
 			return this;
@@ -406,6 +417,7 @@ export class OutputMetaBuilder {
 			shownRange: { start: shownStart, end: shownEnd },
 			artifactId: summary.artifactId,
 			artifactTruncatedBytes,
+			sourceTruncatedBytes,
 			artifactFailureDiagnostic,
 			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
 		};
@@ -550,18 +562,32 @@ export function formatFullOutputReference(artifactId: string): string {
 }
 
 /**
- * Format an artifact reference without claiming completeness when storage was hard-capped.
+ * Format an artifact reference without claiming completeness when capture or storage omitted bytes.
  */
-export function formatArtifactReference(artifactId: string, artifactTruncatedBytes?: number): string {
-	if (artifactTruncatedBytes != null && artifactTruncatedBytes > 0) {
-		return `Read artifact://${artifactId} for retained output (at least ${formatBytes(artifactTruncatedBytes)} omitted by the artifact storage cap)`;
+export function formatArtifactReference(
+	artifactId: string,
+	artifactTruncatedBytes?: number,
+	sourceTruncatedBytes?: number,
+): string {
+	const omissions: string[] = [];
+	if (sourceTruncatedBytes != null && sourceTruncatedBytes > 0) {
+		omissions.push(`at least ${formatBytes(sourceTruncatedBytes)} dropped before Bash capture`);
 	}
-	return formatFullOutputReference(artifactId);
+	if (artifactTruncatedBytes != null && artifactTruncatedBytes > 0) {
+		omissions.push(`at least ${formatBytes(artifactTruncatedBytes)} omitted by the artifact storage cap`);
+	}
+	return omissions.length > 0
+		? `Read artifact://${artifactId} for retained output (${omissions.join("; ")})`
+		: formatFullOutputReference(artifactId);
 }
 
 function formatTruncationArtifactNotice(truncation: TruncationMeta): string {
 	const reference = truncation.artifactId
-		? formatArtifactReference(truncation.artifactId, truncation.artifactTruncatedBytes)
+		? formatArtifactReference(
+				truncation.artifactId,
+				truncation.artifactTruncatedBytes,
+				truncation.sourceTruncatedBytes,
+			)
 		: undefined;
 	if (truncation.artifactFailureDiagnostic) {
 		const failure = `Artifact storage failed: ${truncation.artifactFailureDiagnostic}`;
@@ -569,6 +595,9 @@ function formatTruncationArtifactNotice(truncation: TruncationMeta): string {
 		return failure;
 	}
 	if (reference) return reference;
+	if ((truncation.sourceTruncatedBytes ?? 0) > 0) {
+		return `Bash capture omitted at least ${formatBytes(truncation.sourceTruncatedBytes ?? 0)} before artifact storage; no artifact reference is available`;
+	}
 	return `Artifact storage omitted at least ${formatBytes(truncation.artifactTruncatedBytes ?? 0)}; no artifact reference is available`;
 }
 
@@ -576,6 +605,7 @@ function hasArtifactNotice(truncation: TruncationMeta): boolean {
 	return (
 		truncation.artifactId != null ||
 		(truncation.artifactTruncatedBytes ?? 0) > 0 ||
+		(truncation.sourceTruncatedBytes ?? 0) > 0 ||
 		truncation.artifactFailureDiagnostic != null
 	);
 }

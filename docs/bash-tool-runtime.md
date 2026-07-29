@@ -168,12 +168,15 @@ Both PTY and non-PTY paths use `OutputSink`.
 - `truncated`,
 - `totalLines/totalBytes`,
 - `outputLines/outputBytes`,
-- `artifactId` if artifact file was active.
-- `artifactTruncatedBytes` when the artifact hard cap omitted bytes.
+- `artifactId` if artifact file was active,
+- `artifactTruncatedBytes` when the artifact hard cap omitted bytes,
+- `sourceTruncatedBytes` when the native shell callback queue dropped bytes before the Bash executor received them.
 
 ### Long-output caveat
 
 `BashTool` supplies a 1 KiB byte threshold to `OutputSink` by default, overridden by an explicit `tools.artifactTailBytes` setting. Direct user bang commands continue to use the executor's shared 50 KiB tail plus configured head window. Neither path enforces a hard line-count cap.
+
+The native shell bridge emits visible loss markers when its bounded callback queue overflows and returns cumulative dropped-byte metadata. Bash results carrying that metadata remain truncated even when the retained stream fits the inline window, and any artifact reference is labeled as retained partial output rather than full output.
 
 ## Live tool updates and async jobs
 

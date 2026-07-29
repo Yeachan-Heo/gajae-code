@@ -82,13 +82,24 @@ export function normalizeMinimizedSaveResultForTests(
 function completeRawArtifactAvailable(summary: {
 	artifactId?: string;
 	artifactTruncatedBytes?: number;
+	sourceTruncatedBytes?: number;
 	artifactFailureDiagnostic?: string;
 }): boolean {
 	return (
 		summary.artifactId !== undefined &&
 		(summary.artifactTruncatedBytes ?? 0) <= 0 &&
+		(summary.sourceTruncatedBytes ?? 0) <= 0 &&
 		summary.artifactFailureDiagnostic === undefined
 	);
+}
+
+function applyShellCallbackLoss(summary: OutputSummary, droppedOutputBytes: number | undefined): OutputSummary {
+	if (droppedOutputBytes === undefined || droppedOutputBytes <= 0) return summary;
+	return {
+		...summary,
+		truncated: true,
+		sourceTruncatedBytes: droppedOutputBytes,
+	};
 }
 
 function appendModelNotice(output: string, notice: string): string {
@@ -98,7 +109,12 @@ function appendModelNotice(output: string, notice: string): string {
 
 function minimizedSaveNotice(
 	result: BashArtifactSaveResult,
-	summary: { artifactId?: string; artifactTruncatedBytes?: number; artifactFailureDiagnostic?: string },
+	summary: {
+		artifactId?: string;
+		artifactTruncatedBytes?: number;
+		sourceTruncatedBytes?: number;
+		artifactFailureDiagnostic?: string;
+	},
 ): string | undefined {
 	if (result.status === "failed") return `Bash output artifact save failed: ${result.diagnostic}`;
 	if (result.status === "unavailable" && !completeRawArtifactAvailable(summary)) {
@@ -170,6 +186,8 @@ export interface BashResult {
 	outputBytes: number;
 	artifactId?: string;
 	artifactTruncatedBytes?: number;
+	/** Bytes dropped before the Bash executor received the native output stream. */
+	sourceTruncatedBytes?: number;
 	artifactFailureDiagnostic?: string;
 }
 
@@ -428,7 +446,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
-				...(await sink.dump(annotation)),
+				...applyShellCallbackLoss(await sink.dump(annotation), winner.result.droppedOutputBytes),
 			};
 		}
 
@@ -438,7 +456,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
-				...(await sink.dump("Command cancelled")),
+				...applyShellCallbackLoss(await sink.dump("Command cancelled"), winner.result.droppedOutputBytes),
 			};
 		}
 
@@ -480,7 +498,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 
 		// Normal completion
-		const summary = await sink.dump();
+		const summary = applyShellCallbackLoss(await sink.dump(), winner.result.droppedOutputBytes);
 		const saveNotice = minimizedSaveResult ? minimizedSaveNotice(minimizedSaveResult, summary) : undefined;
 		return {
 			exitCode: winner.result.exitCode,

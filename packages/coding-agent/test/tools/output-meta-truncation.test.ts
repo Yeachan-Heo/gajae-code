@@ -17,6 +17,45 @@ describe("output truncation metadata plumbing", () => {
 		expect(resolveBashOutputSinkHeadBytes(Settings.isolated())).toBe(0);
 		expect(resolveBashOutputSinkHeadBytes(Settings.isolated({ "tools.artifactHeadBytes": 7 }))).toBe(7 * 1024);
 	});
+	test("supports get-only Bash settings adapters without losing explicit budgets", () => {
+		const defaultsOnly = { get: () => undefined } as unknown as Settings;
+		const configured = {
+			get(path: string) {
+				if (path === "tools.artifactTailBytes") return 3;
+				if (path === "tools.artifactHeadBytes") return 2;
+				return undefined;
+			},
+		} as unknown as Settings;
+
+		expect(resolveBashOutputSinkTailBytes(defaultsOnly)).toBe(1024);
+		expect(resolveBashOutputSinkHeadBytes(defaultsOnly)).toBe(0);
+		expect(resolveBashOutputSinkTailBytes(configured)).toBe(3 * 1024);
+		expect(resolveBashOutputSinkHeadBytes(configured)).toBe(2 * 1024);
+	});
+
+	test("does not label artifacts as full when native callback output was dropped", () => {
+		const meta = outputMeta()
+			.truncationFromSummary(
+				{
+					output: "TAIL",
+					truncated: true,
+					totalLines: 10,
+					totalBytes: 100,
+					outputLines: 1,
+					outputBytes: 4,
+					artifactId: "partial-bash",
+					sourceTruncatedBytes: 17,
+				},
+				{ direction: "tail" },
+			)
+			.get();
+		const notice = formatOutputNotice(meta);
+
+		expect(meta?.truncation?.sourceTruncatedBytes).toBe(17);
+		expect(notice).toContain("Read artifact://partial-bash for retained output");
+		expect(notice).toContain("dropped before Bash capture");
+		expect(notice).not.toContain("for full output");
+	});
 	test("forwards noticeOwner on ordinary truncation builders", () => {
 		const result = truncateHead("one\ntwo\nthree", { maxLines: 2, maxBytes: 100 });
 		const meta = outputMeta().truncation(result, { direction: "head", noticeOwner: "body" }).get();

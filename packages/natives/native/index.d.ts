@@ -2180,6 +2180,10 @@ export interface ShellRunResult {
   cancelled: boolean
   /** Whether the command timed out before completion. */
   timedOut: boolean
+  /** Chunks dropped before the JavaScript output callback could receive them. */
+  droppedOutputChunks?: number
+  /** Bytes dropped before the JavaScript output callback could receive them. */
+  droppedOutputBytes?: number
   /**
    * When the minimizer rewrote the captured output, this carries the
    * original buffer + telemetry so the session layer can persist it as

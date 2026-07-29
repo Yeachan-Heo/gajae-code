@@ -110,9 +110,18 @@ function artifactTruncatedBytesForResult(result: BashResult | BashInteractiveRes
 	return typeof bytes === "number" && bytes > 0 ? bytes : undefined;
 }
 
+function sourceTruncatedBytesForResult(result: BashResult | BashInteractiveResult): number | undefined {
+	const bytes = (result as OutputSummary).sourceTruncatedBytes;
+	return typeof bytes === "number" && bytes > 0 ? bytes : undefined;
+}
+
 function artifactReferenceForResult(result: BashResult | BashInteractiveResult): string | undefined {
 	return result.artifactId
-		? formatArtifactReference(result.artifactId, artifactTruncatedBytesForResult(result))
+		? formatArtifactReference(
+				result.artifactId,
+				artifactTruncatedBytesForResult(result),
+				sourceTruncatedBytesForResult(result),
+			)
 		: undefined;
 }
 
@@ -137,9 +146,10 @@ function appendRawArtifactFooter(
 function artifactReferenceIsReachable(text: string, result: BashResult | BashInteractiveResult): boolean {
 	if (!result.artifactId || !text.includes(`artifact://${result.artifactId}`)) return false;
 	const artifactTruncatedBytes = artifactTruncatedBytesForResult(result);
+	const sourceTruncatedBytes = sourceTruncatedBytesForResult(result);
 	return (
-		artifactTruncatedBytes === undefined ||
-		text.includes(formatArtifactReference(result.artifactId, artifactTruncatedBytes))
+		(artifactTruncatedBytes === undefined && sourceTruncatedBytes === undefined) ||
+		text.includes(formatArtifactReference(result.artifactId, artifactTruncatedBytes, sourceTruncatedBytes))
 	);
 }
 
@@ -159,11 +169,15 @@ function artifactWriterFailureNotice(result: BashResult | BashInteractiveResult)
 }
 
 function completeOutputArtifactAvailable(
-	result: Pick<OutputSummary, "artifactId" | "artifactTruncatedBytes" | "artifactFailureDiagnostic">,
+	result: Pick<
+		OutputSummary,
+		"artifactId" | "artifactTruncatedBytes" | "sourceTruncatedBytes" | "artifactFailureDiagnostic"
+	>,
 ): boolean {
 	return (
 		result.artifactId !== undefined &&
 		(typeof result.artifactTruncatedBytes !== "number" || result.artifactTruncatedBytes <= 0) &&
+		(typeof result.sourceTruncatedBytes !== "number" || result.sourceTruncatedBytes <= 0) &&
 		(typeof result.artifactFailureDiagnostic !== "string" || result.artifactFailureDiagnostic.length === 0)
 	);
 }

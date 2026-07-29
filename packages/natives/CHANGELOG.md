@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Shell execution results now report callback-queue dropped chunk and byte counts, allowing callers to distinguish a retained partial stream from complete output instead of relying only on injected text markers.
 ## [0.12.0] - 2026-07-28
 ### Fixed
 
