@@ -6,11 +6,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	prepareManagedSessionScopeForWrite,
+	prepareManagedSessionScopeForWriteSync,
+	resolveManagedScope,
+} from "../src/session/internal/managed-session-scope";
+import {
 	acquireManagedLock,
 	acquireManagedLockSync,
 	captureManagedFileNoFollow,
 	ManagedSessionDescendantStore,
+	ManagedSessionSecurityError,
 	managedDirectoryRoot,
+	managedSecurityFailureClassification,
 	publishManagedFileNoReplace,
 	replaceManagedFileExactSync,
 	retainManagedDirectoryAuthority,
@@ -352,6 +359,26 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 				"identity_mismatch",
 			);
 			expect(fs.readFileSync(destination, "utf8")).toBe("authorized\n");
+			expect(fs.readdirSync(tempDir).some(name => name.includes(".replacement"))).toBe(true);
+		});
+
+		it("surfaces post-delete publication state while retaining the exact staged source", () => {
+			useWindowsPlatform();
+			const destination = path.join(tempDir, "publication-pending.jsonl");
+			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
+			const root = managedDirectoryRoot(tempDir);
+			vi.spyOn(native, "exactReplacePath").mockImplementation(
+				source =>
+					({
+						ok: false,
+						code: "already_exists",
+						detachedPath: source,
+					}) as never,
+			);
+			const expected = captureManagedFileNoFollow(destination);
+			expect(() => replaceManagedFileExactSync(destination, Buffer.from("replacement\n"), expected, root)).toThrow(
+				"managed_replace_publication_pending",
+			);
 			expect(fs.readdirSync(tempDir).some(name => name.includes(".replacement"))).toBe(true);
 		});
 	});
@@ -1633,6 +1660,61 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 		expect(result.failures[0].message).not.toContain("EIO");
 	});
 });
+describe("managed scope failure classification", () => {
+	function fixture() {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-scope-classification-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		const sessionsRoot = path.join(agentDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
+		fs.mkdirSync(sessionsRoot, { recursive: true, mode: 0o700 });
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		if (resolved.kind !== "resolved") throw new Error(`scope fixture failed: ${resolved.code}`);
+		return { root, scope: resolved.scope };
+	}
+
+	it("preserves bounded native security classifications across sync and async preparation", async () => {
+		const sync = fixture();
+		const syncVerify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({
+			ok: false,
+			code: "mode_mismatch",
+		} as never);
+		try {
+			const prepared = prepareManagedSessionScopeForWriteSync(sync.scope);
+			expect(prepared).toMatchObject({ kind: "error", cause: { classification: "mode_mismatch" } });
+			if (prepared.kind !== "error") throw new Error("Expected synchronous preparation failure");
+			expect(JSON.stringify(prepared.cause ?? {})).not.toContain(sync.root);
+			expect(prepared.message).toBe("mode_mismatch");
+			expect(prepared.message).not.toContain(sync.root);
+		} finally {
+			syncVerify.mockRestore();
+			fs.rmSync(sync.root, { recursive: true, force: true });
+		}
+
+		const asynchronous = fixture();
+		const asyncVerify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({
+			ok: false,
+			code: "mode_mismatch",
+		} as never);
+		try {
+			const prepared = await prepareManagedSessionScopeForWrite(asynchronous.scope);
+			expect(prepared).toMatchObject({ kind: "error", cause: { classification: "mode_mismatch" } });
+			if (prepared.kind !== "error") throw new Error("Expected asynchronous preparation failure");
+			expect(JSON.stringify(prepared.cause ?? {})).not.toContain(asynchronous.root);
+			expect(prepared.message).toBe("mode_mismatch");
+			expect(prepared.message).not.toContain(asynchronous.root);
+		} finally {
+			asyncVerify.mockRestore();
+			fs.rmSync(asynchronous.root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps ManagedSessionSecurityError codes bounded in the shared classifier", () => {
+		expect(managedSecurityFailureClassification(new ManagedSessionSecurityError("reparse_point"))).toBe(
+			"reparse_point",
+		);
+	});
+});
 describe("managed lock exact retirement boundaries", () => {
 	const successorRecord = (): string =>
 		`${JSON.stringify({
@@ -1681,6 +1763,189 @@ describe("managed lock exact retirement boundaries", () => {
 			substituteBeforeExactUnlink(lock.path);
 			expect(() => lock.release()).toThrow("migration_busy");
 			expectSuccessorStillExcludes(lock.path);
+		} finally {
+			fs.rmSync(locks, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
+		"keeps synchronous descriptor verification failures retryable",
+		() => {
+			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-verify-"));
+			try {
+				const lock = acquireManagedLockSync(locks, "owner");
+				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({
+					ok: false,
+					code: "identity_unavailable",
+				} as never);
+				expect(() => lock.release()).toThrow("identity_unavailable");
+				expect(fs.existsSync(lock.path)).toBe(true);
+				expect(fs.readFileSync(lock.path, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
+				verify.mockRestore();
+				lock.release();
+				expect(fs.existsSync(lock.path)).toBe(false);
+			} finally {
+				fs.rmSync(locks, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
+		"keeps asynchronous descriptor verification failures retryable",
+		async () => {
+			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-verify-"));
+			try {
+				const lock = await acquireManagedLock(locks, "owner");
+				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({
+					ok: false,
+					code: "identity_unavailable",
+				} as never);
+				await expect(lock.release()).rejects.toThrow("identity_unavailable");
+				expect(fs.existsSync(lock.path)).toBe(true);
+				verify.mockRestore();
+				await lock.release();
+				expect(fs.existsSync(lock.path)).toBe(false);
+			} finally {
+				fs.rmSync(locks, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
+		"finalizes a synchronous lock when descriptor verification proves ownership loss",
+		() => {
+			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-lost-"));
+			try {
+				const lock = acquireManagedLockSync(locks, "owner");
+				const retired = `${lock.path}.retired`;
+				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation(pathname => {
+					if (pathname === lock.path) {
+						fs.renameSync(lock.path, retired);
+						fs.writeFileSync(lock.path, "successor\n", { mode: 0o600 });
+						return { ok: false, code: "identity_mismatch" } as never;
+					}
+					return { ok: true } as never;
+				});
+				expect(() => lock.release()).toThrow("identity_mismatch");
+				expect(fs.readFileSync(lock.path, "utf8")).toBe("successor\n");
+				verify.mockRestore();
+				fs.unlinkSync(lock.path);
+				fs.renameSync(retired, lock.path);
+				expect(() => lock.release()).toThrow("migration_busy");
+				expect(fs.readFileSync(lock.path, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
+			} finally {
+				fs.rmSync(locks, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
+		"finalizes an asynchronous lock when descriptor verification proves ownership loss",
+		async () => {
+			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-lost-"));
+			try {
+				const lock = await acquireManagedLock(locks, "owner");
+				const retired = `${lock.path}.retired`;
+				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation(pathname => {
+					if (pathname === lock.path) {
+						fs.renameSync(lock.path, retired);
+						fs.writeFileSync(lock.path, "successor\n", { mode: 0o600 });
+						return { ok: false, code: "identity_mismatch" } as never;
+					}
+					return { ok: true } as never;
+				});
+				await expect(lock.release()).rejects.toThrow("identity_mismatch");
+				expect(fs.readFileSync(lock.path, "utf8")).toBe("successor\n");
+				verify.mockRestore();
+				fs.unlinkSync(lock.path);
+				fs.renameSync(retired, lock.path);
+				await expect(lock.release()).rejects.toThrow("migration_busy");
+				expect(fs.readFileSync(lock.path, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
+			} finally {
+				fs.rmSync(locks, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
+		"retires a partially initialized synchronous lock after security setup fails",
+		() => {
+			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-create-failure-"));
+			try {
+				vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValueOnce({
+					ok: false,
+					code: "identity_unavailable",
+				} as never);
+				expect(() => acquireManagedLockSync(locks, "owner")).toThrow("identity_unavailable");
+				expect(fs.existsSync(path.join(locks, "owner.lock"))).toBe(false);
+			} finally {
+				fs.rmSync(locks, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
+		"retires a partially initialized asynchronous lock after security setup fails",
+		async () => {
+			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-create-failure-"));
+			try {
+				vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValueOnce({
+					ok: false,
+					code: "identity_unavailable",
+				} as never);
+				await expect(acquireManagedLock(locks, "owner")).rejects.toThrow("identity_unavailable");
+				expect(fs.existsSync(path.join(locks, "owner.lock"))).toBe(false);
+			} finally {
+				fs.rmSync(locks, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("rejects forged cleanup_pending authority while the canonical lock remains occupied", () => {
+		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-forged-"));
+		try {
+			const lock = acquireManagedLockSync(locks, "owner");
+			const forged = path.join(locks, ".gjc-forged-retained");
+			fs.writeFileSync(forged, "forged\n", { mode: 0o600 });
+			const exactUnlink = native.exactUnlink;
+			const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				if (pathname === lock.path) return { ok: false, code: "cleanup_pending", detachedPath: forged };
+				return exactUnlink(pathname, identity);
+			});
+
+			expect(() => lock.release()).toThrow("migration_busy");
+			expect(fs.existsSync(lock.path)).toBe(true);
+			expect(fs.existsSync(forged)).toBe(true);
+			unlink.mockRestore();
+			lock.release();
+			expect(fs.existsSync(lock.path)).toBe(false);
+		} finally {
+			fs.rmSync(locks, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts authorized cleanup_pending retirement and leaves quarantine evidence for a successor", () => {
+		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-authorized-"));
+		try {
+			const lock = acquireManagedLockSync(locks, "owner");
+			const retained = path.join(locks, ".gjc-lock-retire-authorized");
+			const exactUnlink = native.exactUnlink;
+			const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				if (pathname === lock.path) {
+					fs.renameSync(lock.path, retained);
+					return { ok: false, code: "cleanup_pending", detachedPath: retained };
+				}
+				return exactUnlink(pathname, identity);
+			});
+			lock.release();
+			expect(fs.existsSync(lock.path)).toBe(false);
+			expect(fs.readFileSync(retained, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
+			unlink.mockRestore();
+
+			const successor = acquireManagedLockSync(locks, "owner");
+			expect(fs.existsSync(successor.path)).toBe(true);
+			expect(fs.existsSync(retained)).toBe(true);
+			successor.release();
 		} finally {
 			fs.rmSync(locks, { recursive: true, force: true });
 		}

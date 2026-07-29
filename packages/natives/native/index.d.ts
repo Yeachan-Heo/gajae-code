@@ -813,12 +813,6 @@ export declare function detectMacOSAppearance(): MacOSAppearance | null
  */
 export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
 
-/**
- * Replace a staged file using Windows `MoveFileExW` with `REPLACE_EXISTING`
- * and `WRITE_THROUGH`. The staged file's bytes must already have been flushed.
- */
-export declare function durableReplacePath(sourcePath: string, destinationPath: string): NativeDurableReplaceResult
-
 /** Ellipsis strategy for [`truncate_to_width`]. */
 export declare enum Ellipsis {
   /** Use a single Unicode ellipsis character ("…"). */
@@ -850,8 +844,11 @@ export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeD
 
 /**
  * Replace a staged regular file only after deleting the exact expected
- * destination object. Publication uses a retained source handle and a
- * no-replace rename, so a successor installed after deletion is preserved.
+ *
+ * The expected destination identity must describe a regular file, not a
+ * directory or detach-only request.
+ * Publication uses a retained source handle and a no-replace rename, so a
+ * successor installed after deletion is preserved.
  */
 export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
@@ -1701,18 +1698,6 @@ export interface NativeDirectoryTreeSnapshot {
   rootDev: string
   rootIno: string
   entries: Array<NativeDirectoryTreeEntry>
-}
-
-/** Result of a Windows write-through replacement. */
-export interface NativeDurableReplaceResult {
-  ok: boolean
-  code?: string
-  osCode?: number
-  mutationState: string
-  durabilityState: string
-  reason: string
-  primitive: string
-  phase: string
 }
 
 /**

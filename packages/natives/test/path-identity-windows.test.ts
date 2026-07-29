@@ -8,8 +8,8 @@ import {
 	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
-	durableReplacePath,
 	exactRemoveDirectoryTree,
+	exactReplacePath,
 	exactRestore,
 	exactUnlink,
 	renameNoReplacePath,
@@ -50,30 +50,55 @@ afterEach(async () => {
 	);
 });
 describe("native addon capability validation", () => {
-	it("skips a same-version stale addon missing durableReplacePath", () => {
+	it("skips a same-version stale addon missing exactReplacePath", () => {
 		const context = {
 			isCompiledBinary: false,
 			platformTag: "win32-x64",
 			packageVersion: "current",
 			versionSentinelExport: "__piNativesVCurrent",
-			candidates: ["stale.node", "fresh.node"],
+			candidates: ["stale-exact.node", "fresh-exact.node"],
 		};
 		const compatible = {
 			__piNativesVCurrent() {},
 			__piNativesPublishOutcomeV1() {},
 			renameNoReplacePath() {},
 			probeWindowsJobMemory() {},
-			durableReplacePath() {},
+			exactReplacePath() {},
 		};
 		const loaded = loadNative({
 			context,
 			extractEmbeddedAddons: () => [],
 			stageNodeModulesAddon: () => null,
 			requireCandidate: candidate =>
-				candidate === "stale.node" ? { ...compatible, durableReplacePath: undefined } : compatible,
+				candidate === "stale-exact.node" ? { ...compatible, exactReplacePath: undefined } : compatible,
 		});
 
 		expect(loaded).toBe(compatible);
+	});
+
+	it("fails closed when every candidate lacks exactReplacePath", () => {
+		const context = {
+			isCompiledBinary: false,
+			platformTag: "win32-x64",
+			packageVersion: "current",
+			versionSentinelExport: "__piNativesVCurrent",
+			candidates: ["stale.node", "incomplete.node"],
+		};
+		const incomplete = {
+			__piNativesVCurrent() {},
+			__piNativesPublishOutcomeV1() {},
+			renameNoReplacePath() {},
+			probeWindowsJobMemory() {},
+		};
+
+		expect(() =>
+			loadNative({
+				context,
+				extractEmbeddedAddons: () => [],
+				stageNodeModulesAddon: () => null,
+				requireCandidate: () => incomplete,
+			}),
+		).toThrow(/exactReplacePath/);
 	});
 });
 
@@ -161,19 +186,24 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
 	});
-	it("durably replaces a Windows destination with staged bytes", async () => {
+	it("exactly replaces the expected Windows regular destination", async () => {
 		const root = await temporaryDirectory();
-		const source = path.join(root, "staged.json");
-		const destination = path.join(root, "current.json");
-		await fs.writeFile(source, "new");
-		await fs.writeFile(destination, "old");
+		const source = path.join(root, "staged-exact.json");
+		const destination = path.join(root, "current-exact.json");
+		await fs.writeFile(source, "new-exact");
+		await fs.writeFile(destination, "old-exact");
+		const stat = await fs.stat(destination, { bigint: true });
 
-		expect(durableReplacePath(source, destination)).toMatchObject({
-			ok: true,
-			mutationState: "committed",
-			durabilityState: "durable",
-		});
-		expect(await fs.readFile(destination, "utf8")).toBe("new");
+		expect(
+			exactReplacePath(source, destination, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("old-exact"),
+			}),
+		).toEqual({ ok: true });
+		expect(await fs.readFile(destination, "utf8")).toBe("new-exact");
 		expect(
 			await fs.stat(source).then(
 				() => true,
@@ -181,32 +211,174 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			),
 		).toBe(false);
 	});
-	it("preserves an existing destination when durable replacement fails", async () => {
+	it("preserves both files when exact replacement identity validation fails", async () => {
 		const root = await temporaryDirectory();
-		const source = path.join(root, "missing-staged.json");
-		const destination = path.join(root, "current.json");
-		await fs.writeFile(destination, "old");
+		const source = path.join(root, "staged-mismatch.json");
+		const destination = path.join(root, "current-mismatch.json");
+		await fs.writeFile(source, "new-mismatch");
+		await fs.writeFile(destination, "old-mismatch");
+		const stat = await fs.stat(destination, { bigint: true });
 
-		expect(durableReplacePath(source, destination)).toMatchObject({
-			ok: false,
-			mutationState: "not_committed",
-		});
-		expect(await fs.readFile(destination, "utf8")).toBe("old");
+		expect(
+			exactReplacePath(source, destination, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size + 1n,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("old-mismatch"),
+			}),
+		).toEqual({ ok: false, code: "identity_mismatch" });
+		expect(await fs.readFile(source, "utf8")).toBe("new-mismatch");
+		expect(await fs.readFile(destination, "utf8")).toBe("old-mismatch");
 	});
-	it("retains an ambiguous post-mutation durable replacement outcome", async () => {
+	it("preserves a same-size destination successor swapped after identity capture", async () => {
 		const root = await temporaryDirectory();
-		const source = path.join(root, "staged-directory");
-		const destination = path.join(root, "current-directory");
-		await fs.mkdir(source);
-		await fs.writeFile(path.join(source, "state.json"), "new");
+		const source = path.join(root, "staged-swap.json");
+		const destination = path.join(root, "current-swap.json");
+		const retired = path.join(root, "retired-swap.json");
+		await fs.writeFile(source, "new-content");
+		await fs.writeFile(destination, "authorized!");
+		const stat = await fs.stat(destination, { bigint: true });
+		await fs.rename(destination, retired);
+		await fs.writeFile(destination, "successor!!");
 
-		expect(durableReplacePath(source, destination)).toMatchObject({
+		expect(
+			exactReplacePath(source, destination, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("authorized!"),
+			}),
+		).toEqual({ ok: false, code: "identity_mismatch" });
+		expect(await fs.readFile(source, "utf8")).toBe("new-content");
+		expect(await fs.readFile(destination, "utf8")).toBe("successor!!");
+		expect(await fs.readFile(retired, "utf8")).toBe("authorized!");
+	});
+	it("rejects cross-parent exact replacement without touching either file", async () => {
+		const root = await temporaryDirectory();
+		const other = path.join(root, "other");
+		await fs.mkdir(other);
+		const source = path.join(root, "staged-parent.json");
+		const destination = path.join(other, "current-parent.json");
+		await fs.writeFile(source, "new-parent");
+		await fs.writeFile(destination, "old-parent");
+		const stat = await fs.stat(destination, { bigint: true });
+
+		expect(
+			exactReplacePath(source, destination, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("old-parent"),
+			}),
+		).toEqual({ ok: false, code: "parent_mismatch" });
+		expect(await fs.readFile(source, "utf8")).toBe("new-parent");
+		expect(await fs.readFile(destination, "utf8")).toBe("old-parent");
+	});
+	it("rejects a destination junction before regular-file identity validation", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged-reparse.json");
+		const target = path.join(root, "reparse-target");
+		const destination = path.join(root, "current-reparse.json");
+		await fs.writeFile(source, "new-reparse");
+		await fs.mkdir(target);
+		await fs.writeFile(path.join(target, "preserved.txt"), "preserved");
+		await fs.symlink(target, destination, "junction");
+		const stat = await fs.stat(destination, { bigint: true });
+
+		expect(
+			exactReplacePath(source, destination, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("not-read"),
+			}),
+		).toEqual({ ok: false, code: "reparse_point" });
+		expect(await fs.readFile(source, "utf8")).toBe("new-reparse");
+		expect(await fs.readFile(path.join(target, "preserved.txt"), "utf8")).toBe("preserved");
+	});
+	it("fails closed while another handle retains destination write access", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged-writer.json");
+		const destination = path.join(root, "current-writer.json");
+		await fs.writeFile(source, "new-writer");
+		await fs.writeFile(destination, "old-writer");
+		const stat = await fs.stat(destination, { bigint: true });
+		const writer = await fs.open(destination, "r+");
+		try {
+			expect(
+				exactReplacePath(source, destination, {
+					dev: stat.dev,
+					ino: stat.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: sha256("old-writer"),
+				}),
+			).toEqual({ ok: false, code: "io_error" });
+		} finally {
+			await writer.close();
+		}
+		expect(await fs.readFile(source, "utf8")).toBe("new-writer");
+		expect(await fs.readFile(destination, "utf8")).toBe("old-writer");
+	});
+	it("rejects exact replacement for the same path and hard-link aliases", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged-alias.json");
+		const destination = path.join(root, "current-alias.json");
+		await fs.writeFile(source, "same-object");
+		const sourceStat = await fs.stat(source, { bigint: true });
+		expect(
+			exactReplacePath(source, source, {
+				dev: sourceStat.dev,
+				ino: sourceStat.ino,
+				size: sourceStat.size,
+				mtimeNs: sourceStat.mtimeNs,
+				sha256: sha256("same-object"),
+			}),
+		).toEqual({ ok: false, code: "identity_mismatch" });
+		await fs.link(source, destination);
+		const stat = await fs.stat(destination, { bigint: true });
+
+		expect(
+			exactReplacePath(source, destination, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("same-object"),
+			}),
+		).toEqual({ ok: false, code: "identity_mismatch" });
+		expect(await fs.readFile(source, "utf8")).toBe("same-object");
+		expect(await fs.readFile(destination, "utf8")).toBe("same-object");
+	});
+	it("rejects directory and detach-only identities for exact replacement", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged-kind.json");
+		const destination = path.join(root, "current-kind.json");
+		await fs.writeFile(source, "new-kind");
+		await fs.writeFile(destination, "old-kind");
+		const stat = await fs.stat(destination, { bigint: true });
+		const identity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256("old-kind"),
+		};
+
+		expect(exactReplacePath(source, destination, { ...identity, directory: true })).toEqual({
 			ok: false,
-			mutationState: "unknown",
-			durabilityState: "not_provable",
-			reason: "destination_verification_failed",
+			code: "invalid_request",
 		});
-		expect(await fs.readFile(path.join(destination, "state.json"), "utf8")).toBe("new");
+		expect(exactReplacePath(source, destination, { ...identity, detachOnly: true })).toEqual({
+			ok: false,
+			code: "invalid_request",
+		});
+		expect(await fs.readFile(source, "utf8")).toBe("new-kind");
+		expect(await fs.readFile(destination, "utf8")).toBe("old-kind");
 	});
 	it("smokes caller-fd security with fs.openSync and rejects arbitrary fds without terminating", async () => {
 		const root = await temporaryDirectory();
@@ -218,10 +390,16 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			expect(verifyOwnerOnlyFdSecurity(file, "file", fd)).toEqual({ ok: true });
 			expect(fstatSync(fd).isFile()).toBe(true);
 			expect(await fs.readFile(file, "utf8")).toBe("preserve");
+			expect(applyOwnerOnlyFdSecurity(file, "file", 2_147_483_647)).toEqual({
+				ok: false,
+				code: "identity_unavailable",
+			});
 			expect(verifyOwnerOnlyFdSecurity(file, "file", 2_147_483_647)).toEqual({
 				ok: false,
 				code: "identity_unavailable",
 			});
+			expect(await fs.readFile(file, "utf8")).toBe("preserve");
+			expect(verifyOwnerOnlyFdSecurity(file, "file", fd)).toEqual({ ok: true });
 		} finally {
 			closeSync(fd);
 		}
@@ -251,33 +429,47 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		}
 	});
 
-	it("rejects mismatched and reused caller fds without mutating the pathname", async () => {
+	it("rejects mismatched and reused caller fds without mutating pathname security", async () => {
 		const root = await temporaryDirectory();
 		const file = path.join(root, "caller-fd.json");
 		const other = path.join(root, "other.json");
 		await fs.writeFile(file, "authorized");
 		await fs.writeFile(other, "other");
+		const target = openSync(file, "r+");
 		const mismatch = openSync(other, "r+");
 		try {
+			expect(applyOwnerOnlyFdSecurity(file, "file", target)).toEqual({ ok: true });
+			expect(applyOwnerOnlyFdSecurity(other, "file", mismatch)).toEqual({ ok: true });
 			expect(applyOwnerOnlyFdSecurity(file, "file", mismatch)).toEqual({
 				ok: false,
 				code: "identity_mismatch",
 			});
+			expect(verifyOwnerOnlyFdSecurity(file, "file", target)).toEqual({ ok: true });
+			expect(verifyOwnerOnlyFdSecurity(other, "file", mismatch)).toEqual({ ok: true });
 		} finally {
+			closeSync(target);
 			closeSync(mismatch);
 		}
 
 		const stale = openSync(file, "r+");
 		closeSync(stale);
 		const reused = openSync(other, "r+");
+		expect(reused).toBe(stale);
+		const targetAfterReuse = openSync(file, "r+");
 		try {
-			expect(reused).toBe(stale);
+			expect(applyOwnerOnlyFdSecurity(file, "file", stale)).toEqual({
+				ok: false,
+				code: "identity_mismatch",
+			});
 			expect(verifyOwnerOnlyFdSecurity(file, "file", stale)).toEqual({
 				ok: false,
 				code: "identity_mismatch",
 			});
+			expect(verifyOwnerOnlyFdSecurity(file, "file", targetAfterReuse)).toEqual({ ok: true });
+			expect(verifyOwnerOnlyFdSecurity(other, "file", reused)).toEqual({ ok: true });
 			expect(await fs.readFile(file, "utf8")).toBe("authorized");
 		} finally {
+			closeSync(targetAfterReuse);
 			closeSync(reused);
 		}
 	});

@@ -35,7 +35,6 @@ import {
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
 	managedSecurityFailureClassification,
-	managedSessionSecurityCode,
 	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedTombstone,
@@ -180,7 +179,20 @@ export type ManagedScopeResolution =
 	  };
 
 function managedScopeFailureCause(error: unknown): { readonly classification: string } {
-	return { classification: managedSessionSecurityCode(error) ?? "binding_invalid" };
+	return { classification: managedSecurityFailureClassification(error) ?? "binding_invalid" };
+}
+
+const managedScopeFailureCodes = new Set([
+	"atomic_unavailable",
+	"invalid_request",
+	"durability_failed",
+	"durability_not_provable",
+]);
+
+function managedScopeFailureMessage(error: unknown, fallback: string): string {
+	const classification = managedSecurityFailureClassification(error);
+	if (classification) return classification;
+	return error instanceof Error && managedScopeFailureCodes.has(error.message) ? error.message : fallback;
 }
 
 export interface ManagedCandidate {
@@ -826,7 +838,7 @@ export async function ensureManagedScope(
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
 			publication?.classification ??
-			(error instanceof Error ? error.message : "The managed scope could not be initialized.");
+			managedScopeFailureMessage(error, "The managed scope could not be initialized.");
 		const code =
 			message === "atomic_unavailable" ||
 			message === "invalid_request" ||
@@ -838,7 +850,9 @@ export async function ensureManagedScope(
 			kind: "error",
 			code,
 			message,
-			cause: { classification: publication?.classification ?? managedScopeFailureCause(error).classification },
+			cause: publication
+				? { classification: publication.classification, diagnostic: publication.diagnostic }
+				: managedScopeFailureCause(error),
 		};
 	}
 }
@@ -1012,8 +1026,7 @@ export function prepareManagedSessionScopeForWriteSync(
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
-			publication?.classification ??
-			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
+			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
 		const code =
 			message === "atomic_unavailable" ||
 			message === "invalid_request" ||
@@ -1021,14 +1034,14 @@ export function prepareManagedSessionScopeForWriteSync(
 			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
-		const securityClassification = managedSecurityFailureClassification(error);
+
 		return {
 			kind: "error",
 			code,
 			message,
 			cause: publication
 				? { classification: publication.classification, diagnostic: publication.diagnostic }
-				: { classification: securityClassification ?? code, diagnostic: `prepare:${stage}` },
+				: { ...managedScopeFailureCause(error), diagnostic: `prepare:${stage}` },
 		};
 	}
 }
@@ -1791,6 +1804,14 @@ function sameArtifactTreeSnapshot(left: NativeDirectoryTreeSnapshot, right: Nati
 	return leftEntries.every((entry, index) => entry === rightEntries[index]);
 }
 
+function artifactTreePayloadAbsent(snapshot: NativeDirectoryTreeSnapshot): boolean {
+	return (
+		snapshot.entries.length === 1 &&
+		snapshot.entries[0]?.relativePath === "" &&
+		snapshot.entries[0].kind === "directory"
+	);
+}
+
 function assertRetainedArtifactsAuthority(pending: CleanupReceipt): void {
 	if (!pending.detachedArtifactsPath) return;
 	if (!pending.expectedArtifactsIdentity || !pending.expectedArtifactsTree) throw new Error("durability_failed");
@@ -1801,10 +1822,12 @@ function assertRetainedArtifactsAuthority(pending: CleanupReceipt): void {
 		throw new Error("durability_failed");
 	}
 	const observed = artifactIdentityAt(pending.detachedArtifactsPath);
+	const observedTree = snapshotArtifactTree(pending.detachedArtifactsPath);
 	if (
 		!observed ||
 		!sameArtifactRootIdentity(observed, pending.expectedArtifactsIdentity) ||
-		!sameArtifactTreeSnapshot(snapshotArtifactTree(pending.detachedArtifactsPath), pending.expectedArtifactsTree)
+		(!sameArtifactTreeSnapshot(observedTree, pending.expectedArtifactsTree) &&
+			!artifactTreePayloadAbsent(observedTree))
 	)
 		throw new Error("binding_invalid");
 }
@@ -2028,6 +2051,15 @@ function snapshotArtifactTree(pathname: string): NativeDirectoryTreeSnapshot {
 	const result = (native as unknown as NativeDirectorySnapshotApi).snapshotDirectoryTree(pathname);
 	if (!result.ok || !result.snapshot) throw new Error(result.ok ? "unsafe_artifacts" : result.code);
 	return result.snapshot;
+}
+
+function retainedArtifactPayloadAbsent(pathname: string): boolean {
+	try {
+		return artifactTreePayloadAbsent(snapshotArtifactTree(pathname));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+		throw error;
+	}
 }
 
 function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | undefined): CleanupReceipt {
@@ -2990,53 +3022,44 @@ export async function reconcileManagedTombstones(
 					}
 					if (deletion.kind === "cleanup_pending") {
 						const retry = nextCleanupReceipt(target, active);
-						await publishCleanupPending(
-							scope,
-							tombstone,
-							{
-								...retry,
-								expectedArtifactsIdentity:
-									deletion.phase === "artifacts"
-										? deletion.artifactsIdentity
-										: active.expectedArtifactsIdentity,
-								expectedArtifactsTree:
-									deletion.phase === "artifacts" ? deletion.artifactsTree : active.expectedArtifactsTree,
-								detachedArtifactsPath:
-									deletion.phase === "artifacts"
-										? deletion.detachedArtifactsPath
-										: active.detachedArtifactsPath,
+						const pendingEvidence = cleanupPendingEvidence(retry, active, deletion);
+						await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
+						if (deletion.phase === "artifacts") {
+							if (!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath)) continue;
+							await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
+							deletion = await new FileSessionStorage().deleteSessionVerified({
+								sessionsRoot: scope.sessionsRoot,
+								transcriptPath: target.path,
+								sessionId: target.sessionId,
+								cwd: target.cwd,
+								transcriptIdentity: target.identity,
+								plannedArtifactsPath: active.plannedArtifactsPath,
+								plannedTranscriptPath: active.plannedTranscriptPath,
 								detachedTranscriptPath:
-									deletion.phase === "transcript"
-										? deletion.detachedTranscriptPath
-										: active.detachedTranscriptPath,
-								retainedArtifactsSuccessorPath:
-									deletion.phase === "artifacts"
-										? deletion.retainedSuccessorPath
-										: active.retainedArtifactsSuccessorPath,
-								retainedArtifactsPlaceholderPath:
-									deletion.phase === "artifacts"
-										? deletion.retainedPlaceholderPath
-										: active.retainedArtifactsPlaceholderPath,
-								retainedArtifactsUnknownPath:
-									deletion.phase === "artifacts"
-										? deletion.retainedUnknownPath
-										: active.retainedArtifactsUnknownPath,
-								retainedTranscriptSuccessorPath:
-									deletion.phase === "transcript"
-										? deletion.retainedSuccessorPath
-										: active.retainedTranscriptSuccessorPath,
-								retainedTranscriptPlaceholderPath:
-									deletion.phase === "transcript"
-										? deletion.retainedPlaceholderPath
-										: active.retainedTranscriptPlaceholderPath,
-								retainedTranscriptUnknownPath:
-									deletion.phase === "transcript"
-										? deletion.retainedUnknownPath
-										: active.retainedTranscriptUnknownPath,
-							},
-							lock,
-						);
-						continue;
+									active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+								retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+								retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+								retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+								retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+								retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+								retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
+								artifactsRemoved: true,
+							});
+							if (deletion.kind === "cleanup_pending") {
+								if (
+									deletion.phase !== "transcript" ||
+									deletion.detachedTranscriptPath !== active.plannedTranscriptPath
+								)
+									throw new Error("durability_failed");
+								const followup = nextCleanupReceipt(target, pendingEvidence);
+								await publishCleanupPending(
+									scope,
+									tombstone,
+									cleanupPendingEvidence(followup, pendingEvidence, deletion),
+									lock,
+								);
+							}
+						}
 					}
 					fsyncManagedParent(target.path);
 					await publishCleanupCompleted(scope, tombstone, target, lock);
@@ -3050,7 +3073,7 @@ export async function reconcileManagedTombstones(
 				}
 			}
 		} finally {
-			if (lock) await lock.release().catch(() => undefined);
+			if (lock) await lock.release();
 		}
 	}
 }
@@ -3079,8 +3102,7 @@ export async function prepareManagedSessionScopeForWrite(
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
-			publication?.classification ??
-			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
+			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
 		const code =
 			message === "atomic_unavailable" ||
 			message === "invalid_request" ||
@@ -3092,7 +3114,9 @@ export async function prepareManagedSessionScopeForWrite(
 			kind: "error",
 			code,
 			message,
-			cause: { classification: publication?.classification ?? managedScopeFailureCause(error).classification },
+			cause: publication
+				? { classification: publication.classification, diagnostic: publication.diagnostic }
+				: managedScopeFailureCause(error),
 		};
 	}
 }
@@ -3422,7 +3446,7 @@ export async function openManagedCandidateForWrite(
 						: "Managed migration failed.",
 		};
 	} finally {
-		if (lock) await lock.release().catch(() => undefined);
+		if (lock) await lock.release();
 	}
 }
 
@@ -3574,10 +3598,16 @@ export async function deleteManagedSessionCandidate(
 				)
 					throw new Error("durability_failed");
 				const retry = nextCleanupReceipt(target, active);
-				await publishCleanupPending(scope, tombstone, cleanupPendingEvidence(retry, active, deletion), lock);
+				const pendingEvidence = cleanupPendingEvidence(retry, active, deletion);
+				await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 				if (deletion.phase === "artifacts") {
-					// A typed retained artifact root proves durable canonical absence; advance
-					// to the transcript phase instead of stalling on the retained evidence.
+					if (!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath))
+						return {
+							kind: "cleanup_pending",
+							tombstonePath: tombstone,
+							phase: deletion.phase,
+							message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
+						};
 					await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
 					deletion = await new FileSessionStorage().deleteSessionVerified({
 						sessionsRoot: scope.sessionsRoot,
@@ -3588,37 +3618,31 @@ export async function deleteManagedSessionCandidate(
 						plannedArtifactsPath: active.plannedArtifactsPath,
 						plannedTranscriptPath: active.plannedTranscriptPath,
 						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
-						retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
-						retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
-						retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
-						retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
-						retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
-						retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
+						retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+						retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+						retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+						retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+						retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+						retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
 						artifactsRemoved: true,
 					});
 					if (deletion.kind === "cleanup_pending") {
-						const followup = nextCleanupReceipt(target, active);
-						await publishCleanupPending(
-							scope,
-							tombstone,
-							cleanupPendingEvidence(followup, active, deletion),
-							lock,
-						);
 						if (
 							deletion.phase !== "transcript" ||
 							deletion.detachedTranscriptPath !== active.plannedTranscriptPath
 						)
-							return {
-								kind: "cleanup_pending",
-								tombstonePath: tombstone,
-								phase: deletion.phase,
-								message:
-									"Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
-							};
+							throw new Error("durability_failed");
+						const followup = nextCleanupReceipt(target, pendingEvidence);
+						await publishCleanupPending(
+							scope,
+							tombstone,
+							cleanupPendingEvidence(followup, pendingEvidence, deletion),
+							lock,
+						);
 					}
 				}
-				// A typed retained transcript quarantine is durable canonical-absence
-				// evidence — never a terminal byte-deletion claim; complete the receipt.
+				// A retained transcript quarantine proves canonical absence and remains
+				// identity-bound in the durable pending receipt.
 			}
 			fsyncManagedParent(target.path);
 			await publishCleanupCompleted(scope, tombstone, target, lock);
@@ -3628,6 +3652,6 @@ export async function deleteManagedSessionCandidate(
 		const code = expectedFailure(error);
 		return { kind: "error", code, message: error instanceof Error ? error.message : "Managed deletion failed." };
 	} finally {
-		if (lock) await lock.release().catch(() => undefined);
+		if (lock) await lock.release();
 	}
 }

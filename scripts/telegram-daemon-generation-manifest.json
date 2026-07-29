@@ -553,7 +553,7 @@
     "telegram:packages/coding-agent/src/sdk/host/host.ts:TOOL_ACTIVITY_CAPABILITY": "547f80bd6b3bd1c615fc3d885e507aba4418e6c4c54c47d36938b8b2e5d2abd7"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "eb4ab17b01947bc4bb462bd0b3119af41c6aa8375bcd6c6455ed2ef6c509943d",
+    "crates/pi-natives/src/path_identity.rs": "fd23a3dd678c3b00625bd4bdeb848d9087537ea27765300311148e0027d44472",
     "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
     "crates/pi-shell/src/process.rs": "63eb3b3cd6a6a64dd172fbc7df0ab4fde11eadd4015e2408b9f7b94775f6a5e4",
     "packages/natives/native/index.d.ts": "c61e02fd4712c822d30fb4b1496f064097a38718c9443bef526711f828165c50",
