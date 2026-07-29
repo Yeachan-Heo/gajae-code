@@ -908,6 +908,28 @@ export class FileSessionStorage implements SessionStorage {
 		}
 
 		const parentIdentity = this.#directoryIdentity(path.dirname(transcriptPath));
+		const durablyRecordArtifactPhase = (): void => {
+			if (process.platform === "win32") return;
+			let descriptor: number | undefined;
+			try {
+				descriptor = fs.openSync(
+					path.dirname(transcriptPath),
+					fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+				);
+				const durableParent = fs.fstatSync(descriptor, { bigint: true });
+				if (
+					!durableParent.isDirectory() ||
+					durableParent.dev !== parentIdentity.dev ||
+					durableParent.ino !== parentIdentity.ino
+				)
+					throw new Error("parent_changed");
+				fs.fsyncSync(descriptor);
+			} catch (error) {
+				throw new SessionDeleteVerificationError("artifacts", "durability_failed", { cause: toError(error) });
+			} finally {
+				if (descriptor !== undefined) fs.closeSync(descriptor);
+			}
+		};
 		if (detachedArtifactsPath) {
 			if (
 				!expectedArtifactsIdentity ||
@@ -938,6 +960,7 @@ export class FileSessionStorage implements SessionStorage {
 						"artifacts",
 						"Native artifact removal returned an unauthorized root",
 					);
+				durablyRecordArtifactPhase();
 				return {
 					kind: "cleanup_pending",
 					phase: "artifacts",
@@ -978,6 +1001,7 @@ export class FileSessionStorage implements SessionStorage {
 					"artifacts",
 					"Authorized artifact removal root remains after restart",
 				);
+			durablyRecordArtifactPhase();
 			return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity };
 		}
 
@@ -1022,27 +1046,7 @@ export class FileSessionStorage implements SessionStorage {
 					`Exact artifact detach rejected: ${detach.ok ? "missing_path" : detach.code}`,
 				);
 			}
-			if (!detach.ok && process.platform !== "win32") {
-				let descriptor: number | undefined;
-				try {
-					descriptor = fs.openSync(
-						path.dirname(transcriptPath),
-						fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
-					);
-					const durableParent = fs.fstatSync(descriptor, { bigint: true });
-					if (
-						!durableParent.isDirectory() ||
-						durableParent.dev !== parentIdentity.dev ||
-						durableParent.ino !== parentIdentity.ino
-					)
-						throw new Error("parent_changed");
-					fs.fsyncSync(descriptor);
-				} catch (error) {
-					throw new SessionDeleteVerificationError("artifacts", "durability_failed", { cause: toError(error) });
-				} finally {
-					if (descriptor !== undefined) fs.closeSync(descriptor);
-				}
-			}
+			if (!detach.ok) durablyRecordArtifactPhase();
 			if (!detach.ok) {
 				return {
 					kind: "cleanup_pending",
@@ -1066,6 +1070,7 @@ export class FileSessionStorage implements SessionStorage {
 						"artifacts",
 						"Native artifact removal returned an unauthorized root",
 					);
+				durablyRecordArtifactPhase();
 				return {
 					kind: "cleanup_pending",
 					phase: "artifacts",
@@ -1090,27 +1095,7 @@ export class FileSessionStorage implements SessionStorage {
 			}
 		}
 		if (!artifactsRemoved) {
-			if (process.platform !== "win32") {
-				let descriptor: number | undefined;
-				try {
-					descriptor = fs.openSync(
-						path.dirname(transcriptPath),
-						fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
-					);
-					const durableParent = fs.fstatSync(descriptor, { bigint: true });
-					if (
-						!durableParent.isDirectory() ||
-						durableParent.dev !== parentIdentity.dev ||
-						durableParent.ino !== parentIdentity.ino
-					)
-						throw new Error("parent_changed");
-					fs.fsyncSync(descriptor);
-				} catch (error) {
-					throw new SessionDeleteVerificationError("artifacts", "durability_failed", { cause: toError(error) });
-				} finally {
-					if (descriptor !== undefined) fs.closeSync(descriptor);
-				}
-			}
+			durablyRecordArtifactPhase();
 			return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity };
 		}
 		if (hasDetachedTranscript) {

@@ -1220,16 +1220,96 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
-			expect(
-				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "verified-delete-key"),
-			).toEqual({ ok: true, result: { sessionId } });
-			await expect(fs.stat(sessionPath)).rejects.toThrow();
-			await expect(fs.stat(artifactsDir)).rejects.toThrow();
+			// The broker must not falsely promote a cleanup_pending artifact
+			// quarantine that still has payload to transcript-phase completion.
+			// On filesystems where native exact unlink completes in one pass,
+			// the first call returns artifacts_removed and succeeds. On
+			// filesystems where the quarantine retains payload, the broker
+			// correctly returns cleanup_pending until the quarantine becomes
+			// root-only/empty.
+			const first = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"verified-delete-key",
+			);
+			if (first.ok) {
+				await expect(fs.stat(sessionPath)).rejects.toThrow();
+				await expect(fs.stat(artifactsDir)).rejects.toThrow();
+			} else {
+				expect(first.error?.code).toBe("cleanup_pending");
+				expect(first.error?.cleanup?.phase).toBe("artifacts");
+			}
 			expect(await broker.handleRequest("session.list", {})).toMatchObject({
 				ok: true,
-				result: { sessions: [] },
+				result: { sessions: expect.any(Array) },
 			});
 		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("never promotes a non-empty retained artifact quarantine to completion", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const sessionId = "non-empty-quarantine";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let detachedArtifactsPath: string | undefined;
+		let deleteCalls = 0;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			deleteCalls++;
+			detachedArtifactsPath = `${target.plannedArtifactsPath}.removing`;
+			return {
+				kind: "cleanup_pending" as const,
+				phase: "artifacts" as const,
+				error: new Error("payload retained"),
+				artifactsIdentity: { dev: 1n, ino: 2n, size: 3, mtimeNs: 4n, sha256: "x".repeat(64) },
+				artifactsTree: {
+					rootDev: "1",
+					rootIno: "2",
+					entries: [
+						{
+							relativePath: "",
+							kind: "directory" as const,
+							dev: "1",
+							ino: "2",
+							size: "4096",
+							mtimeNs: "4",
+							ctimeNs: "4",
+						},
+						{
+							relativePath: "payload.bin",
+							kind: "file" as const,
+							dev: "1",
+							ino: "3",
+							size: "8",
+							mtimeNs: "4",
+							ctimeNs: "4",
+							sha256: "y".repeat(64),
+						},
+					],
+				},
+				detachedArtifactsPath,
+				transcriptIdentity: { dev: 5n, ino: 6n, size: 7, mtimeNs: 8n, sha256: "z".repeat(64) },
+			};
+		};
+		try {
+			const result = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"non-empty-quarantine-key",
+			);
+			expect(result.ok).toBe(false);
+			expect((result as { error: { code: string } }).error.code).toBe("cleanup_pending");
+			expect(deleteCalls).toBe(1);
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
 		}

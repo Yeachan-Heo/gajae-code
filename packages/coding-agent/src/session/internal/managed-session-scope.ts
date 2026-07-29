@@ -3026,17 +3026,17 @@ export async function reconcileManagedTombstones(
 						await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 						if (deletion.phase === "artifacts") {
 							if (!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath)) continue;
-							await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
+							await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
 							deletion = await new FileSessionStorage().deleteSessionVerified({
 								sessionsRoot: scope.sessionsRoot,
 								transcriptPath: target.path,
 								sessionId: target.sessionId,
 								cwd: target.cwd,
 								transcriptIdentity: target.identity,
-								plannedArtifactsPath: active.plannedArtifactsPath,
-								plannedTranscriptPath: active.plannedTranscriptPath,
+								plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+								plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
 								detachedTranscriptPath:
-									active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+									pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
 								retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
 								retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
 								retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
@@ -3048,7 +3048,7 @@ export async function reconcileManagedTombstones(
 							if (deletion.kind === "cleanup_pending") {
 								if (
 									deletion.phase !== "transcript" ||
-									deletion.detachedTranscriptPath !== active.plannedTranscriptPath
+									deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath
 								)
 									throw new Error("durability_failed");
 								const followup = nextCleanupReceipt(target, pendingEvidence);
@@ -3608,16 +3608,17 @@ export async function deleteManagedSessionCandidate(
 							phase: deletion.phase,
 							message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
 						};
-					await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
+					await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
 					deletion = await new FileSessionStorage().deleteSessionVerified({
 						sessionsRoot: scope.sessionsRoot,
 						transcriptPath: target.path,
 						sessionId: target.sessionId,
 						cwd: target.cwd,
 						transcriptIdentity: target.identity,
-						plannedArtifactsPath: active.plannedArtifactsPath,
-						plannedTranscriptPath: active.plannedTranscriptPath,
-						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+						plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+						plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
+						detachedTranscriptPath:
+							pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
 						retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
 						retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
 						retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
@@ -3629,7 +3630,7 @@ export async function deleteManagedSessionCandidate(
 					if (deletion.kind === "cleanup_pending") {
 						if (
 							deletion.phase !== "transcript" ||
-							deletion.detachedTranscriptPath !== active.plannedTranscriptPath
+							deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath
 						)
 							throw new Error("durability_failed");
 						const followup = nextCleanupReceipt(target, pendingEvidence);

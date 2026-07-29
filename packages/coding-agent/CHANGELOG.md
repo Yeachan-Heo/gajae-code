@@ -11,6 +11,9 @@
 
 ### Fixed
 
+- Broker artifact cleanup no longer promotes a non-empty `cleanup_pending` quarantine to transcript-phase completion. The broker advances only when the retained quarantine is root-only/empty or when the lower layer returns `artifacts_removed`, so artifact bytes cannot vanish behind a success receipt (#3489).
+- POSIX parent identity reproof/fsync is now centralized before every promotable artifact-phase result, preventing a crash-window where a rename is lost after durable retirement is recorded (#3489).
+- Artifact retirement, planned paths, retained authority, and transcript retry in both managed reconciliation and deletion now bind to the newest published `pendingEvidence` attempt, preventing stranded detached transcripts at paths absent from the newest receipt after a crash (#3489).
 - Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
 - Detached task receipts for in-memory parent sessions no longer advertise dead `agent://` output URIs. TaskTool allocates a session-lifetime durable artifact root under the process temp directory, persists child outputs there, authorizes parent and same-session descendants for scoped resolution, and omits the URI entirely when durable allocation fails (#3471).
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.

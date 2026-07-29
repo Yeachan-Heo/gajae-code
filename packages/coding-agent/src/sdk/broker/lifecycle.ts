@@ -3260,26 +3260,31 @@ async function executeLifecycleResponse(
 				`Unable to delete saved session artifacts: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
-		const retainedArtifactsCleanup =
+		const retainedArtifactsRootOnly =
 			deleted.kind === "cleanup_pending" &&
 			deleted.phase === "artifacts" &&
 			deleted.detachedArtifactsPath !== undefined &&
-			cleanupTarget.plannedArtifactsPath !== undefined &&
-			(deleted.detachedArtifactsPath === cleanupTarget.plannedArtifactsPath ||
-				deleted.detachedArtifactsPath === `${cleanupTarget.plannedArtifactsPath}.removing`);
-		if (deleted.kind === "artifacts_removed" || retainedArtifactsCleanup) {
+			(() => {
+				const snapshot = native.snapshotDirectoryTree(deleted.detachedArtifactsPath);
+				if (!snapshot.ok || !snapshot.snapshot) return false;
+				const entries = snapshot.snapshot.entries;
+				return entries.length === 1 && entries[0]?.relativePath === "" && entries[0].kind === "directory";
+			})();
+		const retainedArtifactsEvidence =
+			retainedArtifactsRootOnly && deleted.kind === "cleanup_pending" && deleted.phase === "artifacts"
+				? {
+						detachedArtifactsPath: deleted.detachedArtifactsPath,
+						...(deleted.artifactsIdentity
+							? { artifactsIdentity: serializeCleanupIdentity(deleted.artifactsIdentity) }
+							: {}),
+					}
+				: {};
+		if (deleted.kind === "artifacts_removed" || retainedArtifactsRootOnly) {
 			const transcriptPhaseCleanup = {
 				...preauthorizedCleanup,
 				phase: "transcript" as const,
 				artifactsRemoved: true,
-				...(deleted.kind === "cleanup_pending" && deleted.phase === "artifacts"
-					? {
-							detachedArtifactsPath: deleted.detachedArtifactsPath,
-							...(deleted.artifactsIdentity
-								? { artifactsIdentity: serializeCleanupIdentity(deleted.artifactsIdentity) }
-								: {}),
-						}
-					: {}),
+				...(retainedArtifactsRootOnly ? retainedArtifactsEvidence : {}),
 				...(preauthorizedCleanup.artifactTree
 					? { artifactTree: { ...preauthorizedCleanup.artifactTree, completed: true as const } }
 					: {}),

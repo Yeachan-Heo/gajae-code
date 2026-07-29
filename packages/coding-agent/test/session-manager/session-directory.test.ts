@@ -2206,4 +2206,41 @@ describe("managed session write protocol", () => {
 		expect(replacement.isSymbolicLink()).toBe(true);
 		expect(await fs.readlink(pending.detachedArtifactsPath)).toBe(replacementTarget);
 	});
+	it("binds artifact retirement publication to the newest cleanup attempt", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "retirement-attempt.jsonl");
+		const artifacts = source.slice(0, -6);
+		await fs.mkdir(artifacts, { recursive: true });
+		await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
+		await fs.writeFile(source, transcript("retirement-attempt", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+		const exactUnlink = native.exactUnlink;
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (pathname !== artifacts) return exactUnlink(pathname, identity);
+			if (!identity.directory || !identity.quarantineName) throw new Error("Missing artifact quarantine identity");
+			const retainedRoot = path.join(path.dirname(pathname), identity.quarantineName);
+			syncFs.renameSync(pathname, retainedRoot);
+			return { ok: true, detachedPath: retainedRoot };
+		});
+		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
+			for (const name of syncFs.readdirSync(pathname))
+				syncFs.rmSync(path.join(pathname, name), { recursive: true, force: true });
+			return { ok: false, code: "cleanup_pending", detachedPath: pathname };
+		});
+		try {
+			const result = await deleteManagedSessionCandidate(scope, listed.owned[0]);
+			expect(result.kind).toBe("deleted");
+			if (result.kind !== "deleted") throw new Error("unreachable");
+			const tombstonesDir = path.dirname(result.tombstonePath);
+			const tombstoneFiles = await fs.readdir(tombstonesDir).catch(() => [] as string[]);
+			const artifactsRemoved = tombstoneFiles.find(name => name.includes("artifacts_removed"));
+			expect(artifactsRemoved).toBeDefined();
+			expect(artifactsRemoved).toMatch(/-2\./);
+		} finally {
+			remove.mockRestore();
+			unlink.mockRestore();
+		}
+	});
 });

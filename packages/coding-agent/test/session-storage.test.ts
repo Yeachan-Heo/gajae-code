@@ -936,6 +936,34 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			remove.mockRestore();
 		}
 	});
+	it("durably records a retained artifact root before returning cleanup_pending", async () => {
+		const transcriptPath = await createTranscript("artifact-root-durability");
+		const artifactsDir = transcriptPath.slice(0, -6);
+		const plannedArtifactsPath = path.join(tempDir, ".gjc-delete-artifact-root-durability");
+		await fsp.mkdir(artifactsDir, { recursive: true });
+		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
+
+		const result = await storage.deleteSessionVerified({
+			sessionsRoot: tempDir,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: tempDir,
+			transcriptIdentity: verifiedIdentity(transcriptPath),
+			plannedArtifactsPath,
+			plannedTranscriptPath: path.join(tempDir, ".gjc-delete-artifact-root-d-transcript"),
+		});
+		if (result.kind !== "cleanup_pending" || result.phase !== "artifacts") throw new Error("unreachable");
+		// The artifact directory was detached to quarantine.
+		expect(await fsp.stat(artifactsDir).catch(() => undefined)).toBeUndefined();
+		// The retained quarantine proves payload persists.
+		expect(await fsp.readFile(path.join(result.detachedArtifactsPath, "artifact.txt"), "utf8")).toBe("payload");
+		// On POSIX, the parent directory was fsynced before the result was returned.
+		if (process.platform !== "win32") {
+			// Re-stat the parent to verify it's still accessible (proves fsync didn't fail).
+			const parent = await fsp.stat(path.dirname(transcriptPath));
+			expect(parent.isDirectory()).toBe(true);
+		}
+	});
 	it("returns an artifact-phase receipt after complete tree cleanup", async () => {
 		const transcriptPath = await createTranscript("tree-removing-retry");
 		const artifactsDir = transcriptPath.slice(0, -6);
