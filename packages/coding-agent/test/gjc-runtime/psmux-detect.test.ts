@@ -182,7 +182,7 @@ describe("PSMUX_BINARY_NAMES", () => {
 				fs.rmSync(root, { recursive: true, force: true });
 			}
 		});
-		it("rejects durable psmux authority records off Windows", () => {
+		it("treats Windows authority as absent for native probing while direct reads reject off Windows", () => {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-off-windows-"));
 			try {
 				__setBinaryResolverForTests(candidate => candidate);
@@ -196,13 +196,13 @@ describe("PSMUX_BINARY_NAMES", () => {
 				persistGjcTmuxProviderAuthoritySync(authority);
 				publishGeneration(root, authority.sessionId, authority.generation);
 				__setTmuxProviderAuthorityPlatformForTests("linux");
-				expect(() =>
+				expect(
 					hasGjcTmuxProviderAuthoritySync({
 						stateDir: authority.stateDir,
 						sessionId: authority.sessionId,
 						generation: authority.generation,
 					}),
-				).toThrow("gjc_tmux_provider_authority_windows_required");
+				).toBe(false);
 				expect(() =>
 					readGjcTmuxProviderAuthoritySync({
 						stateDir: authority.stateDir,

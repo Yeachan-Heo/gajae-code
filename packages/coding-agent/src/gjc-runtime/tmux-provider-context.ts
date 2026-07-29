@@ -161,6 +161,7 @@ export function hasGjcTmuxProviderAuthoritySync(input: {
 	sessionId: string;
 	generation: string;
 }): boolean {
+	if (authorityPlatform() !== "win32") return false;
 	const stateDir = path.resolve(input.stateDir);
 	const sessionId = rejectUnsafeToken(input.sessionId, "session_id");
 	const generation = rejectUnsafeToken(input.generation, "generation");
