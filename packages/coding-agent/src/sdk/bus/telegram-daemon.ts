@@ -7213,6 +7213,8 @@ export class TelegramNotificationDaemon {
 		let acceptedTopicArchiveAttempted = false;
 		let creationSuppressed = false;
 		let creationRejected = false;
+		let adoptedTopicId: number | undefined;
+		const adoptionIntentCandidate = this.#adoptionIntents.bySession(sessionId);
 		try {
 			const rec = await this.topics.getOrCreateTopic(
 				sessionId,
