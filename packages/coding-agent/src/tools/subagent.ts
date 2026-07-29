@@ -55,7 +55,9 @@ const subagentSchema = z.object({
 		.min(0)
 		.max(MAX_AWAIT_TIMEOUT_MS)
 		.optional()
-		.describe("until_terminal hard deadline in milliseconds (default 600000); child keeps running if deadline expires"),
+		.describe(
+			"until_terminal hard deadline in milliseconds (default 600000); child keeps running if deadline expires",
+		),
 	heartbeat_ms: z
 		.number()
 		.min(0)
@@ -416,10 +418,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 						MAX_AWAIT_TIMEOUT_MS,
 						Math.max(0, Math.floor(params.deadline_ms ?? DEFAULT_UNTIL_TERMINAL_DEADLINE_MS)),
 					)
-				: Math.min(
-						MAX_AWAIT_TIMEOUT_MS,
-						Math.max(0, Math.floor(params.timeout_ms ?? DEFAULT_AWAIT_TIMEOUT_MS)),
-					);
+				: Math.min(MAX_AWAIT_TIMEOUT_MS, Math.max(0, Math.floor(params.timeout_ms ?? DEFAULT_AWAIT_TIMEOUT_MS)));
 		// Heartbeats only apply to until_terminal; bounded keeps the 500ms change-gated poll.
 		const heartbeatMs =
 			awaitMode === "until_terminal"
@@ -461,9 +460,9 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<SubagentAwaitOutcome>();
 		const timeoutTimer = setTimeout(() => resolveTimeout("timed_out"), waitMs);
 		const jobPromises = runningJobs.map(job => job.promise);
-		const completionPromise = (
-			join === "any_terminal" ? Promise.race(jobPromises) : Promise.all(jobPromises)
-		).then(() => "completed" as const);
+		const completionPromise = (join === "any_terminal" ? Promise.race(jobPromises) : Promise.all(jobPromises)).then(
+			() => "completed" as const,
+		);
 		let onAbort: (() => void) | undefined;
 		try {
 			if (signal) {
