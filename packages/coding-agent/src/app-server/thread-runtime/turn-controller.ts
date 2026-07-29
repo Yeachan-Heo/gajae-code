@@ -107,12 +107,15 @@ interface PromptAck {
 	readonly commandId: string;
 	readonly turnId: string;
 	readonly replayToken?: string;
+	/** Set when reconciliation proved the accepted prompt already terminalized as failed. */
+	readonly reconciledFailure?: { readonly code: string; readonly message: string };
 }
 
 interface PromptStatus {
 	readonly status: string;
 	readonly commandId?: string;
 	readonly turnId?: string;
+	readonly error?: { readonly code: string; readonly message: string };
 }
 
 type FailedLifecycle = {
@@ -363,10 +366,14 @@ function promptStatus(value: unknown): PromptStatus | undefined {
 	if (candidate?.status === undefined || typeof candidate.status !== "string") return undefined;
 	const commandId = candidate.commandId;
 	const turnId = candidate.turnId;
+	const error = isRecord(candidate.error) ? candidate.error : undefined;
+	const errorCode = error && nonEmptyString(error.code) ? error.code : undefined;
+	const errorText = error && nonEmptyString(error.message) ? error.message : undefined;
 	return {
 		status: candidate.status,
 		...(commandId === undefined ? {} : { commandId: nonEmptyString(commandId) ? commandId : undefined }),
 		...(turnId === undefined ? {} : { turnId: nonEmptyString(turnId) ? turnId : undefined }),
+		...(errorCode !== undefined && errorText !== undefined ? { error: { code: errorCode, message: errorText } } : {}),
 	};
 }
 
@@ -569,6 +576,19 @@ export class TurnController {
 			throw active.failure;
 		}
 		if (active.failure !== undefined) throw active.failure;
+
+		// Reconciliation proved this accepted prompt already terminalized as failed. Persist the failed
+		// terminal before releasing the slot so resume can still reconstruct the turn, then report the
+		// failure rather than a start handle no caller can drive.
+		if (ack.reconciledFailure) {
+			try {
+				await this.#finish(active, "agent_failed", [], undefined, ack.reconciledFailure);
+			} catch (error) {
+				this.#markRecovery(active, this.#asControllerError(error, "internal"));
+				throw active.failure;
+			}
+			throw new TurnControllerError("internal", ack.reconciledFailure.message);
+		}
 
 		const response = { turn: cloneTurn(turn) } as const;
 		try {
@@ -782,12 +802,20 @@ export class TurnController {
 			);
 			return undefined;
 		}
+		// A canonical Q26 `failed` status carries `acceptedAt`, so the prompt WAS accepted and then
+		// terminalized. It is not proof of non-acceptance: bind the corroborated child identities and
+		// carry the failure so the turn is materialized durably instead of vanishing from history.
 		if (status.status === "failed") {
-			// Authoritative proof that the child never accepted the prompt: release the admission slot
-			// rather than retaining an active turn that can never be reconciled to a child mapping.
-			const failure = new TurnControllerError("internal", "Child rejected the prompt after submission.");
-			this.#discardBeforeAcceptance(active);
-			active.failure = failure;
+			if (nonEmptyString(status.commandId) && nonEmptyString(status.turnId))
+				return {
+					commandId: status.commandId,
+					turnId: status.turnId,
+					reconciledFailure: status.error ?? { code: "prompt_failed", message: "The child prompt failed." },
+				};
+			this.#markRecovery(
+				active,
+				new TurnControllerError("recovery_required", "Failed prompt reconciliation omitted child identities."),
+			);
 			return undefined;
 		}
 		if (

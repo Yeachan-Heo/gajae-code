@@ -165,7 +165,42 @@ test("a definitively rejected prompt releases the admission slot instead of wedg
 	}
 });
 
-test("a reconciled failed prompt status releases the admission slot without resubmitting", async () => {
+test("a canonical failed prompt status materializes the accepted turn before releasing the slot", async () => {
+	// Q26 `failed` carries acceptedAt, so the prompt WAS accepted and then terminalized. Its history
+	// must survive; releasing the slot without durable records would erase an accepted turn.
+	const client = new FakeClient({
+		promptError: new Error("request timeout"),
+		promptStatus: {
+			status: "failed",
+			commandId: COMMAND_ID,
+			turnId: CHILD_TURN_ID,
+			clientRef: APP_TURN_ID,
+			acceptedAt: 1,
+			terminalAt: 2,
+			error: { code: "prompt_failed", message: "child failed" },
+		},
+	});
+	const manager = managerWith(client);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+
+	await expect(controller.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
+		code: "internal",
+	});
+	// Never resubmitted, and both the created mapping and the failed terminal are durable.
+	expect(client.promptCount()).toBe(1);
+	expect(client.appended.map(record => record.recordKind)).toEqual([
+		"app-server.turn.created",
+		"app-server.turn.terminal",
+	]);
+	const terminal = client.appended.at(-1)?.payload as { turn: Turn };
+	expect(terminal.turn.status).toBe("failed");
+	expect(terminal.turn.error).not.toBeNull();
+	// The slot is released only after that durable record exists.
+	expect(manager.get(THREAD_ID)?.activeTurn).toBe(false);
+	expect(controller.activeTurnCount).toBe(0);
+});
+
+test("a failed prompt status without child identities stays recovery_required", async () => {
 	const client = new FakeClient({
 		promptError: new Error("request timeout"),
 		promptStatus: { status: "failed" },
@@ -174,12 +209,11 @@ test("a reconciled failed prompt status releases the admission slot without resu
 	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
 
 	await expect(controller.start({ threadId: THREAD_ID, params: { text: "hi" } })).rejects.toMatchObject({
-		code: "internal",
+		code: "recovery_required",
 	});
 	expect(client.promptCount()).toBe(1);
 	expect(client.appended).toHaveLength(0);
-	expect(manager.get(THREAD_ID)?.activeTurn).toBe(false);
-	expect(controller.activeTurnCount).toBe(0);
+	expect(controller.getState(THREAD_ID)).toBe("recovery_required");
 });
 
 test("an unknown prompt status still retains recovery state rather than releasing the turn", async () => {
