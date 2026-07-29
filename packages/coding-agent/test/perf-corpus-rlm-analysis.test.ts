@@ -856,14 +856,21 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		expect(report.runner.closureDigest).toBe(sha256(`${report.runner.closureManifest.join("\n")}\n`));
 		expect(report.runner.runtimeControlIdentity).toBe(memoryRuntimeControlIdentity(report.runner));
 
-		const replayReport = structuredClone(report);
+		await writeCorpus(input);
+		const replayReport = JSON.parse(await fs.readFile(path.join(input, "short-01.json"), "utf8")) as PerfCorpusReport;
+		replayReport.gitSha = report.gitSha;
 		replayReport.gitDirty = false;
+		replayReport.runner = structuredClone(report.runner);
+		replayReport.fixtures.forEach((fixture, index) => {
+			if (fixture.memoryBaseline === undefined) return;
+			fixture.memoryBaseline.parentPid = report.runner.runnerPid;
+			fixture.memoryBaseline.childPid = report.runner.runnerPid + index + 1;
+		});
 		expect(replayReport.runner.bunExecutable).toBe("bun");
 		expect(replayReport.runner.argv[0]).toBe("bun");
 		expect(replayReport.runner.command).toBe(replayReport.runner.argv.join(" "));
 		expect(JSON.stringify(replayReport)).not.toContain(path.resolve(import.meta.dir, "../../.."));
 		expect(JSON.stringify(replayReport)).not.toContain(process.execPath);
-		await writeCorpus(input);
 		await fs.writeFile(path.join(input, "short-01.json"), `${JSON.stringify(replayReport)}\n`);
 		for (const entry of await fs.readdir(input)) {
 			if (entry.endsWith(".json") && entry !== "short-01.json" && !entry.startsWith("perf-corpus-")) {
@@ -893,8 +900,8 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			}).exitCode,
 		).toBe(3);
 		const result = await readResult(output);
+		expect(result.diagnostics.validationErrors.filter(error => error.filename === "short-01.json")).toEqual([]);
 		expect(result.admission.short.admittedBlocks).toBeGreaterThanOrEqual(1);
-		expect(result.diagnostics.validationErrors.some(error => error.filename === "short-01.json")).toBe(false);
 	});
 
 	type PrivateRunnerCase = readonly [string, (runner: PerfCorpusReport["runner"]) => void, string];
