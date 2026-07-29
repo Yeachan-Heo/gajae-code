@@ -5,6 +5,7 @@
 
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
+- Bash output-tail initialization now tolerates constrained `ToolSession` settings adapters that expose `get()` without `has()`, preserving the 1 KiB default and explicit head/tail overrides instead of crashing restricted and interceptor Bash execution.
 
 ### Added
 

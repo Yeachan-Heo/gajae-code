@@ -818,7 +818,12 @@ export const BASH_DEFAULT_OUTPUT_TAIL_BYTES = 1024;
  * budget still wins.
  */
 export function resolveBashOutputSinkTailBytes(s: Settings): number {
-	return s.has("tools.artifactTailBytes") ? s.get("tools.artifactTailBytes") * 1024 : BASH_DEFAULT_OUTPUT_TAIL_BYTES;
+	const configuredTailBytes = s.get("tools.artifactTailBytes");
+	const hasExplicitTailBytes =
+		typeof s.has === "function" ? s.has("tools.artifactTailBytes") : configuredTailBytes !== undefined;
+	return hasExplicitTailBytes && configuredTailBytes !== undefined
+		? configuredTailBytes * 1024
+		: BASH_DEFAULT_OUTPUT_TAIL_BYTES;
 }
 /**
  * Bash keeps only the tail unless the user explicitly opts into the shared
@@ -826,7 +831,10 @@ export function resolveBashOutputSinkTailBytes(s: Settings): number {
  * tools without silently turning Bash back into middle-elision mode.
  */
 export function resolveBashOutputSinkHeadBytes(s: Settings): number {
-	return s.has("tools.artifactHeadBytes") ? resolveOutputSinkHeadBytes(s) : 0;
+	const configuredHeadBytes = s.get("tools.artifactHeadBytes");
+	const hasExplicitHeadBytes =
+		typeof s.has === "function" ? s.has("tools.artifactHeadBytes") : configuredHeadBytes !== undefined;
+	return hasExplicitHeadBytes && configuredHeadBytes !== undefined ? configuredHeadBytes * 1024 : 0;
 }
 
 /**
