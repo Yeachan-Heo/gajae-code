@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@gajae-code/ai";
 import { Snowflake } from "@gajae-code/utils";
@@ -250,26 +251,23 @@ describe("task no-session output refs", () => {
 			createSessionResult(createYieldingSession("output that must not get a dead URI")),
 		);
 
-		const realMkdir = fs.mkdir.bind(fs);
-		vi.spyOn(fs, "mkdir").mockImplementation(async (dirPath, options) => {
-			const target = String(dirPath);
-			if (
-				target.includes(`${path.sep}gjc-task-session${path.sep}`) ||
-				target.endsWith(`${path.sep}gjc-task-session`)
-			) {
-				throw new Error("EACCES: permission denied");
-			}
-			return realMkdir(dirPath, options as { recursive?: boolean; mode?: number });
-		});
+		const sessionId = `alloc-fail-${Snowflake.next()}`;
+		const blockedArtifactsPath = path.join(os.tmpdir(), "gjc-task-session", sessionId);
+		await fs.mkdir(path.dirname(blockedArtifactsPath), { recursive: true, mode: 0o700 });
+		await Bun.write(blockedArtifactsPath, "blocked");
 
-		const session = createSession(null, `alloc-fail-${Snowflake.next()}`);
-		const tool = await TaskTool.create(session);
-		const resultText = await runDetachedTask(tool);
+		try {
+			const session = createSession(null, sessionId);
+			const tool = await TaskTool.create(session);
+			const resultText = await runDetachedTask(tool);
 
-		expect(resultText).toContain("Task completed; output artifact unavailable.");
-		expect(resultText).not.toMatch(/agent:\/\/\d+-NoSession/);
-		expect(resultText).not.toContain('ref="agent://');
-		expect(resultText).not.toContain("output stored in agent://");
-		expect(session.getArtifactsDir?.()).toBeNull();
+			expect(resultText).toContain("Task completed; output artifact unavailable.");
+			expect(resultText).not.toMatch(/agent:\/\/\d+-NoSession/);
+			expect(resultText).not.toContain('ref="agent://');
+			expect(resultText).not.toContain("output stored in agent://");
+			expect(session.getArtifactsDir?.()).toBeNull();
+		} finally {
+			await fs.rm(blockedArtifactsPath, { force: true });
+		}
 	});
 });
