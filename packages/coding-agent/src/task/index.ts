@@ -696,10 +696,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// Prefer file-backed session artifacts; otherwise allocate a session-lifetime
 		// durable root so detached outputs remain readable for the parent session.
 		// Resolve before ID allocation so agentOutputManager can scan the durable root.
-		const {
-			effectiveArtifactsDir: batchArtifactsDir,
-			parentArtifactManager: asyncParentArtifactManager,
-		} = await this.#resolveEffectiveArtifactsDir();
+		const { effectiveArtifactsDir: batchArtifactsDir, parentArtifactManager: asyncParentArtifactManager } =
+			await this.#resolveEffectiveArtifactsDir();
 		let externalTaskSessionsDir: string | undefined;
 		if (!batchArtifactsDir) {
 			// Durable allocation failed: keep child session jsonl under local:// only.

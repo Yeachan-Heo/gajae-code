@@ -149,7 +149,9 @@ describe("task no-session output refs", () => {
 		const childOutput = "child full output that must remain readable after task return";
 		const sessionId = `durable-read-${Snowflake.next()}`;
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(createYieldingSession(childOutput)));
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession(childOutput)),
+		);
 
 		const session = createSession(null, sessionId);
 		const tool = await TaskTool.create(session);
@@ -251,7 +253,10 @@ describe("task no-session output refs", () => {
 		const realMkdir = fs.mkdir.bind(fs);
 		vi.spyOn(fs, "mkdir").mockImplementation(async (dirPath, options) => {
 			const target = String(dirPath);
-			if (target.includes(`${path.sep}gjc-task-session${path.sep}`) || target.endsWith(`${path.sep}gjc-task-session`)) {
+			if (
+				target.includes(`${path.sep}gjc-task-session${path.sep}`) ||
+				target.endsWith(`${path.sep}gjc-task-session`)
+			) {
 				throw new Error("EACCES: permission denied");
 			}
 			return realMkdir(dirPath, options as { recursive?: boolean; mode?: number });
