@@ -187,11 +187,21 @@ interface EndpointAuthorityRead {
 
 function readEndpointAuthority(value: unknown): EndpointAuthorityRead {
 	if (value === undefined) return { authority: undefined, failure: undefined, malformed: false };
-	if (!isRecord(value)) return { authority: undefined, failure: undefined, malformed: true };
-	const generation = readProperty(value, "endpointGeneration");
-	const incarnation = readProperty(value, "endpointIncarnation");
-	const mtime = readProperty(value, "endpointMtimeMs");
-	const pid = readProperty(value, "pid");
+	let record: Record<string, unknown>;
+	try {
+		if (!isRecord(value)) return { authority: undefined, failure: undefined, malformed: true };
+		record = value;
+	} catch (error) {
+		return {
+			authority: undefined,
+			failure: { value: undefined, failed: true, error },
+			malformed: false,
+		};
+	}
+	const generation = readProperty(record, "endpointGeneration");
+	const incarnation = readProperty(record, "endpointIncarnation");
+	const mtime = readProperty(record, "endpointMtimeMs");
+	const pid = readProperty(record, "pid");
 	const failure = firstReadFailure([generation, incarnation, mtime, pid]);
 	if (failure) return { authority: undefined, failure, malformed: false };
 	if (

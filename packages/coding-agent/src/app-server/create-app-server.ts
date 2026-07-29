@@ -239,7 +239,22 @@ class Connection implements AppServerConnection {
 		}
 		// Publish the response first. Handler-originated notifications are intentionally held
 		// behind this barrier so no request can be observed after its own side effects.
-		if (result.response && !this.#closed) await this.#queue.enqueue(result.response);
+		if (result.response) {
+			if (this.#closed) {
+				await result.rollbackUndeliveredResponse?.();
+				return;
+			}
+			try {
+				const delivered = await this.#queue.enqueue(result.response);
+				if (!delivered || this.#closed) {
+					await result.rollbackUndeliveredResponse?.();
+					return;
+				}
+			} catch (error) {
+				await result.rollbackUndeliveredResponse?.();
+				throw error;
+			}
+		}
 		for (const publish of deferred) {
 			if (this.#closed) return;
 			await publish();
@@ -261,8 +276,9 @@ class Connection implements AppServerConnection {
 	async #close(): Promise<void> {
 		this.#closed = true;
 		this.#runtime.removeConnection(this.id);
+		const queueClose = this.#queue.close();
 		await this.#inbound;
-		await this.#queue.close();
+		await queueClose;
 	}
 }
 

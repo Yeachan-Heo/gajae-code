@@ -9,7 +9,7 @@ import type { ConnectionState } from "./router/connection-state";
 import { classifyInbound, dispatchClientRequest } from "./router/dispatch";
 import type { ServerRequestBroker } from "./server-requests/broker";
 import type { HandlerContext, HandlerRegistry } from "./suites/handlers";
-import { type ChildBridgeOptions, loadThread } from "./thread-runtime/child-bridge";
+import { type ChildBridgeOptions, type LoadedThreadRuntime, loadThread } from "./thread-runtime/child-bridge";
 import type { ThreadRuntimeManager } from "./thread-runtime/thread-runtime-manager";
 import { serializeError, serializeResult } from "./transport/errors";
 import { decodeLine, encodeMessage, type FrameCodecOptions } from "./transport/framing";
@@ -24,6 +24,7 @@ export interface AppServerOptions {
 export interface InboundResult {
 	readonly response?: Uint8Array;
 	readonly notification?: boolean;
+	readonly rollbackUndeliveredResponse?: () => Promise<void>;
 	/** The frame was deliberately dropped without a wire response. */
 	readonly rejected?: "malformed" | "oversize";
 }
@@ -47,6 +48,36 @@ function isClientResponse(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function createUndeliveredResponseRollback(
+	manager: ThreadRuntimeManager,
+	context: InboundContext | undefined,
+	runtime: LoadedThreadRuntime,
+): () => Promise<void> {
+	let rollback: Promise<void> | undefined;
+	return () => {
+		rollback ??= (async () => {
+			try {
+				await context?.unsubscribe?.(runtime.threadId);
+			} catch {
+				// Connection teardown may already have removed the subscription.
+			}
+			const managed = manager.get(runtime.threadId);
+			if (!managed || managed.sessionId !== runtime.sessionId || managed.client !== runtime.client) return;
+			if (managed.closeRuntime) {
+				manager.remove(runtime.threadId, false);
+				try {
+					await managed.closeRuntime();
+				} catch {
+					// The identity-fenced runtime was removed and every close stage was attempted.
+				}
+			} else {
+				manager.remove(runtime.threadId);
+			}
+		})();
+		return rollback;
+	};
 }
 
 function isErrorResponse(value: unknown): value is { code: number; message: string } {
@@ -164,28 +195,17 @@ export async function processInbound(
 						subscribe: context?.subscribe ? threadId => context.subscribe?.(threadId) : undefined,
 						unsubscribe: context?.unsubscribe ? threadId => context.unsubscribe?.(threadId) : undefined,
 					});
+					const rollbackUndeliveredResponse = createUndeliveredResponseRollback(manager, context, runtime);
 					if (context?.isActive && !context.isActive()) {
-						try {
-							await context.unsubscribe?.(runtime.threadId);
-						} catch {
-							// Connection teardown already removed the subscription; preserve the liveness failure.
-						}
-						const managed = manager.get(runtime.threadId);
-						if (managed && managed.sessionId === runtime.sessionId && managed.client === runtime.client) {
-							if (managed.closeRuntime) {
-								manager.remove(runtime.threadId, false);
-								try {
-									await managed.closeRuntime();
-								} catch {
-									// Preserve the connection-loss failure after attempting idempotent cleanup.
-								}
-							} else {
-								manager.remove(runtime.threadId);
-							}
-						}
+						await rollbackUndeliveredResponse();
 						throw new Error("Requester connection is inactive.");
 					}
-					return { response: serializeResult(verdict.id, runtime.response, transport) ?? undefined };
+					const response = serializeResult(verdict.id, runtime.response, transport);
+					if (!response) {
+						await rollbackUndeliveredResponse();
+						throw new Error("Thread start response could not be serialized.");
+					}
+					return { response, rollbackUndeliveredResponse };
 				} catch (error) {
 					const key = isRecord(error) && error.code === "conflict" ? "conflict" : "internalError";
 					return { response: serializeError(verdict.id, key, transport) ?? undefined };

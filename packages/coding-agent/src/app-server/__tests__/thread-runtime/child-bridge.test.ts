@@ -800,6 +800,41 @@ test("transactional load: nested authority accessor failures still invoke captur
 	}
 });
 
+test("transactional load: revoked authority proxies cannot bypass captured cleanup", async () => {
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const counters = { close: 0, childClose: 0 };
+	const capturedAuthorities: Array<EndpointAuthority | undefined> = [];
+	const revocable = Proxy.revocable(authority(38), {});
+	revocable.revoke();
+	const opts: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "session-revoked-authority",
+			cwd: path.resolve("cwd"),
+			authority: revocable.proxy,
+			client: fakeClient(counters),
+			awaitReady: async () => {},
+			closeChild: async captured => {
+				capturedAuthorities.push(captured);
+				counters.childClose += 1;
+			},
+		}),
+	};
+	let rejection: unknown;
+	try {
+		await loadThread(opts, { cwd: "cwd" });
+	} catch (error) {
+		rejection = error;
+	}
+
+	expect(rejection).toBeInstanceOf(TypeError);
+	expect(counters.close).toBe(1);
+	expect(counters.childClose).toBe(1);
+	expect(capturedAuthorities).toEqual([undefined]);
+	expect(manager.loadedCount).toBe(0);
+	expect(manager.pendingCount).toBe(0);
+});
+
 test("transactional load: spawned child without authority-fenced cleanup fails before readiness", async () => {
 	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
 	const counters = { close: 0 };

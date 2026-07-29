@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createAppServerRuntime } from "../create-app-server";
+import { DEFAULT_OUTBOUND_QUEUE_CAPACITY } from "../transport/connection";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => JSON.parse(new TextDecoder().decode(value)) as Record<string, unknown>;
@@ -640,4 +641,97 @@ test("runtime connection: close before thread/start subscription mutation leaves
 	expect(observerClose).toBe(3);
 	expect(reverseLeaseClose).toBe(1);
 	expect(runtime.subscriptions.isSubscribed(connection.id, sessionId)).toBe(false);
+});
+
+test("runtime connection: outbound backpressure close rolls back an undelivered thread/start", async () => {
+	const writerEntered = Promise.withResolvers<void>();
+	const releaseWriter = Promise.withResolvers<void>();
+	let blockWriter = false;
+	let clientClose = 0;
+	let childClose = 0;
+	let observerClose = 0;
+	const sessionId = "runtime-backpressure-session";
+	const cwd = "/tmp";
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: {
+			create: async () => ({
+				sessionId,
+				cwd,
+				authority: {
+					endpointGeneration: 3,
+					endpointIncarnation: "f".repeat(64),
+					endpointMtimeMs: 1,
+					pid: 1234,
+				},
+				client: {
+					onFrame: () => () => {
+						observerClose += 1;
+					},
+					onReconnect: () => () => {
+						observerClose += 1;
+					},
+					onReconnectFailed: () => () => {
+						observerClose += 1;
+					},
+					request: async () => ({}),
+					query: async () => ({}),
+					control: async () => ({}),
+					close: async () => {
+						clientClose += 1;
+					},
+				},
+				awaitReady: async () => {},
+				closeChild: async () => {
+					childClose += 1;
+				},
+				effectiveSettings: effectiveSettings(sessionId, cwd),
+			}),
+		},
+	});
+	const frames: Uint8Array[] = [];
+	const connection = runtime.createConnection(async frame => {
+		if (blockWriter) {
+			writerEntered.resolve();
+			await releaseWriter.promise;
+		}
+		frames.push(frame);
+	});
+	const queueConnection = connection as typeof connection & {
+		enqueueMessage(message: Record<string, unknown>): Promise<void>;
+	};
+	await initialize(connection);
+	frames.length = 0;
+	blockWriter = true;
+
+	const queuedNotifications: Promise<void>[] = [];
+	queuedNotifications.push(
+		queueConnection.enqueueMessage({ method: "item/started", params: itemStarted("queued-0") }),
+	);
+	await writerEntered.promise;
+	for (let index = 1; index < DEFAULT_OUTBOUND_QUEUE_CAPACITY; index += 1) {
+		queuedNotifications.push(
+			queueConnection.enqueueMessage({ method: "item/started", params: itemStarted(`queued-${index}`) }),
+		);
+	}
+	const processing = connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	for (let attempt = 0; attempt < 100 && runtime.manager.loadedCount === 0; attempt += 1) await Bun.sleep(1);
+	expect(runtime.manager.loadedCount).toBe(1);
+	expect(runtime.subscriptions.isSubscribed(connection.id, sessionId)).toBe(true);
+
+	const closing = connection.close();
+	await processing;
+	expect(runtime.manager.loadedCount).toBe(0);
+	expect(runtime.manager.pendingCount).toBe(0);
+	expect(runtime.subscriptions.isSubscribed(connection.id, sessionId)).toBe(false);
+	expect(clientClose).toBe(1);
+	expect(childClose).toBe(1);
+	expect(observerClose).toBe(3);
+
+	releaseWriter.resolve();
+	await Promise.all([closing, ...queuedNotifications]);
+	expect(frames.some(frame => dec(frame).id === 2)).toBe(false);
 });
