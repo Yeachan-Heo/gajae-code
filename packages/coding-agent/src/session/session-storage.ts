@@ -454,7 +454,7 @@ function secureOwnerOnlyFileDescriptor(
 ): void {
 	if (securityContext && !isValidManagedSecurityContext(securityContext))
 		throw new Error("Invalid managed session security context");
-	if (process.platform !== "linux" || !securityContext) {
+	if (process.platform !== "linux" && process.platform !== "win32") {
 		if (operation === "apply") {
 			const applied = validateNativeSecurityResult(
 				native.applyOwnerOnlyPathSecurity(pathname, "file"),
@@ -471,7 +471,7 @@ function secureOwnerOnlyFileDescriptor(
 		if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
 		return;
 	}
-	if (!pathIsWithin(securityContext.sessionDir, pathname))
+	if (securityContext && !pathIsWithin(securityContext.sessionDir, pathname))
 		throw new Error(`Managed writer escaped its session directory: ${pathname}`);
 	const result = validateNativeSecurityResult(
 		operation === "apply"
