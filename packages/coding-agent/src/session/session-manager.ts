@@ -1727,10 +1727,17 @@ function managedScopeStartupError(
 	action: "resolve" | "prepare",
 	failure: Extract<ReturnType<typeof resolveManagedScopeForWrite>, { kind: "error" }>,
 ): Error {
-	return new Error(`Could not ${action} managed session scope.`, {
+	const classification = failure.cause?.classification ?? failure.code;
+	const diagnostic = failure.cause?.diagnostic;
+	const detail = diagnostic === undefined ? classification : `${classification}: ${diagnostic}`;
+	const message =
+		action === "prepare"
+			? `Could not prepare managed session scope (${detail}).`
+			: "Could not resolve managed session scope.";
+	return new Error(message, {
 		cause: {
-			classification: failure.cause?.classification ?? failure.code,
-			...(failure.cause?.diagnostic === undefined ? {} : { diagnostic: failure.cause.diagnostic }),
+			classification,
+			...(diagnostic === undefined ? {} : { diagnostic }),
 		},
 	});
 }
