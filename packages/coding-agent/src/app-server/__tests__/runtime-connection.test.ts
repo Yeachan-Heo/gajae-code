@@ -904,13 +904,13 @@ test("runtime connection: outbound backpressure close rolls back an undelivered 
 		frames.push(frame);
 	});
 	const queueConnection = connection as typeof connection & {
-		enqueueMessage(message: Record<string, unknown>): Promise<void>;
+		enqueueMessage(message: Record<string, unknown>): Promise<boolean>;
 	};
 	await initialize(connection);
 	frames.length = 0;
 	blockWriter = true;
 
-	const queuedNotifications: Promise<void>[] = [];
+	const queuedNotifications: Promise<boolean>[] = [];
 	queuedNotifications.push(
 		queueConnection.enqueueMessage({ method: "item/started", params: itemStarted("queued-0") }),
 	);
@@ -1253,4 +1253,60 @@ test("runtime connection: a settled approval releases its abandonment finalizer"
 	expect(secondFrames.map(dec).filter(message => message.method === "execCommandApproval")).toEqual([]);
 	await second.close();
 	expect(runtime.broker.pendingCount).toBe(0);
+});
+
+test("runtime connection: a request settled while its frame waits in the queue is never written", async () => {
+	const runtime = createAppServerRuntime();
+	const requester = runtime.createConnection(() => {});
+	// The target's writer blocks on the FIRST frame, so the approval frame behind it is accepted by
+	// the queue but has not been written when the request is settled. `approvalWrites` counts only
+	// frames the writer was actually invoked with.
+	const releaseWriter = Promise.withResolvers<void>();
+	const approvalWrites: Record<string, unknown>[] = [];
+	const target = runtime.createConnection(frame => {
+		const message = dec(frame);
+		if (message.method === "execCommandApproval") approvalWrites.push(message);
+		// Block only on the sentinel, so the handshake completes and the approval frame queues behind
+		// a writer that has not returned.
+		return message.method === "sentinel/block" ? releaseWriter.promise : undefined;
+	});
+	await initialize(requester);
+	await initialize(target);
+	runtime.subscriptions.subscribe(target.id, "thread-a");
+	runtime.manager.register("thread-a", "spawned", undefined, target.id);
+
+	let requestId: string | undefined;
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		requestId = context?.requestClient?.("thread-a", "execCommandApproval", {
+			conversationId: "thread-a",
+			callId: "call-1",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		return { ok: true, result: { dataBase64: "" } };
+	});
+	// Occupy the writer first; the approval frame then sits in the queue behind it.
+	const sentinel = (
+		target as typeof target & { enqueueMessage(message: Record<string, unknown>): Promise<boolean> }
+	).enqueueMessage({ method: "sentinel/block", params: {} });
+	await Bun.sleep(5);
+	const processing = requester.process(enc('{"id":3,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+	await Bun.sleep(5);
+	expect(requestId).toBeDefined();
+
+	// Settle through the manager while the frame is still queued behind the blocked writer.
+	runtime.manager.shutdown();
+	await expect(runtime.broker.getPending(requestId!)).toBeUndefined();
+	releaseWriter.resolve();
+	await sentinel;
+	await processing;
+	await Bun.sleep(5);
+
+	// The already-settled approval must never reach the wire: the client could not answer it.
+	expect(approvalWrites).toEqual([]);
+	expect(runtime.broker.pendingCount).toBe(0);
+	expect(runtime.manager.get("thread-a")?.pendingApprovals ?? 0).toBe(0);
 });

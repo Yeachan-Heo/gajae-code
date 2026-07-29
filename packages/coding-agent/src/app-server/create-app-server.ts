@@ -270,7 +270,16 @@ class Runtime implements AppServerRuntime {
 						const target = active() ? this.#connections.get(connectionId) : undefined;
 						try {
 							if (!target) throw new Error("connection is gone");
-							await target.enqueueMessage({ id, method, params });
+							// The predicate is re-checked immediately before the write, so a request settled by
+							// shutdown/eviction while this frame waited in the queue is dropped rather than
+							// delivered as an unanswerable ghost.
+							if (
+								!(await target.enqueueMessage(
+									{ id, method, params },
+									() => this.broker.getPending(id) !== undefined,
+								))
+							)
+								throw new Error("request was settled before delivery");
 							// Recheck AFTER the await. A recipient can close from inside its own writer while
 							// this enqueue is pending: `handleDisconnect` then runs while the eligible set is
 							// still empty, and the queue deliberately lets the accepted frame finish, so
@@ -383,10 +392,13 @@ class Connection implements AppServerConnection {
 		}
 	}
 
-	async enqueueMessage(message: Record<string, unknown>): Promise<void> {
-		if (this.#closed) return;
+	async enqueueMessage(message: Record<string, unknown>, stillWanted?: () => boolean): Promise<boolean> {
+		if (this.#closed) return false;
 		const frame = encodeMessage(message);
-		await this.#queue.enqueue(this.#transport === "stdio" ? new Uint8Array([...frame, 10]) : frame);
+		return await this.#queue.enqueue(
+			this.#transport === "stdio" ? new Uint8Array([...frame, 10]) : frame,
+			stillWanted,
+		);
 	}
 
 	close(): Promise<void> {
