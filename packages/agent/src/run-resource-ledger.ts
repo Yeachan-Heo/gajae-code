@@ -137,11 +137,15 @@ export function createRunResourceLedger(): RunResourceLedger {
 			}
 
 			if (state.lifecycle === "sealed") {
-				// A sealed run cannot be reopened. Late registration is fenced as
-				// quarantine rather than creating a false settled run.
-				quarantineState(state);
-				appendTombstone(state, entry);
-				observeSettlement(settled, () => {});
+				// Sealing only freezes admission of *new* work; it does not mean the run's
+				// resources have all been registered yet. `agent_end` is published before
+				// seal(), and its handlers register their own post-prompt work while the
+				// event is still draining, so this late registration is the normal
+				// lifecycle rather than an escaped resource. Admit it into ordinary
+				// settlement accounting so the run stays unsettled until it completes;
+				// quarantining here would make every cancel unfenced forever.
+				state.resources.set(id, { entry });
+				observeSettlement(settled, () => settleTracked(state!, id));
 				return;
 			}
 

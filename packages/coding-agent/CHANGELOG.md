@@ -1,15 +1,22 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+
+- `gjc ultragoal quality-gate init` scaffolds a multi-surface quality-gate template (`--surface` repeatable, `--out` required) so agents can fill evidence once and use read-only `quality-gate validate` multi-error diagnostics instead of discovering missing fields one checkpoint at a time (#3474).
+
 ### Fixed
 
 - Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
+- Detached task receipts for in-memory parent sessions no longer advertise dead `agent://` output URIs. TaskTool allocates a session-lifetime durable artifact root under the process temp directory, persists child outputs there, authorizes parent and same-session descendants for scoped resolution, and omits the URI entirely when durable allocation fails (#3471).
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 - Kitty/Ghostty inline images no longer remain visually pinned when transcript, pinned, or overlay rows are replaced, removed, scrolled, resized, or fully repainted. The TUI now parses only bounded named placements, soft-deletes overwritten placements from the previously committed physical frame, retains transmitted pixels, and restores placements from application scrollback without retransmitting image data.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
 - Managed-session startup failures now include their bounded preparation classification (and path-free native durability diagnostic when available), so Windows launch crashes no longer collapse to an unactionable generic error while filesystem paths and raw OS messages remain redacted (#3383).
 - Single-model sessions now rotate immediately to another stored provider credential after a content-free quota or rate-limit failure, without requiring a synthetic model fallback chain. Credential rotation is replay-safe for content-free failures regardless of extension lifecycle participation, and traverses the full credential pool independent of `retry.maxRetries` (#3491).
 - External credential discovery now follows `CLAUDE_CONFIG_DIR` and `CODEX_HOME` instead of always reading `~/.claude` and `~/.codex`, so importing from an account switcher (or any relocated Claude Code / Codex CLI config root) picks up the account the launching shell selected. Both variables resolve through the credential env trust boundary and must be absolute; redacted summaries name the variable, never the resolved path.
+- The `acp_conformance` CI job runs again. The pinned upstream `acpx` checkout resolves its own imports (`@agentclientprotocol/sdk`, `zod`) from its own tree, but its dependencies were never installed, so the corpus runner aborted with `Cannot find module 'zod/v4'` before executing a single case. The checkout is now installed after provenance verification, and the reused warm cache still skips the reinstall.
+- Resuming a session no longer crashes with an unhandled rejection when another session transition is already running. The session picker dispatches resume through a void-returning callback, and `handleResumeSession` had no re-entrancy guard, so a second selection (or a resume issued while compaction, handoff, or a fork was in flight) reached `switchSession` and the `{ code: "busy" }` transition error rejected a promise nobody awaited. Resume now ignores an overlapping request with a status message, reports a busy transition as status, and still propagates every other failure. The progress lease is released on all paths.
 
 ### Added
 - Published bounded, redacted, hash-bound sealed perf-corpus memory evidence and an output-free replay notebook. The authenticated analysis identifies sustained heap growth on the `agent-session` and `tui` surfaces while keeping RSS/native allocation and p95 claims explicitly out of scope.

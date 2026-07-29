@@ -12,6 +12,7 @@
  *   - Progress tracking via JSON events
  *   - Session artifacts for debugging
  */
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
@@ -53,6 +54,7 @@ import {
 	resolveTaskRepositoryBinding,
 } from "../gjc-runtime/repository-binding";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import { ArtifactManager } from "../session/artifacts";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
@@ -88,6 +90,7 @@ interface TaskResumeDescriptor {
 	params: TaskParams;
 	task: TaskItem & { id: string };
 	sessionFile: string | null;
+	durableOutputAllowed?: boolean;
 	forkContextSeed?: ForkContextSeed;
 	agentSource: AgentDefinition["source"];
 }
@@ -420,6 +423,37 @@ export function resolveForkContextMaxTokens(configured: number, model: Model | u
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool Class
 // ═══════════════════════════════════════════════════════════════════════════
+interface SessionLifetimeArtifactsState {
+	dir?: string;
+	manager?: ArtifactManager;
+	ensurePromise?: Promise<string | null>;
+	outputPrefix: string;
+	authorized: boolean;
+	cleanupRegistered: boolean;
+	originalGetArtifactsDir?: ToolSession["getArtifactsDir"];
+	originalGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
+	originalGetArtifactManager?: ToolSession["getArtifactManager"];
+	originalAgentOutputManager?: AgentOutputManager;
+	installedGetArtifactsDir?: ToolSession["getArtifactsDir"];
+	installedGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
+	installedGetArtifactManager?: ToolSession["getArtifactManager"];
+	installedAgentOutputManager?: AgentOutputManager;
+}
+
+const sessionLifetimeArtifacts = new WeakMap<ToolSession, SessionLifetimeArtifactsState>();
+
+function sessionLifetimeArtifactsState(session: ToolSession): SessionLifetimeArtifactsState {
+	let state = sessionLifetimeArtifacts.get(session);
+	if (!state) {
+		state = {
+			authorized: false,
+			cleanupRegistered: false,
+			outputPrefix: `0-Session${randomUUID().replaceAll("-", "")}`,
+		};
+		sessionLifetimeArtifacts.set(session, state);
+	}
+	return state;
+}
 
 /**
  * Task tool - Delegate tasks to specialized agents.
@@ -436,6 +470,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly renderResult = renderResult;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
+	/**
+	 * Session-lifetime durable artifact state is shared atomically by every
+	 * TaskTool created for the same parent ToolSession.
+	 */
 
 	get parameters(): TaskToolSchemaInstance {
 		const isolationEnabled = this.session.settings.get("task.isolation.mode") !== "none";
@@ -476,6 +514,172 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	#getTaskSimpleMode(): TaskSimpleMode {
 		return this.session.settings.get("task.simple");
+	}
+
+	/**
+	 * Ensure a session-lifetime artifact directory when the parent has no session file.
+	 * Returns null only when durable allocation fails (mkdir error) — callers must not
+	 * advertise agent:// URIs without a successful allocation.
+	 */
+	async #ensureSessionLifetimeArtifacts(): Promise<{ dir: string; manager: ArtifactManager } | null> {
+		const state = sessionLifetimeArtifactsState(this.session);
+		if (state.authorized && state.dir && state.manager) return { dir: state.dir, manager: state.manager };
+
+		const sessionArtifactsDir = this.session.getArtifactsDir?.() ?? null;
+		if (sessionArtifactsDir) {
+			const existingManager = this.session.getArtifactManager?.() ?? null;
+			if (existingManager && path.resolve(existingManager.dir) !== path.resolve(sessionArtifactsDir)) return null;
+			const manager = existingManager ?? new ArtifactManager(sessionArtifactsDir);
+			state.dir = sessionArtifactsDir;
+			state.manager = manager;
+			if (!(await this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false))) return null;
+			return { dir: sessionArtifactsDir, manager };
+		}
+		if (!this.session.registerSessionCleanup) return null;
+
+		state.ensurePromise ??= this.#allocateSessionLifetimeArtifacts(state);
+		const dir = await state.ensurePromise;
+		if (!dir || !state.manager) {
+			state.ensurePromise = undefined;
+			return null;
+		}
+		return { dir, manager: state.manager };
+	}
+
+	async #allocateSessionLifetimeArtifacts(state: SessionLifetimeArtifactsState): Promise<string | null> {
+		let dir: string;
+		try {
+			dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-session-"));
+		} catch {
+			state.dir = undefined;
+			state.manager = undefined;
+			return null;
+		}
+		state.dir = dir;
+		state.manager = new ArtifactManager(dir);
+		if (!(await this.#authorizeSessionLifetimeArtifacts(state, dir, state.manager, true))) return null;
+		return dir;
+	}
+
+	/**
+	 * Expose the durable root on the parent ToolSession so subsequent parent-side
+	 * tools and same-session descendants can resolve agent:// without registry-wide
+	 * enumeration (#3302 scoped authorization).
+	 */
+	async #authorizeSessionLifetimeArtifacts(
+		state: SessionLifetimeArtifactsState,
+		dir: string,
+		manager: ArtifactManager,
+		owned: boolean,
+	): Promise<boolean> {
+		if (state.authorized) return true;
+		state.originalGetArtifactsDir = this.session.getArtifactsDir;
+		state.originalGetAuthorizedArtifactsDirs = this.session.getAuthorizedArtifactsDirs;
+		state.originalGetArtifactManager = this.session.getArtifactManager;
+		state.originalAgentOutputManager = this.session.agentOutputManager;
+
+		state.installedGetArtifactsDir = () => state.originalGetArtifactsDir?.() ?? dir;
+		state.installedGetAuthorizedArtifactsDirs = () => {
+			const dirs: string[] = [];
+			const add = (candidate: string | null | undefined) => {
+				if (!candidate) return;
+				const normalized = path.resolve(candidate);
+				if (!dirs.includes(normalized)) dirs.push(normalized);
+			};
+			for (const authorized of state.originalGetAuthorizedArtifactsDirs?.() ?? []) add(authorized);
+			add(dir);
+			return dirs;
+		};
+		state.installedGetArtifactManager = () => manager;
+		if (owned || !this.session.agentOutputManager) {
+			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null, {
+				parentPrefix: owned ? state.outputPrefix : undefined,
+				getAuthorizedArtifactsDirs: () => this.session.getAuthorizedArtifactsDirs?.() ?? [],
+			});
+		}
+
+		let cleanupRan = false;
+		const cleanup = async () => {
+			cleanupRan = true;
+			try {
+				if (owned) await fs.rm(dir, { recursive: true, force: true });
+			} finally {
+				if (this.session.getArtifactsDir === state.installedGetArtifactsDir)
+					this.session.getArtifactsDir = state.originalGetArtifactsDir;
+				if (this.session.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
+					this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
+				if (this.session.getArtifactManager === state.installedGetArtifactManager)
+					this.session.getArtifactManager = state.originalGetArtifactManager;
+				if (this.session.agentOutputManager === state.installedAgentOutputManager)
+					this.session.agentOutputManager = state.originalAgentOutputManager;
+				sessionLifetimeArtifacts.delete(this.session);
+			}
+		};
+		if (owned) {
+			const registerCleanup = this.session.registerSessionCleanup;
+			if (!registerCleanup) {
+				state.dir = undefined;
+				state.manager = undefined;
+				state.ensurePromise = undefined;
+				sessionLifetimeArtifacts.delete(this.session);
+				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+				return false;
+			}
+			try {
+				registerCleanup(cleanup);
+			} catch {
+				state.dir = undefined;
+				state.manager = undefined;
+				state.ensurePromise = undefined;
+				sessionLifetimeArtifacts.delete(this.session);
+				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+				return false;
+			}
+			if (cleanupRan) return false;
+			state.cleanupRegistered = true;
+		}
+
+		state.authorized = true;
+		this.session.getArtifactsDir = state.installedGetArtifactsDir;
+		this.session.getAuthorizedArtifactsDirs = state.installedGetAuthorizedArtifactsDirs;
+		this.session.getArtifactManager = state.installedGetArtifactManager;
+		if (state.installedAgentOutputManager) this.session.agentOutputManager = state.installedAgentOutputManager;
+		return true;
+	}
+
+	/**
+	 * Resolve the effective artifacts directory for this task batch.
+	 * File-backed sessions use the session artifacts path; in-memory parents use
+	 * the session-lifetime durable temp root when allocation succeeds.
+	 */
+	async #resolveEffectiveArtifactsDir(): Promise<{
+		sessionArtifactsDir: string | null;
+		durableArtifactsDir: string | null;
+		effectiveArtifactsDir: string | undefined;
+		parentArtifactManager: ArtifactManager | undefined;
+	}> {
+		const sessionFile = this.session.getSessionFile();
+		const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
+		if (sessionArtifactsDir) {
+			const candidateManager = this.session.getArtifactManager?.() ?? undefined;
+			const parentArtifactManager =
+				candidateManager && path.resolve(candidateManager.dir) === path.resolve(sessionArtifactsDir)
+					? candidateManager
+					: undefined;
+			return {
+				sessionArtifactsDir,
+				durableArtifactsDir: null,
+				effectiveArtifactsDir: sessionArtifactsDir,
+				parentArtifactManager,
+			};
+		}
+		const durable = await this.#ensureSessionLifetimeArtifacts();
+		return {
+			sessionArtifactsDir: null,
+			durableArtifactsDir: durable?.dir ?? null,
+			effectiveArtifactsDir: durable?.dir,
+			parentArtifactManager: durable?.manager,
+		};
 	}
 
 	/**
@@ -589,6 +793,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
+		// Prefer file-backed session artifacts; otherwise allocate a session-lifetime
+		// durable root so detached outputs remain readable for the parent session.
+		// Resolve before ID allocation so agentOutputManager can scan the durable root.
+		const { effectiveArtifactsDir: batchArtifactsDir, parentArtifactManager: asyncParentArtifactManager } =
+			await this.#resolveEffectiveArtifactsDir();
+		let externalTaskSessionsDir: string | undefined;
+		if (!batchArtifactsDir) {
+			// Durable allocation failed: keep child session jsonl under local:// only.
+			// Do not advertise agent:// URIs without durable output backing.
+			const asyncLocalOptions: LocalProtocolOptions = {
+				getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
+				isManagedDestination: this.session.isManagedSessionDestination,
+				getSessionId: this.session.getSessionId ?? (() => null),
+			};
+			await initializeLocalRoot(asyncLocalOptions);
+			externalTaskSessionsDir = resolveLocalUrlToPath("local://subagents/sessions", asyncLocalOptions);
+			await fs.mkdir(externalTaskSessionsDir, { recursive: true, mode: 0o700 });
+		}
+
 		const outputManager =
 			this.session.agentOutputManager ?? new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
 		const uniqueIds = await outputManager.allocateBatch(taskItems.map(t => t.id));
@@ -668,6 +891,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								resumeMessage: message,
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
 								suppressRoiReconciliation: true,
+								...(descriptor.durableOutputAllowed === true
+									? {}
+									: {
+											persistence: {
+												effectiveArtifactsDir: undefined,
+												parentArtifactManager: undefined,
+											},
+										}),
 							},
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -714,20 +945,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 		const frozenForkSeeds = new Map<string, ForkContextSeed>();
-		const asyncParentArtifactManager = this.session.getArtifactManager?.() ?? undefined;
-		const parentSessionFileForBatch = this.session.getSessionFile();
-		const batchArtifactsDir = parentSessionFileForBatch ? parentSessionFileForBatch.slice(0, -6) : null;
-		let externalTaskSessionsDir: string | undefined;
-		if (!batchArtifactsDir) {
-			const asyncLocalOptions: LocalProtocolOptions = {
-				getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
-				isManagedDestination: this.session.isManagedSessionDestination,
-				getSessionId: this.session.getSessionId ?? (() => null),
-			};
-			await initializeLocalRoot(asyncLocalOptions);
-			externalTaskSessionsDir = resolveLocalUrlToPath("local://subagents/sessions", asyncLocalOptions);
-			await fs.mkdir(externalTaskSessionsDir, { recursive: true, mode: 0o700 });
-		}
 
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
@@ -793,6 +1010,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								{
 									sessionFiles: new Map([[uniqueId, subtaskSessionFile]]),
 									suppressRoiReconciliation: true,
+									persistence: {
+										effectiveArtifactsDir: batchArtifactsDir,
+										parentArtifactManager: asyncParentArtifactManager,
+									},
 								},
 							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -902,6 +1123,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								params,
 								task: { ...taskItem, id: uniqueId },
 								sessionFile: subtaskSessionFile,
+								durableOutputAllowed: Boolean(batchArtifactsDir),
 								forkContextSeed: frozenForkSeed,
 								agentSource: fallbackAgentSource,
 							} satisfies TaskResumeDescriptor,
@@ -998,6 +1220,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			runMode?: "initial" | "resume" | "message";
 			resumeMessage?: string;
 			sessionFiles?: ReadonlyMap<string, string | null>;
+			persistence?: {
+				effectiveArtifactsDir: string | undefined;
+				parentArtifactManager: ArtifactManager | undefined;
+			};
 			/**
 			 * Set for per-child async runs: the spawnPlan is carried for gate
 			 * consistency, but batch-level ROI reconciliation must not be computed
@@ -1247,11 +1473,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const preferredIsolationBackend = parseIsolationMode(isolationMode);
 
-		// Derive artifacts directory
-		const sessionFile = this.session.getSessionFile();
-		const artifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
-		const tempArtifactsDir = artifactsDir ? null : path.join(os.tmpdir(), `gjc-task-${Snowflake.next()}`);
-		const effectiveArtifactsDir = artifactsDir || tempArtifactsDir!;
+		// File-backed session artifacts, or a session-lifetime durable temp root for
+		// in-memory parents. Never use a per-task temp dir that is deleted on return —
+		// advertised agent:// URIs must remain readable for the parent session lifetime.
+		const { effectiveArtifactsDir, parentArtifactManager } =
+			executionOverrides?.persistence ?? (await this.#resolveEffectiveArtifactsDir());
+		const hasDurableOutputBacking = Boolean(effectiveArtifactsDir);
 
 		// Share the parent session's local:// root with subagents so they read/write the same scratch space
 		const localProtocolOptions: LocalProtocolOptions = {
@@ -1260,9 +1487,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
 
-		// Subagents adopt the parent's ArtifactManager so artifact IDs are unique
-		// across the whole tree and outputs land flat in the parent's dir.
-		const parentArtifactManager = this.session.getArtifactManager?.() ?? undefined;
+		// Subagents adopt the parent's ArtifactManager (including session-lifetime
+		// durable managers) so artifact IDs are unique and agent:// resolves under
+		// scoped authorization for the whole tree.
 
 		// Initialize progress tracking
 		const progressMap = new Map<number, AgentProgress>();
@@ -1468,7 +1695,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
-						persistArtifacts: !!artifactsDir,
+						persistArtifacts: hasDurableOutputBacking,
 						artifactsDir: effectiveArtifactsDir,
 						managedPersistence,
 						contextFile: contextFilePath,
@@ -1542,7 +1769,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
-						persistArtifacts: !!artifactsDir,
+						persistArtifacts: hasDurableOutputBacking,
 						artifactsDir: effectiveArtifactsDir,
 						managedPersistence,
 						contextFile: contextFilePath,
@@ -1703,7 +1930,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					abortReason: "Cancelled before start",
 				};
 			});
-			if (!artifactsDir) {
+			// Only advertise agent:// when outputs land on durable backing (file-backed
+			// session artifacts or the session-lifetime durable temp root). Ephemeral
+			// or failed allocation must not emit dead URIs (#3471 / #295).
+			if (!hasDurableOutputBacking) {
 				for (const result of results) {
 					delete result.outputMeta;
 					delete result.outputPath;
@@ -1913,12 +2143,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				mergeSummary,
 			});
 
-			// Cleanup temp directory if used
-			const shouldCleanupTempArtifacts =
-				tempArtifactsDir && (!isIsolated || changesApplied === true || changesApplied === null);
-			if (shouldCleanupTempArtifacts) {
-				await fs.rm(tempArtifactsDir, { recursive: true, force: true });
-			}
+			// Session-lifetime durable dirs must outlive this return so parent +
+			// same-session descendants can resolve agent://. Do not rm them here.
 
 			const details: TaskToolDetails = {
 				projectAgentsDir,

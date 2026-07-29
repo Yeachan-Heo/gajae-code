@@ -1604,13 +1604,45 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await batchTempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship one boundary" });
 
-		const unknown = await runNativeUltragoalCommand(["quality-gate", "init"], root);
+		const unknown = await runNativeUltragoalCommand(["quality-gate", "collect"], root);
 		expect(unknown.status).toBe(1);
-		expect(unknown.stderr).toContain("only validate is supported");
+		expect(unknown.stderr).toContain("supported: init, validate");
 
 		const missing = await runNativeUltragoalCommand(["quality-gate", "validate"], root);
 		expect(missing.status).toBe(1);
 		expect(missing.stderr).toContain("requires --quality-gate-json");
+	});
+
+	it("quality-gate init: writes a multi-surface template without mutating goals", async () => {
+		const root = await batchTempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship one boundary" });
+		const goalsPath = path.join(root, ".gjc", `_session-${process.env.GJC_SESSION_ID}`, "ultragoal", "goals.json");
+		const goalsBefore = await fs.readFile(goalsPath, "utf8");
+		const out = path.join(root, "quality-gate.json");
+
+		const init = await runNativeUltragoalCommand(
+			["quality-gate", "init", "--surface", "web", "--surface", "api", "--out", out, "--json"],
+			root,
+		);
+		expect(init.status).toBe(0);
+		expect(await fs.exists(out)).toBe(true);
+		const template = JSON.parse(await fs.readFile(out, "utf8")) as {
+			architectReview?: unknown;
+			executorQa?: { surfaceEvidence?: Array<{ surface?: string }> };
+			iteration?: unknown;
+		};
+		expect(template.architectReview).toBeTruthy();
+		expect(template.executorQa).toBeTruthy();
+		expect(template.iteration).toBeTruthy();
+		const surfaces = (template.executorQa?.surfaceEvidence ?? []).map(row => row.surface);
+		expect(surfaces).toContain("gui/web");
+		expect(surfaces.some(surface => String(surface).includes("api"))).toBe(true);
+
+		const missingOut = await runNativeUltragoalCommand(["quality-gate", "init", "--surface", "web"], root);
+		expect(missingOut.status).toBe(1);
+		expect(missingOut.stderr).toContain("requires --out");
+
+		expect(await fs.readFile(goalsPath, "utf8")).toBe(goalsBefore);
 	});
 
 	it("validation batch: rejects invalid metadata", async () => {

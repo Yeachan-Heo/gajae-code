@@ -2776,6 +2776,182 @@ function hydrateReviewedBatchReplacementClose(input: {
 	};
 }
 /**
+ * Scaffold a schema-shaped quality-gate template for selected surfaces (#3474).
+ * The template is intentionally incomplete for live artifact proofs so `quality-gate
+ * validate` can report remaining evidence gaps in one pass after the author fills paths.
+ */
+export function buildQualityGateInitTemplate(surfaces: readonly string[]): JsonObject {
+	const normalized = surfaces.length > 0 ? surfaces.map(surface => surface.trim()).filter(Boolean) : ["web"];
+	const unique: string[] = [];
+	for (const surface of normalized) {
+		if (!unique.includes(surface)) unique.push(surface);
+	}
+
+	const artifactRefs: JsonObject[] = [
+		{
+			id: "adversarial-report",
+			kind: "failure-mode-test",
+			path: "artifacts/adversarial-report.txt",
+			description: "Adversarial boundary and failure-mode test output",
+			inlineEvidence:
+				"Adversarial boundary cases exercised invalid input, missing state, and repeated submission without violating the contract.",
+		},
+	];
+	const surfaceEvidence: JsonObject[] = [];
+	const contractCoverage: JsonObject[] = [];
+	const adversarialCases: JsonObject[] = [
+		{
+			id: "case-invalid-input",
+			contractRef: "approved-plan:goal",
+			scenario: "Submit invalid or boundary input through the user-facing surface",
+			expectedBehavior: "The implementation rejects or handles the case according to the approved contract",
+			verdict: "passed",
+			artifactRefs: ["adversarial-report"],
+		},
+	];
+
+	unique.forEach((surface, index) => {
+		const surfaceId = `surface-${index + 1}`;
+		const family = surface.toLowerCase();
+		const linked: string[] = [];
+		if (family.includes("web") || family.includes("gui")) {
+			const browserId = `browser-run-${index + 1}`;
+			const shotId = `gui-screenshot-${index + 1}`;
+			linked.push(browserId, shotId);
+			artifactRefs.push(
+				{
+					id: browserId,
+					kind: "browser-automation",
+					path: `artifacts/${browserId}.json`,
+					description: "Browser automation transcript for the approved user-facing flow",
+					inlineEvidence:
+						"Browser automation executed the approved flow, asserted the expected visible result, and captured the final DOM state.",
+				},
+				{
+					id: shotId,
+					kind: "screenshot",
+					path: `artifacts/${shotId}.png`,
+					description: "Screenshot evidence for the GUI/web surface verdict",
+					inlineEvidence:
+						"Screenshot review confirmed the approved screen state, including the success message and absence of regression indicators.",
+				},
+			);
+		} else if (family.includes("cli")) {
+			const replayId = `cli-replay-${index + 1}`;
+			linked.push(replayId);
+			artifactRefs.push({
+				id: replayId,
+				kind: "cli-replay",
+				path: `artifacts/${replayId}.json`,
+				description: "CLI argv replay transcript for the approved command surface",
+				inlineEvidence:
+					"CLI replay executed the allowlisted command and verified recorded stdout against the approved contract.",
+			});
+		} else if (family.includes("api") || family.includes("package")) {
+			const reportId = `api-report-${index + 1}`;
+			linked.push(reportId);
+			artifactRefs.push({
+				id: reportId,
+				kind: "test-report",
+				path: `artifacts/${reportId}.xml`,
+				description: "API/package black-box test report",
+				inlineEvidence:
+					"API/package suite covered happy path, auth failure, and contract-breaking payloads with non-empty report output.",
+			});
+		} else {
+			const evidenceId = `surface-evidence-${index + 1}`;
+			linked.push(evidenceId);
+			artifactRefs.push({
+				id: evidenceId,
+				kind: "transcript",
+				path: `artifacts/${evidenceId}.txt`,
+				description: `Evidence transcript for surface ${surface}`,
+				inlineEvidence: `Surface ${surface} was exercised against the approved contract with recorded transcript evidence.`,
+			});
+		}
+
+		surfaceEvidence.push({
+			id: surfaceId,
+			surface: family.includes("web") || family.includes("gui") ? "gui/web" : surface,
+			contractRef: "approved-plan:goal",
+			invocation: `Exercise surface ${surface} against the approved contract`,
+			verdict: "passed",
+			artifactRefs: linked,
+		});
+		contractCoverage.push({
+			id: `contract-${index + 1}`,
+			contractRef: "approved-plan:goal",
+			obligation: `The completed story satisfies the approved contract on surface ${surface}`,
+			status: "covered",
+			surfaceEvidenceRefs: [surfaceId],
+			adversarialCaseRefs: ["case-invalid-input"],
+		});
+	});
+
+	return {
+		architectReview: {
+			architectureStatus: "CLEAR",
+			productStatus: "CLEAR",
+			codeStatus: "CLEAR",
+			recommendation: "APPROVE",
+			evidence: "architect reviewed architecture, product behavior, and code changes",
+			commands: ["architect-review"],
+			blockers: [],
+		},
+		executorQa: {
+			status: "passed",
+			e2eStatus: "passed",
+			redTeamStatus: "passed",
+			evidence: "executor built and ran e2e plus red-team QA suite",
+			e2eCommands: ["bun test:e2e"],
+			redTeamCommands: ["bun test:red-team"],
+			artifactRefs,
+			contractCoverage,
+			surfaceEvidence,
+			adversarialCases,
+			blockers: [],
+		},
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved final aggregate",
+			blockers: [],
+		},
+		iteration: {
+			status: "passed",
+			evidence: "no verification findings remain after steering iterations",
+			fullRerun: true,
+			reviewCohort: {
+				reviewGeneration: 1,
+				sourceHash: "sha256:replace-with-frozen-source-hash",
+				joined: true,
+				lanes: {
+					cleaner: {
+						status: "passed",
+						sourceHash: "sha256:replace-with-frozen-source-hash",
+						evidence: "cleaner clean",
+						blockers: [],
+					},
+					architect: {
+						status: "CLEAR",
+						sourceHash: "sha256:replace-with-frozen-source-hash",
+						evidence: "architect clear",
+						blockers: [],
+					},
+					qa: {
+						status: "passed",
+						sourceHash: "sha256:replace-with-frozen-source-hash",
+						evidence: "qa passed",
+						blockers: [],
+					},
+				},
+			},
+			rerunCommands: ["bun test:e2e", "bun test:red-team"],
+			blockers: [],
+		},
+	};
+}
+
+/**
  * Read-only quality-gate validation (#3474). Applies exactly the same rules as
  * `checkpoint --status complete` — including deferred-vs-boundary gate selection and
  * artifact existence checks — but never touches `goals.json`, `ledger.jsonl`, or goal
@@ -3957,6 +4133,18 @@ function flagValue(args: readonly string[], flag: string): string | undefined {
 	return args[index + 1];
 }
 
+function flagValues(args: readonly string[], flag: string): string[] {
+	const values: string[] = [];
+	for (let index = 0; index < args.length; index += 1) {
+		if (args[index] !== flag) continue;
+		const value = args[index + 1];
+		if (value === undefined || value.startsWith("-")) continue;
+		values.push(value);
+		index += 1;
+	}
+	return values;
+}
+
 function hasFlag(args: readonly string[], flag: string): boolean {
 	return args.includes(flag);
 }
@@ -3985,6 +4173,8 @@ const FLAGS_WITH_VALUES = new Set([
 	"--order-json",
 	"--classification",
 	"--validation-batch-json",
+	"--out",
+	"--surface",
 ]);
 
 function isHelpArg(arg: string): boolean {
@@ -4114,6 +4304,28 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		].join("\n");
 	}
 
+	if (subject === "quality-gate") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal quality-gate init [--surface <name> ...] --out <path>",
+			"  $ gjc ultragoal quality-gate validate --quality-gate-json <json-or-path> [--goal-id <id>] [--json]",
+			"",
+			"FLAGS",
+			"      --surface=<value>            Surface to scaffold (repeatable; default web)",
+			"      --out=<value>                Output path for quality-gate init",
+			"      --quality-gate-json=<value>  JSON string or path for quality-gate validate",
+			"      --goal-id=<value>            Optional durable goal id for rule-identical validation",
+			"      --json                       Machine-readable output",
+			"",
+			"EXAMPLES",
+			"  $ gjc ultragoal quality-gate init --surface web --surface api --out ./quality-gate.json",
+			"  $ gjc ultragoal quality-gate validate --quality-gate-json ./quality-gate.json --json",
+			"",
+		].join("\n");
+	}
+
 	return [
 		"Run native GJC Ultragoal workflow commands",
 		"",
@@ -4131,10 +4343,11 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  classify-blocker",
 		"  record-critic-verdict",
 		"  record-critic-gate-override",
+		"  quality-gate init",
 		"  quality-gate validate",
 
 		"",
-		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, `gjc ultragoal classify-blocker --help`, `gjc ultragoal record-critic-verdict --help`, or `gjc ultragoal record-critic-gate-override --help` for command-specific requirements.",
+		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, `gjc ultragoal classify-blocker --help`, `gjc ultragoal record-critic-verdict --help`, or `gjc ultragoal record-critic-gate-override --help`, or `gjc ultragoal quality-gate --help` for command-specific requirements.",
 		"",
 	].join("\n");
 }
@@ -4510,12 +4723,32 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 				};
 			}
 			case "quality-gate": {
-				const positional = args.filter(arg => !arg.startsWith("--"));
+				const positional = args.filter(arg => !arg.startsWith("-"));
 				const subcommand = positional[1];
+				if (subcommand === "init") {
+					const out = flagValue(args, "--out");
+					if (!out?.trim()) {
+						return { status: 1, stderr: "quality-gate init requires --out <path>\n" };
+					}
+					const surfaces = flagValues(args, "--surface");
+					const template = buildQualityGateInitTemplate(surfaces);
+					const resolved = path.resolve(cwd, out);
+					await Bun.write(resolved, `${JSON.stringify(template, null, 2)}\n`);
+					if (json) {
+						return {
+							status: 0,
+							stdout: `${JSON.stringify({ ok: true, out: resolved, surfaces: surfaces.length > 0 ? surfaces : ["web"] }, null, 2)}\n`,
+						};
+					}
+					return {
+						status: 0,
+						stdout: `Wrote quality-gate template to ${resolved}\n`,
+					};
+				}
 				if (subcommand !== "validate") {
 					return {
 						status: 1,
-						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; only validate is supported\n`,
+						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; supported: init, validate\n`,
 					};
 				}
 				const qualityGateJson = flagValue(args, "--quality-gate-json");

@@ -1884,6 +1884,7 @@ export class AgentSession {
 	#providerCacheSessionId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
+	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
@@ -3231,6 +3232,21 @@ export class AgentSession {
 
 	getAgentId(): string | undefined {
 		return this.#agentId;
+	}
+
+	registerToolSessionCleanup(cleanup: () => Promise<void> | void): () => void {
+		if (this.#isDisposed) throw new Error("Cannot register tool cleanup after session disposal has started.");
+		this.#toolSessionCleanups.add(cleanup);
+		return () => this.#toolSessionCleanups.delete(cleanup);
+	}
+
+	async #runToolSessionCleanups(): Promise<void> {
+		const cleanups = Array.from(this.#toolSessionCleanups);
+		this.#toolSessionCleanups.clear();
+		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
+		for (const result of results) {
+			if (result.status === "rejected") logger.warn("Tool session cleanup failed", { error: String(result.reason) });
+		}
 	}
 
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
@@ -5565,6 +5581,7 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
+		await this.#runToolSessionCleanups();
 		// Only disconnect the MCP manager THIS session owns (top-level sessions that
 		// connected plugin-bundle MCP servers). Subagents and callers that merely
 		// observe the process-global manager must never tear down a manager they do

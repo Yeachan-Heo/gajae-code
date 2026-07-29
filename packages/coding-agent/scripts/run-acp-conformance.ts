@@ -225,6 +225,11 @@ async function checkoutAcpxSource(): Promise<AcpxCheckout> {
 	await commandOutput(["git", "clean", "-fdx", "--exclude=node_modules"], root);
 	const status = await commandOutput(["git", "status", "--porcelain"], root);
 	if (status.length > 0) throw new Error(`acpx source checkout is not clean at ${ACPX_GIT_HEAD}.`);
+	// The upstream runner resolves its own imports (`@agentclientprotocol/sdk`, `zod`)
+	// from this checkout, not from the gjc workspace, so the pin has to be installed
+	// before it can run. `git clean` deliberately preserves node_modules so a warm
+	// cache skips the reinstall.
+	await commandOutput(["bun", "install", "--no-save", "--ignore-scripts"], root);
 	return { root, head: await commandOutput(["git", "rev-parse", "HEAD"], root) };
 }
 

@@ -7,6 +7,7 @@
 
 - The `invalid_prompt` circuit breaker no longer replays the rejected turn on its repaired resend. The streaming path commits the failed assistant message to the context before the breaker runs, so the one repaired resend re-sent that errored turn as if the model had spoken it — re-triggering `Request blocked (code=invalid_prompt)` and leaving a second assistant tail that no continuation can resume from. The breaker now repairs and resends only the history that preceded the rejection.
 - Compaction pruning now protects the newest two user/`bashExecution` turns, uses conservative read supersession, preserves bounded error-first diagnostics, and exposes reversible artifact-backed originals with exact savings accounting.
+- Cancelling a prompt no longer fails its terminal closed. `agent_end` is published before the run resource ledger is sealed, so the event's own handlers register post-prompt work against an already-sealed run; that late registration was treated as an escaped resource and quarantined the run, making `waitForSettlement` report `unfenced` forever. Cancel therefore never obtained settlement proof and the SDK refused to publish a terminal, surfacing over ACP as `-32603 "Prompt resources did not settle before the terminalization grace expired."` Sealing now only freezes admission of genuinely new work; post-seal registration joins ordinary settlement accounting so the run stays unsettled until it actually completes.
 
 ## [0.12.0] - 2026-07-28
 

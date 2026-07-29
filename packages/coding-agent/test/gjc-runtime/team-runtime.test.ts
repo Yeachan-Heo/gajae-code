@@ -1,8 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isEnoent } from "@gajae-code/utils";
 import { getWorktreesDir } from "@gajae-code/utils/dirs";
 import { sessionReportsDir, teamStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
@@ -164,7 +166,9 @@ case "$1" in
     if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
     count=$((count + 1))
     echo "$count" > "$count_file"
-    echo "%$((count + 1))"
+    new_pane="%$((count + 1))"
+    printf '%s\t%s\t%s\n' "$count" "$target" "$new_pane" > ${JSON.stringify(path.join(root, "tmux-last-split"))}
+    echo "$new_pane"
     ;;
   select-layout|kill-pane)
     exit 0
@@ -188,6 +192,66 @@ async function createGitRepo(): Promise<string> {
 	runGit(repo, ["add", "README.md"]);
 	runGit(repo, ["commit", "-m", "initial"]);
 	return repo;
+}
+
+async function waitForFileText(
+	filePath: string,
+	predicate: (text: string) => boolean,
+	signal?: AbortSignal,
+): Promise<string> {
+	const waiter = Promise.withResolvers<string>();
+	let checking = false;
+	let dirty = false;
+	let settled = false;
+	const fail = (error: unknown) => {
+		if (settled) return;
+		settled = true;
+		waiter.reject(error);
+	};
+	const check = async () => {
+		if (settled) return;
+		if (checking) {
+			dirty = true;
+			return;
+		}
+		checking = true;
+		try {
+			do {
+				dirty = false;
+				let text: string;
+				try {
+					text = await fs.readFile(filePath, "utf8");
+				} catch (error) {
+					if (isEnoent(error)) continue;
+					fail(error);
+					return;
+				}
+				try {
+					if (predicate(text)) {
+						settled = true;
+						waiter.resolve(text);
+					}
+				} catch (error) {
+					fail(error);
+					return;
+				}
+			} while (dirty && !settled);
+		} finally {
+			checking = false;
+		}
+	};
+	const watcher = nodeFs.watch(path.dirname(filePath), { persistent: false }, () => void check());
+	watcher.on("error", fail);
+	const abort = () => fail(signal?.reason ?? new Error(`File wait aborted: ${filePath}`));
+	if (signal?.aborted) abort();
+	else signal?.addEventListener("abort", abort, { once: true });
+	try {
+		await check();
+		return await waiter.promise;
+	} finally {
+		watcher.close();
+		signal?.removeEventListener("abort", abort);
+	}
 }
 
 async function readTeamConfig(stateDir: string): Promise<GjcTeamConfig> {
@@ -3660,7 +3724,19 @@ describe("team worker memory guard wiring", () => {
 		runGit(workerWorktree!, ["add", "-f", "--", protectedPath]);
 		const claim = await claimGjcTeamTask("memory-guard-selector-team", "worker-2", cleanupRoot, env, "task-2");
 		expect(claim.ok).toBe(true);
-		const successorAck = Bun.sleep(50).then(() =>
+		const oldPaneId = snapshot.workers.find(worker => worker.id === "worker-2")?.pane_id;
+		expect(oldPaneId).toBeTruthy();
+		const splitCountText = await fs.readFile(path.join(cleanupRoot, "tmux-split-count"), "utf8");
+		expect(splitCountText).toMatch(/^\d+\s*$/);
+		const splitCount = Number.parseInt(splitCountText.trim(), 10);
+		expect(splitCount).toBe(2);
+		const expectedSplitMarker = `${splitCount + 1}\t${oldPaneId}\t%${splitCount + 2}`;
+		const markerAbort = new AbortController();
+		const successorAck = waitForFileText(
+			path.join(cleanupRoot, "tmux-last-split"),
+			text => text.trim() === expectedSplitMarker,
+			markerAbort.signal,
+		).then(() =>
 			executeGjcTeamApiOperation(
 				"worker-startup-ack",
 				{
@@ -3673,8 +3749,7 @@ describe("team worker memory guard wiring", () => {
 				env,
 			),
 		);
-		const oldPaneId = snapshot.workers.find(worker => worker.id === "worker-2")?.pane_id;
-		const result = (await executeGjcTeamApiOperation(
+		const replacement = executeGjcTeamApiOperation(
 			"apply-worker-memory-guard",
 			{
 				team_name: "memory-guard-selector-team",
@@ -3689,11 +3764,22 @@ describe("team worker memory guard wiring", () => {
 			},
 			cleanupRoot,
 			env,
-		)) as {
+		) as Promise<{
 			result: string;
 			lifecycle_mutated: boolean;
 			ledger: { worker_id: string; state: string; current_task_id?: string; last_checkpoint?: { kind: string } };
-		};
+		}>;
+		let result: Awaited<typeof replacement>;
+		try {
+			result = await replacement;
+		} catch (error) {
+			markerAbort.abort(error);
+			await successorAck.catch(() => {});
+			throw error;
+		}
+		if (result.result !== "replaced") {
+			markerAbort.abort(new Error(`Replacement settled before pane launch ACK: ${result.result}`));
+		}
 		await successorAck;
 		expect(result.result).toBe("replaced");
 		expect(result.lifecycle_mutated).toBe(true);
