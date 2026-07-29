@@ -1872,11 +1872,7 @@ async function buildRalplanHud(options: {
  * authoritative same-pass provenance against the run index, and re-serialize to
  * canonical form so join gates and re-review share one shape (#2902 / #3013).
  */
-function normalizeDispositionArtifact(
-	raw: string,
-	expectedStageN: number,
-	indexText: string | undefined,
-): string {
+function normalizeDispositionArtifact(raw: string, expectedStageN: number, indexText: string | undefined): string {
 	try {
 		const indexedArtifacts = buildIndexedReviewArtifacts(indexText);
 		const doc = parseReviewConflictDocument(raw, {

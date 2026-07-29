@@ -344,9 +344,7 @@ export function assertDispositionProvenance(
 		const receipt = finding.sourceReceipt;
 
 		if (receipt.stage !== finding.sourceRole) {
-			throw new Error(
-				`${field}.sourceReceipt.stage=${receipt.stage} must equal sourceRole=${finding.sourceRole}`,
-			);
+			throw new Error(`${field}.sourceReceipt.stage=${receipt.stage} must equal sourceRole=${finding.sourceRole}`);
 		}
 		if (receipt.stageN !== doc.plannerStageN) {
 			throw new Error(
