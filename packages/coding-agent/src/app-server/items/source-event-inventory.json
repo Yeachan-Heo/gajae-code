@@ -1,0 +1,204 @@
+{
+	"version": 1,
+	"source": {
+		"sessionEventType": "AgentSessionEvent",
+		"sessionEventFile": "packages/coding-agent/src/session/agent-session.ts",
+		"coreEventType": "AgentEvent",
+		"coreEventFile": "packages/agent/src/types.ts"
+	},
+	"permittedUnmapped": [
+		"auto_compaction_start",
+		"auto_compaction_end",
+		"auto_retry_start",
+		"auto_retry_end",
+		"model_fallback_switched",
+		"ttsr_triggered",
+		"todo_reminder",
+		"todo_auto_clear",
+		"irc_message",
+		"subagent_steer_message",
+		"notice",
+		"thinking_level_changed",
+		"goal_updated"
+	],
+	"futureItemFamilies": [
+		{
+			"event": "tool_execution_start",
+			"family": "tool",
+			"reason": "Tool-call items are owned by G007."
+		},
+		{
+			"event": "tool_execution_update",
+			"family": "tool",
+			"reason": "Tool-call items are owned by G007."
+		},
+		{
+			"event": "tool_execution_end",
+			"family": "tool",
+			"reason": "Tool-call items are owned by G007."
+		}
+	],
+	"events": [
+		{
+			"discriminator": "agent_start",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "mapped",
+			"reason": "Lifecycle boundary is consumed as a no-op for this per-turn reducer."
+		},
+		{
+			"discriminator": "agent_end",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "mapped",
+			"reason": "Closes all started agent-message items at the agent boundary."
+		},
+		{
+			"discriminator": "turn_start",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "mapped",
+			"reason": "Turn boundary is consumed as a no-op; turn identity is injected into the reducer."
+		},
+		{
+			"discriminator": "turn_end",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "mapped",
+			"reason": "Uses the final assistant message and closes remaining started items."
+		},
+		{
+			"discriminator": "message_start",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "mapped",
+			"reason": "Starts an assistant-message item exactly once."
+		},
+		{
+			"discriminator": "message_update",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "mapped",
+			"reason": "Updates authoritative assistant state and emits text/error deltas."
+		},
+		{
+			"discriminator": "message_end",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "mapped",
+			"reason": "Terminalizes the corresponding started assistant-message item."
+		},
+		{
+			"discriminator": "tool_execution_start",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "future-item-family",
+			"reason": "Tool-call items belong to G007."
+		},
+		{
+			"discriminator": "tool_execution_update",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "future-item-family",
+			"reason": "Tool-call items belong to G007."
+		},
+		{
+			"discriminator": "tool_execution_end",
+			"sourceType": "AgentEvent",
+			"sourceFile": "packages/agent/src/types.ts",
+			"classification": "future-item-family",
+			"reason": "Tool-call items belong to G007."
+		},
+		{
+			"discriminator": "auto_compaction_start",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Compaction lifecycle has no agent-message item semantics in G005."
+		},
+		{
+			"discriminator": "auto_compaction_end",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Compaction lifecycle has no agent-message item semantics in G005."
+		},
+		{
+			"discriminator": "auto_retry_start",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Retry lifecycle has no agent-message item semantics in G005."
+		},
+		{
+			"discriminator": "auto_retry_end",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Retry lifecycle has no agent-message item semantics in G005."
+		},
+		{
+			"discriminator": "model_fallback_switched",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Model fallback metadata does not create an agent-message item."
+		},
+		{
+			"discriminator": "ttsr_triggered",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Prompt-rule metadata has no agent-message item semantics in G005."
+		},
+		{
+			"discriminator": "todo_reminder",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Todo reminders are not agent-message items; G007 owns other item families."
+		},
+		{
+			"discriminator": "todo_auto_clear",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Todo metadata has no agent-message item semantics in G005."
+		},
+		{
+			"discriminator": "irc_message",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "IRC control messages are not assistant agent-message items."
+		},
+		{
+			"discriminator": "subagent_steer_message",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Subagent steering metadata has no agent-message item semantics in G005."
+		},
+		{
+			"discriminator": "notice",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Notices are control-plane metadata, not assistant agent-message items."
+		},
+		{
+			"discriminator": "thinking_level_changed",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Thinking-level metadata does not create an agent-message item."
+		},
+		{
+			"discriminator": "goal_updated",
+			"sourceType": "AgentSessionEvent",
+			"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+			"classification": "permitted-unmapped",
+			"reason": "Goal metadata has no agent-message item semantics in G005."
+		}
+	]
+}
