@@ -4,6 +4,7 @@
 ### Fixed
 
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
+- The global sessions dashboard and cross-workspace resume lookup now coalesce legacy and v2 transcript copies sharing one session id, preferring the canonical v2 copy instead of listing or resolving the migrated session twice.
 
 ### Added
 

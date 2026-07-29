@@ -4621,6 +4621,21 @@ async function collectSessionsFromFiles(files: string[], storage: SessionStorage
 	return sessions;
 }
 
+function isV2ManagedSession(session: SessionInfo): boolean {
+	return path.basename(path.dirname(session.path)).startsWith("v2-");
+}
+
+function deduplicateGlobalSessions(sessions: SessionInfo[]): SessionInfo[] {
+	const byId = new Map<string, SessionInfo>();
+	for (const session of sessions) {
+		const existing = byId.get(session.id);
+		if (!existing || (isV2ManagedSession(session) && !isV2ManagedSession(existing))) {
+			byId.set(session.id, session);
+		}
+	}
+	return [...byId.values()].sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
+
 export interface ResolvedSessionMatch {
 	session: SessionInfo;
 	scope: "local" | "global";
@@ -10540,7 +10555,7 @@ export class SessionManager {
 					});
 				for (const candidate of listing.owned) logicalFiles.add(candidate.path);
 			}
-			return await collectSessionsFromFiles([...logicalFiles], storage);
+			return deduplicateGlobalSessions(await collectSessionsFromFiles([...logicalFiles], storage));
 		} catch {
 			return [];
 		}

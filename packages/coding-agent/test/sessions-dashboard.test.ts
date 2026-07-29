@@ -9,7 +9,7 @@ import {
 } from "@gajae-code/coding-agent/modes/components/sessions-dashboard";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { resolveResumableSession, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { MemorySessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 
@@ -64,6 +64,13 @@ function snapshotDirectory(root: string): Array<{ path: string; content: string;
 			};
 		})
 		.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function legacySessionDirectoryName(cwd: string): string {
+	return `--${path
+		.resolve(cwd)
+		.replace(/^[/\\]/, "")
+		.replace(/[/\\:]/g, "-")}--`;
 }
 
 describe("sessions dashboard", () => {
@@ -252,6 +259,40 @@ describe("sessions dashboard", () => {
 			await new SelectorController({ ui, editor } as never).showSessionsDashboard();
 			expect(dashboard?.render(80).join("\n")).toContain("Newer");
 			expect(mutations.reduce((count, mutation) => count + mutation.mock.calls.length, 0)).toBe(0);
+			expect(snapshotDirectory(sessionsRoot)).toEqual(before);
+		} finally {
+			setAgentDir(originalAgentDir);
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	it("coalesces legacy and v2 copies of one session id to the canonical v2 session", async () => {
+		const originalAgentDir = getAgentDir();
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "sessions-dashboard-migrated-"));
+		setAgentDir(agentDir);
+		try {
+			const sessionsRoot = path.join(agentDir, "sessions");
+			const cwd = path.join(agentDir, "workspace");
+			fs.mkdirSync(cwd, { recursive: true });
+			const v2File = path.join(SessionManager.getDefaultSessionDir(cwd, agentDir), "canonical.jsonl");
+			const legacyDir = path.join(sessionsRoot, legacySessionDirectoryName(cwd));
+			const legacyFile = path.join(legacyDir, "legacy.jsonl");
+			fs.mkdirSync(legacyDir, { recursive: true });
+			fs.writeFileSync(v2File, sessionText("migrated-session", cwd, "Canonical", "canonical copy"));
+			fs.writeFileSync(legacyFile, sessionText("migrated-session", cwd, "Legacy", "legacy copy"));
+			fs.utimesSync(v2File, new Date("2026-01-01T00:00:00.000Z"), new Date("2026-01-01T00:00:00.000Z"));
+			fs.utimesSync(legacyFile, new Date("2026-01-02T00:00:00.000Z"), new Date("2026-01-02T00:00:00.000Z"));
+			const foreignCwd = path.join(agentDir, "foreign-workspace");
+			fs.mkdirSync(foreignCwd);
+			const before = snapshotDirectory(sessionsRoot);
+
+			const matches = (await SessionManager.listAll()).filter(session => session.id === "migrated-session");
+
+			expect(matches).toHaveLength(1);
+			expect(matches[0]?.path).toBe(v2File);
+			expect(matches[0]?.firstMessage).toBe("canonical copy");
+			const resolved = await resolveResumableSession("migrated-session", foreignCwd, undefined, undefined, agentDir);
+			expect(resolved?.scope).toBe("global");
+			expect(resolved?.session.path).toBe(v2File);
 			expect(snapshotDirectory(sessionsRoot)).toEqual(before);
 		} finally {
 			setAgentDir(originalAgentDir);
