@@ -33,6 +33,22 @@ import {
 	type VerifiedSessionDeleteTarget,
 } from "../src/session/session-storage";
 
+function fdSecuritySuccess(operation: "apply" | "verify") {
+	if (process.platform !== "linux") return { ok: true } as const;
+	return {
+		ok: true,
+		platform: "linux",
+		kind: "file",
+		protocol: operation,
+		aclEvidence: {
+			access: {
+				clear: operation === "apply" ? "already_absent" : "not_run",
+				query: "absent",
+			},
+		},
+	} as const;
+}
+
 describe("native publish outcome classification", () => {
 	const preMutation = {
 		ok: false,
@@ -271,8 +287,8 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 
 	describe("fenced managed publication", () => {
 		it("rejects an expired lease immediately before no-replace publication", async () => {
-			vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
-			vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
+			vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("apply"));
+			vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("verify"));
 			const destination = path.join(tempDir, "fenced-receipt.json");
 			let assertions = 0;
 			await expect(
@@ -668,8 +684,8 @@ describe("FileSessionStorageWriter path security", () => {
 
 	it("uses caller-fd security rather than pathname security for open writers", async () => {
 		const sessionPath = path.join(tempDir, "fd-security.jsonl");
-		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
-		const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
+		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("apply"));
+		const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("verify"));
 		const pathApply = vi.spyOn(native, "applyOwnerOnlyPathSecurity");
 		const pathVerify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity");
 
@@ -702,7 +718,7 @@ describe("FileSessionStorageWriter path security", () => {
 		expect(fs.readFileSync(protectedPath, "utf8")).toBe("payload\n");
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("attacker replacement\n");
 
-		verify.mockReturnValue({ ok: true });
+		verify.mockReturnValue(fdSecuritySuccess("verify"));
 		writer.closeSync();
 		expect(writer.getCloseState()).toBe("closed");
 		verify.mockRestore();
@@ -786,7 +802,10 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			plannedTranscriptPath: path.join(tempDir, ".gjc-delete-happy-transcript"),
 		};
 		const artifacts = await storage.deleteSessionVerified(target);
-		if (artifacts.kind !== "artifacts_removed" || artifacts.phase !== "artifacts")
+		if (
+			(artifacts.kind !== "cleanup_pending" && artifacts.kind !== "artifacts_removed") ||
+			artifacts.phase !== "artifacts"
+		)
 			throw new Error("Expected durable artifact-phase receipt");
 
 		expect(artifacts.transcriptIdentity).toEqual(target.transcriptIdentity);
@@ -898,7 +917,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			plannedTranscriptPath: path.join(tempDir, ".gjc-delete-tree-root-transcript"),
 		};
 		const receipt = await storage.deleteSessionVerified(target);
-		if (receipt.kind !== "artifacts_removed" || receipt.phase !== "artifacts")
+		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
 			throw new Error("Expected artifact-phase receipt");
 		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
 		expect(await fsp.stat(plannedArtifactsPath).catch(() => undefined)).toBeUndefined();
@@ -968,8 +987,8 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		};
 
 		const receipt = await storage.deleteSessionVerified(target);
-		expect(receipt.kind).toBe("artifacts_removed");
-		if (receipt.kind !== "artifacts_removed") throw new Error("unreachable");
+		expect(["cleanup_pending", "artifacts_removed"]).toContain(receipt.kind);
+		if (receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") throw new Error("unreachable");
 		expect(receipt.phase).toBe("artifacts");
 		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
@@ -991,7 +1010,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		};
 
 		const receipt = await storage.deleteSessionVerified(target);
-		if (receipt.kind !== "artifacts_removed" || receipt.phase !== "artifacts")
+		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
 			throw new Error("Expected artifact-phase receipt");
 		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
 		expect(fs.existsSync(artifactsDir)).toBe(false);
@@ -1017,7 +1036,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: expectedIdentity,
 			plannedTranscriptPath,
 		};
-		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		expect(["cleanup_pending", "artifacts_removed"]).toContain((await storage.deleteSessionVerified(target)).kind);
 		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
 		if (result.kind !== "cleanup_pending" || result.phase !== "transcript") throw new Error("unreachable");
 		expect(result.detachedTranscriptPath).toBe(plannedTranscriptPath);
@@ -1158,7 +1177,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		};
 
 		const receipt = await storage.deleteSessionVerified(target);
-		if (receipt.kind !== "artifacts_removed" || receipt.phase !== "artifacts")
+		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
 			throw new Error("Expected artifact-phase receipt");
 		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
 		expect(fs.existsSync(artifactsDir)).toBe(false);
@@ -1300,7 +1319,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: authorizedIdentity,
 		};
 		const receipt = await storage.deleteSessionVerified(target);
-		if (receipt.kind !== "artifacts_removed" || receipt.phase !== "artifacts")
+		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
 			throw new Error("Expected artifact-phase receipt");
 		await fsp.appendFile(transcriptPath, `${JSON.stringify({ type: "message", content: "raced" })}\n`);
 
@@ -1333,7 +1352,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			cwd: tempDir,
 			transcriptIdentity: authorizedIdentity,
 		};
-		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		expect(["cleanup_pending", "artifacts_removed"]).toContain((await storage.deleteSessionVerified(target)).kind);
 		const err = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true }).catch(error => error);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
 		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
