@@ -732,18 +732,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 			}),
 		);
 		const closed = await runNativeRalplanCommand(
-			[
-				"--write",
-				"--stage",
-				"disposition",
-				"--stage_n",
-				"1",
-				"--artifact",
-				closedPath,
-				"--run-id",
-				runId,
-				"--json",
-			],
+			["--write", "--stage", "disposition", "--stage_n", "1", "--artifact", closedPath, "--run-id", runId, "--json"],
 			root,
 		);
 		expect(closed.status).toBe(0);
