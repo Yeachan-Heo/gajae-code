@@ -321,6 +321,15 @@ export async function renderStickyViewportShowcase(
 		const frame = terminal.getViewportAnsi();
 		const pinIndex = mode.ui.children.indexOf(mode.statusLine);
 		const retainedFrame = frame;
+		// `ascii-no-color` must be genuinely escape-free on every host. `chalk.level = 0`
+		// cannot deliver that: theme.ts emits SGR directly (`fgAnsi`/`bgAnsi`) without
+		// consulting chalk, and its color form depends on `detectColorMode()` — truecolor
+		// when COLORTERM=truecolor, indexed `38;5;N` when TERM is dumb/empty/linux (CI).
+		// Stripping here keeps the artifact host-independent instead of encoding whichever
+		// color form the capture host happened to negotiate. Every consumer below — the
+		// persisted ANSI payload and the recorded cursor frame digest — must use this one
+		// value, or the verifier's `cursor.frame_sha256 !== hash(ansi)` check rejects it.
+		const canonicalAnsi = entry.renderMode === "ascii-no-color" ? Bun.stripANSI(retainedFrame) : retainedFrame;
 		const rootOrder = semanticRootIds(mode);
 		const focused = mode.ui.getFocusedComponent();
 		const cursor = observation.cursor;
@@ -330,7 +339,7 @@ export async function renderStickyViewportShowcase(
 			throw new Error("renderer produced no visible semantic anchor");
 		return {
 			terminalText: Bun.stripANSI(retainedFrame),
-			terminalAnsiText: retainedFrame,
+			terminalAnsiText: canonicalAnsi,
 			sourceRevision: "production-tui-virtual-terminal-v3",
 			outputRevision:
 				observation.outputRevision ??
@@ -354,7 +363,11 @@ export async function renderStickyViewportShowcase(
 					pinned: observation.pinBoundary.pinned,
 				},
 				focused_component: focused === mode.editor && observation.focused ? "editor" : null,
-				cursor: { ...cursor, frame_sha256: captureFrame(terminal).sha256, blink: mode.editor.focused },
+				cursor: {
+					...cursor,
+					frame_sha256: new Bun.CryptoHasher("sha256").update(canonicalAnsi).digest("hex"),
+					blink: mode.editor.focused,
+				},
 				selection: observation.selection
 					? {
 							start: {
