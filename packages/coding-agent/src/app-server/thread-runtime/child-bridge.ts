@@ -7,6 +7,7 @@
 
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
+import type { Turn } from "../../../vendor/codex-app-server-schema/stable/typescript/v2/Turn";
 import { experimentalValidators, stableValidators } from "../protocol-source/schema-validators.generated";
 import type {
 	AdmissionReservation,
@@ -257,13 +258,15 @@ function normalizedParams(request: ThreadLoadRequest): Record<string, unknown> {
 	return isRecord(request.params) ? { ...request.params } : {};
 }
 
-function responseFor(
+export function projectThreadResponse(
 	runtime: {
-		sessionId: string;
-		cwd: string;
-		effectiveSettings: ThreadEffectiveSettings;
+		readonly sessionId: string;
+		readonly cwd: string;
+		readonly effectiveSettings: ThreadEffectiveSettings;
 	},
 	experimentalApi: boolean,
+	turns?: readonly Turn[],
+	method: "thread/start" | "thread/resume" = "thread/start",
 ): Record<string, unknown> {
 	const settings = runtime.effectiveSettings;
 	const sourceThread = settings.thread;
@@ -289,7 +292,7 @@ function responseFor(
 		agentRole: sourceThread.agentRole,
 		gitInfo: sourceThread.gitInfo,
 		name: sourceThread.name,
-		turns: [...sourceThread.turns],
+		turns: [...(turns ?? sourceThread.turns)],
 	};
 	const response: Record<string, unknown> = {
 		thread,
@@ -305,28 +308,33 @@ function responseFor(
 	};
 	if (experimentalApi) {
 		if (!Object.hasOwn(settings, "runtimeWorkspaceRoots") || settings.runtimeWorkspaceRoots === undefined)
-			throw new Error("Experimental thread/start response is missing runtimeWorkspaceRoots.");
+			throw new Error(`Experimental ${method} response is missing runtimeWorkspaceRoots.`);
 		if (!Object.hasOwn(settings, "activePermissionProfile"))
-			throw new Error("Experimental thread/start response is missing activePermissionProfile.");
+			throw new Error(`Experimental ${method} response is missing activePermissionProfile.`);
 		if (!Object.hasOwn(settings, "multiAgentMode"))
-			throw new Error("Experimental thread/start response is missing multiAgentMode.");
+			throw new Error(`Experimental ${method} response is missing multiAgentMode.`);
 		if (!Object.hasOwn(sourceThread, "extra"))
-			throw new Error("Experimental thread/start response is missing thread.extra.");
+			throw new Error(`Experimental ${method} response is missing thread.extra.`);
 		if (!Object.hasOwn(sourceThread, "historyMode"))
-			throw new Error("Experimental thread/start response is missing thread.historyMode.");
+			throw new Error(`Experimental ${method} response is missing thread.historyMode.`);
 		if (!Object.hasOwn(sourceThread, "canAcceptDirectInput"))
-			throw new Error("Experimental thread/start response is missing thread.canAcceptDirectInput.");
+			throw new Error(`Experimental ${method} response is missing thread.canAcceptDirectInput.`);
 		thread.extra = sourceThread.extra;
 		thread.historyMode = sourceThread.historyMode;
 		thread.canAcceptDirectInput = sourceThread.canAcceptDirectInput;
 		response.runtimeWorkspaceRoots = [...settings.runtimeWorkspaceRoots];
 		response.activePermissionProfile = settings.activePermissionProfile;
 		response.multiAgentMode = settings.multiAgentMode;
+		if (method === "thread/resume") {
+			response.initialTurnsPage = null;
+			response.turnsBackwardsCursor = null;
+			response.itemsBackwardsCursor = null;
+		}
 	}
 	const validator = experimentalApi
-		? experimentalValidators.clientRequestResults["thread/start"]
-		: stableValidators.clientRequestResults["thread/start"];
-	if (!validator(response)) throw new Error("Child adapter produced an invalid thread/start response.");
+		? experimentalValidators.clientRequestResults[method]
+		: stableValidators.clientRequestResults[method];
+	if (!validator(response)) throw new Error(`Child adapter produced an invalid ${method} response.`);
 	return response;
 }
 
@@ -587,7 +595,10 @@ export async function loadThread(
 		if (effectiveSettings.cwd !== actualCwd)
 			throw new Error("Child effective cwd does not match the captured child cwd.");
 
-		const response = responseFor({ sessionId, cwd: actualCwd, effectiveSettings }, request.experimentalApi === true);
+		const response = projectThreadResponse(
+			{ sessionId, cwd: actualCwd, effectiveSettings },
+			request.experimentalApi === true,
+		);
 		const runtime: LoadedThreadRuntime = {
 			threadId: sessionId,
 			sessionId,

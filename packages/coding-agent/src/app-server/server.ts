@@ -9,8 +9,15 @@ import type { ConnectionState } from "./router/connection-state";
 import { classifyInbound, dispatchClientRequest } from "./router/dispatch";
 import type { ServerRequestBroker } from "./server-requests/broker";
 import type { HandlerContext, HandlerRegistry } from "./suites/handlers";
-import { type ChildBridgeOptions, type LoadedThreadRuntime, loadThread } from "./thread-runtime/child-bridge";
+import {
+	type ChildBridgeOptions,
+	type LoadedThreadRuntime,
+	loadThread,
+	projectThreadResponse,
+} from "./thread-runtime/child-bridge";
 import type { ThreadRuntimeManager } from "./thread-runtime/thread-runtime-manager";
+import { type TurnController, TurnControllerError } from "./thread-runtime/turn-controller";
+import { readAndReconstructTurns } from "./thread-runtime/turn-projection";
 import { serializeError, serializeResult } from "./transport/errors";
 import { decodeLine, encodeMessage, type FrameCodecOptions } from "./transport/framing";
 import type { ListenMode } from "./transport/listen";
@@ -25,6 +32,7 @@ export interface InboundResult {
 	readonly response?: Uint8Array;
 	readonly notification?: boolean;
 	readonly rollbackUndeliveredResponse?: () => Promise<void>;
+	readonly responseDelivered?: () => Promise<void>;
 	/** The frame was deliberately dropped without a wire response. */
 	readonly rejected?: "malformed" | "oversize";
 }
@@ -34,6 +42,7 @@ export interface InboundContext extends HandlerContext {
 	readonly isActive?: () => boolean;
 	readonly broker?: ServerRequestBroker;
 	readonly threadStartAdapter?: ChildBridgeOptions;
+	readonly turnController?: TurnController;
 	readonly unsubscribe?: (threadId: string) => void;
 }
 
@@ -54,14 +63,17 @@ function createUndeliveredResponseRollback(
 	manager: ThreadRuntimeManager,
 	context: InboundContext | undefined,
 	runtime: LoadedThreadRuntime,
+	unsubscribe = true,
 ): () => Promise<void> {
 	let rollback: Promise<void> | undefined;
 	return () => {
 		rollback ??= (async () => {
-			try {
-				await context?.unsubscribe?.(runtime.threadId);
-			} catch {
-				// Connection teardown may already have removed the subscription.
+			if (unsubscribe) {
+				try {
+					await context?.unsubscribe?.(runtime.threadId);
+				} catch {
+					// Connection teardown may already have removed the subscription.
+				}
 			}
 			const managed = manager.get(runtime.threadId);
 			if (!managed || managed.sessionId !== runtime.sessionId || managed.client !== runtime.client) return;
@@ -88,6 +100,246 @@ function isErrorResponse(value: unknown): value is { code: number; message: stri
 		Number.isInteger(value.code) &&
 		typeof value.message === "string"
 	);
+}
+
+const turnStartUnsupportedOverrides = [
+	"responsesapiClientMetadata",
+	"additionalContext",
+	"environments",
+	"cwd",
+	"runtimeWorkspaceRoots",
+	"approvalPolicy",
+	"approvalsReviewer",
+	"sandbox",
+	"sandboxPolicy",
+	"permissions",
+	"model",
+	"serviceTier",
+	"effort",
+	"summary",
+	"personality",
+	"outputSchema",
+	"collaborationMode",
+	"multiAgentMode",
+] as const;
+
+const threadResumeOverrides = [
+	"history",
+	"path",
+	"model",
+	"modelProvider",
+	"serviceTier",
+	"cwd",
+	"runtimeWorkspaceRoots",
+	"approvalPolicy",
+	"approvalsReviewer",
+	"sandbox",
+	"permissions",
+	"config",
+	"baseInstructions",
+	"developerInstructions",
+	"personality",
+	"excludeTurns",
+	"initialTurnsPage",
+] as const;
+
+function hasNonNullProperty(record: Record<string, unknown>, key: string): boolean {
+	return Object.hasOwn(record, key) && record[key] !== undefined && record[key] !== null;
+}
+
+function supportsTurnStart(params: Record<string, unknown>): boolean {
+	if (turnStartUnsupportedOverrides.some(key => hasNonNullProperty(params, key))) return false;
+	if (!Array.isArray(params.input) || params.input.length === 0) return false;
+	return params.input.every(item => {
+		if (!isRecord(item) || item.type !== "text") return false;
+		return typeof item.text === "string" && item.text.trim().length > 0;
+	});
+}
+
+function supportsThreadResume(params: Record<string, unknown>): boolean {
+	return !threadResumeOverrides.some(key => hasNonNullProperty(params, key));
+}
+
+function turnControllerCode(error: unknown): string | undefined {
+	if (error instanceof TurnControllerError) return error.code;
+	if (isRecord(error) && typeof error.code === "string") return error.code;
+	return undefined;
+}
+
+function turnControllerErrorKey(error: unknown): "busy" | "idempotencyConflict" | "internalError" {
+	switch (turnControllerCode(error)) {
+		case "busy":
+			return "busy";
+		case "idempotency_conflict":
+			return "idempotencyConflict";
+		default:
+			return "internalError";
+	}
+}
+
+function createResponseDelivery(context: InboundContext | undefined, threadId: string): () => Promise<void> {
+	let delivery: Promise<void> | undefined;
+	return () => {
+		delivery ??= Promise.resolve().then(async () => {
+			await context?.subscribe?.(threadId);
+		});
+		return delivery;
+	};
+}
+
+function createLoadedResumeRollback(context: InboundContext | undefined, threadId: string): () => Promise<void> {
+	let rollback: Promise<void> | undefined;
+	return () => {
+		rollback ??= Promise.resolve().then(async () => {
+			try {
+				await context?.unsubscribe?.(threadId);
+			} catch {
+				// Connection teardown may already have removed the subscription.
+			}
+		});
+		return rollback;
+	};
+}
+
+async function handleTurnStart(
+	state: ConnectionState,
+	manager: ThreadRuntimeManager,
+	id: string | number,
+	params: unknown,
+	transport: "stdio" | "websocket" | "unix",
+	context: InboundContext | undefined,
+): Promise<InboundResult> {
+	const controller = context?.turnController;
+	if (!controller) return { response: serializeError(id, "notSupported", transport) ?? undefined };
+	if (!isRecord(params)) return { response: serializeError(id, "notSupported", transport) ?? undefined };
+	const threadId = params.threadId;
+	if (typeof threadId !== "string" || threadId.length === 0)
+		return { response: serializeError(id, "notFound", transport) ?? undefined };
+	const managed = manager.get(threadId);
+	if (managed?.lifecycle !== "active" || !managed.client)
+		return { response: serializeError(id, "notFound", transport) ?? undefined };
+	if (!supportsTurnStart(params)) return { response: serializeError(id, "notSupported", transport) ?? undefined };
+
+	let rollbackUndelivered: (() => Promise<void>) | undefined;
+	try {
+		const candidate: unknown = await controller.start({ threadId, params });
+		if (!isRecord(candidate) || !isRecord(candidate.response))
+			throw new Error("Turn controller returned a malformed start handle.");
+		if (typeof candidate.responseDelivered !== "function" || typeof candidate.rollbackUndelivered !== "function")
+			throw new Error("Turn controller returned an incomplete start handle.");
+		const responseDelivered = candidate.responseDelivered as () => Promise<void>;
+		rollbackUndelivered = candidate.rollbackUndelivered as () => Promise<void>;
+		const validators = state.capabilities?.experimentalApi ? experimentalValidators : stableValidators;
+		const validate = validators.clientRequestResults["turn/start"];
+		if (!validate?.(candidate.response)) throw new Error("Turn controller returned an invalid response.");
+		const response = serializeResult(id, candidate.response, transport);
+		if (!response) throw new Error("Turn response could not be serialized.");
+		return { response, responseDelivered, rollbackUndeliveredResponse: rollbackUndelivered };
+	} catch (error) {
+		if (rollbackUndelivered) {
+			try {
+				await rollbackUndelivered();
+			} catch {
+				// Preserve the original controller or validation failure.
+			}
+		}
+		return { response: serializeError(id, turnControllerErrorKey(error), transport) ?? undefined };
+	}
+}
+
+async function handleThreadResume(
+	state: ConnectionState,
+	manager: ThreadRuntimeManager,
+	id: string | number,
+	params: unknown,
+	transport: "stdio" | "websocket" | "unix",
+	context: InboundContext | undefined,
+	threadStartBridge: ChildBridgeOptions | undefined,
+): Promise<InboundResult> {
+	if (!isRecord(params)) return { response: serializeError(id, "notSupported", transport) ?? undefined };
+	const threadId = params.threadId;
+	if (typeof threadId !== "string" || threadId.length === 0)
+		return { response: serializeError(id, "notFound", transport) ?? undefined };
+	if (!supportsThreadResume(params)) return { response: serializeError(id, "notSupported", transport) ?? undefined };
+
+	const experimentalApi = state.capabilities?.experimentalApi === true;
+	const loaded = manager.get(threadId);
+	if (loaded?.lifecycle === "active" && loaded.client) {
+		if (!loaded.effectiveSettings) return { response: serializeError(id, "internalError", transport) ?? undefined };
+		try {
+			const cwd = loaded.effectiveSettings.cwd;
+			const turns = await readAndReconstructTurns(loaded.client);
+			const response = projectThreadResponse(
+				{ sessionId: loaded.sessionId, cwd, effectiveSettings: loaded.effectiveSettings },
+				experimentalApi,
+				turns,
+				"thread/resume",
+			);
+			const validators = experimentalApi ? experimentalValidators : stableValidators;
+			if (!validators.clientRequestResults["thread/resume"]?.(response))
+				throw new Error("Invalid thread/resume response.");
+			const serialized = serializeResult(id, response, transport);
+			if (!serialized) throw new Error("Thread resume response could not be serialized.");
+			if (context?.isActive && !context.isActive()) throw new Error("Requester connection is inactive.");
+			return {
+				response: serialized,
+				responseDelivered: createResponseDelivery(context, threadId),
+				rollbackUndeliveredResponse: createLoadedResumeRollback(context, threadId),
+			};
+		} catch {
+			return { response: serializeError(id, "internalError", transport) ?? undefined };
+		}
+	}
+	if (loaded) return { response: serializeError(id, "notFound", transport) ?? undefined };
+
+	if (typeof threadStartBridge?.create !== "function")
+		return { response: serializeError(id, "notSupported", transport) ?? undefined };
+	const resumeBridge: ChildBridgeOptions = {
+		...threadStartBridge,
+		manager,
+		subscribe: undefined,
+		unsubscribe: undefined,
+	};
+	let runtime: LoadedThreadRuntime | undefined;
+	let rollbackUndelivered: (() => Promise<void>) | undefined;
+	try {
+		runtime = await loadThread(resumeBridge, {
+			threadId,
+			ownership: "attached",
+			connectionId: context?.connectionId,
+			params,
+			experimentalApi,
+		});
+		rollbackUndelivered = createUndeliveredResponseRollback(manager, context, runtime, false);
+		if (runtime.threadId !== threadId) throw new Error("Attached child returned a different thread id.");
+		const turns = await readAndReconstructTurns(runtime.client);
+		const response = projectThreadResponse(
+			{ sessionId: runtime.sessionId, cwd: runtime.cwd, effectiveSettings: runtime.effectiveSettings },
+			experimentalApi,
+			turns,
+			"thread/resume",
+		);
+		const validators = experimentalApi ? experimentalValidators : stableValidators;
+		if (!validators.clientRequestResults["thread/resume"]?.(response))
+			throw new Error("Invalid thread/resume response.");
+		const serialized = serializeResult(id, response, transport);
+		if (!serialized) throw new Error("Thread resume response could not be serialized.");
+		if (context?.isActive && !context.isActive()) throw new Error("Requester connection is inactive.");
+		return {
+			response: serialized,
+			responseDelivered: createResponseDelivery(context, threadId),
+			rollbackUndeliveredResponse: rollbackUndelivered,
+		};
+	} catch {
+		if (rollbackUndelivered) {
+			try {
+				await rollbackUndelivered();
+			} catch {
+				// The identity-fenced attached runtime was removed and every close stage was attempted.
+			}
+		}
+		return { response: serializeError(id, "internalError", transport) ?? undefined };
+	}
 }
 
 /** Process one inbound frame. The async boundary serializes connection processing. */
@@ -183,6 +435,18 @@ export async function processInbound(
 		case "invalidParams":
 			return { response: serializeError(verdict.id, "invalidParams", transport) ?? undefined };
 		case "handle": {
+			if (classification.method === "turn/start")
+				return await handleTurnStart(state, manager, verdict.id, verdict.params, transport, context);
+			if (classification.method === "thread/resume")
+				return await handleThreadResume(
+					state,
+					manager,
+					verdict.id,
+					verdict.params,
+					transport,
+					context,
+					threadStartBridge,
+				);
 			if (classification.method === "thread/start") {
 				if (typeof threadStartBridge?.create !== "function")
 					return { response: serializeError(verdict.id, "notSupported", transport) ?? undefined };
