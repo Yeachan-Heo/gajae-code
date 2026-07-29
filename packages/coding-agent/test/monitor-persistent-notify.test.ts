@@ -60,11 +60,7 @@ function makeSession(ownerId: string, queue: QueuedMessage[], settings: Settings
 	} as unknown as ToolSession;
 }
 
-async function waitFor(
-	predicate: () => boolean,
-	timeoutMs: number,
-	label: string,
-): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) {
 		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
@@ -94,8 +90,7 @@ describe("persistent monitor notify policy", () => {
 		// Ten identical lines on separate ticks, then hold open so intermediate debounce can fire
 		// before terminal flush.
 		const result = await new MonitorTool(session).execute("call", {
-			command:
-				"for i in $(seq 1 10); do printf 'GET /api/jobs/abc 200\\n'; sleep 0.02; done; sleep 3",
+			command: "for i in $(seq 1 10); do printf 'GET /api/jobs/abc 200\\n'; sleep 0.02; done; sleep 3",
 			kind: "log",
 			description: "debounce coalesce",
 			persistent: true,
@@ -139,9 +134,7 @@ describe("persistent monitor notify policy", () => {
 			3_500,
 			"display-only intermediate",
 		);
-		const intermediate = queue.filter(
-			entry => detailsOf(entry).taskId === taskId && entry.triggerTurn === false,
-		);
+		const intermediate = queue.filter(entry => detailsOf(entry).taskId === taskId && entry.triggerTurn === false);
 		expect(intermediate.length).toBeGreaterThanOrEqual(1);
 		for (const entry of intermediate) {
 			expect(entry.triggerTurn).toBe(false);
@@ -176,8 +169,7 @@ describe("persistent monitor notify policy", () => {
 		// Deliver "same" once via debounce, then emit more identical lines in a later window;
 		// the second intermediate flush should be suppressed; terminal still wakes.
 		const result = await new MonitorTool(session).execute("call", {
-			command:
-				"printf 'same\\n'; sleep 2.2; for i in $(seq 1 5); do printf 'same\\n'; sleep 0.02; done; sleep 2.2",
+			command: "printf 'same\\n'; sleep 2.2; for i in $(seq 1 5); do printf 'same\\n'; sleep 0.02; done; sleep 2.2",
 			kind: "poll",
 			description: "on_change skip duplicate",
 			persistent: true,
