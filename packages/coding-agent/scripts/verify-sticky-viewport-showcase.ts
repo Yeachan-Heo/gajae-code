@@ -392,6 +392,23 @@ const hasColorSgr = (ansi: string) =>
 				code === 48,
 		);
 	});
+// Independent, frame-derived transcript geometry. The renderer assigns
+// `transcriptCapacity` and `pinBoundary.row` from one local (tui.ts), so
+// comparing those two to each other can never fail. These derivations read the
+// committed paint instead, so a renderer reporting stale geometry is rejected.
+const STATUS_ROW_MARKER = "⬢";
+const NOTICE_MARKER = "New output — type to follow";
+const frameGeometry = (key: string, text: string) => {
+	const rows = text.split("\n").slice(0, -1);
+	const statusRows = rows.filter(row => row.includes(STATUS_ROW_MARKER));
+	if (statusRows.length !== 1) fail(`entry ${key} status row cardinality is not exactly one`);
+	const statusRow = rows.findIndex(row => row.includes(STATUS_ROW_MARKER));
+	const noticeRows = text.split(NOTICE_MARKER).length - 1;
+	if (noticeRows > 1) fail(`entry ${key} notice row cardinality exceeds one`);
+	// The notice, when present, occupies the first row below the transcript, so
+	// the painted status row sits one lower than the transcript capacity.
+	return { capacity: statusRow - noticeRows, statusRow, noticeRows };
+};
 export async function verifyStickyViewportShowcase(rootInput: string, requireIndependentReview = false): Promise<void> {
 	const root = path.resolve(rootInput);
 	const manifestText = await fs.readFile(path.join(root, "manifest.json"), "utf8");
@@ -530,7 +547,26 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			stateEvidence.composer_visible !== true
 		)
 			fail(`metadata schema mismatch for ${key}`);
-		if (!Number.isInteger(stateEvidence.transcript_capacity)) fail(`capacity metadata/frame mismatch for ${key}`);
+		// Frame-derived geometry must AGREE with the renderer's self-report, which is
+		// strictly stronger than either alone. `transcript_capacity` and
+		// `pin_boundary.row` both come from one renderer local, so they can only be
+		// falsified against the committed paint: a renderer reporting stale capacity
+		// or pin geometry now fails here instead of passing self-consistently.
+		const frameGeom = frameGeometry(key, text);
+		if (
+			!Number.isInteger(stateEvidence.transcript_capacity) ||
+			stateEvidence.transcript_capacity !== frameGeom.capacity ||
+			frameGeom.noticeRows !== (state === "manual-new-output" ? 1 : 0)
+		)
+			fail(`capacity metadata/frame mismatch for ${key}`);
+		// Ordered suffix markers follow the production root order: status-line (5),
+		// hooks-above (6), editor-container (7). Painted order, not reported order.
+		let markerPosition = -1;
+		for (const marker of [STATUS_ROW_MARKER, "hook: ready", "> "]) {
+			const next = text.indexOf(marker, markerPosition + 1);
+			if (next < 0) fail(`entry ${key} ordered suffix marker missing: ${marker}`);
+			markerPosition = next;
+		}
 		const observations = array(stateEvidence.resize_probes, `metadata ${key} resize observations`);
 		const probeWidths = [64, 65, 80, 120, 160, 120, 80, 65, 64];
 		const rootOrder = array(stateEvidence.root_order, `metadata ${key} root order`);
@@ -630,7 +666,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 				]) ||
 			pinBoundary.component !== "status-line" ||
 			pinBoundary.index !== 5 ||
-			pinBoundary.row !== stateEvidence.transcript_capacity ||
+			pinBoundary.row !== frameGeom.capacity ||
 			pinBoundary.pinned !== true ||
 			stateEvidence.focused_component !== "editor" ||
 			!Number.isInteger(cursor.row) ||
