@@ -151,7 +151,7 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		expect(startupError.message).toBe("Could not resolve managed session scope.");
 		expect(startupError.message).not.toContain(external);
 		expect(JSON.stringify(startupError.cause)).not.toContain(external);
-		expect(startupError.cause).toEqual({ classification: "sessions_root_unavailable" });
+		expect(startupError.cause).toEqual({ classification: "reparse_point" });
 	});
 
 	it("surfaces a bounded classification for managed scope preparation failures", async () => {
@@ -309,7 +309,7 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 			const startupError = error as Error;
 			expect(startupError.message).not.toContain(external);
 			expect(JSON.stringify(startupError.cause)).not.toContain(external);
-			expect(startupError.cause).toEqual({ classification: "sessions_root_unavailable" });
+			expect(startupError.cause).toEqual({ classification: "reparse_point" });
 		}
 	});
 
