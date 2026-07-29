@@ -168,17 +168,51 @@ export function ansiToHtml(value: string): string {
 	return `<!doctype html><html lang="en"><meta charset="utf-8"><title>Sticky viewport showcase</title><style>body{margin:0;background:#110b0b;color:#ffe7dc}pre{white-space:pre;font-family:ui-monospace,monospace}@keyframes blink{50%{visibility:hidden}}</style><pre>${body}</pre></html>\n`;
 }
 const json = (value: unknown) => `${JSON.stringify(value, null, 2)}\n`;
-const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const hash = (value: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const PROVENANCE_SOURCES = [
+	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+	"packages/coding-agent/src/modes/interactive-mode.ts",
+	"packages/coding-agent/src/modes/components/irc-sidebar.ts",
+	"packages/tui/src/tui.ts",
+] as const;
+async function git(args: string[]): Promise<Uint8Array> {
+	const result = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+	if ((await result.exited) !== 0)
+		throw new Error(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
+	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
+}
+async function captureProvenance() {
+	const gitHead = new TextDecoder().decode(await git(["rev-parse", "HEAD"])).trim();
+	const sourceSha256 = Object.fromEntries(
+		await Promise.all(
+			PROVENANCE_SOURCES.map(async source => [source, hash(new Uint8Array(await Bun.file(source).arrayBuffer()))]),
+		),
+	);
+	return {
+		git_head: gitHead,
+		git_diff_binary_sha256: hash(await git(["diff", "--binary", "HEAD", "--"])),
+		source_sha256: sourceSha256,
+	};
+}
 function out(args: string[]): string {
 	if (args.length !== 2 || args[0] !== "--out" || !args[1]) throw new Error(`Usage: ${COMMAND}`);
 	return args[1];
 }
-async function capture(entry: StickyViewportShowcaseEntry, root: string) {
+async function capture(
+	entry: StickyViewportShowcaseEntry,
+	root: string,
+	sourceProvenance: Awaited<ReturnType<typeof captureProvenance>>,
+) {
 	const rendered = await renderStickyViewportShowcase(entry);
 	if (!rendered.state.composer_visible)
 		throw new Error(`${entry.key}: focused composer was not visible in production frame`);
-	if (entry.stateId === "manual-new-output" && rendered.state.notice !== true)
-		throw new Error(`${entry.key}: manual output notice precondition failed`);
+	if (
+		(entry.stateId === "manual-new-output" && rendered.state.notice !== true) ||
+		(entry.stateId !== "manual-new-output" && rendered.state.notice !== false)
+	)
+		throw new Error(`${entry.key}: renderer-owned output notice precondition failed`);
 	if (
 		JSON.stringify(rendered.cjkPhraseBoundaries) !==
 		JSON.stringify(entry.stateId === "narrow-cjk" ? CJK_PHRASE_BOUNDARIES : [])
@@ -210,6 +244,7 @@ async function capture(entry: StickyViewportShowcaseEntry, root: string) {
 			fixed_clock: true,
 			author_identity: "capture-sticky-viewport-showcase",
 			executor_identity: "capture-sticky-viewport-showcase",
+			...sourceProvenance,
 		},
 		cjk_phrase_boundaries: rendered.cjkPhraseBoundaries,
 	});
@@ -241,8 +276,9 @@ async function capture(entry: StickyViewportShowcaseEntry, root: string) {
 async function main() {
 	const root = path.resolve(out(process.argv.slice(2)));
 	await fs.mkdir(root, { recursive: true });
+	const sourceProvenance = await captureProvenance();
 	const entries = [];
-	for (const entry of STICKY_VIEWPORT_SHOWCASE_ENTRIES) entries.push(await capture(entry, root));
+	for (const entry of STICKY_VIEWPORT_SHOWCASE_ENTRIES) entries.push(await capture(entry, root, sourceProvenance));
 	const manifest = json({
 		schema_version: 2,
 		fixture_revision: REVISION,
@@ -258,6 +294,7 @@ async function main() {
 			fixed_clock: true,
 			author_identity: "capture-sticky-viewport-showcase",
 			executor_identity: "capture-sticky-viewport-showcase",
+			...sourceProvenance,
 		},
 		review_input_file: "review-input.json",
 		entries,
@@ -281,6 +318,15 @@ async function main() {
 			acceptance_version: ACCEPTANCE_VERSION,
 			design_version: DESIGN_VERSION,
 			host_matrix: HOST_MATRIX,
+			provenance: {
+				capture_mode: "production-tui-virtual-terminal",
+				live_pty: false,
+				network: false,
+				fixed_clock: true,
+				author_identity: "capture-sticky-viewport-showcase",
+				executor_identity: "capture-sticky-viewport-showcase",
+				...sourceProvenance,
+			},
 			narrow_cjk: {
 				entry_key: "narrow-cjk/48x10/unicode-color",
 				phrase_boundaries: ["의미 있는 문장 경계", "意味のある文の境界", "保留语义短语边界"],
