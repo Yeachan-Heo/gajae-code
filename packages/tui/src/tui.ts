@@ -936,6 +936,11 @@ export class TUI extends Container {
 	/** Selects a zero-based painted viewport cell range using the same renderer path as mouse dragging. */
 	setViewportSelection(start: MouseSelectionPoint, end: MouseSelectionPoint): void {
 		if (!this.options.copySelection) return;
+		// Non-finite coordinates would survive the clamp below as NaN, latch
+		// #mouseSelectionDragged, and force a repaint every frame while reporting a
+		// NaN selection through getViewportObservation(). Reject them the same way
+		// scrollViewportBy does rather than storing an unpaintable selection.
+		if (![start.line, start.column, end.line, end.column].every(value => Number.isFinite(value))) return;
 		const map = (point: MouseSelectionPoint): MouseSelectionPoint | null => {
 			const row = Math.max(0, Math.min(this.terminal.rows - 1, point.line));
 			const column = Math.max(0, Math.min(this.terminal.columns - 1, point.column));
