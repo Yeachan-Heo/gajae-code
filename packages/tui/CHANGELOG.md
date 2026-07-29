@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Tui` now exposes renderer-owned viewport observations so tests and evidence capture can assert against committed paint state instead of re-deriving geometry: `getViewportObservation()` (returns a defensive copy of the latest committed observation), `getViewportAnchorSnapshot()`, `getViewportAnchorComponent()`, `getFocusedComponent()`, and `setViewportSelection()`, plus the `TuiViewportObservation` and `MouseSelectionPoint` types.
+
+### Changed
+
+- Alternate-scroll mode (`DECSET 1007`) is now explicitly disabled at startup, on every mouse-capture toggle, at stop, and during emergency restore, so the host terminal or multiplexer owns mouse-wheel scrollback instead of receiving wheel-to-cursor-key translation. Hosts that never answer a `DECRQM ?1007$p` query (Apple Terminal among them) cannot report this mode, so it is reset unconditionally rather than conditionally on a reported state.
+
 ### Fixed
 
 - Kitty/Ghostty inline images no longer remain visually pinned when sticky or semantic viewport repaints move their anchors into application scrollback. The renderer now soft-deletes only the named placement from the old viewport, retains uploaded pixels for history replay, and keeps placement tracking aligned across unresolved-anchor and follow-live transitions.
