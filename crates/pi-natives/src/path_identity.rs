@@ -245,6 +245,7 @@ impl NativeDurableReplaceResult {
 		}
 	}
 
+	#[cfg(windows)]
 	fn success() -> Self {
 		Self {
 			ok:               true,
@@ -816,8 +817,9 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	platform::exact_unlink(Path::new(&path), &identity)
 }
 /// Replace a staged regular file only after deleting the exact expected
-/// destination object. Publication uses a retained source handle and a
-/// no-replace rename, so a successor installed after deletion is preserved.
+///
+/// Publication uses a retained source handle and a no-replace rename, so a
+/// successor installed after deletion is preserved.
 #[napi]
 pub fn exact_replace_path(
 	source_path: String,
