@@ -8,6 +8,7 @@ import { type InboundContext, type InboundResult, processInbound } from "./serve
 import { ServerRequestBroker } from "./server-requests/broker";
 import { ConnectionRegistry, ThreadSubscriptionIndex } from "./subscriptions";
 import { HandlerRegistry, registerBuiltinHandlers } from "./suites/handlers";
+import type { ChildBridgeOptions } from "./thread-runtime/child-bridge";
 import { type AdmissionConfig, ThreadRuntimeManager } from "./thread-runtime/thread-runtime-manager";
 import { BoundedOutboundQueue } from "./transport/connection";
 import { encodeMessage, type FrameCodecOptions } from "./transport/framing";
@@ -15,6 +16,10 @@ import { encodeMessage, type FrameCodecOptions } from "./transport/framing";
 export type AppServerTransport = "stdio" | "websocket" | "unix";
 export type AppServerWriter = (frame: Uint8Array) => Promise<void> | void;
 export type AppServerRejectedFrameHandler = (reason: "malformed" | "oversize") => void;
+
+export interface AppServerRuntimeOptions {
+	readonly threadStartAdapter?: Omit<ChildBridgeOptions, "manager">;
+}
 
 export interface AppServerConnection {
 	readonly id: string;
@@ -50,15 +55,23 @@ class Runtime implements AppServerRuntime {
 	readonly #connections = new Map<string, Connection>();
 	readonly #connectionRegistry = new ConnectionRegistry();
 	readonly #frameCodec: FrameCodecOptions | undefined;
+	readonly #threadStartAdapter: ChildBridgeOptions | undefined;
 	#nextConnectionId = 1;
 	readonly #serverNotificationStability = new Map<string, "stable" | "experimental">(
 		serverNotifications.map(({ method, stability }) => [method, stability]),
 	);
 	#nextRequestId = 1;
 
-	constructor(config: Partial<AdmissionConfig>, frameCodec?: FrameCodecOptions) {
+	constructor(
+		config: Partial<AdmissionConfig>,
+		frameCodec?: FrameCodecOptions,
+		options: AppServerRuntimeOptions = {},
+	) {
 		this.manager = new ThreadRuntimeManager(config);
 		this.#frameCodec = frameCodec;
+		this.#threadStartAdapter = options.threadStartAdapter
+			? { ...options.threadStartAdapter, manager: this.manager }
+			: undefined;
 		registerBuiltinHandlers(this.registry);
 	}
 
@@ -93,8 +106,12 @@ class Runtime implements AppServerRuntime {
 		return {
 			connectionId: connection.id,
 			broker: this.broker,
+			threadStartAdapter: this.#threadStartAdapter,
 			subscribe: threadId => {
 				if (active()) this.subscriptions.subscribe(connection.id, threadId);
+			},
+			unsubscribe: threadId => {
+				if (active()) this.subscriptions.unsubscribe(connection.id, threadId);
 			},
 			respond: () => {},
 			emitTo: (connectionId, method, params) => {
@@ -247,8 +264,9 @@ class Connection implements AppServerConnection {
 export function createAppServerRuntime(
 	config: Partial<AdmissionConfig> = {},
 	frameCodec?: FrameCodecOptions,
+	options: AppServerRuntimeOptions = {},
 ): AppServerRuntime {
-	return new Runtime(config, frameCodec);
+	return new Runtime(config, frameCodec, options);
 }
 
 /**

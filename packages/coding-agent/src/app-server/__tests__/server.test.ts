@@ -1,8 +1,15 @@
 import { expect, test } from "bun:test";
+import * as path from "node:path";
+import { experimentalValidators, stableValidators } from "../protocol-source/schema-validators.generated";
 import { ConnectionState } from "../router/connection-state";
 import { classifyInbound } from "../router/dispatch";
 import { processInbound } from "../server";
-import { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
+import type { ChildBridgeOptions, SessionClient } from "../thread-runtime/child-bridge";
+import {
+	type EndpointAuthority,
+	type ThreadEffectiveSettings,
+	ThreadRuntimeManager,
+} from "../thread-runtime/thread-runtime-manager";
 import { coerceId } from "../transport/framing";
 
 const enc = (s: string) => new TextEncoder().encode(s);
@@ -10,6 +17,67 @@ const dec = (b: Uint8Array | undefined) =>
 	b ? (JSON.parse(new TextDecoder().decode(b)) as Record<string, unknown>) : undefined;
 const state = () => new ConnectionState();
 const mgr = () => new ThreadRuntimeManager();
+
+const authority = (gen: number): EndpointAuthority => ({
+	endpointGeneration: gen,
+	endpointIncarnation: "c".repeat(64),
+	endpointMtimeMs: 1,
+	pid: 1234,
+});
+
+const effectiveSettings = (sessionId: string, cwd: string): ThreadEffectiveSettings => ({
+	model: "requested-model",
+	modelProvider: "openai",
+	serviceTier: null,
+	cwd,
+	instructionSources: [],
+	approvalPolicy: "untrusted",
+	approvalsReviewer: "user",
+	sandbox: { type: "dangerFullAccess" },
+	reasoningEffort: null,
+	thread: {
+		id: sessionId,
+		sessionId,
+		forkedFromId: null,
+		parentThreadId: null,
+		preview: "preview",
+		ephemeral: false,
+		isPinned: false,
+		modelProvider: "openai",
+		createdAt: 0,
+		updatedAt: 0,
+		recencyAt: null,
+		status: { type: "idle" },
+		path: null,
+		cwd,
+		cliVersion: "1",
+		source: "cli",
+		threadSource: null,
+		agentNickname: null,
+		agentRole: null,
+		gitInfo: null,
+		name: null,
+		turns: [],
+		extra: null,
+		historyMode: "paginated",
+		canAcceptDirectInput: true,
+	},
+	runtimeWorkspaceRoots: [],
+	activePermissionProfile: null,
+	multiAgentMode: "proactive",
+});
+
+function serverClient(): SessionClient {
+	return {
+		onFrame: () => () => {},
+		onReconnect: () => () => {},
+		onReconnectFailed: () => () => {},
+		request: async () => ({}),
+		query: async () => ({}),
+		control: async () => ({}),
+		close: async () => {},
+	};
+}
 
 test("server: oversize stdio frame returns GJC-only -32600 id null", async () => {
 	const huge = "x".repeat(5 * 1024 * 1024);
@@ -41,7 +109,7 @@ test("server: request before initialize returns Not initialized", async () => {
 	expect((parsed.error as Record<string, unknown>).message).toBe("Not initialized");
 });
 
-test("server: a planned thread method is not supported after the handshake", async () => {
+test("server: implemented thread/start is not supported when no lifecycle adapter is installed", async () => {
 	const s = state();
 	await processInbound(
 		s,
@@ -173,4 +241,94 @@ test("server: response frames carrying both or neither result and error are inva
 		const result = await processInbound(state(), mgr(), enc(frame));
 		expect((dec(result.response)!.error as Record<string, unknown>).code).toBe(-32600);
 	}
+});
+
+test("server: injected thread/start returns a stable schema response after publication", async () => {
+	const s = state();
+	const manager = mgr();
+	const cwd = path.resolve("server-cwd");
+	let subscribed = false;
+	const bridge: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "server-session-stable",
+			cwd,
+			authority: authority(11),
+			client: serverClient(),
+			awaitReady: async () => {},
+		}),
+		readEffectiveSettings: async () => effectiveSettings("server-session-stable", cwd),
+	};
+	await processInbound(
+		s,
+		manager,
+		enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'),
+	);
+	await processInbound(s, manager, enc('{"method":"initialized"}'));
+	const result = await processInbound(
+		s,
+		manager,
+		enc(`{"id":2,"method":"thread/start","params":{"cwd":"${cwd}"}}`),
+		undefined,
+		"websocket",
+		undefined,
+		{
+			connectionId: "conn-stable",
+			threadStartAdapter: bridge,
+			subscribe: threadId => {
+				subscribed = manager.get(threadId) !== undefined;
+			},
+		},
+	);
+	const parsed = dec(result.response)!;
+	const response = parsed.result as Record<string, unknown>;
+	expect(stableValidators.clientRequestResults["thread/start"](response)).toBe(true);
+	expect((response.thread as Record<string, unknown>).id).toBe("server-session-stable");
+	expect(response).not.toHaveProperty("runtimeWorkspaceRoots");
+	const stableThread = response.thread as Record<string, unknown>;
+	expect(stableThread).not.toHaveProperty("extra");
+	expect(stableThread).not.toHaveProperty("historyMode");
+	expect(stableThread).not.toHaveProperty("canAcceptDirectInput");
+	expect(subscribed).toBe(true);
+});
+
+test("server: injected thread/start selects the experimental 13-field response", async () => {
+	const s = state();
+	const manager = mgr();
+	const cwd = path.resolve("server-experimental-cwd");
+	const bridge: ChildBridgeOptions = {
+		manager,
+		create: async () => ({
+			sessionId: "server-session-experimental",
+			cwd,
+			authority: authority(12),
+			client: serverClient(),
+			awaitReady: async () => {},
+		}),
+		readEffectiveSettings: async () => effectiveSettings("server-session-experimental", cwd),
+	};
+	await processInbound(
+		s,
+		manager,
+		enc(
+			'{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"},"capabilities":{"experimentalApi":true}}}',
+		),
+	);
+	await processInbound(s, manager, enc('{"method":"initialized"}'));
+	const result = await processInbound(
+		s,
+		manager,
+		enc(`{"id":2,"method":"thread/start","params":{"cwd":"${cwd}"}}`),
+		undefined,
+		"websocket",
+		undefined,
+		{ connectionId: "conn-experimental", threadStartAdapter: bridge },
+	);
+	const response = dec(result.response)!.result as Record<string, unknown>;
+	expect(experimentalValidators.clientRequestResults["thread/start"](response)).toBe(true);
+	expect(response).toHaveProperty("runtimeWorkspaceRoots");
+	expect(response).toHaveProperty("activePermissionProfile");
+	expect(response).toHaveProperty("multiAgentMode");
+	const experimentalThread = response.thread as Record<string, unknown>;
+	expect(experimentalThread).toMatchObject({ extra: null, historyMode: "paginated", canAcceptDirectInput: true });
 });

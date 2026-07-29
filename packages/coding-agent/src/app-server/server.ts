@@ -9,6 +9,8 @@ import type { ConnectionState } from "./router/connection-state";
 import { classifyInbound, dispatchClientRequest } from "./router/dispatch";
 import type { ServerRequestBroker } from "./server-requests/broker";
 import type { HandlerContext, HandlerRegistry } from "./suites/handlers";
+import { type ChildBridgeOptions, loadThread } from "./thread-runtime/child-bridge";
+
 import type { ThreadRuntimeManager } from "./thread-runtime/thread-runtime-manager";
 import { serializeError, serializeResult } from "./transport/errors";
 import { decodeLine, encodeMessage, type FrameCodecOptions } from "./transport/framing";
@@ -30,6 +32,8 @@ export interface InboundResult {
 export interface InboundContext extends HandlerContext {
 	readonly connectionId?: string;
 	readonly broker?: ServerRequestBroker;
+	readonly threadStartAdapter?: ChildBridgeOptions;
+	readonly unsubscribe?: (threadId: string) => void;
 }
 
 function isClientResponse(
@@ -56,7 +60,7 @@ function isErrorResponse(value: unknown): value is { code: number; message: stri
 /** Process one inbound frame. The async boundary serializes connection processing. */
 export async function processInbound(
 	state: ConnectionState,
-	manager: ThreadRuntimeManager,
+	_manager: ThreadRuntimeManager,
 	line: Uint8Array,
 	frameCodec?: FrameCodecOptions,
 	transport: "stdio" | "websocket" | "unix" = "websocket",
@@ -133,6 +137,7 @@ export async function processInbound(
 	}
 
 	const verdict = dispatchClientRequest(state, classification);
+	const threadStartBridge = context?.threadStartAdapter;
 	switch (verdict.kind) {
 		case "notInitialized":
 			return { response: serializeError(verdict.id, "notInitialized", transport) ?? undefined };
@@ -145,25 +150,23 @@ export async function processInbound(
 		case "invalidParams":
 			return { response: serializeError(verdict.id, "invalidParams", transport) ?? undefined };
 		case "handle": {
-			if (
-				classification.method === "thread/start" ||
-				classification.method === "thread/resume" ||
-				classification.method === "thread/fork"
-			) {
-				const params = (decoded.raw.params ?? {}) as Record<string, unknown>;
-				const threadId =
-					classification.method === "thread/start"
-						? `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-						: String(params.threadId ?? params.id ?? `thread-${Date.now()}`);
-				const ownership = classification.method === "thread/resume" ? ("attached" as const) : ("spawned" as const);
+			if (classification.method === "thread/start") {
+				if (!threadStartBridge)
+					return { response: serializeError(verdict.id, "notSupported", transport) ?? undefined };
+				const params = (verdict.params ?? {}) as Record<string, unknown>;
 				try {
-					manager.register(threadId, ownership, undefined, context?.connectionId);
-					context?.subscribe?.(threadId);
+					const runtime = await loadThread(threadStartBridge, {
+						connectionId: context?.connectionId,
+						params,
+						experimentalApi: state.capabilities?.experimentalApi === true,
+						subscribe: context?.subscribe ? threadId => context.subscribe?.(threadId) : undefined,
+						unsubscribe: context?.unsubscribe ? threadId => context.unsubscribe?.(threadId) : undefined,
+					});
+					return { response: serializeResult(verdict.id, runtime.response, transport) ?? undefined };
 				} catch (error) {
 					const key = (error as { code?: string }).code === "conflict" ? "conflict" : "internalError";
 					return { response: serializeError(verdict.id, key, transport) ?? undefined };
 				}
-				return { response: serializeResult(verdict.id, { threadId, status: "loaded" }, transport) ?? undefined };
 			}
 			const handler = handlerRegistry?.get(classification.method);
 			if (!handler) return { response: serializeError(verdict.id, "notSupported", transport) ?? undefined };

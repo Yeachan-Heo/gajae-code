@@ -11,7 +11,16 @@ export type SupportManifestOverride = {
 };
 
 const noBackend = "No GJC backend exists for this Codex-only suite.";
-const unsupported = { support: "not_supported" as const, gjcSeam: null, gjcBackendPath: null, semanticGaps: ["No equivalent GJC backend."], translationNotes: [], owner: "app-server", testIds: [], reason: noBackend };
+const unsupported = {
+	support: "not_supported" as const,
+	gjcSeam: null,
+	gjcBackendPath: null,
+	semanticGaps: ["No equivalent GJC backend."],
+	translationNotes: [],
+	owner: "app-server",
+	testIds: [],
+	reason: noBackend,
+};
 const implemented = (gjcSeam: string, testId: string): SupportManifestOverride => ({
 	support: "implemented",
 	gjcSeam,
@@ -23,7 +32,10 @@ const implemented = (gjcSeam: string, testId: string): SupportManifestOverride =
 	reason: "GJC has a production handler registered by registerBuiltinHandlers.",
 });
 export const supportManifestOverrides: Record<string, SupportManifestOverride> = {
-	"fs/readFile": implemented("fsReadFileHandler", "processInbound + handler registry: fs/readFile dispatched through the server"),
+	"fs/readFile": implemented(
+		"fsReadFileHandler",
+		"processInbound + handler registry: fs/readFile dispatched through the server",
+	),
 	"fs/writeFile": implemented("fsWriteFileHandler", "fs/writeFile: writes a base64 file"),
 	"fs/getMetadata": implemented("fsGetMetadataHandler", "fs/getMetadata: reports file metadata"),
 	"fs/readDirectory": implemented("fsReadDirectoryHandler", "fs/readDirectory: lists entries"),
@@ -33,11 +45,26 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	"model/list": implemented("modelListHandler", "model/list: returns ModelListResponse shape with data array"),
 	"skills/list": implemented("skillsListHandler", "skills/list: returns an empty catalog"),
 	"hooks/list": implemented("hooksListHandler", "hooks/list: returns an empty catalog"),
-	"experimentalFeature/list": implemented("experimentalFeatureListHandler", "experimentalFeature/list: returns an empty catalog"),
+	"experimentalFeature/list": implemented(
+		"experimentalFeatureListHandler",
+		"experimentalFeature/list: returns an empty catalog",
+	),
+	"thread/start": {
+		support: "implemented",
+		gjcSeam: "loadThread",
+		gjcBackendPath: "packages/coding-agent/src/app-server/thread-runtime/child-bridge.ts",
+		semanticGaps: [
+			"Real broker child spawn proof remains G2-BLOCKED; component acceptance uses the injected lifecycle adapter.",
+		],
+		translationNotes: ["A Codex thread id is the retained GJC session id."],
+		owner: "app-server",
+		testIds: ["transactional load: readiness, effective settings, publication, and subscription are ordered"],
+		reason: "The runtime provides a transactional retained-child adapter with complete rollback.",
+	},
 	"account/login/cancel": unsupported,
 	"account/login/start": unsupported,
 	"account/logout": unsupported,
-	"getAuthStatus": unsupported,
+	getAuthStatus: unsupported,
 	"marketplace/add": unsupported,
 	"marketplace/remove": unsupported,
 	"marketplace/upgrade": unsupported,

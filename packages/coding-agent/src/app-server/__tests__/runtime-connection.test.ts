@@ -414,3 +414,33 @@ test("runtime connection: an illegal request id is reported as null, never echoe
 	await Bun.sleep(0);
 	expect((dec(frames[0]!) as { id: unknown }).id).toBe(7);
 });
+
+test("runtime connection: production assembly forwards thread/start to the injected transaction adapter", async () => {
+	let createCalls = 0;
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: {
+			create: async () => {
+				createCalls += 1;
+				throw new Error("injected create failed");
+			},
+		},
+	});
+	const frames: Uint8Array[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(frame);
+	});
+	await initialize(connection);
+	frames.length = 0;
+
+	await connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	await Bun.sleep(0);
+
+	expect(createCalls).toBe(1);
+	expect(dec(frames[0]!)).toMatchObject({ id: 2, error: { code: -32603 } });
+	expect(runtime.manager.loadedCount).toBe(0);
+	expect(runtime.manager.pendingCount).toBe(0);
+});
