@@ -66,9 +66,7 @@ test("every source event and assistant inner event is catalogued", () => {
 test("named tools with a pinned catalog type are not hidden behind the unmapped policy", () => {
 	// `mapToolKind` collapses these into `other`, but the pinned union really can represent them,
 	// so leaving them unmapped would make the documented-unmapped list dishonest.
-	// Verified against the generated stable item/started validator: it rejects an `imageGeneration`
-	// item but accepts `dynamicToolCall`, so image generation uses the generic tool-call item.
-	expect(classifyGjcTool("generate_image")).toMatchObject({ kind: "other", type: "dynamicToolCall", mapped: true });
+	expect(classifyGjcTool("generate_image")).toMatchObject({ kind: "other", type: "imageGeneration", mapped: true });
 	expect(classifyGjcTool("computer")).toMatchObject({ kind: "other", type: "dynamicToolCall", mapped: true });
 	// The `other` CATEGORY itself stays unmapped: an unknown tool still fails closed.
 	expect(classifyGjcTool("some_unknown_tool")).toMatchObject({ kind: "other", type: null, mapped: false });

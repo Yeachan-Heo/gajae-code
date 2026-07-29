@@ -214,8 +214,14 @@ class Runtime implements AppServerRuntime {
 					}
 				}
 				const id = `server-${this.#nextRequestId++}`;
-				const request = this.broker.create(id, method, params, threadId, eligible);
+				// Start with NO eligible responder. A connection becomes eligible only once its request
+				// frame has actually been enqueued, so a second subscriber cannot answer the predictable
+				// `server-N` id before (or instead of) receiving it. Pruning a pre-filled set cannot
+				// achieve this: the early answer would already have settled the request.
+				const recipients = [...eligible];
+				const request = this.broker.create(id, method, params, threadId, new Set(recipients));
 				if (!request) return undefined;
+				request.eligibleConnections.clear();
 				// A pending approval must protect its thread from idle eviction, so the counter moves up
 				// only after the broker accepted the request and back down exactly once from that
 				// handle's settlement. Without this the manager evicts a child mid-approval.
@@ -223,22 +229,14 @@ class Runtime implements AppServerRuntime {
 				void request.settled.then(() => {
 					this.manager.adjustPendingApprovals(threadId, -1);
 				});
-				// Only a connection that actually receives the request frame may answer it. Publication is
-				// deferred, so drop each recipient from the eligible set if its enqueue never lands
-				// (closed connection, backpressure, writer error); otherwise an eligible-but-unsent client
-				// could settle a predictable request id it never saw. If nobody receives it, settle now
-				// rather than holding the thread and its pendingApprovals until timeout.
-				const recipients = [...request.eligibleConnections];
 				deferred.push(async () => {
-					let delivered = 0;
 					for (const connectionId of recipients) {
 						const target = active() ? this.#connections.get(connectionId) : undefined;
 						try {
 							if (!target) throw new Error("connection is gone");
 							await target.enqueueMessage({ id, method, params });
-							delivered += 1;
+							request.eligibleConnections.add(connectionId);
 						} catch (error) {
-							request.eligibleConnections.delete(connectionId);
 							logger.warn("Dropping unreachable app-server server-request recipient", {
 								connectionId,
 								id,
@@ -247,7 +245,10 @@ class Runtime implements AppServerRuntime {
 							});
 						}
 					}
-					if (delivered === 0) this.broker.cancel(id, "no eligible connection received the request");
+					// Nobody received it, so settle now rather than holding the thread and its
+					// pendingApprovals until the request times out.
+					if (request.eligibleConnections.size === 0)
+						this.broker.cancel(id, "no eligible connection received the request");
 				});
 				return id;
 			},

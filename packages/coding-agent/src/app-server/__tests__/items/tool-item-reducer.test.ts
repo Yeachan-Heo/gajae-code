@@ -431,12 +431,12 @@ test("named catalog tools actually emit validated items, not just a mapping clai
 		});
 		expect(methods(finished), toolName).toContain("item/completed");
 		// A terminalized item must report its real outcome, not a stale inProgress/success:null.
-		expect(completed(finished).params.item, toolName).toMatchObject({
-			type: "dynamicToolCall",
-			status: "completed",
-			success: true,
-			tool: toolName,
-		});
+		// Each named tool must terminalize as its own pinned type with a real outcome.
+		expect(completed(finished).params.item, toolName).toMatchObject(
+			toolName === "generate_image"
+				? { type: "imageGeneration", status: "completed" }
+				: { type: "dynamicToolCall", status: "completed", success: true, tool: toolName },
+		);
 		expect(r.openItemCount, toolName).toBe(0);
 		expectValidNotifications([...started, ...finished]);
 	}

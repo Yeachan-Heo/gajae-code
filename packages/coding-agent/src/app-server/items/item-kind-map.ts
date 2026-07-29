@@ -97,18 +97,13 @@ function mcpToolParts(toolName: string): { server: string; tool: string } | unde
  */
 const NAMED_OTHER_TOOL_ITEMS: Readonly<Record<string, { readonly type: ThreadItem["type"]; readonly reason: string }>> =
 	Object.freeze({
-		// Verified against the generated stable `item/started` validator: it REJECTS an
-		// `imageGeneration` item (that shape is not in the v2 item surface) but ACCEPTS
-		// `dynamicToolCall`. So image generation stays unmapped and these route through the
-		// pinned generic tool-call item instead.
 		computer: {
 			type: "dynamicToolCall",
 			reason: "Computer control has no dedicated type; dynamicToolCall is the pinned generic tool-call item.",
 		},
 		generate_image: {
-			type: "dynamicToolCall",
-			reason:
-				"The v2 item surface has no imageGeneration item, so image generation uses the generic tool-call item.",
+			type: "imageGeneration",
+			reason: "The stable v2 union has a dedicated imageGeneration item for produced images.",
 		},
 	});
 

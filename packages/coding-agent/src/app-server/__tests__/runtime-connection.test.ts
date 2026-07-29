@@ -1069,3 +1069,42 @@ test("runtime connection: manager shutdown settles a pending approval", async ()
 	await expect(settled).resolves.toMatchObject({ kind: "cancelled" });
 	expect(runtime.broker.pendingCount).toBe(0);
 });
+
+test("runtime connection: a subscriber cannot answer before the request is delivered", async () => {
+	const runtime = createAppServerRuntime();
+	const requester = runtime.createConnection(() => {});
+	const peer = runtime.createConnection(() => {});
+	await initialize(requester);
+	await initialize(peer);
+	runtime.subscriptions.subscribe(requester.id, "thread-a");
+	runtime.subscriptions.subscribe(peer.id, "thread-a");
+
+	let requestId: string | undefined;
+	runtime.registry.register("fs/readFile", (_params, context) => {
+		requestId = context?.requestClient?.("thread-a", "execCommandApproval", {
+			conversationId: "thread-a",
+			callId: "call-1",
+			approvalId: null,
+			command: ["ls"],
+			cwd: "/tmp",
+			reason: null,
+			parsedCmd: [],
+		});
+		return { ok: true, result: { dataBase64: "" } };
+	});
+	// Do NOT await: the peer races the requester's still-pending deferred publication, which is the
+	// real window in which a guessed `server-N` id could be answered before anyone received it.
+	const processing = requester.process(enc('{"id":3,"method":"fs/readFile","params":{"path":"/tmp/test"}}'));
+	await Promise.resolve();
+	expect(requestId).toBeDefined();
+
+	// The frame has not been enqueued to anyone yet, so there is no eligible responder.
+	expect(runtime.broker.resolve(requestId!, peer.id, { decision: "approved" })).toBe(false);
+
+	// After publication completes, a genuine recipient can answer.
+	await processing;
+	const pending = runtime.broker.getPending(requestId!);
+	expect(pending).toBeDefined();
+	expect(runtime.broker.resolve(requestId!, peer.id, { decision: "approved" })).toBe(true);
+	await expect(pending!.settled).resolves.toMatchObject({ kind: "resolved" });
+});

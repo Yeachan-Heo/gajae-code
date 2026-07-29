@@ -97,13 +97,15 @@ type FileChangeItem = Extract<ThreadItem, { type: "fileChange" }>;
 type McpToolCallItem = Extract<ThreadItem, { type: "mcpToolCall" }>;
 type WebSearchItem = Extract<ThreadItem, { type: "webSearch" }>;
 type DynamicToolCallItem = Extract<ThreadItem, { type: "dynamicToolCall" }>;
+type ImageGenerationCatalogItem = Extract<ThreadItem, { type: "imageGeneration" }>;
 type ToolCatalogItem =
 	| CommandExecutionItem
 	| FileChangeItem
 	| McpToolCallItem
 	| WebSearchItem
 	| PlanItem
-	| DynamicToolCallItem;
+	| DynamicToolCallItem
+	| ImageGenerationCatalogItem;
 
 type BaseState<TItem extends ThreadItem = ThreadItem> = {
 	readonly id: string;
@@ -430,7 +432,8 @@ function itemTypeIsTool(type: ThreadItem["type"]): type is ToolCatalogItem["type
 		type === "webSearch" ||
 		type === "plan" ||
 		// The generic pinned tool-call item, used for real tools that have no dedicated type.
-		type === "dynamicToolCall"
+		type === "dynamicToolCall" ||
+		type === "imageGeneration"
 	);
 }
 
@@ -759,6 +762,16 @@ export class ToolItemReducer {
 					durationMs: null,
 				};
 				break;
+			case "imageGeneration":
+				// `result` is a required string in the pinned shape, so start empty and fill on terminal.
+				item = {
+					type: classification.type,
+					id,
+					result: "",
+					revisedPrompt: stringProperty(args, "prompt", "revisedPrompt") ?? null,
+					status: "inProgress",
+				};
+				break;
 			case "dynamicToolCall":
 				// The pinned generic tool-call item: used for real tools with no dedicated type.
 				item = {
@@ -965,6 +978,8 @@ export class ToolItemReducer {
 					status: isError ? "failed" : "completed",
 					durationMs: state.item.durationMs ?? durationMs,
 				};
+			case "imageGeneration":
+				return { ...state.item, status: isError ? "failed" : "completed" };
 			case "dynamicToolCall":
 				// Without this the item would terminalize still reporting inProgress and success:null.
 				return {
