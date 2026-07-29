@@ -151,7 +151,6 @@ interface ActiveTurn {
 	barrierDelivered: boolean;
 	rolledBack: boolean;
 	terminalCommitted: boolean;
-	terminalMessages: readonly AgentMessage[];
 	failure?: TurnControllerError;
 	processingTail: Promise<void>;
 	responseDeliveredPromise?: Promise<void>;
@@ -223,11 +222,12 @@ function textFromInput(params: Readonly<Record<string, unknown>>): string | unde
 	if (typeof params.text === "string" && params.text.trim().length > 0) return params.text;
 	const input = params.input;
 	if (Array.isArray(input)) {
-		const text = input
-			.filter(isRecord)
-			.filter(item => item.type === "text" && typeof item.text === "string")
-			.map(item => item.text as string)
-			.join("");
+		const textParts: string[] = [];
+		for (const item of input) {
+			if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") continue;
+			textParts.push(item.text);
+		}
+		const text = textParts.join("");
 		if (text.trim().length > 0) return text;
 	}
 	if (isRecord(input) && input.type === "text" && typeof input.text === "string" && input.text.trim().length > 0)
@@ -248,6 +248,31 @@ function identityFrom(record: Record<string, unknown>, field: "commandId" | "tur
 	return found;
 }
 
+/** Fold every supplied identity across envelope levels; disagreement is unusable, not a fallback. */
+function corroboratedIdentity(
+	levels: readonly (Record<string, unknown> | undefined)[],
+	field: "commandId" | "turnId",
+): string | undefined {
+	let agreed: string | undefined;
+	for (const level of levels) {
+		if (!level) continue;
+		const supplied = identityFrom(level, field);
+		if (supplied === undefined) {
+			// An alias present but unusable at this level poisons the whole frame.
+			if (identitySupplied(level, field)) return undefined;
+			continue;
+		}
+		if (agreed !== undefined && agreed !== supplied) return undefined;
+		agreed = supplied;
+	}
+	return agreed;
+}
+
+function identitySupplied(record: Record<string, unknown>, field: "commandId" | "turnId"): boolean {
+	const aliases = field === "commandId" ? ["commandId", "command_id"] : ["turnId", "turn_id"];
+	return aliases.some(alias => Object.hasOwn(record, alias));
+}
+
 function eventRecordFromFrame(frame: Record<string, unknown>): Record<string, unknown> | undefined {
 	if (frame.type === "agent_start" || frame.type === "agent_end" || frame.type === "agent_failed") return frame;
 	if (frame.type !== "event") return undefined;
@@ -266,14 +291,10 @@ function parseLifecycle(frame: Record<string, unknown>): ParsedFrame | undefined
 	const event = eventRecordFromFrame(frame);
 	if (!event || typeof event.type !== "string") return undefined;
 	const payload = isRecord(frame.payload) ? frame.payload : undefined;
-	const commandId =
-		identityFrom(frame, "commandId") ??
-		(payload ? identityFrom(payload, "commandId") : undefined) ??
-		identityFrom(event, "commandId");
-	const turnId =
-		identityFrom(frame, "turnId") ??
-		(payload ? identityFrom(payload, "turnId") : undefined) ??
-		identityFrom(event, "turnId");
+	// Every envelope level that supplies an identity must agree. Precedence would let a frame
+	// wrapped with the active mapping smuggle another child's lifecycle payload into this turn.
+	const commandId = corroboratedIdentity([frame, payload, event], "commandId");
+	const turnId = corroboratedIdentity([frame, payload, event], "turnId");
 	if (!commandId || !turnId) return undefined;
 	switch (event.type) {
 		case "agent_start":
@@ -468,7 +489,7 @@ export class TurnController {
 		const text = textFromInput(input.params);
 		if (text === undefined) throw new TurnControllerError("internal", "Turn input must contain text-capable input.");
 		const turnId = this.#idFactory();
-		// Mapping B keeps the app-server UUIDv7 turn.id stable across child reincarnation at the cost of one mapping projection.
+		// Persist the app-server turn id alongside the child identities for recovery.
 		if (!nonEmptyString(turnId)) throw new TurnControllerError("internal", "Turn id factory returned an empty id.");
 		const startedAtMs = this.#clock();
 		const turn = initialTurn(turnId, startedAtMs);
@@ -487,7 +508,6 @@ export class TurnController {
 			barrierDelivered: false,
 			rolledBack: false,
 			terminalCommitted: false,
-			terminalMessages: [],
 			processingTail: Promise.resolve(),
 		};
 		this.#active.set(input.threadId, active);
@@ -515,12 +535,11 @@ export class TurnController {
 				this.#discardBeforeAcceptance(active);
 				throw new TurnControllerError(preflightCode, errorMessage(error, `turn.prompt ${preflightCode}.`), error);
 			}
+			// A definite rejection proves no child accepted the prompt and no mapping was persisted,
+			// so the admission slot must be released instead of wedging the thread in recovery.
 			if (!isUncertainAckFailure(error)) {
-				this.#markRecovery(
-					active,
-					new TurnControllerError("internal", errorMessage(error, "turn.prompt failed."), error),
-				);
-				throw active.failure;
+				this.#discardBeforeAcceptance(active);
+				throw new TurnControllerError("internal", errorMessage(error, "turn.prompt failed."), error);
 			}
 			const reconciled = await this.#reconcileLostAck(active);
 			if (!reconciled)
@@ -582,7 +601,7 @@ export class TurnController {
 			return;
 		}
 		active.processingTail = active.processingTail
-			.then(async () => await this.#processFrame(active, parsed))
+			.then(() => this.#processFrame(active, parsed))
 			.catch(error => {
 				this.#markRecovery(active, this.#asControllerError(error, "internal"));
 			});
@@ -598,10 +617,12 @@ export class TurnController {
 			if (active.rolledBack || active.state === "rolled_back") return;
 			if (active.state === "recovery_required")
 				throw active.failure ?? new TurnControllerError("recovery_required", "Turn cannot be delivered.");
-			active.barrierDelivered = true;
-			active.state = "responded";
+			// Seed the single FIFO processing chain with turn/started plus the buffered frames in the
+			// same synchronous step that opens the barrier. Any live frame that arrives while
+			// turn/started is awaiting a slow subscriber then chains strictly after the buffered set,
+			// so a later terminal can never overtake an earlier observed frame.
 			const buffered = active.bufferedFrames.splice(0, active.bufferedFrames.length);
-			try {
+			const drain = active.processingTail.then(async () => {
 				const started: TurnStartedNotification = {
 					method: "turn/started",
 					params: { threadId: active.threadId, turn: cloneTurn(active.turn) },
@@ -612,6 +633,12 @@ export class TurnController {
 					if (!this.#matches(active, frame)) continue;
 					await this.#processFrame(active, frame);
 				}
+			});
+			active.processingTail = drain.catch(() => {});
+			active.barrierDelivered = true;
+			active.state = "responded";
+			try {
+				await drain;
 				await active.processingTail;
 			} catch (error) {
 				this.#markRecovery(active, this.#asControllerError(error, "internal"));
@@ -678,7 +705,6 @@ export class TurnController {
 		);
 		const receipt = await appendProjectionRecord(active.client, record);
 		active.projection.apply(receipt.record);
-		active.turn.items = [...active.projection.snapshot(active.turn.id).items];
 	}
 
 	async #finish(
@@ -714,23 +740,27 @@ export class TurnController {
 		);
 		const receipt = await appendProjectionRecord(active.client, terminalRecord);
 		active.projection.apply(receipt.record);
-		active.turn.items = [...active.projection.snapshot(active.turn.id).items];
-		active.terminalMessages = messages;
 		active.terminalCommitted = true;
 		active.state = "terminal";
 		this.#manager.setActiveTurn(active.threadId, false);
-		const completed: TurnCompletedNotification = {
-			method: "turn/completed",
-			params: { threadId: active.threadId, turn: cloneTurn(terminal) },
-		};
-		validateNotification(completed);
-		await this.#emit(completed);
-		const usage = usageNotification(active.threadId, active.turn.id, messages);
-		if (usage !== undefined) {
-			validateNotification(usage);
-			await this.#emit(usage);
+		// The terminal is durably committed, so notification delivery is best effort from here.
+		// Dispose in `finally` so a rejecting subscriber cannot retain a phantom active turn and
+		// permanently reject later turns as busy.
+		try {
+			const completed: TurnCompletedNotification = {
+				method: "turn/completed",
+				params: { threadId: active.threadId, turn: cloneTurn(terminal) },
+			};
+			validateNotification(completed);
+			await this.#emit(completed);
+			const usage = usageNotification(active.threadId, active.turn.id, messages);
+			if (usage !== undefined) {
+				validateNotification(usage);
+				await this.#emit(usage);
+			}
+		} finally {
+			this.#disposeActive(active);
 		}
-		this.#disposeActive(active);
 	}
 
 	async #reconcileLostAck(active: ActiveTurn): Promise<PromptAck | undefined> {
@@ -753,7 +783,11 @@ export class TurnController {
 			return undefined;
 		}
 		if (status.status === "failed") {
-			this.#markRecovery(active, new TurnControllerError("internal", "Child rejected the prompt after submission."));
+			// Authoritative proof that the child never accepted the prompt: release the admission slot
+			// rather than retaining an active turn that can never be reconciled to a child mapping.
+			const failure = new TurnControllerError("internal", "Child rejected the prompt after submission.");
+			this.#discardBeforeAcceptance(active);
+			active.failure = failure;
 			return undefined;
 		}
 		if (

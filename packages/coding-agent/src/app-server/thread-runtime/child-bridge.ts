@@ -339,8 +339,7 @@ export function projectThreadResponse(
 }
 
 /**
- * Load one retained child transactionally. The string overload preserves the authority-only
- * adapter API; the request overload is the production boundary.
+ * The string overload preserves the legacy adapter API; the request overload is the production boundary.
  */
 export async function loadThread(opts: ChildBridgeOptions, request: ThreadLoadRequest): Promise<LoadedThreadRuntime>;
 export async function loadThread(

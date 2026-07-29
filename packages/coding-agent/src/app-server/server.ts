@@ -342,7 +342,7 @@ async function handleThreadResume(
 	}
 }
 
-/** Process one inbound frame. The async boundary serializes connection processing. */
+/** Process one inbound frame. Callers serialize frames at the connection boundary. */
 export async function processInbound(
 	state: ConnectionState,
 	manager: ThreadRuntimeManager,

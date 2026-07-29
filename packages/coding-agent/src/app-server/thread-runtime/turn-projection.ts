@@ -399,8 +399,12 @@ export class TurnProjectionReducer {
 		if (prior !== undefined) {
 			if (!sameJson(prior.payload, record.payload) || prior.recordKind !== record.recordKind)
 				throw new ProjectionCorruptError(`Projection source key ${record.sourceKey} conflicts.`);
-			if (record.revision !== undefined && prior.revision !== record.revision)
-				this.#observeRevision(record.revision);
+			// The durable store reuses the original ordinal for a valid idempotent retry, so the same
+			// source key at a different revision is a duplicated log record, not an accepted replay.
+			if (record.revision !== undefined && prior.revision !== undefined && prior.revision !== record.revision)
+				throw new ProjectionCorruptError(
+					`Projection source key ${record.sourceKey} is duplicated at revision ${record.revision}.`,
+				);
 			return this.snapshot(this.turnIdForRecord(record));
 		}
 		this.#observeRevision(record.revision);
@@ -475,7 +479,9 @@ export class TurnProjectionReducer {
 		const state = this.#turns.get(turnId);
 		if (!state) throw new ProjectionCorruptError(`Projection references unknown turn ${turnId}.`);
 		if (state.ordersByItem.size === 0) return state.orderBase ?? 0;
-		return Math.max(...state.ordersByItem.values()) + 1;
+		const orderBase = state.orderBase;
+		if (orderBase === undefined) throw new ProjectionCorruptError("Projection item order base is missing.");
+		return orderBase + state.ordersByItem.size;
 	}
 
 	mapping(turnId: string): TurnCreatedPayload {
