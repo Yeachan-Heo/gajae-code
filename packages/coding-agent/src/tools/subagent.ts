@@ -937,6 +937,10 @@ function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
 		cost: progress.cost,
 		modelOverride: progress.modelOverride ?? null,
 		modelSubstitutionWarning: progress.modelSubstitutionWarning ?? null,
+		// The nested task panel renders this, so it must reach the signature or a
+		// fast-mode-only change would render differently while comparing byte-identical,
+		// suppressing the very update that introduces the glyph.
+		fastMode: progress.fastMode ?? false,
 		// durationMs intentionally excluded (time-derived).
 		extractedToolData: progress.extractedToolData
 			? canonicalizeExtractedToolDataForSignature(progress.extractedToolData)

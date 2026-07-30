@@ -655,4 +655,39 @@ describe("subagent await renderer body cache (PR2)", () => {
 		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(140);
 		expect(subagentBodyCacheTestHooks.size).toBeLessThanOrEqual(128);
 	});
+
+	it("invalidates the cached body when only a nested task's fastMode flips", () => {
+		// The body cache is keyed by subagentAwaitRenderedStateSignature, so a nested
+		// fastMode change that the signature ignored would serve a stale body and the
+		// glyph would never appear.
+		const nested = (fastMode: boolean): SubagentToolDetails => ({
+			subagents: [
+				snapshot({
+					id: "0-Nested",
+					liveProgressAvailable: true,
+					progress: progress({
+						id: "0-Nested",
+						currentTool: "task",
+						inflightTaskDetails: {
+							id: "t1",
+							progress: [progress({ id: "n1", currentTool: "read", fastMode })],
+						} as unknown as NonNullable<AgentProgress["inflightTaskDetails"]>,
+					}),
+				}),
+			],
+		});
+
+		const slow = renderWith(nested(false));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		// Same value again is a genuine cache hit.
+		renderWith(nested(false));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+
+		const fast = renderWith(nested(true));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
+		expect(fast).not.toEqual(slow);
+		expect(theme.icon.fast).toBeTruthy();
+		expect(fast.join("\n")).toContain(theme.icon.fast);
+		expect(slow.join("\n")).not.toContain(theme.icon.fast);
+	});
 });
