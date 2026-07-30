@@ -6,6 +6,7 @@ import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import {
 	ansiToHtml,
 	captureProvenance,
+	committedBlobSha256,
 	PROVENANCE_DIFF_SCOPE,
 	xterm256Color,
 } from "../scripts/capture-sticky-viewport-showcase";
@@ -1032,5 +1033,22 @@ describe("sticky viewport production evidence verifier", () => {
 		// proves the rejection was the oracle mutation and not incidental staleness.
 		await restampProvenance(root);
 		await verifyStickyViewportShowcase(root);
+	}, 300_000);
+	it("accepts an oracle absent from the base commit but present in a reachable commit", async () => {
+		// The review protocol verifies an UNCOMMITTED synthetic merge: `HEAD` is the
+		// current-dev base while the running oracle is the staged PR version. A gate
+		// that only compares against the base blob rejects that honest shape before any
+		// evidence guard runs. The trust boundary is therefore "these exact bytes are
+		// committed somewhere reachable", which an uncommitted mutation cannot satisfy.
+		const oracle = "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts";
+		const running = new Bun.CryptoHasher("sha256")
+			.update(await fs.readFile(path.resolve(import.meta.dir, "../scripts/verify-sticky-viewport-showcase.ts")))
+			.digest("hex");
+		// The parent commit is a stand-in for the synthetic-merge base. This branch
+		// changed the oracle, so the parent's blob differs from the running bytes.
+		const parent = await committedBlobSha256("HEAD~1", oracle);
+		expect(parent).not.toBe(running);
+		// Acceptance therefore cannot be coming from the base blob.
+		await verifyStickyViewportShowcase(await capture());
 	}, 300_000);
 });
