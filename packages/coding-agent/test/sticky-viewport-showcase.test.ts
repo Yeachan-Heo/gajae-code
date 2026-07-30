@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
-import { ansiToHtml, xterm256Color } from "../scripts/capture-sticky-viewport-showcase";
+import {
+	ansiToHtml,
+	captureProvenance,
+	PROVENANCE_DIFF_SCOPE,
+	xterm256Color,
+} from "../scripts/capture-sticky-viewport-showcase";
 import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
 import {
 	SEMANTIC_ANCHOR_DOMAIN,
@@ -75,6 +80,40 @@ async function rebindReviewInput(root: string): Promise<void> {
 	await Bun.write(reviewPath, `${JSON.stringify(review, null, 2)}\n`);
 }
 
+// Re-stamp every persisted provenance block to the values the verifier computes
+// live, then rebind every digest that depends on them. `git_diff_binary_sha256`
+// is recomputed at verify time over the render-dependency closure, so a bundle
+// captured seconds earlier goes stale the moment anything in that closure is
+// written. The staleness guard then rejects BEFORE the guard a corruption case
+// targets, and the case silently proves nothing. Re-stamping models an attacker
+// who controls the entire bundle — they ran the capture themselves, so the
+// provenance stamp is theirs too — which is strictly stronger than one who
+// cannot. The staleness guard keeps its own dedicated coverage below.
+async function restampProvenance(root: string): Promise<void> {
+	const manifestPath = path.join(root, "manifest.json");
+	const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+	const current = await captureProvenance();
+	for (const key of manifest.ordered_keys as string[]) {
+		const metadataPath = path.join(root, key, "metadata.json");
+		const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+		metadata.provenance = { ...metadata.provenance, ...current };
+		const content = `${JSON.stringify(metadata, null, 2)}\n`;
+		await Bun.write(metadataPath, content);
+		const file = manifest.entries
+			.find((entry: { key: string }) => entry.key === key)
+			.files.find((entry: { path: string }) => entry.path.endsWith("/metadata.json"));
+		file.sha256 = new Bun.CryptoHasher("sha256").update(content).digest("hex");
+		file.byte_length = Buffer.byteLength(content);
+	}
+	manifest.provenance = { ...manifest.provenance, ...current };
+	const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+	await Bun.write(manifestPath, manifestText);
+	const reviewPath = path.join(root, "review-input.json");
+	const review = JSON.parse(await fs.readFile(reviewPath, "utf8"));
+	review.provenance = { ...review.provenance, ...current };
+	review.manifest_sha256 = new Bun.CryptoHasher("sha256").update(manifestText).digest("hex");
+	await Bun.write(reviewPath, `${JSON.stringify(review, null, 2)}\n`);
+}
 // The owner's exploit rehashed `metadata.json`, the manifest entry, AND the review
 // input together, so the bundle stayed internally consistent and only the anchor
 // guard could reject it. Every anchor corruption case below performs that same
@@ -82,8 +121,7 @@ async function rebindReviewInput(root: string): Promise<void> {
 // prove nothing about the guard.
 async function writeMetadataCoordinated(root: string, key: string, metadata: unknown): Promise<void> {
 	await Bun.write(path.join(root, key, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`);
-	await rehash(root, key, "metadata.json");
-	await rebindReviewInput(root);
+	await restampProvenance(root);
 }
 // Mutable view of a persisted entry. Only the fields the corruption cases below
 // actually reach into are named; the rest stays opaque so a schema addition does
@@ -567,6 +605,72 @@ describe("sticky viewport production evidence verifier", () => {
 		await Bun.write(nonNarrowMetadataPath, `${JSON.stringify(nonNarrowMetadata, null, 2)}\n`);
 		await rehash(nonNarrowCjkRoot, key, "metadata.json");
 		await expect(verifyStickyViewportShowcase(nonNarrowCjkRoot)).rejects.toThrow("non-narrow CJK boundaries");
+	}, 180_000);
+	// The corruption cases above re-stamp provenance so they isolate the guard they
+	// target. That is only safe if the staleness guard is independently proven to
+	// still reject a genuinely stale bundle — otherwise re-stamping could mask its
+	// removal. These cases carry an internally consistent bundle whose ONLY defect
+	// is provenance, at each of the three sites the verifier checks.
+	it("fails closed for stale and scope-narrowed capture provenance", async () => {
+		const base = await capture();
+		const cloneBase = async () => {
+			const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-stale-"));
+			roots.push(clone);
+			await fs.cp(base, clone, { recursive: true });
+			return clone;
+		};
+		const key = "manual-new-output/80x24/unicode-color";
+		// `git_diff_binary_sha256` covers the render-dependency closure, NOT the whole
+		// worktree. Editing an out-of-scope file cannot change the paint, so it must
+		// not invalidate a bundle; this pins that the test file itself is out of scope
+		// and the renderer sources are in it.
+		expect(PROVENANCE_DIFF_SCOPE).toContain("packages/tui/src");
+		expect(PROVENANCE_DIFF_SCOPE).toContain("packages/coding-agent/src");
+		expect(PROVENANCE_DIFF_SCOPE).not.toContain("packages/coding-agent/test/sticky-viewport-showcase.test.ts");
+
+		// Re-stamping an otherwise untouched bundle must still verify. This is what
+		// makes the re-stamped corruption cases above trustworthy: a rejection there
+		// is the injected defect, never the re-stamp.
+		const restamped = await cloneBase();
+		await restampProvenance(restamped);
+		await verifyStickyViewportShowcase(restamped);
+
+		// Rebind the review input in both manifest cases, so the ONLY remaining defect
+		// is provenance and the rejection cannot be attributed to a digest mismatch.
+		const staleManifest = await cloneBase();
+		const staleManifestPath = path.join(staleManifest, "manifest.json");
+		const staleManifestJson = JSON.parse(await fs.readFile(staleManifestPath, "utf8"));
+		staleManifestJson.provenance.git_diff_binary_sha256 = "0".repeat(64);
+		await Bun.write(staleManifestPath, `${JSON.stringify(staleManifestJson, null, 2)}\n`);
+		await rebindReviewInput(staleManifest);
+		await expect(verifyStickyViewportShowcase(staleManifest)).rejects.toThrow("manifest capture provenance is stale");
+
+		// A bundle must not be able to shrink the covered surface to dodge the digest.
+		const narrowedScope = await cloneBase();
+		const narrowedPath = path.join(narrowedScope, "manifest.json");
+		const narrowed = JSON.parse(await fs.readFile(narrowedPath, "utf8"));
+		narrowed.provenance.git_diff_scope = ["packages/tui/src/tui.ts"];
+		await Bun.write(narrowedPath, `${JSON.stringify(narrowed, null, 2)}\n`);
+		await rebindReviewInput(narrowedScope);
+		await expect(verifyStickyViewportShowcase(narrowedScope)).rejects.toThrow("manifest capture provenance is stale");
+
+		const staleMetadata = await cloneBase();
+		const staleMetadataPath = path.join(staleMetadata, key, "metadata.json");
+		const staleMetadataJson = JSON.parse(await fs.readFile(staleMetadataPath, "utf8"));
+		staleMetadataJson.provenance.git_diff_binary_sha256 = "0".repeat(64);
+		await Bun.write(staleMetadataPath, `${JSON.stringify(staleMetadataJson, null, 2)}\n`);
+		await rehash(staleMetadata, key, "metadata.json");
+		await rebindReviewInput(staleMetadata);
+		await expect(verifyStickyViewportShowcase(staleMetadata)).rejects.toThrow("metadata schema mismatch");
+
+		const staleReview = await cloneBase();
+		const staleReviewPath = path.join(staleReview, "review-input.json");
+		const staleReviewJson = JSON.parse(await fs.readFile(staleReviewPath, "utf8"));
+		staleReviewJson.provenance.git_diff_binary_sha256 = "0".repeat(64);
+		await Bun.write(staleReviewPath, `${JSON.stringify(staleReviewJson, null, 2)}\n`);
+		await expect(verifyStickyViewportShowcase(staleReview)).rejects.toThrow(
+			"review input capture provenance is stale",
+		);
 	}, 180_000);
 	it("rejects table-driven manifest, metadata, and review-input corruption", async () => {
 		const base = await capture();
