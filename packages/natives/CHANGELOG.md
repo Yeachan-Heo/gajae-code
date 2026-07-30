@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- POSIX exact directory-tree cleanup now operates only on the caller-authorized retained root, revalidates the root and each direct child against their descriptors before mutation, rejects initial and late hard-link aliases, and scrubs regular-file payloads through verified descriptors. Canonical root detachment remains the separate exact-unlink phase; replayable retained namespaces are never renamed again, and substituted successors are never renamed, unlinked, or truncated.
 
 ## [0.12.7] - 2026-07-31
 

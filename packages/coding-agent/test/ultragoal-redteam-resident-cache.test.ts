@@ -13,6 +13,7 @@ const MiB = 1024 * 1024;
 const originalAgentDir = getAgentDir();
 const originalAgentDirOverride = process.env.GJC_CODING_AGENT_DIR;
 const originalMaterializedCacheMaxBytesOverride = SessionManagerTestHooks.materializedCacheMaxBytesOverride;
+const originalAfterForkSnapshot = SessionManagerTestHooks.afterForkSnapshot;
 const temporaryDirectories: string[] = [];
 
 beforeEach(() => {
@@ -23,6 +24,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	SessionManagerTestHooks.materializedCacheMaxBytesOverride = originalMaterializedCacheMaxBytesOverride;
 	setAgentDir(originalAgentDir);
+	SessionManagerTestHooks.afterForkSnapshot = originalAfterForkSnapshot;
 	if (originalAgentDirOverride === undefined) delete process.env.GJC_CODING_AGENT_DIR;
 	else process.env.GJC_CODING_AGENT_DIR = originalAgentDirOverride;
 	await Promise.all(
@@ -327,10 +329,33 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 			expect(await Bun.file(path.join(collisionArtifacts, "foreign.txt")).text()).toBe("foreign");
 			expectReadable(manager, branchText);
 
+			const forkSnapshotEntered = Promise.withResolvers<void>();
+			const releaseForkSnapshot = Promise.withResolvers<void>();
+			SessionManagerTestHooks.afterForkSnapshot = () => {
+				forkSnapshotEntered.resolve();
+				return releaseForkSnapshot.promise;
+			};
 			const forkPromise = manager.fork();
-			appendUserText(manager, interleavedText);
-			const forked = await forkPromise;
+			let forked: { oldSessionFile: string; newSessionFile: string } | undefined;
+			try {
+				await forkSnapshotEntered.promise;
+				appendUserText(manager, interleavedText);
+				releaseForkSnapshot.resolve();
+				forked = await forkPromise;
+			} finally {
+				releaseForkSnapshot.resolve();
+				SessionManagerTestHooks.afterForkSnapshot = originalAfterForkSnapshot;
+				await forkPromise.catch(() => undefined);
+			}
 			if (!forked) throw new Error("Expected a forked session.");
+			const persistedSuccessor = await SessionManager.open(forked.newSessionFile);
+			try {
+				expectReadable(persistedSuccessor, rootText);
+				expectReadable(persistedSuccessor, branchText);
+				expect(JSON.stringify(persistedSuccessor.getEntries())).not.toContain(interleavedText);
+			} finally {
+				await persistedSuccessor.close();
+			}
 			await manager.flush();
 			expect(forked.oldSessionFile).toBe(sourceFile);
 			expect(manager.getSessionFile()).toBe(forked.newSessionFile);
@@ -349,6 +374,8 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 			const forkedArtifacts = forked.newSessionFile.slice(0, -6);
 			expect(await Bun.file(path.join(forkedArtifacts, "kept.txt")).text()).toBe("keep");
 			expect(fs.existsSync(path.join(forkedArtifacts, "resident-cache"))).toBe(false);
+			expect(await Bun.file(path.join(sourceArtifacts, "kept.txt")).text()).toBe("keep");
+			expect(await Bun.file(path.join(sourceArtifacts, "resident-cache", "legacy.txt")).text()).toBe("never copy");
 
 			installVerifiedNativeCleanup();
 			await manager.dropSession(forked.oldSessionFile);

@@ -8,10 +8,10 @@ When a session is resumed — either at CLI startup (`-c`/`-r`) or via `/resume`
 already-running TUI session — the model in use is restored from the session file's last
 `model_change` entry, not from the currently configured default model:
 
-- `packages/coding-agent/src/sdk.ts:1019-1033` — CLI-level resume. Restores `existingSession.models.default`
-  unless an explicit `--model`/`options.model` was passed (`hasExplicitModel` gate at `sdk.ts:1005`,
-  `sdk.ts:1024`).
-- `packages/coding-agent/src/session/agent-session.ts:9710-9734` (`switchSession`) — in-process
+- `packages/coding-agent/src/sdk/session.ts:1281-1319` — CLI-level resume. Restores
+  `existingSession.models.default` unless an explicit `--model`/`options.model` was passed
+  (`hasExplicitModel` gate at `session.ts:1281`, restore gate at `session.ts:1309`).
+- `packages/coding-agent/src/session/agent-session.ts:15997-16115` (`switchSession`) — in-process
   `/resume` session switch. Same restore-from-`sessionContext.models.default` behavior, with no
   override path other than the CLI flag (which doesn't apply to a mid-run `/resume`).
 
@@ -40,11 +40,12 @@ Add a settings key, e.g. `session.resumeModelBehavior` (`packages/coding-agent/s
 enum: `"keepSessionModel"` (default, current behavior) | `"useCurrentDefault"`), and branch on it at
 both restore sites:
 
-- `sdk.ts:1024` — when `useCurrentDefault`, skip the `existingSession.models.default` restore and
-  resolve the model the same way a brand-new session would (`resolveModelRoleValue(settings.getModelRole("default"), …)`),
-  with the same `hasModelApiKey` fallback guard already used for the session-restore path.
-- `agent-session.ts:9711` (`switchSession`) — same branch, applied after `sessionContext` is loaded,
-  before `#setModelWithProviderSessionReset`/`agent.setModel`.
+- `sdk/session.ts:1297-1309` — when `useCurrentDefault`, skip the
+  `existingSession.models.default` restore and resolve the model the same way a brand-new session
+  would (`resolveModelRoleValue(settings.getModelRole("default"), …)`), with the same
+  `hasModelApiKey` fallback guard already used for the session-restore path.
+- `agent-session.ts:16087-16115` (`switchSession`) — same branch, applied after `sessionContext` is
+  loaded, before the authoritative model restore.
 
 Stage 2 (done): a third `"ask"` mode prompts in the TUI resume picker
 (`selector-controller.ts` `handleResumeSession` → `#maybePromptResumeModelChoice`) only when the

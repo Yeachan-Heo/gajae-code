@@ -4707,6 +4707,7 @@ export const MATERIALIZED_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
+	afterForkSnapshot?: () => void | Promise<void>;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -6248,6 +6249,8 @@ export class SessionManager {
 			newHeader,
 			...materializedEntries.filter((entry): entry is SessionEntry => entry.type !== "session"),
 		];
+		const forkSnapshotHook = SessionManagerTestHooks.afterForkSnapshot;
+		if (forkSnapshotHook) await forkSnapshotHook();
 
 		await this.#closePersistWriter();
 		this.#persistChain = Promise.resolve();

@@ -30,7 +30,7 @@ function expectDetachedCleanupPending(result: ReturnType<typeof exactUnlink>, de
 }
 
 function expectTreeCleanupPending(result: ReturnType<typeof exactRemoveDirectoryTree>, detachedPath: string): void {
-	expect(result).toEqual({ ok: false, code: "cleanup_pending", detachedPath });
+	expect(result).toEqual({ ok: false, code: "cleanup_pending", payloadDurable: true, detachedPath });
 }
 
 function expectOwnerOnlySuccess(
@@ -501,14 +501,14 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			if (!snapshot.ok || !snapshot.snapshot) throw new Error("missing tree snapshot");
 
 			await fs.rm(first);
-			expectTreeCleanupPending(exactRemoveDirectoryTree(detached, snapshot.snapshot), `${detached}.removing`);
+			expectTreeCleanupPending(exactRemoveDirectoryTree(detached, snapshot.snapshot), detached);
 
 			expect(
 				await fs.stat(detached).then(
 					() => true,
 					() => false,
 				),
-			).toBe(false);
+			).toBe(true);
 		},
 	);
 
@@ -555,7 +555,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			const quarantine = treeQuarantineName(entry);
 			expect(Buffer.byteLength(quarantine)).toBeLessThanOrEqual(255);
 			await fs.rename(child, path.join(detached, quarantine));
-			expectTreeCleanupPending(exactRemoveDirectoryTree(detached, snapshot.snapshot), `${detached}.removing`);
+			expectTreeCleanupPending(exactRemoveDirectoryTree(detached, snapshot.snapshot), detached);
 		},
 	);
 	it.skipIf(process.platform !== "darwin")(
