@@ -2630,6 +2630,36 @@ describe("native GJC ultragoal runtime", () => {
 			memberIds: ["G002", "G003", "G004"],
 		});
 
+		const tamperedAggregateRoot = await prepareRecovery();
+		const tamperedAggregateGoalsPath = path.join(
+			sessionUltragoalDir(tamperedAggregateRoot, TEST_SESSION_ID),
+			"goals.json",
+		);
+		const tamperedAggregatePlan = JSON.parse(await Bun.file(tamperedAggregateGoalsPath).text());
+		tamperedAggregatePlan.goals[5].completionVerification.basis.requiredGoalSetHashBeforeCheckpoint = "f".repeat(64);
+		await fs.writeFile(tamperedAggregateGoalsPath, `${JSON.stringify(tamperedAggregatePlan, null, 2)}\n`);
+		const tamperedAggregateGate = recoveryGate("G005");
+		const tamperedAggregateValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: tamperedAggregateRoot,
+			goalId: "G004",
+			qualityGateJson: tamperedAggregateGate,
+		});
+		expect(tamperedAggregateValidation.valid).toBe(false);
+		expect(
+			tamperedAggregateValidation.errors.some(error =>
+				error.message.includes("fresh final-aggregate receipt covering required goals"),
+			),
+		).toBe(true);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: tamperedAggregateRoot,
+				goalId: "G004",
+				status: "complete",
+				evidence: "tampered aggregate receipt",
+				qualityGateJson: tamperedAggregateGate,
+			}),
+		).rejects.toThrow("fresh final-aggregate receipt covering required goals");
+
 		const wrongRoot = await prepareRecovery();
 		await expect(
 			checkpointUltragoalGoal({

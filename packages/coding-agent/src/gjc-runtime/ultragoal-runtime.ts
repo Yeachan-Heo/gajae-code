@@ -2975,8 +2975,11 @@ function hydrateReviewedBatchReplacementClose(input: {
 	const aggregateGoal = aggregateGoals.find(goal => {
 		const receipt = goal.completionVerification!;
 		const event = findLedgerReceiptEvent(input.ledger, receipt);
+		const eventReceipt = event?.completionVerification as UltragoalCompletionVerification | undefined;
 		return (
 			event !== null &&
+			eventReceipt !== undefined &&
+			hashStructuredValue(eventReceipt) === hashStructuredValue(receipt) &&
 			hashStructuredValue(event.qualityGateJson) === receipt.qualityGateHash &&
 			goal.updatedAt === receipt.verifiedAt &&
 			receipt.basis.relevantGoalIdsBeforeCheckpoint.length === historicalRequiredGoalIds.length &&
