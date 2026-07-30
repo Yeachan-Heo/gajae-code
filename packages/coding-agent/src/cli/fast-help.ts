@@ -52,6 +52,8 @@ Environment Variables:
   XAI_API_KEY                - xAI Grok models
   OPENROUTER_API_KEY         - OpenRouter aggregated models
   KILO_API_KEY               - Kilo Gateway models
+  KIRO_API_KEY               - Kiro relay models (kiro-go / kiro2api)
+  KIRO_BASE_URL              - Kiro relay endpoint (default http://127.0.0.1:8080/v1)
   MISTRAL_API_KEY            - Mistral models
   ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
   MINIMAX_API_KEY            - MiniMax models
