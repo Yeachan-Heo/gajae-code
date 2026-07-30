@@ -2151,6 +2151,7 @@ function canonicalChangeSetRows(value: unknown, fieldName: string): UltragoalCha
 		if (typeof row !== "object" || row === null || Array.isArray(row))
 			throw new Error(`${fieldName}[${index}] must be an object`);
 		const record = row as JsonObject;
+		requireAllowedRecordKeys(record, ["path", "status", "oldPath"], `${fieldName}[${index}]`);
 		const pathValue = nonEmptyString(record.path);
 		if (!pathValue) throw new Error(`${fieldName}[${index}].path is required`);
 		if ("goalId" in record) throw new Error(`${fieldName}[${index}] must not contain goalId attribution`);
@@ -2197,6 +2198,12 @@ function requireExactRecordKeys(record: JsonObject, expectedKeys: readonly strin
 	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
 		throw new Error(`${fieldName} keys must exactly match durable validationBatch memberIds`);
 	}
+}
+
+function requireAllowedRecordKeys(record: JsonObject, allowedKeys: readonly string[], fieldName: string): void {
+	const allowed = new Set(allowedKeys);
+	const unsupported = Object.keys(record).filter(key => !allowed.has(key));
+	if (unsupported.length > 0) throw new Error(`${fieldName} contains unsupported keys: ${unsupported.join(", ")}`);
 }
 
 function requireValidationBatchTuple(
@@ -2441,6 +2448,24 @@ function validateDeferredCompletionQualityGate(
 		throw new Error(`deferred qualityGate contains unsupported keys: ${unsupportedKeys.join(", ")}`);
 	const deferred = qualityGateObject(gate.deferredToBatch);
 	if (!deferred) throw new Error("deferred qualityGate requires deferredToBatch object");
+	requireAllowedRecordKeys(
+		deferred,
+		[
+			"schemaVersion",
+			"kind",
+			"batchId",
+			"memberIds",
+			"finalGoalId",
+			"metadataHash",
+			"deferredLanes",
+			"ranLanes",
+			"targetedVerification",
+			"aiSlopCleaner",
+			"iteration",
+			"changeSet",
+		],
+		"deferredToBatch",
+	);
 	if (deferred.kind !== "validation-batch-deferred")
 		throw new Error("deferredToBatch.kind must be validation-batch-deferred");
 	if (metadata) {
@@ -2476,6 +2501,11 @@ function validateDeferredCompletionQualityGate(
 	validateDeferredLaneDeclaration(deferred, "deferredToBatch");
 	const declaredChangeSet = qualityGateObject(deferred.changeSet);
 	if (!declaredChangeSet) throw new Error("deferredToBatch.changeSet is required");
+	requireAllowedRecordKeys(
+		declaredChangeSet,
+		["memberGoalId", "cumulativeFromBase", "paths", "changeSetHash"],
+		"deferredToBatch.changeSet",
+	);
 	if (declaredChangeSet.memberGoalId !== goal.id)
 		throw new Error(
 			`deferredToBatch.changeSet.memberGoalId must label the checkpointed goal ${goal.id} (or be omitted; the runtime fills it)`,
@@ -2770,6 +2800,21 @@ function validateBatchCloseQualityGate(
 ): void {
 	const close = qualityGateObject(gate.validationBatchClose);
 	if (!close) throw new Error("validationBatchClose is required");
+	requireAllowedRecordKeys(
+		close,
+		[
+			"schemaVersion",
+			"kind",
+			"batchId",
+			"finalGoalId",
+			"memberIds",
+			"memberMetadataHashes",
+			"memberReceipts",
+			"unionChangeSet",
+			"coverageEvidence",
+		],
+		"validationBatchClose",
+	);
 	if (close.schemaVersion !== 1 || close.kind !== "validation-batch-close")
 		throw new Error("validationBatchClose.kind must be validation-batch-close");
 	if (close.batchId !== metadata.batchId || close.finalGoalId !== metadata.finalGoalId)
@@ -2811,6 +2856,11 @@ function validateBatchCloseQualityGate(
 		const memberId = nonEmptyString(record.goalId);
 		if (!memberId || !nonFinalIds.includes(memberId))
 			throw new Error("validationBatchClose.memberReceipts contains invalid member goalId");
+		requireAllowedRecordKeys(
+			record,
+			["goalId", "receiptId", "checkpointLedgerEventId", "qualityGateHash", "changeSetHash", "role"],
+			`validationBatchClose.memberReceipts.${memberId}`,
+		);
 		if (seenReceipts.has(memberId))
 			throw new Error(`validationBatchClose.memberReceipts contains duplicate member ${memberId}`);
 		seenReceipts.add(memberId);
@@ -2835,6 +2885,11 @@ function validateBatchCloseQualityGate(
 	const union = qualityGateObject(close.unionChangeSet);
 	if (union?.source !== "validation-batch")
 		throw new Error("validationBatchClose.unionChangeSet.source must be validation-batch");
+	requireAllowedRecordKeys(
+		union,
+		["source", "memberChangeSetHashes", "paths", "unionHash"],
+		"validationBatchClose.unionChangeSet",
+	);
 	const unionPaths = canonicalChangeSetRows(union.paths, "validationBatchClose.unionChangeSet.paths");
 	requireChangeSetCoverage(changeSet, unionPaths, "validationBatchClose.unionChangeSet.paths");
 	const finalHash = changeSetHashForPaths(unionPaths);
@@ -2960,7 +3015,11 @@ function hydrateReviewedBatchReplacementClose(input: {
 			role: "deferred-member",
 		});
 	}
-	const paths = input.changeSet.paths.map(row => ({ ...row }));
+	const paths = input.changeSet.paths.map(row => ({
+		path: row.path,
+		status: row.status,
+		...(row.oldPath ? { oldPath: row.oldPath } : {}),
+	}));
 	memberChangeSetHashes[input.goal.id] = changeSetHashForPaths(paths);
 	const unionHash = hashStructuredValue({
 		memberChangeSetHashes,

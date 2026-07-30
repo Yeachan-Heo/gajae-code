@@ -1503,6 +1503,26 @@ describe("native GJC ultragoal runtime", () => {
 		});
 		expect(reorderedValidation.valid).toBe(false);
 		expect(reorderedValidation.errors.some(error => error.message.includes("must exactly match"))).toBe(true);
+
+		const gateWithUnknownField = JSON.stringify({
+			deferredToBatch: {
+				forged: "must reject",
+				targetedVerification: {
+					status: "passed",
+					commands: ["bun test targeted"],
+					evidence: "targeted suite passed for G001",
+				},
+			},
+		});
+		const unknownFieldValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			goalId: "G001",
+			qualityGateJson: gateWithUnknownField,
+		});
+		expect(unknownFieldValidation.valid).toBe(false);
+		expect(unknownFieldValidation.errors.some(error => error.message.includes("unsupported keys: forged"))).toBe(
+			true,
+		);
 	});
 
 	it("validation batch close: a minimal close gate is auto-hydrated from durable receipts", async () => {
@@ -1620,6 +1640,31 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson: JSON.stringify(changeSetExtra),
 			}),
 		).rejects.toThrow("memberChangeSetHashes keys");
+
+		const receiptExtra = JSON.parse(batchCloseGate(plan)) as Record<string, unknown>;
+		const receiptClose = receiptExtra.validationBatchClose as Record<string, unknown>;
+		const receiptRows = receiptClose.memberReceipts as Array<Record<string, unknown>>;
+		receiptRows[0]!.forged = "must reject";
+		const receiptValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			goalId: "G003",
+			qualityGateJson: JSON.stringify(receiptExtra),
+		});
+		expect(receiptValidation.valid).toBe(false);
+		expect(
+			receiptValidation.errors.some(error =>
+				error.message.includes("memberReceipts.G001 contains unsupported keys"),
+			),
+		).toBe(true);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G003",
+				status: "complete",
+				evidence: "forged receipt field",
+				qualityGateJson: JSON.stringify(receiptExtra),
+			}),
+		).rejects.toThrow("memberReceipts.G001 contains unsupported keys");
 	});
 
 	it("boundary default: declaration and evidence must agree in both directions", async () => {
