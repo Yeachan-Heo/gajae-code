@@ -5268,7 +5268,7 @@ describe("native GJC ultragoal runtime", () => {
 			},
 		];
 		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
-			"adversarial evidence requires an existing non-empty file",
+			"adversarial-only coverage requires an existing non-empty file",
 		);
 	});
 

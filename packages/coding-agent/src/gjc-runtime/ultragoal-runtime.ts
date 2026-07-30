@@ -1871,11 +1871,10 @@ async function validateSurfaceEvidence(
 	return idMap;
 }
 
-async function validateAdversarialCases(
-	cwd: string,
+function validateAdversarialCases(
 	executorQa: JsonObject,
 	artifactRefs: Map<string, JsonObject>,
-): Promise<Map<string, JsonObject>> {
+): Map<string, JsonObject> {
 	const rows = requireObjectArray(executorQa.adversarialCases, "executorQa.adversarialCases");
 	const idMap = buildRowIdMap(rows, "executorQa.adversarialCases");
 	for (const [index, row] of rows.entries()) {
@@ -1893,18 +1892,6 @@ async function validateAdversarialCases(
 		}
 		const artifactIds = requireStringLinks(row.artifactRefs, `${fieldName}.artifactRefs`);
 		requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
-		for (const artifactId of artifactIds) {
-			const artifact = artifactRefs.get(artifactId)!;
-			if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
-				throw new Error(
-					`qualityGate executorQa.artifactRefs.${artifactId} adversarial evidence requires an existing non-empty file`,
-				);
-			}
-			await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
-				surfaceFamily: "native",
-				live: false,
-			});
-		}
 	}
 	return idMap;
 }
@@ -2020,18 +2007,42 @@ async function validateContractCoverage(
 			);
 		}
 		let successfulProofLinks = 0;
-		if (surfaceIds)
-			successfulProofLinks += successfulLinkedRows(
+		let successfulSurfaceProofLinks = 0;
+		if (surfaceIds) {
+			successfulSurfaceProofLinks = successfulLinkedRows(
 				surfaceIds,
 				surfaceEvidence,
 				`${fieldName}.surfaceEvidenceRefs`,
 			).length;
+			successfulProofLinks += successfulSurfaceProofLinks;
+		}
 		if (adversarialIds) {
-			successfulProofLinks += successfulLinkedRows(
+			const successfulAdversarialRows = successfulLinkedRows(
 				adversarialIds,
 				adversarialCases,
 				`${fieldName}.adversarialCaseRefs`,
-			).length;
+			);
+			if (successfulSurfaceProofLinks === 0 && !artifactIds) {
+				for (const adversarialRow of successfulAdversarialRows) {
+					const caseArtifactIds = requireStringLinks(
+						adversarialRow.artifactRefs,
+						`${fieldName}.adversarialCaseRefs.artifactRefs`,
+					);
+					for (const artifactId of caseArtifactIds) {
+						const artifact = artifactRefs.get(artifactId)!;
+						if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+							throw new Error(
+								`qualityGate executorQa.artifactRefs.${artifactId} adversarial-only coverage requires an existing non-empty file`,
+							);
+						}
+						await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
+							surfaceFamily: "native",
+							live: false,
+						});
+					}
+				}
+			}
+			successfulProofLinks += successfulAdversarialRows.length;
 		}
 		if (artifactIds) {
 			requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
@@ -2068,7 +2079,7 @@ async function validateExecutorQaRedTeamEvidenceInternal(
 ): Promise<void> {
 	const artifactRefs = await validateArtifactRefs(cwd, executorQa);
 	const surfaceEvidence = await validateSurfaceEvidence(cwd, executorQa, artifactRefs);
-	const adversarialCases = await validateAdversarialCases(cwd, executorQa, artifactRefs);
+	const adversarialCases = validateAdversarialCases(executorQa, artifactRefs);
 	const contractCoverage = await validateContractCoverage(
 		cwd,
 		executorQa,
