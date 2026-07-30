@@ -443,13 +443,17 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		if (!user) throw new Error("Missing Windows username");
 		await fs.writeFile(file, "owner-correct");
 		expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
-		await runIcacls(file, "/inheritance:r", "/grant:r", `${user}:(RC,WDAC,RD,WD,AD,REA,WEA,X,DC,RA,WA)`);
+		await runIcacls(file, "/inheritance:r", "/grant:r", `${user}:(RC,WDAC,S,D,RD,WD,AD,REA,WEA,X,DC,RA,WA)`);
 		const identity = await fs.stat(file, { bigint: true });
 
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
-		expect(repairOwnerOnlyPathSecurityExpected(file, "file", identity.dev, identity.ino)).toEqual({ ok: true });
-		expect(verifyOwnerOnlyPathSecurityExpected(file, "file", identity.dev, identity.ino)).toEqual({ ok: true });
-		expect(await fs.readFile(file, "utf8")).toBe("owner-correct");
+		try {
+			expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+			expect(repairOwnerOnlyPathSecurityExpected(file, "file", identity.dev, identity.ino)).toEqual({ ok: true });
+			expect(verifyOwnerOnlyPathSecurityExpected(file, "file", identity.dev, identity.ino)).toEqual({ ok: true });
+			expect(await fs.readFile(file, "utf8")).toBe("owner-correct");
+		} finally {
+			await runIcacls(file, "/reset");
+		}
 	});
 	it("verifies only the captured identity without mutating a swapped replacement", async () => {
 		const root = await temporaryDirectory();
