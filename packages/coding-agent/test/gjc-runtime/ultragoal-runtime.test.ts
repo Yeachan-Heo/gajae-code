@@ -1523,6 +1523,80 @@ describe("native GJC ultragoal runtime", () => {
 		expect(unknownFieldValidation.errors.some(error => error.message.includes("unsupported keys: forged"))).toBe(
 			true,
 		);
+
+		const gateWithMalformedChangeSet = JSON.stringify({
+			deferredToBatch: {
+				targetedVerification: {
+					status: "passed",
+					commands: ["bun test targeted"],
+					evidence: "targeted suite passed for G001",
+				},
+				changeSet: "malformed",
+			},
+		});
+		const malformedValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			goalId: "G001",
+			qualityGateJson: gateWithMalformedChangeSet,
+		});
+		expect(malformedValidation.valid).toBe(false);
+		expect(malformedValidation.errors.some(error => error.message.includes("changeSet is required"))).toBe(true);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "malformed explicit change set",
+				qualityGateJson: gateWithMalformedChangeSet,
+			}),
+		).rejects.toThrow("changeSet is required");
+	});
+
+	it("validation batch deferred: missing Git and CI change-set evidence fails closed", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-no-change-set-"));
+		tempRoots.push(root);
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		delete process.env.CI_DEV_CHANGED_PATHS;
+		try {
+			await createUltragoalPlan({
+				cwd: root,
+				brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+				validationBatches: [
+					{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+				],
+			});
+			await startNextUltragoalGoal({ cwd: root });
+			const minimal = JSON.stringify({
+				deferredToBatch: {
+					targetedVerification: {
+						status: "passed",
+						commands: ["bun test targeted"],
+						evidence: "targeted suite passed for G001",
+					},
+				},
+			});
+			const validation = await validateUltragoalQualityGateReadOnly({
+				cwd: root,
+				goalId: "G001",
+				qualityGateJson: minimal,
+			});
+			expect(validation.valid).toBe(false);
+			expect(
+				validation.errors.some(error => error.message.includes("authoritative computed checkpoint change set")),
+			).toBe(true);
+			await expect(
+				checkpointUltragoalGoal({
+					cwd: root,
+					goalId: "G001",
+					status: "complete",
+					evidence: "missing change-set source",
+					qualityGateJson: minimal,
+				}),
+			).rejects.toThrow("authoritative computed checkpoint change set");
+		} finally {
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+		}
 	});
 
 	it("validation batch close: a minimal close gate is auto-hydrated from durable receipts", async () => {
@@ -1618,6 +1692,29 @@ describe("native GJC ultragoal runtime", () => {
 			}),
 		).rejects.toThrow("memberMetadataHashes keys");
 
+		const metadataPartial = JSON.parse(batchCloseGate(plan)) as Record<string, unknown>;
+		const metadataPartialClose = metadataPartial.validationBatchClose as Record<string, unknown>;
+		const partialMetadataHashes = metadataPartialClose.memberMetadataHashes as Record<string, string>;
+		delete partialMetadataHashes.G002;
+		const metadataPartialValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			goalId: "G003",
+			qualityGateJson: JSON.stringify(metadataPartial),
+		});
+		expect(metadataPartialValidation.valid).toBe(false);
+		expect(metadataPartialValidation.errors.some(error => error.message.includes("memberMetadataHashes.G002"))).toBe(
+			true,
+		);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G003",
+				status: "complete",
+				evidence: "partial metadata tuple",
+				qualityGateJson: JSON.stringify(metadataPartial),
+			}),
+		).rejects.toThrow("memberMetadataHashes.G002");
+
 		const changeSetExtra = JSON.parse(batchCloseGate(plan)) as Record<string, unknown>;
 		const changeSetClose = changeSetExtra.validationBatchClose as Record<string, unknown>;
 		const union = changeSetClose.unionChangeSet as Record<string, unknown>;
@@ -1640,6 +1737,55 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson: JSON.stringify(changeSetExtra),
 			}),
 		).rejects.toThrow("memberChangeSetHashes keys");
+
+		const changeSetPartial = JSON.parse(batchCloseGate(plan)) as Record<string, unknown>;
+		const changeSetPartialClose = changeSetPartial.validationBatchClose as Record<string, unknown>;
+		const partialUnion = changeSetPartialClose.unionChangeSet as Record<string, unknown>;
+		const partialChangeSetHashes = partialUnion.memberChangeSetHashes as Record<string, string>;
+		delete partialChangeSetHashes.G002;
+		delete partialUnion.unionHash;
+		const changeSetPartialValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			goalId: "G003",
+			qualityGateJson: JSON.stringify(changeSetPartial),
+		});
+		expect(changeSetPartialValidation.valid).toBe(false);
+		expect(
+			changeSetPartialValidation.errors.some(error => error.message.includes("memberChangeSetHashes keys")),
+		).toBe(true);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G003",
+				status: "complete",
+				evidence: "partial change-set tuple",
+				qualityGateJson: JSON.stringify(changeSetPartial),
+			}),
+		).rejects.toThrow("memberChangeSetHashes keys");
+
+		const malformedUnion = JSON.parse(batchCloseGate(plan)) as Record<string, unknown>;
+		const malformedClose = malformedUnion.validationBatchClose as Record<string, unknown>;
+		malformedClose.unionChangeSet = "malformed";
+		const malformedUnionValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			goalId: "G003",
+			qualityGateJson: JSON.stringify(malformedUnion),
+		});
+		expect(malformedUnionValidation.valid).toBe(false);
+		expect(
+			malformedUnionValidation.errors.some(error =>
+				error.message.includes("member metadata and change-set hashes are required"),
+			),
+		).toBe(true);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G003",
+				status: "complete",
+				evidence: "malformed explicit union",
+				qualityGateJson: JSON.stringify(malformedUnion),
+			}),
+		).rejects.toThrow("member metadata and change-set hashes are required");
 
 		const receiptExtra = JSON.parse(batchCloseGate(plan)) as Record<string, unknown>;
 		const receiptClose = receiptExtra.validationBatchClose as Record<string, unknown>;
@@ -2458,12 +2604,20 @@ describe("native GJC ultragoal runtime", () => {
 			});
 
 		const validRoot = await prepareRecovery();
+		const validRecoveryGate = recoveryGate("G005");
+		expect(
+			await validateUltragoalQualityGateReadOnly({
+				cwd: validRoot,
+				goalId: "G004",
+				qualityGateJson: validRecoveryGate,
+			}),
+		).toEqual({ valid: true, errors: [] });
 		const closed = await checkpointUltragoalGoal({
 			cwd: validRoot,
 			goalId: "G004",
 			status: "complete",
 			evidence: "hydrated normal batch close",
-			qualityGateJson: recoveryGate("G005"),
+			qualityGateJson: validRecoveryGate,
 		});
 		expect(closed.goals[3]?.completionVerification?.validationBatch).toMatchObject({
 			role: "batch-close",
@@ -2758,7 +2912,7 @@ describe("native GJC ultragoal runtime", () => {
 		await startNextUltragoalGoal({ cwd: root });
 		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
 		const saved = JSON.parse(await Bun.file(goalsPath).text());
-		saved.goals[0].completionVerification.receiptId = "tampered-receipt-id";
+		saved.goals[0].completionVerification.validationBatch.changeSetHash = "f".repeat(64);
 		await fs.writeFile(goalsPath, `${JSON.stringify(saved, null, 2)}\n`);
 		const tamperedPlan = (await readUltragoalPlan(root))!;
 		await expect(
@@ -2769,7 +2923,7 @@ describe("native GJC ultragoal runtime", () => {
 				evidence: "batch close",
 				qualityGateJson: batchCloseGate(tamperedPlan),
 			}),
-		).rejects.toThrow("receipt ledger event is missing");
+		).rejects.toThrow("does not match its ledger event receipt");
 	});
 
 	it("validation batch steering invalidation rejects after deferred receipt and allows before deferred receipt", async () => {

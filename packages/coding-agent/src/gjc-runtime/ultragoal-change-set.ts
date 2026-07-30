@@ -62,28 +62,58 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 
 export function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
 	const rows: UltragoalChangeSetPath[] = [];
-	for (const line of output.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		const parts = trimmed.split(/\s+/);
-		const statusCode = parts[0] ?? "";
+	const append = (statusCode: string, pathValue: string | undefined, oldPath: string | undefined): void => {
+		if (!pathValue) return;
 		let status: UltragoalChangeStatus = "unknown";
 		if (statusCode.startsWith("A")) status = "added";
 		else if (statusCode.startsWith("M")) status = "modified";
 		else if (statusCode.startsWith("D")) status = "deleted";
 		else if (statusCode.startsWith("R")) status = "renamed";
 		else if (statusCode.startsWith("C")) status = "copied";
-		const pathValue = status === "renamed" || status === "copied" ? parts[2] : parts[1];
-		if (!pathValue) continue;
-		const oldPath = status === "renamed" || status === "copied" ? parts[1] : undefined;
 		rows.push({
 			path: normalizeRepoPath(pathValue),
 			oldPath: oldPath ? normalizeRepoPath(oldPath) : undefined,
 			status,
 			category: categorizeComputerChangePath(pathValue),
 		});
+	};
+	if (output.includes("\0")) {
+		const tokens = output.split("\0");
+		let index = 0;
+		while (index < tokens.length) {
+			const statusCode = tokens[index++] ?? "";
+			if (!statusCode) continue;
+			if (statusCode.startsWith("R") || statusCode.startsWith("C")) {
+				const oldPath = tokens[index++];
+				append(statusCode, tokens[index++], oldPath);
+			} else {
+				append(statusCode, tokens[index++], undefined);
+			}
+		}
+		return rows;
+	}
+	for (const line of output.split("\n")) {
+		if (!line.trim()) continue;
+		const [rawStatus = "", firstPath, secondPath] = line.split("\t");
+		const statusCode = rawStatus.trim();
+		append(
+			statusCode,
+			statusCode.startsWith("R") || statusCode.startsWith("C") ? secondPath : firstPath,
+			statusCode.startsWith("R") || statusCode.startsWith("C") ? firstPath : undefined,
+		);
 	}
 	return rows;
+}
+
+export function parseGitUntrackedPaths(output: string): UltragoalChangeSetPath[] {
+	const paths = output.includes("\0") ? output.split("\0") : output.split(/\r?\n/);
+	return paths
+		.filter(pathValue => pathValue.length > 0)
+		.map(pathValue => ({
+			path: normalizeRepoPath(pathValue),
+			status: "added" as UltragoalChangeStatus,
+			category: categorizeComputerChangePath(pathValue),
+		}));
 }
 
 function categorizeCiChangedPath(value: string): UltragoalChangeCategory {
@@ -125,20 +155,25 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 	const baseRef = await resolveGitBase(cwd);
 	const base = baseRef;
 	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
-	const [committed, unstaged, staged, stat, committedDiff, unstagedDiff, stagedDiff] = await Promise.all([
-		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
+	const [committed, unstaged, staged, untracked, stat, committedDiff, unstagedDiff, stagedDiff] = await Promise.all([
+		spawnText(["git", "diff", "--name-status", "-z", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--cached", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 	]);
-	if (!committed.ok && !unstaged.ok && !staged.ok && ciChangedPaths.length === 0) return undefined;
+	if (!committed.ok || !unstaged.ok || !staged.ok || !untracked.ok) {
+		if (ciChangedPaths.length === 0) return undefined;
+		return { source: "checkpoint-git", paths: ciChangedPaths, trusted: true };
+	}
 	const gitPaths = mergeChangeSetPaths([
 		parseGitNameStatus(committed.stdout),
 		parseGitNameStatus(unstaged.stdout),
 		parseGitNameStatus(staged.stdout),
+		parseGitUntrackedPaths(untracked.stdout),
 	]);
 	const paths = gitPaths.length > 0 ? gitPaths : ciChangedPaths;
 	return {

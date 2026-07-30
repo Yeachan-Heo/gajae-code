@@ -338,6 +338,13 @@ export function validateReceiptFreshBase(input: {
 			message: `Ultragoal ${input.goal.id} receipt ledger event is missing.`,
 			goalId: input.goal.id,
 		};
+	const eventReceipt = event.completionVerification as UltragoalCompletionVerification | undefined;
+	if (!eventReceipt || hashStructuredValue(eventReceipt) !== hashStructuredValue(input.receipt))
+		return {
+			state: "active_stale_receipt",
+			message: `Ultragoal ${input.goal.id} receipt does not match its ledger event receipt.`,
+			goalId: input.goal.id,
+		};
 	const generation = computeUltragoalPlanGeneration({
 		plan: input.plan,
 		ledger: input.ledger,
