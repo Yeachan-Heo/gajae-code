@@ -4111,6 +4111,11 @@ async function validateGjcContinuationEligibility(
 	staleMs: number,
 	env: NodeJS.ProcessEnv,
 	reservedHoldUntil?: string,
+	// Revalidation runs after the dispatch fence has been released once for the
+	// reservation write, so a non-claim task edit can legitimately land in between
+	// and bump `version`. Claim identity — owner, token, lease — is what authorizes
+	// continuation; a version bump alone is not a claim change.
+	allowVersionDrift = false,
 ): Promise<string | null> {
 	const phase = await readContinuationJson<Record<string, unknown>>(path.join(dir, "phase.json"));
 	if (
@@ -4150,7 +4155,7 @@ async function validateGjcContinuationEligibility(
 	if (
 		!authority.valid ||
 		authority.task.id !== task.id ||
-		authority.task.version !== task.version ||
+		(!allowVersionDrift && authority.task.version !== task.version) ||
 		authority.task.claim?.owner !== task.claim?.owner ||
 		authority.task.claim?.token !== task.claim?.token ||
 		authority.task.claim?.leased_until !== task.claim?.leased_until
@@ -4489,6 +4494,8 @@ async function continueStalledGjcTeamWorkers(
 			staleMs,
 			env,
 			new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
+
+			true,
 		);
 		if (revalidationReason) {
 			const skippedPath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);

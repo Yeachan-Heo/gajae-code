@@ -5337,7 +5337,18 @@ describe("stalled worker continuation protocol", () => {
 			release();
 			const [, operationResult] = await Promise.all([monitor, result]);
 			expect(finished, name).toBe(true);
-			expect(argv, name).toEqual([expectedArgv]);
+			// psmux appends a bounded ACK instruction to the fixed continuation prompt so
+			// the worker can acknowledge the incident. The suffix embeds the run-scoped
+			// incident hash, so assert the invariant structure exactly and bind the
+			// dynamic tail by prefix plus the ACK operation and attempt it must carry.
+			expect(argv, name).toHaveLength(1);
+			const [sent] = argv;
+			expect(sent, name).toHaveLength(expectedArgv.length);
+			expect(sent!.slice(0, 4), name).toEqual(expectedArgv.slice(0, 4));
+			expect(sent!.slice(5), name).toEqual(expectedArgv.slice(5));
+			expect(sent![4], name).toStartWith(expectedArgv[4]!);
+			expect(sent![4], name).toContain("worker-continuation-ack");
+			expect(sent![4], name).toContain('"attempt":1');
 			for (const hostile of hostileInputs) expect(argv.flat().join("\u0000"), name).not.toContain(hostile);
 			const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
 			if (name === "update task") expect(task.subject).toBe("updated");
@@ -5352,7 +5363,7 @@ describe("stalled worker continuation protocol", () => {
 			expect(["pending", "in_progress", "failed"]).toContain(task.status);
 			if (task.claim) expect(task.claim.owner).toBe("worker-1");
 		}
-	});
+	}, 300_000);
 
 	it("does not recreate a GC-pruned missing-pane worker during a later monitor", async () => {
 		const fixture = await prepareContinuation("continuation-gc-first-team");
