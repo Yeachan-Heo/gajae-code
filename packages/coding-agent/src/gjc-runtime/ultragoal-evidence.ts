@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
 import {
@@ -797,15 +798,16 @@ export async function validateCliReplay(
 	}
 	void options.live;
 	const replay = parseCliReplayRecord(record, fieldName);
-	const replayCwd = await resolveUnderCwd(cwd, replay.replayCwd, fieldName);
-	const subprocess = Bun.spawn(resolveCliReplayCommand(replay.command), {
-		cwd: replayCwd,
-		env: replay.env,
-		stdout: "pipe",
-		stderr: "pipe",
-		detached: process.platform !== "win32",
-	});
+	await resolveUnderCwd(cwd, replay.replayCwd, fieldName);
+	const executionCwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-replay-"));
 	try {
+		const subprocess = Bun.spawn(resolveCliReplayCommand(replay.command), {
+			cwd: executionCwd,
+			env: { ...replay.env, HOME: executionCwd, TMPDIR: executionCwd },
+			stdout: "pipe",
+			stderr: "pipe",
+			detached: process.platform !== "win32",
+		});
 		const [stdout, stderr, exitCode] = await Promise.all([
 			collectCliReplayOutput(subprocess.stdout),
 			collectCliReplayOutput(subprocess.stderr),
@@ -838,6 +840,8 @@ export async function validateCliReplay(
 			throw new Error(`qualityGate ${fieldName} CLI replay timed out after ${replay.timeoutMs}ms`);
 		}
 		throw error;
+	} finally {
+		await fs.rm(executionCwd, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
 

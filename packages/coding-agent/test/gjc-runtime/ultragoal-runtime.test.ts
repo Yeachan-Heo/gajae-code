@@ -767,6 +767,15 @@ describe("ultragoal CLI replay validation", () => {
 		await expectAcceptedExecutorQa(root, cliExecutorQa([cliReplayArtifact()]));
 	});
 
+	it("runs safe literal replay outside repository preload configuration", async () => {
+		const root = await tempDir();
+		const marker = path.join(root, "preload-must-not-run.txt");
+		await Bun.write(path.join(root, "bunfig.toml"), 'preload = ["./replay-preload.ts"]\n');
+		await Bun.write(path.join(root, "replay-preload.ts"), `await Bun.write(${JSON.stringify(marker)}, "unsafe");\n`);
+		await expectAcceptedExecutorQa(root, cliExecutorQa([cliReplayArtifact()]));
+		expect(await Bun.file(marker).exists()).toBe(false);
+	});
+
 	it("rejects string commands", async () => {
 		const stringRoot = await tempDir();
 		const stringError = await expectRejectedExecutorQa(
