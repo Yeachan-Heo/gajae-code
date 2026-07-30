@@ -2042,24 +2042,22 @@ async function validateContractCoverage(
 				`${fieldName}.adversarialCaseRefs`,
 				contractRef,
 			);
-			if (successfulSurfaceProofLinks === 0 && !artifactIds) {
-				for (const adversarialRow of successfulAdversarialRows) {
-					const caseArtifactIds = requireStringLinks(
-						adversarialRow.artifactRefs,
-						`${fieldName}.adversarialCaseRefs.artifactRefs`,
-					);
-					for (const artifactId of caseArtifactIds) {
-						const artifact = artifactRefs.get(artifactId)!;
-						if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
-							throw new Error(
-								`qualityGate executorQa.artifactRefs.${artifactId} adversarial-only coverage requires an existing non-empty file`,
-							);
-						}
-						await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
-							surfaceFamily: "native",
-							live: false,
-						});
+			for (const adversarialRow of successfulAdversarialRows) {
+				const caseArtifactIds = requireStringLinks(
+					adversarialRow.artifactRefs,
+					`${fieldName}.adversarialCaseRefs.artifactRefs`,
+				);
+				for (const artifactId of caseArtifactIds) {
+					const artifact = artifactRefs.get(artifactId)!;
+					if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+						throw new Error(
+							`qualityGate executorQa.artifactRefs.${artifactId} adversarial coverage requires an existing non-empty file`,
+						);
 					}
+					await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
+						surfaceFamily: "native",
+						live: false,
+					});
 				}
 			}
 			successfulProofLinks += successfulAdversarialRows.length;

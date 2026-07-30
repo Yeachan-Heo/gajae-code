@@ -392,6 +392,8 @@ function cliExecutorQa(artifactRefs: Record<string, unknown>[]): Record<string, 
 }
 
 async function expectRejectedExecutorQa(root: string, executorQa: Record<string, unknown>): Promise<string> {
+	await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+	await Bun.write(path.join(root, "artifacts", "adversarial-report.txt"), "adversarial boundary evidence");
 	await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
 	await startNextUltragoalGoal({ cwd: root });
 	const result = await runNativeUltragoalCommand(
@@ -413,6 +415,8 @@ async function expectRejectedExecutorQa(root: string, executorQa: Record<string,
 }
 
 async function expectAcceptedExecutorQa(root: string, executorQa: Record<string, unknown>): Promise<void> {
+	await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+	await Bun.write(path.join(root, "artifacts", "adversarial-report.txt"), "adversarial boundary evidence");
 	await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
 	await startNextUltragoalGoal({ cwd: root });
 	const result = await runNativeUltragoalCommand(
@@ -5270,7 +5274,20 @@ describe("native GJC ultragoal runtime", () => {
 			},
 		];
 		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
-			"adversarial-only coverage requires an existing non-empty file",
+			"adversarial coverage requires an existing non-empty file",
+		);
+	});
+
+	it("rejects receipt-only adversarial proof even when surface proof is valid", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const qa = JSON.parse(passingQualityGate()).executorQa as Record<string, unknown>;
+		const artifactRefs = qa.artifactRefs as Array<Record<string, unknown>>;
+		const adversarialArtifact = artifactRefs.find(row => row.id === "adversarial-report")!;
+		delete adversarialArtifact.path;
+		adversarialArtifact.verifiedReceipt = { type: "test-report", receiptId: "fabricated", status: "passed" };
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
+			"adversarial coverage requires an existing non-empty file",
 		);
 	});
 
