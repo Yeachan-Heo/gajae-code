@@ -24,6 +24,16 @@ function sha256(contents: string): string {
 	return createHash("sha256").update(contents).digest("hex");
 }
 
+function expectRepairableOwnerOnlyMismatch(result: { ok: boolean; code?: string }): void {
+	expect(result.ok).toBe(false);
+	// Windows can assign a newly created object either to the token user SID or
+	// to its enabled owner group. Both are fail-closed pre-repair states: the
+	// former exposes an inherited DACL mismatch, while the latter is the more
+	// specific owner mismatch that apply/repair subsequently corrects.
+	if (!result.code) throw new Error("Missing fail-closed owner-only mismatch code");
+	expect(["acl_verify_failed", "owner_mismatch"]).toContain(result.code);
+}
+
 function treeQuarantineName(entry: { relativePath: string; dev: string; ino: string }): string {
 	const material = Buffer.concat([
 		Buffer.from(entry.relativePath),
@@ -184,8 +194,8 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await fs.mkdir(directory);
 		await fs.writeFile(file, contents);
 
-		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "acl_verify_failed" });
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expectRepairableOwnerOnlyMismatch(verifyOwnerOnlyPathSecurity(directory, "directory"));
+		expectRepairableOwnerOnlyMismatch(verifyOwnerOnlyPathSecurity(file, "file"));
 		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
 		expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
@@ -202,8 +212,8 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const directoryStat = await fs.stat(directory, { bigint: true });
 		const fileStat = await fs.stat(file, { bigint: true });
 
-		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "acl_verify_failed" });
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expectRepairableOwnerOnlyMismatch(verifyOwnerOnlyPathSecurity(directory, "directory"));
+		expectRepairableOwnerOnlyMismatch(verifyOwnerOnlyPathSecurity(file, "file"));
 		expect(repairOwnerOnlyPathSecurityExpected(file, "directory", fileStat.dev, fileStat.ino)).toMatchObject({
 			ok: false,
 		});
@@ -231,7 +241,7 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			ok: false,
 			code: "identity_mismatch",
 		});
-		expect(verifyOwnerOnlyPathSecurity(target, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expectRepairableOwnerOnlyMismatch(verifyOwnerOnlyPathSecurity(target, "file"));
 		expect(await fs.readFile(target, "utf8")).toBe("replacement");
 		expect(await fs.readFile(retained, "utf8")).toBe("authorized");
 	});
