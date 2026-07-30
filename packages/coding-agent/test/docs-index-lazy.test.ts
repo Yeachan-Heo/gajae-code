@@ -30,6 +30,22 @@ async function scanDocsCorpus(): Promise<string[]> {
 	return entries.sort();
 }
 
+const REPO_ROOT = path.join(import.meta.dir, "../../..");
+const GENERATED_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
+
+/** `git diff --quiet HEAD -- <paths>`. Exit 0 means the worktree matches the commit. */
+function matchesHead(...paths: string[]): boolean {
+	const result = Bun.spawnSync({
+		cmd: ["git", "diff", "--quiet", "HEAD", "--", ...paths],
+		cwd: REPO_ROOT,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	// 0 = no diff, 1 = diff. Anything else (no git, not a repo) is a real error.
+	expect([0, 1], result.stderr.toString() || `git diff exited ${result.exitCode}`).toContain(result.exitCode);
+	return result.exitCode === 0;
+}
+
 describe("internal-urls docs index loading", () => {
 	it("does not load the generated docs corpus when importing the barrel", () => {
 		const stdout = runBunEval(`
@@ -84,5 +100,26 @@ describe("internal-urls docs index loading", () => {
 			.map(({ fileName }) => fileName);
 
 		expect(stale, `stale embedded docs index for ${stale.join(", ") || "(none)"}; ${REGENERATE_HINT}`).toEqual([]);
+	});
+
+	/**
+	 * The two assertions above compare the worktree index to the worktree docs, and
+	 * the root `prepare` hook regenerates the index on every `bun install` — which CI
+	 * runs before any test. So a *committed* index that is stale gets silently repaired
+	 * in the worktree and both assertions pass. The invariant they cannot see is
+	 * `committed index == committed docs`.
+	 *
+	 * This closes that: if `docs/` matches HEAD but the index does not, the only thing
+	 * that could have rewritten the index is the generator, which means the commit
+	 * shipped a stale one. When `docs/` is itself dirty the developer is mid-edit and
+	 * there is nothing to conclude, so the check yields rather than false-failing.
+	 */
+	it("commits an index that matches the committed docs", () => {
+		if (!matchesHead("docs")) return;
+
+		expect(
+			matchesHead(GENERATED_INDEX),
+			`committed docs index is stale relative to committed docs/; ${REGENERATE_HINT}`,
+		).toBe(true);
 	});
 });
