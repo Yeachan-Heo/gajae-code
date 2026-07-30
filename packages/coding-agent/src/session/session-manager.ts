@@ -7357,6 +7357,7 @@ export class SessionManager {
 		entries: FileEntry[],
 		sessionFile = this.#sessionFile,
 		destination = this.destination,
+		identity?: { sessionId: string; sessionFile: string | undefined; destination: SessionDestination },
 	): Promise<AtomicEntryWriteOutcome> {
 		if (!sessionFile) return { kind: "applied" };
 		if (destination.kind === "managed") {
@@ -7379,6 +7380,13 @@ export class SessionManager {
 			await writer.flush();
 			await writer.fsync();
 			await writer.close();
+			if (
+				identity &&
+				(this.#sessionId !== identity.sessionId ||
+					this.#sessionFile !== identity.sessionFile ||
+					this.destination !== identity.destination)
+			)
+				throw new Error("session_authority_changed");
 			await this.#replaceSessionFile(tempPath, sessionFile);
 			return { kind: "applied" };
 		} catch (error) {
@@ -7433,16 +7441,43 @@ export class SessionManager {
 		}
 	}
 
-	async #rewriteFileContents(): Promise<void> {
+	async #rewriteFileContents(identity?: {
+		sessionId: string;
+		sessionFile: string | undefined;
+		destination: SessionDestination;
+	}): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const destination = this.destination;
+		if (
+			identity &&
+			(sessionId !== identity.sessionId ||
+				sessionFile !== identity.sessionFile ||
+				destination !== identity.destination)
+		)
+			return;
 		await this.#closePersistWriterInternal();
 		const entries = await Promise.all(
 			materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
 				prepareEntryForPersistence(entry, this.#blobStore),
 			),
 		);
-		const outcome = await this.#writeEntriesAtomically(entries);
-		if (outcome.kind !== "applied") throw outcome.error;
+		if (
+			identity &&
+			(this.#sessionId !== sessionId || this.#sessionFile !== sessionFile || this.destination !== destination)
+		)
+			return;
+		const outcome = await this.#writeEntriesAtomically(entries, sessionFile, destination, identity);
+		if (outcome.kind !== "applied") {
+			if (identity) throw new AtomicEntryWriteOutcomeError(outcome.kind, outcome.error);
+			throw outcome.error;
+		}
+		if (
+			identity &&
+			(this.#sessionId !== sessionId || this.#sessionFile !== sessionFile || this.destination !== destination)
+		)
+			return;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
@@ -8213,7 +8248,11 @@ export class SessionManager {
 									entry => prepareEntryForPersistence(entry, this.#blobStore),
 								),
 							);
-							const outcome = await this.#writeEntriesAtomically(persistedEntries, sessionFile, destination);
+							const outcome = await this.#writeEntriesAtomically(persistedEntries, sessionFile, destination, {
+								sessionId,
+								sessionFile,
+								destination,
+							});
 							if (outcome.kind !== "applied")
 								throw new AtomicEntryWriteOutcomeError(outcome.kind, outcome.error);
 							if (
@@ -8249,11 +8288,18 @@ export class SessionManager {
 				this.#headerExportRevision++;
 				this.#bytesSinceTitleAnchor = 0;
 			} catch (error) {
-				if (
+				const certifiedNoWrite =
 					(error instanceof ManagedAppendOutcomeError && error.outcome === "not_applied") ||
-					(error instanceof AtomicEntryWriteOutcomeError && error.outcome === "not_applied")
-				)
+					(error instanceof AtomicEntryWriteOutcomeError && error.outcome === "not_applied");
+				if (certifiedNoWrite) {
+					if (
+						this.#sessionId !== sessionId ||
+						this.#sessionFile !== sessionFile ||
+						this.destination !== destination
+					)
+						return;
 					throw error;
+				}
 				// The append may have become replay-visible. Do not report a title commit
 				// and prevent later writes from relying on an uncertain transcript.
 				this.#recordPersistError(error);
@@ -8333,7 +8379,7 @@ export class SessionManager {
 					!this.#flushed ||
 					(header?.version ?? 1) < CURRENT_SESSION_VERSION
 				)
-					return this.#rewriteFileContents();
+					return this.#rewriteFileContents(identity);
 				const persistedRecord =
 					record.type === "entry_patch"
 						? (prepareEntryForPersistenceSync(
@@ -8350,7 +8396,7 @@ export class SessionManager {
 					return;
 				}
 				const writer = this.#ensurePersistWriter();
-				if (!writer) return this.#rewriteFileContents();
+				if (!writer) return this.#rewriteFileContents(identity);
 				await writer.writeMany(this.#recordsForPhysicalAppend(persistedRecord));
 			},
 			{ recordError: !options?.titleCommit },

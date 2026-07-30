@@ -151,6 +151,40 @@ class DeferredQueuedFlushStorage extends FileSessionStorage {
 		};
 	}
 }
+class DeferredRewriteCloseStorage extends FileSessionStorage {
+	readonly closeStarted = Promise.withResolvers<void>();
+	readonly releaseClose = Promise.withResolvers<void>();
+	#deferNextClose = false;
+
+	deferNextClose(): void {
+		this.#deferNextClose = true;
+	}
+
+	override openWriter(
+		filePath: string,
+		options?: { flags?: "a" | "w"; onError?: (error: Error) => void },
+	): SessionStorageWriter {
+		const writer = super.openWriter(filePath, options);
+		return {
+			writeLine: line => writer.writeLine(line),
+			writeLineSync: line => writer.writeLineSync(line),
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: async () => {
+				if (this.#deferNextClose) {
+					this.#deferNextClose = false;
+					this.closeStarted.resolve();
+					await this.releaseClose.promise;
+				}
+				await writer.close();
+			},
+			closeSync: () => writer.closeSync(),
+			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
+}
 
 describe("session title source persistence", () => {
 	let testAgentDir: string;
@@ -292,6 +326,41 @@ describe("session title source persistence", () => {
 		const reopened = await SessionManager.open(successorFile, path.dirname(successorFile), storage);
 		expect(reopened.getSessionName()).toBeUndefined();
 		expect(reopened.titleSource).toBeUndefined();
+	});
+	it("abandons a deferred full-rewrite title before direct branch adoption", async () => {
+		const storage = new DeferredRewriteCloseStorage();
+		const sessionDirectory = path.join(testAgentDir, "sessions");
+		const sessionFile = path.join(sessionDirectory, "legacy.jsonl");
+		fs.mkdirSync(sessionDirectory, { recursive: true });
+		const header = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION - 1,
+			id: "legacy",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd,
+		};
+		const message = {
+			type: "message",
+			id: "user",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "hello", timestamp: 1 },
+		};
+		fs.writeFileSync(sessionFile, `${JSON.stringify(header)}\n${JSON.stringify(message)}\n`);
+		const session = await SessionManager.open(sessionFile, cwd, storage);
+		storage.deferNextClose();
+
+		const title = session.setSessionName("Legacy title", "user");
+		await storage.closeStarted.promise;
+		const successorFile = session.createBranchedSession(session.getLeafId()!)!;
+		storage.releaseClose.resolve();
+
+		await expect(title).resolves.toBe(false);
+		expect(session.getSessionFile()).toBe(successorFile);
+		expect(session.getSessionName()).toBeUndefined();
+		expect(getHeader(await loadEntriesFromFile(sessionFile, storage))?.title).toBeUndefined();
+		expect(getHeader(await loadEntriesFromFile(successorFile, storage))?.title).toBeUndefined();
+		expect(fs.readdirSync(sessionDirectory).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 	it("keeps fresh title failures unpublished and distinguishes certified retry from ambiguous replay", async () => {
 		const certifiedStorage = new FileSessionStorage();
