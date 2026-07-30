@@ -40,6 +40,7 @@ There are two different listing pipelines:
    - Reads a bounded 4KB prefix plus at most 16KB of trailing v4 header patches for file-backed sessions.
    - Builds `SessionInfo` objects from bounded metadata and preview extraction; buried patches outside the tail budget deliberately fall back to line-1 header metadata.
    - Drops sessions with zero `message` entries and sorts by `modified` descending.
+- Writers maintain title projection anchors conservatively so a current renamed title remains reachable without widening this read budget. Listing is read-only: legacy or torn/buried metadata uses the documented bounded fallback until a normal append repairs the projection.
 
 ### Metadata fallback behavior
 

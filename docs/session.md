@@ -74,6 +74,7 @@ Session files are JSONL: one JSON object per line.
 - Line 1 is always the session header (`type: "session"`).
 - Remaining lines are `SessionEntry` values or v4/v5 append-only patch records. `header_patch` records update header metadata and `entry_patch` records replace a message payload when replay metadata is sanitized.
 - Entries and patch records are append-only at runtime; branch navigation moves a pointer (`leafId`) rather than mutating existing entries.
+- A resolved title may be repeated in a strict `header_patch` projection anchor during normal later writes. These append-only anchors preserve bounded picker visibility; malformed or torn final records remain ignored by lenient replay and are repaired only by a later writer, never by listing.
 
 ### Header (`SessionHeader`)
 
