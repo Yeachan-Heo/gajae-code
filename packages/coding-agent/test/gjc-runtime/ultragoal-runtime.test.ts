@@ -1350,6 +1350,68 @@ describe("native GJC ultragoal runtime", () => {
 		expect((await readUltragoalPlan(root))?.goals.find(goal => goal.id === "G001")?.status).toBe("complete");
 	});
 
+	it("boundary default: a minimal deferred gate omits every derivable field and is hydrated by the runtime", async () => {
+		const root = await batchTempDir();
+		await writeStructuralArtifacts(root);
+		await createUltragoalPlan({ cwd: root, brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const minimal = JSON.stringify({
+			deferredToBatch: {
+				ranLanes: ["targetedVerification"],
+				targetedVerification: {
+					status: "passed",
+					commands: ["bun test targeted"],
+					evidence: "targeted suite passed for G001",
+				},
+			},
+		});
+		// Read-only validate and checkpoint apply identical hydration rules.
+		expect(
+			await validateUltragoalQualityGateReadOnly({ cwd: root, qualityGateJson: minimal, goalId: "G001" }),
+		).toEqual({ valid: true, errors: [] });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "minimal deferred gate hydrated by the runtime",
+			qualityGateJson: minimal,
+		});
+		expect((await readUltragoalPlan(root))?.goals.find(goal => goal.id === "G001")?.status).toBe("complete");
+	});
+
+	it("validation batch deferred: a minimal member gate is auto-hydrated with the batch tuple and change-set hash", async () => {
+		const root = await batchTempDir();
+		await writeStructuralArtifacts(root);
+		await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+			validationBatches: [
+				{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+			],
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const accepted = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "minimal member gate",
+			qualityGateJson: JSON.stringify({
+				deferredToBatch: {
+					targetedVerification: {
+						status: "passed",
+						commands: ["bun test targeted"],
+						evidence: "targeted suite passed for G001",
+					},
+				},
+			}),
+		});
+		const batch = accepted.goals[0]!.completionVerification?.validationBatch;
+		if (batch?.role !== "deferred-member") throw new Error("expected a deferred-member receipt");
+		// The runtime computed and stamped the change-set hash; no hand-computed hash was supplied.
+		expect(batch.changeSetHash).toMatch(/^[0-9a-f]{64}$/);
+	});
+
 	it("boundary default: declaration and evidence must agree in both directions", async () => {
 		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);

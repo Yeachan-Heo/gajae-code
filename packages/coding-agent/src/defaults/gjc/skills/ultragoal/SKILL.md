@@ -230,9 +230,22 @@ Team remains explicit and separate: Team is not auto-launched, not a hidden pipe
 
 Heavyweight review runs **once per boundary**, not once per story. In aggregate mode the whole required-goal set is one implicit boundary by default: every checkpoint before the run's final required goal may present the lightweight `deferredToBatch` gate, and only the final goal carries the full strict gate. Nothing needs to be declared to get this — it is the default.
 
-Per-subgoal verification is **agent-chosen**. The runtime does not dictate which lanes an intermediate story runs; it enforces only that the declaration matches the evidence. List the lanes you actually ran in `deferredToBatch.ranLanes` (`targetedVerification`, and optionally `aiSlopCleaner` / `iteration`). A declared lane with no evidence is rejected, submitted evidence for an undeclared lane is rejected, and `ranLanes` can never claim `architectReview` or `executorQa` — a deferred gate structurally cannot carry review evidence, so those lanes always belong to the boundary. `targetedVerification` remains mandatory; the ai-slop-cleaner pass and a full verification rerun are boundary duties, not per-subgoal duties.
+A deferred gate is just the proof the runtime cannot know: that targeted verification ran. Everything mechanical — `kind`, the batch tuple, `deferredLanes`, and the whole `changeSet` block (`paths`, `changeSetHash`) — is auto-filled from durable state and the computed cumulative git diff. Never hand-compute a hash. The minimal valid gate:
 
-Deferring never manufactures approvals: a `deferredToBatch` gate still cannot contain `architectReview`, `executorQa`, or `validationBatchClose`, and the boundary gate keeps every existing fail-closed rule.
+```json
+{
+  "deferredToBatch": {
+    "ranLanes": ["targetedVerification"],
+    "targetedVerification": {
+      "status": "passed",
+      "commands": ["bun test <targeted suite>"],
+      "evidence": "what was verified and how it passed"
+    }
+  }
+}
+```
+
+`deferredToBatch.ranLanes` lists the lanes you actually ran (`targetedVerification`, plus optionally `aiSlopCleaner` / `iteration`); declaration and evidence must match in both directions. `ranLanes` can never claim `architectReview` or `executorQa`, and a deferred gate can never contain `architectReview`, `executorQa`, or `validationBatchClose` — review always belongs to the boundary, and deferring never manufactures approvals. Any optional field you do supply must match reality; a wrong value fails closed. Check with `gjc ultragoal quality-gate validate` before checkpointing.
 
 ### Validation batches (explicit phase/module boundaries)
 
