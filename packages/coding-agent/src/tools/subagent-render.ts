@@ -182,12 +182,15 @@ function renderSubagentSnapshotBody(
 		lines.push(`  ${theme.fg("dim", `Agent: ${snapshot.agent} (${snapshot.agentSource})`)}`);
 	}
 	if (snapshot.effectiveModel) {
+		// Fast mode is a property of the tier this model runs under, so the ⚡ glyph
+		// belongs on the model line rather than the id.
+		const fastSuffix = snapshot.fastMode && theme.icon.fast ? ` ${theme.icon.fast}` : "";
 		if (snapshot.modelFellBack && snapshot.requestedModel) {
 			lines.push(
-				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}`,
+				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}${fastSuffix}`,
 			);
 		} else {
-			lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}`);
+			lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}${fastSuffix}`);
 		}
 	}
 	if (snapshot.description) lines.push(`  ${theme.fg("dim", `Description: ${snapshot.description}`)}`);

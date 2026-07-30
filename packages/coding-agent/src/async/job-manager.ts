@@ -164,6 +164,8 @@ export interface SubagentRecord {
 	effectiveModel?: string;
 	/** True when the requested model lacked credentials and the subagent fell back to the parent model. */
 	modelFellBack?: boolean;
+	/** True when the effective subagent provider is in fast mode. */
+	fastMode?: boolean;
 }
 
 /** Lightweight, manager-owned resume payload. The async layer treats `data` as opaque. */
@@ -702,16 +704,17 @@ export class AsyncJobManager {
 		this.#notifyChange();
 	}
 
-	/** Patch model metadata onto an existing subagent record (best-effort; no-op if unknown). */
+	/** Patch model/runtime metadata onto an existing subagent record (best-effort; no-op if unknown). */
 	updateSubagentModel(
 		subagentId: string,
-		model: { requestedModel?: string; effectiveModel?: string; modelFellBack?: boolean },
+		model: { requestedModel?: string; effectiveModel?: string; modelFellBack?: boolean; fastMode?: boolean },
 	): void {
 		const record = this.#subagentRecords.get(subagentId);
 		if (!record) return;
 		record.requestedModel = model.requestedModel;
 		record.effectiveModel = model.effectiveModel;
 		record.modelFellBack = model.modelFellBack;
+		record.fastMode = model.fastMode;
 	}
 
 	#recordFromResumeDescriptor(subagentId: string, filter?: AsyncJobFilter): SubagentRecord | undefined {

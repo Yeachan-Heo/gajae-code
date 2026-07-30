@@ -91,6 +91,79 @@ describe("subagent await live progress", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	it("surfaces retained fast mode from the canonical subagent record", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register(
+			"task",
+			"fast subagent",
+			async () => {
+				await Bun.sleep(150);
+				return "done";
+			},
+			{
+				id: "job-fast",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Fast", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-Fast", jobId));
+		manager.updateSubagentModel("0-Fast", { fastMode: true });
+
+		const result = await tool.execute("inspect", { action: "inspect", ids: ["0-Fast"] });
+		const snap = result.details?.subagents.find(s => s.id === "0-Fast");
+
+		expect(snap?.fastMode).toBe(true);
+
+		manager.cancelSubagent("0-Fast", { ownerId: "0-Main" });
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("retains fast mode across a live progress update", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register(
+			"task",
+			"fast subagent",
+			async () => {
+				await Bun.sleep(2000);
+				return "done";
+			},
+			{
+				id: "job-fast-live",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-FastLive", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-FastLive", jobId));
+		manager.updateSubagentModel("0-FastLive", { fastMode: true });
+
+		const updates: SubagentSnapshot[] = [];
+		const pending = tool.execute(
+			"await",
+			{ action: "await", ids: ["0-FastLive"], timeout_ms: 1500 },
+			undefined,
+			result => {
+				const snap = result.details?.subagents.find(s => s.id === "0-FastLive");
+				if (snap) updates.push(snap);
+			},
+		);
+
+		// Mutate progress only AFTER the await is live, so the panel is forced to
+		// rebuild the snapshot in flight. The record-derived fast flag must survive
+		// that rebuild, or the ⚡ glyph vanishes the moment the subagent reports.
+		await Bun.sleep(50);
+		manager.recordSubagentProgress("0-FastLive", makeProgress({ id: "0-FastLive", currentTool: "read" }));
+		await pending;
+
+		const rebuilt = updates.filter(snap => snap.progress?.currentTool === "read");
+		expect(rebuilt.length).toBeGreaterThan(0);
+		expect(rebuilt.every(snap => snap.fastMode === true)).toBe(true);
+
+		manager.cancelSubagent("0-FastLive", { ownerId: "0-Main" });
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
 	it("isolates live progress per subagent id", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
@@ -410,6 +483,7 @@ describe("subagentAwaitRenderedStateSignature", () => {
 			s => ({ ...s, effectiveModel: "model-2" }),
 			s => ({ ...s, requestedModel: "model-1" }),
 			s => ({ ...s, modelFellBack: true }),
+			s => ({ ...s, fastMode: true }),
 			s => ({ ...s, description: "new description" }),
 			s => ({ ...s, assignment: "new assignment" }),
 			s => ({ ...s, progress: { ...baseProgress, currentTool: "bash" } }),
