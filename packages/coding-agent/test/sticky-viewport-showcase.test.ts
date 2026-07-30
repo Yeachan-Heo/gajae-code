@@ -1044,10 +1044,15 @@ describe("sticky viewport production evidence verifier", () => {
 		const running = new Bun.CryptoHasher("sha256")
 			.update(await fs.readFile(path.resolve(import.meta.dir, "../scripts/verify-sticky-viewport-showcase.ts")))
 			.digest("hex");
-		// The parent commit is a stand-in for the synthetic-merge base. This branch
-		// changed the oracle, so the parent's blob differs from the running bytes.
-		const parent = await committedBlobSha256("HEAD~1", oracle);
-		expect(parent).not.toBe(running);
+		// The merge-base with dev is exactly the base the maintainer's synthetic
+		// integration checks out, and this branch changed the oracle relative to dev,
+		// so that base provably lacks the running bytes. Using it instead of `HEAD~1`
+		// keeps the assertion independent of local commit topology.
+		const base = new TextDecoder()
+			.decode(Bun.spawnSync(["git", "merge-base", "HEAD", "origin/dev"], { stdout: "pipe" }).stdout)
+			.trim();
+		expect(base).not.toBe("");
+		expect(await committedBlobSha256(base, oracle)).not.toBe(running);
 		// Acceptance therefore cannot be coming from the base blob.
 		await verifyStickyViewportShowcase(await capture());
 	}, 300_000);
