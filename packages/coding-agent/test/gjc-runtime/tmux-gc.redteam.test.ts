@@ -38,6 +38,7 @@ function sessionLine(overrides: {
 	sessionId?: string;
 	sessionStateFile?: string;
 	ownerGeneration?: string;
+	psmuxIncarnation?: string;
 	nativeSessionId?: string;
 }): string {
 	return [
@@ -56,6 +57,7 @@ function sessionLine(overrides: {
 		overrides.sessionStateFile ?? "",
 		overrides.ownerGeneration ?? "generation-1",
 		"",
+		overrides.psmuxIncarnation ?? "",
 		overrides.nativeSessionId ?? "$1",
 	].join("\t");
 }
@@ -283,6 +285,65 @@ describe("tmux GC red-team adversarial safety", () => {
 		try {
 			const result = await tmuxSessionsGcAdapter.collect(ctx());
 			const record = result.records.find(entry => entry.id === "gajae_code_reused_name");
+
+			expect(record).toMatchObject({ status: "stale", removable: true });
+			expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({
+				removed: false,
+				skipped: "tmux_revalidation_failed_or_became_live",
+			});
+			expect(calls.some(call => call.includes("kill-session"))).toBe(false);
+		} finally {
+			await fs.rm(stateFile, { force: true });
+		}
+	});
+	it("refuses a changed psmux incarnation before delete", async () => {
+		const stateFile = "/tmp/gjc-redteam-psmux-incarnation-marker.json";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "psmux-session",
+				state: "completed",
+				cwd: "/tmp/gjc-redteam-deleted-project",
+				workdir: "/tmp/gjc-redteam-deleted-project",
+				session_file: null,
+			}),
+		);
+		const calls: string[][] = [];
+		let richListCount = 0;
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation((cmd: string[]) => {
+			calls.push(cmd);
+			if (cmd.includes("list-sessions")) {
+				const format = cmd[cmd.indexOf("-F") + 1] ?? "";
+				if (format === "#{session_name}") return spawnResult(0, "gajae_code_psmux_reused\n");
+				richListCount += 1;
+				return spawnResult(
+					0,
+					sessionLine({
+						name: "gajae_code_psmux_reused",
+						branch: "deleted-branch",
+						project: "/tmp/gjc-redteam-deleted-project",
+						sessionId: "psmux-session",
+						sessionStateFile: stateFile,
+						psmuxIncarnation: richListCount === 1 ? "incarnation-a" : "incarnation-b",
+					}),
+				);
+			}
+			if (cmd.includes("display-message") && cmd.at(-1) === "#{session_id}") return spawnResult(0, "$1\n");
+			if (optionValue(cmd, "@gjc-profile")) return spawnResult(0, "1\n");
+			if (optionValue(cmd, "@gjc-project")) return spawnResult(0, "/tmp/gjc-redteam-deleted-project\n");
+			if (optionValue(cmd, "@gjc-branch")) return spawnResult(0, "deleted-branch\n");
+			if (optionValue(cmd, "@gjc-session-id")) return spawnResult(0, "psmux-session\n");
+			if (optionValue(cmd, "@gjc-owner-generation")) return spawnResult(0, "generation-1\n");
+			if (optionValue(cmd, "@gjc-session-state-file")) return spawnResult(0, `${stateFile}\n`);
+			if (optionValue(cmd, "@gjc-psmux-incarnation"))
+				return spawnResult(0, `${richListCount === 1 ? "incarnation-a" : "incarnation-b"}\n`);
+			return spawnResult(0, "");
+		});
+		try {
+			const result = await tmuxSessionsGcAdapter.collect(ctx());
+			const record = result.records.find(entry => entry.id === "gajae_code_psmux_reused");
 
 			expect(record).toMatchObject({ status: "stale", removable: true });
 			expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({

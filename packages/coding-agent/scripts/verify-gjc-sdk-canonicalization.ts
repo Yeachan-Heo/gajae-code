@@ -1421,13 +1421,6 @@ function braceBlockRange(contents: string, openingBrace: number): ShellRange | u
 	return undefined;
 }
 
-function scopeMatches<T extends RegExpMatchArray>(matches: T[], range: ShellRange): T[] {
-	return matches.filter(match => {
-		const index = match.index ?? -1;
-		return index >= range.start && index < range.end;
-	});
-}
-
 function findFunctionRange(contents: string, headerPattern: RegExp): ShellRange | undefined {
 	const header = headerPattern.exec(contents);
 	if (!header) return undefined;
@@ -1504,121 +1497,62 @@ function exactMemoryGuardSendKeysRanges(contents: string): ShellRange[] {
 	];
 }
 function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
-	// Scope the loop-dispatch counts to `startTmuxSession` so the second
-	// sanctioned call site (`relaunchWorkerPaneForMemoryGuard`, matched by
-	// `exactMemoryGuardSendKeysRanges`) does not read as a duplicate. Fixtures
-	// that carry the canonical shape without the enclosing function keep the
-	// original whole-file scope, so exact-match strictness is unchanged.
-	const mainFnRange = findFunctionRange(
+	const executor =
+		/function\s+executeTeamTmuxMutation\s*\([\s\S]*?\)\s*:\s*Bun\.SyncSubprocess<"pipe",\s*"pipe">\s*\{/.exec(
+			contents,
+		);
+	const continuation = /async\s+function\s+continueStalledGjcTeamWorkers\s*\([^)]*\)\s*:\s*Promise<void>\s*\{/.exec(
 		contents,
-		/async\s+function\s+startTmuxSession\s*\([\s\S]{0,600}?\)\s*:\s*Promise<GjcTeamWorker\[\]>\s*\{/,
-	) ?? { start: 0, end: contents.length };
-	const guardMatches = scopeMatches([...contents.matchAll(/if\s*\(\s*useSendKeysFallback\s*\)\s*\{/g)], mainFnRange);
-	const payloadMatches = scopeMatches(
-		[
-			...contents.matchAll(
-				/Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*workerCommand\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
-			),
-		],
-		mainFnRange,
 	);
-	const continuationPromptMatches = [
-		...contents.matchAll(
-			/(?:const\s+GJC_TEAM_CONTINUATION_PROMPT\s*=\s*["']Continue only your current claimed GJC team task\. Re-read current GJC team state; do not replay prior output; report status\.["']\s*;|import\s*\{[\s\S]{0,1000}?\bGJC_TEAM_CONTINUATION_PROMPT\b[\s\S]{0,1000}?\}\s*from\s*["']\.\/team-workers["']\s*;)/g,
-		),
-	];
-	const continuationMatches = [
-		...contents.matchAll(
-			/const\s+args\s*=\s*Object\.freeze\(\s*\[\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*GJC_TEAM_CONTINUATION_PROMPT\s*,\s*["'];["']\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*["']Enter["']\s*,?\s*\]\s*\)\s*;\s*const\s+dispatch\s*=\s*gjcTeamRuntimeTestSeams\?\.continuationTmuxDispatch\s*\?\s*gjcTeamRuntimeTestSeams\.continuationTmuxDispatch\(config\.tmux_command\s*,\s*args\)\s*:\s*Bun\.spawnSync\(\[config\.tmux_command\s*,\s*\.\.\.args\]\s*,\s*\{\s*stdout\s*:\s*["']ignore["']\s*,\s*stderr\s*:\s*["']ignore["']\s*,\s*timeout\s*:\s*GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS\s*,?\s*\}\s*\)\s*;/g,
-		),
-	];
-	const enterMatches = scopeMatches(
-		[
-			...contents.matchAll(
-				/const\s+sendKeys\s*=\s*Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*["']Enter["']\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
-			),
-		],
-		mainFnRange,
-	);
-	const fallbackPredicateMatches = [
-		...contents.matchAll(
-			/function\s+shouldDispatchWorkerWithSendKeys\([^)]*\)\s*:\s*boolean\s*\{\s*return\s+platform\s*===\s*["']win32["']\s*\|\|\s*path\.basename\(tmuxCommand\)\.toLowerCase\(\)\s*===\s*["']psmux["']\s*;\s*\}/g,
-		),
-	];
-	const useFallbackMatches = scopeMatches(
-		[
-			...contents.matchAll(
-				/const\s+useSendKeysFallback\s*=\s*shouldDispatchWorkerWithSendKeys\(config\.tmux_command\)\s*;/g,
-			),
-		],
-		mainFnRange,
-	);
-	const splitWorkerCommandMatches = scopeMatches(
-		[...contents.matchAll(/\.\.\.\(useSendKeysFallback\s*\?\s*\[\]\s*:\s*\[workerCommand\]\)\s*,/g)],
-		mainFnRange,
-	);
+	if (!executor || !continuation) return [];
+
+	const executorRange = braceBlockRange(contents, (executor.index ?? 0) + executor[0].lastIndexOf("{"));
+	const continuationRange = braceBlockRange(contents, (continuation.index ?? 0) + continuation[0].lastIndexOf("{"));
+	if (!executorRange || !continuationRange) return [];
+
+	const executorBody = contents.slice(executorRange.start, executorRange.end);
+	const literalSend =
+		/\?\s*\[\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*operation\.paneId\s*,\s*operation\.text\s*\]/.exec(
+			executorBody,
+		);
+	const keySend =
+		/operation\.type\s*===\s*["']key-send["']\s*\?\s*\[\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*operation\.paneId\s*,\s*operation\.key\s*\]/.exec(
+			executorBody,
+		);
+	const authorityChecks = executorBody.match(/assertGjcTmuxMutationAuthoritySync\(authority\)/g) ?? [];
 	if (
-		guardMatches.length !== 1 ||
-		payloadMatches.length !== 1 ||
-		enterMatches.length !== 1 ||
-		continuationPromptMatches.length !== 1 ||
-		continuationMatches.length !== 1 ||
-		fallbackPredicateMatches.length !== 1 ||
-		useFallbackMatches.length !== 1 ||
-		splitWorkerCommandMatches.length !== 1
+		!literalSend ||
+		!keySend ||
+		!executorBody.includes("const authority = teamProviderAuthority(config);") ||
+		!executorBody.includes("assertTeamTmuxMutationPreproof(config, operation);") ||
+		authorityChecks.length < 2 ||
+		!executorBody.includes("Bun.spawnSync(")
 	)
 		return [];
-	const guardStart = guardMatches[0].index ?? 0;
-	const payloadStart = payloadMatches[0].index ?? 0;
-	const enterStart = enterMatches[0].index ?? 0;
-	const voidStart = contents.indexOf("void sendKeys.exitCode;", enterStart);
+
+	const continuationBody = contents.slice(continuationRange.start, continuationRange.end);
+	const continuationArgs =
+		/const\s+args\s*=\s*Object\.freeze\(\s*\[\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*continuationPrompt\s*,\s*["'];["']\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*["']Enter["']\s*,?\s*\]\s*\)\s*;/.exec(
+			continuationBody,
+		);
 	if (
-		(useFallbackMatches[0].index ?? 0) >= (splitWorkerCommandMatches[0].index ?? 0) ||
-		(splitWorkerCommandMatches[0].index ?? 0) >= guardStart ||
-		payloadStart >= enterStart ||
-		voidStart < enterStart
+		!continuationArgs ||
+		!continuationBody.includes("const revalidationReason =") ||
+		!continuationBody.includes("await createJsonNoClobber(") ||
+		!continuationBody.includes('type: "literal-send"') ||
+		!continuationBody.includes('type: "key-send"') ||
+		!continuationBody.includes('deferredProof: "continuation-outcome"') ||
+		/args\s*\.\s*(?:push|unshift|splice)\s*\(/.test(continuationBody)
 	)
 		return [];
-	const guard = guardMatches[0];
-	const openingBrace = (guard.index ?? 0) + guard[0].lastIndexOf("{");
-	const range = braceBlockRange(contents, openingBrace);
-	const continuationFunction =
-		/async\s+function\s+continueStalledGjcTeamWorkers\s*\([^)]*\)\s*:\s*Promise<void>\s*\{/.exec(contents);
-	const monitorFence = /await\s+withGjcTeamTaskMutation\([\s\S]{0,500}?async\s+capability\s*=>\s*\{/.exec(contents);
-	if (!range || !continuationFunction || !monitorFence) return [];
-	const continuationOpeningBrace = (continuationFunction.index ?? 0) + continuationFunction[0].lastIndexOf("{");
-	const continuationRange = braceBlockRange(contents, continuationOpeningBrace);
-	const monitorOpeningBrace = (monitorFence.index ?? 0) + monitorFence[0].lastIndexOf("{");
-	const monitorRange = braceBlockRange(contents, monitorOpeningBrace);
-	if (!continuationRange || !monitorRange) return [];
-	const monitorBody = contents.slice(monitorRange.start, monitorRange.end);
-	const continuationCall = /await\s+continueStalledGjcTeamWorkers\s*\(/.exec(monitorBody);
-	const reconciliationCall = /await\s+reconcileGjcTeamStaleClaimsUnlocked\s*\(/.exec(monitorBody);
-	const continuationStart = continuationMatches[0].index ?? 0;
-	const finalValidationStart = contents.lastIndexOf("const revalidationReason =", continuationStart);
-	const skippedBranch = finalValidationStart === -1 ? "" : contents.slice(finalValidationStart, continuationStart);
-	if (
-		payloadStart < range.start ||
-		payloadStart >= range.end ||
-		enterStart < range.start ||
-		enterStart >= range.end ||
-		contents.indexOf("void sendKeys.exitCode;", enterStart) >= range.end ||
-		continuationStart < continuationRange.start ||
-		continuationStart >= continuationRange.end ||
-		finalValidationStart < continuationRange.start ||
-		!continuationCall ||
-		!reconciliationCall ||
-		(continuationCall.index ?? 0) >= (reconciliationCall.index ?? 0) ||
-		!/if\s*\(\s*revalidationReason\s*\)[\s\S]*?return\s*;/.test(skippedBranch)
-	)
-		return [];
+
+	const literalStart = executorRange.start + (literalSend.index ?? 0);
+	const keyStart = executorRange.start + (keySend.index ?? 0);
+	const argsStart = continuationRange.start + (continuationArgs.index ?? 0);
 	return [
-		{ start: payloadStart, end: payloadStart + payloadMatches[0][0].length },
-		{ start: enterStart, end: enterStart + enterMatches[0][0].length },
-		{
-			start: continuationMatches[0].index ?? 0,
-			end: (continuationMatches[0].index ?? 0) + continuationMatches[0][0].length,
-		},
+		{ start: literalStart, end: literalStart + literalSend[0].length },
+		{ start: keyStart, end: keyStart + keySend[0].length },
+		{ start: argsStart, end: argsStart + continuationArgs[0].length },
 	];
 }
 
@@ -3219,47 +3153,68 @@ fi
 		"tmux send-keys content injection is outside sanctioned process lifecycle",
 	);
 	const canonicalTeamRuntimeSendKeysFixture = `
+type TeamTmuxMutation =
+	| { type: "literal-send"; paneId: string; text: string; deferredProof: "continuation-outcome" }
+	| { type: "key-send"; paneId: string; key: string; deferredProof: "continuation-outcome" };
+function executeTeamTmuxMutation(
+	config: GjcTeamConfig,
+	operation: TeamTmuxMutation,
+): Bun.SyncSubprocess<"pipe", "pipe"> {
+	const authority = teamProviderAuthority(config);
+	assertTeamTmuxMutationPreproof(config, operation);
+	const args =
+		operation.type === "literal-send"
+			? ["send-keys", "-l", "-t", operation.paneId, operation.text]
+			: operation.type === "key-send"
+				? ["send-keys", "-t", operation.paneId, operation.key]
+				: [];
+	assertGjcTmuxMutationAuthoritySync(authority);
+	const result = Bun.spawnSync(args);
+	assertGjcTmuxMutationAuthoritySync(authority);
+	return result;
+}
 async function continueStalledGjcTeamWorkers(): Promise<void> {
-	const revalidationReason = null;
-	if (revalidationReason) return;
-function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, platform: NodeJS.Platform = process.platform): boolean {
-	return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";
-}
-const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);
-const splitArgs = [...(useSendKeysFallback ? [] : [workerCommand]),];
-if (useSendKeysFallback) {
-	Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, workerCommand], {
-		stdout: "ignore",
-		stderr: "ignore",
-	});
-	const sendKeys = Bun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], {
-		stdout: "ignore",
-		stderr: "ignore",
-	});
-	void sendKeys.exitCode;
-}
-const GJC_TEAM_CONTINUATION_PROMPT = "Continue only your current claimed GJC team task. Re-read current GJC team state; do not replay prior output; report status.";
-const GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS = 5_000;
-const args = Object.freeze([
-	"send-keys",
-	"-l",
-	"-t",
-	worker.pane_id,
-	GJC_TEAM_CONTINUATION_PROMPT,
-	";",
-	"send-keys",
-	"-t",
-	worker.pane_id,
-	"Enter",
-]);
-
-const dispatch = gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
-	? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
-	: Bun.spawnSync([config.tmux_command, ...args], {
-		stdout: "ignore",
-		stderr: "ignore",
-		timeout: GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS,
-	});
+	const reservationPath = "reservation";
+	const reservation = {};
+	await createJsonNoClobber(
+		reservationPath,
+		reservation,
+		stateWriterOptions(reservationPath, "state", "continuation-reservation"),
+	);
+	const continuationPrompt = "Continue only your current claimed GJC team task. Re-read current GJC team state; do not replay prior output; report status.";
+	const revalidationReason = await validateGjcContinuationEligibility(dir, config, worker);
+	if (revalidationReason) {
+		return;
+	}
+	const args = Object.freeze([
+		"send-keys",
+		"-l",
+		"-t",
+		worker.pane_id,
+		continuationPrompt,
+		";",
+		"send-keys",
+		"-t",
+		worker.pane_id,
+		"Enter",
+	]);
+	const dispatch = gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
+		? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
+		: (() => {
+				executeTeamTmuxMutation(config, {
+					type: "literal-send",
+					paneId: worker.pane_id!,
+					text: continuationPrompt,
+					deferredProof: "continuation-outcome",
+				});
+				return executeTeamTmuxMutation(config, {
+					type: "key-send",
+					paneId: worker.pane_id!,
+					key: "Enter",
+					deferredProof: "continuation-outcome",
+				});
+			})();
+	void dispatch;
 }
 async function monitorGjcTeam(): Promise<void> {
 	await withGjcTeamTaskMutation(taskStore(dir), async capability => {
@@ -3275,6 +3230,26 @@ async function monitorGjcTeam(): Promise<void> {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"\tassertTeamTmuxMutationPreproof(config, operation);\n",
+				"",
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"\tassertGjcTmuxMutationAuthoritySync(authority);\n\treturn result;",
+				"\treturn result;",
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
 				"async function continueStalledGjcTeamWorkers(): Promise<void>",
 				"async function relocatedContinuation(): Promise<void>",
 			),
@@ -3285,7 +3260,7 @@ async function monitorGjcTeam(): Promise<void> {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				"if (revalidationReason) return;",
+				"if (revalidationReason) {\n\t\treturn;\n\t}",
 				"if (revalidationReason) {}",
 			),
 		},
@@ -3324,36 +3299,6 @@ async function monitorGjcTeam(): Promise<void> {
 	);
 	await runSelfTestFixture(
 		{
-			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				"report status.",
-				"report injected status.",
-			),
-		},
-		1,
-		"tmux send-keys content injection is outside sanctioned process lifecycle",
-	);
-	await runSelfTestFixture(
-		{
-			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				'return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";',
-				"return true;",
-			),
-		},
-		1,
-		"tmux send-keys content injection is outside sanctioned process lifecycle",
-	);
-	await runSelfTestFixture(
-		{
-			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				'return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";',
-				'return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux" || tmuxCommand === "tmux";',
-			),
-		},
-		1,
-		"tmux send-keys content injection is outside sanctioned process lifecycle",
-	);
-	await runSelfTestFixture(
-		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": `${canonicalTeamRuntimeSendKeysFixture}\nBun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "prompt"]);\n`,
 		},
 		1,
@@ -3372,8 +3317,8 @@ async function monitorGjcTeam(): Promise<void> {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				'GJC_TEAM_CONTINUATION_PROMPT,\n\t";",',
-				"`$" + "{GJC_TEAM_CONTINUATION_PROMPT}" + '`,\n\t";",',
+				'continuationPrompt,\n\t\t";",',
+				"`$" + "{continuationPrompt}" + '`,\n\t\t";",',
 			),
 		},
 		1,
@@ -3382,8 +3327,8 @@ async function monitorGjcTeam(): Promise<void> {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				'"send-keys",\n\t"-l",\n\t"-t",\n\tworker.pane_id,\n\tGJC_TEAM_CONTINUATION_PROMPT,\n\t";",\n\t"send-keys",\n\t"-t",\n\tworker.pane_id,\n\t"Enter",',
-				'"send-keys", "-t", worker.pane_id, "Enter", ";", "send-keys", "-l", "-t", worker.pane_id, GJC_TEAM_CONTINUATION_PROMPT,',
+				'"send-keys",\n\t\t"-l",\n\t\t"-t",\n\t\tworker.pane_id,\n\t\tcontinuationPrompt,\n\t\t";",\n\t\t"send-keys",\n\t\t"-t",\n\t\tworker.pane_id,\n\t\t"Enter",',
+				'"send-keys", "-t", worker.pane_id, "Enter", ";", "send-keys", "-l", "-t", worker.pane_id, continuationPrompt,',
 			),
 		},
 		1,
@@ -3392,8 +3337,8 @@ async function monitorGjcTeam(): Promise<void> {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				"Bun.spawnSync([config.tmux_command, ...args]",
-				'Bun.spawnSync([config.tmux_command, "run-shell", ...args]',
+				": (() => {",
+				": Bun.spawnSync([config.tmux_command, ...args])",
 			),
 		},
 		1,

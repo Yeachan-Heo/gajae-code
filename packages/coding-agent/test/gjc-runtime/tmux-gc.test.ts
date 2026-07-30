@@ -39,6 +39,7 @@ function sessionLine(overrides: {
 	sessionId?: string;
 	sessionStateFile?: string;
 	ownerGeneration?: string;
+	psmuxIncarnation?: string;
 	nativeSessionId?: string;
 }): string {
 	return [
@@ -57,6 +58,7 @@ function sessionLine(overrides: {
 		overrides.sessionStateFile ?? "",
 		overrides.ownerGeneration ?? "generation-1",
 		"",
+		overrides.psmuxIncarnation ?? "",
 		overrides.nativeSessionId ?? "$1",
 	].join("\t");
 }

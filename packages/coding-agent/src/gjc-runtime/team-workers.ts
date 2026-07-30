@@ -42,6 +42,7 @@ export interface GjcTeamWorkerRuntime {
 	workerDir(dir: string, worker: string): string;
 	readJson<T>(filePath: string): Promise<T | null>;
 	writeJson(filePath: string, value: unknown): Promise<void>;
+	withTaskMutation<T>(dir: string, fn: (capability: GjcTeamTaskMutationCapability) => Promise<T>): Promise<T>;
 	appendEvent(
 		dir: string,
 		event: { type: string; worker?: string; task_id?: string; message: string; data?: Record<string, unknown> },
@@ -368,6 +369,140 @@ export async function writeGjcWorkerStartupAck(
 	});
 	return ack;
 }
+export const GJC_TEAM_CONTINUATION_ACK_POLL_MS = 50;
+export function isValidGjcContinuationAck(
+	value: unknown,
+	reservation: Record<string, unknown>,
+	incident: string,
+	attempt: number,
+): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const ack = value as Record<string, unknown>;
+	const keys = [
+		"schema_version",
+		"incident_hash",
+		"attempt",
+		"attempt_nonce",
+		"reservation_sha256",
+		"worker",
+		"pane_id",
+		"worker_incarnation",
+		"claim_token",
+		"acknowledged_at",
+	];
+	return (
+		Object.keys(ack).length === keys.length &&
+		Object.keys(ack).every(key => keys.includes(key)) &&
+		ack.schema_version === 1 &&
+		ack.incident_hash === incident &&
+		ack.attempt === attempt &&
+		ack.attempt_nonce === reservation.attempt_nonce &&
+		ack.reservation_sha256 === gjcContinuationReservationDigest(reservation) &&
+		ack.worker === reservation.worker &&
+		ack.pane_id === reservation.pane_id &&
+		ack.worker_incarnation === reservation.worker_incarnation &&
+		ack.claim_token === reservation.claim_token &&
+		typeof ack.acknowledged_at === "string" &&
+		Number.isFinite(Date.parse(ack.acknowledged_at))
+	);
+}
+
+export async function writeGjcWorkerContinuationAck(
+	runtime: GjcTeamWorkerRuntime,
+	teamName: string,
+	worker: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+	input: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	const dir = await runtime.findTeamDir(teamName, cwd, env);
+	const inputKeys = ["team_name", "worker_id", "incident_hash", "attempt"];
+	if (
+		Object.keys(input).length !== inputKeys.length ||
+		Object.keys(input).some(key => !inputKeys.includes(key)) ||
+		input.team_name !== teamName ||
+		input.worker_id !== worker ||
+		typeof input.incident_hash !== "string" ||
+		!/^[0-9a-f]{24}$/.test(input.incident_hash) ||
+		(input.attempt !== 1 && input.attempt !== 2)
+	)
+		throw new Error("invalid_continuation_ack_reference");
+	const incident = input.incident_hash;
+	const attempt = input.attempt;
+	return runtime.withTaskMutation(dir, async () => {
+		const config = await runtime.readConfig(dir);
+		const teamWorker = runtime.findKnownWorker(config, worker);
+		const reservation = await readRuntimeJson<Record<string, unknown>>(
+			runtime,
+			path.join(runtime.workerDir(dir, worker), "continuations", incident, `attempt-0${attempt}.reservation.json`),
+		);
+		if (!reservation) throw new Error("missing_continuation_reservation");
+		const task = await readRuntimeJson<unknown>(
+			runtime,
+			path.join(dir, "tasks", `${String(reservation.task_id)}.json`),
+		);
+		const claim = await readRuntimeJson<unknown>(
+			runtime,
+			path.join(dir, "claims", `${String(reservation.task_id)}.json`),
+		);
+		if (
+			!isCanonicalPersistedGjcTeamTask(task, String(reservation.task_id)) ||
+			!isCanonicalPersistedGjcTeamTaskClaim(claim) ||
+			task.claim?.owner !== worker ||
+			task.claim?.token !== reservation.claim_token ||
+			claim.owner !== worker ||
+			claim.token !== reservation.claim_token
+		)
+			throw new Error("continuation_ack_claim_authority_changed");
+		const heartbeat = await readRuntimeJson<WorkerHeartbeatFile>(runtime, heartbeatPath(runtime, dir, worker));
+		if (
+			!heartbeat?.last_turn_at ||
+			!isValidGjcContinuationReservation(
+				reservation,
+				incident,
+				attempt,
+				config,
+				worker,
+				task,
+				claim,
+				heartbeat.last_turn_at,
+				teamWorker.pane_id ?? "",
+			)
+		)
+			throw new Error("invalid_continuation_reservation");
+		const lifecycle = await readWorkerLifecycleRecord(runtime, dir, teamWorker);
+		const incarnation = `${teamWorker.pane_id ?? ""}:${lifecycle.started_at ?? lifecycle.updated_at}`;
+		if (
+			reservation.worker !== worker ||
+			reservation.pane_id !== teamWorker.pane_id ||
+			reservation.pane_id !== lifecycle.pane_id ||
+			reservation.worker_incarnation !== incarnation
+		)
+			throw new Error("continuation_ack_binding_mismatch");
+		const ack = {
+			schema_version: 1,
+			incident_hash: incident,
+			attempt,
+			attempt_nonce: reservation.attempt_nonce,
+			reservation_sha256: gjcContinuationReservationDigest(reservation),
+			worker,
+			pane_id: reservation.pane_id,
+			worker_incarnation: reservation.worker_incarnation,
+			claim_token: reservation.claim_token,
+			acknowledged_at: runtime.now(),
+		};
+		await runtime.writeJson(
+			path.join(runtime.workerDir(dir, worker), "continuations", incident, `attempt-0${attempt}.ack.json`),
+			ack,
+		);
+		await runtime.appendEvent(dir, {
+			type: "worker_continuation_ack",
+			worker,
+			message: `Worker ${worker} acknowledged continuation`,
+		});
+		return ack;
+	});
+}
 
 export async function writeGjcShutdownRequest(
 	runtime: GjcTeamWorkerRuntime,
@@ -513,6 +648,21 @@ function isContinuationLifecycleEligible(lifecycle: GjcTeamWorkerLifecycle, stat
 export const GJC_TEAM_CONTINUATION_PROMPT =
 	"Continue only your current claimed GJC team task. Re-read current GJC team state; do not replay prior output; report status.";
 
+export function buildGjcContinuationPrompt(reservation: Record<string, unknown>): string {
+	const teamName = typeof reservation.team_name === "string" ? reservation.team_name : "";
+	const worker = typeof reservation.worker === "string" ? reservation.worker : "";
+	const incident = typeof reservation.incident_hash === "string" ? reservation.incident_hash : "";
+	const attempt = reservation.attempt === 1 || reservation.attempt === 2 ? reservation.attempt : 0;
+	if (!teamName || !worker || !incident || !attempt) throw new Error("invalid_continuation_reservation_reference");
+	const input = JSON.stringify({
+		team_name: teamName,
+		worker_id: worker,
+		incident_hash: incident,
+		attempt,
+	});
+	return `${GJC_TEAM_CONTINUATION_PROMPT} ACK now: gjc team api worker-continuation-ack --input '${input}' --json.`;
+}
+
 function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	if (typeof value === "object" && value !== null) {
@@ -542,7 +692,9 @@ const reservationKeys = new Set([
 	"heartbeat_at",
 	"pane_id",
 	"tmux_target",
+	"worker_incarnation",
 	"attempt",
+	"attempt_nonce",
 	"reserved_at",
 	"hold_until",
 	"prompt_version",
@@ -584,10 +736,14 @@ export function isValidGjcContinuationReservation(
 		record.heartbeat_at === heartbeatAt &&
 		record.pane_id === paneId &&
 		record.tmux_target === config.tmux_target &&
+		typeof record.worker_incarnation === "string" &&
+		record.worker_incarnation.length > 0 &&
 		record.attempt === attempt &&
+		typeof record.attempt_nonce === "string" &&
+		/^[0-9a-f-]{36}$/i.test(record.attempt_nonce) &&
 		record.prompt_version === 1 &&
 		record.dispatch_protocol === "tmux_command_sequence_v1" &&
-		record.prompt_sha256 === createHash("sha256").update(GJC_TEAM_CONTINUATION_PROMPT).digest("hex") &&
+		record.prompt_sha256 === createHash("sha256").update(buildGjcContinuationPrompt(record)).digest("hex") &&
 		Number.isFinite(reservedAt) &&
 		Number.isFinite(holdUntil) &&
 		Number.isFinite(leaseUntil) &&
@@ -683,6 +839,10 @@ export function isValidGjcContinuationOutcome(
 			exit === undefined &&
 			error === undefined &&
 			hasExactKeys(baseKeys)) ||
+		(outcome.reason === "tmux_exit_zero_unacknowledged" &&
+			exit === 0 &&
+			error === undefined &&
+			hasExactKeys([...baseKeys, "tmux_exit_code"])) ||
 		(outcome.reason === "tmux_nonzero_exit" &&
 			typeof exit === "number" &&
 			Number.isInteger(exit) &&

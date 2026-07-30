@@ -1,6 +1,19 @@
 import type { ResolvedTmuxBinary } from "./psmux-detect";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 
+export {
+	assertGjcTmuxMutationAuthoritySync,
+	bindGjcTmuxProviderAuthority,
+	buildTmuxProviderCommand,
+	hasGjcTmuxProviderAuthoritySync,
+	type ProviderAuthority,
+	type ProviderContext,
+	persistGjcTmuxProviderAuthoritySync,
+	readGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxProviderContext,
+	type TmuxProviderKind,
+} from "./tmux-provider-context";
+
 export const GJC_DEFAULT_TMUX_SESSION = "gajae_code";
 export const GJC_TMUX_SESSION_PREFIX = `${GJC_DEFAULT_TMUX_SESSION}_`;
 export const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
@@ -112,10 +125,9 @@ export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {
 	return (
 		`the active multiplexer "${tmuxCommand}" lists this session but did not return GJC's ${GJC_TMUX_PROFILE_OPTION} ownership tag; ` +
 		"GJC-managed sessions and `gjc team` require a tmux provider that round-trips tmux user options. " +
-		"For psmux on Windows, cwd/start-directory flags such as `-c` do not isolate the server namespace; psmux uses the tmux-compatible global `-L <namespace>` flag for that. " +
-		"GJC_TMUX_COMMAND and GJC_TEAM_TMUX_COMMAND are binary overrides, not shell command lines, so `psmux -L name` is not a supported value. " +
-		"Alternative multiplexers such as psmux on Windows do not reliably persist user options yet, so the Windows-native psmux path is not fully supported; " +
-		"use real tmux for GJC-managed session and team flows."
+		"On Windows psmux, GJC persists a ProviderAuthority that binds the exact executable identity and an isolated `-L <namespace>` server namespace for the owner generation. " +
+		"Recover through GJC so it reuses that persisted authority; do not retry against ambient tmux/psmux or a raw `-L` namespace. " +
+		"GJC_TMUX_COMMAND and GJC_TEAM_TMUX_COMMAND are binary overrides, not shell command lines."
 	);
 }
 
