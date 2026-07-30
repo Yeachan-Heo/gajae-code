@@ -304,12 +304,25 @@ async function main(): Promise<void> {
 	const statsB = summarize("B", "Qwen Code-identical headers");
 
 	// ── Wire verification (redacted, partitioned by arm marker) ───────────────
+	// Exact per-capture: every B capture must carry ALL FOUR canonical values;
+	// every A capture must lack ALL THREE DashScope-specific headers. A partial
+	// fingerprint (e.g. only AuthType present in B, or AuthType alone leaked in
+	// A) must NOT pass. This validates the complete arm fingerprint, not just
+	// one marker header.
+	const dashscopeKeys = ["x-dashscope-cachecontrol", "x-dashscope-useragent", "x-dashscope-authtype"] as const;
 	const armACaptures = captures.filter(c => c.headers["x-benchmark-arm"] === "A");
 	const armBCaptures = captures.filter(c => c.headers["x-benchmark-arm"] === "B");
-	const canonicalPresent = armBCaptures.some(c => c.headers["x-dashscope-authtype"] === "openai");
-	const armAHasDashscope = armACaptures.some(c =>
-		Boolean(c.headers["x-dashscope-cachecontrol"] || c.headers["x-dashscope-useragent"]),
-	);
+	const expectedUa = `QwenCode/${QWEN_CODE_UPSTREAM_VERSION} (${process.platform}; ${process.arch})`;
+	const everyBHasFullCanonical =
+		armBCaptures.length > 0 &&
+		armBCaptures.every(
+			c =>
+				c.headers["user-agent"] === expectedUa &&
+				c.headers["x-dashscope-cachecontrol"] === "enable" &&
+				c.headers["x-dashscope-useragent"] === expectedUa &&
+				c.headers["x-dashscope-authtype"] === "openai",
+		);
+	const armAHasAnyDashscope = armACaptures.some(c => dashscopeKeys.some(key => c.headers[key] !== undefined));
 
 	const report = {
 		upstream: {
@@ -320,9 +333,11 @@ async function main(): Promise<void> {
 		config: { n, warmup, seed, port: actualPort, timeoutMs, server: "local-deterministic" },
 		arms: { A: statsA, B: statsB },
 		wire: {
-			armB_canonical_headers_present: canonicalPresent,
-			armA_dashscope_headers_absent: !armAHasDashscope,
-			note: "Authorization captured as 'Bearer <redacted>'; no tokens/prompts/bodies printed",
+			armB_every_capture_full_canonical: everyBHasFullCanonical,
+			armB_captures: armBCaptures.length,
+			armA_every_capture_no_dashscope: !armAHasAnyDashscope,
+			armA_captures: armACaptures.length,
+			note: "Synthetic loopback smoke test (raw fetch, NOT production SDK shape). Exact per-capture: every B capture carries all four canonical values; every A capture lacks all three DashScope-specific headers. Authorization captured as 'Bearer <redacted>'; no tokens/prompts/bodies printed.",
 		},
 	};
 
@@ -332,7 +347,7 @@ async function main(): Promise<void> {
 		`median=${s.median.toFixed(1)}ms p90=${s.p90.toFixed(1)}ms p95=${s.p95.toFixed(1)}ms mean=${s.mean.toFixed(1)}ms stddev=${s.stddev.toFixed(1)}ms`;
 	process.stderr.write(
 		[
-			`\n# Alibaba Token Plan header-parity A/B (local deterministic server)`,
+			`\n# Alibaba Token Plan header-parity A/B (SYNTHETIC loopback smoke test)`,
 			`Upstream: QwenLM/qwen-code @${QWEN_CODE_UPSTREAM_COMMIT} v${QWEN_CODE_UPSTREAM_VERSION}`,
 			``,
 			`A (legacy/mismatched): n=${statsA.n} success=${statsA.success} err=${statsA.error} to=${statsA.timeout}`,
@@ -342,8 +357,8 @@ async function main(): Promise<void> {
 			`  TTFT  ${fmt(statsB.ttft)}`,
 			`  total ${fmt(statsB.total)}`,
 			``,
-			`Wire: arm-B canonical headers ${canonicalPresent ? "PRESENT ✓" : "MISSING ✗"} | arm-A DashScope headers ${!armAHasDashscope ? "absent ✓" : "LEAKED ✗"}`,
-			`Note: local server only; no live Alibaba credentials used. Authorization redacted.`,
+			`Wire (exact per-capture): arm-B every capture full canonical ${everyBHasFullCanonical ? "PASS ✓" : "FAIL ✗"} (${armBCaptures.length} captures) | arm-A no DashScope headers ${!armAHasAnyDashscope ? "PASS ✓" : "LEAKED ✗"} (${armACaptures.length} captures)`,
+			`Note: SYNTHETIC loopback smoke test (raw fetch, not production SDK shape). Local server only; no live Alibaba credentials used. Authorization redacted.`,
 			``,
 		].join("\n"),
 	);

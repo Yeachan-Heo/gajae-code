@@ -14,28 +14,25 @@ Per the issue's latency-analysis requirements, live results were **not
 fabricated**. The harness is landed and validated against a deterministic local
 server so it is reproducible the moment credentials become available.
 
-## What was validated (local deterministic server)
+## What was validated (synthetic loopback smoke test)
 
-The harness was validated end-to-end against an in-process local HTTP server
-that emits a fixed-size SSE stream. This proves the measurement machinery
-correctly captures TTFT, total latency, success/error/timeout counts, and
-partitions the wire captures per A/B arm. Local-server numbers reflect only
-transport/header overhead — they are **not** representative of real Alibaba
-endpoint latency and are included solely as a smoke test of the harness.
+This harness is a **synthetic loopback smoke test**, not a production-fidelity
+benchmark. It constructs raw `fetch` requests against an in-process local HTTP
+server (not the production OpenAI SDK request shape), so it validates the
+measurement machinery and the per-arm header-transport logic — it does **not**
+measure the real Gajae-Code vs Alibaba request fingerprint or establish
+production latency impact. Production fingerprint parity is proven separately by
+the wire-capture unit tests
+(`packages/ai/test/alibaba-token-plan-headers.test.ts`), which exercise the
+real SDK fetch path.
 
-Representative local run (`--n 15 --warmup 3 --seed 42`):
+The harness proves: it captures TTFT, total latency, success/error/timeout
+counts; it interleaves with a fixed seed; it excludes warmups; and it
+partitions captures per A/B arm with an **exact per-capture** wire check (every
+B capture carries all four canonical values; every A capture lacks all three
+DashScope-specific headers). Local-server numbers reflect only raw-transport
+overhead and are **not** representative of real Alibaba endpoint latency.
 
-```
-A (legacy/mismatched): n=15 success=15 err=0 to=0
-  TTFT  median≈0.7ms  total median≈14.2ms
-B (Qwen-identical):   n=15 success=15 err=0 to=0
-  TTFT  median≈0.6ms  total median≈13.5ms
-Wire: arm-B canonical headers PRESENT ✓ | arm-A DashScope headers absent ✓
-```
-
-These local numbers are intentionally **not** reported as the issue's latency
-results. They only demonstrate the harness runs, interleaves with a fixed seed,
-excludes warmups, and verifies the per-arm wire fingerprint.
 
 ## Reproducing the harness
 
