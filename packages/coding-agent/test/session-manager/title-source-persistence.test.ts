@@ -61,6 +61,30 @@ class FailingPatchStorage extends FileSessionStorage {
 		};
 	}
 }
+class CapturingWriterStorage extends FileSessionStorage {
+	syncAppends: string[] = [];
+
+	override openWriter(
+		filePath: string,
+		options?: { flags?: "a" | "w"; onError?: (error: Error) => void },
+	): SessionStorageWriter {
+		const writer = super.openWriter(filePath, options);
+		return {
+			writeLine: line => writer.writeLine(line),
+			writeLineSync: line => {
+				if (options?.flags !== "w") this.syncAppends.push(line);
+				writer.writeLineSync(line);
+			},
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: () => writer.close(),
+			closeSync: () => writer.closeSync(),
+			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
+}
 
 describe("session title source persistence", () => {
 	let testAgentDir: string;
@@ -161,6 +185,129 @@ describe("session title source persistence", () => {
 		expect(bytes.subarray(Math.max(0, bytes.byteLength - 16 * 1024)).toString("utf8")).toContain("界 title");
 		const listed = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
 		expect(listed.find(candidate => candidate.path === sessionFile)?.title).toBe("界 title");
+	});
+	it("anchors title projections only with the entry that crosses the 8KiB interval", async () => {
+		const storage = new CapturingWriterStorage();
+		const session = SessionManager.create(cwd, path.join(testAgentDir, "sessions"), storage);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		await session.setSessionName("Projected title", "user");
+		storage.syncAppends = [];
+
+		for (let timestamp = 2; timestamp <= 4; timestamp++) {
+			session.appendMessage({ role: "user", content: "x".repeat(2_000), timestamp });
+		}
+		await session.flush();
+		expect(storage.syncAppends).toHaveLength(3);
+		expect(storage.syncAppends.flatMap(batch => batch.trimEnd().split("\n"))).not.toContain(
+			expect.stringContaining('"type":"header_patch"'),
+		);
+
+		session.appendMessage({ role: "user", content: "x".repeat(3_000), timestamp: 5 });
+		await session.flush();
+		expect(storage.syncAppends).toHaveLength(4);
+		const crossingBatch = storage.syncAppends.at(-1)!;
+		const crossingRecords = crossingBatch
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(crossingRecords).toHaveLength(2);
+		expect(crossingRecords[0]).toMatchObject({ type: "message", message: { content: "x".repeat(3_000) } });
+		expect(crossingRecords[1]).toEqual({
+			type: "header_patch",
+			patch: { title: "Projected title", titleSource: "user" },
+		});
+
+		session.appendMessage({ role: "user", content: "small", timestamp: 6 });
+		await session.flush();
+		expect(storage.syncAppends.at(-1)?.trimEnd().split("\n")).toHaveLength(1);
+	});
+
+	it("uses one managed-authority append payload for a crossing entry and title anchor", async () => {
+		const destination = SessionManager.managedDestination(cwd, testAgentDir);
+		const session = SessionManager.create(cwd, destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		await session.setSessionName("Managed title", "user");
+
+		const append = ManagedSessionDescendantStore.prototype.appendWithOutcomeSync;
+		const spy = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendWithOutcomeSync");
+		try {
+			session.appendMessage({ role: "user", content: "x".repeat(9_000), timestamp: 2 });
+			await session.flush();
+			expect(spy).toHaveBeenCalledTimes(1);
+			const payload = Buffer.from(spy.mock.calls[0]![1]).toString("utf8");
+			const records = payload
+				.trimEnd()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(records).toHaveLength(2);
+			expect(records[0]).toMatchObject({ type: "message", message: { content: "x".repeat(9_000) } });
+			expect(records[1]).toEqual({
+				type: "header_patch",
+				patch: { title: "Managed title", titleSource: "user" },
+			});
+		} finally {
+			spy.mockRestore();
+		}
+		expect(append).toBe(ManagedSessionDescendantStore.prototype.appendWithOutcomeSync);
+	});
+
+	it("repairs a buried v5 title patch with a bounded strict title-only projection", async () => {
+		const sessionFile = path.join(cwd, "buried-title.jsonl");
+		const records = [
+			{ type: "session", version: 5, id: "buried", timestamp: "2026-01-01T00:00:00.000Z", cwd },
+			{ type: "header_patch", patch: { title: "Legacy title" } },
+			{
+				type: "message",
+				id: "large",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "x".repeat(20_000), timestamp: 1 },
+			},
+		];
+		fs.writeFileSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const reopened = await SessionManager.open(sessionFile);
+		expect(reopened.getSessionName()).toBe("Legacy title");
+		expect(reopened.titleSource).toBeUndefined();
+
+		reopened.appendMessage({ role: "user", content: "repair", timestamp: 2 });
+		await reopened.flush();
+		const persisted = fs
+			.readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(persisted.at(-1)).toEqual({ type: "header_patch", patch: { title: "Legacy title" } });
+
+		const reads: Array<{ length: number; position: number | null }> = [];
+		const open = fs.promises.open;
+		const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
+			const handle = await open(file, flags, mode);
+			return {
+				read: async (buffer: Buffer, offset: number, length: number, position: number | null) => {
+					reads.push({ length, position });
+					return await handle.read(buffer, offset, length, position);
+				},
+				close: () => handle.close(),
+			} as unknown as fs.promises.FileHandle;
+		});
+		try {
+			const listed = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+			expect(listed.find(candidate => candidate.path === sessionFile)?.title).toBe("Legacy title");
+		} finally {
+			openSpy.mockRestore();
+		}
+		const prefixReads = reads.filter(read => read.position === 0);
+		const trailingReads = reads.filter(read => read.position !== 0);
+		expect(prefixReads).toHaveLength(1);
+		expect(prefixReads[0]?.length).toBeLessThanOrEqual(4 * 1024);
+		expect(trailingReads.reduce((total, read) => total + read.length, 0)).toBeLessThanOrEqual(16 * 1024);
+
+		await expect(reopened.setSessionName("Manual title", "user")).resolves.toBe(true);
+		await expect(reopened.setSessionName("Generated title", "auto")).resolves.toBe(false);
 	});
 
 	it("throws without publishing a title when managed append is certified not applied", async () => {
