@@ -1439,21 +1439,82 @@ describe("native GJC ultragoal runtime", () => {
 			qualityGateJson: deferredBatchGate("G002", plan.goals[1]!.validationBatch!),
 		});
 		await startNextUltragoalGoal({ cwd: root });
+		const minimalClose = JSON.stringify({
+			...JSON.parse(passingQualityGate()),
+			validationBatchClose: { coverageEvidence: "Union validation covered the validation batch." },
+		});
+		// Read-only validate and checkpoint apply identical close hydration.
+		expect(
+			await validateUltragoalQualityGateReadOnly({ cwd: root, qualityGateJson: minimalClose, goalId: "G003" }),
+		).toEqual({ valid: true, errors: [] });
+		// A present-but-malformed union is preserved and rejected, never derived.
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G003",
+				status: "complete",
+				evidence: "malformed union",
+				qualityGateJson: JSON.stringify({
+					...JSON.parse(passingQualityGate()),
+					validationBatchClose: { coverageEvidence: "malformed union", unionChangeSet: null },
+				}),
+			}),
+		).rejects.toThrow("member metadata and change-set hashes are required");
 		const closed = await checkpointUltragoalGoal({
 			cwd: root,
 			goalId: "G003",
 			status: "complete",
 			evidence: "minimal close hydrated by the runtime",
-			qualityGateJson: JSON.stringify({
-				...JSON.parse(passingQualityGate()),
-				validationBatchClose: { coverageEvidence: "Union validation covered the validation batch." },
-			}),
+			qualityGateJson: minimalClose,
 		});
 		const batch = closed.goals[2]!.completionVerification?.validationBatch;
 		if (batch?.role !== "batch-close") throw new Error("expected a batch-close receipt");
 		// unionHash and member hashes were derived by the runtime, not hand-computed.
 		expect(batch.unionHash).toMatch(/^[0-9a-f]{64}$/);
 		expect(Object.keys(batch.memberChangeSetHashes).sort()).toEqual(["G001", "G002", "G003"]);
+	});
+
+	it("hydration never launders malformed supplied deferred fields", async () => {
+		const root = await batchTempDir();
+		await writeStructuralArtifacts(root);
+		await createUltragoalPlan({ cwd: root, brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const targetedVerification = {
+			status: "passed",
+			commands: ["bun test targeted"],
+			evidence: "targeted suite passed for G001",
+		};
+		const nullChangeSet = JSON.stringify({ deferredToBatch: { targetedVerification, changeSet: null } });
+		// Checkpoint and read-only validate reject identically.
+		expect(
+			(await validateUltragoalQualityGateReadOnly({ cwd: root, qualityGateJson: nullChangeSet, goalId: "G001" }))
+				.valid,
+		).toBe(false);
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "malformed changeSet",
+				qualityGateJson: nullChangeSet,
+			}),
+		).rejects.toThrow("deferredToBatch.changeSet is required");
+		// A present-but-malformed row status is preserved and rejected, not inferred.
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "malformed row status",
+				qualityGateJson: JSON.stringify({
+					deferredToBatch: {
+						targetedVerification,
+						changeSet: { paths: [{ path: "a.ts", status: null }] },
+					},
+				}),
+			}),
+		).rejects.toThrow("status is required");
 	});
 
 	it("boundary default: declaration and evidence must agree in both directions", async () => {

@@ -2287,6 +2287,12 @@ function hydrateDeferredGateDefaults(
 		...(row.oldPath ? { oldPath: row.oldPath } : {}),
 	}));
 	const computedByPath = new Map(computedRows.map(row => [row.path, row]));
+	// Only strict `undefined` is default-eligible: a present-but-malformed
+	// `changeSet` (null/array/scalar) is preserved verbatim so validation
+	// rejects it — hydration must never launder bad input into derived state.
+	if (hydrated.changeSet !== undefined && !qualityGateObject(hydrated.changeSet)) {
+		return { ...gate, deferredToBatch: hydrated };
+	}
 	const declared = qualityGateObject(hydrated.changeSet);
 	const changeSetRecord: JsonObject = declared ? { ...declared } : {};
 	if (changeSetRecord.memberGoalId === undefined) changeSetRecord.memberGoalId = goal.id;
@@ -2300,7 +2306,7 @@ function hydrateDeferredGateDefaults(
 			const record = typeof row === "string" ? { path: row } : qualityGateObject(row);
 			if (!record) return row;
 			const pathValue = nonEmptyString(record.path);
-			if (!pathValue || nonEmptyString(record.status)) return record;
+			if (!pathValue || record.status !== undefined) return record;
 			const computed = computedByPath.get(normalizeRepoPath(pathValue));
 			return {
 				...record,
@@ -2375,6 +2381,11 @@ function hydrateBatchCloseDefaults(input: {
 	if (close.memberMetadataHashes === undefined) close.memberMetadataHashes = derivedMetadataHashes;
 	else if (suppliedMetadataHashes) close.memberMetadataHashes = { ...derivedMetadataHashes, ...suppliedMetadataHashes };
 	if (close.memberReceipts === undefined) close.memberReceipts = derivedReceipts;
+	// Same strictness for the union: derive only when omitted; a present
+	// malformed `unionChangeSet` is preserved so validation rejects it.
+	if (close.unionChangeSet !== undefined && !qualityGateObject(close.unionChangeSet)) {
+		return { ...input.gate, validationBatchClose: close };
+	}
 	const requestedUnion = qualityGateObject(close.unionChangeSet);
 	const union: JsonObject = requestedUnion ? { ...requestedUnion } : {};
 	if (union.source === undefined) union.source = "validation-batch";
