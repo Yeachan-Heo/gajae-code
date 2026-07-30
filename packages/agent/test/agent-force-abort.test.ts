@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { Agent, type StreamFn } from "@gajae-code/agent-core";
+import {
+	Agent,
+	type AgentEvent,
+	type AgentTool,
+	getAgentTerminalOwnerContext,
+	type StreamFn,
+} from "@gajae-code/agent-core";
 import type { CursorExecHandlers, SimpleStreamOptions } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -29,9 +35,13 @@ describe("Agent.forceAbort", () => {
 		const model = createMockModel({ responses: [{ content: ["after hung create"] }] });
 		let callCount = 0;
 		const { promise: neverStream } = Promise.withResolvers<AssistantMessageEventStream>();
+		const streamCreationStarted = Promise.withResolvers<void>();
 		const streamFn: StreamFn = (selectedModel, context, options) => {
 			callCount += 1;
-			if (callCount === 1) return neverStream;
+			if (callCount === 1) {
+				streamCreationStarted.resolve();
+				return neverStream;
+			}
 			return model.stream(selectedModel, context, options);
 		};
 		const agent = new Agent({
@@ -39,24 +49,92 @@ describe("Agent.forceAbort", () => {
 			streamFn,
 		});
 
-		void agent.prompt("hang before stream");
+		const firstPrompt = agent.prompt("hang before stream");
 		await waitForStreaming(agent);
+		await streamCreationStarted.promise;
 
 		expect(agent.forceAbort("test timeout")).toBe(true);
 		await agent.waitForIdle();
+		await expect(firstPrompt).resolves.toBeUndefined();
 		expect(agent.state.isStreaming).toBe(false);
 
 		await expect(agent.prompt("next")).resolves.toBeUndefined();
 		expect(model.calls).toHaveLength(1);
 	});
 
+	it("terminalizes the logical owner when force-aborting a maintenance continuation", async () => {
+		const model = createMockModel();
+		const pendingContinuation = new AssistantMessageEventStream();
+		let streamCalls = 0;
+		const streamFn: StreamFn = () => {
+			streamCalls += 1;
+			if (streamCalls === 1) {
+				const response = createAssistantMessage(
+					[{ type: "toolCall", id: "call-1", name: "echo", arguments: {} }],
+					"toolUse",
+				);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "toolUse", message: response });
+					stream.end(response);
+				});
+				return stream;
+			}
+			if (streamCalls === 2) return pendingContinuation;
+			throw new Error("Unexpected provider request");
+		};
+		const tool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Returns a deterministic result.",
+			parameters: { type: "object", properties: {} },
+			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		};
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn,
+		});
+		agent.setMaintainContext(async () => "pruned" as const);
+		let logicalHandle: string | undefined;
+		let logicalDomain = agent.resourceLedger.lookupDomain("missing");
+		let forcedTerminal: Extract<AgentEvent, { type: "agent_end" }> | undefined;
+		agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			if (event.stopReason === "maintenance") {
+				logicalHandle = agent.activeResourceRunId;
+				logicalDomain = logicalHandle ? agent.resourceLedger.lookupDomain(logicalHandle) : undefined;
+				return;
+			}
+			forcedTerminal = event;
+		});
+
+		await agent.prompt("run tool");
+		expect(logicalHandle).toBeDefined();
+		expect(logicalDomain).toBeDefined();
+
+		const continuation = agent.continue({ maintenanceContinuation: true });
+		await waitForStreaming(agent);
+		expect(agent.activeResourceRunId).toBe(logicalHandle);
+		expect(agent.forceAbort("maintenance timeout")).toBe(true);
+		await continuation;
+
+		expect(forcedTerminal?.stopReason).toBe("cancelled");
+		const owner = forcedTerminal ? getAgentTerminalOwnerContext(forcedTerminal) : undefined;
+		expect(owner?.resourceRunId).toBe(logicalHandle);
+		expect(owner?.domain).toBe(logicalDomain);
+	});
+
 	it("forces an ignored abort back to idle and accepts a following prompt", async () => {
 		const model = createMockModel({ responses: [{ content: ["after force"] }] });
 		const hangingStream = new AssistantMessageEventStream();
 		let callCount = 0;
+		const firstStreamStarted = Promise.withResolvers<void>();
 		const streamFn: StreamFn = (selectedModel, context, options) => {
 			callCount += 1;
-			if (callCount === 1) return hangingStream;
+			if (callCount === 1) {
+				firstStreamStarted.resolve();
+				return hangingStream;
+			}
 			return model.stream(selectedModel, context, options);
 		};
 		const agent = new Agent({
@@ -66,6 +144,7 @@ describe("Agent.forceAbort", () => {
 
 		const firstPrompt = agent.prompt("hang");
 		await waitForStreaming(agent);
+		await firstStreamStarted.promise;
 
 		expect(agent.forceAbort("test timeout")).toBe(true);
 		await agent.waitForIdle();
@@ -82,9 +161,14 @@ describe("Agent.forceAbort", () => {
 		const firstStream = new AssistantMessageEventStream();
 		const secondStream = new AssistantMessageEventStream();
 		let callCount = 0;
+		const firstStreamStarted = Promise.withResolvers<void>();
 		const streamFn: StreamFn = () => {
 			callCount += 1;
-			return callCount === 1 ? firstStream : secondStream;
+			if (callCount === 1) {
+				firstStreamStarted.resolve();
+				return firstStream;
+			}
+			return secondStream;
 		};
 		const agent = new Agent({
 			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
@@ -93,6 +177,7 @@ describe("Agent.forceAbort", () => {
 
 		const firstPrompt = agent.prompt("first");
 		await waitForStreaming(agent);
+		await firstStreamStarted.promise;
 		const firstRunExternalEmitter = agent.createExternalEventEmitterForCurrentRun();
 		expect(agent.forceAbort("test timeout")).toBe(true);
 		await expect(firstPrompt).resolves.toBeUndefined();
@@ -200,9 +285,13 @@ describe("Agent.forceAbort", () => {
 		const model = createMockModel({ responses: [{ content: ["after abort"] }] });
 		const firstStream = new AssistantMessageEventStream();
 		let callCount = 0;
+		const firstStreamStarted = Promise.withResolvers<void>();
 		const streamFn: StreamFn = (selectedModel, context, options) => {
 			callCount += 1;
-			if (callCount === 1) return firstStream;
+			if (callCount === 1) {
+				firstStreamStarted.resolve();
+				return firstStream;
+			}
 			return model.stream(selectedModel, context, options);
 		};
 		const agent = new Agent({
@@ -212,6 +301,7 @@ describe("Agent.forceAbort", () => {
 
 		const firstPrompt = agent.prompt("start risky turn");
 		await waitForStreaming(agent);
+		await firstStreamStarted.promise;
 		const partial = createAssistantMessage(
 			[
 				{ type: "thinking", thinking: "partial private reasoning", thinkingSignature: "partial_sig" },

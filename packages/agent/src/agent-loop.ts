@@ -59,6 +59,7 @@ import type {
 	AgentTool,
 	AgentToolResult,
 	ManagedAttemptOutcome,
+	StandaloneRunOwnership,
 	StreamFn,
 } from "./types";
 
@@ -102,6 +103,13 @@ class ManagedAttemptSnapshotError extends Error {
 const managedAttemptTextEncoder = new TextEncoder();
 
 const ABORTED: unique symbol = Symbol("agent-loop-aborted");
+interface StandaloneOwnershipState {
+	continuationAvailable: boolean;
+	continuationClaimed: boolean;
+	terminal: boolean;
+}
+
+const standaloneOwnershipStates = new WeakMap<StandaloneRunOwnership, StandaloneOwnershipState>();
 
 /**
  * Terminal bound for argument-validation loops: how many CONSECUTIVE turns may
@@ -291,7 +299,7 @@ export function agentLoop(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
-	emitManagedAgentStart = true,
+	emitAgentStart = true,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
 
@@ -305,18 +313,17 @@ export function agentLoop(
 			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
-		openResourceRun(config);
-		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
-		attemptStream.push({ type: "turn_start" });
-		for (const prompt of prompts) {
-			stream.push({ type: "message_start", message: prompt });
-			stream.push({ type: "message_end", message: prompt });
-		}
-
 		try {
+			prepareResourceOwnership(config, false);
+			if (emitAgentStart) stream.push({ type: "agent_start" });
+			attemptStream.push({ type: "turn_start" });
+			for (const prompt of prompts) {
+				stream.push({ type: "message_start", message: prompt });
+				stream.push({ type: "message_end", message: prompt });
+			}
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
-			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
+			sealStandaloneOnError(config);
 			stream.fail(err);
 		}
 	})();
@@ -337,7 +344,7 @@ export function agentLoopContinue(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
-	emitManagedAgentStart = true,
+	emitAgentStart = true,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
@@ -356,14 +363,13 @@ export function agentLoopContinue(
 			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
-		openResourceRun(config);
-		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
-		attemptStream.push({ type: "turn_start" });
-
 		try {
+			prepareResourceOwnership(config, true);
+			if (emitAgentStart) stream.push({ type: "agent_start" });
+			attemptStream.push({ type: "turn_start" });
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
-			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
+			sealStandaloneOnError(config);
 			stream.fail(err);
 		}
 	})();
@@ -378,8 +384,93 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
-function openResourceRun(config: AgentLoopConfig): void {
-	if (config.resourceLedger && config.resourceRunId) config.resourceLedger.open(config.resourceRunId);
+function prepareResourceOwnership(config: AgentLoopConfig, continuation: boolean): void {
+	if (!config.resourceLedger || !config.resourceRunId) return;
+	if (config.resourceSealOwner === "caller") {
+		const existing = config.resourceLedger.lookupDomain(config.resourceRunId);
+		if (config.resourceCancellationDomain && existing && config.resourceCancellationDomain !== existing) {
+			config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Prompt resource cancellation domain is unavailable");
+		}
+		const domain = config.resourceCancellationDomain ?? existing ?? config.resourceLedger.open(config.resourceRunId);
+		if (!domain) throw new Error("Prompt resource cancellation domain is unavailable");
+		config.resourceCancellationDomain = domain;
+		return;
+	}
+
+	const existing = config.resourceLedger.lookupDomain(config.resourceRunId);
+	const supplied = config.standaloneRunOwnership;
+	if (supplied) {
+		if (!continuation && existing) {
+			config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Standalone prompt continuation ownership is unavailable");
+		}
+		const state = standaloneOwnershipStates.get(supplied);
+		if (
+			!state ||
+			supplied.resourceRunId !== config.resourceRunId ||
+			supplied.domain !== existing ||
+			(config.resourceCancellationDomain !== undefined && config.resourceCancellationDomain !== existing)
+		) {
+			if (existing) config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Standalone prompt ownership is unavailable");
+		}
+		if (continuation && (!state.continuationClaimed || state.terminal)) {
+			config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Standalone prompt continuation ownership is unavailable");
+		}
+		if (continuation) {
+			state.continuationClaimed = false;
+			state.continuationAvailable = false;
+		}
+		config.resourceCancellationDomain = existing;
+		return;
+	}
+	if (existing) {
+		config.resourceLedger.quarantine(config.resourceRunId);
+		throw new Error("Standalone prompt continuation ownership is unavailable");
+	}
+
+	const domain = config.resourceLedger.open(config.resourceRunId);
+	if (!domain) throw new Error("Prompt resource cancellation domain is unavailable");
+	config.resourceCancellationDomain = domain;
+	const state: StandaloneOwnershipState = {
+		continuationAvailable: false,
+		continuationClaimed: false,
+		terminal: false,
+	};
+	const ownership: StandaloneRunOwnership = {
+		resourceRunId: config.resourceRunId,
+		domain,
+		claimContinuation: () => {
+			if (domain.signal.aborted) {
+				state.terminal = true;
+				return { ok: false, reason: "quarantined" };
+			}
+			if (state.terminal) return { ok: false, reason: "terminal" };
+			if (!state.continuationAvailable || state.continuationClaimed) return { ok: false, reason: "already_claimed" };
+			state.continuationClaimed = true;
+			return { ok: true, ownership };
+		},
+		abandon: reason => {
+			if (state.terminal) return;
+			state.terminal = true;
+			config.resourceLedger?.quarantine(config.resourceRunId!);
+			void reason;
+		},
+	};
+	standaloneOwnershipStates.set(ownership, state);
+	config.standaloneRunOwnership = ownership;
+}
+
+function sealStandaloneOnError(config: AgentLoopConfig): void {
+	const standalone = config.standaloneRunOwnership
+		? standaloneOwnershipStates.get(config.standaloneRunOwnership)
+		: undefined;
+	if (standalone) standalone.terminal = true;
+	if (config.resourceSealOwner !== "caller" && config.resourceLedger && config.resourceRunId) {
+		config.resourceLedger.seal(config.resourceRunId);
+	}
 }
 
 function publishAgentEnd(
@@ -387,8 +478,24 @@ function publishAgentEnd(
 	config: AgentLoopConfig,
 	event: Extract<AgentEvent, { type: "agent_end" }>,
 ): void {
+	// Aborted maintenance yields no continuation, so it is terminal for standalone
+	// ownership and resource sealing. The event itself keeps its `maintenance`
+	// stopReason so AgentSession can still report the aborted maintenance
+	// settlement to its consumers.
+	const maintenanceContinues = event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
 	stream.push(event);
-	if (event.stopReason !== "maintenance" && config.resourceLedger && config.resourceRunId) {
+	const standalone = config.standaloneRunOwnership
+		? standaloneOwnershipStates.get(config.standaloneRunOwnership)
+		: undefined;
+	if (maintenanceContinues) {
+		if (standalone) {
+			standalone.continuationAvailable = true;
+			standalone.continuationClaimed = false;
+		}
+		return;
+	}
+	if (standalone) standalone.terminal = true;
+	if (config.resourceSealOwner !== "caller" && config.resourceLedger && config.resourceRunId) {
 		config.resourceLedger.seal(config.resourceRunId);
 	}
 }
@@ -1347,7 +1454,7 @@ async function runLoopBody(
 				const outcome = loopSignal.aborted ? "aborted" : maintenanceOutcome;
 
 				if (outcome !== "not-needed") {
-					stream.push({
+					publishAgentEnd(stream, config, {
 						type: "agent_end",
 						messages: newMessages,
 						stopReason: "maintenance",
@@ -1810,11 +1917,17 @@ async function streamAssistantResponse(
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
 	const harmonyAbortController = harmonyMitigationEnabled ? new AbortController() : undefined;
-	const requestSignal = harmonyAbortController
-		? signal
-			? AbortSignal.any([signal, harmonyAbortController.signal])
-			: harmonyAbortController.signal
-		: signal;
+	const requestSignals = [
+		...(signal ? [signal] : []),
+		...(config.resourceCancellationDomain ? [config.resourceCancellationDomain.signal] : []),
+		...(harmonyAbortController ? [harmonyAbortController.signal] : []),
+	];
+	const requestSignal =
+		requestSignals.length === 0
+			? undefined
+			: requestSignals.length === 1
+				? requestSignals[0]
+				: AbortSignal.any(requestSignals);
 	const effectiveTemperature =
 		harmonyRetryAttempt > 0 && config.temperature !== undefined ? config.temperature + 0.05 : config.temperature;
 	const effectiveToolChoice = recoveryMode ? "none" : (dynamicToolChoice ?? config.toolChoice);
@@ -1862,21 +1975,44 @@ async function streamAssistantResponse(
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			const fallbackAttempt = config.fallbackManaged ? config.nextFallbackAttempt?.(config.model) : undefined;
-			const responsePromise = Promise.resolve().then(() =>
-				streamFunction(config.model, llmContext, {
-					...config,
-					fallbackAttempt,
-					apiKey: resolvedApiKey,
-					authCredentialType,
-					metadata: resolvedMetadata,
-					sessionId: config.providerSessionId ?? config.sessionId,
-					toolChoice: effectiveToolChoice,
-					reasoning: effectiveReasoning,
-					temperature: effectiveTemperature,
-					signal: requestSignal,
-					onResponse: captureOnResponse,
-				}),
-			);
+			const providerReservation =
+				config.resourceLedger && config.resourceRunId
+					? config.resourceLedger.reserveProducer(
+							config.resourceRunId,
+							config.resourceCancellationDomain,
+							"provider_factory",
+							`${config.model.provider}/${config.model.id}`,
+						)
+					: undefined;
+			if (providerReservation && !providerReservation.ok)
+				throw new Error("Prompt resource ownership is unavailable");
+			if (requestSignal?.aborted) {
+				providerReservation?.ok && providerReservation.lease.closeDiscovery();
+				const aborted = emitAbortedAssistantMessage(null, false, context, config, stream);
+				await finishChat(aborted);
+				return aborted;
+			}
+			let responsePromise: Promise<Awaited<ReturnType<StreamFn>>>;
+			try {
+				responsePromise = Promise.resolve(
+					streamFunction(config.model, llmContext, {
+						...config,
+						fallbackAttempt,
+						apiKey: resolvedApiKey,
+						authCredentialType,
+						metadata: resolvedMetadata,
+						sessionId: config.providerSessionId ?? config.sessionId,
+						toolChoice: effectiveToolChoice,
+						reasoning: effectiveReasoning,
+						temperature: effectiveTemperature,
+						signal: requestSignal,
+						onResponse: captureOnResponse,
+					}),
+				);
+			} catch (error) {
+				providerReservation?.ok && providerReservation.lease.closeDiscovery();
+				throw error;
+			}
 			const { promise: iteratorSettled, resolve: settleIterator } = Promise.withResolvers<void>();
 			let responseResultPromise: Promise<AssistantMessage> | undefined;
 			let responseForResult: { result(): Promise<AssistantMessage> } | undefined;
@@ -1887,16 +2023,55 @@ async function streamAssistantResponse(
 				await iteratorSettled;
 				await Promise.allSettled([getResponseResult()]);
 			});
-			if (config.resourceLedger && config.resourceRunId) {
-				// One ownership spans factory creation, iterator close, and trailing result.
-				config.resourceLedger.track(
-					config.resourceRunId,
-					"provider_factory",
-					`${config.model.provider}/${config.model.id}`,
-					providerLifecycle,
+			const closeLateFactoryResponse = (): void => {
+				void responsePromise.then(
+					response => {
+						responseForResult = response;
+						try {
+							const iterator = response[Symbol.asyncIterator]();
+							try {
+								const returned = iterator.return?.();
+								void Promise.resolve(returned).then(
+									() => settleIterator(),
+									() => settleIterator(),
+								);
+							} catch {
+								settleIterator();
+							}
+						} catch {
+							settleIterator();
+						}
+					},
+					() => settleIterator(),
+				);
+			};
+			if (providerReservation?.ok) {
+				providerReservation.lease.track("provider_iterator", "provider-lifecycle", providerLifecycle);
+				void providerLifecycle.then(
+					() => providerReservation.lease.closeDiscovery(),
+					() => providerReservation.lease.closeDiscovery(),
 				);
 			}
-			const response = await responsePromise;
+			let response: Awaited<typeof responsePromise>;
+			if (requestSignal) {
+				const { promise: factoryAbort, resolve: resolveFactoryAbort } = Promise.withResolvers<typeof ABORTED>();
+				const onFactoryAbort = () => resolveFactoryAbort(ABORTED);
+				requestSignal.addEventListener("abort", onFactoryAbort, { once: true });
+				try {
+					const responseOrAbort = await Promise.race([responsePromise, factoryAbort]);
+					if (responseOrAbort === ABORTED) {
+						const aborted = emitAbortedAssistantMessage(null, false, context, config, stream);
+						await finishChat(aborted);
+						closeLateFactoryResponse();
+						return aborted;
+					}
+					response = responseOrAbort;
+				} finally {
+					requestSignal.removeEventListener("abort", onFactoryAbort);
+				}
+			} else {
+				response = await responsePromise;
+			}
 			responseForResult = response;
 
 			let partialMessage: AssistantMessage | null = null;
@@ -2130,9 +2305,12 @@ async function executeToolCalls(
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
 	const shouldInterruptImmediately = interruptMode !== "wait";
 	const steeringAbortController = new AbortController();
-	const toolSignal = signal
-		? AbortSignal.any([signal, steeringAbortController.signal])
-		: steeringAbortController.signal;
+	const toolSignals = [
+		...(signal ? [signal] : []),
+		...(config.resourceCancellationDomain ? [config.resourceCancellationDomain.signal] : []),
+		steeringAbortController.signal,
+	];
+	const toolSignal = toolSignals.length === 1 ? toolSignals[0] : AbortSignal.any(toolSignals);
 	const interruptState = { triggered: false };
 	let steeringMessages: AgentMessage[] | undefined;
 	let steeringCheck: Promise<void> | null = null;
@@ -2435,11 +2613,28 @@ async function executeToolCalls(
 		const record = records[index];
 		const concurrency = record.tool?.concurrency ?? "shared";
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
+		const reservation =
+			config.resourceLedger && config.resourceRunId
+				? config.resourceLedger.reserveProducer(
+						config.resourceRunId,
+						config.resourceCancellationDomain,
+						"tool",
+						`${record.toolCall.name}:${record.toolCall.id}`,
+					)
+				: undefined;
+		if (reservation && !reservation.ok) {
+			record.skipped = true;
+			recordSkippedTool(telemetry, {
+				toolCallId: record.toolCall.id,
+				toolName: record.toolCall.name,
+				status: "skipped",
+			});
+			emitToolResult(record, createSkippedToolResult(), true);
+			continue;
+		}
 		const task = start
 			.then(() => runTool(record, index))
 			.finally(() => {
-				// Scheduler ownership includes dependency waits and the fallback skip
-				// emission, not only tool.execute().
 				if (!record.toolResultMessage) {
 					record.skipped = true;
 					recordSkippedTool(telemetry, {
@@ -2450,15 +2645,14 @@ async function executeToolCalls(
 					emitToolResult(record, createSkippedToolResult(), true);
 				}
 			});
-		tasks.push(task);
-		if (config.resourceLedger && config.resourceRunId) {
-			config.resourceLedger.track(
-				config.resourceRunId,
-				"tool",
-				`${record.toolCall.name}:${record.toolCall.id}`,
-				task,
+		if (reservation?.ok) {
+			reservation.lease.track("tool", `${record.toolCall.name}:${record.toolCall.id}`, task);
+			void task.then(
+				() => reservation.lease.closeDiscovery(),
+				() => reservation.lease.closeDiscovery(),
 			);
 		}
+		tasks.push(task);
 		if (concurrency === "exclusive") {
 			lastExclusive = task;
 			sharedTasks = [];

@@ -689,7 +689,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 				stopReason: "maintenance",
 				maintenanceOutcome: "aborted",
 			});
-			await Bun.sleep(0);
+			await loop.session.waitForIdle();
 			expect(
 				loop.events.filter(
 					event =>

@@ -38,11 +38,91 @@ export interface RunResourceEntry {
 	registeredAt: number;
 }
 
-export type RunSettlementProof = { status: "settled" } | { status: "unfenced"; pending: RunResourceEntry[] };
+export type RunSettlementReason = "unknown_run" | "run_not_sealed" | "resources_pending" | "quarantined";
+export type RunSettlementProof =
+	| { status: "settled" }
+	| { status: "unfenced"; reason: RunSettlementReason; pending: RunResourceEntry[] };
+
+export interface RunCancellationDomain {
+	readonly resourceRunId: string;
+	readonly signal: AbortSignal;
+}
+
+export interface RunCancellationDomainBridge {
+	open(
+		resourceRunId: string,
+	):
+		| { ok: true; domain: RunCancellationDomain; created: boolean }
+		| { ok: false; reason: "duplicate_identity" | "quarantined" };
+	lookup(resourceRunId: string): RunCancellationDomain | undefined;
+	abort(
+		resourceRunId: string,
+		reason?: unknown,
+	): { ok: true; newlyAborted: boolean } | { ok: false; reason: "unknown_run" | "quarantined" };
+	release(resourceRunId: string, disposition: "settled" | "quarantined"): void;
+}
+
+export type ReserveProducerResult =
+	| { ok: true; lease: RunResourceProducerLease }
+	| { ok: false; reason: "unknown_run" | "sealed" | "quarantined" | "domain_mismatch" };
+export type ClaimProducerResult =
+	| { ok: true; lease: RunResourceProducerLease }
+	| { ok: false; reason: "already_claimed" | "handle_mismatch" | "domain_mismatch" | "closed" | "quarantined" };
+export type ForkProducerResult =
+	| { ok: true; lease: RunResourceProducerLease }
+	| { ok: false; reason: "parent_closed" | "quarantined" | "domain_mismatch" };
+
+export interface RunResourceProducerLease {
+	readonly resourceRunId: string;
+	readonly domain: RunCancellationDomain;
+	readonly signal: AbortSignal;
+	track(kind: RunResourceKind, label: string, settled: PromiseLike<unknown>): boolean;
+	fork(expectedDomain: RunCancellationDomain, kind: RunResourceKind, label: string): ForkProducerResult;
+	closeDiscovery(): void;
+}
+
+export interface AgentTerminalOwnerContext {
+	readonly resourceRunId: string;
+	readonly domain: RunCancellationDomain;
+}
+
+const terminalOwnerContexts = new WeakMap<object, AgentTerminalOwnerContext>();
+
+export function setAgentTerminalOwnerContext(event: object, context: AgentTerminalOwnerContext): void {
+	terminalOwnerContexts.set(event, context);
+}
+
+export function getAgentTerminalOwnerContext(event: object): AgentTerminalOwnerContext | undefined {
+	return terminalOwnerContexts.get(event);
+}
+export interface StandaloneRunOwnership {
+	readonly resourceRunId: string;
+	readonly domain: RunCancellationDomain;
+	claimContinuation():
+		| { ok: true; ownership: StandaloneRunOwnership }
+		| { ok: false; reason: "already_claimed" | "terminal" | "quarantined" };
+	abandon(reason: "cancelled" | "error"): void;
+}
 
 export interface RunResourceLedger {
+	/** Bind the bridge once, before any logical run may be opened. */
+	bindCancellationDomainBridge(bridge: RunCancellationDomainBridge): void;
+	/** Bind the unforgeable AgentSession claim key once, before terminal publication. */
+	bindAgentSessionClaimKey(key: object): void;
 	/** Reserve a run handle before publishing its `agent_start` event. */
-	open(resourceRunId: string): void;
+	open(resourceRunId: string): RunCancellationDomain | undefined;
+	lookupDomain(resourceRunId: string): RunCancellationDomain | undefined;
+	reserveProducer(
+		resourceRunId: string,
+		expectedDomain: RunCancellationDomain | undefined,
+		kind: RunResourceKind,
+		label: string,
+	): ReserveProducerResult;
+	claimProducer(
+		resourceRunId: string,
+		expectedDomain: RunCancellationDomain | undefined,
+		ownerKey: object,
+	): ClaimProducerResult;
 	track(resourceRunId: string, kind: RunResourceKind, label: string, settled: PromiseLike<unknown>): void;
 	pending(resourceRunId: string): RunResourceEntry[];
 	/** Seal a run after terminal event publication; only sealed empty runs settle. */
@@ -73,6 +153,8 @@ export interface ManagedAttemptContinuationOwnership {
 	/** Stable managed logical-run id; use for all terminal completion requests. */
 	readonly logicalRunId: ManagedLogicalRunId;
 	readonly generation: number;
+	readonly domain: RunCancellationDomain;
+	readonly lease: RunResourceProducerLease;
 	isCurrent(): boolean;
 }
 
@@ -383,6 +465,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	resourceLedger?: RunResourceLedger;
 	/** Stable resource ownership identifier for this prompt run. */
 	resourceRunId?: string;
+	/** Immutable logical cancellation domain bound by the resource ledger. */
+	resourceCancellationDomain?: RunCancellationDomain;
+	/** Agent passes caller ownership; direct loop callers retain loop-owned sealing. */
+	resourceSealOwner?: "caller" | "loop";
+	/** Opaque ownership required to resume a standalone maintenance lifecycle. */
+	standaloneRunOwnership?: StandaloneRunOwnership;
 }
 
 /**
