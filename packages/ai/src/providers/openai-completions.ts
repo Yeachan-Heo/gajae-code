@@ -1139,7 +1139,9 @@ async function createClient(
 		if (!clientBaseUrl.includes("/deployments/")) {
 			clientBaseUrl = `${clientBaseUrl}/deployments/${model.id}`;
 		}
-		azureDefaultQuery = { "api-version": apiVersion };
+		if (!endpointQuery || !new URLSearchParams(endpointQuery).has("api-version")) {
+			azureDefaultQuery = { "api-version": apiVersion };
+		}
 	}
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
 	const baseFetch = wrapFetchWithEndpointQuery(fetchOverride ?? fetch, endpointQuery);
