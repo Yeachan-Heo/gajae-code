@@ -1,0 +1,11 @@
+bun test v1.3.14 (0d9b296a)
+
+src/app-server/__tests__/trace-replay.test.ts:
+(pass) trace fixture provenance is pinned and explicitly cannot satisfy the real-client gate <duration>
+(pass) trace replay satisfies the shared oracle and committed golden bytes <duration>
+(pass) trace replay oracle rejects a response with its required identifier dropped <duration>
+
+ 3 pass
+ 0 fail
+ 21 expect() calls
+Ran 3 tests across 1 file. <duration>

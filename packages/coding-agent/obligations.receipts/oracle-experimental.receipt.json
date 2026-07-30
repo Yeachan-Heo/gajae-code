@@ -1,0 +1,18 @@
+{
+	"receiptVersion": 1,
+	"gateId": "oracle-experimental",
+	"argv": [
+		"bun",
+		"../../scripts/verify-codex-app-server-oracle.ts",
+		"--experimental"
+	],
+	"cwd": ".",
+	"exitCode": 0,
+	"treeHash": "7a99978b7c3dc12fabdbef8b69fc9dc8b47c12fe0cda343b90abb950e7f96915",
+	"artifacts": [
+		{
+			"path": "obligations.artifacts/oracle-experimental/stdout.txt",
+			"sha256": "18c169c2d8b6091b2c603f85e1c52ab45985a346234a24a7e6a67a9c161fba0c"
+		}
+	]
+}

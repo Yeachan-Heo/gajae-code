@@ -1,0 +1,18 @@
+{
+	"receiptVersion": 1,
+	"gateId": "spawned-cli-blackbox",
+	"argv": [
+		"bun",
+		"test",
+		"src/app-server/__tests__/e2e/spawned-cli-json-rpc.test.ts"
+	],
+	"cwd": ".",
+	"exitCode": 0,
+	"treeHash": "7a99978b7c3dc12fabdbef8b69fc9dc8b47c12fe0cda343b90abb950e7f96915",
+	"artifacts": [
+		{
+			"path": "obligations.artifacts/spawned-cli-blackbox/stdout.txt",
+			"sha256": "53f6b1d594243a1422d01c2100ffb2dbf49e6c8bcca6748ed18fd029e1987656"
+		}
+	]
+}

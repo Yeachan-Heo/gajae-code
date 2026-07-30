@@ -86,3 +86,6 @@ packages/coding-agent/binaries/
 
 # Python SDK build output
 python/gjc-sdk/build/
+
+# Obligation-gate re-execution HOME (the verifier points HOME here; never repository content)
+packages/coding-agent/.obligations-home/

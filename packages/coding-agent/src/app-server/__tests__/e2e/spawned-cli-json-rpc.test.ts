@@ -17,7 +17,8 @@ type RequestPlan = {
 };
 
 type StdoutReader = {
-	readonly reader: ReadableStreamDefaultReader<Uint8Array>;
+	// Structural: Bun's reader type parameterizes its buffer, which is irrelevant to framing here.
+	readonly reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> };
 	readonly decoder: TextDecoder;
 	buffer: string;
 };
@@ -100,7 +101,9 @@ test("spawned CLI black-box JSON-RPC transcript satisfies the shared oracle", as
 	let stderr: Promise<string> | undefined;
 
 	try {
-		child = Bun.spawn(["bun", "packages/coding-agent/src/cli.ts", "app-server", "--stdio"], {
+		// `process.execPath` rather than a bare "bun": the obligations verifier re-executes this
+		// gate with PATH=/usr/bin:/bin, where a PATH lookup would fail.
+		child = Bun.spawn([process.execPath, "packages/coding-agent/src/cli.ts", "app-server", "--stdio"], {
 			cwd: repoRoot,
 			env: {
 				...process.env,
@@ -115,10 +118,11 @@ test("spawned CLI black-box JSON-RPC transcript satisfies the shared oracle", as
 		expect(Number.isInteger(child.pid) && child.pid > 0, "the real CLI must have a child pid").toBe(true);
 		stderr = new Response(child.stderr).text();
 		const reader = child.stdout.getReader();
-		stdout = { reader, decoder: new TextDecoder(), buffer: "" };
+		const stream: StdoutReader = { reader, decoder: new TextDecoder(), buffer: "" };
+		stdout = stream;
 
 		await sendFrame(child, { jsonrpc: "2.0", id: 1, method: "initialize", params: requests[0]!.params });
-		responses.push(await readFrame(stdout));
+		responses.push(await readFrame(stream));
 		await sendFrame(child, { jsonrpc: "2.0", method: "initialized" });
 
 		for (const request of requests.slice(1)) {
@@ -128,7 +132,7 @@ test("spawned CLI black-box JSON-RPC transcript satisfies the shared oracle", as
 				method: request.method,
 				params: request.params,
 			});
-			responses.push(await readFrame(stdout));
+			responses.push(await readFrame(stream));
 		}
 
 		expect(responses).toHaveLength(requests.length);
@@ -144,7 +148,7 @@ test("spawned CLI black-box JSON-RPC transcript satisfies the shared oracle", as
 			method: request.method,
 			bytes: goldenBytes(responses[index]!),
 		}));
-		const committedGolden: unknown = JSON.parse(readFileSync(goldenPath, "utf8"));
+		const committedGolden = JSON.parse(readFileSync(goldenPath, "utf8")) as typeof actualGolden;
 		expect(actualGolden).toEqual(committedGolden);
 
 		const readFileResponseIndex = requests.findIndex(request => request.method === "fs/readFile");

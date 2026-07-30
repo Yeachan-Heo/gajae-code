@@ -1,0 +1,19 @@
+{
+	"receiptVersion": 1,
+	"gateId": "oracle-stable",
+	"argv": [
+		"bun",
+		"../../scripts/verify-codex-app-server-oracle.ts",
+		"--stable",
+		"--verify-frozen-subtree-oids"
+	],
+	"cwd": ".",
+	"exitCode": 0,
+	"treeHash": "7a99978b7c3dc12fabdbef8b69fc9dc8b47c12fe0cda343b90abb950e7f96915",
+	"artifacts": [
+		{
+			"path": "obligations.artifacts/oracle-stable/stdout.txt",
+			"sha256": "6d22af1e50683169f3825e66502b46cc02fec452c53bab9a501021ef376b37f1"
+		}
+	]
+}

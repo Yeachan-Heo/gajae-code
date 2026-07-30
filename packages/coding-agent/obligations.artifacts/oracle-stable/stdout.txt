@@ -1,0 +1,3 @@
+stable/json: expected 21678ad2a396047ffa933db8bd4350fe3bc7729c actual 21678ad2a396047ffa933db8bd4350fe3bc7729c OK
+stable/typescript: expected 76319ae92ff9b48824d86558d076963dc7cd6157 actual 76319ae92ff9b48824d86558d076963dc7cd6157 OK
+PASS stable schema oracle: frozen subtree OIDs verified

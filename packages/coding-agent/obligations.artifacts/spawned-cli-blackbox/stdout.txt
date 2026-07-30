@@ -1,0 +1,9 @@
+bun test v1.3.14 (0d9b296a)
+
+src/app-server/__tests__/e2e/spawned-cli-json-rpc.test.ts:
+(pass) spawned CLI black-box JSON-RPC transcript satisfies the shared oracle <duration>
+
+ 1 pass
+ 0 fail
+ 10 expect() calls
+Ran 1 test across 1 file. <duration>

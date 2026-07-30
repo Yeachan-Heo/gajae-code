@@ -1,0 +1,18 @@
+{
+	"receiptVersion": 1,
+	"gateId": "trace-replay",
+	"argv": [
+		"bun",
+		"test",
+		"src/app-server/__tests__/trace-replay.test.ts"
+	],
+	"cwd": ".",
+	"exitCode": 0,
+	"treeHash": "7a99978b7c3dc12fabdbef8b69fc9dc8b47c12fe0cda343b90abb950e7f96915",
+	"artifacts": [
+		{
+			"path": "obligations.artifacts/trace-replay/stdout.txt",
+			"sha256": "ecda2289c80793dbc51f2e4f3c9d089e396b9c359b22d613842da6a705b2adca"
+		}
+	]
+}
