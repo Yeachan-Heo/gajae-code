@@ -2840,6 +2840,53 @@ describe("ModelRegistry", () => {
 				restoreLlamaKey();
 			}
 		});
+		test("llama.cpp implicit optional auth reuses the preflight credential for discovery", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async config => (config === "!working-llama-key" ? "working-llama-key" : undefined),
+				});
+				await authStorage.set("llama.cpp", [
+					{ type: "api_key", key: "!working-llama-key" },
+					{ type: "api_key", key: "!dangling-llama-key" },
+				]);
+
+				const requestApiKeys: string[] = [];
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "http://127.0.0.1:8080/models" || url === "http://127.0.0.1:8080/props") {
+						requestApiKeys.push(new Headers(init?.headers).get("Authorization") ?? "");
+						if (url.endsWith("/props")) {
+							return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 65536 } }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(JSON.stringify({ data: [{ id: "preflight-llama-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh();
+
+				expect(requestApiKeys).toEqual(["Bearer working-llama-key", "Bearer working-llama-key"]);
+				expect(registry.find("llama.cpp", "preflight-llama-model")).toBeDefined();
+				expect(registry.getProviderDiscoveryState("llama.cpp")?.status).toBe("ok");
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "llama.cpp",
+					connectionKind: "credential",
+				});
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
 		test("credentialless OpenAI-compatible and llama.cpp discovery bypass dangling credential selectors", async () => {
 			writeRawModelsJson({
 				"credentialless-openai": {

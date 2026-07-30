@@ -16,6 +16,7 @@ type Fixture = {
 	promptDelivered: Promise<void>;
 	promptDeliveryCount: number;
 	blockedUpdateStarted: Promise<void>;
+	replayDeliveryRejected: Promise<void>;
 	releaseBlockedUpdate(): void;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
@@ -51,6 +52,7 @@ async function createFixture(
 		promptAcknowledgement?: Record<string, unknown>;
 		preAcknowledgementFrames?: Record<string, unknown>[];
 		blockAgentMessageChunk?: boolean;
+		rejectReplayDelivery?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -67,6 +69,7 @@ async function createFixture(
 	let promptSocket: TestSocket | undefined;
 	let server!: ReturnType<typeof Bun.serve>;
 	const blockedUpdateStarted = Promise.withResolvers<void>();
+	const replayDeliveryRejected = Promise.withResolvers<void>();
 	const blockedUpdate = Promise.withResolvers<void>();
 	let promptDeliveryCount = 0;
 	let blockedUpdateReleased = false;
@@ -80,6 +83,15 @@ async function createFixture(
 		if (options.blockAgentMessageChunk && update.update.sessionUpdate === "agent_message_chunk") {
 			blockedUpdateStarted.resolve();
 			await blockedUpdate.promise;
+		}
+		if (
+			options.rejectReplayDelivery &&
+			promptDeliveryCount > 0 &&
+			update.update.sessionUpdate === "session_info_update" &&
+			(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle"
+		) {
+			replayDeliveryRejected.resolve();
+			throw new Error("replayed frame delivery broke");
 		}
 	};
 
@@ -247,6 +259,7 @@ async function createFixture(
 		},
 		blockedUpdateStarted: blockedUpdateStarted.promise,
 		releaseBlockedUpdate,
+		replayDeliveryRejected: replayDeliveryRejected.promise,
 		sendStopped,
 		sendFailed,
 		sendAssistantMessage,
@@ -372,6 +385,44 @@ test("ACP delayed hello settles the captured early-terminal owner, not a later p
 		fixture.sendStopped("end_turn");
 		expect(await bounded(second, "later prompt completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		fixture.dispose();
+	}
+});
+test("ACP deferred terminal replay failure is handled without poisoning the frame queue", async () => {
+	const fixture = await createFixture({
+		blockAgentMessageChunk: true,
+		rejectReplayDelivery: true,
+		preAcknowledgementFrames: [
+			{
+				type: "event",
+				payload: {
+					event_type: "message_end",
+					event: {
+						type: "message_end",
+						message: { role: "assistant", content: [{ type: "text", text: "blocked" }] },
+					},
+				},
+			},
+		],
+		terminalBeforeAcknowledgement: true,
+	});
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown): void => {
+		unhandled.push(reason);
+	};
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const pending = prompt(fixture, "replayed terminal failure");
+		await bounded(fixture.blockedUpdateStarted, "blocked replay update");
+		expect(await bounded(pending, "replayed terminal completion")).toEqual({ stopReason: "end_turn" });
+
+		fixture.releaseBlockedUpdate();
+		await bounded(fixture.replayDeliveryRejected, "replayed frame delivery failure");
+		await Bun.sleep(20);
+		expect(unhandled).toEqual([]);
+		await expect(prompt(fixture, "after replay failure")).rejects.toMatchObject({ code: "not_found" });
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
 		fixture.dispose();
 	}
 });

@@ -1064,13 +1064,17 @@ export class AcpAgent implements Agent {
 					}
 				}
 				++record.pendingFrames;
-				record.frameTail = record.frameTail.then(async () => {
+				const task = record.frameTail.then(async () => {
 					try {
 						await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame, waiter);
 					} finally {
 						--record.pendingFrames;
 					}
 				});
+				record.frameTail = task.catch(
+					async error =>
+						await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error)),
+				);
 			}
 			this.#settlePrompt(record, waiter);
 		} catch (error) {

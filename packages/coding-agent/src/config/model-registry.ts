@@ -1880,9 +1880,13 @@ export class ModelRegistry {
 		fetched: boolean;
 	}> {
 		const provider = providerConfig.provider;
+		let preflightApiKey: string | undefined;
+		let preflightCompleted = false;
 		if (this.#optionalAuthProviders.has(provider) && this.authStorage.hasAuth(provider)) {
 			this.#credentiallessAuthFallbackProviders.delete(provider);
 			const apiKey = await this.#peekApiKeyForProvider(provider);
+			preflightApiKey = apiKey;
+			preflightCompleted = true;
 			if (apiKey === undefined) {
 				this.#credentiallessAuthFallbackProviders.add(provider);
 			}
@@ -1892,7 +1896,8 @@ export class ModelRegistry {
 		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, strategy, {
 			cacheDbPath: this.#cacheDbPath,
 			requiresAuth: provider => !this.#isCredentiallessProvider(provider.provider),
-			peekApiKey: provider => this.#peekApiKeyForProvider(provider.provider),
+			peekApiKey: async provider =>
+				preflightCompleted ? preflightApiKey : this.#peekApiKeyForProvider(provider.provider),
 			isAuthenticated,
 			fetchModels: (provider, apiKey) => this.#discoverModelsByProviderType(provider, apiKey),
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider),
