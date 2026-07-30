@@ -779,6 +779,12 @@ describe("AgentSession resilient retry", () => {
 			},
 			{
 				model: responsesModel,
+				errorMessage: "Error: Provider stream timed out while waiting for the first event",
+				settingsOverrides: { "retry.maxRetries": 10 },
+				bareDefault: false,
+			},
+			{
+				model: responsesModel,
 				errorMessage: "OpenAI responses stream timed out while waiting for the first event",
 				settingsOverrides: { "retry.maxRetries": 10 },
 				bareDefault: false,
@@ -786,6 +792,12 @@ describe("AgentSession resilient retry", () => {
 			{
 				model: completionsModel,
 				errorMessage: "Provider stream timed out while waiting for the first event",
+				settingsOverrides: undefined,
+				bareDefault: true,
+			},
+			{
+				model: completionsModel,
+				errorMessage: "Error: Provider stream timed out while waiting for the first event",
 				settingsOverrides: undefined,
 				bareDefault: true,
 			},
@@ -968,25 +980,37 @@ describe("AgentSession resilient retry", () => {
 		expect(last.errorMessage).toContain("first event");
 		expect(waitSpy).toHaveBeenCalled();
 	});
-	it("surfaces a Kimi Code first-event timeout after its continuous wait without replaying the request", async () => {
+	it("surfaces raw and wrapped Kimi Code first-event timeouts without replaying", async () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.5");
 		if (!model) throw new Error("Expected bundled Kimi Code test model to exist");
-		const requestedModels: string[] = [];
-		session = buildStatusErrorSession({
-			model,
-			errorMessage: "Provider stream timed out while waiting for the first event",
-			requestedModels,
-		});
-		const { retryStartEvents, retryEndEvents } = track(session);
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		for (const errorMessage of [
+			"Provider stream timed out while waiting for the first event",
+			"Error: Provider stream timed out while waiting for the first event",
+		]) {
+			const requestedModels: string[] = [];
+			session = buildStatusErrorSession({
+				model,
+				errorMessage,
+				requestedModels,
+				settingsOverrides: { "retry.maxRetries": 10 },
+			});
+			const { retryStartEvents, retryEndEvents } = track(session);
 
-		await session.prompt("slow Kimi request");
-		await session.waitForIdle();
+			await session.prompt("slow Kimi request");
+			await session.waitForIdle();
 
-		expect(retryStartEvents).toHaveLength(0);
-		expect(retryEndEvents).toHaveLength(0);
-		expect(requestedModels).toHaveLength(1);
-		expect(lastAssistant(session).stopReason).toBe("error");
-		expect(lastAssistant(session).errorMessage).toContain("first event");
+			expect(retryStartEvents).toHaveLength(0);
+			expect(retryEndEvents).toHaveLength(0);
+			expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
+			expect(waitSpy).not.toHaveBeenCalled();
+			expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage });
+			expect(session.isRetrying).toBe(false);
+			expect(session.isStreaming).toBe(false);
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
 	});
 
 	it("keeps first-party first-event timeout retries unbounded (#713 scope guard)", async () => {

@@ -988,6 +988,69 @@ describe("AgentSession retry fallback", () => {
 		});
 	});
 
+	it("keeps wrapped terminal-provider timeouts out of managed fallback", async () => {
+		const kimi = getBundledModel("kimi-code", "kimi-k2.5");
+		const alibabaResponses = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const alibabaCompletions = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!kimi || !alibabaResponses || !alibabaCompletions || !fallback) {
+			throw new Error("Expected bundled terminal-provider and fallback models");
+		}
+		authStorage.setRuntimeApiKey("kimi-code", "kimi-test-key");
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		for (const model of [kimi, alibabaResponses, alibabaCompletions]) {
+			const requestedModels: string[] = [];
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: requestedModel => {
+					requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+					return canonicalFirstEventTimeoutStream(
+						requestedModel,
+						[],
+						requestedModel.provider === "alibaba-token-plan" ? { kind: "transport", status: 503 } : undefined,
+					);
+				},
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"fallback.maxAttempts": 2,
+				"retry.baseDelayMs": 1,
+			});
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+			session.setConfiguredModelChain(
+				"default",
+				[`${model.provider}/${model.id}`, `${fallback.provider}/${fallback.id}`],
+				"test",
+			);
+			const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+			const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+			session.subscribe(event => {
+				if (event.type === "model_fallback_switched") switches.push(event);
+			});
+
+			await session.prompt("do not replay wrapped terminal-provider timeout");
+			await session.waitForIdle();
+
+			expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(retryEndEvents).toHaveLength(0);
+			expect(switches).toHaveLength(0);
+			expect(waitSpy).not.toHaveBeenCalled();
+			expect(session.model).toMatchObject({ provider: model.provider, id: model.id });
+			expect(getLastAssistantMessage(session)).toMatchObject({
+				provider: model.provider,
+				api: model.api,
+				stopReason: "error",
+				errorMessage: "Error: Provider stream timed out while waiting for the first event",
+			});
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
+	});
+
 	it("does not replay a Kimi Code first-event timeout through a managed fallback chain", async () => {
 		const primary = getBundledModel("kimi-code", "kimi-k2.5");
 		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1270,7 +1333,7 @@ describe("AgentSession retry fallback", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						stopReason: "error",
-						errorMessage: "Provider stream timed out while waiting for the first event",
+						errorMessage: "Error: Provider stream timed out while waiting for the first event",
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial: failure });
@@ -1299,7 +1362,7 @@ describe("AgentSession retry fallback", () => {
 		expect(getLastAssistantMessage(session)).toMatchObject({
 			provider: fallback.provider,
 			stopReason: "error",
-			errorMessage: "Provider stream timed out while waiting for the first event",
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
 		});
 
 		await session.prompt("Keep the sticky fallback on the next turn");

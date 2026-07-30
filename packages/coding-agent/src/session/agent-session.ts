@@ -873,16 +873,17 @@ type RetryErrorClassification =
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
-const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Error: Provider stream timed out while waiting for the first event";
+const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while waiting for the first event";
+const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = `Error: ${PROVIDER_FIRST_EVENT_TIMEOUT_ERROR}`;
 const PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR = "Provider stream timed out while waiting for first event";
 const BARE_DEFAULT_CODEX_OVERLOAD_ERROR = /^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"anthropic-messages": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"Anthropic stream timed out while waiting for the first event",
 	]),
 	"openai-completions": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"OpenAI completions stream timed out while waiting for the first event",
 	]),
 } as const;
@@ -890,11 +891,11 @@ const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 const ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba-token-plan";
 const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"openai-responses": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"OpenAI responses stream timed out while waiting for the first event",
 	]),
 	"openai-completions": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"OpenAI completions stream timed out while waiting for the first event",
 	]),
 } as const;
@@ -911,6 +912,11 @@ function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boole
 		facts.openaiErrorCode !== undefined ||
 		(facts.headers !== undefined && Object.keys(facts.headers).length > 0)
 	);
+}
+function terminalProviderFirstEventTimeoutIdentity(errorMessage: string): string {
+	return errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
+		? PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
+		: errorMessage;
 }
 function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
 	if (hasBareDefaultRetryDisqualifyingFacts(message)) return false;
@@ -14017,7 +14023,7 @@ export class AgentSession {
 
 	#isKimiCodeFirstEventTimeout(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || message.provider !== "kimi-code") return false;
-		const errorMessage = message.errorMessage ?? "";
+		const errorMessage = terminalProviderFirstEventTimeoutIdentity(message.errorMessage ?? "");
 		if (message.api === "anthropic-messages") {
 			return KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES["anthropic-messages"].has(errorMessage);
 		}
@@ -14044,7 +14050,8 @@ export class AgentSession {
 	#isAlibabaTokenPlanFirstEventTimeout(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || message.provider !== ALIBABA_TOKEN_PLAN_PROVIDER) return false;
 		const timeoutMessages = this.#alibabaTokenPlanTimeoutMessagesForApi(message.api);
-		return timeoutMessages?.has(message.errorMessage ?? "") ?? false;
+		const errorMessage = terminalProviderFirstEventTimeoutIdentity(message.errorMessage ?? "");
+		return timeoutMessages?.has(errorMessage) ?? false;
 	}
 
 	#isAlibabaTokenPlanCompactionTimeout(candidate: Model, errorMessage: string): boolean {
