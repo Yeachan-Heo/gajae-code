@@ -117,6 +117,40 @@ class DeferredTitleReplacementStorage extends FileSessionStorage {
 		await super.rename(from, to);
 	}
 }
+class DeferredQueuedFlushStorage extends FileSessionStorage {
+	readonly flushStarted = Promise.withResolvers<void>();
+	readonly releaseFlush = Promise.withResolvers<void>();
+	#deferNextFlush = false;
+
+	deferNextFlush(): void {
+		this.#deferNextFlush = true;
+	}
+
+	override openWriter(
+		filePath: string,
+		options?: { flags?: "a" | "w"; onError?: (error: Error) => void },
+	): SessionStorageWriter {
+		const writer = super.openWriter(filePath, options);
+		return {
+			writeLine: line => writer.writeLine(line),
+			writeLineSync: line => writer.writeLineSync(line),
+			flush: async () => {
+				if (this.#deferNextFlush) {
+					this.#deferNextFlush = false;
+					this.flushStarted.resolve();
+					await this.releaseFlush.promise;
+				}
+				await writer.flush();
+			},
+			fsync: () => writer.fsync(),
+			close: () => writer.close(),
+			closeSync: () => writer.closeSync(),
+			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
+}
 
 describe("session title source persistence", () => {
 	let testAgentDir: string;
@@ -225,6 +259,39 @@ describe("session title source persistence", () => {
 		expect(session.getSessionName()).toBeUndefined();
 		expect(getHeader(await loadEntriesFromFile(successorFile, storage))?.title).toBeUndefined();
 		expect(getHeader(await loadEntriesFromFile(predecessorFile, storage))?.title).toBe("Predecessor title");
+	});
+	it("discards an existing predecessor title when direct branching adopts a successor before its turn", async () => {
+		const storage = new DeferredQueuedFlushStorage();
+		const session = SessionManager.create(cwd, path.join(testAgentDir, "sessions"), storage);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const predecessorFile = session.getSessionFile()!;
+
+		session.appendMessage({ role: "user", content: "queued persistence", timestamp: 2 });
+		storage.deferNextFlush();
+		const earlierPersistence = session.flush();
+		await storage.flushStarted.promise;
+
+		const title = session.setSessionName("Predecessor title", "user");
+		const successorFile = session.createBranchedSession(session.getLeafId()!)!;
+		storage.releaseFlush.resolve();
+
+		await earlierPersistence;
+		await expect(title).resolves.toBe(false);
+		expect(session.getSessionFile()).toBe(successorFile);
+		expect(session.getSessionName()).toBeUndefined();
+		expect(session.titleSource).toBeUndefined();
+		expect(getHeader(await loadEntriesFromFile(successorFile, storage))?.title).toBeUndefined();
+		expect(getHeader(await loadEntriesFromFile(predecessorFile, storage))?.title).toBeUndefined();
+		expect(
+			(await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(successorFile), storage)).find(
+				candidate => candidate.path === successorFile,
+			)?.title,
+		).toBeUndefined();
+		const reopened = await SessionManager.open(successorFile, path.dirname(successorFile), storage);
+		expect(reopened.getSessionName()).toBeUndefined();
+		expect(reopened.titleSource).toBeUndefined();
 	});
 	it("keeps fresh title failures unpublished and distinguishes certified retry from ambiguous replay", async () => {
 		const certifiedStorage = new FileSessionStorage();

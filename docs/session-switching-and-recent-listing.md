@@ -39,7 +39,7 @@ There are two different listing pipelines:
 2. `SessionManager.list(...)` / `SessionManager.listAll()` (resume pickers and ID matching)
    - Reads a bounded 4KiB prefix plus at most 16KiB of trailing v4/v5 header-patch scan data for file-backed sessions.
    - Builds `SessionInfo` objects from bounded metadata and preview extraction; buried patches outside the tail budget deliberately fall back to line-1 header metadata.
-   - Drops sessions with zero `message` entries and sorts by `modified` descending. Thus a newly named, header-only session can appear in welcome summaries but is excluded from resume pickers and ID matching until a message exists.
+   - Includes header-only sessions and sorts by `modified` descending. Thus a newly named, header-only session can appear in welcome summaries, resume pickers, and ID matching before a `message` entry exists.
    - Resume-selector display data uses `title` (header title, otherwise latest prefix-visible compaction `shortSummary`) and a first user message preview; it does not use the welcome timestamp label fallback.
    - Writers maintain title projection anchors conservatively so a current renamed title remains reachable without widening this read budget. Listing is read-only: legacy or torn/buried metadata uses the documented bounded fallback until a normal append repairs the projection.
 
@@ -54,7 +54,7 @@ For recent summaries (`RecentSessionInfo`):
 For `SessionInfo` resume-selector entries:
 
 - `title` is `header.title` or the latest prefix-visible compaction `shortSummary`
-- `firstMessage` is the first user message text, or `"(no messages)"` while extracting metadata; zero-message sessions are filtered before the selector/list result is returned
+- `firstMessage` is the first user message text, or `"(no messages)"` when the session has no messages; header-only sessions remain in the selector/list result
 
 ## `--continue` resolution and terminal breadcrumb preference
 
@@ -240,4 +240,4 @@ Switch/open can still throw on true I/O failures (permission errors, rewrite fai
 
 - ID matching uses `startsWith` and takes first match in sorted list.
 - No ambiguity UI if multiple sessions share prefix.
-- `SessionManager.list(...)` excludes sessions with zero messages, so those sessions are not resumable via ID match/list picker.
+- `SessionManager.list(...)` includes sessions with zero messages, so those header-only sessions are resumable via ID match/list picker.

@@ -8232,7 +8232,7 @@ export class SessionManager {
 				} else {
 					await this.#persistPatch(
 						{ type: "header_patch", patch: { title: sanitized, titleSource: source } },
-						{ titleCommit: true },
+						{ titleCommit: true, identity: { sessionId, sessionFile, destination } },
 					);
 					if (
 						this.#sessionId !== sessionId ||
@@ -8302,7 +8302,13 @@ export class SessionManager {
 		);
 	}
 
-	async #persistPatch(record: SessionPatchRecord, options?: { titleCommit?: boolean }): Promise<void> {
+	async #persistPatch(
+		record: SessionPatchRecord,
+		options?: {
+			titleCommit?: boolean;
+			identity?: { sessionId: string; sessionFile: string | undefined; destination: SessionDestination };
+		},
+	): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
 		if (!this.storage.existsSync(this.#sessionFile)) {
 			if (options?.titleCommit)
@@ -8311,6 +8317,14 @@ export class SessionManager {
 		}
 		await this.#queuePersistTask(
 			async () => {
+				const identity = options?.identity;
+				if (
+					identity &&
+					(this.#sessionId !== identity.sessionId ||
+						this.#sessionFile !== identity.sessionFile ||
+						this.destination !== identity.destination)
+				)
+					return;
 				if (!this.#sessionFile || !this.storage.existsSync(this.#sessionFile))
 					throw new ManagedAppendOutcomeError("not_applied", "session_file_missing", undefined);
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;

@@ -95,7 +95,7 @@ Notes:
 
 - `version` is optional in v1 files; absence means v1.
 - `parentSession` is an opaque lineage string. Current code writes either a session id or a session path depending on flow (`fork`, `forkFrom`, `createBranchedSession`, or explicit `newSession({ parentSession })`). Treat as metadata, not a typed foreign key.
-- A successful `setSessionName(...)` on a fresh persistent session atomically writes a canonical header containing the accepted `title` and `titleSource`, even when there are no message entries yet. This header-only file is a valid intermediate artifact: the title is durable before success is reported to UI chrome, while resume listings exclude it until a `message` entry exists.
+- A successful `setSessionName(...)` on a fresh persistent session whose file is absent atomically writes a canonical header containing the accepted `title` and `titleSource`, even when there are no message entries yet. For an existing session file, accepted title changes append `header_patch` records instead. A header-only file is a valid intermediate artifact: the title is durable before success is reported to UI chrome and is included in resume listings and ID matching before any `message` entry exists.
 
 ### Entry Base (`SessionEntryBase`)
 
@@ -478,7 +478,7 @@ Writes are serialized through an internal promise chain (`#persistChain`) and `N
 
 - `flush()` flushes writer and calls `fsync()`.
 - Atomic full rewrites (`#rewriteFile`) write to temp file, flush+fsync, close, then rename over target.
-- Used for migrations, `setSessionName`, `rewriteEntries`, move operations, and tool-call arg rewrites.
+- Used for migrations, absent-file title initialization, `rewriteEntries`, move operations, and tool-call arg rewrites; title changes for existing session files append `header_patch` records.
 
 ### Error behavior
 
@@ -523,7 +523,7 @@ Defined in `session-manager.ts`:
 - `list(cwd, sessionDir?)` -> sessions in one project scope
 - `listAll()` -> sessions across all project scopes under `~/.gjc/agent/sessions`
 
-Metadata extraction reads a bounded 4KiB prefix and, for v4/v5 header patches, up to 16KiB of trailing scan data where possible. Welcome naming is explicit title -> prefix-visible first user prompt -> `Untitled · <local HH:MM>`; resume-list entries use title/summary and first-message data, and omit zero-message sessions.
+Metadata extraction reads a bounded 4KiB prefix and, for v4/v5 header patches, up to 16KiB of trailing scan data where possible. Welcome naming is explicit title -> prefix-visible first user prompt -> `Untitled · <local HH:MM>`; resume-list entries use title/summary and first-message data, and include header-only sessions.
 
 ## Related but Distinct: Prompt History Storage
 
