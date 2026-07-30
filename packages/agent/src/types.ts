@@ -709,13 +709,39 @@ export type AgentEvent =
 	  }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start"; scope?: AttemptScope }
-	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[]; scope?: AttemptScope }
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
-	| { type: "message_start"; message: AgentMessage }
+	| { type: "message_start"; message: AgentMessage; scope?: AttemptScope }
 	// Only emitted for assistant messages during streaming
-	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
-	| { type: "message_end"; message: AgentMessage }
+	| {
+			type: "message_update";
+			message: AgentMessage;
+			assistantMessageEvent: AssistantMessageEvent;
+			scope?: AttemptScope;
+	  }
+	| { type: "message_end"; message: AgentMessage; scope?: AttemptScope }
 	// Tool execution lifecycle
-	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any; intent?: string }
-	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError?: boolean };
+	| {
+			type: "tool_execution_start";
+			toolCallId: string;
+			toolName: string;
+			args: any;
+			intent?: string;
+			scope?: AttemptScope;
+	  }
+	| {
+			type: "tool_execution_update";
+			toolCallId: string;
+			toolName: string;
+			args: any;
+			partialResult: any;
+			scope?: AttemptScope;
+	  }
+	| {
+			type: "tool_execution_end";
+			toolCallId: string;
+			toolName: string;
+			result: any;
+			isError?: boolean;
+			scope?: AttemptScope;
+	  };

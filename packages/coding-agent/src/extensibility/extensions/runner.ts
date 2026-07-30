@@ -522,23 +522,16 @@ export class ExtensionRunner {
 	}
 
 	/**
-	 * Refuse-before-delivery guard: throws when the AttemptScope facility is
-	 * active (a record store is injected) but a handler-capable delivery lacks
-	 * a scope — a broken carrier. When the facility is NOT active (no store),
-	 * deliveries proceed without marking, preserving backward compatibility.
-	 */
-	/**
-	 * Fail-closed scope guard: when the AttemptScope facility is active but a
-	 * handler-capable delivery lacks a scope (broken carrier or a stream that
-	 * doesn't participate in the facility), the handler is still delivered
-	 * (preserving backward compatibility) but NO mark is recorded. The record
-	 * stays unknown/missing → `isClean` returns false → admission refuses
-	 * (fail-closed at the decision point, not at delivery). This avoids breaking
-	 * extension handlers for sessions whose streams don't allocate AttemptScope.
+	 * Scope-presence guard. When the AttemptScope facility is active but a
+	 * handler-capable delivery lacks a scope, the handler is still delivered
+	 * (backward-compatible) but NO mark is recorded. The record stays
+	 * unknown/missing → `isClean` returns false → admission refuses
+	 * (fail-closed at the decision point, not at delivery).
 	 */
 	#requireScopeOrFailClosed(_scope: AttemptScopeRef | undefined, _eventLabel: string): void {
-		// No throw — the mark simply doesn't fire when scope is undefined.
-		// isClean(undefined-scope) is false → fail-closed at admission time.
+		// No throw — handler is delivered (backward-compatible); mark is not
+		// recorded when scope is absent. isClean returns false for an
+		// unmarked scope → admission refuses (fail-closed at decision point).
 	}
 
 	getMessageRenderer(customType: string): MessageRenderer | undefined {

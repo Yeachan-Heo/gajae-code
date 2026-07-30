@@ -325,8 +325,8 @@ export function agentLoop(
 			if (emitAgentStart) stream.push({ type: "agent_start", ...(scope ? { scope } : {}) });
 			attemptStream.push({ type: "turn_start", ...(scope ? { scope } : {}) });
 			for (const prompt of prompts) {
-				stream.push({ type: "message_start", message: prompt });
-				stream.push({ type: "message_end", message: prompt });
+				stream.push({ type: "message_start", message: prompt, scope });
+				stream.push({ type: "message_end", message: prompt, scope });
 			}
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction, scope);
 		} catch (err) {
@@ -1450,8 +1450,8 @@ async function runLoopBody(
 			// discarded managed attempt cannot lose it before its retry continuation.
 			if (pendingMessages.length > 0) {
 				for (const message of pendingMessages) {
-					stream.push({ type: "message_start", message });
-					stream.push({ type: "message_end", message });
+					stream.push({ type: "message_start", message, scope: attemptScope });
+					stream.push({ type: "message_end", message, scope: attemptScope });
 					currentContext.messages.push(message);
 					newMessages.push(message);
 				}
@@ -1732,7 +1732,7 @@ async function runLoopBody(
 						status: message.stopReason === "aborted" ? "aborted" : "error",
 					});
 				}
-				stream.push({ type: "turn_end", message, toolResults });
+				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
 				publishAgentEnd(
 					stream,
 					config,
@@ -1810,7 +1810,7 @@ async function runLoopBody(
 				recoveryState.syntheticMessage = undefined;
 			}
 
-			stream.push({ type: "turn_end", message, toolResults });
+			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
 				pendingMessages = steeringMessagesFromExecution;
@@ -2052,7 +2052,7 @@ async function streamAssistantResponse(
 				throw new Error("Prompt resource ownership is unavailable");
 			if (requestSignal?.aborted) {
 				providerReservation?.ok && providerReservation.lease.closeDiscovery();
-				const aborted = emitAbortedAssistantMessage(null, false, context, config, stream);
+				const aborted = emitAbortedAssistantMessage(null, false, context, config, stream, scope);
 				await finishChat(aborted);
 				return aborted;
 			}
@@ -2125,7 +2125,7 @@ async function streamAssistantResponse(
 				try {
 					const responseOrAbort = await Promise.race([responsePromise, factoryAbort]);
 					if (responseOrAbort === ABORTED) {
-						const aborted = emitAbortedAssistantMessage(null, false, context, config, stream);
+						const aborted = emitAbortedAssistantMessage(null, false, context, config, stream, scope);
 						await finishChat(aborted);
 						closeLateFactoryResponse();
 						return aborted;
@@ -2169,7 +2169,14 @@ async function streamAssistantResponse(
 			if (requestSignal) {
 				if (requestSignal.aborted) {
 					closeIterator();
-					const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
+					const aborted = emitAbortedAssistantMessage(
+						partialMessage,
+						addedPartial,
+						context,
+						config,
+						stream,
+						scope,
+					);
 					await finishChat(aborted);
 					return aborted;
 				}
@@ -2187,7 +2194,14 @@ async function streamAssistantResponse(
 						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
 						if (result === ABORTED) {
 							closeIterator();
-							const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
+							const aborted = emitAbortedAssistantMessage(
+								partialMessage,
+								addedPartial,
+								context,
+								config,
+								stream,
+								scope,
+							);
 							await finishChat(aborted);
 							return aborted;
 						}
@@ -2196,7 +2210,14 @@ async function streamAssistantResponse(
 						next = await responseIterator.next();
 					}
 					if (requestSignal?.aborted) {
-						const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
+						const aborted = emitAbortedAssistantMessage(
+							partialMessage,
+							addedPartial,
+							context,
+							config,
+							stream,
+							scope,
+						);
 						await finishChat(aborted);
 						return aborted;
 					}
@@ -2215,7 +2236,7 @@ async function streamAssistantResponse(
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
-							stream.push({ type: "message_start", message: { ...partialMessage } });
+							stream.push({ type: "message_start", message: { ...partialMessage }, scope });
 							break;
 
 						case "toolChoiceIncapability":
@@ -2246,6 +2267,7 @@ async function streamAssistantResponse(
 									type: "message_update",
 									assistantMessageEvent: partialEvent,
 									message: { ...partialMessage },
+									scope,
 								});
 							}
 							break;
@@ -2261,9 +2283,9 @@ async function streamAssistantResponse(
 								context.messages.push(finalMessage);
 							}
 							if (!addedPartial) {
-								stream.push({ type: "message_start", message: { ...finalMessage } });
+								stream.push({ type: "message_start", message: { ...finalMessage }, scope });
 							}
-							stream.push({ type: "message_end", message: finalMessage });
+							stream.push({ type: "message_end", message: finalMessage, scope });
 							await finishChat(finalMessage);
 							return finalMessage;
 						}
@@ -2296,6 +2318,7 @@ function emitAbortedAssistantMessage(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
+	scope?: AttemptScope,
 ): AssistantMessage {
 	const errorMessage = "Request was aborted";
 	const now = Date.now();
@@ -2320,9 +2343,9 @@ function emitAbortedAssistantMessage(
 	if (addedPartial) {
 		context.messages.pop();
 	} else {
-		stream.push({ type: "message_start", message: { ...abortedMessage } });
+		stream.push({ type: "message_start", message: { ...abortedMessage }, scope });
 	}
-	stream.push({ type: "message_end", message: abortedMessage });
+	stream.push({ type: "message_end", message: abortedMessage, scope });
 	return abortedMessage;
 }
 
@@ -2431,6 +2454,7 @@ async function executeToolCalls(
 				toolName: toolCall.name,
 				args: record.args,
 				intent: toolCall.intent,
+				scope,
 			});
 		}
 		stream.push({
@@ -2439,6 +2463,7 @@ async function executeToolCalls(
 			toolName: toolCall.name,
 			result,
 			isError,
+			scope,
 		});
 
 		const toolResultMessage: ToolResultMessage = {
@@ -2456,8 +2481,8 @@ async function executeToolCalls(
 		record.resultEmitted = true;
 		emittedToolResults.push(toolResultMessage);
 
-		stream.push({ type: "message_start", message: toolResultMessage });
-		stream.push({ type: "message_end", message: toolResultMessage });
+		stream.push({ type: "message_start", message: toolResultMessage, scope });
+		stream.push({ type: "message_end", message: toolResultMessage, scope });
 	};
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
@@ -2495,6 +2520,7 @@ async function executeToolCalls(
 			toolName: toolCall.name,
 			args: argsForExecution,
 			intent: toolCall.intent,
+			scope,
 		});
 
 		const toolSpan = startExecuteToolSpan(telemetry, {
@@ -2594,6 +2620,7 @@ async function executeToolCalls(
 							toolName: toolCall.name,
 							args: effectiveArgs,
 							partialResult: coerceToolResult(partialResult).result,
+							scope,
 						});
 					},
 					toolContext,

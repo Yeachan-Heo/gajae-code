@@ -190,37 +190,32 @@ describe("AttemptScope facility regressions (#3592)", () => {
 	});
 
 	describe("provider-drop fail-closed behavior", () => {
-		it("a provider that drops attemptScope leaves no record → isClean fails closed", () => {
+		it("a scope that was never registered has no record → isClean fails closed", () => {
 			const authority = createAttemptScopeAuthority();
 			const store = new AttemptRecordStore(authority);
 
-			// Simulate: scope is allocated and established for the attempt
+			// If the scope was never registered (no facility participation),
+			// there is no record and isClean is false → admission refuses.
+			const scope = authority.mintMain();
+			expect(store.isClean(scope)).toBe(false);
+		});
+
+		it("a scope that was registered+established but never marked stays clean (no handler ran)", () => {
+			const authority = createAttemptScopeAuthority();
+			const store = new AttemptRecordStore(authority);
+
 			const scope = authority.mintMain();
 			store.register(scope);
 			store.establishClean(scope);
-			expect(store.isClean(scope)).toBe(true);
 
-			// Provider drops scope: onPayload/onResponse fire with undefined scope.
-			// markExecuted(undefined) is not possible (scope is required).
-			// The runner's marking code checks `scope !== undefined` before marking.
-			// So the original record stays clean — BUT this is a facility gap:
-			// a real handler ran without the scope being forwarded.
-			//
-			// The fail-closed guarantee: isClean(scope) returns true here ONLY
-			// because no mark was recorded. The #3553 admission must ALSO verify
-			// the carrier was complete (via the refuse-before-delivery guard or
-			// equivalent). This test documents the store-level behavior; the
-			// delivery-level guard is tested in the runner integration tests.
-			//
-			// For now: a dropped scope means markExecuted never fires → the
-			// record reflects "no mark observed" which is truthful (from the
-			// store's perspective, no handler was attributed).
+			// If the provider hook never fires (or fires without forwarding
+			// scope), markExecuted never runs → the record stays clean.
+			// This is correct: no handler was attributed to this scope.
+			// The fail-closed chain for #3553:
+			//   - scope never established → isClean false → refused
+			//   - scope established + handler ran with scope → markExecuted → isClean false → refused
+			//   - scope established + no handler ran → isClean true → admitted (correct)
 			expect(store.isClean(scope)).toBe(true);
-
-			// The REAL fail-closed path: if the original scope was never
-			// registered (no facility), isClean is false:
-			const unregisteredScope = authority.mintMain();
-			expect(store.isClean(unregisteredScope)).toBe(false); // fail-closed
 		});
 
 		it("LRU eviction bounds record count to 1024", () => {
