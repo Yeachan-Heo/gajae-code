@@ -39,6 +39,7 @@ export type ResolveManagedSessionScopeResult =
 				| "sessions_root_unavailable"
 				| "binding_conflict"
 				| "binding_invalid"
+				| "migration_busy"
 				| "atomic_unavailable"
 				| "durability_not_provable"
 				| "durability_failed"

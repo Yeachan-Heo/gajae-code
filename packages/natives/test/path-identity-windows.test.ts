@@ -8,6 +8,7 @@ import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
 	exactRemoveDirectoryTree,
+	exactReplacePath,
 	exactRestore,
 	exactUnlink,
 	renameNoReplacePath,
@@ -87,6 +88,67 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(exactUnlink(file, identity)).toEqual({ ok: false, code: "reparse_point" });
 		expect(await fs.readFile(path.join(relocated, "state.jsonl"), "utf8")).toBe("authorized");
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "reparse_point" });
+	});
+	it("binds exact replacement to both staged source and destination identities", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.json");
+		const destination = path.join(root, "state.json");
+		await fs.writeFile(source, "new-state");
+		await fs.writeFile(destination, "old-state");
+		const sourceStat = await fs.stat(source, { bigint: true });
+		const destinationStat = await fs.stat(destination, { bigint: true });
+		const sourceIdentity = {
+			dev: sourceStat.dev,
+			ino: sourceStat.ino,
+			size: sourceStat.size,
+			mtimeNs: sourceStat.mtimeNs,
+			sha256: sha256("new-state"),
+		};
+		const destinationIdentity = {
+			dev: destinationStat.dev,
+			ino: destinationStat.ino,
+			size: destinationStat.size,
+			mtimeNs: destinationStat.mtimeNs,
+			sha256: sha256("old-state"),
+		};
+		expect(exactReplacePath(source, destination, sourceIdentity, destinationIdentity)).toEqual({ ok: true });
+		expect(await fs.readFile(destination, "utf8")).toBe("new-state");
+		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("rejects a substituted staged source before deleting the exact destination", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.json");
+		const retainedSource = path.join(root, "retained-staged.json");
+		const destination = path.join(root, "state.json");
+		await fs.writeFile(source, "authorized-stage");
+		await fs.writeFile(destination, "old-state");
+		const sourceStat = await fs.stat(source, { bigint: true });
+		const destinationStat = await fs.stat(destination, { bigint: true });
+		const sourceIdentity = {
+			dev: sourceStat.dev,
+			ino: sourceStat.ino,
+			size: sourceStat.size,
+			mtimeNs: sourceStat.mtimeNs,
+			sha256: sha256("authorized-stage"),
+		};
+		const destinationIdentity = {
+			dev: destinationStat.dev,
+			ino: destinationStat.ino,
+			size: destinationStat.size,
+			mtimeNs: destinationStat.mtimeNs,
+			sha256: sha256("old-state"),
+		};
+		await fs.rename(source, retainedSource);
+		await fs.writeFile(source, "substituted-stage");
+
+		expect(exactReplacePath(source, destination, sourceIdentity, destinationIdentity)).toEqual({
+			ok: false,
+			code: "identity_mismatch",
+		});
+		expect(await fs.readFile(destination, "utf8")).toBe("old-state");
+		expect(await fs.readFile(source, "utf8")).toBe("substituted-stage");
+		expect(await fs.readFile(retainedSource, "utf8")).toBe("authorized-stage");
 	});
 	it("rejects a replaced ancestor junction during exact restore and retains detached content", async () => {
 		const root = await temporaryDirectory();

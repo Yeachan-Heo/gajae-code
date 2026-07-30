@@ -1091,7 +1091,11 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 						await writeStateFileSync(stateFile, payload);
 					}),
 			),
-	);
+	).catch(error => {
+		const sessionRoot = path.resolve(path.dirname(stateFile), "..");
+		if ((error as NodeJS.ErrnoException).code === "ENOENT" && !fsSync.existsSync(sessionRoot)) return;
+		throw error;
+	});
 }
 
 export function registerCoordinatorRuntimeStateFinalizer(context: RuntimeStateContext): () => void {

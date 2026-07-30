@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	artifactTreeReplayCompatible,
 	deleteManagedSessionCandidate,
 	listManagedCandidates,
 	MANAGED_SESSION_BINDING_FILE,
@@ -411,6 +412,50 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 });
 
 describe("managed session write protocol", () => {
+	it("accepts partial scrubbed replay trees but rejects moved or rootless entries", () => {
+		const expected = {
+			rootDev: "1",
+			rootIno: "2",
+			entries: [
+				{ relativePath: "", kind: "directory" as const, dev: "1", ino: "2", size: "0", mtimeNs: "1", ctimeNs: "1" },
+				{
+					relativePath: "a.bin",
+					kind: "file" as const,
+					dev: "1",
+					ino: "3",
+					size: "4",
+					mtimeNs: "2",
+					ctimeNs: "2",
+					sha256: "a".repeat(64),
+				},
+				{
+					relativePath: "b.bin",
+					kind: "file" as const,
+					dev: "1",
+					ino: "4",
+					size: "5",
+					mtimeNs: "3",
+					ctimeNs: "3",
+					sha256: "b".repeat(64),
+				},
+			],
+		};
+		const root = expected.entries[0]!;
+		const scrubbedB = {
+			...expected.entries[2]!,
+			size: "0",
+			sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		};
+		expect(artifactTreeReplayCompatible({ ...expected, entries: [root, scrubbedB] }, expected)).toBe(true);
+		expect(artifactTreeReplayCompatible({ ...expected, entries: [root] }, expected)).toBe(true);
+		expect(
+			artifactTreeReplayCompatible(
+				{ ...expected, entries: [root, { ...scrubbedB, relativePath: "moved.bin" }] },
+				expected,
+			),
+		).toBe(false);
+		expect(artifactTreeReplayCompatible({ ...expected, entries: [scrubbedB] }, expected)).toBe(false);
+	});
 	it("revalidates an existing canonical binding without a Windows fsync failure", async () => {
 		const { scope } = await fixture();
 
@@ -1041,6 +1086,44 @@ describe("managed session write protocol", () => {
 		).toBe(false);
 		expect(listManagedCandidates(fresh.scope)).toMatchObject({ kind: "complete", owned: [] });
 		restoreCleanup();
+	});
+
+	it("preserves migration_busy when tombstone reconciliation lock is held", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "busy-tombstone.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("busy-tombstone", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+		const opened = await openManagedCandidateForWrite(scope, listed.owned[0]);
+		if (opened.kind !== "opened") throw new Error(opened.message);
+
+		const nativeExactUnlink = native.exactUnlink;
+		const unlink = vi
+			.spyOn(native, "exactUnlink")
+			.mockImplementation((pathname, identity) =>
+				pathname === opened.path ? { ok: false, code: "io_error" } : nativeExactUnlink(pathname, identity),
+			);
+		try {
+			await expect(deleteManagedSessionCandidate(scope, opened.candidate)).resolves.toMatchObject({
+				kind: "error",
+				code: "durability_failed",
+			});
+		} finally {
+			unlink.mockRestore();
+		}
+
+		const lock = vi.spyOn(managedSessionStorage, "acquireManagedLock").mockRejectedValue(new Error("migration_busy"));
+		try {
+			await expect(prepareManagedSessionScopeForWrite(scope)).resolves.toMatchObject({
+				kind: "error",
+				code: "migration_busy",
+				message: "migration_busy",
+			});
+		} finally {
+			lock.mockRestore();
+		}
 	});
 
 	it("treats a symlinked committed receipt as untrusted and keeps the retained legacy transcript visible", async () => {

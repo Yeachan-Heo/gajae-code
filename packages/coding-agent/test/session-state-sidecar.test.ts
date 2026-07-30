@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	eventAffectsCoordinatorRuntimeState,
@@ -78,6 +79,7 @@ function git(cwd: string, args: string[]): void {
 }
 
 afterEach(async () => {
+	FileLockTestHooks.afterParentMkdir = undefined;
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
 	if (ORIGINAL_SESSION_ID === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
@@ -100,6 +102,28 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 }
 
 describe("coordinator runtime state sidecar", () => {
+	it("ignores a session root removed between postmortem lock parent creation and acquisition", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, ".gjc", "_session-removed", "state", "runtime-state.json");
+		const sessionRoot = path.resolve(path.dirname(stateFile), "..");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		let removed = false;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (removed || !lockPath.endsWith("mutation.lock.lock")) return;
+			removed = true;
+			await fs.rm(sessionRoot, { recursive: true, force: true });
+		};
+
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+				sessionId: "removed",
+				cwd: root,
+				sessionFile: null,
+			}),
+		).resolves.toBeUndefined();
+		expect(removed).toBe(true);
+		expect(fsSync.existsSync(sessionRoot)).toBe(false);
+	});
 	it("reports whether events affect coordinator runtime state", () => {
 		const events = [
 			{ event: { type: "message_update", message: {}, assistantMessageEvent: {} }, affects: false },

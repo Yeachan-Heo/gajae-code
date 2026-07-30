@@ -844,14 +844,15 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
 export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): NativeExactUnlinkResult
 
 /**
- * Replace a staged regular file only after deleting the exact expected
+ * Replace a staged regular file only after validating the exact staged source
+ * and deleting the exact expected destination.
  *
- * The expected destination identity must describe a regular file, not a
- * directory or detach-only request.
- * Publication uses a retained source handle and a no-replace rename, so a
- * successor installed after deletion is preserved.
+ * Both identities must describe regular files, not directories or detach-only
+ * requests. Publication uses the retained verified source handle and a
+ * no-replace rename, so source substitution is rejected and a destination
+ * successor is preserved.
  */
-export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
+export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
  * Restore only the detached object that still has the supplied platform
