@@ -118,7 +118,7 @@ export class SelectList implements Component {
 
 		// If no items match filter, show message
 		if (this.#filteredItems.length === 0) {
-			lines.push(this.theme.noMatch("  No matching commands"));
+			lines.push(truncateToWidth(this.theme.noMatch("  No matching commands"), Math.max(0, width), Ellipsis.Omit));
 			return lines;
 		}
 

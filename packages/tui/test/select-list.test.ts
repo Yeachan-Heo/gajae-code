@@ -203,6 +203,30 @@ describe("SelectList", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	it.each([10, 0])("bounds the no-match row to render width %d", width => {
+		const list = new SelectList([{ value: "run", label: "run" }], 5, testTheme);
+		list.setFilter("missing");
+
+		const rendered = list.render(width);
+
+		expect(rendered).toHaveLength(1);
+		expect(visibleWidth(rendered[0])).toBeLessThanOrEqual(width);
+	});
+
+	it("preserves ANSI styling while bounding the no-match row", () => {
+		const list = new SelectList([{ value: "run", label: "run" }], 5, {
+			...testTheme,
+			noMatch: text => `\x1b[31m${text}\x1b[0m`,
+		});
+		list.setFilter("missing");
+
+		const [row] = list.render(10);
+
+		expect(visibleWidth(row)).toBeLessThanOrEqual(10);
+		expect(row).toContain("\x1b[31m");
+		expect(row).toContain("\x1b[0m");
+	});
+
 	it("preserves enabled-only callbacks when arrow navigation wraps to the same item", () => {
 		const changed: string[] = [];
 		const list = new SelectList([{ value: "only", label: "only" }], 5, testTheme);
