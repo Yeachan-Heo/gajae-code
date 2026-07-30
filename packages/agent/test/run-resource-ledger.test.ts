@@ -112,7 +112,13 @@ describe("run resource ledger", () => {
 			status: "unfenced",
 			pending: [{ kind: "tool", label: "late registration" }],
 		});
+		// Quarantine is terminal: resolving the late work retires nothing, because the
+		// entry only ever reached the bounded tombstone and never entered settlement
+		// accounting, so the run stays unfenced instead of re-opening as settled.
 		late.resolve();
+		await Promise.resolve();
+		expect(ledger.pending("run")).toMatchObject([{ kind: "tool", label: "late registration" }]);
+		expect(await ledger.waitForSettlement("run", { graceMs: 0 })).toMatchObject({ status: "unfenced" });
 	});
 
 	test("bounds the public quarantine tombstone", async () => {
@@ -230,9 +236,16 @@ describe("run resource ledger", () => {
 		const domain = ledger.open("sealed-root");
 		ledger.seal("sealed-root");
 
+		// The seal boundary rejects genuinely new root work in two steps: the first
+		// reservation reports `sealed` and itself quarantines the run, so every
+		// reservation after that reports `quarantined` instead.
 		expect(ledger.reserveProducer("sealed-root", domain, "post_prompt", "late-root")).toEqual({
 			ok: false,
 			reason: "sealed",
+		});
+		expect(ledger.reserveProducer("sealed-root", domain, "post_prompt", "later-root")).toEqual({
+			ok: false,
+			reason: "quarantined",
 		});
 		expect(ledger.lookupDomain("sealed-root")).toBeUndefined();
 	});
