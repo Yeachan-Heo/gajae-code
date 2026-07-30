@@ -164,4 +164,35 @@ describe("OpenAI-compatible request transforms", () => {
 		});
 		expect("reasoning_effort" in body).toBe(false);
 	});
+	it("preserves endpoint query parameters for responses and chat completions", async () => {
+		const capturedUrls: string[] = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			capturedUrls.push(String(input));
+			return capturedUrls.length === 1 ? responsesSseResponse() : completionsSseResponse();
+		});
+		global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
+
+		const responsesModel: Model<"openai-responses"> = {
+			...(getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">),
+			provider: "proxy",
+			baseUrl: "https://gateway.example/v1?tenant=alpha",
+		};
+		for await (const event of streamOpenAIResponses(responsesModel, context, { apiKey: "test-key" })) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		const completionsModel: Model<"openai-completions"> = {
+			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">),
+			provider: "proxy",
+			baseUrl: "https://gateway.example/v1?tenant=alpha",
+		};
+		for await (const event of streamOpenAICompletions(completionsModel, context, { apiKey: "test-key" })) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect(capturedUrls).toEqual([
+			"https://gateway.example/v1/responses?tenant=alpha",
+			"https://gateway.example/v1/chat/completions?tenant=alpha",
+		]);
+	});
 });

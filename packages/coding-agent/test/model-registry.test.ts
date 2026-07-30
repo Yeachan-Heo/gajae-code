@@ -4270,7 +4270,9 @@ describe("ModelRegistry", () => {
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
 				{ provider: "discovery-provider", connectionKind: "credential" },
 			]);
-			expect(registry.find("discovery-provider", "runtime-model")?.baseUrl).toBe("https://runtime.example.com/v1");
+			expect(registry.find("discovery-provider", "runtime-model")?.baseUrl).toBe(
+				"https://runtime.example.com/v1?tenant=alpha",
+			);
 		});
 		test("does not restore configured discovery evidence after a transport override", async () => {
 			writeRawModelsJson({

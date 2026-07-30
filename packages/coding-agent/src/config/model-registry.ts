@@ -2328,7 +2328,7 @@ export class ModelRegistry {
 	): Promise<Model<Api>[]> {
 		const baseUrl = this.#normalizeOpenAIModelsListBaseUrl(providerConfig.baseUrl);
 		const modelsUrl = new URL(baseUrl);
-		const requestBaseUrl = this.#stripEndpointQuery(baseUrl);
+		const requestBaseUrl = baseUrl;
 		modelsUrl.pathname = `${modelsUrl.pathname.replace(/\/+$/g, "")}/models`;
 
 		const headers: Record<string, string> = { ...(providerConfig.headers ?? {}) };
@@ -2418,15 +2418,6 @@ export class ModelRegistry {
 			return `${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search}`;
 		} catch {
 			return endpoint.replace(/\/+$/g, "");
-		}
-	}
-	#stripEndpointQuery(baseUrl: string): string {
-		try {
-			const parsed = new URL(baseUrl);
-			parsed.search = "";
-			return parsed.toString();
-		} catch {
-			return baseUrl;
 		}
 	}
 	#isCredentiallessProvider(provider: string): boolean {
@@ -2543,7 +2534,7 @@ export class ModelRegistry {
 		);
 		return {
 			...entry,
-			baseUrl: baseUrl === undefined ? undefined : this.#stripEndpointQuery(baseUrl),
+			baseUrl,
 			headers,
 			// Preserve the model's existing transport when the override omits one;
 			// providers without a `transport` field keep the default per-API dispatch.

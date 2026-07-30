@@ -163,6 +163,21 @@ function resolveOpenAIProviderBaseUrl(
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 }
+function splitOpenAIEndpointQuery(baseUrl: string | undefined): {
+	baseUrl: string | undefined;
+	defaultQuery: Record<string, string> | undefined;
+} {
+	if (!baseUrl) return { baseUrl, defaultQuery: undefined };
+	try {
+		const url = new URL(baseUrl);
+		const defaultQuery = Object.fromEntries(url.searchParams);
+		if (Object.keys(defaultQuery).length === 0) return { baseUrl, defaultQuery: undefined };
+		url.search = "";
+		return { baseUrl: url.toString(), defaultQuery };
+	} catch {
+		return { baseUrl, defaultQuery: undefined };
+	}
+}
 
 /** Test seam: the provider base URL as resolved from trusted env. */
 export function resolveOpenAIProviderBaseUrlForTest(
@@ -494,13 +509,15 @@ function createClient(
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);
+	const { baseUrl: clientBaseUrl, defaultQuery } = splitOpenAIEndpointQuery(baseUrl);
 	return {
 		client: new OpenAI({
 			apiKey,
-			baseURL: baseUrl,
+			baseURL: clientBaseUrl,
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
+			defaultQuery,
 			fetch: onSseEvent
 				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
 				: transformedFetch,

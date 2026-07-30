@@ -111,6 +111,21 @@ function resolveOpenAIProviderBaseUrl(
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 }
+function splitOpenAIEndpointQuery(baseUrl: string | undefined): {
+	baseUrl: string | undefined;
+	defaultQuery: Record<string, string> | undefined;
+} {
+	if (!baseUrl) return { baseUrl, defaultQuery: undefined };
+	try {
+		const url = new URL(baseUrl);
+		const defaultQuery = Object.fromEntries(url.searchParams);
+		if (Object.keys(defaultQuery).length === 0) return { baseUrl, defaultQuery: undefined };
+		url.search = "";
+		return { baseUrl: url.toString(), defaultQuery };
+	} catch {
+		return { baseUrl, defaultQuery: undefined };
+	}
+}
 
 /** Test seam: the provider base URL as resolved from trusted env. */
 export function resolveOpenAICompletionsBaseUrlForTest(
@@ -1109,6 +1124,8 @@ async function createClient(
 		}
 		azureDefaultQuery = { "api-version": apiVersion };
 	}
+	const { baseUrl: clientBaseUrl, defaultQuery: endpointDefaultQuery } = splitOpenAIEndpointQuery(baseUrl);
+	const defaultQuery = { ...endpointDefaultQuery, ...azureDefaultQuery };
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
 	const baseFetch = fetchOverride ?? fetch;
 	const wrappedFetch = Object.assign(
@@ -1169,11 +1186,11 @@ async function createClient(
 	return {
 		client: new OpenAI({
 			apiKey,
-			baseURL: baseUrl,
+			baseURL: clientBaseUrl,
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
-			defaultQuery: azureDefaultQuery,
+			defaultQuery: Object.keys(defaultQuery).length > 0 ? defaultQuery : undefined,
 			fetch: debugFetch,
 			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 		}),
