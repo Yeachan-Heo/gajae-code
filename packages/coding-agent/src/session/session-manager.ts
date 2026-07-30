@@ -6173,6 +6173,7 @@ export class SessionManager {
 				const candidate = listing.owned.find(candidate => path.resolve(candidate.path) === requestedPath);
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
 				const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
+				if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
 				if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
 					throw new Error(`Could not delete managed session: ${deleted.message}`);
 			} else {
@@ -9864,6 +9865,7 @@ export class SessionManager {
 		const candidate = listing.owned.find(item => path.resolve(item.path) === path.resolve(sessionPath));
 		if (!candidate) throw new Error("Session is not an authorized managed candidate.");
 		const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
+		if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
 		if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
 			throw new Error(`Could not delete managed session: ${deleted.message}`);
 	}

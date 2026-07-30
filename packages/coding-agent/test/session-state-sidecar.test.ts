@@ -124,6 +124,30 @@ describe("coordinator runtime state sidecar", () => {
 		expect(removed).toBe(true);
 		expect(fsSync.existsSync(sessionRoot)).toBe(false);
 	});
+	it("does not suppress a nested state lock failure while the owning session root remains", async () => {
+		const root = await tempRoot();
+		const sessionRoot = path.join(root, ".gjc", "_session-present");
+		const stateFile = path.join(sessionRoot, "runtime", "nested", "runtime-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		await fs.mkdir(sessionRoot, { recursive: true });
+		await fs.writeFile(path.join(sessionRoot, "owner.marker"), "present");
+		let removed = false;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (removed || !lockPath.endsWith("mutation.lock.lock")) return;
+			removed = true;
+			await fs.rm(path.dirname(lockPath), { recursive: true, force: true });
+		};
+
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+				sessionId: "present",
+				cwd: root,
+				sessionFile: null,
+			}),
+		).rejects.toMatchObject({ code: "ENOENT" });
+		expect(removed).toBe(true);
+		expect(fsSync.existsSync(sessionRoot)).toBe(true);
+	});
 	it("reports whether events affect coordinator runtime state", () => {
 		const events = [
 			{ event: { type: "message_update", message: {}, assistantMessageEvent: {} }, affects: false },

@@ -241,7 +241,8 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 
 async function tryAcquireLock(lockPath: string): Promise<LockInfo | null> {
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
-	await FileLockTestHooks.afterParentMkdir?.(lockPath);
+	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
+	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	try {
 		await fs.mkdir(lockPath);
 		return await writeLockInfo(lockPath);

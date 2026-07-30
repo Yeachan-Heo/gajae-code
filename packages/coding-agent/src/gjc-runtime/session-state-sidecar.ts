@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
-import { sessionRuntimeDir } from "./session-layout";
+import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
 	lifecyclePaths,
@@ -1022,6 +1022,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	const identity = normalizedIdentity(context);
+	const ownerSessionRoot = sessionRoot(context.cwd, identity.sessionId);
 	const ownerTerminalVerdict = context.ownerTerminal
 		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, identity.sessionId)
 		: null;
@@ -1092,8 +1093,13 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 					}),
 			),
 	).catch(error => {
-		const sessionRoot = path.resolve(path.dirname(stateFile), "..");
-		if ((error as NodeJS.ErrnoException).code === "ENOENT" && !fsSync.existsSync(sessionRoot)) return;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			try {
+				fsSync.lstatSync(ownerSessionRoot);
+			} catch (rootError) {
+				if ((rootError as NodeJS.ErrnoException).code === "ENOENT") return;
+			}
+		}
 		throw error;
 	});
 }
