@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as crypto from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
@@ -13,6 +15,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/launch-worktree";
 
 const cleanupRoots: string[] = [];
+const cleanupPaths: string[] = [];
 
 function run(command: string, args: string[], cwd: string): string {
 	const result = Bun.spawnSync([command, ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -60,6 +63,7 @@ afterEach(async () => {
 		await fs.rm(root, { recursive: true, force: true });
 		await fs.rm(bucket, { recursive: true, force: true });
 	}
+	for (const cleanupPath of cleanupPaths.splice(0)) await fs.rm(cleanupPath, { recursive: true, force: true });
 });
 
 describe("default launch worktrees", () => {
@@ -191,25 +195,151 @@ describe("default launch worktrees", () => {
 		expect(run("git", ["branch", "--show-current"], named.cwd)).toBe("feat/hud-ui-alignment");
 	});
 
-	it("reports an actionable error when the worktree bucket is a broken symlink", async () => {
-		const repo = await createRepo("gjc-launch-broken-bucket-symlink-");
+	it("reports a private, platform-neutral error for a broken bucket symlink without deleting it", async () => {
+		const repo = await createRepo("gjc launch 'broken-bucket-symlink-");
 		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
-		await fs.symlink(path.join(path.dirname(repo), "missing-cold-storage-target"), bucket);
+		const missingTarget = path.join(path.dirname(repo), "private-missing-cold-storage-target");
+		await fs.symlink(missingTarget, bucket, process.platform === "win32" ? "junction" : "dir");
 
-		expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
-			/worktree_bucket_broken_symlink:[\s\S]*symbolic link[\s\S]*missing-cold-storage-target[\s\S]*rm [^\n]*\.gajae-code-worktrees/,
-		);
+		let message = "";
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain("worktree_bucket_broken_symlink");
+		expect(message).toContain("platform-appropriate filesystem tools");
+		expect(message).toContain("GJC did not delete or replace the entry");
+		expect(message).not.toContain(missingTarget);
+		expect(message).not.toMatch(/`?rm\s/);
+		expect((await fs.lstat(bucket)).isSymbolicLink()).toBe(true);
 	});
 
-	it("reports an actionable error when the worktree bucket exists but is not a directory", async () => {
+	it("reclassifies a broken symlink racing the bucket mkdir instead of leaking raw EEXIST", async () => {
+		const repo = await createRepo("gjc-launch-bucket-mkdir-race-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const missingTarget = path.join(path.dirname(repo), "racing-missing-bucket-target");
+		const mkdirSpy = spyOn(fsSync, "mkdirSync").mockImplementationOnce((targetPath: fsSync.PathLike) => {
+			expect(path.resolve(String(targetPath))).toBe(path.resolve(bucket));
+			fsSync.symlinkSync(missingTarget, targetPath, process.platform === "win32" ? "junction" : "dir");
+			throw Object.assign(new Error("raw mkdir race"), { code: "EEXIST" });
+		});
+
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+				/worktree_bucket_broken_symlink[\s\S]*GJC did not delete or replace the entry/,
+			);
+		} finally {
+			mkdirSpy.mockRestore();
+		}
+		expect((await fs.lstat(bucket)).isSymbolicLink()).toBe(true);
+	});
+
+	it("does not treat non-ENOENT bucket inspection failures as a missing directory", async () => {
+		const repo = await createRepo("gjc-launch-bucket-inspection-failure-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const lstatSpy = spyOn(fsSync, "lstatSync").mockImplementationOnce(() => {
+			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+		});
+
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+				/worktree_bucket_inspection_failed[\s\S]*EACCES[\s\S]*GJC did not modify the entry/,
+			);
+		} finally {
+			lstatSpy.mockRestore();
+		}
+		expect(await Bun.file(bucket).exists()).toBe(false);
+	});
+
+	it("allows a valid directory symlink or Windows junction as the worktree bucket", async () => {
+		const repo = await createRepo("gjc-launch-valid-bucket-symlink-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const target = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-target-"));
+		cleanupPaths.push(target);
+		await fs.symlink(target, bucket, process.platform === "win32" ? "junction" : "dir");
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
+		const expectedPath = path.join(target, testSlug("feature/demo"));
+		expect(await fs.realpath(launched.cwd)).toBe(await fs.realpath(expectedPath));
+		expect((await fs.lstat(bucket)).isSymbolicLink()).toBe(true);
+		expect(launched.worktree.enabled && launched.worktree.created).toBe(true);
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
+		expect(await fs.realpath(reused.cwd)).toBe(await fs.realpath(expectedPath));
+		expect(reused.worktree.enabled && reused.worktree.reused).toBe(true);
+	});
+
+	it("reports a symlink to a non-directory target without disclosing or deleting the target", async () => {
+		const repo = await createRepo("gjc-launch-bucket-file-symlink-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const target = path.join(path.dirname(repo), "private-bucket-target-file");
+		cleanupPaths.push(target);
+		await Bun.write(target, "preserve-me\n");
+		await fs.symlink(target, bucket, "file");
+
+		let message = "";
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toMatch(/worktree_bucket_not_directory[\s\S]*symbolic link whose target is not a directory/);
+		expect(message).not.toContain(target);
+		expect(await Bun.file(target).text()).toBe("preserve-me\n");
+		expect((await fs.lstat(bucket)).isSymbolicLink()).toBe(true);
+	});
+
+	it("reports a regular-file bucket without shell text or deletion side effects", async () => {
 		const repo = await createRepo("gjc-launch-bucket-not-directory-");
 		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
 		await Bun.write(bucket, "not-a-directory\n");
 
-		expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
-			/worktree_bucket_not_directory:[\s\S]*not a directory[\s\S]*rm [^\n]*\.gajae-code-worktrees/,
-		);
+		let message = "";
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toMatch(/worktree_bucket_not_directory[\s\S]*not a directory/);
+		expect(message).toContain("platform-appropriate filesystem tools");
+		expect(message).not.toMatch(/`?rm\s/);
+		expect(await Bun.file(bucket).text()).toBe("not-a-directory\n");
 	});
+
+	if (process.platform !== "win32") {
+		it("reports a FIFO bucket as a non-directory without deleting it", async () => {
+			const repo = await createRepo("gjc-launch-bucket-fifo-");
+			const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+			const created = Bun.spawnSync(["mkfifo", bucket], { stdout: "pipe", stderr: "pipe" });
+			expect(created.exitCode).toBe(0);
+
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+				/worktree_bucket_not_directory[\s\S]*not a directory/,
+			);
+			expect((await fs.lstat(bucket)).isFIFO()).toBe(true);
+		});
+
+		it("reports a Unix socket bucket as a non-directory without deleting it", async () => {
+			const repo = await createRepo("gjc-launch-bucket-socket-");
+			const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+			const server = net.createServer();
+			const ready = Promise.withResolvers<void>();
+			server.once("error", ready.reject);
+			server.listen(bucket, ready.resolve);
+			await ready.promise;
+
+			try {
+				expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+					/worktree_bucket_not_directory[\s\S]*not a directory/,
+				);
+				expect((await fs.lstat(bucket)).isSocket()).toBe(true);
+			} finally {
+				const closed = Promise.withResolvers<void>();
+				server.close(error => (error ? closed.reject(error) : closed.resolve()));
+				await closed.promise;
+			}
+		});
+	}
 
 	it("creates named launch worktrees from reusable branch names", async () => {
 		const repo = await createRepo("gjc-launch-named-worktree-");

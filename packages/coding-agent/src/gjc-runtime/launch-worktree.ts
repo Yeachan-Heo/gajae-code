@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { shortenPath } from "../tools/render-utils";
 
 export type GjcLaunchWorktreeMode =
 	| { enabled: false }
@@ -138,39 +139,105 @@ function hasBranchInUse(entries: GitWorktreeEntry[], branchName: string, worktre
 	return entries.some(entry => entry.branchRef === expectedRef && path.resolve(entry.path) !== resolvedPath);
 }
 
-function ensureBucketDirUsable(bucketPath: string): void {
-	// fs.existsSync follows symlinks and reports false for a broken symlink,
-	// so a bucket that is a dangling symlink (e.g. offloaded cold storage that
-	// is no longer mounted) looks "missing". Bun's mkdirSync({ recursive: true })
-	// then throws a raw EEXIST because the directory entry exists but resolves
-	// to nothing, which crashes the launch with no actionable guidance. Detect
-	// such entries up front and surface remediation steps instead.
-	let lstat: fs.Stats;
+function fileSystemErrorCode(error: unknown): string | null {
+	return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+		? error.code
+		: null;
+}
+
+function formatBucketPath(bucketPath: string): string {
+	return JSON.stringify(shortenPath(bucketPath));
+}
+
+function brokenBucketSymlinkError(bucketPath: string): Error {
+	return new Error(
+		[
+			"worktree_bucket_broken_symlink",
+			"The GJC launch worktree bucket is a symbolic link whose target cannot be resolved; it may be unmounted or offloaded cold storage.",
+			`Path: ${formatBucketPath(bucketPath)}`,
+			"Safe remediation: restore or remount the link target, or inspect and remove the dangling link with platform-appropriate filesystem tools, then relaunch. GJC did not delete or replace the entry.",
+		].join("\n"),
+	);
+}
+
+function bucketNotDirectoryError(bucketPath: string, symlinkTarget = false): Error {
+	return new Error(
+		[
+			"worktree_bucket_not_directory",
+			symlinkTarget
+				? "The GJC launch worktree bucket is a symbolic link whose target is not a directory."
+				: "The GJC launch worktree bucket path exists but is not a directory.",
+			`Path: ${formatBucketPath(bucketPath)}`,
+			"Safe remediation: inspect the obstructing entry and move or remove it with platform-appropriate filesystem tools, then relaunch. GJC did not delete or replace the entry.",
+		].join("\n"),
+	);
+}
+
+function inspectBucketDir(bucketPath: string): "missing" | "usable" {
+	let entry: fs.Stats;
 	try {
-		lstat = fs.lstatSync(bucketPath);
-	} catch {
-		return; // No entry at the bucket path; mkdirSync will create it normally.
-	}
-	if (lstat.isDirectory()) return;
-	if (lstat.isSymbolicLink()) {
-		const target = fs.readlinkSync(bucketPath);
+		entry = fs.lstatSync(bucketPath);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") return "missing";
 		throw new Error(
 			[
-				`worktree_bucket_broken_symlink:${bucketPath}`,
-				`The GJC launch worktree bucket is a symbolic link to ${target}, but the target does not exist (it may be unmounted or offloaded cold storage).`,
-				`Path: ${bucketPath}`,
-				`Safe remediation: restore or remount the link target, or remove the dangling symlink with \`rm ${bucketPath}\` and relaunch.`,
+				"worktree_bucket_inspection_failed",
+				`GJC could not inspect the launch worktree bucket${fileSystemErrorCode(error) ? ` (${fileSystemErrorCode(error)})` : ""}.`,
+				`Path: ${formatBucketPath(bucketPath)}`,
+				"Safe remediation: verify that the bucket parent is accessible, then relaunch. GJC did not modify the entry.",
 			].join("\n"),
 		);
 	}
-	throw new Error(
-		[
-			`worktree_bucket_not_directory:${bucketPath}`,
-			`The GJC launch worktree bucket path exists but is not a directory.`,
-			`Path: ${bucketPath}`,
-			`Safe remediation: inspect and remove the obstructing entry with \`rm ${bucketPath}\` and relaunch.`,
-		].join("\n"),
-	);
+	if (entry.isDirectory()) return "usable";
+	if (!entry.isSymbolicLink()) throw bucketNotDirectoryError(bucketPath);
+
+	let target: fs.Stats;
+	try {
+		target = fs.statSync(bucketPath);
+	} catch (error) {
+		const code = fileSystemErrorCode(error);
+		if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") throw brokenBucketSymlinkError(bucketPath);
+		throw new Error(
+			[
+				"worktree_bucket_target_inspection_failed",
+				`GJC could not inspect the launch worktree bucket link target${code ? ` (${code})` : ""}.`,
+				`Path: ${formatBucketPath(bucketPath)}`,
+				"Safe remediation: verify that the link target is accessible, then relaunch. GJC did not modify the link.",
+			].join("\n"),
+		);
+	}
+	if (target.isDirectory()) return "usable";
+	throw bucketNotDirectoryError(bucketPath, true);
+}
+
+function ensureBucketDirUsable(bucketPath: string): void {
+	inspectBucketDir(bucketPath);
+	try {
+		fs.mkdirSync(bucketPath, { recursive: true });
+	} catch (error) {
+		// The entry can change between lstat/stat and mkdir. Re-inspect so a
+		// racing broken link or non-directory is still reported actionably.
+		inspectBucketDir(bucketPath);
+		const code = fileSystemErrorCode(error);
+		throw new Error(
+			[
+				"worktree_bucket_create_failed",
+				`GJC could not create or reuse the launch worktree bucket${code ? ` (${code})` : ""}.`,
+				`Path: ${formatBucketPath(bucketPath)}`,
+				"Safe remediation: verify parent permissions and bucket accessibility, then relaunch. GJC did not delete or replace any entry.",
+			].join("\n"),
+		);
+	}
+	if (inspectBucketDir(bucketPath) === "missing") {
+		throw new Error(
+			[
+				"worktree_bucket_changed_during_preflight",
+				"The GJC launch worktree bucket disappeared while launch was preparing it.",
+				`Path: ${formatBucketPath(bucketPath)}`,
+				"Safe remediation: stabilize the bucket mount or parent directory, then relaunch. GJC did not delete or replace any entry.",
+			].join("\n"),
+		);
+	}
 }
 
 function pruneStaleWorktreePath(repoRoot: string): void {
@@ -303,7 +370,6 @@ export function ensureLaunchWorktree(
 	}
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
-	fs.mkdirSync(path.dirname(plan.worktreePath), { recursive: true });
 	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
 	const args = ["worktree", "add"];
 	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
