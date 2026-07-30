@@ -189,6 +189,37 @@ describe("SearchTool internal URL resolution", () => {
 		// Hashline anchor (LINE+ID|content) is kept for mutable local:// sources
 		expect(text).toMatch(/^\*?\s*\d+[a-z]{2}\|/m);
 	});
+	it("resolves percent-encoded local URL authorities without selecting decoded siblings", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "report%3Araw.txt"), "percent-named sibling\n");
+		await Bun.write(path.join(localRoot, "report:raw.txt"), "colon-named sibling\n");
+
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const tool = new SearchTool(createSession());
+		const result = await tool.execute("test-call", {
+			pattern: "sibling",
+			paths: ["local://report%253Araw.txt"],
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("percent-named sibling");
+		expect(text).not.toContain("colon-named sibling");
+	});
+
+	it("rejects malformed percent escapes in local URL authorities", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "bad%ZZ.txt"), "must not be reachable\n");
+
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const tool = new SearchTool(createSession());
+		await expect(tool.execute("test-call", { pattern: "reachable", paths: ["local://bad%ZZ.txt"] })).rejects.toThrow(
+			"Invalid URL encoding in local:// path",
+		);
+	});
 
 	it("keeps hashlines on mutable files when mixed with immutable artifact:// inputs", async () => {
 		const content = "alpha line\nbeta needle line\ngamma line\n";

@@ -103,25 +103,25 @@ async function buildListing(url: InternalUrl, localRoot: string): Promise<Intern
 function extractRelativePath(url: InternalUrl): string {
 	const host = url.rawHost || url.hostname;
 	const pathname = url.rawPathname ?? url.pathname;
+	const encodedHost = url.href.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1] ?? "";
 
-	const combined = host
-		? pathname && pathname !== "/"
-			? `${host}${pathname}`
-			: host
-		: pathname && pathname !== "/"
-			? pathname.slice(1)
-			: "";
-
-	if (!combined) {
-		return "";
-	}
-
-	let decoded: string;
+	let decodedPathname: string;
 	try {
-		decoded = decodeURIComponent(combined.replaceAll("\\", "/"));
+		decodeURIComponent(encodedHost);
+		decodedPathname = decodeURIComponent(pathname);
 	} catch {
 		throw new Error(`Invalid URL encoding in local:// path: ${url.href}`);
 	}
+
+	const combined = host
+		? decodedPathname && decodedPathname !== "/"
+			? `${host}${decodedPathname}`
+			: host
+		: decodedPathname && decodedPathname !== "/"
+			? decodedPathname.slice(1)
+			: "";
+
+	const decoded = combined.replaceAll("\\", "/");
 	try {
 		validateRelativePath(decoded);
 	} catch (error) {
