@@ -14,6 +14,9 @@ import { mcpHandlers } from "./mcp-handlers";
 import { modelConfigHandlers } from "./model-config-handlers";
 import { processHandlers } from "./process-handlers";
 import { skillsHandlers } from "./skills-handlers";
+import { threadMutationHandlers } from "./thread-mutation-handlers";
+import { threadReadHandlers } from "./thread-read-handlers";
+import { workspaceQueryHandlers } from "./workspace-query-handlers";
 
 export interface HandlerContext {
 	/** Connection the request arrived on; notification handlers target it directly. */
@@ -189,4 +192,7 @@ export function registerBuiltinHandlers(registry: HandlerRegistry): void {
 	for (const [method, handler] of Object.entries(skillsHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(hooksHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(goalsReviewHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(threadReadHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(threadMutationHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(workspaceQueryHandlers)) registry.register(method, handler);
 }

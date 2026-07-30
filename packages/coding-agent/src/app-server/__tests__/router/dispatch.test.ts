@@ -70,7 +70,7 @@ test("dispatchClientRequest: a planned method remains notSupported on an experim
 	state.completeInitialize();
 	const verdict = dispatchClientRequest(
 		state,
-		classifyInbound(req("fuzzyFileSearch/sessionStart", 1, { roots: ["/workspace"], sessionId: "session-1" })),
+		classifyInbound(req("memory/reset", 1, {})),
 	);
 	expect(verdict).toMatchObject({ kind: "notSupported", reason: "backendLess" });
 });
