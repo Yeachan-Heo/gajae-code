@@ -5,7 +5,7 @@ import { AsyncJobManager, type AsyncJobRegisterOptions } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
-import type { TaskParams } from "../../src/task/types";
+import { getTaskSchema, type TaskParams } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 
 const TEST_AGENTS = [
@@ -110,7 +110,7 @@ describe("task.simple", () => {
 			expect(properties.spawnPlan).toBeDefined();
 		}
 	});
-	it("documents explicit worktree requests as isolated delegation", async () => {
+	it("documents explicit worktree requests as the durable worktree field, not PAL isolation", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: TEST_AGENTS,
 			projectAgentsDir: null,
@@ -121,6 +121,96 @@ describe("task.simple", () => {
 		expect(tool.description).toContain(
 			'REQUIRED when the user explicitly requests a worktree (for example, "use worktree")',
 		);
+		expect(tool.description).toContain("real persistent git worktree, identical to what `gjc --worktree` creates");
+		expect(tool.description).toContain("mutually exclusive with `isolated`");
+		expect(tool.description).toContain("This is NOT a git worktree");
+	});
+
+	it("exposes the durable worktree field in every schema variant, including with isolation disabled", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+
+		for (const mode of ["default", "schema-free", "independent"]) {
+			for (const isolationMode of ["auto", "none"]) {
+				const tool = await TaskTool.create(
+					createSession({ "task.simple": mode, "task.isolation.mode": isolationMode }),
+				);
+				const properties = getSchemaProperties(tool);
+				// The durable worktree path is the counterpart of `gjc --worktree`, not a PAL backend, so it
+				// must stay reachable even when task isolation is disabled.
+				expect(properties.worktree).toBeDefined();
+				expect(Boolean(properties.isolated)).toBe(isolationMode !== "none");
+			}
+		}
+	});
+
+	it("rejects a durable worktree request combined with isolated before spawning any subagent", async () => {
+		const discover = vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const tool = await TaskTool.create(createSession({ "task.isolation.mode": "auto" }));
+		discover.mockClear();
+
+		const result = await tool.execute("tool-worktree-isolated", {
+			agent: "task",
+			worktree: true,
+			isolated: true,
+			tasks: [{ id: "T1", description: "d", assignment: "a" }],
+		} as unknown as TaskParams);
+
+		expect(getFirstText(result)).toContain("mutually exclusive");
+		expect(result.details?.results ?? []).toHaveLength(0);
+	});
+
+	it("rejects a durable worktree request with more than one task before spawning any subagent", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const tool = await TaskTool.create(createSession({ "task.isolation.mode": "none" }));
+
+		const result = await tool.execute("tool-worktree-multitask", {
+			agent: "task",
+			worktree: true,
+			tasks: [
+				{ id: "T1", description: "d", assignment: "a" },
+				{ id: "T2", description: "d", assignment: "a" },
+			],
+		} as unknown as TaskParams);
+
+		expect(getFirstText(result)).toContain("requires exactly one task");
+		expect(result.details?.results ?? []).toHaveLength(0);
+	});
+
+	it("rejects a blank durable worktree branch name instead of silently detaching", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const tool = await TaskTool.create(createSession({ "task.isolation.mode": "none" }));
+
+		// A blank name must never quietly become a detached worktree: that is a different identity
+		// than the caller asked for.
+		const result = await tool.execute("tool-worktree-blank", {
+			agent: "task",
+			worktree: "   ",
+			tasks: [{ id: "T1", description: "d", assignment: "a" }],
+		} as unknown as TaskParams);
+
+		expect(getFirstText(result)).toContain("blank branch name");
+		expect(result.details?.results ?? []).toHaveLength(0);
+
+		// The declared parameter schema rejects blank names too, before the tool is even reached.
+		const schema = getTaskSchema({ isolationEnabled: false, simpleMode: "default" });
+		const base = { agent: "task", tasks: [{ id: "T1", description: "d", assignment: "a" }] };
+		expect(schema.safeParse({ ...base, worktree: "   " }).success).toBe(false);
+		expect(schema.safeParse({ ...base, worktree: "" }).success).toBe(false);
+		expect(schema.safeParse({ ...base, worktree: false }).success).toBe(false);
+		expect(schema.safeParse({ ...base, worktree: "feature/ok" }).success).toBe(true);
+		expect(schema.safeParse({ ...base, worktree: true }).success).toBe(true);
 	});
 	it("hides IRC guidance when the IRC tool is not available", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({

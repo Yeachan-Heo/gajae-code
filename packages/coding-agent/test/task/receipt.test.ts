@@ -439,6 +439,133 @@ describe("task result receipts", () => {
 		expect(rendered).not.toContain("raw ");
 		expect(rendered).not.toContain("stderr");
 	});
+
+	it("carries the durable worktree artifact through the public receipt surface", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				id: "8-Worktree",
+				worktree: {
+					path: "/repos/demo.gajae-code-worktrees/main-1a2b3c4d",
+					identity: "detached",
+					baseRef: "31e18e6cd179e80acc0e4d6865700555ab4c783b",
+					created: true,
+					reused: false,
+				},
+				producedChanges: true,
+				outputMeta: { lineCount: 2, charCount: 64, byteSize: 64, sha256: "f".repeat(64) },
+			}),
+		);
+
+		expect(receipt.worktree?.path).toBe("/repos/demo.gajae-code-worktrees/main-1a2b3c4d");
+		expect(receipt.worktree?.identity).toBe("detached");
+		expect(receipt.worktree?.baseRef).toBe("31e18e6cd179e80acc0e4d6865700555ab4c783b");
+		expect(receipt.worktree?.created).toBe(true);
+		expect(receipt.worktree?.reused).toBe(false);
+		expect(receipt.preview).toContain("created git worktree /repos/demo.gajae-code-worktrees/main-1a2b3c4d");
+		expect(receipt.preview).toContain("detached at 31e18e6cd179e80acc0e4d6865700555ab4c783b");
+		// The worktree is the artifact: no patch or synthetic task branch is reported.
+		expect(receipt.branchName).toBeUndefined();
+		expect(receipt.roi?.producedChanges).toBe(true);
+		expect(() => assertNoRawTaskFields(receipt, "receipt")).not.toThrow();
+	});
+
+	it("reports a named durable worktree as a branch identity and preserves reuse/dirty facts", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				id: "9-WorktreeNamed",
+				worktree: {
+					path: "/repos/demo.gajae-code-worktrees/feature-demo-1a2b3c4d",
+					identity: "branch",
+					branchName: "feature/demo",
+					baseRef: "31e18e6cd179e80acc0e4d6865700555ab4c783b",
+					headRef: "9f3c2ab7d51e40928c6ad4419f2b8e07c5d1a6b4",
+					created: false,
+					reused: true,
+					dirty: true,
+				},
+			}),
+		);
+
+		expect(receipt.worktree?.identity).toBe("branch");
+		expect(receipt.worktree?.branchName).toBe("feature/demo");
+		expect(receipt.worktree?.reused).toBe(true);
+		expect(receipt.worktree?.dirty).toBe(true);
+		// A reused branch can sit ahead of the source base; the receipt must carry where it actually is.
+		expect(receipt.worktree?.headRef).toBe("9f3c2ab7d51e40928c6ad4419f2b8e07c5d1a6b4");
+		expect(receipt.worktree?.headRef).not.toBe(receipt.worktree?.baseRef);
+		expect(receipt.preview).toContain("reused git worktree");
+		expect(receipt.preview).toContain("branch feature/demo");
+	});
+
+	it.each([
+		"worktree_dirty",
+		"worktree_path_conflict",
+		"worktree_target_mismatch",
+		"branch_in_use",
+		"worktree_busy",
+	] as const)("surfaces the typed %s worktree error instead of a generic failure", code => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				id: `10-${code}`,
+				exitCode: 1,
+				error: `${code}:/repos/demo.gajae-code-worktrees/main-1a2b3c4d`,
+				worktreeError: { code, message: `${code}:/repos/demo.gajae-code-worktrees/main-1a2b3c4d` },
+			}),
+		);
+
+		expect(receipt.status).toBe("failed");
+		expect(receipt.worktreeError?.code).toBe(code);
+		expect(receipt.errorSummary).toBe(`Worktree unavailable: ${code}.`);
+		expect(receipt.preview).toContain(`worktree unavailable (${code})`);
+		expect(receipt.preview).not.toBe("Task failed; error recorded.");
+		expect(() => assertNoRawTaskFields(receipt, "receipt")).not.toThrow();
+	});
+
+	it("renders the durable worktree and its typed error in the model-facing summary", () => {
+		const rendered = prompt.render(taskSummaryTemplate, {
+			successCount: 1,
+			totalCount: 2,
+			cancelledCount: 0,
+			hasCancelledNote: false,
+			duration: "10ms",
+			summaries: [
+				{
+					agent: "executor",
+					status: "completed",
+					id: "11-Worktree",
+					synopsis:
+						"Task completed; work is in the created git worktree /repos/demo.gajae-code-worktrees/main-1a2b.",
+					worktree: {
+						path: "/repos/demo.gajae-code-worktrees/main-1a2b",
+						identity: "detached",
+						head: "9f3c2ab7d51e40928c6ad4419f2b8e07c5d1a6b4",
+						baseRef: "31e18e6cd179e80acc0e4d6865700555ab4c783b",
+						disposition: "created",
+						dirty: true,
+					},
+				},
+				{
+					agent: "executor",
+					status: "failed",
+					id: "12-WorktreeBusy",
+					synopsis: "Task failed; worktree unavailable (worktree_busy).",
+					worktreeError: {
+						code: "worktree_busy",
+						message: "worktree_busy:/repos/demo.gajae-code-worktrees/main-1a2b",
+					},
+				},
+			],
+		});
+
+		expect(rendered).toContain('<worktree path="/repos/demo.gajae-code-worktrees/main-1a2b"');
+		expect(rendered).toContain('identity="detached"');
+		// The model must see the worktree's own HEAD alongside the base it was planned from.
+		expect(rendered).toContain('head="9f3c2ab7d51e40928c6ad4419f2b8e07c5d1a6b4"');
+		expect(rendered).toContain('base="31e18e6cd179e80acc0e4d6865700555ab4c783b"');
+		expect(rendered).toContain('disposition="created"');
+		expect(rendered).toContain('dirty="true"');
+		expect(rendered).toContain('<worktree-error code="worktree_busy">');
+	});
 });
 
 describe("agent protocol metadata verification", () => {

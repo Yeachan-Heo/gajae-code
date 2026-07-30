@@ -9,9 +9,11 @@ import type { Args } from "@gajae-code/coding-agent/cli/args";
 import { buildDefaultTmuxLaunchPlan } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import {
 	ensureLaunchWorktree,
+	type GjcLaunchWorktreeResult,
 	parseLaunchWorktreeMode,
 	planLaunchWorktree,
 	prepareLaunchWorktree,
+	provisionGitWorktree,
 } from "@gajae-code/coding-agent/gjc-runtime/launch-worktree";
 
 const cleanupRoots: string[] = [];
@@ -117,6 +119,47 @@ describe("default launch worktrees", () => {
 		const second = prepareLaunchWorktree(repo, ["--worktree", "--slow", "opus"]);
 		expect(await fs.realpath(second.cwd)).toBe(await fs.realpath(expectedPath));
 		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
+	});
+
+	it("shares create/reuse semantics between provisionGitWorktree and prepareLaunchWorktree in either order", async () => {
+		const bareMode = { enabled: true, detached: true, name: null } as const;
+		const stateInvariant = (worktree: GjcLaunchWorktreeResult | { enabled: false }) => {
+			if (!worktree.enabled) throw new Error("expected an enabled worktree result");
+			const { repoRoot, worktreePath, detached, baseRef, createdBranch } = worktree;
+			return { repoRoot, worktreePath, detached, baseRef, createdBranch };
+		};
+
+		// Repo A: the canonical mode-only entry point creates, the argv wrapper reuses.
+		const repoA = await createRepo("gjc-launch-parity-direct-first-");
+		await fs.mkdir(path.join(repoA, "node_modules"));
+		const directCreates = provisionGitWorktree(repoA, bareMode);
+		const wrapperReuses = prepareLaunchWorktree(repoA, ["--worktree", "--", "hello"]);
+
+		expect(directCreates.worktree.enabled && directCreates.worktree.created).toBe(true);
+		expect(directCreates.worktree.enabled && directCreates.worktree.reused).toBe(false);
+		expect(wrapperReuses.worktree.enabled && wrapperReuses.worktree.created).toBe(false);
+		expect(wrapperReuses.worktree.enabled && wrapperReuses.worktree.reused).toBe(true);
+		expect(stateInvariant(wrapperReuses.worktree)).toEqual(stateInvariant(directCreates.worktree));
+		expect(await fs.realpath(wrapperReuses.cwd)).toBe(await fs.realpath(directCreates.cwd));
+		expect((await fs.lstat(path.join(directCreates.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+		// Only the argv wrapper carries remaining args; the mode-only entry point has none to preserve.
+		expect(wrapperReuses.args).toEqual(["hello"]);
+		expect("args" in directCreates).toBe(false);
+
+		// Repo B: reversed — the argv wrapper creates, the canonical entry point reuses.
+		const repoB = await createRepo("gjc-launch-parity-wrapper-first-");
+		await fs.mkdir(path.join(repoB, "node_modules"));
+		const wrapperCreates = prepareLaunchWorktree(repoB, ["--worktree", "--", "hello"]);
+		const directReuses = provisionGitWorktree(repoB, bareMode);
+
+		expect(wrapperCreates.worktree.enabled && wrapperCreates.worktree.created).toBe(true);
+		expect(wrapperCreates.worktree.enabled && wrapperCreates.worktree.reused).toBe(false);
+		expect(directReuses.worktree.enabled && directReuses.worktree.created).toBe(false);
+		expect(directReuses.worktree.enabled && directReuses.worktree.reused).toBe(true);
+		expect(stateInvariant(directReuses.worktree)).toEqual(stateInvariant(wrapperCreates.worktree));
+		expect(await fs.realpath(directReuses.cwd)).toBe(await fs.realpath(wrapperCreates.cwd));
+		expect((await fs.lstat(path.join(wrapperCreates.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+		expect(wrapperCreates.args).toEqual(["hello"]);
 	});
 
 	it("creates launch worktrees beside the canonical source repo when launched from an existing worktree", async () => {

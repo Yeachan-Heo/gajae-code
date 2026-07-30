@@ -61,6 +61,13 @@ import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { createManagedTaskPersistence, renderSubagentUserPrompt, runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
+import {
+	acquireDurableWorktree,
+	computeProducedChanges,
+	type DurableWorktreeAcquisition,
+	refreshDurableWorktreeHead,
+	releaseDurableWorktree,
+} from "./git-worktree";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
@@ -201,6 +208,27 @@ function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | unde
 		if (error) invalid.push(`index ${i}: ${error}`);
 	}
 	return invalid.length > 0 ? `Invalid task ids: ${invalid.join(" ")}` : undefined;
+}
+
+/**
+ * Validate the shape of a durable git-worktree request.
+ *
+ * `worktree` provisions a real persistent worktree at one deterministic canonical path, so it
+ * cannot be combined with disposable PAL isolation and cannot be shared by parallel tasks.
+ */
+function validateDurableWorktreeRequest(params: TaskParams): string | undefined {
+	if (params.worktree === undefined) return undefined;
+	if (typeof params.worktree === "string" && params.worktree.trim().length === 0) {
+		return "`worktree` was given a blank branch name. Pass `true` for a detached worktree at HEAD, or a non-blank branch name.";
+	}
+	if (params.isolated === true) {
+		return "`worktree` and `isolated` are mutually exclusive: `worktree` provisions a persistent git worktree identical to `gjc --worktree`, while `isolated` uses disposable PAL isolation. Pick one.";
+	}
+	const taskCount = params.tasks?.length ?? 0;
+	if (taskCount !== 1) {
+		return `\`worktree\` requires exactly one task (received ${taskCount}): a single canonical worktree path cannot be shared by parallel tasks. Issue separate calls, or use \`isolated\` for parallel disposable isolation.`;
+	}
+	return undefined;
 }
 
 // Re-export types and utilities
@@ -725,6 +753,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const taskIdValidationError = validateTaskIdsForScheduling(rawTaskItems);
 		if (taskIdValidationError) {
 			return createTaskModeError(taskIdValidationError);
+		}
+		// Durable-worktree request shape is pure parameter validation: reject a malformed call before
+		// any dispatch, so the outcome does not depend on session background-execution capability.
+		const worktreeRequestError = validateDurableWorktreeRequest(params);
+		if (worktreeRequestError) {
+			return createTaskModeError(worktreeRequestError);
 		}
 		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, rawTaskItems);
 		if (bindingResolution.error) {
@@ -1259,6 +1293,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const isolationMode = this.session.settings.get("task.isolation.mode");
 		const isolationRequested = "isolated" in boundParams ? boundParams.isolated === true : false;
 		const isIsolated = isolationMode !== "none" && isolationRequested;
+		// Durable git-worktree request: deliberately independent of the PAL isolation gate above so it
+		// stays reachable under the default task.isolation.mode="none". Shape was already validated in
+		// `execute`, before any dispatch.
+		const durableWorktreeRequest = boundParams.worktree;
 		const mergeMode = this.session.settings.get("task.isolation.merge");
 		const commitStyle = this.session.settings.get("task.isolation.commits");
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
@@ -1674,65 +1712,110 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					assertPathUnderRepositoryBinding(taskRepositoryBinding, ".");
 				}
 				if (!isIsolated) {
-					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
-					const result = await runSubprocess({
-						cwd: this.session.cwd,
-						agent: effectiveAgent,
-						task: renderTaskAssignment(task.assignment, simpleMode),
-						assignment: task.assignment.trim(),
-						executionMode: task.executionMode,
-						context: sharedContext,
-						description: task.description,
-						index,
-						id: task.id,
-						runMode: overrides?.runMode ?? executionOverrides?.runMode,
-						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
-						subagentId: task.id,
-						taskDepth,
-						modelOverride,
-						parentActiveModelPattern,
-						parentSessionId: this.session.getSessionId?.() ?? undefined,
-						thinkingLevel: thinkingLevelOverride,
-						outputSchema: effectiveOutputSchema,
-						sessionFile: taskSessionFile,
-						persistArtifacts: hasDurableOutputBacking,
-						artifactsDir: effectiveArtifactsDir,
-						managedPersistence,
-						contextFile: contextFilePath,
-						ircAvailable: hasAvailableIrcTool(this.session),
-						enableLsp: subagentLspEnabled,
-						signal,
-						eventBus: this.session.eventBus,
-						onProgress: progress => {
-							progressMap.set(index, {
-								...structuredClone(progress),
-							});
-							AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
-							emitProgress();
-						},
-						authStorage: this.session.authStorage,
-						modelRegistry: this.session.modelRegistry,
-						agentRegistry: this.session.agentRegistry,
-						settings: this.session.settings,
-						inheritedServiceTier: this.session.serviceTier,
-						isFastForSubagentProvider: provider => this.session.isFastForSubagentProvider?.(provider) ?? false,
-						contextFiles,
-						skills: availableSkills,
-						autoloadSkills: resolvedAutoloadSkills,
-						workspaceTree: this.session.workspaceTree,
-						promptTemplates,
-						localProtocolOptions,
-						parentArtifactManager,
-						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
-						parentTelemetry: this.session.getTelemetry?.(),
-						forkContextSeed,
-					});
-					return {
-						...result,
-						...(forkContext ? { forkContext } : {}),
-						forkContextAdvisory,
-						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
-					};
+					// Durable git-worktree lane: the in-session counterpart to `gjc --worktree`. Reached
+					// independently of the PAL isolation gate above, so it works with task.isolation.mode="none".
+					let durable: Extract<DurableWorktreeAcquisition, { ok: true }> | undefined;
+					if (durableWorktreeRequest !== undefined) {
+						const acquisition = await acquireDurableWorktree(this.session.cwd, durableWorktreeRequest, task.id);
+						if (!acquisition.ok) {
+							return {
+								index,
+								id: task.id,
+								agent: agent.name,
+								agentSource: agent.source,
+								task: renderTaskAssignment(task.assignment.trim(), simpleMode),
+								assignment: task.assignment.trim(),
+								description: task.description,
+								exitCode: 1,
+								output: "",
+								stderr: acquisition.error.message,
+								truncated: false,
+								durationMs: 0,
+								tokens: 0,
+								modelOverride,
+								forkContext,
+								error: acquisition.error.message,
+								worktreeError: acquisition.error,
+							};
+						}
+						durable = acquisition;
+					}
+					const executionRoot = durable?.worktreePath ?? this.session.cwd;
+					try {
+						// Inside the guard's try/finally: a binding rejection here must still release the
+						// process-local worktree hold, or the canonical path stays wedged as `worktree_busy`.
+						await assertExecutionRootMatchesRepositoryBinding(executionRoot, taskRepositoryBinding);
+						const result = await runSubprocess({
+							cwd: this.session.cwd,
+							...(durable ? { worktree: durable.worktreePath } : {}),
+							agent: effectiveAgent,
+							task: renderTaskAssignment(task.assignment, simpleMode),
+							assignment: task.assignment.trim(),
+							executionMode: task.executionMode,
+							context: sharedContext,
+							description: task.description,
+							index,
+							id: task.id,
+							runMode: overrides?.runMode ?? executionOverrides?.runMode,
+							resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
+							subagentId: task.id,
+							taskDepth,
+							modelOverride,
+							parentActiveModelPattern,
+							parentSessionId: this.session.getSessionId?.() ?? undefined,
+							thinkingLevel: thinkingLevelOverride,
+							outputSchema: effectiveOutputSchema,
+							sessionFile: taskSessionFile,
+							persistArtifacts: hasDurableOutputBacking,
+							artifactsDir: effectiveArtifactsDir,
+							managedPersistence,
+							contextFile: contextFilePath,
+							ircAvailable: hasAvailableIrcTool(this.session),
+							enableLsp: subagentLspEnabled,
+							signal,
+							eventBus: this.session.eventBus,
+							onProgress: progress => {
+								progressMap.set(index, {
+									...structuredClone(progress),
+								});
+								AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
+								emitProgress();
+							},
+							authStorage: this.session.authStorage,
+							modelRegistry: this.session.modelRegistry,
+							agentRegistry: this.session.agentRegistry,
+							settings: this.session.settings,
+							inheritedServiceTier: this.session.serviceTier,
+							isFastForSubagentProvider: provider => this.session.isFastForSubagentProvider?.(provider) ?? false,
+							contextFiles,
+							skills: availableSkills,
+							autoloadSkills: resolvedAutoloadSkills,
+							workspaceTree: this.session.workspaceTree,
+							promptTemplates,
+							localProtocolOptions,
+							parentArtifactManager,
+							parentHindsightSessionState: this.session.getHindsightSessionState?.(),
+							parentTelemetry: this.session.getTelemetry?.(),
+							forkContextSeed,
+						});
+						return {
+							...result,
+							...(forkContext ? { forkContext } : {}),
+							forkContextAdvisory,
+							repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
+							...(durable
+								? {
+										// Re-read HEAD: a subagent that committed moved it past the provisioning-time ref.
+										worktree: refreshDurableWorktreeHead(durable.info),
+										// The worktree itself is the durable result: no patch is captured, applied, or published.
+										producedChanges: await computeProducedChanges(durable.worktreePath, durable.baseline),
+									}
+								: {}),
+						};
+					} finally {
+						// Guard bookkeeping only — the worktree persists exactly as `gjc --worktree` leaves it.
+						if (durable) releaseDurableWorktree(durable.worktreePath);
+					}
 				}
 
 				const taskStart = Date.now();
@@ -2128,6 +2211,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								lineCount: r.outputRef.lineCount,
 								charSize: formatBytes(r.outputRef.sizeBytes),
 							}
+						: undefined,
+					worktree: r.worktree
+						? {
+								path: r.worktree.path,
+								identity: r.worktree.branchName ? `branch ${r.worktree.branchName}` : "detached",
+								// The worktree's own HEAD, which for a reused branch can differ from baseRef.
+								head: r.worktree.headRef ?? r.worktree.baseRef,
+								baseRef: r.worktree.baseRef,
+								disposition: r.worktree.created ? "created" : "reused",
+								dirty: r.worktree.dirty === true,
+							}
+						: undefined,
+					worktreeError: r.worktreeError
+						? { code: r.worktreeError.code, message: r.worktreeError.message }
 						: undefined,
 				};
 			});

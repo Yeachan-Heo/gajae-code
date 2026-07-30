@@ -931,6 +931,17 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 	if (result.branchName && success) {
 		lines.push(`${continuePrefix}${theme.fg("dim", `Branch: ${result.branchName}`)}`);
 	}
+	if (result.worktree) {
+		const head = result.worktree.headRef ?? result.worktree.baseRef;
+		const identity = result.worktree.branchName
+			? `branch ${result.worktree.branchName} @ ${head.slice(0, 8)}`
+			: `detached ${head.slice(0, 8)}`;
+		const disposition = result.worktree.created ? "created" : "reused";
+		const dirty = result.worktree.dirty ? ", dirty" : "";
+		lines.push(
+			`${continuePrefix}${theme.fg("dim", `Worktree: ${result.worktree.path} (${identity}, ${disposition}${dirty})`)}`,
+		);
+	}
 	if (result.abortSummary) {
 		lines.push(
 			`${continuePrefix}${theme.fg("error", theme.status.aborted)} ${theme.fg("dim", truncateToWidth(replaceTabs(result.abortSummary), 80))}`,

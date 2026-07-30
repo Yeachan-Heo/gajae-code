@@ -1,3 +1,4 @@
+import type { DurableWorktreeError, DurableWorktreeInfo } from "./git-worktree";
 import {
 	hasCompleteUsageCostBreakdown,
 	type ReviewFindingsArtifactRef,
@@ -39,6 +40,10 @@ export interface TaskResultReceipt {
 	cost?: number;
 	usageCostBreakdownComplete?: true;
 	branchName?: string;
+	/** Durable git worktree provisioned for a `worktree` request; the task's result artifact. */
+	worktree?: DurableWorktreeInfo;
+	/** Typed durable-worktree provisioning failure, actionable without exposing raw output. */
+	worktreeError?: DurableWorktreeError;
 	retryFailure?: { attempt: number; errorSummary: string };
 	setupFailure?: { summary: string };
 	errorSummary?: string;
@@ -131,8 +136,21 @@ function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outp
 	if (raw.abortReason) {
 		return `Task ${status}; abort reason recorded.`;
 	}
+	// Durable-worktree provisioning failures are actionable and contain no subagent output, so the
+	// typed code and remediation reach the caller instead of the generic "error recorded" synopsis.
+	if (raw.worktreeError) {
+		return `Task ${status}; worktree unavailable (${raw.worktreeError.code}): ${raw.worktreeError.message}`;
+	}
 	if (raw.error) {
 		return `Task ${status}; error recorded.`;
+	}
+	if (raw.worktree) {
+		const identity = raw.worktree.branchName
+			? `branch ${raw.worktree.branchName}`
+			: `detached at ${raw.worktree.baseRef}`;
+		const disposition = raw.worktree.created ? "created" : "reused";
+		const ref = outputRef ? `; output stored in ${outputRef.uri}` : "";
+		return `Task ${status}; work is in the ${disposition} git worktree ${raw.worktree.path} (${identity})${ref}.`;
 	}
 	if (outputRef) {
 		return `Task ${status}; output stored in ${outputRef.uri} (${outputRef.lineCount} lines, ${outputRef.sizeBytes} bytes).`;
@@ -275,11 +293,16 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		usageCostBreakdownComplete:
 			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
 		branchName: raw.branchName,
+		worktree: raw.worktree,
+		worktreeError: raw.worktreeError,
 		fastMode: raw.fastMode,
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
-		errorSummary: raw.setupFailure?.summary ?? (raw.error ? "Error recorded." : undefined),
+		errorSummary:
+			raw.setupFailure?.summary ??
+			(raw.worktreeError ? `Worktree unavailable: ${raw.worktreeError.code}.` : undefined) ??
+			(raw.error ? "Error recorded." : undefined),
 		setupFailure: raw.setupFailure ? { summary: raw.setupFailure.summary } : undefined,
 		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
 		preview,

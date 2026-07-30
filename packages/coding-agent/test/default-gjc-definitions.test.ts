@@ -515,7 +515,9 @@ Project executor override body.
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
 		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
-		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
+		expect(routing).toContain("delegate implementation through `task` with `worktree: true`");
+		expect(routing).toContain("mutually exclusive with `isolated`");
+		expect(routing).not.toContain("delegate implementation through `task` with `isolated: true`");
 		expect(routing).toContain("read the full skill text and follow it exactly");
 		expect(routing).toContain("Before explicit execution approval or a valid non-off ralplan final runtime receipt");
 		expect(routing).toContain(

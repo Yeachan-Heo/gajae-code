@@ -2,6 +2,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { DurableWorktreeError, DurableWorktreeInfo } from "./git-worktree";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import type { SpawnRoiReconciliation } from "./roi-reconciliation";
@@ -139,6 +140,17 @@ const createTaskSchema = (options: { isolationEnabled: boolean; simpleMode: Task
 		agent: z.string().describe("agent type"),
 		tasks: z.array(itemSchema).describe("tasks to execute in parallel"),
 		spawnPlan: spawnPlanSchema.optional(),
+		// Always present, independent of `task.isolation.mode`: this is the in-session counterpart to
+		// `gjc --worktree`, not a PAL isolation backend, so it must stay reachable when isolation is off.
+		worktree: z
+			.union([
+				z.literal(true),
+				z.string().refine(value => value.trim().length > 0, "worktree branch name must not be blank"),
+			])
+			.optional()
+			.describe(
+				"run the single task in a real persistent git worktree identical to `gjc --worktree`: true detaches at HEAD in the source-branch worktree, a string checks out that branch name. Mutually exclusive with isolated; requires exactly one task.",
+			),
 	});
 	if (contextEnabled) {
 		schema = schema.extend({
@@ -199,6 +211,11 @@ export interface TaskParams {
 	spawnPlan?: SpawnPlanReceipt;
 	tasks: TaskItem[];
 	isolated?: boolean;
+	/**
+	 * Durable git-worktree request, the in-session counterpart to `gjc --worktree`.
+	 * Mutually exclusive with {@link TaskParams.isolated} and restricted to a single task.
+	 */
+	worktree?: true | string;
 }
 
 /** A code review finding reported by the reviewer agent */
@@ -470,6 +487,10 @@ export interface SingleResult {
 	nestedPatches?: NestedRepoPatch[];
 	/** Whether isolated execution produced a non-empty root or nested patch. */
 	producedChanges?: boolean;
+	/** Durable git worktree provisioned for a `worktree` request; the task's result artifact. */
+	worktree?: DurableWorktreeInfo;
+	/** Typed durable-worktree provisioning failure, surfaced instead of a generic error. */
+	worktreeError?: DurableWorktreeError;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/** Full wrapper-owned review evidence, kept separate from caller completion data. */

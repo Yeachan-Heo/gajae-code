@@ -401,18 +401,39 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 	return "symlink";
 }
 
-/** Result of {@link prepareLaunchWorktree}: the effective working directory, remaining args, and resolved worktree plan. */
-export interface PreparedLaunchWorktree {
+/**
+ * Result of {@link provisionGitWorktree}: the effective working directory and resolved worktree.
+ *
+ * Mode-only — it carries no CLI argv, because callers that did not parse argv have none to
+ * preserve. {@link prepareLaunchWorktree} is the only place remaining args are attached.
+ */
+export interface ProvisionedGitWorktree {
 	cwd: string;
-	args: string[];
 	worktree: GjcLaunchWorktreeResult | { enabled: false };
+}
+
+/** Result of {@link prepareLaunchWorktree}: the effective working directory, remaining args, and resolved worktree plan. */
+export interface PreparedLaunchWorktree extends ProvisionedGitWorktree {
+	args: string[];
+}
+
+/**
+ * Canonical worktree provisioning entry point: `plan → ensure → node_modules reuse`.
+ *
+ * The CLI and task-tool paths both go through this function, so path/slug/bucket resolution,
+ * reuse/dirty semantics, branch handling, and `node_modules` reuse have exactly one implementation
+ * shared by both. Transactional consumers such as the SDK lifecycle broker instead sequence the
+ * lower-level primitives themselves so they can interleave their own ledger transitions.
+ */
+export function provisionGitWorktree(cwd: string, mode: GjcLaunchWorktreeMode): ProvisionedGitWorktree {
+	const planned = planLaunchWorktree(cwd, mode);
+	const ensured = ensureLaunchWorktree(planned);
+	if (!ensured.enabled) return { cwd, worktree: ensured };
+	ensureReusableNodeModules(ensured.repoRoot, ensured.worktreePath);
+	return { cwd: ensured.worktreePath, worktree: ensured };
 }
 
 export function prepareLaunchWorktree(cwd: string, args: string[]): PreparedLaunchWorktree {
 	const parsed = parseLaunchWorktreeMode(args);
-	const planned = planLaunchWorktree(cwd, parsed.mode);
-	const ensured = ensureLaunchWorktree(planned);
-	if (!ensured.enabled) return { cwd, args: parsed.remainingArgs, worktree: ensured };
-	ensureReusableNodeModules(ensured.repoRoot, ensured.worktreePath);
-	return { cwd: ensured.worktreePath, args: parsed.remainingArgs, worktree: ensured };
+	return { ...provisionGitWorktree(cwd, parsed.mode), args: parsed.remainingArgs };
 }

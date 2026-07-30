@@ -427,4 +427,40 @@ describe("task renderer: nested live rendering", () => {
 			Date.now = originalNow;
 		}
 	});
+
+	it("renders the durable worktree line for detached and named results", async () => {
+		const detached = await renderResult({
+			...makeCompletedSubResult("3-WorktreeDetached", "Durable detached work"),
+			worktree: {
+				path: "/repos/demo.gajae-code-worktrees/main-1a2b3c4d",
+				identity: "detached",
+				baseRef: "31e18e6cd179e80acc0e4d6865700555ab4c783b",
+				headRef: "31e18e6cd179e80acc0e4d6865700555ab4c783b",
+				created: true,
+				reused: false,
+			},
+		});
+		expect(detached).toContain("Worktree: /repos/demo.gajae-code-worktrees/main-1a2b3c4d");
+		expect(detached).toContain("detached 31e18e6c");
+		expect(detached).toContain("created");
+
+		const named = await renderResult({
+			...makeCompletedSubResult("4-WorktreeNamed", "Durable named work"),
+			worktree: {
+				path: "/repos/demo.gajae-code-worktrees/feature-demo-1a2b3c4d",
+				identity: "branch",
+				branchName: "feature/demo",
+				baseRef: "31e18e6cd179e80acc0e4d6865700555ab4c783b",
+				headRef: "9f3c2ab7d51e40928c6ad4419f2b8e07c5d1a6b4",
+				created: false,
+				reused: true,
+				dirty: true,
+			},
+		});
+		expect(named).toContain("branch feature/demo");
+		expect(named).toContain("reused, dirty");
+		// The rendered ref must be the worktree's own HEAD, not the stale source base.
+		expect(named).toContain("9f3c2ab7");
+		expect(named).not.toContain("31e18e6c");
+	});
 });

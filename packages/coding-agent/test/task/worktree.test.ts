@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
+import { acquireDurableWorktree, releaseDurableWorktree } from "../../src/task/git-worktree";
 import {
 	captureBaseline,
 	captureDeltaPatch,
@@ -73,6 +74,38 @@ describe("worktree isolation helpers", () => {
 		expect(parseIsolationMode("block-clone")).toBe(natives.IsoBackendKind.WindowsBlockClone);
 		expect(parseIsolationMode("rcopy")).toBe(natives.IsoBackendKind.Rcopy);
 		expect(parseIsolationMode("worktree")).toBe(natives.IsoBackendKind.Rcopy);
+	});
+
+	it("keeps the legacy `worktree` isolation mode on the disposable PAL/Rcopy path", () => {
+		// The durable `task` `worktree` field is a separate concern: it must not steal or reinterpret
+		// the legacy `task.isolation.mode="worktree"` alias, which stays PAL/Rcopy for existing installs.
+		expect(parseIsolationMode("worktree")).toBe(natives.IsoBackendKind.Rcopy);
+		expect(parseIsolationMode("worktree")).toBe(parseIsolationMode("rcopy"));
+		// And `none` still means "no PAL isolation" rather than routing anywhere new.
+		expect(parseIsolationMode("none")).toBeUndefined();
+	});
+
+	it("provisions durable worktrees independently of the PAL isolation mode", async () => {
+		const { repo } = await createGitRepo();
+		// `task.isolation.mode="none"` disables PAL isolation entirely; the durable worktree path must
+		// still work, because it is the counterpart of `gjc --worktree`, not a PAL backend.
+		expect(parseIsolationMode("none")).toBeUndefined();
+
+		const acquired = await acquireDurableWorktree(repo, true, "LEGACY-1");
+		expect(acquired.ok).toBe(true);
+		if (!acquired.ok) return;
+		expect(acquired.info.created).toBe(true);
+		const realRepo = await fs.realpath(repo);
+		const bucket = path.join(path.dirname(realRepo), `${path.basename(realRepo)}.gajae-code-worktrees`);
+		expect(acquired.worktreePath.startsWith(bucket)).toBe(true);
+		releaseDurableWorktree(acquired.worktreePath);
+
+		Bun.spawnSync(["git", "worktree", "remove", "--force", acquired.worktreePath], {
+			cwd: repo,
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		await fs.rm(bucket, { recursive: true, force: true });
 	});
 
 	it("retries isoResolve candidates when a backend is path-unavailable", async () => {
