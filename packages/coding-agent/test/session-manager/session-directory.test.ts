@@ -849,7 +849,7 @@ describe("managed session write protocol", () => {
 		]);
 	});
 
-	it("keeps migrated deletion pending while retained artifact bytes remain", async () => {
+	it("retires live migrated paths when only an exchange-placeholder quarantine remains (#3538)", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
 		const source = path.join(legacy, "append-delete.jsonl");
@@ -870,13 +870,15 @@ describe("managed session write protocol", () => {
 		const active = listed.owned.find(candidate => candidate.path === opened.path);
 		if (!active) throw new Error("Missing appended v2 candidate");
 
+		// Exchange-placeholder-only retention is intermediate, not terminal for
+		// dropSession: live candidate paths must be retired even if the detached
+		// quarantine still holds bytes for reconcileManagedTombstones (#3538).
 		await expect(deleteManagedSessionCandidate(scope, active)).resolves.toMatchObject({
-			kind: "cleanup_pending",
-			phase: "artifacts",
+			kind: "deleted",
 			tombstonePath: expect.stringContaining(".json"),
 		});
-		expect(await fs.stat(source)).toBeDefined();
-		expect(await fs.stat(opened.path)).toBeDefined();
+		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.access(opened.path)).rejects.toMatchObject({ code: "ENOENT" });
 		await expect(fs.access(artifactRoot)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 

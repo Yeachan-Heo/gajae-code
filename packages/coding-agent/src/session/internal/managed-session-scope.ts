@@ -2062,6 +2062,27 @@ function retainedArtifactPayloadAbsent(pathname: string): boolean {
 	}
 }
 
+/**
+ * Native exact-unlink may retain only an exchange placeholder while the
+ * detached quarantine still holds payload. That is intermediate recovery
+ * evidence the reconciler retries; direct `dropSession` must not treat it as
+ * terminal (#3538).
+ */
+function isExchangePlaceholderOnlyRetention(deletion: {
+	retainedPlaceholderPath?: string;
+	retainedSuccessorPath?: string;
+	retainedUnknownPath?: string;
+}): boolean {
+	return (
+		!!deletion.retainedPlaceholderPath &&
+		!deletion.retainedSuccessorPath &&
+		!deletion.retainedUnknownPath
+	);
+}
+
+/** Bounded in-call retries for placeholder-only artifact cleanup (#3538). */
+const DIRECT_DELETE_PLACEHOLDER_RETRIES = 2;
+
 function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | undefined): CleanupReceipt {
 	const attempt = (pending?.attempt ?? 0) + 1;
 	const directory = path.dirname(target.path);
@@ -3597,36 +3618,132 @@ export async function deleteManagedSessionCandidate(
 					(deletion.phase === "transcript" && deletion.detachedTranscriptPath !== active.plannedTranscriptPath)
 				)
 					throw new Error("durability_failed");
-				const retry = nextCleanupReceipt(target, active);
-				const pendingEvidence = cleanupPendingEvidence(retry, active, deletion);
+				let pendingEvidence = cleanupPendingEvidence(nextCleanupReceipt(target, active), active, deletion);
 				await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 				if (deletion.phase === "artifacts") {
-					if (!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath))
-						return {
-							kind: "cleanup_pending",
-							tombstonePath: tombstone,
-							phase: deletion.phase,
-							message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
-						};
-					await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
-					deletion = await new FileSessionStorage().deleteSessionVerified({
-						sessionsRoot: scope.sessionsRoot,
-						transcriptPath: target.path,
-						sessionId: target.sessionId,
-						cwd: target.cwd,
-						transcriptIdentity: target.identity,
-						plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
-						plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
-						detachedTranscriptPath:
-							pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
-						retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
-						retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
-						retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
-						retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
-						retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
-						retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
-						artifactsRemoved: true,
-					});
+					// Retry tree removal on the detached quarantine while retention is
+					// exchange-placeholder only (#3538).
+					for (let attempt = 0; attempt < DIRECT_DELETE_PLACEHOLDER_RETRIES; attempt++) {
+						if (retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath)) break;
+						if (
+							deletion.kind !== "cleanup_pending" ||
+							deletion.phase !== "artifacts" ||
+							!isExchangePlaceholderOnlyRetention(deletion)
+						) {
+							break;
+						}
+						const retryAttempt = nextCleanupReceipt(target, pendingEvidence);
+						pendingEvidence = cleanupPendingEvidence(retryAttempt, pendingEvidence, deletion);
+						await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
+						deletion = await new FileSessionStorage().deleteSessionVerified({
+							sessionsRoot: scope.sessionsRoot,
+							transcriptPath: target.path,
+							sessionId: target.sessionId,
+							cwd: target.cwd,
+							transcriptIdentity: target.identity,
+							expectedArtifactsIdentity: deletion.artifactsIdentity,
+							expectedArtifactsTree: deletion.artifactsTree,
+							detachedArtifactsPath: deletion.detachedArtifactsPath,
+							retainedArtifactsSuccessorPath: deletion.retainedSuccessorPath,
+							retainedArtifactsPlaceholderPath: deletion.retainedPlaceholderPath,
+							retainedArtifactsUnknownPath: deletion.retainedUnknownPath,
+							retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+							retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+							retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
+							plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+							plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
+							detachedTranscriptPath:
+								pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+						});
+						if (deletion.kind === "artifacts_removed" || deletion.kind === "deleted") break;
+						if (deletion.kind !== "cleanup_pending" || deletion.phase !== "artifacts") break;
+						if (
+							!isAuthorizedArtifactRoot(
+								target,
+								pendingEvidence.detachedArtifactsPath ?? pendingEvidence.plannedArtifactsPath,
+								deletion.detachedArtifactsPath,
+							)
+						) {
+							throw new Error("durability_failed");
+						}
+					}
+					let deferArtifactQuarantine = false;
+					if (deletion.kind === "artifacts_removed") {
+						await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
+						deletion = await new FileSessionStorage().deleteSessionVerified({
+							sessionsRoot: scope.sessionsRoot,
+							transcriptPath: target.path,
+							sessionId: target.sessionId,
+							cwd: target.cwd,
+							transcriptIdentity: target.identity,
+							plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+							plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
+							detachedTranscriptPath:
+								pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+							retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+							retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+							retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+							retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+							retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+							retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
+							artifactsRemoved: true,
+						});
+					} else if (deletion.kind === "cleanup_pending" && deletion.phase === "artifacts") {
+						if (!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath)) {
+							// Live artifact path is already detached. Exchange-placeholder
+							// quarantine retention is intermediate — finish transcript
+							// retirement for dropSession, leave quarantine for
+							// reconcileManagedTombstones (#3538).
+							if (!isExchangePlaceholderOnlyRetention(deletion)) {
+								return {
+									kind: "cleanup_pending",
+									tombstonePath: tombstone,
+									phase: deletion.phase,
+									message:
+										"Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
+								};
+							}
+							deferArtifactQuarantine = true;
+							deletion = await new FileSessionStorage().deleteSessionVerified({
+								sessionsRoot: scope.sessionsRoot,
+								transcriptPath: target.path,
+								sessionId: target.sessionId,
+								cwd: target.cwd,
+								transcriptIdentity: target.identity,
+								plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+								plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
+								detachedTranscriptPath:
+									pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+								retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+								retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+								retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+								retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+								retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+								retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
+								artifactsRemoved: true,
+							});
+						} else {
+							await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
+							deletion = await new FileSessionStorage().deleteSessionVerified({
+								sessionsRoot: scope.sessionsRoot,
+								transcriptPath: target.path,
+								sessionId: target.sessionId,
+								cwd: target.cwd,
+								transcriptIdentity: target.identity,
+								plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+								plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
+								detachedTranscriptPath:
+									pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+								retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+								retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+								retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+								retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+								retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+								retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
+								artifactsRemoved: true,
+							});
+						}
+					}
 					if (deletion.kind === "cleanup_pending") {
 						if (
 							deletion.phase !== "transcript" ||
@@ -3640,6 +3757,10 @@ export async function deleteManagedSessionCandidate(
 							cleanupPendingEvidence(followup, pendingEvidence, deletion),
 							lock,
 						);
+					}
+					if (deferArtifactQuarantine) {
+						fsyncManagedParent(target.path);
+						continue;
 					}
 				}
 				// A retained transcript quarantine proves canonical absence and remains

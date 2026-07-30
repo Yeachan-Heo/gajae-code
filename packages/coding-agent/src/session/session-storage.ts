@@ -1046,22 +1046,12 @@ export class FileSessionStorage implements SessionStorage {
 					`Exact artifact detach rejected: ${detach.ok ? "missing_path" : detach.code}`,
 				);
 			}
+			// A native `cleanup_pending` detach still yields an identity-bound quarantine.
+			// Exchange-placeholder retention is intermediate recovery evidence — continue
+			// recursive removal of the detached root instead of abandoning the phase
+			// (#3538). Successor/unknown retention is merged into the pending receipt
+			// only if tree removal also fails.
 			if (!detach.ok) durablyRecordArtifactPhase();
-			if (!detach.ok) {
-				return {
-					kind: "cleanup_pending",
-					phase: "artifacts",
-					error: new SessionDeleteVerificationError("artifacts", `Exact artifact detach retained: ${detach.code}`),
-					artifactsIdentity,
-					detachedArtifactsPath: detach.detachedPath,
-					artifactsTree,
-					...(detach.retainedSuccessorPath ? { retainedSuccessorPath: detach.retainedSuccessorPath } : {}),
-					...(detach.retainedPlaceholderPath ? { retainedPlaceholderPath: detach.retainedPlaceholderPath } : {}),
-					...(detach.retainedUnknownPath ? { retainedUnknownPath: detach.retainedUnknownPath } : {}),
-
-					transcriptIdentity,
-				};
-			}
 			const removal = removeDirectoryTreeExact(detach.detachedPath, artifactsTree);
 			if (!removal.ok) {
 				const retainedRoot = removal.detachedPath ?? detach.detachedPath;
@@ -1070,26 +1060,28 @@ export class FileSessionStorage implements SessionStorage {
 						"artifacts",
 						"Native artifact removal returned an unauthorized root",
 					);
-				durablyRecordArtifactPhase();
+				if (detach.ok) durablyRecordArtifactPhase();
+				const retainedSuccessorPath =
+					removal.retainedSuccessorPath ?? detach.retainedSuccessorPath ?? retainedArtifactsSuccessorPath;
+				const retainedPlaceholderPath =
+					removal.retainedPlaceholderPath ?? detach.retainedPlaceholderPath ?? retainedArtifactsPlaceholderPath;
+				const retainedUnknownPath =
+					removal.retainedUnknownPath ?? detach.retainedUnknownPath ?? retainedArtifactsUnknownPath;
 				return {
 					kind: "cleanup_pending",
 					phase: "artifacts",
 					error: new SessionDeleteVerificationError(
 						"artifacts",
-						`Exact detached artifact removal rejected: ${removal.code}`,
+						detach.ok
+							? `Exact detached artifact removal rejected: ${removal.code}`
+							: `Exact artifact detach retained (${detach.code}); tree removal rejected: ${removal.code}`,
 					),
 					artifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
 					artifactsTree,
-					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
-						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
-						: {}),
-					...((removal.retainedPlaceholderPath ?? retainedArtifactsPlaceholderPath)
-						? { retainedPlaceholderPath: removal.retainedPlaceholderPath ?? retainedArtifactsPlaceholderPath }
-						: {}),
-					...((removal.retainedUnknownPath ?? retainedArtifactsUnknownPath)
-						? { retainedUnknownPath: removal.retainedUnknownPath ?? retainedArtifactsUnknownPath }
-						: {}),
+					...(retainedSuccessorPath ? { retainedSuccessorPath } : {}),
+					...(retainedPlaceholderPath ? { retainedPlaceholderPath } : {}),
+					...(retainedUnknownPath ? { retainedUnknownPath } : {}),
 					transcriptIdentity,
 				};
 			}
