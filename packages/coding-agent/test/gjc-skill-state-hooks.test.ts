@@ -34,9 +34,12 @@ import { WORKFLOW_STATE_VERSION } from "../src/skill-state/workflow-state-contra
 describe("GJC native skill-state hooks", () => {
 	let tempDir: string | undefined;
 	let originalGjcSessionId: string | undefined;
+	let originalCiDevChangedPaths: string | undefined;
 
 	beforeAll(() => {
 		originalGjcSessionId = process.env.GJC_SESSION_ID;
+		originalCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-skill-state-hooks.test.ts";
 		process.env.GJC_SESSION_ID = "test-session";
 	});
 
@@ -46,6 +49,8 @@ describe("GJC native skill-state hooks", () => {
 		} else {
 			process.env.GJC_SESSION_ID = originalGjcSessionId;
 		}
+		if (originalCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+		else process.env.CI_DEV_CHANGED_PATHS = originalCiDevChangedPaths;
 	});
 
 	const testEffectiveSkillConfig = {
