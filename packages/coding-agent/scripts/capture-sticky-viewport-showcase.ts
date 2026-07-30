@@ -217,6 +217,23 @@ async function git(args: string[]): Promise<Uint8Array> {
 		throw new Error(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
 	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
 }
+
+// Digest of a path's COMMITTED blob at a given commit, read straight out of the
+// object database. This is the only provenance input a bundle author cannot
+// restamp: `captureProvenance()` hashes the worktree, so mutating an oracle file
+// and re-running it yields a self-consistent stamp. The committed blob is fixed
+// by the commit id, so changing it requires a new commit -- which changes
+// `git_head` and is therefore visible to the reviewer.
+export async function committedBlobSha256(commit: string, filePath: string): Promise<string | null> {
+	const result = Bun.spawn(["git", "cat-file", "blob", `${commit}:${filePath}`], {
+		cwd: process.cwd(),
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const bytes = new Uint8Array(await new Response(result.stdout).arrayBuffer());
+	if ((await result.exited) !== 0) return null;
+	return hash(bytes);
+}
 export type CaptureProvenance = {
 	git_head: string;
 	git_diff_scope: readonly string[];

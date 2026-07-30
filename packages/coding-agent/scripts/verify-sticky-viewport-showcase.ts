@@ -8,6 +8,7 @@ import {
 import {
 	ansiToHtml,
 	captureProvenance,
+	committedBlobSha256,
 	PROVENANCE_DIFF_SCOPE,
 	xterm256Color,
 } from "./capture-sticky-viewport-showcase";
@@ -414,6 +415,26 @@ const frameGeometry = (key: string, text: string) => {
 // and this file's own sha256 is inside `source_sha256`, so a bundle author cannot
 // restate it. Geometry was measured identical across indexed-color and truecolor
 // hosts, so pinning it costs no host portability.
+// Files that OWN the verification contract itself: the expectation table, the
+// anchor digest function, and every guard below. `source_sha256` cannot protect
+// these, because it is produced by `captureProvenance()` from the worktree -- an
+// author who edits an oracle and restamps provenance gets a self-consistent
+// bundle. So these two are pinned to their committed blobs at the bundle's own
+// `git_head` instead. Product-source diffs stay permitted for staged current-dev
+// integration; oracle diffs do not.
+const ORACLE_SOURCES = [
+	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+] as const;
+const verifyOracleIntegrity = async (gitHead: string) => {
+	for (const source of ORACLE_SOURCES) {
+		const committed = await committedBlobSha256(gitHead, source);
+		// Fail closed: an unreadable blob is indistinguishable from a rewritten one.
+		if (committed === null) fail(`oracle integrity: ${source} has no committed blob at ${gitHead}`);
+		const running = hash(new Uint8Array(await fs.readFile(source)));
+		if (running !== committed) fail(`oracle integrity: ${source} differs from its committed blob at ${gitHead}`);
+	}
+};
 const SEMANTIC_ANCHOR_EXPECTATION: Readonly<
 	Record<string, { frameRow: number; graphemeStart: number; graphemeEnd: number; cellStart: number; cellEnd: number }>
 > = Object.freeze({
@@ -661,6 +682,9 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		JSON.stringify(provenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256)
 	)
 		fail("manifest capture provenance is stale");
+	// Runs before every entry check: a rewritten oracle would otherwise decide
+	// what "valid" means for all of them.
+	await verifyOracleIntegrity(provenance.git_head as string);
 	const entries = array(manifest.entries, "manifest entries");
 	if (entries.length !== KEYS.length) fail("manifest entries must contain exactly 20 entries");
 	// Cross-entry anchor identity ledger. Uniqueness is a hard contract, not a
