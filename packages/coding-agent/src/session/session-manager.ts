@@ -9613,6 +9613,7 @@ export class SessionManager {
 				authority,
 			);
 		} catch (error) {
+			if (error instanceof Error && error.message === "migration_busy") throw new SessionMigrationBusyError();
 			if (error instanceof Error && error.message.startsWith("Managed root authority changed"))
 				managedDestinationStore.assertBound();
 			throw error;

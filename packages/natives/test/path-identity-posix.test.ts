@@ -29,8 +29,13 @@ function expectDetachedCleanupPending(result: ReturnType<typeof exactUnlink>, de
 	});
 }
 
-function expectTreeCleanupPending(result: ReturnType<typeof exactRemoveDirectoryTree>, detachedPath: string): void {
-	expect(result).toEqual({ ok: false, code: "cleanup_pending", payloadDurable: true, detachedPath });
+function expectTreeCleanupPending(result: ReturnType<typeof exactRemoveDirectoryTree>, plannedPath: string): void {
+	expect(result).toEqual({
+		ok: false,
+		code: "cleanup_pending",
+		payloadDurable: true,
+		detachedPath: `${plannedPath}.removing`,
+	});
 }
 
 function expectOwnerOnlySuccess(
@@ -508,7 +513,8 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 					() => true,
 					() => false,
 				),
-			).toBe(true);
+			).toBe(false);
+			expect(await fs.stat(`${detached}.removing`).then(stat => stat.isDirectory())).toBe(true);
 		},
 	);
 

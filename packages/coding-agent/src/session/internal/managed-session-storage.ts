@@ -266,6 +266,16 @@ type LockRecord = {
 	released?: boolean;
 };
 
+export interface ManagedLockRetirementTestEvent {
+	readonly path: string;
+	readonly attemptId: string;
+}
+
+/** Test-only seam immediately before exact retirement of one observed lock identity. */
+export const ManagedLockTestHooks: {
+	beforeObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
+} = {};
+
 /** Captured configured-root authority for managed paths only. */
 export interface ManagedDirectoryRoot {
 	readonly canonicalPath: string;
@@ -1240,11 +1250,9 @@ function isCtimeOnlyIdentityMismatch(
 	return sameStableIdentityIgnoringCtime(observed, expected) && observed.ctimeNs !== expected.ctimeNs;
 }
 
-function parseLock(pathname: string): LockRecord | undefined {
+function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
 	try {
-		const stat = fs.lstatSync(pathname);
-		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
-		const value: unknown = JSON.parse(fs.readFileSync(pathname, "utf8"));
+		const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
 		if (!value || typeof value !== "object") return undefined;
 		const record = value as Partial<LockRecord>;
 		return typeof record.attemptId === "string" &&
@@ -1256,6 +1264,26 @@ function parseLock(pathname: string): LockRecord | undefined {
 			(record.released === undefined || typeof record.released === "boolean")
 			? (record as LockRecord)
 			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function parseLock(pathname: string): LockRecord | undefined {
+	try {
+		const stat = fs.lstatSync(pathname);
+		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+		return parseLockBytes(fs.readFileSync(pathname));
+	} catch {
+		return undefined;
+	}
+}
+
+function captureLock(pathname: string): { record: LockRecord; snapshot: ManagedFileSnapshot } | undefined {
+	try {
+		const snapshot = captureManagedFileNoFollow(pathname);
+		const record = parseLockBytes(snapshot.bytes);
+		return record ? { record, snapshot } : undefined;
 	} catch {
 		return undefined;
 	}
@@ -1667,18 +1695,23 @@ export async function acquireManagedLock(
 			};
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const owner = parseLock(lockPath);
+			const observed = captureLock(lockPath);
+			const owner = observed?.record;
 			const reclaimable =
 				owner?.released === true ||
 				(owner !== undefined && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner));
-			if (owner && reclaimable) {
-				const quarantine = `${lockPath}.${randomUUID()}.stale`;
+			if (observed && owner && reclaimable) {
 				try {
-					fs.renameSync(lockPath, quarantine);
-					const quarantined = parseLock(quarantine);
-					if (!quarantined || quarantined.attemptId !== owner.attemptId) throw new Error("migration_busy");
-					fs.unlinkSync(quarantine);
-					fsyncDirectory(locksDirectory);
+					ManagedLockTestHooks.beforeObservedRetirement?.({ path: lockPath, attemptId: owner.attemptId });
+					const removed = exactUnlink(lockPath, {
+						dev: observed.snapshot.identity.dev,
+						ino: observed.snapshot.identity.ino,
+						size: BigInt(observed.snapshot.identity.size),
+						mtimeNs: observed.snapshot.identity.mtimeNs,
+						sha256: observed.snapshot.identity.sha256,
+						quarantineName: `.gjc-lock-${randomUUID()}.stale`,
+					});
+					if (removed.ok || removed.code === "cleanup_pending") fsyncDirectory(locksDirectory);
 				} catch {
 					/* retry owner observation */
 				}

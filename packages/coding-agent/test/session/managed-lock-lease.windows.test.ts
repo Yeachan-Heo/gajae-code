@@ -2,11 +2,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { acquireManagedLock } from "../../src/session/internal/managed-session-storage";
+import { acquireManagedLock, ManagedLockTestHooks } from "../../src/session/internal/managed-session-storage";
 
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
+	ManagedLockTestHooks.beforeObservedRetirement = undefined;
 	for (const directory of temporaryDirectories.splice(0)) {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
@@ -70,4 +71,36 @@ describe("managed migration lock lease ownership", () => {
 		expect(() => first.assertOwned()).toThrow("migration_busy");
 		await first.release().catch(() => undefined);
 	});
+
+	it("preserves a successor installed after a released lock was observed", async () => {
+		const locks = createLockRoot("retirement-race");
+		const first = await acquireManagedLock(locks, "migration");
+		await first.release();
+		const successorAttemptId = "successor-attempt";
+		let injected = false;
+		ManagedLockTestHooks.beforeObservedRetirement = ({ path: lockPath, attemptId }) => {
+			if (injected) return;
+			injected = true;
+			fs.renameSync(lockPath, `${lockPath}.${attemptId}.retired`);
+			const now = Date.now();
+			fs.writeFileSync(
+				lockPath,
+				`${JSON.stringify({
+					attemptId: successorAttemptId,
+					pid: process.pid,
+					processStartId: "successor-process",
+					createdAt: now,
+					heartbeatAt: now,
+					leaseExpiresAt: now + 60_000,
+				})}\n`,
+				{ mode: 0o600 },
+			);
+		};
+
+		const waitStartedAt = Date.now();
+		await expect(acquireManagedLock(locks, "migration")).rejects.toThrow("migration_busy");
+		expect(Date.now() - waitStartedAt).toBeGreaterThanOrEqual(4_500);
+		expect(injected).toBe(true);
+		expect(readLock(first.path).attemptId).toBe(successorAttemptId);
+	}, 15_000);
 });
