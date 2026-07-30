@@ -343,13 +343,42 @@ describe("ultragoal review command", () => {
 		process.env.PATH = `${fakeBin}${path.delimiter}${savedPath ?? ""}`;
 		try {
 			const output = await review(root, ["--pr", "123", "--executor-qa-json", qaPath]);
-			expect(output.verdict).toBe("inconclusive: weak-contract");
+			expect(output.verdict).toBe("fail");
 		} finally {
 			if (savedPath === undefined) delete process.env.PATH;
 			else process.env.PATH = savedPath;
 		}
 	});
 
+	it("spec plus PR preserves the PR inventory uncertainty", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		await Bun.write(path.join(root, "spec.md"), "Strong acceptance criteria");
+		const output = await review(root, [
+			"--spec",
+			"spec.md",
+			"--pr",
+			"999999999",
+			"--executor-qa-json",
+			await writeQa(root, validExecutorQa()),
+		]);
+		expect(output.contractStrength).toBe("strong");
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
+	it("unavailable PR fallback remains incomplete even when the local checkout is clean", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const output = await review(root, [
+			"--pr",
+			"999999999",
+			"--executor-qa-json",
+			await writeQa(root, validExecutorQa()),
+		]);
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
 	it("uses spec override as a strong contract and allows clean pass", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);

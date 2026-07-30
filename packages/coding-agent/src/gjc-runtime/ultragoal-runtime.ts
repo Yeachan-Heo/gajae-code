@@ -4152,7 +4152,10 @@ export {
 
 function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
 	const kind = nonEmptyString(source.kind);
-	if (kind === "spec") return { source: "review-spec", paths: [], trusted: true };
+	if (kind === "spec") {
+		const codeSource = qualityGateObject(source.codeSource);
+		return codeSource ? changeSetFromReviewSource(codeSource) : undefined;
+	}
 	if (kind === "pr" && typeof source.diff === "string") {
 		const paths = parseUnifiedDiffPaths(source.diff);
 		return {
@@ -4165,7 +4168,10 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 		};
 	}
 	const local = qualityGateObject(source.local);
-	if (kind === "pr" && local) return changeSetFromReviewSource(local);
+	if (kind === "pr" && local) {
+		const localChangeSet = changeSetFromReviewSource(local);
+		return localChangeSet ? { ...localChangeSet, captureIncomplete: true } : undefined;
+	}
 	if (kind === "worktree")
 		return {
 			source: "review-worktree",
@@ -4246,9 +4252,15 @@ async function resolveReviewSource(
 ): Promise<{ contractStrength: UltragoalReviewContractStrength; source: JsonObject }> {
 	if (specPath) {
 		const absolute = path.resolve(cwd, specPath);
+		const codeReviewSource = await resolveReviewSource(cwd, args, undefined);
 		return {
 			contractStrength: "strong",
-			source: { kind: "spec", path: specPath, contract: await Bun.file(absolute).text() },
+			source: {
+				kind: "spec",
+				path: specPath,
+				contract: await Bun.file(absolute).text(),
+				codeSource: codeReviewSource.source,
+			},
 		};
 	}
 	const pr = flagValue(args, "--pr");
