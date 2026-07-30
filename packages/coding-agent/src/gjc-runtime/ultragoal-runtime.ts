@@ -2175,13 +2175,29 @@ function requireChangeSetCoverage(
 	fieldName: string,
 ): void {
 	if (!expected) return;
+	const expectedExactKeys = new Set(
+		expected.paths.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`),
+	);
 	const declaredExactKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`));
-	const declaredPathKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}`));
 	for (const row of expected.paths) {
-		const pathKey = `${row.oldPath ?? ""}\u0000${row.path}`;
-		const exactKey = `${pathKey}\u0000${row.status}`;
-		const covered = row.status === "unknown" ? declaredPathKeys.has(pathKey) : declaredExactKeys.has(exactKey);
-		if (!covered) throw new Error(`${fieldName} does not cover computed checkpoint change-set path ${row.path}`);
+		const exactKey = `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`;
+		if (!declaredExactKeys.has(exactKey)) {
+			throw new Error(`${fieldName} does not cover computed checkpoint change-set path ${row.path}`);
+		}
+	}
+	if (
+		declared.length !== expected.paths.length ||
+		declared.some(row => !expectedExactKeys.has(`${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`))
+	) {
+		throw new Error(`${fieldName} must exactly match the computed checkpoint change set`);
+	}
+}
+
+function requireExactRecordKeys(record: JsonObject, expectedKeys: readonly string[], fieldName: string): void {
+	const actual = Object.keys(record).sort();
+	const expected = [...expectedKeys].sort();
+	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+		throw new Error(`${fieldName} keys must exactly match durable validationBatch memberIds`);
 	}
 }
 
@@ -2782,6 +2798,12 @@ function validateBatchCloseQualityGate(
 		if (memberId !== metadata.finalGoalId && member.status !== "complete")
 			throw new Error(`validationBatchClose cannot close before ${memberId} is complete`);
 	}
+	requireExactRecordKeys(memberMetadataHashes, metadata.memberIds, "validationBatchClose.memberMetadataHashes");
+	requireExactRecordKeys(
+		memberChangeSetHashes,
+		metadata.memberIds,
+		"validationBatchClose.unionChangeSet.memberChangeSetHashes",
+	);
 	if (receiptRows.length !== nonFinalIds.length)
 		throw new Error("validationBatchClose.memberReceipts must list every non-final member exactly once");
 	for (const row of receiptRows) {
