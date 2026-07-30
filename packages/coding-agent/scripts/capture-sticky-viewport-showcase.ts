@@ -177,19 +177,56 @@ const PROVENANCE_SOURCES = [
 	"packages/coding-agent/src/modes/components/irc-sidebar.ts",
 	"packages/tui/src/tui.ts",
 ] as const;
+// Working-tree scope for `git_diff_binary_sha256`, persisted alongside the digest
+// as `git_diff_scope` so a reviewer reads the covered surface off the bundle
+// instead of inferring it.
+//
+// This digest used to hash `git diff --binary HEAD --` over the ENTIRE worktree.
+// The verifier recomputes it live at verify time, so that coupled bundle validity
+// to every tracked file in the repo: an unrelated edit anywhere — a doc typo,
+// another package's test — retroactively made every already-captured bundle
+// "stale". Those are false positives, and they are nondeterministic, because any
+// write landing in the capture→verify window flips the digest mid-run and masks
+// whichever guard was actually under test.
+//
+// The scope below is the transitive render-dependency closure of the fixture:
+// every workspace package the capture reaches (coding-agent → agent, ai,
+// bridge-client, natives, stats, tui, utils), the fixture plus the virtual
+// terminal it paints into, both showcase scripts, and the lockfile pinning the
+// installed dependency versions. Uncommitted edits inside this closure still
+// invalidate a bundle — that is the property the staleness guard exists to
+// enforce. Edits outside it no longer can, because they cannot change the paint.
+export const PROVENANCE_DIFF_SCOPE = [
+	"bun.lock",
+	"packages/agent/src",
+	"packages/ai/src",
+	"packages/bridge-client/src",
+	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+	"packages/coding-agent/src",
+	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+	"packages/natives/native",
+	"packages/stats/src",
+	"packages/tui/src",
+	"packages/tui/test/virtual-terminal.ts",
+	"packages/utils/src",
+] as const;
 async function git(args: string[]): Promise<Uint8Array> {
 	const result = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
 	if ((await result.exited) !== 0)
 		throw new Error(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
 	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
 }
-type CaptureProvenance = {
+export type CaptureProvenance = {
 	git_head: string;
+	git_diff_scope: readonly string[];
 	git_diff_binary_sha256: string;
 	source_sha256: Record<string, string>;
 };
 
-async function captureProvenance(): Promise<CaptureProvenance> {
+// Single source of truth: the verifier imports this so capture and verify can
+// never drift into computing the field two different ways.
+export async function captureProvenance(): Promise<CaptureProvenance> {
 	const gitHead = new TextDecoder().decode(await git(["rev-parse", "HEAD"])).trim();
 	const sourceSha256 = Object.fromEntries(
 		await Promise.all(
@@ -198,7 +235,8 @@ async function captureProvenance(): Promise<CaptureProvenance> {
 	);
 	return {
 		git_head: gitHead,
-		git_diff_binary_sha256: hash(await git(["diff", "--binary", "HEAD", "--"])),
+		git_diff_scope: PROVENANCE_DIFF_SCOPE,
+		git_diff_binary_sha256: hash(await git(["diff", "--binary", "HEAD", "--", ...PROVENANCE_DIFF_SCOPE])),
 		source_sha256: sourceSha256,
 	};
 }
