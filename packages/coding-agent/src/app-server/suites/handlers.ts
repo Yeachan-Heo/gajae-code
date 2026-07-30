@@ -22,6 +22,7 @@ import { processHandlers } from "./process-handlers";
 import { skillsHandlers } from "./skills-handlers";
 import { threadMutationHandlers } from "./thread-mutation-handlers";
 import { threadReadHandlers } from "./thread-read-handlers";
+import { threadSessionOpsHandlers } from "./thread-session-ops-handlers";
 import { workspaceQueryHandlers } from "./workspace-query-handlers";
 
 export interface HandlerContext {
@@ -211,4 +212,5 @@ export function registerBuiltinHandlers(registry: HandlerRegistry): void {
 	for (const [method, handler] of Object.entries(pluginHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(policyConfigHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(liveRuntimeHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(threadSessionOpsHandlers)) registry.register(method, handler);
 }
