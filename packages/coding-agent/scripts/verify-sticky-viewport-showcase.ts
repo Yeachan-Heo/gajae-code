@@ -1,5 +1,10 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+	SEMANTIC_ANCHOR_DOMAIN,
+	semanticAnchorDigest,
+	semanticAnchorNamespace,
+} from "../test/fixtures/tui/sticky-viewport-showcase";
 import { ansiToHtml, xterm256Color } from "./capture-sticky-viewport-showcase";
 
 const KEYS = [
@@ -64,6 +69,18 @@ const INDEPENDENT_REVIEW_KEYS = [
 const INDEPENDENT_REVIEW_RESULT_KEYS = ["key", "result", "notes", "artifact_checks"] as const;
 const INDEPENDENT_REVIEW_DEFECT_KEYS = ["description", "accepted"] as const;
 const ARTIFACT_CHECK_KEYS = ["terminal_txt", "terminal_ansi_txt", "terminal_html", "metadata_json"] as const;
+const SEMANTIC_ANCHOR_KEYS = [
+	"domain",
+	"id",
+	"namespace",
+	"grapheme_start",
+	"grapheme_end",
+	"cell_start",
+	"cell_end",
+	"frame_start_row",
+	"row_text_sha256",
+	"frame_sha256",
+] as const;
 const SEMANTIC_ROOT_IDS = [
 	"irc-split",
 	"pending-messages",
@@ -409,6 +426,77 @@ const frameGeometry = (key: string, text: string) => {
 	// the painted status row sits one lower than the transcript capacity.
 	return { capacity: statusRow - noticeRows, statusRow, noticeRows };
 };
+// Semantic anchor identity guard. The persisted `semantic_anchor.id` is the only
+// durable handle on WHICH painted row the evidence anchors, so it must be
+// unforgeable rather than merely well-formed. A geometry-only digest failed both
+// ways: distinct entries painting different content at equal offsets collapsed
+// onto one id, and an 8-hex truncation is brute-forceable. This recomputes the
+// full domain-separated digest from the persisted inputs plus the committed paint
+// and rejects arbitrary, transplanted, aliased, malformed, and truncated ids. It
+// runs BEFORE every downstream metadata check so a forged id can never ride
+// through on an earlier-passing path.
+const verifySemanticAnchor = (
+	key: string,
+	state: string,
+	value: unknown,
+	text: string,
+	ansiSha256: string,
+	seen: Map<string, string>,
+) => {
+	if (state === "capacity-zero") {
+		if (value !== null) fail(`semantic anchor guard: ${key} must not carry an anchor at zero capacity`);
+		return;
+	}
+	const anchor = object(value, `semantic anchor ${key}`);
+	exactKeys(anchor, SEMANTIC_ANCHOR_KEYS, `semantic anchor ${key}`);
+	if (anchor.domain !== SEMANTIC_ANCHOR_DOMAIN)
+		fail(`semantic anchor guard: ${key} domain separation literal mismatch`);
+	const id = anchor.id;
+	const namespace = anchor.namespace;
+	if (typeof id !== "string" || typeof namespace !== "string" || !namespace)
+		fail(`semantic anchor guard: ${key} id or namespace is not a nonempty string`);
+	const geometry = ["grapheme_start", "grapheme_end", "cell_start", "cell_end", "frame_start_row"] as const;
+	for (const field of geometry)
+		if (!Number.isInteger(anchor[field]) || (anchor[field] as number) < 0)
+			fail(`semantic anchor guard: ${key} ${field} is not a nonnegative integer`);
+	const graphemeStart = anchor.grapheme_start as number;
+	const graphemeEnd = anchor.grapheme_end as number;
+	const cellStart = anchor.cell_start as number;
+	const cellEnd = anchor.cell_end as number;
+	const frameRow = anchor.frame_start_row as number;
+	if (graphemeEnd <= graphemeStart || cellEnd <= cellStart)
+		fail(`semantic anchor guard: ${key} geometry span is empty or inverted`);
+	// The row text is read from the committed paint, never from metadata, so the id
+	// stays bound to what the artifact actually renders at the recorded row.
+	const rows = text.split("\n");
+	const rowText = rows[frameRow];
+	if (rowText === undefined) fail(`semantic anchor guard: ${key} frame_start_row is outside the committed paint`);
+	if (anchor.row_text_sha256 !== hash(rowText as string))
+		fail(`semantic anchor guard: ${key} row content digest does not match the painted anchor row`);
+	if (anchor.frame_sha256 !== ansiSha256)
+		fail(`semantic anchor guard: ${key} frame digest does not match the committed frame`);
+	if (semanticAnchorNamespace(id as string) !== namespace)
+		fail(`semantic anchor guard: ${key} id namespace does not match the persisted namespace`);
+	const expected = `${namespace}:${semanticAnchorDigest({
+		entryKey: key,
+		namespace: namespace as string,
+		rowText: rowText as string,
+		graphemeStart,
+		graphemeEnd,
+		cellStart,
+		cellEnd,
+		frameRow,
+		frameSha256: ansiSha256,
+	})}`;
+	if (id !== expected) fail(`semantic anchor guard: ${key} id is not the digest of its own persisted inputs`);
+	// No silent aliasing: distinct evidence entries are distinct anchors by
+	// construction, because the entry key is inside the preimage. A repeat here can
+	// only mean a transplanted id, so it is a hard failure rather than an
+	// equivalence to be tolerated.
+	const owner = seen.get(id as string);
+	if (owner !== undefined) fail(`semantic anchor guard: ${key} id aliases the anchor already claimed by ${owner}`);
+	seen.set(id as string, key);
+};
 export async function verifyStickyViewportShowcase(rootInput: string, requireIndependentReview = false): Promise<void> {
 	const root = path.resolve(rootInput);
 	const manifestText = await fs.readFile(path.join(root, "manifest.json"), "utf8");
@@ -445,6 +533,9 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		fail("manifest capture provenance is stale");
 	const entries = array(manifest.entries, "manifest entries");
 	if (entries.length !== KEYS.length) fail("manifest entries must contain exactly 20 entries");
+	// Cross-entry anchor identity ledger. Uniqueness is a hard contract, not a
+	// tolerance: every distinct evidence entry must own a distinct anchor id.
+	const anchorIds = new Map<string, string>();
 	for (let index = 0; index < KEYS.length; index += 1) {
 		const key = KEYS[index]!;
 		const entry = object(entries[index], `entry ${index}`);
@@ -547,6 +638,10 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			stateEvidence.composer_visible !== true
 		)
 			fail(`metadata schema mismatch for ${key}`);
+		// Anchor identity is validated here, before any downstream metadata check, so
+		// a forged, transplanted, or aliased id cannot ride through on an
+		// earlier-passing path.
+		verifySemanticAnchor(key, state!, stateEvidence.semantic_anchor, text, hash(ansi), anchorIds);
 		// Frame-derived geometry must AGREE with the renderer's self-report, which is
 		// strictly stronger than either alone. `transcript_capacity` and
 		// `pin_boundary.row` both come from one renderer local, so they can only be
@@ -583,21 +678,6 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			metadata.output_revision !== stateEvidence.observed_output_revision
 		)
 			fail(`renderer-owned viewport state mismatch for ${key}`);
-		const semanticAnchor =
-			state === "capacity-zero"
-				? stateEvidence.semantic_anchor
-				: object(stateEvidence.semantic_anchor, `metadata ${key} semantic anchor`);
-		const semanticAnchorValid =
-			state === "capacity-zero"
-				? semanticAnchor === null && stateEvidence.transcript_capacity === 0
-				: typeof (semanticAnchor as Record<string, unknown>).id === "string" &&
-					((semanticAnchor as Record<string, unknown>).id as string).length > 0 &&
-					Number.isInteger((semanticAnchor as Record<string, unknown>).grapheme_start) &&
-					((semanticAnchor as Record<string, unknown>).grapheme_start as number) >= 0 &&
-					Number.isInteger((semanticAnchor as Record<string, unknown>).cell_start) &&
-					((semanticAnchor as Record<string, unknown>).cell_start as number) >= 0 &&
-					Number.isInteger((semanticAnchor as Record<string, unknown>).frame_start_row) &&
-					((semanticAnchor as Record<string, unknown>).frame_start_row as number) >= 0;
 		const visibleEmpty = object(stateEvidence.visible_empty_irc_frame, `metadata ${key} visible empty IRC frame`);
 		exactKeys(stateEvidence, STATE_KEYS, `metadata ${key} state`);
 		strings(rootOrder, SEMANTIC_ROOT_IDS, `metadata ${key} semantic root IDs`);
@@ -679,7 +759,6 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			!Number.isInteger(cursor.col) ||
 			(cursor.col as number) < 0 ||
 			(cursor.col as number) >= columns ||
-			!semanticAnchorValid ||
 			cursor.frame_sha256 !== hash(ansi) ||
 			cursor.blink !== true
 		)

@@ -90,26 +90,54 @@ const semanticRootIds = (mode: InteractiveMode) =>
 		if (child === mode.hookWidgetContainerBelow) return "hooks-below";
 		throw new Error("unexpected production root child");
 	});
+// Domain-separated semantic anchor identity. A geometry-only digest is forgeable
+// and aliasing: distinct evidence entries painting different content at the same
+// row/cell offsets collapse onto one id, and an 8-hex truncation is searchable by
+// brute force. The preimage therefore binds the evidence entry key, the painted
+// anchor row text, the COMPLETE geometry (grapheme and cell start AND end plus
+// frameRow), and the committed frame digest, under a versioned domain literal so
+// the digest cannot be repurposed in another context.
+export const SEMANTIC_ANCHOR_DOMAIN = "gjc.sticky-viewport.semantic-anchor.v1";
+// Netstring framing (`<byteLength>:<value>,`). A plain `a:b:c` join is ambiguous
+// as soon as any field may itself contain `:` — which namespaces and painted row
+// text both do — so distinct field tuples could otherwise share a preimage.
+export const semanticAnchorPreimage = (fields: readonly string[]) =>
+	fields.map(field => `${Buffer.byteLength(field)}:${field},`).join("");
+export const semanticAnchorDigest = (input: {
+	entryKey: string;
+	namespace: string;
+	rowText: string;
+	graphemeStart: number;
+	graphemeEnd: number;
+	cellStart: number;
+	cellEnd: number;
+	frameRow: number;
+	frameSha256: string;
+}) =>
+	new Bun.CryptoHasher("sha256")
+		.update(
+			semanticAnchorPreimage([
+				SEMANTIC_ANCHOR_DOMAIN,
+				input.entryKey,
+				input.namespace,
+				input.rowText,
+				String(input.graphemeStart),
+				String(input.graphemeEnd),
+				String(input.cellStart),
+				String(input.cellEnd),
+				String(input.frameRow),
+				input.frameSha256,
+			]),
+		)
+		.digest("hex");
+/** Namespace of a renderer anchor id, i.e. everything before its volatile per-run suffix. */
+export const semanticAnchorNamespace = (id: string) => id.split(":").slice(0, -1).join(":");
 // Every persisted frame must be canonical for its render mode, not just the
 // top-level payload. `metadata.json` is a required manifest artifact, so raw
 // frames here would make the whole bundle host-dependent: theme.ts emits SGR
 // directly and `detectColorMode()` picks truecolor vs indexed `38;5;n` from
 // COLORTERM/TERM. Stripping at the single capture point keeps
 // `visible_empty_irc_frame` and every resize probe byte-identical across hosts.
-const canonicalAnchorId = (anchor: {
-	id: string;
-	graphemeStart: number;
-	graphemeEnd: number;
-	cellStart: number;
-	cellEnd: number;
-}) => {
-	const namespace = anchor.id.split(":").slice(0, -1).join(":");
-	const digest = new Bun.CryptoHasher("sha256")
-		.update(`${anchor.graphemeStart}:${anchor.graphemeEnd}:${anchor.cellStart}:${anchor.cellEnd}`)
-		.digest("hex")
-		.slice(0, 8);
-	return namespace ? `${namespace}:${digest}` : digest;
-};
 const captureFrame = (terminal: VirtualTerminal, renderMode: StickyViewportShowcaseEntry["renderMode"]) => {
 	const raw = terminal.getViewportAnsi();
 	const ansi = renderMode === "ascii-no-color" ? Bun.stripANSI(raw) : raw;
@@ -124,10 +152,25 @@ const captureFrame = (terminal: VirtualTerminal, renderMode: StickyViewportShowc
 async function createMode(entry: StickyViewportShowcaseEntry) {
 	resetSettingsForTest();
 	const dir = TempDir.createSync("@sticky-viewport-");
+	// The default status-line preset paints the `git` and `path` segments into every
+	// frame at >=120 columns. Both are host state, not renderer state: `path` prints
+	// the cwd basename, and `git` prints the branch plus staged/unstaged counts that
+	// `StatusLineComponent` resolves through an async `git status --porcelain` whose
+	// completion races the capture — the same worktree at the same merge state paints
+	// `detached` or `detached +8` depending on which render observes the resolved
+	// promise. `metadata.json` is a required artifact, so that race makes the bundle
+	// digest nondeterministic run-to-run and across hosts. Neither segment carries
+	// sticky-viewport evidence, so the capture pins a deterministic custom preset that
+	// excludes them instead of sampling repository state at all.
+	const statusLineOverrides = {
+		"statusLine.preset": "custom",
+		"statusLine.leftSegments": ["model"],
+		"statusLine.rightSegments": ["session_name"],
+	} as const;
 	await Settings.init({
 		inMemory: true,
 		cwd: dir.path(),
-		overrides: { "startup.quiet": true, "mouse.enabled": true },
+		overrides: { "startup.quiet": true, "mouse.enabled": true, ...statusLineOverrides },
 	});
 	const auth = await AuthStorage.create(":memory:");
 	const registry = new ModelRegistry(auth);
@@ -136,6 +179,9 @@ async function createMode(entry: StickyViewportShowcaseEntry) {
 	const settings = Settings.isolated();
 	settings.set("startup.quiet", true);
 	settings.set("mouse.enabled", true);
+	settings.set("statusLine.preset", statusLineOverrides["statusLine.preset"]);
+	settings.set("statusLine.leftSegments", [...statusLineOverrides["statusLine.leftSegments"]]);
+	settings.set("statusLine.rightSegments", [...statusLineOverrides["statusLine.rightSegments"]]);
 	const session = new AgentSession({
 		agent: new Agent({
 			initialState: { model, systemPrompt: ["Sticky viewport production capture"], tools: [], messages: [] },
@@ -351,6 +397,8 @@ export async function renderStickyViewportShowcase(
 		// persisted ANSI payload and the recorded cursor frame digest — must use this one
 		// value, or the verifier's `cursor.frame_sha256 !== hash(ansi)` check rejects it.
 		const canonicalAnsi = entry.renderMode === "ascii-no-color" ? Bun.stripANSI(retainedFrame) : retainedFrame;
+		const canonicalText = Bun.stripANSI(retainedFrame);
+		const frameSha256 = new Bun.CryptoHasher("sha256").update(canonicalAnsi).digest("hex");
 		const rootOrder = semanticRootIds(mode);
 		const focused = mode.ui.getFocusedComponent();
 		const cursor = observation.cursor;
@@ -359,7 +407,7 @@ export async function renderStickyViewportShowcase(
 		if (anchor === null && observation.transcriptCapacity > 0)
 			throw new Error("renderer produced no visible semantic anchor");
 		return {
-			terminalText: Bun.stripANSI(retainedFrame),
+			terminalText: canonicalText,
 			terminalAnsiText: canonicalAnsi,
 			sourceRevision: "production-tui-virtual-terminal-v3",
 			outputRevision:
@@ -386,7 +434,7 @@ export async function renderStickyViewportShowcase(
 				focused_component: focused === mode.editor && observation.focused ? "editor" : null,
 				cursor: {
 					...cursor,
-					frame_sha256: new Bun.CryptoHasher("sha256").update(canonicalAnsi).digest("hex"),
+					frame_sha256: frameSha256,
 					blink: mode.editor.focused,
 				},
 				selection: observation.selection
@@ -402,17 +450,42 @@ export async function renderStickyViewportShowcase(
 						}
 					: null,
 				semantic_anchor: anchor
-					? {
+					? (() => {
 							// `anchor.id` embeds a per-run session entry id, so persisting it raw
 							// makes the required metadata artifact differ between two captures on
-							// the SAME host. Keep the semantic namespace and replace only the
-							// volatile suffix with a digest of the anchor's own geometry, so the
-							// bundle is reproducible while distinct anchors stay distinguishable.
-							id: canonicalAnchorId(anchor),
-							grapheme_start: anchor.graphemeStart,
-							cell_start: anchor.cellStart,
-							frame_start_row: anchor.frameRow,
-						}
+							// the SAME host. Keep the semantic namespace and replace the volatile
+							// suffix with a domain-separated digest that binds this entry, the
+							// painted anchor row, the complete geometry, and the committed frame —
+							// so the bundle stays reproducible while distinct anchors stay
+							// distinguishable and no id is transplantable to another entry.
+							const rows = canonicalText.split("\n");
+							const rowText = rows[anchor.frameRow];
+							if (rowText === undefined) throw new Error("semantic anchor frame row is outside the paint");
+							const namespace = semanticAnchorNamespace(anchor.id);
+							if (!namespace) throw new Error("semantic anchor id carries no namespace");
+							return {
+								domain: SEMANTIC_ANCHOR_DOMAIN,
+								id: `${namespace}:${semanticAnchorDigest({
+									entryKey: entry.key,
+									namespace,
+									rowText,
+									graphemeStart: anchor.graphemeStart,
+									graphemeEnd: anchor.graphemeEnd,
+									cellStart: anchor.cellStart,
+									cellEnd: anchor.cellEnd,
+									frameRow: anchor.frameRow,
+									frameSha256,
+								})}`,
+								namespace,
+								grapheme_start: anchor.graphemeStart,
+								grapheme_end: anchor.graphemeEnd,
+								cell_start: anchor.cellStart,
+								cell_end: anchor.cellEnd,
+								frame_start_row: anchor.frameRow,
+								row_text_sha256: new Bun.CryptoHasher("sha256").update(rowText).digest("hex"),
+								frame_sha256: frameSha256,
+							};
+						})()
 					: null,
 				cjk_contiguous_semantics: CJK_BOUNDARIES,
 				coverage: STICKY_VIEWPORT_SHOWCASE_COVERAGE,
