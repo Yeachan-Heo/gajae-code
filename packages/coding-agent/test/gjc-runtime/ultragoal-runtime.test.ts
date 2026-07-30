@@ -5208,7 +5208,32 @@ describe("native GJC ultragoal runtime", () => {
 			},
 		];
 		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
-			"must reference an existing non-empty artifact path",
+			"artifact-only coverage requires an existing non-empty file",
+		);
+	});
+
+	it("rejects fabricated receipt-only artifact coverage without a file", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const qa = JSON.parse(passingQualityGate()).executorQa as Record<string, unknown>;
+		const artifactRefs = qa.artifactRefs as Array<Record<string, unknown>>;
+		artifactRefs.push({
+			id: "receipt-only-proof",
+			kind: "failure-mode-test",
+			description: "fabricated receipt-only proof",
+			verifiedReceipt: { type: "test-report", receiptId: "fabricated", status: "passed" },
+		});
+		qa.contractCoverage = [
+			{
+				id: "receipt-only",
+				contractRef: "approved-plan:goal",
+				obligation: "receipt-only proof must be authoritative",
+				status: "covered",
+				artifactRefs: ["receipt-only-proof"],
+			},
+		];
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
+			"artifact-only coverage requires an existing non-empty file",
 		);
 	});
 

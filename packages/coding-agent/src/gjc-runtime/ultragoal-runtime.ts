@@ -2023,7 +2023,13 @@ async function validateContractCoverage(
 		if (artifactIds) {
 			requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
 			for (const artifactId of artifactIds) {
-				await validateArtifactProof(cwd, artifactRefs.get(artifactId)!, `executorQa.artifactRefs.${artifactId}`, {
+				const artifact = artifactRefs.get(artifactId)!;
+				if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+					throw new Error(
+						`qualityGate executorQa.artifactRefs.${artifactId} artifact-only coverage requires an existing non-empty file`,
+					);
+				}
+				await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
 					surfaceFamily: "native",
 					live: false,
 				});
