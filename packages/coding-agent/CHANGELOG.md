@@ -286,8 +286,6 @@
 
 - Added SDK v3 prompt reconciliation through `turn.prompt_status` with caller-supplied `clientRef` correlation, bounded live-session lifecycle retention, reconnect-safe lookup, and explicit ordered non-replay semantics for `turn.prompt` (#2930).
 - Added `models.profiles.list` discovery of the effective built-in plus `models.yml` profile catalog, exact-ID pre-spawn validation that reloads host configuration for each lifecycle request, and structured `unknown_model_profile` / `model_profile_registry_error` details across lifecycle startup failures (#2931).
-### Added
-
 - Added bundled light TUI themes `red-claw-light` and `blue-crab-light` — light-classified counterparts of the crustacean brand themes, shipped as a matched set with the same token wiring, crab symbol overrides, and distinct brand-vs-semantic (error/warning/diff-removal) tokens. Both are selectable from Settings or `/theme` and classify as light via background luminance.
 
 ### Changed

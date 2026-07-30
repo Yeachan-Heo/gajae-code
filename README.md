@@ -274,7 +274,7 @@ Run `gjc config set startup.checkUpdate false` to disable the launch-time check.
 
 ## TUI identity
 
-The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab-light theme. Both crustacean brand themes also ship light counterparts (`red-claw-light`, `blue-crab-light`) as a matched set. Three bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror those tools for easy eye-migration, while `gruvbox-dark` remains available as a classic dark option. All are selectable from Settings or `/theme`; explicit user theme settings still win.
+The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals retain the existing blue-crab slot default. Both crustacean brand themes also ship light counterparts (`red-claw-light`, `blue-crab-light`) as a matched set. Three bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror those tools for easy eye-migration, while `gruvbox-dark` remains available as a classic dark option. All are selectable from Settings or `/theme`; explicit user theme settings still win.
 
 ### Bundled theme grid
 
@@ -284,8 +284,8 @@ Pick from Settings (`Appearance -> Dark theme` / `Light theme`) or `/theme`.
 | --- | --- | --- |
 | `red-claw` | Dark GJC default with warm red-claw accents and strong status contrast. | Native GJC identity for dark terminals. |
 | `blue-crab` | Deep-ocean blue palette with bright coastal accents. | A cool blue alternative for dark terminals. |
-| `red-claw-light` | Light cream palette with warm red-claw accents. | Native GJC identity for light terminals. |
-| `blue-crab-light` | Light ice-blue palette tuned for readable light slots. | Light terminal or OS appearance (default). |
+| `red-claw-light` | Light cream palette with warm red-claw accents. | A warm light option for light terminals. |
+| `blue-crab-light` | Light ice-blue palette tuned for readable light slots. | A cool blue alternative for light terminals. |
 | `claude-code` | Claude Code-inspired dark palette with terracotta and pink highlights. | Claude Code muscle memory without leaving GJC. |
 | `codex` | Crisp dark blue-gray palette with sharper coding-session contrast. | A Codex-like dark workspace. |
 | `opencode` | OpenCode-inspired dark palette with punchier terminal accents. | OpenCode muscle memory in the bundled picker. |
@@ -354,7 +354,7 @@ Thanks to the people and agents helping shape the early Gajae-Code releases, inc
 
 ## Inspirations and lineage
 
-Gajae-Code's default TUI identity is red-claw for dark appearance and blue-crab-light for light appearance. The wider bundled set adds the matching `red-claw-light` and `blue-crab` variants, `gruvbox-dark`, and the `claude-code`, `codex`, and `opencode` migration themes. It builds on lessons from a small family of agent harnesses while keeping the public GJC surface intentionally focused. Historical attribution is kept in [`NOTICE.md`](NOTICE.md).
+Gajae-Code's default TUI identity is red-claw for dark appearance, with the existing blue-crab light-slot default retained. The wider bundled set adds the light-classified `red-claw-light` and `blue-crab-light` variants, `gruvbox-dark`, and the `claude-code`, `codex`, and `opencode` migration themes. It builds on lessons from a small family of agent harnesses while keeping the public GJC surface intentionally focused. Historical attribution is kept in [`NOTICE.md`](NOTICE.md).
 
 ## License
 

@@ -569,7 +569,7 @@ export const SETTINGS_SCHEMA = {
 
 	"theme.light": {
 		type: "string",
-		default: "blue-crab-light",
+		default: "blue-crab",
 		ui: {
 			tab: "appearance",
 			label: "Light Theme",

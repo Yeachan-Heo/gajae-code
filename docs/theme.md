@@ -163,12 +163,12 @@ Auto theme slot selection uses terminal appearance in this order:
 3. macOS appearance fallback only for the known-broken macOS/Zellij OSC 11 path
 4. dark slot fallback
 
-Built-in theme note: `red-claw` is the default dark GJC theme, and `blue-crab-light` is the default light-slot theme. The crustacean brand themes ship as matched dark/light pairs (`red-claw`/`red-claw-light`, `blue-crab`/`blue-crab-light`) with separate semantic error/warning/diff-removal tokens and crab-oriented symbol overrides; the `-light` variants classify as light via background luminance, while `red-claw` and `blue-crab` are dark-classified. Three bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror those tools for easy eye-migration, and `gruvbox-dark` provides the classic Gruvbox dark palette. All four are dark-classified and recommended for `theme.dark`, but are selectable in either slot; they keep GJC's default symbol identity (no crab-symbol overrides).
+Built-in theme note: `red-claw` is the default dark GJC theme, and `blue-crab` remains the default light-slot theme. The crustacean brand themes ship as matched dark/light pairs (`red-claw`/`red-claw-light`, `blue-crab`/`blue-crab-light`) with separate semantic error/warning/diff-removal tokens and crab-oriented symbol overrides; the `-light` variants classify as light via background luminance, while `red-claw` and `blue-crab` are dark-classified. Three bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror those tools for easy eye-migration, and `gruvbox-dark` provides the classic Gruvbox dark palette. All four are dark-classified and recommended for `theme.dark`, but are selectable in either slot; they keep GJC's default symbol identity (no crab-symbol overrides).
 
 Current defaults from settings schema:
 
 - `theme.dark = "red-claw"`
-- `theme.light = "blue-crab-light"`
+- `theme.light = "blue-crab"`
 - `symbolPreset = "unicode"`
 - `colorBlindMode = false`
 
@@ -227,14 +227,14 @@ Persisted keys:
 - `symbolPreset`
 - `colorBlindMode`
 
-Legacy migration exists: old flat `theme: "name"` is migrated to nested `theme.dark` or `theme.light` based on luminance detection; legacy built-in names `dark`/`light` map to `red-claw`/`blue-crab-light` unless matching custom theme files exist.
+Legacy migration exists: old flat `theme: "name"` is migrated to nested `theme.dark` or `theme.light` based on luminance detection; legacy built-in names `dark`/`light` map to `red-claw`/`blue-crab` unless matching custom theme files exist.
 
 ## Creating a custom theme (practical)
 
 1. Create file in custom themes dir, e.g. `~/.gjc/agent/themes/my-theme.json`.
 2. Include `name`, optional `vars`, and **all required** `colors` tokens.
 3. Optionally include `symbols` and `export`.
-4. Select the theme in Settings (`Appearance -> Dark theme` or `Appearance -> Light theme`) depending on which auto slot you want. All bundled themes are selectable: the crustacean defaults `red-claw` and `blue-crab-light`, their matched counterparts `red-claw-light` and `blue-crab`, plus `gruvbox-dark` and the migration themes `claude-code`, `codex`, and `opencode` (dark-classified, recommended for the dark slot but selectable in either).
+4. Select the theme in Settings (`Appearance -> Dark theme` or `Appearance -> Light theme`) depending on which auto slot you want. All bundled themes are selectable: the existing slot defaults `red-claw` and `blue-crab`, their light-classified counterparts `red-claw-light` and `blue-crab-light`, plus `gruvbox-dark` and the migration themes `claude-code`, `codex`, and `opencode` (dark-classified, recommended for the dark slot but selectable in either).
 
 Minimal skeleton:
 
