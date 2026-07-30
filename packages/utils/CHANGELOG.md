@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Positive-integer environment helpers now reject malformed, fractional, exponent-form, non-positive, and unsafe values instead of silently accepting their numeric prefixes (#3593).
 
 ## [0.12.4] - 2026-07-30
 
