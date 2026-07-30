@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `fetchWithRetry` now normalizes every response and network-error delay immediately before scheduling, including clamping values above the platform timer ceiling so large backoffs cannot collapse into an immediate retry.
+
 ## [0.12.6] - 2026-07-31
 ### Fixed
 
