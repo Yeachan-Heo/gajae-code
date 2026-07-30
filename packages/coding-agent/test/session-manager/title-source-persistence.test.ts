@@ -103,6 +103,20 @@ class DisappearingTitleStorage extends MemorySessionStorage {
 		return super.existsSync(filePath);
 	}
 }
+class DeferredTitleReplacementStorage extends FileSessionStorage {
+	readonly replacementStarted = Promise.withResolvers<void>();
+	readonly releaseReplacement = Promise.withResolvers<void>();
+	#deferNextRename = true;
+
+	override async rename(from: string, to: string): Promise<void> {
+		if (this.#deferNextRename) {
+			this.#deferNextRename = false;
+			this.replacementStarted.resolve();
+			await this.releaseReplacement.promise;
+		}
+		await super.rename(from, to);
+	}
+}
 
 describe("session title source persistence", () => {
 	let testAgentDir: string;
@@ -172,6 +186,45 @@ describe("session title source persistence", () => {
 		const reopened = await SessionManager.open(sessionFile!);
 		expect(reopened.getSessionName()).toBe("Fresh title");
 		expect(reopened.titleSource).toBe("auto");
+	});
+	it("serializes an assistant append behind a deferred fresh-title replacement", async () => {
+		const storage = new DeferredTitleReplacementStorage();
+		const session = SessionManager.create(cwd, path.join(testAgentDir, "sessions"), storage);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		const title = session.setSessionName("Fresh title", "auto");
+		await storage.replacementStarted.promise;
+
+		session.appendMessage(makeAssistantMessage());
+		storage.releaseReplacement.resolve();
+
+		await expect(title).resolves.toBe(true);
+		await session.flush();
+		const reopened = await SessionManager.open(
+			session.getSessionFile()!,
+			path.dirname(session.getSessionFile()!),
+			storage,
+		);
+		expect(reopened.getSessionName()).toBe("Fresh title");
+		expect(
+			reopened.getEntries().filter(entry => entry.type === "message" && entry.message.role === "assistant"),
+		).toHaveLength(1);
+	});
+	it("does not publish a deferred fresh title into a successor session", async () => {
+		const storage = new DeferredTitleReplacementStorage();
+		const session = SessionManager.create(cwd, path.join(testAgentDir, "sessions"), storage);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		const predecessorFile = session.getSessionFile()!;
+		const title = session.setSessionName("Predecessor title", "auto");
+		await storage.replacementStarted.promise;
+
+		const successorFile = session.createBranchedSession(session.getLeafId()!)!;
+		storage.releaseReplacement.resolve();
+
+		await expect(title).resolves.toBe(false);
+		expect(session.getSessionFile()).toBe(successorFile);
+		expect(session.getSessionName()).toBeUndefined();
+		expect(getHeader(await loadEntriesFromFile(successorFile, storage))?.title).toBeUndefined();
+		expect(getHeader(await loadEntriesFromFile(predecessorFile, storage))?.title).toBe("Predecessor title");
 	});
 	it("keeps fresh title failures unpublished and distinguishes certified retry from ambiguous replay", async () => {
 		const certifiedStorage = new FileSessionStorage();

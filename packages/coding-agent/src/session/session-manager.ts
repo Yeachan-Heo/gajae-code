@@ -4781,6 +4781,8 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#titleCommitChain: Promise<void> = Promise.resolve();
+	/** Queued persistence blocks synchronous appends until its authority turn completes. */
+	#queuedPersistTasks = 0;
 	#bytesSinceTitleAnchor: number | undefined;
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
@@ -7040,6 +7042,7 @@ export class SessionManager {
 		task: () => Promise<void>,
 		options?: { ignoreError?: boolean; recordError?: boolean },
 	): Promise<void> {
+		this.#queuedPersistTasks++;
 		const next = this.#persistChain.then(async () => {
 			if (this.#persistError && !options?.ignoreError) throw this.#persistError;
 			await task();
@@ -7047,6 +7050,11 @@ export class SessionManager {
 		this.#persistChain = next.catch(error => {
 			if (options?.recordError !== false) this.#recordPersistError(error);
 		});
+		void next
+			.finally(() => {
+				this.#queuedPersistTasks--;
+			})
+			.catch(() => {});
 		return next;
 	}
 
@@ -7345,19 +7353,24 @@ export class SessionManager {
 			throw toError(err);
 		}
 	}
-	async #writeEntriesAtomically(entries: FileEntry[]): Promise<AtomicEntryWriteOutcome> {
-		if (!this.#sessionFile) return { kind: "applied" };
-		if (this.destination.kind === "managed") {
+	async #writeEntriesAtomically(
+		entries: FileEntry[],
+		sessionFile = this.#sessionFile,
+		destination = this.destination,
+	): Promise<AtomicEntryWriteOutcome> {
+		if (!sessionFile) return { kind: "applied" };
+		if (destination.kind === "managed") {
 			try {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-				await this.#managedTranscriptStore().replace(path.basename(this.#sessionFile), bytes);
+				const store = managedStoreFromContext(destination.securityContext, path.resolve(path.dirname(sessionFile)));
+				await store.replace(path.basename(sessionFile), bytes);
 				return { kind: "applied" };
 			} catch (error) {
 				return { kind: "ambiguous", error: toError(error) };
 			}
 		}
-		const dir = path.resolve(this.#sessionFile, "..");
-		const tempPath = path.join(dir, `.${path.basename(this.#sessionFile)}.${Snowflake.next()}.tmp`);
+		const dir = path.resolve(sessionFile, "..");
+		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.tmp`);
 		const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
 		try {
 			for (const entry of entries) {
@@ -7366,7 +7379,7 @@ export class SessionManager {
 			await writer.flush();
 			await writer.fsync();
 			await writer.close();
-			await this.#replaceSessionFile(tempPath, this.#sessionFile);
+			await this.#replaceSessionFile(tempPath, sessionFile);
 			return { kind: "applied" };
 		} catch (error) {
 			const writeError = toError(error);
@@ -8170,42 +8183,71 @@ export class SessionManager {
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
 		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const destination = this.destination;
 
 		let applied = false;
 		const commit = this.#titleCommitChain.then(async () => {
 			if (this.#titleSource === "user" && source === "auto") return;
-			if (this.#sessionId !== sessionId) return;
+			if (this.#sessionId !== sessionId || this.#sessionFile !== sessionFile || this.destination !== destination)
+				return;
 			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 
 			try {
 				// A title is user-visible metadata. A new session must have a canonical
 				// header before success is reported, even before its first assistant reply.
-				if (this.persist && this.#sessionFile && !this.storage.existsSync(this.#sessionFile)) {
+				if (this.persist && sessionFile && !this.storage.existsSync(sessionFile)) {
 					const candidateEntries = this.#fileEntries.map(entry =>
 						entry === header ? { ...entry, title: sanitized, titleSource: source } : entry,
 					);
-					const persistedEntries = await Promise.all(
-						materializeResidentEntriesForPersistenceSync(candidateEntries, this.#residentBlobStores()).map(
-							entry => prepareEntryForPersistence(entry, this.#blobStore),
-						),
+					await this.#queuePersistTask(
+						async () => {
+							if (
+								this.#sessionId !== sessionId ||
+								this.#sessionFile !== sessionFile ||
+								this.destination !== destination
+							)
+								return;
+							const persistedEntries = await Promise.all(
+								materializeResidentEntriesForPersistenceSync(candidateEntries, this.#residentBlobStores()).map(
+									entry => prepareEntryForPersistence(entry, this.#blobStore),
+								),
+							);
+							const outcome = await this.#writeEntriesAtomically(persistedEntries, sessionFile, destination);
+							if (outcome.kind !== "applied")
+								throw new AtomicEntryWriteOutcomeError(outcome.kind, outcome.error);
+							if (
+								this.#sessionId !== sessionId ||
+								this.#sessionFile !== sessionFile ||
+								this.destination !== destination
+							)
+								return;
+							this.#needsFullRewriteOnNextPersist = false;
+							this.#flushed = true;
+							this.#ensuredOnDisk = true;
+							applied = true;
+						},
+						{ recordError: false },
 					);
-					const outcome = await this.#writeEntriesAtomically(persistedEntries);
-					if (outcome.kind !== "applied") throw new AtomicEntryWriteOutcomeError(outcome.kind, outcome.error);
-					this.#needsFullRewriteOnNextPersist = false;
-					this.#flushed = true;
-					this.#ensuredOnDisk = true;
 				} else {
 					await this.#persistPatch(
 						{ type: "header_patch", patch: { title: sanitized, titleSource: source } },
 						{ titleCommit: true },
 					);
+					if (
+						this.#sessionId !== sessionId ||
+						this.#sessionFile !== sessionFile ||
+						this.destination !== destination
+					)
+						return;
+					applied = true;
 				}
+				if (!applied) return;
 				this.#sessionName = sanitized;
 				this.#titleSource = source;
 				if (header) applyHeaderPatch(header, { title: sanitized, titleSource: source });
 				this.#headerExportRevision++;
 				this.#bytesSinceTitleAnchor = 0;
-				applied = true;
 			} catch (error) {
 				if (
 					(error instanceof ManagedAppendOutcomeError && error.outcome === "not_applied") ||
@@ -8318,6 +8360,10 @@ export class SessionManager {
 			}
 		}
 
+		if (this.#queuedPersistTasks > 0) {
+			this.#rewriteFile().catch(() => {});
+			return;
+		}
 		if (this.#needsFullRewriteOnNextPersist || !this.#flushed) {
 			// Cold path: rewrite the whole file atomically. Async — the writer is
 			// closed/reopened and every entry is re-prepared. Errors flow through

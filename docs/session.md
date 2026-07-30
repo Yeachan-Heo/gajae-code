@@ -95,6 +95,7 @@ Notes:
 
 - `version` is optional in v1 files; absence means v1.
 - `parentSession` is an opaque lineage string. Current code writes either a session id or a session path depending on flow (`fork`, `forkFrom`, `createBranchedSession`, or explicit `newSession({ parentSession })`). Treat as metadata, not a typed foreign key.
+- A successful `setSessionName(...)` on a fresh persistent session atomically writes a canonical header containing the accepted `title` and `titleSource`, even when there are no message entries yet. This header-only file is a valid intermediate artifact: the title is durable before success is reported to UI chrome, while resume listings exclude it until a `message` entry exists.
 
 ### Entry Base (`SessionEntryBase`)
 
@@ -466,12 +467,12 @@ Algorithm:
 Writes are serialized through an internal promise chain (`#persistChain`) and `NdjsonFileWriter`.
 
 - `append*` updates in-memory state immediately.
-- Persistence is deferred until at least one assistant message exists.
-  - Before first assistant: entries are retained in memory; no file append occurs.
+- Except for accepted title changes, persistence is deferred until at least one assistant message exists:
+  - Before first assistant: entries are retained in memory; no ordinary file append occurs.
+  - A successful title change on a fresh persistent session atomically persists the header-only artifact described above; it does not require an assistant reply.
   - When first assistant exists: full in-memory session is flushed to file.
   - Afterwards: new entries append incrementally.
-
-Rationale in code: avoid persisting sessions that never produced an assistant response.
+- Rationale in code: avoid persisting sessions that never produced an assistant response, while making accepted user-visible title metadata durable before chrome reports success.
 
 ### Durability operations
 
@@ -522,7 +523,7 @@ Defined in `session-manager.ts`:
 - `list(cwd, sessionDir?)` -> sessions in one project scope
 - `listAll()` -> sessions across all project scopes under `~/.gjc/agent/sessions`
 
-Metadata extraction reads only a prefix (`readTextPrefix(..., 4096)`) where possible.
+Metadata extraction reads a bounded 4KiB prefix and, for v4/v5 header patches, up to 16KiB of trailing scan data where possible. Welcome naming is explicit title -> prefix-visible first user prompt -> `Untitled · <local HH:MM>`; resume-list entries use title/summary and first-message data, and omit zero-message sessions.
 
 ## Related but Distinct: Prompt History Storage
 

@@ -31,29 +31,30 @@ Default writes are v2-only. Legacy discovery/migration is lazy, validates identi
 There are two different listing pipelines:
 
 1. `getRecentSessions(sessionDir, limit)` (welcome/summary view)
-   - Reads a bounded 4KB prefix plus bounded trailing v4 header patches from each file.
+   - Reads a bounded 4KiB prefix plus up to 16KiB of trailing v4/v5 header-patch scan data from each file.
    - Parses header metadata, applicable tail patches, and the earliest user text preview.
    - Returns lightweight `RecentSessionInfo` with lazy `name` and `timeAgo` getters.
    - Sorts by file `mtime` descending.
-
+   - Its display-name fallback is explicit title -> prefix-visible first user prompt -> `Untitled · <local HH:MM>` (from the header timestamp, or `mtime` if that timestamp is invalid/missing). It never displays the UUID or filename as a fallback.
 2. `SessionManager.list(...)` / `SessionManager.listAll()` (resume pickers and ID matching)
-   - Reads a bounded 4KB prefix plus at most 16KB of trailing v4 header patches for file-backed sessions.
+   - Reads a bounded 4KiB prefix plus at most 16KiB of trailing v4/v5 header-patch scan data for file-backed sessions.
    - Builds `SessionInfo` objects from bounded metadata and preview extraction; buried patches outside the tail budget deliberately fall back to line-1 header metadata.
-   - Drops sessions with zero `message` entries and sorts by `modified` descending.
-- Writers maintain title projection anchors conservatively so a current renamed title remains reachable without widening this read budget. Listing is read-only: legacy or torn/buried metadata uses the documented bounded fallback until a normal append repairs the projection.
+   - Drops sessions with zero `message` entries and sorts by `modified` descending. Thus a newly named, header-only session can appear in welcome summaries but is excluded from resume pickers and ID matching until a message exists.
+   - Resume-selector display data uses `title` (header title, otherwise latest prefix-visible compaction `shortSummary`) and a first user message preview; it does not use the welcome timestamp label fallback.
+   - Writers maintain title projection anchors conservatively so a current renamed title remains reachable without widening this read budget. Listing is read-only: legacy or torn/buried metadata uses the documented bounded fallback until a normal append repairs the projection.
 
 ### Metadata fallback behavior
 
 For recent summaries (`RecentSessionInfo`):
 
-- display name preference: `header.title` -> first user prompt -> `header.id` -> filename
-- name is truncated to 40 chars for compact displays
-- control characters/newlines are stripped/sanitized from title-derived names
+- display name preference: explicit `header.title` -> first user prompt visible in the prefix -> `Untitled · <local HH:MM>`
+- the timestamp label uses the header timestamp when valid, otherwise the file `mtime`; UUID and filename are never name fallbacks
+- control characters/newlines are stripped/sanitized from title- and prompt-derived names
 
-For `SessionInfo` list entries:
+For `SessionInfo` resume-selector entries:
 
-- `title` is `header.title` or latest compaction `shortSummary`
-- `firstMessage` is first user message text or `"(no messages)"`
+- `title` is `header.title` or the latest prefix-visible compaction `shortSummary`
+- `firstMessage` is the first user message text, or `"(no messages)"` while extracting metadata; zero-message sessions are filtered before the selector/list result is returned
 
 ## `--continue` resolution and terminal breadcrumb preference
 
