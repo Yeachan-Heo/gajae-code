@@ -1,5 +1,5 @@
 import { fuzzyFind } from "@gajae-code/natives";
-import { config, diff, head, branch, repo } from "../../utils/git";
+import { branch, config, diff, head, repo } from "../../utils/git";
 import type { HandlerContext, HandlerResult, MethodHandler } from "./handlers";
 
 type RecordValue = Record<string, unknown>;
@@ -63,10 +63,11 @@ const fuzzyFileSearchSessionStopHandler: MethodHandler = (params, context) => {
 const fuzzyFileSearchSessionUpdateHandler: MethodHandler = async (params, context) => {
 	const p = record(params);
 	if (!p || typeof p.sessionId !== "string" || typeof p.query !== "string") return invalidParams();
+	const query = p.query;
 	const session = sessions.get(key(p.sessionId, context));
 	if (!session) return notFound();
 	try {
-		const files = (await Promise.all(session.roots.map(root => searchRoot(root, p.query)))).flat();
+		const files = (await Promise.all(session.roots.map(root => searchRoot(root, query)))).flat();
 		context?.emitTo?.(context.connectionId ?? "", "fuzzyFileSearch/sessionUpdated", {
 			sessionId: p.sessionId,
 			query: p.query,
@@ -109,11 +110,11 @@ const gitDiffToRemoteHandler: MethodHandler = async params => {
 };
 
 export const workspaceQueryHandlers: Record<string, MethodHandler> = {
-	"fuzzyFileSearch": fuzzyFileSearchHandler,
+	fuzzyFileSearch: fuzzyFileSearchHandler,
 	"fuzzyFileSearch/sessionStart": fuzzyFileSearchSessionStartHandler,
 	"fuzzyFileSearch/sessionStop": fuzzyFileSearchSessionStopHandler,
 	"fuzzyFileSearch/sessionUpdate": fuzzyFileSearchSessionUpdateHandler,
-	"gitDiffToRemote": gitDiffToRemoteHandler,
+	gitDiffToRemote: gitDiffToRemoteHandler,
 };
 
 export function getWorkspaceSearchSessionCount(): number {

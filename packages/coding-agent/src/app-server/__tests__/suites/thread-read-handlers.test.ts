@@ -60,7 +60,7 @@ async function appendProjectedTurn(manager: SessionManager, turnId: string, mark
 		type: "userMessage" as const,
 		id: `${turnId}-user-item`,
 		clientId: null,
-		content: [{ type: "text" as const, text: `${marker} user` }],
+		content: [{ type: "text" as const, text: `${marker} user`, text_elements: [] }],
 	};
 	const assistantItem = {
 		type: "agentMessage" as const,

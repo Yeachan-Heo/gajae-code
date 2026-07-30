@@ -70,7 +70,7 @@ test("dispatchClientRequest: a planned method remains notSupported on an experim
 	state.completeInitialize();
 	const verdict = dispatchClientRequest(
 		state,
-		classifyInbound(req("memory/reset", 1, {})),
+		classifyInbound(req("thread/approveGuardianDeniedAction", 1, { threadId: "t1", event: {} })),
 	);
 	expect(verdict).toMatchObject({ kind: "notSupported", reason: "backendLess" });
 });

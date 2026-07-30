@@ -317,6 +317,11 @@ export class ThreadRuntimeManager {
 		return this.#threads.get(threadId);
 	}
 
+	/** Every currently loaded thread, in load order. */
+	loaded(): ManagedThread[] {
+		return [...this.#threads.values()];
+	}
+
 	/** Mark a published committing runtime active after subscription completes. */
 	markActive(threadId: string): ManagedThread | undefined {
 		const thread = this.#threads.get(threadId);

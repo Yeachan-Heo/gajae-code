@@ -6,12 +6,16 @@
 // marketplace, windowsSandbox, ChatGPT auth) return -32081 automatically by the
 // dispatcher (no handler registered = notSupported verdict from dispatchClientRequest).
 
+import type { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
 import { commandExecHandlers } from "./command-exec-handlers";
+import { environmentAppHandlers } from "./environment-app-handlers";
 import { fsWatchHandlers } from "./fs-watch-handlers";
 import { goalsReviewHandlers } from "./goals-review-handlers";
 import { hooksHandlers } from "./hooks-handlers";
 import { mcpHandlers } from "./mcp-handlers";
 import { modelConfigHandlers } from "./model-config-handlers";
+import { pluginHandlers } from "./plugin-handlers";
+import { policyConfigHandlers } from "./policy-config-handlers";
 import { processHandlers } from "./process-handlers";
 import { skillsHandlers } from "./skills-handlers";
 import { threadMutationHandlers } from "./thread-mutation-handlers";
@@ -21,6 +25,10 @@ import { workspaceQueryHandlers } from "./workspace-query-handlers";
 export interface HandlerContext {
 	/** Connection the request arrived on; notification handlers target it directly. */
 	readonly connectionId?: string;
+	/** Loaded-thread runtime, for handlers that act on live threads. */
+	readonly manager?: ThreadRuntimeManager;
+	/** Stop delivering thread notifications to this connection. */
+	unsubscribe?: (threadId: string) => void | Promise<void>;
 	respond?: (result: unknown) => void;
 	emitTo?: (connectionId: string, method: string, params: unknown) => void;
 	broadcastThread?: (threadId: string, method: string, params: unknown) => void;
@@ -195,4 +203,7 @@ export function registerBuiltinHandlers(registry: HandlerRegistry): void {
 	for (const [method, handler] of Object.entries(threadReadHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(threadMutationHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(workspaceQueryHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(environmentAppHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(pluginHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(policyConfigHandlers)) registry.register(method, handler);
 }

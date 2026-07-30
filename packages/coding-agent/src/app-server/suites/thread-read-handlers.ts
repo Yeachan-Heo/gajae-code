@@ -7,6 +7,7 @@ import { readAppServerProjections } from "../../session/app-server-projection";
 import {
 	type FileEntry,
 	loadEntriesFromFile,
+	type SessionEntry,
 	type SessionHeader,
 	type SessionInfo,
 	SessionManager,
@@ -202,7 +203,8 @@ function projectThread(
 
 function projectionTurns(entries: readonly FileEntry[]): readonly Turn[] {
 	const store = {
-		getEntries: () => entries,
+		// The projection store reads session entries; a session header is not one of them.
+		getEntries: () => entries.filter((entry): entry is SessionEntry => entry.type !== "session"),
 		appendAppServerProjectionEntry: (_data: unknown) => {
 			throw new Error("read-only projection store");
 		},
@@ -456,6 +458,7 @@ export const threadTurnsListHandler: MethodHandler = async params => {
 export const threadSearchHandler: MethodHandler = async params => {
 	const p = paramsRecord(params);
 	if (!p || typeof p.searchTerm !== "string") return invalidParams();
+	const searchTerm = p.searchTerm;
 	const limit = readLimit(p.limit);
 	const sortKey = readSortKey(p.sortKey);
 	const sortDirection = readSortDirection(p.sortDirection, "desc");
@@ -473,10 +476,10 @@ export const threadSearchHandler: MethodHandler = async params => {
 		if (p.archived !== undefined && p.archived !== null && typeof p.archived !== "boolean") return false;
 		if (Array.isArray(sourceKinds) && sourceKinds.length > 0 && !sourceKinds.includes(record.sourceKind))
 			return false;
-		return snippet(record.text, p.searchTerm) !== undefined;
+		return snippet(record.text, searchTerm) !== undefined;
 	});
 	const results = sortSessions(matches, sortKey, sortDirection).flatMap(record => {
-		const found = snippet(record.text, p.searchTerm);
+		const found = snippet(record.text, searchTerm);
 		return found ? [{ thread: threadForSearch(record), snippet: found.snippet }] : [];
 	});
 	const result = page(results, p.cursor, limit, "thread-search");
@@ -487,13 +490,14 @@ export const threadSearchHandler: MethodHandler = async params => {
 export const threadSearchOccurrencesHandler: MethodHandler = async params => {
 	const p = paramsRecord(params);
 	if (!p || typeof p.threadId !== "string" || typeof p.searchTerm !== "string") return invalidParams();
+	const searchTerm = p.searchTerm;
 	if (!optionalStringIsValid(p, "cursor")) return invalidParams();
 	const limit = readLimit(p.limit);
 	if (limit === undefined) return invalidParams();
 	const records = await loadSessions();
 	const record = records.find(candidate => candidate.thread.id === p.threadId);
 	if (!record) return notFound();
-	if (p.searchTerm.length === 0) {
+	if (searchTerm.length === 0) {
 		const result = { data: [], nextCursor: null };
 		return resultWithValidator("experimental", "thread/searchOccurrences", result);
 	}
@@ -502,7 +506,7 @@ export const threadSearchOccurrencesHandler: MethodHandler = async params => {
 			const text = visibleItemText(item);
 			if (!text) return [];
 			const lowerText = text.toLocaleLowerCase();
-			const lowerTerm = p.searchTerm.toLocaleLowerCase();
+			const lowerTerm = searchTerm.toLocaleLowerCase();
 			const found: Array<{
 				turnId: string;
 				itemId: string;
@@ -513,14 +517,14 @@ export const threadSearchOccurrencesHandler: MethodHandler = async params => {
 			let index = lowerText.indexOf(lowerTerm);
 			while (index >= 0) {
 				const start = Math.max(0, index - 80);
-				const end = Math.min(text.length, index + p.searchTerm.length + 80);
+				const end = Math.min(text.length, index + searchTerm.length + 80);
 				found.push({
 					turnId: turn.id,
 					itemId: item.id,
 					snippet: text.slice(start, end),
 					snippetMatchRange: {
 						start: index - start,
-						end: index - start + p.searchTerm.length,
+						end: index - start + searchTerm.length,
 					},
 					turnCursor: encodeCursor("thread-turn", turnIndex),
 				});

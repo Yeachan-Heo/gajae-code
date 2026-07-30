@@ -478,7 +478,7 @@ export async function processInbound(
 			const handler = handlerRegistry?.get(classification.method);
 			if (!handler) return { response: serializeError(verdict.id, "notSupported", transport) ?? undefined };
 			try {
-				const handlerResult = await handler(decoded.raw.params, context);
+				const handlerResult = await handler(decoded.raw.params, { ...context, manager });
 				if (!handlerResult.ok)
 					return { response: serializeError(verdict.id, handlerResult.errorKey, transport) ?? undefined };
 				// A handler response must conform to the profile negotiated by initialize. Fail

@@ -1,11 +1,11 @@
 import { afterAll, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fuzzyFind } from "@gajae-code/natives";
-import { workspaceQueryHandlers, getWorkspaceSearchSessionCount } from "../../suites/workspace-query-handlers";
 import type { HandlerContext } from "../../suites/handlers";
+import { getWorkspaceSearchSessionCount, workspaceQueryHandlers } from "../../suites/workspace-query-handlers";
 
 const root = mkdtempSync(join(tmpdir(), "gjc-workspace-query-suite-"));
 const workspace = join(root, "workspace");
@@ -31,18 +31,33 @@ afterAll(() => rmSync(root, { recursive: true, force: true }));
 test("fuzzyFileSearch uses native fuzzy ranking over real workspace files", async () => {
 	const native = await fuzzyFind({ query: "history srch", path: workspace, maxResults: 20 });
 	expect(native.matches[0]?.path).toBe("history-search.ts");
-	const response = resultOf(await workspaceQueryHandlers.fuzzyFileSearch({ query: "history srch", root: workspace }, context)) as { files: Array<{ path: string }> };
+	const response = resultOf(
+		await workspaceQueryHandlers.fuzzyFileSearch({ query: "history srch", root: workspace }, context),
+	) as { files: Array<{ path: string }> };
 	expect(response.files[0]?.path).toBe("history-search.ts");
 });
 
 test("fuzzy search sessions retain roots and emit real incremental updates", async () => {
 	const notifications: unknown[] = [];
-	const sessionContext: HandlerContext = { connectionId: "session", emitTo: (_id, _method, params) => notifications.push(params) };
-	resultOf(workspaceQueryHandlers["fuzzyFileSearch/sessionStart"]({ sessionId: "s1", roots: [workspace] }, sessionContext));
+	const sessionContext: HandlerContext = {
+		connectionId: "session",
+		emitTo: (_id, _method, params) => notifications.push(params),
+	};
+	resultOf(
+		await workspaceQueryHandlers["fuzzyFileSearch/sessionStart"](
+			{ sessionId: "s1", roots: [workspace] },
+			sessionContext,
+		),
+	);
 	expect(getWorkspaceSearchSessionCount()).toBe(1);
-	resultOf(await workspaceQueryHandlers["fuzzyFileSearch/sessionUpdate"]({ sessionId: "s1", query: "history srch" }, sessionContext));
+	resultOf(
+		await workspaceQueryHandlers["fuzzyFileSearch/sessionUpdate"](
+			{ sessionId: "s1", query: "history srch" },
+			sessionContext,
+		),
+	);
 	expect((notifications[0] as { files: Array<{ path: string }> }).files[0]?.path).toBe("history-search.ts");
-	resultOf(workspaceQueryHandlers["fuzzyFileSearch/sessionStop"]({ sessionId: "s1" }, sessionContext));
+	resultOf(await workspaceQueryHandlers["fuzzyFileSearch/sessionStop"]({ sessionId: "s1" }, sessionContext));
 	expect(getWorkspaceSearchSessionCount()).toBe(0);
 });
 
@@ -57,11 +72,17 @@ test("gitDiffToRemote returns a real tracking-branch diff and notFound for non-g
 	execFileSync("git", ["config", "branch.main.merge", "refs/heads/main"], { cwd: repo });
 	execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: repo });
 	writeFileSync(join(repo, "tracked.txt"), "after\n");
-	const response = resultOf(await workspaceQueryHandlers.gitDiffToRemote({ cwd: repo }, context)) as { sha: string; diff: string };
+	const response = resultOf(await workspaceQueryHandlers.gitDiffToRemote({ cwd: repo }, context)) as {
+		sha: string;
+		diff: string;
+	};
 	expect(response.sha).toMatch(/^[0-9a-f]{40}$/);
 	expect(response.diff).toContain("-before");
 	expect(response.diff).toContain("+after");
-	expect(await workspaceQueryHandlers.gitDiffToRemote({ cwd: workspace }, context)).toEqual({ ok: false, errorKey: "notFound" });
+	expect(await workspaceQueryHandlers.gitDiffToRemote({ cwd: workspace }, context)).toEqual({
+		ok: false,
+		errorKey: "notFound",
+	});
 });
 
 test("workspaceQueryHandlers omits getConversationSummary because no session identity is pinned", () => {
