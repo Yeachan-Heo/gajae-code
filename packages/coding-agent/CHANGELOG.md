@@ -30,6 +30,7 @@
 - `gjc --worktree` / `gjc -w` launch no longer crashes with a raw uncaught `EEXIST` when the worktree bucket directory (`<repo>.gajae-code-worktrees`) is a broken symbolic link to unmounted or offloaded cold storage. The launch distinguishes dangling links and non-directory entries from valid directory symlinks or Windows junctions, reclassifies mkdir races, avoids disclosing raw link targets or unsafe shell commands, and never deletes or replaces an obstructing entry.
 - POSIX parent identity reproof/fsync is now centralized before every promotable artifact-phase result, preventing a crash-window where a rename is lost after durable retirement is recorded (#3489).
 - Artifact retirement, planned paths, retained authority, and transcript retry in both managed reconciliation and deletion now bind to the newest published `pendingEvidence` attempt, preventing stranded detached transcripts at paths absent from the newest receipt after a crash (#3489).
+- Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
 - Detached task receipts for in-memory parent sessions no longer advertise dead `agent://` output URIs. TaskTool allocates a session-lifetime durable artifact root under the process temp directory, persists child outputs there, authorizes parent and same-session descendants for scoped resolution, and omits the URI entirely when durable allocation fails (#3471).
 - Managed-session replacement and cleanup now bind Windows destination mutation to exact native identity, keep lock acquisition/release retryable without reviving lost ownership, and report retained artifact payloads as `cleanup_pending` until only the verified root remains.
 - Resuming a session no longer crashes with an unhandled rejection when another session transition is already running. The session picker dispatches resume through a void-returning callback, and `handleResumeSession` had no re-entrancy guard, so a second selection (or a resume issued while compaction, handoff, or a fork was in flight) reached `switchSession` and the `{ code: "busy" }` transition error rejected a promise nobody awaited. Resume now ignores an overlapping request with a status message, reports a busy transition as status, and still propagates every other failure. The progress lease is released on all paths.
@@ -53,6 +54,7 @@
 ### Added
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
+- The interactive terminal’s responsive IRC/todo work-lane contract now covers exact narrow/wide geometry, requested versus effective IRC visibility, direct-root pin ordering, todo lane bounds, remapped IRC toggles, and live composer shortcut hints.
 
 ### Fixed
 

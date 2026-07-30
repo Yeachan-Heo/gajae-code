@@ -6,10 +6,8 @@ import {
 	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
 	exactRemoveDirectoryTree,
-	exactReplacePath,
 	exactUnlink,
 	type NativeDirectoryTreeSnapshot,
-	type NativeExactUnlinkResult,
 	type NativeOwnerOnlySecurityResult,
 	openRecoveryFsRoot,
 	type RecoveryFsRoot,
@@ -36,6 +34,7 @@ const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 
+const LOCK_STALE_RECHECK_MS = 100;
 export class ManagedPublishError extends Error {
 	readonly classification:
 		| "destination_conflict"
@@ -45,14 +44,12 @@ export class ManagedPublishError extends Error {
 		| "identity_mismatch"
 		| "io_error"
 		| "durability_failed";
-	readonly code: ManagedPublishError["classification"];
 	readonly diagnostic: string;
 
 	constructor(classification: ManagedPublishError["classification"], outcome: NativePublishOutcome) {
 		super(classification);
 		this.name = "ManagedPublishError";
 		this.classification = classification;
-		this.code = classification;
 		this.diagnostic = formatNativePublishDiagnostic(outcome);
 	}
 }
@@ -137,24 +134,15 @@ export interface ManagedStorageLock {
 	assertOwned(): void;
 	release(): Promise<void>;
 }
-export interface ManagedStorageLockSync {
-	path: string;
-	attemptId: string;
-	assertOwned(): void;
-	release(): void;
-}
 
 export interface ManagedFileSnapshot {
 	bytes: Buffer;
 	identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint; ctimeNs: bigint; sha256: string };
 }
 
-export const MANAGED_SESSION_SECURITY_CODES = [
-	"acl_denied",
-	"acl_io_error",
-	"acl_present",
-	"acl_malformed",
-	"acl_unknown",
+const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
+const ACL_CLEAR_EVIDENCE = new Set(["cleared", "already_absent", "unsupported", "not_run"]);
+const GENERAL_FAILURE_CODES = new Set([
 	"acl_unavailable",
 	"acl_apply_failed",
 	"acl_verify_failed",
@@ -167,52 +155,7 @@ export const MANAGED_SESSION_SECURITY_CODES = [
 	"owner_mismatch",
 	"mode_mismatch",
 	"io_error",
-] as const;
-export type ManagedSessionSecurityCode = (typeof MANAGED_SESSION_SECURITY_CODES)[number];
-const ACL_FAILURE_CODES = new Set<ManagedSessionSecurityCode>([
-	"acl_denied",
-	"acl_io_error",
-	"acl_present",
-	"acl_malformed",
-	"acl_unknown",
 ]);
-const ACL_CLEAR_EVIDENCE = new Set(["cleared", "already_absent", "unsupported", "not_run"]);
-const GENERAL_FAILURE_CODES = new Set<ManagedSessionSecurityCode>(MANAGED_SESSION_SECURITY_CODES);
-const LOCK_OWNERSHIP_LOSS_CODES = new Set<ManagedSessionSecurityCode>([
-	"not_found",
-	"not_directory",
-	"reparse_point",
-	"identity_mismatch",
-]);
-
-function lockDescriptorOwnershipLost(error: unknown): boolean {
-	const code = managedSecurityFailureClassification(error);
-	return code !== undefined && LOCK_OWNERSHIP_LOSS_CODES.has(code as ManagedSessionSecurityCode);
-}
-
-export class ManagedSessionSecurityError extends Error {
-	readonly code: ManagedSessionSecurityCode;
-
-	constructor(code: ManagedSessionSecurityCode) {
-		super(code);
-		this.name = "ManagedSessionSecurityError";
-		this.code = code;
-	}
-}
-
-export function managedSessionSecurityCode(error: unknown): ManagedSessionSecurityCode | undefined {
-	if (!(error instanceof Error) || typeof (error as unknown as { code?: unknown }).code !== "string") return undefined;
-	const code = (error as unknown as { code: string }).code;
-	return GENERAL_FAILURE_CODES.has(code as ManagedSessionSecurityCode)
-		? (code as ManagedSessionSecurityCode)
-		: undefined;
-}
-
-function managedSessionSecurityErrorForCode(code: string | undefined): ManagedSessionSecurityError {
-	return new ManagedSessionSecurityError(
-		GENERAL_FAILURE_CODES.has(code as ManagedSessionSecurityCode) ? (code as ManagedSessionSecurityCode) : "io_error",
-	);
-}
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
 	return Object.keys(value).every(key => allowed.includes(key));
@@ -230,11 +173,10 @@ export function validateNativeSecurityResult(
 	const result = value as Record<string, unknown>;
 	if (result.ok === false) {
 		if (typeof result.code !== "string") throw new Error("Malformed owner-only security failure");
-		const code = result.code as ManagedSessionSecurityCode;
-		if (!ACL_FAILURE_CODES.has(code) && !GENERAL_FAILURE_CODES.has(code)) {
+		if (!ACL_FAILURE_CODES.has(result.code) && !GENERAL_FAILURE_CODES.has(result.code)) {
 			throw new Error("Unknown owner-only security failure code");
 		}
-		if (ACL_FAILURE_CODES.has(code)) {
+		if (ACL_FAILURE_CODES.has(result.code)) {
 			if (
 				(result.operation !== "clear" && result.operation !== "query") ||
 				(result.attribute !== "access" && result.attribute !== "default")
@@ -455,7 +397,7 @@ class ManagedSecurityError extends Error {
 }
 
 export function managedSecurityFailureClassification(error: unknown): string | undefined {
-	return error instanceof ManagedSecurityError ? error.getClassification() : managedSessionSecurityCode(error);
+	return error instanceof ManagedSecurityError ? error.getClassification() : undefined;
 }
 
 function securityError(pathname: string, result: NativeSecurity): Error {
@@ -475,11 +417,10 @@ function windowsExistingVerifyFirst(policy: ManagedSessionSecurityPolicy): boole
 
 function assertManagedPathIdentity(pathname: string, kind: "directory" | "file", expected: fs.BigIntStats): void {
 	const current = fs.lstatSync(pathname, { bigint: true });
-	if (current.isSymbolicLink()) throw new ManagedSessionSecurityError("reparse_point");
+	if (current.isSymbolicLink()) throw new Error("reparse_point");
 	const expectedKind = kind === "directory" ? current.isDirectory() : current.isFile();
-	if (!expectedKind) throw new ManagedSessionSecurityError("not_directory");
-	if (current.dev !== expected.dev || current.ino !== expected.ino)
-		throw new ManagedSessionSecurityError("identity_mismatch");
+	if (!expectedKind) throw new Error(kind === "directory" ? "not_directory" : "not_file");
+	if (current.dev !== expected.dev || current.ino !== expected.ino) throw new Error("identity_mismatch");
 }
 
 function verifyExistingManagedPathSecurity(
@@ -499,7 +440,7 @@ function verifyExistingManagedPathSecurity(
 function secureExistingManagedDirectory(pathname: string, kind: "directory" | "file"): void {
 	const named = fs.lstatSync(pathname, { bigint: true });
 	const safeKind = kind === "directory" ? named.isDirectory() : named.isFile();
-	if (!safeKind || named.isSymbolicLink()) throw new ManagedSessionSecurityError("reparse_point");
+	if (!safeKind || named.isSymbolicLink()) throw new Error(`Unsafe managed ${kind}: ${pathname}`);
 	const verified = validateNativeSecurityResult(
 		verifyOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
 		"verify",
@@ -659,14 +600,15 @@ export class ManagedSessionDescendantStore {
 		if (this.#authority) {
 			if (this.#authorityBaseDir === this.#baseDir) {
 				const verified = this.#authority.verifyOwnerOnlyDirectory();
-				if (!verified.ok) throw managedSessionSecurityErrorForCode(verified.code);
+				if (!verified.ok) throw new Error(verified.code ?? "acl_verify_failed");
 			} else {
 				this.#assertBound();
 				return;
 			}
 		} else {
 			const named = fs.lstatSync(this.#baseDir, { bigint: true });
-			if (!named.isDirectory() || named.isSymbolicLink()) throw new ManagedSessionSecurityError("reparse_point");
+			if (!named.isDirectory() || named.isSymbolicLink())
+				throw new Error(`Unsafe managed directory: ${this.#baseDir}`);
 			if (windowsExistingVerifyFirst(this.#policy))
 				verifyExistingManagedPathSecurity(this.#baseDir, "directory", named);
 			else {
@@ -753,13 +695,7 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			if (process.platform === "win32") {
-				const existing = this.readExpected(relativePath);
-				if (existing) replaceManagedFileExactSync(resolved, bytes, existing, this.#subtreeRoot);
-				else await publishManagedFileNoReplace(resolved, bytes, undefined, this.#subtreeRoot, this.#policy);
-			} else {
-				await replaceManagedFile(resolved, bytes, this.#subtreeRoot, this.#policy);
-			}
+			await replaceManagedFile(resolved, bytes, this.#subtreeRoot, this.#policy);
 			this.#assertBound();
 			return;
 		}
@@ -772,13 +708,7 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			if (process.platform === "win32") {
-				const existing = this.readExpected(relativePath);
-				if (existing) replaceManagedFileExactSync(resolved, bytes, existing, this.#subtreeRoot);
-				else publishManagedFileNoReplaceSync(resolved, bytes, this.#subtreeRoot, this.#policy);
-			} else {
-				replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy);
-			}
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy);
 			this.#assertBound();
 			return;
 		}
@@ -1225,7 +1155,7 @@ export class ManagedSessionDescendantStore {
 }
 
 function secureFileDescriptor(pathname: string, fd: number, operation: "apply" | "verify"): void {
-	if (process.platform !== "linux" && process.platform !== "win32") {
+	if (process.platform !== "linux") {
 		if (operation === "apply") secure(pathname, "file");
 		else {
 			const verified = validateNativeSecurityResult(verifyOwnerOnlyPathSecurity(pathname, "file"), "verify", "file");
@@ -1309,9 +1239,11 @@ function isCtimeOnlyIdentityMismatch(
 	return sameStableIdentityIgnoringCtime(observed, expected) && observed.ctimeNs !== expected.ctimeNs;
 }
 
-function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
+function parseLock(pathname: string): LockRecord | undefined {
 	try {
-		const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
+		const stat = fs.lstatSync(pathname);
+		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+		const value: unknown = JSON.parse(fs.readFileSync(pathname, "utf8"));
 		if (!value || typeof value !== "object") return undefined;
 		const record = value as Partial<LockRecord>;
 		return typeof record.attemptId === "string" &&
@@ -1322,16 +1254,6 @@ function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
 			typeof record.createdAt === "number"
 			? (record as LockRecord)
 			: undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function parseLock(pathname: string): LockRecord | undefined {
-	try {
-		const stat = fs.lstatSync(pathname);
-		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
-		return parseLockBytes(fs.readFileSync(pathname));
 	} catch {
 		return undefined;
 	}
@@ -1356,82 +1278,6 @@ function writeLockDescriptor(fd: number, record: LockRecord): void {
 
 function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
-}
-function exactLockRetirementAccepted(lockPath: string, removed: NativeExactUnlinkResult): boolean {
-	if (removed.ok) return true;
-	if (removed.code !== "cleanup_pending") return false;
-	const lockDirectory = path.dirname(path.resolve(lockPath));
-	const authority = [
-		removed.detachedPath,
-		removed.retainedSuccessorPath,
-		removed.retainedPlaceholderPath,
-		removed.retainedUnknownPath,
-	].find(pathname => {
-		if (typeof pathname !== "string" || pathname.length === 0 || !path.isAbsolute(pathname)) return false;
-		const resolved = path.resolve(pathname);
-		if (resolved === path.resolve(lockPath) || path.dirname(resolved) !== lockDirectory) return false;
-		if (!path.basename(resolved).startsWith(".gjc-")) return false;
-		try {
-			return !fs.lstatSync(resolved).isSymbolicLink();
-		} catch {
-			return false;
-		}
-	});
-	try {
-		fs.lstatSync(lockPath);
-		return false;
-	} catch (error) {
-		return !!authority && (error as NodeJS.ErrnoException).code === "ENOENT";
-	}
-}
-
-function unlinkManagedLockSnapshotExact(lockPath: string, snapshot: ManagedFileSnapshot): void {
-	const removed = exactUnlink(lockPath, {
-		dev: snapshot.identity.dev,
-		ino: snapshot.identity.ino,
-		size: BigInt(snapshot.identity.size),
-		mtimeNs: snapshot.identity.mtimeNs,
-		sha256: snapshot.identity.sha256,
-		quarantineName: `.gjc-lock-retire-${process.pid}-${randomUUID()}`,
-	});
-	if (!exactLockRetirementAccepted(lockPath, removed)) throw new Error("migration_busy");
-	fsyncDirectory(path.dirname(lockPath));
-}
-
-function retireCreatedManagedLockExact(lockPath: string, fd: number): void {
-	const opened = fs.fstatSync(fd, { bigint: true });
-	const snapshot = captureManagedFileNoFollow(lockPath);
-	if (snapshot.identity.dev !== opened.dev || snapshot.identity.ino !== opened.ino) throw new Error("migration_busy");
-	unlinkManagedLockSnapshotExact(lockPath, snapshot);
-}
-
-/**
- * Retire a lock only after exact identity and attempt fencing. A typed
- * `cleanup_pending` result is terminal lock-authority retirement, not a claim
- * that retained bytes were deleted: accept it only when native exact-unlink
- * supplies concrete internal authority in this lock directory and the canonical
- * lock name is absent, so a successor may acquire while quarantine evidence stays
- * retained for recovery.
- */
-function retireManagedLockExact(
-	lockPath: string,
-	expected: { lockIdentity?: fs.BigIntStats; attemptId: string },
-): void {
-	let snapshot: ManagedFileSnapshot;
-	try {
-		snapshot = captureManagedFileNoFollow(lockPath);
-	} catch {
-		throw new Error("migration_busy");
-	}
-	const record = parseLockBytes(snapshot.bytes);
-	if (
-		!record ||
-		record.attemptId !== expected.attemptId ||
-		(expected.lockIdentity &&
-			(snapshot.identity.dev !== expected.lockIdentity.dev || snapshot.identity.ino !== expected.lockIdentity.ino))
-	)
-		throw new Error("migration_busy");
-	unlinkManagedLockSnapshotExact(lockPath, snapshot);
 }
 
 /** Create a managed directory and fail closed unless its owner-only mode/ACL verifies. */
@@ -1640,126 +1486,8 @@ export function publishManagedFileNoReplaceSync(
 	if (failure !== undefined) throw failure;
 }
 
-/**
- * Atomically replace a managed file only when the destination is still the
- * exact captured object. Unlike `replaceManagedFileSync`, this never performs
- * an unconditional pathname rename.
- */
-export function replaceManagedFileExactSync(
-	destination: string,
-	bytes: Uint8Array,
-	expected: Pick<ManagedFileSnapshot, "identity">,
-	root: ManagedDirectoryRoot,
-): void {
-	assertManagedDirectoryRoot(root);
-	managedRelativePath(root, destination);
-	if (process.platform === "win32") {
-		const parent = path.dirname(destination);
-		const lock = acquireManagedLockSync(
-			parent,
-			`.${path.basename(destination)}.replace`,
-			root,
-			"windows-existing-verify-first",
-		);
-		const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.replacement`);
-		let fd: number | undefined;
-		let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
-		let publicationUncertain = false;
-		try {
-			lock.assertOwned();
-			const current = captureManagedFileNoFollow(destination);
-			if (!sameIdentity(current.identity, expected.identity) || current.identity.sha256 !== expected.identity.sha256)
-				throw new Error("managed_replace_identity_mismatch");
-			fd = fs.openSync(
-				staging,
-				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-				0o600,
-			);
-			secureFileDescriptor(staging, fd, "apply");
-			let offset = 0;
-			while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
-			fs.fsyncSync(fd);
-			secureFileDescriptor(staging, fd, "verify");
-			const staged = fs.fstatSync(fd, { bigint: true });
-			stagedIdentity = { dev: staged.dev, ino: staged.ino };
-			fs.closeSync(fd);
-			fd = undefined;
-			lock.assertOwned();
-			const outcome = exactReplacePath(staging, destination, {
-				dev: expected.identity.dev,
-				ino: expected.identity.ino,
-				size: BigInt(expected.identity.size),
-				mtimeNs: expected.identity.mtimeNs,
-				sha256: expected.identity.sha256,
-			});
-			if (!outcome.ok) {
-				publicationUncertain = true;
-				throw new Error(
-					outcome.detachedPath === staging
-						? "managed_replace_publication_pending"
-						: (outcome.code ?? "managed_replace_identity_mismatch"),
-				);
-			}
-			lock.assertOwned();
-			const published = fs.lstatSync(destination, { bigint: true });
-			if (
-				!published.isFile() ||
-				published.isSymbolicLink() ||
-				published.dev !== staged.dev ||
-				published.ino !== staged.ino
-			) {
-				publicationUncertain = true;
-				throw new Error("destination_identity_changed");
-			}
-			secureExistingManagedDirectory(destination, "file");
-		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
-			if (stagedIdentity && !publicationUncertain) {
-				try {
-					const named = fs.lstatSync(staging, { bigint: true });
-					if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino) fs.unlinkSync(staging);
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") publicationUncertain = true;
-				}
-			}
-			lock.release();
-		}
-		return;
-	}
-	const parent = path.dirname(destination);
-	const parentStat = fs.lstatSync(parent, { bigint: true });
-	if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("managed_replace_parent_unavailable");
-	const authority = openRecoveryFsRoot(parent);
-	try {
-		const retained = authority.identity();
-		if (
-			!retained.ok ||
-			!retained.identity ||
-			retained.identity.dev !== parentStat.dev.toString() ||
-			retained.identity.ino !== parentStat.ino.toString()
-		)
-			throw new Error("managed_replace_parent_identity_changed");
-		const verified = authority.verifyOwnerOnlyDirectory();
-		if (!verified.ok) throw new Error(verified.code ?? "managed_replace_parent_unavailable");
-		const replaced = authority.replaceManaged(
-			path.basename(destination),
-			bytes,
-			expected.identity.dev.toString(),
-			expected.identity.ino.toString(),
-			expected.identity.size.toString(),
-			expected.identity.mtimeNs.toString(),
-			expected.identity.ctimeNs.toString(),
-			expected.identity.sha256,
-		);
-		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_identity_mismatch");
-		const synced = authority.fsync();
-		if (!synced.ok) throw new Error(synced.code ?? "managed_replace_fsync_failed");
-	} finally {
-		authority.close();
-	}
-}
 /** Replace one managed regular file while retaining the secured staging fd through publication. */
-function replaceManagedFileSync(
+export function replaceManagedFileSync(
 	destination: string,
 	bytes: Uint8Array,
 	root: ManagedDirectoryRoot,
@@ -1807,7 +1535,7 @@ function replaceManagedFileSync(
 	}
 }
 
-async function replaceManagedFile(
+export async function replaceManagedFile(
 	destination: string,
 	bytes: Uint8Array,
 	root: ManagedDirectoryRoot,
@@ -1842,6 +1570,7 @@ export async function acquireManagedLock(
 	ensureManagedDirectory(locksDirectory, root, policy);
 	const lockPath = path.join(locksDirectory, `${name}.lock`);
 	const deadline = Date.now() + LOCK_WAIT_MS;
+	let staleObservedAt: number | undefined;
 	while (true) {
 		const attemptId = randomUUID();
 		const now = Date.now();
@@ -1866,11 +1595,7 @@ export async function acquireManagedLock(
 				fs.fsyncSync(fd);
 				fsyncDirectory(locksDirectory);
 			} catch (error) {
-				try {
-					retireCreatedManagedLockExact(lockPath, fd);
-				} finally {
-					fs.closeSync(fd);
-				}
+				fs.closeSync(fd);
 				throw error;
 			}
 			const lockIdentity = fs.fstatSync(fd, { bigint: true });
@@ -1878,8 +1603,12 @@ export async function acquireManagedLock(
 			let descriptorClosed = false;
 			const closeDescriptor = (): void => {
 				if (descriptorClosed) return;
-				fs.closeSync(fd);
-				descriptorClosed = true;
+				try {
+					secureFileDescriptor(lockPath, fd, "verify");
+				} finally {
+					fs.closeSync(fd);
+					descriptorClosed = true;
+				}
 			};
 			const assertOwned = (): void => {
 				const current = parseLock(lockPath);
@@ -1894,7 +1623,8 @@ export async function acquireManagedLock(
 					descriptorClosed ||
 					!current ||
 					!sameFileIdentity(lockIdentity, named) ||
-					current.attemptId !== attemptId
+					current.attemptId !== attemptId ||
+					current.leaseExpiresAt < Date.now()
 				)
 					throw new Error("migration_busy");
 			};
@@ -1912,160 +1642,42 @@ export async function acquireManagedLock(
 				attemptId,
 				assertOwned,
 				async release(): Promise<void> {
-					const finalize = (): void => {
-						clearInterval(heartbeat);
+					clearInterval(heartbeat);
+					try {
+						assertOwned();
+						const now = Date.now();
+						// Do not unlink by pathname: a stale owner could otherwise remove a successor.
+						// The lease is retired through the verified inode-bound descriptor instead.
+						writeLockDescriptor(fd, { ...record, heartbeatAt: now, leaseExpiresAt: now });
+						fsyncDirectory(locksDirectory);
+					} finally {
 						released = true;
 						closeDescriptor();
-					};
-					try {
-						assertOwned();
-					} catch (error) {
-						finalize();
-						throw error;
 					}
-					try {
-						secureFileDescriptor(lockPath, fd, "verify");
-					} catch (error) {
-						if (lockDescriptorOwnershipLost(error)) finalize();
-						throw error;
-					}
-					try {
-						retireManagedLockExact(lockPath, { lockIdentity, attemptId });
-					} catch (error) {
-						try {
-							assertOwned();
-						} catch {
-							finalize();
-						}
-						throw error;
-					}
-					finalize();
 				},
 			};
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			const owner = parseLock(lockPath);
-			if (owner && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner)) {
-				try {
-					retireManagedLockExact(lockPath, { attemptId: owner.attemptId });
-				} catch {
-					/* retry owner observation */
+			if (owner && owner.leaseExpiresAt < Date.now()) {
+				const ownerGone = ownerDefinitelyGone(owner);
+				if (staleObservedAt === undefined) staleObservedAt = Date.now();
+				if (ownerGone || Date.now() - staleObservedAt >= LOCK_STALE_RECHECK_MS) {
+					const quarantine = `${lockPath}.${randomUUID()}.stale`;
+					try {
+						fs.renameSync(lockPath, quarantine);
+						const quarantined = parseLock(quarantine);
+						if (!quarantined || quarantined.attemptId !== owner.attemptId) throw new Error("migration_busy");
+						fs.unlinkSync(quarantine);
+						fsyncDirectory(locksDirectory);
+					} catch {
+						/* retry owner observation */
+					}
+					staleObservedAt = undefined;
 				}
-			}
+			} else staleObservedAt = undefined;
 			if (Date.now() >= deadline) throw new Error("migration_busy");
 			await new Promise<void>(resolve => setTimeout(resolve, 50));
-		}
-	}
-}
-/** Acquire a synchronous lease lock for a short cross-process critical section. */
-export function acquireManagedLockSync(
-	locksDirectory: string,
-	name: string,
-	root?: ManagedDirectoryRoot,
-	policy: ManagedSessionSecurityPolicy = "default",
-): ManagedStorageLockSync {
-	ensureManagedDirectory(locksDirectory, root, policy);
-	const lockPath = path.join(locksDirectory, `${name}.lock`);
-	const deadline = Date.now() + LOCK_WAIT_MS;
-	while (true) {
-		const attemptId = randomUUID();
-		const now = Date.now();
-		const record: LockRecord = {
-			attemptId,
-			pid: process.pid,
-			bootId: bootId(),
-			processStartId: PROCESS_START_ID,
-			createdAt: now,
-			heartbeatAt: now,
-			leaseExpiresAt: now + LOCK_LEASE_MS,
-		};
-		try {
-			const fd = fs.openSync(
-				lockPath,
-				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-				0o600,
-			);
-			try {
-				secureFileDescriptor(lockPath, fd, "apply");
-				writeLockDescriptor(fd, record);
-				fsyncDirectory(locksDirectory);
-			} catch (error) {
-				try {
-					retireCreatedManagedLockExact(lockPath, fd);
-				} finally {
-					fs.closeSync(fd);
-				}
-				throw error;
-			}
-			const lockIdentity = fs.fstatSync(fd, { bigint: true });
-			let released = false;
-			let descriptorClosed = false;
-			const assertOwned = (): void => {
-				const current = parseLock(lockPath);
-				let named: fs.BigIntStats;
-				try {
-					named = fs.lstatSync(lockPath, { bigint: true });
-				} catch {
-					throw new Error("migration_busy");
-				}
-				if (
-					released ||
-					descriptorClosed ||
-					!current ||
-					!sameFileIdentity(lockIdentity, named) ||
-					current.attemptId !== attemptId
-				)
-					throw new Error("migration_busy");
-			};
-			return {
-				path: lockPath,
-				attemptId,
-				assertOwned,
-				release(): void {
-					const finalize = (): void => {
-						released = true;
-						if (!descriptorClosed) {
-							fs.closeSync(fd);
-							descriptorClosed = true;
-						}
-					};
-					try {
-						assertOwned();
-					} catch (error) {
-						finalize();
-						throw error;
-					}
-					try {
-						secureFileDescriptor(lockPath, fd, "verify");
-					} catch (error) {
-						if (lockDescriptorOwnershipLost(error)) finalize();
-						throw error;
-					}
-					try {
-						retireManagedLockExact(lockPath, { lockIdentity, attemptId });
-					} catch (error) {
-						try {
-							assertOwned();
-						} catch {
-							finalize();
-						}
-						throw error;
-					}
-					finalize();
-				},
-			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const owner = parseLock(lockPath);
-			if (owner && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner)) {
-				try {
-					retireManagedLockExact(lockPath, { attemptId: owner.attemptId });
-				} catch {
-					/* Retry owner observation. */
-				}
-			}
-			if (Date.now() >= deadline) throw new Error("migration_busy");
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(50, deadline - Date.now()));
 		}
 	}
 }

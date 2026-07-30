@@ -43,7 +43,6 @@ export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
-export const exactReplacePath = nativeBindings.exactReplacePath;
 export const exactRestore = nativeBindings.exactRestore;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const executeShell = nativeBindings.executeShell;
