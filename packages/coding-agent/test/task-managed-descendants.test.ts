@@ -127,7 +127,7 @@ describe.skipIf(process.platform !== "linux")("managed task descendant persisten
 		const persistence = createManagedTaskPersistence(artifacts, "0-task-2");
 		await fs.rename(artifactsDir, path.join(root, "detached"));
 		await fs.mkdir(artifactsDir, { mode: 0o700 });
-		await expect(persistence.openSession()).rejects.toThrow("root binding changed");
+		await expect(persistence.openSession(root)).rejects.toThrow("root binding changed");
 
 		await expect(persistence.publishOutput("blocked", Buffer.from("{}", "utf8"))).rejects.toThrow(
 			"root binding changed",

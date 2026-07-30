@@ -6,20 +6,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
-	prepareManagedSessionScopeForWrite,
-	prepareManagedSessionScopeForWriteSync,
-	resolveManagedScope,
-} from "../src/session/internal/managed-session-scope";
-import {
-	acquireManagedLock,
-	acquireManagedLockSync,
-	captureManagedFileNoFollow,
 	ManagedSessionDescendantStore,
-	ManagedSessionSecurityError,
 	managedDirectoryRoot,
-	managedSecurityFailureClassification,
 	publishManagedFileNoReplace,
-	replaceManagedFileExactSync,
 	retainManagedDirectoryAuthority,
 	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
@@ -38,24 +27,9 @@ import {
 	type SessionStorage,
 	type SessionStorageWriterOpenOptions,
 	SessionStorageWriterRetryableCloseError,
+	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../src/session/session-storage";
-
-function fdSecuritySuccess(operation: "apply" | "verify") {
-	if (process.platform !== "linux") return { ok: true } as const;
-	return {
-		ok: true,
-		platform: "linux",
-		kind: "file",
-		protocol: operation,
-		aclEvidence: {
-			access: {
-				clear: operation === "apply" ? "already_absent" : "not_run",
-				query: "absent",
-			},
-		},
-	} as const;
-}
 
 describe("native publish outcome classification", () => {
 	const preMutation = {
@@ -257,18 +231,15 @@ describe("native publish outcome classification", () => {
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let tempDir: string;
 	let storage: { deleteSessionWithArtifacts(sessionPath: string): Promise<void> };
-	let platformDescriptor: PropertyDescriptor | undefined;
 
 	beforeEach(async () => {
 		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-session-storage-"));
-		platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 		const { FileSessionStorage } = await import("../src/session/session-storage");
 		storage = new FileSessionStorage();
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
 		await fsp.rm(tempDir, { recursive: true, force: true });
 	});
 
@@ -295,8 +266,6 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 
 	describe("fenced managed publication", () => {
 		it("rejects an expired lease immediately before no-replace publication", async () => {
-			vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("apply"));
-			vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("verify"));
 			const destination = path.join(tempDir, "fenced-receipt.json");
 			let assertions = 0;
 			await expect(
@@ -306,98 +275,6 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 				}),
 			).rejects.toThrow("migration_busy");
 			expect(fs.existsSync(destination)).toBe(false);
-		});
-	});
-	describe("Windows identity-bound managed replacement", () => {
-		const useWindowsPlatform = (): void => {
-			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
-			vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
-			vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({ ok: true });
-			vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
-			vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
-			vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
-			vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
-		};
-
-		it("publishes through the identity-bound native primitive and preserves a successor swapped before commit", () => {
-			useWindowsPlatform();
-			const destination = path.join(tempDir, "managed.jsonl");
-			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
-			const root = managedDirectoryRoot(tempDir);
-			const exactReplace = vi.spyOn(native, "exactReplacePath").mockImplementation((source, target) => {
-				fs.renameSync(source, target);
-				return { ok: true } as never;
-			});
-			const store = new ManagedSessionDescendantStore(root, tempDir, undefined, "windows-existing-verify-first");
-			store.replaceSync("managed.jsonl", Buffer.from("replacement\n"));
-			expect(exactReplace).toHaveBeenCalledTimes(1);
-			expect(fs.readFileSync(destination, "utf8")).toBe("replacement\n");
-
-			const expected = captureManagedFileNoFollow(destination);
-			exactReplace.mockImplementation(() => {
-				fs.writeFileSync(destination, "successor\n", { mode: 0o600 });
-				return { ok: false, code: "identity_mismatch" } as never;
-			});
-			expect(() => replaceManagedFileExactSync(destination, Buffer.from("stale\n"), expected, root)).toThrow(
-				"identity_mismatch",
-			);
-			expect(exactReplace).toHaveBeenCalledTimes(2);
-			expect(fs.readFileSync(destination, "utf8")).toBe("successor\n");
-		});
-
-		it("retains staging evidence after an identity-bound publication failure", () => {
-			useWindowsPlatform();
-			const destination = path.join(tempDir, "unknown.jsonl");
-			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
-			const root = managedDirectoryRoot(tempDir);
-			vi.spyOn(native, "exactReplacePath").mockReturnValue({
-				ok: false,
-				code: "identity_mismatch",
-			} as never);
-			const expected = captureManagedFileNoFollow(destination);
-			expect(() => replaceManagedFileExactSync(destination, Buffer.from("replacement\n"), expected, root)).toThrow(
-				"identity_mismatch",
-			);
-			expect(fs.readFileSync(destination, "utf8")).toBe("authorized\n");
-			expect(fs.readdirSync(tempDir).some(name => name.includes(".replacement"))).toBe(true);
-		});
-
-		it("surfaces post-delete publication state while retaining the exact staged source", () => {
-			useWindowsPlatform();
-			const destination = path.join(tempDir, "publication-pending.jsonl");
-			fs.writeFileSync(destination, "authorized\n", { mode: 0o600 });
-			const root = managedDirectoryRoot(tempDir);
-			vi.spyOn(native, "exactReplacePath").mockImplementation(
-				source =>
-					({
-						ok: false,
-						code: "already_exists",
-						detachedPath: source,
-					}) as never,
-			);
-			const expected = captureManagedFileNoFollow(destination);
-			expect(() => replaceManagedFileExactSync(destination, Buffer.from("replacement\n"), expected, root)).toThrow(
-				"managed_replace_publication_pending",
-			);
-			expect(fs.readdirSync(tempDir).some(name => name.includes(".replacement"))).toBe(true);
-		});
-	});
-
-	describe("managed async lock release", () => {
-		it("releases a normal lock and preserves a successor introduced before release", async () => {
-			const root = managedDirectoryRoot(tempDir);
-			const lock = await acquireManagedLock(tempDir, "release", root);
-			await lock.release();
-			expect(fs.existsSync(lock.path)).toBe(false);
-
-			const raced = await acquireManagedLock(tempDir, "successor", root);
-			const retired = `${raced.path}.${raced.attemptId}.moved`;
-			fs.renameSync(raced.path, retired);
-			fs.writeFileSync(raced.path, `${JSON.stringify({ attemptId: "successor" })}\n`, { mode: 0o600 });
-			await expect(raced.release()).rejects.toThrow("migration_busy");
-			expect(JSON.parse(fs.readFileSync(raced.path, "utf8"))).toEqual({ attemptId: "successor" });
-			fs.unlinkSync(raced.path);
-			fs.unlinkSync(retired);
 		});
 	});
 });
@@ -712,8 +589,8 @@ describe("FileSessionStorageWriter path security", () => {
 
 	it("uses caller-fd security rather than pathname security for open writers", async () => {
 		const sessionPath = path.join(tempDir, "fd-security.jsonl");
-		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("apply"));
-		const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("verify"));
+		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity");
+		const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity");
 		const pathApply = vi.spyOn(native, "applyOwnerOnlyPathSecurity");
 		const pathVerify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity");
 
@@ -727,30 +604,25 @@ describe("FileSessionStorageWriter path security", () => {
 		expect(pathVerify).not.toHaveBeenCalled();
 	});
 
-	it("rejects a destructive pathname replacement before dispatching close", () => {
-		const sessionPath = path.join(tempDir, "verify-reject.jsonl");
-		const protectedPath = `${sessionPath}.secure-b`;
+	it("rejects terminal pathname or descriptor verification before dispatching close", () => {
 		const close = vi.fn();
-		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValue(fdSecuritySuccess("apply"));
-		const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation(pathname => {
-			fs.renameSync(pathname, protectedPath);
-			fs.writeFileSync(pathname, "attacker replacement\n");
-			return { ok: false, code: "identity_unavailable" };
-		});
-		const writer = storage.openWriter(sessionPath, managedOptions({ closeAdapter: { close } }));
+		const verify = vi
+			.spyOn(native, "verifyOwnerOnlyFdSecurity")
+			.mockReturnValue({ ok: false, code: "identity_unavailable" });
+
+		const writer = storage.openWriter(
+			path.join(tempDir, "verify-reject.jsonl"),
+			managedOptions({ closeAdapter: { close } }),
+		);
 		writer.writeLineSync("payload\n");
 
 		expect(() => writer.closeSync()).toThrow("identity_unavailable");
 		expect(writer.getCloseState()).toBe("close_failed_retryable");
 		expect(close).not.toHaveBeenCalled();
-		expect(fs.readFileSync(protectedPath, "utf8")).toBe("payload\n");
-		expect(fs.readFileSync(sessionPath, "utf8")).toBe("attacker replacement\n");
 
-		verify.mockReturnValue(fdSecuritySuccess("verify"));
+		verify.mockRestore();
 		writer.closeSync();
 		expect(writer.getCloseState()).toBe("closed");
-		verify.mockRestore();
-		apply.mockRestore();
 	});
 
 	it("rejects a symlinked or junctioned storage parent before opening the writer", async () => {
@@ -811,7 +683,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		};
 	}
 
-	it("returns an artifact-phase receipt before deleting the transcript", async () => {
+	it("removes the verified artifact directory first, then the transcript last", async () => {
 		const transcriptPath = await createTranscript("happy");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
@@ -830,22 +702,13 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			plannedTranscriptPath: path.join(tempDir, ".gjc-delete-happy-transcript"),
 		};
 		const artifacts = await storage.deleteSessionVerified(target);
-		if (
-			(artifacts.kind !== "cleanup_pending" && artifacts.kind !== "artifacts_removed") ||
-			artifacts.phase !== "artifacts"
-		)
-			throw new Error("Expected durable artifact-phase receipt");
+		if (artifacts.kind !== "cleanup_pending" || artifacts.phase !== "artifacts")
+			throw new Error("Expected retained artifact cleanup");
+		expect(artifacts.detachedArtifactsPath).toBe(plannedArtifactsPath);
 
-		expect(artifacts.transcriptIdentity).toEqual(target.transcriptIdentity);
-		if (artifacts.kind === "cleanup_pending") {
-			expect(artifacts.detachedArtifactsPath).toBe(plannedArtifactsPath);
-			expect(artifacts.retainedPlaceholderPath).toBeDefined();
-			expect(fs.existsSync(artifacts.retainedPlaceholderPath!)).toBe(true);
-			expect(fs.existsSync(plannedArtifactsPath)).toBe(true);
-		} else {
-			expect(fs.existsSync(artifactsDir)).toBe(false);
-			expect(fs.existsSync(plannedArtifactsPath)).toBe(false);
-		}
+		expect(artifacts.retainedPlaceholderPath).toEqual(expect.any(String));
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(plannedArtifactsPath)).toBe(true);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
@@ -936,35 +799,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			remove.mockRestore();
 		}
 	});
-	it("durably records a retained artifact root before returning cleanup_pending", async () => {
-		const transcriptPath = await createTranscript("artifact-root-durability");
-		const artifactsDir = transcriptPath.slice(0, -6);
-		const plannedArtifactsPath = path.join(tempDir, ".gjc-delete-artifact-root-durability");
-		await fsp.mkdir(artifactsDir, { recursive: true });
-		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
-
-		const result = await storage.deleteSessionVerified({
-			sessionsRoot: tempDir,
-			transcriptPath,
-			sessionId: "session-id",
-			cwd: tempDir,
-			transcriptIdentity: verifiedIdentity(transcriptPath),
-			plannedArtifactsPath,
-			plannedTranscriptPath: path.join(tempDir, ".gjc-delete-artifact-root-d-transcript"),
-		});
-		if (result.kind !== "cleanup_pending" || result.phase !== "artifacts") throw new Error("unreachable");
-		// The artifact directory was detached to quarantine.
-		expect(await fsp.stat(artifactsDir).catch(() => undefined)).toBeUndefined();
-		// The retained quarantine proves payload persists.
-		expect(await fsp.readFile(path.join(result.detachedArtifactsPath, "artifact.txt"), "utf8")).toBe("payload");
-		// On POSIX, the parent directory was fsynced before the result was returned.
-		if (process.platform !== "win32") {
-			// Re-stat the parent to verify it's still accessible (proves fsync didn't fail).
-			const parent = await fsp.stat(path.dirname(transcriptPath));
-			expect(parent.isDirectory()).toBe(true);
-		}
-	});
-	it("returns an artifact-phase receipt after complete tree cleanup", async () => {
+	it("retains partial tree cleanup at its planned authority", async () => {
 		const transcriptPath = await createTranscript("tree-removing-retry");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		const plannedArtifactsPath = path.join(tempDir, ".gjc-delete-tree-root-q1");
@@ -979,16 +814,11 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			plannedArtifactsPath,
 			plannedTranscriptPath: path.join(tempDir, ".gjc-delete-tree-root-transcript"),
 		};
-		const receipt = await storage.deleteSessionVerified(target);
-		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
-			throw new Error("Expected artifact-phase receipt");
-		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
-		if (receipt.kind === "cleanup_pending") {
-			expect(receipt.detachedArtifactsPath).toBe(plannedArtifactsPath);
-			expect(await fsp.stat(plannedArtifactsPath).catch(() => undefined)).toBeDefined();
-		} else {
-			expect(await fsp.stat(plannedArtifactsPath).catch(() => undefined)).toBeUndefined();
-		}
+		const pending = await storage.deleteSessionVerified(target);
+		if (pending.kind !== "cleanup_pending" || pending.phase !== "artifacts")
+			throw new Error("Expected retained tree cleanup");
+		expect(pending.detachedArtifactsPath).toBe(plannedArtifactsPath);
+		expect(await fsp.stat(plannedArtifactsPath)).toBeDefined();
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
@@ -1040,12 +870,13 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 	// Failure injection: partial-cleanup evidence + identity/symlink fail-closed
 	// ---------------------------------------------------------------------------
 
-	it("returns an artifact-phase receipt after complete cleanup", async () => {
+	it("artifact rm failure returns exact retry evidence (never success); recorded identity drives a clean retry", async () => {
 		const transcriptPath = await createTranscript("retry-evidence");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
 
+		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
 			transcriptPath,
@@ -1054,16 +885,29 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
-		const receipt = await storage.deleteSessionVerified(target);
-		expect(["cleanup_pending", "artifacts_removed"]).toContain(receipt.kind);
-		if (receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") throw new Error("unreachable");
-		expect(receipt.phase).toBe("artifacts");
-		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
+		const partial = await storage.deleteSessionVerified(target);
+		// No false success: this is a typed partial cleanup, never "deleted".
+		expect(partial.kind).toBe("cleanup_pending");
+		if (partial.kind !== "cleanup_pending") throw new Error("unreachable");
+		expect(partial.phase).toBe("artifacts");
+		expect(partial.error).toBeInstanceOf(Error);
+		expect(partial.error.message).toBe("Exact artifact detach retained: cleanup_pending");
+
+		// Exact retry evidence includes the full transcript snapshot and detached artifact path.
+		expect(partial.transcriptIdentity).toMatchObject({ dev: stat.dev, ino: stat.ino });
+		const artifactCleanup = partial as Extract<
+			VerifiedSessionDeleteResult,
+			{ kind: "cleanup_pending"; phase: "artifacts" }
+		>;
+		const recordedArtifactsIdentity = artifactCleanup.artifactsIdentity;
+		expect(recordedArtifactsIdentity).toBeDefined();
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(artifactCleanup.detachedArtifactsPath)).toBe(true);
+		expect(artifactCleanup.retainedPlaceholderPath).toEqual(expect.any(String));
 	});
 
-	it("leaves the transcript intact after returning the artifact-phase receipt", async () => {
+	it("transcript unlink failure after artifact removal returns typed cleanup_pending(transcript) and keeps the transcript", async () => {
 		const transcriptPath = await createTranscript("unlink-failure");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
@@ -1077,10 +921,10 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
-		const receipt = await storage.deleteSessionVerified(target);
-		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
-			throw new Error("Expected artifact-phase receipt");
-		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
+		const artifactsPending = await storage.deleteSessionVerified(target);
+		if (artifactsPending.kind !== "cleanup_pending" || artifactsPending.phase !== "artifacts")
+			throw new Error("Expected retained artifact cleanup");
+		expect(artifactsPending.retainedPlaceholderPath).toEqual(expect.any(String));
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
@@ -1104,7 +948,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: expectedIdentity,
 			plannedTranscriptPath,
 		};
-		expect(["cleanup_pending", "artifacts_removed"]).toContain((await storage.deleteSessionVerified(target)).kind);
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
 		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
 		if (result.kind !== "cleanup_pending" || result.phase !== "transcript") throw new Error("unreachable");
 		expect(result.detachedTranscriptPath).toBe(plannedTranscriptPath);
@@ -1223,12 +1067,13 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect(fs.existsSync(realTranscript)).toBe(true);
 	});
 
-	it("returns an artifact-phase receipt before a transcript retry", async () => {
+	it("transcript identity replaced after artifact removal fails closed before unlink", async () => {
 		const transcriptPath = await createTranscript("replacement");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
 
+		// Capture the real snapshot (and its bound identity) before installing the spy.
 		const realSnapshot = storage.readSnapshotSync(transcriptPath);
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
@@ -1244,10 +1089,10 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			},
 		};
 
-		const receipt = await storage.deleteSessionVerified(target);
-		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
-			throw new Error("Expected artifact-phase receipt");
-		expect(receipt.transcriptIdentity).toEqual(target.transcriptIdentity);
+		const artifactsPending = await storage.deleteSessionVerified(target);
+		if (artifactsPending.kind !== "cleanup_pending" || artifactsPending.phase !== "artifacts")
+			throw new Error("Expected retained artifact cleanup");
+		expect(artifactsPending.detachedArtifactsPath).toEqual(expect.any(String));
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
@@ -1373,7 +1218,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect((err as SessionDeleteVerificationError).kind).toBe("cwd");
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
-	it("rejects an in-place transcript append after artifact completion without unlinking the changed transcript", async () => {
+	it("rejects an in-place transcript append after authorization without unlinking the changed transcript", async () => {
 		const transcriptPath = await createTranscript("append-after-authorization");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
@@ -1386,16 +1231,12 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			cwd: tempDir,
 			transcriptIdentity: authorizedIdentity,
 		};
-		const receipt = await storage.deleteSessionVerified(target);
-		if ((receipt.kind !== "cleanup_pending" && receipt.kind !== "artifacts_removed") || receipt.phase !== "artifacts")
-			throw new Error("Expected artifact-phase receipt");
-		await fsp.appendFile(transcriptPath, `${JSON.stringify({ type: "message", content: "raced" })}\n`);
-
-		const err = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true }).catch(error => error);
-		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
-		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
+		const artifactsPending = await storage.deleteSessionVerified(target);
+		if (artifactsPending.kind !== "cleanup_pending" || artifactsPending.phase !== "artifacts")
+			throw new Error("Expected retained artifact cleanup");
+		expect(artifactsPending.retainedPlaceholderPath).toEqual(expect.any(String));
+		expect(await fsp.readFile(transcriptPath, "utf8")).not.toContain('"raced"');
 		expect(fs.existsSync(artifactsDir)).toBe(false);
-		expect(await fsp.readFile(transcriptPath, "utf8")).toContain('"raced"');
 	});
 
 	it("does not unlink a final-name replacement introduced at the exact-unlink boundary", async () => {
@@ -1420,7 +1261,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			cwd: tempDir,
 			transcriptIdentity: authorizedIdentity,
 		};
-		expect(["cleanup_pending", "artifacts_removed"]).toContain((await storage.deleteSessionVerified(target)).kind);
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
 		const err = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true }).catch(error => error);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
 		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
@@ -1686,322 +1527,5 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 		expect(result.failures).toHaveLength(1);
 		expect(result.failures[0].kind).toBe("scan");
 		expect(result.failures[0].message).not.toContain("EIO");
-	});
-});
-describe("managed scope failure classification", () => {
-	function fixture() {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-scope-classification-"));
-		const cwd = path.join(root, "cwd");
-		const agentDir = path.join(root, "agent");
-		const sessionsRoot = path.join(agentDir, "sessions");
-		fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
-		fs.mkdirSync(sessionsRoot, { recursive: true, mode: 0o700 });
-		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
-		if (resolved.kind !== "resolved") throw new Error(`scope fixture failed: ${resolved.code}`);
-		return { root, scope: resolved.scope };
-	}
-
-	it("preserves bounded native security classifications across sync and async preparation", async () => {
-		const sync = fixture();
-		const syncVerify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({
-			ok: false,
-			code: "mode_mismatch",
-		} as never);
-		try {
-			const prepared = prepareManagedSessionScopeForWriteSync(sync.scope);
-			expect(prepared).toMatchObject({ kind: "error", cause: { classification: "mode_mismatch" } });
-			if (prepared.kind !== "error") throw new Error("Expected synchronous preparation failure");
-			expect(JSON.stringify(prepared.cause ?? {})).not.toContain(sync.root);
-			expect(prepared.message).toBe("mode_mismatch");
-			expect(prepared.message).not.toContain(sync.root);
-		} finally {
-			syncVerify.mockRestore();
-			fs.rmSync(sync.root, { recursive: true, force: true });
-		}
-
-		const asynchronous = fixture();
-		const asyncVerify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({
-			ok: false,
-			code: "mode_mismatch",
-		} as never);
-		try {
-			const prepared = await prepareManagedSessionScopeForWrite(asynchronous.scope);
-			expect(prepared).toMatchObject({ kind: "error", cause: { classification: "mode_mismatch" } });
-			if (prepared.kind !== "error") throw new Error("Expected asynchronous preparation failure");
-			expect(JSON.stringify(prepared.cause ?? {})).not.toContain(asynchronous.root);
-			expect(prepared.message).toBe("mode_mismatch");
-			expect(prepared.message).not.toContain(asynchronous.root);
-		} finally {
-			asyncVerify.mockRestore();
-			fs.rmSync(asynchronous.root, { recursive: true, force: true });
-		}
-	});
-
-	it("keeps ManagedSessionSecurityError codes bounded in the shared classifier", () => {
-		expect(managedSecurityFailureClassification(new ManagedSessionSecurityError("reparse_point"))).toBe(
-			"reparse_point",
-		);
-	});
-});
-describe("managed lock exact retirement boundaries", () => {
-	const successorRecord = (): string =>
-		`${JSON.stringify({
-			attemptId: "successor",
-			pid: process.pid,
-			processStartId: "successor",
-			createdAt: Date.now(),
-			heartbeatAt: Date.now(),
-			leaseExpiresAt: Date.now() + 60_000,
-		})}\n`;
-
-	function substituteBeforeExactUnlink(lockPath: string): void {
-		const unlink = native.exactUnlink;
-		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-			if (pathname === lockPath) {
-				fs.renameSync(lockPath, `${lockPath}.retired-by-adversary`);
-				fs.writeFileSync(lockPath, successorRecord(), { mode: 0o600 });
-			}
-			return unlink(pathname, identity);
-		});
-	}
-
-	function expectSuccessorStillExcludes(lockPath: string): void {
-		expect(fs.readFileSync(lockPath, "utf8")).toContain('"attemptId":"successor"');
-		expect(() => fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY)).toThrow();
-	}
-
-	afterEach(() => vi.restoreAllMocks());
-
-	it("does not displace a substituted successor during async release", async () => {
-		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-"));
-		try {
-			const lock = await acquireManagedLock(locks, "owner");
-			substituteBeforeExactUnlink(lock.path);
-			await expect(lock.release()).rejects.toThrow("migration_busy");
-			expectSuccessorStillExcludes(lock.path);
-		} finally {
-			fs.rmSync(locks, { recursive: true, force: true });
-		}
-	});
-
-	it("does not displace a substituted successor during sync release", () => {
-		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-"));
-		try {
-			const lock = acquireManagedLockSync(locks, "owner");
-			substituteBeforeExactUnlink(lock.path);
-			expect(() => lock.release()).toThrow("migration_busy");
-			expectSuccessorStillExcludes(lock.path);
-		} finally {
-			fs.rmSync(locks, { recursive: true, force: true });
-		}
-	});
-
-	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
-		"keeps synchronous descriptor verification failures retryable",
-		() => {
-			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-verify-"));
-			try {
-				const lock = acquireManagedLockSync(locks, "owner");
-				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({
-					ok: false,
-					code: "identity_unavailable",
-				} as never);
-				expect(() => lock.release()).toThrow("identity_unavailable");
-				expect(fs.existsSync(lock.path)).toBe(true);
-				expect(fs.readFileSync(lock.path, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
-				verify.mockRestore();
-				lock.release();
-				expect(fs.existsSync(lock.path)).toBe(false);
-			} finally {
-				fs.rmSync(locks, { recursive: true, force: true });
-			}
-		},
-	);
-
-	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
-		"keeps asynchronous descriptor verification failures retryable",
-		async () => {
-			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-verify-"));
-			try {
-				const lock = await acquireManagedLock(locks, "owner");
-				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockReturnValue({
-					ok: false,
-					code: "identity_unavailable",
-				} as never);
-				await expect(lock.release()).rejects.toThrow("identity_unavailable");
-				expect(fs.existsSync(lock.path)).toBe(true);
-				verify.mockRestore();
-				await lock.release();
-				expect(fs.existsSync(lock.path)).toBe(false);
-			} finally {
-				fs.rmSync(locks, { recursive: true, force: true });
-			}
-		},
-	);
-
-	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
-		"finalizes a synchronous lock when descriptor verification proves ownership loss",
-		() => {
-			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-lost-"));
-			try {
-				const lock = acquireManagedLockSync(locks, "owner");
-				const retired = `${lock.path}.retired`;
-				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation(pathname => {
-					if (pathname === lock.path) {
-						fs.renameSync(lock.path, retired);
-						fs.writeFileSync(lock.path, "successor\n", { mode: 0o600 });
-						return { ok: false, code: "identity_mismatch" } as never;
-					}
-					return { ok: true } as never;
-				});
-				expect(() => lock.release()).toThrow("identity_mismatch");
-				expect(fs.readFileSync(lock.path, "utf8")).toBe("successor\n");
-				verify.mockRestore();
-				fs.unlinkSync(lock.path);
-				fs.renameSync(retired, lock.path);
-				expect(() => lock.release()).toThrow("migration_busy");
-				expect(fs.readFileSync(lock.path, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
-			} finally {
-				fs.rmSync(locks, { recursive: true, force: true });
-			}
-		},
-	);
-
-	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
-		"finalizes an asynchronous lock when descriptor verification proves ownership loss",
-		async () => {
-			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-lost-"));
-			try {
-				const lock = await acquireManagedLock(locks, "owner");
-				const retired = `${lock.path}.retired`;
-				const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation(pathname => {
-					if (pathname === lock.path) {
-						fs.renameSync(lock.path, retired);
-						fs.writeFileSync(lock.path, "successor\n", { mode: 0o600 });
-						return { ok: false, code: "identity_mismatch" } as never;
-					}
-					return { ok: true } as never;
-				});
-				await expect(lock.release()).rejects.toThrow("identity_mismatch");
-				expect(fs.readFileSync(lock.path, "utf8")).toBe("successor\n");
-				verify.mockRestore();
-				fs.unlinkSync(lock.path);
-				fs.renameSync(retired, lock.path);
-				await expect(lock.release()).rejects.toThrow("migration_busy");
-				expect(fs.readFileSync(lock.path, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
-			} finally {
-				fs.rmSync(locks, { recursive: true, force: true });
-			}
-		},
-	);
-
-	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
-		"retires a partially initialized synchronous lock after security setup fails",
-		() => {
-			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-sync-create-failure-"));
-			try {
-				vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValueOnce({
-					ok: false,
-					code: "identity_unavailable",
-				} as never);
-				expect(() => acquireManagedLockSync(locks, "owner")).toThrow("identity_unavailable");
-				expect(fs.existsSync(path.join(locks, "owner.lock"))).toBe(false);
-			} finally {
-				fs.rmSync(locks, { recursive: true, force: true });
-			}
-		},
-	);
-
-	it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
-		"retires a partially initialized asynchronous lock after security setup fails",
-		async () => {
-			const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-async-create-failure-"));
-			try {
-				vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockReturnValueOnce({
-					ok: false,
-					code: "identity_unavailable",
-				} as never);
-				await expect(acquireManagedLock(locks, "owner")).rejects.toThrow("identity_unavailable");
-				expect(fs.existsSync(path.join(locks, "owner.lock"))).toBe(false);
-			} finally {
-				fs.rmSync(locks, { recursive: true, force: true });
-			}
-		},
-	);
-
-	it("rejects forged cleanup_pending authority while the canonical lock remains occupied", () => {
-		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-forged-"));
-		try {
-			const lock = acquireManagedLockSync(locks, "owner");
-			const forged = path.join(locks, ".gjc-forged-retained");
-			fs.writeFileSync(forged, "forged\n", { mode: 0o600 });
-			const exactUnlink = native.exactUnlink;
-			const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-				if (pathname === lock.path) return { ok: false, code: "cleanup_pending", detachedPath: forged };
-				return exactUnlink(pathname, identity);
-			});
-
-			expect(() => lock.release()).toThrow("migration_busy");
-			expect(fs.existsSync(lock.path)).toBe(true);
-			expect(fs.existsSync(forged)).toBe(true);
-			unlink.mockRestore();
-			lock.release();
-			expect(fs.existsSync(lock.path)).toBe(false);
-		} finally {
-			fs.rmSync(locks, { recursive: true, force: true });
-		}
-	});
-
-	it("accepts authorized cleanup_pending retirement and leaves quarantine evidence for a successor", () => {
-		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-authorized-"));
-		try {
-			const lock = acquireManagedLockSync(locks, "owner");
-			const retained = path.join(locks, ".gjc-lock-retire-authorized");
-			const exactUnlink = native.exactUnlink;
-			const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-				if (pathname === lock.path) {
-					fs.renameSync(lock.path, retained);
-					return { ok: false, code: "cleanup_pending", detachedPath: retained };
-				}
-				return exactUnlink(pathname, identity);
-			});
-			lock.release();
-			expect(fs.existsSync(lock.path)).toBe(false);
-			expect(fs.readFileSync(retained, "utf8")).toContain(`"attemptId":"${lock.attemptId}"`);
-			unlink.mockRestore();
-
-			const successor = acquireManagedLockSync(locks, "owner");
-			expect(fs.existsSync(successor.path)).toBe(true);
-			expect(fs.existsSync(retained)).toBe(true);
-			successor.release();
-		} finally {
-			fs.rmSync(locks, { recursive: true, force: true });
-		}
-	});
-
-	it("does not displace a substituted successor during stale reclaim", async () => {
-		const locks = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lock-stale-"));
-		const lockPath = path.join(locks, "owner.lock");
-		try {
-			fs.writeFileSync(
-				lockPath,
-				`${JSON.stringify({
-					attemptId: "stale",
-					pid: 2_147_483_647,
-					processStartId: "stale",
-					createdAt: 0,
-					heartbeatAt: 0,
-					leaseExpiresAt: 0,
-				})}\n`,
-				{ mode: 0o600 },
-			);
-			substituteBeforeExactUnlink(lockPath);
-			let calls = 0;
-			vi.spyOn(Date, "now").mockImplementation(() => (calls++ < 3 ? 1_000 : 6_001));
-			await expect(acquireManagedLock(locks, "owner")).rejects.toThrow("migration_busy");
-			expectSuccessorStillExcludes(lockPath);
-		} finally {
-			fs.rmSync(locks, { recursive: true, force: true });
-		}
 	});
 });

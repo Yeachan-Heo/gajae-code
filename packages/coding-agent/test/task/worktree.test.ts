@@ -4,13 +4,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
 import {
+	applyNestedPatches,
 	captureBaseline,
 	captureDeltaPatch,
 	ensureIsolation,
 	getGitNoIndexNullPath,
 	mergeTaskBranches,
 	parseIsolationMode,
+	serializeRecoveryPatchBundle,
+	verifyNestedPatchesApplied,
+	verifyRootPatchesApplied,
 } from "../../src/task/worktree";
+import * as gitUtils from "../../src/utils/git";
 
 const tempDirs: string[] = [];
 
@@ -155,5 +160,129 @@ describe("worktree isolation helpers", () => {
 		expect(delta.rootPatch).toContain("+task output");
 		expect(delta.rootPatch).not.toContain("baseline dirty change");
 		expect(delta.rootPatch).not.toContain("preexisting.txt");
+	});
+
+	it("verifies the owner worktree exactly matches captured patches", async () => {
+		const { repo } = await createGitRepo();
+		const baseline = await captureBaseline(repo);
+		await fs.writeFile(path.join(repo, "merged.txt"), "child version\n");
+		const delta = await captureDeltaPatch(repo, baseline);
+		expect(await verifyRootPatchesApplied(repo, baseline, [delta.rootPatch])).toBe(true);
+
+		await fs.writeFile(path.join(repo, "merged.txt"), "owner conflict\n");
+		expect(await verifyRootPatchesApplied(repo, baseline, [delta.rootPatch])).toBe(false);
+	});
+
+	it("serializes nested-only changes into a durable recovery bundle", () => {
+		const bundle = serializeRecoveryPatchBundle({
+			rootPatch: "",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch bytes" }],
+		});
+		const parsed = JSON.parse(bundle) as {
+			version: number;
+			rootPatch: string;
+			nestedPatches: Array<{ relativePath: string; patch: string }>;
+		};
+		expect(parsed).toEqual({
+			version: 1,
+			rootPatch: "",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch bytes" }],
+		});
+	});
+
+	it("fails closed when a captured nested repository is unavailable", async () => {
+		const { repo } = await createGitRepo();
+		await expect(
+			applyNestedPatches(repo, [{ relativePath: "missing-nested", patch: "nested patch bytes" }]),
+		).rejects.toThrow("Nested repository is unavailable: missing-nested");
+	});
+
+	it("fails closed when a baseline nested repository disappears before capture", async () => {
+		const { repo } = await createGitRepo();
+		const nested = path.join(repo, "nested");
+		await fs.mkdir(nested, { recursive: true });
+		await runGit(nested, ["init"]);
+		await runGit(nested, ["config", "user.email", "nested@example.com"]);
+		await runGit(nested, ["config", "user.name", "Nested"]);
+		await fs.writeFile(path.join(nested, "nested.txt"), "nested base\n");
+		await runGit(nested, ["add", "nested.txt"]);
+		await runGit(nested, ["commit", "-m", "nested base"]);
+		const baseline = await captureBaseline(repo);
+		expect(baseline.nested.some(entry => entry.relativePath === "nested")).toBe(true);
+
+		await fs.writeFile(path.join(repo, "merged.txt"), "root change survives partial capture\n");
+		await fs.rm(path.join(nested, ".git"), { recursive: true, force: true });
+		const delta = await captureDeltaPatch(repo, baseline);
+		expect(delta.rootPatch).toContain("root change survives partial capture");
+		expect(delta.captureErrors?.[0]).toBe("Nested repository capture failed (nested): ENOENT");
+		const bundle = JSON.parse(serializeRecoveryPatchBundle(delta)) as { captureErrors?: string[] };
+		expect(bundle.captureErrors).toEqual(delta.captureErrors);
+		expect(JSON.stringify(bundle)).not.toContain(repo);
+	});
+
+	it("applies nested task patches without committing pre-existing owner state", async () => {
+		const { repo } = await createGitRepo();
+		const nested = path.join(repo, "nested-owner-state");
+		await fs.mkdir(nested, { recursive: true });
+		await runGit(nested, ["init"]);
+		await runGit(nested, ["config", "user.email", "nested@example.com"]);
+		await runGit(nested, ["config", "user.name", "Nested"]);
+		for (const file of ["task.txt", "staged.txt", "unstaged.txt"]) {
+			await fs.writeFile(path.join(nested, file), `${file} base\n`);
+		}
+		await runGit(nested, ["add", "."]);
+		await runGit(nested, ["commit", "-m", "nested base"]);
+
+		await fs.writeFile(path.join(nested, "staged.txt"), "owner staged\n");
+		await runGit(nested, ["add", "staged.txt"]);
+		await fs.writeFile(path.join(nested, "unstaged.txt"), "owner unstaged\n");
+		await fs.writeFile(path.join(nested, "untracked.txt"), "owner untracked\n");
+		const baseline = await captureBaseline(repo);
+		await fs.writeFile(path.join(nested, "task.txt"), "task change\n");
+		const taskPatch = `${await runGit(nested, ["diff", "--binary", "--", "task.txt"])}\n`;
+		await runGit(nested, ["checkout", "--", "task.txt"]);
+		const headBefore = await runGit(nested, ["rev-parse", "HEAD"]);
+
+		await applyNestedPatches(repo, [{ relativePath: "nested-owner-state", patch: taskPatch }]);
+		expect(
+			await verifyNestedPatchesApplied(repo, baseline, [{ relativePath: "nested-owner-state", patch: taskPatch }]),
+		).toBe(true);
+
+		expect(await runGit(nested, ["rev-parse", "HEAD"])).toBe(headBefore);
+		const status = await runGit(nested, ["status", "--porcelain=v1"]);
+		expect(status).toContain("M  staged.txt");
+		expect(status).toContain(" M task.txt");
+		expect(status).toContain(" M unstaged.txt");
+		expect(status).toContain("?? untracked.txt");
+	});
+
+	it("rolls back earlier nested repositories when a later apply fails", async () => {
+		const { repo } = await createGitRepo();
+		const nestedDirs = [path.join(repo, "nested-a"), path.join(repo, "nested-b")];
+		const patches: Array<{ relativePath: string; patch: string }> = [];
+		for (const [index, nested] of nestedDirs.entries()) {
+			await fs.mkdir(nested, { recursive: true });
+			await runGit(nested, ["init"]);
+			await runGit(nested, ["config", "user.email", "nested@example.com"]);
+			await runGit(nested, ["config", "user.name", "Nested"]);
+			await fs.writeFile(path.join(nested, "value.txt"), `base-${index}\n`);
+			await runGit(nested, ["add", "value.txt"]);
+			await runGit(nested, ["commit", "-m", "base"]);
+			await fs.writeFile(path.join(nested, "value.txt"), `task-${index}\n`);
+			patches.push({
+				relativePath: path.basename(nested),
+				patch: `${await runGit(nested, ["diff", "--binary", "--", "value.txt"])}\n`,
+			});
+			await runGit(nested, ["checkout", "--", "value.txt"]);
+		}
+		const realApply = gitUtils.patch.applyText.bind(gitUtils.patch);
+		vi.spyOn(gitUtils.patch, "applyText").mockImplementation(async (cwd, patch, options = {}) => {
+			if (!options.reverse && cwd === nestedDirs[1]) throw new Error("simulated later apply failure");
+			await realApply(cwd, patch, options);
+		});
+
+		await expect(applyNestedPatches(repo, patches)).rejects.toThrow("earlier nested patches were rolled back");
+		expect(await fs.readFile(path.join(nestedDirs[0]!, "value.txt"), "utf8")).toBe("base-0\n");
+		expect(await fs.readFile(path.join(nestedDirs[1]!, "value.txt"), "utf8")).toBe("base-1\n");
 	});
 });

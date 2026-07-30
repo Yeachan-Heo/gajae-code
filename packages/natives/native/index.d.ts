@@ -843,16 +843,6 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
 export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult
 
 /**
- * Replace a staged regular file only after deleting the exact expected
- *
- * The expected destination identity must describe a regular file, not a
- * directory or detach-only request.
- * Publication uses a retained source handle and a no-replace rename, so a
- * successor installed after deletion is preserved.
- */
-export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
-
-/**
  * Restore only the detached object that still has the supplied platform
  * identity. The detached and original paths must retain the same validated
  * parent, and restoration never replaces an existing original path.
@@ -1736,10 +1726,6 @@ export interface NativeExactFileIdentity {
 export interface NativeExactUnlinkResult {
   ok: boolean
   code?: string
-  /**
-   * On Windows this is returned in the caller's namespace; retained handle
-   * operations continue to use the volume-GUID canonical path internally.
-   */
   detachedPath?: string
   retainedSuccessorPath?: string
   /**

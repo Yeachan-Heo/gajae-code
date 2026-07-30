@@ -240,8 +240,8 @@ describe("ToolSession adapter fast-mode delegation", () => {
 		});
 	});
 
-	afterEach(() => {
-		created.session.dispose();
+	afterEach(async () => {
+		await created.session.dispose();
 		authStorage.close();
 		tempDir.removeSync();
 	});
