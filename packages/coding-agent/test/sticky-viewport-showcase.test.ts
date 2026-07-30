@@ -1048,7 +1048,16 @@ describe("sticky viewport production evidence verifier", () => {
 				stdout: "pipe",
 				stderr: "pipe",
 				stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
-				env: { ...process.env, GIT_INDEX_FILE: index },
+				// CI runners have no git identity, and `commit-tree` requires one. Supply it
+				// through env so the test never mutates repository or global git config.
+				env: {
+					...process.env,
+					GIT_INDEX_FILE: index,
+					GIT_AUTHOR_NAME: "gjc-test",
+					GIT_AUTHOR_EMAIL: "gjc-test@example.invalid",
+					GIT_COMMITTER_NAME: "gjc-test",
+					GIT_COMMITTER_EMAIL: "gjc-test@example.invalid",
+				},
 			});
 			const out = await new Response(proc.stdout).text();
 			if ((await proc.exited) !== 0) throw new Error(`git ${args[0]}: ${await new Response(proc.stderr).text()}`);
