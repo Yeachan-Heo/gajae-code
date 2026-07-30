@@ -137,6 +137,7 @@ type SemanticAnchorEvidence = {
 	frame_start_row: number;
 	row_text_sha256: string;
 	frame_sha256: string;
+	frame_text_sha256: string;
 };
 type MetadataEvidence = {
 	state: {
@@ -163,7 +164,9 @@ async function recomputeAnchor(root: string, key: string): Promise<void> {
 		anchor.frame_start_row
 	]!;
 	const frameSha256 = new Bun.CryptoHasher("sha256").update(ansi).digest("hex");
+	const frameTextSha256 = new Bun.CryptoHasher("sha256").update(Bun.stripANSI(ansi)).digest("hex");
 	anchor.frame_sha256 = frameSha256;
+	anchor.frame_text_sha256 = frameTextSha256;
 	anchor.row_text_sha256 = new Bun.CryptoHasher("sha256").update(rowText).digest("hex");
 	anchor.id = `${anchor.namespace}:${semanticAnchorDigest({
 		entryKey: key,
@@ -174,7 +177,7 @@ async function recomputeAnchor(root: string, key: string): Promise<void> {
 		cellStart: anchor.cell_start,
 		cellEnd: anchor.cell_end,
 		frameRow: anchor.frame_start_row,
-		frameSha256,
+		frameTextSha256,
 	})}`;
 	await writeMetadataCoordinated(root, key, metadata);
 }
@@ -373,7 +376,7 @@ describe("sticky viewport production evidence verifier", () => {
 					cellStart: anchor.cell_start,
 					cellEnd: anchor.cell_end,
 					frameRow: anchor.frame_start_row,
-					frameSha256: anchor.frame_sha256,
+					frameTextSha256: anchor.frame_text_sha256,
 				})}`,
 			);
 			// No silent aliasing: the geometry-only digest collapsed 17 anchors onto 6
@@ -466,6 +469,29 @@ describe("sticky viewport production evidence verifier", () => {
 		anchorOf(truncatedMetadata).id = `user:entry:${fullId.split(":")[2]!.slice(0, 8)}`;
 		await writeMetadataCoordinated(truncated, key, truncatedMetadata);
 		await expect(verifyStickyViewportShowcase(truncated)).rejects.toThrow("semantic anchor guard");
+
+		// 6. Fully coordinated relocation + geometry transplant. Every digest the
+		// producer controls is recomputed — row text digest, frame digests, the full
+		// 64-hex id, metadata digest, manifest, review-input binding, and scoped
+		// provenance — so the bundle is internally consistent by construction. Digest
+		// consistency therefore cannot reject it; only the source-side immutable
+		// expectation can, because the verifier's own bytes are inside
+		// `source_sha256` and a bundle producer cannot rewrite them.
+		const relocated = await cloneBase();
+		const transplantMetadata = await readMetadata(relocated, "manual-history/80x24/unicode-color");
+		const transplant = anchorOf(transplantMetadata);
+		const relocatedMetadata = await readMetadata(relocated, key);
+		const victim = anchorOf(relocatedMetadata);
+		victim.grapheme_start = transplant.grapheme_start;
+		victim.grapheme_end = transplant.grapheme_end;
+		victim.cell_start = transplant.cell_start;
+		victim.cell_end = transplant.cell_end;
+		victim.frame_start_row = victim.frame_start_row + 1;
+		await writeMetadataCoordinated(relocated, key, relocatedMetadata);
+		await recomputeAnchor(relocated, key);
+		await expect(verifyStickyViewportShowcase(relocated)).rejects.toThrow(
+			"anchor row or geometry does not match its immutable expectation",
+		);
 	}, 300_000);
 	it("fails closed for semantic evidence and provenance corruption", async () => {
 		// `capture()` spawns a ~2.2s subprocess. Capture once and clone the
@@ -921,6 +947,27 @@ describe("sticky viewport production evidence verifier", () => {
 		await verifyStickyViewportShowcase(dumb);
 		await verifyStickyViewportShowcase(truecolor);
 		await verifyStickyViewportShowcase(dumbRepeat);
+		// Semantic anchor identity must name WHAT is anchored, not how the host
+		// negotiated color. The first digest bound the ANSI frame sha256, so 16 of 17
+		// anchors changed id between an indexed-color and a truecolor host while the
+		// stripped paint was byte-identical — an evidence field that moves for a
+		// reason unrelated to its meaning. The preimage now binds the stripped-text
+		// digest, and `frame_sha256` stays persisted only as artifact binding.
+		let comparedAnchors = 0;
+		for (const key of keys) {
+			const dumbAnchor = (await readMetadata(dumb, key)).state.semantic_anchor;
+			const truecolorAnchor = (await readMetadata(truecolor, key)).state.semantic_anchor;
+			if (dumbAnchor === null || truecolorAnchor === null) {
+				expect(dumbAnchor).toBe(truecolorAnchor);
+				continue;
+			}
+			expect(dumbAnchor.id).toBe(truecolorAnchor.id);
+			expect(dumbAnchor.frame_text_sha256).toBe(truecolorAnchor.frame_text_sha256);
+			expect(dumbAnchor.row_text_sha256).toBe(truecolorAnchor.row_text_sha256);
+			expect(dumbAnchor.frame_start_row).toBe(truecolorAnchor.frame_start_row);
+			comparedAnchors += 1;
+		}
+		expect(comparedAnchors).toBe(17);
 	}, 600_000);
 
 	it("rejects escape bytes in required ascii-no-color metadata frames", async () => {

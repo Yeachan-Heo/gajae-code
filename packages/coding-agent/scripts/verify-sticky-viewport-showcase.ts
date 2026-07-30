@@ -85,6 +85,7 @@ const SEMANTIC_ANCHOR_KEYS = [
 	"frame_start_row",
 	"row_text_sha256",
 	"frame_sha256",
+	"frame_text_sha256",
 ] as const;
 const SEMANTIC_ROOT_IDS = [
 	"irc-split",
@@ -406,6 +407,136 @@ const frameGeometry = (key: string, text: string) => {
 	// the painted status row sits one lower than the transcript capacity.
 	return { capacity: statusRow - noticeRows, statusRow, noticeRows };
 };
+// Immutable per-entry anchor expectation. A recomputed digest only proves internal
+// consistency: the producer chooses `frame_start_row` and the geometry, so it can
+// mint a cryptographically valid id for a RELOCATED or TRANSPLANTED anchor. This
+// table is the independent witness. It lives in verifier source, not in the bundle,
+// and this file's own sha256 is inside `source_sha256`, so a bundle author cannot
+// restate it. Geometry was measured identical across indexed-color and truecolor
+// hosts, so pinning it costs no host portability.
+const SEMANTIC_ANCHOR_EXPECTATION: Readonly<
+	Record<string, { frameRow: number; graphemeStart: number; graphemeEnd: number; cellStart: number; cellEnd: number }>
+> = Object.freeze({
+	"live-overflow/80x24/unicode-color": {
+		frameRow: 2,
+		graphemeStart: 0,
+		graphemeEnd: 1638400,
+		cellStart: 0,
+		cellEnd: 1638400,
+	},
+	"live-overflow/120x36/unicode-color": {
+		frameRow: 2,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"manual-history/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"manual-history/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"manual-new-output/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"manual-new-output/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"multiline-editor-hooks-pet/80x24/unicode-color": {
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 1638400,
+		cellStart: 0,
+		cellEnd: 1638400,
+	},
+	"multiline-editor-hooks-pet/120x36/unicode-color": {
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"capacity-many/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"capacity-many/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"capacity-one/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 1605632,
+		cellStart: 0,
+		cellEnd: 1605632,
+	},
+	"capacity-one/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3211264,
+		cellStart: 0,
+		cellEnd: 3211264,
+	},
+	"selection-boundary/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"selection-boundary/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"manual-new-output/80x24/ascii-no-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"multiline-editor-hooks-pet/48x10/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"narrow-cjk/48x10/unicode-color": {
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 589824,
+		cellStart: 0,
+		cellEnd: 589824,
+	},
+});
 // Semantic anchor identity guard. The persisted `semantic_anchor.id` is the only
 // durable handle on WHICH painted row the evidence anchors, so it must be
 // unforgeable rather than merely well-formed. A geometry-only digest failed both
@@ -446,6 +577,18 @@ const verifySemanticAnchor = (
 	const frameRow = anchor.frame_start_row as number;
 	if (graphemeEnd <= graphemeStart || cellEnd <= cellStart)
 		fail(`semantic anchor guard: ${key} geometry span is empty or inverted`);
+	// Independent witness: reject relocation/transplant even when every digest and
+	// provenance field is internally consistent.
+	const expectation = SEMANTIC_ANCHOR_EXPECTATION[key];
+	if (!expectation) fail(`semantic anchor guard: ${key} has no immutable anchor expectation`);
+	if (
+		frameRow !== expectation!.frameRow ||
+		graphemeStart !== expectation!.graphemeStart ||
+		graphemeEnd !== expectation!.graphemeEnd ||
+		cellStart !== expectation!.cellStart ||
+		cellEnd !== expectation!.cellEnd
+	)
+		fail(`semantic anchor guard: ${key} anchor row or geometry does not match its immutable expectation`);
 	// The row text is read from the committed paint, never from metadata, so the id
 	// stays bound to what the artifact actually renders at the recorded row.
 	const rows = text.split("\n");
@@ -455,6 +598,9 @@ const verifySemanticAnchor = (
 		fail(`semantic anchor guard: ${key} row content digest does not match the painted anchor row`);
 	if (anchor.frame_sha256 !== ansiSha256)
 		fail(`semantic anchor guard: ${key} frame digest does not match the committed frame`);
+	const frameTextSha256 = hash(Bun.stripANSI(text));
+	if (anchor.frame_text_sha256 !== frameTextSha256)
+		fail(`semantic anchor guard: ${key} frame text digest does not match the committed paint`);
 	if (semanticAnchorNamespace(id as string) !== namespace)
 		fail(`semantic anchor guard: ${key} id namespace does not match the persisted namespace`);
 	const expected = `${namespace}:${semanticAnchorDigest({
@@ -466,7 +612,7 @@ const verifySemanticAnchor = (
 		cellStart,
 		cellEnd,
 		frameRow,
-		frameSha256: ansiSha256,
+		frameTextSha256,
 	})}`;
 	if (id !== expected) fail(`semantic anchor guard: ${key} id is not the digest of its own persisted inputs`);
 	// No silent aliasing: distinct evidence entries are distinct anchors by
