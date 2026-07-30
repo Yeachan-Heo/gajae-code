@@ -62,6 +62,17 @@ describe("ultragoal change-set extraction", () => {
 		]);
 	});
 
+	it("preserves leading, trailing, and embedded newline bytes in NUL-delimited paths", () => {
+		const pathValue = " leading and trailing\nname.ts ";
+		expect(parseGitUntrackedPaths(`${pathValue}\0`)).toEqual([
+			{
+				path: pathValue,
+				status: "added",
+				category: "other",
+			},
+		]);
+	});
+
 	it("includes untracked files in the computed cumulative change set", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-untracked-change-set-"));
 		try {

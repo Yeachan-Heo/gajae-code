@@ -1599,6 +1599,43 @@ describe("native GJC ultragoal runtime", () => {
 		}
 	});
 
+	it("validation batch deferred: preserves leading and trailing whitespace in computed paths", async () => {
+		const root = await batchTempDir();
+		const whitespacePath = " leading-and-trailing.ts ";
+		process.env.CI_DEV_CHANGED_PATHS = whitespacePath;
+		await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+			validationBatches: [
+				{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+			],
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const minimal = JSON.stringify({
+			deferredToBatch: {
+				targetedVerification: {
+					status: "passed",
+					commands: ["bun test targeted"],
+					evidence: "targeted suite passed for G001",
+				},
+			},
+		});
+		expect(
+			await validateUltragoalQualityGateReadOnly({ cwd: root, goalId: "G001", qualityGateJson: minimal }),
+		).toEqual({ valid: true, errors: [] });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "whitespace path preserved",
+			qualityGateJson: minimal,
+		});
+		const persisted = (await readUltragoalLedger(root)).at(-1)?.qualityGateJson as Record<string, unknown>;
+		const deferred = persisted.deferredToBatch as Record<string, unknown>;
+		const changeSet = deferred.changeSet as Record<string, unknown>;
+		expect(changeSet.paths).toEqual([{ path: whitespacePath, status: "unknown" }]);
+	});
+
 	it("validation batch close: a minimal close gate is auto-hydrated from durable receipts", async () => {
 		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);

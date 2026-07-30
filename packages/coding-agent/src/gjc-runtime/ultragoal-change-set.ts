@@ -130,8 +130,7 @@ function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 	if (!raw) return [];
 	return raw
 		.split(/\r?\n/)
-		.map(row => row.trim())
-		.filter(Boolean)
+		.filter(row => row.length > 0)
 		.map(pathValue => ({
 			path: normalizeRepoPath(pathValue),
 			status: "unknown" as UltragoalChangeStatus,

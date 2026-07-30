@@ -663,6 +663,10 @@ function buildCompletionReceipt(input: {
 export function nonEmptyString(value: unknown): string | null {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
+
+function exactNonEmptyString(value: unknown): string | null {
+	return typeof value === "string" && value.length > 0 ? value : null;
+}
 export function stringArray(value: unknown): string[] | null {
 	return Array.isArray(value) && value.every(item => typeof item === "string") ? value.map(item => item.trim()) : null;
 }
@@ -2152,12 +2156,12 @@ function canonicalChangeSetRows(value: unknown, fieldName: string): UltragoalCha
 			throw new Error(`${fieldName}[${index}] must be an object`);
 		const record = row as JsonObject;
 		requireAllowedRecordKeys(record, ["path", "status", "oldPath"], `${fieldName}[${index}]`);
-		const pathValue = nonEmptyString(record.path);
+		const pathValue = exactNonEmptyString(record.path);
 		if (!pathValue) throw new Error(`${fieldName}[${index}].path is required`);
 		if ("goalId" in record) throw new Error(`${fieldName}[${index}] must not contain goalId attribution`);
 		const status = nonEmptyString(record.status);
 		if (!status) throw new Error(`${fieldName}[${index}].status is required`);
-		const oldPath = nonEmptyString(record.oldPath);
+		const oldPath = exactNonEmptyString(record.oldPath);
 		return {
 			path: normalizeRepoPath(pathValue),
 			status: status as UltragoalChangeStatus,
@@ -2321,7 +2325,7 @@ function hydrateDeferredGateDefaults(
 		changeSetRecord.paths = changeSetRecord.paths.map(row => {
 			const record = typeof row === "string" ? { path: row } : qualityGateObject(row);
 			if (!record) return row;
-			const pathValue = nonEmptyString(record.path);
+			const pathValue = exactNonEmptyString(record.path);
 			if (!pathValue || nonEmptyString(record.status)) return record;
 			const computed = computedByPath.get(normalizeRepoPath(pathValue));
 			return {
