@@ -1546,6 +1546,7 @@ export interface UltragoalChangeSet extends JsonObject {
 	paths: UltragoalChangeSetPath[];
 	rawDiffStat?: string;
 	rawDiff?: string;
+	captureIncomplete?: boolean;
 	trusted: true;
 }
 
@@ -1568,10 +1569,6 @@ export function normalizeChangeSetPath(value: string): string {
 	return value.replace(/^\.\//, "");
 }
 
-function isToolsIndexPath(value: string): boolean {
-	return normalizeRepoPath(value) === TOOLS_INDEX_PATH;
-}
-
 export function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
 	const normalized = normalizeRepoPath(value);
 	if (normalized.startsWith("crates/pi-natives/src/computer/")) return "code";
@@ -1582,6 +1579,7 @@ export function categorizeComputerChangePath(value: string): UltragoalChangeCate
 	)
 		return "tool";
 	if (
+		normalized === TOOLS_INDEX_PATH ||
 		normalized === "packages/coding-agent/src/tools/renderers.ts" ||
 		normalized === "packages/coding-agent/src/config/settings-schema.ts"
 	)
@@ -1597,76 +1595,11 @@ export function categorizeComputerChangePath(value: string): UltragoalChangeCate
 }
 
 function isComputerControlSurfaceCategory(category: UltragoalChangeCategory): boolean {
-	// The computer-use red-team suite is conditional, not universal (see the
-	// ultragoal SKILL): require it only when the change actually touches
-	// computer-control source — the computer tool (`tool`), its behavior-bearing
-	// settings/renderer wiring (`settings-registry`), or computer Rust (`code`).
-	// A bare regeneration of the SHARED native binding (`generated-binding`:
-	// packages/natives/native/index.{d.ts,js}) is NOT by itself a computer-use
-	// change: that file is generated from Rust, so any real computer-use behavior
-	// change must also touch one of the categories above and will still trigger
-	// the suite. Treating aggregate binding or registration files as a computer
-	// surface forced the suite on unrelated changes, which the SKILL explicitly
-	// warns against, so they are excluded here.
+	// Shared behavior registries are intentionally conservative: a path-only or
+	// uninspectable change cannot prove that computer controls were untouched.
+	// Generated bindings remain excluded because their behavior-bearing Rust
+	// source is captured separately.
 	return category === "code" || category === "tool" || category === "settings-registry";
-}
-
-function isComputerSpecificToolsIndexDiff(diff: string | undefined, targetPath: string): boolean {
-	if (!diff || !isToolsIndexPath(targetPath)) return false;
-	let inTargetFile = false;
-	for (const line of diff.split("\n")) {
-		if (line.startsWith("diff --git ")) {
-			const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-			inTargetFile = !!match && (isToolsIndexPath(match[1]!) || isToolsIndexPath(match[2]!));
-			continue;
-		}
-		if (!inTargetFile || line.startsWith("+++") || line.startsWith("---")) continue;
-		if (!line.startsWith("+") && !line.startsWith("-")) continue;
-		const changedLine = line.slice(1);
-		if (
-			/\bComputerTool\b/.test(changedLine) ||
-			/\bisComputerCallable\b/.test(changedLine) ||
-			/\bisComputerLoadablePlatform\b/.test(changedLine) ||
-			/["']computer["']/.test(changedLine) ||
-			/["']\.\/computer["']/.test(changedLine) ||
-			/\bcomputer\s*:/.test(changedLine)
-		) {
-			return true;
-		}
-	}
-	return false;
-}
-
-/** Settings registry file that holds ALL settings, most of them unrelated to computer control. */
-const SETTINGS_SCHEMA_PATH = "packages/coding-agent/src/config/settings-schema.ts";
-
-export function isSettingsSchemaPath(value: string): boolean {
-	return normalizeRepoPath(value) === SETTINGS_SCHEMA_PATH;
-}
-
-/**
- * The settings registry holds every setting (themes, tool output sizes, retry
- * knobs, …), so a bare `settings-schema.ts` edit is NOT by itself a computer
- * change. Mirror {@link isComputerSpecificToolsIndexDiff}: only treat it as a
- * computer-control surface when the diff actually adds/removes a `computer.*`
- * setting key. When no diff is available, callers fall back to the conservative
- * (fail-closed) categorization instead of this narrowing.
- */
-function isComputerSpecificSettingsDiff(diff: string | undefined, targetPath: string): boolean {
-	if (!diff || !isSettingsSchemaPath(targetPath)) return false;
-	let inTargetFile = false;
-	for (const line of diff.split("\n")) {
-		if (line.startsWith("diff --git ")) {
-			const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-			inTargetFile = !!match && (isSettingsSchemaPath(match[1]!) || isSettingsSchemaPath(match[2]!));
-			continue;
-		}
-		if (!inTargetFile || line.startsWith("+++") || line.startsWith("---")) continue;
-		if (!line.startsWith("+") && !line.startsWith("-")) continue;
-		const changedLine = line.slice(1);
-		if (/["']computer\./.test(changedLine)) return true;
-	}
-	return false;
 }
 
 function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolean {
@@ -1677,28 +1610,8 @@ function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolea
 
 function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | undefined): boolean {
 	if (!changeSet?.trusted) return false;
-	return changeSet.paths.some(row => {
-		if (isComputerControlSurfaceChangePath(row)) {
-			// The settings registry mixes computer and non-computer settings. Narrow it
-			// with the diff so unrelated settings edits do not force the computer suite;
-			// fall back to the conservative categorization when no diff is available.
-			const touchesSettingsSchema =
-				isSettingsSchemaPath(row.path) || (row.oldPath ? isSettingsSchemaPath(row.oldPath) : false);
-			if (touchesSettingsSchema && changeSet.rawDiff !== undefined) {
-				return (
-					isComputerSpecificSettingsDiff(changeSet.rawDiff, row.path) ||
-					(row.oldPath ? isComputerSpecificSettingsDiff(changeSet.rawDiff, row.oldPath) : false)
-				);
-			}
-			return true;
-		}
-		const touchesToolsIndex = isToolsIndexPath(row.path) || (row.oldPath ? isToolsIndexPath(row.oldPath) : false);
-		if (touchesToolsIndex && changeSet.rawDiff === undefined) return true;
-		return (
-			isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.path) ||
-			(row.oldPath ? isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.oldPath) : false)
-		);
-	});
+	if (changeSet.captureIncomplete) return true;
+	return changeSet.paths.some(isComputerControlSurfaceChangePath);
 }
 
 function requiresComputerRedTeamSuite(executorQa: JsonObject, changeSet: UltragoalChangeSet | undefined): boolean {
@@ -2186,6 +2099,8 @@ function requireChangeSetCoverage(
 	fieldName: string,
 ): void {
 	if (!expected) throw new Error(`${fieldName} requires an authoritative computed checkpoint change set`);
+	if (expected.captureIncomplete)
+		throw new Error(`${fieldName} requires a complete authoritative checkpoint change set`);
 	const expectedExactRows = expected.paths.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`);
 	const declaredExactRows = declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`);
 	const declaredExactKeys = new Set(declaredExactRows);
@@ -4220,32 +4135,47 @@ async function readOptionalExecutorQa(cwd: string, value: string | undefined): P
 import {
 	computeCheckpointChangeSet,
 	parseGitNameStatus,
+	parseGitUntrackedPaths,
 	parseUnifiedDiffPaths,
 	resolveGitBase,
 	spawnText,
 } from "./ultragoal-change-set";
 
-export { computeCheckpointChangeSet, parseGitNameStatus, parseUnifiedDiffPaths, resolveGitBase, spawnText };
+export {
+	computeCheckpointChangeSet,
+	parseGitNameStatus,
+	parseGitUntrackedPaths,
+	parseUnifiedDiffPaths,
+	resolveGitBase,
+	spawnText,
+};
 
 function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
 	const kind = nonEmptyString(source.kind);
 	if (kind === "spec") return { source: "review-spec", paths: [], trusted: true };
-	if (kind === "pr" && typeof source.diff === "string")
+	if (kind === "pr" && typeof source.diff === "string") {
+		const paths = parseUnifiedDiffPaths(source.diff);
 		return {
 			source: "review-pr",
-			paths: parseUnifiedDiffPaths(source.diff),
+			paths,
 			rawDiffStat: source.diff,
 			rawDiff: source.diff,
+			captureIncomplete: source.captureIncomplete === true || (source.diff.length > 0 && paths.length === 0),
 			trusted: true,
 		};
+	}
 	const local = qualityGateObject(source.local);
 	if (kind === "pr" && local) return changeSetFromReviewSource(local);
 	if (kind === "worktree")
 		return {
 			source: "review-worktree",
-			paths: parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
-			rawDiffStat: String(source.diffStat ?? ""),
-			rawDiff: String(source.diff ?? ""),
+			paths: [
+				...parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
+				...parseGitUntrackedPaths(String(source.untracked ?? "")),
+			],
+			rawDiffStat: typeof source.diffStat === "string" ? source.diffStat : undefined,
+			rawDiff: typeof source.diff === "string" ? source.diff : undefined,
+			captureIncomplete: source.captureIncomplete === true,
 			trusted: true,
 		};
 	if (kind === "branch" || kind === "pr-fallback")
@@ -4254,8 +4184,9 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 			baseRef: nonEmptyString(source.base) ?? undefined,
 			headRef: "HEAD",
 			paths: parseGitNameStatus(String(source.nameStatus ?? "")),
-			rawDiffStat: String(source.diffStat ?? ""),
-			rawDiff: String(source.diff ?? ""),
+			rawDiffStat: typeof source.diffStat === "string" ? source.diffStat : undefined,
+			rawDiff: typeof source.diff === "string" ? source.diff : undefined,
+			captureIncomplete: source.captureIncomplete === true,
 			trusted: true,
 		};
 	return undefined;
@@ -4263,35 +4194,48 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 
 async function localDiffSource(cwd: string, sourceKind: string, branch?: string): Promise<JsonObject> {
 	if (sourceKind === "worktree") {
-		const [status, diffStat, unstaged, staged, unstagedDiff, stagedDiff] = await Promise.all([
+		const [status, diffStat, unstaged, staged, untracked, unstagedDiff, stagedDiff] = await Promise.all([
 			spawnText(["git", "status", "--short"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--stat"], { cwd, timeoutMs: 5000 }),
-			spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
-			spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff", "--cached", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 		]);
 		return {
 			kind: "worktree",
-			status: status.stdout,
-			diffStat: diffStat.stdout,
-			diff: [unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n"),
-			nameStatus: `${unstaged.stdout}\n${staged.stdout}`,
+			...(status.ok ? { status: status.stdout } : {}),
+			...(diffStat.ok ? { diffStat: diffStat.stdout } : {}),
+			...(unstagedDiff.ok && stagedDiff.ok
+				? { diff: [unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n") }
+				: {}),
+			nameStatus: [unstaged.ok ? unstaged.stdout : "", staged.ok ? staged.stdout : ""].join(""),
+			...(untracked.ok ? { untracked: untracked.stdout } : {}),
+			captureIncomplete:
+				!status.ok ||
+				!diffStat.ok ||
+				!unstaged.ok ||
+				!staged.ok ||
+				!untracked.ok ||
+				!unstagedDiff.ok ||
+				!stagedDiff.ok,
 		};
 	}
 	const base = await resolveGitBase(cwd, branch);
 	const [diffStat, nameStatus, diff] = await Promise.all([
 		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status", "-z", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 	]);
 	return {
 		kind: sourceKind,
 		base,
 		branch,
-		diffStat: diffStat.stdout,
-		diff: diff.stdout,
-		nameStatus: nameStatus.stdout,
+		...(diffStat.ok ? { diffStat: diffStat.stdout } : {}),
+		...(diff.ok ? { diff: diff.stdout } : {}),
+		nameStatus: nameStatus.ok ? nameStatus.stdout : "",
+		captureIncomplete: !diffStat.ok || !nameStatus.ok || !diff.ok,
 	};
 }
 

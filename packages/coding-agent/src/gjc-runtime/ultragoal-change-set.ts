@@ -1,8 +1,6 @@
 import {
 	categorizeComputerChangePath,
-	isSettingsSchemaPath,
 	normalizeChangeSetPath,
-	type UltragoalChangeCategory,
 	type UltragoalChangeSet,
 	type UltragoalChangeSetPath,
 	type UltragoalChangeStatus,
@@ -123,15 +121,6 @@ export function parseGitUntrackedPaths(output: string): UltragoalChangeSetPath[]
 		}));
 }
 
-function categorizeCiChangedPath(value: string): UltragoalChangeCategory {
-	// CI_DEV_CHANGED_PATHS intentionally carries path names only. Mixed registries
-	// such as settings-schema.ts require diff-level narrowing; without the diff,
-	// treating the whole registry as computer-control source forces the mandatory
-	// computer red-team suite on unrelated settings changes.
-	if (isSettingsSchemaPath(value)) return "other";
-	return categorizeComputerChangePath(value);
-}
-
 function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 	const raw = process.env.CI_DEV_CHANGED_PATHS;
 	if (!raw) return [];
@@ -141,7 +130,7 @@ function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 		.map(pathValue => ({
 			path: normalizeChangeSetPath(pathValue),
 			status: "unknown" as UltragoalChangeStatus,
-			category: categorizeCiChangedPath(pathValue),
+			category: categorizeComputerChangePath(pathValue),
 		}));
 }
 
@@ -155,7 +144,8 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 	const ciChangedPaths = ciDevChangedPathRows();
 	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
 	if (!inGit.ok || inGit.stdout.trim() !== "true") {
-		if (ciChangedPaths.length === 0) return undefined;
+		if (ciChangedPaths.length === 0)
+			return { source: "checkpoint-git", paths: [], captureIncomplete: true, trusted: true };
 		return { source: "checkpoint-git", paths: ciChangedPaths, trusted: true };
 	}
 	const baseRef = await resolveGitBase(cwd);
@@ -171,7 +161,24 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 	]);
-	if (!committed.ok || !unstaged.ok || !staged.ok || !untracked.ok) return undefined;
+	if (!committed.ok || !unstaged.ok || !staged.ok || !untracked.ok) {
+		const paths = mergeChangeSetPaths([
+			committed.ok ? parseGitNameStatus(committed.stdout) : [],
+			unstaged.ok ? parseGitNameStatus(unstaged.stdout) : [],
+			staged.ok ? parseGitNameStatus(staged.stdout) : [],
+			untracked.ok ? parseGitUntrackedPaths(untracked.stdout) : [],
+			ciChangedPaths,
+		]);
+		return {
+			source: "checkpoint-git",
+			baseRef,
+			mergeBase: mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : undefined,
+			headRef: "HEAD",
+			paths,
+			captureIncomplete: true,
+			trusted: true,
+		};
+	}
 	const gitPaths = mergeChangeSetPaths([
 		parseGitNameStatus(committed.stdout),
 		parseGitNameStatus(unstaged.stdout),

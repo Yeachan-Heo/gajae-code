@@ -1582,7 +1582,7 @@ describe("native GJC ultragoal runtime", () => {
 			});
 			expect(validation.valid).toBe(false);
 			expect(
-				validation.errors.some(error => error.message.includes("authoritative computed checkpoint change set")),
+				validation.errors.some(error => error.message.includes("complete authoritative checkpoint change set")),
 			).toBe(true);
 			await expect(
 				checkpointUltragoalGoal({
@@ -1592,7 +1592,7 @@ describe("native GJC ultragoal runtime", () => {
 					evidence: "missing change-set source",
 					qualityGateJson: minimal,
 				}),
-			).rejects.toThrow("authoritative computed checkpoint change set");
+			).rejects.toThrow("complete authoritative checkpoint change set");
 		} finally {
 			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;

@@ -305,6 +305,28 @@ describe("ultragoal review command", () => {
 		});
 	}, 15_000);
 
+	it("review worktree requires computer QA for an untracked shared registry", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const toolsIndex = path.join(root, "packages/coding-agent/src/tools/index.ts");
+		await fs.mkdir(path.dirname(toolsIndex), { recursive: true });
+		await fs.writeFile(toolsIndex, "export const BUILTIN_TOOLS = { ordinary: true };\n");
+		const output = await review(root, ["--executor-qa-json", await writeQa(root, validExecutorQa())]);
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
+	it("review worktree requires computer QA when inventory bytes are incomplete", async () => {
+		if (process.platform === "win32") return;
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const invalidPath = Buffer.concat([Buffer.from(root), Buffer.from(path.sep), Buffer.from([0xff])]);
+		await fs.writeFile(invalidPath, "unrepresentable pathname\n");
+		const output = await review(root, ["--executor-qa-json", await writeQa(root, validExecutorQa())]);
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
 	it("uses spec override as a strong contract and allows clean pass", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);

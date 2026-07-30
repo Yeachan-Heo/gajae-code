@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Ultragoal validation-batch hydration now fails closed unless deferred and final-close evidence exactly matches a complete authoritative cumulative Git/CI inventory and durable batch tuple. Explicit malformed, partial, unknown, reordered, or stale receipt data is rejected; Git path capture is byte-safe, NUL-delimited, and includes untracked files; incomplete capture conservatively requires computer-control QA; shared settings and tool registries cannot use partial diffs to bypass that suite; validate/checkpoint replacement hydration is identical; and current/replacement receipts are byte-bound to ledger payloads (#3541).
 
 ## [0.12.4] - 2026-07-30
 
@@ -9,7 +12,6 @@
 ### Fixed
 
 - The release cut no longer deletes previously released changelog headings whose body is empty. `releasedChangelogContent` ran `removeEmptyVersionEntries` before transforming `## [Unreleased]`, so cutting a release replaced the prior empty semver heading instead of inserting the new one above it — v0.12.2 dropped the `## [0.12.1] - 2026-07-29` heading from four package changelogs. Released sections are now immutable history and are always preserved.
-- Ultragoal validation-batch hydration now fails closed unless deferred and final-close evidence exactly matches an authoritative cumulative Git/CI inventory and durable batch tuple. Explicit malformed, partial, unknown, reordered, or stale receipt data is rejected; Git path capture is NUL-safe and includes untracked files; read-only validation and checkpoint persistence share replacement-close hydration; and current receipts are byte-bound to their ledger payloads (#3541).
 
 ## [0.12.2] - 2026-07-30
 

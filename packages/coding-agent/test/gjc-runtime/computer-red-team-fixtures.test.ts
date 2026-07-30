@@ -353,7 +353,7 @@ describe("computer red-team fixture matrix", () => {
 		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
 	});
 
-	it("does not trigger from non-computer edit to tools index registration", async () => {
+	it("fails closed for any tools-index edit", async () => {
 		const root = await tempDir();
 		await initRepo(root);
 		await seedPlan(root);
@@ -363,7 +363,8 @@ describe("computer red-team fixture matrix", () => {
 			row => row.id !== "blast-radius",
 		);
 		const qa = executorQa({ computerTouching: false, cases, surface: "native" });
-		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+		const message = await checkpoint(root, qa).catch(error => String(error));
+		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
 
 	it("fails tools-index classification closed when full diff bytes cannot be decoded", async () => {
@@ -424,7 +425,7 @@ export function isToolAllowed(name: string): boolean {
 		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
 	});
 
-	it("does not trigger from a non-computer settings-schema edit", async () => {
+	it("fails closed for any settings-schema edit", async () => {
 		const root = await tempDir();
 		await initRepo(root);
 		await seedPlan(root);
@@ -438,10 +439,11 @@ export function isToolAllowed(name: string): boolean {
 			row => row.id !== "blast-radius",
 		);
 		const qa = executorQa({ computerTouching: false, cases, surface: "native" });
-		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+		const message = await checkpoint(root, qa).catch(error => String(error));
+		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
 
-	it("does not trigger from CI path-only non-computer settings-schema edit", async () => {
+	it("fails closed for CI path-only settings-schema edits", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "@goal computer gate fixture" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -453,7 +455,8 @@ export function isToolAllowed(name: string): boolean {
 				row => row.id !== "blast-radius",
 			);
 			const qa = executorQa({ computerTouching: false, cases, surface: "native" });
-			expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+			const message = await checkpoint(root, qa).catch(error => String(error));
+			expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 		} finally {
 			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
@@ -470,6 +473,24 @@ export function isToolAllowed(name: string): boolean {
 		const prefix = new TextEncoder().encode('export const SETTINGS = {\n\t"tools.maxInlineResultBytes": ');
 		await fs.writeFile(path.join(root, settingsPath), new Uint8Array([...prefix, 0xff, 0x0a, 0x7d, 0x3b, 0x0a]));
 		await runGit(root, ["add", settingsPath]);
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const message = await checkpoint(root, executorQa({ computerTouching: false, cases })).catch(error =>
+			String(error),
+		);
+		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
+	it("requires mandatory QA when invalid untracked bytes make inventory incomplete", async () => {
+		if (process.platform === "win32") return;
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(root);
+		const invalidPath = Buffer.concat([Buffer.from(root), Buffer.from(path.sep), Buffer.from([0xff])]);
+		await fs.writeFile(invalidPath, "unrepresentable pathname\n");
 		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
 			row => row.id !== "blast-radius",
 		);
