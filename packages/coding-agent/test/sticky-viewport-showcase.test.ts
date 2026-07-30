@@ -5,7 +5,11 @@ import * as path from "node:path";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { ansiToHtml, xterm256Color } from "../scripts/capture-sticky-viewport-showcase";
 import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
-import { STICKY_VIEWPORT_SHOWCASE_COVERAGE } from "./fixtures/tui/sticky-viewport-showcase";
+import {
+	SEMANTIC_ANCHOR_DOMAIN,
+	STICKY_VIEWPORT_SHOWCASE_COVERAGE,
+	semanticAnchorDigest,
+} from "./fixtures/tui/sticky-viewport-showcase";
 
 const roots: string[] = [];
 async function capture(): Promise<string> {
@@ -69,6 +73,72 @@ async function rebindReviewInput(root: string): Promise<void> {
 	const review = JSON.parse(await fs.readFile(reviewPath, "utf8"));
 	review.manifest_sha256 = new Bun.CryptoHasher("sha256").update(manifest).digest("hex");
 	await Bun.write(reviewPath, `${JSON.stringify(review, null, 2)}\n`);
+}
+
+// The owner's exploit rehashed `metadata.json`, the manifest entry, AND the review
+// input together, so the bundle stayed internally consistent and only the anchor
+// guard could reject it. Every anchor corruption case below performs that same
+// coordinated rehash — otherwise it would fail on an earlier digest check and
+// prove nothing about the guard.
+async function writeMetadataCoordinated(root: string, key: string, metadata: unknown): Promise<void> {
+	await Bun.write(path.join(root, key, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`);
+	await rehash(root, key, "metadata.json");
+	await rebindReviewInput(root);
+}
+// Mutable view of a persisted entry. Only the fields the corruption cases below
+// actually reach into are named; the rest stays opaque so a schema addition does
+// not force a change here.
+type SemanticAnchorEvidence = {
+	domain: string;
+	id: string;
+	namespace: string;
+	grapheme_start: number;
+	grapheme_end: number;
+	cell_start: number;
+	cell_end: number;
+	frame_start_row: number;
+	row_text_sha256: string;
+	frame_sha256: string;
+};
+type MetadataEvidence = {
+	state: {
+		semantic_anchor: SemanticAnchorEvidence | null;
+		cursor: { frame_sha256: string };
+		visible_empty_irc_frame: { text: string };
+		resize_probes: Array<{ frame: { text: string } }>;
+	} & Record<string, unknown>;
+} & Record<string, unknown>;
+async function readMetadata(root: string, key: string): Promise<MetadataEvidence> {
+	return JSON.parse(await fs.readFile(path.join(root, key, "metadata.json"), "utf8")) as MetadataEvidence;
+}
+// Recompute a VALID anchor for an already-mutated frame. The anchor guard runs
+// before the downstream metadata checks, so a case that mutates the painted frame
+// to exercise one of those later checks must carry an anchor that is honest about
+// the new paint — otherwise the guard rejects first and the case stops proving
+// what it was written to prove.
+async function recomputeAnchor(root: string, key: string): Promise<void> {
+	const metadata = await readMetadata(root, key);
+	const anchor = metadata.state.semantic_anchor;
+	if (anchor === null) return;
+	const ansi = await fs.readFile(path.join(root, key, "terminal-ansi.txt"), "utf8");
+	const rowText = (await fs.readFile(path.join(root, key, "terminal.txt"), "utf8")).split("\n")[
+		anchor.frame_start_row
+	]!;
+	const frameSha256 = new Bun.CryptoHasher("sha256").update(ansi).digest("hex");
+	anchor.frame_sha256 = frameSha256;
+	anchor.row_text_sha256 = new Bun.CryptoHasher("sha256").update(rowText).digest("hex");
+	anchor.id = `${anchor.namespace}:${semanticAnchorDigest({
+		entryKey: key,
+		namespace: anchor.namespace,
+		rowText,
+		graphemeStart: anchor.grapheme_start,
+		graphemeEnd: anchor.grapheme_end,
+		cellStart: anchor.cell_start,
+		cellEnd: anchor.cell_end,
+		frameRow: anchor.frame_start_row,
+		frameSha256,
+	})}`;
+	await writeMetadataCoordinated(root, key, metadata);
 }
 
 async function validIndependentReview(root: string): Promise<Record<string, unknown>> {
@@ -197,6 +267,10 @@ describe("sticky viewport production evidence verifier", () => {
 		const root = await capture();
 		const cubeKey = "manual-new-output/80x24/unicode-color";
 		await replaceAnsiColor(root, cubeKey, "\x1b[38;5;196;48;5;51m");
+		// Give the mutated frame an honest anchor, so the anchor guard has nothing to
+		// object to and `cursor.frame_sha256` remains the sole falsified digest. This
+		// keeps the case pointed at the runtime observation check it was written for.
+		await recomputeAnchor(root, cubeKey);
 		await rebindReviewInput(root);
 		await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("runtime observation mismatch");
 	}, 120_000);
@@ -226,6 +300,135 @@ describe("sticky viewport production evidence verifier", () => {
 	it("captures and accepts the immutable production 20-key matrix", async () => {
 		await verifyStickyViewportShowcase(await capture());
 	}, 120_000);
+	it("binds every semantic anchor id to its own entry, content, geometry, and frame", async () => {
+		const root = await capture();
+		const keys: string[] = JSON.parse(await fs.readFile(path.join(root, "manifest.json"), "utf8")).ordered_keys;
+		const seen = new Map<string, string>();
+		let anchored = 0;
+		for (const key of keys) {
+			const metadata = await readMetadata(root, key);
+			const anchor = metadata.state.semantic_anchor;
+			if (anchor === null) continue;
+			anchored += 1;
+			expect(anchor.domain).toBe(SEMANTIC_ANCHOR_DOMAIN);
+			expect(anchor.namespace).toBe("user:entry");
+			// Full-length digest: the previous 8-hex suffix was brute-forceable, and a
+			// chosen-input search found a colliding geometry pair in ~26k attempts.
+			expect(anchor.id).toMatch(/^user:entry:[0-9a-f]{64}$/);
+			// Every digest input is persisted, so a third party can recompute the id
+			// without re-running the capture.
+			const text = await fs.readFile(path.join(root, key, "terminal.txt"), "utf8");
+			const rowText = text.split("\n")[anchor.frame_start_row]!;
+			expect(anchor.row_text_sha256).toBe(new Bun.CryptoHasher("sha256").update(rowText).digest("hex"));
+			expect(anchor.frame_sha256).toBe(
+				new Bun.CryptoHasher("sha256")
+					.update(await fs.readFile(path.join(root, key, "terminal-ansi.txt"), "utf8"))
+					.digest("hex"),
+			);
+			expect(anchor.id).toBe(
+				`user:entry:${semanticAnchorDigest({
+					entryKey: key,
+					namespace: "user:entry",
+					rowText,
+					graphemeStart: anchor.grapheme_start,
+					graphemeEnd: anchor.grapheme_end,
+					cellStart: anchor.cell_start,
+					cellEnd: anchor.cell_end,
+					frameRow: anchor.frame_start_row,
+					frameSha256: anchor.frame_sha256,
+				})}`,
+			);
+			// No silent aliasing: the geometry-only digest collapsed 17 anchors onto 6
+			// ids, one of which claimed six entries with different painted frames.
+			expect(seen.has(anchor.id)).toBe(false);
+			seen.set(anchor.id, key);
+		}
+		expect(anchored).toBe(17);
+		expect(seen.size).toBe(17);
+		await verifyStickyViewportShowcase(root);
+	}, 120_000);
+	it("rejects rehashed semantic anchor forgery, transplant, geometry, content, and truncation", async () => {
+		const base = await capture();
+		const cloneBase = async () => {
+			const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-anchor-"));
+			roots.push(clone);
+			await fs.cp(base, clone, { recursive: true });
+			return clone;
+		};
+		const key = "manual-new-output/80x24/unicode-color";
+		const otherKey = "manual-history/80x24/unicode-color";
+		// Every case below asserts on a non-null anchor, so narrow once here rather
+		// than repeating a non-null assertion at each mutation site.
+		const anchorOf = (metadata: MetadataEvidence): SemanticAnchorEvidence => {
+			const anchor = metadata.state.semantic_anchor;
+			if (anchor === null) throw new Error(`expected a semantic anchor for ${key}`);
+			return anchor;
+		};
+
+		// 1. Arbitrary id. This is the exact `deadbeef`-style substitution the owner
+		// pushed through the official verifier.
+		const arbitrary = await cloneBase();
+		const arbitraryMetadata = await readMetadata(arbitrary, key);
+		anchorOf(arbitraryMetadata).id = "user:entry:deadbeef";
+		await writeMetadataCoordinated(arbitrary, key, arbitraryMetadata);
+		await expect(verifyStickyViewportShowcase(arbitrary)).rejects.toThrow("semantic anchor guard");
+
+		// 2. Cross-entry transplant. Previously accepted, because ids were not bound
+		// to the entry they describe.
+		const swapped = await cloneBase();
+		const donor = await readMetadata(swapped, otherKey);
+		const swappedMetadata = await readMetadata(swapped, key);
+		expect(anchorOf(donor).id).not.toBe(anchorOf(swappedMetadata).id);
+		anchorOf(swappedMetadata).id = anchorOf(donor).id;
+		await writeMetadataCoordinated(swapped, key, swappedMetadata);
+		await expect(verifyStickyViewportShowcase(swapped)).rejects.toThrow("semantic anchor guard");
+
+		// 3. Two distinct anchor geometries under one id. `grapheme_end`/`cell_end`
+		// were not even persisted before, so neither was recomputable.
+		for (const field of ["grapheme_end", "cell_end"] as const) {
+			const geometry = await cloneBase();
+			const geometryMetadata = await readMetadata(geometry, key);
+			anchorOf(geometryMetadata)[field] = anchorOf(geometryMetadata)[field] + 1;
+			await writeMetadataCoordinated(geometry, key, geometryMetadata);
+			await expect(verifyStickyViewportShowcase(geometry)).rejects.toThrow("semantic anchor guard");
+		}
+
+		// 4. Content mutation with UNCHANGED geometry. Every other digest in the
+		// bundle is coordinately recomputed — including the row and frame digests the
+		// guard itself reads — so only the id-to-content binding can reject this.
+		const content = await cloneBase();
+		const contentMetadata = await readMetadata(content, key);
+		const frameRow = anchorOf(contentMetadata).frame_start_row;
+		const ansiPath = path.join(content, key, "terminal-ansi.txt");
+		const ansiRows = (await fs.readFile(ansiPath, "utf8")).split("\n");
+		// Same cell width, so the geometry the guard recomputes against is identical.
+		expect(ansiRows[frameRow]).toContain("selectable");
+		ansiRows[frameRow] = ansiRows[frameRow]!.replace("selectable", "selectabIe");
+		const mutatedAnsi = ansiRows.join("\n");
+		await Bun.write(ansiPath, mutatedAnsi);
+		await Bun.write(path.join(content, key, "terminal.txt"), Bun.stripANSI(mutatedAnsi));
+		await Bun.write(path.join(content, key, "terminal.html"), ansiToHtml(mutatedAnsi));
+		const mutatedFrameSha = new Bun.CryptoHasher("sha256").update(mutatedAnsi).digest("hex");
+		contentMetadata.state.cursor.frame_sha256 = mutatedFrameSha;
+		anchorOf(contentMetadata).frame_sha256 = mutatedFrameSha;
+		anchorOf(contentMetadata).row_text_sha256 = new Bun.CryptoHasher("sha256")
+			.update(Bun.stripANSI(mutatedAnsi).split("\n")[frameRow]!)
+			.digest("hex");
+		for (const name of ["terminal-ansi.txt", "terminal.txt", "terminal.html"] as const)
+			await rehash(content, key, name);
+		await writeMetadataCoordinated(content, key, contentMetadata);
+		await expect(verifyStickyViewportShowcase(content)).rejects.toThrow("semantic anchor guard");
+
+		// 5. Truncated-prefix collision. The owner found two distinct geometry tuples
+		// colliding on prefix `f2dc8fc6` in 26,084 attempts, so a truncated id must
+		// never be accepted as equivalent to its own full digest.
+		const truncated = await cloneBase();
+		const truncatedMetadata = await readMetadata(truncated, key);
+		const fullId = anchorOf(truncatedMetadata).id;
+		anchorOf(truncatedMetadata).id = `user:entry:${fullId.split(":")[2]!.slice(0, 8)}`;
+		await writeMetadataCoordinated(truncated, key, truncatedMetadata);
+		await expect(verifyStickyViewportShowcase(truncated)).rejects.toThrow("semantic anchor guard");
+	}, 300_000);
 	it("fails closed for semantic evidence and provenance corruption", async () => {
 		// `capture()` spawns a ~2.2s subprocess. Capture once and clone the
 		// deterministic output so each corruption case stays isolated without
@@ -343,6 +546,10 @@ describe("sticky viewport production evidence verifier", () => {
 			.digest("hex");
 		await Bun.write(cjkMetadataPath, `${JSON.stringify(cjkMetadata, null, 2)}\n`);
 		await rehash(cjkRoot, cjkKey, "metadata.json");
+		// The mutated CJK paint moves the anchor row, so re-derive the anchor from it.
+		// The guard then has no objection and the narrow-CJK boundary check stays the
+		// assertion under test.
+		await recomputeAnchor(cjkRoot, cjkKey);
 		await expect(verifyStickyViewportShowcase(cjkRoot)).rejects.toThrow("narrow CJK boundaries");
 
 		const evidenceRoot = await cloneBase();
@@ -552,7 +759,7 @@ describe("sticky viewport production evidence verifier", () => {
 			await expect(verifyStickyViewportShowcase(root, true)).rejects.toThrow("independent review");
 		}
 	}, 180_000);
-	it("keeps required ascii-no-color metadata escape-free and reproducible across capture hosts", async () => {
+	it("keeps required metadata escape-free, repo-independent, and reproducible within and across hosts", async () => {
 		// `metadata.json` is a required manifest artifact, so host-negotiated color
 		// there makes the whole bundle host-dependent even when the three top-level
 		// payloads are canonical. `detectColorMode()` picks indexed `38;5;n` when
@@ -561,16 +768,56 @@ describe("sticky viewport production evidence verifier", () => {
 		const asciiKeys = ["manual-new-output/80x24/ascii-no-color", "capacity-zero/48x10/ascii-no-color"] as const;
 		const dumb = await captureWithEnv({ TERM: "dumb" }, ["COLORTERM"]);
 		const truecolor = await captureWithEnv({ TERM: "xterm-256color", COLORTERM: "truecolor" });
+		// Same host, same worktree, same merge state, back-to-back. This is the axis
+		// the `detached` vs `detached +8` defect broke: the status line resolved repo
+		// state through an async `git status --porcelain` whose completion raced the
+		// capture, so one run painted the staged count and the next did not.
+		const dumbRepeat = await captureWithEnv({ TERM: "dumb" }, ["COLORTERM"]);
 		for (const key of asciiKeys) {
 			const dumbMetadata = await fs.readFile(path.join(dumb, key, "metadata.json"), "utf8");
 			const truecolorMetadata = await fs.readFile(path.join(truecolor, key, "metadata.json"), "utf8");
+			const repeatMetadata = await fs.readFile(path.join(dumbRepeat, key, "metadata.json"), "utf8");
 			expect(dumbMetadata).not.toContain("\u001b[");
 			expect(truecolorMetadata).not.toContain("\u001b[");
 			expect(dumbMetadata).toEqual(truecolorMetadata);
+			expect(dumbMetadata).toEqual(repeatMetadata);
+			expect(new Bun.CryptoHasher("sha256").update(dumbMetadata).digest("hex")).toBe(
+				new Bun.CryptoHasher("sha256").update(truecolorMetadata).digest("hex"),
+			);
+		}
+		// Repository state must not reach ANY required frame, on either color axis.
+		// The git segment paints the branch plus `*n`/`+n`/`?n` porcelain counts at
+		// >=120 columns, and the path segment paints the cwd basename — both are host
+		// state, and the capture now pins a preset that excludes them outright.
+		const keys: string[] = JSON.parse(await fs.readFile(path.join(dumb, "manifest.json"), "utf8")).ordered_keys;
+		for (const root of [dumb, truecolor, dumbRepeat]) {
+			for (const key of keys) {
+				const metadata = await readMetadata(root, key);
+				const frames = [
+					metadata.state.visible_empty_irc_frame.text as string,
+					...(metadata.state.resize_probes as Array<{ frame: { text: string } }>).map(probe => probe.frame.text),
+				];
+				for (const frame of frames) {
+					expect(frame).toContain("⬢");
+					// No branch name, no porcelain counts, no cwd basename.
+					expect(frame).not.toContain("detached");
+					expect(frame).not.toContain("⑂");
+					expect(frame).not.toContain("🗑");
+					expect(frame).not.toMatch(/[*+?]\d+\s/);
+				}
+			}
+			// Unicode entries legitimately differ in SGR form across hosts, but their
+			// semantic payload must not: stripping color has to leave identical bytes.
+			for (const key of keys) {
+				const stripped = Bun.stripANSI(await fs.readFile(path.join(root, key, "terminal.txt"), "utf8"));
+				const reference = Bun.stripANSI(await fs.readFile(path.join(dumb, key, "terminal.txt"), "utf8"));
+				expect(stripped).toEqual(reference);
+			}
 		}
 		await verifyStickyViewportShowcase(dumb);
 		await verifyStickyViewportShowcase(truecolor);
-	}, 300_000);
+		await verifyStickyViewportShowcase(dumbRepeat);
+	}, 600_000);
 
 	it("rejects escape bytes in required ascii-no-color metadata frames", async () => {
 		const base = await capture();
