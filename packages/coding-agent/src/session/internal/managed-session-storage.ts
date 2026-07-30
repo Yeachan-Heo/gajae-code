@@ -8,6 +8,7 @@ import {
 	exactRemoveDirectoryTree,
 	exactUnlink,
 	type NativeDirectoryTreeSnapshot,
+	type NativeExactUnlinkResult,
 	type NativeOwnerOnlySecurityResult,
 	openRecoveryFsRoot,
 	type RecoveryFsRoot,
@@ -1774,4 +1775,271 @@ export async function unlinkManagedFileVerified(
 	if (!sameIdentity(snapshot.identity, expected)) throw new Error("source_changed");
 	await fsp.unlink(pathname);
 	fsyncDirectory(path.dirname(pathname));
+}
+
+function lockDescriptorOwnershipLost(error: unknown): boolean {
+	const code = managedSecurityFailureClassification(error);
+	return code !== undefined && LOCK_OWNERSHIP_LOSS_CODES.has(code as ManagedSessionSecurityCode);
+}
+
+export class ManagedSessionSecurityError extends Error {
+	readonly code: ManagedSessionSecurityCode;
+
+	constructor(code: ManagedSessionSecurityCode) {
+		super(code);
+		this.name = "ManagedSessionSecurityError";
+		this.code = code;
+	}
+}
+function retireCreatedManagedLockExact(lockPath: string, fd: number): void {
+	const opened = fs.fstatSync(fd, { bigint: true });
+	const snapshot = captureManagedFileNoFollow(lockPath);
+	if (snapshot.identity.dev !== opened.dev || snapshot.identity.ino !== opened.ino) throw new Error("migration_busy");
+	unlinkManagedLockSnapshotExact(lockPath, snapshot);
+}
+
+/**
+ * Retire a lock only after exact identity and attempt fencing. A typed
+ * `cleanup_pending` result is terminal lock-authority retirement, not a claim
+ * that retained bytes were deleted: accept it only when native exact-unlink
+ * supplies concrete internal authority in this lock directory and the canonical
+ * lock name is absent, so a successor may acquire while quarantine evidence stays
+ * retained for recovery.
+ */
+/**
+ * Retire a lock only after exact identity and attempt fencing. A typed
+ * `cleanup_pending` result is terminal lock-authority retirement, not a claim
+ * that retained bytes were deleted: accept it only when native exact-unlink
+ * supplies concrete internal authority in this lock directory and the canonical
+ * lock name is absent, so a successor may acquire while quarantine evidence stays
+ * retained for recovery.
+ */
+function retireManagedLockExact(
+	lockPath: string,
+	expected: { lockIdentity?: fs.BigIntStats; attemptId: string },
+): void {
+	let snapshot: ManagedFileSnapshot;
+	try {
+		snapshot = captureManagedFileNoFollow(lockPath);
+	} catch {
+		throw new Error("migration_busy");
+	}
+	const record = parseLockBytes(snapshot.bytes);
+	if (
+		!record ||
+		record.attemptId !== expected.attemptId ||
+		(expected.lockIdentity &&
+			(snapshot.identity.dev !== expected.lockIdentity.dev || snapshot.identity.ino !== expected.lockIdentity.ino))
+	)
+		throw new Error("migration_busy");
+	unlinkManagedLockSnapshotExact(lockPath, snapshot);
+}
+
+/** Create a managed directory and fail closed unless its owner-only mode/ACL verifies. */
+/** Acquire a synchronous lease lock for a short cross-process critical section. */
+export function acquireManagedLockSync(
+	locksDirectory: string,
+	name: string,
+	root?: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
+): ManagedStorageLockSync {
+	ensureManagedDirectory(locksDirectory, root, policy);
+	const lockPath = path.join(locksDirectory, `${name}.lock`);
+	const deadline = Date.now() + LOCK_WAIT_MS;
+	while (true) {
+		const attemptId = randomUUID();
+		const now = Date.now();
+		const record: LockRecord = {
+			attemptId,
+			pid: process.pid,
+			bootId: bootId(),
+			processStartId: PROCESS_START_ID,
+			createdAt: now,
+			heartbeatAt: now,
+			leaseExpiresAt: now + LOCK_LEASE_MS,
+		};
+		try {
+			const fd = fs.openSync(
+				lockPath,
+				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+				0o600,
+			);
+			try {
+				secureFileDescriptor(lockPath, fd, "apply");
+				writeLockDescriptor(fd, record);
+				fsyncDirectory(locksDirectory);
+			} catch (error) {
+				try {
+					retireCreatedManagedLockExact(lockPath, fd);
+				} finally {
+					fs.closeSync(fd);
+				}
+				throw error;
+			}
+			const lockIdentity = fs.fstatSync(fd, { bigint: true });
+			let released = false;
+			let descriptorClosed = false;
+			const assertOwned = (): void => {
+				const current = parseLock(lockPath);
+				let named: fs.BigIntStats;
+				try {
+					named = fs.lstatSync(lockPath, { bigint: true });
+				} catch {
+					throw new Error("migration_busy");
+				}
+				if (
+					released ||
+					descriptorClosed ||
+					!current ||
+					!sameFileIdentity(lockIdentity, named) ||
+					current.attemptId !== attemptId
+				)
+					throw new Error("migration_busy");
+			};
+			return {
+				path: lockPath,
+				attemptId,
+				assertOwned,
+				release(): void {
+					const finalize = (): void => {
+						released = true;
+						if (!descriptorClosed) {
+							fs.closeSync(fd);
+							descriptorClosed = true;
+						}
+					};
+					try {
+						assertOwned();
+					} catch (error) {
+						finalize();
+						throw error;
+					}
+					try {
+						secureFileDescriptor(lockPath, fd, "verify");
+					} catch (error) {
+						if (lockDescriptorOwnershipLost(error)) finalize();
+						throw error;
+					}
+					try {
+						retireManagedLockExact(lockPath, { lockIdentity, attemptId });
+					} catch (error) {
+						try {
+							assertOwned();
+						} catch {
+							finalize();
+						}
+						throw error;
+					}
+					finalize();
+				},
+			};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const owner = parseLock(lockPath);
+			if (owner && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner)) {
+				try {
+					retireManagedLockExact(lockPath, { attemptId: owner.attemptId });
+				} catch {
+					/* Retry owner observation. */
+				}
+			}
+			if (Date.now() >= deadline) throw new Error("migration_busy");
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(50, deadline - Date.now()));
+		}
+	}
+}
+
+export interface ManagedArtifactTreeLimits {
+	maxFiles?: number;
+	maxTotalBytes?: number;
+}
+
+/** Bounds a no-follow artifact tree before it can be copied or deleted. */
+const LOCK_OWNERSHIP_LOSS_CODES = new Set<ManagedSessionSecurityCode>([
+	"not_found",
+	"not_directory",
+	"reparse_point",
+	"identity_mismatch",
+]);
+export type ManagedSessionSecurityCode = (typeof MANAGED_SESSION_SECURITY_CODES)[number];
+export interface ManagedStorageLockSync {
+	path: string;
+	attemptId: string;
+	assertOwned(): void;
+	release(): void;
+}
+function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
+	try {
+		const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
+		if (!value || typeof value !== "object") return undefined;
+		const record = value as Partial<LockRecord>;
+		return typeof record.attemptId === "string" &&
+			typeof record.pid === "number" &&
+			typeof record.processStartId === "string" &&
+			typeof record.leaseExpiresAt === "number" &&
+			typeof record.heartbeatAt === "number" &&
+			typeof record.createdAt === "number"
+			? (record as LockRecord)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+function unlinkManagedLockSnapshotExact(lockPath: string, snapshot: ManagedFileSnapshot): void {
+	const removed = exactUnlink(lockPath, {
+		dev: snapshot.identity.dev,
+		ino: snapshot.identity.ino,
+		size: BigInt(snapshot.identity.size),
+		mtimeNs: snapshot.identity.mtimeNs,
+		sha256: snapshot.identity.sha256,
+		quarantineName: `.gjc-lock-retire-${process.pid}-${randomUUID()}`,
+	});
+	if (!exactLockRetirementAccepted(lockPath, removed)) throw new Error("migration_busy");
+	fsyncDirectory(path.dirname(lockPath));
+}
+export const MANAGED_SESSION_SECURITY_CODES = [
+	"acl_denied",
+	"acl_io_error",
+	"acl_present",
+	"acl_malformed",
+	"acl_unknown",
+	"acl_unavailable",
+	"acl_apply_failed",
+	"acl_verify_failed",
+	"not_found",
+	"not_directory",
+	"network_unsupported",
+	"reparse_point",
+	"identity_unavailable",
+	"identity_mismatch",
+	"owner_mismatch",
+	"mode_mismatch",
+	"io_error",
+] as const;
+function exactLockRetirementAccepted(lockPath: string, removed: NativeExactUnlinkResult): boolean {
+	if (removed.ok) return true;
+	if (removed.code !== "cleanup_pending") return false;
+	const lockDirectory = path.dirname(path.resolve(lockPath));
+	const authority = [
+		removed.detachedPath,
+		removed.retainedSuccessorPath,
+		removed.retainedPlaceholderPath,
+		removed.retainedUnknownPath,
+	].find(pathname => {
+		if (typeof pathname !== "string" || pathname.length === 0 || !path.isAbsolute(pathname)) return false;
+		const resolved = path.resolve(pathname);
+		if (resolved === path.resolve(lockPath) || path.dirname(resolved) !== lockDirectory) return false;
+		if (!path.basename(resolved).startsWith(".gjc-")) return false;
+		try {
+			return !fs.lstatSync(resolved).isSymbolicLink();
+		} catch {
+			return false;
+		}
+	});
+	try {
+		fs.lstatSync(lockPath);
+		return false;
+	} catch (error) {
+		return !!authority && (error as NodeJS.ErrnoException).code === "ENOENT";
+	}
 }
