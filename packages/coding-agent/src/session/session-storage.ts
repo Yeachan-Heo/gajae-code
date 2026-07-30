@@ -136,6 +136,12 @@ export function createManagedSessionSecurityContext(input: {
 }
 
 export type SessionStorageSecurityContext = ManagedSessionSecurityContext | undefined;
+/**
+ * Evidence available after one append attempt. `not_applied` is reserved for
+ * failures certified before the append primitive is invoked; callers must
+ * treat every later failure as `ambiguous`.
+ */
+export type SessionStorageAppendOutcome = "not_applied" | "applied" | "ambiguous";
 
 export interface SessionStorageWriter {
 	writeLine(line: string): Promise<void>;

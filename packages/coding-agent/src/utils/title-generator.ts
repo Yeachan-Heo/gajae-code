@@ -69,6 +69,11 @@ function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel
  *   resolver instead of a pre-evaluated value ensures the metadata's account_uuid
  *   reflects the credential actually selected for this request.
  */
+export type SessionTitleGenerationResult =
+	| { kind: "title"; title: string }
+	| { kind: "unavailable"; reason: "no_model" | "no_credential" | "empty_result" | "timed_out" | "aborted" }
+	| { kind: "failed"; reason: "provider_error" | "request_error" };
+
 export async function generateSessionTitle(
 	firstMessage: string,
 	registry: ModelRegistry,
@@ -76,11 +81,12 @@ export async function generateSessionTitle(
 	sessionId?: string,
 	currentModel?: Model<Api>,
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined,
-): Promise<string | null> {
+	signal?: AbortSignal,
+): Promise<SessionTitleGenerationResult> {
 	const model = getTitleModel(registry, settings, currentModel);
 	if (!model) {
 		logger.debug("title-generator: no title model found");
-		return null;
+		return { kind: "unavailable", reason: "no_model" };
 	}
 
 	// Truncate message if too long
@@ -90,13 +96,25 @@ export async function generateSessionTitle(
 ${truncatedMessage}
 </user-message>`;
 
-	const apiKey = await registry.getApiKey(model, sessionId);
+	let apiKey: string | undefined;
+	try {
+		apiKey = await registry.getApiKey(model, sessionId, { signal });
+	} catch (err) {
+		logger.debug("title-generator: credential error", { error: err instanceof Error ? err.name : typeof err });
+		if (signal?.aborted) {
+			return {
+				kind: "unavailable",
+				reason: signal.reason instanceof Error && signal.reason.name === "TimeoutError" ? "timed_out" : "aborted",
+			};
+		}
+		return { kind: "failed", reason: "request_error" };
+	}
 	if (!apiKey) {
 		logger.debug("title-generator: no API key for smol model", {
 			provider: model.provider,
 			id: model.id,
 		});
-		return null;
+		return { kind: "unavailable", reason: "no_credential" };
 	}
 	// Resolve metadata after getApiKey so the session-sticky credential for this
 	// request is already recorded; metadataResolver can then return the correct
@@ -130,6 +148,7 @@ ${truncatedMessage}
 				disableReasoning: true,
 				toolChoice: { type: "tool", name: SET_TITLE_TOOL_NAME },
 				metadata,
+				signal,
 			},
 		);
 
@@ -137,9 +156,8 @@ ${truncatedMessage}
 			logger.debug("title-generator: response error", {
 				model: request.model,
 				stopReason: response.stopReason,
-				errorMessage: response.errorMessage,
 			});
-			return null;
+			return { kind: "failed", reason: "provider_error" };
 		}
 
 		const title = extractGeneratedTitle(response.content);
@@ -151,17 +169,20 @@ ${truncatedMessage}
 			stopReason: response.stopReason,
 		});
 
-		if (!title) {
-			return null;
-		}
-
-		return title.replace(/^["']|["']$/g, "").replace(/[.!?]$/, "");
+		if (!title) return { kind: "unavailable", reason: "empty_result" };
+		return { kind: "title", title: title.replace(/^["']|["']$/g, "").replace(/[.!?]$/, "") };
 	} catch (err) {
 		logger.debug("title-generator: error", {
 			model: request.model,
-			error: err instanceof Error ? err.message : String(err),
+			error: err instanceof Error ? err.name : typeof err,
 		});
-		return null;
+		if (signal?.aborted) {
+			return {
+				kind: "unavailable",
+				reason: signal.reason instanceof Error && signal.reason.name === "TimeoutError" ? "timed_out" : "aborted",
+			};
+		}
+		return { kind: "failed", reason: "request_error" };
 	}
 }
 

@@ -55,6 +55,7 @@ const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
 interface InputControllerDependencies {
 	loadPastedImageBatch?: typeof loadPastedImageBatch;
+	generateSessionTitle?: typeof generateSessionTitle;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -64,17 +65,21 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	#pendingFirstTitleTask: { sessionId: string; controller: AbortController; settled: Promise<void> } | undefined;
+	readonly #generateSessionTitle: typeof generateSessionTitle;
 
 	constructor(
 		private ctx: InteractiveModeContext,
 		dependencies: InputControllerDependencies = {},
 	) {
 		this.#loadPastedImageBatch = dependencies.loadPastedImageBatch ?? loadPastedImageBatch;
+		this.#generateSessionTitle = dependencies.generateSessionTitle ?? generateSessionTitle;
 		this.actionRegistry = new ActionRegistry({
 			context: undefined,
 			showError: actionId => this.ctx.showError(actionId),
 		});
 		this.#registerActions();
+		this.ctx.onStop?.(() => this.#cancelFirstTitleTask());
 	}
 
 	#registerActions(): void {
@@ -948,32 +953,9 @@ export class InputController {
 		// First, move any pending bash components to chat
 		this.ctx.flushPendingBashComponents();
 
-		// Generate session title on first message
 		const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-		if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) {
-			const registry = this.ctx.session.modelRegistry;
-			generateSessionTitle(
-				text,
-				registry,
-				this.ctx.settings,
-				this.ctx.session.sessionId,
-				this.ctx.session.model,
-				provider => this.ctx.session.agent.metadataForProvider(provider),
-			)
-				.then(async title => {
-					if (title) {
-						const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
-						if (applied) {
-							setSessionTerminalTitle(
-								this.ctx.sessionManager.getSessionName()!,
-								this.ctx.sessionManager.getCwd(),
-							);
-							this.ctx.updateEditorBorderColor();
-						}
-					}
-				})
-				.catch(() => {});
-		}
+		const shouldGenerateTitle =
+			!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$pickenv("GJC_NO_TITLE", "PI_NO_TITLE");
 
 		if (this.ctx.onInputCallback) {
 			// Include any pending images from clipboard paste
@@ -985,11 +967,65 @@ export class InputController {
 
 			this.ctx.onInputCallback(submission);
 		}
+		if (shouldGenerateTitle) this.#startFirstTitleTask(text);
 		if (this.#canModifyComposer(composer)) {
 			this.ctx.editor.addToHistory(text);
 		}
 	}
 
+	#cancelFirstTitleTask(): void {
+		this.#pendingFirstTitleTask?.controller.abort();
+		this.#pendingFirstTitleTask = undefined;
+	}
+
+	#startFirstTitleTask(firstMessage: string): void {
+		const sessionId = this.ctx.session.sessionId;
+		if (this.#pendingFirstTitleTask?.sessionId === sessionId) return;
+		this.#cancelFirstTitleTask();
+
+		const controller = new AbortController();
+		const timeout = AbortSignal.timeout(1_500);
+		const signal = AbortSignal.any([controller.signal, timeout]);
+		const abortedResult = Promise.withResolvers<undefined>();
+		controller.signal.addEventListener("abort", () => abortedResult.resolve(undefined), { once: true });
+		const timeoutResult = Promise.withResolvers<undefined>();
+		timeout.addEventListener("abort", () => timeoutResult.resolve(undefined), { once: true });
+		const settled = (async () => {
+			const result = await Promise.race([
+				this.#generateSessionTitle(
+					firstMessage,
+					this.ctx.session.modelRegistry,
+					this.ctx.settings,
+					sessionId,
+					this.ctx.session.model,
+					provider => this.ctx.session.agent.metadataForProvider(provider),
+					signal,
+				),
+				abortedResult.promise,
+				timeoutResult.promise,
+			]);
+			if (!result || result.kind === "failed") {
+				if (result?.kind === "failed") logger.warn("Session title generation failed.", { reason: result.reason });
+				return;
+			}
+			if (result.kind !== "title" || this.ctx.session.sessionId !== sessionId) return;
+			try {
+				if (await this.ctx.sessionManager.setSessionName(result.title, "auto")) {
+					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
+					this.ctx.updateEditorBorderColor();
+				}
+			} catch {
+				logger.warn("Session title could not be saved.", { reason: "persistence_failed" });
+			}
+		})().catch(error => {
+			logger.warn("Session title generation failed.", { reason: error instanceof Error ? error.name : "unknown" });
+		});
+		const pending = { sessionId, controller, settled };
+		this.#pendingFirstTitleTask = pending;
+		void settled.finally(() => {
+			if (this.#pendingFirstTitleTask === pending) this.#pendingFirstTitleTask = undefined;
+		});
+	}
 	handleCtrlC(): void {
 		const now = Date.now();
 		if (now - this.ctx.lastSigintTime < 500) {

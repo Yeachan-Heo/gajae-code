@@ -3,6 +3,7 @@ import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:t
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { formatKeyHint as formatKeyHintForPlatform } from "../src/config/keybindings";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
@@ -60,6 +61,8 @@ async function createContext(options?: {
 	busyPromptMode?: "steer" | "queue";
 	followUpKeys?: string[];
 	ircSidebarToggleKeys?: string[];
+	titleEnabled?: boolean;
+	sessionId?: string;
 }) {
 	let editorText = "";
 	const keyMap: Record<string, string[]> = {
@@ -82,6 +85,7 @@ async function createContext(options?: {
 	const onInputCallback = vi.fn();
 	const showHookSelector = vi.fn(async () => "Attach images" as string | undefined);
 	const toggleIrcSidebar = vi.fn();
+	let stopListener: (() => void) | undefined;
 	const startPendingSubmission = vi.fn(
 		(
 			input: {
@@ -188,6 +192,10 @@ async function createContext(options?: {
 			isBashRunning: false,
 			isEvalRunning: false,
 			messages: [],
+			sessionId: options?.sessionId ?? "session-a",
+			modelRegistry: {},
+			model: undefined,
+			agent: { metadataForProvider: vi.fn() },
 			abortBash: vi.fn(),
 			extensionRunner: undefined,
 			prompt,
@@ -228,8 +236,9 @@ async function createContext(options?: {
 				return "/";
 			},
 			getSessionName() {
-				return "test-session";
+				return options?.titleEnabled ? undefined : "test-session";
 			},
+			setSessionName: vi.fn(async () => false),
 		} as unknown as InteractiveModeContext["sessionManager"],
 		locallySubmittedUserSignatures: new Set<string>(),
 		isKnownSlashCommand: () => false,
@@ -282,6 +291,12 @@ async function createContext(options?: {
 		showHookSelector,
 
 		hasActiveBtw: vi.fn(() => false),
+		onStop(callback: () => void) {
+			stopListener = callback;
+			return () => {
+				if (stopListener === callback) stopListener = undefined;
+			};
+		},
 	} as unknown as InteractiveModeContext;
 
 	return {
@@ -311,6 +326,7 @@ async function createContext(options?: {
 			sessionQueuedMessages,
 			editorContainerChildren,
 		},
+		stop: () => stopListener?.(),
 	};
 }
 
@@ -1358,5 +1374,74 @@ describe("InputController shell mode cues", () => {
 		expect(editor.addToHistory).toHaveBeenCalledWith("!!pwd");
 		expect(ctx.isBashMode).toBe(false);
 		expect(ctx.isBashNoContext).toBe(false);
+	});
+	describe("first-session title lifecycle", () => {
+		it("dispatches immediately, suppresses duplicates, and releases an ignored provider after 1.5 seconds", async () => {
+			vi.useFakeTimers();
+			const deferred = Promise.withResolvers<{ kind: "title"; title: string }>();
+			const generateTitle = vi.fn(() => deferred.promise);
+			const { InputController, ctx, editor, spies } = await createContext({ titleEnabled: true });
+			const controller = new InputController(ctx, { generateSessionTitle: generateTitle as never });
+			controller.setupEditorSubmitHandler();
+
+			await editor.onSubmit?.("first message");
+			await editor.onSubmit?.("duplicate submission");
+
+			expect(spies.onInputCallback).toHaveBeenCalledWith(expect.objectContaining({ text: "first message" }));
+			expect(generateTitle).toHaveBeenCalledTimes(1);
+
+			vi.advanceTimersByTime(1_500);
+			await Promise.resolve();
+			await Promise.resolve();
+			deferred.resolve({ kind: "title", title: "Late title" });
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(
+				(
+					ctx.sessionManager as unknown as {
+						setSessionName: Mock<(name: string, source?: "auto" | "user") => Promise<boolean>>;
+					}
+				).setSessionName,
+			).not.toHaveBeenCalled();
+		});
+
+		it("invalidates a late title after a session switch and stops waiting when the controller stops", async () => {
+			const deferred = Promise.withResolvers<{ kind: "title"; title: string }>();
+			const generateTitle = vi.fn(() => deferred.promise);
+			const { InputController, ctx, editor, stop } = await createContext({ titleEnabled: true });
+			const controller = new InputController(ctx, { generateSessionTitle: generateTitle as never });
+			controller.setupEditorSubmitHandler();
+
+			await editor.onSubmit?.("first message");
+			(ctx.session as unknown as { sessionId: string }).sessionId = "session-b";
+			stop();
+			deferred.resolve({ kind: "title", title: "Late title" });
+			await Promise.resolve();
+
+			expect(
+				(
+					ctx.sessionManager as unknown as {
+						setSessionName: Mock<(name: string, source?: "auto" | "user") => Promise<boolean>>;
+					}
+				).setSessionName,
+			).not.toHaveBeenCalled();
+		});
+	});
+	it("observes provider failures without exposing their message", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+		const generateTitle = vi.fn(async () => {
+			throw new Error("credential-secret");
+		});
+		const { InputController, ctx, editor } = await createContext({ titleEnabled: true });
+		const controller = new InputController(ctx, { generateSessionTitle: generateTitle as never });
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("first message");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(warn).toHaveBeenCalledWith("Session title generation failed.", { reason: "Error" });
+		warn.mockRestore();
 	});
 });

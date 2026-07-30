@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,7 +10,12 @@ import {
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
+import * as native from "@gajae-code/natives";
 import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
+import {
+	ManagedAppendOutcomeError,
+	ManagedSessionDescendantStore,
+} from "../../src/session/internal/managed-session-storage";
 
 import { makeAssistantMessage } from "./helpers";
 import { injectManagedAppend } from "./managed-failure-injection";
@@ -113,6 +118,132 @@ describe("session title source persistence", () => {
 
 		const reopened = await SessionManager.open(sessionFile!);
 		expect(reopened.getSessionName()).toBe("Manual title");
+		expect(reopened.titleSource).toBe("user");
+	});
+	it("durably persists a fresh session title before reporting success", async () => {
+		const session = SessionManager.create(cwd);
+		const sessionFile = session.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		await expect(session.setSessionName("Fresh title", "auto")).resolves.toBe(true);
+		expect(fs.existsSync(sessionFile!)).toBe(true);
+
+		const reopened = await SessionManager.open(sessionFile!);
+		expect(reopened.getSessionName()).toBe("Fresh title");
+		expect(reopened.titleSource).toBe("auto");
+	});
+
+	it("serializes late auto titles behind a manual rename", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		const manual = session.setSessionName("Manual title", "user");
+		const lateAuto = session.setSessionName("Generated title", "auto");
+		await expect(manual).resolves.toBe(true);
+		await expect(lateAuto).resolves.toBe(false);
+		expect(session.getSessionName()).toBe("Manual title");
+	});
+
+	it("keeps the current UTF-8 title in the bounded tail after transcript growth", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sessionFile = session.getSessionFile()!;
+		await session.setSessionName("界 title", "user");
+
+		session.appendMessage({ role: "user", content: "界".repeat(7_000), timestamp: 2 });
+		await session.flush();
+
+		const bytes = fs.readFileSync(sessionFile);
+		expect(bytes.byteLength).toBeGreaterThan(16 * 1024);
+		expect(bytes.subarray(Math.max(0, bytes.byteLength - 16 * 1024)).toString("utf8")).toContain("界 title");
+		const listed = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+		expect(listed.find(candidate => candidate.path === sessionFile)?.title).toBe("界 title");
+	});
+
+	it("throws without publishing a title when managed append is certified not applied", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		const injection =
+			process.platform === "linux"
+				? injectManagedAppend((_relativePath, data) =>
+						Buffer.from(data).includes(Buffer.from('"type":"header_patch"'))
+							? { ok: false, code: "header_patch_write_failed" }
+							: "passthrough",
+					)
+				: (() => {
+						const append = ManagedSessionDescendantStore.prototype.appendWithOutcomeSync;
+						const spy = vi
+							.spyOn(ManagedSessionDescendantStore.prototype, "appendWithOutcomeSync")
+							.mockImplementation(function (this: ManagedSessionDescendantStore, relativePath, data) {
+								if (Buffer.from(data).includes(Buffer.from('"type":"header_patch"')))
+									throw new ManagedAppendOutcomeError("not_applied", "header_patch_write_failed", undefined);
+								return append.call(this, relativePath, data);
+							});
+						return {
+							restore: () => spy.mockRestore(),
+							assertHit: () => expect(spy).toHaveBeenCalled(),
+						};
+					})();
+		try {
+			await expect(session.setSessionName("will fail", "user")).rejects.toThrow("header_patch_write_failed");
+			injection.assertHit();
+			expect(session.getSessionName()).toBeUndefined();
+			expect(session.titleSource).toBeUndefined();
+		} finally {
+			injection.restore();
+		}
+
+		await expect(session.setSessionName("later", "user")).resolves.toBe(true);
+		expect(session.getSessionName()).toBe("later");
+	});
+
+	it("fails closed after a managed title append becomes ambiguous", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sessionFile = session.getSessionFile()!;
+
+		let restore: () => void;
+		if (process.platform === "linux") {
+			const append = native.RecoveryFsRoot.prototype.appendManaged;
+			const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				...args: Parameters<(typeof native.RecoveryFsRoot.prototype)["appendManaged"]>
+			) {
+				append.apply(this, args);
+				throw new Error("post_append_authority_verification_failed");
+			});
+			restore = () => spy.mockRestore();
+		} else {
+			const fsync = fs.fsyncSync;
+			const spy = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+				fsync(fd);
+				throw new Error("post_append_authority_verification_failed");
+			});
+			restore = () => spy.mockRestore();
+		}
+
+		try {
+			await expect(session.setSessionName("ambiguous", "user")).rejects.toThrow(
+				"post_append_authority_verification_failed",
+			);
+			expect(session.getSessionName()).toBeUndefined();
+			await expect(session.setSessionName("later", "user")).rejects.toThrow(
+				"post_append_authority_verification_failed",
+			);
+		} finally {
+			restore();
+		}
+
+		const reopened = await SessionManager.open(sessionFile);
+		expect(reopened.getSessionName()).toBe("ambiguous");
 		expect(reopened.titleSource).toBe("user");
 	});
 

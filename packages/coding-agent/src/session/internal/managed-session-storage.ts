@@ -18,6 +18,7 @@ import {
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
+import type { SessionStorageAppendOutcome } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,
@@ -30,6 +31,17 @@ export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
+/** Failure evidence for a managed append attempt. */
+export class ManagedAppendOutcomeError extends Error {
+	constructor(
+		readonly outcome: Exclude<SessionStorageAppendOutcome, "applied">,
+		message: string,
+		readonly cause: unknown,
+	) {
+		super(message);
+		this.name = "ManagedAppendOutcomeError";
+	}
+}
 const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
@@ -717,72 +729,103 @@ export class ManagedSessionDescendantStore {
 	}
 
 	appendSync(relativePath: string, bytes: Uint8Array): void {
-		this.#assertBound();
-		const resolved = this.#resolve(relativePath);
-		let existing = this.readExpected(relativePath);
-		if (!existing) throw new Error("managed_append_missing");
-		if (this.#authority) {
-			const appended = this.#authority.appendManaged(
-				this.#relative(resolved),
-				bytes,
-				existing.identity.dev.toString(),
-				existing.identity.ino.toString(),
-				existing.identity.size.toString(),
-				existing.identity.mtimeNs.toString(),
-				existing.identity.ctimeNs.toString(),
-				existing.identity.sha256,
-			);
-			if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-			this.#assertBound();
-			return;
-		}
-		// On Darwin, the first write-append open can change only ctime (e.g. com.apple.provenance)
-		// while leaving dev/ino/size/mtime/content intact. Allow one bounded refresh+retry for that
-		// transition only; any other identity change or a second ctime transition stays fail-closed.
-		// See https://github.com/Yeachan-Heo/gajae-code/issues/2944
-		let fd: number | undefined;
-		let darwinCtimeRefreshConsumed = false;
+		this.appendWithOutcomeSync(relativePath, bytes);
+	}
+
+	/**
+	 * Append with evidence suitable for metadata commits. Only failures before
+	 * the append primitive is entered are certified as not applied.
+	 */
+	appendWithOutcomeSync(relativePath: string, bytes: Uint8Array): SessionStorageAppendOutcome {
+		let resolved: string;
+		let existing: ManagedFileSnapshot | undefined;
 		try {
-			for (;;) {
-				fd = fs.openSync(resolved, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
-				const before = identity(fs.fstatSync(fd, { bigint: true }));
-				if (!sameIdentity(before, existing.identity)) {
-					const allowDarwinCtimeRefresh =
-						process.platform === "darwin" &&
-						!darwinCtimeRefreshConsumed &&
-						isCtimeOnlyIdentityMismatch(before, existing.identity);
-					if (!allowDarwinCtimeRefresh) throw new Error("identity_mismatch");
-					fs.closeSync(fd);
-					fd = undefined;
-					darwinCtimeRefreshConsumed = true;
-					const original = existing;
-					const refreshed = this.readExpected(relativePath);
-					if (
-						!refreshed ||
-						!sameStableIdentityIgnoringCtime(refreshed.identity, original.identity) ||
-						refreshed.identity.sha256 !== original.identity.sha256 ||
-						!refreshed.bytes.equals(original.bytes)
-					) {
-						throw new Error("identity_mismatch");
-					}
-					existing = refreshed;
-					continue;
-				}
-				secureFileDescriptor(resolved, fd, "verify");
-				let offset = 0;
-				while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
-				fs.fsyncSync(fd);
-				secureFileDescriptor(resolved, fd, "verify");
-				const after = identity(fs.fstatSync(fd, { bigint: true }));
-				const named = identity(fs.lstatSync(resolved, { bigint: true }));
-				if (!sameIdentity(after, named) || after.dev !== before.dev || after.ino !== before.ino)
-					throw new Error("identity_mismatch");
-				break;
-			}
-		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
+			this.#assertBound();
+			resolved = this.#resolve(relativePath);
+			existing = this.readExpected(relativePath) ?? undefined;
+			if (!existing) throw new Error("managed_append_missing");
+		} catch (error) {
+			throw new ManagedAppendOutcomeError(
+				"not_applied",
+				error instanceof Error ? error.message : String(error),
+				error,
+			);
 		}
-		this.#assertBound();
+
+		try {
+			if (this.#authority) {
+				const appended = this.#authority.appendManaged(
+					this.#relative(resolved),
+					bytes,
+					existing.identity.dev.toString(),
+					existing.identity.ino.toString(),
+					existing.identity.size.toString(),
+					existing.identity.mtimeNs.toString(),
+					existing.identity.ctimeNs.toString(),
+					existing.identity.sha256,
+				);
+				if (!appended.ok)
+					throw new ManagedAppendOutcomeError("not_applied", appended.code ?? "managed_append_failed", appended);
+				this.#assertBound();
+				return "applied";
+			}
+
+			// On Darwin, the first write-append open can change only ctime (e.g. com.apple.provenance)
+			// while leaving dev/ino/size/mtime/content intact. Allow one bounded refresh+retry for that
+			// transition only; any other identity change or a second ctime transition stays fail-closed.
+			// See https://github.com/Yeachan-Heo/gajae-code/issues/2944
+			let fd: number | undefined;
+			let darwinCtimeRefreshConsumed = false;
+			try {
+				for (;;) {
+					fd = fs.openSync(resolved, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
+					const before = identity(fs.fstatSync(fd, { bigint: true }));
+					if (!sameIdentity(before, existing.identity)) {
+						const allowDarwinCtimeRefresh =
+							process.platform === "darwin" &&
+							!darwinCtimeRefreshConsumed &&
+							isCtimeOnlyIdentityMismatch(before, existing.identity);
+						if (!allowDarwinCtimeRefresh) throw new Error("identity_mismatch");
+						fs.closeSync(fd);
+						fd = undefined;
+						darwinCtimeRefreshConsumed = true;
+						const original = existing;
+						const refreshed = this.readExpected(relativePath);
+						if (
+							!refreshed ||
+							!sameStableIdentityIgnoringCtime(refreshed.identity, original.identity) ||
+							refreshed.identity.sha256 !== original.identity.sha256 ||
+							!refreshed.bytes.equals(original.bytes)
+						) {
+							throw new Error("identity_mismatch");
+						}
+						existing = refreshed;
+						continue;
+					}
+					secureFileDescriptor(resolved, fd, "verify");
+					let offset = 0;
+					while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+					fs.fsyncSync(fd);
+					secureFileDescriptor(resolved, fd, "verify");
+					const after = identity(fs.fstatSync(fd, { bigint: true }));
+					const named = identity(fs.lstatSync(resolved, { bigint: true }));
+					if (!sameIdentity(after, named) || after.dev !== before.dev || after.ino !== before.ino)
+						throw new Error("identity_mismatch");
+					break;
+				}
+			} finally {
+				if (fd !== undefined) fs.closeSync(fd);
+			}
+			this.#assertBound();
+			return "applied";
+		} catch (error) {
+			if (error instanceof ManagedAppendOutcomeError) throw error;
+			throw new ManagedAppendOutcomeError(
+				"ambiguous",
+				error instanceof Error ? error.message : String(error),
+				error,
+			);
+		}
 	}
 
 	#relative(resolved: string): string {

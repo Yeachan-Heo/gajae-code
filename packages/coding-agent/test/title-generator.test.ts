@@ -52,7 +52,7 @@ describe("title generator", () => {
 			createSettings(model),
 		);
 
-		expect(title).toBe("Structured Title");
+		expect(title).toEqual({ kind: "title", title: "Structured Title" });
 		expect(completeSimpleMock.mock.calls[0]?.[1]).toMatchObject({
 			tools: [expect.objectContaining({ name: "set_title" })],
 		});
@@ -75,7 +75,7 @@ describe("title generator", () => {
 			createSettings(model),
 		);
 
-		expect(title).toBe("Text Title");
+		expect(title).toEqual({ kind: "title", title: "Text Title" });
 	});
 
 	it("uses a reasoning-safe output budget for reasoning models", async () => {
@@ -99,8 +99,53 @@ describe("title generator", () => {
 		);
 		const maxTokens = (completeSimpleMock.mock.calls[0]?.[2] as { maxTokens?: number } | undefined)?.maxTokens;
 
-		expect(title).toBe("Budget Title");
+		expect(title).toEqual({ kind: "title", title: "Budget Title" });
 		expect(maxTokens).toBeGreaterThanOrEqual(1024);
+	});
+	it("classifies unavailable, provider failures, and aborts while forwarding the request signal", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const unavailable = await generateSessionTitle(
+			"message",
+			{
+				getAvailable: () => [],
+				getApiKey: async () => "unused",
+			} as never,
+			createSettings(model),
+		);
+		expect(unavailable).toEqual({ kind: "unavailable", reason: "no_model" });
+
+		const signal = AbortSignal.abort(new Error("cancelled"));
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "error",
+			content: [],
+		} as never);
+		const failed = await generateSessionTitle(
+			"message",
+			createRegistry(model),
+			createSettings(model),
+			undefined,
+			undefined,
+			undefined,
+			signal,
+		);
+		expect(failed).toEqual({ kind: "failed", reason: "provider_error" });
+		expect(completeSimpleMock.mock.calls[0]?.[2]).toMatchObject({ signal });
+
+		const aborted = await generateSessionTitle(
+			"message",
+			{
+				getAvailable: () => [model],
+				getApiKey: async () => {
+					throw signal.reason;
+				},
+			} as never,
+			createSettings(model),
+			undefined,
+			undefined,
+			undefined,
+			signal,
+		);
+		expect(aborted).toEqual({ kind: "unavailable", reason: "aborted" });
 	});
 });
 
