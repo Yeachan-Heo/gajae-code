@@ -273,7 +273,7 @@ describe("gjc session command", () => {
 		expect(payload.ok).toBe(false);
 		expect(payload.reason).toBe("gjc_tmux_session_untagged");
 		expect(typeof payload.detail).toBe("string");
-		expect(payload.detail).toContain("not fully supported");
+		expect(payload.detail).toContain("did not return GJC's @gjc-profile ownership tag");
 		expect(payload.detail).not.toContain(" — ");
 	});
 	it("awaits force-close before reporting JSON success", async () => {
