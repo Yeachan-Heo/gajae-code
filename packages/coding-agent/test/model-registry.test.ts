@@ -4038,6 +4038,35 @@ describe("ModelRegistry", () => {
 				{ provider: "discovery-provider", connectionKind: "credential" },
 			]);
 		});
+		test("forces an online configured discovery probe after the credential changes", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			let requests = 0;
+			using _hook = hookFetch(() => {
+				requests++;
+				return new Response(JSON.stringify({ data: [{ id: `discovered-model-${requests}` }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online");
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-b");
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+
+			expect(requests).toBe(2);
+			expect(registry.find("discovery-provider", "discovered-model-2")).toBeDefined();
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
 		test("does not retain configured discovery evidence after an in-flight credential change", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
@@ -4063,6 +4092,7 @@ describe("ModelRegistry", () => {
 			await refresh;
 
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+			expect(registry.find("discovery-provider", "discovered-model")).toBeUndefined();
 		});
 		test("does not retain configured discovery evidence after an in-flight endpoint change", async () => {
 			writeRawModelsJson({
@@ -4090,6 +4120,7 @@ describe("ModelRegistry", () => {
 				await refresh;
 
 				expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+				expect(registry.find("discovery-provider", "discovered-model")).toBeUndefined();
 			} finally {
 				restore();
 			}

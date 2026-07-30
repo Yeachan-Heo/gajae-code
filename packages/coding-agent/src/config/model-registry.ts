@@ -1893,7 +1893,15 @@ export class ModelRegistry {
 		}
 		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
-		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, strategy, {
+		const authGenerationBeforeDiscovery = this.#getProviderEvidenceGeneration(provider);
+		const evidence = this.#configuredDiscoveryEvidence.get(provider);
+		const refreshStrategy =
+			strategy === "online-if-uncached" &&
+			evidence !== undefined &&
+			(evidence.authGeneration !== authGenerationBeforeDiscovery || evidence.endpoint !== endpoint)
+				? "online"
+				: strategy;
+		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, refreshStrategy, {
 			cacheDbPath: this.#cacheDbPath,
 			requiresAuth: provider => !this.#isCredentiallessProvider(provider.provider),
 			peekApiKey: async provider =>
@@ -1904,7 +1912,14 @@ export class ModelRegistry {
 		});
 		const authGeneration =
 			mergeInput.authGeneration ?? this.#getProviderEvidenceGeneration(effectiveProviderConfig.provider);
-		if (!mergeInput.current) {
+		const current =
+			mergeInput.current &&
+			authGeneration === this.#getProviderEvidenceGeneration(effectiveProviderConfig.provider) &&
+			endpoint ===
+				this.#normalizeDiscoveryEvidenceEndpoint(
+					this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
+				);
+		if (!current) {
 			return {
 				provider: effectiveProviderConfig.provider,
 				current: false,
