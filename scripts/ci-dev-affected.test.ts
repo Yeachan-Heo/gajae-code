@@ -16,6 +16,8 @@ const packages: WorkspacePackage[] = [
 	},
 ];
 
+const EMBEDDED_DOCS_GATE_KEY = "test:packages/coding-agent/test/docs-index-lazy.test.ts";
+
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);
 }
@@ -1247,8 +1249,50 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
-	test("docs/changelog-only changes plan nothing expensive", () => {
-		expect(targeted(["docs/guide.md", "CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	test("changelog and package-readme-only changes plan nothing", () => {
+		expect(targeted(["CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	});
+
+	// docs/ is the source the embedded docs index is generated from, so shipping a
+	// docs edit without regenerating that index is the one drift class a docs-only
+	// change can introduce. Both planners must select that gate, because dev CI runs
+	// on push as well as pull_request.
+	test("docs-only changes select the embedded-docs gate and nothing else", () => {
+		const changed = ["docs/guide.md", "docs/nested/other.md"];
+		for (const keys of [targeted(changed), planTasks(changed, packages)].map(tasks =>
+			tasks.map(task => task.key),
+		)) {
+			expect(keys).toEqual([EMBEDDED_DOCS_GATE_KEY]);
+		}
+	});
+
+	// The generated index is a real source file, so it also pulls its owning-package
+	// tasks. The gate must still be selected -- that is the half a docs-only plan
+	// cannot cover on its own.
+	test("a generated-docs-index change also selects the embedded-docs gate", () => {
+		for (const changed of [
+			["packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
+			["docs/guide.md", "packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
+		]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				expect(tasks.map(task => task.key)).toContain(EMBEDDED_DOCS_GATE_KEY);
+			}
+		}
+	});
+
+	// Markdown outside docs/ is not embedded, so it must not drag the gate in.
+	test("the embedded-docs gate stays out of unrelated plans", () => {
+		for (const changed of [
+			["CHANGELOG.md"],
+			["packages/coding-agent/README.md"],
+			["README.md"],
+			[".gjc/skills/example/SKILL.md"],
+			["packages/example/src/index.ts"],
+		]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				expect(tasks.map(task => task.key)).not.toContain(EMBEDDED_DOCS_GATE_KEY);
+			}
+		}
 	});
 
 test("Python SDK changes plan dedicated Python validation and one native build", () => {
