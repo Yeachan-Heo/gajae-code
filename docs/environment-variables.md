@@ -279,13 +279,13 @@ On native Windows, [psmux](https://github.com/psmux/psmux) may be installed as `
 
 If the selected command, an explicit `GJC_PSMUX_COMMAND`, or a resolved companion cannot be identified consistently, GJC reports `gjc_tmux_provider_ambiguous` and refuses before applying native-tmux target or mutation semantics. Correct `PATH`, set `GJC_TMUX_COMMAND` to a verified executable, or make `GJC_PSMUX_COMMAND` resolve to the same wrapper identity.
 
-Managed psmux creation, attachment, lifecycle mutation, and team startup remain unsupported because psmux does not provide the immutable native session identity required by GJC's owner-isolation contract. Use WSL with native tmux, or another verified native tmux installation, for those managed flows. `/pet` separately reports actionable multiplexer graphics guidance when image escapes are unavailable.
+GJC-managed Windows psmux flows persist a `ProviderAuthority` for each owner generation. It binds the resolved absolute executable's identity and GJC's isolated server namespace; a missing, changed, or ambiguous identity fails closed. GJC recovery reads and re-proves that persisted authority rather than using an ambient multiplexer.
 
 #### Windows psmux namespace boundary
 
-psmux follows tmux-style server semantics: `new-session -c <path>`, `new-window -c <path>`, and GJC's `gjc --tmux` cwd only choose the start directory for the session/window/pane. They do **not** create a per-project server namespace. psmux server isolation uses the tmux-compatible global flag `-L <namespace>`.
+psmux follows tmux-style server semantics: `new-session -c <path>`, `new-window -c <path>`, and GJC's `gjc --tmux` cwd only choose the start directory for the session/window/pane. They do **not** create a per-project server namespace. For a managed Windows psmux owner, GJC creates and persists an isolated namespace and invokes the bound executable with `-L <namespace>` on every operation.
 
-GJC does not currently expose a supported `GJC_TMUX_NAMESPACE` runtime knob or parse flags from `GJC_TMUX_COMMAND`. Do not set `GJC_TMUX_COMMAND="psmux -L my-project"`; GJC treats the value as one executable path/name. Runtime `-L` support requires a structured tmux command resolver so launch, `gjc session`, and `gjc team` all target the same namespace. Until that exists, manage psmux namespaces explicitly outside GJC (for example by starting `psmux -L <namespace>` yourself before `gjc --tmux` and letting GJC attach) and treat them as unsupported for GJC ownership-tag/team guarantees.
+GJC does not expose a `GJC_TMUX_NAMESPACE` runtime knob or parse flags from `GJC_TMUX_COMMAND`. Do not set `GJC_TMUX_COMMAND="psmux -L my-project"` and do not recover with ambient `tmux`/`psmux` or a manually supplied `-L` value; `GJC_TMUX_COMMAND` is one executable path/name. Use the GJC session or lifecycle operation so it reuses the persisted ProviderAuthority. If that authority cannot be read and re-proved, GJC refuses the operation.
 
 #### WSL / Windows Terminal scrolling
 

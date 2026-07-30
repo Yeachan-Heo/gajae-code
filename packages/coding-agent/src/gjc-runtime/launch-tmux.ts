@@ -19,16 +19,15 @@ import {
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
-	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
-	GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
-	GJC_COORDINATOR_SESSION_READINESS_FILE_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "./session-state-sidecar";
 import {
+	assertGjcTmuxMutationAuthoritySync,
+	bindGjcTmuxProviderAuthority,
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
@@ -41,8 +40,12 @@ import {
 	GJC_TMUX_PROFILE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 	type GjcTmuxProfileCommand,
+	type ProviderAuthority,
+	persistGjcTmuxProviderAuthoritySync,
+	readGjcTmuxProviderAuthoritySync,
 	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
+	resolveGjcTmuxProviderContext,
 } from "./tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
@@ -50,16 +53,20 @@ import {
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
 	lifecyclePaths,
+	type ManagedOwnerPredecessorEvidence,
+	type OwnerGenerationBaseline,
 	type OwnerIsolationProbeSync,
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
+import { assertGjcTmuxStagedMutationAuthoritySync } from "./tmux-provider-context";
 import {
 	findGjcTmuxSessionByName,
 	findGjcTmuxSessionByScope,
 	type GjcTmuxSessionStatus,
+	type ProvenTmuxSessionIdentity,
 	proveGjcTmuxSessionMutationTarget,
 } from "./tmux-sessions";
 import {
@@ -85,6 +92,7 @@ export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 
 const WINDOWS_PSMUX_ATTACH_RETRY_DELAY_MS = 100;
+const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 type LaunchPolicy = "direct" | "tmux";
@@ -106,6 +114,23 @@ export interface TmuxLaunchContext {
 	platform?: NodeJS.Platform;
 	tty?: TtyState;
 	spawnSync?: TmuxSpawnSync;
+	/**
+	 * Provider authority boundaries. Production resolves, persists, and asserts
+	 * the durable psmux authority; tests may inject deterministic equivalents.
+	 */
+	providerAuthorityResolver?: (input: {
+		platform: NodeJS.Platform;
+		env: NodeJS.ProcessEnv;
+		command: string;
+		stateDir: string;
+		sessionId: string;
+		generation: string;
+	}) => ProviderAuthority;
+	providerAuthorityPersist?: (authority: ProviderAuthority) => void;
+	/** Re-proves an immutable staged authority before generation publication. */
+	providerAuthorityStagedAssert?: (authority: ProviderAuthority) => void;
+	/** Re-proves a current authority after generation publication. */
+	providerAuthorityAssert?: (authority: ProviderAuthority) => void;
 	tmuxAvailable?: boolean;
 	tmuxStatusLines?: number;
 	worktreeBranch?: string | null;
@@ -168,12 +193,13 @@ export interface TmuxLaunchPlan {
 	ownerRunId?: string;
 	ownerIncarnation?: string;
 	/** Generation state captured before owner-isolation planning; required for publication CAS. */
-	ownerGenerationBaseline?: import("./tmux-owner-isolation").OwnerGenerationBaseline;
+	ownerGenerationBaseline?: OwnerGenerationBaseline;
 	/** Native tmux session identity emitted atomically by `new-session -P -F`. */
 	createdSessionId?: string;
 	/** Safe server identity proven immediately after creation. */
 	createdServerIdentity?: { pid: number; startTime: string; pidProven?: boolean };
 	isPsmux: boolean;
+	authority?: ProviderAuthority;
 	platform: NodeJS.Platform;
 }
 
@@ -188,108 +214,6 @@ function allowsExistingTmuxAttach(parsed: Args, env: NodeJS.ProcessEnv): boolean
 	// `--resume` belongs to the inner GJC session resolver. Let it reach main.ts so
 	// value-less resume can show the session picker and valued resume can honor the target.
 	return Boolean(parsed.continue || explicitTmuxSessionName(env));
-}
-type WindowsPsmuxCompatibilityState = "fresh" | "continuation" | "managed";
-
-function windowsPsmuxCompatibilityState(plan: TmuxLaunchPlan, env: NodeJS.ProcessEnv): WindowsPsmuxCompatibilityState {
-	const marker = (value: string | undefined): boolean => Boolean(value?.trim());
-	if (
-		marker(env.GJC_SESSION_ID) ||
-		marker(env[GJC_COORDINATOR_SESSION_ID_ENV]) ||
-		marker(env[GJC_COORDINATOR_SESSION_BRANCH_ENV]) ||
-		marker(env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV]) ||
-		marker(env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV]) ||
-		marker(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]) ||
-		marker(env[GJC_TMUX_ACTIVE_SESSION_ENV]) ||
-		marker(env[GJC_TMUX_OWNER_GENERATION_ENV]) ||
-		marker(env[GJC_TMUX_OWNER_STATE_DIR_ENV]) ||
-		marker(env[GJC_TMUX_OWNER_SERVER_KEY_ENV]) ||
-		Object.entries(env).some(([key, value]) => key.startsWith("GJC_TEAM_") && marker(value))
-	)
-		return "managed";
-	return plan.attachSessionName ? "continuation" : "fresh";
-}
-
-type PsmuxSessionInventory =
-	| { kind: "available"; names: ReadonlySet<string> }
-	| { kind: "no-server" }
-	| { kind: "unverifiable"; result: TmuxSpawnResult };
-
-function classifyPsmuxSessionInventory(result: TmuxSpawnResult): PsmuxSessionInventory {
-	if (result.exitCode === 0) {
-		const names = new Set(
-			(result.stdout ?? "")
-				.split(/\r?\n/)
-				.map(name => name.trim())
-				.filter(Boolean),
-		);
-		return { kind: "available", names };
-	}
-	const stderr = result.stderr?.trim() ?? "";
-	if (/\bno server running\b/i.test(stderr)) return { kind: "no-server" };
-	return { kind: "unverifiable", result };
-}
-
-function launchWindowsPsmuxCompatibilitySession(
-	plan: TmuxLaunchPlan,
-	env: NodeJS.ProcessEnv,
-	spawnSync: TmuxSpawnSync,
-	diagnostic: (message: string) => void,
-): boolean {
-	const options: TmuxSpawnOptions = {
-		cwd: plan.cwd,
-		env,
-		stdin: "pipe",
-		stdout: "pipe",
-		stderr: "pipe",
-		captureStderr: true,
-	};
-	const attachOptions: TmuxSpawnOptions = { ...options, stdin: "inherit", stdout: "inherit", stderr: "inherit" };
-	const state = windowsPsmuxCompatibilityState(plan, env);
-	if (state === "managed") {
-		diagnostic("psmux cannot provide immutable owner identity; refusing managed session creation.\n");
-		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
-	}
-
-	const targetName = plan.attachSessionName ?? plan.sessionName;
-	const inventory = (): PsmuxSessionInventory =>
-		classifyPsmuxSessionInventory(spawnSync(plan.tmuxCommand, ["list-sessions", "-F", "#{session_name}"], options));
-
-	if (state === "continuation") {
-		const existing = inventory();
-		const detail = existing.kind === "unverifiable" ? existing.result.stderr : undefined;
-		diagnostic(
-			formatTmuxLaunchDiagnostic(
-				existing.kind === "available" && existing.names.has(targetName)
-					? "existing psmux session is name-only and cannot be attached safely"
-					: "existing session target not found",
-				detail,
-			),
-		);
-		return true;
-	}
-
-	const before = inventory();
-	if (before.kind === "unverifiable") {
-		diagnostic(formatTmuxLaunchDiagnostic("fresh session inventory failed", before.result.stderr));
-		return true;
-	}
-	if (before.kind === "available" && before.names.has(targetName)) {
-		diagnostic("tmux fresh session target already exists; preserving session without mutation.\n");
-		return true;
-	}
-	const detachedIndex = plan.newSessionArgs.indexOf("-d");
-	const foregroundArgs =
-		detachedIndex < 0
-			? plan.newSessionArgs
-			: [...plan.newSessionArgs.slice(0, detachedIndex), ...plan.newSessionArgs.slice(detachedIndex + 1)];
-	const created = spawnSync(plan.tmuxCommand, foregroundArgs, attachOptions);
-	if (created.exitCode !== 0) {
-		const wrapperWarning = detectCorruptedGjcWrapper();
-		const suffix = wrapperWarning ? ` Wrapper warning: ${wrapperWarning}` : "";
-		diagnostic(formatTmuxLaunchDiagnostic("foreground new-session failed", created.stderr) + suffix);
-	}
-	return true;
 }
 
 function findExistingSessionForLaunch(context: {
@@ -323,6 +247,7 @@ export interface GjcTmuxProfileContext {
 	ownerGeneration?: string | null;
 	ownerServerKey?: string | null;
 	version?: string | null;
+	psmuxIncarnation?: string | null;
 }
 
 function tmuxExitMarkerPath(sessionStateFile: string): string {
@@ -497,6 +422,11 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 		},
 		{ tmuxCommand: context.tmuxCommand },
 	);
+	if (context.psmuxIncarnation)
+		commands.push({
+			description: "record psmux incarnation",
+			args: ["set-option", "-t", context.target, GJC_TMUX_PSMUX_INCARNATION_OPTION, context.psmuxIncarnation],
+		});
 	if (commands.length === 0) return { skipped: true, commands: [], failures: [] };
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
 	const cwd = context.cwd ?? process.cwd();
@@ -556,8 +486,8 @@ function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
 function isWindowsPlatform(platform: NodeJS.Platform | undefined): boolean {
 	return platform === "win32";
 }
-function pathModuleForPlatform(platform: NodeJS.Platform | undefined): typeof path.win32 | typeof path {
-	return isWindowsPlatform(platform) ? path.win32 : path;
+function pathModuleForPlatform(platform: NodeJS.Platform | undefined): typeof path.win32 | typeof path.posix {
+	return isWindowsPlatform(platform) ? path.win32 : path.posix;
 }
 
 function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
@@ -768,12 +698,15 @@ function readCurrentBranch(cwd: string): string | null {
 	}
 }
 
-function createdSessionTarget(plan: TmuxLaunchPlan): string {
-	return plan.createdSessionId ?? plan.sessionName;
-}
-
 function createdSessionExactTarget(plan: TmuxLaunchPlan, env: NodeJS.ProcessEnv): string {
-	return plan.createdSessionId ?? buildGjcTmuxExactSessionTarget(plan.sessionName, { env });
+	return (
+		plan.createdSessionId ??
+		buildGjcTmuxExactSessionTarget(plan.sessionName, {
+			env,
+			platform: plan.platform,
+			binary: { command: plan.tmuxCommand, isPsmux: plan.isPsmux, viaExplicitOverride: true },
+		})
+	);
 }
 
 function createdSessionOptionTarget(plan: TmuxLaunchPlan, env: NodeJS.ProcessEnv): string {
@@ -781,7 +714,11 @@ function createdSessionOptionTarget(plan: TmuxLaunchPlan, env: NodeJS.ProcessEnv
 	// identity (with its required empty-window suffix) for every later option
 	// mutation; a reusable session name could resolve to a different session.
 	if (plan.createdSessionId) return `${plan.createdSessionId}:`;
-	return buildGjcTmuxExactOptionTarget(plan.sessionName, { env });
+	return buildGjcTmuxExactOptionTarget(plan.sessionName, {
+		env,
+		platform: plan.platform,
+		binary: { command: plan.tmuxCommand, isPsmux: plan.isPsmux, viaExplicitOverride: true },
+	});
 }
 
 function cleanupCreatedTmuxSession(
@@ -790,7 +727,9 @@ function cleanupCreatedTmuxSession(
 	options: TmuxSpawnOptions,
 	probe: OwnerIsolationProbeSync,
 ): void {
-	if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, options, probe))
+	// psmux does not disclose an immutable session ID. Never turn its reusable
+	// name readback into a destructive cleanup target.
+	if (plan.isPsmux || !isCreatedTmuxSessionIdentityStable(plan, spawnSync, options, probe))
 		throw new Error("gjc_tmux_exact_cleanup_uncertain");
 	const nativeSessionId = plan.createdSessionId!;
 	// Emit the `#{pid}` clause only when the server proof proved a PID. Non-Linux
@@ -815,19 +754,31 @@ function cleanupCreatedTmuxSession(
 	if (guarded.exitCode !== 0 || guarded.stdout?.trim() !== "__gjc_tmux_guarded_cleanup_ok__")
 		throw new Error("gjc_tmux_exact_cleanup_uncertain");
 }
+function cleanupCreatedTmuxSessionBeforePublicationFailure(
+	plan: TmuxLaunchPlan,
+	spawnSync: TmuxSpawnSync,
+	options: TmuxSpawnOptions,
+	probe: OwnerIsolationProbeSync,
+): void {
+	// Generation publication is the commit point. Before it, clean up only when
+	// the immutable session and server proof still identify our provisional
+	// session; a failed proof must preserve it for recovery.
+	if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, options, probe)) return;
+	try {
+		cleanupCreatedTmuxSession(plan, spawnSync, options, probe);
+	} catch {
+		// The guarded command either refused or its proof changed after the
+		// preflight. In both cases preserving the session is safer than retrying.
+	}
+}
 
 function cleanupCreatedTmuxSessionAfterFailure(
 	plan: TmuxLaunchPlan,
 	spawnSync: TmuxSpawnSync,
 	options: TmuxSpawnOptions,
 	probe: OwnerIsolationProbeSync,
-	primary: Error,
 ): void {
-	try {
-		cleanupCreatedTmuxSession(plan, spawnSync, options, probe);
-	} catch (cleanupError) {
-		throw new AggregateError([primary, cleanupError], "gjc_tmux_exact_cleanup_uncertain");
-	}
+	cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, options, probe);
 }
 
 function isCreatedTmuxSessionIdentityStable(
@@ -836,8 +787,17 @@ function isCreatedTmuxSessionIdentityStable(
 	options: TmuxSpawnOptions,
 	probe: OwnerIsolationProbeSync,
 ): boolean {
-	if (plan.isPsmux || !plan.createdSessionId || !plan.createdServerIdentity) return false;
+	if (!plan.createdServerIdentity) return false;
 	try {
+		if (plan.isPsmux) {
+			const binding = spawnSync(
+				plan.tmuxCommand,
+				["display-message", "-p", "-t", createdSessionExactTarget(plan, options.env), "#{session_name}"],
+				options,
+			);
+			return binding.exitCode === 0 && binding.stdout?.trim() === plan.sessionName;
+		}
+		if (!plan.createdSessionId) return false;
 		const before = probe.probeServer(plan.tmuxCommand);
 		if (
 			before.state !== "safe" ||
@@ -876,7 +836,7 @@ function isWindowsPsmuxMissingSessionRegistrationRace(
 	result: { exitCode?: number | null; stderr?: string },
 ): boolean {
 	if (plan.platform !== "win32" || !plan.isPsmux || result.exitCode === 0) return false;
-	return result.stderr?.trim() === `psmux: can't find session '=${plan.sessionName}' (no server running)`;
+	return result.stderr?.trim() === `psmux: can't find session '${plan.sessionName}' (no server running)`;
 }
 function waitForWindowsPsmuxAttachRetry(): void {
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, WINDOWS_PSMUX_ATTACH_RETRY_DELAY_MS);
@@ -900,6 +860,7 @@ function parseTmuxStatusLineCount(value: string): number {
 }
 
 function readTmuxStatusLineCount(tmuxCommand: string, cwd: string, env: NodeJS.ProcessEnv): number {
+	if (resolveGjcTmuxBinary({ env }).isPsmux) return 0;
 	const result = Bun.spawnSync([tmuxCommand, "show-options", "-gqv", "status"], {
 		cwd,
 		env,
@@ -998,11 +959,13 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	const existingSessionName = allowsExistingTmuxAttach(context.parsed, env)
 		? "existingBranchSessionName" in context
 			? (context.existingBranchSessionName ?? undefined)
-			: findExistingSessionForLaunch({
-					env,
-					project,
-					branch,
-				})
+			: resolvedBinary.isPsmux && platform === "win32"
+				? explicitTmuxSessionName(env)
+				: findExistingSessionForLaunch({
+						env,
+						project,
+						branch,
+					})
 		: undefined;
 	const innerCommand = buildInnerCommand(
 		{
@@ -1057,8 +1020,8 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 function trustedReplacementAuthority(
 	stateDir: string,
 	sessionId: string,
-	baseline: ReturnType<typeof captureOwnerGenerationBaselineSync>,
-): ReturnType<typeof resolveManagedOwnerPredecessorSync> {
+	baseline: OwnerGenerationBaseline,
+): ManagedOwnerPredecessorEvidence | undefined {
 	return resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline);
 }
 
@@ -1284,7 +1247,7 @@ function createIsolatedTmuxSession(
 				startTime: server.startTime!,
 				pidProven: server.pidProven,
 			};
-			cleanupCreatedTmuxSessionAfterFailure(plan, spawn, options, probe, new Error("owner_generation_stale"));
+			cleanupCreatedTmuxSessionAfterFailure(plan, spawn, options, probe);
 		},
 	});
 	// A failed planned spawn is the new-session failure. Let its established
@@ -1311,6 +1274,7 @@ function requiredProfileFailure(profile: GjcTmuxProfileResult): GjcTmuxProfileRe
 		"@gjc-session-state-file",
 		"@gjc-owner-generation",
 		"@gjc-owner-server-key",
+		GJC_TMUX_PSMUX_INCARNATION_OPTION,
 	]);
 	return profile.failures.find(item => requiredOptions.has(String(item.command.args[item.command.args.length - 2])));
 }
@@ -1332,13 +1296,6 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		const ambientProvider = resolveGjcTmuxBinary({ platform: "win32", env });
 		if (ambientProvider.isPsmux) return false;
 	}
-	if (plan?.isPsmux && plan.platform === "win32" && !env.TMUX)
-		return launchWindowsPsmuxCompatibilitySession(
-			plan,
-			env,
-			context.spawnSync ?? defaultSpawnSync,
-			context.diagnosticWriter ?? safeStderrWrite,
-		);
 	// Direct launches inside an ambient tmux session retain their existing title
 	// behavior, but only after managed-launch applicability was ruled out.
 	renameExistingTmuxWindowIfNeeded(context);
@@ -1364,17 +1321,87 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	}
 
 	const rawSpawnSync = context.spawnSync ?? defaultSpawnSync;
+	if (plan.isPsmux && plan.platform === "win32") {
+		try {
+			if (plan.attachSessionName) {
+				const stateDir = env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim();
+				const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim();
+				const generation = env[GJC_TMUX_OWNER_GENERATION_ENV]?.trim();
+				if (!stateDir || !sessionId || !generation) throw new Error("gjc_tmux_provider_authority_unavailable");
+				plan.authority = readGjcTmuxProviderAuthoritySync({ stateDir, sessionId, generation });
+			} else {
+				prepareManagedOwnerLifecycle(plan, context);
+				if (!plan.sessionId || !plan.ownerGeneration || !plan.sessionStateFile)
+					throw new Error("gjc_tmux_provider_authority_missing_lifecycle_identity");
+				const stateDir = path.dirname(plan.sessionStateFile);
+				const previousAuthority =
+					plan.ownerGenerationBaseline?.state === "current"
+						? readGjcTmuxProviderAuthoritySync({
+								stateDir,
+								sessionId: plan.sessionId,
+								generation: plan.ownerGenerationBaseline.generation,
+							})
+						: undefined;
+				plan.authority = previousAuthority
+					? bindGjcTmuxProviderAuthority(previousAuthority, {
+							stateDir,
+							sessionId: plan.sessionId,
+							generation: plan.ownerGeneration,
+						})
+					: (
+							context.providerAuthorityResolver ??
+							(input =>
+								bindGjcTmuxProviderAuthority(
+									resolveGjcTmuxProviderContext({
+										platform: input.platform,
+										env: input.env,
+										binary: { command: input.command, isPsmux: true, viaExplicitOverride: true },
+									}),
+									input,
+								))
+						)({
+							platform: plan.platform,
+							env,
+							command: plan.tmuxCommand,
+							stateDir,
+							sessionId: plan.sessionId,
+							generation: plan.ownerGeneration,
+						});
+			}
+			plan.tmuxCommand = plan.authority.command;
+			if (!plan.attachSessionName) {
+				(context.providerAuthorityPersist ?? persistGjcTmuxProviderAuthoritySync)(plan.authority);
+				(context.providerAuthorityStagedAssert ?? assertGjcTmuxStagedMutationAuthoritySync)(plan.authority);
+			}
+		} catch (error) {
+			(context.diagnosticWriter ?? safeStderrWrite)(`tmux provider authority resolution failed: ${String(error)}`);
+			return true;
+		}
+	}
+	let providerAuthorityPublished = !plan.authority || Boolean(plan.attachSessionName);
+	const spawnSync: TmuxSpawnSync = (command, args, options) => {
+		const authority = plan.authority;
+		if (!authority) return rawSpawnSync(command, args, options);
+		const assertAuthority = providerAuthorityPublished
+			? (context.providerAuthorityAssert ?? assertGjcTmuxMutationAuthoritySync)
+			: (context.providerAuthorityStagedAssert ?? assertGjcTmuxStagedMutationAuthoritySync);
+		assertAuthority(authority);
+		try {
+			return rawSpawnSync(command, [...authority.commandPrefix, ...args], options);
+		} finally {
+			assertAuthority(authority);
+		}
+	};
+	const creationSpawn = plan.authority ? spawnSync : rawSpawnSync;
 	const options: TmuxSpawnOptions = {
 		cwd: plan.cwd,
 		env,
-
 		stdin: "inherit",
 		stdout: "inherit",
 		stderr: "inherit",
 	};
 	const ownerIsolationProbe =
-		context.ownerIsolationProbe ?? defaultOwnerIsolationProbe(plan, env, rawSpawnSync, context.callerCgroupReader);
-	const spawnSync = rawSpawnSync;
+		context.ownerIsolationProbe ?? defaultOwnerIsolationProbe(plan, env, spawnSync, context.callerCgroupReader);
 	const attachOptions: TmuxSpawnOptions = { ...options };
 	const controlOptions: TmuxSpawnOptions = {
 		...options,
@@ -1409,7 +1436,6 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		: undefined;
 	const buildProfileInputs = (): GjcTmuxProfileContext => ({
 		tmuxCommand: plan.tmuxCommand,
-		target: createdSessionTarget(plan),
 		cwd: plan.cwd,
 		env,
 		spawnSync,
@@ -1420,7 +1446,54 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		ownerGeneration: plan.ownerGeneration ?? null,
 		ownerServerKey: plan.tmuxCommand,
 		version: VERSION,
+		psmuxIncarnation: plan.isPsmux ? (plan.ownerIncarnation ?? null) : null,
+		target: createdSessionOptionTarget(plan, env),
 	});
+	const hasExactRequiredPsmuxMetadata = (): boolean => {
+		if (!plan.isPsmux || !plan.authority) return true;
+		const required = [
+			...buildGjcTmuxProfileCommands(createdSessionOptionTarget(plan, env), env, {
+				sessionId: plan.sessionId,
+				sessionStateFile: plan.sessionStateFile,
+				ownerGeneration: plan.ownerGeneration,
+				ownerServerKey: plan.tmuxCommand,
+				version: VERSION,
+			}),
+			...(plan.ownerIncarnation
+				? [
+						{
+							description: "record psmux incarnation",
+							args: [
+								"set-option",
+								"-t",
+								createdSessionOptionTarget(plan, env),
+								GJC_TMUX_PSMUX_INCARNATION_OPTION,
+								plan.ownerIncarnation,
+							],
+						},
+					]
+				: []),
+		].filter(command =>
+			[
+				"@gjc-profile",
+				"@gjc-session-id",
+				"@gjc-session-state-file",
+				"@gjc-owner-generation",
+				"@gjc-owner-server-key",
+				GJC_TMUX_PSMUX_INCARNATION_OPTION,
+			].includes(command.args[command.args.length - 2] ?? ""),
+		);
+		return required.every(command => {
+			const option = command.args[command.args.length - 2]!;
+			const expected = command.args[command.args.length - 1]!;
+			const readback = spawnSync(
+				plan.tmuxCommand,
+				["display-message", "-p", "-t", createdSessionOptionTarget(plan, env), `#{${option}}`],
+				controlOptions,
+			);
+			return readback.exitCode === 0 && readback.stdout?.trim() === expected;
+		});
+	};
 	const probeHasSession = (): TmuxSpawnResult =>
 		spawnSync(plan.tmuxCommand, ["has-session", "-t", createdSessionExactTarget(plan, env)], probeOptions);
 	const attachCreatedSession = (): TmuxSpawnResult =>
@@ -1428,9 +1501,13 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 
 	if (plan.attachSessionName) {
 		let existingTarget: string;
-		let existingProof: ReturnType<typeof proveGjcTmuxSessionMutationTarget> | undefined;
+		let existingProof: ProvenTmuxSessionIdentity | undefined;
 		if (plan.platform !== "linux") {
-			existingTarget = buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env });
+			existingTarget = buildGjcTmuxExactSessionTarget(plan.attachSessionName, {
+				env,
+				platform: plan.platform,
+				binary: { command: plan.tmuxCommand, isPsmux: plan.isPsmux, viaExplicitOverride: true },
+			});
 		} else {
 			try {
 				existingProof = proveGjcTmuxSessionMutationTarget(plan.attachSessionName, env);
@@ -1448,7 +1525,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				target:
 					plan.platform === "linux" && existingTarget.startsWith("$")
 						? `${existingTarget}:`
-						: buildGjcTmuxExactOptionTarget(plan.attachSessionName, { env }),
+						: buildGjcTmuxExactOptionTarget(plan.attachSessionName, {
+								env,
+								platform: plan.platform,
+								binary: { command: plan.tmuxCommand, isPsmux: plan.isPsmux, viaExplicitOverride: true },
+							}),
 				sessionName: plan.attachSessionName,
 				title: rootTerminalTitle,
 				spawnSync,
@@ -1486,7 +1567,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	}
 	const created = createIsolatedTmuxSession(
 		plan,
-		rawSpawnSync,
+		creationSpawn,
 		newSessionOptions,
 		context.diagnosticWriter ?? safeStderrWrite,
 		ownerIsolationProbe,
@@ -1513,7 +1594,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			}
 			const retry = createIsolatedTmuxSession(
 				plan,
-				rawSpawnSync,
+				creationSpawn,
 				newSessionOptions,
 				context.diagnosticWriter ?? safeStderrWrite,
 				ownerIsolationProbe,
@@ -1526,13 +1607,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 						failedRetryDiagnostic(retry, retryProbe),
 					),
 				);
-				cleanupCreatedTmuxSessionAfterFailure(
-					plan,
-					spawnSync,
-					options,
-					ownerIsolationProbe,
-					new Error("new-session retry failed after missing session"),
-				);
+				cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe);
 
 				return true;
 			}
@@ -1564,24 +1639,19 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic("profile tagging failed", ownershipFailure.stderr),
 				);
+				cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
 				return true;
 			}
 			const retry = createIsolatedTmuxSession(
 				plan,
-				rawSpawnSync,
+				creationSpawn,
 				newSessionOptions,
 				context.diagnosticWriter ?? safeStderrWrite,
 				ownerIsolationProbe,
 			);
 			const retryProbe = probeHasSession();
 			if (retry.exitCode !== 0 || retryProbe.exitCode !== 0) {
-				cleanupCreatedTmuxSessionAfterFailure(
-					plan,
-					spawnSync,
-					options,
-					ownerIsolationProbe,
-					new Error("new-session retry failed after ownership failure"),
-				);
+				cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe);
 
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic(
@@ -1595,17 +1665,18 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			const retryOwnershipFailure = requiredProfileFailure(retryProfile);
 			emitOptionalProfileDiagnostics(retryProfile, context.diagnosticWriter ?? safeStderrWrite);
 			if (retryOwnershipFailure) {
-				cleanupCreatedTmuxSessionAfterFailure(
-					plan,
-					spawnSync,
-					options,
-					ownerIsolationProbe,
-					new Error("profile tagging failed after retry"),
-				);
+				cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe);
 
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic("profile tagging failed after retry", retryOwnershipFailure.stderr),
 				);
+				return true;
+			}
+			if (!hasExactRequiredPsmuxMetadata()) {
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					"tmux required ownership metadata readback failed; preserving session without publication.\n",
+				);
+				cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
 				return true;
 			}
 			// Recovery succeeded via retry — fall through to attach-session below.
@@ -1634,6 +1705,13 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
 		return true;
 	}
+	if (!hasExactRequiredPsmuxMetadata()) {
+		(context.diagnosticWriter ?? safeStderrWrite)(
+			"tmux required ownership metadata readback failed; preserving session without publication.\n",
+		);
+		cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
+		return true;
+	}
 	if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, controlOptions, ownerIsolationProbe)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(
 			"tmux created session proof failed; preserving session without attach.\n",
@@ -1641,109 +1719,50 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		return true;
 	}
 	try {
-		resolveManagedOwnerPredecessorSync(
-			path.dirname(plan.sessionStateFile!),
-			plan.sessionId!,
-			plan.ownerGenerationBaseline!,
-		);
-		replaceOwnerGenerationSync(
-			path.dirname(plan.sessionStateFile!),
-			plan.sessionId!,
-			plan.ownerGeneration!,
-			plan.ownerGenerationBaseline!,
-		);
+		const stateDir = path.dirname(plan.sessionStateFile!);
+		resolveManagedOwnerPredecessorSync(stateDir, plan.sessionId!, plan.ownerGenerationBaseline!);
+		replaceOwnerGenerationSync(stateDir, plan.sessionId!, plan.ownerGeneration!, plan.ownerGenerationBaseline!);
+		providerAuthorityPublished = true;
 	} catch (error) {
-		const publicationError = error instanceof Error ? error : new Error(String(error));
-		cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe, publicationError);
+		cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
 		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner lifecycle publication failed: ${String(error)}`);
 		return true;
 	}
-	if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, controlOptions, ownerIsolationProbe)) {
-		(context.diagnosticWriter ?? safeStderrWrite)(
-			"tmux created session proof failed after lifecycle publication; preserving session without attach.\n",
-		);
-		return true;
-	}
-	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
-	const attached = attachCreatedSession();
-	if (attached.exitCode === 0) return true;
-	if (isTmuxAttachDisconnectError(attached)) {
-		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
-		return true;
-	}
-	if (isWindowsPsmuxAttachConnectionRefused(plan, attached)) {
-		waitForWindowsPsmuxAttachRetry();
-		const probeAfterAttach = probeHasSession();
-		if (probeAfterAttach.exitCode === 0) {
-			const retryAttached = attachCreatedSession();
-			if (retryAttached.exitCode === 0) return true;
-			if (isTmuxAttachDisconnectError(retryAttached)) {
-				(context.diagnosticWriter ?? safeStderrWrite)(
-					formatTmuxLaunchDiagnostic("attach disconnected", retryAttached.stderr),
-				);
-				return true;
-			}
-			cleanupCreatedTmuxSessionAfterFailure(
-				plan,
-				spawnSync,
-				options,
-				ownerIsolationProbe,
-				new Error("attach retry failed"),
-			);
-
+	try {
+		if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, controlOptions, ownerIsolationProbe)) {
 			(context.diagnosticWriter ?? safeStderrWrite)(
-				formatTmuxLaunchDiagnostic("attach retry failed", retryAttached.stderr),
+				"tmux created session proof failed after lifecycle publication; preserving session without attach.\n",
 			);
 			return true;
-		} else {
-			if (!isWindowsPsmuxMissingSessionRegistrationRace(plan, probeAfterAttach)) {
-				(context.diagnosticWriter ?? safeStderrWrite)(
-					formatTmuxLaunchDiagnostic("attach recovery probe failed", probeAfterAttach.stderr),
-				);
-				return true;
-			}
-			const retry = createIsolatedTmuxSession(
-				plan,
-				rawSpawnSync,
-				newSessionOptions,
-				context.diagnosticWriter ?? safeStderrWrite,
-				ownerIsolationProbe,
+		}
+		if (!hasExactRequiredPsmuxMetadata()) {
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				"tmux required ownership metadata readback failed after lifecycle publication; preserving session without attach.\n",
 			);
-			const retryProbe = probeHasSession();
-			if (retry.exitCode === 0 && retryProbe.exitCode === 0) {
-				renameTmuxWindow(
-					plan.tmuxCommand,
-					windowTitle,
-					spawnSync,
-					controlOptions,
-					createdSessionExactTarget(plan, env),
-				);
-				const retryProfile = applyGjcTmuxProfile(buildProfileInputs());
-				const retryOwnershipFailure = requiredProfileFailure(retryProfile);
-				emitOptionalProfileDiagnostics(retryProfile, context.diagnosticWriter ?? safeStderrWrite);
-				if (retryOwnershipFailure) {
-					cleanupCreatedTmuxSessionAfterFailure(
-						plan,
-						spawnSync,
-						options,
-						ownerIsolationProbe,
-						new Error("profile tagging failed after retry"),
-					);
-
+			return true;
+		}
+		// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
+		const attached = attachCreatedSession();
+		if (attached.exitCode === 0) return true;
+		if (isTmuxAttachDisconnectError(attached)) {
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
+			);
+			return true;
+		}
+		if (isWindowsPsmuxAttachConnectionRefused(plan, attached)) {
+			waitForWindowsPsmuxAttachRetry();
+			const probeAfterAttach = probeHasSession();
+			if (probeAfterAttach.exitCode === 0) {
+				if (
+					!isCreatedTmuxSessionIdentityStable(plan, spawnSync, controlOptions, ownerIsolationProbe) ||
+					!hasExactRequiredPsmuxMetadata()
+				) {
 					(context.diagnosticWriter ?? safeStderrWrite)(
-						formatTmuxLaunchDiagnostic("profile tagging failed after retry", retryOwnershipFailure.stderr),
+						"tmux created session proof failed after attach recovery probe; preserving session without attach.\n",
 					);
 					return true;
 				}
-				ensureCreatedTmuxWindowTracksCallerTerminal(plan, spawnSync, controlOptions);
-				applyGjcTmuxRootTerminalTitleProfile({
-					tmuxCommand: plan.tmuxCommand,
-					target: createdSessionOptionTarget(plan, env),
-					sessionName: plan.sessionName,
-					title: rootTerminalTitle,
-					spawnSync,
-					options: controlOptions,
-				});
 				const retryAttached = attachCreatedSession();
 				if (retryAttached.exitCode === 0) return true;
 				if (isTmuxAttachDisconnectError(retryAttached)) {
@@ -1752,50 +1771,47 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 					);
 					return true;
 				}
-				cleanupCreatedTmuxSessionAfterFailure(
-					plan,
-					spawnSync,
-					options,
-					ownerIsolationProbe,
-					new Error("attach failed after recovery"),
-				);
 
 				(context.diagnosticWriter ?? safeStderrWrite)(
-					formatTmuxLaunchDiagnostic("attach failed after recovery", retryAttached.stderr),
+					formatTmuxLaunchDiagnostic("attach retry failed", retryAttached.stderr),
 				);
 				return true;
 			}
-			cleanupCreatedTmuxSessionAfterFailure(
-				plan,
-				spawnSync,
-				options,
-				ownerIsolationProbe,
-				new Error("attach recovery recreate failed"),
-			);
-
-			const recoveryFailure = retry.exitCode !== 0 ? retry.stderr : retryProbe.stderr;
+			if (!isWindowsPsmuxMissingSessionRegistrationRace(plan, probeAfterAttach)) {
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic("attach recovery probe failed", probeAfterAttach.stderr),
+				);
+				return true;
+			}
 			(context.diagnosticWriter ?? safeStderrWrite)(
-				formatTmuxLaunchDiagnostic("attach recovery recreate failed", recoveryFailure),
+				"tmux attach recovery found the published session missing; preserving lifecycle state without recreation.\n",
 			);
 			return true;
 		}
-	}
-	// Closing an SSH/Windows Terminal tab can make `tmux attach-session`
-	// exit with code 1 and no captured stderr while the tmux server correctly
-	// keeps the just-created session alive. Preserve that live session so the
-	// user can reattach instead of treating the parent client teardown as a
-	// launch failure.
-	const attachFailureStderr = attached.stderr?.trim() ?? "";
-	if (attachFailureStderr.length === 0) {
-		const probeAfterAttachFailure = probeHasSession();
-		if (probeAfterAttachFailure.exitCode === 0) {
-			(context.diagnosticWriter ?? safeStderrWrite)(
-				formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
-			);
-			return true;
+		// Closing an SSH/Windows Terminal tab can make `tmux attach-session`
+		// exit with code 1 and no captured stderr while the tmux server correctly
+		// keeps the just-created session alive. Preserve that live session so the
+		// user can reattach instead of treating the parent client teardown as a
+		// launch failure.
+		const attachFailureStderr = attached.stderr?.trim() ?? "";
+		if (attachFailureStderr.length === 0) {
+			const probeAfterAttachFailure = probeHasSession();
+			if (probeAfterAttachFailure.exitCode === 0) {
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
+				);
+				return true;
+			}
 		}
+		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach failed", attached.stderr));
+		return true;
+	} catch (error) {
+		(context.diagnosticWriter ?? safeStderrWrite)(
+			formatTmuxLaunchDiagnostic(
+				"post-publication verification or attach failed; preserving committed session",
+				String(error),
+			),
+		);
+		return true;
 	}
-	cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe, new Error("attach failed"));
-	(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach failed", attached.stderr));
-	return true;
 }

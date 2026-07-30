@@ -119,7 +119,15 @@ describe("deep-interview staged transitions", () => {
 		await run(root, ["apply", "--json"]);
 		const after = await readState(root);
 		const state = after.state as Record<string, unknown>;
-		expect((state.established_facts as unknown[]).length).toBe(checkSummary.result_fact_count as number);
+		const establishedFacts = state.established_facts;
+		if (!Array.isArray(establishedFacts)) {
+			throw new Error("Expected state established_facts to be an array");
+		}
+		const resultFactCount = checkSummary.result_fact_count;
+		if (typeof resultFactCount !== "number") {
+			throw new Error("Expected check summary result_fact_count to be a number");
+		}
+		expect(establishedFacts.length).toBe(resultFactCount);
 	});
 
 	it("rejects non-initialize staging against missing state", async () => {
