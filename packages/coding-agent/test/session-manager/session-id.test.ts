@@ -53,6 +53,37 @@ describe("SessionManager session ids", () => {
 		const branchedId = expectUuidV7SessionId(session);
 		expect(branchedId).not.toBe(firstId);
 	});
+	it("does not project a predecessor title into a persistent branch", async () => {
+		using tempDir = TempDir.createSync("@pi-session-id-branch-title-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		const branchPointId = session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.flush();
+		await session.setSessionName("Predecessor title", "user");
+
+		const branchFile = session.createBranchedSession(branchPointId);
+		if (!branchFile) throw new Error("Expected persistent branch file");
+		expect(session.getSessionName()).toBeUndefined();
+		expect(session.titleSource).toBeUndefined();
+
+		session.appendMessage({ role: "user", content: "branch append", timestamp: 2 });
+		await session.flush();
+		await session.close();
+
+		const records = fsSync
+			.readFileSync(branchFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line) as { type?: string; title?: string; patch?: { title?: string } });
+		expect(records[0]?.title).toBeUndefined();
+		expect(
+			records.some(record => record.type === "header_patch" && record.patch?.title === "Predecessor title"),
+		).toBe(false);
+		const listed = await SessionManager.listForResumePickerReadOnly(tempDir.path(), tempDir.path());
+		expect(listed.find(candidate => candidate.path === branchFile)?.title).toBeUndefined();
+		const reopened = await SessionManager.open(branchFile);
+		expect(reopened.getSessionName()).toBeUndefined();
+		expect(reopened.titleSource).toBeUndefined();
+	});
 
 	it("persists managed hot-path appends before returning", async () => {
 		using tempDir = TempDir.createSync("@pi-session-managed-sync-append-");

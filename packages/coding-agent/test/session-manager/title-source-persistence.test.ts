@@ -185,6 +185,12 @@ describe("session title source persistence", () => {
 		certifiedRename.mockRestore();
 		await expect(certified.setSessionName("Certified retry", "user")).resolves.toBe(true);
 		expect(certified.getSessionName()).toBe("Certified retry");
+		certified.appendMessage({ role: "user", content: "healthy append", timestamp: 1 });
+		await certified.flush();
+		await certified.close();
+		const certifiedReopened = await SessionManager.open(certifiedFile);
+		expect(certifiedReopened.getSessionName()).toBe("Certified retry");
+		expect(certifiedReopened.titleSource).toBe("user");
 
 		const ambiguousCwd = path.join(cwd, "ambiguous");
 		fs.mkdirSync(ambiguousCwd, { recursive: true });

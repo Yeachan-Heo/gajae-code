@@ -850,6 +850,20 @@ export type DefaultModelSelectionPromotion =
 type SessionFileReplacementSyncOutcome =
 	| { readonly kind: "replaced" }
 	| { readonly kind: "restored_previous"; readonly error: Error };
+type AtomicEntryWriteOutcome =
+	| { readonly kind: "applied" }
+	| { readonly kind: "not_applied"; readonly error: Error }
+	| { readonly kind: "ambiguous"; readonly error: Error };
+
+class AtomicEntryWriteOutcomeError extends Error {
+	constructor(
+		readonly outcome: Exclude<AtomicEntryWriteOutcome["kind"], "applied">,
+		error: Error,
+	) {
+		super(error.message, { cause: error });
+		this.name = "AtomicEntryWriteOutcomeError";
+	}
+}
 
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeNode {
@@ -7331,12 +7345,16 @@ export class SessionManager {
 			throw toError(err);
 		}
 	}
-	async #writeEntriesAtomically(entries: FileEntry[]): Promise<void> {
-		if (!this.#sessionFile) return;
+	async #writeEntriesAtomically(entries: FileEntry[]): Promise<AtomicEntryWriteOutcome> {
+		if (!this.#sessionFile) return { kind: "applied" };
 		if (this.destination.kind === "managed") {
-			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-			await this.#managedTranscriptStore().replace(path.basename(this.#sessionFile), bytes);
-			return;
+			try {
+				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+				await this.#managedTranscriptStore().replace(path.basename(this.#sessionFile), bytes);
+				return { kind: "applied" };
+			} catch (error) {
+				return { kind: "ambiguous", error: toError(error) };
+			}
 		}
 		const dir = path.resolve(this.#sessionFile, "..");
 		const tempPath = path.join(dir, `.${path.basename(this.#sessionFile)}.${Snowflake.next()}.tmp`);
@@ -7349,7 +7367,10 @@ export class SessionManager {
 			await writer.fsync();
 			await writer.close();
 			await this.#replaceSessionFile(tempPath, this.#sessionFile);
-		} catch (err) {
+			return { kind: "applied" };
+		} catch (error) {
+			const writeError = toError(error);
+			const outcome = this.storage.existsSync(tempPath) ? "not_applied" : "ambiguous";
 			try {
 				await writer.close();
 			} catch {
@@ -7360,7 +7381,7 @@ export class SessionManager {
 			} catch {
 				// Ignore cleanup errors
 			}
-			throw toError(err);
+			return { kind: outcome, error: writeError };
 		}
 	}
 
@@ -7407,7 +7428,8 @@ export class SessionManager {
 				prepareEntryForPersistence(entry, this.#blobStore),
 			),
 		);
-		await this.#writeEntriesAtomically(entries);
+		const outcome = await this.#writeEntriesAtomically(entries);
+		if (outcome.kind !== "applied") throw outcome.error;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
@@ -8167,7 +8189,8 @@ export class SessionManager {
 							entry => prepareEntryForPersistence(entry, this.#blobStore),
 						),
 					);
-					await this.#writeEntriesAtomically(persistedEntries);
+					const outcome = await this.#writeEntriesAtomically(persistedEntries);
+					if (outcome.kind !== "applied") throw new AtomicEntryWriteOutcomeError(outcome.kind, outcome.error);
 					this.#needsFullRewriteOnNextPersist = false;
 					this.#flushed = true;
 					this.#ensuredOnDisk = true;
@@ -8184,7 +8207,11 @@ export class SessionManager {
 				this.#bytesSinceTitleAnchor = 0;
 				applied = true;
 			} catch (error) {
-				if (error instanceof ManagedAppendOutcomeError && error.outcome === "not_applied") throw error;
+				if (
+					(error instanceof ManagedAppendOutcomeError && error.outcome === "not_applied") ||
+					(error instanceof AtomicEntryWriteOutcomeError && error.outcome === "not_applied")
+				)
+					throw error;
 				// The append may have become replay-visible. Do not report a title commit
 				// and prevent later writes from relying on an uncertain transcript.
 				this.#recordPersistError(error);
@@ -9468,6 +9495,9 @@ export class SessionManager {
 			}
 			this.#sessionId = newSessionId;
 			this.#sessionFile = newSessionFile;
+			this.#sessionName = undefined;
+			this.#titleSource = undefined;
+			this.#bytesSinceTitleAnchor = undefined;
 			this.#flushed = true;
 			this.#commitResidentTextStoreTransition(transition);
 			return newSessionFile;
@@ -9501,6 +9531,9 @@ export class SessionManager {
 			"retain-and-throw",
 		);
 		this.#sessionId = newSessionId;
+		this.#sessionName = undefined;
+		this.#titleSource = undefined;
+		this.#bytesSinceTitleAnchor = undefined;
 		this.#commitResidentTextStoreTransition(transition);
 		return undefined;
 	}
