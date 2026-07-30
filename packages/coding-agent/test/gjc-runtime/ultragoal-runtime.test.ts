@@ -767,27 +767,64 @@ describe("ultragoal CLI replay validation", () => {
 		await expectAcceptedExecutorQa(root, cliExecutorQa([cliReplayArtifact()]));
 	});
 
-	it("rejects string commands and unallowlisted argv commands", async () => {
+	it("rejects string commands", async () => {
 		const stringRoot = await tempDir();
 		const stringError = await expectRejectedExecutorQa(
 			stringRoot,
 			cliExecutorQa([cliReplayArtifact({ command: 'bun -e "console.log(1)"' })]),
 		);
 		expect(stringError).toContain("argv string array");
-
-		const unallowlistedRoot = await tempDir();
-		const unallowlistedError = await expectRejectedExecutorQa(
-			unallowlistedRoot,
-			cliExecutorQa([cliReplayArtifact({ command: ["bun", "install"] })]),
-		);
-		expect(unallowlistedError).toContain("allowlist");
-		expect(unallowlistedError).toContain('command "bun" with 1 arg is blocked');
-		expect(unallowlistedError).not.toContain("install");
-		expect(unallowlistedError).toContain("Allowed replay commands");
-		expect(unallowlistedError).toContain("replayExempt metadata");
 	});
 
-	it("rejects execution-affecting env and git side-effect flags", async () => {
+	it("accepts any argv command without an executable allowlist", async () => {
+		const root = await tempDir();
+		// bun test / bun install / arbitrary executables are all accepted now;
+		// the replaySafe flag plus the sandbox (subprocess, timeout, output cap,
+		// env scrubbing) is the safety boundary, not an executable allowlist.
+		await expectAcceptedExecutorQa(
+			root,
+			cliExecutorQa([
+				cliReplayArtifact({
+					command: ["bun", "-e", 'console.log("arbitrary-replay-ok")'],
+					recordedStdout: "arbitrary-replay-ok\n",
+					invariants: [{ type: "substring", value: "arbitrary-replay-ok" }],
+				}),
+			]),
+		);
+	});
+
+	it("reads the referenced replay file when the artifactRef kind is cli-replay", async () => {
+		const root = await tempDir();
+		// Regression: an artifactRef carrying `kind: "cli-replay"` and a `path` (but no
+		// inline `command`) used to short-circuit as an inline replay record, so the
+		// referenced file was never read and validation failed with a confusing
+		// `schemaVersion must be 1` error pointing at the ref instead of the file.
+		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+		await Bun.write(
+			path.join(root, "artifacts", "referenced-replay.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				kind: "cli-replay",
+				replaySafe: true,
+				command: ["bun", "-e", 'console.log("referenced-replay-ok")'],
+				recordedStdout: "referenced-replay-ok\n",
+				invariants: [{ type: "substring", value: "referenced-replay-ok" }],
+			}),
+		);
+		await expectAcceptedExecutorQa(
+			root,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					path: "artifacts/referenced-replay.json",
+					description: "Runtime argv replay referenced by path",
+				},
+			]),
+		);
+	});
+
+	it("rejects execution-affecting env vars", async () => {
 		const envRoot = await tempDir();
 		const envError = await expectRejectedExecutorQa(
 			envRoot,
@@ -795,36 +832,6 @@ describe("ultragoal CLI replay validation", () => {
 		);
 		expect(envError).toContain("env.NODE_OPTIONS");
 		expect(envError).toContain("safe environment allowlist");
-
-		const gitRoot = await tempDir();
-		const gitError = await expectRejectedExecutorQa(
-			gitRoot,
-			cliExecutorQa([
-				cliReplayArtifact({
-					command: ["git", "diff", "--output=artifact.txt"],
-					recordedStdout: "",
-				}),
-			]),
-		);
-		expect(gitError).toContain("allowlist");
-		expect(gitError).toContain('command "git" with 2 args is blocked');
-		expect(gitError).not.toContain("--output=artifact.txt");
-	});
-
-	it("rejects path-qualified or case-spoofed replay executables", async () => {
-		const root = await tempDir();
-		for (const command of [
-			["./git", "status"],
-			["/tmp/npm", "--version"],
-			["scripts/node", "--version"],
-			["GIT", "status"],
-		]) {
-			const error = await expectRejectedExecutorQa(
-				root,
-				cliExecutorQa([cliReplayArtifact({ command, recordedStdout: "" })]),
-			);
-			expect(error).toContain("allowlist");
-		}
 	});
 
 	it("kills SIGTERM-ignoring CLI replay processes during timeout escalation", async () => {

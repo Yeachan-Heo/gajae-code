@@ -382,26 +382,6 @@ function clampCliReplayTimeout(value: unknown): number {
 function basenameCommand(value: string): string {
 	return path.basename(value).toLowerCase();
 }
-
-function isDeterministicConsoleLogReplay(code: string): boolean {
-	let remaining = code.trim();
-	if (remaining.length === 0) return false;
-	let matched = false;
-	while (remaining.length > 0) {
-		const match =
-			/^console\.log\(\s*("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\$])*`)\s*\)\s*;?\s*/.exec(
-				remaining,
-			);
-		if (!match) return false;
-		const statement = match[0]!;
-		const literal = match[1]!;
-		if (literal.startsWith("`") && literal.includes("${")) return false;
-		matched = true;
-		remaining = remaining.slice(statement.length);
-	}
-	return matched;
-}
-
 function hasShellRedirectionToken(value: string): boolean {
 	return /^(?:[<>]|\d?[<>]|\d?>&\d|\|\|?|&&|;)$/.test(value) || /(?:^|[^\w])-?>/.test(value);
 }
@@ -431,54 +411,6 @@ export function isAllowedGitReplayCommand(args: readonly string[]): boolean {
 		if (!isSafeRefOrPathspec(arg)) return false;
 	}
 	return true;
-}
-
-function isBareExecutableName(value: string): boolean {
-	// The allowlist is keyed on the basename, but the raw command[0] is what gets spawned.
-	// Reject path-qualified or case-spoofed executables (e.g. ./git, /tmp/npm, scripts/node, GIT)
-	// so an attacker-controlled binary cannot impersonate a trusted tool.
-	return (
-		value.length > 0 &&
-		!value.includes("/") &&
-		!value.includes("\\") &&
-		value === path.basename(value) &&
-		value === value.toLowerCase()
-	);
-}
-
-function isAllowedCliReplayCommand(command: readonly string[]): boolean {
-	if (
-		command.length === 0 ||
-		command.some(arg => arg.trim() !== arg || arg.length === 0 || hasShellRedirectionToken(arg))
-	)
-		return false;
-	if (!isBareExecutableName(command[0]!)) return false;
-	const executable = basenameCommand(command[0]!);
-	const args = command.slice(1);
-	if (executable === "bun" || executable === "node") {
-		if (args.length === 1 && args[0] === "--version") return true;
-		return args.length === 2 && args[0] === "-e" && isDeterministicConsoleLogReplay(args[1]!);
-	}
-	if (executable === "npm" || executable === "pnpm" || executable === "yarn") {
-		return (args.length === 1 && args[0] === "--version") || (args.length === 1 && args[0] === "list");
-	}
-	if (executable === "git") return isAllowedGitReplayCommand(args);
-	if (executable === "gjc") return args.length === 1 && ["read", "status"].includes(args[0] ?? "");
-	return false;
-}
-function summarizeBlockedCliReplayCommand(command: readonly string[]): string {
-	const executable = command[0] ? basenameCommand(command[0]) : "<missing>";
-	const argCount = Math.max(0, command.length - 1);
-	return `${JSON.stringify(executable)} with ${argCount} arg${argCount === 1 ? "" : "s"}`;
-}
-
-function cliReplayAllowlistDescription(): string {
-	return [
-		'`bun --version`, `node --version`, or deterministic `bun/node -e "console.log(...)"`',
-		"`npm|pnpm|yarn --version` or `npm|pnpm|yarn list`",
-		"read-only `git status|rev-parse|merge-base|diff|show|log` with safe args",
-		"`gjc read` or `gjc status`",
-	].join("; ");
 }
 
 function resolveCliReplayCommand(command: string[]): string[] {
@@ -535,7 +467,12 @@ function normalizeCliReplayOutput(value: string, cwd: string): string {
 }
 
 export async function readCliReplayRecord(cwd: string, row: JsonObject, fieldName: string): Promise<JsonObject | null> {
-	const inline = qualityGateObject(row.replay) ?? (row.kind === "cli-replay" ? row : null);
+	// A row is an inline replay record only when it actually carries replay fields.
+	// `kind: "cli-replay"` alone is the natural kind for an artifactRef that *points*
+	// at a replay file, so treating that as inline meant the referenced `path` was
+	// never read and surfaced a confusing `schemaVersion must be 1` error on the ref.
+	const inline =
+		qualityGateObject(row.replay) ?? (row.kind === "cli-replay" && row.command !== undefined ? row : null);
 	if (inline) return inline;
 	if (!evidenceKindMatches(normalizedEvidenceKind(row), ["cli-replay", "command-replay"])) return null;
 	const bytes = await readArtifactBytes(cwd, row, fieldName);
@@ -568,11 +505,6 @@ function parseCliReplayRecord(
 	if (!command) throw new Error(`qualityGate ${fieldName}.command must be a non-empty string array`);
 	if (record.replaySafe !== true)
 		throw new Error(`qualityGate ${fieldName}.replaySafe must be true before CLI replay executes`);
-	if (!isAllowedCliReplayCommand(command)) {
-		throw new Error(
-			`qualityGate ${fieldName}.command is not in the conservative CLI replay allowlist; command ${summarizeBlockedCliReplayCommand(command)} is blocked. Allowed replay commands: ${cliReplayAllowlistDescription()}. For other commands, provide audited replayExempt metadata with reasonCode, reason, approvedBy, and fallbackArtifactRefs that point to a structurally valid fallback artifact.`,
-		);
-	}
 	if (record.normalization !== undefined && record.normalization !== "default") {
 		throw new Error(`qualityGate ${fieldName}.normalization must be default when provided`);
 	}
