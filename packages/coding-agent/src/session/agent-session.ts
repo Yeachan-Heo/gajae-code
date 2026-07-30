@@ -2493,6 +2493,14 @@ export class AgentSession {
 		pending: AgentSessionEvent,
 		lease: RunResourceProducerLease | undefined,
 	): Promise<void> {
+		let extensionDelivery: Promise<void> | undefined;
+		const releaseLease = () => {
+			if (!lease) return;
+			if (this.#postPromptLeases.get(lease.resourceRunId) === lease) {
+				this.#postPromptLeases.delete(lease.resourceRunId);
+			}
+			lease.closeDiscovery();
+		};
 		const publish = async () => {
 			// Worker integration is first-party lifecycle persistence, not an extension
 			// hook. Make it durable before publishing the terminal boundary while user
@@ -2501,18 +2509,16 @@ export class AgentSession {
 			// Persist before notifying synchronous subscribers: a subscriber may start a
 			// successor prompt from agent_end, whose running state must serialize after
 			// this terminal boundary rather than be overwritten by it.
-			await this.#persistRuntimeStateInBackground(pending);
+			void this.#persistRuntimeStateInBackground(pending);
 			this.#emit(pending);
-			await this.#queueExtensionEvent(pending, undefined, true);
+			extensionDelivery = this.#queueExtensionEvent(pending, undefined, true);
 		};
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
 			else await publish();
 		} finally {
-			if (lease && this.#postPromptLeases.get(lease.resourceRunId) === lease) {
-				this.#postPromptLeases.delete(lease.resourceRunId);
-			}
-			lease?.closeDiscovery();
+			if (extensionDelivery) void extensionDelivery.then(releaseLease, releaseLease);
+			else releaseLease();
 			this.#agentEndPublicationInFlight = Math.max(0, this.#agentEndPublicationInFlight - 1);
 			this.#resolveSessionSettlement();
 		}
