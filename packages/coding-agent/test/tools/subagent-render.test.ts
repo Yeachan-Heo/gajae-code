@@ -69,6 +69,37 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("read");
 		expect(out).toContain("scanning the repo");
 	});
+	it("renders the fast glyph on the model line only when fast mode is enabled", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-LiveFast",
+					fastMode: true,
+					effectiveModel: "openai-codex/gpt-5.6-sol",
+					liveProgressAvailable: true,
+				}),
+				snapshot({
+					id: "0-TerminalFast",
+					status: "completed",
+					fastMode: true,
+					effectiveModel: "openai-codex/gpt-5.6-sol",
+					resultText: "done",
+				}),
+				snapshot({
+					id: "0-TerminalNormal",
+					status: "completed",
+					effectiveModel: "anthropic/claude-sonnet-4-5",
+					resultText: "done",
+				}),
+			],
+		});
+		// The glyph rides the model line, never the id.
+		expect(out).toContain(`Model: openai-codex/gpt-5.6-sol ${theme.icon.fast}`);
+		expect(out).not.toContain(`0-LiveFast ${theme.icon.fast}`);
+		expect(out).not.toContain(`0-TerminalFast ${theme.icon.fast}`);
+		expect(out).toContain("Model: anthropic/claude-sonnet-4-5");
+		expect(out).not.toContain(`Model: anthropic/claude-sonnet-4-5 ${theme.icon.fast}`);
+	});
 
 	it("expands live recent output, tool args, and the full task section when expanded=true and collapses them back (AC1/AC2)", () => {
 		const details: SubagentToolDetails = {
