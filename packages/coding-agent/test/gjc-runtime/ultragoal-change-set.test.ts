@@ -6,6 +6,7 @@ import {
 	computeCheckpointChangeSet,
 	parseGitNameStatus,
 	parseGitUntrackedPaths,
+	spawnText,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-change-set";
 
 describe("ultragoal change-set extraction", () => {
@@ -71,6 +72,23 @@ describe("ultragoal change-set extraction", () => {
 				category: "other",
 			},
 		]);
+	});
+
+	it("keeps literal POSIX backslash pairs distinct from slash paths", () => {
+		const backslashPath = "dir\\\\name.ts";
+		expect(parseGitUntrackedPaths(`${backslashPath}\0dir/name.ts\0`).map(row => row.path)).toEqual([
+			backslashPath,
+			"dir/name.ts",
+		]);
+	});
+
+	it("fails command capture closed when stdout is not valid UTF-8", async () => {
+		const result = await spawnText([process.execPath, "-e", "process.stdout.write(Buffer.from([0xff]))"], {
+			cwd: process.cwd(),
+		});
+		expect(result.ok).toBe(false);
+		expect(result.stdout).toBe("");
+		expect(result.stderr).toContain("not valid UTF-8");
 	});
 
 	it("includes untracked files in the computed cumulative change set", async () => {

@@ -1,7 +1,7 @@
 import {
 	categorizeComputerChangePath,
 	isSettingsSchemaPath,
-	normalizeRepoPath,
+	normalizeChangeSetPath,
 	type UltragoalChangeCategory,
 	type UltragoalChangeSet,
 	type UltragoalChangeSetPath,
@@ -15,12 +15,19 @@ export async function spawnText(
 	try {
 		const proc = Bun.spawn(command, { cwd: options.cwd, stdout: "pipe", stderr: "pipe" });
 		const timeout = setTimeout(() => proc.kill(), options.timeoutMs ?? 5000);
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
+		const [stdoutBytes, stderrBytes, exitCode] = await Promise.all([
+			new Response(proc.stdout).arrayBuffer(),
+			new Response(proc.stderr).arrayBuffer(),
 			proc.exited,
 		]);
 		clearTimeout(timeout);
+		let stdout: string;
+		try {
+			stdout = new TextDecoder("utf-8", { fatal: true }).decode(stdoutBytes);
+		} catch {
+			return { ok: false, stdout: "", stderr: "command stdout was not valid UTF-8" };
+		}
+		const stderr = new TextDecoder().decode(stderrBytes);
 		return { ok: exitCode === 0, stdout, stderr };
 	} catch (error) {
 		return { ok: false, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
@@ -71,8 +78,8 @@ export function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
 		else if (statusCode.startsWith("R")) status = "renamed";
 		else if (statusCode.startsWith("C")) status = "copied";
 		rows.push({
-			path: normalizeRepoPath(pathValue),
-			oldPath: oldPath ? normalizeRepoPath(oldPath) : undefined,
+			path: normalizeChangeSetPath(pathValue),
+			oldPath: oldPath ? normalizeChangeSetPath(oldPath) : undefined,
 			status,
 			category: categorizeComputerChangePath(pathValue),
 		});
@@ -110,7 +117,7 @@ export function parseGitUntrackedPaths(output: string): UltragoalChangeSetPath[]
 	return paths
 		.filter(pathValue => pathValue.length > 0)
 		.map(pathValue => ({
-			path: normalizeRepoPath(pathValue),
+			path: normalizeChangeSetPath(pathValue),
 			status: "added" as UltragoalChangeStatus,
 			category: categorizeComputerChangePath(pathValue),
 		}));
@@ -132,7 +139,7 @@ function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 		.split(/\r?\n/)
 		.filter(row => row.length > 0)
 		.map(pathValue => ({
-			path: normalizeRepoPath(pathValue),
+			path: normalizeChangeSetPath(pathValue),
 			status: "unknown" as UltragoalChangeStatus,
 			category: categorizeCiChangedPath(pathValue),
 		}));
@@ -164,10 +171,7 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 	]);
-	if (!committed.ok || !unstaged.ok || !staged.ok || !untracked.ok) {
-		if (ciChangedPaths.length === 0) return undefined;
-		return { source: "checkpoint-git", paths: ciChangedPaths, trusted: true };
-	}
+	if (!committed.ok || !unstaged.ok || !staged.ok || !untracked.ok) return undefined;
 	const gitPaths = mergeChangeSetPaths([
 		parseGitNameStatus(committed.stdout),
 		parseGitNameStatus(unstaged.stdout),
@@ -193,8 +197,8 @@ export function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
 		if (!line.startsWith("diff --git ")) continue;
 		const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
 		if (!match) continue;
-		const oldPath = normalizeRepoPath(match[1]!);
-		const newPath = normalizeRepoPath(match[2]!);
+		const oldPath = normalizeChangeSetPath(match[1]!);
+		const newPath = normalizeChangeSetPath(match[2]!);
 		paths.push({
 			path: newPath,
 			oldPath: oldPath === newPath ? undefined : oldPath,

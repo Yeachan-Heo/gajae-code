@@ -1564,6 +1564,10 @@ export function normalizeRepoPath(value: string): string {
 	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
 }
 
+export function normalizeChangeSetPath(value: string): string {
+	return value.replace(/^\.\//, "");
+}
+
 function isToolsIndexPath(value: string): boolean {
 	return normalizeRepoPath(value) === TOOLS_INDEX_PATH;
 }
@@ -2163,9 +2167,9 @@ function canonicalChangeSetRows(value: unknown, fieldName: string): UltragoalCha
 		if (!status) throw new Error(`${fieldName}[${index}].status is required`);
 		const oldPath = exactNonEmptyString(record.oldPath);
 		return {
-			path: normalizeRepoPath(pathValue),
+			path: normalizeChangeSetPath(pathValue),
 			status: status as UltragoalChangeStatus,
-			...(oldPath ? { oldPath: normalizeRepoPath(oldPath) } : {}),
+			...(oldPath ? { oldPath: normalizeChangeSetPath(oldPath) } : {}),
 		};
 	});
 }
@@ -2327,7 +2331,7 @@ function hydrateDeferredGateDefaults(
 			if (!record) return row;
 			const pathValue = exactNonEmptyString(record.path);
 			if (!pathValue || nonEmptyString(record.status)) return record;
-			const computed = computedByPath.get(normalizeRepoPath(pathValue));
+			const computed = computedByPath.get(normalizeChangeSetPath(pathValue));
 			return {
 				...record,
 				status: computed?.status ?? "unknown",
