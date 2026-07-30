@@ -229,21 +229,13 @@ async function git(args: string[]): Promise<Uint8Array> {
 // by the commit id, so changing it requires a new commit -- which changes
 // `git_head` and is therefore visible to the reviewer.
 /** sha256 of every distinct blob this path has ever had in any ref-reachable commit. */
-export async function reachableBlobSha256s(filePath: string): Promise<string[]> {
-	const out = new TextDecoder().decode(await git(["rev-list", "--all", "--objects", "--", filePath]));
-	const ids = new Set<string>();
-	for (const line of out.split("\n")) {
-		const [id, ...rest] = line.trim().split(" ");
-		if (id && id.length === 40 && rest.join(" ") === filePath) ids.add(id);
+export async function gitObjectType(commitish: string): Promise<string | null> {
+	try {
+		const out = new TextDecoder().decode(await git(["cat-file", "-t", commitish])).trim();
+		return out || null;
+	} catch {
+		return null;
 	}
-	const digests: string[] = [];
-	for (const id of ids) {
-		try {
-			const bytes = await git(["cat-file", "blob", id]);
-			digests.push(hash(bytes));
-		} catch {}
-	}
-	return digests;
 }
 export async function committedBlobSha256(commit: string, filePath: string): Promise<string | null> {
 	const result = Bun.spawn(["git", "cat-file", "blob", `${commit}:${filePath}`], {
@@ -257,6 +249,7 @@ export async function committedBlobSha256(commit: string, filePath: string): Pro
 }
 export type CaptureProvenance = {
 	git_head: string;
+	oracle_commit: string;
 	git_diff_scope: readonly string[];
 	git_diff_binary_sha256: string;
 	source_sha256: Record<string, string>;
@@ -273,6 +266,7 @@ export async function captureProvenance(): Promise<CaptureProvenance> {
 	);
 	return {
 		git_head: gitHead,
+		oracle_commit: process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT?.trim() ?? gitHead,
 		git_diff_scope: PROVENANCE_DIFF_SCOPE,
 		git_diff_binary_sha256: hash(await git(["diff", "--binary", "HEAD", "--", ...PROVENANCE_DIFF_SCOPE])),
 		source_sha256: sourceSha256,

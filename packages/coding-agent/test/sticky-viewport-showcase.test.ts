@@ -1034,7 +1034,55 @@ describe("sticky viewport production evidence verifier", () => {
 		await restampProvenance(root);
 		await verifyStickyViewportShowcase(root);
 	}, 300_000);
-	it("accepts an oracle absent from the base commit but present in a reachable commit", async () => {
+	it("rejects oracle bytes authorized only by an unrelated local or remote-tracking ref", async () => {
+		// `--all` reachability proves a commit exists somewhere, not that it is the
+		// commit under review. Committing malicious oracle bytes on any side ref must
+		// not authorize them, with or without an explicit trusted authority.
+		const root = await capture();
+		const oracle = "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts";
+		const original = await fs.readFile(oracle, "utf8");
+		const index = path.join(os.tmpdir(), `gjc-attacker-index-${Date.now()}`);
+		const refs = ["refs/heads/gjc-test-attacker-ref", "refs/remotes/origin/gjc-test-attacker-ref"];
+		const git = async (args: string[], stdin?: string) => {
+			const proc = Bun.spawn(["git", ...args], {
+				stdout: "pipe",
+				stderr: "pipe",
+				stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
+				env: { ...process.env, GIT_INDEX_FILE: index },
+			});
+			const out = await new Response(proc.stdout).text();
+			if ((await proc.exited) !== 0) throw new Error(`git ${args[0]}: ${await new Response(proc.stderr).text()}`);
+			return out.trim();
+		};
+		try {
+			const malicious = `${original}\n// attacker-authorized bytes\n`;
+			const blob = await git(["hash-object", "-w", "--stdin"], malicious);
+			await git(["read-tree", "HEAD"]);
+			await git(["update-index", "--add", "--cacheinfo", `100644,${blob},${oracle}`]);
+			const tree = await git(["write-tree"]);
+			const commit = await git(["commit-tree", tree, "-p", "HEAD", "-m", "attacker oracle"]);
+			for (const ref of refs) await git(["update-ref", ref, commit]);
+			// The malicious bytes are now reachable from two side refs and are what the
+			// verifier would actually execute.
+			await Bun.write(oracle, malicious);
+			await restampProvenance(root);
+			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("oracle integrity");
+			process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT = await git(["rev-parse", "HEAD"]);
+			try {
+				await restampProvenance(root);
+				await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("oracle integrity");
+			} finally {
+				delete process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT;
+			}
+		} finally {
+			await Bun.write(oracle, original);
+			for (const ref of refs) {
+				Bun.spawnSync(["git", "update-ref", "-d", ref], { stdout: "ignore", stderr: "ignore" });
+			}
+			await fs.rm(index, { force: true });
+		}
+	}, 300_000);
+	it("requires the declared oracle authority to carry the running oracle bytes", async () => {
 		// The review protocol verifies an UNCOMMITTED synthetic merge: `HEAD` is the
 		// current-dev base while the running oracle is the staged PR version. A gate
 		// that only compares against the base blob rejects that honest shape before any

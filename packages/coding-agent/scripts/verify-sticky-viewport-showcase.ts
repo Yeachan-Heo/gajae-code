@@ -9,8 +9,8 @@ import {
 	ansiToHtml,
 	captureProvenance,
 	committedBlobSha256,
+	gitObjectType,
 	PROVENANCE_DIFF_SCOPE,
-	reachableBlobSha256s,
 	xterm256Color,
 } from "./capture-sticky-viewport-showcase";
 
@@ -435,37 +435,32 @@ const ORACLE_SOURCES = [
 // environment-supplied rather than bundle-supplied, so a bundle author cannot
 // choose which commit vouches for the oracle.
 const ORACLE_COMMIT_ENV = "GJC_STICKY_VIEWPORT_ORACLE_COMMIT";
-const verifyOracleIntegrity = async (gitHead: string) => {
-	// The reviewed PR head — not the integration worktree's `HEAD`. The review
-	// protocol validates an *uncommitted* synthetic merge: the running oracle is
-	// the PR's version while `HEAD` is the current-dev base, so comparing against
-	// `HEAD` alone rejects honest bundles. Accept the running bytes when that exact
-	// content exists as this path's blob in ANY commit reachable from any ref, which
-	// is true for the reviewed PR head and false for a worktree-only mutation. An
-	// attacker who commits the mutation puts it in the reviewed diff, where it is
-	// visible rather than laundered through a restamped provenance block.
+const verifyOracleIntegrity = async (gitHead: string, declaredProvenanceCommit: unknown) => {
+	// Authority is exactly one commit. Reachability is NOT authority: bytes
+	// committed on an unrelated local or remote-tracking ref are reachable via
+	// `--all` yet were never reviewed, so enumerating refs would let any pushed
+	// or fetched branch authorize the oracle. The reviewed commit is therefore
+	// either declared out-of-band by the review harness or it is `git_head`.
 	const declared = process.env[ORACLE_COMMIT_ENV]?.trim();
+	if (declared !== undefined && !/^[0-9a-f]{40}$/.test(declared))
+		fail(`oracle integrity: ${ORACLE_COMMIT_ENV} must be a full 40-hex commit id`);
+	const authority = declared ?? gitHead;
+	// Fail closed when the authority is not a readable commit object.
+	if ((await gitObjectType(authority)) !== "commit")
+		fail(`oracle integrity: authority ${authority} is not a readable commit object`);
+	// The bundle records which commit it claimed; a mismatch means the bundle was
+	// captured against a different authority than the one being verified.
+	if (declaredProvenanceCommit !== authority)
+		fail(
+			`oracle integrity: provenance oracle_commit ${String(declaredProvenanceCommit)} is not the authority ${authority}`,
+		);
+	// Both oracle files must resolve at that same commit; per-file provenance
+	// from different refs is not accepted.
 	for (const source of ORACLE_SOURCES) {
+		const committed = await committedBlobSha256(authority, source);
+		if (committed === null) fail(`oracle integrity: ${source} has no committed blob at ${authority}`);
 		const running = hash(new Uint8Array(await fs.readFile(source)));
-		let matched = false;
-		let sawBlob = false;
-		for (const commit of declared ? [declared, gitHead] : [gitHead]) {
-			const committed = await committedBlobSha256(commit, source);
-			if (committed === null) continue;
-			sawBlob = true;
-			if (running === committed) {
-				matched = true;
-				break;
-			}
-		}
-		if (!matched) {
-			const reachable = await reachableBlobSha256s(source);
-			if (reachable.length > 0) sawBlob = true;
-			matched = reachable.includes(running);
-		}
-		// Fail closed: no readable blob anywhere is indistinguishable from a rewrite.
-		if (!sawBlob) fail(`oracle integrity: ${source} has no committed blob`);
-		if (!matched) fail(`oracle integrity: ${source} differs from every committed blob of that path`);
+		if (running !== committed) fail(`oracle integrity: ${source} differs from its committed blob at ${authority}`);
 	}
 };
 const SEMANTIC_ANCHOR_EXPECTATION: Readonly<
@@ -717,7 +712,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		fail("manifest capture provenance is stale");
 	// Runs before every entry check: a rewritten oracle would otherwise decide
 	// what "valid" means for all of them.
-	await verifyOracleIntegrity(provenance.git_head as string);
+	await verifyOracleIntegrity(provenance.git_head as string, provenance.oracle_commit);
 	const entries = array(manifest.entries, "manifest entries");
 	if (entries.length !== KEYS.length) fail("manifest entries must contain exactly 20 entries");
 	// Cross-entry anchor identity ledger. Uniqueness is a hard contract, not a
