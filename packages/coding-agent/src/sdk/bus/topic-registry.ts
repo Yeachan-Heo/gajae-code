@@ -799,11 +799,18 @@ export class TopicRegistry {
 		await this.inflight.get(sessionId)?.catch(() => undefined);
 	}
 
-	/** Remove only after a definite remote deletion; ambiguity deliberately retains its fence. */
+	/**
+	 * Remove only after a definite remote deletion; ambiguity deliberately retains
+	 * its fence. Once the record is gone its topic id no longer collides, so the
+	 * derived routing tables are recomputed: a surviving colliding record becomes
+	 * routable again and a settled id becomes adoptable, without waiting for a
+	 * daemon restart to rebuild them from the persisted snapshot.
+	 */
 	settleDelete(sessionId: string, topicId: string): boolean {
 		const record = this.topics.get(sessionId);
 		if (!record || record.topicId !== topicId || record.authorityState !== "delete_pending") return false;
 		this.topics.delete(sessionId);
+		this.rebuildInboundRoutes();
 		return true;
 	}
 
