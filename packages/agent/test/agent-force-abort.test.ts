@@ -330,4 +330,69 @@ describe("Agent.forceAbort", () => {
 			{ role: "user", content: [{ type: "text", text: "after abort" }], timestamp: expect.any(Number) },
 		]);
 	});
+
+	it("seals the caller-owned run when maintenance aborts instead of leaving it unfenced", async () => {
+		// The loop runs with `resourceSealOwner: "caller"`, so it deliberately leaves
+		// sealing to Agent. Treating an aborted maintenance as an ordinary checkpoint
+		// therefore left the run open forever and made every cancel report
+		// `run_not_sealed` with nothing actually pending.
+		const model = createMockModel();
+		let streamCalls = 0;
+		const streamFn: StreamFn = () => {
+			streamCalls += 1;
+			if (streamCalls > 1) throw new Error("Maintenance abort must not start a second request");
+			const response = createAssistantMessage(
+				[{ type: "toolCall", id: "call-1", name: "echo", arguments: {} }],
+				"toolUse",
+			);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "done", reason: "toolUse", message: response });
+				stream.end(response);
+			});
+			return stream;
+		};
+		const tool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Returns a deterministic result.",
+			parameters: { type: "object", properties: {} },
+			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		};
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn,
+		});
+		const maintenanceEntered = Promise.withResolvers<void>();
+		const maintenanceGate = Promise.withResolvers<void>();
+		agent.setMaintainContext(async () => {
+			maintenanceEntered.resolve();
+			await maintenanceGate.promise;
+			return "not-needed" as const;
+		});
+
+		let handle: string | undefined;
+		const terminals: Array<Extract<AgentEvent, { type: "agent_end" }>> = [];
+		agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			terminals.push(event);
+			if (event.stopReason === "maintenance") handle ??= agent.activeResourceRunId;
+		});
+
+		const prompt = agent.prompt("run tool");
+		await maintenanceEntered.promise;
+		handle ??= agent.activeResourceRunId;
+		agent.abort();
+		maintenanceGate.resolve();
+		await prompt;
+		await agent.waitForIdle();
+
+		expect(handle).toBeDefined();
+		// The event keeps its maintenance shape so AgentSession can still report the
+		// aborted maintenance settlement; only the sealing decision changed.
+		expect(terminals).toMatchObject([{ stopReason: "maintenance", maintenanceOutcome: "aborted" }]);
+		expect(await agent.resourceLedger.waitForSettlement(handle!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+	});
 });
