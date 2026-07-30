@@ -636,6 +636,9 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 					typeof frame.ansi !== "string" ||
 					frame.text !== Bun.stripANSI(frame.ansi) ||
 					frame.sha256 !== hash(frame.ansi) ||
+					// Required ASCII metadata frames must be escape-free too, or the bundle
+					// digest stays host-dependent even when the top-level payload is canonical.
+					(mode === "ascii-no-color" && /\x1b\[/.test(frame.ansi as string)) ||
 					(!capacityConstrained && split && !frame.text.includes("│")) ||
 					(!capacityConstrained &&
 						!split &&
@@ -651,6 +654,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			typeof visibleEmpty.ansi !== "string" ||
 			visibleEmpty.text !== Bun.stripANSI(visibleEmpty.ansi) ||
 			visibleEmpty.sha256 !== hash(visibleEmpty.ansi) ||
+			(mode === "ascii-no-color" && /\x1b\[/.test(visibleEmpty.ansi as string)) ||
 			JSON.stringify(rootOrder) !==
 				JSON.stringify([
 					"irc-split",

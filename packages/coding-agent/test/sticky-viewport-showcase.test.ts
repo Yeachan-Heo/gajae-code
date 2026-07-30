@@ -22,6 +22,24 @@ async function capture(): Promise<string> {
 	if ((await result.exited) !== 0) throw new Error(await new Response(result.stderr).text());
 	return root;
 }
+async function captureWithEnv(overrides: Record<string, string>, drop: readonly string[] = []): Promise<string> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-env-"));
+	roots.push(root);
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+	for (const key of drop) delete env[key];
+	const result = Bun.spawn(
+		["bun", "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts", "--out", root],
+		{
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...env, ...overrides },
+		},
+	);
+	if ((await result.exited) !== 0) throw new Error(await new Response(result.stderr).text());
+	return root;
+}
 async function rehash(root: string, key: string, name: string): Promise<void> {
 	const manifestPath = path.join(root, "manifest.json");
 	const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
@@ -534,4 +552,59 @@ describe("sticky viewport production evidence verifier", () => {
 			await expect(verifyStickyViewportShowcase(root, true)).rejects.toThrow("independent review");
 		}
 	}, 180_000);
+	it("keeps required ascii-no-color metadata escape-free and reproducible across capture hosts", async () => {
+		// `metadata.json` is a required manifest artifact, so host-negotiated color
+		// there makes the whole bundle host-dependent even when the three top-level
+		// payloads are canonical. `detectColorMode()` picks indexed `38;5;n` when
+		// TERM is dumb/empty/linux and truecolor `38;2;r;g;b` when COLORTERM says so,
+		// which is exactly the pair this asserts away.
+		const asciiKeys = ["manual-new-output/80x24/ascii-no-color", "capacity-zero/48x10/ascii-no-color"] as const;
+		const dumb = await captureWithEnv({ TERM: "dumb" }, ["COLORTERM"]);
+		const truecolor = await captureWithEnv({ TERM: "xterm-256color", COLORTERM: "truecolor" });
+		for (const key of asciiKeys) {
+			const dumbMetadata = await fs.readFile(path.join(dumb, key, "metadata.json"), "utf8");
+			const truecolorMetadata = await fs.readFile(path.join(truecolor, key, "metadata.json"), "utf8");
+			expect(dumbMetadata).not.toContain("\u001b[");
+			expect(truecolorMetadata).not.toContain("\u001b[");
+			expect(dumbMetadata).toEqual(truecolorMetadata);
+		}
+		await verifyStickyViewportShowcase(dumb);
+		await verifyStickyViewportShowcase(truecolor);
+	}, 300_000);
+
+	it("rejects escape bytes in required ascii-no-color metadata frames", async () => {
+		const base = await capture();
+		const key = "manual-new-output/80x24/ascii-no-color";
+		const cloneBase = async () => {
+			const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-ascii-"));
+			roots.push(clone);
+			await fs.cp(base, clone, { recursive: true });
+			return clone;
+		};
+		const forge = (value: string) => {
+			const forged = `\u001b[31m${value}`;
+			return {
+				ansi: forged,
+				text: Bun.stripANSI(forged),
+				sha256: new Bun.CryptoHasher("sha256").update(forged).digest("hex"),
+			};
+		};
+		// The pre-existing text/digest checks are satisfied on purpose, so only the
+		// no-color guard can reject these.
+		const emptyRoot = await cloneBase();
+		const emptyPath = path.join(emptyRoot, key, "metadata.json");
+		const emptyMetadata = JSON.parse(await fs.readFile(emptyPath, "utf8"));
+		emptyMetadata.state.visible_empty_irc_frame = forge(emptyMetadata.state.visible_empty_irc_frame.ansi);
+		await Bun.write(emptyPath, `${JSON.stringify(emptyMetadata, null, 2)}\n`);
+		await rehash(emptyRoot, key, "metadata.json");
+		await expect(verifyStickyViewportShowcase(emptyRoot)).rejects.toThrow("runtime observation mismatch");
+
+		const probeRoot = await cloneBase();
+		const probePath = path.join(probeRoot, key, "metadata.json");
+		const probeMetadata = JSON.parse(await fs.readFile(probePath, "utf8"));
+		probeMetadata.state.resize_probes[0].frame = forge(probeMetadata.state.resize_probes[0].frame.ansi);
+		await Bun.write(probePath, `${JSON.stringify(probeMetadata, null, 2)}\n`);
+		await rehash(probeRoot, key, "metadata.json");
+		await expect(verifyStickyViewportShowcase(probeRoot)).rejects.toThrow("runtime observation mismatch");
+	}, 300_000);
 });
