@@ -193,11 +193,17 @@ const PROVENANCE_SOURCES = [
 // every workspace package the capture reaches (coding-agent → agent, ai,
 // bridge-client, natives, stats, tui, utils), the fixture plus the virtual
 // terminal it paints into, both showcase scripts, and the lockfile pinning the
-// installed dependency versions. Uncommitted edits inside this closure still
+// installed dependency versions, plus the Rust crates behind the native addon:
+// the built `.node` is gitignored, so `packages/natives/native` cannot witness a
+// Rust source edit that changes the paint after a rebuild.
+// Uncommitted edits inside this closure still
 // invalidate a bundle — that is the property the staleness guard exists to
 // enforce. Edits outside it no longer can, because they cannot change the paint.
 export const PROVENANCE_DIFF_SCOPE = [
 	"bun.lock",
+	"crates/pi-ast",
+	"crates/pi-natives",
+	"crates/pi-shell",
 	"packages/agent/src",
 	"packages/ai/src",
 	"packages/bridge-client/src",
