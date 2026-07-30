@@ -248,6 +248,15 @@ type Input = Record<string, unknown>;
 export const isCanonicalSessionId = (value: string): boolean => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 const defaultStateRoot = (cwd: string) => path.join(path.resolve(cwd), ".gjc", "state");
 const hasDefaultStateRoot = (cwd: string, root: string) => path.resolve(root) === defaultStateRoot(cwd);
+function isCanonicalLifecycleRequestPath(cwd: string, root: string, id: string, requestPath: string): boolean {
+	if (!hasDefaultStateRoot(cwd, root)) return false;
+	const directory = path.join(path.resolve(root), "sdk");
+	const resolved = path.resolve(requestPath);
+	if (path.dirname(resolved) !== directory) return false;
+	return new RegExp(
+		`^\\.${escapeRegExp(id)}\\.lifecycle-request\\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.json$`,
+	).test(path.basename(resolved));
+}
 
 export interface SessionLifecycleWorktreeTarget {
 	enabled: true;
@@ -445,6 +454,7 @@ export async function readSessionLifecycleLaunchRequestFile(
 	filePath: string | undefined,
 	now = Date.now(),
 ): Promise<SessionLifecycleLaunchRequest> {
+	let shouldUnlink = false;
 	const requestPath = filePath?.trim();
 	if (!requestPath || !path.isAbsolute(requestPath)) throw new Error("GJC_SDK_LIFECYCLE_REQUEST_FILE is required.");
 	let handle: fs.FileHandle | undefined;
@@ -454,12 +464,15 @@ export async function readSessionLifecycleLaunchRequestFile(
 		if (!stat.isFile() || (process.platform !== "win32" && (stat.mode & 0o077) !== 0))
 			throw new Error("GJC_SDK_LIFECYCLE_REQUEST_FILE is not restrictive.");
 		const value = await handle.readFile("utf8");
-		return readSessionLifecycleLaunchRequest(value, now);
+		const request = readSessionLifecycleLaunchRequest(value, now);
+		shouldUnlink = isCanonicalLifecycleRequestPath(request.cwd, request.stateRoot, request.sessionId, requestPath);
+		return request;
 	} finally {
 		await handle?.close().catch(() => {});
-		await fs.unlink(requestPath).catch(error => {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		});
+		if (shouldUnlink)
+			await fs.unlink(requestPath).catch(error => {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			});
 	}
 }
 

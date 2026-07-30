@@ -16,6 +16,7 @@ import {
 	hasValidLifecycleDeadlines,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
+	readSessionLifecycleLaunchRequestFile,
 	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
 	setProcessIncarnationForTest,
@@ -496,6 +497,31 @@ test("broker derives and validates the exact five-timestamp lifecycle windows", 
 	).toBe(false);
 });
 
+test("session host lifecycle request cleanup only unlinks broker-owned request paths", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-request-cleanup-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "request-cleanup";
+	const request = {
+		operation: "session.create",
+		sessionId,
+		cwd: root,
+		stateRoot,
+		...deriveLifecycleDeadlines(Date.now(), 10_000),
+	} as const;
+	const externalPath = path.join(root, "sensitive.lifecycle-request.json");
+	try {
+		const externalValue = JSON.stringify(request);
+		await fs.writeFile(externalPath, externalValue, { mode: 0o600 });
+		await expect(readSessionLifecycleLaunchRequestFile(externalPath)).resolves.toMatchObject({ sessionId });
+		expect(await fs.readFile(externalPath, "utf8")).toBe(externalValue);
+
+		const requestPath = await writeSessionLifecycleLaunchRequest(stateRoot, sessionId, request);
+		await expect(readSessionLifecycleLaunchRequestFile(requestPath)).resolves.toMatchObject({ sessionId });
+		await expect(fs.stat(requestPath)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
 test("session host exact cutoff writes proven pre-session absence", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-exact-cutoff-"));
 	const agentDir = path.join(root, "agent");
