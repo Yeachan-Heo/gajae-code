@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30
