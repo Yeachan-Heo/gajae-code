@@ -2,11 +2,6 @@
 
 ## [Unreleased]
 
-## [0.12.3] - 2026-07-30
-
-## [0.12.2] - 2026-07-30
-
-## [0.12.1] - 2026-07-29
 ### Added
 
 - `Tui` now exposes renderer-owned viewport observations so tests and evidence capture can assert against committed paint state instead of re-deriving geometry: `getViewportObservation()` (returns a defensive copy of the latest committed observation), `getViewportAnchorSnapshot()`, `getViewportAnchorComponent()`, `getFocusedComponent()`, and `setViewportSelection()`, plus the `TuiViewportObservation` and `MouseSelectionPoint` types.
@@ -18,6 +13,8 @@
 ### Fixed
 
 - The renderer's reported cursor column is now clamped to the last real cell, so it always names a column that exists in the current terminal width. On the wire this is unchanged (a terminal already clamps `CHA` to the last column), but the reported value is now truthful for callers reading it through the viewport observation.
+
+## [0.12.3] - 2026-07-30
 
 ## [0.12.2] - 2026-07-30
 
