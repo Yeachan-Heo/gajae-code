@@ -4517,17 +4517,25 @@ async function continueStalledGjcTeamWorkers(
 				true,
 			);
 			if (revalidationReason) return { kind: "skipped" as const, reason: revalidationReason };
+			// Eligibility validation above proves the worker owns a real pane, but that
+			// runtime proof does not narrow the optional `pane_id` field for the type
+			// checker. Bind it to a proven non-empty local and dispatch through that, so
+			// the frozen argv is `readonly string[]` and both send operations address the
+			// identical pane. A missing pane id here is an eligibility gap, not a
+			// dispatch error, so report it as the same typed skipped outcome.
+			const paneId = worker.pane_id;
+			if (!paneId) return { kind: "skipped" as const, reason: "worker_pane_missing" };
 			try {
-				const args = Object.freeze([
+				const args: readonly string[] = Object.freeze([
 					"send-keys",
 					"-l",
 					"-t",
-					worker.pane_id!,
+					paneId,
 					continuationPrompt,
 					";",
 					"send-keys",
 					"-t",
-					worker.pane_id!,
+					paneId,
 					"Enter",
 				]);
 				const dispatch = await (gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
@@ -4535,13 +4543,13 @@ async function continueStalledGjcTeamWorkers(
 					: (() => {
 							executeTeamTmuxMutation(config, {
 								type: "literal-send",
-								paneId: worker.pane_id!,
+								paneId,
 								text: continuationPrompt,
 								deferredProof: "continuation-outcome",
 							});
 							return executeTeamTmuxMutation(config, {
 								type: "key-send",
-								paneId: worker.pane_id!,
+								paneId,
 								key: "Enter",
 								deferredProof: "continuation-outcome",
 							});
