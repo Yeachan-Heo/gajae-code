@@ -5,7 +5,12 @@ import {
 	semanticAnchorDigest,
 	semanticAnchorNamespace,
 } from "../test/fixtures/tui/sticky-viewport-showcase";
-import { ansiToHtml, xterm256Color } from "./capture-sticky-viewport-showcase";
+import {
+	ansiToHtml,
+	captureProvenance,
+	PROVENANCE_DIFF_SCOPE,
+	xterm256Color,
+} from "./capture-sticky-viewport-showcase";
 
 const KEYS = [
 	"live-overflow/80x24/unicode-color",
@@ -125,31 +130,6 @@ type Style = {
 };
 type Run = { text: string; style: Style };
 const hash = (value: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
-const PROVENANCE_SOURCES = [
-	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
-	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
-	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
-	"packages/coding-agent/src/modes/interactive-mode.ts",
-	"packages/coding-agent/src/modes/components/irc-sidebar.ts",
-	"packages/tui/src/tui.ts",
-] as const;
-async function git(args: string[]): Promise<Uint8Array> {
-	const result = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
-	if ((await result.exited) !== 0) fail(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
-	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
-}
-async function currentProvenance() {
-	const sourceSha256 = Object.fromEntries(
-		await Promise.all(
-			PROVENANCE_SOURCES.map(async source => [source, hash(new Uint8Array(await Bun.file(source).arrayBuffer()))]),
-		),
-	);
-	return {
-		git_head: new TextDecoder().decode(await git(["rev-parse", "HEAD"])).trim(),
-		git_diff_binary_sha256: hash(await git(["diff", "--binary", "HEAD", "--"])),
-		source_sha256: sourceSha256,
-	};
-}
 const cellWidth = (grapheme: string) => {
 	const scalar = grapheme.codePointAt(0)!;
 	if (scalar === 0x200d || (scalar >= 0x300 && scalar <= 0x36f) || (scalar >= 0xfe00 && scalar <= 0xfe0f)) return 0;
@@ -513,7 +493,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		fail("manifest schema or provenance literals mismatch");
 	strings(manifest.ordered_keys, KEYS, "manifest ordered_keys");
 	const provenance = object(manifest.provenance, "manifest provenance");
-	const expectedProvenance = await currentProvenance();
+	const expectedProvenance = await captureProvenance();
 	if (
 		provenance.capture_mode !== "production-tui-virtual-terminal" ||
 		provenance.live_pty !== false ||
@@ -525,8 +505,12 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		!provenance.executor_identity.trim()
 	)
 		fail("manifest provenance mismatch");
+	// `git_diff_scope` is compared against the verifier's own constant, so a bundle
+	// cannot narrow the covered surface to dodge the digest: claiming a smaller
+	// scope than the verifier requires is itself a staleness rejection.
 	if (
 		provenance.git_head !== expectedProvenance.git_head ||
+		JSON.stringify(provenance.git_diff_scope) !== JSON.stringify(PROVENANCE_DIFF_SCOPE) ||
 		provenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
 		JSON.stringify(provenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256)
 	)
@@ -633,6 +617,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			metaProvenance.author_identity !== provenance.author_identity ||
 			metaProvenance.executor_identity !== provenance.executor_identity ||
 			metaProvenance.git_head !== expectedProvenance.git_head ||
+			JSON.stringify(metaProvenance.git_diff_scope) !== JSON.stringify(PROVENANCE_DIFF_SCOPE) ||
 			metaProvenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
 			JSON.stringify(metaProvenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256) ||
 			stateEvidence.composer_visible !== true
@@ -810,6 +795,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 	const reviewProvenance = object(reviewInput.provenance, "review input provenance");
 	if (
 		reviewProvenance.git_head !== expectedProvenance.git_head ||
+		JSON.stringify(reviewProvenance.git_diff_scope) !== JSON.stringify(PROVENANCE_DIFF_SCOPE) ||
 		reviewProvenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
 		JSON.stringify(reviewProvenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256)
 	)
