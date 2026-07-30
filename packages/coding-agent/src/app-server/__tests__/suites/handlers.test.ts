@@ -248,9 +248,10 @@ test("cleanup temp dir", async () => {
 
 // Support-manifest parity in BOTH directions: a row may not claim `implemented` without a
 // dispatchable seam, and a registered handler may not exist without an implemented row.
-// `thread/start`, `thread/resume` and `turn/start` are answered by the server itself rather
-// than the handler registry, so they are the only implemented rows without a registry entry.
-const SERVER_OWNED_METHODS = ["thread/resume", "thread/start", "turn/start"];
+// `initialize`, `thread/start`, `thread/resume` and `turn/start` are answered by the server
+// itself rather than the handler registry, so they are the only implemented rows without a
+// registry entry.
+const SERVER_OWNED_METHODS = ["initialize", "thread/resume", "thread/start", "turn/start"];
 
 test("support manifest and handler registry agree in both directions", () => {
 	const registry = new HandlerRegistry();
