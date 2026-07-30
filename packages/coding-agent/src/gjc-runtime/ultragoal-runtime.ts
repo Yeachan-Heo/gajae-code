@@ -1976,12 +1976,13 @@ async function validateMandatoryComputerAdversarialCases(
 	}
 }
 
-function validateContractCoverage(
+async function validateContractCoverage(
+	cwd: string,
 	executorQa: JsonObject,
 	surfaceEvidence: Map<string, JsonObject>,
 	adversarialCases: Map<string, JsonObject>,
 	artifactRefs: Map<string, JsonObject>,
-): JsonObject[] {
+): Promise<JsonObject[]> {
 	const rows = requireObjectArray(executorQa.contractCoverage, "executorQa.contractCoverage");
 	buildRowIdMap(rows, "executorQa.contractCoverage");
 	let hasSuccessfulContractCoverage = false;
@@ -2021,6 +2022,12 @@ function validateContractCoverage(
 		}
 		if (artifactIds) {
 			requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+			for (const artifactId of artifactIds) {
+				await validateArtifactProof(cwd, artifactRefs.get(artifactId)!, `executorQa.artifactRefs.${artifactId}`, {
+					surfaceFamily: "native",
+					live: false,
+				});
+			}
 			successfulProofLinks += artifactIds.length;
 		}
 		if (successfulProofLinks === 0) {
@@ -2043,7 +2050,13 @@ async function validateExecutorQaRedTeamEvidenceInternal(
 	const artifactRefs = await validateArtifactRefs(cwd, executorQa);
 	const surfaceEvidence = await validateSurfaceEvidence(cwd, executorQa, artifactRefs);
 	const adversarialCases = validateAdversarialCases(executorQa, artifactRefs);
-	const contractCoverage = validateContractCoverage(executorQa, surfaceEvidence, adversarialCases, artifactRefs);
+	const contractCoverage = await validateContractCoverage(
+		cwd,
+		executorQa,
+		surfaceEvidence,
+		adversarialCases,
+		artifactRefs,
+	);
 	if (requiresComputerRedTeamSuite(executorQa, options.changeSet)) {
 		await validateMandatoryComputerAdversarialCases(cwd, contractCoverage, adversarialCases, artifactRefs);
 	}
@@ -4133,7 +4146,9 @@ async function readOptionalExecutorQa(cwd: string, value: string | undefined): P
 }
 
 import {
+	ciDevChangedPathRows,
 	computeCheckpointChangeSet,
+	mergeChangeSetPaths,
 	parseGitNameStatus,
 	parseGitUntrackedPaths,
 	parseUnifiedDiffPaths,
@@ -4142,7 +4157,9 @@ import {
 } from "./ultragoal-change-set";
 
 export {
+	ciDevChangedPathRows,
 	computeCheckpointChangeSet,
+	mergeChangeSetPaths,
 	parseGitNameStatus,
 	parseGitUntrackedPaths,
 	parseUnifiedDiffPaths,
@@ -4175,10 +4192,11 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 	if (kind === "worktree")
 		return {
 			source: "review-worktree",
-			paths: [
-				...parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
-				...parseGitUntrackedPaths(String(source.untracked ?? "")),
-			],
+			paths: mergeChangeSetPaths([
+				parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
+				parseGitUntrackedPaths(String(source.untracked ?? "")),
+				ciDevChangedPathRows(),
+			]),
 			rawDiffStat: typeof source.diffStat === "string" ? source.diffStat : undefined,
 			rawDiff: typeof source.diff === "string" ? source.diff : undefined,
 			captureIncomplete: source.captureIncomplete === true,
@@ -4189,7 +4207,7 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 			source: "review-branch",
 			baseRef: nonEmptyString(source.base) ?? undefined,
 			headRef: "HEAD",
-			paths: parseGitNameStatus(String(source.nameStatus ?? "")),
+			paths: mergeChangeSetPaths([parseGitNameStatus(String(source.nameStatus ?? "")), ciDevChangedPathRows()]),
 			rawDiffStat: typeof source.diffStat === "string" ? source.diffStat : undefined,
 			rawDiff: typeof source.diff === "string" ? source.diff : undefined,
 			captureIncomplete: source.captureIncomplete === true,

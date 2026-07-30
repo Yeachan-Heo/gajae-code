@@ -5187,6 +5187,30 @@ describe("native GJC ultragoal runtime", () => {
 		expect(surfaceError).toContain("executorQa.surfaceEvidence[0].artifactRefs");
 		expect(coverageError).toContain("executorQa.contractCoverage[0].surfaceEvidenceRefs");
 	});
+	it("rejects artifact-only contract coverage when the artifact file is missing", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const qa = JSON.parse(passingQualityGate()).executorQa as Record<string, unknown>;
+		const artifactRefs = qa.artifactRefs as Array<Record<string, unknown>>;
+		artifactRefs.push({
+			id: "missing-proof",
+			kind: "failure-mode-test",
+			path: "artifacts/missing-proof.txt",
+			description: "missing proof",
+		});
+		qa.contractCoverage = [
+			{
+				id: "artifact-only",
+				contractRef: "approved-plan:goal",
+				obligation: "artifact-only proof must exist",
+				status: "covered",
+				artifactRefs: ["missing-proof"],
+			},
+		];
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
+			"must reference an existing non-empty artifact path",
+		);
+	});
 
 	it("enforces not-applicable and surface artifact compatibility rules", async () => {
 		const root = await tempDir();
@@ -6229,5 +6253,17 @@ describe("resolveGitBase nearest integration base", () => {
 		await commit(dir, "feature.txt", "feature work");
 
 		expect(await resolveGitBase(dir, "main")).toBe("main");
+	});
+
+	it("rejects repositories without a recognized integration base", async () => {
+		const dir = await tempDir();
+		await git(dir, ["init"]);
+		await git(dir, ["config", "user.email", "test@example.com"]);
+		await git(dir, ["config", "user.name", "Test User"]);
+		await Bun.write(path.join(dir, "README.md"), "initial\n");
+		await git(dir, ["add", "README.md"]);
+		await git(dir, ["commit", "-m", "initial"]);
+		await git(dir, ["branch", "-m", "feature-only"]);
+		await expect(resolveGitBase(dir)).rejects.toThrow("authoritative integration base");
 	});
 });

@@ -60,9 +60,7 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 		}
 		if (best) return best.ref;
 	}
-	const mergeBase = await spawnText(["git", "merge-base", "HEAD", "origin/main"], { cwd, timeoutMs: 3000 });
-	if (mergeBase.ok && mergeBase.stdout.trim()) return mergeBase.stdout.trim();
-	return "HEAD~1";
+	throw new Error("unable to resolve an authoritative integration base");
 }
 
 export function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
@@ -121,7 +119,7 @@ export function parseGitUntrackedPaths(output: string): UltragoalChangeSetPath[]
 		}));
 }
 
-function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
+export function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 	const raw = process.env.CI_DEV_CHANGED_PATHS;
 	if (!raw) return [];
 	return raw
@@ -134,7 +132,7 @@ function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 		}));
 }
 
-function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChangeSetPath[] {
+export function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChangeSetPath[] {
 	const byKey = new Map<string, UltragoalChangeSetPath>();
 	for (const row of groups.flat()) byKey.set(`${row.oldPath ?? ""}\u0000${row.path}`, row);
 	return [...byKey.values()];

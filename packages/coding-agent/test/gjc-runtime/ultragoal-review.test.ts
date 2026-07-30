@@ -379,6 +379,25 @@ describe("ultragoal review command", () => {
 		expect(output.verdict).toBe("fail");
 		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
+	it("review branch merges CI-only protected paths", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/src/tools/index.ts";
+		try {
+			const output = await review(root, [
+				"--branch",
+				"HEAD",
+				"--executor-qa-json",
+				await writeQa(root, validExecutorQa()),
+			]);
+			expect(output.verdict).toBe("fail");
+			expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+		} finally {
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+		}
+	});
 	it("rejects an unresolved review branch with and without a spec", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);
