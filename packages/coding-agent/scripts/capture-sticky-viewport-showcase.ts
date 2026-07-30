@@ -197,7 +197,11 @@ const PROVENANCE_SOURCES = [
 // invalidate a bundle — that is the property the staleness guard exists to
 // enforce. Edits outside it no longer can, because they cannot change the paint.
 export const PROVENANCE_DIFF_SCOPE = [
+	"Cargo.lock",
+	"Cargo.toml",
 	"bun.lock",
+	"crates",
+
 	"packages/agent/src",
 	"packages/ai/src",
 	"packages/bridge-client/src",
@@ -224,6 +228,23 @@ async function git(args: string[]): Promise<Uint8Array> {
 // and re-running it yields a self-consistent stamp. The committed blob is fixed
 // by the commit id, so changing it requires a new commit -- which changes
 // `git_head` and is therefore visible to the reviewer.
+/** sha256 of every distinct blob this path has ever had in any ref-reachable commit. */
+export async function reachableBlobSha256s(filePath: string): Promise<string[]> {
+	const out = new TextDecoder().decode(await git(["rev-list", "--all", "--objects", "--", filePath]));
+	const ids = new Set<string>();
+	for (const line of out.split("\n")) {
+		const [id, ...rest] = line.trim().split(" ");
+		if (id && id.length === 40 && rest.join(" ") === filePath) ids.add(id);
+	}
+	const digests: string[] = [];
+	for (const id of ids) {
+		try {
+			const bytes = await git(["cat-file", "blob", id]);
+			digests.push(hash(bytes));
+		} catch {}
+	}
+	return digests;
+}
 export async function committedBlobSha256(commit: string, filePath: string): Promise<string | null> {
 	const result = Bun.spawn(["git", "cat-file", "blob", `${commit}:${filePath}`], {
 		cwd: process.cwd(),

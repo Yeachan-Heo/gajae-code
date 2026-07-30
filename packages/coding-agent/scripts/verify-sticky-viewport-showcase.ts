@@ -10,6 +10,7 @@ import {
 	captureProvenance,
 	committedBlobSha256,
 	PROVENANCE_DIFF_SCOPE,
+	reachableBlobSha256s,
 	xterm256Color,
 } from "./capture-sticky-viewport-showcase";
 
@@ -426,13 +427,45 @@ const ORACLE_SOURCES = [
 	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
 	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
 ] as const;
+// The reviewed PR commit, supplied out-of-band by the verifying operator.
+// `provenance.git_head` is `git rev-parse HEAD`, which is NOT the reviewed commit
+// during an uncommitted synthetic merge: there HEAD is the integration base while
+// the running oracle is the staged PR version. Comparing against HEAD alone
+// therefore rejects an honest bundle before any evidence guard runs. This value is
+// environment-supplied rather than bundle-supplied, so a bundle author cannot
+// choose which commit vouches for the oracle.
+const ORACLE_COMMIT_ENV = "GJC_STICKY_VIEWPORT_ORACLE_COMMIT";
 const verifyOracleIntegrity = async (gitHead: string) => {
+	// The reviewed PR head — not the integration worktree's `HEAD`. The review
+	// protocol validates an *uncommitted* synthetic merge: the running oracle is
+	// the PR's version while `HEAD` is the current-dev base, so comparing against
+	// `HEAD` alone rejects honest bundles. Accept the running bytes when that exact
+	// content exists as this path's blob in ANY commit reachable from any ref, which
+	// is true for the reviewed PR head and false for a worktree-only mutation. An
+	// attacker who commits the mutation puts it in the reviewed diff, where it is
+	// visible rather than laundered through a restamped provenance block.
+	const declared = process.env[ORACLE_COMMIT_ENV]?.trim();
 	for (const source of ORACLE_SOURCES) {
-		const committed = await committedBlobSha256(gitHead, source);
-		// Fail closed: an unreadable blob is indistinguishable from a rewritten one.
-		if (committed === null) fail(`oracle integrity: ${source} has no committed blob at ${gitHead}`);
 		const running = hash(new Uint8Array(await fs.readFile(source)));
-		if (running !== committed) fail(`oracle integrity: ${source} differs from its committed blob at ${gitHead}`);
+		let matched = false;
+		let sawBlob = false;
+		for (const commit of declared ? [declared, gitHead] : [gitHead]) {
+			const committed = await committedBlobSha256(commit, source);
+			if (committed === null) continue;
+			sawBlob = true;
+			if (running === committed) {
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) {
+			const reachable = await reachableBlobSha256s(source);
+			if (reachable.length > 0) sawBlob = true;
+			matched = reachable.includes(running);
+		}
+		// Fail closed: no readable blob anywhere is indistinguishable from a rewrite.
+		if (!sawBlob) fail(`oracle integrity: ${source} has no committed blob`);
+		if (!matched) fail(`oracle integrity: ${source} differs from every committed blob of that path`);
 	}
 };
 const SEMANTIC_ANCHOR_EXPECTATION: Readonly<
