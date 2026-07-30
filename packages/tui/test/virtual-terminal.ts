@@ -261,7 +261,6 @@ export class VirtualTerminal implements Terminal {
 		return `${rows.join("\n")}\n`;
 	}
 
-	/** Returns the hardware cursor position from the emulated terminal's active viewport. */
 	/**
 	 * Get the entire scroll buffer
 	 */

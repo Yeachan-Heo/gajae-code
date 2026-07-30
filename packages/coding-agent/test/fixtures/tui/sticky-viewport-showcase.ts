@@ -90,8 +90,29 @@ const semanticRootIds = (mode: InteractiveMode) =>
 		if (child === mode.hookWidgetContainerBelow) return "hooks-below";
 		throw new Error("unexpected production root child");
 	});
-const captureFrame = (terminal: VirtualTerminal) => {
-	const ansi = terminal.getViewportAnsi();
+// Every persisted frame must be canonical for its render mode, not just the
+// top-level payload. `metadata.json` is a required manifest artifact, so raw
+// frames here would make the whole bundle host-dependent: theme.ts emits SGR
+// directly and `detectColorMode()` picks truecolor vs indexed `38;5;n` from
+// COLORTERM/TERM. Stripping at the single capture point keeps
+// `visible_empty_irc_frame` and every resize probe byte-identical across hosts.
+const canonicalAnchorId = (anchor: {
+	id: string;
+	graphemeStart: number;
+	graphemeEnd: number;
+	cellStart: number;
+	cellEnd: number;
+}) => {
+	const namespace = anchor.id.split(":").slice(0, -1).join(":");
+	const digest = new Bun.CryptoHasher("sha256")
+		.update(`${anchor.graphemeStart}:${anchor.graphemeEnd}:${anchor.cellStart}:${anchor.cellEnd}`)
+		.digest("hex")
+		.slice(0, 8);
+	return namespace ? `${namespace}:${digest}` : digest;
+};
+const captureFrame = (terminal: VirtualTerminal, renderMode: StickyViewportShowcaseEntry["renderMode"]) => {
+	const raw = terminal.getViewportAnsi();
+	const ansi = renderMode === "ascii-no-color" ? Bun.stripANSI(raw) : raw;
 	return {
 		ansi,
 		text: Bun.stripANSI(ansi),
@@ -216,7 +237,7 @@ export async function renderStickyViewportShowcase(
 		mode.ircLedger.reset();
 		mode.ui.requestResizeRender();
 		await terminal.waitForRender();
-		const visibleEmptyIrcFrame = captureFrame(terminal);
+		const visibleEmptyIrcFrame = captureFrame(terminal, entry.renderMode);
 		for (const probe of PROBES) {
 			terminal.resize(probe.columns, probe.rows);
 			mode.ircLedger.reset();
@@ -256,7 +277,7 @@ export async function renderStickyViewportShowcase(
 				);
 			mode.ui.requestResizeRender();
 			await terminal.waitForRender();
-			const frame = captureFrame(terminal);
+			const frame = captureFrame(terminal, entry.renderMode);
 			const sidebarVisible = probe.columns >= 65;
 			const layout = computeIrcWorkLaneWidths(probe.columns, sidebarVisible);
 			resizeProbes.push({
@@ -382,7 +403,12 @@ export async function renderStickyViewportShowcase(
 					: null,
 				semantic_anchor: anchor
 					? {
-							id: anchor.id,
+							// `anchor.id` embeds a per-run session entry id, so persisting it raw
+							// makes the required metadata artifact differ between two captures on
+							// the SAME host. Keep the semantic namespace and replace only the
+							// volatile suffix with a digest of the anchor's own geometry, so the
+							// bundle is reproducible while distinct anchors stay distinguishable.
+							id: canonicalAnchorId(anchor),
 							grapheme_start: anchor.graphemeStart,
 							cell_start: anchor.cellStart,
 							frame_start_row: anchor.frameRow,
