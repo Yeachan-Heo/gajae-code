@@ -20,6 +20,13 @@
 ### Fixed
 
 - The renderer's reported cursor column is now clamped to the last real cell, so it always names a column that exists in the current terminal width. On the wire this is unchanged (a terminal already clamps `CHA` to the last column), but the reported value is now truthful for callers reading it through the viewport observation.
+
+## [0.12.2] - 2026-07-30
+
+## [0.12.1] - 2026-07-29
+
+### Fixed
+
 - Kitty/Ghostty inline images no longer remain visually pinned when sticky or semantic viewport repaints move their anchors into application scrollback. The renderer now soft-deletes only the named placement from the old viewport, retains uploaded pixels for history replay, and keeps placement tracking aligned across unresolved-anchor and follow-live transitions.
 
 ## [0.12.0] - 2026-07-28
