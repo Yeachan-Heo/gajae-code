@@ -713,6 +713,44 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
+	it("revalidates a retained scrubbed root immediately before transcript unlink", async () => {
+		const transcriptPath = await createTranscript("retained-boundary");
+		const retainedRoot = path.join(tempDir, ".gjc-delete-retained-boundary-artifacts.removing");
+		await fsp.mkdir(retainedRoot);
+		await Bun.write(path.join(retainedRoot, "artifact.txt"), "");
+		const retainedStat = fs.lstatSync(retainedRoot, { bigint: true });
+		const retainedTree = native.snapshotDirectoryTree(retainedRoot);
+		if (!retainedTree.ok || !retainedTree.snapshot) throw new Error("Missing retained tree snapshot");
+		await Bun.write(path.join(retainedRoot, "successor.txt"), "successor payload");
+
+		const error = await storage
+			.deleteSessionVerified({
+				sessionsRoot: tempDir,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: tempDir,
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+				artifactsRemoved: true,
+				expectedArtifactsIdentity: {
+					dev: retainedStat.dev,
+					ino: retainedStat.ino,
+					size: Number(retainedStat.size),
+					mtimeNs: retainedStat.mtimeNs,
+					sha256: "",
+				},
+				expectedArtifactsTree: retainedTree.snapshot,
+				detachedArtifactsPath: retainedRoot,
+				plannedArtifactsPath: path.join(tempDir, ".gjc-delete-retained-boundary-artifacts"),
+				plannedTranscriptPath: path.join(tempDir, ".gjc-delete-retained-boundary-transcript"),
+			})
+			.catch(value => value);
+
+		expect(error).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((error as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+		expect(await Bun.file(path.join(retainedRoot, "successor.txt")).text()).toBe("successor payload");
+	});
+
 	it.skipIf(process.platform !== "linux")(
 		"does not report artifacts removed before the session parent is durable",
 		async () => {
