@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { Agent, AgentBusyError } from "@gajae-code/agent-core";
+import { Agent, AgentBusyError, type AgentTool } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -9,6 +9,7 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
@@ -85,6 +86,12 @@ describe("AgentSession auto-retry busy recovery", () => {
 			settings,
 			modelRegistry,
 		});
+		const handles: string[] = [];
+		const terminalEvents: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_start" && agent.activeResourceRunId) handles.push(agent.activeResourceRunId);
+			if (event.type === "agent_end") terminalEvents.push(event);
+		});
 
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -100,11 +107,22 @@ describe("AgentSession auto-retry busy recovery", () => {
 		expect(session.isRetrying).toBe(false);
 		// The aborted retry is reported as a failure so the UI can clean up.
 		expect(retryEndEvents.at(-1)).toMatchObject({ success: false });
+		expect(handles).toHaveLength(1);
+		expect(terminalEvents).toHaveLength(1);
+		expect(await agent.resourceLedger.waitForSettlement(handles[0]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
 
 		// The actual user-visible symptom: subsequent prompts must work, not throw
 		// AgentBusyError forever.
 		await session.prompt("second message");
 		expect(session.isStreaming).toBe(false);
+		expect(handles).toHaveLength(2);
+		expect(handles[0]).not.toBe(handles[1]);
+		expect(terminalEvents).toHaveLength(2);
+		expect(await agent.resourceLedger.waitForSettlement(handles[1]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
 	});
 
 	it("recovers a later retryable error normally after a prior retry was abandoned", async () => {
@@ -214,6 +232,121 @@ describe("AgentSession auto-retry busy recovery", () => {
 		expect(session.isStreaming).toBe(false);
 	});
 
+	it("settles A before its accepted retry successor B completes", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const heldToolStarted = Promise.withResolvers<void>();
+		const releaseHeldTool = Promise.withResolvers<void>();
+		const holdTool: AgentTool = {
+			name: "hold",
+			label: "Hold",
+			description: "Holds the accepted retry successor open",
+			parameters: z.object({}),
+			execute: async () => {
+				heldToolStarted.resolve();
+				await releaseHeldTool.promise;
+				return { content: [{ type: "text" as const, text: "released" }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
+				{ content: [{ type: "toolCall", name: "hold", arguments: {} }] },
+				{ content: ["retry successor completed"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [holdTool], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 5_000,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const handles: string[] = [];
+		const domains = new Map<string, AbortSignal>();
+		session.subscribe(event => {
+			if (event.type !== "agent_start" || !agent.activeResourceRunId) return;
+			const handle = agent.activeResourceRunId;
+			handles.push(handle);
+			const domain = agent.resourceLedger.lookupDomain(handle);
+			if (domain) domains.set(handle, domain.signal);
+		});
+
+		const prompt = session.prompt("retry with held successor");
+		let firstHandle: string | undefined;
+		let successorHandle: string | undefined;
+		try {
+			await heldToolStarted.promise;
+
+			expect(handles).toHaveLength(2);
+			[firstHandle, successorHandle] = handles;
+			const firstSignal = domains.get(firstHandle!);
+			const successorSignal = domains.get(successorHandle!);
+			expect(firstSignal).toBeDefined();
+			expect(successorSignal).toBeDefined();
+			expect(firstSignal).not.toBe(successorSignal);
+			expect(firstSignal?.aborted).toBe(false);
+			expect(successorSignal?.aborted).toBe(false);
+			expect(await agent.resourceLedger.waitForSettlement(firstHandle!, { graceMs: 100 })).toEqual({
+				status: "settled",
+			});
+		} finally {
+			releaseHeldTool.resolve();
+			await prompt;
+		}
+		await session.waitForIdle();
+		expect(await agent.resourceLedger.waitForSettlement(successorHandle!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+	});
+	it("keeps a retry predecessor settled and terminally distinct from its successor", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const mock = createMockModel({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
+				{ content: ["retry successor succeeded"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 5_000,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const handles: string[] = [];
+		const terminalEvents: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_start" && agent.activeResourceRunId) handles.push(agent.activeResourceRunId);
+			if (event.type === "agent_end") terminalEvents.push(event);
+		});
+
+		await session.prompt("retry with an owned successor");
+		await session.waitForIdle();
+
+		expect(handles).toHaveLength(2);
+		expect(handles[0]).not.toBe(handles[1]);
+		expect(await agent.resourceLedger.waitForSettlement(handles[0]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+		expect(await agent.resourceLedger.waitForSettlement(handles[1]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+		expect(terminalEvents).toHaveLength(1);
+	});
 	it("does not wedge when an auto-retry recovers on a turn ending with a successful yield", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");

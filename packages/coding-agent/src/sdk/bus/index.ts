@@ -27,7 +27,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { ThinkingLevel } from "@gajae-code/agent-core";
+import { type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
@@ -115,6 +115,25 @@ export {
 	runIdentityControlSuccessPath,
 	runIdentityControlTerminalPath,
 } from "./control-drain-lease";
+
+const PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT = 8;
+const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
+
+export function formatPromptSettlementDiagnostic(
+	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
+	now = Date.now(),
+): string {
+	const pending = proof.pending.slice(0, PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT).map(entry => ({
+		kind: entry.kind,
+		labelHash: crypto.createHash("sha256").update(entry.label).digest("hex").slice(0, 16),
+		ageMs: Math.max(0, Math.min(PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS, now - entry.registeredAt)),
+	}));
+	return JSON.stringify({
+		reason: proof.reason,
+		pending,
+		omitted: Math.max(0, proof.pending.length - pending.length),
+	});
+}
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -3990,10 +4009,7 @@ export function createNotificationsExtension(
 			submission.phase = "terminalizing";
 			if (options.fence) {
 				const seam = ctx as typeof ctx & {
-					abortPromptAndWait?: (
-						handle: string,
-						options: { graceMs: number },
-					) => Promise<{ status: "settled" } | { status: "unfenced" }>;
+					abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 				};
 				// Only the handle captured for this correlation may be fenced; a later run
 				// must never be aborted by an older prompt's cleanup.
@@ -4006,7 +4022,7 @@ export function createNotificationsExtension(
 					);
 					return;
 				}
-				let proof: { status: "settled" } | { status: "unfenced" };
+				let proof: RunSettlementProof;
 				try {
 					proof = await seam.abortPromptAndWait(submission.executionHandle, {
 						graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
@@ -4022,6 +4038,7 @@ export function createNotificationsExtension(
 					return;
 				}
 				if (proof?.status !== "settled") {
+					logger.warn(`sdk: prompt resource settlement unfenced: ${formatPromptSettlementDiagnostic(proof)}`);
 					// No settlement proof: never publish a normal terminal. The durable
 					// pending claim stays active so restart recovery finalizes it.
 					failPromptClosed(

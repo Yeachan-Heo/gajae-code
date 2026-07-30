@@ -41,10 +41,27 @@ projection-only: it must never infer a terminal outcome from `activity`, prose,
 `paused`, `exhausted`, or local cancel flags.
 
 The SDK durably claims a pending prompt outcome before cleanup, finalizes that
-claim exactly once, and fences terminalization to the prompt handle. An ACP
-adapter may project only that finalized SDK outcome. If a resource remains
-unsettled after the fixed terminalization grace, the endpoint fails closed; it
-must not fabricate a terminal result.
+claim exactly once, and fences terminalization to the prompt's accepted execution
+handle. Each logical handle has one immutable cancellation domain and one latched
+`AbortSignal`; provider, tool, terminal-publication, and prompt-owned follow-up
+producers derive their signal from that domain rather than accepting a mutable
+session-global signal.
+
+Agent-managed runs have one seal owner: terminal publication reserves ownership
+before synchronous listeners run, closes publication discovery even when a
+listener throws, and seals once in the Agent finalizer. Producer claims and forks
+fail closed when the handle/domain is missing, sealed, quarantined, duplicated,
+mismatched, or already closed; rejected descendants must not be scheduled.
+Standalone loops retain the same domain across maintenance continuations and must
+either reach one final seal or explicitly abandon and quarantine the lifecycle.
+
+ACP waits once for the fixed 10-second terminalization grace. If settlement is
+not proven, the SDK preserves the generic `terminal_uncertain`/connection-closed
+contract and does not fabricate a terminal result. Internal diagnostics may
+include only the typed settlement reason plus at most eight resource kinds,
+hashed labels, clamped ages, and an omitted count; raw labels, prompts, provider
+identifiers, tool arguments, paths, credentials, and other wire-visible details
+must never be logged.
 
 ## Coordinator MCP routing
 

@@ -426,6 +426,31 @@ for (const terminalType of ["agent_end", "agent_failed"] as const) {
 	});
 }
 
+test("ACP preserves the fixed settlement-grace invalid-terminal rejection", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "unsettled prompt resources");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: {
+				code: "terminal_uncertain",
+				message: "Prompt resources did not settle before the terminalization grace expired.",
+			},
+		});
+		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
+			code: "connection_closed",
+			message:
+				"ACP prompt terminal was invalid: Prompt resources did not settle before the terminalization grace expired.",
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP suppresses partial and duplicate terminals after settlement", async () => {
 	const fixture = await createFixture();
 	try {
