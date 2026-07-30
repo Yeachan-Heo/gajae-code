@@ -332,7 +332,11 @@ describe("computer red-team fixture matrix", () => {
 				],
 			}),
 		).catch(error => String(error));
-		expect(message).toContain("COMPUTER_REDTEAM_INLINE_ONLY");
+		// Adversarial coverage is fail-closed on path existence before the computer-specific
+		// COMPUTER_REDTEAM_INLINE_ONLY taxonomy can fire (#3541/#3543).
+		expect(message).toContain(
+			"qualityGate executorQa.artifactRefs.case-proof adversarial coverage requires an existing non-empty file",
+		);
 	});
 
 	it("passes full valid computer gate", async () => {
