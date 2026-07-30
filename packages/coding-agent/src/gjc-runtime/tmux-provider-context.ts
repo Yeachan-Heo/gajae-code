@@ -285,6 +285,38 @@ function recordFor(authority: ProviderAuthority): ProviderRecord {
 }
 
 /** Persist an immutable, generation-scoped authority before generation publication. Native tmux needs no record. */
+// A retained lock descriptor for this exact authority name means another writer
+// is mid-publish. Its lease may already be expired while its owner process is
+// still alive — a paused or slow writer — and stealing in that window would let
+// two writers publish the same generation-scoped authority. Expiry alone is
+// therefore not permission to proceed: only an owner that is definitely gone
+// releases the name. This is deliberately local to the psmux authority path so
+// it does not depend on the managed-storage lease helpers.
+function migrationBusyIfLiveHolder(locksDirectory: string, name: string): void {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(path.join(locksDirectory, `${name}.lock`), "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw new Error("migration_busy");
+	}
+	let holder: { pid?: unknown } | undefined;
+	try {
+		holder = JSON.parse(raw) as { pid?: unknown };
+	} catch {
+		// An unreadable descriptor is indistinguishable from a live one.
+		throw new Error("migration_busy");
+	}
+	const pid = typeof holder?.pid === "number" && Number.isInteger(holder.pid) ? holder.pid : undefined;
+	if (pid === undefined) throw new Error("migration_busy");
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		// ESRCH proves the owner is gone; EPERM proves it is alive under another uid.
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+	}
+	throw new Error("migration_busy");
+}
 export function persistGjcTmuxProviderAuthoritySync(authority: ProviderAuthority): void {
 	if (authority.kind !== "windows-psmux") return;
 	requireWindowsAuthorityPlatform();
@@ -292,6 +324,7 @@ export function persistGjcTmuxProviderAuthoritySync(authority: ProviderAuthority
 	const bytes = new TextEncoder().encode(JSON.stringify(recordFor(authority)));
 	const name = authorityName(authority.generation);
 	const managedRoot = prepareWindowsAuthorityRoot(root);
+	migrationBusyIfLiveHolder(path.join(managedRoot.canonicalPath, "provider-authority-locks"), name);
 	// `publishManagedFileNoReplaceSync` is create-without-clobber, so it is itself
 	// the mutual exclusion for this generation-scoped authority: a second writer
 	// loses the create rather than racing a separate lock file. The readback below
