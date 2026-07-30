@@ -4160,7 +4160,7 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 			paths,
 			rawDiffStat: source.diff,
 			rawDiff: source.diff,
-			captureIncomplete: source.captureIncomplete === true || (source.diff.length > 0 && paths.length === 0),
+			captureIncomplete: true,
 			trusted: true,
 		};
 	}

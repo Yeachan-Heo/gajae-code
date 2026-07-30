@@ -463,6 +463,28 @@ export function isToolAllowed(name: string): boolean {
 		}
 	});
 
+	it("preserves CI shared-registry paths alongside unrelated Git rows", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(root, "README.md", "unrelated local change\n");
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/src/config/settings-schema.ts";
+		try {
+			const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+				row => row.id !== "blast-radius",
+			);
+			const message = await checkpoint(root, executorQa({ computerTouching: false, cases })).catch(error =>
+				String(error),
+			);
+			expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+		} finally {
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+		}
+	});
+
 	it("fails settings classification closed when full diff bytes cannot be decoded", async () => {
 		const root = await tempDir();
 		await initRepo(root);

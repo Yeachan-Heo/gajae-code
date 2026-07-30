@@ -179,13 +179,13 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 			trusted: true,
 		};
 	}
-	const gitPaths = mergeChangeSetPaths([
+	const paths = mergeChangeSetPaths([
 		parseGitNameStatus(committed.stdout),
 		parseGitNameStatus(unstaged.stdout),
 		parseGitNameStatus(staged.stdout),
 		parseGitUntrackedPaths(untracked.stdout),
+		ciChangedPaths,
 	]);
-	const paths = gitPaths.length > 0 ? gitPaths : ciChangedPaths;
 	return {
 		source: "checkpoint-git",
 		baseRef,

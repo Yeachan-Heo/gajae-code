@@ -327,6 +327,29 @@ describe("ultragoal review command", () => {
 		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
 
+	it("PR patch review requires computer QA because patch inventory is non-authoritative", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const qaPath = await writeQa(root, validExecutorQa());
+		const fakeBin = path.join(root, "fake-bin");
+		await fs.mkdir(fakeBin);
+		const ghPath = path.join(fakeBin, "gh");
+		await fs.writeFile(
+			ghPath,
+			`#!/bin/sh\nif [ "$2" = "view" ]; then printf '{"title":"test","body":"","baseRefName":"dev"}'; else printf 'diff --git a/README.md b/README.md\\n--- a/README.md\\n+++ b/README.md\\n@@ -1 +1 @@\\n-old\\n+new\\n'; fi\n`,
+			{ mode: 0o755 },
+		);
+		const savedPath = process.env.PATH;
+		process.env.PATH = `${fakeBin}${path.delimiter}${savedPath ?? ""}`;
+		try {
+			const output = await review(root, ["--pr", "123", "--executor-qa-json", qaPath]);
+			expect(output.verdict).toBe("inconclusive: weak-contract");
+		} finally {
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+		}
+	});
+
 	it("uses spec override as a strong contract and allows clean pass", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);
