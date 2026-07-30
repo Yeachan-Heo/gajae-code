@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { renameSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { NotificationServer } from "@gajae-code/natives";
@@ -752,6 +752,7 @@ test("lifecycle request files require a verified Windows user DACL before public
 			platform: "win32",
 			runCommand(command, args) {
 				calls.push({ command, args });
+				expect(readFileSync(String(args.at(-1)), "utf8")).toBe("");
 				return { exitCode: 0, stdout: "GJC_LIFECYCLE_REQUEST_DACL_OK\n" };
 			},
 		});

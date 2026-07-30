@@ -479,11 +479,11 @@ export async function writeSessionLifecycleLaunchRequest(
 	);
 	let closed = false;
 	try {
+		protectLifecycleRequestFile(requestPath, options);
 		await handle.writeFile(JSON.stringify(request));
 		await handle.sync();
 		await handle.close();
 		closed = true;
-		protectLifecycleRequestFile(requestPath, options);
 	} catch (error) {
 		if (!closed) {
 			await handle.close().catch(() => {});
