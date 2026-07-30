@@ -202,8 +202,12 @@ const PROVENANCE_SOURCES = [
 // invalidate a bundle — that is the property the staleness guard exists to
 // enforce. Edits outside it no longer can, because they cannot change the paint.
 export const PROVENANCE_DIFF_SCOPE = [
+	"Cargo.lock",
+	"Cargo.toml",
 	"bun.lock",
+	"crates/gjc-sdk",
 	"crates/pi-ast",
+	"crates/pi-iso",
 	"crates/pi-natives",
 	"crates/pi-shell",
 	"packages/agent/src",
@@ -214,6 +218,7 @@ export const PROVENANCE_DIFF_SCOPE = [
 	"packages/coding-agent/src",
 	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
 	"packages/natives/native",
+	"packages/natives/scripts",
 	"packages/stats/src",
 	"packages/tui/src",
 	"packages/tui/test/virtual-terminal.ts",
