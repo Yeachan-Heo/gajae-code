@@ -7,11 +7,12 @@
  * dir is owned by the test and rooted under an isolated temp root, so session
  * transcripts and artifacts never land in the developer's real `~/.gjc`.
  *
- * Over the public SDK surface, this proves both outcomes against a real subprocess:
- * advertisement, complete deletion of an artifact-free session, and fail-closed
- * `cleanup_pending` rejection when an artifact payload can only be detached to
- * retained quarantine evidence. Strict unit tests in `acp-agent.test.ts` remain
- * the authority proof for duplicate/identity/close-state edge cases.
+ * Over the public SDK 1.2.1 surface (`ClientSideConnection` / `ndJsonStream`)
+ * this proves the full lifecycle against a real subprocess: capability
+ * advertisement → create → explicit scoped list → artifact creation → delete →
+ * post-delete list absence → transcript/artifact absence → repeat-delete no-op
+ * `{}` → unknown-delete no-op `{}`. Strict unit tests in `acp-agent.test.ts`
+ * remain the authority proof for the duplicate/identity/close-state edge cases.
  *
  * No process-global env mutation, no gates/formatters/commits/pushes.
  */
@@ -273,7 +274,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 		}
 	}, 60_000);
 
-	it("create → list → delete → absence → repeat/unknown no-op over stdio", async () => {
+	it("create → list → artifact → delete → absence → repeat/unknown no-op over stdio", async () => {
 		const oracle = await spawnOracle();
 		const { connection, workspace, root } = oracle;
 		try {
@@ -300,6 +301,13 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			expect(transcripts).toHaveLength(1);
 			const sessionPath = transcripts[0]!;
 
+			// Artifact creation in the sibling artifacts directory (strip ".jsonl").
+			const artifactsDir = sessionPath.slice(0, -6);
+			await fs.promises.mkdir(artifactsDir, { recursive: true });
+			const artifactPath = path.join(artifactsDir, "oracle.txt");
+			await fs.promises.writeFile(artifactPath, "artifact");
+			expect(fs.existsSync(artifactPath)).toBe(true);
+
 			// Delete it.
 			const deleteResult = await connection.deleteSession({ sessionId });
 			expect(deleteResult).toEqual({});
@@ -308,9 +316,10 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			const listAfter = await connection.listSessions({ cwd: workspace });
 			expect(listAfter.sessions.map(session => session.sessionId)).not.toContain(sessionId);
 
-			// Transcript and its empty artifacts directory are gone.
+			// Transcript and its artifacts directory (and artifact) are gone.
 			expect(fs.existsSync(sessionPath)).toBe(false);
-			expect(fs.existsSync(sessionPath.slice(0, -6))).toBe(false);
+			expect(fs.existsSync(artifactsDir)).toBe(false);
+			expect(fs.existsSync(artifactPath)).toBe(false);
 
 			// Repeat delete of the now-absent id is a no-op {}.
 			const repeatDelete = await connection.deleteSession({ sessionId });
@@ -319,35 +328,6 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			// Delete of an id that never existed is also {}.
 			const unknownDelete = await connection.deleteSession({ sessionId: "never-existed" });
 			expect(unknownDelete).toEqual({});
-		} catch (error) {
-			rethrowWithStderr(oracle, error);
-		}
-	}, 60_000);
-
-	it("fails closed when artifact payload deletion remains cleanup_pending", async () => {
-		const oracle = await spawnOracle();
-		const { connection, workspace, root } = oracle;
-		try {
-			await connection.initialize({ protocolVersion: 1, clientCapabilities: {} });
-			const { sessionId } = await connection.newSession({ cwd: workspace, mcpServers: [] });
-			const transcripts = await Array.fromAsync(
-				new Bun.Glob("**/*.jsonl").scan({
-					cwd: path.join(root, "agent", "sessions"),
-					absolute: true,
-					onlyFiles: true,
-				}),
-			);
-			expect(transcripts).toHaveLength(1);
-			const sessionPath = transcripts[0]!;
-			const artifactsDir = sessionPath.slice(0, -6);
-			await fs.promises.mkdir(artifactsDir, { recursive: true });
-			await fs.promises.writeFile(path.join(artifactsDir, "oracle.txt"), "artifact");
-
-			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Saved session cleanup is pending in artifacts",
-			);
-			expect(fs.existsSync(sessionPath)).toBe(true);
-			expect(fs.existsSync(artifactsDir)).toBe(false);
 		} catch (error) {
 			rethrowWithStderr(oracle, error);
 		}

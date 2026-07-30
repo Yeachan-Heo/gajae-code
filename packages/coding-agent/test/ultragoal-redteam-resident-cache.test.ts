@@ -292,10 +292,6 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 			const forkedArtifacts = forked.newSessionFile.slice(0, -6);
 			expect(await Bun.file(path.join(forkedArtifacts, "kept.txt")).text()).toBe("keep");
 			expect(fs.existsSync(path.join(forkedArtifacts, "resident-cache"))).toBe(false);
-			// Managed deletion intentionally fails closed while a POSIX quarantine
-			// retains payload bytes. This lifecycle test has already verified artifact
-			// copy/filter behavior, so retire the source payload before exercising drop.
-			fs.rmSync(sourceArtifacts, { recursive: true, force: true });
 
 			await manager.dropSession(forked.oldSessionFile);
 			expect(fs.existsSync(forked.oldSessionFile)).toBe(false);
