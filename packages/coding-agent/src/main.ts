@@ -59,12 +59,16 @@ import {
 import type { AgentSession } from "./session/agent-session";
 
 import {
+	formatOperatorFacingSessionOpenError,
+	isOperatorFacingSessionOpenError,
 	type ResumeSessionIdentity,
 	resolveResumableSession,
+	SessionArtifactCapacityError,
 	type SessionDestination,
 	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
 	SessionManager,
+	SessionMigrationBusyError,
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
@@ -1208,13 +1212,31 @@ export async function runRootCommand(
 				undefined,
 				resumeMigrationPolicy,
 			);
-		} catch {
-			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
+		} catch (error) {
+			if (isOperatorFacingSessionOpenError(error)) {
+				process.stderr.write(`${formatOperatorFacingSessionOpenError(error)}\n`);
+			} else {
+				process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
+			}
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		}
 		if (opened.kind === "error") {
-			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
+			if (opened.reason === "artifact_capacity_exceeded") {
+				process.stderr.write(
+					`${formatOperatorFacingSessionOpenError(
+						new SessionArtifactCapacityError(
+							opened.message ?? "Session artifacts exceed the migration capacity.",
+						),
+					)}\n`,
+				);
+			} else if (opened.reason === "migration_busy") {
+				process.stderr.write(
+					`${formatOperatorFacingSessionOpenError(new SessionMigrationBusyError(opened.message))}\n`,
+				);
+			} else {
+				process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
+			}
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		}
@@ -1381,9 +1403,29 @@ export async function runRootCommand(
 
 	// Create session manager based on CLI flags. A bare resume was strictly opened
 	// before startup discovery, so it never reaches create-or-open behavior here.
-	const sessionManager =
-		bareResumeSessionManager ??
-		(await logger.time("createSessionManager", createSessionManager, parsedArgs, cwd, settingsInstance));
+	let sessionManager: SessionManager | undefined = bareResumeSessionManager;
+	if (!sessionManager) {
+		try {
+			sessionManager = await logger.time(
+				"createSessionManager",
+				createSessionManager,
+				parsedArgs,
+				cwd,
+				settingsInstance,
+			);
+		} catch (error) {
+			// Capacity / migration fencing failures must not become uncaught crashes (#3508).
+			if (isOperatorFacingSessionOpenError(error)) {
+				process.stderr.write(`${formatOperatorFacingSessionOpenError(error)}\n`);
+				if (!deps.suppressProcessExit) process.exitCode = 1;
+				authStorage.close();
+				stopThemeWatcher();
+				await postmortem.cleanup();
+				return;
+			}
+			throw error;
+		}
+	}
 
 	// Restore the resumed session's working directory so the HUD branch, the
 	// project path, and the agent's tools all match where the session was

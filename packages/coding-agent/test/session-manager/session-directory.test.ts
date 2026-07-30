@@ -20,7 +20,12 @@ import {
 	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
 import { classifyNativePublishOutcome } from "../../src/session/internal/native-publish-outcome";
-import { SessionArtifactCapacityError, SessionManager } from "../../src/session/session-manager";
+import {
+	formatSessionArtifactCapacityRecovery,
+	SessionArtifactCapacityError,
+	SessionManager,
+	SessionMigrationBusyError,
+} from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
 const temporaryDirectories: string[] = [];
@@ -538,6 +543,10 @@ describe("managed session write protocol", () => {
 		await expect(
 			SessionManager.continueRecent(cwd, SessionManager.managedDestination(cwd, path.dirname(sessionsRoot))),
 		).rejects.toThrow(SessionArtifactCapacityError);
+		const capacityMessage = `Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or 512 MiB).`;
+		expect(formatSessionArtifactCapacityRecovery(capacityMessage)).toContain("gjc --resume");
+		expect(formatSessionArtifactCapacityRecovery(capacityMessage)).toContain("gjc gc --prune");
+		expect(new SessionMigrationBusyError().code).toBe("migration_busy");
 	}, 120_000);
 
 	it("distinguishes artifact capacity from unsafe topology violations", async () => {

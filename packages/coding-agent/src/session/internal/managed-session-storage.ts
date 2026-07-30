@@ -1618,21 +1618,31 @@ export async function acquireManagedLock(
 				} catch {
 					throw new Error("migration_busy");
 				}
+				// Live holders prove ownership via the open fd + attemptId/inode identity.
+				// Do not self-fence solely because a JS timer heartbeat was starved by long
+				// synchronous lock-held work (Windows legacy migration can exceed 60s) (#3508).
 				if (
 					released ||
 					descriptorClosed ||
 					!current ||
 					!sameFileIdentity(lockIdentity, named) ||
-					current.attemptId !== attemptId ||
-					current.leaseExpiresAt < Date.now()
+					current.attemptId !== attemptId
 				)
 					throw new Error("migration_busy");
+				const now = Date.now();
+				// Keep the on-disk lease fresh so waiters still observe a live owner even when
+				// setInterval heartbeats cannot run during long event-loop blocks.
+				if (current.leaseExpiresAt < now + LOCK_HEARTBEAT_MS) {
+					writeLockDescriptor(fd, {
+						...record,
+						heartbeatAt: now,
+						leaseExpiresAt: now + LOCK_LEASE_MS,
+					});
+				}
 			};
 			const heartbeat = setInterval(() => {
 				try {
 					assertOwned();
-					const now = Date.now();
-					writeLockDescriptor(fd, { ...record, heartbeatAt: now, leaseExpiresAt: now + LOCK_LEASE_MS });
 				} catch {
 					/* fencing rejects later publication */
 				}
