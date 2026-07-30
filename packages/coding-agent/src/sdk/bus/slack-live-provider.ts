@@ -1,5 +1,8 @@
 import type {
+	SlackConfigurationProbeResult,
+	SlackDiagnosticProvider,
 	SlackMessageSearchResult,
+	SlackOneShotTestResult,
 	SlackPostedMessage,
 	SlackProviderClient,
 	SlackSocketEnvelope,
@@ -69,6 +72,8 @@ type SlackApiResponse = {
 	message?: unknown;
 	messages?: unknown;
 	retry_after?: unknown;
+	team_id?: unknown;
+	user_id?: unknown;
 };
 
 function string(value: unknown): string | undefined {
@@ -96,7 +101,7 @@ function socketFromGlobal(url: string): SlackWebSocket {
  * Production Socket Mode and Web API client. It keeps all connection state in
  * memory and deliberately never maintains a Slack cursor.
  */
-export class SlackLiveProvider implements SlackProviderClient {
+export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticProvider {
 	readonly #appToken: string;
 	readonly #botToken: string;
 	readonly #fetch: (input: string, init?: RequestInit) => Promise<Response>;
@@ -138,6 +143,68 @@ export class SlackLiveProvider implements SlackProviderClient {
 		this.#maxRateLimitRetries = Math.max(0, options.maxRateLimitRetries ?? MAX_RATE_LIMIT_RETRIES);
 		this.#maxRetryAfterMs = Math.max(0, options.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS);
 		this.#activityTimeoutMs = Math.max(1, options.activityTimeoutMs ?? 60_000);
+	}
+
+	async probeConfiguration(signal?: AbortSignal): Promise<SlackConfigurationProbeResult> {
+		if (signal?.aborted) return { ok: false, detail: "Slack configuration probe cancelled." };
+		try {
+			const bot = await this.#request("auth.test", this.#botToken, {}, false, signal);
+			if (bot.ok !== true) return { ok: false, detail: "Slack bot token authorization failed." };
+			const app = await this.#request("apps.connections.open", this.#appToken, {}, false, signal);
+			if (app.ok !== true || !string(app.url)) {
+				return { ok: false, detail: "Slack app token Socket Mode authorization failed." };
+			}
+			return {
+				ok: true,
+				detail: "Slack bot and app credentials are valid.",
+				teamId: string(bot.team_id),
+				userId: string(bot.user_id),
+			};
+		} catch (error) {
+			if (signal?.aborted) return { ok: false, detail: "Slack configuration probe cancelled." };
+			return { ok: false, detail: error instanceof Error ? error.message : "Slack configuration probe failed." };
+		}
+	}
+
+	async sendOneShotTest(input: {
+		channel: string;
+		message: string;
+		idempotencyKey: string;
+		signal?: AbortSignal;
+	}): Promise<SlackOneShotTestResult> {
+		if (input.signal?.aborted) return { ok: false, detail: "Slack notification test cancelled." };
+		try {
+			const response = await this.#request(
+				"chat.postMessage",
+				this.#botToken,
+				{ channel: input.channel, text: input.message, client_msg_id: input.idempotencyKey },
+				true,
+				input.signal,
+			);
+			if (response.ok !== true) throw new SlackProviderError("web_api", "chat.postMessage");
+			const posted = this.#message(response);
+			if (!posted) {
+				return {
+					ok: false,
+					detail: "Slack may have accepted the message but returned no message receipt.",
+					uncertain: true,
+				};
+			}
+			return {
+				ok: true,
+				detail: "Slack notification test delivered.",
+				channel: posted.channel,
+				timestamp: posted.ts,
+			};
+		} catch (error) {
+			if (input.signal?.aborted) return { ok: false, detail: "Slack notification test cancelled." };
+			const uncertain = error instanceof SlackProviderError && error.mayHaveBeenAccepted;
+			return {
+				ok: false,
+				detail: error instanceof Error ? error.message : "Slack notification test failed.",
+				...(uncertain ? { uncertain: true } : {}),
+			};
+		}
 	}
 
 	async start(onEnvelope: (envelope: SlackSocketEnvelope) => void | Promise<void>): Promise<void> {
@@ -310,14 +377,17 @@ export class SlackLiveProvider implements SlackProviderClient {
 		token: string,
 		body: Record<string, string | undefined>,
 		retryRateLimit = false,
+		signal?: AbortSignal,
 	): Promise<SlackApiResponse> {
 		for (let attempt = 0; ; attempt++) {
+			signal?.throwIfAborted();
 			let response: Response;
 			try {
 				response = await this.#fetch(`${SLACK_API}/${operation}`, {
 					method: "POST",
 					headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=utf-8" },
 					body: JSON.stringify(body),
+					signal,
 				});
 			} catch {
 				throw new SlackProviderError("connection", operation);

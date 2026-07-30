@@ -20,14 +20,25 @@ import type { Settings } from "../../config/settings";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
-	isDiscordConfigured,
-	isGloballyConfigured,
-	isTelegramConfigured,
+	hasAnyCompleteProvider,
+	hasAnyEffectivelyEnabledProvider,
+	isDiscordComplete,
+	isProviderEffectivelyEnabled,
+	isTelegramComplete,
+	isSlackComplete,
 	maskToken,
 	type NotificationConfig,
+	type NotificationProvider,
+	type NotificationRuntime,
+	type ProviderResolution,
+	resolveNotificationProvider,
 	tokenFingerprint,
 } from "./config";
 import { type DaemonPaths, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { DiscordLiveProvider } from "./discord-live-provider";
+import type { DiscordDiagnosticProvider } from "./discord-provider";
+import { SlackLiveProvider } from "./slack-live-provider";
+import type { SlackDiagnosticProvider } from "./slack-provider";
 import { type OwnerFreshnessSnapshot, readOwnerFreshnessSnapshot, type TelegramDaemonFs } from "./telegram-daemon";
 import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
@@ -161,6 +172,9 @@ export interface NotificationServiceDeps {
 	pidAlive?: (pid: number) => boolean;
 	fetchImpl?: typeof fetch;
 	apiBase?: string;
+	createDiscordDiagnostic?: (config: { applicationId: string; botToken: string }) => DiscordDiagnosticProvider;
+	createSlackDiagnostic?: (config: { appToken: string; botToken: string }) => SlackDiagnosticProvider;
+	providerRuntimeStatus?: (provider: NotificationProvider) => Promise<NotificationRuntime> | NotificationRuntime;
 }
 
 function defaultPidAlive(pid: number): boolean {
@@ -187,6 +201,12 @@ export interface AdapterConfigView {
 	botTokenMasked: string;
 	channel: string | undefined;
 	configured: boolean;
+	quarantined: boolean;
+	desiredEnabled: boolean;
+	desiredSource: ProviderResolution["desiredSource"];
+	effectiveEnabled: boolean;
+	issues: ProviderResolution["issues"];
+	runtime?: NotificationRuntime;
 }
 
 export interface NotificationStatusReport {
@@ -194,13 +214,29 @@ export interface NotificationStatusReport {
 	redact: boolean;
 	verbosity: "lean" | "verbose";
 	globallyConfigured: boolean;
+	anyProviderEffective: boolean;
 	telegram: AdapterConfigView & { tokenFingerprint: string | undefined };
 	discord: AdapterConfigView;
 	slack: AdapterConfigView;
 }
 
-function adapterConfigured(token: string | undefined, channel: string | undefined): boolean {
-	return Boolean(token?.trim()) && Boolean(channel?.trim());
+function adapterView(
+	cfg: NotificationConfig,
+	provider: NotificationProvider,
+	token: string | undefined,
+	channel: string | undefined,
+): AdapterConfigView {
+	const resolution = resolveNotificationProvider(cfg, provider);
+	return {
+		botTokenMasked: maskToken(token),
+		channel,
+		configured: resolution.configured,
+		quarantined: resolution.quarantined,
+		desiredEnabled: resolution.desiredEnabled,
+		desiredSource: resolution.desiredSource,
+		effectiveEnabled: resolution.effectiveEnabled,
+		issues: resolution.issues,
+	};
 }
 
 /** Build a secret-safe structured status snapshot from settings. */
@@ -210,43 +246,38 @@ export function buildNotificationStatusReport(settings: Settings): NotificationS
 		enabled: cfg.enabled,
 		redact: cfg.redact,
 		verbosity: cfg.verbosity,
-		globallyConfigured: isGloballyConfigured(cfg),
+		globallyConfigured: hasAnyCompleteProvider(cfg),
+		anyProviderEffective: hasAnyEffectivelyEnabledProvider(cfg),
 		telegram: {
-			botTokenMasked: maskToken(cfg.botToken),
-			channel: cfg.chatId,
-			configured: isTelegramConfigured(cfg),
+			...adapterView(cfg, "telegram", cfg.botToken, cfg.chatId),
 			tokenFingerprint: cfg.botToken?.trim() ? tokenFingerprint(cfg.botToken) : undefined,
 		},
-		discord: {
-			botTokenMasked: maskToken(cfg.discord.botToken),
-			channel: cfg.discord.parentChannelId,
-			configured: isDiscordConfigured(cfg),
-		},
-		slack: {
-			botTokenMasked: maskToken(cfg.slack.botToken),
-			channel: cfg.slack.channelId,
-			configured: adapterConfigured(cfg.slack.botToken, cfg.slack.channelId),
-		},
+		discord: adapterView(cfg, "discord", cfg.discord.botToken, cfg.discord.parentChannelId),
+		slack: adapterView(cfg, "slack", cfg.slack.botToken, cfg.slack.channelId),
 	};
 }
 
 /** Render a status report as human-readable lines (no secrets). */
 export function formatNotificationStatusReport(report: NotificationStatusReport): string {
-	const yesNo = (v: boolean): string => (v ? "yes" : "no");
+	const yesNo = (value: boolean): string => (value ? "yes" : "no");
+	const provider = (name: NotificationProvider, view: AdapterConfigView): string[] => [
+		`  ${name}.configured: ${yesNo(view.configured)}`,
+		`  ${name}.needsRepair: ${yesNo(view.quarantined)}`,
+		`  ${name}.desired: ${view.desiredEnabled ? "on" : "off"} (${view.desiredSource})`,
+		`  ${name}.effective: ${yesNo(view.effectiveEnabled)}`,
+		`  ${name}.botToken: ${view.botTokenMasked}`,
+		`  ${name}.destination: ${view.channel ?? "(unset)"}`,
+	];
 	return [
 		"Notifications",
 		`  enabled: ${report.enabled}`,
-		`  globally configured: ${yesNo(report.globallyConfigured)}`,
+		`  any provider effective: ${yesNo(report.anyProviderEffective)}`,
 		`  redact: ${report.redact}`,
 		`  verbosity: ${report.verbosity}`,
-		`  telegram.botToken: ${report.telegram.botTokenMasked}`,
-		`  telegram.chatId: ${report.telegram.channel ?? "(unset)"}`,
+		...provider("telegram", report.telegram),
 		`  telegram.fingerprint: ${report.telegram.tokenFingerprint ?? "(unset)"}`,
-		`  telegram.configured: ${yesNo(report.telegram.configured)}`,
-		`  discord.botToken: ${report.discord.botTokenMasked}`,
-		`  discord.parentChannelId: ${report.discord.channel ?? "(unset)"}`,
-		`  slack.botToken: ${report.slack.botTokenMasked}`,
-		`  slack.channelId: ${report.slack.channel ?? "(unset)"}`,
+		...provider("discord", report.discord),
+		...provider("slack", report.slack),
 	].join("\n");
 }
 
@@ -508,6 +539,8 @@ export interface EndpointHealth {
 export interface NotificationHealthReport {
 	overall: HealthLevel;
 	configured: boolean;
+	provider?: NotificationProvider;
+	resolution?: ProviderResolution;
 	checks: HealthCheck[];
 	daemon: DaemonHealth;
 	endpoints: EndpointHealth;
@@ -518,20 +551,25 @@ export interface HealthOptions {
 	settings: Settings;
 	stateRoot?: string;
 	deps?: NotificationServiceDeps;
-	/** When true and Telegram is configured, probe the Bot API (getMe) for reachability. */
+	provider?: NotificationProvider;
+	/** When true, use the selected provider's REST-only diagnostic path. */
 	probe?: boolean;
+	signal?: AbortSignal;
 }
 
 async function probeTelegramReachability(
 	fetchImpl: typeof fetch,
 	apiBase: string,
 	token: string,
+	signal?: AbortSignal,
 ): Promise<{ ok: boolean; detail: string }> {
+	if (signal?.aborted) return { ok: false, detail: "Telegram probe cancelled." };
 	try {
 		const response = await fetchImpl(`${apiBase.replace(/\/$/, "")}/bot${token}/getMe`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: "{}",
+			signal,
 		});
 		const payload = (await response.json().catch(() => undefined)) as
 			| { ok?: boolean; description?: string; result?: { username?: string } }
@@ -544,9 +582,58 @@ async function probeTelegramReachability(
 			ok: false,
 			detail: sanitizeDiagnostic(payload?.description ?? `Telegram getMe failed (HTTP ${response.status})`, token),
 		};
-	} catch (err) {
-		return { ok: false, detail: sanitizeDiagnostic(err instanceof Error ? err.message : "network error", token) };
+	} catch (error) {
+		if (signal?.aborted) return { ok: false, detail: "Telegram probe cancelled." };
+		return { ok: false, detail: sanitizeDiagnostic(error instanceof Error ? error.message : "network error", token) };
 	}
+}
+
+function effectiveProviders(cfg: NotificationConfig): NotificationProvider[] {
+	return (["telegram", "discord", "slack"] as const).filter(provider =>
+		isProviderEffectivelyEnabled(cfg, provider),
+	);
+}
+
+function selectNotificationProvider(
+	cfg: NotificationConfig,
+	requested: NotificationProvider | undefined,
+): NotificationProvider | undefined {
+	if (requested) return requested;
+	const effective = effectiveProviders(cfg);
+	return effective.length === 1 ? effective[0] : undefined;
+}
+
+async function probeSelectedProvider(
+	cfg: NotificationConfig,
+	provider: NotificationProvider,
+	deps: NotificationServiceDeps,
+	signal?: AbortSignal,
+): Promise<{ ok: boolean; detail: string }> {
+	if (provider === "telegram" && isTelegramComplete(cfg)) {
+		return await probeTelegramReachability(
+			deps.fetchImpl ?? globalThis.fetch,
+			deps.apiBase ?? DEFAULT_API_BASE,
+			cfg.botToken,
+			signal,
+		);
+	}
+	if (provider === "discord" && isDiscordComplete(cfg)) {
+		const adapter =
+			deps.createDiscordDiagnostic?.({ applicationId: cfg.discord.applicationId, botToken: cfg.discord.botToken }) ??
+			new DiscordLiveProvider({
+				applicationId: cfg.discord.applicationId,
+				botToken: cfg.discord.botToken,
+				fetchImpl: deps.fetchImpl,
+			});
+		return await adapter.probeConfiguration(signal);
+	}
+	if (provider === "slack" && isSlackComplete(cfg)) {
+		const adapter =
+			deps.createSlackDiagnostic?.({ appToken: cfg.slack.appToken, botToken: cfg.slack.botToken }) ??
+			new SlackLiveProvider({ appToken: cfg.slack.appToken, botToken: cfg.slack.botToken, fetch: deps.fetchImpl });
+		return await adapter.probeConfiguration(signal);
+	}
+	return { ok: false, detail: `${provider} configuration is unavailable.` };
 }
 
 function worst(a: HealthLevel, b: HealthLevel): HealthLevel {
@@ -563,20 +650,28 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	const stateRoot = opts.stateRoot ?? defaultStateRoot();
 
 	const cfg: NotificationConfig = getNotificationConfig(opts.settings);
-	const configured = isGloballyConfigured(cfg);
-	const telegramConfigured = isTelegramConfigured(cfg);
+	const provider = selectNotificationProvider(cfg, opts.provider);
+	const resolution = provider ? resolveNotificationProvider(cfg, provider) : undefined;
+	const configured = resolution?.configured ?? hasAnyCompleteProvider(cfg);
+	const telegramConfigured = isTelegramComplete(cfg);
 	const checks: HealthCheck[] = [];
 
-	if (!cfg.enabled) {
-		checks.push({
-			name: "config",
-			level: "warn",
-			detail: "notifications are disabled (notifications.enabled=false)",
-		});
+	if (provider && resolution?.quarantined) {
+		checks.push({ name: "config", level: "error", detail: `${provider} configuration needs repair` });
+	} else if (provider && !resolution?.configured) {
+		checks.push({ name: "config", level: "warn", detail: `${provider} is not fully configured` });
+	} else if (provider && !resolution?.desiredEnabled) {
+		checks.push({ name: "intent", level: "warn", detail: `${provider} desired intent is off` });
+	} else if (provider && !resolution?.effectiveEnabled) {
+		checks.push({ name: "config", level: "warn", detail: `${provider} is not effective while the global master is off` });
+	} else if (!provider && effectiveProviders(cfg).length > 1) {
+		checks.push({ name: "selection", level: "warn", detail: "select a provider because multiple providers are effective" });
+	} else if (!cfg.enabled) {
+		checks.push({ name: "config", level: "warn", detail: "notifications are disabled (notifications.enabled=false)" });
 	} else if (!configured) {
 		checks.push({ name: "config", level: "warn", detail: "no notification adapter is fully configured" });
 	} else {
-		checks.push({ name: "config", level: "ok", detail: "enabled with at least one configured adapter" });
+		checks.push({ name: "config", level: "ok", detail: provider ? `${provider} is effective` : "enabled with one configured adapter" });
 	}
 
 	// Daemon ownership state (offline; corrupt or unreadable state degrades to a
@@ -697,24 +792,28 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 		});
 	}
 
-	// Optional network reachability probe.
+	// Optional selected REST-only reachability probe.
 	let reachability = { probed: false, ok: false, detail: "not probed" };
-	if (opts.probe && telegramConfigured) {
-		const result = await probeTelegramReachability(
-			deps.fetchImpl ?? globalThis.fetch,
-			deps.apiBase ?? DEFAULT_API_BASE,
-			cfg.botToken,
-		);
-		reachability = { probed: true, ...result };
-		checks.push({
-			name: "reachability",
-			level: result.ok ? "ok" : "error",
-			detail: `Telegram: ${result.detail}`,
-		});
+	if (opts.probe) {
+		if (!provider) {
+			reachability = { probed: false, ok: false, detail: "provider selection required" };
+			checks.push({ name: "reachability", level: "error", detail: "provider selection required" });
+		} else if (!resolution?.effectiveEnabled) {
+			reachability = { probed: false, ok: false, detail: `${provider} is unavailable` };
+			checks.push({ name: "reachability", level: "error", detail: `${provider} is unavailable` });
+		} else {
+			const result = await probeSelectedProvider(cfg, provider, deps, opts.signal);
+			reachability = { probed: true, ...result };
+			checks.push({
+				name: "reachability",
+				level: result.ok ? "ok" : "error",
+				detail: `${provider}: ${result.detail}`,
+			});
+		}
 	}
 
 	const overall = checks.reduce<HealthLevel>((acc, check) => worst(acc, check.level), "ok");
-	return { overall, configured, checks, daemon, endpoints, reachability };
+	return { overall, configured, ...(provider ? { provider, resolution } : {}), checks, daemon, endpoints, reachability };
 }
 
 /** Render a health report as human-readable lines (no secrets). */
@@ -731,66 +830,139 @@ export function formatNotificationHealthReport(report: NotificationHealthReport)
 
 export interface NotificationTestResult {
 	ok: boolean;
-	adapter: "telegram";
-	chatId: string | undefined;
+	adapter?: NotificationProvider;
+	destination?: string;
 	detail: string;
+	uncertain?: boolean;
 }
 
 export interface TestOptions {
 	settings: Settings;
 	deps?: NotificationServiceDeps;
+	provider?: NotificationProvider;
 	text?: string;
+	signal?: AbortSignal;
 }
 
-/** Send a one-off test notification through the configured Telegram adapter. */
+async function selectedProviderRuntimeReady(
+	provider: NotificationProvider,
+	deps: NotificationServiceDeps,
+): Promise<boolean> {
+	if (!deps.providerRuntimeStatus) return true;
+	const status = await deps.providerRuntimeStatus(provider);
+	return status === "ready" || status === "attached";
+}
+
+/** Send a one-off test through exactly one durable, effective provider. */
 export async function sendNotificationTest(opts: TestOptions): Promise<NotificationTestResult> {
 	const deps = opts.deps ?? {};
 	const cfg = getNotificationConfig(opts.settings);
-	if (!isTelegramConfigured(cfg)) {
+	const provider = selectNotificationProvider(cfg, opts.provider);
+	if (!provider) {
 		return {
 			ok: false,
-			adapter: "telegram",
-			chatId: cfg.chatId,
-			detail: "Telegram is not configured (need notifications.enabled + botToken + chatId). Run `gjc notify setup`.",
+			detail:
+				effectiveProviders(cfg).length === 0
+					? "No notification provider is effective. Configure and enable one provider first."
+					: "Multiple notification providers are effective; select one with --provider.",
 		};
 	}
-	const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-	const apiBase = (deps.apiBase ?? DEFAULT_API_BASE).replace(/\/$/, "");
+	const resolution = resolveNotificationProvider(cfg, provider);
+	if (!resolution.effectiveEnabled) {
+		return {
+			ok: false,
+			adapter: provider,
+			detail: resolution.quarantined
+				? `${provider} configuration needs repair.`
+				: `${provider} is unavailable because configuration, desired intent, or the global master is off.`,
+		};
+	}
+	if (!(await selectedProviderRuntimeReady(provider, deps))) {
+		return { ok: false, adapter: provider, detail: `${provider} runtime is not ready or attached.` };
+	}
+	if (opts.signal?.aborted) return { ok: false, adapter: provider, detail: `${provider} notification test cancelled.` };
 	const text = opts.text ?? "GJC notifications test message. If you can read this, delivery works.";
-	try {
-		const response = await fetchImpl(`${apiBase}/bot${cfg.botToken}/sendMessage`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ chat_id: cfg.chatId, text }),
-		});
-		const payload = (await response.json().catch(() => undefined)) as
-			| { ok?: boolean; description?: string }
-			| undefined;
-		if (response.ok && payload?.ok) {
-			return { ok: true, adapter: "telegram", chatId: cfg.chatId, detail: `delivered to chat ${cfg.chatId}` };
+	if (provider === "telegram" && isTelegramComplete(cfg)) {
+		const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+		const apiBase = (deps.apiBase ?? DEFAULT_API_BASE).replace(/\/$/, "");
+		try {
+			const response = await fetchImpl(`${apiBase}/bot${cfg.botToken}/sendMessage`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ chat_id: cfg.chatId, text }),
+				signal: opts.signal,
+			});
+			const payload = (await response.json().catch(() => undefined)) as
+				| { ok?: boolean; description?: string }
+				| undefined;
+			if (response.ok && payload?.ok) {
+				return { ok: true, adapter: "telegram", destination: cfg.chatId, detail: `delivered to chat ${cfg.chatId}` };
+			}
+			return {
+				ok: false,
+				adapter: "telegram",
+				destination: cfg.chatId,
+				detail: sanitizeDiagnostic(
+					payload?.description ?? `Telegram sendMessage failed (HTTP ${response.status})`,
+					cfg.botToken,
+				),
+			};
+		} catch (error) {
+			return {
+				ok: false,
+				adapter: "telegram",
+				destination: cfg.chatId,
+				detail: opts.signal?.aborted
+					? "Telegram notification test cancelled."
+					: sanitizeDiagnostic(error instanceof Error ? error.message : "network error", cfg.botToken),
+			};
 		}
+	}
+	if (provider === "discord" && isDiscordComplete(cfg)) {
+		const adapter =
+			deps.createDiscordDiagnostic?.({ applicationId: cfg.discord.applicationId, botToken: cfg.discord.botToken }) ??
+			new DiscordLiveProvider({
+				applicationId: cfg.discord.applicationId,
+				botToken: cfg.discord.botToken,
+				fetchImpl: deps.fetchImpl,
+			});
+		const result = await adapter.sendOneShotTest({
+			channelId: cfg.discord.parentChannelId,
+			message: text,
+			signal: opts.signal,
+		});
 		return {
-			ok: false,
-			adapter: "telegram",
-			chatId: cfg.chatId,
-			detail: sanitizeDiagnostic(
-				payload?.description ?? `Telegram sendMessage failed (HTTP ${response.status})`,
-				cfg.botToken,
-			),
-		};
-	} catch (err) {
-		return {
-			ok: false,
-			adapter: "telegram",
-			chatId: cfg.chatId,
-			detail: sanitizeDiagnostic(err instanceof Error ? err.message : "network error", cfg.botToken),
+			ok: result.ok,
+			adapter: "discord",
+			destination: cfg.discord.parentChannelId,
+			detail: result.detail,
+			...(result.uncertain ? { uncertain: true } : {}),
 		};
 	}
+	if (provider === "slack" && isSlackComplete(cfg)) {
+		const adapter =
+			deps.createSlackDiagnostic?.({ appToken: cfg.slack.appToken, botToken: cfg.slack.botToken }) ??
+			new SlackLiveProvider({ appToken: cfg.slack.appToken, botToken: cfg.slack.botToken, fetch: deps.fetchImpl });
+		const result = await adapter.sendOneShotTest({
+			channel: cfg.slack.channelId,
+			message: text,
+			idempotencyKey: crypto.randomUUID(),
+			signal: opts.signal,
+		});
+		return {
+			ok: result.ok,
+			adapter: "slack",
+			destination: cfg.slack.channelId,
+			detail: result.detail,
+			...(result.uncertain ? { uncertain: true } : {}),
+		};
+	}
+	return { ok: false, adapter: provider, detail: `${provider} configuration is unavailable.` };
 }
 
 /** Render a test result as a single human-readable line (no secrets). */
 export function formatNotificationTestResult(result: NotificationTestResult): string {
-	return `Notification test (${result.adapter}): ${result.ok ? "OK" : "FAILED"} — ${result.detail}`;
+	return `Notification test (${result.adapter ?? "unselected"}): ${result.ok ? "OK" : result.uncertain ? "UNCERTAIN" : "FAILED"} — ${result.detail}`;
 }
 
 // --- recovery -----------------------------------------------------------

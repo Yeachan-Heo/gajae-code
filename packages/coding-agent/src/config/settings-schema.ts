@@ -149,9 +149,10 @@ export type AnyUiMetadata = UiBase & {
 
 interface BooleanDef {
 	type: "boolean";
-	default: boolean;
+	default?: boolean;
 	ui?: UiBoolean;
 }
+
 
 interface StringDef {
 	type: "string";
@@ -285,6 +286,7 @@ export const SETTINGS_SCHEMA = {
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
+	"notifications.telegram.enabled": { type: "boolean" },
 	"notifications.telegram.botToken": {
 		type: "string",
 		default: undefined,
@@ -336,10 +338,12 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"notifications.telegram.topics.nameTemplate": { type: "string", default: undefined },
+	"notifications.discord.enabled": { type: "boolean" },
 	"notifications.discord.botToken": { type: "string", default: undefined },
 	"notifications.discord.applicationId": { type: "string", default: undefined },
 	"notifications.discord.guildId": { type: "string", default: undefined },
 	"notifications.discord.parentChannelId": { type: "string", default: undefined },
+	"notifications.slack.enabled": { type: "boolean" },
 	"notifications.slack.botToken": { type: "string", default: undefined },
 	"notifications.slack.appToken": { type: "string", default: undefined },
 	"notifications.slack.workspaceId": { type: "string", default: undefined },
@@ -3646,25 +3650,28 @@ type Schema = typeof SETTINGS_SCHEMA;
 export type SettingPath = keyof Schema;
 
 /** Infer the value type for a setting path */
-export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boolean" }
+export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boolean"; default: boolean }
 	? boolean
-	: Schema[P] extends { type: "string" }
-		? string | undefined
-		: Schema[P] extends { type: "number" }
-			? number
-			: Schema[P] extends { type: "enum"; values: infer V }
-				? V extends readonly string[]
-					? V[number]
-					: never
-				: Schema[P] extends { type: "array"; default: infer D }
-					? D
-					: Schema[P] extends { type: "record"; default: infer D }
+	: Schema[P] extends { type: "boolean" }
+		? boolean | undefined
+		: Schema[P] extends { type: "string" }
+			? string | undefined
+			: Schema[P] extends { type: "number" }
+				? number
+				: Schema[P] extends { type: "enum"; values: infer V }
+					? V extends readonly string[]
+						? V[number]
+						: never
+					: Schema[P] extends { type: "array"; default: infer D }
 						? D
-						: never;
+						: Schema[P] extends { type: "record"; default: infer D }
+							? D
+							: never;
 
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
-	return SETTINGS_SCHEMA[path].default as SettingValue<P>;
+	const definition = SETTINGS_SCHEMA[path];
+	return ("default" in definition ? definition.default : undefined) as SettingValue<P>;
 }
 
 /** Check if a path has UI metadata (should appear in settings panel) */
@@ -3991,6 +3998,7 @@ export interface MemoryGuardSettings {
 export interface NotificationsSettings {
 	enabled: boolean;
 	telegram: {
+		enabled?: boolean;
 		botToken: string | undefined;
 		chatId: string | undefined;
 		sound: "all" | "important" | "none";
@@ -4014,16 +4022,19 @@ export interface NotificationsSettings {
 		};
 	};
 	discord: {
+		enabled?: boolean;
 		botToken: string | undefined;
 		applicationId: string | undefined;
 		guildId: string | undefined;
 		parentChannelId: string | undefined;
 	};
 	slack: {
+		enabled?: boolean;
 		botToken: string | undefined;
 		appToken: string | undefined;
 		workspaceId: string | undefined;
 		channelId: string | undefined;
+		authorizedUserId: string | undefined;
 	};
 	redact: boolean;
 	verbosity: "lean" | "verbose";

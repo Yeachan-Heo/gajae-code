@@ -11,8 +11,9 @@ import {
 } from "./chat-daemon-control";
 import { type ChatDaemonRuntimeConfig, ChatDaemonRuntime as DefaultChatDaemonRuntime } from "./chat-daemon-runtime";
 import {
-	isDiscordConfigured,
-	isSlackConfigured,
+	isDiscordComplete,
+	isProviderEffectivelyEnabled,
+	isSlackComplete,
 	loadNotificationConfigFile,
 	notificationConfigFromFile,
 } from "./config";
@@ -60,7 +61,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 	const config = notificationConfigFromFile(loaded.value);
 	if (!config.enabled) return undefined;
 	if (kind === "discord") {
-		if (!isDiscordConfigured(config)) {
+		if (!isProviderEffectivelyEnabled(config, "discord") || !isDiscordComplete(config)) {
 			throw new Error("Discord notifications are enabled but configuration is incomplete");
 		}
 		const discord = config.discord;
@@ -78,7 +79,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			presentation: { redact: config.redact, verbosity: config.verbosity },
 		};
 	}
-	if (!isSlackConfigured(config)) {
+	if (!isProviderEffectivelyEnabled(config, "slack") || !isSlackComplete(config)) {
 		throw new Error("Slack notifications are enabled but configuration is incomplete");
 	}
 	const slack = config.slack;
@@ -149,7 +150,7 @@ export async function runChatDaemonInternal(
 
 	let incarnation: string | undefined;
 	let runtime: ChatDaemonRuntimeHandle | undefined;
-	let interval: ReturnType<typeof setInterval> | undefined;
+	let interval: NodeJS.Timeout | number | undefined;
 	let stopping = false;
 	let terminalError: unknown;
 	let runtimeStop: Promise<void> | undefined;

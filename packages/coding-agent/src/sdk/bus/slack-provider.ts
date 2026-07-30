@@ -15,6 +15,30 @@ export interface SlackMessageSearchResult {
 	client_msg_id?: string;
 }
 
+export interface SlackConfigurationProbeResult {
+	ok: boolean;
+	detail: string;
+	teamId?: string;
+	userId?: string;
+}
+
+export interface SlackOneShotTestResult {
+	ok: boolean;
+	detail: string;
+	channel?: string;
+	timestamp?: string;
+	uncertain?: boolean;
+}
+
+export interface SlackDiagnosticProvider {
+	probeConfiguration(signal?: AbortSignal): Promise<SlackConfigurationProbeResult>;
+	sendOneShotTest(input: {
+		channel: string;
+		message: string;
+		idempotencyKey: string;
+		signal?: AbortSignal;
+	}): Promise<SlackOneShotTestResult>;
+}
 /** Minimal Socket Mode + Web API seam. Implementations may wrap the official Slack SDK. */
 export interface SlackProviderClient {
 	start(onEnvelope: (envelope: SlackSocketEnvelope) => void | Promise<void>): Promise<void>;

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { z } from "zod/v4";
 import { getTelegramFileSink } from "../sdk/bus/attachment-registry";
-import { getNotificationConfig, isGloballyConfigured } from "../sdk/bus/config";
+import { getNotificationConfig, isProviderEffectivelyEnabled } from "../sdk/bus/config";
 import type { ToolSession } from "./index";
 
 const TELEGRAM_SEND_MAX_FILE_BYTES = 50 * 1024 * 1024;
@@ -41,7 +41,9 @@ export class TelegramSendTool implements AgentTool<typeof telegramSendSchema, Te
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): TelegramSendTool | null {
-		return isGloballyConfigured(getNotificationConfig(session.settings)) ? new TelegramSendTool(session) : null;
+		return isProviderEffectivelyEnabled(getNotificationConfig(session.settings), "telegram")
+			? new TelegramSendTool(session)
+			: null;
 	}
 
 	/**

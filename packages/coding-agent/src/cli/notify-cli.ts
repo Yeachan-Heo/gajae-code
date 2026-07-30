@@ -7,7 +7,12 @@ import { createInterface } from "node:readline/promises";
 import { APP_NAME } from "@gajae-code/utils/dirs";
 import chalk from "chalk";
 import { Settings, type SettingsAtomicPatch } from "../config/settings";
-import { type EnsureChatDaemonResult, ensureDiscordDaemon, ensureSlackDaemon } from "../sdk/bus/chat-daemon-control";
+import {
+	ChatDaemonController,
+	type EnsureChatDaemonResult,
+	ensureDiscordDaemon,
+	ensureSlackDaemon,
+} from "../sdk/bus/chat-daemon-control";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../sdk/bus/config";
 import {
 	clearTelegramActivationMarker,
@@ -17,6 +22,8 @@ import {
 	persistTelegramActivationMarker,
 	proposedTelegramIdentity,
 	reconcileCommittedTelegramConfiguration,
+	mutateNotificationProvider,
+	type NotificationProviderRuntimeAuthority,
 } from "../sdk/bus/notification-orchestration";
 import {
 	buildNotificationStatusReport,
@@ -34,6 +41,7 @@ import {
 	ensureTelegramDaemonRunningDetailed,
 	resolveTelegramSetupPreflight,
 } from "../sdk/bus/telegram-daemon";
+import { TelegramDaemonController } from "../sdk/bus/telegram-daemon-control";
 import { runDaemonInternal } from "../sdk/bus/telegram-daemon-cli";
 import {
 	runTelegramSetup as runTelegramPairingSetup,
@@ -93,75 +101,99 @@ export interface NotifyCommandDeps {
 }
 
 export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
-	if (args.length === 0 || args[0] !== "notify") {
-		return undefined;
-	}
-
+	if (args.length === 0 || args[0] !== "notify") return undefined;
 	const action = args[1];
-	if (action === "setup" || action === "status") {
-		const rest = args.slice(2);
-		const flag = (name: string): string | undefined => {
-			const i = rest.indexOf(name);
-			return i >= 0 ? rest[i + 1] : undefined;
-		};
-		const valueFlags = [
-			"--token",
-			"--chat-id",
-			"--discord-bot-token",
-			"--discord-application-id",
-			"--discord-guild-id",
-			"--discord-parent-channel-id",
-			"--slack-bot-token",
-			"--slack-app-token",
-			"--slack-workspace-id",
-			"--slack-channel-id",
-			"--slack-authorized-user-id",
-		];
-		if (
-			valueFlags.some(name => {
-				const index = rest.indexOf(name);
-				const value = index >= 0 ? rest[index + 1] : undefined;
-				return index >= 0 && (!value || value.startsWith("--"));
-			})
-		)
-			return undefined;
-		const provider = rest[0]?.startsWith("--") ? undefined : rest[0];
-		if (provider !== undefined && provider !== "telegram" && provider !== "discord" && provider !== "slack") {
-			return undefined;
+	const providerValue = (value: string | undefined): NotifySetupProvider | undefined =>
+		value === "telegram" || value === "discord" || value === "slack" ? value : undefined;
+	const parseFlags = (
+		rest: string[],
+		valueFlags: ReadonlySet<string>,
+		booleanFlags: ReadonlySet<string>,
+	): Map<string, string | true> | undefined => {
+		const parsed = new Map<string, string | true>();
+		for (let index = 0; index < rest.length; index++) {
+			const flag = rest[index];
+			if (!flag?.startsWith("--") || parsed.has(flag)) return undefined;
+			if (booleanFlags.has(flag)) {
+				parsed.set(flag, true);
+				continue;
+			}
+			if (!valueFlags.has(flag)) return undefined;
+			const value = rest[++index];
+			if (!value || value.startsWith("--")) return undefined;
+			parsed.set(flag, value);
 		}
+		return parsed;
+	};
+
+	if (action === "setup") {
+		const rest = args.slice(2);
+		const positional = rest[0]?.startsWith("--") ? undefined : rest.shift();
+		const provider = positional === undefined ? undefined : providerValue(positional);
+		if (positional !== undefined && !provider) return undefined;
+		const flags = parseFlags(
+			rest,
+			new Set([
+				"--token",
+				"--chat-id",
+				"--discord-bot-token",
+				"--discord-application-id",
+				"--discord-guild-id",
+				"--discord-parent-channel-id",
+				"--slack-bot-token",
+				"--slack-app-token",
+				"--slack-workspace-id",
+				"--slack-channel-id",
+				"--slack-authorized-user-id",
+			]),
+			new Set(["--redact"]),
+		);
+		if (!flags) return undefined;
+		const value = (name: string): string | undefined => {
+			const found = flags.get(name);
+			return typeof found === "string" ? found : undefined;
+		};
+		return {
+			action,
+			rawArgs: args.slice(2),
+			...(provider ? { provider } : {}),
+			token: value("--token"),
+			chatId: value("--chat-id"),
+			discordBotToken: value("--discord-bot-token"),
+			discordApplicationId: value("--discord-application-id"),
+			discordGuildId: value("--discord-guild-id"),
+			discordParentChannelId: value("--discord-parent-channel-id"),
+			slackBotToken: value("--slack-bot-token"),
+			slackAppToken: value("--slack-app-token"),
+			slackWorkspaceId: value("--slack-workspace-id"),
+			slackChannelId: value("--slack-channel-id"),
+			slackAuthorizedUserId: value("--slack-authorized-user-id"),
+			redact: flags.get("--redact") === true,
+		};
+	}
+	if (action === "status") {
+		return args.length === 2 ? { action, rawArgs: [] } : undefined;
+	}
+	if (action === "health" || action === "test") {
+		const rest = args.slice(2);
+		const flags = parseFlags(
+			rest,
+			new Set(action === "health" ? ["--provider"] : ["--provider", "--message"]),
+			new Set(action === "health" ? ["--probe"] : []),
+		);
+		if (!flags) return undefined;
+		const rawProvider = flags.get("--provider");
+		const provider = typeof rawProvider === "string" ? providerValue(rawProvider) : undefined;
+		if (rawProvider !== undefined && !provider) return undefined;
 		return {
 			action,
 			rawArgs: rest,
 			...(provider ? { provider } : {}),
-			token: flag("--token"),
-			chatId: flag("--chat-id"),
-			...(flag("--discord-bot-token") ? { discordBotToken: flag("--discord-bot-token") } : {}),
-			...(flag("--discord-application-id") ? { discordApplicationId: flag("--discord-application-id") } : {}),
-			...(flag("--discord-guild-id") ? { discordGuildId: flag("--discord-guild-id") } : {}),
-			...(flag("--discord-parent-channel-id")
-				? { discordParentChannelId: flag("--discord-parent-channel-id") }
-				: {}),
-			...(flag("--slack-bot-token") ? { slackBotToken: flag("--slack-bot-token") } : {}),
-			...(flag("--slack-app-token") ? { slackAppToken: flag("--slack-app-token") } : {}),
-			...(flag("--slack-workspace-id") ? { slackWorkspaceId: flag("--slack-workspace-id") } : {}),
-			...(flag("--slack-channel-id") ? { slackChannelId: flag("--slack-channel-id") } : {}),
-			...(flag("--slack-authorized-user-id") ? { slackAuthorizedUserId: flag("--slack-authorized-user-id") } : {}),
-			redact: rest.includes("--redact"),
+			probe: flags.get("--probe") === true,
+			message: typeof flags.get("--message") === "string" ? (flags.get("--message") as string) : undefined,
 		};
 	}
-	if (action === "health" || action === "test" || action === "recovery") {
-		const rest = args.slice(2);
-		const flag = (name: string): string | undefined => {
-			const i = rest.indexOf(name);
-			return i >= 0 ? rest[i + 1] : undefined;
-		};
-		return {
-			action,
-			rawArgs: rest,
-			probe: rest.includes("--probe"),
-			message: flag("--message"),
-		};
-	}
+	if (action === "recovery") return args.length === 2 ? { action, rawArgs: [] } : undefined;
 	if (action === "daemon-internal") {
 		return {
 			action,
@@ -169,7 +201,6 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 			rawArgs: args.slice(2),
 		};
 	}
-
 	return undefined;
 }
 
@@ -273,18 +304,30 @@ async function runDiscordSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps):
 		deps,
 	);
 	const settings = await getSettings(deps);
-	const patches: SettingsAtomicPatch[] = [
-		{ path: "notifications.discord.botToken", op: "set", value: botToken },
-		{ path: "notifications.discord.applicationId", op: "set", value: applicationId },
-		{ path: "notifications.discord.guildId", op: "set", value: guildId },
-		{ path: "notifications.discord.parentChannelId", op: "set", value: parentChannelId },
-		{ path: "notifications.enabled", op: "set", value: true },
-	];
-	if (cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
-	await settings.commitAtomicBatch(patches);
-	const daemon = await ensureConfiguredProviderDaemon("discord", settings, deps);
+	const runtime: NotificationProviderRuntimeAuthority = {
+		activate: async provider => {
+			if (provider !== "discord") throw new Error("Unexpected provider activation request.");
+			const result = await ensureConfiguredProviderDaemon("discord", settings, deps);
+			if (result === "disabled") throw new Error("Discord runtime did not activate.");
+		},
+		deactivate: async () => undefined,
+	};
+	const result = await mutateNotificationProvider({
+		settings,
+		mutation: {
+			provider: "discord",
+			botToken: { action: "replace", value: botToken },
+			applicationId,
+			guildId,
+			parentChannelId,
+		},
+		configureAndActivate: true,
+		...(cmd.redact ? { redact: true } : {}),
+		runtime,
+	});
+	if (result.status === "commit_failed") throw new Error("Discord configuration was not saved because the CAS commit failed.");
 	process.stdout.write(
-		`Discord notifications enabled. botToken=${maskToken(botToken)} applicationId=${applicationId} guildId=${guildId} parentChannelId=${parentChannelId} daemon=${daemon}\n`,
+		`Discord configuration saved. botToken=${maskToken(botToken)} applicationId=${applicationId} guildId=${guildId} parentChannelId=${parentChannelId} result=${result.status}\n`,
 	);
 }
 
@@ -295,21 +338,31 @@ async function runSlackSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): P
 	const channelId = await promptSetupValue(cmd.slackChannelId, "--slack-channel-id", false, deps);
 	const authorizedUserId = cmd.slackAuthorizedUserId?.trim() || undefined;
 	const settings = await getSettings(deps);
-	const patches: SettingsAtomicPatch[] = [
-		{ path: "notifications.slack.botToken", op: "set", value: botToken },
-		{ path: "notifications.slack.appToken", op: "set", value: appToken },
-		{ path: "notifications.slack.workspaceId", op: "set", value: workspaceId },
-		{ path: "notifications.slack.channelId", op: "set", value: channelId },
-		authorizedUserId === undefined
-			? { path: "notifications.slack.authorizedUserId", op: "unset" }
-			: { path: "notifications.slack.authorizedUserId", op: "set", value: authorizedUserId },
-		{ path: "notifications.enabled", op: "set", value: true },
-	];
-	if (cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
-	await settings.commitAtomicBatch(patches);
-	const daemon = await ensureConfiguredProviderDaemon("slack", settings, deps);
+	const runtime: NotificationProviderRuntimeAuthority = {
+		activate: async provider => {
+			if (provider !== "slack") throw new Error("Unexpected provider activation request.");
+			const result = await ensureConfiguredProviderDaemon("slack", settings, deps);
+			if (result === "disabled") throw new Error("Slack runtime did not activate.");
+		},
+		deactivate: async () => undefined,
+	};
+	const result = await mutateNotificationProvider({
+		settings,
+		mutation: {
+			provider: "slack",
+			botToken: { action: "replace", value: botToken },
+			appToken: { action: "replace", value: appToken },
+			workspaceId,
+			channelId,
+			authorizedUserId,
+		},
+		configureAndActivate: true,
+		...(cmd.redact ? { redact: true } : {}),
+		runtime,
+	});
+	if (result.status === "commit_failed") throw new Error("Slack configuration was not saved because the CAS commit failed.");
 	process.stdout.write(
-		`Slack notifications enabled. botToken=${maskToken(botToken)} appToken=${maskToken(appToken)} workspaceId=${workspaceId} channelId=${channelId} authorizedUserId=${authorizedUserId ?? "(unset; inbound denied)"} daemon=${daemon}\n`,
+		`Slack configuration saved. botToken=${maskToken(botToken)} appToken=${maskToken(appToken)} workspaceId=${workspaceId} channelId=${channelId} authorizedUserId=${authorizedUserId ?? "(unset; inbound denied)"} result=${result.status}\n`,
 	);
 }
 
@@ -385,6 +438,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 			{ path: "notifications.telegram.botToken", op: "set", value: token.trim() },
 			{ path: "notifications.telegram.chatId", op: "set", value: result.chatId },
 			{ path: "notifications.enabled", op: "set", value: true },
+			{ path: "notifications.telegram.enabled", op: "set", value: true },
 		];
 		if (deps.setupRedact ?? cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
 		const receipt = await settings.commitAtomicBatch(patches);
@@ -586,6 +640,7 @@ async function runHealth(deps: NotifyCommandDeps, cmd: NotifyCommandArgs): Promi
 	const settings = await getSettings(deps);
 	const report = await checkNotificationHealth({
 		settings,
+		provider: cmd.provider,
 		probe: cmd.probe,
 		deps: { fetchImpl: deps.fetchImpl, apiBase: deps.apiBase },
 	});
@@ -598,8 +653,19 @@ async function runTest(deps: NotifyCommandDeps, cmd: NotifyCommandArgs): Promise
 	const settings = await getSettings(deps);
 	const result = await sendNotificationTest({
 		settings,
+		provider: cmd.provider,
 		text: cmd.message,
-		deps: { fetchImpl: deps.fetchImpl, apiBase: deps.apiBase },
+		deps: {
+			fetchImpl: deps.fetchImpl,
+			apiBase: deps.apiBase,
+			providerRuntimeStatus: async provider => {
+				const status =
+					provider === "telegram"
+						? await new TelegramDaemonController(settings).status()
+						: await new ChatDaemonController(settings, provider).status();
+				return status.health === "running" ? "ready" : "inactive";
+			},
+		},
 	});
 	process.stdout.write(`${formatNotificationTestResult(result)}\n`);
 	if (!result.ok && deps.setExitCode) deps.setExitCode(1);
@@ -616,8 +682,8 @@ export function printNotifyHelp(): void {
 	process.stdout.write(`${chalk.bold(`${APP_NAME} notify`)} - Configure Telegram, Discord, or Slack notifications
 
 ${chalk.bold("Interactive path:")}
-  In a running GJC session, use /settings → Notifications for setup, health, test, recovery,
-  reconnect, global enable/disable, adapter-local Telegram removal, and session on/off.
+  In a running GJC session, use /settings → Notifications for first-class Telegram, Discord,
+  and Slack configure/edit/repair, desired intent, health, test, removal, global master, and session controls.
   The CLI subcommands below remain the authoritative headless and automation fallback.
 
 ${chalk.bold("Usage:")}
@@ -625,15 +691,15 @@ ${chalk.bold("Usage:")}
   ${APP_NAME} notify setup discord --discord-bot-token <token> --discord-application-id <id> --discord-guild-id <id> --discord-parent-channel-id <id>
   ${APP_NAME} notify setup slack --slack-bot-token <token> --slack-app-token <token> --slack-workspace-id <id> --slack-channel-id <id> [--slack-authorized-user-id <id>]
   ${APP_NAME} notify status
-  ${APP_NAME} notify health [--probe]
-  ${APP_NAME} notify test [--message <text>]
+  ${APP_NAME} notify health [--provider telegram|discord|slack] [--probe]
+  ${APP_NAME} notify test [--provider telegram|discord|slack] [--message <text>]
   ${APP_NAME} notify recovery
 
 ${chalk.bold("Subcommands:")}
-  setup     Pair Telegram or save complete non-interactive Discord/Slack notification settings
-  status    Show notification configuration without secrets
-  health    Report config, daemon-ownership and endpoint health (--probe adds a Telegram reachability check)
-  test      Send a one-off test notification through the configured Telegram adapter
+  setup     Pair Telegram or atomically save and activate complete Discord/Slack settings
+  status    Show global master and provider configured/repair/desired/effective state without secrets
+  health    Report selected provider state; --probe uses REST only and never opens Gateway/Socket Mode
+  test      Send a one-off test through one selected or uniquely effective provider
   recovery  Clear dead-owner daemon locks and stale per-session endpoint files (never touches a live owner)
 
 ${chalk.bold("Examples:")}
@@ -642,8 +708,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} notify setup discord --discord-bot-token <token> --discord-application-id <id> --discord-guild-id <id> --discord-parent-channel-id <id>
   ${APP_NAME} notify setup slack --slack-bot-token <token> --slack-app-token <token> --slack-workspace-id <id> --slack-channel-id <id> [--slack-authorized-user-id <id>]
   ${APP_NAME} notify status
-  ${APP_NAME} notify health --probe
-  ${APP_NAME} notify test --message "hello from gjc"
+  ${APP_NAME} notify health --provider discord --probe
+  ${APP_NAME} notify test --provider slack --message "hello from gjc"
   ${APP_NAME} notify recovery
 
 ${chalk.bold("Threaded Mode:")}

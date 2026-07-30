@@ -6,7 +6,8 @@ import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patc
 import type { Settings } from "../../config/settings";
 import {
 	getNotificationConfig,
-	isTelegramConfigured,
+	isProviderEffectivelyEnabled,
+	isTelegramComplete,
 	type NotificationSettingsReader,
 	parseNotificationSettingsSnapshot,
 } from "./config";
@@ -76,6 +77,8 @@ export function createLightweightDaemonSettings(input: {
 			switch (pathName) {
 				case "notifications.enabled":
 					return snapshot.enabled;
+				case "notifications.telegram.enabled":
+					return snapshot.telegram.enabled;
 				case "notifications.telegram.botToken":
 					return snapshot.telegram.botToken;
 				case "notifications.telegram.chatId":
@@ -84,6 +87,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.telegram.btw.enabled;
 				case "notifications.telegram.streaming.enabled":
 					return snapshot.telegram.streaming.enabled;
+				case "notifications.discord.enabled":
+					return snapshot.discord.enabled;
 				case "notifications.discord.botToken":
 					return snapshot.discord.botToken;
 				case "notifications.discord.applicationId":
@@ -92,6 +97,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.discord.guildId;
 				case "notifications.discord.parentChannelId":
 					return snapshot.discord.parentChannelId;
+				case "notifications.slack.enabled":
+					return snapshot.slack.enabled;
 				case "notifications.slack.botToken":
 					return snapshot.slack.botToken;
 				case "notifications.slack.appToken":
@@ -223,7 +230,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
-	if (!isTelegramConfigured(cfg)) return;
+	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
 	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? TelegramNotificationDaemon;
 	const readState = deps.readDaemonState ?? readDaemonState;
 	const daemon = new Daemon({

@@ -40,6 +40,10 @@ export default class Notify extends Command {
 			description: "Slack user id authorized for inbound replies and commands",
 		}),
 		redact: Flags.boolean({ description: "Enable redaction of remote notification content" }),
+		provider: Flags.string({
+			description: "notify health/test: select telegram, discord, or slack",
+			options: ["telegram", "discord", "slack"],
+		}),
 		probe: Flags.boolean({ description: "notify health: probe Telegram reachability (getMe)" }),
 		message: Flags.string({ description: "notify test: custom message body" }),
 		"owner-id": Flags.string({ description: "Internal: daemon owner id" }),
@@ -64,16 +68,23 @@ export default class Notify extends Command {
 			...(agentDir ? ["--agent-dir", agentDir] : []),
 			...extra,
 		];
-		const provider = extra[0];
+		const positionalProvider = action === "setup" ? extra[0] : undefined;
 		if (
-			action === "setup" &&
-			provider !== undefined &&
-			provider !== "telegram" &&
-			provider !== "discord" &&
-			provider !== "slack"
+			positionalProvider !== undefined &&
+			positionalProvider !== "telegram" &&
+			positionalProvider !== "discord" &&
+			positionalProvider !== "slack"
 		) {
-			throw new Error(`Unknown notification provider: ${provider}`);
+			throw new Error(`Unknown notification provider: ${positionalProvider}`);
 		}
+		const providerFlag = flagRec.provider as string | undefined;
+		if (providerFlag && action !== "health" && action !== "test") {
+			throw new Error("--provider is valid only for notify health and notify test.");
+		}
+		if (action !== "setup" && action !== "daemon-internal" && extra.length > 0) {
+			throw new Error(`Unexpected notify arguments: ${extra.join(" ")}`);
+		}
+		const provider = providerFlag ?? positionalProvider;
 
 		const cmd: NotifyCommandArgs = {
 			action: action as NotifyAction,

@@ -52,7 +52,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * cleanup); generation 38 binds exact cleanup to parent and link-count authority.
  * Generation 39 applies rustfmt and clippy-equivalent cleanup to the pi-shell
  * process-tree authority (#3682); generation 40 hardens exact Bash process-tree
- * ownership, settlement, and descendant cleanup authority.
+ * ownership, settlement, and descendant cleanup authority. Generation 38 also
+ * adds durable provider-intent admission without changing owner, reclaim,
+ * signal, or spawn authority.
  */
 export const DAEMON_GENERATION = 40;
 

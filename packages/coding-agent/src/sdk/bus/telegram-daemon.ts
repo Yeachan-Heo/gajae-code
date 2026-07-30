@@ -11,7 +11,7 @@ import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { resizeImageBuffer } from "../../utils/image-resize";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
-import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
+import { getNotificationConfig, isProviderEffectivelyEnabled, isTelegramComplete, tokenFingerprint } from "./config";
 import {
 	parseInThreadConfigCommand,
 	parseRichToggleCommand,
@@ -3412,7 +3412,7 @@ async function ensureTelegramDaemonRunningDetailedOnce(
 	deps: TelegramDaemonDeps = {},
 ): Promise<EnsureTelegramDaemonDetailedResult> {
 	const cfg = getNotificationConfig(input.settings);
-	if (!isTelegramConfigured(cfg)) return "disabled";
+	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return "disabled";
 	const root = notificationRootForCwd(input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
 	// A live v0.10 parent has no stable process authority on Windows. Never turn an
@@ -3672,7 +3672,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 	if (input.registerRoot === false || (result !== "attached" && result !== "spawned")) return result;
 
 	const cfg = getNotificationConfig(input.settings);
-	if (!isTelegramConfigured(cfg)) return "disabled";
+	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return "disabled";
 	const ownerIsCurrent = async (): Promise<boolean> => {
 		const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: deps.fs });
 		return isCurrentCompatibleOwner({

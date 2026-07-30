@@ -26,7 +26,7 @@ import { OWNERSHIP_MISMATCH_MESSAGE, ownershipMismatchRecovery } from "../../dae
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { isProcessIncarnation } from "../broker/process-incarnation";
 
-import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
+import { getNotificationConfig, isTelegramComplete, tokenFingerprint } from "./config";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "./notification-service";
 import {
 	type AttestedLegacyDaemonOwner,
@@ -221,7 +221,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	async status(): Promise<DaemonStatus> {
 		const runtime = this.runtimeInfo();
 		const cfg = getNotificationConfig(this.settings);
-		const configured = isTelegramConfigured(cfg);
+		const configured = isTelegramComplete(cfg);
 		if (!configured) {
 			return { kind: this.kind, configured: false, health: "not_configured", runtime };
 		}
@@ -369,7 +369,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	#currentConfigurationMatches(tokenFingerprintValue: string, chatId: string): boolean {
 		const current = getNotificationConfig(this.settings);
 		return (
-			isTelegramConfigured(current) &&
+			isTelegramComplete(current) &&
 			tokenFingerprint(current.botToken) === tokenFingerprintValue &&
 			current.chatId === chatId
 		);

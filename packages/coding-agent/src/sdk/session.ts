@@ -108,10 +108,10 @@ import { MCPManager } from "../runtime-mcp";
 import { createNotificationsExtension } from "../sdk/bus";
 import {
 	getNotificationConfig,
-	isNotificationHostEligible,
+	isGenericNotificationHostEligible,
 	type NotificationConfig,
 	SPAWN_PROVENANCE_ENV,
-	shouldRegisterNotificationsExtension,
+	shouldRegisterGenericNotificationsExtension,
 } from "../sdk/bus/config";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
@@ -1909,7 +1909,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const spawnProvenance = process.env[SPAWN_PROVENANCE_ENV];
 		const spawnedByGjc = typeof spawnProvenance === "string" && spawnProvenance.trim().length > 0;
 		delete process.env[SPAWN_PROVENANCE_ENV];
-		const notificationHostEligible = isNotificationHostEligible({
+		const notificationHostEligible = isGenericNotificationHostEligible({
 			env: process.env,
 			hostModeSupported: options.notificationHostModeSupported ?? true,
 			taskDepth,
@@ -1921,10 +1921,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const notificationSessionController = new NotificationSessionController({
 			eligible: notificationHostEligible,
 			getConfig: () => getNotificationConfig(settings),
+			spawnedByGjc,
 		});
 		if (
 			lifecycleStartupCapability ||
-			shouldRegisterNotificationsExtension({
+			shouldRegisterGenericNotificationsExtension({
 				env: process.env,
 				cfg: notificationCfg,
 				taskDepth,

@@ -16,7 +16,12 @@ import type {
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
-import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
+import {
+	getNotificationConfig,
+	isDiscordComplete,
+	isProviderEffectivelyEnabled,
+	isSlackComplete,
+} from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
 export type ChatDaemonAction = "stop" | "reload";
@@ -40,9 +45,10 @@ export type ChatDaemonAction = "stop" | "reload";
  * daemon transports. Generation 16 applies Telegram sound-policy configuration
  * through shared notification parsing. Generation 17 bound managed-session
  * replacement to exact native filesystem authority; generation 18 retired that
- * binding, and generation 19 binds exact cleanup to parent/link-count authority.
- * Discord generation 21 applies rustfmt and clippy-equivalent cleanup to the
- * pi-shell process-tree authority (#3682). Discord generation 22 / slack
+ * binding, and generation 19 binds exact cleanup to parent/link-count authority
+ * while also adding durable provider-intent admission without changing lifecycle
+ * behavior. Discord generation 21 applies rustfmt and clippy-equivalent cleanup to
+ * the pi-shell process-tree authority (#3682). Discord generation 22 / slack
  * generation 21 refreshes retained cleanup semantics; discord generation 23 /
  * slack generation 22 hardens exact Bash process-tree ownership shared by chat
  * daemon cleanup.
@@ -276,7 +282,7 @@ export function chatDaemonPaths(
 function identityFor(settings: Settings, kind: ChatDaemonKind): string | undefined {
 	const cfg = getNotificationConfig(settings);
 	if (kind === "discord") {
-		if (!isDiscordConfigured(cfg)) return undefined;
+		if (!isDiscordComplete(cfg)) return undefined;
 		return fingerprint([
 			cfg.discord.botToken,
 			cfg.discord.applicationId,
@@ -286,7 +292,7 @@ function identityFor(settings: Settings, kind: ChatDaemonKind): string | undefin
 			cfg.verbosity,
 		]);
 	}
-	if (!isSlackConfigured(cfg)) return undefined;
+	if (!isSlackComplete(cfg)) return undefined;
 	return fingerprint([
 		cfg.slack.botToken,
 		cfg.slack.appToken,
@@ -458,6 +464,8 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		return await this.operate("reload", opts);
 	}
 	async ensure(): Promise<EnsureChatDaemonResult> {
+		const cfg = getNotificationConfig(this.settings);
+		if (!isProviderEffectivelyEnabled(cfg, this.kind)) return "disabled";
 		const identity = this.identity();
 		if (!identity) return "disabled";
 		const existing = await readChatDaemonState(this.settings.getAgentDir(), this.kind);

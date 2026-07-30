@@ -31,6 +31,27 @@ export interface DiscordMessageComponent {
 	}>;
 }
 
+export interface DiscordConfigurationProbeResult {
+	ok: boolean;
+	detail: string;
+	botUserId?: string;
+}
+
+export interface DiscordOneShotTestResult {
+	ok: boolean;
+	detail: string;
+	messageId?: string;
+	uncertain?: boolean;
+}
+
+export interface DiscordDiagnosticProvider {
+	probeConfiguration(signal?: AbortSignal): Promise<DiscordConfigurationProbeResult>;
+	sendOneShotTest(input: {
+		channelId: string;
+		message: string;
+		signal?: AbortSignal;
+	}): Promise<DiscordOneShotTestResult>;
+}
 export interface DiscordProvider {
 	readonly applicationId: string;
 	readonly botUserId: string;

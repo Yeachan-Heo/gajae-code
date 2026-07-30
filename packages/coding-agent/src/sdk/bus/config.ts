@@ -49,39 +49,59 @@ export function readTelegramActivationMarkers(value?: unknown): TelegramActivati
 	return markers;
 }
 
+export type NotificationProvider = "telegram" | "discord" | "slack";
+export type NotificationRuntime = "inactive" | "starting" | "ready" | "attached" | "blocked" | "failed";
+export type ProviderSecretDisposition = "keep" | "replace" | "remove";
+export type ProviderResolutionIssueCode =
+	| "missing"
+	| "blank"
+	| "wrong_type"
+	| "invalid_container"
+	| "contradictory";
+
+export interface ProviderResolutionIssue {
+	path: string;
+	code: ProviderResolutionIssueCode;
+}
+
+export type NotificationProviderIssueCode = ProviderResolutionIssueCode;
+export type NotificationProviderIssue = ProviderResolutionIssue;
+
+export interface ProviderResolution {
+	provider: NotificationProvider;
+	configured: boolean;
+	quarantined: boolean;
+	desiredEnabled: boolean;
+	desiredSource: "explicit" | "legacy";
+	effectiveEnabled: boolean;
+	issues: readonly ProviderResolutionIssue[];
+}
+const NOTIFICATION_PROVIDERS = ["telegram", "discord", "slack"] as const;
+
 export interface NotificationSettingsSnapshot {
 	enabled: boolean;
 	telegram: {
+		enabled?: boolean;
 		botToken?: string;
 		chatId?: string;
 		activation?: Record<string, unknown>;
 		sound: "all" | "important" | "none";
-		btw: {
-			enabled: boolean;
-		};
-		rich: {
-			enabled: boolean;
-		};
-		richDraft: {
-			enabled: boolean;
-		};
-		toolActivity: {
-			enabled: boolean;
-		};
-		streaming: {
-			enabled: boolean;
-		};
-		topics: {
-			nameTemplate?: string;
-		};
+		btw: { enabled: boolean };
+		rich: { enabled: boolean };
+		richDraft: { enabled: boolean };
+		toolActivity: { enabled: boolean };
+		streaming: { enabled: boolean };
+		topics: { nameTemplate?: string };
 	};
 	discord: {
+		enabled?: boolean;
 		botToken?: string;
 		applicationId?: string;
 		guildId?: string;
 		parentChannelId?: string;
 	};
 	slack: {
+		enabled?: boolean;
 		botToken?: string;
 		appToken?: string;
 		workspaceId?: string;
@@ -92,40 +112,254 @@ export interface NotificationSettingsSnapshot {
 	verbosity: "lean" | "verbose";
 	sessionScope: "all" | "primary";
 	idleTimeoutMs: number;
+	/** Safe provider-local validation issues. Raw values never cross this boundary. */
+	providerIssues?: Partial<Record<NotificationProvider, readonly ProviderResolutionIssue[]>>;
 }
 
 /**
  * Narrow settings boundary for remote notification identity and behavior.
- * Implementations must return only user-global values, with schema defaults
- * applied; project settings and runtime overrides are intentionally excluded.
+ * Implementations return only user-global values; project settings and runtime
+ * overrides are intentionally excluded.
  */
 export interface NotificationSettingsReader {
 	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot;
 	getAgentDir(): string;
 }
+
 function notificationConfigurationError(): Error {
 	return new Error("gjc_notify_daemon_invalid_configuration");
 }
 
-function notificationSettingsObject(value: unknown): Record<string, unknown> {
+type NotificationObject = Record<string, unknown>;
+
+function notificationObject(value: unknown): NotificationObject {
 	if (value === undefined) return {};
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw notificationConfigurationError();
-	return value as Record<string, unknown>;
+	return value as NotificationObject;
 }
 
-function notificationSettingsString(value: unknown): string | undefined {
+function providerObject(value: unknown, pathName: string, issues: ProviderResolutionIssue[]): NotificationObject {
+	if (value === undefined) return {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		issues.push({ path: pathName, code: "invalid_container" });
+		return {};
+	}
+	return value as NotificationObject;
+}
+
+function addProviderIssue(issues: ProviderResolutionIssue[], pathName: string, code: ProviderResolutionIssueCode): void {
+	if (!issues.some(issue => issue.path === pathName && issue.code === code)) issues.push({ path: pathName, code });
+}
+
+function providerString(
+	container: NotificationObject,
+	key: string,
+	pathName: string,
+	issues: ProviderResolutionIssue[],
+): string | undefined {
+	const value = container[key];
 	if (value === undefined) return undefined;
-	if (typeof value === "string") return value;
-	throw notificationConfigurationError();
+	if (typeof value !== "string") {
+		addProviderIssue(issues, pathName, "wrong_type");
+		return undefined;
+	}
+	if (value.trim().length === 0) {
+		addProviderIssue(issues, pathName, "blank");
+		return undefined;
+	}
+	return value;
 }
 
-function notificationSettingsBoolean(value: unknown, fallback: boolean): boolean {
+function providerBoolean(
+	container: NotificationObject,
+	key: string,
+	pathName: string,
+	fallback: boolean,
+	issues: ProviderResolutionIssue[],
+): boolean {
+	const value = container[key];
 	if (value === undefined) return fallback;
-	if (typeof value === "boolean") return value;
-	throw notificationConfigurationError();
+	if (typeof value !== "boolean") {
+		addProviderIssue(issues, pathName, "wrong_type");
+		return fallback;
+	}
+	return value;
 }
 
-function notificationSettingsChoice<T extends string>(value: unknown, fallback: T, choices: readonly T[]): T {
+function providerChoice<T extends string>(
+	container: NotificationObject,
+	key: string,
+	pathName: string,
+	fallback: T,
+	choices: readonly T[],
+	issues: ProviderResolutionIssue[],
+): T {
+	const value = container[key];
+	if (value === undefined) return fallback;
+	if (typeof value === "string" && choices.includes(value as T)) return value as T;
+	addProviderIssue(issues, pathName, "wrong_type");
+	return fallback;
+}
+
+function providerActivation(
+	container: NotificationObject,
+	pathName: string,
+	issues: ProviderResolutionIssue[],
+): Record<string, unknown> | undefined {
+	const value = container.activation;
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		addProviderIssue(issues, pathName, "invalid_container");
+		return undefined;
+	}
+	const safe = readTelegramActivationMarkers(value);
+	if (Object.keys(safe).length !== Object.keys(value as NotificationObject).length) {
+		addProviderIssue(issues, pathName, "contradictory");
+	}
+	return Object.keys(safe).length === 0 ? undefined : safe;
+}
+
+function providerTopics(
+	container: NotificationObject,
+	pathName: string,
+	issues: ProviderResolutionIssue[],
+): { nameTemplate?: string } {
+	const topics = providerObject(container.topics, pathName, issues);
+	return { nameTemplate: providerString(topics, "nameTemplate", `${pathName}.nameTemplate`, issues) };
+}
+
+function providerEnabled(
+	container: NotificationObject,
+	pathName: string,
+	issues: ProviderResolutionIssue[],
+): boolean | undefined {
+	const value = container.enabled;
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") {
+		addProviderIssue(issues, pathName, "wrong_type");
+		return undefined;
+	}
+	return value;
+}
+
+function addMissingRequiredProviderIssues(
+	container: NotificationObject,
+	required: readonly string[],
+	basePath: string,
+	issues: ProviderResolutionIssue[],
+): void {
+	const anyRequiredPresent = required.some(key => container[key] !== undefined);
+	if (!anyRequiredPresent) return;
+	for (const key of required) {
+		if (container[key] === undefined) addProviderIssue(issues, `${basePath}.${key}`, "missing");
+	}
+}
+
+function providerIssuesSnapshot(
+	provider: NotificationProvider,
+	issues: readonly ProviderResolutionIssue[],
+): Partial<Record<NotificationProvider, readonly ProviderResolutionIssue[]>> | undefined {
+	return issues.length === 0 ? undefined : { [provider]: issues.map(issue => ({ ...issue })) };
+}
+
+/** Validate and snapshot raw global notification configuration without leaking invalid provider values. */
+export function parseNotificationSettingsSnapshot(rawConfig?: unknown): NotificationSettingsSnapshot {
+	const root = notificationObject(rawConfig);
+	const notifications = notificationObject(root.notifications);
+	const telegramIssues: ProviderResolutionIssue[] = [];
+	const discordIssues: ProviderResolutionIssue[] = [];
+	const slackIssues: ProviderResolutionIssue[] = [];
+	const telegram = providerObject(notifications.telegram, "notifications.telegram", telegramIssues);
+	const discord = providerObject(notifications.discord, "notifications.discord", discordIssues);
+	const slack = providerObject(notifications.slack, "notifications.slack", slackIssues);
+	const btw = providerObject(telegram.btw, "notifications.telegram.btw", telegramIssues);
+	const rich = providerObject(telegram.rich, "notifications.telegram.rich", telegramIssues);
+	const richDraft = providerObject(telegram.richDraft, "notifications.telegram.richDraft", telegramIssues);
+	const toolActivity = providerObject(telegram.toolActivity, "notifications.telegram.toolActivity", telegramIssues);
+	const streaming = providerObject(telegram.streaming, "notifications.telegram.streaming", telegramIssues);
+	const activation = providerActivation(telegram, "notifications.telegram.activation", telegramIssues);
+	const daemon = notificationObject(notifications.daemon);
+	addMissingRequiredProviderIssues(
+		telegram,
+		["botToken", "chatId"],
+		"notifications.telegram",
+		telegramIssues,
+	);
+	addMissingRequiredProviderIssues(
+		discord,
+		["botToken", "applicationId", "guildId", "parentChannelId"],
+		"notifications.discord",
+		discordIssues,
+	);
+	addMissingRequiredProviderIssues(
+		slack,
+		["botToken", "appToken", "workspaceId", "channelId"],
+		"notifications.slack",
+		slackIssues,
+	);
+	const telegramEnabled = providerEnabled(telegram, "notifications.telegram.enabled", telegramIssues);
+	const discordEnabled = providerEnabled(discord, "notifications.discord.enabled", discordIssues);
+	const slackEnabled = providerEnabled(slack, "notifications.slack.enabled", slackIssues);
+	const telegramSnapshot: NotificationSettingsSnapshot["telegram"] = {
+		...(telegramEnabled === undefined ? {} : { enabled: telegramEnabled }),
+		botToken: providerString(telegram, "botToken", "notifications.telegram.botToken", telegramIssues),
+		chatId: providerString(telegram, "chatId", "notifications.telegram.chatId", telegramIssues),
+		...(activation === undefined ? {} : { activation }),
+		sound: providerChoice(telegram, "sound", "notifications.telegram.sound", "all", ["all", "important", "none"], telegramIssues),
+		btw: { enabled: providerBoolean(btw, "enabled", "notifications.telegram.btw.enabled", true, telegramIssues) },
+		rich: { enabled: providerBoolean(rich, "enabled", "notifications.telegram.rich.enabled", true, telegramIssues) },
+		richDraft: {
+			enabled: providerBoolean(richDraft, "enabled", "notifications.telegram.richDraft.enabled", false, telegramIssues),
+	},
+	toolActivity: {
+		enabled: providerBoolean(toolActivity, "enabled", "notifications.telegram.toolActivity.enabled", false, telegramIssues),
+	},
+	streaming: {
+		enabled: providerBoolean(streaming, "enabled", "notifications.telegram.streaming.enabled", true, telegramIssues),
+	},
+	topics: providerTopics(telegram, "notifications.telegram.topics", telegramIssues),
+	};
+	const discordSnapshot: NotificationSettingsSnapshot["discord"] = {
+		...(discordEnabled === undefined ? {} : { enabled: discordEnabled }),
+		botToken: providerString(discord, "botToken", "notifications.discord.botToken", discordIssues),
+		applicationId: providerString(discord, "applicationId", "notifications.discord.applicationId", discordIssues),
+		guildId: providerString(discord, "guildId", "notifications.discord.guildId", discordIssues),
+		parentChannelId: providerString(discord, "parentChannelId", "notifications.discord.parentChannelId", discordIssues),
+	};
+	const slackSnapshot: NotificationSettingsSnapshot["slack"] = {
+		...(slackEnabled === undefined ? {} : { enabled: slackEnabled }),
+		botToken: providerString(slack, "botToken", "notifications.slack.botToken", slackIssues),
+		appToken: providerString(slack, "appToken", "notifications.slack.appToken", slackIssues),
+		workspaceId: providerString(slack, "workspaceId", "notifications.slack.workspaceId", slackIssues),
+		channelId: providerString(slack, "channelId", "notifications.slack.channelId", slackIssues),
+		authorizedUserId: providerString(slack, "authorizedUserId", "notifications.slack.authorizedUserId", slackIssues),
+	};
+	const providerIssues: Partial<Record<NotificationProvider, readonly ProviderResolutionIssue[]>> = {
+		...(providerIssuesSnapshot("telegram", telegramIssues) ?? {}),
+		...(providerIssuesSnapshot("discord", discordIssues) ?? {}),
+		...(providerIssuesSnapshot("slack", slackIssues) ?? {}),
+	};
+	const snapshot: NotificationSettingsSnapshot = {
+		enabled: notificationGlobalBoolean(notifications.enabled, false),
+		telegram: telegramSnapshot,
+		discord: discordSnapshot,
+		slack: slackSnapshot,
+		redact: notificationGlobalBoolean(notifications.redact, false),
+		verbosity: notificationGlobalChoice(notifications.verbosity, "lean", ["lean", "verbose"]),
+		sessionScope: notificationGlobalChoice(notifications.sessionScope, "all", ["all", "primary"]),
+		idleTimeoutMs: notificationIdleTimeoutMs(daemon.idleTimeoutMs),
+	};
+	if (Object.keys(providerIssues).length > 0) snapshot.providerIssues = providerIssues;
+	return snapshot;
+}
+
+function notificationGlobalBoolean(value: unknown, fallback: boolean): boolean {
+	if (value === undefined) return fallback;
+	if (typeof value !== "boolean") throw notificationConfigurationError();
+	return value;
+}
+
+function notificationGlobalChoice<T extends string>(value: unknown, fallback: T, choices: readonly T[]): T {
 	if (value === undefined) return fallback;
 	if (typeof value === "string" && choices.includes(value as T)) return value as T;
 	throw notificationConfigurationError();
@@ -137,89 +371,22 @@ function notificationIdleTimeoutMs(value: unknown): number {
 	throw notificationConfigurationError();
 }
 
-/**
- * Validate and snapshot the raw global notification configuration used by both
- * the interactive host and the lightweight daemon process.
- */
-export function parseNotificationSettingsSnapshot(rawConfig?: unknown): NotificationSettingsSnapshot {
-	const root = notificationSettingsObject(rawConfig);
-	const notifications = notificationSettingsObject(root.notifications);
-	const telegram = notificationSettingsObject(notifications.telegram);
-	const btw = notificationSettingsObject(telegram.btw);
-	const rich = notificationSettingsObject(telegram.rich);
-	const richDraft = notificationSettingsObject(telegram.richDraft);
-	const toolActivity = notificationSettingsObject(telegram.toolActivity);
-	const streaming = notificationSettingsObject(telegram.streaming);
-	const topics = notificationSettingsObject(telegram.topics);
-	const activation = readTelegramActivationMarkers(notificationSettingsObject(telegram.activation));
-	const discord = notificationSettingsObject(notifications.discord);
-	const slack = notificationSettingsObject(notifications.slack);
-	const daemon = notificationSettingsObject(notifications.daemon);
-	return {
-		enabled: notificationSettingsBoolean(notifications.enabled, false),
-		telegram: {
-			botToken: notificationSettingsString(telegram.botToken),
-			chatId: notificationSettingsString(telegram.chatId),
-			...(Object.keys(activation).length === 0 ? {} : { activation }),
-			sound: notificationSettingsChoice<"all" | "important" | "none">(telegram.sound, "all", [
-				"all",
-				"important",
-				"none",
-			]),
-			btw: {
-				enabled: notificationSettingsBoolean(btw.enabled, true),
-			},
-			rich: {
-				enabled: notificationSettingsBoolean(rich.enabled, true),
-			},
-			richDraft: {
-				enabled: notificationSettingsBoolean(richDraft.enabled, false),
-			},
-			toolActivity: {
-				enabled: notificationSettingsBoolean(toolActivity.enabled, false),
-			},
-			streaming: {
-				enabled: notificationSettingsBoolean(streaming.enabled, true),
-			},
-			topics: {
-				nameTemplate: notificationSettingsString(topics.nameTemplate),
-			},
-		},
-		discord: {
-			botToken: notificationSettingsString(discord.botToken),
-			applicationId: notificationSettingsString(discord.applicationId),
-			guildId: notificationSettingsString(discord.guildId),
-			parentChannelId: notificationSettingsString(discord.parentChannelId),
-		},
-		slack: {
-			botToken: notificationSettingsString(slack.botToken),
-			appToken: notificationSettingsString(slack.appToken),
-			workspaceId: notificationSettingsString(slack.workspaceId),
-			channelId: notificationSettingsString(slack.channelId),
-			authorizedUserId: notificationSettingsString(slack.authorizedUserId),
-		},
-		redact: notificationSettingsBoolean(notifications.redact, false),
-		verbosity: notificationSettingsChoice<"lean" | "verbose">(notifications.verbosity, "lean", ["lean", "verbose"]),
-		sessionScope: notificationSettingsChoice<"all" | "primary">(notifications.sessionScope, "all", [
-			"all",
-			"primary",
-		]),
-		idleTimeoutMs: notificationIdleTimeoutMs(daemon.idleTimeoutMs),
-	};
-}
-
 export interface NotificationConfig {
 	enabled: boolean;
 	botToken?: string;
 	activation?: TelegramActivationMarkers;
 	chatId?: string;
+	/** Optional nested Telegram intent metadata; absent means legacy configuration. */
+	telegram?: { enabled?: boolean };
 	discord: {
+		enabled?: boolean;
 		botToken?: string;
 		applicationId?: string;
 		guildId?: string;
 		parentChannelId?: string;
 	};
 	slack: {
+		enabled?: boolean;
 		botToken?: string;
 		appToken?: string;
 		workspaceId?: string;
@@ -228,51 +395,41 @@ export interface NotificationConfig {
 	};
 	redact: boolean;
 	verbosity: "lean" | "verbose";
-	/**
-	 * Which sessions may register a notification endpoint. `all` (default)
-	 * preserves historical behavior; `primary` suppresses GJC-spawned children
-	 * (those carrying {@link SPAWN_PROVENANCE_ENV}) unless they explicitly opt in.
-	 */
 	sessionScope: "all" | "primary";
 	sound: "all" | "important" | "none";
 	idleTimeoutMs: number;
-	btw: {
-		enabled: boolean;
-	};
-	rich: {
-		enabled: boolean;
-	};
-	richDraft: {
-		enabled: boolean;
-	};
-	toolActivity: {
-		enabled: boolean;
-	};
-	streaming: {
-		enabled: boolean;
-	};
-	topics: {
-		/**
-		 * Optional Telegram forum-topic name template with `{repo}`, `{branch}`,
-		 * and `{title}` placeholders. Unset preserves the built-in
-		 * `{repo}/{branch} - {title}` composition (with its title/repo/branch
-		 * fallbacks).
-		 */
-		nameTemplate?: string;
-	};
+	btw: { enabled: boolean };
+	rich: { enabled: boolean };
+	richDraft: { enabled: boolean };
+	toolActivity: { enabled: boolean };
+	streaming: { enabled: boolean };
+	topics: { nameTemplate?: string };
+	providerIssues?: Partial<Record<NotificationProvider, readonly ProviderResolutionIssue[]>>;
 }
 
-/** Read typed global-only notification config from a narrow settings reader. */
-export function getNotificationConfig(settings: NotificationSettingsReader): NotificationConfig {
-	const snapshot = settings.getNotificationSettingsSnapshot();
+function notificationConfigFromSnapshot(snapshot: NotificationSettingsSnapshot): NotificationConfig {
 	const activation = readTelegramActivationMarkers(snapshot.telegram.activation);
-	return {
+	const config: NotificationConfig = {
 		enabled: snapshot.enabled,
 		botToken: snapshot.telegram.botToken,
 		...(Object.keys(activation).length === 0 ? {} : { activation }),
 		chatId: snapshot.telegram.chatId,
-		discord: snapshot.discord,
-		slack: snapshot.slack,
+		...(snapshot.telegram.enabled === undefined ? {} : { telegram: { enabled: snapshot.telegram.enabled } }),
+		discord: {
+			...(snapshot.discord.enabled === undefined ? {} : { enabled: snapshot.discord.enabled }),
+			botToken: snapshot.discord.botToken,
+			applicationId: snapshot.discord.applicationId,
+			guildId: snapshot.discord.guildId,
+			parentChannelId: snapshot.discord.parentChannelId,
+		},
+		slack: {
+			...(snapshot.slack.enabled === undefined ? {} : { enabled: snapshot.slack.enabled }),
+			botToken: snapshot.slack.botToken,
+			appToken: snapshot.slack.appToken,
+			workspaceId: snapshot.slack.workspaceId,
+			channelId: snapshot.slack.channelId,
+			authorizedUserId: snapshot.slack.authorizedUserId,
+		},
 		redact: snapshot.redact,
 		verbosity: snapshot.verbosity,
 		sessionScope: snapshot.sessionScope,
@@ -285,40 +442,16 @@ export function getNotificationConfig(settings: NotificationSettingsReader): Not
 		streaming: snapshot.telegram.streaming,
 		topics: snapshot.telegram.topics,
 	};
+	if (snapshot.providerIssues) config.providerIssues = snapshot.providerIssues;
+	return config;
 }
 
-const notificationConfigSchema = z
-	.object({
-		notifications: z
-			.object({
-				enabled: z.boolean().optional(),
-				discord: z
-					.object({
-						botToken: z.string().optional(),
-						applicationId: z.string().optional(),
-						guildId: z.string().optional(),
-						parentChannelId: z.string().optional(),
-					})
-					.passthrough()
-					.optional(),
-				slack: z
-					.object({
-						botToken: z.string().optional(),
-						appToken: z.string().optional(),
-						workspaceId: z.string().optional(),
-						channelId: z.string().optional(),
-						authorizedUserId: z.string().optional(),
-					})
-					.passthrough()
-					.optional(),
-				redact: z.boolean().optional(),
-				verbosity: z.enum(["lean", "verbose"]).optional(),
-			})
-			.passthrough()
-			.optional(),
-	})
-	.passthrough();
+/** Read typed global-only notification config from a narrow settings reader. */
+export function getNotificationConfig(settings: NotificationSettingsReader): NotificationConfig {
+	return notificationConfigFromSnapshot(settings.getNotificationSettingsSnapshot());
+}
 
+const notificationConfigSchema = z.object({}).passthrough();
 type NotificationConfigFile = z.infer<typeof notificationConfigSchema>;
 
 /** Read daemon settings through the canonical validated config-file boundary. */
@@ -326,119 +459,216 @@ export function loadNotificationConfigFile(agentDir: string): LoadResult<Notific
 	return new ConfigFile("config", notificationConfigSchema, path.join(agentDir, "config.yml")).tryLoad();
 }
 
-export function notificationConfigFromFile(
-	value: NotificationConfigFile,
-): Pick<NotificationConfig, "enabled" | "discord" | "slack" | "redact" | "verbosity"> {
-	const notifications = value.notifications;
-	return {
-		enabled: notifications?.enabled ?? false,
-		discord: notifications?.discord ?? {},
-		slack: notifications?.slack ?? {},
-		redact: notifications?.redact ?? false,
-		verbosity: notifications?.verbosity ?? "lean",
-	};
+export function notificationConfigFromFile(value: NotificationConfigFile): NotificationConfig {
+	return notificationConfigFromSnapshot(parseNotificationSettingsSnapshot(value));
 }
 
 export function hasNonBlankValue(value: string | undefined): boolean {
 	return typeof value === "string" && value.trim().length > 0;
 }
 
-/**
- * Resolve live assistant streaming independently of generic notification
- * lifecycle enablement. Explicit environment values override the durable
- * Telegram preference; otherwise streaming is available only to an active
- * configured Telegram identity.
- */
-export function isNotificationStreamingEnabled(input: { cfg: NotificationConfig; env: NodeJS.ProcessEnv }): boolean {
-	const override = input.env.GJC_NOTIFICATIONS_STREAM?.trim().toLowerCase();
-	if (override === "1") return true;
-	if (override === "0" || override === "off" || override === "false") return false;
-	return (
-		input.cfg.streaming.enabled && isTelegramConfigured(input.cfg) && !getCurrentTelegramActivationMarker(input.cfg)
-	);
+function providerRequiredFields(cfg: NotificationConfig, provider: NotificationProvider): Readonly<Record<string, unknown>> {
+	if (provider === "telegram") return { botToken: cfg.botToken, chatId: cfg.chatId };
+	if (provider === "discord") {
+		return {
+			botToken: cfg.discord.botToken,
+			applicationId: cfg.discord.applicationId,
+			guildId: cfg.discord.guildId,
+			parentChannelId: cfg.discord.parentChannelId,
+		};
+	}
+	return {
+		botToken: cfg.slack.botToken,
+		appToken: cfg.slack.appToken,
+		workspaceId: cfg.slack.workspaceId,
+		channelId: cfg.slack.channelId,
+	};
 }
 
-/** Is Telegram configured with usable non-blank boundary credentials? */
-export function isTelegramConfigured(
+function providerOptionalFields(cfg: NotificationConfig, provider: NotificationProvider): Readonly<Record<string, unknown>> {
+	return provider === "slack" ? { authorizedUserId: cfg.slack.authorizedUserId } : {};
+}
+
+function providerConfigEnabled(cfg: NotificationConfig, provider: NotificationProvider): unknown {
+	if (provider === "telegram") return cfg.telegram?.enabled;
+	if (provider === "discord") return cfg.discord.enabled;
+	return cfg.slack.enabled;
+}
+
+function providerStoredIssues(cfg: NotificationConfig, provider: NotificationProvider): readonly ProviderResolutionIssue[] {
+	return cfg.providerIssues?.[provider] ?? [];
+}
+
+function uniqueProviderIssues(issues: readonly ProviderResolutionIssue[]): ProviderResolutionIssue[] {
+	const result: ProviderResolutionIssue[] = [];
+	for (const issue of issues) {
+		if (!result.some(existing => existing.path === issue.path && existing.code === issue.code)) result.push({ ...issue });
+	}
+	return result;
+}
+
+function providerFacts(cfg: NotificationConfig, provider: NotificationProvider): {
+	configured: boolean;
+	quarantined: boolean;
+	issues: ProviderResolutionIssue[];
+} {
+	const required = providerRequiredFields(cfg, provider);
+	const optional = providerOptionalFields(cfg, provider);
+	const issues = [...providerStoredIssues(cfg, provider)];
+	const anyRequiredPresent = Object.values(required).some(value => value !== undefined);
+	for (const [key, value] of Object.entries(required)) {
+		const pathName = `notifications.${provider}.${key}`;
+		if (value === undefined) {
+			if (anyRequiredPresent) issues.push({ path: pathName, code: "missing" });
+		} else if (typeof value !== "string") issues.push({ path: pathName, code: "wrong_type" });
+		else if (value.trim().length === 0) issues.push({ path: pathName, code: "blank" });
+	}
+	for (const [key, value] of Object.entries(optional)) {
+		if (value === undefined) continue;
+		const pathName = `notifications.${provider}.${key}`;
+		if (typeof value !== "string") issues.push({ path: pathName, code: "wrong_type" });
+		else if (value.trim().length === 0) issues.push({ path: pathName, code: "blank" });
+	}
+	const uniqueIssues = uniqueProviderIssues(issues);
+	const configured =
+		Object.values(required).every(value => typeof value === "string" && value.trim().length > 0) && uniqueIssues.length === 0;
+	return { configured, quarantined: uniqueIssues.length > 0, issues: uniqueIssues };
+}
+
+export function isProviderComplete(cfg: NotificationConfig, provider: NotificationProvider): boolean {
+	return providerFacts(cfg, provider).configured;
+}
+
+export function isTelegramComplete(cfg: NotificationConfig): cfg is NotificationConfig & { botToken: string; chatId: string } {
+	return isProviderComplete(cfg, "telegram");
+}
+
+export function isDiscordComplete(
 	cfg: NotificationConfig,
-): cfg is NotificationConfig & { botToken: string; chatId: string } {
-	return cfg.enabled && hasNonBlankValue(cfg.botToken) && hasNonBlankValue(cfg.chatId);
-}
-
-/** Is Discord configured with all credentials and routing identifiers required by its daemon. */
-export function isDiscordConfigured(cfg: Pick<NotificationConfig, "enabled" | "discord">): cfg is Pick<
-	NotificationConfig,
-	"enabled"
-> & {
+): cfg is NotificationConfig & {
 	discord: { botToken: string; applicationId: string; guildId: string; parentChannelId: string };
 } {
-	return (
-		cfg.enabled &&
-		hasNonBlankValue(cfg.discord.botToken) &&
-		hasNonBlankValue(cfg.discord.applicationId) &&
-		hasNonBlankValue(cfg.discord.guildId) &&
-		hasNonBlankValue(cfg.discord.parentChannelId)
-	);
+	return isProviderComplete(cfg, "discord");
 }
 
-/** Is Slack configured with both SDK tokens and its workspace/channel routing identifiers. */
-export function isSlackConfigured(cfg: Pick<NotificationConfig, "enabled" | "slack">): cfg is Pick<
-	NotificationConfig,
-	"enabled"
-> & {
+export function isSlackComplete(
+	cfg: NotificationConfig,
+): cfg is NotificationConfig & {
 	slack: { botToken: string; appToken: string; workspaceId: string; channelId: string };
 } {
-	return (
-		cfg.enabled &&
-		hasNonBlankValue(cfg.slack.botToken) &&
-		hasNonBlankValue(cfg.slack.appToken) &&
-		hasNonBlankValue(cfg.slack.workspaceId) &&
-		hasNonBlankValue(cfg.slack.channelId)
-	);
+	return isProviderComplete(cfg, "slack");
 }
 
-/** Is global config sufficient for auto-on (enabled + at least one configured adapter)? */
-export function isGloballyConfigured(cfg: NotificationConfig): boolean {
-	return cfg.enabled && (isTelegramConfigured(cfg) || isDiscordConfigured(cfg) || isSlackConfigured(cfg));
+export function resolveNotificationProvider(cfg: NotificationConfig, provider: NotificationProvider): ProviderResolution {
+	const facts = providerFacts(cfg, provider);
+	const configuredEnabled = providerConfigEnabled(cfg, provider);
+	const explicitIssue = facts.issues.some(issue => issue.path === `notifications.${provider}.enabled`);
+	const explicit = typeof configuredEnabled === "boolean" ? configuredEnabled : undefined;
+	const desiredSource: ProviderResolution["desiredSource"] = explicit !== undefined || explicitIssue ? "explicit" : "legacy";
+	const desiredEnabled = explicit ?? (facts.configured && !facts.quarantined);
+	return {
+		provider,
+		configured: facts.configured,
+		quarantined: facts.quarantined,
+		desiredEnabled,
+		desiredSource,
+		effectiveEnabled: cfg.enabled && desiredEnabled && facts.configured && !facts.quarantined,
+		issues: facts.issues,
+	};
 }
+
+export function isProviderEffectivelyEnabled(cfg: NotificationConfig, provider: NotificationProvider): boolean {
+	return resolveNotificationProvider(cfg, provider).effectiveEnabled;
+}
+
+export function hasAnyCompleteProvider(cfg: NotificationConfig): boolean {
+	return NOTIFICATION_PROVIDERS.some(provider => isProviderComplete(cfg, provider));
+}
+
+export function hasAnyEffectivelyEnabledProvider(cfg: NotificationConfig): boolean {
+	return NOTIFICATION_PROVIDERS.some(provider => isProviderEffectivelyEnabled(cfg, provider));
+}
+
 
 /**
- * Per-run opt-out for completion notifications, honored before settings lookups.
- *
- * `GJC_NOTIFY=off` (also `0` / `false`, case-insensitive) suppresses the
- * completion notification surface for this process only. `config.yml` is
- * untouched and child processes inherit the env var, which lets non-interactive
- * fleet runs (`gjc -p --no-session`) stay silent even when a user-level/global
- * completion notification configuration is enabled.
+ * Resolve generic live-stream policy. This policy only governs automatic
+ * current-session frames; it never changes durable provider eligibility.
  */
-export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
-	const v = env.GJC_NOTIFY?.trim().toLowerCase();
-	return v === "off" || v === "0" || v === "false";
+export type GenericNotificationSessionSource =
+	| "hard_opt_out"
+	| "session_local_off"
+	| "explicit_env"
+	| "token_env"
+	| "configured_provider"
+	| "session_scope"
+	| "none";
+
+export interface GenericNotificationSessionEligibility {
+	enabled: boolean;
+	source: GenericNotificationSessionSource;
 }
 
-/** Canonical host eligibility for the dormant notification session surface. */
-export interface NotificationHostEligibilityInput {
+export type GenericNotificationStreamSource = "session_not_admitted" | "env_on" | "env_off" | "durable_telegram" | "none";
+
+export interface GenericNotificationStreamPolicy {
+	enabled: boolean;
+	source: GenericNotificationStreamSource;
+}
+
+export interface GenericNotificationSessionEligibilityInput {
+	cfg: NotificationConfig;
 	env: NodeJS.ProcessEnv;
-	/** False for host modes that cannot own a notification session endpoint. */
-	hostModeSupported?: boolean;
-	/** Task recursion depth; helper/subagent sessions must not own remote surfaces. */
-	taskDepth?: number;
-	/** Parent subagent id/prefix; present for helper/subagent sessions even when depth is omitted. */
-	parentTaskPrefix?: string;
-	/** Role-agent type/name; present for task sessions even if depth metadata is lost. */
-	currentAgentType?: string;
-	/** Canonical global session scope; absent preserves the default `all` behavior. */
-	sessionScope?: NotificationConfig["sessionScope"];
-	/** Whether this process was spawned by one of GJC's marked child spawn sites. */
+	sessionDisabled: boolean;
 	spawnedByGjc?: boolean;
 }
 
-/**
- * Resolve whether this host may receive the dormant notification controller.
- * This intentionally says nothing about whether an adapter is configured: an
- * eligible unconfigured host still gets a zero-side-effect control surface.
- */
-export function isNotificationHostEligible(input: NotificationHostEligibilityInput): boolean {
+export function resolveGenericNotificationSessionEligibility(
+	input: GenericNotificationSessionEligibilityInput,
+): GenericNotificationSessionEligibility {
+	if (input.env.GJC_NOTIFICATIONS === "0") return { enabled: false, source: "hard_opt_out" };
+	if (input.sessionDisabled) return { enabled: false, source: "session_local_off" };
+	if (input.env.GJC_NOTIFICATIONS === "1") return { enabled: true, source: "explicit_env" };
+	if (input.env.GJC_NOTIFICATIONS_TOKEN) return { enabled: true, source: "token_env" };
+	if (input.spawnedByGjc && input.cfg.sessionScope === "primary") {
+		return { enabled: false, source: "session_scope" };
+	}
+	if (hasAnyEffectivelyEnabledProvider(input.cfg)) return { enabled: true, source: "configured_provider" };
+	return { enabled: false, source: "none" };
+}
+
+export function resolveGenericNotificationStreamPolicy(input: {
+	cfg: NotificationConfig;
+	env: NodeJS.ProcessEnv;
+	genericSessionEnabled: boolean;
+}): GenericNotificationStreamPolicy {
+	if (!input.genericSessionEnabled) return { enabled: false, source: "session_not_admitted" };
+	const override = input.env.GJC_NOTIFICATIONS_STREAM?.trim().toLowerCase();
+	if (override === "1") return { enabled: true, source: "env_on" };
+	if (override === "0" || override === "off" || override === "false") return { enabled: false, source: "env_off" };
+	const durableEnabled =
+		input.cfg.streaming.enabled &&
+		isProviderEffectivelyEnabled(input.cfg, "telegram") &&
+		!getCurrentTelegramActivationMarker(input.cfg);
+	return { enabled: durableEnabled, source: durableEnabled ? "durable_telegram" : "none" };
+}
+
+export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
+	const value = env.GJC_NOTIFY?.trim().toLowerCase();
+	return value === "off" || value === "0" || value === "false";
+}
+
+export interface NotificationHostEligibilityInput {
+	env: NodeJS.ProcessEnv;
+	hostModeSupported?: boolean;
+	taskDepth?: number;
+	parentTaskPrefix?: string;
+	currentAgentType?: string;
+	sessionScope?: NotificationConfig["sessionScope"];
+	spawnedByGjc?: boolean;
+}
+
+/** Generic host eligibility for the dormant automatic notification surface. */
+export function isGenericNotificationHostEligible(input: NotificationHostEligibilityInput): boolean {
 	if (completionNotifyDisabledByEnv(input.env)) return false;
 	if (input.hostModeSupported === false) return false;
 	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
@@ -448,31 +678,19 @@ export function isNotificationHostEligible(input: NotificationHostEligibilityInp
 	return true;
 }
 
-/**
- * Legacy compatibility helper for callers that require both host eligibility
- * and a currently configured or explicit notification runtime.
- */
-export function shouldRegisterNotificationsExtension(input: {
+export interface GenericNotificationRegistrationInput {
 	env: NodeJS.ProcessEnv;
 	cfg?: NotificationConfig;
-	/** Task recursion depth; helper/subagent sessions must not spawn remote surfaces. */
 	taskDepth?: number;
-	/** Parent subagent id/prefix; present for helper/subagent sessions even when depth is omitted. */
 	parentTaskPrefix?: string;
-	/** Role-agent type/name; present for task sessions even if depth metadata is lost. */
 	currentAgentType?: string;
-	/**
-	 * True when this session was launched by one of GJC's own programmatic
-	 * separate-process child spawn sites (marked via {@link SPAWN_PROVENANCE_ENV}).
-	 * Under `notifications.sessionScope = "primary"` such children are suppressed
-	 * unless they explicitly opt in, so an interactive parent that fans out work
-	 * does not flood the paired chat with topics for children the user never
-	 * asked for. User-opened sessions (CLI/tmux/headless) never carry the marker.
-	 */
 	spawnedByGjc?: boolean;
-}): boolean {
+}
+
+/** Generic registration admission; direct provider actions do not call this helper. */
+export function shouldRegisterGenericNotificationsExtension(input: GenericNotificationRegistrationInput): boolean {
 	if (
-		!isNotificationHostEligible({
+		!isGenericNotificationHostEligible({
 			env: input.env,
 			taskDepth: input.taskDepth,
 			parentTaskPrefix: input.parentTaskPrefix,
@@ -483,36 +701,14 @@ export function shouldRegisterNotificationsExtension(input: {
 	) {
 		return false;
 	}
-	return (
-		input.env.GJC_NOTIFICATIONS === "1" ||
-		Boolean(input.env.GJC_NOTIFICATIONS_TOKEN) ||
-		Boolean(input.cfg && isGloballyConfigured(input.cfg))
-	);
+	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
+	return input.cfg !== undefined && hasAnyEffectivelyEnabledProvider(input.cfg);
 }
 
-/**
- * Resolve whether THIS session should run notifications.
- * Precedence (highest first):
- *  1) env.GJC_NOTIFICATIONS === "0"  -> false (hard opt-out)
- *  2) sessionDisabled === true       -> false (local /notify off)
- *  3) env.GJC_NOTIFICATIONS === "1" || env.GJC_NOTIFICATIONS_TOKEN present -> true (legacy explicit)
- *  4) spawned GJC child with `sessionScope=primary` -> false
- *  5) isGloballyConfigured(cfg)      -> true (global auto-on)
- *  6) otherwise false
- */
-export function isSessionNotificationsEnabled(input: {
-	cfg: NotificationConfig;
-	env: NodeJS.ProcessEnv;
-	sessionDisabled: boolean;
-	/** This process was programmatically spawned by GJC (consumed at SDK startup). */
-	spawnedByGjc?: boolean;
-}): boolean {
-	if (input.env.GJC_NOTIFICATIONS === "0") return false;
-	if (input.sessionDisabled) return false;
-	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
-	if (input.spawnedByGjc && input.cfg.sessionScope === "primary") return false;
-	return isGloballyConfigured(input.cfg);
+export function isGenericNotificationSessionEnabled(input: GenericNotificationSessionEligibilityInput): boolean {
+	return resolveGenericNotificationSessionEligibility(input).enabled;
 }
+
 
 /** Mask a bot token for display: first 4 chars + "…" + "(len N)"; "(unset)" when undefined/empty. Never reveal full token. */
 export function maskToken(token: string | undefined): string {

@@ -1,4 +1,12 @@
-import type { DiscordInboundEvent, DiscordMessageComponent, DiscordProvider, DiscordThread } from "./discord-provider";
+import type {
+	DiscordConfigurationProbeResult,
+	DiscordDiagnosticProvider,
+	DiscordInboundEvent,
+	DiscordMessageComponent,
+	DiscordOneShotTestResult,
+	DiscordProvider,
+	DiscordThread,
+} from "./discord-provider";
 
 const API_BASE = "https://discord.com/api/v10";
 const GATEWAY_INTENTS = 1 + 512 + 32_768;
@@ -35,7 +43,7 @@ export interface DiscordLiveProviderOptions {
 type JsonRecord = Record<string, unknown>;
 
 /** Discord REST/Gateway implementation. The only credential is held privately and is never emitted. */
-export class DiscordLiveProvider implements DiscordProvider {
+export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticProvider {
 	readonly applicationId: string;
 	readonly #token: string;
 	readonly #fetch: DiscordFetch;
@@ -228,6 +236,53 @@ export class DiscordLiveProvider implements DiscordProvider {
 			if (id) return { id };
 		}
 		return null;
+	}
+
+	async probeConfiguration(signal?: AbortSignal): Promise<DiscordConfigurationProbeResult> {
+		if (signal?.aborted) return { ok: false, detail: "Discord configuration probe cancelled." };
+		try {
+			const currentUser = await this.#request("/users/@me", { signal });
+			const botUserId = this.#string(currentUser, "id");
+			if (!botUserId) return { ok: false, detail: "Discord returned an invalid bot identity." };
+			const application = await this.#request("/oauth2/applications/@me", { signal });
+			const applicationId = this.#string(application, "id");
+			if (!applicationId || applicationId !== this.applicationId) {
+				return { ok: false, detail: "Discord application identity does not match the configured application ID." };
+			}
+			return { ok: true, detail: "Discord bot and application credentials are valid.", botUserId };
+		} catch (error) {
+			if (signal?.aborted) return { ok: false, detail: "Discord configuration probe cancelled." };
+			const detail = error instanceof Error ? error.message : "Discord configuration probe failed.";
+			return { ok: false, detail };
+		}
+	}
+
+	async sendOneShotTest(input: {
+		channelId: string;
+		message: string;
+		signal?: AbortSignal;
+	}): Promise<DiscordOneShotTestResult> {
+		if (input.signal?.aborted) return { ok: false, detail: "Discord notification test cancelled." };
+		try {
+			const response = await this.#request(`/channels/${input.channelId}/messages`, {
+				method: "POST",
+				body: JSON.stringify({ content: input.message }),
+				signal: input.signal,
+			});
+			const messageId = this.#string(response, "id");
+			if (!messageId) {
+				return {
+					ok: false,
+					detail: "Discord may have accepted the message but returned no message receipt.",
+					uncertain: true,
+				};
+			}
+			return { ok: true, detail: "Discord notification test delivered.", messageId };
+		} catch (error) {
+			if (input.signal?.aborted) return { ok: false, detail: "Discord notification test cancelled." };
+			const detail = error instanceof Error ? error.message : "Discord notification test failed.";
+			return { ok: false, detail, uncertain: !detail.startsWith("Discord API request failed") };
+		}
 	}
 
 	async start(onEvent: (event: DiscordInboundEvent) => Promise<void>): Promise<void> {

@@ -98,7 +98,7 @@ type DurableBatchRevision = {
 };
 type NotificationValidationState = {
 	malformedConfigRoot: boolean;
-	invalidNotificationConfiguration: boolean;
+	invalidNotificationGlobal: boolean;
 	generation: number;
 };
 type NotificationValidationRestoreGuard = {
@@ -378,7 +378,7 @@ export class Settings implements NotificationSettingsReader {
 	#hasMalformedConfigRoot = false;
 	/** YAML syntax was unrecoverable, so the loaded defaults are read-only until config.yml is repaired. */
 	#hasRecoveredConfigSyntax = false;
-	#hasInvalidNotificationConfiguration = false;
+	#hasInvalidNotificationGlobal = false;
 	#notificationValidationGeneration = 0;
 	/** Notification subtree fingerprint from the last raw durable config read. */
 	#durableNotificationFingerprint: string | undefined;
@@ -513,7 +513,7 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot {
 		return parseNotificationSettingsSnapshot(
-			this.#hasMalformedConfigRoot || this.#hasInvalidNotificationConfiguration ? null : this.#global,
+			this.#hasMalformedConfigRoot || this.#hasInvalidNotificationGlobal ? null : this.#rawNotificationConfig,
 		);
 	}
 
@@ -895,7 +895,7 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#futureSchemaVersion = this.#futureSchemaVersion;
 		cloned.#hasMalformedConfigRoot = this.#hasMalformedConfigRoot;
 		cloned.#hasRecoveredConfigSyntax = this.#hasRecoveredConfigSyntax;
-		cloned.#hasInvalidNotificationConfiguration = this.#hasInvalidNotificationConfiguration;
+		cloned.#hasInvalidNotificationGlobal = this.#hasInvalidNotificationGlobal;
 		cloned.#notificationValidationGeneration = this.#notificationValidationGeneration;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#rawNotificationConfig = structuredClone(this.#rawNotificationConfig);
@@ -1149,7 +1149,7 @@ export class Settings implements NotificationSettingsReader {
 	#resetYamlLoadState(): void {
 		this.#hasMalformedConfigRoot = false;
 		this.#hasRecoveredConfigSyntax = false;
-		this.#hasInvalidNotificationConfiguration = false;
+		this.#hasInvalidNotificationGlobal = false;
 		this.#schemaReport = { issues: [], valid: true };
 		this.#schemaMigrationPending = false;
 		this.#futureSchemaVersion = false;
@@ -1211,7 +1211,7 @@ export class Settings implements NotificationSettingsReader {
 				parseNotificationSettingsSnapshot(parsedRaw);
 			} catch (error) {
 				if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration") throw error;
-				this.#hasInvalidNotificationConfiguration = true;
+				this.#hasInvalidNotificationGlobal = true;
 			}
 		}
 		this.#futureSchemaVersion =
@@ -1875,7 +1875,7 @@ export class Settings implements NotificationSettingsReader {
 	#notificationValidationState(): NotificationValidationState {
 		return {
 			malformedConfigRoot: this.#hasMalformedConfigRoot,
-			invalidNotificationConfiguration: this.#hasInvalidNotificationConfiguration,
+			invalidNotificationGlobal: this.#hasInvalidNotificationGlobal,
 			generation: this.#notificationValidationGeneration,
 		};
 	}
@@ -1900,7 +1900,7 @@ export class Settings implements NotificationSettingsReader {
 	}
 	#restoreNotificationValidationState(state: NotificationValidationState): void {
 		this.#hasMalformedConfigRoot = state.malformedConfigRoot;
-		this.#hasInvalidNotificationConfiguration = state.invalidNotificationConfiguration;
+		this.#hasInvalidNotificationGlobal = state.invalidNotificationGlobal;
 	}
 	#rejectAtomicNotificationRepairForMalformedRoot(patches: readonly AtomicYamlPatch[], root: unknown): void {
 		if (
@@ -1951,17 +1951,17 @@ export class Settings implements NotificationSettingsReader {
 	#recomputeNotificationValidationFromRaw(): void {
 		if (this.#rawNotificationConfig === undefined) {
 			this.#hasMalformedConfigRoot = true;
-			this.#hasInvalidNotificationConfiguration = false;
+			this.#hasInvalidNotificationGlobal = false;
 			return;
 		}
 		try {
 			parseNotificationSettingsSnapshot(this.#rawNotificationConfig);
 			this.#hasMalformedConfigRoot = false;
-			this.#hasInvalidNotificationConfiguration = false;
+			this.#hasInvalidNotificationGlobal = false;
 		} catch (error) {
 			if (error instanceof Error && error.message === "gjc_notify_daemon_invalid_configuration") {
 				this.#hasMalformedConfigRoot = false;
-				this.#hasInvalidNotificationConfiguration = true;
+				this.#hasInvalidNotificationGlobal = true;
 				return;
 			}
 			throw error;
@@ -1973,10 +1973,10 @@ export class Settings implements NotificationSettingsReader {
 		try {
 			parseNotificationSettingsSnapshot(this.#rawNotificationConfig);
 			this.#hasMalformedConfigRoot = false;
-			this.#hasInvalidNotificationConfiguration = false;
+			this.#hasInvalidNotificationGlobal = false;
 		} catch (error) {
 			if (error instanceof Error && error.message === "gjc_notify_daemon_invalid_configuration") {
-				this.#hasInvalidNotificationConfiguration = true;
+				this.#hasInvalidNotificationGlobal = true;
 				return;
 			}
 			throw error;
@@ -2054,9 +2054,9 @@ export class Settings implements NotificationSettingsReader {
 // Setting Hooks
 // ═══════════════════════════════════════════════════════════════════════════
 
-type SettingHook<P extends SettingPath> = (value: SettingValue<P>, prev: SettingValue<P>) => void;
+type SettingHook = (value: unknown, prev: unknown) => void;
 
-const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
+const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook>> = {
 	"theme.dark": value => {
 		if (typeof value === "string") {
 			setAutoThemeMapping("dark", value);

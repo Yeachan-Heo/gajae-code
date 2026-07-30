@@ -1,9 +1,10 @@
 import {
 	getCurrentTelegramActivationMarker,
-	isNotificationStreamingEnabled,
-	isSessionNotificationsEnabled,
-	isTelegramConfigured,
+	type GenericNotificationSessionSource,
+	isProviderEffectivelyEnabled,
 	type NotificationConfig,
+	resolveGenericNotificationSessionEligibility,
+	resolveGenericNotificationStreamPolicy,
 } from "./config";
 
 /** Minimal session-manager surface shared by extension, TUI, and headless hosts. */
@@ -48,9 +49,9 @@ export interface NotificationSessionRuntime<Context extends NotificationSessionC
 export interface NotificationSessionStatus {
 	eligible: boolean;
 	locallyEnabled: boolean;
-	effectiveEnabled: boolean;
+	genericSessionEnabled: boolean;
+	genericEligibilitySource: GenericNotificationSessionSource;
 	running: boolean;
-	environment: "off" | "explicit" | "token" | "default";
 }
 
 export interface NotificationSessionReconcileResult {
@@ -61,6 +62,7 @@ export interface NotificationSessionReconcileResult {
 export interface NotificationRuntimePolicy {
 	redact: boolean;
 	verbosity: NotificationConfig["verbosity"];
+	/** Generic live-frame delivery policy; never proof of provider effectiveness. */
 	stream: boolean;
 	mode: "provisional" | "committed";
 }
@@ -72,14 +74,16 @@ export interface NotificationSessionControllerOptions {
 	getConfig(): NotificationConfig;
 	/** Kept as a reference so test and embedding hosts can supply their own environment. */
 	env?: NodeJS.ProcessEnv;
+	/** This process was launched by a marked GJC child spawn site. */
+	spawnedByGjc?: boolean;
 }
 
 /**
  * Shared owner of notification session policy.
  *
- * Gate A is captured at creation. Gate B is evaluated for each session
- * operation with `isSessionNotificationsEnabled`. Gate C verifies complete
- * Telegram ownership before a generic endpoint is allowed to start.
+ * Gate A is captured at creation. Gate B is evaluated through the typed generic
+ * session policy. Provider effectiveness remains separate; Telegram owner proof
+ * runs only when Telegram is effective and has no inactive marker.
  */
 const MAX_RECONCILE_ATTEMPTS = 3;
 
@@ -87,6 +91,7 @@ export class NotificationSessionController {
 	readonly #eligible: boolean;
 	readonly #getConfig: () => NotificationConfig;
 	readonly #env: NodeJS.ProcessEnv;
+	readonly #spawnedByGjc: boolean;
 	readonly #disabledSessions = new Set<string>();
 	/** Sessions held inactive after a post-commit foreign daemon identity race. */
 	readonly #blockedRuntimeSessions = new Set<string>();
@@ -100,6 +105,7 @@ export class NotificationSessionController {
 		this.#eligible = options.eligible;
 		this.#getConfig = options.getConfig;
 		this.#env = options.env ?? process.env;
+		this.#spawnedByGjc = options.spawnedByGjc ?? false;
 	}
 
 	/** Attach the concrete generic endpoint implementation used by this host. */
@@ -257,24 +263,27 @@ export class NotificationSessionController {
 				return { outcome: "failed", status: this.#failClosedStatus(binding, runtime) };
 			}
 			const status = this.#status(binding, cfg, runtime);
-			if (!status.effectiveEnabled) {
+			if (!status.genericSessionEnabled) {
 				if (runtime && status.running) await runtime.stop(binding);
 				if (!this.#isCurrentConfig(cfg)) continue;
 				return { outcome: status.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
 			}
 
 			if (!runtime) return { outcome: "disabled", status };
-			if (getCurrentTelegramActivationMarker(cfg)) {
+			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
+			const telegramEffective = isProviderEffectivelyEnabled(cfg, "telegram");
+			const nonTelegramEffective =
+				isProviderEffectivelyEnabled(cfg, "discord") || isProviderEffectivelyEnabled(cfg, "slack");
+			if (telegramEffective && telegramMarker && !nonTelegramEffective) {
 				if (runtime.isRunning(binding)) await runtime.stop(binding);
-				this.#blockedRuntimeSessions.add(binding.sessionId);
 				if (!this.#isCurrentConfig(cfg)) continue;
 				return { outcome: "disabled", status: this.#status(binding, cfg, runtime) };
 			}
-			if (isTelegramConfigured(cfg)) {
+			if (telegramEffective && !telegramMarker) {
 				try {
 					const ensured = await runtime.ensureTelegramDaemon?.(binding);
 					if (!this.#isCurrentConfig(cfg)) continue;
-					if (ensured !== "ready") {
+					if (ensured !== "ready" && !nonTelegramEffective) {
 						if (runtime.isRunning(binding)) await runtime.stop(binding);
 						this.#blockedRuntimeSessions.add(binding.sessionId);
 						return {
@@ -284,21 +293,27 @@ export class NotificationSessionController {
 					}
 				} catch {
 					if (!this.#isCurrentConfig(cfg)) continue;
-					if (runtime.isRunning(binding)) await runtime.stop(binding);
-					this.#blockedRuntimeSessions.add(binding.sessionId);
-					return { outcome: "failed", status: this.#status(binding, cfg, runtime) };
+					if (!nonTelegramEffective) {
+						if (runtime.isRunning(binding)) await runtime.stop(binding);
+						this.#blockedRuntimeSessions.add(binding.sessionId);
+						return { outcome: "failed", status: this.#status(binding, cfg, runtime) };
+					}
 				}
 			}
 
 			const current = this.#status(binding, cfg, runtime);
-			if (!current.effectiveEnabled || !this.#isCurrentConfig(cfg)) continue;
+			if (!current.genericSessionEnabled || !this.#isCurrentConfig(cfg)) continue;
 			this.#refreshPolicy(
 				runtime,
 				binding,
 				{
 					redact: cfg.redact,
 					verbosity: cfg.verbosity,
-					stream: isNotificationStreamingEnabled({ cfg, env: this.#env }),
+					stream: resolveGenericNotificationStreamPolicy({
+						cfg,
+						env: this.#env,
+						genericSessionEnabled: current.genericSessionEnabled,
+					}).enabled,
 				},
 				"committed",
 			);
@@ -311,7 +326,11 @@ export class NotificationSessionController {
 				{
 					redact: cfg.redact,
 					verbosity: cfg.verbosity,
-					stream: isNotificationStreamingEnabled({ cfg, env: this.#env }),
+					stream: resolveGenericNotificationStreamPolicy({
+						cfg,
+						env: this.#env,
+						genericSessionEnabled: current.genericSessionEnabled,
+					}).enabled,
 				},
 				"committed",
 			);
@@ -325,7 +344,7 @@ export class NotificationSessionController {
 			}
 			runtime.activate?.(binding);
 			const afterStart = this.#status(binding, cfg, runtime);
-			if (!afterStart.effectiveEnabled) {
+			if (!afterStart.genericSessionEnabled) {
 				if (afterStart.running) await runtime.stop(binding);
 				return {
 					outcome: afterStart.running ? "stopped" : "disabled",
@@ -357,9 +376,9 @@ export class NotificationSessionController {
 		return {
 			eligible: this.#eligible,
 			locallyEnabled: false,
-			effectiveEnabled: false,
+			genericSessionEnabled: false,
+			genericEligibilitySource: "none",
 			running: runtime?.isRunning(binding) ?? false,
-			environment: "off",
 		};
 	}
 
@@ -414,26 +433,29 @@ export class NotificationSessionController {
 		const locallyEnabled = !this.#disabledSessions.has(binding.sessionId);
 		const blockedRuntime = this.#blockedRuntimeSessions.has(binding.sessionId);
 		const shuttingDown = this.#shuttingDownSessions.has(binding.sessionId);
-		const effectiveEnabled =
+		const eligibility = resolveGenericNotificationSessionEligibility({
+			cfg,
+			env: this.#env,
+			sessionDisabled: !locallyEnabled,
+			spawnedByGjc: this.#spawnedByGjc,
+		});
+		const telegramMarkerBlocksOnlyProvider =
+			Boolean(getCurrentTelegramActivationMarker(cfg)) &&
+			isProviderEffectivelyEnabled(cfg, "telegram") &&
+			!isProviderEffectivelyEnabled(cfg, "discord") &&
+			!isProviderEffectivelyEnabled(cfg, "slack");
+		const genericSessionEnabled =
 			!blockedRuntime &&
 			!shuttingDown &&
-			!getCurrentTelegramActivationMarker(cfg) &&
+			!telegramMarkerBlocksOnlyProvider &&
 			this.#eligible &&
-			isSessionNotificationsEnabled({ cfg, env: this.#env, sessionDisabled: !locallyEnabled });
-		const environment =
-			this.#env.GJC_NOTIFICATIONS === "0"
-				? "off"
-				: this.#env.GJC_NOTIFICATIONS === "1"
-					? "explicit"
-					: this.#env.GJC_NOTIFICATIONS_TOKEN
-						? "token"
-						: "default";
+			eligibility.enabled;
 		return {
 			eligible: this.#eligible,
 			locallyEnabled,
-			effectiveEnabled,
+			genericSessionEnabled,
+			genericEligibilitySource: eligibility.source,
 			running: runtime?.isRunning(binding) ?? false,
-			environment,
 		};
 	}
 }
