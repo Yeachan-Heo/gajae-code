@@ -1566,6 +1566,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// (serviceTier === undefined) would be resurrected to the startup value.
 				return agent ? agent.serviceTier : initialServiceTier;
 			},
+			isFastForSubagentProvider: provider => session?.isFastForSubagentProvider(provider) ?? false,
 			getAgentId: () => resolvedAgentId,
 			bashAllowedPrefixes: options.bashAllowedPrefixes,
 			bashRestrictionProfile: options.bashRestrictionProfile,

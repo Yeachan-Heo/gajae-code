@@ -3,7 +3,11 @@ import { AsyncJobManager, type SubagentRecord } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import type { AgentProgress } from "../../src/task/types";
 import { SubagentTool, type ToolSession } from "../../src/tools";
-import { type SubagentSnapshot, subagentAwaitRenderedStateSignature } from "../../src/tools/subagent";
+import {
+	type SubagentSnapshot,
+	type SubagentToolDetails,
+	subagentAwaitRenderedStateSignature,
+} from "../../src/tools/subagent";
 
 function createSession(agentId = "0-Main"): ToolSession {
 	return {
@@ -88,6 +92,79 @@ describe("subagent await live progress", () => {
 		expect(snap?.progress?.recentOutput).toContain("scanning files");
 
 		manager.cancelSubagent("0-Live", { ownerId: "0-Main" });
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("surfaces retained fast mode from the canonical subagent record", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register(
+			"task",
+			"fast subagent",
+			async () => {
+				await Bun.sleep(150);
+				return "done";
+			},
+			{
+				id: "job-fast",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Fast", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-Fast", jobId));
+		manager.updateSubagentModel("0-Fast", { fastMode: true });
+
+		const result = await tool.execute("inspect", { action: "inspect", ids: ["0-Fast"] });
+		const snap = result.details?.subagents.find(s => s.id === "0-Fast");
+
+		expect(snap?.fastMode).toBe(true);
+
+		manager.cancelSubagent("0-Fast", { ownerId: "0-Main" });
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("retains fast mode across a live progress update", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register(
+			"task",
+			"fast subagent",
+			async () => {
+				await Bun.sleep(2000);
+				return "done";
+			},
+			{
+				id: "job-fast-live",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-FastLive", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-FastLive", jobId));
+		manager.updateSubagentModel("0-FastLive", { fastMode: true });
+
+		const updates: SubagentSnapshot[] = [];
+		const pending = tool.execute(
+			"await",
+			{ action: "await", ids: ["0-FastLive"], timeout_ms: 1500 },
+			undefined,
+			result => {
+				const snap = result.details?.subagents.find(s => s.id === "0-FastLive");
+				if (snap) updates.push(snap);
+			},
+		);
+
+		// Mutate progress only AFTER the await is live, so the panel is forced to
+		// rebuild the snapshot in flight. The record-derived fast flag must survive
+		// that rebuild, or the ⚡ glyph vanishes the moment the subagent reports.
+		await Bun.sleep(50);
+		manager.recordSubagentProgress("0-FastLive", makeProgress({ id: "0-FastLive", currentTool: "read" }));
+		await pending;
+
+		const rebuilt = updates.filter(snap => snap.progress?.currentTool === "read");
+		expect(rebuilt.length).toBeGreaterThan(0);
+		expect(rebuilt.every(snap => snap.fastMode === true)).toBe(true);
+
+		manager.cancelSubagent("0-FastLive", { ownerId: "0-Main" });
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
@@ -410,6 +487,7 @@ describe("subagentAwaitRenderedStateSignature", () => {
 			s => ({ ...s, effectiveModel: "model-2" }),
 			s => ({ ...s, requestedModel: "model-1" }),
 			s => ({ ...s, modelFellBack: true }),
+			s => ({ ...s, fastMode: true }),
 			s => ({ ...s, description: "new description" }),
 			s => ({ ...s, assignment: "new assignment" }),
 			s => ({ ...s, progress: { ...baseProgress, currentTool: "bash" } }),
@@ -498,6 +576,49 @@ describe("subagentAwaitRenderedStateSignature", () => {
 			subagentAwaitRenderedStateSignature([early]),
 		);
 	});
+
+	it("changes when only fastMode flips, at every rendered progress route", () => {
+		// The nested task panel renders `AgentProgress.fastMode`, and the producer's
+		// await gating plus the body cache both key off this signature. If the shared
+		// progress canonicalizer omits fastMode, the one update that introduces the
+		// glyph compares byte-identical and is suppressed, leaving a stale body.
+		const nestedTask = (fastMode: boolean) =>
+			[{ id: "n1", progress: [makeProgress({ id: "n1", fastMode })] }] as unknown as NonNullable<
+				AgentProgress["extractedToolData"]
+			>["task"];
+		const inflight = (fastMode: boolean) =>
+			({ id: "t1", progress: [makeProgress({ id: "t1", fastMode })] }) as unknown as NonNullable<
+				AgentProgress["inflightTaskDetails"]
+			>;
+
+		const routes: Array<[string, (fastMode: boolean) => SubagentSnapshot]> = [
+			["root progress", fastMode => makeSnapshot({ id: "0-A", progress: makeProgress({ id: "0-A", fastMode }) })],
+			[
+				"inflightTaskDetails.progress",
+				fastMode =>
+					makeSnapshot({
+						id: "0-A",
+						progress: makeProgress({ id: "0-A", inflightTaskDetails: inflight(fastMode) }),
+					}),
+			],
+			[
+				"extractedToolData.task[].progress",
+				fastMode =>
+					makeSnapshot({
+						id: "0-A",
+						progress: makeProgress({ id: "0-A", extractedToolData: { task: nestedTask(fastMode) } }),
+					}),
+			],
+		];
+
+		for (const [route, build] of routes) {
+			const slow = subagentAwaitRenderedStateSignature([build(false)]);
+			const fast = subagentAwaitRenderedStateSignature([build(true)]);
+			expect(fast, `fastMode must reach the signature via ${route}`).not.toBe(slow);
+			// Same value twice stays stable, so the difference is fastMode and not churn.
+			expect(subagentAwaitRenderedStateSignature([build(true)])).toBe(fast);
+		}
+	});
 });
 
 describe("subagent await emit gating", () => {
@@ -554,6 +675,71 @@ describe("subagent await emit gating", () => {
 		ac.abort();
 		for (const control of controls) control.resolve();
 		await Promise.all(execs);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("emits exactly once when only a nested task's fastMode flips, and not for an unchanged poll", async () => {
+		vi.useFakeTimers();
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const control = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"task",
+			"0-Nested",
+			async () => {
+				await control.promise;
+				return "done";
+			},
+			{
+				id: "job-0-Nested",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Nested", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-Nested", jobId));
+
+		const nested = (fastMode: boolean) =>
+			makeProgress({
+				id: "0-Nested",
+				currentTool: "task",
+				inflightTaskDetails: {
+					id: "t1",
+					progress: [makeProgress({ id: "n1", fastMode })],
+				} as unknown as NonNullable<AgentProgress["inflightTaskDetails"]>,
+			});
+
+		manager.recordSubagentProgress("0-Nested", nested(false));
+		const ac = new AbortController();
+		const spy = vi.fn();
+		const exec = tool.execute(
+			"await-0-Nested",
+			{ action: "await", ids: ["0-Nested"], timeout_ms: 3_600_000 },
+			ac.signal,
+			spy,
+		);
+		await Promise.resolve();
+		expect(spy).toHaveBeenCalledTimes(1);
+
+		// Re-recording the identical nested progress is not a rendered-state change.
+		manager.recordSubagentProgress("0-Nested", nested(false));
+		vi.advanceTimersByTime(500);
+		expect(spy).toHaveBeenCalledTimes(1);
+
+		// Flipping only the nested fastMode changes what renders, so it must emit once.
+		manager.recordSubagentProgress("0-Nested", nested(true));
+		vi.advanceTimersByTime(500);
+		expect(spy).toHaveBeenCalledTimes(2);
+		const emitted = spy.mock.calls.at(-1)?.[0] as { details?: SubagentToolDetails } | undefined;
+		expect(emitted?.details?.subagents?.[0]?.progress?.inflightTaskDetails?.progress?.[0]?.fastMode).toBe(true);
+
+		// And the new value is then stable: another identical poll stays quiet.
+		manager.recordSubagentProgress("0-Nested", nested(true));
+		vi.advanceTimersByTime(500);
+		expect(spy).toHaveBeenCalledTimes(2);
+
+		ac.abort();
+		control.resolve();
+		await exec;
 		await manager.dispose({ timeoutMs: 100 });
 	});
 });

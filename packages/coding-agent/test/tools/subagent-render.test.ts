@@ -69,6 +69,37 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("read");
 		expect(out).toContain("scanning the repo");
 	});
+	it("renders the fast glyph on the model line only when fast mode is enabled", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-LiveFast",
+					fastMode: true,
+					effectiveModel: "openai-codex/gpt-5.6-sol",
+					liveProgressAvailable: true,
+				}),
+				snapshot({
+					id: "0-TerminalFast",
+					status: "completed",
+					fastMode: true,
+					effectiveModel: "openai-codex/gpt-5.6-sol",
+					resultText: "done",
+				}),
+				snapshot({
+					id: "0-TerminalNormal",
+					status: "completed",
+					effectiveModel: "anthropic/claude-sonnet-4-5",
+					resultText: "done",
+				}),
+			],
+		});
+		// The glyph rides the model line, never the id.
+		expect(out).toContain(`Model: openai-codex/gpt-5.6-sol ${theme.icon.fast}`);
+		expect(out).not.toContain(`0-LiveFast ${theme.icon.fast}`);
+		expect(out).not.toContain(`0-TerminalFast ${theme.icon.fast}`);
+		expect(out).toContain("Model: anthropic/claude-sonnet-4-5");
+		expect(out).not.toContain(`Model: anthropic/claude-sonnet-4-5 ${theme.icon.fast}`);
+	});
 
 	it("expands live recent output, tool args, and the full task section when expanded=true and collapses them back (AC1/AC2)", () => {
 		const details: SubagentToolDetails = {
@@ -623,5 +654,40 @@ describe("subagent await renderer body cache (PR2)", () => {
 		}
 		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(140);
 		expect(subagentBodyCacheTestHooks.size).toBeLessThanOrEqual(128);
+	});
+
+	it("invalidates the cached body when only a nested task's fastMode flips", () => {
+		// The body cache is keyed by subagentAwaitRenderedStateSignature, so a nested
+		// fastMode change that the signature ignored would serve a stale body and the
+		// glyph would never appear.
+		const nested = (fastMode: boolean): SubagentToolDetails => ({
+			subagents: [
+				snapshot({
+					id: "0-Nested",
+					liveProgressAvailable: true,
+					progress: progress({
+						id: "0-Nested",
+						currentTool: "task",
+						inflightTaskDetails: {
+							id: "t1",
+							progress: [progress({ id: "n1", currentTool: "read", fastMode })],
+						} as unknown as NonNullable<AgentProgress["inflightTaskDetails"]>,
+					}),
+				}),
+			],
+		});
+
+		const slow = renderWith(nested(false));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		// Same value again is a genuine cache hit.
+		renderWith(nested(false));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+
+		const fast = renderWith(nested(true));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
+		expect(fast).not.toEqual(slow);
+		expect(theme.icon.fast).toBeTruthy();
+		expect(fast.join("\n")).toContain(theme.icon.fast);
+		expect(slow.join("\n")).not.toContain(theme.icon.fast);
 	});
 });

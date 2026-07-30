@@ -308,7 +308,9 @@ export class ProcessTerminal implements Terminal {
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
-		// Disable alternate-scroll so the host owns wheel scrolling unless mouse capture is enabled.
+		// Button-event reporting preserves wheel input while also letting the TUI implement drag selection.
+		// Alternate-scroll must stay disabled: otherwise Windows Terminal/tmux can translate wheel notches
+		// into cursor Up/Down input, which the focused composer interprets as prompt history.
 		// Clear both tracking variants first so stale modes from another application cannot leak across startup.
 		this.#safeWrite(
 			this.#mouseEnabled

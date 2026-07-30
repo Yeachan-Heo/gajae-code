@@ -1533,6 +1533,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
 					effectiveModel: resolvedModelString,
 					modelFellBack: authFallbackUsed === true,
+					fastMode: progress.fastMode,
 				});
 			}
 			if (model?.contextWindow && model.contextWindow > 0) {

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-07-30
+
 ### Fixed
 
 - Mara Cloud login now validates pasted credentials against the authenticated chat-completions endpoint instead of the public `/v1/models` catalog. The catalog returns `200` even for random invalid bearer tokens, so the previous check could persist unusable keys.

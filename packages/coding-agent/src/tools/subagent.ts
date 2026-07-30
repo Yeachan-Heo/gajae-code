@@ -84,6 +84,8 @@ export interface SubagentSnapshot {
 	requestedModel?: string;
 	/** True when the requested model lacked credentials and fell back to the parent model. */
 	modelFellBack?: boolean;
+	/** True when the effective subagent provider is in fast mode. */
+	fastMode?: boolean;
 }
 
 export type SubagentAwaitOutcome = "completed" | "timed_out" | "interrupted";
@@ -698,6 +700,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (record.effectiveModel) fields.effectiveModel = record.effectiveModel;
 		if (record.requestedModel) fields.requestedModel = record.requestedModel;
 		if (record.modelFellBack) fields.modelFellBack = true;
+		if (record.fastMode) fields.fastMode = true;
 		return fields;
 	}
 
@@ -906,6 +909,7 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 		effectiveModel: snapshot.effectiveModel ?? null,
 		requestedModel: snapshot.requestedModel ?? null,
 		modelFellBack: snapshot.modelFellBack ?? false,
+		fastMode: snapshot.fastMode ?? false,
 		// durationMs intentionally excluded (time-derived; would defeat idle gating).
 		progress: snapshot.progress ? canonicalizeProgressForSignature(snapshot.progress) : null,
 	};
@@ -933,6 +937,10 @@ function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
 		cost: progress.cost,
 		modelOverride: progress.modelOverride ?? null,
 		modelSubstitutionWarning: progress.modelSubstitutionWarning ?? null,
+		// The nested task panel renders this, so it must reach the signature or a
+		// fast-mode-only change would render differently while comparing byte-identical,
+		// suppressing the very update that introduces the glyph.
+		fastMode: progress.fastMode ?? false,
 		// durationMs intentionally excluded (time-derived).
 		extractedToolData: progress.extractedToolData
 			? canonicalizeExtractedToolDataForSignature(progress.extractedToolData)

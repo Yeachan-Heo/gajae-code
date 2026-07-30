@@ -394,7 +394,14 @@ describe("SDK socket serve", () => {
 			const b = await socketConnect(socketPath);
 			a.write(`gjc-sdk-transport/1 token=${token}\n{ "client": "a" }\n`);
 			b.write(`gjc-sdk-transport/1 token=${token}\n{ "client": "b" }\n`);
-			await waitFor(() => (fake.connections.length === 2 ? fake.connections : undefined), "isolated upstream pairs");
+			await waitFor(
+				() =>
+					fake.connections.length === 2 &&
+					fake.connections.every(connection => connection.messages[0] !== undefined)
+						? fake.connections
+						: undefined,
+				"isolated upstream pairs",
+			);
 			expect(fake.connections.map(connection => connection.messages[0]).sort()).toEqual([
 				'{ "client": "a" }',
 				'{ "client": "b" }',
