@@ -41,25 +41,26 @@ const tempRoots: string[] = [];
 
 let savedSessionId: string | undefined;
 let savedSessionFile: string | undefined;
-// Capture the host CI planner's changed paths once at module load. Most tests
-// below create temp dirs INSIDE the enclosing git work tree, so
-// computeCheckpointChangeSet would otherwise merge CI_DEV_CHANGED_PATHS (which
-// includes computer control surface paths on branches that touch them) into the
-// computed change set and falsely trigger the mandatory computer red-team suite.
-// Clear it in beforeEach and restore the original in afterEach; batchTempDir
-// and the explicit CI-leak tests override the value within their own scope.
+// Pin a non-computer test path as CI_DEV_CHANGED_PATHS for every test. Temp
+// dirs live outside the enclosing git work tree (os.tmpdir), so
+// computeCheckpointChangeSet falls through to the CI_DEV_CHANGED_PATHS-only
+// path — without a non-empty path it returns captureIncomplete=true which
+// unconditionally triggers the mandatory computer red-team suite even when no
+// computer surface was touched. batchTempDir overrides this with its own batch
+// paths; the explicit CI-leak tests override within their own scope.
 const ORIGINAL_CI_DEV_CHANGED_PATHS = process.env.CI_DEV_CHANGED_PATHS;
+const NON_COMPUTER_TEST_PATH = "packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts";
 
 beforeEach(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
 	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	delete process.env.GJC_SESSION_FILE;
-	delete process.env.CI_DEV_CHANGED_PATHS;
+	process.env.CI_DEV_CHANGED_PATHS = NON_COMPUTER_TEST_PATH;
 });
 
 async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-runtime-"));
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-"));
 	tempRoots.push(dir);
 	return dir;
 }

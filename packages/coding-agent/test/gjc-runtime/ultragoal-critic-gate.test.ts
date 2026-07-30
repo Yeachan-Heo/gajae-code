@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
 import { verifyUltragoalDurableCompletionState } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
@@ -27,25 +28,23 @@ import {
 
 const TEST_SESSION_ID = "ultragoal-critic-gate-test-session";
 const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
-// These checkpoints create temp dirs inside the enclosing git work tree, so
-// computeCheckpointChangeSet would otherwise sweep the CI planner's
-// CI_DEV_CHANGED_PATHS (which includes computer control surface paths on
-// branches that touch them) into the computed change set and falsely trigger
-// the mandatory computer red-team suite. Clear it before each test so the
-// generic gate fixtures validate their own contract instead of the host
-// branch's diff; restore the original after the whole suite finishes.
+// Temp dirs live outside the enclosing git work tree (os.tmpdir) so
+// computeCheckpointChangeSet falls through to the CI_DEV_CHANGED_PATHS-only
+// path. Pin a non-computer path so the mandatory computer red-team suite is
+// not falsely triggered by captureIncomplete or git-command timeouts under
+// parallel shard load.
 const ORIGINAL_CI_DEV_CHANGED_PATHS = process.env.CI_DEV_CHANGED_PATHS;
 const tempRoots: string[] = [];
 
 async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-critic-gate-"));
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-critic-gate-"));
 	tempRoots.push(dir);
 	return dir;
 }
 
 beforeEach(() => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
-	delete process.env.CI_DEV_CHANGED_PATHS;
+	process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-runtime/ultragoal-critic-gate.test.ts";
 });
 
 afterEach(async () => {
@@ -58,7 +57,6 @@ afterAll(() => {
 	if (ORIGINAL_CI_DEV_CHANGED_PATHS === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 	else process.env.CI_DEV_CHANGED_PATHS = ORIGINAL_CI_DEV_CHANGED_PATHS;
 });
-
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {
 	let crc = index;

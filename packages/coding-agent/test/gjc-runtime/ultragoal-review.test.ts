@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
 import { modeStatePath as sessionModeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -28,23 +29,21 @@ async function runGit(cwd: string, args: string[]): Promise<void> {
 
 beforeAll(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
-	// Each review tempDir inits its own git repo inside the enclosing work tree,
-	// but computeCheckpointChangeSet still merges the CI planner's
-	// CI_DEV_CHANGED_PATHS into the computed change set. On branches that touch
-	// computer control surface paths that would falsely trigger the mandatory
-	// computer red-team suite. Capture the original once and clear it before each
-	// test so the dedicated CI-leak tests below set their own value within their
-	// own scope; restore the original after the whole suite finishes.
 	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
 });
 
 beforeEach(() => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
-	delete process.env.CI_DEV_CHANGED_PATHS;
+	// Temp dirs live outside the enclosing git work tree (os.tmpdir) and each
+	// inits its own standalone git repo. computeCheckpointChangeSet still
+	// merges CI_DEV_CHANGED_PATHS into the computed change set. Pin a
+	// non-computer path so the mandatory computer red-team suite is not falsely
+	// triggered; the dedicated CI-leak tests below override within their scope.
+	process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-runtime/ultragoal-review.test.ts";
 });
 
 async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-review-"));
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-review-"));
 	tempRoots.push(dir);
 	await runGit(dir, ["init"]);
 	await runGit(dir, ["config", "user.email", "test@example.com"]);
