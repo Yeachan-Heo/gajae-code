@@ -379,6 +379,20 @@ describe("ultragoal review command", () => {
 		expect(output.verdict).toBe("fail");
 		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
+	it("rejects an unresolved review branch with and without a spec", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		await Bun.write(path.join(root, "spec.md"), "Strong acceptance criteria");
+		const qaPath = await writeQa(root, validExecutorQa());
+		for (const args of [
+			["--branch", "missing-review-branch", "--executor-qa-json", qaPath],
+			["--spec", "spec.md", "--branch", "missing-review-branch", "--executor-qa-json", qaPath],
+		]) {
+			const result = await runNativeUltragoalCommand(["review", ...args, "--json"], root);
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("review branch missing-review-branch does not resolve");
+		}
+	});
 	it("uses spec override as a strong contract and allows clean pass", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);

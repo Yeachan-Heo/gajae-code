@@ -4228,6 +4228,10 @@ async function localDiffSource(cwd: string, sourceKind: string, branch?: string)
 				!stagedDiff.ok,
 		};
 	}
+	if (branch) {
+		const branchExists = await spawnText(["git", "rev-parse", "--verify", branch], { cwd, timeoutMs: 3000 });
+		if (!branchExists.ok) throw new Error(`review branch ${branch} does not resolve`);
+	}
 	const base = await resolveGitBase(cwd, branch);
 	const [diffStat, nameStatus, diff] = await Promise.all([
 		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
