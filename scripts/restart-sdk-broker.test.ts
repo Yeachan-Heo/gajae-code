@@ -96,6 +96,31 @@ test("does not start a replacement when authenticated shutdown fails", async () 
 	expect(ensured).toBe(false);
 });
 
+test("rejects when authenticated shutdown exceeds the graceful timeout", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const neverSettlingShutdown = Promise.withResolvers<void>();
+	let ensureCalled = false;
+	await expect(
+		Promise.race([
+			restartSdkBroker(
+				{ agentDir: "/agent", gracefulTimeoutMs: 20 },
+				deps({
+					readDiscovery: async () => previous,
+					shutdown: () => neverSettlingShutdown.promise,
+					ensure: async () => {
+						ensureCalled = true;
+						return discovery(2, "darwin:2:0");
+					},
+				}),
+			),
+			Bun.sleep(200).then(() => {
+				throw new Error("watchdog timeout");
+			}),
+		]),
+	).rejects.toThrow("did not complete its authenticated shutdown within 20ms");
+	expect(ensureCalled).toBe(false);
+});
+
 test("falls back to an identity-fenced signal when the broker lacks broker.shutdown", async () => {
 	const previous = discovery(1, "darwin:1:0");
 	const replacement = discovery(2, "darwin:2:0");

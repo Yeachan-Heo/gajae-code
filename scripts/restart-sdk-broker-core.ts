@@ -50,6 +50,12 @@ async function stopPreviousBroker(discovery: BrokerDiscoveryLike, deps: RestartS
 	}
 }
 
+function createAuthenticatedShutdownTimeoutError(previousPid: number, gracefulTimeoutMs: number): Error {
+	return new Error(
+		`SDK broker pid ${previousPid} did not complete its authenticated shutdown within ${gracefulTimeoutMs}ms.`,
+	);
+}
+
 /**
  * Session hosts outlive the broker that spawned them, so a broker-only restart keeps
  * serving whatever source those processes started with. Closing them through the live
@@ -74,16 +80,25 @@ export async function restartSdkBroker(
 	let closedSessionIds: string[] | undefined;
 	if (previous) {
 		if (options.closeSessionHosts) closedSessionIds = await closeSessionHosts(previous, deps);
-		await stopPreviousBroker(previous, deps);
 		const deadline = Date.now() + gracefulTimeoutMs;
+		const timeout = Promise.withResolvers<void>();
+		const timeoutId = setTimeout(() => {
+			timeout.reject(createAuthenticatedShutdownTimeoutError(previous.pid, gracefulTimeoutMs));
+		}, Math.max(0, deadline - Date.now()));
+		try {
+			await Promise.race([stopPreviousBroker(previous, deps), timeout.promise]);
+		} finally {
+			clearTimeout(timeoutId);
+		}
+
 		while (Date.now() < deadline) {
 			const current = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
 			if (!current || current.pid !== previous.pid || current.incarnation !== previous.incarnation) break;
-			await deps.sleep(SHUTDOWN_POLL_INTERVAL_MS);
+			await deps.sleep(Math.min(SHUTDOWN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
 		}
 		const current = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
 		if (current?.pid === previous.pid && current.incarnation === previous.incarnation) {
-			throw new Error(`SDK broker pid ${previous.pid} did not complete its authenticated shutdown.`);
+			throw createAuthenticatedShutdownTimeoutError(previous.pid, gracefulTimeoutMs);
 		}
 	}
 
