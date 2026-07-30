@@ -5,10 +5,12 @@ import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import type { AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { TempDir } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -201,5 +203,64 @@ describe("AgentSession fast-mode Q1 auto-disable (provider-scoped marker)", () =
 		expect(entries.length).toBe(before + 1);
 		expect(entries.at(-1)?.serviceTier).toBeNull();
 		expect(session.serviceTier).toBeUndefined();
+	});
+});
+
+// The Task tool reaches the session through the SDK's `ToolSession` adapter and calls
+// `isFastForSubagentProvider` optionally (`?.(provider) ?? false`). An adapter that omits
+// the member therefore degrades silently to "never fast", which is exactly how the ⚡
+// glyph went missing for every subagent. Pin the delegation to the adapter object.
+describe("ToolSession adapter fast-mode delegation", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let created: Awaited<ReturnType<typeof createAgentSession>>;
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@pi-tool-session-fast-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		created = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(),
+			authStorage,
+			// `task.serviceTier` defaults to "inherit", so the subagent predicate resolves
+			// this scoped parent tier: priority on OpenAI providers, nothing on Anthropic.
+			settings: Settings.isolated({ serviceTier: "openai-only", "recipe.enabled": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
+		});
+	});
+
+	afterEach(async () => {
+		await created.session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+	});
+
+	function toolSession(): ToolSession {
+		const tool = created.session.getToolByName("subagent");
+		if (!tool) throw new Error("subagent tool is not registered");
+		return (tool as unknown as { session: ToolSession }).session;
+	}
+
+	it("exposes isFastForSubagentProvider on the adapter handed to tools", () => {
+		expect(typeof toolSession().isFastForSubagentProvider).toBe("function");
+	});
+
+	it("delegates the scoped subagent tier through the adapter", () => {
+		const adapter = toolSession();
+		expect(adapter.isFastForSubagentProvider?.("openai")).toBe(true);
+		expect(adapter.isFastForSubagentProvider?.("openai-codex")).toBe(true);
+		expect(adapter.isFastForSubagentProvider?.("anthropic")).toBe(false);
+		expect(adapter.isFastForSubagentProvider?.(undefined)).toBe(false);
 	});
 });

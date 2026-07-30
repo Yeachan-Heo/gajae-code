@@ -16,6 +16,8 @@ const packages: WorkspacePackage[] = [
 	},
 ];
 
+const EMBEDDED_DOCS_GATE_KEY = "test:packages/coding-agent/test/docs-index-lazy.test.ts";
+
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);
 }
@@ -948,8 +950,10 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(stderr).toContain("not in the current plan");
 	});
 
+	// CHANGELOG.md, not a docs/ path: docs/**/*.md selects the embedded-docs gate,
+	// which is a native consumer and therefore now carries a native producer.
 	test("--native-build is a no-op when the plan has no native build task", async () => {
-		const { stdout, exitCode } = await runScript(["--native-build"], "docs/readme.md");
+		const { stdout, exitCode } = await runScript(["--native-build"], "CHANGELOG.md");
 		expect(exitCode).toBe(0);
 		expect(stdout).toContain("no native build tasks in plan");
 	});
@@ -1247,8 +1251,65 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
-	test("docs/changelog-only changes plan nothing expensive", () => {
-		expect(targeted(["docs/guide.md", "CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	test("changelog and package-readme-only changes plan nothing", () => {
+		expect(targeted(["CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	});
+
+	// docs/ is the source the embedded docs index is generated from, so shipping a
+	// docs edit without regenerating that index is the one drift class a docs-only
+	// change can introduce. Both planners must select that gate, because dev CI runs
+	// on push as well as pull_request. The gate reads the generated corpus through the
+	// package barrel, so it is a native consumer: it has to bring its own producer, or
+	// the shard's `if: matrix.native` download step asks for an artifact that the
+	// skipped `affected-native` job never uploaded.
+	test("docs-only changes select the embedded-docs gate and its native producer", () => {
+		const changed = ["docs/guide.md", "docs/nested/other.md"];
+		for (const keys of [targeted(changed), planTasks(changed, packages)].map(tasks =>
+			tasks.map(task => task.key),
+		)) {
+			expect(keys).toEqual([EMBEDDED_DOCS_GATE_KEY, "native-linux-x64"]);
+		}
+	});
+
+	// The producer invariant stated as the matrix sees it: any plan with a native
+	// consumer must also carry a native producer, or has_native gates it off.
+	test("a docs-only plan never ships a native consumer without a producer", () => {
+		for (const changed of [["docs/guide.md"], ["docs/tools/read.md", "docs/guide.md"]]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				const entries = describeTasks(tasks);
+				expect(entries.some(entry => entry.native)).toBe(true);
+				expect(entries.some(entry => entry.nativeBuild)).toBe(true);
+			}
+		}
+	});
+
+	// The generated index is a real source file, so it also pulls its owning-package
+	// tasks. The gate must still be selected -- that is the half a docs-only plan
+	// cannot cover on its own.
+	test("a generated-docs-index change also selects the embedded-docs gate", () => {
+		for (const changed of [
+			["packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
+			["docs/guide.md", "packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
+		]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				expect(tasks.map(task => task.key)).toContain(EMBEDDED_DOCS_GATE_KEY);
+			}
+		}
+	});
+
+	// Markdown outside docs/ is not embedded, so it must not drag the gate in.
+	test("the embedded-docs gate stays out of unrelated plans", () => {
+		for (const changed of [
+			["CHANGELOG.md"],
+			["packages/coding-agent/README.md"],
+			["README.md"],
+			[".gjc/skills/example/SKILL.md"],
+			["packages/example/src/index.ts"],
+		]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				expect(tasks.map(task => task.key)).not.toContain(EMBEDDED_DOCS_GATE_KEY);
+			}
+		}
 	});
 
 test("Python SDK changes plan dedicated Python validation and one native build", () => {

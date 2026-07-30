@@ -421,9 +421,6 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.probeWindowsJobMemory !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required memory probe capability \`probeWindowsJobMemory\`.`);
 	}
-	if (typeof bindings.exactReplacePath !== "function") {
-		throw new Error(`Loaded ${candidate} but it lacks required exact replacement capability \`exactReplacePath\`.`);
-	}
 }
 
 function buildHelpMessage(ctx) {

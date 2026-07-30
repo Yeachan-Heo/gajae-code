@@ -1,7 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Agent, type AgentEvent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
+import {
+	Agent,
+	type AgentEvent,
+	type AgentTool,
+	type StreamFn,
+	setAgentTerminalOwnerContext,
+} from "@gajae-code/agent-core";
 
 import type { AssistantMessage, Model, StopReason } from "@gajae-code/ai";
 
@@ -683,13 +689,21 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 				assistantFor(model, { content: [{ type: "text", text: "unused" }], totalTokens: 1, stopReason: "stop" }),
 		});
 		try {
-			loop.session.agent.emitExternalEvent({
+			const resourceRunId = "aborted-maintenance-terminal-owner";
+			const domain = loop.session.agent.resourceLedger.open(resourceRunId);
+			if (!domain) throw new Error("Expected aborted maintenance resource domain");
+			const claimProducer = vi.spyOn(loop.session.agent.resourceLedger, "claimProducer");
+			const event = {
 				type: "agent_end",
 				messages: [],
 				stopReason: "maintenance",
 				maintenanceOutcome: "aborted",
-			});
-			await Bun.sleep(0);
+			} satisfies AgentEvent;
+			setAgentTerminalOwnerContext(event, { resourceRunId, domain });
+			loop.session.agent.emitExternalEvent(event);
+			loop.session.agent.resourceLedger.seal(resourceRunId);
+			await loop.session.waitForIdle();
+			expect(claimProducer).toHaveBeenCalledWith(resourceRunId, domain, expect.anything());
 			expect(
 				loop.events.filter(
 					event =>

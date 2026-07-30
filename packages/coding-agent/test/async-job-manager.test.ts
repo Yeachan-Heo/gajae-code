@@ -384,6 +384,44 @@ describe("AsyncJobManager", () => {
 		await manager.waitForAll();
 		expect(manager.getJob(parentJobId)?.status).toBe("cancelled");
 	});
+	test("updateSubagentModel preserves fields omitted from a partial patch", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const jobId = manager.register("task", "fast subagent", async () => "done", { ownerId: "0-Main" });
+		manager.registerSubagentRecord({
+			subagentId: "0-Fast",
+			ownerId: "0-Main",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+
+		manager.updateSubagentModel("0-Fast", {
+			requestedModel: "anthropic/claude-opus-4-5",
+			effectiveModel: "anthropic/claude-sonnet-4-5",
+			modelFellBack: true,
+			fastMode: true,
+		});
+		expect(manager.getSubagentRecord("0-Fast")).toMatchObject({
+			requestedModel: "anthropic/claude-opus-4-5",
+			effectiveModel: "anthropic/claude-sonnet-4-5",
+			modelFellBack: true,
+			fastMode: true,
+		});
+
+		// A narrow fast-mode patch must not erase the model identity recorded above;
+		// unconditional assignment used to blank all three of the omitted fields.
+		manager.updateSubagentModel("0-Fast", { fastMode: false });
+		expect(manager.getSubagentRecord("0-Fast")).toMatchObject({
+			requestedModel: "anthropic/claude-opus-4-5",
+			effectiveModel: "anthropic/claude-sonnet-4-5",
+			modelFellBack: true,
+			fastMode: false,
+		});
+
+		manager.cancelAll();
+	});
 	test("retention-zero eviction runs onEvict and records a monitor tombstone", async () => {
 		let evictCount = 0;
 		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });

@@ -68,6 +68,80 @@ describe("AgentSession abort timeout", () => {
 		expect(notices.some(message => message.includes("Abort cleanup timed out"))).toBe(true);
 	});
 
+	it("aborts and quarantines only the captured prompt domain while a successor remains live", async () => {
+		tempDir = TempDir.createSync("@gjc-exact-prompt-abort-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled anthropic model to exist");
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+
+		const first = agent.resourceLedger.open("captured-a");
+		const successor = agent.resourceLedger.open("successor-b");
+		if (!first || !successor) throw new Error("Expected prompt cancellation domains");
+		const cancellationAware = Promise.withResolvers<void>();
+		first.signal.addEventListener("abort", () => cancellationAware.resolve(), { once: true });
+		const firstProducer = agent.resourceLedger.reserveProducer(
+			"captured-a",
+			first,
+			"post_prompt",
+			"cancellation-aware",
+		);
+		if (!firstProducer.ok) throw new Error("Expected first producer reservation");
+		firstProducer.lease.track("post_prompt", "cancellation-aware-child", cancellationAware.promise);
+		firstProducer.lease.closeDiscovery();
+		agent.resourceLedger.seal("captured-a");
+
+		expect(await session.abortPromptAndWait("captured-a", { graceMs: 100 })).toEqual({ status: "settled" });
+		expect(first.signal.aborted).toBe(true);
+		expect(successor.signal.aborted).toBe(false);
+
+		const hanging = Promise.withResolvers<void>();
+		const hangingDomain = agent.resourceLedger.open("captured-hanging");
+		if (!hangingDomain) throw new Error("Expected hanging prompt domain");
+		const hangingProducer = agent.resourceLedger.reserveProducer(
+			"captured-hanging",
+			hangingDomain,
+			"post_prompt",
+			"hanging",
+		);
+		if (!hangingProducer.ok) throw new Error("Expected hanging producer reservation");
+		hangingProducer.lease.track("post_prompt", "hanging-child", hanging.promise);
+		hangingProducer.lease.closeDiscovery();
+		agent.resourceLedger.seal("captured-hanging");
+
+		const proof = await session.abortPromptAndWait("captured-hanging", { graceMs: 5 });
+		expect(proof).toMatchObject({
+			status: "unfenced",
+			reason: "resources_pending",
+			pending: [{ kind: "post_prompt", label: "hanging-child" }],
+		});
+		expect(hangingDomain.signal.aborted).toBe(true);
+		expect(successor.signal.aborted).toBe(false);
+		expect(await session.abortPromptAndWait("captured-hanging", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "quarantined",
+			pending: [{ kind: "post_prompt", label: "hanging-child" }],
+		});
+
+		agent.resourceLedger.seal("successor-b");
+		hanging.resolve();
+	});
+
 	it("settles a never-resolving worker integration request after aborting it", async () => {
 		let aborted = false;
 		const scheduler = new WorkerIntegrationRequestScheduler(

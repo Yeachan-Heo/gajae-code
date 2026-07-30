@@ -183,7 +183,6 @@ const requiredGeneratedBindingSymbols = [
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
-	"exactReplacePath",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {
@@ -254,7 +253,7 @@ console.log(`Building pi-natives for ${targetPlatform}-${targetArch}${variantSuf
 // Resolve napi bin directly: `bunx @napi-rs/cli` can pick up the wrong bin on
 // systems where `cli` exists on PATH (e.g. Mono's /usr/bin/cli on Ubuntu).
 const napiBin = Bun.which("napi", {
-	PATH: `${path.join(import.meta.dir, "..", "node_modules", ".bin")}${path.delimiter}${path.join(repoRoot, "node_modules", ".bin")}${path.delimiter}${process.env.PATH ?? ""}`,
+	PATH: `${path.join(import.meta.dir, "..", "node_modules", ".bin")}:${path.join(repoRoot, "node_modules", ".bin")}:${process.env.PATH ?? ""}`,
 });
 if (!napiBin) {
 	throw new Error("Could not locate @napi-rs/cli `napi` binary in node_modules/.bin");

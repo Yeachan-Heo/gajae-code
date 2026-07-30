@@ -453,6 +453,23 @@ describe("SubagentTool", () => {
 		expect(postRequest).toEqual({ kind: "failed", text: "Subagent failed." });
 	});
 
+	it("maps an exit-zero merge_failed receipt to a failed async job outcome", () => {
+		expect(
+			subagentRunOutcomeFromSingleResult("Recovery required.", {
+				aborted: false,
+				exitCode: 0,
+				status: "merge_failed",
+			}),
+		).toEqual({ kind: "failed", text: "Recovery required." });
+	});
+
+	it("maps a missing task receipt to a failed async job outcome", () => {
+		expect(subagentRunOutcomeFromSingleResult("Task result unavailable.", undefined)).toEqual({
+			kind: "failed",
+			text: "Task result unavailable.",
+		});
+	});
+
 	it("consumes a watched completion before unwatch can redeliver it", async () => {
 		const delivered: string[] = [];
 		const manager = new AsyncJobManager({

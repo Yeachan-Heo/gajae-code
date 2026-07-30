@@ -83,13 +83,19 @@ async function captureUntrackedPatch(repoRoot: string, untracked: readonly strin
 	if (untracked.length === 0) return "";
 	const nullPath = getGitNoIndexNullPath();
 	const untrackedDiffs = await Promise.all(
-		untracked.map(entry =>
-			git.diff(repoRoot, {
+		untracked.map(async entry => {
+			const absolutePath = path.join(repoRoot, entry);
+			const stat = await fs.lstat(absolutePath);
+			if (stat.isFile()) {
+				const handle = await fs.open(absolutePath, "r");
+				await handle.close();
+			}
+			return await git.diff(repoRoot, {
 				allowFailure: true,
 				binary: true,
 				noIndex: { left: nullPath, right: entry },
-			}),
-		),
+			});
+		}),
 	);
 	return untrackedDiffs.filter(diff => diff.trim()).join("\n");
 }
@@ -135,24 +141,38 @@ export async function captureBaseline(repoRoot: string): Promise<WorktreeBaselin
 	return { root, nested };
 }
 
-async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise<string> {
+async function captureRepoCurrentTree(repoDir: string): Promise<string> {
 	const currentHead = (await git.head.sha(repoDir)) ?? "";
 	const currentStaged = await git.diff(repoDir, { binary: true, cached: true });
 	const currentUnstaged = await git.diff(repoDir, { binary: true });
 	const currentUntracked = await git.ls.untracked(repoDir);
 	const currentUntrackedPatch = await captureUntrackedPatch(repoDir, currentUntracked);
+	return await writeSyntheticTree(repoDir, currentHead, [currentStaged, currentUnstaged, currentUntrackedPatch]);
+}
 
+async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise<string> {
 	const baselineTree = await writeSyntheticTree(repoDir, rb.headCommit, [rb.staged, rb.unstaged, rb.untrackedPatch]);
-	const currentTree = await writeSyntheticTree(repoDir, currentHead, [
-		currentStaged,
-		currentUnstaged,
-		currentUntrackedPatch,
-	]);
+	const currentTree = await captureRepoCurrentTree(repoDir);
 
 	return git.diff.tree(repoDir, baselineTree, currentTree, {
-		allowFailure: true,
 		binary: true,
 	});
+}
+
+/** Confirm that applying patches to the captured owner baseline exactly matches the current owner worktree. */
+export async function verifyRootPatchesApplied(
+	repoRoot: string,
+	baseline: WorktreeBaseline,
+	patches: readonly string[],
+): Promise<boolean> {
+	const baselineTree = await writeSyntheticTree(repoRoot, baseline.root.headCommit, [
+		baseline.root.staged,
+		baseline.root.unstaged,
+		baseline.root.untrackedPatch,
+	]);
+	const expectedTree = await writeSyntheticTree(repoRoot, baselineTree, patches);
+	const currentTree = await captureRepoCurrentTree(repoRoot);
+	return expectedTree === currentTree;
 }
 
 export interface NestedRepoPatch {
@@ -163,64 +183,123 @@ export interface NestedRepoPatch {
 export interface DeltaPatchResult {
 	rootPatch: string;
 	nestedPatches: NestedRepoPatch[];
+	captureErrors?: string[];
+}
+
+export interface RecoveryPatchBundle {
+	version: 1;
+	rootPatch: string;
+	nestedPatches: NestedRepoPatch[];
+	captureErrors?: string[];
+}
+
+function captureErrorCode(error: unknown): string {
+	const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+	return typeof code === "string" && code.length > 0 ? code : "unknown_error";
+}
+
+export function serializeRecoveryPatchBundle(delta: DeltaPatchResult): string {
+	if (delta.nestedPatches.length === 0 && !delta.captureErrors?.length) return delta.rootPatch;
+	return `${JSON.stringify({
+		version: 1,
+		rootPatch: delta.rootPatch,
+		nestedPatches: delta.nestedPatches,
+		...(delta.captureErrors?.length ? { captureErrors: delta.captureErrors } : {}),
+	} satisfies RecoveryPatchBundle)}\n`;
+}
+
+export async function verifyNestedPatchesApplied(
+	repoRoot: string,
+	baseline: WorktreeBaseline,
+	patches: readonly NestedRepoPatch[],
+): Promise<boolean> {
+	const grouped = new Map<string, string[]>();
+	for (const patch of patches) {
+		const current = grouped.get(patch.relativePath) ?? [];
+		current.push(patch.patch);
+		grouped.set(patch.relativePath, current);
+	}
+	for (const [relativePath, repoPatches] of grouped) {
+		const nestedBaseline = baseline.nested.find(entry => entry.relativePath === relativePath)?.baseline;
+		if (!nestedBaseline) return false;
+		const nestedDir = path.join(repoRoot, relativePath);
+		const baselineTree = await writeSyntheticTree(nestedDir, nestedBaseline.headCommit, [
+			nestedBaseline.staged,
+			nestedBaseline.unstaged,
+			nestedBaseline.untrackedPatch,
+		]);
+		const expectedTree = await writeSyntheticTree(nestedDir, baselineTree, repoPatches);
+		if ((await captureRepoCurrentTree(nestedDir)) !== expectedTree) return false;
+	}
+	return true;
 }
 
 export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
 	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root);
 	const nestedPatches: NestedRepoPatch[] = [];
+	const captureErrors: string[] = [];
 
 	for (const { relativePath, baseline: nb } of baseline.nested) {
 		const nestedDir = path.join(isolationDir, relativePath);
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
-		} catch {
-			continue;
+			const patch = await captureRepoDeltaPatch(nestedDir, nb);
+			if (patch.trim()) nestedPatches.push({ relativePath, patch });
+		} catch (error) {
+			captureErrors.push(`Nested repository capture failed (${relativePath}): ${captureErrorCode(error)}`);
 		}
-		const patch = await captureRepoDeltaPatch(nestedDir, nb);
-		if (patch.trim()) nestedPatches.push({ relativePath, patch });
 	}
 
-	return { rootPatch, nestedPatches };
+	return { rootPatch, nestedPatches, ...(captureErrors.length ? { captureErrors } : {}) };
 }
 
-/**
- * Apply nested repo patches directly to their working directories after parent merge.
- * @param commitMessage Optional async function to generate a commit message from the combined diff.
- *                      If omitted or returns null, falls back to a generic message.
- */
-export async function applyNestedPatches(
-	repoRoot: string,
-	patches: NestedRepoPatch[],
-	commitMessage?: (diff: string) => Promise<string | null>,
-): Promise<void> {
-	// Group patches by target repo to apply all at once and commit
+/** Preflight every nested delta, then roll back earlier repositories if a later apply fails. */
+export async function applyNestedPatches(repoRoot: string, patches: NestedRepoPatch[]): Promise<void> {
 	const byRepo = new Map<string, NestedRepoPatch[]>();
-	for (const p of patches) {
-		if (!p.patch.trim()) continue;
-		const group = byRepo.get(p.relativePath) ?? [];
-		group.push(p);
-		byRepo.set(p.relativePath, group);
+	for (const patch of patches) {
+		if (!patch.patch.trim()) continue;
+		const group = byRepo.get(patch.relativePath) ?? [];
+		group.push(patch);
+		byRepo.set(patch.relativePath, group);
 	}
 
-	for (const [relativePath, repoPatches] of byRepo) {
+	const prepared: Array<{ relativePath: string; nestedDir: string; combinedPatch: string }> = [];
+	for (const [relativePath, repoPatches] of [...byRepo.entries()].sort(([left], [right]) =>
+		left.localeCompare(right),
+	)) {
 		const nestedDir = path.join(repoRoot, relativePath);
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
 		} catch {
-			continue;
+			throw new Error(`Nested repository is unavailable: ${relativePath}`);
 		}
+		const combinedPatch = git.patch.join(repoPatches.map(entry => entry.patch));
+		if (!(await git.patch.canApplyText(nestedDir, combinedPatch))) {
+			throw new Error(`Nested repository patch does not apply cleanly: ${relativePath}`);
+		}
+		prepared.push({ relativePath, nestedDir, combinedPatch });
+	}
 
-		const combinedDiff = repoPatches.map(p => p.patch).join("\n");
-		for (const { patch } of repoPatches) {
-			await git.patch.applyText(nestedDir, patch);
+	const applied: typeof prepared = [];
+	try {
+		for (const entry of prepared) {
+			await git.patch.applyText(entry.nestedDir, entry.combinedPatch);
+			applied.push(entry);
 		}
-
-		// Commit so nested repo history reflects the task changes
-		if ((await git.status(nestedDir)).trim().length > 0) {
-			const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
-			await git.stage.files(nestedDir);
-			await git.commit(nestedDir, msg);
+	} catch (error) {
+		const rollbackFailures: string[] = [];
+		for (const entry of applied.reverse()) {
+			try {
+				await git.patch.applyText(entry.nestedDir, entry.combinedPatch, { reverse: true });
+			} catch {
+				rollbackFailures.push(entry.relativePath);
+			}
 		}
+		const message = error instanceof Error ? error.message : String(error);
+		const rollback = rollbackFailures.length
+			? `; rollback failed for: ${rollbackFailures.join(", ")}`
+			: "; earlier nested patches were rolled back";
+		throw new Error(`Nested repository patch application failed: ${message}${rollback}`);
 	}
 }
 

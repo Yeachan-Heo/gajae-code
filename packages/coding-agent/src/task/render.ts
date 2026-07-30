@@ -7,7 +7,7 @@
 import path from "node:path";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { formatNumber } from "@gajae-code/utils";
+import { formatNumber, sanitizeText } from "@gajae-code/utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import {
@@ -915,6 +915,17 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 	}
 	if (result.roi?.lowRoi) {
 		lines.push(`${continuePrefix}${theme.fg("warning", "low ROI: produced no material contribution")}`);
+	}
+
+	if (result.persistence?.recoveryRef) {
+		const label = result.persistence.ownerWorktreeApplied ? "Recovery patch" : "Unapplied recovery patch";
+		const recoveryUri = truncateToWidth(replaceTabs(sanitizeText(result.persistence.recoveryRef.uri)), 80);
+		lines.push(
+			`${continuePrefix}${theme.fg(
+				result.persistence.ownerWorktreeApplied ? "dim" : "warning",
+				`${label}: ${recoveryUri} (${formatBytes(result.persistence.recoveryRef.sizeBytes)})`,
+			)}`,
+		);
 	}
 
 	if (result.outputRef) {

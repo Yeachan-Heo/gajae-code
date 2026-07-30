@@ -1,6 +1,20 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
+- Ultragoal validation-batch hydration now fails closed unless deferred and final-close evidence exactly matches a complete authoritative cumulative Git/CI inventory and durable batch tuple. Explicit malformed, partial, unknown, reordered, or stale receipt data is rejected; Git path capture is byte-safe, NUL-delimited, and includes untracked files; incomplete capture conservatively requires computer-control QA; shared settings and tool registries cannot use partial diffs to bypass that suite; validate/checkpoint replacement hydration is identical; and current/replacement receipts are byte-bound to ledger payloads (#3541).
+- Fixture quality gates that complete intermediate Ultragoal stories now write file-backed adversarial artifact proof; skill-state hooks and computer red-team fixtures match the unconditional adversarial path check so #3543 CI stays fail-closed without weakening hydration exactness (#3543).
+
+### Fixed
+
+- Canonical wrapped first-event timeouts now continue the same clean turn through bounded retries and configured fallback rotation, while preserving replay-safety, cancellation, provider-terminal policies, exact attempt diagnostics, and task/subagent retry-status truth (#3553).
+- Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
+
+## [0.12.4] - 2026-07-30
+
+## [0.12.3] - 2026-07-30
 
 ### Fixed
 
@@ -26,6 +40,7 @@
 - `gjc --worktree` / `gjc -w` launch no longer crashes with a raw uncaught `EEXIST` when the worktree bucket directory (`<repo>.gajae-code-worktrees`) is a broken symbolic link to unmounted or offloaded cold storage. The launch distinguishes dangling links and non-directory entries from valid directory symlinks or Windows junctions, reclassifies mkdir races, avoids disclosing raw link targets or unsafe shell commands, and never deletes or replaces an obstructing entry.
 - POSIX parent identity reproof/fsync is now centralized before every promotable artifact-phase result, preventing a crash-window where a rename is lost after durable retirement is recorded (#3489).
 - Artifact retirement, planned paths, retained authority, and transcript retry in both managed reconciliation and deletion now bind to the newest published `pendingEvidence` attempt, preventing stranded detached transcripts at paths absent from the newest receipt after a crash (#3489).
+- Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
 - Detached task receipts for in-memory parent sessions no longer advertise dead `agent://` output URIs. TaskTool allocates a session-lifetime durable artifact root under the process temp directory, persists child outputs there, authorizes parent and same-session descendants for scoped resolution, and omits the URI entirely when durable allocation fails (#3471).
 - Managed-session replacement and cleanup now bind Windows destination mutation to exact native identity, keep lock acquisition/release retryable without reviving lost ownership, and report retained artifact payloads as `cleanup_pending` until only the verified root remains.
 - Resuming a session no longer crashes with an unhandled rejection when another session transition is already running. The session picker dispatches resume through a void-returning callback, and `handleResumeSession` had no re-entrancy guard, so a second selection (or a resume issued while compaction, handoff, or a fork was in flight) reached `switchSession` and the `{ code: "busy" }` transition error rejected a promise nobody awaited. Resume now ignores an overlapping request with a status message, reports a busy transition as status, and still propagates every other failure. The progress lease is released on all paths.
@@ -41,14 +56,17 @@
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 - Kitty/Ghostty inline images no longer remain visually pinned when transcript, pinned, or overlay rows are replaced, removed, scrolled, resized, or fully repainted. The TUI now parses only bounded named placements, soft-deletes overwritten placements from the previously committed physical frame, retains transmitted pixels, and restores placements from application scrollback without retransmitting image data.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
+- Bash output-tail initialization now tolerates constrained `ToolSession` settings adapters that expose `get()` without `has()`, preserving the 1 KiB default and explicit head/tail overrides instead of crashing restricted and interceptor Bash execution.
 - Managed-session startup failures now include their bounded preparation classification (and path-free native durability diagnostic when available), so Windows launch crashes no longer collapse to an unactionable generic error while filesystem paths and raw OS messages remain redacted (#3383).
 - Single-model sessions now rotate immediately to another stored provider credential after a content-free quota or rate-limit failure, without requiring a synthetic model fallback chain. Credential rotation is replay-safe for content-free failures regardless of extension lifecycle participation, and traverses the full credential pool independent of `retry.maxRetries` (#3491).
 - External credential discovery now follows `CLAUDE_CONFIG_DIR` and `CODEX_HOME` instead of always reading `~/.claude` and `~/.codex`, so importing from an account switcher (or any relocated Claude Code / Codex CLI config root) picks up the account the launching shell selected. Both variables resolve through the credential env trust boundary and must be absolute; redacted summaries name the variable, never the resolved path.
 - The `acp_conformance` CI job runs again. The pinned upstream `acpx` checkout resolves its own imports (`@agentclientprotocol/sdk`, `zod`) from its own tree, but its dependencies were never installed, so the corpus runner aborted with `Cannot find module 'zod/v4'` before executing a single case. The checkout is now installed after provenance verification, and the reused warm cache still skips the reinstall.
+- ACP prompt terminalization now binds each accepted execution handle to one immutable cancellation domain, reserves producer ownership before terminal publication, and quarantines only the exact run when settlement cannot be proven. The fixed 10-second fail-closed external error remains unchanged while internal diagnostics report only bounded resource kinds, hashed labels, clamped ages, and omitted counts.
 
 ### Added
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
+- The interactive terminal’s responsive IRC/todo work-lane contract now covers exact narrow/wide geometry, requested versus effective IRC visibility, direct-root pin ordering, todo lane bounds, remapped IRC toggles, and live composer shortcut hints.
 
 ### Fixed
 

@@ -38,12 +38,14 @@ export type ChatDaemonAction = "stop" | "reload";
  * chat daemons after notification configuration parsing changes. Generation 15
  * applies the current notification configuration directly when starting chat
  * daemon transports. Generation 16 applies Telegram sound-policy configuration
- * through shared notification parsing. Generation 17 binds managed-session
- * replacement to exact native filesystem authority.
+ * through shared notification parsing. Generation 17 bound managed-session
+ * replacement to exact native filesystem authority; generation 18 retires that
+ * binding (revert of #3489, which stalled POSIX artifact cleanup) while keeping
+ * the lifecycle contract moving strictly forward.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 17,
-	slack: 17,
+	discord: 18,
+	slack: 18,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

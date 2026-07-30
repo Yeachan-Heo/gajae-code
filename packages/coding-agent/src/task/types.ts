@@ -442,6 +442,20 @@ export function createSetupFailureSummary(error: unknown): SetupFailureSummary {
 	};
 }
 
+export interface TaskRecoveryArtifactRef {
+	uri: string;
+	sizeBytes: number;
+	sha256: string;
+	/** Recovery artifacts remain readable for the parent session lifetime. */
+	durability: "session";
+}
+
+export interface TaskPersistenceResult {
+	outcome: "applied" | "no_changes" | "recovery_available";
+	ownerWorktreeApplied: boolean;
+	recoveryRef?: TaskRecoveryArtifactRef;
+}
+
 /** Result from a single agent execution */
 export interface SingleResult {
 	index: number;
@@ -491,6 +505,10 @@ export interface SingleResult {
 	worktree?: DurableWorktreeInfo;
 	/** Typed durable-worktree provisioning failure, surfaced instead of a generic error. */
 	worktreeError?: DurableWorktreeError;
+	/** Receipt-safe owner-worktree persistence result for isolated execution. */
+	persistence?: TaskPersistenceResult;
+	/** Identity-bound patch artifact captured before isolation cleanup. */
+	recoveryRef?: TaskRecoveryArtifactRef;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/** Full wrapper-owned review evidence, kept separate from caller completion data. */

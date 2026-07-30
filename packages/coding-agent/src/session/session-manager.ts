@@ -9708,6 +9708,7 @@ export class SessionManager {
 		destination: SessionDestination,
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
+		cwdOverride?: string,
 	): Promise<SessionManager> {
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
@@ -9721,16 +9722,20 @@ export class SessionManager {
 		const captured = store.readExpected(path.basename(resolved));
 		const entries = captured ? parseSessionEntries(captured.bytes.toString("utf8")) : [];
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		const manager = new SessionManager(
-			header?.cwd ?? getProjectDir(),
-			destination.directory,
-			true,
-			storage,
-			destination,
+		const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : (header?.cwd ?? getProjectDir());
+		const cwdChanged = Boolean(
+			header && cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd),
 		);
+		if (header && cwdChanged) header.cwd = sessionCwd;
+		const manager = new SessionManager(sessionCwd, destination.directory, true, storage, destination);
 		if (entries.length > 0) {
-			const migrationApplied = migrateToCurrentVersion(entries);
+			const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
 			await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
+			if (cwdChanged) {
+				await manager.#rewriteFile();
+				manager.#flushed = true;
+				manager.#ensuredOnDisk = true;
+			}
 			writeTerminalBreadcrumb(manager.cwd, resolved);
 			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		} else {

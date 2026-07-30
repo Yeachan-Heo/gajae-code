@@ -1,8 +1,6 @@
 import {
 	categorizeComputerChangePath,
-	isSettingsSchemaPath,
-	normalizeRepoPath,
-	type UltragoalChangeCategory,
+	normalizeChangeSetPath,
 	type UltragoalChangeSet,
 	type UltragoalChangeSetPath,
 	type UltragoalChangeStatus,
@@ -15,12 +13,19 @@ export async function spawnText(
 	try {
 		const proc = Bun.spawn(command, { cwd: options.cwd, stdout: "pipe", stderr: "pipe" });
 		const timeout = setTimeout(() => proc.kill(), options.timeoutMs ?? 5000);
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
+		const [stdoutBytes, stderrBytes, exitCode] = await Promise.all([
+			new Response(proc.stdout).arrayBuffer(),
+			new Response(proc.stderr).arrayBuffer(),
 			proc.exited,
 		]);
 		clearTimeout(timeout);
+		let stdout: string;
+		try {
+			stdout = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(stdoutBytes);
+		} catch {
+			return { ok: false, stdout: "", stderr: "command stdout was not valid UTF-8" };
+		}
+		const stderr = new TextDecoder().decode(stderrBytes);
 		return { ok: exitCode === 0, stdout, stderr };
 	} catch (error) {
 		return { ok: false, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
@@ -55,61 +60,79 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 		}
 		if (best) return best.ref;
 	}
-	const mergeBase = await spawnText(["git", "merge-base", "HEAD", "origin/main"], { cwd, timeoutMs: 3000 });
-	if (mergeBase.ok && mergeBase.stdout.trim()) return mergeBase.stdout.trim();
-	return "HEAD~1";
+	throw new Error("unable to resolve an authoritative integration base");
 }
 
 export function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
 	const rows: UltragoalChangeSetPath[] = [];
-	for (const line of output.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		const parts = trimmed.split(/\s+/);
-		const statusCode = parts[0] ?? "";
+	const append = (statusCode: string, pathValue: string | undefined, oldPath: string | undefined): void => {
+		if (!pathValue) return;
 		let status: UltragoalChangeStatus = "unknown";
 		if (statusCode.startsWith("A")) status = "added";
 		else if (statusCode.startsWith("M")) status = "modified";
 		else if (statusCode.startsWith("D")) status = "deleted";
 		else if (statusCode.startsWith("R")) status = "renamed";
 		else if (statusCode.startsWith("C")) status = "copied";
-		const pathValue = status === "renamed" || status === "copied" ? parts[2] : parts[1];
-		if (!pathValue) continue;
-		const oldPath = status === "renamed" || status === "copied" ? parts[1] : undefined;
 		rows.push({
-			path: normalizeRepoPath(pathValue),
-			oldPath: oldPath ? normalizeRepoPath(oldPath) : undefined,
+			path: normalizeChangeSetPath(pathValue),
+			oldPath: oldPath ? normalizeChangeSetPath(oldPath) : undefined,
 			status,
 			category: categorizeComputerChangePath(pathValue),
 		});
+	};
+	if (output.includes("\0")) {
+		const tokens = output.split("\0");
+		let index = 0;
+		while (index < tokens.length) {
+			const statusCode = tokens[index++] ?? "";
+			if (!statusCode) continue;
+			if (statusCode.startsWith("R") || statusCode.startsWith("C")) {
+				const oldPath = tokens[index++];
+				append(statusCode, tokens[index++], oldPath);
+			} else {
+				append(statusCode, tokens[index++], undefined);
+			}
+		}
+		return rows;
+	}
+	for (const line of output.split("\n")) {
+		if (!line.trim()) continue;
+		const [rawStatus = "", firstPath, secondPath] = line.split("\t");
+		const statusCode = rawStatus.trim();
+		append(
+			statusCode,
+			statusCode.startsWith("R") || statusCode.startsWith("C") ? secondPath : firstPath,
+			statusCode.startsWith("R") || statusCode.startsWith("C") ? firstPath : undefined,
+		);
 	}
 	return rows;
 }
 
-function categorizeCiChangedPath(value: string): UltragoalChangeCategory {
-	// CI_DEV_CHANGED_PATHS intentionally carries path names only. Mixed registries
-	// such as settings-schema.ts require diff-level narrowing; without the diff,
-	// treating the whole registry as computer-control source forces the mandatory
-	// computer red-team suite on unrelated settings changes.
-	if (isSettingsSchemaPath(value)) return "other";
-	return categorizeComputerChangePath(value);
+export function parseGitUntrackedPaths(output: string): UltragoalChangeSetPath[] {
+	const paths = output.includes("\0") ? output.split("\0") : output.split(/\r?\n/);
+	return paths
+		.filter(pathValue => pathValue.length > 0)
+		.map(pathValue => ({
+			path: normalizeChangeSetPath(pathValue),
+			status: "added" as UltragoalChangeStatus,
+			category: categorizeComputerChangePath(pathValue),
+		}));
 }
 
-function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
+export function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 	const raw = process.env.CI_DEV_CHANGED_PATHS;
 	if (!raw) return [];
 	return raw
 		.split(/\r?\n/)
-		.map(row => row.trim())
-		.filter(Boolean)
+		.filter(row => row.length > 0)
 		.map(pathValue => ({
-			path: normalizeRepoPath(pathValue),
+			path: normalizeChangeSetPath(pathValue),
 			status: "unknown" as UltragoalChangeStatus,
-			category: categorizeCiChangedPath(pathValue),
+			category: categorizeComputerChangePath(pathValue),
 		}));
 }
 
-function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChangeSetPath[] {
+export function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChangeSetPath[] {
 	const byKey = new Map<string, UltragoalChangeSetPath>();
 	for (const row of groups.flat()) byKey.set(`${row.oldPath ?? ""}\u0000${row.path}`, row);
 	return [...byKey.values()];
@@ -119,36 +142,59 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 	const ciChangedPaths = ciDevChangedPathRows();
 	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
 	if (!inGit.ok || inGit.stdout.trim() !== "true") {
-		if (ciChangedPaths.length === 0) return undefined;
+		if (ciChangedPaths.length === 0)
+			return { source: "checkpoint-git", paths: [], captureIncomplete: true, trusted: true };
 		return { source: "checkpoint-git", paths: ciChangedPaths, trusted: true };
 	}
 	const baseRef = await resolveGitBase(cwd);
 	const base = baseRef;
 	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
-	const [committed, unstaged, staged, stat, committedDiff, unstagedDiff, stagedDiff] = await Promise.all([
-		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
+	const [committed, unstaged, staged, untracked, stat, committedDiff, unstagedDiff, stagedDiff] = await Promise.all([
+		spawnText(["git", "diff", "--name-status", "-z", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--cached", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 	]);
-	if (!committed.ok && !unstaged.ok && !staged.ok && ciChangedPaths.length === 0) return undefined;
-	const gitPaths = mergeChangeSetPaths([
+	if (!committed.ok || !unstaged.ok || !staged.ok || !untracked.ok) {
+		const paths = mergeChangeSetPaths([
+			committed.ok ? parseGitNameStatus(committed.stdout) : [],
+			unstaged.ok ? parseGitNameStatus(unstaged.stdout) : [],
+			staged.ok ? parseGitNameStatus(staged.stdout) : [],
+			untracked.ok ? parseGitUntrackedPaths(untracked.stdout) : [],
+			ciChangedPaths,
+		]);
+		return {
+			source: "checkpoint-git",
+			baseRef,
+			mergeBase: mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : undefined,
+			headRef: "HEAD",
+			paths,
+			captureIncomplete: true,
+			trusted: true,
+		};
+	}
+	const paths = mergeChangeSetPaths([
 		parseGitNameStatus(committed.stdout),
 		parseGitNameStatus(unstaged.stdout),
 		parseGitNameStatus(staged.stdout),
+		parseGitUntrackedPaths(untracked.stdout),
+		ciChangedPaths,
 	]);
-	const paths = gitPaths.length > 0 ? gitPaths : ciChangedPaths;
 	return {
 		source: "checkpoint-git",
 		baseRef,
 		mergeBase: mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : undefined,
 		headRef: "HEAD",
 		paths,
-		rawDiffStat: stat.stdout,
-		rawDiff: [committedDiff.stdout, unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n"),
+		rawDiffStat: stat.ok ? stat.stdout : undefined,
+		rawDiff:
+			committedDiff.ok && unstagedDiff.ok && stagedDiff.ok
+				? [committedDiff.stdout, unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n")
+				: undefined,
 		trusted: true,
 	};
 }
@@ -159,8 +205,8 @@ export function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
 		if (!line.startsWith("diff --git ")) continue;
 		const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
 		if (!match) continue;
-		const oldPath = normalizeRepoPath(match[1]!);
-		const newPath = normalizeRepoPath(match[2]!);
+		const oldPath = normalizeChangeSetPath(match[1]!);
+		const newPath = normalizeChangeSetPath(match[2]!);
 		paths.push({
 			path: newPath,
 			oldPath: oldPath === newPath ? undefined : oldPath,

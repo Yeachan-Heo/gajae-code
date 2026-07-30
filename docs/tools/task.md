@@ -54,25 +54,25 @@ The tool returns one text block plus `details: TaskToolDetails`.
 
 `details` fields:
 - `projectAgentsDir: string | null` — nearest discovered project `agents/` dir.
-- `results: SingleResult[]` — one entry per task in input order for synchronous execution; empty for async-launch responses.
+- `results: TaskResultReceipt[]` — receipt-safe per-task results; async launch responses start empty and later updates/final jobs carry receipts.
 - `totalDurationMs: number`
 - `usage?: Usage` — sum of per-subagent assistant-message usage.
-- `outputPaths?: string[]` — written `.md` artifact paths for completed subagent outputs.
+- raw output/patch filesystem paths are internal and are not exposed; readable artifacts use `agent://` / `local://` references.
 - `progress?: AgentProgress[]` — live or final per-task progress snapshots.
 - `async?: { state: "running" | "completed" | "failed"; jobId: string; type: "task" }` — present for background execution updates/results.
 
-`SingleResult` includes:
-- identity: `index`, `id`, `agent`, `agentSource`, `description`, optional `assignment`
-- status: `exitCode`, optional `error`, optional `aborted`, optional `abortReason`
-- output: `output`, `stderr`, `truncated`, `durationMs`, `tokens`
-- artifact metadata: `outputPath?`, `patchPath?`, `branchName?`, `nestedPatches?`, `outputMeta?`
-- extracted tool data: `extractedToolData?` from registered subprocess tool handlers such as `yield` and `report_finding`
+`TaskResultReceipt` includes:
+- identity and status: `index`, `id`, `agent`, `agentSource`, `description`, `status`, `exitCode`
+- bounded output metadata: `preview`, `outputRef?`, duration/tokens/usage, retry/setup/abort summaries
+- isolated persistence: `persistence?: { outcome: "applied" | "no_changes" | "recovery_available"; ownerWorktreeApplied; recoveryRef? }`
+- recovery identity: `recoveryRef` uses a unique session-scoped `local://subagents/<id>-<snowflake>.patch` URI plus byte size and SHA-256; nested/error bundles are JSON-encoded in that artifact
+- branch/review/fork-context/repository-binding metadata that passed the receipt sanitizer
 
 Artifacts and side channels:
 - Every subagent with an artifacts dir writes `<id>.md`; `agent://<id>` resolves to that file.
 - If the output file is JSON, `agent://<id>/<path>` and `agent://<id>?q=<query>` perform JSON extraction in `packages/coding-agent/src/internal-urls/agent-protocol.ts`.
 - When the parent session persists artifacts, each subagent also gets `<id>.jsonl` session history.
-- Isolated patch mode writes `<id>.patch` per successful task before merge.
+- Isolated execution writes a unique recovery artifact before cleanup whenever root changes, nested changes, or incomplete-capture evidence exists, including failed/paused/aborted tasks.
 - Async mode returns immediately after job registration, then emits `onUpdate(...)` progress snapshots and later hands completion to the session async-job pipeline.
 
 ## Flow
@@ -99,11 +99,12 @@ Artifacts and side channels:
 12. For each task, it seeds an `AgentProgress` entry and runs `runTask(...)` through `mapWithConcurrencyLimit(...)` using `task.maxConcurrency`.
 13. Non-isolated `runTask(...)` calls `runSubprocess(...)` directly with parent cwd.
 14. Isolated `runTask(...)`:
-   - creates an isolation workspace (`ensureWorktree(...)`, `ensureFuseOverlay(...)`, or `ensureProjfsOverlay(...)`)
-   - applies the captured baseline for worktrees
-   - runs `runSubprocess(...)` inside that workspace
-   - on success, either commits to a per-task branch (`mergeMode === "branch"`) or captures a patch with `captureDeltaPatch(...)`
-   - always cleans up the isolation workspace/backend
+   - creates an isolation workspace through the PAL backend
+   - binds the managed child session cwd to that execution workspace
+   - runs `runSubprocess(...)` inside the workspace
+   - captures root/nested deltas for every outcome before cleanup; incomplete nested capture preserves the root delta plus capture errors
+   - in branch mode, only successful task branches are merge candidates; in patch mode, only successful root patches are apply candidates
+   - always cleans up the isolation workspace/backend after the recovery artifact is durable
 15. `runSubprocess(...)` in `packages/coding-agent/src/task/executor.ts` creates a child agent session with:
    - isolated settings snapshot via `Settings.isolated(...)`, forcing `async.enabled = false` and `bash.autoBackground.enabled = false`
    - child `agentId` / `parentTaskPrefix` equal to the allocated task id
@@ -118,11 +119,12 @@ Artifacts and side channels:
 17. `runSubprocess(...)` subscribes to child agent events, coalesces progress updates every 150 ms, forwards lifecycle/progress events on the parent event bus, and extracts tool data through `subprocessToolRegistry`.
 18. The child must finish through the hidden `yield` tool. If it does not, `runSubprocess(...)` sends up to 3 reminder prompts; the last reminder forces `toolChoice = yield` when supported.
 19. Finalization uses `finalizeSubprocessOutput(...)` to reconcile raw assistant text, `yield` payloads, structured schemas, `report_finding` data, and abort states. Output is truncated with `MAX_OUTPUT_BYTES` / `MAX_OUTPUT_LINES` before returning to the parent, but the full raw output is still written to `<id>.md`.
-20. After all sync tasks finish, `#executeSync(...)` aggregates usage, collects artifact paths, and if isolation was used merges results back:
-   - branch mode: cherry-pick per-task branches with `mergeTaskBranches(...)`, then delete merged branches with `cleanupTaskBranches(...)`
-   - patch mode: combine non-empty patch artifacts, dry-check with `git.patch.canApplyText(...)`, then apply or leave manual artifacts
-   - nested repo patches are applied separately with `applyNestedPatches(...)`
-21. The final text summary is rendered from `packages/coding-agent/src/prompts/tools/task-summary.md` and includes `agent://<id>` handles for outputs that exist.
+20. After sync task work finishes, `#executeSync(...)` aggregates receipts and reconciles isolation:
+   - branch mode records per-branch applied/recovery truth from the actual merged set, including partial merges
+   - patch mode dry-checks successful root patches, applies them, then proves the complete owner worktree against the captured baseline plus all applied patches
+   - merge/proof exceptions downgrade affected receipts to `recovery_available`
+   - nested repo patches apply without staging or committing unrelated owner state; missing/conflicting nested repos downgrade affected receipts
+21. The final summary renders receipt-safe `agent://` output and `local://` recovery handles; exit-zero `merge_failed` receipts make both batch and individual async jobs fail.
 
 ## Modes / Variants
 - Execution mode
@@ -152,7 +154,7 @@ Artifacts and side channels:
 ## Side Effects
 - Filesystem
   - Writes `context.md`, `<id>.jsonl`, and `<id>.md` under the session artifacts dir or a temp task dir.
-  - In isolated patch mode writes `<id>.patch` artifacts.
+  - In isolated mode writes unique session-scoped recovery artifacts containing root patches or JSON root/nested/capture-error bundles.
   - Creates/removes worktrees or overlay mount directories.
   - In branch mode creates temporary worktrees and task branches.
 - Network
@@ -160,7 +162,7 @@ Artifacts and side channels:
 - Subprocesses / native bindings
   - `fuse-overlayfs` and `fusermount`/`fusermount3` for FUSE isolation.
   - ProjFS native bindings via `@gajae-code/natives` on Windows.
-  - Git operations for baseline capture, patch apply, worktrees, branches, stash, cherry-pick, commits.
+  - Git operations for baseline capture, patch apply/proof, worktrees, branches, stash, and cherry-pick; nested patches are left as working-tree changes rather than committing owner state.
 - Session state (transcript, memory, jobs, checkpoints, registries)
   - Creates child `AgentSession` instances with isolated settings snapshots.
   - Registers async jobs in `session.asyncJobManager` for background task mode.
@@ -200,9 +202,10 @@ Artifacts and side channels:
 - Isolated execution without a git repo returns `Isolated task execution requires a git repository. ...`.
 - Backend resolution can return a hard error (`ProjFS isolation initialization failed...`) or a non-fatal warning with fallback to `worktree`.
 - `mapWithConcurrencyLimit(...)` fails fast on non-abort worker exceptions; already completed results are preserved only in the thrown path’s local state, not surfaced unless the caller catches and converts them.
-- Child-session failures surface as `SingleResult.exitCode = 1` with `stderr`/`error` populated.
+- Child-session failures retain failed/paused/aborted status; captured isolated changes remain recovery-only and are never auto-applied.
 - If the child omits `yield`, `finalizeSubprocessOutput(...)` injects warnings such as `SYSTEM WARNING: Subagent exited without calling yield tool after 3 reminders.`
 - Async scheduling failures are accumulated per task; if no jobs start, the tool returns `Failed to start background task jobs: ...`.
+- An async child with no receipt, or any receipt whose status is not `completed`, terminates its individual async job as failed (paused remains paused).
 - `agent://<id>` resolution errors are model-visible when another tool reads them: no session, no artifacts dir, missing id, conflicting extraction syntax, or invalid JSON for extraction.
 
 ## Notes
@@ -212,7 +215,7 @@ Artifacts and side channels:
 - Child sessions do not inherit conversation history automatically. The only built-in carry-over is shared `context`, optional `context.md`, workspace tree/context files, and shared `local://` root.
 - `Settings.isolated(...)` gives each child a session-isolated settings snapshot; tool enablement is recomputed inside the child session rather than sharing mutable parent tool state.
 - Plan mode mutates an `effectiveAgent` with a read-only tool subset and plan-mode prompt text, but `runSubprocess(...)` is still invoked with `agent` rather than `effectiveAgent`. Model/thinking/schema overrides use the effective agent; prompt/tool/spawn restrictions do not fully flow through this call path.
-- Branch-mode merge temporarily stashes the parent repo before cherry-picking task branches. A stash-pop conflict is treated as merge failure and leaves recovery state behind.
-- Patch-mode only applies combined root patches if every successful task produced a patch and `git.patch.canApplyText(...)` succeeds.
-- Nested git repos are handled separately from the root repo. They are copied into isolated worktrees, diffed independently, and merged later with `applyNestedPatches(...)` because parent git cannot track their file-level changes.
+- Branch-mode merge temporarily stashes the parent repo before cherry-picking task branches. Partial/failed merges preserve per-branch applied truth and recovery handles.
+- Patch mode applies only successful root patches and requires exact owner-worktree proof before reporting `applied`.
+- Nested git repos are diffed independently. Recovery bundles include nested patches and capture errors; application never stages or commits pre-existing nested owner changes.
 - `agent://` ids are numeric-prefixed (`0-Task`, `1-Task`, nested like `0-Parent.0-Child`) by `AgentOutputManager`; this is what prevents artifact collisions across repeated or nested task invocations.

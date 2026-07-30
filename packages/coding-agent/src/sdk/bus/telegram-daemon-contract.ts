@@ -46,10 +46,12 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * 33 adds action-bound multi-select state rendering and replay-safe option
  * snapshots. Generation 34 converts non-photo image formats (including WebP)
  * into Telegram-compatible photo uploads when possible. Generation 35 adds
- * user-created topic adoption (forum-topic folder picker). Generation 36 binds
- * managed-session replacement to exact native filesystem authority.
+ * user-created topic adoption (forum-topic folder picker). Generation 36 bound
+ * managed-session replacement to exact native filesystem authority; generation
+ * 37 retires that binding (revert of #3489, which stalled POSIX artifact
+ * cleanup) while keeping the lifecycle contract moving strictly forward.
  */
-export const DAEMON_GENERATION = 36;
+export const DAEMON_GENERATION = 37;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers

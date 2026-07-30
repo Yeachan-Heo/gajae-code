@@ -30,7 +30,7 @@ export const Shell = nativeBindings.Shell;
 
 // functions
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_12_2 = nativeBindings.__piNativesV0_12_2;
+export const __piNativesV0_12_4 = nativeBindings.__piNativesV0_12_4;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
@@ -43,7 +43,6 @@ export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
-export const exactReplacePath = nativeBindings.exactReplacePath;
 export const exactRestore = nativeBindings.exactRestore;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const executeShell = nativeBindings.executeShell;

@@ -80,6 +80,7 @@ export function emergencyTerminalRestore(): void {
 					"\x1b[?1000l" + // Disable normal mouse reporting
 					"\x1b[?1002l" + // Disable button-event mouse reporting
 					"\x1b[?1006l" + // Disable SGR extended mouse reporting
+					"\x1b[?1007l" + // Disable alternate-scroll wheel-to-cursor translation
 					"\x1b[?2031l" + // Disable Mode 2031 appearance notifications
 					"\x1b[<u" + // Pop kitty keyboard protocol
 					"\x1b[>4;0m" + // Disable modifyOtherKeys fallback
@@ -278,7 +279,9 @@ export class ProcessTerminal implements Terminal {
 		this.#mouseEnabled = enabled;
 		if (this.#started)
 			this.#safeWrite(
-				this.#mouseEnabled ? "\x1b[?1000l\x1b[?1002h\x1b[?1006h" : "\x1b[?1000l\x1b[?1002l\x1b[?1006l",
+				this.#mouseEnabled
+					? "\x1b[?1000l\x1b[?1002h\x1b[?1006h\x1b[?1007l"
+					: "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l",
 			);
 	}
 
@@ -306,8 +309,14 @@ export class ProcessTerminal implements Terminal {
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
 		// Button-event reporting preserves wheel input while also letting the TUI implement drag selection.
+		// Alternate-scroll must stay disabled: otherwise Windows Terminal/tmux can translate wheel notches
+		// into cursor Up/Down input, which the focused composer interprets as prompt history.
 		// Clear both tracking variants first so stale modes from another application cannot leak across startup.
-		this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000l\x1b[?1002h\x1b[?1006h" : "\x1b[?1000l\x1b[?1002l\x1b[?1006l");
+		this.#safeWrite(
+			this.#mouseEnabled
+				? "\x1b[?1000l\x1b[?1002h\x1b[?1006h\x1b[?1007l"
+				: "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l",
+		);
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);
@@ -801,6 +810,7 @@ export class ProcessTerminal implements Terminal {
 		this.#safeWrite("\x1b[?1000l");
 		this.#safeWrite("\x1b[?1002l");
 		this.#safeWrite("\x1b[?1006l");
+		this.#safeWrite("\x1b[?1007l");
 
 		// Disable Mode 2031 appearance change notifications
 		this.#safeWrite("\x1b[?2031l");

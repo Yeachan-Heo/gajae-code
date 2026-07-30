@@ -34,9 +34,12 @@ import { WORKFLOW_STATE_VERSION } from "../src/skill-state/workflow-state-contra
 describe("GJC native skill-state hooks", () => {
 	let tempDir: string | undefined;
 	let originalGjcSessionId: string | undefined;
+	let originalCiDevChangedPaths: string | undefined;
 
 	beforeAll(() => {
 		originalGjcSessionId = process.env.GJC_SESSION_ID;
+		originalCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-skill-state-hooks.test.ts";
 		process.env.GJC_SESSION_ID = "test-session";
 	});
 
@@ -46,6 +49,8 @@ describe("GJC native skill-state hooks", () => {
 		} else {
 			process.env.GJC_SESSION_ID = originalGjcSessionId;
 		}
+		if (originalCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+		else process.env.CI_DEV_CHANGED_PATHS = originalCiDevChangedPaths;
 	});
 
 	const testEffectiveSkillConfig = {
@@ -117,7 +122,14 @@ describe("GJC native skill-state hooks", () => {
 		};
 	}
 
-	function ultragoalQualityGate(): string {
+	async function ultragoalQualityGate(root: string): Promise<string> {
+		const artifactsDir = path.join(root, "artifacts");
+		await fs.mkdir(artifactsDir, { recursive: true });
+		// Adversarial coverage is file-backed and fail-closed (#3541/#3543): inlineEvidence alone is rejected.
+		await Bun.write(
+			path.join(artifactsDir, "adversarial-report.txt"),
+			"Adversarial cases covered invalid input, missing state, and repeated operation boundaries.\n",
+		);
 		return JSON.stringify({
 			architectReview: {
 				architectureStatus: "CLEAR",
@@ -151,9 +163,8 @@ describe("GJC native skill-state hooks", () => {
 					{
 						id: "adversarial",
 						kind: "failure-mode-test",
+						path: "artifacts/adversarial-report.txt",
 						description: "Adversarial verification report",
-						inlineEvidence:
-							"Adversarial cases covered invalid input, missing state, and repeated operation boundaries.",
 					},
 				],
 				contractCoverage: [
@@ -1584,7 +1595,7 @@ disabledExtensions:
 			goalId: "G001",
 			status: "complete",
 			evidence: "first stage verified",
-			qualityGateJson: ultragoalQualityGate(),
+			qualityGateJson: await ultragoalQualityGate(root),
 		});
 		await dispatchGjcNativeSkillHook(
 			{
@@ -1734,7 +1745,7 @@ disabledExtensions:
 			goalId: "G001",
 			status: "complete",
 			evidence: "first stage verified",
-			qualityGateJson: ultragoalQualityGate(),
+			qualityGateJson: await ultragoalQualityGate(root),
 		});
 		await dispatchGjcNativeSkillHook(
 			{

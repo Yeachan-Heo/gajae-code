@@ -112,7 +112,13 @@ describe("run resource ledger", () => {
 			status: "unfenced",
 			pending: [{ kind: "tool", label: "late registration" }],
 		});
+		// Quarantine is terminal: resolving the late work retires nothing, because the
+		// entry only ever reached the bounded tombstone and never entered settlement
+		// accounting, so the run stays unfenced instead of re-opening as settled.
 		late.resolve();
+		await Promise.resolve();
+		expect(ledger.pending("run")).toMatchObject([{ kind: "tool", label: "late registration" }]);
+		expect(await ledger.waitForSettlement("run", { graceMs: 0 })).toMatchObject({ status: "unfenced" });
 	});
 
 	test("bounds the public quarantine tombstone", async () => {
@@ -147,6 +153,158 @@ describe("run resource ledger", () => {
 		ledger.seal("second");
 		await Promise.resolve();
 		expect(ledger.pending("second")).toEqual([]);
+	});
+
+	test("keeps one domain identity until sealed settlement and rejects released handle reuse", async () => {
+		const ledger = createRunResourceLedger();
+		const domain = ledger.open("identity");
+		expect(domain).toBeDefined();
+		expect(ledger.open("identity")).toBe(domain);
+
+		const reserved = ledger.reserveProducer("identity", domain, "post_prompt", "child");
+		expect(reserved.ok).toBe(true);
+		if (!reserved.ok) throw new Error("Expected producer reservation");
+		const child = Promise.withResolvers<void>();
+		expect(reserved.lease.track("post_prompt", "child-work", child.promise)).toBe(true);
+		reserved.lease.closeDiscovery();
+		ledger.seal("identity");
+
+		expect(ledger.lookupDomain("identity")).toBe(domain);
+		child.resolve();
+		expect(await ledger.waitForSettlement("identity", { graceMs: 1_000 })).toEqual({ status: "settled" });
+		expect(ledger.lookupDomain("identity")).toBeUndefined();
+		expect(ledger.open("identity")).toBeUndefined();
+	});
+
+	test("supports descendant discovery after a parent closes", async () => {
+		const ledger = createRunResourceLedger();
+		const domain = ledger.open("descendants");
+		const root = ledger.reserveProducer("descendants", domain, "post_prompt", "root");
+		expect(root.ok).toBe(true);
+		if (!root.ok) throw new Error("Expected root reservation");
+		const child = root.lease.fork(root.lease.domain, "post_prompt", "child");
+		expect(child.ok).toBe(true);
+		if (!child.ok) throw new Error("Expected child reservation");
+
+		root.lease.closeDiscovery();
+		const grandchild = child.lease.fork(child.lease.domain, "post_prompt", "grandchild");
+		expect(grandchild.ok).toBe(true);
+		if (!grandchild.ok) throw new Error("Expected grandchild reservation");
+		grandchild.lease.closeDiscovery();
+		child.lease.closeDiscovery();
+		ledger.seal("descendants");
+
+		expect(await ledger.waitForSettlement("descendants", { graceMs: 1_000 })).toEqual({ status: "settled" });
+	});
+	test("allows a live pre-seal lease to fork after root seal", async () => {
+		const ledger = createRunResourceLedger();
+		const domain = ledger.open("sealed-descendant");
+		const root = ledger.reserveProducer("sealed-descendant", domain, "post_prompt", "root");
+		expect(root.ok).toBe(true);
+		if (!root.ok) throw new Error("Expected root reservation");
+
+		ledger.seal("sealed-descendant");
+		const child = root.lease.fork(root.lease.domain, "post_prompt", "child");
+		expect(child.ok).toBe(true);
+		if (!child.ok) throw new Error("Expected child reservation");
+		child.lease.closeDiscovery();
+		root.lease.closeDiscovery();
+
+		expect(await ledger.waitForSettlement("sealed-descendant", { graceMs: 1_000 })).toEqual({ status: "settled" });
+	});
+
+	test("reports closed and quarantined parents distinctly", () => {
+		const ledger = createRunResourceLedger();
+		const domain = ledger.open("closed-parent");
+		const root = ledger.reserveProducer("closed-parent", domain, "post_prompt", "root");
+		expect(root.ok).toBe(true);
+		if (!root.ok) throw new Error("Expected root reservation");
+
+		root.lease.closeDiscovery();
+		expect(root.lease.fork(root.lease.domain, "post_prompt", "late")).toEqual({
+			ok: false,
+			reason: "parent_closed",
+		});
+		expect(root.lease.fork(root.lease.domain, "post_prompt", "later")).toEqual({
+			ok: false,
+			reason: "quarantined",
+		});
+		expect(ledger.lookupDomain("closed-parent")).toBeUndefined();
+	});
+	test("rejects and quarantines a new root reservation after seal", () => {
+		const ledger = createRunResourceLedger();
+		const domain = ledger.open("sealed-root");
+		ledger.seal("sealed-root");
+
+		// The seal boundary rejects genuinely new root work in two steps: the first
+		// reservation reports `sealed` and itself quarantines the run, so every
+		// reservation after that reports `quarantined` instead.
+		expect(ledger.reserveProducer("sealed-root", domain, "post_prompt", "late-root")).toEqual({
+			ok: false,
+			reason: "sealed",
+		});
+		expect(ledger.reserveProducer("sealed-root", domain, "post_prompt", "later-root")).toEqual({
+			ok: false,
+			reason: "quarantined",
+		});
+		expect(ledger.lookupDomain("sealed-root")).toBeUndefined();
+	});
+
+	test("quarantines only the bound run on a domain mismatch", async () => {
+		const ledger = createRunResourceLedger();
+		const first = ledger.open("first-domain");
+		const second = ledger.open("second-domain");
+		expect(first).toBeDefined();
+		expect(second).toBeDefined();
+		if (!first || !second) throw new Error("Expected cancellation domains");
+
+		expect(ledger.reserveProducer("first-domain", second, "tool", "mismatch")).toEqual({
+			ok: false,
+			reason: "domain_mismatch",
+		});
+		expect(first.signal.aborted).toBe(true);
+		expect(second.signal.aborted).toBe(false);
+		await expect(ledger.waitForSettlement("first-domain", { graceMs: 0 })).resolves.toMatchObject({
+			status: "unfenced",
+			reason: "quarantined",
+		});
+		const secondReservation = ledger.reserveProducer("second-domain", second, "tool", "valid");
+		expect(secondReservation.ok).toBe(true);
+		if (secondReservation.ok) secondReservation.lease.closeDiscovery();
+	});
+
+	test("rejects a child fork with a mismatched cancellation domain without affecting its successor", () => {
+		const ledger = createRunResourceLedger();
+		const first = ledger.open("fork-first");
+		const second = ledger.open("fork-second");
+		if (!first || !second) throw new Error("Expected cancellation domains");
+		const root = ledger.reserveProducer("fork-first", first, "post_prompt", "root");
+		if (!root.ok) throw new Error("Expected root reservation");
+
+		expect(root.lease.fork(second, "post_prompt", "mismatch")).toEqual({
+			ok: false,
+			reason: "domain_mismatch",
+		});
+		expect(first.signal.aborted).toBe(true);
+		expect(second.signal.aborted).toBe(false);
+		expect(ledger.lookupDomain("fork-first")).toBeUndefined();
+		expect(ledger.lookupDomain("fork-second")).toBe(second);
+	});
+
+	test("duplicate terminal owner claims fail closed without granting a second lease", () => {
+		const ledger = createRunResourceLedger();
+		const ownerKey = {};
+		ledger.bindAgentSessionClaimKey(ownerKey);
+		const domain = ledger.open("terminal-claim");
+		expect(domain).toBeDefined();
+		expect(ledger.claimProducer("terminal-claim", domain, {})).toEqual({ ok: false, reason: "closed" });
+
+		const first = ledger.claimProducer("terminal-claim", domain, ownerKey);
+		expect(first.ok).toBe(true);
+		const duplicate = ledger.claimProducer("terminal-claim", domain, ownerKey);
+		expect(duplicate).toEqual({ ok: false, reason: "already_claimed" });
+		expect(domain?.signal.aborted).toBe(true);
+		if (first.ok) first.lease.closeDiscovery();
 	});
 });
 

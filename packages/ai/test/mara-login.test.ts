@@ -9,7 +9,7 @@ afterEach(() => {
 });
 
 describe("mara login", () => {
-	it("opens Mara Cloud key settings and validates against models endpoint", async () => {
+	it("opens Mara Cloud key settings and validates against chat completions", async () => {
 		let authUrl: string | undefined;
 		let authInstructions: string | undefined;
 		let promptMessage: string | undefined;
@@ -17,10 +17,19 @@ describe("mara login", () => {
 
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			const url = typeof input === "string" ? input : input.toString();
-			expect(url).toBe("https://api.cloud.mara.com/v1/models");
-			expect(init?.method).toBe("GET");
-			expect(init?.headers).toEqual({ Authorization: "Bearer mara-test-key" });
-			return new Response(JSON.stringify({ data: [] }), {
+			expect(url).toBe("https://api.cloud.mara.com/v1/chat/completions");
+			expect(init?.method).toBe("POST");
+			expect(init?.headers).toEqual({
+				"Content-Type": "application/json",
+				Authorization: "Bearer mara-test-key",
+			});
+			expect(JSON.parse(String(init?.body))).toEqual({
+				model: "DeepSeek-V3.1",
+				messages: [{ role: "user", content: "ping" }],
+				max_tokens: 1,
+				temperature: 0,
+			});
+			return new Response(JSON.stringify({ choices: [] }), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});
@@ -59,7 +68,7 @@ describe("mara login", () => {
 		await expect(loginMara({})).rejects.toThrow("Mara Cloud login requires onPrompt callback");
 	});
 
-	it("surfaces models endpoint validation errors", async () => {
+	it("surfaces chat completions validation errors", async () => {
 		global.fetch = vi.fn(async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
 
 		await expect(

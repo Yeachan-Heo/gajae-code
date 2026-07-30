@@ -663,6 +663,10 @@ function buildCompletionReceipt(input: {
 export function nonEmptyString(value: unknown): string | null {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
+
+function exactNonEmptyString(value: unknown): string | null {
+	return typeof value === "string" && value.length > 0 ? value : null;
+}
 export function stringArray(value: unknown): string[] | null {
 	return Array.isArray(value) && value.every(item => typeof item === "string") ? value.map(item => item.trim()) : null;
 }
@@ -1490,12 +1494,20 @@ export function requireResolvedLinks(ids: string[], map: Map<string, JsonObject>
 		if (!map.has(id)) throw new Error(`qualityGate ${fieldName} references unknown id ${id}`);
 	}
 }
-function successfulLinkedRows(ids: string[], map: Map<string, JsonObject>, fieldName: string): JsonObject[] {
+function successfulLinkedRows(
+	ids: string[],
+	map: Map<string, JsonObject>,
+	fieldName: string,
+	expectedContractRef: string,
+): JsonObject[] {
 	const rows: JsonObject[] = [];
 	for (const id of ids) {
 		const row = map.get(id);
 		if (!row) throw new Error(`qualityGate ${fieldName} references unknown id ${id}`);
 		requireSuccessfulRowOutcome(row, `${fieldName}.${id}`);
+		if (requiredStringField(row, "contractRef", `${fieldName}.${id}`) !== expectedContractRef) {
+			throw new Error(`qualityGate ${fieldName}.${id}.contractRef must match ${expectedContractRef}`);
+		}
 		rows.push(row);
 	}
 	return rows;
@@ -1542,6 +1554,7 @@ export interface UltragoalChangeSet extends JsonObject {
 	paths: UltragoalChangeSetPath[];
 	rawDiffStat?: string;
 	rawDiff?: string;
+	captureIncomplete?: boolean;
 	trusted: true;
 }
 
@@ -1560,8 +1573,8 @@ export function normalizeRepoPath(value: string): string {
 	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
 }
 
-function isToolsIndexPath(value: string): boolean {
-	return normalizeRepoPath(value) === TOOLS_INDEX_PATH;
+export function normalizeChangeSetPath(value: string): string {
+	return value.replace(/^\.\//, "");
 }
 
 export function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
@@ -1574,6 +1587,7 @@ export function categorizeComputerChangePath(value: string): UltragoalChangeCate
 	)
 		return "tool";
 	if (
+		normalized === TOOLS_INDEX_PATH ||
 		normalized === "packages/coding-agent/src/tools/renderers.ts" ||
 		normalized === "packages/coding-agent/src/config/settings-schema.ts"
 	)
@@ -1589,76 +1603,11 @@ export function categorizeComputerChangePath(value: string): UltragoalChangeCate
 }
 
 function isComputerControlSurfaceCategory(category: UltragoalChangeCategory): boolean {
-	// The computer-use red-team suite is conditional, not universal (see the
-	// ultragoal SKILL): require it only when the change actually touches
-	// computer-control source — the computer tool (`tool`), its behavior-bearing
-	// settings/renderer wiring (`settings-registry`), or computer Rust (`code`).
-	// A bare regeneration of the SHARED native binding (`generated-binding`:
-	// packages/natives/native/index.{d.ts,js}) is NOT by itself a computer-use
-	// change: that file is generated from Rust, so any real computer-use behavior
-	// change must also touch one of the categories above and will still trigger
-	// the suite. Treating aggregate binding or registration files as a computer
-	// surface forced the suite on unrelated changes, which the SKILL explicitly
-	// warns against, so they are excluded here.
+	// Shared behavior registries are intentionally conservative: a path-only or
+	// uninspectable change cannot prove that computer controls were untouched.
+	// Generated bindings remain excluded because their behavior-bearing Rust
+	// source is captured separately.
 	return category === "code" || category === "tool" || category === "settings-registry";
-}
-
-function isComputerSpecificToolsIndexDiff(diff: string | undefined, targetPath: string): boolean {
-	if (!diff || !isToolsIndexPath(targetPath)) return false;
-	let inTargetFile = false;
-	for (const line of diff.split("\n")) {
-		if (line.startsWith("diff --git ")) {
-			const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-			inTargetFile = !!match && (isToolsIndexPath(match[1]!) || isToolsIndexPath(match[2]!));
-			continue;
-		}
-		if (!inTargetFile || line.startsWith("+++") || line.startsWith("---")) continue;
-		if (!line.startsWith("+") && !line.startsWith("-")) continue;
-		const changedLine = line.slice(1);
-		if (
-			/\bComputerTool\b/.test(changedLine) ||
-			/\bisComputerCallable\b/.test(changedLine) ||
-			/\bisComputerLoadablePlatform\b/.test(changedLine) ||
-			/["']computer["']/.test(changedLine) ||
-			/["']\.\/computer["']/.test(changedLine) ||
-			/\bcomputer\s*:/.test(changedLine)
-		) {
-			return true;
-		}
-	}
-	return false;
-}
-
-/** Settings registry file that holds ALL settings, most of them unrelated to computer control. */
-const SETTINGS_SCHEMA_PATH = "packages/coding-agent/src/config/settings-schema.ts";
-
-export function isSettingsSchemaPath(value: string): boolean {
-	return normalizeRepoPath(value) === SETTINGS_SCHEMA_PATH;
-}
-
-/**
- * The settings registry holds every setting (themes, tool output sizes, retry
- * knobs, …), so a bare `settings-schema.ts` edit is NOT by itself a computer
- * change. Mirror {@link isComputerSpecificToolsIndexDiff}: only treat it as a
- * computer-control surface when the diff actually adds/removes a `computer.*`
- * setting key. When no diff is available, callers fall back to the conservative
- * (fail-closed) categorization instead of this narrowing.
- */
-function isComputerSpecificSettingsDiff(diff: string | undefined, targetPath: string): boolean {
-	if (!diff || !isSettingsSchemaPath(targetPath)) return false;
-	let inTargetFile = false;
-	for (const line of diff.split("\n")) {
-		if (line.startsWith("diff --git ")) {
-			const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-			inTargetFile = !!match && (isSettingsSchemaPath(match[1]!) || isSettingsSchemaPath(match[2]!));
-			continue;
-		}
-		if (!inTargetFile || line.startsWith("+++") || line.startsWith("---")) continue;
-		if (!line.startsWith("+") && !line.startsWith("-")) continue;
-		const changedLine = line.slice(1);
-		if (/["']computer\./.test(changedLine)) return true;
-	}
-	return false;
 }
 
 function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolean {
@@ -1669,26 +1618,8 @@ function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolea
 
 function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | undefined): boolean {
 	if (!changeSet?.trusted) return false;
-	return changeSet.paths.some(row => {
-		if (isComputerControlSurfaceChangePath(row)) {
-			// The settings registry mixes computer and non-computer settings. Narrow it
-			// with the diff so unrelated settings edits do not force the computer suite;
-			// fall back to the conservative categorization when no diff is available.
-			const touchesSettingsSchema =
-				isSettingsSchemaPath(row.path) || (row.oldPath ? isSettingsSchemaPath(row.oldPath) : false);
-			if (touchesSettingsSchema && changeSet.rawDiff !== undefined) {
-				return (
-					isComputerSpecificSettingsDiff(changeSet.rawDiff, row.path) ||
-					(row.oldPath ? isComputerSpecificSettingsDiff(changeSet.rawDiff, row.oldPath) : false)
-				);
-			}
-			return true;
-		}
-		return (
-			isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.path) ||
-			(row.oldPath ? isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.oldPath) : false)
-		);
-	});
+	if (changeSet.captureIncomplete) return true;
+	return changeSet.paths.some(isComputerControlSurfaceChangePath);
 }
 
 function requiresComputerRedTeamSuite(executorQa: JsonObject, changeSet: UltragoalChangeSet | undefined): boolean {
@@ -1901,6 +1832,16 @@ async function validateSurfaceEvidence(
 		}
 		const artifactIds = requireStringLinks(row.artifactRefs, `${fieldName}.artifactRefs`);
 		requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+		if (!isLiveSurfaceFamily(family)) {
+			for (const artifactId of artifactIds) {
+				const artifact = artifactRefs.get(artifactId)!;
+				if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+					throw new Error(
+						`qualityGate executorQa.artifactRefs.${artifactId} non-live surface evidence requires an existing non-empty file`,
+					);
+				}
+			}
+		}
 		await validateLiveSurfaceProofPresence(cwd, family, artifactIds, artifactRefs);
 		validateSurfaceArtifactCompatibility(surface, artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
 		await validateSurfaceStructuralRequirement(cwd, family, artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
@@ -2053,18 +1994,19 @@ async function validateMandatoryComputerAdversarialCases(
 	}
 }
 
-function validateContractCoverage(
+async function validateContractCoverage(
+	cwd: string,
 	executorQa: JsonObject,
 	surfaceEvidence: Map<string, JsonObject>,
 	adversarialCases: Map<string, JsonObject>,
 	artifactRefs: Map<string, JsonObject>,
-): JsonObject[] {
+): Promise<JsonObject[]> {
 	const rows = requireObjectArray(executorQa.contractCoverage, "executorQa.contractCoverage");
 	buildRowIdMap(rows, "executorQa.contractCoverage");
 	let hasSuccessfulContractCoverage = false;
 	for (const [index, row] of rows.entries()) {
 		const fieldName = `executorQa.contractCoverage[${index}]`;
-		requiredStringField(row, "contractRef", fieldName);
+		const contractRef = requiredStringField(row, "contractRef", fieldName);
 		const status = optionalStatusField(row, fieldName);
 		if (status === NOT_APPLICABLE_STATUS) {
 			requiredStringField(row, "reason", fieldName);
@@ -2083,21 +2025,57 @@ function validateContractCoverage(
 			);
 		}
 		let successfulProofLinks = 0;
-		if (surfaceIds)
-			successfulProofLinks += successfulLinkedRows(
+		let successfulSurfaceProofLinks = 0;
+		if (surfaceIds) {
+			successfulSurfaceProofLinks = successfulLinkedRows(
 				surfaceIds,
 				surfaceEvidence,
 				`${fieldName}.surfaceEvidenceRefs`,
+				contractRef,
 			).length;
+			successfulProofLinks += successfulSurfaceProofLinks;
+		}
 		if (adversarialIds) {
-			successfulProofLinks += successfulLinkedRows(
+			const successfulAdversarialRows = successfulLinkedRows(
 				adversarialIds,
 				adversarialCases,
 				`${fieldName}.adversarialCaseRefs`,
-			).length;
+				contractRef,
+			);
+			for (const adversarialRow of successfulAdversarialRows) {
+				const caseArtifactIds = requireStringLinks(
+					adversarialRow.artifactRefs,
+					`${fieldName}.adversarialCaseRefs.artifactRefs`,
+				);
+				for (const artifactId of caseArtifactIds) {
+					const artifact = artifactRefs.get(artifactId)!;
+					if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+						throw new Error(
+							`qualityGate executorQa.artifactRefs.${artifactId} adversarial coverage requires an existing non-empty file`,
+						);
+					}
+					await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
+						surfaceFamily: "native",
+						live: false,
+					});
+				}
+			}
+			successfulProofLinks += successfulAdversarialRows.length;
 		}
 		if (artifactIds) {
 			requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+			for (const artifactId of artifactIds) {
+				const artifact = artifactRefs.get(artifactId)!;
+				if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+					throw new Error(
+						`qualityGate executorQa.artifactRefs.${artifactId} artifact-only coverage requires an existing non-empty file`,
+					);
+				}
+				await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
+					surfaceFamily: "native",
+					live: false,
+				});
+			}
 			successfulProofLinks += artifactIds.length;
 		}
 		if (successfulProofLinks === 0) {
@@ -2120,7 +2098,13 @@ async function validateExecutorQaRedTeamEvidenceInternal(
 	const artifactRefs = await validateArtifactRefs(cwd, executorQa);
 	const surfaceEvidence = await validateSurfaceEvidence(cwd, executorQa, artifactRefs);
 	const adversarialCases = validateAdversarialCases(executorQa, artifactRefs);
-	const contractCoverage = validateContractCoverage(executorQa, surfaceEvidence, adversarialCases, artifactRefs);
+	const contractCoverage = await validateContractCoverage(
+		cwd,
+		executorQa,
+		surfaceEvidence,
+		adversarialCases,
+		artifactRefs,
+	);
 	if (requiresComputerRedTeamSuite(executorQa, options.changeSet)) {
 		await validateMandatoryComputerAdversarialCases(cwd, contractCoverage, adversarialCases, artifactRefs);
 	}
@@ -2151,16 +2135,17 @@ function canonicalChangeSetRows(value: unknown, fieldName: string): UltragoalCha
 		if (typeof row !== "object" || row === null || Array.isArray(row))
 			throw new Error(`${fieldName}[${index}] must be an object`);
 		const record = row as JsonObject;
-		const pathValue = nonEmptyString(record.path);
+		requireAllowedRecordKeys(record, ["path", "status", "oldPath"], `${fieldName}[${index}]`);
+		const pathValue = exactNonEmptyString(record.path);
 		if (!pathValue) throw new Error(`${fieldName}[${index}].path is required`);
 		if ("goalId" in record) throw new Error(`${fieldName}[${index}] must not contain goalId attribution`);
 		const status = nonEmptyString(record.status);
 		if (!status) throw new Error(`${fieldName}[${index}].status is required`);
-		const oldPath = nonEmptyString(record.oldPath);
+		const oldPath = exactNonEmptyString(record.oldPath);
 		return {
-			path: normalizeRepoPath(pathValue),
+			path: normalizeChangeSetPath(pathValue),
 			status: status as UltragoalChangeStatus,
-			...(oldPath ? { oldPath: normalizeRepoPath(oldPath) } : {}),
+			...(oldPath ? { oldPath: normalizeChangeSetPath(oldPath) } : {}),
 		};
 	});
 }
@@ -2174,15 +2159,37 @@ function requireChangeSetCoverage(
 	declared: readonly UltragoalChangeSetPath[],
 	fieldName: string,
 ): void {
-	if (!expected) return;
-	const declaredExactKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`));
-	const declaredPathKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}`));
-	for (const row of expected.paths) {
-		const pathKey = `${row.oldPath ?? ""}\u0000${row.path}`;
-		const exactKey = `${pathKey}\u0000${row.status}`;
-		const covered = row.status === "unknown" ? declaredPathKeys.has(pathKey) : declaredExactKeys.has(exactKey);
-		if (!covered) throw new Error(`${fieldName} does not cover computed checkpoint change-set path ${row.path}`);
+	if (!expected) throw new Error(`${fieldName} requires an authoritative computed checkpoint change set`);
+	if (expected.captureIncomplete)
+		throw new Error(`${fieldName} requires a complete authoritative checkpoint change set`);
+	const expectedExactRows = expected.paths.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`);
+	const declaredExactRows = declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`);
+	const declaredExactKeys = new Set(declaredExactRows);
+	for (const [index, row] of expected.paths.entries()) {
+		if (!declaredExactKeys.has(expectedExactRows[index]!)) {
+			throw new Error(`${fieldName} does not cover computed checkpoint change-set path ${row.path}`);
+		}
 	}
+	if (
+		declaredExactRows.length !== expectedExactRows.length ||
+		declaredExactRows.some((key, index) => key !== expectedExactRows[index])
+	) {
+		throw new Error(`${fieldName} must exactly match the computed checkpoint change set`);
+	}
+}
+
+function requireExactRecordKeys(record: JsonObject, expectedKeys: readonly string[], fieldName: string): void {
+	const actual = Object.keys(record).sort();
+	const expected = [...expectedKeys].sort();
+	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+		throw new Error(`${fieldName} keys must exactly match durable validationBatch memberIds`);
+	}
+}
+
+function requireAllowedRecordKeys(record: JsonObject, allowedKeys: readonly string[], fieldName: string): void {
+	const allowed = new Set(allowedKeys);
+	const unsupported = Object.keys(record).filter(key => !allowed.has(key));
+	if (unsupported.length > 0) throw new Error(`${fieldName} contains unsupported keys: ${unsupported.join(", ")}`);
 }
 
 function requireValidationBatchTuple(
@@ -2288,6 +2295,7 @@ function hydrateDeferredGateDefaults(
 	}));
 	const computedByPath = new Map(computedRows.map(row => [row.path, row]));
 	const declared = qualityGateObject(hydrated.changeSet);
+	if (hydrated.changeSet !== undefined && !declared) return { ...gate, deferredToBatch: hydrated };
 	const changeSetRecord: JsonObject = declared ? { ...declared } : {};
 	if (changeSetRecord.memberGoalId === undefined) changeSetRecord.memberGoalId = goal.id;
 	if (changeSetRecord.cumulativeFromBase === undefined) changeSetRecord.cumulativeFromBase = true;
@@ -2299,9 +2307,9 @@ function hydrateDeferredGateDefaults(
 		changeSetRecord.paths = changeSetRecord.paths.map(row => {
 			const record = typeof row === "string" ? { path: row } : qualityGateObject(row);
 			if (!record) return row;
-			const pathValue = nonEmptyString(record.path);
+			const pathValue = exactNonEmptyString(record.path);
 			if (!pathValue || nonEmptyString(record.status)) return record;
-			const computed = computedByPath.get(normalizeRepoPath(pathValue));
+			const computed = computedByPath.get(normalizeChangeSetPath(pathValue));
 			return {
 				...record,
 				status: computed?.status ?? "unknown",
@@ -2357,7 +2365,12 @@ function hydrateBatchCloseDefaults(input: {
 		if (member?.validationBatch) derivedMetadataHashes[memberId] = member.validationBatch.metadataHash;
 		if (!member || memberId === input.goal.id) continue;
 		try {
-			const receipt = requireDeferredMemberReceiptFresh(input.plan, input.ledger, member, "validationBatchClose hydration");
+			const receipt = requireDeferredMemberReceiptFresh(
+				input.plan,
+				input.ledger,
+				member,
+				"validationBatchClose hydration",
+			);
 			derivedChangeSetHashes[memberId] = receipt.validationBatch.changeSetHash;
 			derivedReceipts.push({
 				goalId: memberId,
@@ -2371,11 +2384,12 @@ function hydrateBatchCloseDefaults(input: {
 			// Member not fresh/complete: omit it so validation reports the real defect.
 		}
 	}
-	const suppliedMetadataHashes = qualityGateObject(close.memberMetadataHashes);
 	if (close.memberMetadataHashes === undefined) close.memberMetadataHashes = derivedMetadataHashes;
-	else if (suppliedMetadataHashes) close.memberMetadataHashes = { ...derivedMetadataHashes, ...suppliedMetadataHashes };
 	if (close.memberReceipts === undefined) close.memberReceipts = derivedReceipts;
 	const requestedUnion = qualityGateObject(close.unionChangeSet);
+	if (close.unionChangeSet !== undefined && !requestedUnion) {
+		return { ...input.gate, validationBatchClose: close };
+	}
 	const union: JsonObject = requestedUnion ? { ...requestedUnion } : {};
 	if (union.source === undefined) union.source = "validation-batch";
 	if (union.paths === undefined) {
@@ -2388,17 +2402,16 @@ function hydrateBatchCloseDefaults(input: {
 	try {
 		const unionRows = canonicalChangeSetRows(union.paths, "validationBatchClose.unionChangeSet.paths");
 		const suppliedChangeSetHashes = qualityGateObject(union.memberChangeSetHashes);
-		const memberChangeSetHashes: Record<string, unknown> = {
+		const derivedMemberChangeSetHashes: Record<string, unknown> = {
 			...derivedChangeSetHashes,
 			[metadata.finalGoalId]: changeSetHashForPaths(unionRows),
-			...suppliedChangeSetHashes,
 		};
-		if (union.memberChangeSetHashes === undefined || suppliedChangeSetHashes) {
-			union.memberChangeSetHashes = memberChangeSetHashes;
+		if (union.memberChangeSetHashes === undefined) {
+			union.memberChangeSetHashes = derivedMemberChangeSetHashes;
 		}
 		if (union.unionHash === undefined) {
 			union.unionHash = hashStructuredValue({
-				memberChangeSetHashes: qualityGateObject(union.memberChangeSetHashes) ?? memberChangeSetHashes,
+				memberChangeSetHashes: suppliedChangeSetHashes ?? derivedMemberChangeSetHashes,
 				paths: unionRows.map(row => ({ path: row.path, status: row.status, oldPath: row.oldPath })),
 			});
 		}
@@ -2421,6 +2434,24 @@ function validateDeferredCompletionQualityGate(
 		throw new Error(`deferred qualityGate contains unsupported keys: ${unsupportedKeys.join(", ")}`);
 	const deferred = qualityGateObject(gate.deferredToBatch);
 	if (!deferred) throw new Error("deferred qualityGate requires deferredToBatch object");
+	requireAllowedRecordKeys(
+		deferred,
+		[
+			"schemaVersion",
+			"kind",
+			"batchId",
+			"memberIds",
+			"finalGoalId",
+			"metadataHash",
+			"deferredLanes",
+			"ranLanes",
+			"targetedVerification",
+			"aiSlopCleaner",
+			"iteration",
+			"changeSet",
+		],
+		"deferredToBatch",
+	);
 	if (deferred.kind !== "validation-batch-deferred")
 		throw new Error("deferredToBatch.kind must be validation-batch-deferred");
 	if (metadata) {
@@ -2456,14 +2487,17 @@ function validateDeferredCompletionQualityGate(
 	validateDeferredLaneDeclaration(deferred, "deferredToBatch");
 	const declaredChangeSet = qualityGateObject(deferred.changeSet);
 	if (!declaredChangeSet) throw new Error("deferredToBatch.changeSet is required");
+	requireAllowedRecordKeys(
+		declaredChangeSet,
+		["memberGoalId", "cumulativeFromBase", "paths", "changeSetHash"],
+		"deferredToBatch.changeSet",
+	);
 	if (declaredChangeSet.memberGoalId !== goal.id)
 		throw new Error(
 			`deferredToBatch.changeSet.memberGoalId must label the checkpointed goal ${goal.id} (or be omitted; the runtime fills it)`,
 		);
 	if (declaredChangeSet.cumulativeFromBase !== true)
-		throw new Error(
-			"deferredToBatch.changeSet.cumulativeFromBase must be true (or omitted; the runtime fills it)",
-		);
+		throw new Error("deferredToBatch.changeSet.cumulativeFromBase must be true (or omitted; the runtime fills it)");
 	const paths = canonicalChangeSetRows(declaredChangeSet.paths, "deferredToBatch.changeSet.paths");
 	requireChangeSetCoverage(changeSet, paths, "deferredToBatch.changeSet.paths");
 	if (declaredChangeSet.changeSetHash !== changeSetHashForPaths(paths))
@@ -2752,6 +2786,21 @@ function validateBatchCloseQualityGate(
 ): void {
 	const close = qualityGateObject(gate.validationBatchClose);
 	if (!close) throw new Error("validationBatchClose is required");
+	requireAllowedRecordKeys(
+		close,
+		[
+			"schemaVersion",
+			"kind",
+			"batchId",
+			"finalGoalId",
+			"memberIds",
+			"memberMetadataHashes",
+			"memberReceipts",
+			"unionChangeSet",
+			"coverageEvidence",
+		],
+		"validationBatchClose",
+	);
 	if (close.schemaVersion !== 1 || close.kind !== "validation-batch-close")
 		throw new Error("validationBatchClose.kind must be validation-batch-close");
 	if (close.batchId !== metadata.batchId || close.finalGoalId !== metadata.finalGoalId)
@@ -2778,6 +2827,12 @@ function validateBatchCloseQualityGate(
 		if (memberId !== metadata.finalGoalId && member.status !== "complete")
 			throw new Error(`validationBatchClose cannot close before ${memberId} is complete`);
 	}
+	requireExactRecordKeys(memberMetadataHashes, metadata.memberIds, "validationBatchClose.memberMetadataHashes");
+	requireExactRecordKeys(
+		memberChangeSetHashes,
+		metadata.memberIds,
+		"validationBatchClose.unionChangeSet.memberChangeSetHashes",
+	);
 	if (receiptRows.length !== nonFinalIds.length)
 		throw new Error("validationBatchClose.memberReceipts must list every non-final member exactly once");
 	for (const row of receiptRows) {
@@ -2787,6 +2842,11 @@ function validateBatchCloseQualityGate(
 		const memberId = nonEmptyString(record.goalId);
 		if (!memberId || !nonFinalIds.includes(memberId))
 			throw new Error("validationBatchClose.memberReceipts contains invalid member goalId");
+		requireAllowedRecordKeys(
+			record,
+			["goalId", "receiptId", "checkpointLedgerEventId", "qualityGateHash", "changeSetHash", "role"],
+			`validationBatchClose.memberReceipts.${memberId}`,
+		);
 		if (seenReceipts.has(memberId))
 			throw new Error(`validationBatchClose.memberReceipts contains duplicate member ${memberId}`);
 		seenReceipts.add(memberId);
@@ -2811,6 +2871,11 @@ function validateBatchCloseQualityGate(
 	const union = qualityGateObject(close.unionChangeSet);
 	if (union?.source !== "validation-batch")
 		throw new Error("validationBatchClose.unionChangeSet.source must be validation-batch");
+	requireAllowedRecordKeys(
+		union,
+		["source", "memberChangeSetHashes", "paths", "unionHash"],
+		"validationBatchClose.unionChangeSet",
+	);
 	const unionPaths = canonicalChangeSetRows(union.paths, "validationBatchClose.unionChangeSet.paths");
 	requireChangeSetCoverage(changeSet, unionPaths, "validationBatchClose.unionChangeSet.paths");
 	const finalHash = changeSetHashForPaths(unionPaths);
@@ -2896,8 +2961,11 @@ function hydrateReviewedBatchReplacementClose(input: {
 	const aggregateGoal = aggregateGoals.find(goal => {
 		const receipt = goal.completionVerification!;
 		const event = findLedgerReceiptEvent(input.ledger, receipt);
+		const eventReceipt = event?.completionVerification as UltragoalCompletionVerification | undefined;
 		return (
 			event !== null &&
+			eventReceipt !== undefined &&
+			hashStructuredValue(eventReceipt) === hashStructuredValue(receipt) &&
 			hashStructuredValue(event.qualityGateJson) === receipt.qualityGateHash &&
 			goal.updatedAt === receipt.verifiedAt &&
 			receipt.basis.relevantGoalIdsBeforeCheckpoint.length === historicalRequiredGoalIds.length &&
@@ -2936,7 +3004,11 @@ function hydrateReviewedBatchReplacementClose(input: {
 			role: "deferred-member",
 		});
 	}
-	const paths = input.changeSet.paths.map(row => ({ ...row }));
+	const paths = input.changeSet.paths.map(row => ({
+		path: row.path,
+		status: row.status,
+		...(row.oldPath ? { oldPath: row.oldPath } : {}),
+	}));
 	memberChangeSetHashes[input.goal.id] = changeSetHashForPaths(paths);
 	const unionHash = hashStructuredValue({
 		memberChangeSetHashes,
@@ -3170,12 +3242,29 @@ export async function validateUltragoalQualityGateReadOnly(input: {
 	}
 	const ledger = plan ? await readUltragoalLedger(input.cwd, sessionId) : undefined;
 	const changeSet = await computeCheckpointChangeSet(input.cwd);
-	let hydratedGate = goal ? hydrateDeferredGateDefaults(gate, goal, changeSet) : gate;
-	if (goal && plan && ledger) {
-		hydratedGate = hydrateBatchCloseDefaults({ gate: hydratedGate, plan, goal, ledger, changeSet });
-	}
 	try {
-		await validateCompletionQualityGate(input.cwd, hydratedGate, { changeSet, plan: plan ?? undefined, goal, ledger });
+		const validationBatch = goal ? requireFreshValidationBatchMetadata(goal) : undefined;
+		let hydratedGate =
+			validationBatch && plan && goal && ledger
+				? hydrateReviewedBatchReplacementClose({
+						gate,
+						plan,
+						goal,
+						metadata: validationBatch,
+						ledger,
+						changeSet,
+					})
+				: gate;
+		if (goal) hydratedGate = hydrateDeferredGateDefaults(hydratedGate, goal, changeSet);
+		if (goal && plan && ledger) {
+			hydratedGate = hydrateBatchCloseDefaults({ gate: hydratedGate, plan, goal, ledger, changeSet });
+		}
+		await validateCompletionQualityGate(input.cwd, hydratedGate, {
+			changeSet,
+			plan: plan ?? undefined,
+			goal,
+			ledger,
+		});
 		return { valid: true, errors: [] };
 	} catch (error) {
 		if (error instanceof UltragoalQualityGateError) return { valid: false, errors: error.diagnostics };
@@ -4105,34 +4194,60 @@ async function readOptionalExecutorQa(cwd: string, value: string | undefined): P
 }
 
 import {
+	ciDevChangedPathRows,
 	computeCheckpointChangeSet,
+	mergeChangeSetPaths,
 	parseGitNameStatus,
+	parseGitUntrackedPaths,
 	parseUnifiedDiffPaths,
 	resolveGitBase,
 	spawnText,
 } from "./ultragoal-change-set";
 
-export { computeCheckpointChangeSet, parseGitNameStatus, parseUnifiedDiffPaths, resolveGitBase, spawnText };
+export {
+	ciDevChangedPathRows,
+	computeCheckpointChangeSet,
+	mergeChangeSetPaths,
+	parseGitNameStatus,
+	parseGitUntrackedPaths,
+	parseUnifiedDiffPaths,
+	resolveGitBase,
+	spawnText,
+};
 
 function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
 	const kind = nonEmptyString(source.kind);
-	if (kind === "spec") return { source: "review-spec", paths: [], trusted: true };
-	if (kind === "pr" && typeof source.diff === "string")
+	if (kind === "spec") {
+		const codeSource = qualityGateObject(source.codeSource);
+		return codeSource ? changeSetFromReviewSource(codeSource) : undefined;
+	}
+	if (kind === "pr" && typeof source.diff === "string") {
+		const paths = parseUnifiedDiffPaths(source.diff);
 		return {
 			source: "review-pr",
-			paths: parseUnifiedDiffPaths(source.diff),
+			paths,
 			rawDiffStat: source.diff,
 			rawDiff: source.diff,
+			captureIncomplete: true,
 			trusted: true,
 		};
+	}
 	const local = qualityGateObject(source.local);
-	if (kind === "pr" && local) return changeSetFromReviewSource(local);
+	if (kind === "pr" && local) {
+		const localChangeSet = changeSetFromReviewSource(local);
+		return localChangeSet ? { ...localChangeSet, captureIncomplete: true } : undefined;
+	}
 	if (kind === "worktree")
 		return {
 			source: "review-worktree",
-			paths: parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
-			rawDiffStat: String(source.diffStat ?? ""),
-			rawDiff: String(source.diff ?? ""),
+			paths: mergeChangeSetPaths([
+				parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
+				parseGitUntrackedPaths(String(source.untracked ?? "")),
+				ciDevChangedPathRows(),
+			]),
+			rawDiffStat: typeof source.diffStat === "string" ? source.diffStat : undefined,
+			rawDiff: typeof source.diff === "string" ? source.diff : undefined,
+			captureIncomplete: source.captureIncomplete === true,
 			trusted: true,
 		};
 	if (kind === "branch" || kind === "pr-fallback")
@@ -4140,9 +4255,10 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 			source: "review-branch",
 			baseRef: nonEmptyString(source.base) ?? undefined,
 			headRef: "HEAD",
-			paths: parseGitNameStatus(String(source.nameStatus ?? "")),
-			rawDiffStat: String(source.diffStat ?? ""),
-			rawDiff: String(source.diff ?? ""),
+			paths: mergeChangeSetPaths([parseGitNameStatus(String(source.nameStatus ?? "")), ciDevChangedPathRows()]),
+			rawDiffStat: typeof source.diffStat === "string" ? source.diffStat : undefined,
+			rawDiff: typeof source.diff === "string" ? source.diff : undefined,
+			captureIncomplete: source.captureIncomplete === true,
 			trusted: true,
 		};
 	return undefined;
@@ -4150,35 +4266,52 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 
 async function localDiffSource(cwd: string, sourceKind: string, branch?: string): Promise<JsonObject> {
 	if (sourceKind === "worktree") {
-		const [status, diffStat, unstaged, staged, unstagedDiff, stagedDiff] = await Promise.all([
+		const [status, diffStat, unstaged, staged, untracked, unstagedDiff, stagedDiff] = await Promise.all([
 			spawnText(["git", "status", "--short"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--stat"], { cwd, timeoutMs: 5000 }),
-			spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
-			spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff", "--cached", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 		]);
 		return {
 			kind: "worktree",
-			status: status.stdout,
-			diffStat: diffStat.stdout,
-			diff: [unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n"),
-			nameStatus: `${unstaged.stdout}\n${staged.stdout}`,
+			...(status.ok ? { status: status.stdout } : {}),
+			...(diffStat.ok ? { diffStat: diffStat.stdout } : {}),
+			...(unstagedDiff.ok && stagedDiff.ok
+				? { diff: [unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n") }
+				: {}),
+			nameStatus: [unstaged.ok ? unstaged.stdout : "", staged.ok ? staged.stdout : ""].join(""),
+			...(untracked.ok ? { untracked: untracked.stdout } : {}),
+			captureIncomplete:
+				!status.ok ||
+				!diffStat.ok ||
+				!unstaged.ok ||
+				!staged.ok ||
+				!untracked.ok ||
+				!unstagedDiff.ok ||
+				!stagedDiff.ok,
 		};
+	}
+	if (branch) {
+		const branchExists = await spawnText(["git", "rev-parse", "--verify", branch], { cwd, timeoutMs: 3000 });
+		if (!branchExists.ok) throw new Error(`review branch ${branch} does not resolve`);
 	}
 	const base = await resolveGitBase(cwd, branch);
 	const [diffStat, nameStatus, diff] = await Promise.all([
 		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status", "-z", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 	]);
 	return {
 		kind: sourceKind,
 		base,
 		branch,
-		diffStat: diffStat.stdout,
-		diff: diff.stdout,
-		nameStatus: nameStatus.stdout,
+		...(diffStat.ok ? { diffStat: diffStat.stdout } : {}),
+		...(diff.ok ? { diff: diff.stdout } : {}),
+		nameStatus: nameStatus.ok ? nameStatus.stdout : "",
+		captureIncomplete: !diffStat.ok || !nameStatus.ok || !diff.ok,
 	};
 }
 
@@ -4189,9 +4322,15 @@ async function resolveReviewSource(
 ): Promise<{ contractStrength: UltragoalReviewContractStrength; source: JsonObject }> {
 	if (specPath) {
 		const absolute = path.resolve(cwd, specPath);
+		const codeReviewSource = await resolveReviewSource(cwd, args, undefined);
 		return {
 			contractStrength: "strong",
-			source: { kind: "spec", path: specPath, contract: await Bun.file(absolute).text() },
+			source: {
+				kind: "spec",
+				path: specPath,
+				contract: await Bun.file(absolute).text(),
+				codeSource: codeReviewSource.source,
+			},
 		};
 	}
 	const pr = flagValue(args, "--pr");

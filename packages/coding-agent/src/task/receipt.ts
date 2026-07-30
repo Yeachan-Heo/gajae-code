@@ -44,6 +44,7 @@ export interface TaskResultReceipt {
 	worktree?: DurableWorktreeInfo;
 	/** Typed durable-worktree provisioning failure, actionable without exposing raw output. */
 	worktreeError?: DurableWorktreeError;
+	persistence?: SingleResult["persistence"];
 	retryFailure?: { attempt: number; errorSummary: string };
 	setupFailure?: { summary: string };
 	errorSummary?: string;
@@ -133,6 +134,18 @@ function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outp
 	if (raw.retryFailure) {
 		return `Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}.`;
 	}
+	if (raw.persistence?.outcome === "recovery_available") {
+		const recovery = raw.persistence.recoveryRef
+			? ` Recovery patch: ${raw.persistence.recoveryRef.uri} (${raw.persistence.recoveryRef.sizeBytes} bytes).`
+			: "";
+		return `Task ${status}; changes were not persisted to the owner worktree.${recovery}`;
+	}
+	if (raw.persistence?.outcome === "applied") {
+		return `Task ${status}; changes persisted to the owner worktree.`;
+	}
+	if (raw.persistence?.outcome === "no_changes") {
+		return `Task ${status}; no changes to persist.`;
+	}
 	if (raw.abortReason) {
 		return `Task ${status}; abort reason recorded.`;
 	}
@@ -161,7 +174,7 @@ function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outp
 function getStatus(raw: SingleResult): TaskResultReceipt["status"] {
 	if (raw.paused) return "paused";
 	if (raw.aborted) return "aborted";
-	if (raw.exitCode === 0 && raw.error) return "merge_failed";
+	if (raw.exitCode === 0 && (raw.error || raw.persistence?.outcome === "recovery_available")) return "merge_failed";
 	if (raw.exitCode !== 0 || raw.error) return "failed";
 	return "completed";
 }
@@ -295,6 +308,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		branchName: raw.branchName,
 		worktree: raw.worktree,
 		worktreeError: raw.worktreeError,
+		persistence: raw.persistence,
 		fastMode: raw.fastMode,
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
@@ -302,7 +316,11 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		errorSummary:
 			raw.setupFailure?.summary ??
 			(raw.worktreeError ? `Worktree unavailable: ${raw.worktreeError.code}.` : undefined) ??
-			(raw.error ? "Error recorded." : undefined),
+			(raw.error
+				? "Error recorded."
+				: raw.persistence?.outcome === "recovery_available"
+					? "Changes were not persisted to the owner worktree."
+					: undefined),
 		setupFailure: raw.setupFailure ? { summary: raw.setupFailure.summary } : undefined,
 		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
 		preview,

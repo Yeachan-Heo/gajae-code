@@ -491,7 +491,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_12_2(): void
+export declare function __piNativesV0_12_4(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -841,16 +841,6 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
  * authoritative throughout recursive removal.
  */
 export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult
-
-/**
- * Replace a staged regular file only after deleting the exact expected
- *
- * The expected destination identity must describe a regular file, not a
- * directory or detach-only request.
- * Publication uses a retained source handle and a no-replace rename, so a
- * successor installed after deletion is preserved.
- */
-export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
  * Restore only the detached object that still has the supplied platform
@@ -1736,10 +1726,6 @@ export interface NativeExactFileIdentity {
 export interface NativeExactUnlinkResult {
   ok: boolean
   code?: string
-  /**
-   * On Windows this is returned in the caller's namespace; retained handle
-   * operations continue to use the volume-GUID canonical path internally.
-   */
   detachedPath?: string
   retainedSuccessorPath?: string
   /**

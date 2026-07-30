@@ -123,6 +123,28 @@ describe("task renderer: nested live rendering", () => {
 		expect(finalText).toContain(`Fast final child ${theme.icon.fast}`);
 	});
 
+	it("renders owner-worktree recovery patch receipts", async () => {
+		const text = await renderResult({
+			...makeCompletedSubResult("4-Recovery", "Recovery child"),
+			status: "merge_failed",
+			persistence: {
+				outcome: "recovery_available",
+				ownerWorktreeApplied: false,
+				recoveryRef: {
+					uri: `local://subagents/${"x".repeat(120)}\t\u0000.patch`,
+					sizeBytes: 256,
+					sha256: "c".repeat(64),
+					durability: "session",
+				},
+			},
+		});
+
+		expect(text).toContain("Unapplied recovery patch: local://subagents/");
+		expect(text).not.toContain("\t");
+		expect(text).not.toContain("\u0000");
+		expect(text).not.toContain("x".repeat(100));
+	});
+
 	it("renders completed nested task results stored in extractedToolData.task while parent is in-progress", async () => {
 		const parent = makeRunningProgress({
 			id: "1-Parent",

@@ -43,6 +43,7 @@ import {
 	createOpenAIResponsesHistoryPayload,
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
+	neutralizeReservedControlTokens,
 	neutralizeResponsesInputControlTokens,
 	normalizeSystemPrompts,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
@@ -746,7 +747,12 @@ async function buildTransformedCodexRequestBody(
 		}
 	}
 
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	// Neutralize leaked Harmony control tokens in the system prompt too:
+	// `params.instructions` and the developer messages prepended inside
+	// `transformRequestBody` bypass the `input` sanitizer above, so a poisoned
+	// system prompt rejects every turn with
+	// `Request blocked (code=invalid_prompt)`.
+	const systemPrompts = normalizeSystemPrompts(context.systemPrompt).map(neutralizeReservedControlTokens);
 	if (systemPrompts.length > 0) {
 		params.instructions = systemPrompts[0];
 	}

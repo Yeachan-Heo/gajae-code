@@ -305,6 +305,113 @@ describe("ultragoal review command", () => {
 		});
 	}, 15_000);
 
+	it("review worktree requires computer QA for an untracked shared registry", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const toolsIndex = path.join(root, "packages/coding-agent/src/tools/index.ts");
+		await fs.mkdir(path.dirname(toolsIndex), { recursive: true });
+		await fs.writeFile(toolsIndex, "export const BUILTIN_TOOLS = { ordinary: true };\n");
+		const output = await review(root, ["--executor-qa-json", await writeQa(root, validExecutorQa())]);
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
+	it("review worktree requires computer QA when inventory bytes are incomplete", async () => {
+		if (process.platform === "win32") return;
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const invalidPath = Buffer.concat([Buffer.from(root), Buffer.from(path.sep), Buffer.from([0xff])]);
+		await fs.writeFile(invalidPath, "unrepresentable pathname\n");
+		const output = await review(root, ["--executor-qa-json", await writeQa(root, validExecutorQa())]);
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
+	it("PR patch review requires computer QA because patch inventory is non-authoritative", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const qaPath = await writeQa(root, validExecutorQa());
+		const fakeBin = path.join(root, "fake-bin");
+		await fs.mkdir(fakeBin);
+		const ghPath = path.join(fakeBin, "gh");
+		await fs.writeFile(
+			ghPath,
+			`#!/bin/sh\nif [ "$2" = "view" ]; then printf '{"title":"test","body":"","baseRefName":"dev"}'; else printf 'diff --git a/README.md b/README.md\\n--- a/README.md\\n+++ b/README.md\\n@@ -1 +1 @@\\n-old\\n+new\\n'; fi\n`,
+			{ mode: 0o755 },
+		);
+		const savedPath = process.env.PATH;
+		process.env.PATH = `${fakeBin}${path.delimiter}${savedPath ?? ""}`;
+		try {
+			const output = await review(root, ["--pr", "123", "--executor-qa-json", qaPath]);
+			expect(output.verdict).toBe("fail");
+		} finally {
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+		}
+	});
+
+	it("spec plus PR preserves the PR inventory uncertainty", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		await Bun.write(path.join(root, "spec.md"), "Strong acceptance criteria");
+		const output = await review(root, [
+			"--spec",
+			"spec.md",
+			"--pr",
+			"999999999",
+			"--executor-qa-json",
+			await writeQa(root, validExecutorQa()),
+		]);
+		expect(output.contractStrength).toBe("strong");
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
+	it("unavailable PR fallback remains incomplete even when the local checkout is clean", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const output = await review(root, [
+			"--pr",
+			"999999999",
+			"--executor-qa-json",
+			await writeQa(root, validExecutorQa()),
+		]);
+		expect(output.verdict).toBe("fail");
+		expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+	it("review branch merges CI-only protected paths", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/src/tools/index.ts";
+		try {
+			const output = await review(root, [
+				"--branch",
+				"HEAD",
+				"--executor-qa-json",
+				await writeQa(root, validExecutorQa()),
+			]);
+			expect(output.verdict).toBe("fail");
+			expect(JSON.stringify(output.findings)).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+		} finally {
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+		}
+	});
+	it("rejects an unresolved review branch with and without a spec", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		await Bun.write(path.join(root, "spec.md"), "Strong acceptance criteria");
+		const qaPath = await writeQa(root, validExecutorQa());
+		for (const args of [
+			["--branch", "missing-review-branch", "--executor-qa-json", qaPath],
+			["--spec", "spec.md", "--branch", "missing-review-branch", "--executor-qa-json", qaPath],
+		]) {
+			const result = await runNativeUltragoalCommand(["review", ...args, "--json"], root);
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("review branch missing-review-branch does not resolve");
+		}
+	});
 	it("uses spec override as a strong contract and allows clean pass", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);

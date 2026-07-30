@@ -27,6 +27,7 @@ import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
 	isInvalidPromptError,
+	neutralizeReservedControlTokens,
 	neutralizeResponsesInputControlTokens,
 	normalizeSystemPrompts,
 	resolveCacheRetention,
@@ -60,6 +61,7 @@ import {
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
 import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
+import { mergeDashScopeTokenPlanHeaders } from "./dashscope-token-plan-headers";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -446,8 +448,17 @@ function createClient(
 	}
 	const rawApiKey = apiKey;
 
+	const baseHeaders =
+		model.provider === "alibaba-token-plan"
+			? // Emit Qwen Code's canonical DashScope request fingerprint (User-Agent /
+				// X-DashScope-CacheControl / X-DashScope-UserAgent / X-DashScope-AuthType)
+				// so DashScope treats the caller identically to upstream QwenLM/qwen-code.
+				// Canonical identity is the base; caller headers win per key (upstream
+				// `{...default, ...customHeaders}`). #3557.
+				mergeDashScopeTokenPlanHeaders({ ...(model.headers ?? {}), ...(extraHeaders ?? {}) })
+			: { ...(model.headers ?? {}), ...(extraHeaders ?? {}) };
 	const headers = applyOpenAIRequestTransformHeaders(
-		{ ...(model.headers ?? {}), ...(extraHeaders ?? {}) },
+		baseHeaders,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);
@@ -523,7 +534,13 @@ function buildParams(
 	);
 	const messages: ResponseInput = neutralizeResponsesInputControlTokens(conversationMessages);
 
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	// Neutralize leaked Harmony control tokens in the system prompt too: the
+	// `instructions` field and developer-role messages bypass the `input`
+	// request-boundary sanitizer above, and a poisoned system prompt (e.g.
+	// injected project context quoting `<|channel|>` markers) rejects EVERY
+	// turn with `Request blocked (code=invalid_prompt)` — unrepairable by the
+	// history circuit breaker.
+	const systemPrompts = normalizeSystemPrompts(context.systemPrompt).map(neutralizeReservedControlTokens);
 	if (isComposerHarnessModel(model.id)) {
 		systemPrompts.unshift(COMPOSER_EDIT_DISCIPLINE_PROMPT);
 	}

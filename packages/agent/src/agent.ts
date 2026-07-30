@@ -39,11 +39,14 @@ import type {
 	ManagedAttemptDecision,
 	ManagedAttemptOutcome,
 	ManagedLogicalRunId,
+	RunCancellationDomain,
+	RunCancellationDomainBridge,
 	RunResourceLedger,
 	RunTerminalRequest,
 	StreamFn,
 	ToolCallContext,
 } from "./types";
+import { setAgentTerminalOwnerContext } from "./types";
 
 function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[]): void {
 	for (const message of messages) {
@@ -296,6 +299,8 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 	/** Disable transport replay; fallback accounting is owned by the caller. */
 	fallbackManaged?: boolean;
+	/** Continue a cooperative maintenance checkpoint under its existing logical run and cancellation domain. */
+	maintenanceContinuation?: boolean;
 	/** Called synchronously after this invocation claims the agent run, before asynchronous provider work. */
 	onRunAccepted?: () => void;
 	/** Called once immediately before every managed upstream request. */
@@ -367,8 +372,8 @@ export class Agent {
 	#runSequence = 0;
 	#activeRunId?: number;
 	#activeResourceRunId?: string;
+	#activeResourceCancellationDomain?: RunCancellationDomain;
 	#continuationGeneration = 0;
-	#activeFallbackManaged = false;
 	#kimiApiFormat?: "openai" | "anthropic";
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
@@ -395,6 +400,10 @@ export class Agent {
 	#terminalizedLogicalRunIds = new Set<ManagedLogicalRunId>();
 	#managedLogicalRunOwner?: ManagedLogicalRunId;
 	readonly resourceLedger: RunResourceLedger = createRunResourceLedger();
+	bindRunCancellationDomainBridge(bridge: RunCancellationDomainBridge, agentSessionClaimKey?: object): void {
+		this.resourceLedger.bindCancellationDomainBridge(bridge);
+		if (agentSessionClaimKey) this.resourceLedger.bindAgentSessionClaimKey(agentSessionClaimKey);
+	}
 
 	streamFn: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
@@ -1158,6 +1167,8 @@ export class Agent {
 	forceAbort(reason = "Force aborted"): boolean {
 		const runId = this.#activeRunId;
 		const managedLogicalRunId = this.#managedLogicalRunOwner;
+		const activeResourceDomain = this.#activeResourceCancellationDomain;
+		const activeResourceRunId = this.#activeResourceRunId;
 		const hadActiveRun = runId !== undefined && (this.#runningPrompt !== undefined || this.#state.isStreaming);
 		if (!hadActiveRun) return false;
 
@@ -1168,7 +1179,6 @@ export class Agent {
 		this.#state.pendingToolCalls = new Set<string>();
 		this.#abortController = undefined;
 		this.#cursorToolResultBuffer = [];
-		this.resourceLedger.quarantine(this.#activeResourceRunId ?? String(managedLogicalRunId ?? runId));
 		this.#managedLogicalRunOwner = undefined;
 
 		const resolve = this.#resolveRunningPrompt;
@@ -1176,12 +1186,15 @@ export class Agent {
 		this.#resolveRunningPrompt = undefined;
 		this.#activeRunId = undefined;
 		this.#activeResourceRunId = undefined;
+		this.#activeResourceCancellationDomain = undefined;
 		resolve?.();
-		if (this.#activeFallbackManaged) {
-			this.requestRunTerminal(managedLogicalRunId ?? runId, { stopReason: "cancelled" });
-		} else {
-			this.#finalizeRun(runId, { type: "agent_end", messages: [] });
-		}
+		this.#finalizeRun(
+			managedLogicalRunId ?? runId,
+			{ type: "agent_end", messages: [], stopReason: "cancelled" },
+			undefined,
+			activeResourceDomain,
+		);
+		if (activeResourceRunId) this.resourceLedger.quarantine(activeResourceRunId);
 		return true;
 	}
 
@@ -1350,6 +1363,10 @@ export class Agent {
 		const model = this.#state.model;
 		if (!model) throw new Error("No model configured");
 
+		const maintenanceContinuation = options?.maintenanceContinuation === true;
+		if (maintenanceContinuation && this.#managedLogicalRunOwner === undefined) {
+			throw new Error("Maintenance continuation ownership is unavailable");
+		}
 		let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
 
 		const { promise, resolve } = Promise.withResolvers<void>();
@@ -1366,10 +1383,26 @@ export class Agent {
 		this.#state.error = undefined;
 
 		const fallbackManaged = options?.fallbackManaged === true;
-		const managedLogicalRunOwner = fallbackManaged ? (this.#managedLogicalRunOwner ?? runId) : undefined;
+		const managedLogicalRunOwner = fallbackManaged
+			? (this.#managedLogicalRunOwner ?? runId)
+			: maintenanceContinuation
+				? this.#managedLogicalRunOwner
+				: undefined;
+		const continuesLogicalRun = fallbackManaged || maintenanceContinuation;
 		const startsManagedLogicalRun = fallbackManaged && this.#managedLogicalRunOwner === undefined;
 		this.#activeResourceRunId = String(managedLogicalRunOwner ?? runId);
-		this.resourceLedger.open(this.#activeResourceRunId);
+		this.#activeResourceCancellationDomain = this.resourceLedger.open(this.#activeResourceRunId);
+		if (!this.#activeResourceCancellationDomain) {
+			this.#state.isStreaming = false;
+			this.#abortController = undefined;
+			this.#activeRunId = undefined;
+			this.#activeResourceRunId = undefined;
+			this.#activeResourceCancellationDomain = undefined;
+			this.#runningPrompt = undefined;
+			this.#resolveRunningPrompt = undefined;
+			resolve();
+			throw new Error("Prompt resource cancellation domain is unavailable");
+		}
 		options?.onRunAccepted?.();
 		if (startsManagedLogicalRun) {
 			this.#managedLogicalRunOwner = managedLogicalRunOwner;
@@ -1383,6 +1416,7 @@ export class Agent {
 			this.#abortController = undefined;
 			this.#activeRunId = undefined;
 			this.#activeResourceRunId = undefined;
+			this.#activeResourceCancellationDomain = undefined;
 			this.#runningPrompt = undefined;
 			this.#resolveRunningPrompt = undefined;
 			resolve();
@@ -1392,7 +1426,6 @@ export class Agent {
 		}
 		// Each run gets a fresh buffer only after managed stale-state validation.
 		this.#cursorToolResultBuffer = [];
-		this.#activeFallbackManaged = fallbackManaged;
 
 		const reasoning = this.#state.thinkingLevel;
 		const context: AgentContext = {
@@ -1482,6 +1515,8 @@ export class Agent {
 			signal: abortController.signal,
 			resourceLedger: this.resourceLedger,
 			resourceRunId: this.#activeResourceRunId,
+			resourceCancellationDomain: this.#activeResourceCancellationDomain,
+			resourceSealOwner: "caller",
 			getApiKey: this.getApiKey,
 			getAuthCredentialType: this.getAuthCredentialType,
 			getToolContext: this.#getToolContext,
@@ -1575,8 +1610,8 @@ export class Agent {
 
 		try {
 			const stream = messages
-				? agentLoop(messages, context, config, abortController.signal, this.streamFn, !fallbackManaged)
-				: agentLoopContinue(context, config, abortController.signal, this.streamFn, !fallbackManaged);
+				? agentLoop(messages, context, config, abortController.signal, this.streamFn, !continuesLogicalRun)
+				: agentLoopContinue(context, config, abortController.signal, this.streamFn, !continuesLogicalRun);
 
 			for await (const event of stream) {
 				if (this.#activeRunId !== runId) {
@@ -1636,7 +1671,13 @@ export class Agent {
 						}
 						this.#state.isStreaming = false;
 						this.#state.streamMessage = null;
-						if (event.stopReason === "maintenance") {
+						// A maintenance checkpoint is only non-terminal while a continuation will
+						// follow. An aborted maintenance yields none, and because the loop runs with
+						// `resourceSealOwner: "caller"` it deliberately leaves sealing to us, so
+						// treating it as a checkpoint here would leave the run open forever and make
+						// every cancel report `run_not_sealed`.
+						if (event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted") {
+							this.#managedLogicalRunOwner ??= managedLogicalRunOwner ?? runId;
 							maintenanceInterrupted = true;
 							this.#emit(event);
 							continue;
@@ -1716,12 +1757,31 @@ export class Agent {
 			) {
 				continuation = managedDecision.continuation;
 			}
-			const ownership: ManagedAttemptContinuationOwnership = {
-				runId,
-				logicalRunId: managedLogicalRunOwner ?? runId,
-				generation: continuationGeneration,
-				isCurrent: () => this.#continuationGeneration === continuationGeneration && this.#activeRunId === undefined,
-			};
+			const domain = this.#activeResourceCancellationDomain;
+			const continuationReservation =
+				continuation && domain
+					? this.resourceLedger.reserveProducer(
+							String(managedLogicalRunOwner ?? runId),
+							domain,
+							"post_prompt",
+							"managed-continuation",
+						)
+					: undefined;
+			if (continuation && !continuationReservation?.ok) {
+				this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
+				continuation = undefined;
+			}
+			const ownership: ManagedAttemptContinuationOwnership | undefined = continuationReservation?.ok
+				? {
+						runId,
+						logicalRunId: managedLogicalRunOwner ?? runId,
+						generation: continuationGeneration,
+						domain: continuationReservation.lease.domain,
+						lease: continuationReservation.lease,
+						isCurrent: () =>
+							this.#continuationGeneration === continuationGeneration && this.#activeRunId === undefined,
+					}
+				: undefined;
 			if (this.#activeRunId === runId) {
 				this.#state.isStreaming = false;
 				this.#state.streamMessage = null;
@@ -1729,20 +1789,20 @@ export class Agent {
 				this.#abortController = undefined;
 				this.#activeRunId = undefined;
 				this.#activeResourceRunId = undefined;
-				this.#activeFallbackManaged = false;
+				this.#activeResourceCancellationDomain = undefined;
 				this.#resolveRunningPrompt?.();
 				this.#runningPrompt = undefined;
 				this.#resolveRunningPrompt = undefined;
 			}
 			if (
-				fallbackManaged &&
+				continuesLogicalRun &&
 				!continuation &&
 				!maintenanceInterrupted &&
 				this.#managedLogicalRunOwner === managedLogicalRunOwner
 			) {
 				this.#managedLogicalRunOwner = undefined;
 			}
-			if (continuation && ownership.isCurrent()) {
+			if (continuation && ownership?.isCurrent()) {
 				try {
 					await continuation(ownership);
 					if (
@@ -1765,6 +1825,8 @@ export class Agent {
 						this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
 						if (this.#managedLogicalRunOwner === managedLogicalRunOwner) this.#managedLogicalRunOwner = undefined;
 					}
+				} finally {
+					ownership.lease.closeDiscovery();
 				}
 			}
 		}
@@ -1781,18 +1843,35 @@ export class Agent {
 		logicalRunId: ManagedLogicalRunId,
 		event?: Extract<AgentEvent, { type: "agent_end" }>,
 		beforeEvent?: () => void,
+		knownDomain?: RunCancellationDomain,
 	): void {
 		if (this.#terminalizedLogicalRunIds.has(logicalRunId)) return;
+		const resourceRunId = String(logicalRunId);
+		const boundDomain = this.resourceLedger.lookupDomain(resourceRunId);
+		const domain = boundDomain ?? knownDomain;
+		const terminalReservation = boundDomain
+			? this.resourceLedger.reserveProducer(resourceRunId, boundDomain, "post_prompt", "terminal-publication")
+			: undefined;
 		this.#terminalizedLogicalRunIds.add(logicalRunId);
 		if (this.#terminalizedLogicalRunIds.size > 256) {
 			this.#terminalizedLogicalRunIds.delete(this.#terminalizedLogicalRunIds.values().next().value!);
 		}
+		const terminalEvent: Extract<AgentEvent, { type: "agent_end" }> = event ?? { type: "agent_end", messages: [] };
+		if (domain) {
+			setAgentTerminalOwnerContext(terminalEvent, {
+				resourceRunId,
+				domain,
+			});
+		}
 		try {
 			beforeEvent?.();
-			if (event) this.#emit(event);
+			this.#emit(terminalEvent);
 		} finally {
-			// Publish terminal lifecycle synchronously before sealing the stable handle.
-			this.resourceLedger.seal(String(logicalRunId));
+			try {
+				terminalReservation?.ok && terminalReservation.lease.closeDiscovery();
+			} finally {
+				this.resourceLedger.seal(resourceRunId);
+			}
 		}
 	}
 
