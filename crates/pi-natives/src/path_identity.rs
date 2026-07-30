@@ -267,6 +267,63 @@ impl NativeNoReplaceResult {
 	}
 }
 
+/// Result of a Windows write-through replacement.
+#[napi(object)]
+pub struct NativeDurableReplaceResult {
+	pub ok:               bool,
+	pub code:             Option<String>,
+	pub os_code:          Option<i32>,
+	pub mutation_state:   String,
+	pub durability_state: String,
+	pub reason:           String,
+	pub primitive:        String,
+	pub phase:            String,
+}
+
+impl NativeDurableReplaceResult {
+	#[cfg(not(windows))]
+	fn unsupported() -> Self {
+		Self {
+			ok:               false,
+			code:             Some("unsupported_platform".to_owned()),
+			os_code:          None,
+			mutation_state:   "not_committed".to_owned(),
+			durability_state: "not_attempted".to_owned(),
+			reason:           "unsupported_platform".to_owned(),
+			primitive:        "unsupported".to_owned(),
+			phase:            "preflight".to_owned(),
+		}
+	}
+
+	fn failure(code: &str, os_code: Option<i32>, mutation_state: &str, phase: &str) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			os_code,
+			mutation_state: mutation_state.to_owned(),
+			durability_state: "not_attempted".to_owned(),
+			reason: code.to_owned(),
+			primitive: "move_file_ex_write_through".to_owned(),
+			phase: phase.to_owned(),
+		}
+	}
+
+	#[cfg(windows)]
+	fn success() -> Self {
+		Self {
+			ok:               true,
+			code:             None,
+			os_code:          None,
+			mutation_state:   "committed".to_owned(),
+			durability_state: "durable".to_owned(),
+			reason:           "none".to_owned(),
+			primitive:        "move_file_ex_write_through".to_owned(),
+			phase:            "complete".to_owned(),
+		}
+	}
+}
+
+
 /// A deterministic, no-follow description of a directory tree. `relative_path`
 /// is UTF-8, uses `/` separators, and is empty only for the root entry.
 #[napi(object)]
@@ -793,6 +850,32 @@ pub fn rename_no_replace_path(
 		Path::new(&source_path),
 		Path::new(&destination_path),
 	))
+}
+
+/// Replace a staged file using Windows `MoveFileExW` with `REPLACE_EXISTING`
+/// and `WRITE_THROUGH`. The staged file's bytes must already have been flushed.
+#[napi]
+pub fn durable_replace_path(
+	source_path: String,
+	destination_path: String,
+) -> NativeDurableReplaceResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeDurableReplaceResult::failure(
+			"invalid_request",
+			None,
+			"not_committed",
+			"preflight",
+		);
+	}
+	#[cfg(windows)]
+	{
+		platform::durable_replace_path(Path::new(&source_path), Path::new(&destination_path))
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = (source_path, destination_path);
+		NativeDurableReplaceResult::unsupported()
+	}
 }
 
 /// Capture a deterministic, descriptor-relative snapshot of a regular-file and
@@ -5632,6 +5715,126 @@ mod platform {
 				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 			},
 			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+	}
+
+	#[derive(PartialEq)]
+	enum ReplacePathIdentity {
+		Missing,
+		Present { volume_serial_number: u32, file_index: u64 },
+		Unobservable,
+	}
+
+	fn observe_replace_path_identity(path: &Path) -> ReplacePathIdentity {
+		let handle = match open_path(path, true, FILE_READ_ATTRIBUTES) {
+			Ok(handle) => handle,
+			Err("not_found") => return ReplacePathIdentity::Missing,
+			Err(_) => return ReplacePathIdentity::Unobservable,
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let observed = if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+			ReplacePathIdentity::Unobservable
+		} else {
+			ReplacePathIdentity::Present {
+				volume_serial_number: information.dwVolumeSerialNumber,
+				file_index:           (u64::from(information.nFileIndexHigh) << 32)
+					| u64::from(information.nFileIndexLow),
+			}
+		};
+		unsafe { CloseHandle(handle) };
+		observed
+	}
+
+	fn move_file_ex_failure(
+		os_code: i32,
+		source_before: ReplacePathIdentity,
+		destination_before: ReplacePathIdentity,
+		source_path: &Path,
+		destination_path: &Path,
+	) -> NativeDurableReplaceResult {
+		let unchanged = source_before != ReplacePathIdentity::Unobservable
+			&& destination_before != ReplacePathIdentity::Unobservable
+			&& source_before == observe_replace_path_identity(source_path)
+			&& destination_before == observe_replace_path_identity(destination_path);
+		NativeDurableReplaceResult {
+			ok:               false,
+			code:             Some("move_file_ex_failed".to_owned()),
+			os_code:          Some(os_code),
+			mutation_state:   if unchanged {
+				"not_committed"
+			} else {
+				"unknown"
+			}
+			.to_owned(),
+			durability_state: if unchanged {
+				"not_attempted"
+			} else {
+				"not_provable"
+			}
+			.to_owned(),
+			reason:           if unchanged {
+				"move_file_ex_failed"
+			} else {
+				"unknown"
+			}
+			.to_owned(),
+			primitive:        "move_file_ex_write_through".to_owned(),
+			phase:            "replace".to_owned(),
+		}
+	}
+
+	pub(super) fn durable_replace_path(
+		source_path: &Path,
+		destination_path: &Path,
+	) -> NativeDurableReplaceResult {
+		let source_path = match lexical_absolute_path(source_path) {
+			Ok(path) => path,
+			Err(code) => {
+				return NativeDurableReplaceResult::failure(code, None, "not_committed", "preflight");
+			},
+		};
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => {
+				return NativeDurableReplaceResult::failure(code, None, "not_committed", "preflight");
+			},
+		};
+		let source_before = observe_replace_path_identity(&source_path);
+		let destination_before = observe_replace_path_identity(&destination_path);
+		let mut source_wide: Vec<u16> = source_path.as_os_str().encode_wide().collect();
+		let mut destination_wide: Vec<u16> = destination_path.as_os_str().encode_wide().collect();
+		source_wide.push(0);
+		destination_wide.push(0);
+		const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+		const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+		let moved = unsafe {
+			windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+				source_wide.as_ptr(),
+				destination_wide.as_ptr(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+			)
+		};
+		if moved == 0 {
+			return move_file_ex_failure(
+				unsafe { GetLastError() } as i32,
+				source_before,
+				destination_before,
+				&source_path,
+				&destination_path,
+			);
+		}
+		match std::fs::symlink_metadata(&destination_path) {
+			Ok(metadata) if metadata.is_file() => NativeDurableReplaceResult::success(),
+			_ => NativeDurableReplaceResult {
+				ok:               false,
+				code:             Some("destination_verification_failed".to_owned()),
+				os_code:          None,
+				mutation_state:   "unknown".to_owned(),
+				durability_state: "not_provable".to_owned(),
+				reason:           "destination_verification_failed".to_owned(),
+				primitive:        "move_file_ex_write_through".to_owned(),
+				phase:            "verify".to_owned(),
+			},
 		}
 	}
 }

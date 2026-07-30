@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `durableReplacePath(sourcePath, destinationPath)` replaces an existing destination file on Windows with `MoveFileExW` using `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, so the namespace mutation is on stable storage before the call returns rather than sitting in the volume's write-back cache. The typed result reports `mutationState` (`committed` / `not_committed` / `unknown`) and `durabilityState` so callers can distinguish a replacement that provably did not happen — safe to retry or fall back — from one whose outcome cannot be proven. Non-Windows hosts return `unsupported_platform` without touching the filesystem.
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30

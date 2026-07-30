@@ -41,6 +41,7 @@ export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
+export const durableReplacePath = nativeBindings.durableReplacePath;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
 export const exactRestore = nativeBindings.exactRestore;

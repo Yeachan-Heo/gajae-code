@@ -4,6 +4,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { NativeDurableReplaceResult } from "@gajae-code/natives";
+import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
@@ -579,11 +581,55 @@ async function readJson<T>(fsImpl: TelegramDaemonFs, file: string): Promise<T | 
 	}
 }
 
+/**
+ * Replace `destination` with the already-staged, already-flushed `staged` file.
+ *
+ * On Windows a plain rename replaces the destination but leaves the namespace
+ * mutation in the volume's write-back cache, so a crash immediately afterwards
+ * can lose an acknowledged daemon-state write. `durableReplacePath` issues
+ * `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, which does not return until the
+ * replacement is on stable storage.
+ *
+ * Availability is never reduced: when the native binding is missing, throws, or
+ * reports the replacement was definitely not committed, this falls back to the
+ * previous rename. It only refuses to fall back when the native outcome cannot
+ * prove the replacement did *not* land, because a fallback rename in that case
+ * could resurrect the staged file over a newer successor.
+ *
+ * @internal Exported for tests; `platform` and `durableReplace` are injectable
+ * so the Windows branch is reachable on any host.
+ */
+export async function replaceStagedPublication(
+	fsImpl: TelegramDaemonFs,
+	staged: string,
+	destination: string,
+	platform: NodeJS.Platform = process.platform,
+	durableReplace:
+		| ((sourcePath: string, destinationPath: string) => NativeDurableReplaceResult)
+		| undefined = native.durableReplacePath,
+): Promise<void> {
+	if (platform === "win32" && typeof durableReplace === "function") {
+		let outcome: NativeDurableReplaceResult | undefined;
+		try {
+			outcome = durableReplace(staged, destination);
+		} catch (error) {
+			logger.debug?.("telegram: durable replacement unavailable, falling back to rename", { error });
+		}
+		if (outcome?.ok) return;
+		if (outcome && outcome.mutationState !== "not_committed") {
+			throw new Error(
+				`telegram durable replacement did not commit: ${outcome.code ?? outcome.reason} (${outcome.mutationState})`,
+			);
+		}
+	}
+	await fsImpl.rename(staged, destination);
+}
+
 async function writeJsonAtomic(fsImpl: TelegramDaemonFs, file: string, data: unknown): Promise<void> {
 	const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	await fsImpl.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
 	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
-	await fsImpl.rename(tmp, file);
+	await replaceStagedPublication(fsImpl, tmp, file);
 }
 
 function validDaemonPid(pid: unknown): pid is number {

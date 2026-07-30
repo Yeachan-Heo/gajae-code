@@ -415,6 +415,9 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 			"`__piNativesPublishOutcomeV1`; trying the next compatible artifact.",
 		);
 	}
+	if (typeof bindings.durableReplacePath !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required durable replacement capability \`durableReplacePath\`.`);
+	}
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}

@@ -182,6 +182,7 @@ const requiredGeneratedBindingSymbols = [
 	"openRecoveryFsRoot",
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
+	"durableReplacePath",
 	"probeWindowsJobMemory",
 ] as const;
 
