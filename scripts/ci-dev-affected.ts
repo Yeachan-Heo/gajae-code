@@ -422,6 +422,7 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/src/sdk/session-directory.ts" ||
 		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
 		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||
+		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts";
 }
 

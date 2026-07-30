@@ -34,6 +34,7 @@
 ### Fixed
 
 - Managed-session deletion now immediately continues a descriptor-authorized POSIX artifact detach through exact payload scrubbing before retiring the transcript. Durable direct and replay cleanup preserve substituted successors, while fork regressions use an explicit snapshot barrier instead of scheduler timing.
+- Managed-session migration keeps a definitely live holder exclusive beyond the 60-second lease without timer-dependent self-fencing, permits immediate successor acquisition only after explicit release or proven process death, and surfaces capacity/busy startup failures through fixed path/content-redacted guidance (#3508).
 
 ## [0.12.5] - 2026-07-30
 ### Fixed

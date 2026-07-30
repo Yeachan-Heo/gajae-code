@@ -83,8 +83,8 @@ import {
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
-
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
+import { SessionMigrationBusyError } from "./internal/session-open-errors";
 import {
 	hasOnlyKeys as hasOnlyMemoryGuardKeys,
 	isMemoryGuardDecimalString,
@@ -940,6 +940,8 @@ export class SessionMigrationPolicyError extends Error {
 }
 
 export class SessionArtifactCapacityError extends Error {
+	readonly code = "artifact_capacity_exceeded";
+
 	constructor(message: string) {
 		super(message);
 		this.name = "SessionArtifactCapacityError";
@@ -954,7 +956,12 @@ export interface StrictSessionOpenSuccess {
 
 export interface StrictSessionOpenFailure {
 	kind: "error";
-	reason: ResumeTailError["reason"] | "identity-mismatch" | "migration-required" | "artifact_capacity_exceeded";
+	reason:
+		| ResumeTailError["reason"]
+		| "identity-mismatch"
+		| "migration-required"
+		| "artifact_capacity_exceeded"
+		| "migration_busy";
 	message?: string;
 }
 
@@ -9614,6 +9621,7 @@ export class SessionManager {
 			managedDestinationStore.assertBound();
 			if (opened.code === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
 			if (opened.code === "artifact_capacity_exceeded") throw new SessionArtifactCapacityError(opened.message);
+			if (opened.code === "migration_busy") throw new SessionMigrationBusyError();
 			throw new Error(`Could not open managed session: ${opened.message}`);
 		}
 		assertManagedDestinationBound();
@@ -9709,7 +9717,15 @@ export class SessionManager {
 			throw new Error(`Could not open session: ${inspected.reason}`);
 		}
 		const opened = await SessionManager.openExistingStrict(inspected.identity, destination, storage, migrationPolicy);
-		if (opened.kind === "error") throw new Error(`Could not open session: ${opened.reason}`);
+		if (opened.kind === "error") {
+			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
+			if (opened.reason === "artifact_capacity_exceeded")
+				throw new SessionArtifactCapacityError(
+					opened.message ?? "Session artifacts exceed the migration capacity.",
+				);
+			if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
+			throw new Error(`Could not open session: ${opened.reason}`);
+		}
 		return opened.manager;
 	}
 
@@ -10392,6 +10408,7 @@ export class SessionManager {
 					return { kind: "error", reason: "legacy_migration_disabled" };
 				if (error instanceof SessionArtifactCapacityError)
 					return { kind: "error", reason: "artifact_capacity_exceeded", message: error.message };
+				if (error instanceof SessionMigrationBusyError) return { kind: "error", reason: "migration_busy" };
 				if (
 					error instanceof Error &&
 					(error.message.includes("source_changed") || error.message.includes("changed before migration"))
@@ -10454,6 +10471,7 @@ export class SessionManager {
 					throw new SessionArtifactCapacityError(
 						opened.message ?? "Session artifacts exceed the migration capacity.",
 					);
+				if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
 				return undefined;
 			}
 			return opened.manager;

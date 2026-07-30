@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { TempDir } from "@gajae-code/utils";
 import type { Args } from "../src/cli/args";
 import { parseArgs } from "../src/cli/args";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
@@ -16,12 +17,19 @@ import {
 } from "../src/main";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
 import type { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { SessionMigrationBusyError } from "../src/session/internal/session-open-errors";
 import {
 	type ResumeSessionIdentity,
+	SessionArtifactCapacityError,
 	type SessionDestination,
 	type SessionInfo,
 	SessionManager,
 } from "../src/session/session-manager";
+
+const SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE =
+	"The selected legacy session's artifacts exceed the supported migration capacity. Archive or remove only that legacy session's artifacts after confirming they are no longer needed, then retry.";
+const SESSION_MIGRATION_BUSY_MESSAGE = "Another session migration is still active. Wait for it to finish, then retry.";
 
 const identity: ResumeSessionIdentity = {
 	canonicalPath: "/sessions/selected.jsonl",
@@ -431,6 +439,72 @@ it("bounds a rejected selected strict-open promise to one error before session s
 	expect(strictOpens).toBe(1);
 	expect(authDiscoveries).toBe(0);
 	expect(sessionCreations).toBe(0);
+});
+
+it("renders fixed redacted operator guidance for bare-resume managed failures", async () => {
+	for (const testCase of [
+		{
+			reason: "artifact_capacity_exceeded" as const,
+			message: SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE,
+		},
+		{ reason: "migration_busy" as const, message: SESSION_MIGRATION_BUSY_MESSAGE },
+	]) {
+		const stderr = await captureStderr(async () => {
+			await initializeBareResumeManagedScope();
+			await runRootCommand(bareArgs(), [], {
+				suppressProcessExit: true,
+				isResumePickerTerminal: () => true,
+				listManagedForResumePickerReadOnly: async () => [sessionInfo],
+				selectResumeSession: async () => ({
+					kind: "selected",
+					path: sessionInfo.path,
+					identity,
+					action: "open-idle",
+				}),
+				openExistingSessionStrict: async () => ({
+					kind: "error",
+					reason: testCase.reason,
+					message: "PRIVATE_PATH PRIVATE_CONTENT",
+				}),
+			});
+		});
+		expect(stderr).toBe(`${testCase.message}\n`);
+		expect(stderr).not.toContain("PRIVATE_PATH");
+		expect(stderr).not.toContain("PRIVATE_CONTENT");
+	}
+});
+
+it("renders the same fixed guidance for normal startup typed failures", async () => {
+	for (const testCase of [
+		{
+			error: new SessionArtifactCapacityError("PRIVATE_PATH PRIVATE_CONTENT"),
+			message: SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE,
+		},
+		{ error: new SessionMigrationBusyError(), message: SESSION_MIGRATION_BUSY_MESSAGE },
+	]) {
+		using tempDir = TempDir.createSync("@gjc-session-startup-error-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const stderr = await captureStderr(async () => {
+			await runRootCommand(
+				parseArgs(["--mode", "text", "--no-session", "--no-skills", "--no-rules", "--no-tools", "--no-lsp"]),
+				[],
+				{
+					createSessionManager: async () => {
+						throw testCase.error;
+					},
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					suppressProcessExit: true,
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				},
+			);
+		});
+		expect(stderr).toBe(`${testCase.message}\n`);
+		expect(stderr).not.toContain("PRIVATE_PATH");
+		expect(stderr).not.toContain("PRIVATE_CONTENT");
+	}
 });
 
 describe("resume continuation after interactive initialization", () => {

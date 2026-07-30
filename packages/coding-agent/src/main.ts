@@ -57,10 +57,11 @@ import {
 	discoverAuthStorage,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
-
+import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
 	type ResumeSessionIdentity,
 	resolveResumableSession,
+	SessionArtifactCapacityError,
 	type SessionDestination,
 	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
@@ -562,6 +563,22 @@ export function resolveManagedAgentDirForScope(_cwd: string): string {
 	return getAgentDir();
 }
 export const BARE_RESUME_OPEN_ERROR = "Could not open the selected session. Use --resume <id>.";
+const SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE =
+	"The selected legacy session's artifacts exceed the supported migration capacity. Archive or remove only that legacy session's artifacts after confirming they are no longer needed, then retry.";
+
+function operatorFacingSessionOpenMessage(value: unknown): string | undefined {
+	const code =
+		value instanceof SessionArtifactCapacityError
+			? value.code
+			: value instanceof SessionMigrationBusyError
+				? value.code
+				: typeof value === "string"
+					? value
+					: undefined;
+	if (code === "artifact_capacity_exceeded") return SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE;
+	if (code === "migration_busy") return new SessionMigrationBusyError().message;
+	return undefined;
+}
 
 function isBareResume(parsed: Args): boolean {
 	return (
@@ -1072,6 +1089,7 @@ type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promis
 
 export interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
+	createSessionManager?: typeof createSessionManager;
 	discoverAuthStorage?: typeof discoverAuthStorage;
 	runAcpMode?: (options?: { agentDir?: string }) => Promise<void>;
 	settings?: Settings;
@@ -1208,13 +1226,13 @@ export async function runRootCommand(
 				undefined,
 				resumeMigrationPolicy,
 			);
-		} catch {
-			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
+		} catch (error) {
+			process.stderr.write(`${operatorFacingSessionOpenMessage(error) ?? BARE_RESUME_OPEN_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		}
 		if (opened.kind === "error") {
-			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
+			process.stderr.write(`${operatorFacingSessionOpenMessage(opened.reason) ?? BARE_RESUME_OPEN_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		}
@@ -1381,9 +1399,27 @@ export async function runRootCommand(
 
 	// Create session manager based on CLI flags. A bare resume was strictly opened
 	// before startup discovery, so it never reaches create-or-open behavior here.
-	const sessionManager =
-		bareResumeSessionManager ??
-		(await logger.time("createSessionManager", createSessionManager, parsedArgs, cwd, settingsInstance));
+	let sessionManager: SessionManager | undefined = bareResumeSessionManager;
+	if (!sessionManager) {
+		try {
+			sessionManager = await logger.time(
+				"createSessionManager",
+				deps.createSessionManager ?? createSessionManager,
+				parsedArgs,
+				cwd,
+				settingsInstance,
+			);
+		} catch (error) {
+			const message = operatorFacingSessionOpenMessage(error);
+			if (!message) throw error;
+			process.stderr.write(`${message}\n`);
+			if (!deps.suppressProcessExit) process.exitCode = 1;
+			authStorage.close();
+			stopThemeWatcher();
+			await postmortem.cleanup();
+			return;
+		}
+	}
 
 	// Restore the resumed session's working directory so the HUD branch, the
 	// project path, and the agent's tools all match where the session was

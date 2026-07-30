@@ -34,7 +34,6 @@ const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 
-const LOCK_STALE_RECHECK_MS = 100;
 export class ManagedPublishError extends Error {
 	readonly classification:
 		| "destination_conflict"
@@ -264,6 +263,7 @@ type LockRecord = {
 	createdAt: number;
 	heartbeatAt: number;
 	leaseExpiresAt: number;
+	released?: boolean;
 };
 
 /** Captured configured-root authority for managed paths only. */
@@ -1252,7 +1252,8 @@ function parseLock(pathname: string): LockRecord | undefined {
 			typeof record.processStartId === "string" &&
 			typeof record.leaseExpiresAt === "number" &&
 			typeof record.heartbeatAt === "number" &&
-			typeof record.createdAt === "number"
+			typeof record.createdAt === "number" &&
+			(record.released === undefined || typeof record.released === "boolean")
 			? (record as LockRecord)
 			: undefined;
 	} catch {
@@ -1571,7 +1572,6 @@ export async function acquireManagedLock(
 	ensureManagedDirectory(locksDirectory, root, policy);
 	const lockPath = path.join(locksDirectory, `${name}.lock`);
 	const deadline = Date.now() + LOCK_WAIT_MS;
-	let staleObservedAt: number | undefined;
 	while (true) {
 		const attemptId = randomUUID();
 		const now = Date.now();
@@ -1604,12 +1604,8 @@ export async function acquireManagedLock(
 			let descriptorClosed = false;
 			const closeDescriptor = (): void => {
 				if (descriptorClosed) return;
-				try {
-					secureFileDescriptor(lockPath, fd, "verify");
-				} finally {
-					fs.closeSync(fd);
-					descriptorClosed = true;
-				}
+				fs.closeSync(fd);
+				descriptorClosed = true;
 			};
 			const assertOwned = (): void => {
 				const current = parseLock(lockPath);
@@ -1623,17 +1619,23 @@ export async function acquireManagedLock(
 					released ||
 					descriptorClosed ||
 					!current ||
+					current.released === true ||
 					!sameFileIdentity(lockIdentity, named) ||
-					current.attemptId !== attemptId ||
-					current.leaseExpiresAt < Date.now()
+					current.attemptId !== attemptId
 				)
 					throw new Error("migration_busy");
+				const now = Date.now();
+				if (current.leaseExpiresAt < now + LOCK_HEARTBEAT_MS) {
+					writeLockDescriptor(fd, {
+						...record,
+						heartbeatAt: now,
+						leaseExpiresAt: now + LOCK_LEASE_MS,
+					});
+				}
 			};
 			const heartbeat = setInterval(() => {
 				try {
 					assertOwned();
-					const now = Date.now();
-					writeLockDescriptor(fd, { ...record, heartbeatAt: now, leaseExpiresAt: now + LOCK_LEASE_MS });
 				} catch {
 					/* fencing rejects later publication */
 				}
@@ -1646,10 +1648,16 @@ export async function acquireManagedLock(
 					clearInterval(heartbeat);
 					try {
 						assertOwned();
+						secureFileDescriptor(lockPath, fd, "verify");
 						const now = Date.now();
-						// Do not unlink by pathname: a stale owner could otherwise remove a successor.
-						// The lease is retired through the verified inode-bound descriptor instead.
-						writeLockDescriptor(fd, { ...record, heartbeatAt: now, leaseExpiresAt: now });
+						// A released record is the only live-process reclaim authority. Expiry alone
+						// never authorizes stealing from a holder whose process is still present.
+						writeLockDescriptor(fd, {
+							...record,
+							released: true,
+							heartbeatAt: now,
+							leaseExpiresAt: now,
+						});
 						fsyncDirectory(locksDirectory);
 					} finally {
 						released = true;
@@ -1660,23 +1668,21 @@ export async function acquireManagedLock(
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			const owner = parseLock(lockPath);
-			if (owner && owner.leaseExpiresAt < Date.now()) {
-				const ownerGone = ownerDefinitelyGone(owner);
-				if (staleObservedAt === undefined) staleObservedAt = Date.now();
-				if (ownerGone || Date.now() - staleObservedAt >= LOCK_STALE_RECHECK_MS) {
-					const quarantine = `${lockPath}.${randomUUID()}.stale`;
-					try {
-						fs.renameSync(lockPath, quarantine);
-						const quarantined = parseLock(quarantine);
-						if (!quarantined || quarantined.attemptId !== owner.attemptId) throw new Error("migration_busy");
-						fs.unlinkSync(quarantine);
-						fsyncDirectory(locksDirectory);
-					} catch {
-						/* retry owner observation */
-					}
-					staleObservedAt = undefined;
+			const reclaimable =
+				owner?.released === true ||
+				(owner !== undefined && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner));
+			if (owner && reclaimable) {
+				const quarantine = `${lockPath}.${randomUUID()}.stale`;
+				try {
+					fs.renameSync(lockPath, quarantine);
+					const quarantined = parseLock(quarantine);
+					if (!quarantined || quarantined.attemptId !== owner.attemptId) throw new Error("migration_busy");
+					fs.unlinkSync(quarantine);
+					fsyncDirectory(locksDirectory);
+				} catch {
+					/* retry owner observation */
 				}
-			} else staleObservedAt = undefined;
+			}
 			if (Date.now() >= deadline) throw new Error("migration_busy");
 			await new Promise<void>(resolve => setTimeout(resolve, 50));
 		}

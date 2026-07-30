@@ -20,6 +20,7 @@ import {
 	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
 import { classifyNativePublishOutcome } from "../../src/session/internal/native-publish-outcome";
+import { SessionMigrationBusyError } from "../../src/session/internal/session-open-errors";
 import { SessionArtifactCapacityError, SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
@@ -559,6 +560,27 @@ describe("managed session write protocol", () => {
 			SessionManager.continueRecent(cwd, SessionManager.managedDestination(cwd, path.dirname(sessionsRoot))),
 		).rejects.toThrow(SessionArtifactCapacityError);
 	}, 120_000);
+
+	it("returns a typed strict-open busy failure and surfaces it from continueRecent", async () => {
+		const { cwd, sessionsRoot } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "strict-migration-busy.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, strictTranscript("strict-migration-busy", cwd));
+		const inspection = await SessionManager.inspectSessionTailReadOnly(source);
+		if (inspection.kind === "error") throw new Error(`Expected resumable source session, got ${inspection.reason}`);
+		const lock = vi.spyOn(managedSessionStorage, "acquireManagedLock").mockRejectedValue(new Error("migration_busy"));
+		try {
+			const destination = SessionManager.managedDestination(cwd, path.dirname(sessionsRoot));
+			expect(await SessionManager.openExistingStrict(inspection.identity, destination)).toEqual({
+				kind: "error",
+				reason: "migration_busy",
+			});
+			await expect(SessionManager.continueRecent(cwd, destination)).rejects.toThrow(SessionMigrationBusyError);
+		} finally {
+			lock.mockRestore();
+		}
+	});
 
 	it("distinguishes artifact capacity from unsafe topology violations", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-artifact-validation-"));
