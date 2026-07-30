@@ -21,6 +21,8 @@
 
 - The renderer's reported cursor column is now clamped to the last real cell, so it always names a column that exists in the current terminal width. On the wire this is unchanged (a terminal already clamps `CHA` to the last column), but the reported value is now truthful for callers reading it through the viewport observation.
 
+## [0.12.3] - 2026-07-30
+
 ## [0.12.2] - 2026-07-30
 
 ## [0.12.1] - 2026-07-29
