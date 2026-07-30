@@ -68,6 +68,7 @@ import {
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
 import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
+import { mergeDashScopeTokenPlanHeaders } from "./dashscope-token-plan-headers";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -1070,6 +1071,14 @@ async function createClient(
 	}
 	if (model.provider === "kimi-code") {
 		headers = { ...getKimiCommonHeaders(), ...headers };
+	}
+	if (model.provider === "alibaba-token-plan") {
+		// Emit Qwen Code's canonical DashScope request fingerprint (User-Agent /
+		// X-DashScope-CacheControl / X-DashScope-UserAgent / X-DashScope-AuthType)
+		// so DashScope treats the caller identically to upstream QwenLM/qwen-code.
+		// Canonical identity is the base; caller headers win per key (upstream
+		// `{...default, ...customHeaders}`). #3557.
+		headers = mergeDashScopeTokenPlanHeaders(headers);
 	}
 	headers = applyOpenAIRequestTransformHeaders(headers, model.requestTransform, `Gajae-Code/${packageJson.version}`);
 	let copilotPremiumRequests: number | undefined;

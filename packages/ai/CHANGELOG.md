@@ -1,6 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Alibaba Token Plan requests now carry Qwen Code's canonical DashScope request fingerprint on both transports. The built-in `alibaba-token-plan` provider (openai-responses `qwen3.8-max-preview` and openai-completions `glm-5.2`/`deepseek-v4-pro`) now emits the four upstream identity/cache/auth headers (`User-Agent`, `X-DashScope-CacheControl: enable`, `X-DashScope-UserAgent`, `X-DashScope-AuthType: openai`) matching `QwenLM/qwen-code` v0.21.1 (commit `f4cd6e1`) exactly, via a shared helper. DashScope is compatibility-sensitive to this client fingerprint, so a non-identical set can cause request instability and affect first-event latency. Caller headers still win per key (upstream `{...default, ...customHeaders}` precedence); non-Alibaba providers are byte-unchanged (#3557).
+
+### Added
+
+- Reproducible Alibaba Token Plan header-parity A/B latency benchmark (`packages/ai/scripts/alibaba-token-plan-latency-ab.ts`): a fixed-seed interleaved A/B comparison of legacy vs Qwen-identical headers against a deterministic local HTTP server, reporting n/success/error/timeout and TTFT/total latency median/p90/p95/mean/stddev. No live credentials are required; a public-safe blocked-live-data receipt is included (`packages/ai/test/fixtures/alibaba-token-plan-latency-blocked-receipt.md`) (#3557).
+
 
 ## [0.12.4] - 2026-07-30
 
