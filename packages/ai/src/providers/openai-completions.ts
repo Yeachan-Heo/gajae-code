@@ -113,18 +113,31 @@ function resolveOpenAIProviderBaseUrl(
 }
 function splitOpenAIEndpointQuery(baseUrl: string | undefined): {
 	baseUrl: string | undefined;
-	defaultQuery: Record<string, string> | undefined;
+	endpointQuery: string | undefined;
 } {
-	if (!baseUrl) return { baseUrl, defaultQuery: undefined };
+	if (!baseUrl) return { baseUrl, endpointQuery: undefined };
 	try {
 		const url = new URL(baseUrl);
-		const defaultQuery = Object.fromEntries(url.searchParams);
-		if (Object.keys(defaultQuery).length === 0) return { baseUrl, defaultQuery: undefined };
+		const endpointQuery = url.search.slice(1);
+		if (!endpointQuery) return { baseUrl, endpointQuery: undefined };
 		url.search = "";
-		return { baseUrl: url.toString(), defaultQuery };
+		return { baseUrl: url.toString(), endpointQuery };
 	} catch {
-		return { baseUrl, defaultQuery: undefined };
+		return { baseUrl, endpointQuery: undefined };
 	}
+}
+
+function wrapFetchWithEndpointQuery(fetchImpl: FetchImpl, endpointQuery: string | undefined): FetchImpl {
+	if (!endpointQuery) return fetchImpl;
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			url.search += `${url.search ? "&" : "?"}${endpointQuery}`;
+			if (input instanceof Request) return fetchImpl(new Request(url.toString(), input), init);
+			return fetchImpl(url, init);
+		},
+		fetchImpl.preconnect ? { preconnect: fetchImpl.preconnect } : {},
+	);
 }
 
 /** Test seam: the provider base URL as resolved from trusted env. */
@@ -1116,18 +1129,20 @@ async function createClient(
 	}
 	// Azure OpenAI requires /deployments/{id}/chat/completions?api-version=YYYY-MM-DD.
 	// The generic openai-completions path adds neither, producing silent 404s.
+	const { baseUrl: endpointBaseUrl, endpointQuery } = splitOpenAIEndpointQuery(baseUrl);
+	let clientBaseUrl = endpointBaseUrl;
+	// Azure OpenAI requires /deployments/{id}/chat/completions?api-version=YYYY-MM-DD.
+	// The generic openai-completions path adds neither, producing silent 404s.
 	let azureDefaultQuery: Record<string, string> | undefined;
-	if (baseUrl?.includes(".openai.azure.com")) {
+	if (clientBaseUrl?.includes(".openai.azure.com")) {
 		const apiVersion = $env.AZURE_OPENAI_API_VERSION || "2024-10-21";
-		if (!baseUrl.includes("/deployments/")) {
-			baseUrl = `${baseUrl}/deployments/${model.id}`;
+		if (!clientBaseUrl.includes("/deployments/")) {
+			clientBaseUrl = `${clientBaseUrl}/deployments/${model.id}`;
 		}
 		azureDefaultQuery = { "api-version": apiVersion };
 	}
-	const { baseUrl: clientBaseUrl, defaultQuery: endpointDefaultQuery } = splitOpenAIEndpointQuery(baseUrl);
-	const defaultQuery = { ...endpointDefaultQuery, ...azureDefaultQuery };
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
-	const baseFetch = fetchOverride ?? fetch;
+	const baseFetch = wrapFetchWithEndpointQuery(fetchOverride ?? fetch, endpointQuery);
 	const wrappedFetch = Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const response = await baseFetch(input, init);
@@ -1190,7 +1205,7 @@ async function createClient(
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
-			defaultQuery: Object.keys(defaultQuery).length > 0 ? defaultQuery : undefined,
+			defaultQuery: azureDefaultQuery,
 			fetch: debugFetch,
 			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 		}),

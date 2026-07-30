@@ -165,18 +165,31 @@ function resolveOpenAIProviderBaseUrl(
 }
 function splitOpenAIEndpointQuery(baseUrl: string | undefined): {
 	baseUrl: string | undefined;
-	defaultQuery: Record<string, string> | undefined;
+	endpointQuery: string | undefined;
 } {
-	if (!baseUrl) return { baseUrl, defaultQuery: undefined };
+	if (!baseUrl) return { baseUrl, endpointQuery: undefined };
 	try {
 		const url = new URL(baseUrl);
-		const defaultQuery = Object.fromEntries(url.searchParams);
-		if (Object.keys(defaultQuery).length === 0) return { baseUrl, defaultQuery: undefined };
+		const endpointQuery = url.search.slice(1);
+		if (!endpointQuery) return { baseUrl, endpointQuery: undefined };
 		url.search = "";
-		return { baseUrl: url.toString(), defaultQuery };
+		return { baseUrl: url.toString(), endpointQuery };
 	} catch {
-		return { baseUrl, defaultQuery: undefined };
+		return { baseUrl, endpointQuery: undefined };
 	}
+}
+
+function wrapFetchWithEndpointQuery(fetchImpl: FetchImpl, endpointQuery: string | undefined): FetchImpl {
+	if (!endpointQuery) return fetchImpl;
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			url.search += `${url.search ? "&" : "?"}${endpointQuery}`;
+			if (input instanceof Request) return fetchImpl(new Request(url.toString(), input), init);
+			return fetchImpl(url, init);
+		},
+		fetchImpl.preconnect ? { preconnect: fetchImpl.preconnect } : {},
+	);
 }
 
 /** Test seam: the provider base URL as resolved from trusted env. */
@@ -502,14 +515,14 @@ function createClient(
 		headers.session_id ??= sessionId;
 		headers["x-client-request-id"] ??= sessionId;
 	}
-	const baseFetch = fetchOverride ?? fetch;
+	const { baseUrl: clientBaseUrl, endpointQuery } = splitOpenAIEndpointQuery(baseUrl);
+	const baseFetch = wrapFetchWithEndpointQuery(fetchOverride ?? fetch, endpointQuery);
 	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(baseFetch, maxRetryDelayMs);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
 		boundedFetch,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);
-	const { baseUrl: clientBaseUrl, defaultQuery } = splitOpenAIEndpointQuery(baseUrl);
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -517,7 +530,6 @@ function createClient(
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
-			defaultQuery,
 			fetch: onSseEvent
 				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
 				: transformedFetch,

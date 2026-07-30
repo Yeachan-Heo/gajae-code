@@ -175,7 +175,7 @@ describe("OpenAI-compatible request transforms", () => {
 		const responsesModel: Model<"openai-responses"> = {
 			...(getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">),
 			provider: "proxy",
-			baseUrl: "https://gateway.example/v1?tenant=alpha",
+			baseUrl: "https://gateway.example/v1?scope=read&scope=write",
 		};
 		for await (const event of streamOpenAIResponses(responsesModel, context, { apiKey: "test-key" })) {
 			if (event.type === "done" || event.type === "error") break;
@@ -184,15 +184,15 @@ describe("OpenAI-compatible request transforms", () => {
 		const completionsModel: Model<"openai-completions"> = {
 			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">),
 			provider: "proxy",
-			baseUrl: "https://gateway.example/v1?tenant=alpha",
+			baseUrl: "https://gateway.example/v1?scope=read&scope=write",
 		};
 		for await (const event of streamOpenAICompletions(completionsModel, context, { apiKey: "test-key" })) {
 			if (event.type === "done" || event.type === "error") break;
 		}
 
 		expect(capturedUrls).toEqual([
-			"https://gateway.example/v1/responses?tenant=alpha",
-			"https://gateway.example/v1/chat/completions?tenant=alpha",
+			"https://gateway.example/v1/responses?scope=read&scope=write",
+			"https://gateway.example/v1/chat/completions?scope=read&scope=write",
 		]);
 	});
 });
