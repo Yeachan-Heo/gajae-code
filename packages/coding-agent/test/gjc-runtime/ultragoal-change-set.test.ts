@@ -91,6 +91,19 @@ describe("ultragoal change-set extraction", () => {
 		expect(result.stderr).toContain("not valid UTF-8");
 	});
 
+	it("preserves a leading UTF-8 BOM as part of the first pathname", async () => {
+		const result = await spawnText(
+			[
+				process.execPath,
+				"-e",
+				"process.stdout.write(Buffer.from([0xef,0xbb,0xbf,0x6e,0x61,0x6d,0x65,0x2e,0x74,0x73,0x00]))",
+			],
+			{ cwd: process.cwd() },
+		);
+		expect(result.ok).toBe(true);
+		expect(parseGitUntrackedPaths(result.stdout)[0]?.path).toBe("\uFEFFname.ts");
+	});
+
 	it("includes untracked files in the computed cumulative change set", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-untracked-change-set-"));
 		try {

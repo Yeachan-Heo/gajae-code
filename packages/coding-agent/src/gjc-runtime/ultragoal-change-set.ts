@@ -23,7 +23,7 @@ export async function spawnText(
 		clearTimeout(timeout);
 		let stdout: string;
 		try {
-			stdout = new TextDecoder("utf-8", { fatal: true }).decode(stdoutBytes);
+			stdout = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(stdoutBytes);
 		} catch {
 			return { ok: false, stdout: "", stderr: "command stdout was not valid UTF-8" };
 		}
