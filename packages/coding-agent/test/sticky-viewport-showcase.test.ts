@@ -8,6 +8,8 @@ import {
 	captureProvenance,
 	committedBlobSha256,
 	PROVENANCE_DIFF_SCOPE,
+	REPOSITORY_ROOT,
+	resolveRepositoryPath,
 	xterm256Color,
 } from "../scripts/capture-sticky-viewport-showcase";
 import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
@@ -18,13 +20,17 @@ import {
 } from "./fixtures/tui/sticky-viewport-showcase";
 
 const roots: string[] = [];
+const restoreEnvironment = (name: string, value: string | undefined): void => {
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+};
 async function capture(): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-"));
 	roots.push(root);
 	const result = Bun.spawn(
 		["bun", "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts", "--out", root],
 		{
-			cwd: path.resolve(import.meta.dir, "../../.."),
+			cwd: REPOSITORY_ROOT,
 			stdout: "pipe",
 			stderr: "pipe",
 		},
@@ -41,7 +47,7 @@ async function captureWithEnv(overrides: Record<string, string>, drop: readonly 
 	const result = Bun.spawn(
 		["bun", "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts", "--out", root],
 		{
-			cwd: path.resolve(import.meta.dir, "../../.."),
+			cwd: REPOSITORY_ROOT,
 			stdout: "pipe",
 			stderr: "pipe",
 			env: { ...env, ...overrides },
@@ -1016,7 +1022,7 @@ describe("sticky viewport production evidence verifier", () => {
 		// validation, because a mutated table would otherwise define what "valid"
 		// means for every anchor downstream.
 		const root = await capture();
-		const oraclePath = path.resolve(import.meta.dir, "../scripts/verify-sticky-viewport-showcase.ts");
+		const oraclePath = resolveRepositoryPath("packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts");
 		const original = await fs.readFile(oraclePath, "utf8");
 		try {
 			const mutated = original.replace(/("manual-new-output\/80x24\/unicode-color":\s*\{\s*frameRow:\s*)0/, "$11");
@@ -1040,11 +1046,14 @@ describe("sticky viewport production evidence verifier", () => {
 		// not authorize them, with or without an explicit trusted authority.
 		const root = await capture();
 		const oracle = "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts";
-		const original = await fs.readFile(oracle, "utf8");
+		const original = await fs.readFile(resolveRepositoryPath(oracle), "utf8");
 		const index = path.join(os.tmpdir(), `gjc-attacker-index-${Date.now()}`);
-		const refs = ["refs/heads/gjc-test-attacker-ref", "refs/remotes/origin/gjc-test-attacker-ref"];
+		const refSuffix = `${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+		const refs = [`refs/heads/gjc-test-attacker-${refSuffix}`, `refs/remotes/origin/gjc-test-attacker-${refSuffix}`];
+		const originalOracleCommit = process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT;
 		const git = async (args: string[], stdin?: string) => {
 			const proc = Bun.spawn(["git", ...args], {
+				cwd: REPOSITORY_ROOT,
 				stdout: "pipe",
 				stderr: "pipe",
 				stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
@@ -1057,6 +1066,9 @@ describe("sticky viewport production evidence verifier", () => {
 					GIT_AUTHOR_EMAIL: "gjc-test@example.invalid",
 					GIT_COMMITTER_NAME: "gjc-test",
 					GIT_COMMITTER_EMAIL: "gjc-test@example.invalid",
+					GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+					GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+					TZ: "UTC",
 				},
 			});
 			const out = await new Response(proc.stdout).text();
@@ -1073,7 +1085,7 @@ describe("sticky viewport production evidence verifier", () => {
 			for (const ref of refs) await git(["update-ref", ref, commit]);
 			// The malicious bytes are now reachable from two side refs and are what the
 			// verifier would actually execute.
-			await Bun.write(oracle, malicious);
+			await Bun.write(resolveRepositoryPath(oracle), malicious);
 			await restampProvenance(root);
 			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("oracle integrity");
 			process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT = await git(["rev-parse", "HEAD"]);
@@ -1081,36 +1093,78 @@ describe("sticky viewport production evidence verifier", () => {
 				await restampProvenance(root);
 				await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("oracle integrity");
 			} finally {
-				delete process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT;
+				restoreEnvironment("GJC_STICKY_VIEWPORT_ORACLE_COMMIT", originalOracleCommit);
 			}
 		} finally {
-			await Bun.write(oracle, original);
+			restoreEnvironment("GJC_STICKY_VIEWPORT_ORACLE_COMMIT", originalOracleCommit);
+			await Bun.write(resolveRepositoryPath(oracle), original);
 			for (const ref of refs) {
-				Bun.spawnSync(["git", "update-ref", "-d", ref], { stdout: "ignore", stderr: "ignore" });
+				Bun.spawnSync(["git", "update-ref", "-d", ref], {
+					cwd: REPOSITORY_ROOT,
+					stdout: "ignore",
+					stderr: "ignore",
+				});
 			}
 			await fs.rm(index, { force: true });
 		}
 	}, 300_000);
-	it("requires the declared oracle authority to carry the running oracle bytes", async () => {
-		// The review protocol verifies an UNCOMMITTED synthetic merge: `HEAD` is the
-		// current-dev base while the running oracle is the staged PR version. A gate
-		// that only compares against the base blob rejects that honest shape before any
-		// evidence guard runs. The trust boundary is therefore "these exact bytes are
-		// committed somewhere reachable", which an uncommitted mutation cannot satisfy.
+	it("rejects an older declared oracle authority that lacks the running verifier bytes", async () => {
 		const oracle = "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts";
-		const running = new Bun.CryptoHasher("sha256")
-			.update(await fs.readFile(path.resolve(import.meta.dir, "../scripts/verify-sticky-viewport-showcase.ts")))
-			.digest("hex");
-		// The merge-base with dev is exactly the base the maintainer's synthetic
-		// integration checks out, and this branch changed the oracle relative to dev,
-		// so that base provably lacks the running bytes. Using it instead of `HEAD~1`
-		// keeps the assertion independent of local commit topology.
-		const base = new TextDecoder()
-			.decode(Bun.spawnSync(["git", "merge-base", "HEAD", "origin/dev"], { stdout: "pipe" }).stdout)
-			.trim();
-		expect(base).not.toBe("");
-		expect(await committedBlobSha256(base, oracle)).not.toBe(running);
-		// Acceptance therefore cannot be coming from the base blob.
-		await verifyStickyViewportShowcase(await capture());
+		const oraclePath = resolveRepositoryPath(oracle);
+		const runningBytes = await fs.readFile(oraclePath);
+		const running = new Bun.CryptoHasher("sha256").update(runningBytes).digest("hex");
+		const original = new TextDecoder().decode(runningBytes);
+		const older = original.replace("Authority is exactly one commit.", "Authority is one explicitly trusted commit.");
+		expect(older).not.toBe(original);
+
+		const temporaryGitDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-older-oracle-"));
+		const index = path.join(temporaryGitDirectory, "index");
+		const originalOracleCommit = process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT;
+		const git = async (args: string[], stdin?: string): Promise<string> => {
+			const proc = Bun.spawn(["git", ...args], {
+				cwd: REPOSITORY_ROOT,
+				stdout: "pipe",
+				stderr: "pipe",
+				stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
+				env: {
+					...process.env,
+					GIT_INDEX_FILE: index,
+					GIT_AUTHOR_NAME: "gjc-sticky-viewport-test",
+					GIT_AUTHOR_EMAIL: "gjc-sticky-viewport-test@example.invalid",
+					GIT_COMMITTER_NAME: "gjc-sticky-viewport-test",
+					GIT_COMMITTER_EMAIL: "gjc-sticky-viewport-test@example.invalid",
+					GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+					GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+					TZ: "UTC",
+				},
+			});
+			const out = await new Response(proc.stdout).text();
+			if ((await proc.exited) !== 0) throw new Error(`git ${args[0]}: ${await new Response(proc.stderr).text()}`);
+			return out.trim();
+		};
+
+		try {
+			const olderBlob = await git(["hash-object", "-w", "--stdin"], older);
+			await git(["read-tree", "HEAD"]);
+			await git(["update-index", "--add", "--cacheinfo", `100644,${olderBlob},${oracle}`]);
+			const tree = await git(["write-tree"]);
+			const authority = await git(["commit-tree", tree, "-p", "HEAD", "-m", "older trusted oracle"]);
+			expect(authority).toMatch(/^[0-9a-f]{40}$/);
+			expect(await committedBlobSha256(authority, oracle)).not.toBe(running);
+
+			process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT = authority;
+			const root = await capture();
+			await restampProvenance(root);
+			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow(
+				`oracle integrity: ${oracle} differs from its committed blob at ${authority}`,
+			);
+
+			restoreEnvironment("GJC_STICKY_VIEWPORT_ORACLE_COMMIT", originalOracleCommit);
+			await restampProvenance(root);
+			await verifyStickyViewportShowcase(root);
+		} finally {
+			restoreEnvironment("GJC_STICKY_VIEWPORT_ORACLE_COMMIT", originalOracleCommit);
+			await fs.rm(temporaryGitDirectory, { recursive: true, force: true });
+		}
 	}, 300_000);
 });

@@ -11,6 +11,7 @@ import {
 	committedBlobSha256,
 	gitObjectType,
 	PROVENANCE_DIFF_SCOPE,
+	resolveRepositoryPath,
 	xterm256Color,
 } from "./capture-sticky-viewport-showcase";
 
@@ -459,7 +460,7 @@ const verifyOracleIntegrity = async (gitHead: string, declaredProvenanceCommit: 
 	for (const source of ORACLE_SOURCES) {
 		const committed = await committedBlobSha256(authority, source);
 		if (committed === null) fail(`oracle integrity: ${source} has no committed blob at ${authority}`);
-		const running = hash(new Uint8Array(await fs.readFile(source)));
+		const running = hash(new Uint8Array(await fs.readFile(resolveRepositoryPath(source))));
 		if (running !== committed) fail(`oracle integrity: ${source} differs from its committed blob at ${authority}`);
 	}
 };

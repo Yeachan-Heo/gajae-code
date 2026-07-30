@@ -1,11 +1,16 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+
 import {
 	renderStickyViewportShowcase,
 	STICKY_VIEWPORT_SHOWCASE_ENTRIES,
 	STICKY_VIEWPORT_SHOWCASE_KEYS,
 	type StickyViewportShowcaseEntry,
 } from "../test/fixtures/tui/sticky-viewport-showcase";
+
+export const REPOSITORY_ROOT = path.resolve(import.meta.dir, "../../..");
+export const resolveRepositoryPath = (repositoryRelativePath: string): string =>
+	path.join(REPOSITORY_ROOT, repositoryRelativePath);
 
 const COMMAND =
 	"bun packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts --out .gjc/qa/sticky-viewport-<run>";
@@ -216,7 +221,7 @@ export const PROVENANCE_DIFF_SCOPE = [
 	"packages/utils/src",
 ] as const;
 async function git(args: string[]): Promise<Uint8Array> {
-	const result = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawn(["git", ...args], { cwd: REPOSITORY_ROOT, stdout: "pipe", stderr: "pipe" });
 	if ((await result.exited) !== 0)
 		throw new Error(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
 	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
@@ -239,7 +244,7 @@ export async function gitObjectType(commitish: string): Promise<string | null> {
 }
 export async function committedBlobSha256(commit: string, filePath: string): Promise<string | null> {
 	const result = Bun.spawn(["git", "cat-file", "blob", `${commit}:${filePath}`], {
-		cwd: process.cwd(),
+		cwd: REPOSITORY_ROOT,
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -261,7 +266,10 @@ export async function captureProvenance(): Promise<CaptureProvenance> {
 	const gitHead = new TextDecoder().decode(await git(["rev-parse", "HEAD"])).trim();
 	const sourceSha256 = Object.fromEntries(
 		await Promise.all(
-			PROVENANCE_SOURCES.map(async source => [source, hash(new Uint8Array(await Bun.file(source).arrayBuffer()))]),
+			PROVENANCE_SOURCES.map(async source => [
+				source,
+				hash(new Uint8Array(await Bun.file(resolveRepositoryPath(source)).arrayBuffer())),
+			]),
 		),
 	);
 	return {
