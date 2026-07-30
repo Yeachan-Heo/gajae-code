@@ -531,6 +531,30 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	"plugin/share/delete": unsupported,
 	"plugin/share/checkout": unsupported,
 	"plugin/share/updateTargets": unsupported,
+	"thread/loaded/list": laneRow(
+		"threadLoadedListHandler",
+		"suites/live-runtime-handlers.ts",
+		["thread/loaded/list reports the real loaded threads and refuses without a runtime"],
+		"The ids come from the live ThreadRuntimeManager rather than a fabricated list.",
+	),
+	"thread/unsubscribe": laneRow(
+		"threadUnsubscribeHandler",
+		"suites/live-runtime-handlers.ts",
+		["thread/unsubscribe distinguishes notLoaded, notSubscribed and a real unsubscribe"],
+		"Unsubscribe uses the connection's real notification-delivery capability.",
+	),
+	"turn/interrupt": laneRow(
+		"turnInterruptHandler",
+		"suites/live-runtime-handlers.ts",
+		["turn/interrupt aborts the live turn through the real control seam exactly once"],
+		"Interrupt issues the child's real turn.abort control operation for the active turn only.",
+	),
+	"turn/steer": laneRow(
+		"turnSteerHandler",
+		"suites/live-runtime-handlers.ts",
+		["turn/steer carries real text to the child and rejects a stale precondition"],
+		"Steer issues the child's real turn.steer control operation after the expectedTurnId check.",
+	),
 	// Codex-only thread surfaces with no GJC counterpart. These stay surface-present at -32081
 	// rather than being faked; the honest reason is recorded per method.
 	"app/list": unsupported,

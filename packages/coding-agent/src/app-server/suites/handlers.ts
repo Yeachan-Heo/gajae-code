@@ -7,11 +7,13 @@
 // dispatcher (no handler registered = notSupported verdict from dispatchClientRequest).
 
 import type { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
+import type { TurnController } from "../thread-runtime/turn-controller";
 import { commandExecHandlers } from "./command-exec-handlers";
 import { environmentAppHandlers } from "./environment-app-handlers";
 import { fsWatchHandlers } from "./fs-watch-handlers";
 import { goalsReviewHandlers } from "./goals-review-handlers";
 import { hooksHandlers } from "./hooks-handlers";
+import { liveRuntimeHandlers } from "./live-runtime-handlers";
 import { mcpHandlers } from "./mcp-handlers";
 import { modelConfigHandlers } from "./model-config-handlers";
 import { pluginHandlers } from "./plugin-handlers";
@@ -27,6 +29,8 @@ export interface HandlerContext {
 	readonly connectionId?: string;
 	/** Loaded-thread runtime, for handlers that act on live threads. */
 	readonly manager?: ThreadRuntimeManager;
+	/** Live-turn controller, for handlers that interrupt or steer a running turn. */
+	readonly turnController?: TurnController;
 	/** Stop delivering thread notifications to this connection. */
 	unsubscribe?: (threadId: string) => void | Promise<void>;
 	respond?: (result: unknown) => void;
@@ -206,4 +210,5 @@ export function registerBuiltinHandlers(registry: HandlerRegistry): void {
 	for (const [method, handler] of Object.entries(environmentAppHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(pluginHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(policyConfigHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(liveRuntimeHandlers)) registry.register(method, handler);
 }

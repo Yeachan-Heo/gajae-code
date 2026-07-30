@@ -488,6 +488,41 @@ export class TurnController {
 		return this.#active.size;
 	}
 
+	/** The live Codex turn id for a thread, or undefined when no turn is genuinely running. */
+	activeTurnId(threadId: string): string | undefined {
+		const active = this.#active.get(threadId);
+		if (!active || active.state === "terminal" || active.state === "rolled_back") return undefined;
+		return active.turn.id;
+	}
+
+	/**
+	 * Abort the live turn through the retained child's real `turn.abort` control operation.
+	 * The turn settles through the existing frame path; this only issues the request.
+	 */
+	async interruptTurn(threadId: string, turnId: string): Promise<void> {
+		const active = this.#requireLiveTurn(threadId, turnId);
+		await active.client.control("turn.abort");
+	}
+
+	/**
+	 * Steer the live turn through the retained child's real `turn.steer` control operation.
+	 * `expectedTurnId` is an active-turn precondition, so a stale id never steers another turn.
+	 */
+	async steerTurn(threadId: string, expectedTurnId: string, text: string): Promise<string> {
+		const active = this.#requireLiveTurn(threadId, expectedTurnId);
+		await active.client.control("turn.steer", { text });
+		return active.turn.id;
+	}
+
+	#requireLiveTurn(threadId: string, turnId: string): ActiveTurn {
+		const active = this.#active.get(threadId);
+		if (!active || active.state === "terminal" || active.state === "rolled_back")
+			throw new TurnControllerError("internal", `Thread ${threadId} has no active turn.`);
+		if (active.turn.id !== turnId)
+			throw new TurnControllerError("idempotency_conflict", `Turn ${turnId} is not the active turn.`);
+		return active;
+	}
+
 	acceptFrame(threadId: string, frame: Record<string, unknown>): void {
 		const active = this.#active.get(threadId);
 		if (active) this.#ingestFrame(active, frame);
