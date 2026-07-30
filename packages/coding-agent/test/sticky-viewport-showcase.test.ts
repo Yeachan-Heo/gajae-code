@@ -1005,4 +1005,32 @@ describe("sticky viewport production evidence verifier", () => {
 		await rehash(probeRoot, key, "metadata.json");
 		await expect(verifyStickyViewportShowcase(probeRoot)).rejects.toThrow("runtime observation mismatch");
 	}, 300_000);
+	it("rejects a mutated verifier oracle expectation even when every provenance field is restamped", async () => {
+		// The expectation table is immutable only if its digest comes from somewhere
+		// the bundle cannot reach. `captureProvenance()` hashes the WORKTREE file, so
+		// an author who edits the table and restamps provenance keeps the bundle
+		// internally consistent, and that was accepted. The committed blob at the
+		// recorded `git_head` is outside that reach: changing it requires a commit,
+		// which changes `git_head` itself. This must reject BEFORE semantic-anchor
+		// validation, because a mutated table would otherwise define what "valid"
+		// means for every anchor downstream.
+		const root = await capture();
+		const oraclePath = path.resolve(import.meta.dir, "../scripts/verify-sticky-viewport-showcase.ts");
+		const original = await fs.readFile(oraclePath, "utf8");
+		try {
+			const mutated = original.replace(/("manual-new-output\/80x24\/unicode-color":\s*\{\s*frameRow:\s*)0/, "$11");
+			expect(mutated).not.toBe(original);
+			await Bun.write(oraclePath, mutated);
+			// Restamp exactly as the oracle did: metadata, manifest, review input, and
+			// every provenance block recomputed against the mutated worktree.
+			await restampProvenance(root);
+			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("oracle integrity");
+		} finally {
+			await Bun.write(oraclePath, original);
+		}
+		// Restoring the committed bytes makes the same bundle valid again, which
+		// proves the rejection was the oracle mutation and not incidental staleness.
+		await restampProvenance(root);
+		await verifyStickyViewportShowcase(root);
+	}, 300_000);
 });
