@@ -2073,11 +2073,7 @@ function isExchangePlaceholderOnlyRetention(deletion: {
 	retainedSuccessorPath?: string;
 	retainedUnknownPath?: string;
 }): boolean {
-	return (
-		!!deletion.retainedPlaceholderPath &&
-		!deletion.retainedSuccessorPath &&
-		!deletion.retainedUnknownPath
-	);
+	return !!deletion.retainedPlaceholderPath && !deletion.retainedSuccessorPath && !deletion.retainedUnknownPath;
 }
 
 /** Bounded in-call retries for placeholder-only artifact cleanup (#3538). */
