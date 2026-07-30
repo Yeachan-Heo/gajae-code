@@ -1,9 +1,20 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as zlib from "node:zlib";
 import { Resvg } from "@resvg/resvg-js";
+import { LIGHT_THEME_EVIDENCE_SOURCE_PATHS, LIGHT_THEME_EVIDENCE_SOURCE_TREES } from "./light-theme-evidence-authority";
 
-export const TERMINAL_EVIDENCE_VERSION = "gjc-terminal-cell-grid-v1";
+export {
+	LIGHT_THEME_EVIDENCE_CANONICAL_COMMAND,
+	LIGHT_THEME_EVIDENCE_CANONICAL_OUTPUT,
+	LIGHT_THEME_EVIDENCE_CAPTURE_TOOL_VERSION,
+	LIGHT_THEME_EVIDENCE_REVIEW_REQUIREMENTS,
+	LIGHT_THEME_EVIDENCE_SOURCE_PATHS,
+	LIGHT_THEME_EVIDENCE_SOURCE_TREES,
+} from "./light-theme-evidence-authority";
+
+export const TERMINAL_EVIDENCE_VERSION = "gjc-terminal-cell-grid-v2";
 export const CELL_GEOMETRY = {
 	cellWidthPx: 10,
 	cellHeightPx: 20,
@@ -12,39 +23,6 @@ export const CELL_GEOMETRY = {
 	verticalPaddingPx: 16,
 	devicePixelRatio: 1,
 } as const;
-
-export const LIGHT_THEME_EVIDENCE_SOURCE_PATHS = [
-	"bun.lock",
-	"packages/coding-agent/package.json",
-	"packages/coding-agent/src/config/settings-schema.ts",
-	"packages/coding-agent/src/config/settings.ts",
-	"packages/coding-agent/src/modes/DESIGN.md",
-	"packages/coding-agent/src/modes/components/assistant-message.ts",
-	"packages/coding-agent/src/modes/components/bash-execution.ts",
-	"packages/coding-agent/src/modes/components/custom-message.ts",
-	"packages/coding-agent/src/modes/components/diff.ts",
-	"packages/coding-agent/src/modes/components/eval-execution.ts",
-	"packages/coding-agent/src/modes/components/notifications-settings-editor.ts",
-	"packages/coding-agent/src/modes/components/provider-onboarding-selector.ts",
-	"packages/coding-agent/src/modes/components/settings-selector.ts",
-	"packages/coding-agent/src/modes/components/tool-execution.ts",
-	"packages/coding-agent/src/modes/components/tool-status-header.ts",
-	"packages/coding-agent/src/modes/components/tree-selector.ts",
-	"packages/coding-agent/src/modes/components/user-message.ts",
-	"packages/coding-agent/src/modes/components/welcome.ts",
-	"packages/coding-agent/src/session/session-manager.ts",
-	"packages/coding-agent/src/modes/theme/defaults/blue-crab-light.json",
-	"packages/coding-agent/src/modes/theme/defaults/index.ts",
-	"packages/coding-agent/src/modes/theme/defaults/red-claw-light.json",
-	"packages/coding-agent/src/modes/theme/theme.ts",
-	"packages/coding-agent/src/tui/status-line.ts",
-	"packages/coding-agent/scripts/capture-light-theme-compliance-showcase.ts",
-	"packages/coding-agent/scripts/lib/terminal-visual-evidence.ts",
-	"packages/coding-agent/test/fixtures/tui/light-theme-compliance-showcase.ts",
-	"packages/coding-agent/test/fixtures/tui/light-theme-consumer-atlas.ts",
-	"packages/coding-agent/test/fixtures/tui/notifications-settings-showcase.ts",
-	"packages/coding-agent/test/light-theme-compliance.test.ts",
-] as const;
 
 export interface SourceFingerprint {
 	source_revision: string;
@@ -157,6 +135,41 @@ export interface PngEvidence {
 	sentinelSamples: readonly { role: string; x: number; y: number; rgb: string }[];
 }
 
+export interface DecodedPngEvidence {
+	width: number;
+	height: number;
+	pixels: Uint8Array;
+	decodedRgbaSha256: string;
+	nonUniform: boolean;
+}
+
+const PNG_SIGNATURE = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const PNG_CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
+	let crc = value;
+	for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) === 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+	return crc >>> 0;
+});
+
+function readPngUint32(bytes: Uint8Array, offset: number): number {
+	if (offset < 0 || offset + 4 > bytes.byteLength) throw new Error("PNG uint32 read is out of bounds");
+	return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0);
+}
+
+function pngCrc32(bytes: Uint8Array): number {
+	let crc = 0xffffffff;
+	for (const byte of bytes) crc = PNG_CRC_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function paethPredictor(left: number, above: number, upperLeft: number): number {
+	const prediction = left + above - upperLeft;
+	const leftDistance = Math.abs(prediction - left);
+	const aboveDistance = Math.abs(prediction - above);
+	const upperLeftDistance = Math.abs(prediction - upperLeft);
+	if (leftDistance <= aboveDistance && leftDistance <= upperLeftDistance) return left;
+	return aboveDistance <= upperLeftDistance ? above : upperLeft;
+}
+
 const BASIC_COLORS: Readonly<Record<number, string>> = {
 	30: "#000000",
 	31: "#cc0000",
@@ -224,12 +237,72 @@ export function assertHtmlThemeIdentity(html: string, expectedTheme: string, exp
 	}
 }
 
-export async function captureSourceFingerprint(repoRoot: string): Promise<SourceFingerprint> {
-	const sourceFiles: Array<{ path: string; sha256: string; byte_length: number }> = [];
-	for (const relativePath of LIGHT_THEME_EVIDENCE_SOURCE_PATHS) {
-		const bytes = new Uint8Array(await Bun.file(path.join(repoRoot, relativePath)).arrayBuffer());
-		sourceFiles.push({ path: relativePath, sha256: sha256(bytes), byte_length: bytes.byteLength });
+type EvidenceSourceFile = { path: string; sha256: string; byte_length: number };
+
+function normalizeEvidenceSourcePath(relativePath: string): string {
+	const normalized = path.posix.normalize(relativePath.split(path.sep).join("/"));
+	if (!normalized || normalized === "." || path.posix.isAbsolute(normalized) || normalized.startsWith("../")) {
+		throw new Error(`Unsafe light-theme evidence source path: ${relativePath}`);
 	}
+	return normalized;
+}
+
+async function collectEvidenceTreeFiles(repoRoot: string, relativeDirectory: string, output: string[]): Promise<void> {
+	const normalizedDirectory = normalizeEvidenceSourcePath(relativeDirectory);
+	const absoluteDirectory = path.join(repoRoot, normalizedDirectory);
+	const directoryStat = await fs.lstat(absoluteDirectory);
+	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+		throw new Error(`Evidence source tree must be a real directory: ${normalizedDirectory}`);
+	}
+	for (const entry of (await fs.readdir(absoluteDirectory, { withFileTypes: true })).sort((left, right) =>
+		left.name.localeCompare(right.name),
+	)) {
+		const relativePath = path.posix.join(normalizedDirectory, entry.name);
+		if (entry.isSymbolicLink()) throw new Error(`Evidence source tree contains a symlink: ${relativePath}`);
+		if (entry.isDirectory()) {
+			await collectEvidenceTreeFiles(repoRoot, relativePath, output);
+		} else if (entry.isFile()) {
+			output.push(relativePath);
+		} else {
+			throw new Error(`Evidence source tree contains a non-file entry: ${relativePath}`);
+		}
+	}
+}
+
+export async function collectLightThemeEvidenceSourcePaths(
+	repoRoot: string,
+	sourcePaths: readonly string[] = LIGHT_THEME_EVIDENCE_SOURCE_PATHS,
+	sourceTrees: readonly string[] = LIGHT_THEME_EVIDENCE_SOURCE_TREES,
+): Promise<string[]> {
+	const collected = sourcePaths.map(normalizeEvidenceSourcePath);
+	for (const sourceTree of sourceTrees) await collectEvidenceTreeFiles(repoRoot, sourceTree, collected);
+	const unique = [...new Set(collected)].sort((left, right) => left.localeCompare(right));
+	if (unique.length !== collected.length)
+		throw new Error("Light-theme evidence source authority contains duplicate paths");
+	return unique;
+}
+
+export async function fingerprintEvidenceSourceFiles(
+	repoRoot: string,
+	relativePaths: readonly string[],
+): Promise<{ source_fingerprint: string; source_files: EvidenceSourceFile[] }> {
+	const sourceFiles: EvidenceSourceFile[] = [];
+	for (const relativePath of [...relativePaths].sort((left, right) => left.localeCompare(right))) {
+		const normalized = normalizeEvidenceSourcePath(relativePath);
+		const absolutePath = path.join(repoRoot, normalized);
+		const fileStat = await fs.lstat(absolutePath);
+		if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+			throw new Error(`Evidence source authority must contain only real files: ${normalized}`);
+		}
+		const bytes = new Uint8Array(await Bun.file(absolutePath).arrayBuffer());
+		sourceFiles.push({ path: normalized, sha256: sha256(bytes), byte_length: bytes.byteLength });
+	}
+	return { source_fingerprint: sha256(stableJson(sourceFiles)), source_files: sourceFiles };
+}
+
+export async function captureSourceFingerprint(repoRoot: string): Promise<SourceFingerprint> {
+	const relativePaths = await collectLightThemeEvidenceSourcePaths(repoRoot);
+	const source = await fingerprintEvidenceSourceFiles(repoRoot, relativePaths);
 	const git = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
 		cwd: repoRoot,
 		stdout: "pipe",
@@ -237,11 +310,9 @@ export async function captureSourceFingerprint(repoRoot: string): Promise<Source
 	});
 	if (git.exitCode !== 0) throw new Error(`Cannot resolve git revision: ${git.stderr.toString()}`);
 	const commit = git.stdout.toString().trim();
-	const source_fingerprint = sha256(stableJson(sourceFiles));
 	return {
-		source_revision: `${commit}+worktree:${source_fingerprint}`,
-		source_fingerprint,
-		source_files: sourceFiles,
+		source_revision: `${commit}+worktree:${source.source_fingerprint}`,
+		...source,
 	};
 }
 
@@ -531,13 +602,123 @@ export function cellGridToSvg(
 	return { svg, displayListSha256, samples };
 }
 
-function pixelHex(pixels: Uint8Array, width: number, x: number, y: number): string {
+export function pngPixelHex(pixels: Uint8Array, width: number, x: number, y: number): string {
 	const offset = (y * width + x) * 4;
 	const channels = [pixels[offset], pixels[offset + 1], pixels[offset + 2]];
 	if (channels.some(channel => channel === undefined)) {
 		throw new Error(`PNG sentinel coordinate is out of bounds: ${x},${y}`);
 	}
 	return `#${channels.map(channel => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
+export function decodePngRgba(bytes: Uint8Array): DecodedPngEvidence {
+	if (bytes.byteLength < PNG_SIGNATURE.byteLength || !PNG_SIGNATURE.every((byte, index) => bytes[index] === byte)) {
+		throw new Error("PNG signature is invalid");
+	}
+	let offset = PNG_SIGNATURE.byteLength;
+	let width = 0;
+	let height = 0;
+	let sawHeader = false;
+	let sawEnd = false;
+	const compressedChunks: Uint8Array[] = [];
+	while (offset < bytes.byteLength) {
+		if (offset + 12 > bytes.byteLength) throw new Error("PNG chunk header is truncated");
+		const length = readPngUint32(bytes, offset);
+		const typeOffset = offset + 4;
+		const dataOffset = typeOffset + 4;
+		const crcOffset = dataOffset + length;
+		if (crcOffset + 4 > bytes.byteLength) throw new Error("PNG chunk data is truncated");
+		const typeBytes = bytes.slice(typeOffset, dataOffset);
+		const type = new TextDecoder().decode(typeBytes);
+		if (!/^[A-Za-z]{4}$/.test(type) || (typeBytes[2]! & 0x20) !== 0) {
+			throw new Error(`PNG chunk type is invalid: ${type}`);
+		}
+		if (!sawHeader && type !== "IHDR") throw new Error("PNG IHDR must be the first chunk");
+		const data = bytes.slice(dataOffset, crcOffset);
+		const crcInput = new Uint8Array(typeBytes.byteLength + data.byteLength);
+		crcInput.set(typeBytes);
+		crcInput.set(data, typeBytes.byteLength);
+		if (pngCrc32(crcInput) !== readPngUint32(bytes, crcOffset)) throw new Error(`PNG ${type} CRC mismatch`);
+		if (type === "IHDR") {
+			if (sawHeader || length !== 13) throw new Error("PNG IHDR is invalid");
+			width = readPngUint32(data, 0);
+			height = readPngUint32(data, 4);
+			if (
+				width <= 0 ||
+				height <= 0 ||
+				width * height > 20_000_000 ||
+				data[8] !== 8 ||
+				data[9] !== 6 ||
+				data[10] !== 0 ||
+				data[11] !== 0 ||
+				data[12] !== 0
+			) {
+				throw new Error("PNG must be bounded non-interlaced 8-bit RGBA");
+			}
+			sawHeader = true;
+		} else if (type === "IDAT") {
+			if (!sawHeader || sawEnd) throw new Error("PNG IDAT ordering is invalid");
+			compressedChunks.push(data);
+		} else if (type === "IEND") {
+			if (length !== 0 || !sawHeader || compressedChunks.length === 0) throw new Error("PNG IEND is invalid");
+			sawEnd = true;
+			offset = crcOffset + 4;
+			break;
+		} else if ((typeBytes[0]! & 0x20) === 0 && type !== "PLTE") {
+			throw new Error(`Unsupported critical PNG chunk: ${type}`);
+		}
+		offset = crcOffset + 4;
+	}
+	if (!sawEnd || offset !== bytes.byteLength) throw new Error("PNG is missing IEND or has trailing data");
+	const compressed = new Uint8Array(compressedChunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+	let compressedOffset = 0;
+	for (const chunk of compressedChunks) {
+		compressed.set(chunk, compressedOffset);
+		compressedOffset += chunk.byteLength;
+	}
+	const bytesPerPixel = 4;
+	const stride = width * bytesPerPixel;
+	const expectedInflatedLength = (stride + 1) * height;
+	const inflated = new Uint8Array(zlib.inflateSync(compressed, { maxOutputLength: expectedInflatedLength }));
+	if (inflated.byteLength !== expectedInflatedLength) throw new Error("PNG inflated RGBA length mismatch");
+	const pixels = new Uint8Array(stride * height);
+	for (let row = 0; row < height; row += 1) {
+		const sourceOffset = row * (stride + 1);
+		const filter = inflated[sourceOffset];
+		if (filter === undefined || filter > 4) throw new Error(`Unsupported PNG row filter: ${String(filter)}`);
+		for (let columnByte = 0; columnByte < stride; columnByte += 1) {
+			const encoded = inflated[sourceOffset + 1 + columnByte]!;
+			const destination = row * stride + columnByte;
+			const left = columnByte >= bytesPerPixel ? pixels[destination - bytesPerPixel]! : 0;
+			const above = row > 0 ? pixels[destination - stride]! : 0;
+			const upperLeft = row > 0 && columnByte >= bytesPerPixel ? pixels[destination - stride - bytesPerPixel]! : 0;
+			const predictor =
+				filter === 0
+					? 0
+					: filter === 1
+						? left
+						: filter === 2
+							? above
+							: filter === 3
+								? Math.floor((left + above) / 2)
+								: paethPredictor(left, above, upperLeft);
+			pixels[destination] = (encoded + predictor) & 0xff;
+		}
+	}
+	const firstPixel = pixels.slice(0, 4);
+	let nonUniform = false;
+	for (let pixelOffset = 4; pixelOffset < pixels.byteLength; pixelOffset += 4) {
+		if (
+			pixels[pixelOffset] !== firstPixel[0] ||
+			pixels[pixelOffset + 1] !== firstPixel[1] ||
+			pixels[pixelOffset + 2] !== firstPixel[2] ||
+			pixels[pixelOffset + 3] !== firstPixel[3]
+		) {
+			nonUniform = true;
+			break;
+		}
+	}
+	return { width, height, pixels, decodedRgbaSha256: sha256(pixels), nonUniform };
 }
 
 export function rasterizeSvg(
@@ -573,7 +754,7 @@ export function rasterizeSvg(
 	}
 	if (!nonUniform) throw new Error("PNG evidence is uniform");
 	for (const sample of samples) {
-		const actual = pixelHex(pixels, rendered.width, sample.x, sample.y);
+		const actual = pngPixelHex(pixels, rendered.width, sample.x, sample.y);
 		if (actual.toLowerCase() !== sample.rgb.toLowerCase()) {
 			throw new Error(`PNG sentinel ${sample.role} mismatch: expected ${sample.rgb}, got ${actual}`);
 		}

@@ -760,7 +760,7 @@ export class SettingsSelectorComponent extends Container {
 	#currentTabId: SettingTab | "plugins" | "gjc-bundles" = "appearance";
 	#textInputActive = false;
 
-	get activeTabId(): SettingTab | "plugins" {
+	get activeTabId(): SettingTab | "plugins" | "gjc-bundles" {
 		return this.#currentTabId;
 	}
 

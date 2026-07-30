@@ -1,8 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added bundled `red-claw-light` and `blue-crab-light` themes as opt-in choices while retaining `blue-crab` as the default light-slot theme. Their production-backed compliance corpus covers 180 entries and 900 hashed leaves across truecolor, ANSI-256, no-color, CJK wrapping, overflow/windowing, and named TUI consumers.
+
 ### Fixed
 
+- Light-theme compliance evidence now fails closed on the exact source-policy/renderer/native closure, canonical author identities, exact manifest sets and paths, independently decoded PNG RGBA/sentinels, and exhaustive independent-review bindings. Capture output deletion is confined to a preflighted non-symlinked `.gjc/qa` descendant, both bundled light themes reference the live repository schema, and exact-head PR CI requires the published corpus archive instead of silently skipping absent evidence.
 - Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
 - Ultragoal validation-batch hydration now fails closed unless deferred and final-close evidence exactly matches a complete authoritative cumulative Git/CI inventory and durable batch tuple. Explicit malformed, partial, unknown, reordered, or stale receipt data is rejected; Git path capture is byte-safe, NUL-delimited, and includes untracked files; incomplete capture conservatively requires computer-control QA; shared settings and tool registries cannot use partial diffs to bypass that suite; validate/checkpoint replacement hydration is identical; and current/replacement receipts are byte-bound to ledger payloads (#3541).
 - Fixture quality gates that complete intermediate Ultragoal stories now write file-backed adversarial artifact proof; skill-state hooks and computer red-team fixtures match the unconditional adversarial path check so #3543 CI stays fail-closed without weakening hydration exactness (#3543).

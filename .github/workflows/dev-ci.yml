@@ -47,6 +47,7 @@ jobs:
       has_python: ${{ steps.plan.outputs.has_python }}
       has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}
       has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}
+      has_light_theme_evidence: ${{ steps.plan.outputs.has_light_theme_evidence }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
       plan_mode: ${{ steps.plan.outputs.plan_mode }}
       plan_digest: ${{ steps.plan.outputs.plan_digest }}
@@ -634,12 +635,75 @@ jobs:
           overwrite: true
 
 
+  light-theme-evidence:
+    name: Light-theme exact-head evidence
+    needs: [affected-plan, affected-native]
+    if: ${{ always() && needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_light_theme_evidence == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ env.HEAD_REPOSITORY }}
+          ref: ${{ env.CI_DEV_SOURCE_SHA }}
+          fetch-depth: 0
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3.14"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        if: ${{ needs.affected-native.result == 'skipped' }}
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        if: ${{ needs.affected-native.result == 'skipped' }}
+        with:
+          shared-key: dev-light-theme-evidence-native
+          cache-on-failure: true
+          save-if: false
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - name: Install system deps for fallback native build
+        if: ${{ needs.affected-native.result == 'skipped' }}
+        run: bash scripts/ci-install-system-deps.sh
+      - run: bun install --frozen-lockfile
+      - name: Download native addon(s)
+        if: ${{ needs.affected-native.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-native-${{ github.run_id }}
+          path: packages/natives/native
+      - name: Build fallback native addon
+        if: ${{ needs.affected-native.result == 'skipped' }}
+        run: bun --cwd=packages/natives run build
+      - name: Download and validate exact-head evidence archive
+        run: |
+          bun packages/coding-agent/scripts/ci-light-theme-evidence.ts download \
+            --repository "$HEAD_REPOSITORY" \
+            --revision "$CI_DEV_SOURCE_SHA" \
+            --output "$RUNNER_TEMP/gjc-light-theme-evidence-$CI_DEV_SOURCE_SHA"
+      - name: Validate every evidence leaf and independent review
+        env:
+          GJC_LIGHT_THEME_EVIDENCE_REQUIRED: "1"
+        run: bun test packages/coding-agent/test/light-theme-compliance.test.ts
+
   # This producer is deliberately not the protected status: the downstream job
   # validates the finalized bundle downloaded by its immutable artifact ID.
   affected-evidence-producer:
     name: Affected path validation / evidence producer
     if: ${{ always() }}
-    needs: [affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
+    needs: [affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke, light-theme-evidence]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
@@ -665,6 +729,12 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3.14"
+      - name: Enforce exact-head light-theme evidence dependency
+        shell: bash
+        run: |
+          required='${{ needs.affected-plan.outputs.has_light_theme_evidence }}'
+          result='${{ needs.light-theme-evidence.result }}'
+          test "$result" = "$([ "$required" = true ] && printf success || printf skipped)"
       - name: Download canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -728,7 +798,7 @@ jobs:
   affected:
     name: Affected path validation
     if: ${{ always() }}
-    needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
+    needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke, light-theme-evidence]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     env:
@@ -763,6 +833,9 @@ jobs:
           test '${{ needs.affected-plan.result }}' = success
           test '${{ needs.affected-evidence-producer.outputs.artifact_id }}' != ''
           test '${{ needs.affected-evidence-producer.outputs.artifact_digest }}' != ''
+          required='${{ needs.affected-plan.outputs.has_light_theme_evidence }}'
+          result='${{ needs.light-theme-evidence.result }}'
+          test "$result" = "$([ "$required" = true ] && printf success || printf skipped)"
           test "$CI_DEV_EVIDENCE_ROOT" != "$GITHUB_WORKSPACE"
           case "$CI_DEV_EVIDENCE_ROOT" in "$GITHUB_WORKSPACE"/*) exit 1;; esac
           rm -rf "$CI_DEV_EVIDENCE_ROOT"

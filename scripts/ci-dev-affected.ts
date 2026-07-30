@@ -3,6 +3,7 @@
 import { $ } from "bun";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import { needsLightThemeEvidence } from "../packages/coding-agent/scripts/lib/light-theme-evidence-authority";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
@@ -454,6 +455,7 @@ async function emitFullMatrix(): Promise<void> {
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
 		`has_python=${hasPython}`,
+		"has_light_theme_evidence=false",
 		"",
 	];
 	await fs.appendFile(githubOutput, lines.join("\n"));
@@ -485,6 +487,7 @@ async function emitMatrix(): Promise<void> {
 	const hasPython = tasks.some(task => task.phase === "python");
 	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
 	const hasWindowsSessionPath = needsWindowsSessionPathRegression(paths);
+	const hasLightThemeEvidence = mode === "pr" && needsLightThemeEvidence(paths);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
@@ -492,6 +495,7 @@ async function emitMatrix(): Promise<void> {
 		`has_python=${hasPython}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`has_windows_session_path=${hasWindowsSessionPath}`,
+		`has_light_theme_evidence=${hasLightThemeEvidence}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,

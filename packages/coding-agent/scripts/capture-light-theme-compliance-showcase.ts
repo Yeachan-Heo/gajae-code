@@ -1,4 +1,6 @@
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	LIGHT_THEME_COMPLIANCE_ENTRIES,
@@ -21,16 +23,205 @@ import {
 	cellGridToHtml,
 	cellGridToSvg,
 	type FontRecord,
+	LIGHT_THEME_EVIDENCE_CANONICAL_COMMAND,
+	LIGHT_THEME_EVIDENCE_CAPTURE_TOOL_VERSION,
+	LIGHT_THEME_EVIDENCE_REVIEW_REQUIREMENTS,
 	parseAnsiCellGrid,
 	rasterizeSvg,
 	sha256,
 	stableJson,
 } from "./lib/terminal-visual-evidence";
 
-const CAPTURE_TOOL_VERSION = "gjc-light-theme-compliance-v2";
-const CANONICAL_COMMAND =
-	"bun packages/coding-agent/scripts/capture-light-theme-compliance-showcase.ts --output .gjc/qa/gjc-light-theme-compliance/current";
 const EXPECTED_LEAF_COUNT = LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT;
+const QA_RELATIVE_ROOT = path.join(".gjc", "qa");
+const AUTHOR_IDENTITY_PATTERN = /^[a-z][a-z0-9-]*:[^\s,]+$/;
+
+interface AuthorIdentities {
+	implementation_author_ids: string[];
+	capture_author_ids: string[];
+}
+
+function readAuthorIdentityList(variableName: string): string[] {
+	const raw = Bun.env[variableName];
+	const identities = raw
+		?.split(",")
+		.map(identity => identity.trim())
+		.filter(Boolean);
+	if (
+		!identities ||
+		identities.length === 0 ||
+		identities.some(identity => !AUTHOR_IDENTITY_PATTERN.test(identity)) ||
+		new Set(identities).size !== identities.length
+	) {
+		throw new Error(
+			`${variableName} must contain one or more unique comma-separated canonical identities (for example, github:octocat)`,
+		);
+	}
+	return identities.sort((left, right) => left.localeCompare(right));
+}
+
+function readAuthorIdentities(): AuthorIdentities {
+	return {
+		implementation_author_ids: readAuthorIdentityList("GJC_LIGHT_THEME_IMPLEMENTATION_AUTHOR_IDS"),
+		capture_author_ids: readAuthorIdentityList("GJC_LIGHT_THEME_CAPTURE_AUTHOR_IDS"),
+	};
+}
+
+function isEnoent(error: unknown): boolean {
+	return Boolean(
+		error && typeof error === "object" && "code" in error && (error as { code: unknown }).code === "ENOENT",
+	);
+}
+
+function samePath(left: string, right: string): boolean {
+	return path.resolve(left) === path.resolve(right);
+}
+
+function isStrictDescendant(root: string, target: string): boolean {
+	const relative = path.relative(path.resolve(root), path.resolve(target));
+	return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+}
+
+function hasLexicalDotDot(candidate: string): boolean {
+	return candidate.split(/[\\/]/).includes("..");
+}
+
+function usageError(): Error {
+	return new Error(`Usage: ${LIGHT_THEME_EVIDENCE_CANONICAL_COMMAND}`);
+}
+
+function rejectionError(reason: string, candidate: string): Error {
+	return new Error(`Refusing capture output path (${reason}): ${candidate}`);
+}
+
+/**
+ * Resolve and preflight the capture `--output` path without mutating the filesystem.
+ * Returns a path that is a strict non-symlinked descendant of `<repo>/.gjc/qa`.
+ */
+export async function resolveCaptureOutputPath(
+	args: string[],
+	repoRoot: string,
+	homeDir: string = os.homedir(),
+): Promise<string> {
+	if (args.length !== 2 || args[0] !== "--output" || !args[1]) throw usageError();
+
+	const requested = args[1];
+	if (hasLexicalDotDot(requested)) {
+		throw rejectionError("lexical .. alias", requested);
+	}
+
+	const resolvedRepoRoot = path.resolve(repoRoot);
+	const resolvedHome = path.resolve(homeDir);
+	const qaRoot = path.join(resolvedRepoRoot, QA_RELATIVE_ROOT);
+	const gitDir = path.join(resolvedRepoRoot, ".git");
+	const filesystemRoot = path.parse(resolvedRepoRoot).root;
+
+	const outputPath = path.isAbsolute(requested) ? path.resolve(requested) : path.resolve(resolvedRepoRoot, requested);
+
+	if (samePath(outputPath, filesystemRoot)) {
+		throw rejectionError("filesystem root", outputPath);
+	}
+	if (samePath(outputPath, resolvedRepoRoot)) {
+		throw rejectionError("repository root", outputPath);
+	}
+	if (samePath(outputPath, resolvedHome)) {
+		throw rejectionError("home directory", outputPath);
+	}
+	if (samePath(outputPath, gitDir) || isStrictDescendant(gitDir, outputPath)) {
+		throw rejectionError(".git directory", outputPath);
+	}
+	if (samePath(outputPath, qaRoot)) {
+		throw rejectionError("QA root", outputPath);
+	}
+	if (!isStrictDescendant(qaRoot, outputPath)) {
+		throw rejectionError("outside dedicated .gjc/qa root", outputPath);
+	}
+	if (hasLexicalDotDot(path.relative(qaRoot, outputPath))) {
+		throw rejectionError("lexical .. alias", outputPath);
+	}
+
+	// No-follow walk from the repository root so host aliases like /tmp -> /private/tmp
+	// do not block legitimate temp fixtures while still rejecting repo-local escapes.
+	const relativeFromRepo = path.relative(resolvedRepoRoot, outputPath);
+	let cursor = resolvedRepoRoot;
+	for (const segment of relativeFromRepo.split(path.sep)) {
+		cursor = path.join(cursor, segment);
+		let stats: Stats;
+		try {
+			stats = await fs.lstat(cursor);
+		} catch (error) {
+			if (isEnoent(error)) break;
+			throw error;
+		}
+		if (stats.isSymbolicLink()) {
+			throw rejectionError("symlink component", cursor);
+		}
+	}
+
+	let realRepoRoot = resolvedRepoRoot;
+	try {
+		realRepoRoot = await fs.realpath(resolvedRepoRoot);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+
+	let realHome = resolvedHome;
+	try {
+		realHome = await fs.realpath(resolvedHome);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+
+	const realQaRoot = path.join(realRepoRoot, QA_RELATIVE_ROOT);
+	const realGitDir = path.join(realRepoRoot, ".git");
+
+	let existingAncestor = outputPath;
+	const missingSuffix: string[] = [];
+	for (;;) {
+		try {
+			const stats = await fs.lstat(existingAncestor);
+			if (stats.isSymbolicLink()) {
+				throw rejectionError("symlink component", existingAncestor);
+			}
+			break;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			const parent = path.dirname(existingAncestor);
+			if (samePath(parent, existingAncestor)) break;
+			missingSuffix.unshift(path.basename(existingAncestor));
+			existingAncestor = parent;
+		}
+	}
+
+	try {
+		const realAncestor = await fs.realpath(existingAncestor);
+		const realOutputPath = missingSuffix.length === 0 ? realAncestor : path.resolve(realAncestor, ...missingSuffix);
+
+		if (samePath(realOutputPath, path.parse(realOutputPath).root)) {
+			throw rejectionError("filesystem root alias", realOutputPath);
+		}
+		if (samePath(realOutputPath, realRepoRoot)) {
+			throw rejectionError("repository root alias", realOutputPath);
+		}
+		if (samePath(realOutputPath, realHome)) {
+			throw rejectionError("home directory alias", realOutputPath);
+		}
+		if (samePath(realOutputPath, realGitDir) || isStrictDescendant(realGitDir, realOutputPath)) {
+			throw rejectionError(".git directory alias", realOutputPath);
+		}
+		if (samePath(realOutputPath, realQaRoot)) {
+			throw rejectionError("QA root alias", realOutputPath);
+		}
+		if (!isStrictDescendant(realQaRoot, realOutputPath)) {
+			throw rejectionError("canonical path escapes .gjc/qa", realOutputPath);
+		}
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("Refusing capture output path")) throw error;
+		if (!isEnoent(error)) throw error;
+	}
+
+	return outputPath;
+}
 
 interface ArtifactFile {
 	path: string;
@@ -50,13 +241,6 @@ interface ManifestEntry {
 	display_list_sha256: string;
 	decoded_rgba_sha256: string;
 	files: ArtifactFile[];
-}
-
-function parseOutputPath(args: string[]): string {
-	if (args.length !== 2 || args[0] !== "--output" || !args[1]) {
-		throw new Error(`Usage: ${CANONICAL_COMMAND}`);
-	}
-	return path.resolve(args[1]);
 }
 
 async function writeArtifact(
@@ -165,8 +349,8 @@ async function captureEntry(
 		terminal_evidence: {
 			capture_timestamp: rendered.provenance.fixedClockTimestamp,
 			actual_capture_receipt: "run-receipt.json",
-			tool_version: CAPTURE_TOOL_VERSION,
-			command_or_replay_source: CANONICAL_COMMAND,
+			tool_version: LIGHT_THEME_EVIDENCE_CAPTURE_TOOL_VERSION,
+			command_or_replay_source: LIGHT_THEME_EVIDENCE_CANONICAL_COMMAND,
 			terminal_size: entry.viewport,
 			font_rendering_assumptions: "capture-environment.json#fonts,cell_geometry,color_profile",
 			wrapping_policy: "production renderer output; grapheme cells use Intl.Segmenter and Bun.stringWidth",
@@ -203,12 +387,14 @@ async function main(): Promise<void> {
 	Bun.env.LANG = "en_US.UTF-8";
 	Bun.env.LC_ALL = "en_US.UTF-8";
 	const startedAt = Date.now();
-	const outputRoot = parseOutputPath(process.argv.slice(2));
 	const repoRoot = path.resolve(import.meta.dir, "../../..");
-	await fs.rm(outputRoot, { recursive: true, force: true });
-	await fs.mkdir(outputRoot, { recursive: true });
+	const outputRoot = await resolveCaptureOutputPath(process.argv.slice(2), repoRoot);
+	const receiptOutputPath = path.relative(repoRoot, outputRoot).split(path.sep).join("/");
+	const authorIdentities = readAuthorIdentities();
 	const environment = await captureEnvironment(repoRoot);
 	const source = await captureSourceFingerprint(repoRoot);
+	await fs.rm(outputRoot, { recursive: true, force: true });
+	await fs.mkdir(outputRoot, { recursive: true });
 	const entries: ManifestEntry[] = [];
 	for (const entry of LIGHT_THEME_COMPLIANCE_ENTRIES) {
 		entries.push(await captureEntry(outputRoot, entry, environment, source));
@@ -220,13 +406,14 @@ async function main(): Promise<void> {
 	const keys = entries.map(entry => entry.key);
 	if (new Set(keys).size !== keys.length) throw new Error("Capture contains duplicate entry keys");
 	const manifest = stableJson({
-		schema_version: 1,
-		capture_tool: CAPTURE_TOOL_VERSION,
-		command: CANONICAL_COMMAND,
+		schema_version: 2,
+		capture_tool: LIGHT_THEME_EVIDENCE_CAPTURE_TOOL_VERSION,
+		command: LIGHT_THEME_EVIDENCE_CANONICAL_COMMAND,
 		source_revision: source.source_revision,
 		source_fingerprint: source.source_fingerprint,
 		source_files: source.source_files,
 		environment_id: environment.environment_id,
+		author_identities: authorIdentities,
 		expected_entry_count: LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT,
 		entry_count: entries.length,
 		expected_leaf_count: EXPECTED_LEAF_COUNT,
@@ -247,20 +434,17 @@ async function main(): Promise<void> {
 	});
 	const manifestSha256 = sha256(manifest);
 	const reviewInput = stableJson({
-		schema_version: 1,
+		schema_version: 2,
 		manifest_path: "manifest.json",
 		manifest_sha256: manifestSha256,
 		source_revision: source.source_revision,
 		environment_id: environment.environment_id,
+		author_identities: authorIdentities,
 		expected_entry_count: LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT,
 		expected_leaf_count: EXPECTED_LEAF_COUNT,
 		reviewed_entry_keys: keys,
 		reviewer_output_file: "independent-review.json",
-		requirements: [
-			"Recompute every leaf hash and byte length before visual inspection.",
-			"Inspect all 180 entries without sampling, including every consumer-atlas, CJK, overflow, no-color, and 256-color key.",
-			"Reject any requested/resolved/key/sentinel mismatch, bad semantic wrap, hidden tail, or unresolved finding.",
-		],
+		requirements: LIGHT_THEME_EVIDENCE_REVIEW_REQUIREMENTS,
 	});
 	await Bun.write(path.join(outputRoot, "manifest.json"), manifest);
 	await Bun.write(path.join(outputRoot, "capture-environment.json"), stableJson(environment));
@@ -268,10 +452,10 @@ async function main(): Promise<void> {
 	await Bun.write(
 		path.join(outputRoot, "run-receipt.json"),
 		stableJson({
-			schema_version: 1,
+			schema_version: 2,
 			captured_at: new Date().toISOString(),
 			elapsed_ms: Date.now() - startedAt,
-			output_path: outputRoot,
+			output_path: receiptOutputPath,
 			manifest_sha256: manifestSha256,
 			source_revision: source.source_revision,
 			environment_id: environment.environment_id,
@@ -285,4 +469,6 @@ async function main(): Promise<void> {
 	);
 }
 
-await main();
+if (import.meta.main) {
+	await main();
+}

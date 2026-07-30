@@ -422,6 +422,23 @@ through a closed typed union and must call the named production components.
 It must not draw a parallel settings list, transcript, diff, markdown,
 syntax, status line, or overflow facsimile.
 
+Canonical capture requires explicit, non-empty implementation and capture
+identities. Each identity uses the stable `scheme:value` form (for example,
+`github:octocat`):
+
+```sh
+GJC_LIGHT_THEME_IMPLEMENTATION_AUTHOR_IDS=github:<implementation-author> \
+GJC_LIGHT_THEME_CAPTURE_AUTHOR_IDS=github:<capture-author> \
+bun packages/coding-agent/scripts/capture-light-theme-compliance-showcase.ts \
+  --output .gjc/qa/gjc-light-theme-compliance/current
+```
+
+The output must be a strict, non-symlinked descendant of the repository's
+`.gjc/qa` directory. The capture command rejects the filesystem root, home,
+repository, `.git`, `.gjc/qa` itself, ancestors, outside paths, lexical `..`
+aliases, and symlink aliases before any recursive removal. It also completes
+author, environment, and source preflight before replacing a prior corpus.
+
 ### Actual consumer and contrast inventory
 
 `pageBg` below means the selected theme's export page background. `default`
@@ -650,20 +667,69 @@ width/SVG serializer versions, locale, `TZ=UTC`, font records, geometry, DPR,
 and color profile. Its canonical-field SHA-256 is the environment ID. Two
 clean captures may claim byte determinism only with identical source,
 inputs, command, and environment ID; all deterministic leaves, PNG bytes,
-and decoded RGBA hashes must match. Run time, elapsed time, and output path
-are isolated in `run-receipt.json`.
+and decoded RGBA hashes must match. Run time and elapsed time are isolated in
+`run-receipt.json`; its output path is the canonical repository-relative
+`.gjc/qa/gjc-light-theme-compliance/current`, never a host-absolute path.
 
-`manifest.json` also records the exact path/hash/byte-length records from
-`LIGHT_THEME_EVIDENCE_SOURCE_PATHS`, plus their aggregate source fingerprint and
-Git/worktree revision. Evidence validation recomputes that set from the current
-worktree; any contract, theme, production renderer, dependency lock, fixture,
-capture-helper, capture-script, or validator change makes the capture stale.
+Evidence validation also re-renders every canonical key from the current
+production fixture and byte-compares both plain and ANSI terminal output.
+A second `Bun.stripANSI` path verifies plain-text fidelity, and a separate
+HTML envelope/entity extractor verifies that the retained `<pre>` text is
+exactly the terminal text. These checks are additive to rebuilding the
+canonical cell grid, HTML, and SVG display list; a self-consistent forged
+serializer output cannot replace the current production render.
+
+The validator decodes each retained PNG directly from its PNG bytes, validates
+chunk CRC/order, requires bounded non-interlaced 8-bit RGBA, reverses every PNG
+row filter, and recomputes dimensions, decoded RGBA SHA-256, non-uniformity,
+and every sentinel sample independently of Resvg's capture-time pixel buffer.
+A valid PNG envelope or capture-time metadata claim cannot substitute for
+decoded pixel proof.
+
+`manifest.json` schema version 2 records the exact sorted
+path/hash/byte-length authority from `LIGHT_THEME_EVIDENCE_SOURCE_PATHS` plus
+every regular file under `LIGHT_THEME_EVIDENCE_SOURCE_TREES`, along with their
+aggregate source fingerprint and Git/worktree revision. The closure includes
+this contract, both actual retained default palettes as well as the added
+light palettes, theme/schema/settings policy, production renderer and
+transitive TUI/native/width sources, dependency manifests and lockfiles,
+fixtures, capture/validator/transport scripts and tests, and the Dev CI
+workflow/planner. Symlinks, duplicate paths, missing trees, non-files, or an
+exact-set/hash/revision mismatch fail closed. Evidence validation recomputes
+the full closure from the current worktree; any authority change makes the
+capture stale.
 
 Across different environments, acceptance uses identical matrix, replayed
 cell-grid hash, text, ANSI semantics, grapheme spans, role-per-cell and
 occupancy maps, sticky/window metadata, valid PNG dimensions/RGBA, theme
 sentinel samples, and human semantic review. PNG format/dimensions alone are
 not evidence.
+
+### Exact-head CI evidence transport
+
+A completed corpus, including `independent-review.json`, is packaged without
+vendoring it in the repository:
+
+```sh
+bun packages/coding-agent/scripts/ci-light-theme-evidence.ts archive \
+  --source .gjc/qa/gjc-light-theme-compliance/current \
+  --output .gjc/qa/gjc-light-theme-compliance/gjc-light-theme-compliance.tar.gz
+```
+
+The pull-request head repository publishes that file as the sole asset named
+`gjc-light-theme-compliance.tar.gz` on release tag
+`light-theme-evidence-<exact-40-hex-PR-head>`. Dev CI schedules the dedicated
+`Light-theme exact-head evidence` job for every PR that changes any source
+authority path or tree. It downloads only that head repository/tag/asset,
+refuses unsafe/excess/missing archive paths, bounds both compressed and
+extracted bytes against decompression bombs, requires exactly five root
+controls plus 180 entry directories and 900 leaves, exports
+`GJC_LIGHT_THEME_EVIDENCE` and `GJC_LIGHT_THEME_EVIDENCE_REQUIRED=1`, then
+runs the exhaustive evidence test.
+A missing asset, missing environment variable, stale source closure, invalid
+leaf, or invalid independent review fails both the evidence job and the
+protected affected aggregate. Push CI does not require a historical PR
+release asset.
 
 ### Notifications byte-equivalence gate
 
@@ -679,17 +745,21 @@ copy, viewport/render-mode extras, fixture timestamp, and review-input counts
 must match. Only external receipt revision/time/elapsed/output-path fields may
 differ. There is no theme-aware or structural-diff exception.
 
-### Independent review schema version 1
+### Independent review schema version 2
 
 `independent-review.json` rejects unknown top-level fields except optional
 string `notes`. It requires:
 
-- literal `schema_version: 1`, `decision: "pass"`, and a UTC `reviewed_at`
+- literal `schema_version: 2`, `decision: "pass"`, and a UTC `reviewed_at`
   after capture and before any later source/output change;
 - non-empty reviewer `id`, `role`, and `affiliation`;
 - independence arrays for implementation and capture author IDs, false
   `reviewer_authored_implementation` and `reviewer_authored_capture`, a
   non-empty basis, and no reviewer ID in either author array;
+- manifest schema version 2 non-empty, unique canonical implementation and
+  capture author arrays, copied exactly into review input and the review
+  independence block; omitted or empty arrays fail instead of vacuously
+  proving independence;
 - manifest relative path, lowercase SHA-256, source revision, environment ID,
   expected/observed entry counts 180, and expected/observed leaf counts 900;
 - exactly 180 unique `reviewed_entry_keys`, set-equal to the manifest;

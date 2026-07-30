@@ -3,6 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import {
+	isLightThemeEvidenceAuthorityPath,
+	needsLightThemeEvidence,
+} from "../packages/coding-agent/scripts/lib/light-theme-evidence-authority";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -78,7 +82,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
 		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() }}");
-		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
+		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke, light-theme-evidence]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
 		expect(workflow).toContain("artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}");
@@ -137,6 +141,29 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("Validate finalized Darwin smoke receipt");
 		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT");
 		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED");
+	});
+	test("requires exact-head light-theme evidence for every authority path", async () => {
+		expect(isLightThemeEvidenceAuthorityPath("packages/coding-agent/src/modes/theme/defaults/red-claw-light.json")).toBe(true);
+		expect(isLightThemeEvidenceAuthorityPath("packages/tui/src/terminal.ts")).toBe(true);
+		expect(isLightThemeEvidenceAuthorityPath("packages/coding-agent/src/modes/components/dynamic-border.ts")).toBe(
+			true,
+		);
+		expect(isLightThemeEvidenceAuthorityPath("packages/coding-agent/src/tui/output-block.ts")).toBe(true);
+		expect(isLightThemeEvidenceAuthorityPath("packages/ai/src/model-thinking.ts")).toBe(true);
+		expect(needsLightThemeEvidence(["packages/coding-agent/test/light-theme-compliance.test.ts"])).toBe(true);
+		expect(needsLightThemeEvidence(["packages/ai/src/index.ts"])).toBe(false);
+
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		expect(workflow).toContain("has_light_theme_evidence: ${{ steps.plan.outputs.has_light_theme_evidence }}");
+		const job = workflow.slice(workflow.indexOf("  light-theme-evidence:"), workflow.indexOf("\n  # This producer"));
+		expect(job).toContain("name: Light-theme exact-head evidence");
+		expect(job).toContain("needs.affected-plan.outputs.has_light_theme_evidence == 'true'");
+		expect(job).toContain("github.event.pull_request.head.repo.full_name");
+		expect(job).toContain("--revision \"$CI_DEV_SOURCE_SHA\"");
+		expect(job).toContain('GJC_LIGHT_THEME_EVIDENCE_REQUIRED: "1"');
+		expect(job).toContain("bun test packages/coding-agent/test/light-theme-compliance.test.ts");
+		expect(workflow.match(/needs: \[[^\n]*light-theme-evidence\]/g)).toHaveLength(2);
+		expect(workflow.match(/needs\.light-theme-evidence\.result/g)?.length).toBeGreaterThanOrEqual(2);
 	});
 
 	test("routes the Windows session-path regression suite onto windows-latest and requires it", async () => {
@@ -670,6 +697,24 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(matrix.include.some((shard: { key: string }) => shard.key.startsWith("cargo-build:"))).toBe(true);
 		// Native build tasks never appear as shards.
 		expect(matrix.include.every((shard: { key: string }) => shard.key !== "native-linux-x64")).toBe(true);
+	});
+	test("--matrix-json requires evidence only for PR changes in the authority closure", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-light-theme-evidence-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const changedPath = "packages/coding-agent/src/modes/theme/defaults/red-claw-light.json";
+		const { exitCode } = await runScript(["--matrix-json"], changedPath, {
+			GITHUB_EVENT_NAME: "pull_request",
+			CI_DEV_PLAN_MODE: "pr",
+			GITHUB_OUTPUT: outputFile,
+		});
+		expect(exitCode).toBe(0);
+		expect(await Bun.file(outputFile).text()).toContain("has_light_theme_evidence=true");
+
+		const pushOutput = path.join(tempDir, "push-output.txt");
+		const push = await runScript(["--matrix-json"], changedPath, { GITHUB_OUTPUT: pushOutput });
+		expect(push.exitCode).toBe(0);
+		expect(await Bun.file(pushOutput).text()).toContain("has_light_theme_evidence=false");
 	});
 	test("CI_FORCE_FULL emits Python work outside the shard matrix", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-python-full-"));
