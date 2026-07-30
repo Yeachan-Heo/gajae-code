@@ -88,17 +88,14 @@ export function extractFailures(rawLog: string): ExtractionResult {
 			continue;
 		}
 
-		if (reportedFailCount === undefined) {
-			const summary = BUN_SUMMARY.exec(line);
-			if (summary?.[1]) {
-				reportedFailCount = Number(summary[1]);
-				continue;
-			}
+		const summary = BUN_SUMMARY.exec(line);
+		if (summary?.[1]) {
+			reportedFailCount = (reportedFailCount ?? 0) + Number(summary[1]);
 		}
 
-		if (reportedErrorCount === undefined) {
-			const errors = BUN_ERROR_SUMMARY.exec(line);
-			if (errors?.[1]) reportedErrorCount = Number(errors[1]);
+		const errors = BUN_ERROR_SUMMARY.exec(line);
+		if (errors?.[1]) {
+			reportedErrorCount = (reportedErrorCount ?? 0) + Number(errors[1]);
 		}
 	}
 

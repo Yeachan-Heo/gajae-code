@@ -67,6 +67,24 @@ describe("extractFailures", () => {
 		expect(result.reportedFailCount).toBe(6);
 		expect(result.identities).toHaveLength(1);
 	});
+	test("aggregates multiple summary lines across timestamped invocations", () => {
+		const log = [`${TS} 0 fail`, `${TS}(fail) one recognised`, `${TS} 2 fail`].join("\n");
+
+		const result = extractFailures(log);
+
+		expect(result.reportedFailCount).toBe(2);
+		expect(result.underCounted).toBe(true);
+		expect(result.identities).toEqual(["one recognised"]);
+	});
+
+	test("aggregates suite-level error summaries across invocations", () => {
+		const log = [`${TS} 2 fail`, `${TS} 1 error`, `${TS} 1 error`].join("\n");
+
+		const result = extractFailures(log);
+
+		expect(result.reportedErrorCount).toBe(2);
+		expect(result.underCounted).toBe(false);
+	});
 
 	test("does not flag under-counting when extraction agrees with the summary", () => {
 		const log = [`${TS}(fail) a`, `${TS}(fail) b`, `${TS} 2 fail`].join("\n");
