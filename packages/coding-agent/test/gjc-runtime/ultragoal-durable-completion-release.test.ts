@@ -26,12 +26,21 @@ const tempRoots: string[] = [];
 
 let savedSessionId: string | undefined;
 let savedSessionFile: string | undefined;
+let savedCiDevChangedPaths: string | undefined;
 
 beforeEach(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
 	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	delete process.env.GJC_SESSION_FILE;
+	// These checkpoints create temp dirs inside the enclosing git work tree, so
+	// computeCheckpointChangeSet would otherwise sweep the CI planner's
+	// CI_DEV_CHANGED_PATHS (which includes computer control surface paths on
+	// branches that touch them) into the computed change set and falsely trigger
+	// the mandatory computer red-team suite. Pin it away so the generic gate
+	// fixtures validate their own contract instead of the host branch's diff.
+	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+	delete process.env.CI_DEV_CHANGED_PATHS;
 });
 
 afterEach(async () => {
@@ -39,6 +48,8 @@ afterEach(async () => {
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	if (savedSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 	else process.env.GJC_SESSION_FILE = savedSessionFile;
+	if (savedCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+	else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 

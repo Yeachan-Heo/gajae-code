@@ -41,12 +41,21 @@ const tempRoots: string[] = [];
 
 let savedSessionId: string | undefined;
 let savedSessionFile: string | undefined;
+// Capture the host CI planner's changed paths once at module load. Most tests
+// below create temp dirs INSIDE the enclosing git work tree, so
+// computeCheckpointChangeSet would otherwise merge CI_DEV_CHANGED_PATHS (which
+// includes computer control surface paths on branches that touch them) into the
+// computed change set and falsely trigger the mandatory computer red-team suite.
+// Clear it in beforeEach and restore the original in afterEach; batchTempDir
+// and the explicit CI-leak tests override the value within their own scope.
+const ORIGINAL_CI_DEV_CHANGED_PATHS = process.env.CI_DEV_CHANGED_PATHS;
 
 beforeEach(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
 	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	delete process.env.GJC_SESSION_FILE;
+	delete process.env.CI_DEV_CHANGED_PATHS;
 });
 
 async function tempDir(): Promise<string> {
@@ -54,8 +63,6 @@ async function tempDir(): Promise<string> {
 	tempRoots.push(dir);
 	return dir;
 }
-
-let savedCiDevChangedPaths: { value: string | undefined } | undefined;
 
 /**
  * Root for validation-batch tests, hermetically OUTSIDE the enclosing git
@@ -69,7 +76,6 @@ let savedCiDevChangedPaths: { value: string | undefined } | undefined;
 async function batchTempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-batch-"));
 	tempRoots.push(dir);
-	savedCiDevChangedPaths ??= { value: process.env.CI_DEV_CHANGED_PATHS };
 	process.env.CI_DEV_CHANGED_PATHS = batchChangeSetPaths()
 		.map(row => row.path)
 		.join("\n");
@@ -81,11 +87,8 @@ afterEach(async () => {
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	if (savedSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 	else process.env.GJC_SESSION_FILE = savedSessionFile;
-	if (savedCiDevChangedPaths) {
-		if (savedCiDevChangedPaths.value === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
-		else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths.value;
-		savedCiDevChangedPaths = undefined;
-	}
+	if (ORIGINAL_CI_DEV_CHANGED_PATHS === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+	else process.env.CI_DEV_CHANGED_PATHS = ORIGINAL_CI_DEV_CHANGED_PATHS;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
@@ -14,6 +14,7 @@ import {
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let savedSessionId: string | undefined;
+let savedCiDevChangedPaths: string | undefined;
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -27,7 +28,19 @@ async function runGit(cwd: string, args: string[]): Promise<void> {
 
 beforeAll(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
+	// Each review tempDir inits its own git repo inside the enclosing work tree,
+	// but computeCheckpointChangeSet still merges the CI planner's
+	// CI_DEV_CHANGED_PATHS into the computed change set. On branches that touch
+	// computer control surface paths that would falsely trigger the mandatory
+	// computer red-team suite. Capture the original once and clear it before each
+	// test so the dedicated CI-leak tests below set their own value within their
+	// own scope; restore the original after the whole suite finishes.
+	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+});
+
+beforeEach(() => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	delete process.env.CI_DEV_CHANGED_PATHS;
 });
 
 async function tempDir(): Promise<string> {
@@ -43,15 +56,15 @@ async function tempDir(): Promise<string> {
 }
 
 afterEach(async () => {
-	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 afterAll(() => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
+	if (savedCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+	else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths;
 });
-
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {
 	let crc = index;

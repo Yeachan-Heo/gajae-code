@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
@@ -12,22 +12,35 @@ import {
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let savedSessionId: string | undefined;
+let savedCiDevChangedPaths: string | undefined;
 
 afterEach(async () => {
-	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 afterAll(() => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
+	if (savedCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+	else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths;
 });
 
 beforeAll(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
-	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
 });
 
+beforeEach(() => {
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	// These checkpoints create temp dirs inside the enclosing git work tree, so
+	// computeCheckpointChangeSet would otherwise sweep the CI planner's
+	// CI_DEV_CHANGED_PATHS (which includes computer control surface paths on
+	// branches that touch them) into the computed change set and falsely trigger
+	// the mandatory computer red-team suite. Clear it before each test so the
+	// generic gate fixtures validate their own contract instead of the host
+	// branch's diff; restore the original after the whole suite finishes.
+	delete process.env.CI_DEV_CHANGED_PATHS;
+});
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-dogfood-"));
 	tempRoots.push(dir);

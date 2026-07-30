@@ -292,6 +292,15 @@ describe("computer red-team fixture matrix", () => {
 		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
 
+	it("passes a complete mandatory computer red-team gate on a genuine computer change", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(root);
+		expect(await checkpoint(root, executorQa({ computerTouching: true }))).toContain("Checkpointed G001 as complete");
+	});
+
 	it("fails not_applicable on a mandatory case", async () => {
 		const root = await tempDir();
 		await initRepo(root);
