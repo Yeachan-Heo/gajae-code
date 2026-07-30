@@ -441,6 +441,25 @@ export function isToolAllowed(name: string): boolean {
 		}
 	});
 
+	it("fails settings classification closed when full diff bytes cannot be decoded", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		const settingsPath = "packages/coding-agent/src/config/settings-schema.ts";
+		await fs.mkdir(path.dirname(path.join(root, settingsPath)), { recursive: true });
+		const prefix = new TextEncoder().encode('export const SETTINGS = {\n\t"tools.maxInlineResultBytes": ');
+		await fs.writeFile(path.join(root, settingsPath), new Uint8Array([...prefix, 0xff, 0x0a, 0x7d, 0x3b, 0x0a]));
+		await runGit(root, ["add", settingsPath]);
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const message = await checkpoint(root, executorQa({ computerTouching: false, cases })).catch(error =>
+			String(error),
+		);
+		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
 	it("triggers from a computer-specific settings-schema diff", async () => {
 		const root = await tempDir();
 		await initRepo(root);

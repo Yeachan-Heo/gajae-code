@@ -185,8 +185,11 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 		mergeBase: mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : undefined,
 		headRef: "HEAD",
 		paths,
-		rawDiffStat: stat.stdout,
-		rawDiff: [committedDiff.stdout, unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n"),
+		rawDiffStat: stat.ok ? stat.stdout : undefined,
+		rawDiff:
+			committedDiff.ok && unstagedDiff.ok && stagedDiff.ok
+				? [committedDiff.stdout, unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n")
+				: undefined,
 		trusted: true,
 	};
 }
