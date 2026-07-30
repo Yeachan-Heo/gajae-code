@@ -3905,6 +3905,8 @@ describe("ModelRegistry", () => {
 
 			expect(registry.find("tracked-provider", "tracked-model")).toBeDefined();
 			expect(trackedRows()).toEqual([]);
+			authStorage.setRuntimeApiKey("tracked-provider", "");
+			expect(trackedRows()).toEqual([]);
 
 			await authStorage.set("tracked-provider", [
 				{ type: "api_key", key: "account-a" },

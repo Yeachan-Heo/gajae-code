@@ -1685,7 +1685,7 @@ export class AuthStorage {
 		} catch {
 			return false;
 		}
-		if (this.#runtimeOverrides.has(storageProvider)) return true;
+		if (this.hasRuntimeApiKey(storageProvider)) return true;
 		if (this.#configOverrides.has(storageProvider)) return true;
 		if (this.#getCredentialsForProvider(storageProvider).length > 0) return true;
 		if (getEnvApiKey(storageProvider)) return true;
