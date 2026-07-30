@@ -173,7 +173,7 @@ function qualityGate(): Record<string, unknown> {
 					obligation: "The red-team gate proves a browser/web surface with structural live artifacts",
 					status: "covered",
 					surfaceEvidenceRefs: ["surface-web"],
-					adversarialCaseRefs: ["case-invalid-input"],
+					adversarialCaseRefs: ["case-invalid-input-web"],
 				},
 				{
 					id: "contract-cli",
@@ -181,7 +181,7 @@ function qualityGate(): Record<string, unknown> {
 					obligation: "The red-team gate replays the deterministic CLI argv command and matches recorded stdout",
 					status: "covered",
 					surfaceEvidenceRefs: ["surface-cli"],
-					adversarialCaseRefs: ["case-invalid-input"],
+					adversarialCaseRefs: ["case-invalid-input-cli"],
 				},
 			],
 			surfaceEvidence: [
@@ -204,10 +204,18 @@ function qualityGate(): Record<string, unknown> {
 			],
 			adversarialCases: [
 				{
-					id: "case-invalid-input",
-					contractRef: "AC-26",
-					scenario: "Tampered live evidence is supplied to the hardened gate",
-					expectedBehavior: "The gate rejects blank screenshots and mismatched CLI stdout",
+					id: "case-invalid-input-web",
+					contractRef: "AC-26:web",
+					scenario: "Tampered web evidence is supplied to the hardened gate",
+					expectedBehavior: "The gate rejects blank screenshots",
+					verdict: "passed",
+					artifactRefs: ["adversarial-report"],
+				},
+				{
+					id: "case-invalid-input-cli",
+					contractRef: "AC-26:cli",
+					scenario: "Tampered CLI evidence is supplied to the hardened gate",
+					expectedBehavior: "The gate rejects mismatched CLI stdout",
 					verdict: "passed",
 					artifactRefs: ["adversarial-report"],
 				},
