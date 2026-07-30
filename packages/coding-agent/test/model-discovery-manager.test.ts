@@ -126,6 +126,65 @@ describe("ModelDiscoveryManager", () => {
 		});
 		expect(peekCount).toBe(1);
 	});
+	test("does not cache responses after credentials rotate during fetch", async () => {
+		const cacheDir = mkdtempSync(join(tmpdir(), "model-discovery-credentials-race-"));
+		const cacheDbPath = join(cacheDir, "models.db");
+		const provider = { provider: "test" };
+		const manager = new ModelDiscoveryManager<typeof provider>();
+		manager.setProviders([provider]);
+		const fetchStarted = deferred<void>();
+		const firstFetch = deferred<Model<Api>[]>();
+		let authGeneration = "generation-a";
+		let fetchCount = 0;
+
+		try {
+			const callbacks = {
+				cacheDbPath,
+				requiresAuth: () => true,
+				peekApiKey: async () => (authGeneration === "generation-a" ? "credential-a" : "credential-b"),
+				isAuthenticated: (apiKey: string | undefined) => apiKey !== undefined,
+				fetchModels: async (_provider: typeof provider, apiKey: string | undefined) => {
+					if (fetchCount++ === 0) {
+						expect(apiKey).toBe("credential-a");
+						fetchStarted.resolve();
+						return firstFetch.promise;
+					}
+					expect(apiKey).toBe("credential-b");
+					return [model("current")];
+				},
+				getEvidenceGeneration: () => authGeneration,
+			};
+
+			const firstDiscovery = manager.discover(provider, "online", callbacks);
+			await fetchStarted.promise;
+			authGeneration = "generation-b";
+			firstFetch.resolve([model("stale")]);
+
+			expect(await firstDiscovery).toMatchObject({
+				current: true,
+				authGeneration: "generation-a",
+				fetched: true,
+				models: [expect.objectContaining({ id: "stale" })],
+			});
+			expect(readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+
+			const currentDiscovery = await manager.discover(provider, "online-if-uncached", callbacks);
+			expect(currentDiscovery).toMatchObject({
+				current: true,
+				authGeneration: "generation-b",
+				fetched: true,
+				models: [expect.objectContaining({ id: "current" })],
+			});
+			expect(fetchCount).toBe(2);
+			expect(readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toMatchObject({
+				authoritative: true,
+				models: [expect.objectContaining({ id: "current" })],
+			});
+		} finally {
+			closeModelCache(cacheDbPath);
+			rmSync(cacheDir, { recursive: true, force: true });
+		}
+	});
 
 	test("rejects stale same-provider results without blocking independent providers", async () => {
 		const manager = new ModelDiscoveryManager<{ provider: string }>();

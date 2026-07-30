@@ -165,7 +165,10 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			staticModels: [],
 			cacheDbPath: callbacks.cacheDbPath,
 			cacheTtlMs: 24 * 60 * 60 * 1000,
-			canPublishCache: () => this.isCurrent(token),
+			canPublishCache: () =>
+				this.isCurrent(token) &&
+				(callbacks.getEvidenceGeneration === undefined ||
+					callbacks.getEvidenceGeneration(provider) === authGeneration),
 			fetchDynamicModels: async () => {
 				try {
 					return await callbacks.fetchModels(provider, apiKey);
