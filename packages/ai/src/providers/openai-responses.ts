@@ -27,6 +27,7 @@ import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
 	isInvalidPromptError,
+	neutralizeReservedControlTokens,
 	neutralizeResponsesInputControlTokens,
 	normalizeSystemPrompts,
 	resolveCacheRetention,
@@ -533,7 +534,13 @@ function buildParams(
 	);
 	const messages: ResponseInput = neutralizeResponsesInputControlTokens(conversationMessages);
 
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	// Neutralize leaked Harmony control tokens in the system prompt too: the
+	// `instructions` field and developer-role messages bypass the `input`
+	// request-boundary sanitizer above, and a poisoned system prompt (e.g.
+	// injected project context quoting `<|channel|>` markers) rejects EVERY
+	// turn with `Request blocked (code=invalid_prompt)` — unrepairable by the
+	// history circuit breaker.
+	const systemPrompts = normalizeSystemPrompts(context.systemPrompt).map(neutralizeReservedControlTokens);
 	if (isComposerHarnessModel(model.id)) {
 		systemPrompts.unshift(COMPOSER_EDIT_DISCIPLINE_PROMPT);
 	}
