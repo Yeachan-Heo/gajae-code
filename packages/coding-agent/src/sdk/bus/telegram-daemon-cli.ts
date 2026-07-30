@@ -267,6 +267,24 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				daemon.requestStop("stop");
 				return;
 			}
+			// The owner id embeds the spawning session's PID (e.g. "18208-ms5udiwl-...").
+			// When that session exits, its detached daemon keeps running because the
+			// startup-only liveness check at process spawn never repeats — so a later
+			// session spawns a fresh daemon while the orphaned one still polls the same
+			// bot token. Telegram then round-robins callback queries between the two,
+			// and every button on the older daemon's in-memory messageRoutes misses,
+			// flooding the chat with "This button is stale after notification daemon
+			// restart." Re-check the launcher PID each tick and self-exit once it is
+			// gone, closing the orphaned-poller window. PIDs absent from the owner id
+			// (Windows source launchers) are left alone via ownerProcessIsAlive's guard.
+			if (!ownerProcessIsAlive(ownerId, deps)) {
+				recordDaemonCompatibilityDiagnostic(
+					"GJC notify daemon exiting because its spawning owner process is no longer alive",
+				);
+				stopRequested = true;
+				daemon.requestStop("stop");
+				return;
+			}
 			if (lastHeartbeatAt === undefined || heartbeatAt !== lastHeartbeatAt) {
 				lastHeartbeatAt = heartbeatAt;
 				stalledSince = now();
