@@ -27,9 +27,14 @@ function contextFor(notifications: Notification[]): HandlerContext {
 	} as HandlerContext;
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
+// Recursive watch registration is asynchronous on macOS fsevents, so an early write can land
+// before the watch is armed. Keep re-writing until the notification arrives.
+async function waitForChange(predicate: () => boolean, rewrite: () => void, timeoutMs = 20_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
-	while (!predicate() && Date.now() < deadline) await Bun.sleep(10);
+	while (!predicate() && Date.now() < deadline) {
+		rewrite();
+		await Bun.sleep(25);
+	}
 	if (!predicate()) throw new Error("Timed out waiting for filesystem notification");
 }
 
@@ -85,8 +90,10 @@ test("FS-002 fs/watch emits a real fs/changed notification for a nested file wri
 	}
 	expect(getFsWatchRegistrySize()).toBe(1);
 
-	writeFileSync(changedPath, "after");
-	await waitFor(() => notifications.some(notification => notification.method === "fs/changed"));
+	await waitForChange(
+		() => notifications.some(notification => notification.method === "fs/changed"),
+		() => writeFileSync(changedPath, `after ${Date.now()}`),
+	);
 	const changed = notifications.find(notification => notification.method === "fs/changed");
 	expect(changed).toBeDefined();
 	expect(stableValidators.serverNotificationParams["fs/changed"]?.(changed?.params)).toBe(true);

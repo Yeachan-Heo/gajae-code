@@ -17,10 +17,10 @@ import {
 	fsWriteFileHandler,
 	HandlerRegistry,
 	type HandlerResult,
-	hooksListHandler,
-	skillsListHandler,
 } from "../suites/handlers";
+import { hooksHandlers } from "../suites/hooks-handlers";
 import { configReadHandler, modelListHandler } from "../suites/model-config-handlers";
+import { skillsHandlers } from "../suites/skills-handlers";
 import { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
 
 const encoder = new TextEncoder();
@@ -75,8 +75,8 @@ test("implemented handler results validate against stable clientRequestResults",
 		{ method: "fs/remove", result: resultOf(await fsRemoveHandler({ path: directoryPath })) },
 		{ method: "config/read", result: resultOf(await configReadHandler({})) },
 		{ method: "model/list", result: resultOf(await modelListHandler({})) },
-		{ method: "skills/list", result: resultOf(await skillsListHandler({})) },
-		{ method: "hooks/list", result: resultOf(await hooksListHandler({})) },
+		{ method: "skills/list", result: resultOf(await skillsHandlers["skills/list"]({ cwds: [process.cwd()] })) },
+		{ method: "hooks/list", result: resultOf(await hooksHandlers["hooks/list"]({ cwds: [process.cwd()] })) },
 		{ method: "experimentalFeature/list", result: resultOf(await experimentalFeatureListHandler({})) },
 	];
 

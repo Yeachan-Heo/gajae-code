@@ -8,8 +8,12 @@
 
 import { commandExecHandlers } from "./command-exec-handlers";
 import { fsWatchHandlers } from "./fs-watch-handlers";
+import { goalsReviewHandlers } from "./goals-review-handlers";
+import { hooksHandlers } from "./hooks-handlers";
+import { mcpHandlers } from "./mcp-handlers";
 import { modelConfigHandlers } from "./model-config-handlers";
 import { processHandlers } from "./process-handlers";
+import { skillsHandlers } from "./skills-handlers";
 
 export interface HandlerContext {
 	/** Connection the request arrived on; notification handlers target it directly. */
@@ -160,20 +164,6 @@ export const fsRemoveHandler: MethodHandler = params => {
 	}
 };
 
-/** skills/list: list gjc skills for a cwd. */
-export const skillsListHandler: MethodHandler = () => {
-	// List gjc skills; the full skill-discovery integration is a later phase.
-	return {
-		ok: true,
-		result: { data: [] },
-	};
-};
-
-/** hooks/list: list gjc hooks for a cwd. */
-export const hooksListHandler: MethodHandler = () => {
-	return { ok: true, result: { data: [] } };
-};
-
 /** experimentalFeature/list: list feature flags. */
 export const experimentalFeatureListHandler: MethodHandler = () => {
 	return { ok: true, result: { data: [] } };
@@ -190,11 +180,13 @@ export function registerBuiltinHandlers(registry: HandlerRegistry): void {
 	registry.register("fs/readDirectory", fsReadDirectoryHandler);
 	registry.register("fs/createDirectory", fsCreateDirectoryHandler);
 	registry.register("fs/remove", fsRemoveHandler);
-	registry.register("skills/list", skillsListHandler);
-	registry.register("hooks/list", hooksListHandler);
 	registry.register("experimentalFeature/list", experimentalFeatureListHandler);
 	for (const [method, handler] of Object.entries(fsWatchHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(commandExecHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(processHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(modelConfigHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(mcpHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(skillsHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(hooksHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(goalsReviewHandlers)) registry.register(method, handler);
 }
