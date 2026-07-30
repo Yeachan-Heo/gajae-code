@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The GitHub status-line lookup now rejects malformed PR numbers and control-bearing or non-HTTP(S) URLs before they reach terminal rendering.
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30
