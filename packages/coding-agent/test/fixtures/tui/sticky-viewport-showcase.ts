@@ -112,7 +112,7 @@ export const semanticAnchorDigest = (input: {
 	cellStart: number;
 	cellEnd: number;
 	frameRow: number;
-	frameSha256: string;
+	frameTextSha256: string;
 }) =>
 	new Bun.CryptoHasher("sha256")
 		.update(
@@ -126,7 +126,7 @@ export const semanticAnchorDigest = (input: {
 				String(input.cellStart),
 				String(input.cellEnd),
 				String(input.frameRow),
-				input.frameSha256,
+				input.frameTextSha256,
 			]),
 		)
 		.digest("hex");
@@ -461,6 +461,13 @@ export async function renderStickyViewportShowcase(
 							const rows = canonicalText.split("\n");
 							const rowText = rows[anchor.frameRow];
 							if (rowText === undefined) throw new Error("semantic anchor frame row is outside the paint");
+							// Semantic identity must not move with the host's color encoding. The
+							// ANSI frame digest differs between indexed and truecolor hosts while the
+							// stripped paint is identical, so the preimage binds the stripped text and
+							// `frame_sha256` stays as a separate artifact-binding field.
+							const frameTextSha256 = new Bun.CryptoHasher("sha256")
+								.update(Bun.stripANSI(canonicalText))
+								.digest("hex");
 							const namespace = semanticAnchorNamespace(anchor.id);
 							if (!namespace) throw new Error("semantic anchor id carries no namespace");
 							return {
@@ -474,7 +481,7 @@ export async function renderStickyViewportShowcase(
 									cellStart: anchor.cellStart,
 									cellEnd: anchor.cellEnd,
 									frameRow: anchor.frameRow,
-									frameSha256,
+									frameTextSha256: frameTextSha256,
 								})}`,
 								namespace,
 								grapheme_start: anchor.graphemeStart,
@@ -484,6 +491,7 @@ export async function renderStickyViewportShowcase(
 								frame_start_row: anchor.frameRow,
 								row_text_sha256: new Bun.CryptoHasher("sha256").update(rowText).digest("hex"),
 								frame_sha256: frameSha256,
+								frame_text_sha256: frameTextSha256,
 							};
 						})()
 					: null,
