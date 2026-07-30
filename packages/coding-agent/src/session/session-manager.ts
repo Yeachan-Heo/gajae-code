@@ -8288,18 +8288,12 @@ export class SessionManager {
 				this.#headerExportRevision++;
 				this.#bytesSinceTitleAnchor = 0;
 			} catch (error) {
+				if (this.#sessionId !== sessionId || this.#sessionFile !== sessionFile || this.destination !== destination)
+					return;
 				const certifiedNoWrite =
 					(error instanceof ManagedAppendOutcomeError && error.outcome === "not_applied") ||
 					(error instanceof AtomicEntryWriteOutcomeError && error.outcome === "not_applied");
-				if (certifiedNoWrite) {
-					if (
-						this.#sessionId !== sessionId ||
-						this.#sessionFile !== sessionFile ||
-						this.destination !== destination
-					)
-						return;
-					throw error;
-				}
+				if (certifiedNoWrite) throw error;
 				// The append may have become replay-visible. Do not report a title commit
 				// and prevent later writes from relying on an uncertain transcript.
 				this.#recordPersistError(error);

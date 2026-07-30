@@ -107,6 +107,7 @@ class DeferredTitleReplacementStorage extends FileSessionStorage {
 	readonly replacementStarted = Promise.withResolvers<void>();
 	readonly releaseReplacement = Promise.withResolvers<void>();
 	#deferNextRename = true;
+	#rejectDeferredRename = false;
 
 	override async rename(from: string, to: string): Promise<void> {
 		if (this.#deferNextRename) {
@@ -114,7 +115,12 @@ class DeferredTitleReplacementStorage extends FileSessionStorage {
 			this.replacementStarted.resolve();
 			await this.releaseReplacement.promise;
 		}
+		if (this.#rejectDeferredRename) throw new Error("post_replace_ambiguous");
 		await super.rename(from, to);
+	}
+
+	rejectDeferredRename(): void {
+		this.#rejectDeferredRename = true;
 	}
 }
 class DeferredQueuedFlushStorage extends FileSessionStorage {
@@ -155,9 +161,13 @@ class DeferredRewriteCloseStorage extends FileSessionStorage {
 	readonly closeStarted = Promise.withResolvers<void>();
 	readonly releaseClose = Promise.withResolvers<void>();
 	#deferNextClose = false;
+	#rejectDeferredClose = false;
 
 	deferNextClose(): void {
 		this.#deferNextClose = true;
+	}
+	rejectDeferredClose(): void {
+		this.#rejectDeferredClose = true;
 	}
 
 	override openWriter(
@@ -176,6 +186,7 @@ class DeferredRewriteCloseStorage extends FileSessionStorage {
 					this.closeStarted.resolve();
 					await this.releaseClose.promise;
 				}
+				if (this.#rejectDeferredClose) throw new Error("deferred_close_failed");
 				await writer.close();
 			},
 			closeSync: () => writer.closeSync(),
@@ -361,6 +372,57 @@ describe("session title source persistence", () => {
 		expect(getHeader(await loadEntriesFromFile(sessionFile, storage))?.title).toBeUndefined();
 		expect(getHeader(await loadEntriesFromFile(successorFile, storage))?.title).toBeUndefined();
 		expect(fs.readdirSync(sessionDirectory).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	});
+	it("does not poison a successor when deferred title rewrite close fails after adoption", async () => {
+		const storage = new DeferredRewriteCloseStorage();
+		const sessionDirectory = path.join(testAgentDir, "close-failure-sessions");
+		const sessionFile = path.join(sessionDirectory, "legacy.jsonl");
+		fs.mkdirSync(sessionDirectory, { recursive: true });
+		fs.writeFileSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION - 1, id: "legacy-close", timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n${JSON.stringify({ type: "message", id: "user", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "hello", timestamp: 1 } })}\n`,
+		);
+		const session = await SessionManager.open(sessionFile, cwd, storage);
+		storage.deferNextClose();
+		const title = session.setSessionName("Rejected title", "user");
+		await storage.closeStarted.promise;
+		const successorFile = session.createBranchedSession(session.getLeafId()!)!;
+		storage.rejectDeferredClose();
+		storage.releaseClose.resolve();
+
+		await expect(title).resolves.toBe(false);
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const reopened = await SessionManager.open(successorFile, cwd, storage);
+		expect(reopened.getSessionName()).toBeUndefined();
+		expect(reopened.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant")).toBe(
+			true,
+		);
+	});
+	it("does not poison a successor when atomic replacement fails after adoption", async () => {
+		const storage = new DeferredTitleReplacementStorage();
+		const sessionDirectory = path.join(testAgentDir, "replace-failure-sessions");
+		const sessionFile = path.join(sessionDirectory, "legacy.jsonl");
+		fs.mkdirSync(sessionDirectory, { recursive: true });
+		fs.writeFileSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION - 1, id: "legacy-replace", timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n${JSON.stringify({ type: "message", id: "user", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "hello", timestamp: 1 } })}\n`,
+		);
+		const session = await SessionManager.open(sessionFile, cwd, storage);
+		const title = session.setSessionName("Rejected title", "user");
+		await storage.replacementStarted.promise;
+		const successorFile = session.createBranchedSession(session.getLeafId()!)!;
+		storage.rejectDeferredRename();
+		storage.releaseReplacement.resolve();
+
+		await expect(title).resolves.toBe(false);
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const reopened = await SessionManager.open(successorFile, cwd, storage);
+		expect(reopened.getSessionName()).toBeUndefined();
+		expect(reopened.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant")).toBe(
+			true,
+		);
 	});
 	it("keeps fresh title failures unpublished and distinguishes certified retry from ambiguous replay", async () => {
 		const certifiedStorage = new FileSessionStorage();
