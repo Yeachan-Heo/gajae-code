@@ -3,7 +3,6 @@ import * as path from "node:path";
 
 import {
 	renderStickyViewportShowcase,
-	STICKY_VIEWPORT_FRAME_TEXT_WITNESS,
 	STICKY_VIEWPORT_SHOWCASE_ENTRIES,
 	STICKY_VIEWPORT_SHOWCASE_KEYS,
 	type StickyViewportShowcaseEntry,
@@ -175,15 +174,6 @@ export function ansiToHtml(value: string): string {
 }
 const json = (value: unknown) => `${JSON.stringify(value, null, 2)}\n`;
 const hash = (value: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
-// Host-independent digest of a painted frame. `frame_sha256` hashes the ANSI
-// artifact, which legitimately differs between an indexed-color and a truecolor
-// host because `detectColorMode()` negotiates `38;5;n` versus `38;2;r;g;b` per
-// host. The ANSI-STRIPPED paint is byte-identical across both, so it is the only
-// frame-wide value that can be pinned to a committed witness without breaking
-// host portability. It lives here rather than in the fixture so the verifier
-// imports the derivation from a module that does not also own the expectation
-// table it is checked against.
-export const stickyViewportFrameTextDigest = (frame: string): string => hash(Bun.stripANSI(frame));
 const PROVENANCE_SOURCES = [
 	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
 	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
@@ -308,16 +298,6 @@ async function capture(entry: StickyViewportShowcaseEntry, root: string, sourceP
 		JSON.stringify(entry.stateId === "narrow-cjk" ? CJK_PHRASE_BOUNDARIES : [])
 	)
 		throw new Error(`${entry.key}: CJK phrase boundary metadata precondition failed`);
-	// Capture-time drift check. The verifier pins the whole painted frame to a
-	// committed witness, so a legitimate renderer change must update that table in
-	// the same reviewed commit. Asserting here makes the drift fail at capture with
-	// the observed digest in hand, instead of surfacing later as an opaque verify
-	// failure on an already-published bundle.
-	const frameTextDigest = stickyViewportFrameTextDigest(rendered.terminalText);
-	if (frameTextDigest !== STICKY_VIEWPORT_FRAME_TEXT_WITNESS[entry.key])
-		throw new Error(
-			`${entry.key}: painted frame digest is ${frameTextDigest} but the committed witness pins ${STICKY_VIEWPORT_FRAME_TEXT_WITNESS[entry.key]}`,
-		);
 	const directory = path.join(root, ...entry.key.split("/"));
 	await fs.mkdir(directory, { recursive: true });
 	const metadata = json({

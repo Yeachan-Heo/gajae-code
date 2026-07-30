@@ -14,7 +14,6 @@ import {
 	gitObjectType,
 	PROVENANCE_DIFF_SCOPE,
 	resolveRepositoryPath,
-	stickyViewportFrameTextDigest,
 	xterm256Color,
 } from "./capture-sticky-viewport-showcase";
 
@@ -695,6 +694,7 @@ const verifySemanticAnchor = (
 // the artifact digest and legitimately diverges between an indexed-color and a
 // truecolor host; the stripped paint does not, so it is the only frame-wide
 // surface that a single committed value can pin on both hosts.
+export const stickyViewportFrameTextDigest = (frame: string): string => hash(Bun.stripANSI(frame));
 const verifyFrameTextWitness = (key: string, text: string) => {
 	// Fail closed: an unwitnessed key is an unpinned frame, not a pass.
 	const expected: string | undefined = STICKY_VIEWPORT_FRAME_TEXT_WITNESS[key as StickyViewportShowcaseKey];

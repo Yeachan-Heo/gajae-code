@@ -152,10 +152,10 @@ export const semanticAnchorNamespace = (id: string) => id.split(":").slice(0, -1
 // here like every other key.
 //
 // Values are rendered output, not authored constants: regenerate by printing
-// `stickyViewportFrameTextDigest(render.terminalText)` for each key. This file is
-// in the verifier's `ORACLE_SOURCES`, so `verifyOracleIntegrity()` forces these
-// bytes to match their committed blob at the reviewed authority commit -- a
-// producer cannot restate the pin without a reviewed commit.
+// `stickyViewportFrameTextDigest(render.terminalText)` for each key. Both this
+// table and the digest derivation in the verifier are in `ORACLE_SOURCES`, so
+// `verifyOracleIntegrity()` forces them to match their committed blobs at the
+// reviewed authority commit -- a producer cannot restate either side.
 export const STICKY_VIEWPORT_FRAME_TEXT_WITNESS: Readonly<Record<StickyViewportShowcaseKey, string>> = Object.freeze({
 	"live-overflow/80x24/unicode-color": "18ff7c45f2d6871a12fe0c6eb5b444b8f53c3c83f012bf551c460753c1af4bbe",
 	"live-overflow/120x36/unicode-color": "d5ed298e00b6f3f775cca5103deec287d56a6cc5efa68fa5fb3da9f2bf7bced0",

@@ -10,10 +10,12 @@ import {
 	PROVENANCE_DIFF_SCOPE,
 	REPOSITORY_ROOT,
 	resolveRepositoryPath,
-	stickyViewportFrameTextDigest,
 	xterm256Color,
 } from "../scripts/capture-sticky-viewport-showcase";
-import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
+import {
+	stickyViewportFrameTextDigest,
+	verifyStickyViewportShowcase,
+} from "../scripts/verify-sticky-viewport-showcase";
 import {
 	SEMANTIC_ANCHOR_DOMAIN,
 	STICKY_VIEWPORT_FRAME_TEXT_WITNESS,
@@ -1093,7 +1095,6 @@ describe("sticky viewport production evidence verifier", () => {
 			// The operator may have declared an authority for the whole run (that is how
 			// an uncommitted staged oracle is reviewed). Save and restore it rather than
 			// deleting, or this case silently unpins every later case in the file.
-			const declared = process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT;
 			process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT = await git(["rev-parse", "HEAD"]);
 			try {
 				await restampProvenance(root);
@@ -1248,7 +1249,11 @@ describe("sticky viewport production evidence verifier", () => {
 		// frame witness their paint had no immutable expectation at all: every row was
 		// rewritable under the same coordinated rehash.
 		const root = await capture();
-		for (const key of ["capacity-zero/80x24/unicode-color", "capacity-zero/48x10/ascii-no-color"] as const) {
+		for (const key of [
+			"capacity-zero/80x24/unicode-color",
+			"capacity-zero/120x36/unicode-color",
+			"capacity-zero/48x10/ascii-no-color",
+		] as const) {
 			const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-frame-zero-"));
 			roots.push(clone);
 			await fs.cp(root, clone, { recursive: true });
