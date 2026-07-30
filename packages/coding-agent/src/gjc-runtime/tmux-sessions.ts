@@ -4,9 +4,10 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@gajae-code/natives";
+import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
-import { tmuxRuntimeSessionPath } from "./session-layout";
+import { GJC_DIR, GJC_SESSION_PREFIX, tmuxRuntimeSessionPath } from "./session-layout";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -15,14 +16,18 @@ import {
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "./session-state-sidecar";
 import {
+	assertGjcTmuxMutationAuthoritySync,
+	bindGjcTmuxProviderAuthority,
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
 	buildGjcTmuxUntaggedSessionError,
+	buildTmuxProviderCommand,
 	GJC_TMUX_BRANCH_OPTION,
 	GJC_TMUX_BRANCH_SLUG_OPTION,
+	GJC_TMUX_COMMAND_ENV,
 	GJC_TMUX_OWNER_GENERATION_OPTION,
 	GJC_TMUX_OWNER_SERVER_KEY_OPTION,
 	GJC_TMUX_PROFILE_OPTION,
@@ -31,8 +36,13 @@ import {
 	GJC_TMUX_SESSION_ID_OPTION,
 	GJC_TMUX_SESSION_STATE_FILE_OPTION,
 	GJC_TMUX_VERSION_OPTION,
+	hasGjcTmuxProviderAuthoritySync,
 	normalizeTmuxCreatedAt,
+	type ProviderAuthority,
+	persistGjcTmuxProviderAuthoritySync,
+	readGjcTmuxProviderAuthoritySync,
 	resolveGjcTmuxCommand,
+	resolveGjcTmuxProviderContext,
 } from "./tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
@@ -52,6 +62,11 @@ import {
 	type TmuxOwnerIsolationExecutionResult,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
+import {
+	assertGjcTmuxStagedMutationAuthoritySync,
+	gjcTmuxAuthorityPlatform,
+	listGjcTmuxProviderAuthoritiesSync,
+} from "./tmux-provider-context";
 import { buildWindowsPowerShellInnerCommand } from "./windows-powershell-command";
 
 export interface GjcTmuxSessionStatus {
@@ -69,6 +84,9 @@ export interface GjcTmuxSessionStatus {
 	version?: string;
 	ownerGeneration?: string;
 	nativeSessionId?: string;
+	psmuxIncarnation?: string;
+	/** Exact durable provider binding used to discover this psmux session. */
+	providerAuthority?: ProviderAuthority;
 
 	panePids: number[];
 	profile?: string;
@@ -84,6 +102,7 @@ export interface GjcTmuxSessionTagsForGc {
 	version?: string;
 	ownerGeneration?: string;
 	nativeSessionId?: string;
+	psmuxIncarnation?: string;
 
 	createdAt?: string;
 	attached?: boolean;
@@ -99,6 +118,7 @@ export interface ProvenTmuxSessionIdentity {
 	nativeSessionId: string;
 	serverPid: number;
 	serverStartTime: string;
+	psmuxIncarnation?: string;
 }
 
 export interface ExpectedGjcTmuxSessionIdentity {
@@ -108,6 +128,7 @@ export interface ExpectedGjcTmuxSessionIdentity {
 	sessionStateFile: string;
 	project: string;
 	createdAt: string;
+	psmuxIncarnation?: string;
 }
 
 export interface ExactOwnerIdentity {
@@ -128,6 +149,7 @@ export interface ForceCloseOwnerDependencies {
 	sleep(ms: number): Promise<void>;
 	listPanePids(sessionName: string, env: NodeJS.ProcessEnv): number[];
 }
+const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 
 const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 5_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
@@ -156,15 +178,57 @@ export function __setMutationServerProofForTests(
 	mutationServerProofTestDependency = dependency;
 }
 
-function runTmux(args: string[], env: NodeJS.ProcessEnv = process.env): string {
-	const tmuxCommand = resolveGjcTmuxCommand(env);
-	const result = Bun.spawnSync([tmuxCommand, ...args], {
-		stdout: "pipe",
-		stderr: "pipe",
-		env,
-	});
-	if (result.exitCode === 0) return result.stdout.toString();
-	throw new Error(result.stderr.toString().trim() || `tmux ${args.join(" ")} failed`);
+function psmuxAuthorityFromEnv(env: NodeJS.ProcessEnv): ProviderAuthority | null {
+	const stateDir = env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim();
+	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim();
+	const generation = env[GJC_TMUX_OWNER_GENERATION_ENV]?.trim();
+	if (!stateDir || !sessionId || !generation) return null;
+	if (!hasGjcTmuxProviderAuthoritySync({ stateDir, sessionId, generation })) return null;
+	return readGjcTmuxProviderAuthoritySync({ stateDir, sessionId, generation });
+}
+function environmentForProviderAuthority(
+	env: NodeJS.ProcessEnv,
+	authority: ProviderAuthority | undefined,
+): NodeJS.ProcessEnv {
+	if (!authority) return env;
+	return {
+		...env,
+		[GJC_TMUX_COMMAND_ENV]: authority.command,
+		[GJC_TMUX_OWNER_STATE_DIR_ENV]: authority.stateDir,
+		[GJC_COORDINATOR_SESSION_ID_ENV]: authority.sessionId,
+		[GJC_TMUX_OWNER_GENERATION_ENV]: authority.generation,
+	};
+}
+
+function runTmux(
+	args: string[],
+	env: NodeJS.ProcessEnv = process.env,
+	provisionalAuthority?: ProviderAuthority,
+): string {
+	const authority = provisionalAuthority ?? psmuxAuthorityFromEnv(env);
+	const binary = resolveGjcTmuxBinary({ env });
+	if (binary.isPsmux && !authority) throw new Error("gjc_tmux_provider_authority_unavailable");
+	const tmuxCommand = authority?.command ?? binary.command;
+	if (authority)
+		(provisionalAuthority ? assertGjcTmuxStagedMutationAuthoritySync : assertGjcTmuxMutationAuthoritySync)(authority);
+	let result: Bun.SyncSubprocess<"pipe", "pipe">;
+	try {
+		result = Bun.spawnSync(
+			[tmuxCommand, ...(authority ? buildTmuxProviderCommand(authority, args[0]!, args.slice(1)) : args)],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
+	} finally {
+		if (authority)
+			(provisionalAuthority ? assertGjcTmuxStagedMutationAuthoritySync : assertGjcTmuxMutationAuthoritySync)(
+				authority,
+			);
+	}
+	if (result.exitCode === 0) return result.stdout?.toString() ?? "";
+	throw new Error(result.stderr?.toString().trim() || `tmux ${args.join(" ")} failed`);
 }
 function normalizeExactTmuxTarget(sessionTarget: string, env: NodeJS.ProcessEnv, kind: "session" | "option"): string {
 	if (sessionTarget.startsWith("$")) return sessionTarget;
@@ -209,6 +273,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 		sessionStateFile = "",
 		ownerGeneration = "",
 		version = "",
+		psmuxIncarnation = "",
 		nativeSessionId = "",
 	] = line.split("\t");
 
@@ -232,7 +297,8 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 		sessionStateFile: sessionStateFile || undefined,
 		version: version || undefined,
 		ownerGeneration: ownerGeneration || undefined,
-		nativeSessionId: nativeSessionId || undefined,
+		psmuxIncarnation: nativeSessionId ? psmuxIncarnation || undefined : undefined,
+		nativeSessionId: nativeSessionId || (psmuxIncarnation.startsWith("$") ? psmuxIncarnation : undefined),
 	};
 }
 
@@ -270,7 +336,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 				const [, name, windows, created] = match;
 				const createdEpoch = String(Math.floor(new Date(`${created} UTC`).getTime() / 1000) || 0);
 
-				return [name, windows, "0", createdEpoch, "", "", "0", "", "", "", "", "", "", "", "", ""].join("\t");
+				return [name, windows, "0", createdEpoch, "", "", "0", "", "", "", "", "", "", "", "", "", ""].join("\t");
 			});
 		}
 	}
@@ -279,7 +345,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 
 function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
 	return runListSessions(
-		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}\t#{${GJC_TMUX_OWNER_GENERATION_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}\t#{session_id}`,
+		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}\t#{${GJC_TMUX_OWNER_GENERATION_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}\t#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}}\t#{session_id}`,
 
 		env,
 	);
@@ -288,28 +354,98 @@ function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
 function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[] {
 	return runListSessions("#{session_name}", env).map(line => line.split("\t")[0] ?? line);
 }
+function canonicalProviderStateDirs(cwd: string): string[] {
+	const gjcDir = path.join(cwd, GJC_DIR);
+	let entries: fsSync.Dirent[];
+	try {
+		entries = fsSync.readdirSync(gjcDir, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	return entries
+		.filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && entry.name.startsWith(GJC_SESSION_PREFIX))
+		.map(entry => path.join(gjcDir, entry.name, "runtime", "tmux-sessions"))
+		.filter(candidate => {
+			try {
+				return fsSync.lstatSync(candidate).isDirectory();
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+				throw error;
+			}
+		});
+}
+
+function psmuxAuthorityEnvironments(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv[] {
+	const explicitAuthority = psmuxAuthorityFromEnv(env);
+	if (explicitAuthority) return [environmentForProviderAuthority(env, explicitAuthority)];
+	const explicitStateDir =
+		env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim() ??
+		(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ? path.dirname(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]) : "");
+	const ambient = resolveGjcTmuxBinary({ env });
+	if (gjcTmuxAuthorityPlatform() === "win32") {
+		const ambientAvailable = path.isAbsolute(ambient.command)
+			? fsSync.existsSync(ambient.command)
+			: Bun.which(ambient.command) !== null;
+		const shouldDiscoverPersisted = ambient.isPsmux || (!ambient.viaExplicitOverride && !ambientAvailable);
+		if (shouldDiscoverPersisted) {
+			const stateDirs = explicitStateDir ? [explicitStateDir] : canonicalProviderStateDirs(process.cwd());
+			const authorities = stateDirs.flatMap(stateDir => {
+				try {
+					return listGjcTmuxProviderAuthoritiesSync(stateDir);
+				} catch (error) {
+					const classification = managedSecurityFailureClassification(error);
+					const message =
+						typeof error === "object" && error !== null && "message" in error && typeof error.message === "string"
+							? error.message
+							: "";
+					const foreignOwner = classification === "owner_mismatch" || message.endsWith(": owner_mismatch");
+					if (!explicitStateDir && foreignOwner) return [];
+					throw error;
+				}
+			});
+			if (authorities.length > 0)
+				return authorities.map(authority => environmentForProviderAuthority(env, authority));
+		}
+	}
+	if (ambient.isPsmux) throw new Error("gjc_tmux_provider_authority_unavailable");
+	return [env];
+}
 
 export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus[] {
-	return listSessionLines(env)
-		.map(parseSessionLine)
-		.filter((session): session is GjcTmuxSessionStatus => session != null)
-		.map(session => hydrateSessionFromExactOptions(session, env))
-		.filter((session): session is GjcTmuxSessionStatus => session?.profile === GJC_TMUX_PROFILE_VALUE)
-		.sort((a, b) => a.name.localeCompare(b.name));
+	const discovered = psmuxAuthorityEnvironments(env).flatMap(authorityEnv => {
+		const authority = psmuxAuthorityFromEnv(authorityEnv) ?? undefined;
+		return listSessionLines(authorityEnv)
+			.map(parseSessionLine)
+			.filter((session): session is GjcTmuxSessionStatus => session != null)
+			.map(session => hydrateSessionFromExactOptions(session, authorityEnv))
+			.filter((session): session is GjcTmuxSessionStatus => session?.profile === GJC_TMUX_PROFILE_VALUE)
+			.map(session => (authority ? { ...session, providerAuthority: authority } : session));
+	});
+	const names = new Set<string>();
+	for (const session of discovered) {
+		if (names.has(session.name)) throw new Error(`gjc_tmux_provider_authority_ambiguous:${session.name}`);
+		names.add(session.name);
+	}
+	return discovered.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** @internal */
 export function listTmuxSessionsForGc(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionsForGc {
-	const sessions = listSessionLines(env)
-		.map(parseSessionLine)
-		.filter((session): session is GjcTmuxSessionStatus => session != null)
-		.map(session => hydrateSessionFromExactOptions(session, env));
+	const authorityEnvironments = psmuxAuthorityEnvironments(env);
+	const sessions = authorityEnvironments.flatMap(authorityEnv =>
+		listSessionLines(authorityEnv)
+			.map(parseSessionLine)
+			.filter((session): session is GjcTmuxSessionStatus => session != null)
+			.map(session => hydrateSessionFromExactOptions(session, authorityEnv)),
+	);
 	const tagged = sessions
 		.filter(session => session.profile === GJC_TMUX_PROFILE_VALUE)
 		.sort((a, b) => a.name.localeCompare(b.name));
 	const taggedNames = new Set(tagged.map(session => session.name));
 	const byName = new Map(sessions.map(session => [session.name, session]));
-	const untagged = listRawTmuxSessionNames(env)
+	const untagged = authorityEnvironments
+		.flatMap(authorityEnv => listRawTmuxSessionNames(authorityEnv))
 		.filter(name => !taggedNames.has(name))
 		.map(
 			name =>
@@ -367,7 +503,8 @@ export function createGjcTmuxSession(
 	options: CreateGjcTmuxSessionOptions = {},
 ): GjcTmuxSessionStatus {
 	const platform = options.platform ?? process.platform;
-	const tmuxCommand = resolveGjcTmuxCommand(env, platform);
+	const provider = resolveGjcTmuxProviderContext({ env, platform });
+	const tmuxCommand = provider.command;
 	const sessionName = buildGjcTmuxSessionName(env);
 	const cwd = process.cwd();
 	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName;
@@ -376,6 +513,7 @@ export function createGjcTmuxSession(
 		tmuxRuntimeSessionPath(cwd, env.GJC_SESSION_ID?.trim() || sessionId, buildGjcTmuxSessionSlug(sessionName));
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
+	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
 	const childEnvironment: Record<string, string> = {
 		GJC_TMUX_LAUNCHED: "1",
 		[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
@@ -384,6 +522,7 @@ export function createGjcTmuxSession(
 		[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 		[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
 	};
+	const executionEnv = { ...env, ...childEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 	const command =
 		platform === "win32"
@@ -393,12 +532,13 @@ export function createGjcTmuxSession(
 					.join(" ")} gjc`;
 	const tmuxArgv = [
 		tmuxCommand,
-		"new-session",
-		"-d",
-		"-s",
-		sessionName,
-		...(platform === "win32" ? [] : ["-P", "-F", "#{session_id}"]),
-		command,
+		...buildTmuxProviderCommand(provider, "new-session", [
+			"-d",
+			"-s",
+			sessionName,
+			...(platform === "win32" ? [] : ["-P", "-F", "#{session_id}"]),
+			command,
+		]),
 	];
 	function probeTmuxServer(tmuxCommand: string, env: NodeJS.ProcessEnv): TmuxServerProof {
 		if (platform !== "linux") {
@@ -446,7 +586,7 @@ export function createGjcTmuxSession(
 		}
 	}
 
-	const probeServer = () => probeTmuxServer(tmuxCommand, env);
+	const probeServer = () => probeTmuxServer(tmuxCommand, executionEnv);
 
 	const testOwnerProbe = createOwnerIsolationTestDependencies?.probe;
 	const ownerProbe: OwnerIsolationProbeSync = {
@@ -490,8 +630,6 @@ export function createGjcTmuxSession(
 				}
 			}),
 	};
-	if (resolveGjcTmuxBinary({ env, platform }).isPsmux)
-		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
 
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const ownerPlan = planTmuxOwnerIsolationSync(
@@ -510,19 +648,25 @@ export function createGjcTmuxSession(
 		ownerProbe,
 	);
 	if (!ownerPlan.ok) throw new Error(`gjc_tmux_owner_isolation_${ownerPlan.code}:${ownerPlan.diagnostic}`);
+	persistGjcTmuxProviderAuthoritySync(authority);
 
 	const outcome = (createOwnerIsolationTestDependencies?.execute ?? executeTmuxOwnerIsolationPlanSync)(ownerPlan, {
 		socketKey: tmuxCommand,
 		spawn: (argv, stdinLine) => {
-			const result = stdinLine
-				? Bun.spawnSync(argv, {
-						stdout: "pipe",
-						stderr: "pipe",
-						stdin: Buffer.from(stdinLine),
-						env,
-					})
-				: Bun.spawnSync(argv, { stdout: "pipe", stderr: "pipe", env });
-			return { exitCode: result.exitCode, stdout: result.stdout.toString() };
+			assertGjcTmuxStagedMutationAuthoritySync(authority);
+			try {
+				const result = stdinLine
+					? Bun.spawnSync(argv, {
+							stdout: "pipe",
+							stderr: "pipe",
+							stdin: Buffer.from(stdinLine),
+							env: executionEnv,
+						})
+					: Bun.spawnSync(argv, { stdout: "pipe", stderr: "pipe", env: executionEnv });
+				return { exitCode: result.exitCode, stdout: result.stdout.toString() };
+			} finally {
+				assertGjcTmuxStagedMutationAuthoritySync(authority);
+			}
 		},
 		probeServer: ownerProbe.probeServer,
 		isCurrentGeneration: () => isOwnerGenerationBaselineCurrentSync(stateDir, sessionId, baseline),
@@ -532,108 +676,92 @@ export function createGjcTmuxSession(
 				nativeSessionId,
 				execution.attempt_session,
 				tmuxCommand,
-				env,
+				executionEnv,
 				server.pid,
 				server.startTime,
 				server.pidProven,
+				authority,
 			);
 		},
 	});
 	if (!outcome.ok) throw new Error(`gjc_tmux_owner_isolation_${outcome.code}:${outcome.diagnostic}`);
 
-	const nativeSessionId = outcome.native_session_id;
+	const nativeSessionId = outcome.native_session_id ?? (provider.binary.isPsmux ? sessionName : undefined);
 	if (!nativeSessionId) throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
-	const server = requireSafeTmuxServerForMutation(tmuxCommand, env);
+	const psmuxIncarnation = provider.binary.isPsmux ? crypto.randomUUID() : undefined;
+	const server = requireSafeTmuxServerForMutation(tmuxCommand, executionEnv);
 	if (server.pid !== outcome.server_pid || server.startTime !== outcome.server_start_time)
 		throw new Error("gjc_tmux_owner_changed_after_create");
-	if (!isNativeTmuxSessionBoundToName(nativeSessionId, sessionName, env))
+	if (!provider.binary.isPsmux && !isNativeTmuxSessionBoundToName(nativeSessionId, sessionName, executionEnv))
 		throw new Error("gjc_tmux_owner_changed_after_create");
 
+	const createdMetadata = {
+		sessionId,
+		sessionStateFile: stateFile,
+		ownerGeneration: generation,
+		ownerServerKey: tmuxCommand,
+		version: env.npm_package_version ?? null,
+	};
 	try {
 		tagCreatedTmuxSession(
 			nativeSessionId,
 			sessionName,
 			{ pid: outcome.server_pid, pidProven: server.pidProven },
-			env,
-			{
-				sessionId,
-				sessionStateFile: stateFile,
-				ownerGeneration: generation,
-				ownerServerKey: tmuxCommand,
-				version: env.npm_package_version ?? null,
-			},
+			executionEnv,
+			{ ...createdMetadata },
 			tmuxCommand,
+			authority,
 		);
-	} catch (tagError) {
-		try {
-			cleanupExactCreatedTmuxSession(
-				nativeSessionId,
-				sessionName,
-				tmuxCommand,
-				env,
-				outcome.server_pid,
-				outcome.server_start_time,
-				server.pidProven,
+		if (psmuxIncarnation) {
+			runTmux(
+				[
+					"set-option",
+					"-t",
+					normalizeExactTmuxTarget(sessionName, executionEnv, "option"),
+					GJC_TMUX_PSMUX_INCARNATION_OPTION,
+					psmuxIncarnation,
+				],
+				executionEnv,
+				authority,
 			);
-		} catch (cleanupError) {
-			throw new AggregateError([tagError, cleanupError], "gjc_tmux_profile_tag_failed_cleanup_failed");
 		}
-		throw tagError;
-	}
-
-	if (nativeSessionId) {
-		const firstServer = requireSafeTmuxServerForMutation(tmuxCommand, env);
+		if (!createdTmuxMetadataMatches(nativeSessionId, createdMetadata, psmuxIncarnation, executionEnv, authority))
+			throw new Error("gjc_tmux_created_metadata_mismatch");
+		const reprovenIdentity = proveGjcTmuxSessionMutationTarget(sessionName, executionEnv, authority);
+		if (
+			reprovenIdentity.nativeSessionId !== nativeSessionId ||
+			reprovenIdentity.serverPid !== outcome.server_pid ||
+			reprovenIdentity.serverStartTime !== outcome.server_start_time ||
+			reprovenIdentity.psmuxIncarnation !== psmuxIncarnation
+		)
+			throw new Error("gjc_tmux_owner_changed_after_create");
+		const firstServer = requireSafeTmuxServerForMutation(tmuxCommand, executionEnv);
 		if (firstServer.pid !== outcome.server_pid || firstServer.startTime !== outcome.server_start_time)
 			throw new Error("gjc_tmux_owner_changed_after_create");
-		const status = statusGjcTmuxSessionByNativeId(nativeSessionId, env);
-		const finalServer = requireSafeTmuxServerForMutation(tmuxCommand, env);
+		const finalServer = requireSafeTmuxServerForMutation(tmuxCommand, executionEnv);
 		if (finalServer.pid !== firstServer.pid || finalServer.startTime !== firstServer.startTime)
 			throw new Error("gjc_tmux_owner_changed_after_create");
-		try {
-			replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline);
-		} catch (publicationError) {
-			try {
-				cleanupExactCreatedTmuxSession(
-					nativeSessionId,
-					sessionName,
-					tmuxCommand,
-					env,
-					outcome.server_pid,
-					outcome.server_start_time,
-					finalServer.pidProven,
-				);
-			} catch (cleanupError) {
-				throw new AggregateError(
-					[publicationError, cleanupError],
-					"gjc_tmux_owner_generation_publish_failed_cleanup_failed",
-				);
-			}
-			throw publicationError;
-		}
-		return status;
-	}
-	try {
 		replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline);
-	} catch (publicationError) {
+	} catch (precommitError) {
 		try {
 			cleanupExactCreatedTmuxSession(
 				nativeSessionId,
 				sessionName,
 				tmuxCommand,
-				env,
+				executionEnv,
 				outcome.server_pid,
 				outcome.server_start_time,
 				server.pidProven,
+				authority,
 			);
 		} catch (cleanupError) {
-			throw new AggregateError(
-				[publicationError, cleanupError],
-				"gjc_tmux_owner_generation_publish_failed_cleanup_failed",
-			);
+			throw new AggregateError([precommitError, cleanupError], "gjc_tmux_precommit_failed_cleanup_failed");
 		}
-		throw publicationError;
+		throw precommitError;
 	}
-	return statusGjcTmuxSession(sessionName, env);
+	return provider.binary.isPsmux
+		? statusGjcTmuxSession(sessionName, executionEnv)
+		: statusGjcTmuxSessionByNativeId(nativeSessionId, executionEnv);
 }
 
 function statusGjcTmuxSessionByNativeId(nativeSessionId: string, env: NodeJS.ProcessEnv): GjcTmuxSessionStatus {
@@ -665,12 +793,16 @@ function guardedTmuxSessionPredicate(
 	nativeSessionId: string,
 	sessionName: string,
 	expectedOwnerGeneration?: string,
+	expectedPsmuxIncarnation?: string,
 ): string {
 	const ownerGenerationPredicate = expectedOwnerGeneration
 		? `#{==:#{${GJC_TMUX_OWNER_GENERATION_OPTION}},${expectedOwnerGeneration}}`
 		: "1";
 	const serverPidPredicate = expectedServer.pidProven === false ? "1" : `#{==:#{pid},${expectedServer.pid}}`;
-	return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${nativeSessionId}},#{&&:#{==:#{session_name},${sessionName}},${ownerGenerationPredicate}}}}`;
+	if (!expectedPsmuxIncarnation)
+		return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${nativeSessionId}},#{&&:#{==:#{session_name},${sessionName}},${ownerGenerationPredicate}}}}`;
+	const psmuxIncarnationPredicate = `#{==:#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}},${expectedPsmuxIncarnation}}`;
+	return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${nativeSessionId}},#{&&:#{==:#{session_name},${sessionName}},#{&&:${ownerGenerationPredicate},${psmuxIncarnationPredicate}}}}}`;
 }
 
 function runGuardedTmuxSessionCommand(
@@ -680,6 +812,8 @@ function runGuardedTmuxSessionCommand(
 	env: NodeJS.ProcessEnv,
 	thenCommand: string,
 	expectedOwnerGeneration?: string,
+	provisionalAuthority?: ProviderAuthority,
+	expectedPsmuxIncarnation?: string,
 ): void {
 	const result = runTmux(
 		[
@@ -687,11 +821,18 @@ function runGuardedTmuxSessionCommand(
 			"-t",
 			normalizeExactTmuxTarget(nativeSessionId, env, "session"),
 			"-F",
-			guardedTmuxSessionPredicate(expectedServer, nativeSessionId, sessionName, expectedOwnerGeneration),
+			guardedTmuxSessionPredicate(
+				expectedServer,
+				nativeSessionId,
+				sessionName,
+				expectedOwnerGeneration,
+				expectedPsmuxIncarnation,
+			),
 			`${thenCommand} ; display-message -p __gjc_tmux_guarded_mutation_ok__`,
 			"display-message -p __gjc_tmux_guarded_mutation_refused__",
 		],
 		env,
+		provisionalAuthority,
 	).trim();
 	if (result !== "__gjc_tmux_guarded_mutation_ok__") throw new Error("gjc_tmux_cleanup_target_changed");
 }
@@ -712,12 +853,21 @@ function tagCreatedTmuxSession(
 		version?: string | null;
 	},
 	tmuxCommand: string,
+	provisionalAuthority?: ProviderAuthority,
 ): void {
 	const target = `${nativeSessionId}:`;
 	const commands = buildGjcTmuxProfileCommands(target, env, metadata, { tmuxCommand })
 		.map(command => command.args.map(tmuxCommandArgument).join(" "))
 		.join(" ; ");
-	runGuardedTmuxSessionCommand(nativeSessionId, sessionName, expectedServer, env, commands);
+	runGuardedTmuxSessionCommand(
+		nativeSessionId,
+		sessionName,
+		expectedServer,
+		env,
+		commands,
+		undefined,
+		provisionalAuthority,
+	);
 }
 
 function cleanupExactCreatedTmuxSession(
@@ -728,6 +878,7 @@ function cleanupExactCreatedTmuxSession(
 	expectedPid: number,
 	expectedStartTime: string,
 	expectedPidProven?: boolean,
+	provisionalAuthority?: ProviderAuthority,
 ): void {
 	const server = requireSafeTmuxServerForMutation(tmuxCommand, env);
 	if (server.pid !== expectedPid || server.startTime !== expectedStartTime)
@@ -738,6 +889,8 @@ function cleanupExactCreatedTmuxSession(
 		{ pid: expectedPid, pidProven: expectedPidProven ?? server.pidProven },
 		env,
 		`kill-session -t ${tmuxCommandArgument(normalizeExactTmuxTarget(nativeSessionId, env, "session"))}`,
+		undefined,
+		provisionalAuthority,
 	);
 }
 
@@ -786,33 +939,44 @@ function requireSafeTmuxServerForMutation(
 export function proveGjcTmuxSessionMutationTarget(
 	sessionName: string,
 	env: NodeJS.ProcessEnv = process.env,
+	provisionalAuthority?: ProviderAuthority,
 ): ProvenTmuxSessionIdentity {
-	const session = statusGjcTmuxSession(sessionName, env);
-	if (readProfileForExactTarget(session.name, env) !== GJC_TMUX_PROFILE_VALUE)
+	const target = provisionalAuthority ? sessionName : statusGjcTmuxSession(sessionName, env).name;
+	if (readProfileForExactTarget(target, env, provisionalAuthority) !== GJC_TMUX_PROFILE_VALUE)
 		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
 	const firstServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(env), env);
-	if (resolveGjcTmuxBinary({ env }).isPsmux) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
-	const nativeSessionId = readNativeTmuxSessionId(session.name, env);
+	const nativeSessionId = readNativeTmuxSessionId(target, env, provisionalAuthority);
 	if (!nativeSessionId) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	if (
-		readNativeTmuxSessionId(nativeSessionId, env) !== nativeSessionId ||
-		readProfileForExactTarget(nativeSessionId, env) !== GJC_TMUX_PROFILE_VALUE
+		readNativeTmuxSessionId(nativeSessionId, env, provisionalAuthority) !== nativeSessionId ||
+		readProfileForExactTarget(nativeSessionId, env, provisionalAuthority) !== GJC_TMUX_PROFILE_VALUE
 	)
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
 	const finalServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(env), env);
 	if (finalServer.pid !== firstServer.pid || finalServer.startTime !== firstServer.startTime)
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
+	const psmuxIncarnation = resolveGjcTmuxBinary({ env }).isPsmux
+		? readExactOptionForGc(target, GJC_TMUX_PSMUX_INCARNATION_OPTION, env, provisionalAuthority)
+		: undefined;
+	if (resolveGjcTmuxBinary({ env }).isPsmux && !psmuxIncarnation)
+		throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	return {
 		nativeSessionId,
 		serverPid: finalServer.pid,
 		serverStartTime: finalServer.startTime,
+		psmuxIncarnation,
 	};
 }
 
-function readProfileForExactTarget(sessionName: string, env: NodeJS.ProcessEnv): string {
+function readProfileForExactTarget(
+	sessionName: string,
+	env: NodeJS.ProcessEnv,
+	provisionalAuthority?: ProviderAuthority,
+): string {
 	const raw = runTmux(
 		["show-options", "-qv", "-t", normalizeExactTmuxTarget(sessionName, env, "option"), GJC_TMUX_PROFILE_OPTION],
 		env,
+		provisionalAuthority,
 	).trim();
 	// tmux returns just the value; psmux returns `key value`. Strip the
 	// leading key on psmux so the GJC_TMUX_PROFILE_VALUE equality check
@@ -824,15 +988,20 @@ function readProfileForExactTarget(sessionName: string, env: NodeJS.ProcessEnv):
 	return raw;
 }
 
-function readExactOptionForGc(sessionName: string, option: string, env: NodeJS.ProcessEnv): string | undefined {
+function readExactOptionForGc(
+	sessionName: string,
+	option: string,
+	env: NodeJS.ProcessEnv,
+	provisionalAuthority?: ProviderAuthority,
+): string | undefined {
 	try {
 		const raw = runTmux(
 			["show-options", "-qv", "-t", normalizeExactTmuxTarget(sessionName, env, "option"), option],
 			env,
+			provisionalAuthority,
 		).trim();
 		if (!raw) return undefined;
-		// tmux returns just the option value (e.g. `1` for @gjc-profile).
-		// psmux 3.3.0 returns `key value` (or `key "value with space"` for
+		// tmux returns just the value; psmux returns `key value` (or `key "value with space"` for
 		// @gjc-branch etc.). On psmux, parse the last token and strip any
 		// surrounding double quotes so both shapes resolve to the same value.
 		if (resolveGjcTmuxBinary({ env }).isPsmux) {
@@ -851,13 +1020,69 @@ function readExactOptionForGc(sessionName: string, option: string, env: NodeJS.P
 		return undefined;
 	}
 }
+function readCreatedTmuxMetadataOption(
+	nativeSessionId: string,
+	option: string,
+	env: NodeJS.ProcessEnv,
+	provisionalAuthority?: ProviderAuthority,
+): string | undefined {
+	try {
+		const raw = runTmux(
+			["show-options", "-qv", "-t", normalizeExactTmuxTarget(nativeSessionId, env, "option"), option],
+			env,
+			provisionalAuthority,
+		).replace(/\r?\n$/, "");
+		if (!raw) return undefined;
+		if (!resolveGjcTmuxBinary({ env }).isPsmux) return raw;
+		const prefix = `${option} `;
+		if (!raw.startsWith(prefix)) return undefined;
+		const value = raw.slice(prefix.length);
+		if (value.startsWith('"') && value.endsWith('"')) return value.slice(1, -1);
+		return value;
+	} catch {
+		return undefined;
+	}
+}
 
-function readNativeTmuxSessionId(sessionTarget: string, env: NodeJS.ProcessEnv): string | undefined {
-	if (resolveGjcTmuxBinary({ env }).isPsmux) return undefined;
+function createdTmuxMetadataMatches(
+	nativeSessionId: string,
+	metadata: {
+		sessionId: string;
+		sessionStateFile: string;
+		ownerGeneration: string;
+		ownerServerKey: string;
+		version: string | null;
+	},
+	psmuxIncarnation: string | undefined,
+	env: NodeJS.ProcessEnv,
+	provisionalAuthority?: ProviderAuthority,
+): boolean {
+	const expected: Array<readonly [string, string]> = [
+		[GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE],
+		[GJC_TMUX_SESSION_ID_OPTION, metadata.sessionId],
+		[GJC_TMUX_SESSION_STATE_FILE_OPTION, metadata.sessionStateFile],
+		[GJC_TMUX_OWNER_GENERATION_OPTION, metadata.ownerGeneration],
+		[GJC_TMUX_OWNER_SERVER_KEY_OPTION, metadata.ownerServerKey],
+	];
+	if (metadata.version) expected.push([GJC_TMUX_VERSION_OPTION, metadata.version]);
+	if (psmuxIncarnation) expected.push([GJC_TMUX_PSMUX_INCARNATION_OPTION, psmuxIncarnation]);
+	return expected.every(
+		([option, intended]) =>
+			readCreatedTmuxMetadataOption(nativeSessionId, option, env, provisionalAuthority) === intended,
+	);
+}
+
+function readNativeTmuxSessionId(
+	sessionTarget: string,
+	env: NodeJS.ProcessEnv,
+	provisionalAuthority?: ProviderAuthority,
+): string | undefined {
+	if (resolveGjcTmuxBinary({ env }).isPsmux) return sessionTarget;
 	try {
 		const sessionId = runTmux(
 			["display-message", "-p", "-t", normalizeExactTmuxTarget(sessionTarget, env, "option"), "#{session_id}"],
 			env,
+			provisionalAuthority,
 		).trim();
 		return sessionId || undefined;
 	} catch {
@@ -885,12 +1110,13 @@ function isNativeTmuxSessionBoundToName(nativeSessionId: string, sessionName: st
 }
 
 function hydrateSessionFromExactOptions(session: GjcTmuxSessionStatus, env: NodeJS.ProcessEnv): GjcTmuxSessionStatus {
-	if (session.profile === GJC_TMUX_PROFILE_VALUE) return session;
-	const profile = readExactOptionForGc(session.name, GJC_TMUX_PROFILE_OPTION, env);
-	if (profile !== GJC_TMUX_PROFILE_VALUE) return session;
+	if (session.profile !== GJC_TMUX_PROFILE_VALUE) {
+		const profile = readExactOptionForGc(session.name, GJC_TMUX_PROFILE_OPTION, env);
+		if (profile !== GJC_TMUX_PROFILE_VALUE) return session;
+		session = { ...session, profile };
+	}
 	return {
 		...session,
-		profile,
 		branch: session.branch ?? readExactOptionForGc(session.name, GJC_TMUX_BRANCH_OPTION, env),
 		branchSlug: session.branchSlug ?? readExactOptionForGc(session.name, GJC_TMUX_BRANCH_SLUG_OPTION, env),
 		project: session.project ?? readExactOptionForGc(session.name, GJC_TMUX_PROJECT_OPTION, env),
@@ -899,8 +1125,10 @@ function hydrateSessionFromExactOptions(session: GjcTmuxSessionStatus, env: Node
 			session.sessionStateFile ?? readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, env),
 		ownerGeneration:
 			session.ownerGeneration ?? readExactOptionForGc(session.name, GJC_TMUX_OWNER_GENERATION_OPTION, env),
-
 		version: session.version ?? readExactOptionForGc(session.name, GJC_TMUX_VERSION_OPTION, env),
+		psmuxIncarnation:
+			session.psmuxIncarnation ?? readExactOptionForGc(session.name, GJC_TMUX_PSMUX_INCARNATION_OPTION, env),
+		nativeSessionId: session.nativeSessionId ?? readNativeTmuxSessionId(session.name, env),
 	};
 }
 
@@ -913,13 +1141,14 @@ export function readTmuxSessionTagsForGc(
 	return {
 		profile: readExactOptionForGc(sessionName, GJC_TMUX_PROFILE_OPTION, env),
 		project: readExactOptionForGc(sessionName, GJC_TMUX_PROJECT_OPTION, env),
+		psmuxIncarnation: readExactOptionForGc(sessionName, GJC_TMUX_PSMUX_INCARNATION_OPTION, env),
 		branch: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_OPTION, env),
 		branchSlug: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_SLUG_OPTION, env),
 		sessionId: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_ID_OPTION, env),
 		sessionStateFile: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_STATE_FILE_OPTION, env),
 		version: readExactOptionForGc(sessionName, GJC_TMUX_VERSION_OPTION, env),
 		ownerGeneration: readExactOptionForGc(sessionName, GJC_TMUX_OWNER_GENERATION_OPTION, env),
-		nativeSessionId: session?.nativeSessionId,
+		nativeSessionId: session?.nativeSessionId ?? readNativeTmuxSessionId(sessionName, env),
 		createdAt: session?.createdAt,
 		attached: session?.attached,
 		panePids: session?.panePids,
@@ -938,6 +1167,7 @@ export function removeGjcTmuxSession(
 	if (
 		expectedIdentity &&
 		(session.nativeSessionId !== expectedIdentity.nativeSessionId ||
+			session.psmuxIncarnation !== expectedIdentity.psmuxIncarnation ||
 			session.ownerGeneration !== expectedIdentity.ownerGeneration ||
 			session.sessionId !== expectedIdentity.sessionId ||
 			session.sessionStateFile !== expectedIdentity.sessionStateFile ||
@@ -948,7 +1178,6 @@ export function removeGjcTmuxSession(
 	if (readProfileForExactTarget(session.name, env) !== GJC_TMUX_PROFILE_VALUE) {
 		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
 	}
-	if (resolveGjcTmuxBinary({ env }).isPsmux) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	const nativeSessionId = readNativeTmuxSessionId(session.name, env);
 	if (!nativeSessionId) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	if (expectedIdentity && nativeSessionId !== expectedIdentity.nativeSessionId)
@@ -992,8 +1221,8 @@ async function readProcessStartTime(pid: number): Promise<string | null> {
 function exactManagedOwnerSupervisor(supervisorPid: number, supervisorStartTime: string): Process {
 	const supervisor = Process.fromPid(supervisorPid);
 	if (!supervisor) throw new Error("managed_owner_supervisor_unverifiable");
-	if (process.platform === "linux" && supervisor.incarnation !== `linux:${supervisorStartTime}`)
-		throw new Error("managed_owner_supervisor_incarnation_mismatch");
+	const expectedIncarnation = process.platform === "linux" ? `linux:${supervisorStartTime}` : supervisorStartTime;
+	if (supervisor.incarnation !== expectedIncarnation) throw new Error("managed_owner_supervisor_incarnation_mismatch");
 	return supervisor;
 }
 
@@ -1069,6 +1298,7 @@ async function requireUnchangedOwnerForCompatibilityCleanup(
 	identity: ExactOwnerIdentity,
 	initialStateFile: string,
 	initialServer: { pid: number; startTime: string },
+	initialPsmuxIncarnation: string | undefined,
 	listPanePids: (sessionName: string, env: NodeJS.ProcessEnv) => number[],
 	readStartTime: (pid: number) => Promise<string | null>,
 ): Promise<boolean> {
@@ -1106,6 +1336,10 @@ async function requireUnchangedOwnerForCompatibilityCleanup(
 				: null,
 			readExactOptionForGc(nativeSessionId, GJC_TMUX_OWNER_SERVER_KEY_OPTION, env) !== identity.socketKey
 				? "server_key"
+				: null,
+			initialPsmuxIncarnation !== undefined &&
+			readExactOptionForGc(nativeSessionId, GJC_TMUX_PSMUX_INCARNATION_OPTION, env) !== initialPsmuxIncarnation
+				? "psmux_incarnation"
 				: null,
 		].filter((value): value is string => value !== null);
 		if (mismatches.length > 0) throw new Error(`gjc_tmux_owner_changed:${sessionName}:${mismatches.join(",")}`);
@@ -1173,35 +1407,44 @@ export async function forceCloseGjcTmuxSession(
 	expectedStateFile?: string,
 	deps: Partial<ForceCloseOwnerDependencies> = {},
 ): Promise<GjcTmuxSessionStatus> {
-	if (resolveGjcTmuxBinary({ env }).isPsmux) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	const session = statusGjcTmuxSession(sessionName, env);
-	if (readProfileForExactTarget(session.name, env) !== GJC_TMUX_PROFILE_VALUE)
+	const sessionEnv = environmentForProviderAuthority(env, session.providerAuthority);
+	if (readProfileForExactTarget(session.name, sessionEnv) !== GJC_TMUX_PROFILE_VALUE)
 		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
-	const exactPanePids = (deps.listPanePids ?? readExactSessionPanePids)(session.name, env);
+	const exactPanePids = (deps.listPanePids ?? readExactSessionPanePids)(session.name, sessionEnv);
 	if (exactPanePids.length !== 1) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
-	const actualSessionId = readExactOptionForGc(session.name, GJC_TMUX_SESSION_ID_OPTION, env);
-	const actualStateFile = readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, env);
-	const actualGeneration = readExactOptionForGc(session.name, GJC_TMUX_OWNER_GENERATION_OPTION, env);
-	const actualServerKey = readExactOptionForGc(session.name, GJC_TMUX_OWNER_SERVER_KEY_OPTION, env);
-
+	const actualSessionId = readExactOptionForGc(session.name, GJC_TMUX_SESSION_ID_OPTION, sessionEnv);
+	const actualStateFile = readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, sessionEnv);
+	const actualGeneration = readExactOptionForGc(session.name, GJC_TMUX_OWNER_GENERATION_OPTION, sessionEnv);
+	const actualServerKey = readExactOptionForGc(session.name, GJC_TMUX_OWNER_SERVER_KEY_OPTION, sessionEnv);
+	const isPsmux = resolveGjcTmuxBinary({ env: sessionEnv }).isPsmux;
+	const initialPsmuxIncarnation = isPsmux
+		? readExactOptionForGc(session.name, GJC_TMUX_PSMUX_INCARNATION_OPTION, sessionEnv)
+		: undefined;
 	if (expectedSessionId !== undefined && actualSessionId !== expectedSessionId)
 		throw new Error(`gjc_tmux_session_id_mismatch:${sessionName}`);
 	if (expectedStateFile !== undefined && actualStateFile !== expectedStateFile)
 		throw new Error(`gjc_tmux_session_state_file_mismatch:${sessionName}`);
-	if (!actualSessionId || !actualStateFile || !actualGeneration || !actualServerKey)
+	if (
+		!actualSessionId ||
+		!actualStateFile ||
+		!actualGeneration ||
+		!actualServerKey ||
+		(isPsmux && !initialPsmuxIncarnation)
+	)
 		throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
-	const nativeSessionId = readNativeTmuxSessionId(session.name, env);
+	const nativeSessionId = readNativeTmuxSessionId(session.name, sessionEnv);
 	if (!nativeSessionId) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 
 	const resolveOwner =
 		deps.resolveOwner ?? ((name, targetEnv) => resolveExactOwner(name, targetEnv, exactPanePids[0]!));
-	const identity = await resolveOwner(session.name, env);
+	const identity = await resolveOwner(session.name, sessionEnv);
 	if (identity.pid !== exactPanePids[0]) throw new Error(`gjc_tmux_owner_identity_mismatch:${sessionName}`);
 	if (identity.sessionId !== actualSessionId || identity.stateDir !== path.dirname(actualStateFile))
 		throw new Error(`gjc_tmux_owner_identity_mismatch:${sessionName}`);
 	if (identity.generation !== actualGeneration) throw new Error(`gjc_tmux_owner_generation_mismatch:${sessionName}`);
 	if (identity.socketKey !== actualServerKey) throw new Error(`gjc_tmux_owner_server_key_mismatch:${sessionName}`);
-	const initialServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(env), env);
+	const initialServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(sessionEnv), sessionEnv);
 
 	const currentStartTime = await (deps.readProcessStartTime ?? readProcessStartTime)(identity.pid);
 	if (currentStartTime !== identity.startTime) throw new Error("owner_pid_identity_mismatch");
@@ -1259,23 +1502,26 @@ export async function forceCloseGjcTmuxSession(
 				const cleanupRequired = await requireUnchangedOwnerForCompatibilityCleanup(
 					session.name,
 					nativeSessionId,
-					env,
+					sessionEnv,
 					identity,
 					actualStateFile,
 					initialServer,
+					initialPsmuxIncarnation,
 					deps.listPanePids ?? readExactSessionPanePids,
 					deps.readProcessStartTime ?? readProcessStartTime,
 				);
 				if (!cleanupRequired) return;
-				if (deps.cleanupSession) deps.cleanupSession(nativeSessionId, env);
+				if (deps.cleanupSession) deps.cleanupSession(nativeSessionId, sessionEnv);
 				else
 					runGuardedTmuxSessionCommand(
 						nativeSessionId,
 						session.name,
 						initialServer,
-						env,
+						sessionEnv,
 						`kill-session -t '${nativeSessionId}'`,
 						identity.generation,
+						session.providerAuthority,
+						initialPsmuxIncarnation,
 					);
 			},
 		},
@@ -1284,18 +1530,25 @@ export async function forceCloseGjcTmuxSession(
 }
 
 export function attachGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): never {
-	if (resolveGjcTmuxBinary({ env }).isPsmux) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	const session = statusGjcTmuxSession(sessionName, env);
-	const tmuxCommand = resolveGjcTmuxCommand(env);
-	requireSafeTmuxServerForMutation(tmuxCommand, env);
+	const sessionEnv = environmentForProviderAuthority(env, session.providerAuthority);
+	const authority = session.providerAuthority ?? psmuxAuthorityFromEnv(sessionEnv);
+	const tmuxCommand = authority?.command ?? resolveGjcTmuxCommand(sessionEnv);
+	if (authority) assertGjcTmuxMutationAuthoritySync(authority);
+	requireSafeTmuxServerForMutation(tmuxCommand, sessionEnv);
 	const result = Bun.spawnSync(
-		[tmuxCommand, "attach-session", "-t", buildGjcTmuxExactSessionTarget(session.name, { env })],
-		{
-			stdin: "inherit",
-			stdout: "inherit",
-			stderr: "inherit",
-			env,
-		},
+		[
+			tmuxCommand,
+			...(authority
+				? buildTmuxProviderCommand(authority, "attach-session", [
+						"-t",
+						buildGjcTmuxExactSessionTarget(session.name, { binary: authority.binary }),
+					])
+				: ["attach-session", "-t", buildGjcTmuxExactSessionTarget(session.name, { env: sessionEnv })]),
+		],
+		{ stdin: "inherit", stdout: "inherit", stderr: "inherit", env: sessionEnv },
 	);
-	process.exit(result.exitCode ?? 1);
+	if (authority) assertGjcTmuxMutationAuthoritySync(authority);
+	if (result.exitCode !== 0) throw new Error(`gjc_tmux_attach_failed:${sessionName}`);
+	process.exit(0);
 }

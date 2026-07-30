@@ -2182,6 +2182,8 @@ async function fsyncDirectory(directoryPath: string): Promise<void> {
 	const directory = await fs.open(directoryPath, "r");
 	try {
 		await directory.sync();
+	} catch (error) {
+		if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
 	} finally {
 		await directory.close();
 	}
