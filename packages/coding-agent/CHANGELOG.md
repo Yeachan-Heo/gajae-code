@@ -5,6 +5,7 @@
 ### Fixed
 
 - Canonical wrapped first-event timeouts now continue the same clean turn through bounded retries and configured fallback rotation, while preserving replay-safety, cancellation, provider-terminal policies, exact attempt diagnostics, and task/subagent retry-status truth (#3553).
+- Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
 
 ## [0.12.4] - 2026-07-30
 
