@@ -204,7 +204,14 @@ if (command === "-V" || command === "--version") {
 		} catch {}
 		count += 1;
 		await writeFile(config.countPath, String(count));
-		console.log("%" + (count + 1));
+		const newPane = "%" + (count + 1);
+		// The predecessor shell fake published this 3-field marker on every split, and
+		// the memory-guard replacement test waits on it to know a successor pane was
+		// launched before it publishes the generation-bound startup ACK. Without it the
+		// ACK never arrives, relaunch hits its startup deadline, and the guard reports
+		// a retrying outcome instead of a replaced one.
+		await writeFile(config.lastSplitPath, count + "\t" + (targetAfter("-t") ?? "") + "\t" + newPane + "\n");
+		console.log(newPane);
 	}
 } else if (command === "kill-pane") {
 	const target = targetAfter("-t");
@@ -281,6 +288,7 @@ async function createFakeTmuxBin(
 			profilePath: path.join(root, "tmux-profile-tag"),
 			killedDir: root,
 			countPath: path.join(root, "tmux-split-count"),
+			lastSplitPath: path.join(root, "tmux-last-split"),
 			optionPath: path.join(root, "tmux-options.json"),
 		}),
 	);
@@ -3995,14 +4003,19 @@ describe("team worker memory guard wiring", () => {
 			await successorAck.catch(() => {});
 			throw error;
 		}
+		if (process.platform !== "linux") {
+			// Advisory-only hosts never launch a successor pane, so the split-marker
+			// waiter cannot resolve. Cancel it and swallow the abort before asserting,
+			// otherwise the awaited waiter rejects and masks the advisory outcome.
+			markerAbort.abort(new Error("advisory host: no successor pane launch expected"));
+			await successorAck.catch(() => {});
+			expect(result).toMatchObject({ result: "advisory", lifecycle_mutated: false });
+			return;
+		}
 		if (result.result !== "replaced") {
 			markerAbort.abort(new Error(`Replacement settled before pane launch ACK: ${result.result}`));
 		}
 		await successorAck;
-		if (process.platform !== "linux") {
-			expect(result).toMatchObject({ result: "advisory", lifecycle_mutated: false });
-			return;
-		}
 		expect(result).toMatchObject({ result: "replaced" });
 		expect(result.lifecycle_mutated).toBe(true);
 		expect(result.ledger.worker_id).toBe("worker-2");

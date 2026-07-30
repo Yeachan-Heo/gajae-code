@@ -1032,8 +1032,15 @@ export async function listTeamWorkerGcRecords(teamRoot: string, probe: GcPidProb
 export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProbe): Promise<boolean> {
 	if (!record.path || !record.id.includes("/")) return false;
 	const teamDirPath = path.dirname(path.dirname(record.path));
-	return withGjcTeamTaskMutation(taskStore(teamDirPath), capability =>
-		pruneTeamWorkerGcRecordUnlocked(record, probe, capability),
+	// Prune deletes claim records and rewrites claimed tasks, so it is an
+	// authority-changing operation and must take the same team mutation fence the
+	// rest of the public surface takes. Without it, prune can strip a claim inside
+	// the continuation dispatch window and silently suppress a stalled-worker
+	// continuation.
+	return withGjcTeamMutationFence(teamDirPath, () =>
+		withGjcTeamTaskMutation(taskStore(teamDirPath), capability =>
+			pruneTeamWorkerGcRecordUnlocked(record, probe, capability),
+		),
 	);
 }
 
@@ -4483,21 +4490,68 @@ async function continueStalledGjcTeamWorkers(
 		let tmuxError: { name: string; code?: string; message: string } | undefined;
 		let dispatchedAt: string | undefined;
 		let dispatchHoldUntil: string | undefined;
-		if (gjcTeamRuntimeTestSeams?.continuationBeforeDispatch)
-			await gjcTeamRuntimeTestSeams.continuationBeforeDispatch();
-		const revalidationReason = await validateGjcContinuationEligibility(
-			dir,
-			config,
-			worker,
-			task,
-			heartbeat.last_turn_at,
-			staleMs,
-			env,
-			new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
+		// The reservation above was written under the task lock, and that lock is
+		// released before dispatch. Revalidation plus send-keys is therefore its own
+		// critical section, and it must exclude concurrent claim mutation: otherwise a
+		// claim-releasing operation (worker GC prune, stale-claim recovery) lands in
+		// the gap, revalidation observes no current claim, and the incident is
+		// journalled `skipped` with no continuation dispatched at all.
+		//
+		// Take the same team mutation fence every public authority-changing operation
+		// takes, and release it before the ACK wait. The ACK is published by a
+		// separate receiver process that must acquire the same cross-process fence,
+		// so holding it across the wait would deadlock the very ACK being awaited.
+		const attemptOutcome = await withGjcTeamMutationFence(dir, async () => {
+			if (gjcTeamRuntimeTestSeams?.continuationBeforeDispatch)
+				await gjcTeamRuntimeTestSeams.continuationBeforeDispatch();
+			const revalidationReason = await validateGjcContinuationEligibility(
+				dir,
+				config,
+				worker,
+				task,
+				heartbeat.last_turn_at,
+				staleMs,
+				env,
+				new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
 
-			true,
-		);
-		if (revalidationReason) {
+				true,
+			);
+			if (revalidationReason) return { kind: "skipped" as const, reason: revalidationReason };
+			try {
+				const args = Object.freeze([
+					"send-keys",
+					"-l",
+					"-t",
+					worker.pane_id,
+					continuationPrompt,
+					";",
+					"send-keys",
+					"-t",
+					worker.pane_id,
+					"Enter",
+				]);
+				const dispatch = await (gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
+					? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
+					: (() => {
+							executeTeamTmuxMutation(config, {
+								type: "literal-send",
+								paneId: worker.pane_id!,
+								text: continuationPrompt,
+								deferredProof: "continuation-outcome",
+							});
+							return executeTeamTmuxMutation(config, {
+								type: "key-send",
+								paneId: worker.pane_id!,
+								key: "Enter",
+								deferredProof: "continuation-outcome",
+							});
+						})());
+				return { kind: "dispatched" as const, exitCode: dispatch.exitCode };
+			} catch (error) {
+				return { kind: "threw" as const, error };
+			}
+		});
+		if (attemptOutcome.kind === "skipped") {
 			const skippedPath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
 			await withGjcTeamTaskMutation(taskStore(dir), async () => {
 				await createJsonNoClobber(
@@ -4509,7 +4563,7 @@ async function continueStalledGjcTeamWorkers(
 						reservation_sha256: gjcContinuationReservationDigest(reservation),
 						recorded_at: now(),
 						result: "skipped",
-						reason: revalidationReason,
+						reason: attemptOutcome.reason,
 					},
 					stateWriterOptions(skippedPath, "state", "continuation-outcome"),
 				);
@@ -4517,36 +4571,9 @@ async function continueStalledGjcTeamWorkers(
 			return;
 		}
 		try {
-			const args = Object.freeze([
-				"send-keys",
-				"-l",
-				"-t",
-				worker.pane_id,
-				continuationPrompt,
-				";",
-				"send-keys",
-				"-t",
-				worker.pane_id,
-				"Enter",
-			]);
-			const dispatch = await (gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
-				? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
-				: (() => {
-						executeTeamTmuxMutation(config, {
-							type: "literal-send",
-							paneId: worker.pane_id!,
-							text: continuationPrompt,
-							deferredProof: "continuation-outcome",
-						});
-						return executeTeamTmuxMutation(config, {
-							type: "key-send",
-							paneId: worker.pane_id!,
-							key: "Enter",
-							deferredProof: "continuation-outcome",
-						});
-					})());
-			tmuxExitCode = dispatch.exitCode;
-			if (dispatch.exitCode === 0) {
+			if (attemptOutcome.kind === "threw") throw attemptOutcome.error;
+			tmuxExitCode = attemptOutcome.exitCode;
+			if (attemptOutcome.exitCode === 0) {
 				// Bound the ack wait on the seamed clock so a test that advances `nowMs`
 				// exhausts the dispatch budget deterministically instead of sleeping.
 				// The wait loop advances EITHER the seamed clock (a test-supplied
@@ -4594,7 +4621,7 @@ async function continueStalledGjcTeamWorkers(
 						await Bun.sleep(GJC_TEAM_CONTINUATION_ACK_POLL_MS);
 					}
 				}
-			} else if (typeof dispatch.exitCode === "number") outcomeReason = "tmux_nonzero_exit";
+			} else if (typeof attemptOutcome.exitCode === "number") outcomeReason = "tmux_nonzero_exit";
 		} catch (error) {
 			outcomeReason = "tmux_dispatch_threw";
 			const name = normalizeGjcContinuationDispatchError(
