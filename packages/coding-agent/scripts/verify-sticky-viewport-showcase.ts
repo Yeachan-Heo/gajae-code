@@ -2,6 +2,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	SEMANTIC_ANCHOR_DOMAIN,
+	STICKY_VIEWPORT_FRAME_TEXT_WITNESS,
+	type StickyViewportShowcaseKey,
 	semanticAnchorDigest,
 	semanticAnchorNamespace,
 } from "../test/fixtures/tui/sticky-viewport-showcase";
@@ -12,6 +14,7 @@ import {
 	gitObjectType,
 	PROVENANCE_DIFF_SCOPE,
 	resolveRepositoryPath,
+	stickyViewportFrameTextDigest,
 	xterm256Color,
 } from "./capture-sticky-viewport-showcase";
 
@@ -673,6 +676,35 @@ const verifySemanticAnchor = (
 	if (owner !== undefined) fail(`semantic anchor guard: ${key} id aliases the anchor already claimed by ${owner}`);
 	seen.set(id as string, key);
 };
+// Whole-frame content witness. The semantic anchor guard above pins exactly ONE
+// painted row per entry, and `anchor.frame_sha256` is recomputed from the
+// bundle's OWN artifact, so it only proves internal consistency: a producer who
+// rewrites a non-anchor row and coordinately rehashes every dependent digest --
+// artifacts, metadata, manifest entry, provenance blocks, review-input binding --
+// stayed self-consistent and was ACCEPTED. In an 80x24 frame 13 rows carry
+// content while one is anchored, so the transcript rows carrying the bundle's own
+// evidence text were rewritable at will.
+//
+// This compares the painted frame against a value committed in oracle source,
+// which no bundle can reach. It is invoked LAST in the per-entry loop, after the
+// anchor guard and after every geometry, marker, and CJK oracle, so a mutation
+// those already attribute keeps its narrower message and only the rows no other
+// oracle inspects surface here.
+//
+// The digest is over the ANSI-STRIPPED paint. `frame_sha256` stays untouched as
+// the artifact digest and legitimately diverges between an indexed-color and a
+// truecolor host; the stripped paint does not, so it is the only frame-wide
+// surface that a single committed value can pin on both hosts.
+const verifyFrameTextWitness = (key: string, text: string) => {
+	// Fail closed: an unwitnessed key is an unpinned frame, not a pass.
+	const expected: string | undefined = STICKY_VIEWPORT_FRAME_TEXT_WITNESS[key as StickyViewportShowcaseKey];
+	if (expected === undefined) fail(`frame content guard: ${key} has no committed frame text witness`);
+	const observed = stickyViewportFrameTextDigest(text);
+	if (observed !== expected)
+		fail(
+			`frame content guard: ${key} painted frame digest is ${observed} but the committed witness pins ${expected}`,
+		);
+};
 export async function verifyStickyViewportShowcase(rootInput: string, requireIndependentReview = false): Promise<void> {
 	const root = path.resolve(rootInput);
 	const manifestText = await fs.readFile(path.join(root, "manifest.json"), "utf8");
@@ -982,6 +1014,15 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 				fail("narrow CJK visible terminal evidence missing");
 			verifyCjkCellOracle(text, columns, pinBoundary.row, cursor.row);
 		} else strings(metadata.cjk_phrase_boundaries, [], `non-narrow CJK boundaries for ${key}`);
+		// Whole-frame pin, LAST in the per-entry loop. It runs after the semantic
+		// anchor guard so an anchor-row mutation keeps its narrower anchor
+		// attribution, and after the geometry, marker, and CJK oracles so a case that
+		// mutates the paint to reach one of those keeps its own attribution too.
+		// Ordering costs nothing here: every check above reads the same painted frame
+		// this pins, so none of them can be subverted by a paint this guard would
+		// reject. What lands here is the residue -- rows no other oracle looks at,
+		// which is precisely the unpinned surface this guard exists to close.
+		verifyFrameTextWitness(key, text);
 	}
 	const required = new Set([
 		"manifest.json",

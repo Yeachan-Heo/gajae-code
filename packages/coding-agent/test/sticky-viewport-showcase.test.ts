@@ -10,11 +10,13 @@ import {
 	PROVENANCE_DIFF_SCOPE,
 	REPOSITORY_ROOT,
 	resolveRepositoryPath,
+	stickyViewportFrameTextDigest,
 	xterm256Color,
 } from "../scripts/capture-sticky-viewport-showcase";
 import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
 import {
 	SEMANTIC_ANCHOR_DOMAIN,
+	STICKY_VIEWPORT_FRAME_TEXT_WITNESS,
 	STICKY_VIEWPORT_SHOWCASE_COVERAGE,
 	semanticAnchorDigest,
 } from "./fixtures/tui/sticky-viewport-showcase";
@@ -1088,6 +1090,10 @@ describe("sticky viewport production evidence verifier", () => {
 			await Bun.write(resolveRepositoryPath(oracle), malicious);
 			await restampProvenance(root);
 			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow("oracle integrity");
+			// The operator may have declared an authority for the whole run (that is how
+			// an uncommitted staged oracle is reviewed). Save and restore it rather than
+			// deleting, or this case silently unpins every later case in the file.
+			const declared = process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT;
 			process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT = await git(["rev-parse", "HEAD"]);
 			try {
 				await restampProvenance(root);
@@ -1166,5 +1172,119 @@ describe("sticky viewport production evidence verifier", () => {
 			restoreEnvironment("GJC_STICKY_VIEWPORT_ORACLE_COMMIT", originalOracleCommit);
 			await fs.rm(temporaryGitDirectory, { recursive: true, force: true });
 		}
+	}, 300_000);
+	// Rewrite one painted row and perform the FULL coordinated rehash the bundle
+	// producer controls: all three artifacts, their manifest digests, the cursor
+	// frame digest, the anchor (optionally reminted so it is honest about the new
+	// paint), every provenance block, and the review-input binding. The result is
+	// internally consistent by construction, so no digest-consistency check can
+	// reject it.
+	async function forgeRow(
+		root: string,
+		key: string,
+		row: number,
+		mutate: (rowText: string) => string,
+		remintAnchor: boolean,
+	): Promise<string> {
+		const ansiPath = path.join(root, key, "terminal-ansi.txt");
+		const ansiRows = (await fs.readFile(ansiPath, "utf8")).split("\n");
+		const before = ansiRows[row]!;
+		ansiRows[row] = mutate(before);
+		if (ansiRows[row] === before) throw new Error(`row ${row} of ${key} was not mutated`);
+		const mutatedAnsi = ansiRows.join("\n");
+		const mutatedText = Bun.stripANSI(mutatedAnsi);
+		await Bun.write(ansiPath, mutatedAnsi);
+		await Bun.write(path.join(root, key, "terminal.txt"), mutatedText);
+		await Bun.write(path.join(root, key, "terminal.html"), ansiToHtml(mutatedAnsi));
+		for (const name of ["terminal-ansi.txt", "terminal.txt", "terminal.html"] as const) await rehash(root, key, name);
+		const metadata = await readMetadata(root, key);
+		metadata.state.cursor.frame_sha256 = new Bun.CryptoHasher("sha256").update(mutatedAnsi).digest("hex");
+		await writeMetadataCoordinated(root, key, metadata);
+		if (remintAnchor) await recomputeAnchor(root, key);
+		await rebindReviewInput(root);
+		return mutatedText;
+	}
+	const rejectionMessage = async (root: string): Promise<string> => {
+		try {
+			await verifyStickyViewportShowcase(root);
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+		throw new Error("expected the verifier to reject this bundle");
+	};
+	it("rejects a coordinated non-anchor row forgery the anchor guard cannot see", async () => {
+		// Measured defect: the semantic anchor pins exactly ONE painted row, and
+		// `anchor.frame_sha256` is recomputed from the bundle's own artifact. Mutating
+		// `selectable` to `selectabIe` on a NON-anchor transcript row under a full
+		// coordinated rehash was ACCEPTED — in an 80x24 frame 13 rows carry content and
+		// only one was pinned, so ~10 rows, including the transcript rows carrying the
+		// bundle's own evidence text, took arbitrary content.
+		const root = await capture();
+		const key = "manual-new-output/80x24/unicode-color";
+		const anchorRow = (await readMetadata(root, key)).state.semantic_anchor!.frame_start_row;
+		const rows = (await fs.readFile(path.join(root, key, "terminal.txt"), "utf8")).split("\n");
+		// A row carrying the same token as the anchor row but which the anchor does
+		// not cover, so the mutation is provably outside the anchor's reach. The
+		// replacement is the same cell width, so no geometry check can notice.
+		const targetRow = rows.findIndex((text, index) => index !== anchorRow && text.includes("selectable"));
+		expect(targetRow).toBeGreaterThanOrEqual(0);
+		expect(targetRow).not.toBe(anchorRow);
+		const mutatedText = await forgeRow(root, key, targetRow, text => text.replace("selectable", "selectabIe"), true);
+		const observed = stickyViewportFrameTextDigest(mutatedText);
+		const expected = STICKY_VIEWPORT_FRAME_TEXT_WITNESS[key];
+		expect(observed).not.toBe(expected);
+		const message = await rejectionMessage(root);
+		expect(message).toBe(
+			`Sticky viewport evidence invalid: frame content guard: ${key} painted frame digest is ${observed} but the committed witness pins ${expected}`,
+		);
+		// Proves the rejection is the new whole-frame pin and not an earlier check
+		// that happened to fire: no anchor guard, no digest, no provenance staleness.
+		expect(message).not.toContain("semantic anchor guard");
+		expect(message).not.toContain("hash or byte length mismatch");
+		expect(message).not.toContain("capture provenance is stale");
+	}, 300_000);
+	it("pins the capacity-zero frames whose semantic anchor is null", async () => {
+		// The three capacity-zero entries carry `semantic_anchor: null`, so before the
+		// frame witness their paint had no immutable expectation at all: every row was
+		// rewritable under the same coordinated rehash.
+		const root = await capture();
+		for (const key of ["capacity-zero/80x24/unicode-color", "capacity-zero/48x10/ascii-no-color"] as const) {
+			const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-frame-zero-"));
+			roots.push(clone);
+			await fs.cp(root, clone, { recursive: true });
+			expect((await readMetadata(clone, key)).state.semantic_anchor).toBeNull();
+			const rows = (await fs.readFile(path.join(clone, key, "terminal.txt"), "utf8")).split("\n");
+			const targetRow = rows.findIndex(text => text.includes("reserved suffix row 1 "));
+			expect(targetRow).toBeGreaterThanOrEqual(0);
+			// Same width, and it touches none of the ordered suffix markers, so only the
+			// frame witness can object.
+			const mutatedText = await forgeRow(
+				clone,
+				key,
+				targetRow,
+				text => text.replace("reserved suffix row 1 ", "reserved suffix row I "),
+				true,
+			);
+			const observed = stickyViewportFrameTextDigest(mutatedText);
+			expect(await rejectionMessage(clone)).toBe(
+				`Sticky viewport evidence invalid: frame content guard: ${key} painted frame digest is ${observed} but the committed witness pins ${STICKY_VIEWPORT_FRAME_TEXT_WITNESS[key]}`,
+			);
+		}
+	}, 300_000);
+	it("keeps anchor-row mutation attributed to the semantic anchor guard", async () => {
+		// The frame witness must not steal attribution. An anchor-row mutation is
+		// still the anchor guard's case, so the new guard is positioned after it and
+		// this asserts the narrower message survives.
+		const root = await capture();
+		const key = "manual-new-output/80x24/unicode-color";
+		const anchorRow = (await readMetadata(root, key)).state.semantic_anchor!.frame_start_row;
+		const rows = (await fs.readFile(path.join(root, key, "terminal.txt"), "utf8")).split("\n");
+		expect(rows[anchorRow]).toContain("selectable");
+		// `remintAnchor: false`: every artifact and provenance digest is coordinately
+		// rehashed, but the anchor id and row digest still describe the old paint.
+		await forgeRow(root, key, anchorRow, text => text.replace("selectable", "selectabIe"), false);
+		const message = await rejectionMessage(root);
+		expect(message).toContain("semantic anchor guard");
+		expect(message).not.toContain("frame content guard");
 	}, 300_000);
 });

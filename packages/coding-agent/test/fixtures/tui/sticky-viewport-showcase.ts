@@ -132,6 +132,53 @@ export const semanticAnchorDigest = (input: {
 		.digest("hex");
 /** Namespace of a renderer anchor id, i.e. everything before its volatile per-run suffix. */
 export const semanticAnchorNamespace = (id: string) => id.split(":").slice(0, -1).join(":");
+// Immutable per-entry witness over the WHOLE painted frame, not just the anchor
+// row. The semantic anchor pins exactly one row; in an 80x24 frame only 13 rows
+// carry content, so every other painted row -- including the transcript rows that
+// carry the bundle's own evidence text -- was pinned to nothing. `frame_sha256`
+// cannot close that: the verifier recomputes it from the bundle's own artifact, so
+// a producer who rewrites a row and rehashes every dependent digest stays
+// internally consistent and was accepted.
+//
+// The digest is over the ANSI-STRIPPED paint (`stickyViewportFrameTextDigest`).
+// An ANSI-frame digest is not pinnable: `detectColorMode()` negotiates truecolor
+// `38;2;r;g;b` versus indexed `38;5;n` from COLORTERM/TERM, so one committed value
+// would reject an honest capture on the other host. The stripped paint is
+// byte-identical across both, which is why `terminal.txt` is the pinned surface
+// and `frame_sha256` stays as host-dependent artifact binding only.
+//
+// The three capacity-zero entries have a null semantic anchor, so before this
+// table their frames carried no immutable expectation at all. They are covered
+// here like every other key.
+//
+// Values are rendered output, not authored constants: regenerate by printing
+// `stickyViewportFrameTextDigest(render.terminalText)` for each key. This file is
+// in the verifier's `ORACLE_SOURCES`, so `verifyOracleIntegrity()` forces these
+// bytes to match their committed blob at the reviewed authority commit -- a
+// producer cannot restate the pin without a reviewed commit.
+export const STICKY_VIEWPORT_FRAME_TEXT_WITNESS: Readonly<Record<StickyViewportShowcaseKey, string>> = Object.freeze({
+	"live-overflow/80x24/unicode-color": "18ff7c45f2d6871a12fe0c6eb5b444b8f53c3c83f012bf551c460753c1af4bbe",
+	"live-overflow/120x36/unicode-color": "d5ed298e00b6f3f775cca5103deec287d56a6cc5efa68fa5fb3da9f2bf7bced0",
+	"manual-history/80x24/unicode-color": "f2b5cc88983601d313b32d58fe62170adbba19056d9486fa9fd595040b954332",
+	"manual-history/120x36/unicode-color": "904c7e94fc0d20a31deabc2e93f794261dcbfbc97f8bd31e8a386698235fde13",
+	"manual-new-output/80x24/unicode-color": "dce169b90e5a7f6557c1db829cda47716fc250d71698892637ba00b199c4a706",
+	"manual-new-output/120x36/unicode-color": "e7cfa1971dead39a00f98200e6172117f4535301040cb4c7f40486e2e55d2463",
+	"multiline-editor-hooks-pet/80x24/unicode-color": "b6d42786e23bd931c450ba0a63886bb633c3976c4f410aad1f2fc7775a3e48fe",
+	"multiline-editor-hooks-pet/120x36/unicode-color":
+		"3944f1563c74aba7bbac2b287d8fe17917e8aefe39d74a4d6fbd7433ffba60b2",
+	"capacity-many/80x24/unicode-color": "b55610b0ecd90502338a67a951d014f9b2311658a0c64d008d6590613fef3101",
+	"capacity-many/120x36/unicode-color": "956a4cc18b50abaf30fcbe0401cf5cf876da6f1611ad1f326d2b0a0042fda409",
+	"capacity-one/80x24/unicode-color": "58dee6e4f2df74de3324ed39cfa89680f6888850717f312d9da994f932031755",
+	"capacity-one/120x36/unicode-color": "80d87c6062a26c39f932a21446cfd453852edd694db6d005544bb46d02eb916e",
+	"capacity-zero/80x24/unicode-color": "174bbb2e5913a0361c32e74abb519e0a34ed7f46d4dc29235d8c7fb568c76a86",
+	"capacity-zero/120x36/unicode-color": "482db3cfb4f47050fbdebb450721851b3f6aefb3493825321e259810848b7339",
+	"selection-boundary/80x24/unicode-color": "8a6b28cff37576e3e11d5d8a549aa33efde56b4dd6d6704da91e506d79a0ca44",
+	"selection-boundary/120x36/unicode-color": "9e45f3a188c836870c708290e5d094842f75d142de1a072465866ef1425fa027",
+	"manual-new-output/80x24/ascii-no-color": "dce169b90e5a7f6557c1db829cda47716fc250d71698892637ba00b199c4a706",
+	"capacity-zero/48x10/ascii-no-color": "d39aeb89abc4aaaa5523668f63cfe918dae6751a8dac1025178c9dbcfb68c8f9",
+	"multiline-editor-hooks-pet/48x10/unicode-color": "c54fbe3d52e8e3625cd90e746b0c4be25f5563a0c950be615d372e7295afde59",
+	"narrow-cjk/48x10/unicode-color": "dcdc88cc87b4693ef0f1500fe304de994da6f2c6916faf5165bacda77c66c161",
+});
 // Every persisted frame must be canonical for its render mode, not just the
 // top-level payload. `metadata.json` is a required manifest artifact, so raw
 // frames here would make the whole bundle host-dependent: theme.ts emits SGR
