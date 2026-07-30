@@ -119,6 +119,8 @@ export function writeStdioFrame(writer: StdioWriter, frame: Uint8Array): Promise
  * production stdio entry point.
  */
 export async function runStdioServer(config: ResolvedAppServerConfig): Promise<void> {
+	// No threadStartAdapter or PermissionAdapter is attached here; server-request approvals are NOT
+	// reachable through the shipped stdio transport today.
 	const runtime = createAppServerRuntime(
 		{ maxLoadedThreads: config.maxLoadedThreads },
 		{ maxFrameBytes: config.maxFrameBytes },

@@ -276,6 +276,63 @@ test("real child tool arguments map to protocol-valid approval params", () => {
 	}
 });
 
+test("top-level pinned fileChanges maps take precedence and produce protocol-valid patch approvals", () => {
+	const cases = [
+		{
+			toolName: "write",
+			rawInput: { path: "/tmp/add.ts", content: "next", fileChanges: { bad: { type: "invalid" } } },
+			fileChanges: { "/tmp/add.ts": { type: "add", content: "next" } },
+		},
+		{
+			toolName: "delete",
+			rawInput: { path: "/tmp/delete.ts", fileChanges: {} },
+			fileChanges: { "/tmp/delete.ts": { type: "delete", content: "old\n" } },
+		},
+		{
+			toolName: "edit",
+			rawInput: {
+				path: "/tmp/update.ts",
+				edits: [{ oldText: "old", newText: "new" }],
+				fileChanges: { bad: { type: "invalid" } },
+			},
+			fileChanges: { "/tmp/update.ts": { type: "update", unified_diff: "@@ -1 +1 @@\n-old\n+new\n" } },
+		},
+	] as const;
+
+	for (const { toolName, rawInput, fileChanges } of cases) {
+		const toolCall = {
+			toolCallId: `call-${toolName}`,
+			toolName,
+			title: toolName,
+			rawInput,
+			fileChanges,
+		} as Parameters<typeof mapToolCallToCodexRequest>[0] & { fileChanges: unknown };
+		const mapped = mapToolCallToCodexRequest(toolCall, { conversationId: "thread-1" });
+		expect(mapped.method, toolName).toBe("applyPatchApproval");
+		expect((mapped.params as { fileChanges: unknown }).fileChanges, toolName).toEqual(fileChanges);
+		expect(stableValidators.serverRequestParams.applyPatchApproval(mapped.params), toolName).toBe(true);
+	}
+});
+
+test("invalid or empty top-level fileChanges maps fail closed with missing_approval_field", () => {
+	for (const fileChanges of [{}, { "/tmp/a.ts": { type: "update", unified_diff: 42 } }, null]) {
+		const toolCall = {
+			toolCallId: "call-invalid-file-changes",
+			toolName: "edit",
+			title: "edit",
+			rawInput: { path: "/tmp/a.ts", edits: [{ oldText: "a", newText: "b" }] },
+			fileChanges,
+		} as Parameters<typeof mapToolCallToCodexRequest>[0] & { fileChanges: unknown };
+		let error: unknown;
+		try {
+			mapToolCallToCodexRequest(toolCall, { conversationId: "thread-1" });
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(PermissionAdapterError);
+		expect(error).toMatchObject({ code: "missing_approval_field" });
+	}
+});
 test("patch arguments that cannot yield a pinned FileChange fail closed", () => {
 	for (const [toolName, rawInput] of [
 		// edit/apply_patch args are mode-dependent and carry no unified diff at this seam.

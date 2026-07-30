@@ -218,20 +218,26 @@ function isFileChange(value: unknown): boolean {
 }
 
 /**
- * Normalize the REAL child tool arguments into pinned `FileChange` members.
+ * Resolve a faithful pinned `FileChange` map for the current permission seam.
  *
- * `AgentSession` forwards raw tool args (`rawInput: args`), so a `write` is `{path, content}`,
- * a `delete` is `{path}`, and a `move` is `{oldPath, newPath}` — none of which are Codex
- * `FileChange` maps. Casting them through produced params the generated validator rejects.
- * Anything that cannot be represented honestly fails closed instead of being coerced.
+ * Upstream now supplies faithful maps for write/delete/move/edit/apply_patch through
+ * `toolCall.fileChanges`; raw args alone still fail closed for write/delete/edit/apply_patch
+ * (move remains representable only when both endpoints are present).
  */
 function fileChangesFor(
 	toolName: string,
 	input: Record<string, unknown> | undefined,
+	topLevelFileChanges: unknown,
 ): ApplyPatchApprovalParams["fileChanges"] {
-	// A child that already speaks the Codex shape is passed through, but only after validation.
-	const supplied = input?.fileChanges ?? input?.changes;
-	if (isRecord(supplied)) {
+	// Prefer the map pinned by the upstream permission seam. A map that is present but malformed
+	// must not fall through to a less faithful raw-argument projection.
+	const supplied = topLevelFileChanges !== undefined ? topLevelFileChanges : (input?.fileChanges ?? input?.changes);
+	if (supplied !== undefined) {
+		if (!isRecord(supplied))
+			throw new PermissionAdapterError(
+				"missing_approval_field",
+				"Patch permission fileChanges must be a pinned FileChange map.",
+			);
 		for (const [path, change] of Object.entries(supplied)) {
 			if (!isFileChange(change))
 				throw new PermissionAdapterError(
@@ -318,7 +324,7 @@ export function mapToolCallToCodexRequest(
 		};
 		return { method: "execCommandApproval", params: assertApprovalParams("execCommandApproval", params) };
 	}
-	const patchChanges = fileChangesFor(toolCall.toolName, input);
+	const patchChanges = fileChangesFor(toolCall.toolName, input, toolCall.fileChanges);
 	const grantRoot = options.grantRoot ?? (input ? stringField(input, "grantRoot") : undefined);
 	const params: ApplyPatchApprovalParams = {
 		conversationId,

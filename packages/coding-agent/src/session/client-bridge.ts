@@ -9,6 +9,8 @@
  * destructive operations behind user permission prompts.
  */
 
+import type { PermissionFileChangeMap } from "./permission-file-changes";
+
 export interface ClientBridgeCapabilities {
 	/** Client implements `fs/read_text_file`. */
 	readTextFile?: boolean;
@@ -27,6 +29,8 @@ export interface ClientBridgePermissionToolCall {
 	kind?: string;
 	status?: "pending" | "in_progress" | "completed" | "failed";
 	rawInput?: unknown;
+	/** Faithful pinned FileChange map for mutation tools; absent when none can be built honestly. */
+	fileChanges?: PermissionFileChangeMap;
 	content?: unknown[];
 	locations?: { path: string; line?: number }[];
 }

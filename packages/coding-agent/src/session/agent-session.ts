@@ -404,6 +404,7 @@ import {
 	SILENT_ABORT_MARKER,
 	SKILL_PROMPT_MESSAGE_TYPE,
 } from "./messages";
+import { planPermissionFileChanges } from "./permission-file-changes";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
@@ -6759,6 +6760,12 @@ export class AgentSession {
 					if (signal?.aborted) {
 						throw new ToolAbortError("Permission request cancelled");
 					}
+					let fileChanges: Awaited<ReturnType<typeof planPermissionFileChanges>>;
+					try {
+						fileChanges = await planPermissionFileChanges(target.name, args, this.sessionManager.getCwd());
+					} catch {
+						fileChanges = undefined;
+					}
 					type PermissionRaceResult =
 						| { kind: "permission"; outcome: ClientBridgePermissionOutcome }
 						| { kind: "aborted" };
@@ -6775,6 +6782,7 @@ export class AgentSession {
 								...(isExecutionTool ? { kind: "execute" } : {}),
 								status: "pending",
 								rawInput: args,
+								...(fileChanges ? { fileChanges } : {}),
 								...(commandContent ? { content: commandContent } : {}),
 								locations: extractPermissionLocations(
 									args,
