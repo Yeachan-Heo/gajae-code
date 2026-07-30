@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
@@ -1794,27 +1795,46 @@ export function hasTypedVerifiedReceipt(value: unknown): boolean {
 	return Boolean(type && id && (status === "verified" || status === "passed"));
 }
 
-export async function hasExistingNonEmptyArtifact(cwd: string, value: unknown): Promise<boolean> {
+async function resolveExistingArtifactPathUnderCwd(
+	cwd: string,
+	value: unknown,
+	fieldName: string,
+): Promise<string | null> {
 	const artifactPath = nonEmptyString(value);
-	if (!artifactPath) return false;
-	const resolved = path.resolve(cwd, artifactPath);
+	if (!artifactPath) return null;
+	const lexicalRoot = path.resolve(cwd);
+	const lexical = path.resolve(lexicalRoot, artifactPath);
+	const lexicalRelative = path.relative(lexicalRoot, lexical);
+	if (lexicalRelative === ".." || lexicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(lexicalRelative)) {
+		throw new Error(`qualityGate ${fieldName} artifact path must resolve under the repository cwd`);
+	}
 	try {
-		const file = Bun.file(resolved);
-		return (await file.exists()) && file.size > 0;
+		const [root, resolved] = await Promise.all([fs.realpath(lexicalRoot), fs.realpath(lexical)]);
+		const relative = path.relative(root, resolved);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			throw new Error(`qualityGate ${fieldName} artifact path must not escape the repository cwd through symlinks`);
+		}
+		if (!(await fs.stat(resolved)).isFile()) {
+			throw new Error(`qualityGate ${fieldName} artifact path must reference a regular file`);
+		}
+		return resolved;
 	} catch (error) {
-		if (isEnoent(error)) return false;
+		if (isEnoent(error)) return null;
 		throw error;
 	}
 }
 
+export async function hasExistingNonEmptyArtifact(cwd: string, value: unknown): Promise<boolean> {
+	const resolved = await resolveExistingArtifactPathUnderCwd(cwd, value, "artifact");
+	if (!resolved) return false;
+	return (await fs.stat(resolved)).size > 0;
+}
+
 export async function readArtifactBytes(cwd: string, row: JsonObject, fieldName: string): Promise<Buffer | null> {
-	const artifactPath = nonEmptyString(row.path);
-	if (!artifactPath) return null;
-	const resolved = path.resolve(cwd, artifactPath);
+	const resolved = await resolveExistingArtifactPathUnderCwd(cwd, row.path, fieldName);
+	if (!resolved) return null;
 	try {
-		const file = Bun.file(resolved);
-		if (!(await file.exists())) return null;
-		return Buffer.from(await file.arrayBuffer());
+		return Buffer.from(await Bun.file(resolved).arrayBuffer());
 	} catch (error) {
 		if (isEnoent(error)) return null;
 		throw new Error(`qualityGate ${fieldName} artifact could not be read: ${String(error)}`);

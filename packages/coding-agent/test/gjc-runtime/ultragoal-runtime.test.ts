@@ -776,21 +776,35 @@ describe("ultragoal CLI replay validation", () => {
 		expect(stringError).toContain("argv string array");
 	});
 
-	it("accepts any argv command without an executable allowlist", async () => {
-		const root = await tempDir();
-		// bun test / bun install / arbitrary executables are all accepted now;
-		// the replaySafe flag plus the sandbox (subprocess, timeout, output cap,
-		// env scrubbing) is the safety boundary, not an executable allowlist.
+	it("accepts focused bun test replay and rejects arbitrary command execution", async () => {
+		const acceptedRoot = await tempDir();
+		await Bun.write(
+			path.join(acceptedRoot, "focused-replay.test.ts"),
+			'import { expect, test } from "bun:test"; test("replay", () => { console.log("BUN_TEST_REPLAY_OK"); expect(2 + 2).toBe(4); });\n',
+		);
 		await expectAcceptedExecutorQa(
-			root,
+			acceptedRoot,
 			cliExecutorQa([
 				cliReplayArtifact({
-					command: ["bun", "-e", 'console.log("arbitrary-replay-ok")'],
-					recordedStdout: "arbitrary-replay-ok\n",
-					invariants: [{ type: "substring", value: "arbitrary-replay-ok" }],
+					command: ["bun", "test", "focused-replay.test.ts"],
+					recordedStdout: "",
+					invariants: [{ type: "substring", value: "BUN_TEST_REPLAY_OK" }],
 				}),
 			]),
 		);
+
+		for (const command of [
+			["/bin/sh", "-c", "printf unsafe"],
+			["sh", "-c", "printf unsafe"],
+			["bun", "install"],
+			["bun", "-e", 'await Bun.write("unsafe", "x")'],
+			["bun", "test", "../outside.test.ts"],
+			["bun", "test", "--preload", "evil.ts", "focused-replay.test.ts"],
+		]) {
+			const rejectedRoot = await tempDir();
+			const error = await expectRejectedExecutorQa(rejectedRoot, cliExecutorQa([cliReplayArtifact({ command })]));
+			expect(error).toContain("deterministic CLI replay allowlist");
+		}
 	});
 
 	it("reads the referenced replay file when the artifactRef kind is cli-replay", async () => {
@@ -824,6 +838,66 @@ describe("ultragoal CLI replay validation", () => {
 		);
 	});
 
+	it("fails closed on ambiguous replay rows and repository path escapes", async () => {
+		const ambiguousRoot = await tempDir();
+		const ambiguousError = await expectRejectedExecutorQa(
+			ambiguousRoot,
+			cliExecutorQa([{ ...cliReplayArtifact(), path: "artifacts/replay.json" }]),
+		);
+		expect(ambiguousError).toContain("must not mix nested replay");
+
+		const malformedRoot = await tempDir();
+		const malformedError = await expectRejectedExecutorQa(
+			malformedRoot,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					description: "Malformed replay row",
+					replay: "self-attested",
+					path: "artifacts/replay.json",
+				},
+			]),
+		);
+		expect(malformedError).toContain(".replay must be an object");
+
+		const cwdRoot = await tempDir();
+		const outsideCwd = await tempDir();
+		await fs.symlink(outsideCwd, path.join(cwdRoot, "linked-cwd"), "dir");
+		const cwdError = await expectRejectedExecutorQa(
+			cwdRoot,
+			cliExecutorQa([cliReplayArtifact({ cwd: "linked-cwd" })]),
+		);
+		expect(cwdError).toContain("without symlink escape");
+
+		const artifactRoot = await tempDir();
+		const outsideArtifactRoot = await tempDir();
+		await fs.mkdir(path.join(artifactRoot, "artifacts"), { recursive: true });
+		const outsideReplay = path.join(outsideArtifactRoot, "replay.json");
+		await Bun.write(
+			outsideReplay,
+			JSON.stringify({
+				schemaVersion: 1,
+				kind: "cli-replay",
+				replaySafe: true,
+				command: ["bun", "-e", 'console.log("outside")'],
+				recordedStdout: "outside\n",
+			}),
+		);
+		await fs.symlink(outsideReplay, path.join(artifactRoot, "artifacts", "replay.json"));
+		const artifactError = await expectRejectedExecutorQa(
+			artifactRoot,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					description: "Escaping replay artifact",
+					path: "artifacts/replay.json",
+				},
+			]),
+		);
+		expect(artifactError).toContain("must not escape the repository cwd through symlinks");
+	});
 	it("rejects execution-affecting env vars", async () => {
 		const envRoot = await tempDir();
 		const envError = await expectRejectedExecutorQa(
@@ -849,6 +923,25 @@ describe("ultragoal CLI replay validation", () => {
 		};
 		await expect(waitForReplayProcessWithTimeout(fakeProcess, 1, 1)).rejects.toThrow("timeout");
 		expect(killedWith).toBe("SIGKILL");
+	});
+
+	it("kills the POSIX replay process group before detached children can continue", async () => {
+		if (process.platform === "win32") return;
+		const root = await tempDir();
+		const marker = path.join(root, "survived.txt");
+		const subprocess = Bun.spawn(
+			[
+				"/bin/sh",
+				"-c",
+				"trap '' TERM; (trap '' TERM; sleep 0.25; printf escaped > \"$1\") & while :; do sleep 1; done",
+				"sh",
+				marker,
+			],
+			{ stdout: "ignore", stderr: "ignore", detached: true },
+		);
+		await expect(waitForReplayProcessWithTimeout(subprocess, 10, 50)).rejects.toThrow("timeout");
+		await Bun.sleep(350);
+		expect(await Bun.file(marker).exists()).toBe(false);
 	});
 
 	it("rejects stdout mismatches", async () => {
@@ -983,6 +1076,41 @@ describe("ultragoal CLI replay validation", () => {
 			]),
 		);
 		expect(invalidFallbackError).toContain("control sequences");
+
+		const testReportRoot = await tempDir();
+		await fs.mkdir(path.join(testReportRoot, "artifacts"), { recursive: true });
+		await Bun.write(
+			path.join(testReportRoot, "artifacts", "test-report.json"),
+			JSON.stringify({ command: ["bun", "test", "focused.test.ts"], total: 1, passed: 1, failed: 0 }),
+		);
+		const testReportError = await expectRejectedExecutorQa(
+			testReportRoot,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					description: "Replay exemption with test report fallback",
+					replay: {
+						schemaVersion: 1,
+						kind: "cli-replay",
+						replayExempt: {
+							reasonCode: "platform_unavailable",
+							reason:
+								"The focused test runner is unavailable on this platform and requires an audited fallback.",
+							approvedBy: "executor-qa",
+							fallbackArtifactRefs: ["test-report"],
+						},
+					},
+				},
+				{
+					id: "test-report",
+					kind: "test-report",
+					path: "artifacts/test-report.json",
+					description: "Structured focused test report",
+				},
+			]),
+		);
+		expect(testReportError).toContain("requires at least one structurally-valid fallback artifact");
 	});
 
 	it("honors substring regex and not_substring invariants instead of full stdout equality", async () => {

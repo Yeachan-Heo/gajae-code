@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
 import {
@@ -382,6 +383,25 @@ function clampCliReplayTimeout(value: unknown): number {
 function basenameCommand(value: string): string {
 	return path.basename(value).toLowerCase();
 }
+
+function isDeterministicConsoleLogReplay(code: string): boolean {
+	let remaining = code.trim();
+	if (remaining.length === 0) return false;
+	let matched = false;
+	while (remaining.length > 0) {
+		const match =
+			/^console\.log\(\s*("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\$])*`)\s*\)\s*;?\s*/.exec(
+				remaining,
+			);
+		if (!match) return false;
+		const statement = match[0]!;
+		const literal = match[1]!;
+		if (literal.startsWith("`") && literal.includes("${")) return false;
+		matched = true;
+		remaining = remaining.slice(statement.length);
+	}
+	return matched;
+}
 function hasShellRedirectionToken(value: string): boolean {
 	return /^(?:[<>]|\d?[<>]|\d?>&\d|\|\|?|&&|;)$/.test(value) || /(?:^|[^\w])-?>/.test(value);
 }
@@ -413,19 +433,134 @@ export function isAllowedGitReplayCommand(args: readonly string[]): boolean {
 	return true;
 }
 
-function resolveCliReplayCommand(command: string[]): string[] {
-	if (basenameCommand(command[0]!) === "bun") return [process.execPath, ...command.slice(1)];
-	return command;
+function isBareExecutableName(value: string): boolean {
+	return (
+		value.length > 0 &&
+		!value.includes("/") &&
+		!value.includes("\\") &&
+		value === path.basename(value) &&
+		value === value.toLowerCase()
+	);
 }
 
-function resolveUnderCwd(cwd: string, replayCwd: unknown, fieldName: string): string {
+function isSafeExplicitTestPath(value: string): boolean {
+	if (!value || value.startsWith("-") || path.isAbsolute(value) || value.includes("\\") || /[\0\n\r*?[\]]/.test(value))
+		return false;
+	const segments = value.split("/");
+	if (segments.some(segment => !segment || segment === "." || segment === "..")) return false;
+	return /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(value);
+}
+
+function explicitBunTestPaths(args: readonly string[]): string[] | null {
+	if (args[0] !== "test") return null;
+	const paths: string[] = [];
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--bail") continue;
+		if (arg === "--test-name-pattern") {
+			const pattern = args[++index];
+			if (!pattern || pattern.length > 512 || /[\0\n\r]/.test(pattern)) return null;
+			continue;
+		}
+		if (!isSafeExplicitTestPath(arg)) return null;
+		paths.push(arg);
+	}
+	return paths.length > 0 ? paths : null;
+}
+
+function isAllowedCliReplayCommand(command: readonly string[]): boolean {
+	if (
+		command.length === 0 ||
+		command.some(arg => arg.trim() !== arg || arg.length === 0 || hasShellRedirectionToken(arg))
+	)
+		return false;
+	if (!isBareExecutableName(command[0]!)) return false;
+	if (command[0] !== "bun") return false;
+	const args = command.slice(1);
+	if (args.length === 1 && args[0] === "--version") return true;
+	if (args.length === 2 && args[0] === "-e") return isDeterministicConsoleLogReplay(args[1]!);
+	if (process.platform === "win32") return false;
+	return explicitBunTestPaths(args) !== null;
+}
+
+function summarizeBlockedCliReplayCommand(command: readonly string[]): string {
+	const executable = command[0] ? basenameCommand(command[0]) : "<missing>";
+	const argCount = Math.max(0, command.length - 1);
+	return `${JSON.stringify(executable)} with ${argCount} arg${argCount === 1 ? "" : "s"}`;
+}
+
+function cliReplayAllowlistDescription(): string {
+	return '`bun --version`, deterministic `bun -e "console.log(...)"`, or `bun test` with explicit repository-contained *.test.*/*.spec.* files (optional --bail/--test-name-pattern)';
+}
+
+async function assertBunTestPathsUnderRoot(
+	rootCwd: string,
+	replayCwd: string,
+	command: readonly string[],
+	fieldName: string,
+): Promise<void> {
+	const testPaths = explicitBunTestPaths(command.slice(1));
+	if (!testPaths) return;
+	const root = await fs.realpath(path.resolve(rootCwd));
+	for (const testPath of testPaths) {
+		const lexical = path.resolve(replayCwd, testPath);
+		const relative = path.relative(root, lexical);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			throw new Error(`qualityGate ${fieldName}.command test path must resolve under the repository cwd`);
+		}
+		let stat: Awaited<ReturnType<typeof fs.lstat>>;
+		let real: string;
+		try {
+			stat = await fs.lstat(lexical);
+			real = await fs.realpath(lexical);
+		} catch {
+			throw new Error(`qualityGate ${fieldName}.command test path must reference an existing regular file`);
+		}
+		const realRelative = path.relative(root, real);
+		if (
+			stat.isSymbolicLink() ||
+			!stat.isFile() ||
+			realRelative === ".." ||
+			realRelative.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(realRelative)
+		) {
+			throw new Error(
+				`qualityGate ${fieldName}.command test path must be a non-symlink regular file under the repository cwd`,
+			);
+		}
+	}
+}
+
+function resolveCliReplayCommand(command: string[]): string[] {
+	return [process.execPath, ...command.slice(1)];
+}
+
+async function resolveUnderCwd(cwd: string, replayCwd: unknown, fieldName: string): Promise<string> {
 	const relative = replayCwd === undefined ? "." : nonEmptyString(replayCwd);
 	if (!relative) throw new Error(`qualityGate ${fieldName}.cwd must be a non-empty string when provided`);
-	const root = path.resolve(cwd);
-	const resolved = path.resolve(root, relative);
+	const lexicalRoot = path.resolve(cwd);
+	const lexical = path.resolve(lexicalRoot, relative);
+	const relativeToLexicalRoot = path.relative(lexicalRoot, lexical);
+	if (
+		relativeToLexicalRoot === ".." ||
+		relativeToLexicalRoot.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relativeToLexicalRoot)
+	) {
+		throw new Error(`qualityGate ${fieldName}.cwd must resolve under the repository cwd`);
+	}
+	let root: string;
+	let resolved: string;
+	try {
+		[root, resolved] = await Promise.all([fs.realpath(lexicalRoot), fs.realpath(lexical)]);
+	} catch {
+		throw new Error(`qualityGate ${fieldName}.cwd must reference an existing directory under the repository cwd`);
+	}
 	const relativeToRoot = path.relative(root, resolved);
 	if (relativeToRoot === ".." || relativeToRoot.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToRoot)) {
-		throw new Error(`qualityGate ${fieldName}.cwd must resolve under the repository cwd`);
+		throw new Error(`qualityGate ${fieldName}.cwd must resolve under the repository cwd without symlink escape`);
+	}
+	if (!(await fs.stat(resolved)).isDirectory()) {
+		throw new Error(`qualityGate ${fieldName}.cwd must reference a directory`);
 	}
 	return resolved;
 }
@@ -467,16 +602,27 @@ function normalizeCliReplayOutput(value: string, cwd: string): string {
 }
 
 export async function readCliReplayRecord(cwd: string, row: JsonObject, fieldName: string): Promise<JsonObject | null> {
-	// A row is an inline replay record only when it actually carries replay fields.
-	// `kind: "cli-replay"` alone is the natural kind for an artifactRef that *points*
-	// at a replay file, so treating that as inline meant the referenced `path` was
-	// never read and surfaced a confusing `schemaVersion must be 1` error on the ref.
-	const inline =
-		qualityGateObject(row.replay) ?? (row.kind === "cli-replay" && row.command !== undefined ? row : null);
-	if (inline) return inline;
+	const nestedReplay = row.replay === undefined ? null : qualityGateObject(row.replay);
+	if (row.replay !== undefined && !nestedReplay) {
+		throw new Error(`qualityGate ${fieldName}.replay must be an object when provided`);
+	}
+	const inlineFieldNames = ["schemaVersion", "replaySafe", "command", "cwd", "env", "timeoutMs", "expectedExitCode"];
+	const hasTopLevelInlineFields = inlineFieldNames.some(name => row[name] !== undefined);
+	const hasPath = row.path !== undefined;
+	if (nestedReplay && (hasPath || hasTopLevelInlineFields)) {
+		throw new Error(`qualityGate ${fieldName} must not mix nested replay, artifact path, or top-level replay fields`);
+	}
+	if (hasTopLevelInlineFields && hasPath) {
+		throw new Error(`qualityGate ${fieldName} must not mix inline replay fields with an artifact path`);
+	}
+	if (nestedReplay) return nestedReplay;
+	if (row.kind === "cli-replay" && hasTopLevelInlineFields) return row;
 	if (!evidenceKindMatches(normalizedEvidenceKind(row), ["cli-replay", "command-replay"])) return null;
+	if (!hasPath) {
+		throw new Error(`qualityGate ${fieldName} CLI replay artifact must provide either replay fields or path`);
+	}
 	const bytes = await readArtifactBytes(cwd, row, fieldName);
-	if (!bytes) return null;
+	if (!bytes) throw new Error(`qualityGate ${fieldName} CLI replay artifact path must reference a readable file`);
 	try {
 		return requireQualityGateObject(JSON.parse(bytes.toString("utf8")), `${fieldName}.replay`);
 	} catch (error) {
@@ -505,6 +651,11 @@ function parseCliReplayRecord(
 	if (!command) throw new Error(`qualityGate ${fieldName}.command must be a non-empty string array`);
 	if (record.replaySafe !== true)
 		throw new Error(`qualityGate ${fieldName}.replaySafe must be true before CLI replay executes`);
+	if (!isAllowedCliReplayCommand(command)) {
+		throw new Error(
+			`qualityGate ${fieldName}.command is not in the deterministic CLI replay allowlist; command ${summarizeBlockedCliReplayCommand(command)} is blocked. Allowed replay commands: ${cliReplayAllowlistDescription()}. For other commands, provide audited replayExempt metadata with reasonCode, reason, approvedBy, and fallbackArtifactRefs that point to a structurally valid fallback artifact.`,
+		);
+	}
 	if (record.normalization !== undefined && record.normalization !== "default") {
 		throw new Error(`qualityGate ${fieldName}.normalization must be default when provided`);
 	}
@@ -597,11 +748,24 @@ async function collectCliReplayOutput(
 
 export interface ReplayProcessHandle {
 	readonly exited: Promise<number>;
+	readonly pid?: number;
 	kill(signal?: number | NodeJS.Signals): void;
 }
 
+function signalReplayProcessTree(handle: ReplayProcessHandle, signal: NodeJS.Signals): void {
+	if (process.platform !== "win32" && Number.isInteger(handle.pid) && (handle.pid ?? 0) > 0) {
+		try {
+			process.kill(-handle.pid!, signal);
+			return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+		}
+	}
+	handle.kill(signal);
+}
+
 export async function waitForReplayProcessWithTimeout(
-	process: ReplayProcessHandle,
+	handle: ReplayProcessHandle,
 	timeoutMs: number,
 	graceMs = 2000,
 ): Promise<number> {
@@ -611,21 +775,21 @@ export async function waitForReplayProcessWithTimeout(
 	const timeout = new Promise<typeof timedOut>(resolve => {
 		timeoutTimer = setTimeout(() => resolve(timedOut), timeoutMs);
 	});
-	const first = await Promise.race([process.exited, timeout]);
+	const first = await Promise.race([handle.exited, timeout]);
 	if (first !== timedOut) {
 		if (timeoutTimer) clearTimeout(timeoutTimer);
 		return first;
 	}
-	process.kill("SIGTERM");
+	signalReplayProcessTree(handle, "SIGTERM");
 	const killed = Symbol("killed");
 	const grace = new Promise<typeof killed>(resolve => {
 		graceTimer = setTimeout(() => {
-			process.kill("SIGKILL");
+			signalReplayProcessTree(handle, "SIGKILL");
 			resolve(killed);
 		}, graceMs);
 	});
-	await Promise.race([process.exited, grace]);
-	await process.exited.catch(() => undefined);
+	await Promise.race([handle.exited, grace]);
+	await handle.exited.catch(() => undefined);
 	if (timeoutTimer) clearTimeout(timeoutTimer);
 	if (graceTimer) clearTimeout(graceTimer);
 	throw new Error("timeout");
@@ -684,18 +848,20 @@ export async function validateCliReplay(
 	}
 	void options.live;
 	const replay = parseCliReplayRecord(record, fieldName);
-	const replayCwd = resolveUnderCwd(cwd, replay.replayCwd, fieldName);
-	const process = Bun.spawn(resolveCliReplayCommand(replay.command), {
+	const replayCwd = await resolveUnderCwd(cwd, replay.replayCwd, fieldName);
+	await assertBunTestPathsUnderRoot(cwd, replayCwd, replay.command, fieldName);
+	const subprocess = Bun.spawn(resolveCliReplayCommand(replay.command), {
 		cwd: replayCwd,
 		env: replay.env,
 		stdout: "pipe",
 		stderr: "pipe",
+		detached: process.platform !== "win32",
 	});
 	try {
 		const [stdout, stderr, exitCode] = await Promise.all([
-			collectCliReplayOutput(process.stdout),
-			collectCliReplayOutput(process.stderr),
-			waitForReplayProcessWithTimeout(process, replay.timeoutMs),
+			collectCliReplayOutput(subprocess.stdout),
+			collectCliReplayOutput(subprocess.stderr),
+			waitForReplayProcessWithTimeout(subprocess, replay.timeoutMs),
 		]);
 		if (stdout.truncated || stderr.truncated)
 			throw new Error(`qualityGate ${fieldName} CLI replay output exceeded 1 MiB buffer cap`);
