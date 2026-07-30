@@ -2,10 +2,27 @@ import { describe, expect, it } from "bun:test";
 import { classifyProviderRetry, classifyProviderRetryFromTransport } from "../../src/task/provider-retry-status";
 
 describe("classifyProviderRetry", () => {
-	it("classifies first-event timeouts from message prose", () => {
-		expect(classifyProviderRetry("Provider stream timed out while waiting for the first event")).toBe(
+	it("classifies canonical first-event timeout prose", () => {
+		for (const message of [
+			"Provider stream timed out while waiting for the first event",
+			"Anthropic stream timed out while waiting for the first event",
+			"Error: Provider stream timed out while waiting for the first event",
+		]) {
+			expect(classifyProviderRetry(message)).toBe("first_event_timeout");
+		}
+	});
+
+	it("classifies only the exact no-the first-event compatibility message", () => {
+		expect(classifyProviderRetry("Provider stream timed out while waiting for first event")).toBe(
 			"first_event_timeout",
 		);
+		for (const message of [
+			"Error: Provider stream timed out while waiting for first event",
+			"Provider stream timed out while waiting for first event.",
+			"Provider stream timeout waiting for first event",
+		]) {
+			expect(classifyProviderRetry(message)).toBe("provider_error");
+		}
 	});
 
 	it("classifies idle stalls from message prose", () => {
@@ -37,10 +54,24 @@ describe("classifyProviderRetryFromTransport", () => {
 		).toBe("first_event_timeout");
 	});
 
-	it("falls back to message regex when providerCode is absent", () => {
+	it("keeps typed first-event authority over incompatible prose", () => {
+		expect(
+			classifyProviderRetryFromTransport({
+				providerCode: "stream_first_event_timeout",
+				errorMessage: "Provider stream timed out while waiting for first event.",
+			}),
+		).toBe("first_event_timeout");
+	});
+
+	it("falls back to message classification when providerCode is absent", () => {
 		expect(
 			classifyProviderRetryFromTransport({
 				errorMessage: "Provider stream timed out while waiting for the first event",
+			}),
+		).toBe("first_event_timeout");
+		expect(
+			classifyProviderRetryFromTransport({
+				errorMessage: "Provider stream timed out while waiting for first event",
 			}),
 		).toBe("first_event_timeout");
 		expect(
@@ -51,7 +82,7 @@ describe("classifyProviderRetryFromTransport", () => {
 		expect(classifyProviderRetryFromTransport({ errorMessage: "boom" })).toBe("provider_error");
 	});
 
-	it("falls back to message regex when providerCode is not the first-event fact", () => {
+	it("falls back to message classification when providerCode is not the first-event fact", () => {
 		expect(
 			classifyProviderRetryFromTransport({
 				providerCode: "rate_limit_error",

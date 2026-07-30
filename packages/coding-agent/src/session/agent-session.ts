@@ -869,6 +869,8 @@ type RetryErrorClassification =
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
+const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Error: Provider stream timed out while waiting for the first event";
+const PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR = "Provider stream timed out while waiting for first event";
 const BARE_DEFAULT_CODEX_OVERLOAD_ERROR = /^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"anthropic-messages": new Set([
@@ -904,6 +906,20 @@ function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boole
 		facts.anthropicErrorType !== undefined ||
 		facts.openaiErrorCode !== undefined ||
 		(facts.headers !== undefined && Object.keys(facts.headers).length > 0)
+	);
+}
+function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
+	if (hasBareDefaultRetryDisqualifyingFacts(message)) return false;
+	return (
+		message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR ||
+		message.errorMessage === PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR
+	);
+}
+
+function isBareDefaultWrappedFirstEventTimeout(message: AssistantMessage): boolean {
+	return (
+		message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR &&
+		!hasBareDefaultRetryDisqualifyingFacts(message)
 	);
 }
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
@@ -14003,6 +14019,7 @@ export class AgentSession {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) {
 			return "terminal";
 		}
+		if (isMessageOnlyFirstEventTimeout(message)) return "first_event_timeout";
 		// Legacy providers that have not yet stamped the typed timeout fact retain
 		// their existing bounded ollama-cloud behavior.
 		if (this.#isFirstEventTimeoutErrorMessage(err) && this.#shouldFailClosedOnFirstEventTimeout(message)) {
@@ -14378,17 +14395,20 @@ export class AgentSession {
 		// retry.enabled=false always surfaces immediately, matching the explicit
 		// user opt-out.
 		if (!managedFallback && !retrySettings.enabled) return false;
-		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
-		if (classification === "first_event_timeout") {
+		const classification = this.#classifyErrorForRetry(message);
+		const firstEventTimeout = classification === "first_event_timeout";
+		if (!managedFallback && firstEventTimeout) {
 			this.#firstEventTimeoutRetryStartedAt ??= Date.now();
 		}
 		// First-event timeouts are replay-safe only before any model progress,
 		// abort, or extension/provider lifecycle participation.
-		if (
-			classification === "first_event_timeout" &&
-			(!this.#hasCleanRetryReplaySafety || assistantMessageHasVisibleOrToolContent(message))
-		) {
-			return false;
+		if (firstEventTimeout && (!this.#hasCleanRetryReplaySafety || assistantMessageHasVisibleOrToolContent(message))) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
 		}
 		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		if (!trigger) {
@@ -14415,12 +14435,14 @@ export class AgentSession {
 		// capacity-overload event.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
+			const bareDefaultWrappedFirstEventTimeout = isBareDefaultWrappedFirstEventTimeout(message);
 			// Content-free Codex overload is replay-safe by the same reasoning as
 			// credential rotation: no partial output means no observable state.
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
 				(!canReplayCodexOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
+					!bareDefaultWrappedFirstEventTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
@@ -14429,7 +14451,7 @@ export class AgentSession {
 				return false;
 			}
 		}
-		const legacyUnbounded = classification === "transient";
+		const legacyUnbounded = !managedFallback && classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
@@ -14522,12 +14544,11 @@ export class AgentSession {
 			await this.#emitSessionEvent({
 				type: "auto_retry_start",
 				attempt: this.#retryAttempt,
-				maxAttempts:
-					classification === "first_event_timeout"
+				maxAttempts: managedFallback
+					? controller.maxAttempts
+					: firstEventTimeout
 						? retrySettings.maxRetries + 1
-						: managedFallback
-							? controller.maxAttempts
-							: retrySettings.maxRetries,
+						: retrySettings.maxRetries,
 				delayMs,
 				errorMessage,
 				unbounded: managedFallback ? false : legacyUnbounded,

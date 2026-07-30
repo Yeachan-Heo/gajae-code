@@ -516,15 +516,15 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
 
-	it("does not retry when retry.enabled is false", async () => {
+	it("does not retry the canonical wrapped timeout when retry.enabled is false", async () => {
 		session = buildSession({
-			responses: [{ throw: "503 service unavailable: overloaded_error" }],
+			responses: [{ throw: "Error: Provider stream timed out while waiting for the first event" }],
 			settingsOverrides: { "retry.enabled": false },
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents } = track(session);
 
-		await session.prompt("trigger transient with retry disabled");
+		await session.prompt("canonical timeout with retry disabled");
 		await session.waitForIdle();
 
 		expect(retryStartEvents).toHaveLength(0);
@@ -567,12 +567,13 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
 
-	it("abortRetry cancels the retry and surfaces the error", async () => {
+	it("abortRetry cancels a canonical first-event retry and surfaces cancellation", async () => {
+		const errorMessage = "Error: Provider stream timed out while waiting for the first event";
 		session = buildSession({
-			responses: [{ throw: "503 service unavailable: overloaded_error" }, { content: ["should not reach"] }],
+			responses: [{ throw: errorMessage }, { content: ["should not reach"] }],
 			settingsOverrides: { "retry.baseDelayMs": 600_000, "retry.maxDelayMs": 600_000 },
 		});
-		const { retryEndEvents } = track(session);
+		const { retryStartEvents, retryEndEvents } = track(session);
 		let resolveStarted!: () => void;
 		const started = new Promise<void>(r => {
 			resolveStarted = r;
@@ -598,6 +599,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: false });
 		expect(retryEndEvents[0].finalError).toContain("cancelled");
+		expect(retryStartEvents).toEqual([expect.objectContaining({ errorMessage, unbounded: false, maxAttempts: 2 })]);
 		// The errored assistant message was stripped in preparation for the retry,
 		// so cancellation simply returns to idle (the error remains in session history).
 		expect(session.isRetrying).toBe(false);
@@ -1206,26 +1208,73 @@ describe("AgentSession resilient retry", () => {
 		expect(progressModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
-	it("retries a bare-default watchdog with an empty extension runner", async () => {
+	it("recovers the canonical wrapped first-event timeout in the same bare-default turn", async () => {
+		const errorMessage = "Error: Provider stream timed out while waiting for the first event";
 		const requestedModels: string[] = [];
 		session = buildBareRetrySession({
-			responses: [
-				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
-				{ content: ["recovered"] },
-			],
+			responses: [{ throw: errorMessage }, { content: ["recovered"] }],
 			requestedModels,
 			extensionRunner: createExtensionRunner(),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents, retryEndEvents } = track(session);
+		const maxAttempts = session.settings.getGroup("retry").maxRetries + 1;
 
-		await session.prompt("bare-config empty extension watchdog");
+		await session.prompt("bare-config canonical wrapped timeout");
 		await session.waitForIdle();
 
-		expect(retryStartEvents).toHaveLength(1);
 		expect(requestedModels).toHaveLength(2);
-		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
-		expect(lastAssistant(session).stopReason).toBe("stop");
+		expect(retryStartEvents).toEqual([
+			expect.objectContaining({ attempt: 1, maxAttempts, errorMessage, unbounded: false }),
+		]);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true, attempt: 1 })]);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "recovered" }],
+		});
+	});
+
+	it("bounds canonical wrapped first-event timeout exhaustion with exact diagnostics", async () => {
+		const errorMessage = "Error: Provider stream timed out while waiting for the first event";
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage,
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 2 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("exhaust canonical wrapped timeout");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(3);
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.every(event => event.maxAttempts === 3 && event.unbounded === false)).toBe(true);
+		expect(lastAssistant(session).errorMessage).toMatch(
+			/^First-event stream timeout exhausted after 3 attempts; waited \d+ms total: Error: Provider stream timed out while waiting for the first event$/,
+		);
+	});
+
+	it("bounds the exact no-the first-event compatibility message under explicit retry policy", async () => {
+		const errorMessage = "Provider stream timed out while waiting for first event";
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage,
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 1 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("exact no-the first-event timeout");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toEqual([
+			expect.objectContaining({ attempt: 1, maxAttempts: 2, errorMessage, unbounded: false }),
+		]);
+		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
 	});
 	it("does not replay a bare-default watchdog after a reasoning summary start hook participates", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -1240,7 +1289,7 @@ describe("AgentSession resilient retry", () => {
 						model,
 						[],
 						"error",
-						"Example Provider Watchdog stream stalled while waiting for the next event",
+						"Error: Provider stream timed out while waiting for the first event",
 					);
 					stream.push({ type: "start", partial: failure });
 					stream.push({ type: "reasoning_summary_start", contentIndex: 0, partial: failure });
@@ -1277,7 +1326,7 @@ describe("AgentSession resilient retry", () => {
 		const requestedModels: string[] = [];
 		session = buildBareRetrySession({
 			responses: [
-				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ throw: "Error: Provider stream timed out while waiting for the first event" },
 				{ content: ["should-not-reach"] },
 			],
 			requestedModels,
@@ -1312,7 +1361,7 @@ describe("AgentSession resilient retry", () => {
 			session = buildBareRetrySession({
 				responses: [
 					{
-						throw: "Example Provider Watchdog stream timed out while waiting for the first event",
+						throw: "Error: Provider stream timed out while waiting for the first event",
 						...(eventType === "after_provider_response" ? { responseHeaders: { "x-request-id": "test" } } : {}),
 					},
 					{ content: ["should-not-reach"] },
@@ -1351,8 +1400,8 @@ describe("AgentSession resilient retry", () => {
 		const requestedModels: string[] = [];
 		session = buildBareRetrySession({
 			responses: [
-				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
-				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ throw: "Error: Provider stream timed out while waiting for the first event" },
+				{ throw: "Error: Provider stream timed out while waiting for the first event" },
 				{ content: ["should-not-reach"] },
 			],
 			requestedModels,
@@ -1413,7 +1462,7 @@ describe("AgentSession resilient retry", () => {
 							model,
 							[],
 							"error",
-							"Example Provider Watchdog stream timed out while waiting for the first event",
+							"Error: Provider stream timed out while waiting for the first event",
 						);
 						if (!partialOutput) empty.transportFailure = { kind: "transport", status: 503 };
 						stream.push({ type: "start", partial: empty });
@@ -1422,7 +1471,7 @@ describe("AgentSession resilient retry", () => {
 								model,
 								[{ type: "text", text: "already visible" }],
 								"error",
-								"Example Provider Watchdog stream timed out while waiting for the first event",
+								"Error: Provider stream timed out while waiting for the first event",
 							);
 							stream.push({ type: "text_start", contentIndex: 0, partial: empty });
 							stream.push({ type: "text_delta", contentIndex: 0, delta: "already ", partial: visible });
@@ -1489,7 +1538,7 @@ describe("AgentSession resilient retry", () => {
 						model,
 						[],
 						"error",
-						"Example Provider Watchdog stream timed out while waiting for the first event",
+						"Error: Provider stream timed out while waiting for the first event",
 					);
 					stream.push({ type: "start", partial: failure });
 					stream.push({ type: "error", reason: "error", error: failure });
@@ -1543,7 +1592,7 @@ describe("AgentSession resilient retry", () => {
 							model,
 							[],
 							"error",
-							"Example Provider Watchdog stream timed out while waiting for the first event",
+							"Error: Provider stream timed out while waiting for the first event",
 						);
 						stream.push({ type: "start", partial: failure });
 						stream.push({ type: "error", reason: "error", error: failure });
@@ -1583,8 +1632,9 @@ describe("AgentSession resilient retry", () => {
 	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {
 		const nearMisses = [
 			"stream timed out while waiting for the first event",
-			"Error: Provider stream timed out while waiting for the first event",
+			"Provider stream timed out while waiting for first event",
 			"Provider stream timed out while waiting for the first event.",
+			"TypeError: Provider stream timed out while waiting for the first event",
 			"Provider stream timeout waiting for first event",
 		];
 		for (const errorMessage of nearMisses) {
