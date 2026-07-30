@@ -1,5 +1,6 @@
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { hasFsCode, isEnoent } from "@gajae-code/utils/fs-error";
 
@@ -40,6 +41,29 @@ function currentProcessStartTime(): string {
 	return ownProcessStartTime;
 }
 
+let ownHostId: string | undefined;
+
+/**
+ * Stable identity of the host that owns a lock record.
+ *
+ * Liveness below is probed against the *local* process table, which is only
+ * meaningful for a lock written by this host. A state directory on a shared
+ * volume (NFS home directories are explicitly supported) is contended by
+ * several hosts, and a remote owner's pid is almost never a live local pid — so
+ * without this field a foreign host's freshly-taken lock reads as `dead` and is
+ * reclaimed instantly, with no stale grace period at all.
+ */
+function currentHostId(): string {
+	if (ownHostId === undefined) {
+		try {
+			ownHostId = os.hostname() || "unknown";
+		} catch {
+			ownHostId = "unknown";
+		}
+	}
+	return ownHostId;
+}
+
 function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, string | null>): string | null {
 	if (!cache) return processStartTime(owner.pid);
 	const key = `${owner.pid}:${owner.start_time ?? ""}`;
@@ -50,7 +74,15 @@ function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, s
 	return startTime;
 }
 
+function ownerIsForeignHost(owner: FileLockOwnerToken): boolean {
+	return owner.host_id !== undefined && owner.host_id !== currentHostId();
+}
+
 function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
+	// A remote owner's pid indexes a different process table; never claim to know
+	// it is alive, and never let the caller conclude it is dead either (see
+	// `staleLockSnapshot`, which routes foreign owners to elapsed time only).
+	if (ownerIsForeignHost(owner)) return false;
 	if (ownerLiveness(owner.pid) !== "alive") return false;
 	if (!owner.start_time) return true;
 	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
@@ -58,7 +90,12 @@ function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, st
 }
 
 function writeLockInfo(lockPath: string): Promise<LockInfo> {
-	const info: LockInfo = { pid: process.pid, start_time: currentProcessStartTime(), timestamp: Date.now() };
+	const info: LockInfo = {
+		pid: process.pid,
+		start_time: currentProcessStartTime(),
+		host_id: currentHostId(),
+		timestamp: Date.now(),
+	};
 	return Bun.write(`${lockPath}/info`, JSON.stringify(info)).then(() => info);
 }
 
@@ -72,17 +109,18 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	}
 
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, timestamp } = parsed as Partial<LockInfo>;
+	const { pid, start_time, host_id, timestamp } = parsed as Partial<LockInfo>;
 	if (
 		typeof pid !== "number" ||
 		!Number.isInteger(pid) ||
 		pid <= 0 ||
 		typeof timestamp !== "number" ||
 		!Number.isFinite(timestamp) ||
-		(start_time !== undefined && (typeof start_time !== "string" || !start_time))
+		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
+		(host_id !== undefined && (typeof host_id !== "string" || !host_id))
 	)
 		return null;
-	return { pid, start_time, timestamp };
+	return { pid, start_time, host_id, timestamp };
 }
 
 /** @internal */
@@ -94,6 +132,11 @@ export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOw
 export interface FileLockOwnerToken {
 	pid: number;
 	start_time?: string;
+	/**
+	 * Host that wrote the record. Absent on pre-host-id locks, which keep the
+	 * previous local-pid semantics for backward compatibility.
+	 */
+	host_id?: string;
 
 	timestamp: number;
 }
@@ -143,6 +186,10 @@ export async function removeFileLockDirForGc(
 	if (
 		current.pid !== expected.pid ||
 		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
+		// Two hosts sharing a volume can coincide on pid and even timestamp, so
+		// host identity is part of owner equality. An absent expectation still
+		// matches an absent record, preserving pre-host-id behaviour.
+		current.host_id !== expected.host_id ||
 		current.timestamp !== expected.timestamp
 	) {
 		return "owner_changed";
@@ -210,6 +257,13 @@ async function staleLockSnapshot(
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
 	if (ownerIsAlive(info, startTimeCache)) return { stale: false };
+	// A foreign host's pid says nothing about that host's process table, so the
+	// `dead` fast path must not apply to it. Such an owner is reclaimable only
+	// after the elapsed-time heuristic, which is the same grace period a local
+	// owner of indeterminate liveness receives.
+	if (ownerIsForeignHost(info)) {
+		return Date.now() - info.timestamp > staleMs ? { stale: true, owner: info } : { stale: false };
+	}
 	if (ownerLiveness(info.pid) === "dead" || Date.now() - info.timestamp > staleMs) {
 		return { stale: true, owner: info };
 	}
