@@ -3966,9 +3966,33 @@ export async function recordUltragoalReviewBlockers(input: {
 	title: string;
 	objective: string;
 	evidence: string;
-}): Promise<UltragoalPlan> {
+}): Promise<{ plan: UltragoalPlan; blockerGoalId: string }> {
 	const objective = input.objective.trim();
 	if (!objective) throw new Error("record-review-blockers --objective is required");
+	// Pre-check on the persisted plan BEFORE any mutation (#3613): dedup and cap are
+	// evaluated against the durable state so a dedup-hit is a pure idempotent return
+	// (no checkpoint, no writePlan, no appendLedger) and a cap-hit throws before any
+	// partial write corrupts goals.json/ledger. Read-check-then-write on this snapshot.
+	const prePlan = await readUltragoalPlan(input.cwd);
+	if (!prePlan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
+	// Dedup BEFORE the budget check: an identical-objective open review_blocker already
+	// descending from this blocked goal is returned idempotently — mirroring
+	// recordReviewFindingGoals' findOpenReviewBlockerGoal path and the checkpoint #645
+	// dedup discipline. Identity = review_blocker kind + trimmed objective +
+	// same blockedGoalId + non-resolved status.
+	const existing = findOpenReviewBlockerGoal(prePlan, objective);
+	if (existing && existing.steering?.kind === "review_blocker" && existing.steering.blockedGoalId === input.goalId) {
+		return { plan: prePlan, blockerGoalId: existing.id };
+	}
+	// Bounded cap: count unresolved descents off this blocked goal BEFORE any mutation.
+	// Resolved (complete/superseded) ancestors never count, so legitimate multi-generation
+	// review is not falsely capped. Descents 1..3 may exist; creating the 4th triggers the
+	// deterministic terminal human handoff. Durable across replay/restart/concurrency:
+	// recomputed from the persisted plan snapshot each call.
+	const unresolvedDescents = countUnresolvedReviewBlockerDescents(prePlan, input.goalId);
+	if (unresolvedDescents >= MAX_REVIEW_BLOCKER_DESCENTS)
+		throw new UltragoalReviewBlockerRecursionCapError(input.goalId, unresolvedDescents);
+	// Only now transition the blocked goal to review_blocked and record the new descent.
 	const plan = await checkpointUltragoalGoal({
 		cwd: input.cwd,
 		goalId: input.goalId,
@@ -3978,7 +4002,7 @@ export async function recordUltragoalReviewBlockers(input: {
 	const persistedPlan = await readUltragoalPlan(input.cwd);
 	if (persistedPlan?.state_revision !== undefined) plan.state_revision = persistedPlan.state_revision;
 	const now = new Date().toISOString();
-	const nextId = `G${String(plan.goals.length + 1).padStart(3, "0")}`;
+	const nextId = nextUltragoalGoalId(plan);
 	plan.goals.push({
 		id: nextId,
 		title: input.title.trim() || "Resolve final code-review blockers",
@@ -3991,7 +4015,7 @@ export async function recordUltragoalReviewBlockers(input: {
 	plan.updatedAt = now;
 	await writePlan(input.cwd, plan);
 	await appendLedger(input.cwd, { event: "review_blockers_recorded", goalId: input.goalId, blockerGoalId: nextId });
-	return plan;
+	return { plan, blockerGoalId: nextId };
 }
 
 export type UltragoalBlockerClassification = "human_blocked" | "resolvable";
@@ -4379,6 +4403,57 @@ function findOpenReviewBlockerGoal(plan: UltragoalPlan, message: string): Ultrag
 			goal.objective.trim() === objective &&
 			!RESOLVED_REVIEW_BLOCKER_STATUSES.has(goal.status),
 	);
+}
+
+/**
+ * Maximum unresolved review_blocker descents chained off a single blocked goal.
+ * Descents 1..3 may exist; an attempt to create the 4th triggers the deterministic
+ * terminal {@link UltragoalReviewBlockerRecursionCapError} handoff (#3613).
+ */
+const MAX_REVIEW_BLOCKER_DESCENTS = 3;
+
+/**
+ * Typed terminal handoff thrown when {@link recordUltragoalReviewBlockers} would
+ * exceed {@link MAX_REVIEW_BLOCKER_DESCENTS} unresolved review_blocker descents
+ * off a single blocked goal (#3613). Never silently marks unresolved technical
+ * findings complete; the operator/leader must pause and escalate.
+ */
+export class UltragoalReviewBlockerRecursionCapError extends Error {
+	readonly code = "review_blocker_recursion_cap" as const;
+	readonly blockedGoalId: string;
+	readonly unresolvedDescents: number;
+	readonly cap: number;
+	constructor(blockedGoalId: string, unresolvedDescents: number, cap = MAX_REVIEW_BLOCKER_DESCENTS) {
+		super(
+			`review_blocker_recursion_cap: goal ${blockedGoalId} already has ${unresolvedDescents} unresolved review_blocker descents (cap=${cap}). ` +
+				"Record a human pause/escalation or resolve existing blockers before recording more. " +
+				"Unresolved technical findings are never auto-completed.",
+		);
+		this.name = "UltragoalReviewBlockerRecursionCapError";
+		this.blockedGoalId = blockedGoalId;
+		this.unresolvedDescents = unresolvedDescents;
+		this.cap = cap;
+	}
+}
+
+/**
+ * Count unresolved review_blocker descents off a single blocked goal. A descent
+ * counts iff `steering.kind === "review_blocker"` AND
+ * `steering.blockedGoalId === goalId` AND status is not resolved
+ * (complete/superseded). Resolved ancestors never count, so legitimate
+ * multi-generation review is not falsely capped (#3613). Durable across
+ * replay/restart/concurrency: computed from the persisted plan snapshot each call.
+ */
+function countUnresolvedReviewBlockerDescents(plan: UltragoalPlan, goalId: string): number {
+	return plan.goals.reduce((count, goal) => {
+		if (
+			goal.steering?.kind === "review_blocker" &&
+			goal.steering.blockedGoalId === goalId &&
+			!RESOLVED_REVIEW_BLOCKER_STATUSES.has(goal.status)
+		)
+			return count + 1;
+		return count;
+	}, 0);
 }
 
 async function recordReviewFindingGoals(cwd: string, findings: readonly UltragoalReviewFinding[]): Promise<string[]> {
@@ -5133,20 +5208,19 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 				};
 			}
 			case "record-review-blockers": {
-				const plan = await recordUltragoalReviewBlockers({
+				const { blockerGoalId } = await recordUltragoalReviewBlockers({
 					cwd,
 					goalId: flagValue(args, "--goal-id") ?? "",
 					title: flagValue(args, "--title") ?? "Resolve final code-review blockers",
 					objective: flagValue(args, "--objective") ?? "",
 					evidence: flagValue(args, "--evidence") ?? "",
 				});
-				const goal = plan.goals.at(-1);
 				return {
 					status: 0,
 					stdout: json
 						? renderCliWriteReceipt({
 								ok: true,
-								goal_id: goal?.id,
+								goal_id: blockerGoalId,
 								goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 							})
 						: "Recorded review blockers.\n",

@@ -314,6 +314,8 @@ One generation freezes the change set and reviews it exactly once:
    ```sh
    gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve verification blockers" --objective "<blocker-resolution objective>" --evidence "<joined cohort findings>"
    ```
+
+   Review-blocker recursion cap (#3613): `record-review-blockers` dedups identical-objective blockers (same trimmed objective + same blocked goal + open status) and bounds the number of unresolved review_blocker descents per blocked goal to **3**. Descents 1..3 may exist; an attempt to create a 4th throws a typed `review_blocker_recursion_cap` terminal handoff (CLI exit 1, operator-visible marker) — never silently auto-completing findings. When the cap fires, record a human pause/escalation or resolve existing blockers before recording more.
 10. One consolidated fix batch produces exactly **one new generation**. Re-freeze the fixed source as a new `sourceHash`, bump `reviewGeneration`, and set `deltaOnly: true` with `priorGenerationSourceHash` and the `deltaPaths` actually changed. Generation 2+ reviews are **delta-only**: they may not pull in unrelated scope without an explicit `scopeExpansion` carrying `severity`, `novelty`, and `justification`. Repeat until a generation joins clean.
 11. Only after a generation joins clean, checkpoint the story as complete with a structured quality gate. The terminal critic runs **once** on that final joined generation; when `criticReview.sourceHash` is present it must match the cohort's `sourceHash`. The checkpoint creates a receipt in `ledger.jsonl`; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before the agent calls `goal({"op":"complete"})` to reconcile the inline UX goal state.
 
