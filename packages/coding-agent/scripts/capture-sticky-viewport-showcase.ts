@@ -2,11 +2,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	renderStickyViewportShowcase,
-	semanticAnchorRowExcerpt,
 	STICKY_VIEWPORT_ANCHOR_WITNESS,
 	STICKY_VIEWPORT_SHOWCASE_ENTRIES,
 	STICKY_VIEWPORT_SHOWCASE_KEYS,
 	type StickyViewportShowcaseEntry,
+	semanticAnchorRowExcerpt,
 } from "../test/fixtures/tui/sticky-viewport-showcase";
 
 const COMMAND =

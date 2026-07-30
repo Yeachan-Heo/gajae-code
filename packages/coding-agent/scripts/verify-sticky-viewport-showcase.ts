@@ -2,12 +2,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	SEMANTIC_ANCHOR_DOMAIN,
-	semanticAnchorDigest,
-	semanticAnchorNamespace,
-	semanticAnchorRowExcerpt,
 	STICKY_VIEWPORT_ANCHOR_WITNESS,
 	type StickyViewportAnchorWitness,
 	type StickyViewportShowcaseKey,
+	semanticAnchorDigest,
+	semanticAnchorNamespace,
+	semanticAnchorRowExcerpt,
 } from "../test/fixtures/tui/sticky-viewport-showcase";
 import {
 	ansiToHtml,

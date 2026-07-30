@@ -12,11 +12,11 @@ import {
 import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
 import {
 	SEMANTIC_ANCHOR_DOMAIN,
-	semanticAnchorDigest,
-	semanticAnchorRowExcerpt,
 	STICKY_VIEWPORT_ANCHOR_WITNESS,
 	STICKY_VIEWPORT_SHOWCASE_COVERAGE,
 	type StickyViewportShowcaseKey,
+	semanticAnchorDigest,
+	semanticAnchorRowExcerpt,
 } from "./fixtures/tui/sticky-viewport-showcase";
 
 const roots: string[] = [];
@@ -621,7 +621,10 @@ describe("sticky viewport production evidence verifier", () => {
 		const cjkForged = await forge(cjkKey, async (metadata, root) => {
 			for (const name of ["terminal.txt", "terminal-ansi.txt", "terminal.html"] as const) {
 				const artifactPath = path.join(root, cjkKey, name);
-				const rewritten = (await fs.readFile(artifactPath, "utf8")).replace("意味のある文の境界", "missing CJK proof");
+				const rewritten = (await fs.readFile(artifactPath, "utf8")).replace(
+					"意味のある文の境界",
+					"missing CJK proof",
+				);
 				await Bun.write(artifactPath, rewritten);
 				await rehash(root, cjkKey, name);
 			}
