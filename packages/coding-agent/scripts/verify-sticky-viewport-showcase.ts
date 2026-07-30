@@ -4,6 +4,10 @@ import {
 	SEMANTIC_ANCHOR_DOMAIN,
 	semanticAnchorDigest,
 	semanticAnchorNamespace,
+	semanticAnchorRowExcerpt,
+	STICKY_VIEWPORT_ANCHOR_WITNESS,
+	type StickyViewportAnchorWitness,
+	type StickyViewportShowcaseKey,
 } from "../test/fixtures/tui/sticky-viewport-showcase";
 import {
 	ansiToHtml,
@@ -410,23 +414,73 @@ const frameGeometry = (key: string, text: string) => {
 // durable handle on WHICH painted row the evidence anchors, so it must be
 // unforgeable rather than merely well-formed. A geometry-only digest failed both
 // ways: distinct entries painting different content at equal offsets collapsed
-// onto one id, and an 8-hex truncation is brute-forceable. This recomputes the
-// full domain-separated digest from the persisted inputs plus the committed paint
-// and rejects arbitrary, transplanted, aliased, malformed, and truncated ids. It
-// runs BEFORE every downstream metadata check so a forged id can never ride
-// through on an earlier-passing path.
+// onto one id, and an 8-hex truncation is brute-forceable. The recomputation
+// below rejects arbitrary, transplanted, aliased, malformed, and truncated ids,
+// and it runs BEFORE every downstream metadata check so a forged id can never
+// ride through on an earlier-passing path.
+//
+// Recomputation alone is NOT sufficient, and cannot be made sufficient. Every
+// digest input is bundle content, so an attacker who rewrites the paint and then
+// honestly recomputes the id, the row and frame digests, `metadata.json`, the
+// manifest entry, and the review-input binding yields a bundle that recomputes
+// correctly at every level. Fabricated geometry, anchor-row content mutation, and
+// anchor-row relocation were all accepted that way.
+//
+// So the guard first compares the persisted anchor against
+// `STICKY_VIEWPORT_ANCHOR_WITNESS` — committed source the attacker did not write,
+// pinning the intended semantic row and the complete geometry per entry. That
+// comparison runs before the recomputation, because a self-consistent forgery
+// passes recomputation by construction and can only be caught against a
+// reference outside the bundle.
+const verifyAnchorWitness = (
+	key: string,
+	witness: StickyViewportAnchorWitness,
+	anchor: Record<string, unknown>,
+	text: string,
+) => {
+	// Geometry is compared field by field against committed source, so a
+	// fabricated span or a relocated row contradicts git history rather than
+	// merely failing to match a digest the attacker also controls.
+	const pinned = [
+		["frame_start_row", witness.frameRow],
+		["grapheme_start", witness.graphemeStart],
+		["grapheme_end", witness.graphemeEnd],
+		["cell_start", witness.cellStart],
+		["cell_end", witness.cellEnd],
+	] as const;
+	for (const [field, expected] of pinned)
+		if (anchor[field] !== expected)
+			fail(
+				`semantic anchor guard: ${key} ${field} is ${String(anchor[field])} but the committed witness pins ${expected}`,
+			);
+	if (anchor.namespace !== witness.namespace)
+		fail(`semantic anchor guard: ${key} namespace contradicts the committed witness`);
+	// The row is read out of the committed paint at the WITNESS row, not at the row
+	// the bundle nominates, so a relocation cannot redirect this read.
+	const rowText = text.split("\n")[witness.frameRow];
+	if (rowText === undefined) fail(`semantic anchor guard: ${key} committed witness row is outside the painted frame`);
+	if (hash(rowText as string) !== witness.rowTextSha256)
+		fail(`semantic anchor guard: ${key} painted anchor row content contradicts the committed witness`);
+	if (semanticAnchorRowExcerpt(rowText as string) !== witness.rowExcerpt)
+		fail(`semantic anchor guard: ${key} painted anchor row excerpt contradicts the committed witness`);
+};
 const verifySemanticAnchor = (
 	key: string,
-	state: string,
 	value: unknown,
 	text: string,
 	ansiSha256: string,
 	seen: Map<string, string>,
 ) => {
-	if (state === "capacity-zero") {
+	// The committed witness, not a bundle-supplied state field, decides whether an
+	// anchor is expected at all. A bundle can neither invent an anchor where source
+	// pins none, nor drop one where source pins it.
+	const witness = STICKY_VIEWPORT_ANCHOR_WITNESS[key as StickyViewportShowcaseKey];
+	if (witness === undefined) fail(`semantic anchor guard: ${key} has no committed witness`);
+	if (witness === null) {
 		if (value !== null) fail(`semantic anchor guard: ${key} must not carry an anchor at zero capacity`);
 		return;
 	}
+	if (value === null) fail(`semantic anchor guard: ${key} is missing the anchor its committed witness pins`);
 	const anchor = object(value, `semantic anchor ${key}`);
 	exactKeys(anchor, SEMANTIC_ANCHOR_KEYS, `semantic anchor ${key}`);
 	if (anchor.domain !== SEMANTIC_ANCHOR_DOMAIN)
@@ -439,6 +493,9 @@ const verifySemanticAnchor = (
 	for (const field of geometry)
 		if (!Number.isInteger(anchor[field]) || (anchor[field] as number) < 0)
 			fail(`semantic anchor guard: ${key} ${field} is not a nonnegative integer`);
+	// Committed-source comparison FIRST. A coordinated forgery recomputes every
+	// digest below honestly, so it can only be rejected here.
+	verifyAnchorWitness(key, witness, anchor, text);
 	const graphemeStart = anchor.grapheme_start as number;
 	const graphemeEnd = anchor.grapheme_end as number;
 	const cellStart = anchor.cell_start as number;
@@ -626,7 +683,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		// Anchor identity is validated here, before any downstream metadata check, so
 		// a forged, transplanted, or aliased id cannot ride through on an
 		// earlier-passing path.
-		verifySemanticAnchor(key, state!, stateEvidence.semantic_anchor, text, hash(ansi), anchorIds);
+		verifySemanticAnchor(key, stateEvidence.semantic_anchor, text, hash(ansi), anchorIds);
 		// Frame-derived geometry must AGREE with the renderer's self-report, which is
 		// strictly stronger than either alone. `transcript_capacity` and
 		// `pin_boundary.row` both come from one renderer local, so they can only be

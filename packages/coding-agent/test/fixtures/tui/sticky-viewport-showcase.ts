@@ -132,6 +132,239 @@ export const semanticAnchorDigest = (input: {
 		.digest("hex");
 /** Namespace of a renderer anchor id, i.e. everything before its volatile per-run suffix. */
 export const semanticAnchorNamespace = (id: string) => id.split(":").slice(0, -1).join(":");
+// Committed per-entry semantic-anchor witness.
+//
+// `semanticAnchorDigest` makes the persisted `id` unforgeable only against an
+// attacker who cannot rewrite its inputs. It cannot survive a COORDINATED
+// forgery: every digest input — entry key, namespace, row text, geometry, frame
+// digest — is bundle content, so an attacker who edits the paint and then
+// honestly recomputes the id, the row/frame digests, `metadata.json`, the
+// manifest entry, and the review-input binding produces a bundle that is
+// self-consistent at every level. Recomputation cannot distinguish an honest
+// capture from an honest recomputation of a lie. Three such forgeries were
+// accepted by the digest-only guard: fabricated geometry, anchor-row content
+// mutation, and anchor-row relocation (the #3547 relocation attack).
+//
+// The fix must compare the bundle against something the attacker did not write.
+// This table is that reference: it is committed source, inside the verifier's
+// provenance scope, and it fixes the intended semantic row and the COMPLETE
+// geometry for every evidence entry. A relocation or geometry forgery now
+// contradicts a value in git history that regenerating the bundle cannot change.
+//
+// Shape (a) — this immutable per-entry expectation — was chosen over shape (b),
+// an independently derived renderer witness that re-derives the anchor geometry
+// from the persisted frame text at verify time. (b) was rejected for two
+// reasons, and the first is fatal on its own:
+//   1. It is not independent. Any derivation whose only input is the persisted
+//      frame is still reading attacker-controlled bytes. A relocation forgery
+//      rewrites the frame and the row pointer together, so a re-derivation from
+//      that frame reproduces the forged answer and agrees with it.
+//   2. It is not well defined. Which painted row is "the" semantic anchor is a
+//      property of renderer state (the anchor snapshot and scroll position), not
+//      of the painted glyphs. The transcript paints many near-identical
+//      `assistant N: transcript output remains selectable` rows, so frame text
+//      alone cannot select one. Determinism across hosts is therefore not the
+//      binding objection — definability is.
+//
+// `frame_sha256` is deliberately NOT pinned here. Unicode entries negotiate SGR
+// form per host (`detectColorMode()` emits truecolor or indexed `38;5;n`), so the
+// frame digest, and therefore the anchor `id`, is host-dependent by construction.
+// The stripped row text is not, which is why the row is pinned by content digest.
+// `rowExcerpt` is the whitespace-collapsed row, carried so a reviewer reads the
+// intended anchor row directly instead of trusting an opaque hash; the verifier
+// checks it against the painted row too, so it cannot drift into a stale comment.
+export type StickyViewportAnchorWitness = {
+	namespace: string;
+	frameRow: number;
+	graphemeStart: number;
+	graphemeEnd: number;
+	cellStart: number;
+	cellEnd: number;
+	rowTextSha256: string;
+	rowExcerpt: string;
+};
+export const STICKY_VIEWPORT_ANCHOR_WITNESS: Readonly<
+	Record<StickyViewportShowcaseKey, StickyViewportAnchorWitness | null>
+> = {
+	"live-overflow/80x24/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 2,
+		graphemeStart: 0,
+		graphemeEnd: 1638400,
+		cellStart: 0,
+		cellEnd: 1638400,
+		rowTextSha256: "c7c56ed881b988f5d204a70b9c072f991ddd0fc74ba203b4654f64328682c981",
+		rowExcerpt: "assistant 45: transcript output remains │",
+	},
+	"live-overflow/120x36/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 2,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+		rowTextSha256: "04c328525aa5bc10558b31390cf2e889a4d12b88c0bb341dd7fcbca673f50538",
+		rowExcerpt: "assistant 42: transcript output remains selectable │",
+	},
+	"manual-history/80x24/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+		rowTextSha256: "8f423933386a56af181c4d542744fe14bc48c6bf57074bab97345a38483de973",
+		rowExcerpt: "selectable │",
+	},
+	"manual-history/120x36/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+		rowTextSha256: "c3c73569fd17b9ab82e207b8f04d1ad5fd51c17f9ee11e4ba52a97e0c9a47cea",
+		rowExcerpt: "assistant 35: transcript output remains selectable │",
+	},
+	"manual-new-output/80x24/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+		rowTextSha256: "8f423933386a56af181c4d542744fe14bc48c6bf57074bab97345a38483de973",
+		rowExcerpt: "selectable │",
+	},
+	"manual-new-output/120x36/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+		rowTextSha256: "c3c73569fd17b9ab82e207b8f04d1ad5fd51c17f9ee11e4ba52a97e0c9a47cea",
+		rowExcerpt: "assistant 35: transcript output remains selectable │",
+	},
+	"multiline-editor-hooks-pet/80x24/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 1638400,
+		cellStart: 0,
+		cellEnd: 1638400,
+		rowTextSha256: "ff5849f516489b7fe88b4fbc4bb65add27f4819d49ed6d1d783a249802c6d3e9",
+		rowExcerpt: "assistant 42: transcript output remains │",
+	},
+	"multiline-editor-hooks-pet/120x36/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+		rowTextSha256: "985e06aa6d2a2bb6c55169fc60a2378fd22277826a57184c474c465ade8ef929",
+		rowExcerpt: "assistant 36: transcript output remains selectable │",
+	},
+	"capacity-many/80x24/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+		rowTextSha256: "8f423933386a56af181c4d542744fe14bc48c6bf57074bab97345a38483de973",
+		rowExcerpt: "selectable │",
+	},
+	"capacity-many/120x36/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+		rowTextSha256: "c3c73569fd17b9ab82e207b8f04d1ad5fd51c17f9ee11e4ba52a97e0c9a47cea",
+		rowExcerpt: "assistant 35: transcript output remains selectable │",
+	},
+	"capacity-one/80x24/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 1605632,
+		cellStart: 0,
+		cellEnd: 1605632,
+		rowTextSha256: "e16d8a594b614babc7b67564d4f037793cb2fc438f97e74c81c8d7c2f3830529",
+		rowExcerpt: "assistant 0: transcript output remains │",
+	},
+	"capacity-one/120x36/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3211264,
+		cellStart: 0,
+		cellEnd: 3211264,
+		rowTextSha256: "68c6c8b4cc020773046fc9327de6fef9f71c66958699fc9251ddec83548f4d99",
+		rowExcerpt: "assistant 0: transcript output remains selectable │",
+	},
+	// Zero transcript capacity paints no transcript row, so there is no semantic
+	// anchor to pin. `null` is the expectation, and the verifier enforces it:
+	// inventing an anchor here contradicts committed source.
+	"capacity-zero/80x24/unicode-color": null,
+	"capacity-zero/120x36/unicode-color": null,
+	"selection-boundary/80x24/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+		rowTextSha256: "8f423933386a56af181c4d542744fe14bc48c6bf57074bab97345a38483de973",
+		rowExcerpt: "selectable │",
+	},
+	"selection-boundary/120x36/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+		rowTextSha256: "c3c73569fd17b9ab82e207b8f04d1ad5fd51c17f9ee11e4ba52a97e0c9a47cea",
+		rowExcerpt: "assistant 35: transcript output remains selectable │",
+	},
+	"manual-new-output/80x24/ascii-no-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+		rowTextSha256: "8f423933386a56af181c4d542744fe14bc48c6bf57074bab97345a38483de973",
+		rowExcerpt: "selectable │",
+	},
+	"capacity-zero/48x10/ascii-no-color": null,
+	"multiline-editor-hooks-pet/48x10/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+		rowTextSha256: "26ecd22de6e16f2dc046c1c17b4c8b4ed13e7ff8f45d9d0be5ddf5ce2f135d2d",
+		rowExcerpt: "selectable",
+	},
+	"narrow-cjk/48x10/unicode-color": {
+		namespace: "user:entry",
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 589824,
+		cellStart: 0,
+		cellEnd: 589824,
+		rowTextSha256: "8c72d2b57243cd7e214b567420ea4a23b18ba775db11bfb15570c4dc375c0215",
+		rowExcerpt: "意味のある文の境界",
+	},
+};
+/** Whitespace-collapsed painted row, i.e. the form `rowExcerpt` pins. */
+export const semanticAnchorRowExcerpt = (rowText: string) => rowText.trim().replace(/\s+/g, " ");
 // Every persisted frame must be canonical for its render mode, not just the
 // top-level payload. `metadata.json` is a required manifest artifact, so raw
 // frames here would make the whole bundle host-dependent: theme.ts emits SGR

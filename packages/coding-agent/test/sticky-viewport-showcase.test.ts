@@ -12,8 +12,11 @@ import {
 import { verifyStickyViewportShowcase } from "../scripts/verify-sticky-viewport-showcase";
 import {
 	SEMANTIC_ANCHOR_DOMAIN,
-	STICKY_VIEWPORT_SHOWCASE_COVERAGE,
 	semanticAnchorDigest,
+	semanticAnchorRowExcerpt,
+	STICKY_VIEWPORT_ANCHOR_WITNESS,
+	STICKY_VIEWPORT_SHOWCASE_COVERAGE,
+	type StickyViewportShowcaseKey,
 } from "./fixtures/tui/sticky-viewport-showcase";
 
 const roots: string[] = [];
@@ -149,11 +152,12 @@ type MetadataEvidence = {
 async function readMetadata(root: string, key: string): Promise<MetadataEvidence> {
 	return JSON.parse(await fs.readFile(path.join(root, key, "metadata.json"), "utf8")) as MetadataEvidence;
 }
-// Recompute a VALID anchor for an already-mutated frame. The anchor guard runs
-// before the downstream metadata checks, so a case that mutates the painted frame
-// to exercise one of those later checks must carry an anchor that is honest about
-// the new paint — otherwise the guard rejects first and the case stops proving
-// what it was written to prove.
+// Recompute a VALID anchor for an already-mutated frame, and route the write
+// through the coordinated rehash. This is the attacker's own move: it produces an
+// anchor whose id, row digest, and frame digest are all HONEST about the mutated
+// paint, so every self-referential check in the verifier passes. The coordinated
+// forgery test relies on that to prove the committed witness — not the
+// recomputation — is what rejects a self-consistent lie.
 async function recomputeAnchor(root: string, key: string): Promise<void> {
 	const metadata = await readMetadata(root, key);
 	const anchor = metadata.state.semantic_anchor;
@@ -346,7 +350,11 @@ describe("sticky viewport production evidence verifier", () => {
 		for (const key of keys) {
 			const metadata = await readMetadata(root, key);
 			const anchor = metadata.state.semantic_anchor;
-			if (anchor === null) continue;
+			if (anchor === null) {
+				// A null anchor is legitimate ONLY where committed source pins null.
+				expect(STICKY_VIEWPORT_ANCHOR_WITNESS[key as StickyViewportShowcaseKey]).toBeNull();
+				continue;
+			}
 			anchored += 1;
 			expect(anchor.domain).toBe(SEMANTIC_ANCHOR_DOMAIN);
 			expect(anchor.namespace).toBe("user:entry");
@@ -357,6 +365,21 @@ describe("sticky viewport production evidence verifier", () => {
 			// without re-running the capture.
 			const text = await fs.readFile(path.join(root, key, "terminal.txt"), "utf8");
 			const rowText = text.split("\n")[anchor.frame_start_row]!;
+			// Committed-source agreement. A fresh capture must reproduce the intended
+			// semantic row and the complete geometry pinned in git history. If a
+			// legitimate renderer change moves an anchor, this fails until the witness is
+			// updated in the same commit — which makes the intended row a reviewed source
+			// change instead of a silent regeneration.
+			const witness = STICKY_VIEWPORT_ANCHOR_WITNESS[key as StickyViewportShowcaseKey];
+			if (!witness) throw new Error(`${key} has no committed anchor witness`);
+			expect(anchor.frame_start_row).toBe(witness.frameRow);
+			expect(anchor.grapheme_start).toBe(witness.graphemeStart);
+			expect(anchor.grapheme_end).toBe(witness.graphemeEnd);
+			expect(anchor.cell_start).toBe(witness.cellStart);
+			expect(anchor.cell_end).toBe(witness.cellEnd);
+			expect(anchor.namespace).toBe(witness.namespace);
+			expect(anchor.row_text_sha256).toBe(witness.rowTextSha256);
+			expect(semanticAnchorRowExcerpt(rowText)).toBe(witness.rowExcerpt);
 			expect(anchor.row_text_sha256).toBe(new Bun.CryptoHasher("sha256").update(rowText).digest("hex"));
 			expect(anchor.frame_sha256).toBe(
 				new Bun.CryptoHasher("sha256")
@@ -467,6 +490,149 @@ describe("sticky viewport production evidence verifier", () => {
 		await writeMetadataCoordinated(truncated, key, truncatedMetadata);
 		await expect(verifyStickyViewportShowcase(truncated)).rejects.toThrow("semantic anchor guard");
 	}, 300_000);
+	// Review-2 P1-A. Every case in the test above corrupts the anchor id itself, so
+	// recomputing the digest from the persisted inputs is enough to reject it. A
+	// COORDINATED forgery cannot be rejected that way, and no amount of hardening
+	// the digest can change that: the attacker ran the capture, so they rewrite the
+	// paint and then HONESTLY recompute the id, the row digest, the frame digest,
+	// `metadata.json`, the manifest entry, and the review-input binding. Every
+	// self-referential check then passes by construction, because each one compares
+	// attacker-supplied bytes against other attacker-supplied bytes.
+	//
+	// Three such forgeries were accepted by the digest-only guard: fabricated
+	// geometry, anchor-row content mutation, and anchor-row relocation (#3547).
+	// They are rejected only by comparison against `STICKY_VIEWPORT_ANCHOR_WITNESS`,
+	// which is committed source the attacker did not write. Each case below asserts
+	// the shipped anchor IS the honest digest of its own inputs before verifying, so
+	// a rejection can never be attributed to a stale digest it forgot to update.
+	it("rejects coordinated anchor forgery that honestly recomputes every dependent digest", async () => {
+		const base = await capture();
+		const cloneBase = async () => {
+			const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-coordinated-"));
+			roots.push(clone);
+			await fs.cp(base, clone, { recursive: true });
+			return clone;
+		};
+		const key = "manual-new-output/80x24/unicode-color";
+		const anchorOf = (metadata: MetadataEvidence): SemanticAnchorEvidence => {
+			const anchor = metadata.state.semantic_anchor;
+			if (anchor === null) throw new Error("expected a semantic anchor");
+			return anchor;
+		};
+		// Proof that the forgery is self-consistent. If any of these fail, the case
+		// would be rejected by the recomputation guard rather than by the witness, and
+		// would prove nothing about coordinated forgery.
+		const expectSelfConsistent = async (root: string, entryKey: string) => {
+			const metadata = await readMetadata(root, entryKey);
+			const anchor = anchorOf(metadata);
+			const text = await fs.readFile(path.join(root, entryKey, "terminal.txt"), "utf8");
+			const ansi = await fs.readFile(path.join(root, entryKey, "terminal-ansi.txt"), "utf8");
+			const rowText = text.split("\n")[anchor.frame_start_row]!;
+			const frameSha256 = new Bun.CryptoHasher("sha256").update(ansi).digest("hex");
+			expect(anchor.frame_sha256).toBe(frameSha256);
+			expect(anchor.row_text_sha256).toBe(new Bun.CryptoHasher("sha256").update(rowText).digest("hex"));
+			expect(anchor.id).toBe(
+				`${anchor.namespace}:${semanticAnchorDigest({
+					entryKey,
+					namespace: anchor.namespace,
+					rowText,
+					graphemeStart: anchor.grapheme_start,
+					graphemeEnd: anchor.grapheme_end,
+					cellStart: anchor.cell_start,
+					cellEnd: anchor.cell_end,
+					frameRow: anchor.frame_start_row,
+					frameSha256,
+				})}`,
+			);
+		};
+		// Apply a mutation, then rebind everything that depends on it: `recomputeAnchor`
+		// recomputes the anchor honestly for the mutated paint and routes the write
+		// through `writeMetadataCoordinated`, which re-stamps the manifest entry and the
+		// review-input binding.
+		const forge = async (
+			entryKey: string,
+			mutate: (metadata: MetadataEvidence, root: string) => Promise<void> | void,
+		) => {
+			const root = await cloneBase();
+			const metadata = await readMetadata(root, entryKey);
+			await mutate(metadata, root);
+			await Bun.write(path.join(root, entryKey, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`);
+			await recomputeAnchor(root, entryKey);
+			await expectSelfConsistent(root, entryKey);
+			return root;
+		};
+
+		// 1. Fabricated geometry. The span is widened to a value that is still a
+		// nonnegative, non-inverted integer range, so every structural check accepts
+		// it; the witness pins the exact end offsets.
+		const fabricated = await forge(key, metadata => {
+			anchorOf(metadata).grapheme_end += 4096;
+			anchorOf(metadata).cell_end += 4096;
+		});
+		await expect(verifyStickyViewportShowcase(fabricated)).rejects.toThrow(
+			`semantic anchor guard: ${key} grapheme_end`,
+		);
+
+		// 2. Anchor-row content mutation. `selectable` becomes `selectabIe` at equal
+		// cell width, so no geometry or layout check notices, and the row and frame
+		// digests are recomputed to agree with the forged paint.
+		const mutated = await forge(key, async (metadata, root) => {
+			const frameRow = anchorOf(metadata).frame_start_row;
+			const ansiPath = path.join(root, key, "terminal-ansi.txt");
+			const rows = (await fs.readFile(ansiPath, "utf8")).split("\n");
+			expect(rows[frameRow]).toContain("selectable");
+			rows[frameRow] = rows[frameRow]!.replace("selectable", "selectabIe");
+			const forged = rows.join("\n");
+			await Bun.write(ansiPath, forged);
+			await Bun.write(path.join(root, key, "terminal.txt"), Bun.stripANSI(forged));
+			await Bun.write(path.join(root, key, "terminal.html"), ansiToHtml(forged));
+			metadata.state.cursor.frame_sha256 = new Bun.CryptoHasher("sha256").update(forged).digest("hex");
+			for (const name of ["terminal-ansi.txt", "terminal.txt", "terminal.html"] as const)
+				await rehash(root, key, name);
+		});
+		await expect(verifyStickyViewportShowcase(mutated)).rejects.toThrow(
+			`semantic anchor guard: ${key} painted anchor row content contradicts the committed witness`,
+		);
+
+		// 3. Anchor-row relocation — the #3547 attack. The evidence still points at a
+		// real painted row, just not the intended one, and every digest agrees with the
+		// relocation. Nothing inside the bundle contradicts it.
+		const relocated = await forge(key, async (metadata, root) => {
+			const rows = (await fs.readFile(path.join(root, key, "terminal.txt"), "utf8")).split("\n").slice(0, -1);
+			const from = anchorOf(metadata).frame_start_row;
+			const to = rows.findIndex((row, index) => index !== from && row.trim().length > 0);
+			expect(to).toBeGreaterThanOrEqual(0);
+			expect(to).not.toBe(from);
+			anchorOf(metadata).frame_start_row = to;
+		});
+		await expect(verifyStickyViewportShowcase(relocated)).rejects.toThrow(
+			`semantic anchor guard: ${key} frame_start_row`,
+		);
+
+		// 4. The narrow-CJK anchor row rewritten across every painted artifact, with
+		// the anchor honestly recomputed. Unlike cases 1-3 this was NOT accepted before
+		// the witness — the narrow-CJK cell oracle already rejected it, with a message
+		// about the missing canonical phrase. It is kept here because this exact
+		// mutation used to live in the semantic-evidence test, where it was written to
+		// exercise a LATER check and therefore had to carry an honest anchor. The
+		// witness now rejects it earlier, so the case moves here rather than being
+		// deleted, and it pins which guard owns it.
+		const cjkKey = "narrow-cjk/48x10/unicode-color";
+		const cjkForged = await forge(cjkKey, async (metadata, root) => {
+			for (const name of ["terminal.txt", "terminal-ansi.txt", "terminal.html"] as const) {
+				const artifactPath = path.join(root, cjkKey, name);
+				const rewritten = (await fs.readFile(artifactPath, "utf8")).replace("意味のある文の境界", "missing CJK proof");
+				await Bun.write(artifactPath, rewritten);
+				await rehash(root, cjkKey, name);
+			}
+			metadata.state.cursor.frame_sha256 = new Bun.CryptoHasher("sha256")
+				.update(await fs.readFile(path.join(root, cjkKey, "terminal-ansi.txt"), "utf8"))
+				.digest("hex");
+		});
+		await expect(verifyStickyViewportShowcase(cjkForged)).rejects.toThrow(
+			`semantic anchor guard: ${cjkKey} painted anchor row content contradicts the committed witness`,
+		);
+	}, 300_000);
 	it("fails closed for semantic evidence and provenance corruption", async () => {
 		// `capture()` spawns a ~2.2s subprocess. Capture once and clone the
 		// deterministic output so each corruption case stays isolated without
@@ -566,28 +732,20 @@ describe("sticky viewport production evidence verifier", () => {
 		await rehash(pinRoot, pinKey, "metadata.json");
 		await expect(verifyStickyViewportShowcase(pinRoot)).rejects.toThrow("capacity metadata/frame mismatch");
 
+		// Metadata-only mutation. The `cjk_phrase_boundaries` matrix check runs ahead
+		// of the narrow-CJK frame-evidence check, so clearing the field is enough to
+		// exercise it. The painted artifacts are deliberately left intact: the CJK
+		// phrase sits on the committed anchor row, so rewriting it contradicts the
+		// committed anchor witness and is rejected by the semantic anchor guard first.
+		// That rewrite is retained as an explicit witness case in the coordinated
+		// forgery test, so the coverage moves rather than disappears.
 		const cjkRoot = await cloneBase();
 		const cjkKey = "narrow-cjk/48x10/unicode-color";
-		for (const name of ["terminal.txt", "terminal-ansi.txt", "terminal.html"] as const) {
-			const artifactPath = path.join(cjkRoot, cjkKey, name);
-			await Bun.write(
-				artifactPath,
-				(await fs.readFile(artifactPath, "utf8")).replace("意味のある文の境界", "missing CJK proof"),
-			);
-			await rehash(cjkRoot, cjkKey, name);
-		}
 		const cjkMetadataPath = path.join(cjkRoot, cjkKey, "metadata.json");
 		const cjkMetadata = JSON.parse(await fs.readFile(cjkMetadataPath, "utf8"));
 		cjkMetadata.cjk_phrase_boundaries = [];
-		cjkMetadata.state.cursor.frame_sha256 = new Bun.CryptoHasher("sha256")
-			.update(await fs.readFile(path.join(cjkRoot, cjkKey, "terminal-ansi.txt"), "utf8"))
-			.digest("hex");
 		await Bun.write(cjkMetadataPath, `${JSON.stringify(cjkMetadata, null, 2)}\n`);
 		await rehash(cjkRoot, cjkKey, "metadata.json");
-		// The mutated CJK paint moves the anchor row, so re-derive the anchor from it.
-		// The guard then has no objection and the narrow-CJK boundary check stays the
-		// assertion under test.
-		await recomputeAnchor(cjkRoot, cjkKey);
 		await expect(verifyStickyViewportShowcase(cjkRoot)).rejects.toThrow("narrow CJK boundaries");
 
 		const evidenceRoot = await cloneBase();

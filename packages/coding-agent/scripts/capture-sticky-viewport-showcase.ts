@@ -2,6 +2,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	renderStickyViewportShowcase,
+	semanticAnchorRowExcerpt,
+	STICKY_VIEWPORT_ANCHOR_WITNESS,
 	STICKY_VIEWPORT_SHOWCASE_ENTRIES,
 	STICKY_VIEWPORT_SHOWCASE_KEYS,
 	type StickyViewportShowcaseEntry,
@@ -264,6 +266,38 @@ async function capture(entry: StickyViewportShowcaseEntry, root: string, sourceP
 		JSON.stringify(entry.stateId === "narrow-cjk" ? CJK_PHRASE_BOUNDARIES : [])
 	)
 		throw new Error(`${entry.key}: CJK phrase boundary metadata precondition failed`);
+	// Capture-time agreement with the committed per-entry witness. The verifier
+	// enforces this too, but failing here names renderer drift at the point it
+	// happens instead of surfacing later as an unexplained bundle rejection. If a
+	// legitimate renderer change moves an anchor, the witness must be updated in
+	// the same commit — which is the point: the intended semantic row becomes a
+	// reviewed source change rather than a silent regeneration.
+	const witness = STICKY_VIEWPORT_ANCHOR_WITNESS[entry.key];
+	const anchor = (rendered.state as { semantic_anchor: Record<string, unknown> | null }).semantic_anchor;
+	if (witness === null) {
+		if (anchor !== null)
+			throw new Error(`${entry.key}: renderer produced an anchor the committed witness pins as absent`);
+	} else {
+		if (anchor === null)
+			throw new Error(`${entry.key}: renderer produced no anchor but the committed witness pins one`);
+		const rowText = rendered.terminalText.split("\n")[witness.frameRow];
+		if (rowText === undefined)
+			throw new Error(`${entry.key}: committed witness row ${witness.frameRow} is outside the painted frame`);
+		const mismatch = [
+			["frame_start_row", anchor.frame_start_row, witness.frameRow],
+			["grapheme_start", anchor.grapheme_start, witness.graphemeStart],
+			["grapheme_end", anchor.grapheme_end, witness.graphemeEnd],
+			["cell_start", anchor.cell_start, witness.cellStart],
+			["cell_end", anchor.cell_end, witness.cellEnd],
+			["namespace", anchor.namespace, witness.namespace],
+			["row_text_sha256", hash(rowText), witness.rowTextSha256],
+			["row_excerpt", semanticAnchorRowExcerpt(rowText), witness.rowExcerpt],
+		].find(([, actual, expected]) => actual !== expected);
+		if (mismatch)
+			throw new Error(
+				`${entry.key}: semantic anchor ${String(mismatch[0])} is ${String(mismatch[1])} but the committed witness pins ${String(mismatch[2])}`,
+			);
+	}
 	const directory = path.join(root, ...entry.key.split("/"));
 	await fs.mkdir(directory, { recursive: true });
 	const metadata = json({
