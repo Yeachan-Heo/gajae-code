@@ -1,4 +1,3 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
@@ -328,60 +327,12 @@ async function validatePtyCaptureArtifact(cwd: string, row: JsonObject, fieldNam
 	return true;
 }
 
-function requiredNonNegativeInteger(row: JsonObject, name: string, fieldName: string): number {
-	const value = row[name];
-	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-		throw new Error(`qualityGate ${fieldName}.${name} must be a non-negative integer`);
-	}
-	return value;
-}
-
-async function validateBunTestReportArtifact(cwd: string, row: JsonObject, fieldName: string): Promise<boolean> {
-	const bytes = await readArtifactBytes(cwd, row, fieldName);
-	if (!bytes) throw new Error(`qualityGate ${fieldName} bun test report path must resolve to an existing file`);
-	let report: JsonObject;
-	try {
-		report = requireQualityGateObject(JSON.parse(bytes.toString("utf8")), fieldName);
-	} catch (error) {
-		throw new Error(`qualityGate ${fieldName} bun test report must be valid JSON: ${String(error)}`);
-	}
-	if (report.schemaVersion !== 1) throw new Error(`qualityGate ${fieldName}.schemaVersion must be 1`);
-	if (report.kind !== "bun-test-report") throw new Error(`qualityGate ${fieldName}.kind must be bun-test-report`);
-	const command = nonEmptyStringArray(report.command);
-	if (!command) throw new Error(`qualityGate ${fieldName}.command must be focused bun test argv`);
-	if (command[0] !== "bun" || explicitBunTestPaths(command.slice(1)) === null) {
-		throw new Error(`qualityGate ${fieldName}.command must describe focused bun test argv with explicit test files`);
-	}
-	await assertBunTestReportPathsUnderRoot(cwd, command, fieldName);
-	const total = requiredNonNegativeInteger(report, "total", fieldName);
-	const passed = requiredNonNegativeInteger(report, "passed", fieldName);
-	const failed = requiredNonNegativeInteger(report, "failed", fieldName);
-	const skipped = requiredNonNegativeInteger(report, "skipped", fieldName);
-	if (total < 1 || passed < 1 || failed !== 0 || total !== passed + failed + skipped) {
-		throw new Error(`qualityGate ${fieldName} bun test counts must describe a non-empty zero-failure run`);
-	}
-	if (report.exitCode !== 0) throw new Error(`qualityGate ${fieldName}.exitCode must be 0`);
-	const stdoutPath = requiredStringField(report, "stdoutPath", fieldName);
-	const stdoutBytes = await readArtifactBytes(cwd, { path: stdoutPath }, `${fieldName}.stdoutPath`);
-	if (!stdoutBytes) throw new Error(`qualityGate ${fieldName}.stdoutPath must reference captured bun test output`);
-	const stdoutSha256 = requiredStringField(report, "stdoutSha256", fieldName);
-	if (!/^[0-9a-f]{64}$/.test(stdoutSha256)) {
-		throw new Error(`qualityGate ${fieldName}.stdoutSha256 must be a lowercase SHA-256 digest`);
-	}
-	const actualStdoutSha256 = crypto.createHash("sha256").update(stdoutBytes).digest("hex");
-	if (actualStdoutSha256 !== stdoutSha256) {
-		throw new Error(`qualityGate ${fieldName}.stdoutSha256 must match the captured stdoutPath bytes`);
-	}
-	return true;
-}
-
-function structuralArtifactKind(row: JsonObject): "screenshot" | "automation" | "pty" | "test-report" | null {
+function structuralArtifactKind(row: JsonObject): "screenshot" | "automation" | "pty" | null {
 	const kind = normalizedEvidenceKind(row);
 	if (evidenceKindMatches(kind, ["screenshot", "image", "visual"])) return "screenshot";
 	if (evidenceKindMatches(kind, ["browser", "playwright", "pandawright", "automation", "app-automation"]))
 		return "automation";
 	if (evidenceKindMatches(kind, ["pty", "tui", "terminal-capture"])) return "pty";
-	if (evidenceKindMatches(kind, ["test-report", "bun-test-report"])) return "test-report";
 	return null;
 }
 
@@ -397,9 +348,6 @@ export async function validateStructuralArtifact(
 	if (kind === "screenshot") return validateScreenshotArtifact(cwd, row, fieldName);
 	if (kind === "automation") return validateAutomationTranscriptArtifact(cwd, row, fieldName, options);
 	if (kind === "pty") return validatePtyCaptureArtifact(cwd, row, fieldName);
-	if (kind === "test-report" && options.surfaceFamily === "cli") {
-		return validateBunTestReportArtifact(cwd, row, fieldName);
-	}
 	return false;
 }
 
@@ -495,68 +443,6 @@ function isBareExecutableName(value: string): boolean {
 	);
 }
 
-function isSafeExplicitTestPath(value: string): boolean {
-	if (!value || value.startsWith("-") || path.isAbsolute(value) || value.includes("\\") || /[\0\n\r*?[\]]/.test(value))
-		return false;
-	const segments = value.split("/");
-	if (segments.some(segment => !segment || segment === "." || segment === "..")) return false;
-	return /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(value);
-}
-
-function explicitBunTestPaths(args: readonly string[]): string[] | null {
-	if (args[0] !== "test") return null;
-	const paths: string[] = [];
-	for (let index = 1; index < args.length; index++) {
-		const arg = args[index]!;
-		if (arg === "--bail") continue;
-		if (arg === "--test-name-pattern") {
-			const pattern = args[++index];
-			if (!pattern || pattern.length > 512 || /[\0\n\r]/.test(pattern)) return null;
-			continue;
-		}
-		if (!isSafeExplicitTestPath(arg)) return null;
-		paths.push(arg);
-	}
-	return paths.length > 0 ? paths : null;
-}
-
-async function assertBunTestReportPathsUnderRoot(
-	cwd: string,
-	command: readonly string[],
-	fieldName: string,
-): Promise<void> {
-	const testPaths = explicitBunTestPaths(command.slice(1));
-	if (!testPaths) throw new Error(`qualityGate ${fieldName}.command must describe focused bun test argv`);
-	const root = await fs.realpath(path.resolve(cwd));
-	for (const testPath of testPaths) {
-		const lexical = path.resolve(root, testPath);
-		const lexicalRelative = path.relative(root, lexical);
-		if (lexicalRelative === ".." || lexicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(lexicalRelative)) {
-			throw new Error(`qualityGate ${fieldName}.command test path must resolve under the repository cwd`);
-		}
-		let stat: Awaited<ReturnType<typeof fs.lstat>>;
-		let resolved: string;
-		try {
-			stat = await fs.lstat(lexical);
-			resolved = await fs.realpath(lexical);
-		} catch {
-			throw new Error(`qualityGate ${fieldName}.command test path must reference an existing regular file`);
-		}
-		const relative = path.relative(root, resolved);
-		if (
-			stat.isSymbolicLink() ||
-			!stat.isFile() ||
-			relative === ".." ||
-			relative.startsWith(`..${path.sep}`) ||
-			path.isAbsolute(relative)
-		) {
-			throw new Error(
-				`qualityGate ${fieldName}.command test path must be a non-symlink file under the repository cwd`,
-			);
-		}
-	}
-}
-
 function isAllowedCliReplayCommand(command: readonly string[]): boolean {
 	if (
 		command.length === 0 ||
@@ -576,7 +462,7 @@ function summarizeBlockedCliReplayCommand(command: readonly string[]): string {
 }
 
 function cliReplayAllowlistDescription(): string {
-	return '`bun --version` or deterministic `bun -e "console.log(...)"`; focused bun test results must use an audited replayExempt bun-test-report artifact and are never executed by the gate';
+	return '`bun --version` or deterministic `bun -e "console.log(...)"`; focused bun test execution is blocked and replayExempt still requires an existing screenshot, automation, or PTY structural fallback';
 }
 
 function resolveCliReplayCommand(command: string[]): string[] {

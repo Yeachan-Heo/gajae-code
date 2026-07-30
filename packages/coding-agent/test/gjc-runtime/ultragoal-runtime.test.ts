@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1093,13 +1092,6 @@ describe("ultragoal CLI replay validation", () => {
 
 		const testReportRoot = await tempDir();
 		await fs.mkdir(path.join(testReportRoot, "artifacts"), { recursive: true });
-		await fs.mkdir(path.join(testReportRoot, "packages", "coding-agent", "test"), { recursive: true });
-		await Bun.write(
-			path.join(testReportRoot, "packages", "coding-agent", "test", "focused.test.ts"),
-			"// evidence only\n",
-		);
-		const testOutput = "1 pass\n0 fail\n";
-		await Bun.write(path.join(testReportRoot, "artifacts", "test-output.txt"), testOutput);
 		await Bun.write(
 			path.join(testReportRoot, "artifacts", "test-report.json"),
 			JSON.stringify({
@@ -1111,17 +1103,15 @@ describe("ultragoal CLI replay validation", () => {
 				failed: 0,
 				skipped: 0,
 				exitCode: 0,
-				stdoutPath: "artifacts/test-output.txt",
-				stdoutSha256: crypto.createHash("sha256").update(testOutput).digest("hex"),
 			}),
 		);
-		await expectAcceptedExecutorQa(
+		const testReportError = await expectRejectedExecutorQa(
 			testReportRoot,
 			cliExecutorQa([
 				{
 					id: "cli-replay",
 					kind: "cli-replay",
-					description: "Replay exemption with structured bun test report",
+					description: "Replay exemption with unresolved structured test report fallback",
 					replay: {
 						schemaVersion: 1,
 						kind: "cli-replay",
@@ -1142,69 +1132,7 @@ describe("ultragoal CLI replay validation", () => {
 				},
 			]),
 		);
-	});
-
-	it("rejects malformed or failed bun test report fallbacks", async () => {
-		const rejectedReport = async (overrides: Record<string, unknown>): Promise<string> => {
-			const root = await tempDir();
-			await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
-			await fs.mkdir(path.join(root, "packages", "coding-agent", "test"), { recursive: true });
-			await Bun.write(path.join(root, "packages", "coding-agent", "test", "focused.test.ts"), "// evidence only\n");
-			const testOutput = "1 pass\n0 fail\n";
-			await Bun.write(path.join(root, "artifacts", "test-output.txt"), testOutput);
-			await Bun.write(
-				path.join(root, "artifacts", "test-report.json"),
-				JSON.stringify({
-					schemaVersion: 1,
-					kind: "bun-test-report",
-					command: ["bun", "test", "packages/coding-agent/test/focused.test.ts"],
-					total: 1,
-					passed: 1,
-					failed: 0,
-					skipped: 0,
-					exitCode: 0,
-					stdoutPath: "artifacts/test-output.txt",
-					stdoutSha256: crypto.createHash("sha256").update(testOutput).digest("hex"),
-					...overrides,
-				}),
-			);
-			return expectRejectedExecutorQa(
-				root,
-				cliExecutorQa([
-					{
-						id: "cli-replay",
-						kind: "cli-replay",
-						description: "Unsafe replay exemption",
-						replay: {
-							schemaVersion: 1,
-							kind: "cli-replay",
-							replayExempt: {
-								reasonCode: "unsafe_side_effect",
-								reason: "The gate must not execute model-authored test code without a sandbox.",
-								approvedBy: "executor-qa",
-								fallbackArtifactRefs: ["test-report"],
-							},
-						},
-					},
-					{
-						id: "test-report",
-						kind: "bun-test-report",
-						path: "artifacts/test-report.json",
-						description: "Rejected structured bun test report",
-					},
-				]),
-			);
-		};
-
-		expect(await rejectedReport({ command: ["bun", "test", "../outside.test.ts"] })).toContain(
-			"focused bun test argv",
-		);
-		expect(await rejectedReport({ total: 2, passed: 1, failed: 1 })).toContain("zero-failure run");
-		expect(await rejectedReport({ stdoutSha256: "model-authored" })).toContain("lowercase SHA-256");
-		expect(await rejectedReport({ stdoutSha256: "f".repeat(64) })).toContain(
-			"must match the captured stdoutPath bytes",
-		);
-		expect(await rejectedReport({ kind: "test-report" })).toContain("kind must be bun-test-report");
+		expect(testReportError).toContain("requires at least one structurally-valid fallback artifact");
 	});
 
 	it("honors substring regex and not_substring invariants instead of full stdout equality", async () => {
