@@ -2,7 +2,6 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	acquireManagedLockSync,
 	captureManagedFileNoFollow,
 	type ManagedFileSnapshot,
 	prepareManagedDirectoryRoot,
@@ -293,30 +292,19 @@ export function persistGjcTmuxProviderAuthoritySync(authority: ProviderAuthority
 	const bytes = new TextEncoder().encode(JSON.stringify(recordFor(authority)));
 	const name = authorityName(authority.generation);
 	const managedRoot = prepareWindowsAuthorityRoot(root);
-	const lock = acquireManagedLockSync(
-		path.join(managedRoot.canonicalPath, "provider-authority-locks"),
-		name,
+	// `publishManagedFileNoReplaceSync` is create-without-clobber, so it is itself
+	// the mutual exclusion for this generation-scoped authority: a second writer
+	// loses the create rather than racing a separate lock file. The readback below
+	// still proves the published record binds this session and generation.
+	publishManagedFileNoReplaceSync(
+		path.join(managedRoot.canonicalPath, name),
+		bytes,
 		managedRoot,
 		"windows-existing-verify-first",
 	);
-	try {
-		lock.assertOwned();
-		publishManagedFileNoReplaceSync(
-			path.join(managedRoot.canonicalPath, name),
-			bytes,
-			managedRoot,
-			"windows-existing-verify-first",
-		);
-		lock.assertOwned();
-		const verified = readWindowsAuthority(managedRoot.canonicalPath, authority.generation);
-		if (
-			verified.record.session_id !== authority.sessionId ||
-			verified.record.owner_generation !== authority.generation
-		)
-			throw new Error("gjc_tmux_provider_authority_publish_failed");
-	} finally {
-		lock.release();
-	}
+	const verified = readWindowsAuthority(managedRoot.canonicalPath, authority.generation);
+	if (verified.record.session_id !== authority.sessionId || verified.record.owner_generation !== authority.generation)
+		throw new Error("gjc_tmux_provider_authority_publish_failed");
 }
 
 export function readGjcTmuxProviderAuthoritySync(input: {
