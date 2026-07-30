@@ -1,0 +1,186 @@
+[
+	{
+		"error": {
+			"code": -32600,
+			"message": "Not initialized"
+		},
+		"id": 1
+	},
+	{
+		"id": 2,
+		"result": {
+			"codexHome": "<normalized>",
+			"platformFamily": "Darwin",
+			"platformOs": "darwin",
+			"userAgent": "<normalized>"
+		}
+	},
+	{
+		"error": {
+			"code": -32600,
+			"message": "Already initialized"
+		},
+		"id": 3
+	},
+	{
+		"error": {
+			"code": -32081,
+			"message": "Not supported"
+		},
+		"id": 4
+	},
+	{
+		"id": 5,
+		"result": {
+			"approvalPolicy": "untrusted",
+			"approvalsReviewer": "user",
+			"cwd": "<normalized>",
+			"instructionSources": [],
+			"model": "requested-model",
+			"modelProvider": "openai",
+			"reasoningEffort": null,
+			"sandbox": {
+				"type": "dangerFullAccess"
+			},
+			"serviceTier": null,
+			"thread": {
+				"agentNickname": null,
+				"agentRole": null,
+				"cliVersion": "1",
+				"createdAt": "<normalized>",
+				"cwd": "<normalized>",
+				"ephemeral": false,
+				"forkedFromId": null,
+				"gitInfo": null,
+				"id": "component-integration-thread",
+				"isPinned": false,
+				"modelProvider": "openai",
+				"name": null,
+				"parentThreadId": null,
+				"path": null,
+				"preview": "preview",
+				"recencyAt": null,
+				"sessionId": "<normalized>",
+				"source": "cli",
+				"status": {
+					"type": "idle"
+				},
+				"threadSource": null,
+				"turns": [],
+				"updatedAt": "<normalized>"
+			}
+		}
+	},
+	{
+		"id": 6,
+		"result": {
+			"turn": {
+				"completedAt": null,
+				"durationMs": null,
+				"error": null,
+				"id": "component-integration-turn-1",
+				"items": [],
+				"itemsView": "full",
+				"startedAt": "<normalized>",
+				"status": "inProgress"
+			}
+		}
+	},
+	{
+		"method": "turn/started",
+		"params": {
+			"threadId": "<normalized>",
+			"turn": {
+				"completedAt": null,
+				"durationMs": null,
+				"error": null,
+				"id": "component-integration-turn-1",
+				"items": [],
+				"itemsView": "full",
+				"startedAt": "<normalized>",
+				"status": "inProgress"
+			}
+		}
+	},
+	{
+		"method": "turn/completed",
+		"params": {
+			"threadId": "<normalized>",
+			"turn": {
+				"completedAt": "<normalized>",
+				"durationMs": "<normalized>",
+				"error": null,
+				"id": "component-integration-turn-1",
+				"items": [],
+				"itemsView": "full",
+				"startedAt": "<normalized>",
+				"status": "completed"
+			}
+		}
+	},
+	{
+		"id": 7,
+		"result": {
+			"turn": {
+				"completedAt": null,
+				"durationMs": null,
+				"error": null,
+				"id": "component-integration-turn-2",
+				"items": [],
+				"itemsView": "full",
+				"startedAt": "<normalized>",
+				"status": "inProgress"
+			}
+		}
+	},
+	{
+		"method": "turn/started",
+		"params": {
+			"threadId": "<normalized>",
+			"turn": {
+				"completedAt": null,
+				"durationMs": null,
+				"error": null,
+				"id": "component-integration-turn-2",
+				"items": [],
+				"itemsView": "full",
+				"startedAt": "<normalized>",
+				"status": "inProgress"
+			}
+		}
+	},
+	{
+		"error": {
+			"code": -32016,
+			"message": "Resource is busy."
+		},
+		"id": 8
+	},
+	{
+		"error": {
+			"code": -32010,
+			"message": "Not found."
+		},
+		"id": 9
+	},
+	{
+		"id": 10,
+		"result": {}
+	},
+	{
+		"method": "turn/completed",
+		"params": {
+			"threadId": "<normalized>",
+			"turn": {
+				"completedAt": "<normalized>",
+				"durationMs": "<normalized>",
+				"error": null,
+				"id": "component-integration-turn-2",
+				"items": [],
+				"itemsView": "full",
+				"startedAt": "<normalized>",
+				"status": "interrupted"
+			}
+		}
+	}
+]

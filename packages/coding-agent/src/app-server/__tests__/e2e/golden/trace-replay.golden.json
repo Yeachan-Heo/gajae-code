@@ -1,0 +1,6 @@
+[
+	"{\n\t\"id\": 1,\n\t\"result\": {\n\t\t\"codexHome\": \"<normalized>\",\n\t\t\"platformFamily\": \"Darwin\",\n\t\t\"platformOs\": \"darwin\",\n\t\t\"userAgent\": \"<normalized>\"\n\t}\n}",
+	"{\n\t\"error\": {\n\t\t\"code\": -32081,\n\t\t\"message\": \"Not supported\"\n\t},\n\t\"id\": 3\n}",
+	"{\n\t\"id\": 4,\n\t\"result\": {\n\t\t\"data\": [\n\t\t\t{\n\t\t\t\t\"cwd\": \"<normalized>\",\n\t\t\t\t\"errors\": [],\n\t\t\t\t\"skills\": []\n\t\t\t}\n\t\t]\n\t}\n}",
+	"{\n\t\"id\": 5,\n\t\"result\": {\n\t\t\"data\": [],\n\t\t\"nextCursor\": null\n\t}\n}"
+]

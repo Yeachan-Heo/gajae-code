@@ -1,0 +1,32 @@
+[
+	{
+		"id": 1,
+		"method": "initialize",
+		"bytes": "{\n\t\"id\": 1,\n\t\"result\": {\n\t\t\"codexHome\": \"<normalized>\",\n\t\t\"platformFamily\": \"Darwin\",\n\t\t\"platformOs\": \"darwin\",\n\t\t\"userAgent\": \"<normalized>\"\n\t}\n}"
+	},
+	{
+		"id": 2,
+		"method": "fs/readFile",
+		"bytes": "{\n\t\"id\": 2,\n\t\"result\": {\n\t\t\"dataBase64\": \"c3Bhd25lZCBzdGRpbyBibGFjay1ib3ggZml4dHVyZQo=\"\n\t}\n}"
+	},
+	{
+		"id": 3,
+		"method": "fs/copy",
+		"bytes": "{\n\t\"id\": 3,\n\t\"result\": {}\n}"
+	},
+	{
+		"id": 4,
+		"method": "model/list",
+		"bytes": "{\n\t\"id\": 4,\n\t\"result\": {\n\t\t\"data\": [\n\t\t\t{\n\t\t\t\t\"additionalSpeedTiers\": [],\n\t\t\t\t\"availabilityNux\": null,\n\t\t\t\t\"defaultReasoningEffort\": \"minimal\",\n\t\t\t\t\"defaultServiceTier\": null,\n\t\t\t\t\"description\": \"alibaba-token-plan/deepseek-v4-pro (openai-completions)\",\n\t\t\t\t\"displayName\": \"DeepSeek V4 Pro\",\n\t\t\t\t\"hidden\": false,\n\t\t\t\t\"id\": \"alibaba-token-plan/deepseek-v4-pro\",\n\t\t\t\t\"inputModalities\": [\n\t\t\t\t\t\"text\"\n\t\t\t\t],\n\t\t\t\t\"isDefault\": false,\n\t\t\t\t\"model\": \"deepseek-v4-pro\",\n\t\t\t\t\"serviceTiers\": [],\n\t\t\t\t\"supportedReasoningEfforts\": [\n\t\t\t\t\t{\n\t\t\t\t\t\t\"description\": \"minimal reasoning for DeepSeek V4 Pro\",\n\t\t\t\t\t\t\"reasoningEffort\": \"minimal\"\n\t\t\t\t\t},\n\t\t\t\t\t{\n\t\t\t\t\t\t\"description\": \"low reasoning for DeepSeek V4 Pro\",\n\t\t\t\t\t\t\"reasoningEffort\": \"low\"\n\t\t\t\t\t},\n\t\t\t\t\t{\n\t\t\t\t\t\t\"description\": \"medium reasoning for DeepSeek V4 Pro\",\n\t\t\t\t\t\t\"reasoningEffort\": \"medium\"\n\t\t\t\t\t},\n\t\t\t\t\t{\n\t\t\t\t\t\t\"description\": \"high reasoning for DeepSeek V4 Pro\",\n\t\t\t\t\t\t\"reasoningEffort\": \"high\"\n\t\t\t\t\t},\n\t\t\t\t\t{\n\t\t\t\t\t\t\"description\": \"xhigh reasoning for DeepSeek V4 Pro\",\n\t\t\t\t\t\t\"reasoningEffort\": \"xhigh\"\n\t\t\t\t\t}\n\t\t\t\t],\n\t\t\t\t\"supportsPersonality\": false,\n\t\t\t\t\"upgrade\": null,\n\t\t\t\t\"upgradeInfo\": null\n\t\t\t}\n\t\t],\n\t\t\"nextCursor\": \"1\"\n\t}\n}"
+	},
+	{
+		"id": 5,
+		"method": "thread/loaded/list",
+		"bytes": "{\n\t\"id\": 5,\n\t\"result\": {\n\t\t\"data\": [],\n\t\t\"nextCursor\": null\n\t}\n}"
+	},
+	{
+		"id": 6,
+		"method": "app/list",
+		"bytes": "{\n\t\"error\": {\n\t\t\"code\": -32081,\n\t\t\"message\": \"Not supported\"\n\t},\n\t\"id\": 6\n}"
+	}
+]
