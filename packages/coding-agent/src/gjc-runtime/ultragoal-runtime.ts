@@ -1494,12 +1494,20 @@ export function requireResolvedLinks(ids: string[], map: Map<string, JsonObject>
 		if (!map.has(id)) throw new Error(`qualityGate ${fieldName} references unknown id ${id}`);
 	}
 }
-function successfulLinkedRows(ids: string[], map: Map<string, JsonObject>, fieldName: string): JsonObject[] {
+function successfulLinkedRows(
+	ids: string[],
+	map: Map<string, JsonObject>,
+	fieldName: string,
+	expectedContractRef: string,
+): JsonObject[] {
 	const rows: JsonObject[] = [];
 	for (const id of ids) {
 		const row = map.get(id);
 		if (!row) throw new Error(`qualityGate ${fieldName} references unknown id ${id}`);
 		requireSuccessfulRowOutcome(row, `${fieldName}.${id}`);
+		if (requiredStringField(row, "contractRef", `${fieldName}.${id}`) !== expectedContractRef) {
+			throw new Error(`qualityGate ${fieldName}.${id}.contractRef must match ${expectedContractRef}`);
+		}
 		rows.push(row);
 	}
 	return rows;
@@ -1824,6 +1832,16 @@ async function validateSurfaceEvidence(
 		}
 		const artifactIds = requireStringLinks(row.artifactRefs, `${fieldName}.artifactRefs`);
 		requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+		if (!isLiveSurfaceFamily(family)) {
+			for (const artifactId of artifactIds) {
+				const artifact = artifactRefs.get(artifactId)!;
+				if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+					throw new Error(
+						`qualityGate executorQa.artifactRefs.${artifactId} non-live surface evidence requires an existing non-empty file`,
+					);
+				}
+			}
+		}
 		await validateLiveSurfaceProofPresence(cwd, family, artifactIds, artifactRefs);
 		validateSurfaceArtifactCompatibility(surface, artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
 		await validateSurfaceStructuralRequirement(cwd, family, artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
@@ -1988,7 +2006,7 @@ async function validateContractCoverage(
 	let hasSuccessfulContractCoverage = false;
 	for (const [index, row] of rows.entries()) {
 		const fieldName = `executorQa.contractCoverage[${index}]`;
-		requiredStringField(row, "contractRef", fieldName);
+		const contractRef = requiredStringField(row, "contractRef", fieldName);
 		const status = optionalStatusField(row, fieldName);
 		if (status === NOT_APPLICABLE_STATUS) {
 			requiredStringField(row, "reason", fieldName);
@@ -2013,6 +2031,7 @@ async function validateContractCoverage(
 				surfaceIds,
 				surfaceEvidence,
 				`${fieldName}.surfaceEvidenceRefs`,
+				contractRef,
 			).length;
 			successfulProofLinks += successfulSurfaceProofLinks;
 		}
@@ -2021,6 +2040,7 @@ async function validateContractCoverage(
 				adversarialIds,
 				adversarialCases,
 				`${fieldName}.adversarialCaseRefs`,
+				contractRef,
 			);
 			if (successfulSurfaceProofLinks === 0 && !artifactIds) {
 				for (const adversarialRow of successfulAdversarialRows) {

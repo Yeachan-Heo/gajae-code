@@ -5057,7 +5057,7 @@ describe("native GJC ultragoal runtime", () => {
 		).rejects.toThrow(/terminal control sequences/);
 	});
 
-	it("accepts non-live typed receipt or artifact proof but rejects bare inline-only proof", async () => {
+	it("requires file-backed non-live surface proof and rejects receipt-only or inline-only proof", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
 		await Bun.write(path.join(root, "artifacts", "api-output.txt"), "api package consumer test output");
@@ -5100,7 +5100,9 @@ describe("native GJC ultragoal runtime", () => {
 				adversarialCaseRefs: ["case-api"],
 			},
 		];
-		await validateExecutorQaRedTeamEvidenceForReview(root, receiptExecutorQa);
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, receiptExecutorQa)).rejects.toThrow(
+			"non-live surface evidence requires an existing non-empty file",
+		);
 
 		const artifactExecutorQa = JSON.parse(JSON.stringify(receiptExecutorQa)) as Record<string, unknown>;
 		artifactExecutorQa.artifactRefs = [
@@ -5123,7 +5125,7 @@ describe("native GJC ultragoal runtime", () => {
 			},
 		];
 		await expect(validateExecutorQaRedTeamEvidenceForReview(root, inlineExecutorQa)).rejects.toThrow(
-			/inlineEvidence alone is not sufficient/,
+			"non-live surface evidence requires an existing non-empty file",
 		);
 	});
 
@@ -5269,6 +5271,22 @@ describe("native GJC ultragoal runtime", () => {
 		];
 		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
 			"adversarial-only coverage requires an existing non-empty file",
+		);
+	});
+
+	it("rejects coverage links whose contractRef does not match", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const surfaceMismatch = JSON.parse(passingQualityGate()).executorQa as Record<string, unknown>;
+		(surfaceMismatch.surfaceEvidence as Array<Record<string, unknown>>)[0]!.contractRef = "other-contract";
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, surfaceMismatch)).rejects.toThrow(
+			"contractRef must match approved-plan:goal",
+		);
+
+		const adversarialMismatch = JSON.parse(passingQualityGate()).executorQa as Record<string, unknown>;
+		(adversarialMismatch.adversarialCases as Array<Record<string, unknown>>)[0]!.contractRef = "other-contract";
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, adversarialMismatch)).rejects.toThrow(
+			"contractRef must match approved-plan:goal",
 		);
 	});
 
