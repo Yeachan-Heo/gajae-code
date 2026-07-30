@@ -65,14 +65,14 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		"fsReadFileHandler",
 		"processInbound + handler registry: fs/readFile dispatched through the server",
 	),
-	"fs/writeFile": implemented("fsWriteFileHandler", "fs/writeFile: writes a base64 file"),
-	"fs/getMetadata": implemented("fsGetMetadataHandler", "fs/getMetadata: reports file metadata"),
+	"fs/writeFile": implemented("fsWriteFileHandler", "fs/writeFile: writes base64 data to a file"),
+	"fs/getMetadata": implemented("fsGetMetadataHandler", "fs/getMetadata: returns file metadata"),
 	"fs/readDirectory": implemented("fsReadDirectoryHandler", "fs/readDirectory: lists entries"),
-	"fs/createDirectory": implemented("fsCreateDirectoryHandler", "fs/createDirectory: creates recursively"),
-	"fs/remove": implemented("fsRemoveHandler", "fs/remove: removes a file tree"),
+	"fs/createDirectory": implemented("fsCreateDirectoryHandler", "fs/createDirectory: creates a directory"),
+	"fs/remove": implemented("fsRemoveHandler", "fs/remove: removes a file"),
 	"experimentalFeature/list": implemented(
 		"experimentalFeatureListHandler",
-		"experimentalFeature/list: returns an empty catalog",
+		"implemented handler results validate against stable clientRequestResults",
 	),
 	"thread/start": {
 		support: "implemented",
@@ -93,7 +93,7 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		semanticGaps: ["Requires an injected retained-child adapter; the G2 real child remains blocked."],
 		translationNotes: ["Only nonempty text UserInput entries and null/absent turn overrides are admitted."],
 		owner: "app-server",
-		testIds: ["server: turn/start routes through the durable TurnController"],
+		testIds: ["turn/start returns a validated response plus both delivery hooks and defers notifications"],
 		reason: "TurnController.start owns admission, durable projection, and notification delivery barriers.",
 	},
 	"thread/resume": {
@@ -103,7 +103,7 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		semanticGaps: ["Requires an injected retained-child adapter; the G2 real child remains blocked."],
 		translationNotes: ["Only threadId with null/absent resume overrides is admitted."],
 		owner: "app-server",
-		testIds: ["server: thread/resume reconstructs persisted turns and defers subscription"],
+		testIds: ["thread/resume reconstructs durable turns for stable and experimental profiles exactly once"],
 		reason: "thread/resume reads the durable projection and projects the negotiated response profile.",
 	},
 	"fs/copy": laneRow(
@@ -650,7 +650,9 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		semanticGaps: ["GJC has no guardian policy layer that denies actions for later approval."],
 		translationNotes: [],
 		owner: "app-server",
-		testIds: ["dispatchClientRequest: a planned method remains notSupported on an experimentalApi connection"],
+		testIds: [
+			"dispatchClientRequest: a non-implemented method remains notSupported on an experimentalApi connection",
+		],
 		reason: "No guardian subsystem exists, so no handler is registered.",
 	},
 	"thread/increment_elicitation": unsupported,

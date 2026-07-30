@@ -273,3 +273,25 @@ test("support manifest and handler registry agree in both directions", () => {
 		expect(registered.has(row.method), `${row.method} must not register a handler`).toBe(false);
 	}
 });
+
+// Manifest truth: a row may not cite a test id that does not exist. This turns `testIds` from
+// prose into a checked reference by scanning the real test names in the app-server test tree.
+test("every support-manifest test id names a real test", async () => {
+	const { Glob } = await import("bun");
+	const root = join(import.meta.dir, "..");
+	const names = new Set<string>();
+	for await (const relative of new Glob("**/*.test.ts").scan(root)) {
+		const source = await Bun.file(join(root, relative)).text();
+		for (const match of source.matchAll(/\btest\(\s*(["'`])((?:\\.|(?!\1)[\s\S])*?)\1/g)) {
+			const name = match[2];
+			if (name) names.add(name.replace(/\\(["'`\\])/g, "$1"));
+		}
+	}
+	expect(names.size).toBeGreaterThan(100);
+
+	const missing: string[] = [];
+	for (const row of supportManifest) {
+		for (const id of row.testIds) if (!names.has(id)) missing.push(`${row.method} -> ${id}`);
+	}
+	expect(missing).toEqual([]);
+});

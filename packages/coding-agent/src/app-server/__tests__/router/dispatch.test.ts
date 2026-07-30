@@ -49,7 +49,10 @@ test("dispatchClientRequest: alreadyInitialized on a duplicate initialize after 
 	const state = new ConnectionState();
 	state.beginInitialize(undefined);
 	state.completeInitialize();
-	const verdict = dispatchClientRequest(state, classifyInbound(req("initialize", 1, { clientInfo: { name: "test", version: "1" } })));
+	const verdict = dispatchClientRequest(
+		state,
+		classifyInbound(req("initialize", 1, { clientInfo: { name: "test", version: "1" } })),
+	);
 	expect(verdict.kind).toBe("alreadyInitialized");
 });
 
@@ -64,7 +67,7 @@ test("dispatchClientRequest: an experimental method on a stable connection -> no
 	expect(verdict.reason).toBe("experimentalGate");
 });
 
-test("dispatchClientRequest: a planned method remains notSupported on an experimentalApi connection", () => {
+test("dispatchClientRequest: a non-implemented method remains notSupported on an experimentalApi connection", () => {
 	const state = new ConnectionState();
 	state.beginInitialize({ capabilities: { experimentalApi: true } });
 	state.completeInitialize();
@@ -82,14 +85,20 @@ test("dispatchClientRequest: rejects malformed params for implemented methods be
 		["fs/writeFile", { path: "/workspace/file", dataBase64: 1 }],
 	] as const;
 	for (const [method, params] of malformed) {
-		expect(dispatchClientRequest(state, classifyInbound(req(method, 7, params)))).toEqual({ kind: "invalidParams", id: 7 });
+		expect(dispatchClientRequest(state, classifyInbound(req(method, 7, params)))).toEqual({
+			kind: "invalidParams",
+			id: 7,
+		});
 	}
 });
 
 test("dispatchClientRequest: preserves vendored unknown-key and optional-params semantics", () => {
 	const state = initializedState();
 	expect(dispatchClientRequest(state, classifyInbound(req("config/read", 8, { unknown: true }))).kind).toBe("handle");
-	expect(dispatchClientRequest(state, classifyInbound({ method: "account/logout", id: 9 }))).toMatchObject({ kind: "notSupported", id: 9 });
+	expect(dispatchClientRequest(state, classifyInbound({ method: "account/logout", id: 9 }))).toMatchObject({
+		kind: "notSupported",
+		id: 9,
+	});
 });
 
 test("dispatchClientRequest: an explicitly implemented method reaches the handler verdict", () => {
@@ -101,7 +110,10 @@ test("dispatchClientRequest: a backend-less (not_supported) method -> notSupport
 	const state = new ConnectionState();
 	state.beginInitialize(undefined);
 	state.completeInitialize();
-	const verdict = dispatchClientRequest(state, classifyInbound(req("account/login/cancel", 1, { loginId: "login-1" })));
+	const verdict = dispatchClientRequest(
+		state,
+		classifyInbound(req("account/login/cancel", 1, { loginId: "login-1" })),
+	);
 	expect(verdict.kind).toBe("notSupported");
 	if (verdict.kind !== "notSupported") throw new Error("unreachable");
 	expect(verdict.reason).toBe("backendLess");
