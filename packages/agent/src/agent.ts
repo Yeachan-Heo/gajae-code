@@ -23,6 +23,8 @@ import {
 import { extractHttpStatusFromError } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
+import { createAttemptScopeAuthority } from "./attempt-scope";
 import type { HarmonyAuditEvent } from "./harmony-leak";
 import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
 import { createRunResourceLedger } from "./run-resource-ledger";
@@ -128,7 +130,7 @@ export interface AgentOptions {
 	 * Optional transform applied to context before convertToLlm.
 	 * Use for context pruning, injecting external context, etc.
 	 */
-	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScope) => Promise<AgentMessage[]>;
 
 	/**
 	 * Steering mode: "all" = send all steering messages at once, "one-at-a-time" = one per turn
@@ -302,7 +304,8 @@ export interface AgentPromptOptions {
 	/** Continue a cooperative maintenance checkpoint under its existing logical run and cancellation domain. */
 	maintenanceContinuation?: boolean;
 	/** Called synchronously after this invocation claims the agent run, before asynchronous provider work. */
-	onRunAccepted?: () => void;
+	/** Receives the immutable run handle as the first callback argument. */
+	onRunAccepted?: (...args: any[]) => void;
 	/** Called once immediately before every managed upstream request. */
 	nextFallbackAttempt?: AgentLoopConfig["nextFallbackAttempt"];
 	/** Called after a managed upstream request is accepted and committed. */
@@ -335,6 +338,8 @@ export class Agent {
 		error: undefined,
 	};
 	#contextRevision = 0;
+	#attemptAuthority = createAttemptScopeAuthority();
+	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
 	#listeners = new Set<(e: AgentEvent) => void>();
 	#abortController?: AbortController;
@@ -403,6 +408,16 @@ export class Agent {
 	bindRunCancellationDomainBridge(bridge: RunCancellationDomainBridge, agentSessionClaimKey?: object): void {
 		this.resourceLedger.bindCancellationDomainBridge(bridge);
 		if (agentSessionClaimKey) this.resourceLedger.bindAgentSessionClaimKey(agentSessionClaimKey);
+	}
+
+	/** Mint a side-attempt scope and its authority unregister function. */
+	mintSideAttemptScope(): { scope: AttemptScope; dispose: () => void } {
+		return this.#attemptAuthority.mintSide();
+	}
+
+	/** Return the Agent-owned attempt scope authority for session record injection. */
+	getAttemptScopeAuthority() {
+		return this.#attemptAuthority;
 	}
 
 	streamFn: StreamFn;
@@ -1164,9 +1179,20 @@ export class Agent {
 	 * did not drain. The abandoned provider/tool stream may still settle later, so
 	 * #runLoop guards every state mutation with a run id.
 	 */
-	forceAbort(reason = "Force aborted"): boolean {
+	forceAbort(reason: string, logicalRunId: ManagedLogicalRunId | number): boolean;
+	/** @deprecated Pass the logical run id explicitly; retained for older hosts. */
+	forceAbort(reason?: string): boolean;
+	forceAbort(reason = "Force aborted", logicalRunId?: ManagedLogicalRunId | number): boolean {
+		const targetLogicalRunId = logicalRunId ?? this.#managedLogicalRunOwner ?? this.#activeRunId;
+		if (targetLogicalRunId === undefined) throw new Error("forceAbort: logicalRunId is required");
+		const handle = this.#runHandles.get(targetLogicalRunId);
+		if (!handle) throw new Error(`forceAbort: unknown logicalRunId ${targetLogicalRunId} (no attempt handle)`);
 		const runId = this.#activeRunId;
 		const managedLogicalRunId = this.#managedLogicalRunOwner;
+		const activeLogicalRunId = managedLogicalRunId ?? runId;
+		if (activeLogicalRunId !== undefined && activeLogicalRunId !== targetLogicalRunId) {
+			throw new Error(`forceAbort: logicalRunId ${targetLogicalRunId} does not match the active run`);
+		}
 		const activeResourceDomain = this.#activeResourceCancellationDomain;
 		const activeResourceRunId = this.#activeResourceRunId;
 		const hadActiveRun = runId !== undefined && (this.#runningPrompt !== undefined || this.#state.isStreaming);
@@ -1174,6 +1200,7 @@ export class Agent {
 
 		this.#abortController?.abort(reason);
 		this.#continuationGeneration++;
+		this.#attemptAuthority.advanceMain();
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
 		this.#state.pendingToolCalls = new Set<string>();
@@ -1189,8 +1216,8 @@ export class Agent {
 		this.#activeResourceCancellationDomain = undefined;
 		resolve?.();
 		this.#finalizeRun(
-			managedLogicalRunId ?? runId,
-			{ type: "agent_end", messages: [], stopReason: "cancelled" },
+			targetLogicalRunId,
+			{ type: "agent_end", messages: [], stopReason: "cancelled", scope: handle.scope },
 			undefined,
 			activeResourceDomain,
 		);
@@ -1231,6 +1258,8 @@ export class Agent {
 	 */
 	requestRunTerminal(logicalRunId: ManagedLogicalRunId, request: RunTerminalRequest): boolean {
 		if (this.#terminalizedLogicalRunIds.has(logicalRunId)) return false;
+		const handle = this.#runHandles.get(logicalRunId);
+		if (!handle) throw new Error(`requestRunTerminal: unknown logicalRunId ${logicalRunId} (no attempt handle)`);
 		if (this.#managedLogicalRunOwner === logicalRunId) {
 			this.#managedLogicalRunOwner = undefined;
 		}
@@ -1240,6 +1269,7 @@ export class Agent {
 				type: "agent_end",
 				messages: request.messages ?? [],
 				...(request.stopReason === "cancelled" ? { stopReason: "cancelled" as const } : {}),
+				scope: handle.scope,
 			},
 			() => {
 				for (const message of request.messages ?? []) {
@@ -1403,10 +1433,14 @@ export class Agent {
 			resolve();
 			throw new Error("Prompt resource cancellation domain is unavailable");
 		}
-		options?.onRunAccepted?.();
+		const logicalRunId = managedLogicalRunOwner ?? runId;
+		const scope = this.#attemptAuthority.mintMain();
+		const handle: AttemptRunHandle = { logicalRunId, scope };
+		this.#runHandles.set(logicalRunId, handle);
+		options?.onRunAccepted?.(handle);
 		if (startsManagedLogicalRun) {
-			this.#managedLogicalRunOwner = managedLogicalRunOwner;
-			this.#emit({ type: "agent_start" });
+			this.#managedLogicalRunOwner = logicalRunId;
+			this.#emit({ type: "agent_start", scope });
 		}
 		if (fallbackManaged && this.#cursorToolResultBuffer.length > 0) {
 			const error = new ManagedCursorInvariantError(
@@ -1509,6 +1543,8 @@ export class Agent {
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
 			transformContext: this.#transformContext,
+			attemptMinter: { mint: () => this.#attemptAuthority.mintMain() },
+			initialScope: scope,
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
@@ -1610,8 +1646,8 @@ export class Agent {
 
 		try {
 			const stream = messages
-				? agentLoop(messages, context, config, abortController.signal, this.streamFn, !continuesLogicalRun)
-				: agentLoopContinue(context, config, abortController.signal, this.streamFn, !continuesLogicalRun);
+				? agentLoop(messages, context, config, abortController.signal, this.streamFn, !continuesLogicalRun, scope)
+				: agentLoopContinue(context, config, abortController.signal, this.streamFn, !continuesLogicalRun, scope);
 
 			for await (const event of stream) {
 				if (this.#activeRunId !== runId) {
@@ -1778,6 +1814,7 @@ export class Agent {
 						generation: continuationGeneration,
 						domain: continuationReservation.lease.domain,
 						lease: continuationReservation.lease,
+						handle,
 						isCurrent: () =>
 							this.#continuationGeneration === continuationGeneration && this.#activeRunId === undefined,
 					}
@@ -1846,6 +1883,10 @@ export class Agent {
 		knownDomain?: RunCancellationDomain,
 	): void {
 		if (this.#terminalizedLogicalRunIds.has(logicalRunId)) return;
+		const handle = this.#runHandles.get(logicalRunId);
+		if (!handle && !event?.scope) {
+			throw new Error(`finalizeRun: unknown logicalRunId ${logicalRunId} (no attempt handle)`);
+		}
 		const resourceRunId = String(logicalRunId);
 		const boundDomain = this.resourceLedger.lookupDomain(resourceRunId);
 		const domain = boundDomain ?? knownDomain;
@@ -1856,7 +1897,12 @@ export class Agent {
 		if (this.#terminalizedLogicalRunIds.size > 256) {
 			this.#terminalizedLogicalRunIds.delete(this.#terminalizedLogicalRunIds.values().next().value!);
 		}
-		const terminalEvent: Extract<AgentEvent, { type: "agent_end" }> = event ?? { type: "agent_end", messages: [] };
+		const terminalEvent: Extract<AgentEvent, { type: "agent_end" }> = event ?? {
+			type: "agent_end",
+			messages: [],
+			scope: handle?.scope,
+		};
+		if (handle) terminalEvent.scope = handle.scope;
 		if (domain) {
 			setAgentTerminalOwnerContext(terminalEvent, {
 				resourceRunId,
@@ -1870,7 +1916,11 @@ export class Agent {
 			try {
 				terminalReservation?.ok && terminalReservation.lease.closeDiscovery();
 			} finally {
-				this.resourceLedger.seal(resourceRunId);
+				try {
+					this.resourceLedger.seal(resourceRunId);
+				} finally {
+					this.#runHandles.delete(logicalRunId);
+				}
 			}
 		}
 	}

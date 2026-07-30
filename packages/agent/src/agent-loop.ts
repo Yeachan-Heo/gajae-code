@@ -22,6 +22,7 @@ import {
 } from "@gajae-code/ai";
 import { isInvalidPromptError, neutralizeReservedControlTokens } from "@gajae-code/ai/utils";
 import { sanitizeText } from "@gajae-code/utils";
+import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
 	detectHarmonyLeakInAssistantMessage,
@@ -57,6 +58,7 @@ import type {
 	AgentLoopConfig,
 	AgentMessage,
 	AgentTool,
+	AgentToolContext,
 	AgentToolResult,
 	ManagedAttemptOutcome,
 	StandaloneRunOwnership,
@@ -189,15 +191,16 @@ function repairInvalidPromptHistory(messages: AgentMessage[]): boolean {
 	return changed;
 }
 
-function managedFailureOutcome(message: AssistantMessage): ManagedAttemptOutcome {
+function managedFailureOutcome(message: AssistantMessage, scope?: AttemptScope): ManagedAttemptOutcome {
 	return {
 		type: "retryable_discarded",
 		failure: { message, transportFailure: managedTransportFailure(message) },
+		scope,
 	};
 }
 
-function managedContextOverflowOutcome(message: AssistantMessage): ManagedAttemptOutcome {
-	return { type: "context_overflow_discarded", message };
+function managedContextOverflowOutcome(message: AssistantMessage, scope?: AttemptScope): ManagedAttemptOutcome {
+	return { type: "context_overflow_discarded", message, scope };
 }
 
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
@@ -300,6 +303,7 @@ export function agentLoop(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 	emitAgentStart = true,
+	initialScope?: AttemptScope,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
 
@@ -309,19 +313,22 @@ export function agentLoop(
 			...context,
 			messages: [...context.messages, ...prompts],
 		};
+		// Allocate before constructing the provisional transaction so every first turn
+		// has one stable scope for lifecycle events, transform hooks, and transport.
+		const scope = initialScope ?? config.initialScope ?? config.attemptMinter?.mint("main");
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 			: undefined;
 		const attemptStream = transaction ?? stream;
 		try {
 			prepareResourceOwnership(config, false);
-			if (emitAgentStart) stream.push({ type: "agent_start" });
-			attemptStream.push({ type: "turn_start" });
+			if (emitAgentStart) stream.push({ type: "agent_start", ...(scope ? { scope } : {}) });
+			attemptStream.push({ type: "turn_start", ...(scope ? { scope } : {}) });
 			for (const prompt of prompts) {
 				stream.push({ type: "message_start", message: prompt });
 				stream.push({ type: "message_end", message: prompt });
 			}
-			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction, scope);
 		} catch (err) {
 			sealStandaloneOnError(config);
 			stream.fail(err);
@@ -345,6 +352,7 @@ export function agentLoopContinue(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 	emitAgentStart = true,
+	initialScope?: AttemptScope,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
@@ -359,15 +367,18 @@ export function agentLoopContinue(
 	(async () => {
 		const newMessages: AgentMessage[] = [];
 		const currentContext: AgentContext = { ...context };
+		// Allocate before constructing the provisional transaction so every first turn
+		// has one stable scope for lifecycle events, transform hooks, and transport.
+		const scope = initialScope ?? config.initialScope ?? config.attemptMinter?.mint("main");
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 			: undefined;
 		const attemptStream = transaction ?? stream;
 		try {
 			prepareResourceOwnership(config, true);
-			if (emitAgentStart) stream.push({ type: "agent_start" });
-			attemptStream.push({ type: "turn_start" });
-			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
+			if (emitAgentStart) stream.push({ type: "agent_start", ...(scope ? { scope } : {}) });
+			attemptStream.push({ type: "turn_start", ...(scope ? { scope } : {}) });
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction, scope);
 		} catch (err) {
 			sealStandaloneOnError(config);
 			stream.fail(err);
@@ -477,13 +488,16 @@ function publishAgentEnd(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	config: AgentLoopConfig,
 	event: Extract<AgentEvent, { type: "agent_end" }>,
+	scope?: AttemptScope,
 ): void {
 	// Aborted maintenance yields no continuation, so it is terminal for standalone
 	// ownership and resource sealing. The event itself keeps its `maintenance`
 	// stopReason so AgentSession can still report the aborted maintenance
 	// settlement to its consumers.
-	const maintenanceContinues = event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
-	stream.push(event);
+	const publishedEvent = scope ? { ...event, scope } : event;
+	const maintenanceContinues =
+		publishedEvent.stopReason === "maintenance" && publishedEvent.maintenanceOutcome !== "aborted";
+	stream.push(publishedEvent);
 	const standalone = config.standaloneRunOwnership
 		? standaloneOwnershipStates.get(config.standaloneRunOwnership)
 		: undefined;
@@ -848,6 +862,7 @@ class ManagedAttemptTransaction {
 			| ((message: AssistantMessage, event: AssistantMessageEvent) => void)
 			| undefined,
 		private readonly model: AgentLoopConfig["model"],
+		readonly scope?: AttemptScope,
 	) {}
 
 	push(event: AgentEvent): void {
@@ -990,8 +1005,9 @@ function buildAgentEndEvent(
 	telemetry: AgentTelemetry | undefined,
 	stepCount: number,
 	stopReason: "completed" | "paused" = "completed",
+	scope?: AttemptScope,
 ): Extract<AgentEvent, { type: "agent_end" }> {
-	const base = { type: "agent_end" as const, messages, stopReason };
+	const base = { type: "agent_end" as const, messages, stopReason, ...(scope ? { scope } : {}) };
 	if (!telemetry) return base;
 	const snapshot = telemetry.collector.snapshot({ stepCount });
 	if (telemetry.collector.markRunEnded()) {
@@ -1322,6 +1338,7 @@ async function runLoop(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	streamFn?: StreamFn,
 	initialTransaction?: ManagedAttemptTransaction,
+	initialScope?: AttemptScope,
 ): Promise<void> {
 	const loopSignal = signal ?? new AbortController().signal;
 
@@ -1343,6 +1360,7 @@ async function runLoop(
 				stepCounter,
 				streamFn,
 				initialTransaction,
+				initialScope,
 			),
 		);
 	} catch (err) {
@@ -1372,8 +1390,10 @@ async function runLoopBody(
 	stepCounter: StepCounter,
 	streamFn?: StreamFn,
 	initialTransaction?: ManagedAttemptTransaction,
+	initialScope?: AttemptScope,
 ): Promise<void> {
 	let firstTurn = true;
+	let lastAttemptScope: AttemptScope | undefined;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 	let harmonyRetryAttempt = 0;
@@ -1408,15 +1428,20 @@ async function runLoopBody(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			const scope =
+				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
+			initialScope = undefined;
 			const transaction =
 				initialTransaction ??
 				(config.fallbackManaged
-					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
+					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 					: undefined);
 			initialTransaction = undefined;
+			const attemptScope = transaction?.scope ?? scope;
+			lastAttemptScope = attemptScope;
 			const attemptStream = transaction ?? stream;
 			if (!firstTurn) {
-				attemptStream.push({ type: "turn_start" });
+				attemptStream.push({ type: "turn_start", ...(attemptScope ? { scope: attemptScope } : {}) });
 			} else {
 				firstTurn = false;
 			}
@@ -1454,12 +1479,17 @@ async function runLoopBody(
 				const outcome = loopSignal.aborted ? "aborted" : maintenanceOutcome;
 
 				if (outcome !== "not-needed") {
-					publishAgentEnd(stream, config, {
-						type: "agent_end",
-						messages: newMessages,
-						stopReason: "maintenance",
-						maintenanceOutcome: outcome,
-					});
+					publishAgentEnd(
+						stream,
+						config,
+						{
+							type: "agent_end",
+							messages: newMessages,
+							stopReason: "maintenance",
+							maintenanceOutcome: outcome,
+						},
+						attemptScope,
+					);
 					stream.end(newMessages);
 					return;
 				}
@@ -1502,6 +1532,7 @@ async function runLoopBody(
 					telemetry,
 					invokeAgentSpan,
 					stepCounter,
+					attemptScope,
 					streamFn,
 					harmonyRetryAttempt,
 					recoveryState.pending && recoveryState.syntheticMessage
@@ -1523,7 +1554,9 @@ async function runLoopBody(
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
-						await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(failureMessage));
+						await config.onManagedAttemptOutcome?.(
+							managedContextOverflowOutcome(failureMessage, transaction.scope),
+						);
 						stream.end(newMessages);
 						return;
 					}
@@ -1531,7 +1564,7 @@ async function runLoopBody(
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
-						await config.onManagedAttemptOutcome?.(managedFailureOutcome(failureMessage));
+						await config.onManagedAttemptOutcome?.(managedFailureOutcome(failureMessage, transaction.scope));
 						stream.end(newMessages);
 						return;
 					}
@@ -1623,7 +1656,7 @@ async function runLoopBody(
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
-				await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(message));
+				await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(message, transaction?.scope));
 				stream.end(newMessages);
 				return;
 			}
@@ -1644,7 +1677,7 @@ async function runLoopBody(
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
-				await config.onManagedAttemptOutcome?.(managedFailureOutcome(message));
+				await config.onManagedAttemptOutcome?.(managedFailureOutcome(message, transaction?.scope));
 				stream.end(newMessages);
 				return;
 			}
@@ -1653,7 +1686,11 @@ async function runLoopBody(
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
-				await config.onManagedAttemptOutcome?.({ type: "run_terminal", reason: "cancelled" });
+				await config.onManagedAttemptOutcome?.({
+					type: "run_terminal",
+					reason: "cancelled",
+					scope: transaction?.scope,
+				});
 				stream.end(newMessages);
 				return;
 			}
@@ -1696,7 +1733,12 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults });
-				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
 				stream.end(newMessages);
 				return;
 			}
@@ -1734,6 +1776,7 @@ async function runLoopBody(
 						config,
 						telemetry,
 						invokeAgentSpan,
+						attemptScope,
 					);
 
 					toolResults.push(...executionResult.toolResults);
@@ -1776,7 +1819,12 @@ async function runLoopBody(
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 			if (pendingMessages.length > 0) continue;
 			if (config.shouldPause?.()) {
-				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused", attemptScope),
+					attemptScope,
+				);
 				stream.end(newMessages);
 				return;
 			}
@@ -1797,7 +1845,12 @@ async function runLoopBody(
 				message.errorMessage = message.errorMessage
 					? `${message.errorMessage} | ${breakerMessage}`
 					: breakerMessage;
-				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
 				stream.end(newMessages);
 				return;
 			}
@@ -1806,7 +1859,12 @@ async function runLoopBody(
 		// Agent would stop here. Check for follow-up messages.
 		await config.onBeforeYield?.();
 		if (config.shouldPause?.()) {
-			publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+			publishAgentEnd(
+				stream,
+				config,
+				buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused", lastAttemptScope),
+				lastAttemptScope,
+			);
 			stream.end(newMessages);
 			return;
 		}
@@ -1821,7 +1879,12 @@ async function runLoopBody(
 		break;
 	}
 
-	publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+	publishAgentEnd(
+		stream,
+		config,
+		buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", lastAttemptScope),
+		lastAttemptScope,
+	);
 	stream.end(newMessages);
 }
 
@@ -1854,6 +1917,7 @@ async function streamAssistantResponse(
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
 	stepCounter: StepCounter,
+	scope?: AttemptScope,
 	streamFn?: StreamFn,
 	harmonyRetryAttempt = 0,
 	recoveryMode?: { syntheticMessage: UserMessage },
@@ -1861,7 +1925,7 @@ async function streamAssistantResponse(
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
+		messages = await config.transformContext(messages, signal, scope);
 	}
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[]) and normalize at the LLM boundary.
@@ -1997,6 +2061,7 @@ async function streamAssistantResponse(
 				responsePromise = Promise.resolve(
 					streamFunction(config.model, llmContext, {
 						...config,
+						attemptScope: scope,
 						fallbackAttempt,
 						apiKey: resolvedApiKey,
 						authCredentialType,
@@ -2283,6 +2348,7 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
+	scope?: AttemptScope,
 ): Promise<{
 	toolResults: ToolResultMessage[];
 	steeringMessages?: AgentMessage[];
@@ -2506,7 +2572,7 @@ async function executeToolCalls(
 				// Reflect post-hook args so emitted tool results / afterToolCall see what actually executed.
 				record.args = effectiveArgs;
 
-				const toolContext = getToolContext
+				const baseToolContext = getToolContext
 					? getToolContext({
 							batchId,
 							index,
@@ -2514,6 +2580,9 @@ async function executeToolCalls(
 							toolCalls: toolCallInfos,
 						})
 					: undefined;
+				const toolContext = scope
+					? (Object.assign(baseToolContext ?? {}, { attemptScope: scope }) as AgentToolContext)
+					: baseToolContext;
 				const execution = tool.execute(
 					toolCall.id,
 					transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs,

@@ -385,19 +385,29 @@ export interface StreamOptions {
 	/**
 	 * Optional callback for inspecting or replacing provider payloads before sending.
 	 * Return undefined to keep the payload unchanged.
+	 * The `scope` parameter carries the per-attempt identity for execution attribution.
 	 */
-	onPayload?: (payload: unknown, model?: Model<Api>) => unknown | undefined | Promise<unknown | undefined>;
+	onPayload?: (
+		payload: unknown,
+		model?: Model<Api>,
+		scope?: AttemptScopeRef,
+	) => unknown | undefined | Promise<unknown | undefined>;
 	/**
 	 * Optional callback for provider response metadata after headers are received.
+	 * The `scope` parameter carries the per-attempt identity for execution attribution.
 	 */
-	onResponse?: (response: ProviderResponseMetadata, model?: Model<Api>) => void | Promise<void>;
+	onResponse?: (
+		response: ProviderResponseMetadata,
+		model?: Model<Api>,
+		scope?: AttemptScopeRef,
+	) => void | Promise<void>;
 	/**
 	 * Optional callback for raw Server-Sent Events as they arrive from HTTP streaming providers.
 	 *
 	 * Diagnostic only: provider implementations must ignore callback failures and must not
 	 * let observers alter stream contents.
 	 */
-	onSseEvent?: (event: RawSseEvent, model?: Model<Api>) => void;
+	onSseEvent?: (event: RawSseEvent, model?: Model<Api>, scope?: AttemptScopeRef) => void;
 	/**
 	 * Optional override for the first streamed event watchdog in milliseconds.
 	 * Set to 0 to disable the first-event watchdog for this request.
@@ -427,6 +437,21 @@ export interface StreamOptions {
 	authCredentialType?: "api_key" | "oauth";
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
+}
+
+/**
+ * Low-level structural carrier for per-attempt identity attribution.
+ *
+ * Defined in `packages/ai` so that {@link SimpleStreamOptions} and provider
+ * hook signatures can carry an attempt identity without a reverse dependency
+ * on `packages/agent`. The concrete `AttemptScope` in `packages/agent` is
+ * structurally assignable to this interface (same `attemptId` + `generation`
+ * + `lineage` fields).
+ */
+export interface AttemptScopeRef {
+	readonly attemptId: string;
+	readonly generation: number;
+	readonly lineage: string;
 }
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
@@ -465,6 +490,8 @@ export interface SimpleStreamOptions extends StreamOptions {
 	syntheticApiFormat?: "openai" | "anthropic";
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
+	/** Per-attempt identity for execution attribution. Threaded into onPayload/onResponse calls. */
+	attemptScope?: AttemptScopeRef;
 }
 
 // Generic StreamFunction with typed options

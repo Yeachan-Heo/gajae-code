@@ -109,15 +109,19 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
 	) {
+		const scope = context?.attemptScope;
 		// Emit tool_call event - extensions can block execution
 		if (this.runner.hasHandlers("tool_call")) {
 			try {
-				const callResult = (await this.runner.emitToolCall({
-					type: "tool_call",
-					toolName: this.tool.name,
-					toolCallId,
-					input: params as Record<string, unknown>,
-				})) as ToolCallEventResult | undefined;
+				const callResult = (await this.runner.emitToolCall(
+					{
+						type: "tool_call",
+						toolName: this.tool.name,
+						toolCallId,
+						input: params as Record<string, unknown>,
+					},
+					scope,
+				)) as ToolCallEventResult | undefined;
 
 				if (callResult?.block) {
 					const reason = callResult.reason || "Tool execution was blocked by an extension";
@@ -147,15 +151,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 		// Emit tool_result event - extensions can modify the result and error status
 		if (this.runner.hasHandlers("tool_result")) {
-			const resultResult = await this.runner.emitToolResult({
-				type: "tool_result",
-				toolName: this.tool.name,
-				toolCallId,
-				input: params as Record<string, unknown>,
-				content: result.content,
-				details: result.details,
-				isError: !!executionError,
-			});
+			const resultResult = await this.runner.emitToolResult(
+				{
+					type: "tool_result",
+					toolName: this.tool.name,
+					toolCallId,
+					input: params as Record<string, unknown>,
+					content: result.content,
+					details: result.details,
+					isError: !!executionError,
+				},
+				scope,
+			);
 
 			if (resultResult) {
 				const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
