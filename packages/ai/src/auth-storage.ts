@@ -846,6 +846,7 @@ export class AuthStorage {
 	#store: AuthCredentialStore;
 	#configValueResolver: (config: string) => Promise<string | undefined>;
 	#resolvedStoredApiKeyValues: Map<string, Map<string, string>> = new Map();
+	#lastResolvedStoredApiKey = new Map<string, string>();
 	#refreshOAuthCredentialOverride?: AuthStorageOptions["refreshOAuthCredential"];
 	#fetchUsageReportsOverride?: AuthStorageOptions["fetchUsageReports"];
 	#sourceLabel?: string;
@@ -1042,8 +1043,11 @@ export class AuthStorage {
 	 * Remove a runtime credential selector.
 	 */
 	removeRuntimeCredentialSelector(provider: string): void {
-		if (this.#runtimeCredentialSelectors.delete(resolveOAuthStorageProvider(provider)))
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeCredentialSelectors.delete(storageProvider)) {
+			this.#lastResolvedStoredApiKey.delete(storageProvider);
 			this.#bumpGeneration("remove-runtime-credential-selector", provider);
+		}
 	}
 
 	/**
@@ -1148,6 +1152,8 @@ export class AuthStorage {
 	#setStoredCredentials(provider: string, credentials: StoredCredential[]): void {
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return;
+		this.#resolvedStoredApiKeyValues.delete(provider);
+		this.#lastResolvedStoredApiKey.delete(provider);
 		if (credentials.length === 0) {
 			this.#data.delete(provider);
 		} else {
@@ -1681,7 +1687,18 @@ export class AuthStorage {
 	hasAuth(provider: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		try {
-			this.#resolveSelectedStoredCredential(storageProvider);
+			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider);
+			if (selectedCredential?.credential.type === "api_key") {
+				if (!this.#hasUsableResolvedStoredApiKey(storageProvider, selectedCredential.credential.key)) return false;
+			}
+			if (!selectedCredential) {
+				const apiKeys = this.#getCredentialsForProvider(storageProvider).filter(
+					credential => credential.type === "api_key",
+				);
+				if (apiKeys.length === 1 && !this.#hasUsableResolvedStoredApiKey(storageProvider, apiKeys[0].key)) {
+					return false;
+				}
+			}
 		} catch {
 			return false;
 		}
@@ -3560,7 +3577,12 @@ export class AuthStorage {
 		const values = this.#resolvedStoredApiKeyValues.get(storageProvider) ?? new Map<string, string>();
 		values.set(key, value ?? "");
 		this.#resolvedStoredApiKeyValues.set(storageProvider, values);
+		this.#lastResolvedStoredApiKey.set(storageProvider, key);
 		return value;
+	}
+	#hasUsableResolvedStoredApiKey(provider: string, key: string): boolean {
+		const resolved = this.#resolvedStoredApiKeyValues.get(resolveOAuthStorageProvider(provider))?.get(key);
+		return resolved === undefined || resolved.length > 0;
 	}
 
 	/**

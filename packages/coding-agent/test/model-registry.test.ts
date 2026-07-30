@@ -3937,6 +3937,19 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai", "gpt-4o-mini")).toBeDefined();
 			expect(activeRowsFor(registry, ["openai"])).toEqual([{ provider: "openai", connectionKind: "credential" }]);
 		});
+		test("excludes bundled providers when the selected stored key resolver returns undefined", async () => {
+			authStorage.close();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async () => undefined,
+			});
+			await authStorage.set("anthropic", [{ type: "api_key", key: "!missing-anthropic-key" }]);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+
+			expect(registry.getAll().some(model => model.provider === "anthropic")).toBe(true);
+			expect(activeRowsFor(registry, ["anthropic"])).toEqual([]);
+		});
 
 		test("tracks credential addition, replacement, removal, dedupe, and registry-only exclusions", async () => {
 			writeRawModelsJson({
