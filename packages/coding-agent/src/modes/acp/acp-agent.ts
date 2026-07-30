@@ -1916,15 +1916,18 @@ export class AcpAgent implements Agent {
 		try {
 			skills = await adapter.query("skill.list/state");
 		} catch {
-			// Builtins remain useful when an older SDK host cannot expose skill state.
+			// Skills are optional; the ACP command surface below remains deterministic.
 		}
+		const availableCommands = acpAvailableCommandsFromSkills(skills).filter(
+			command => !ACP_BUILTIN_SLASH_COMMANDS.some(builtin => builtin.name === command.name),
+		);
 		await this.#publishSessionUpdate(
 			id,
 			{
 				sessionId: id,
 				update: {
 					sessionUpdate: "available_commands_update",
-					availableCommands: acpAvailableCommandsFromSkills(skills),
+					availableCommands,
 				},
 			},
 			adapter,

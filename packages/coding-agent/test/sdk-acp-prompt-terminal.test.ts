@@ -4,6 +4,7 @@ import type { AgentSideConnection, PromptRequest, SessionNotification } from "@a
 import { TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -281,6 +282,19 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
 		prompt: [{ type: "text", text }],
 	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
 }
+test("ACP does not advertise builtins that the prompt path cannot dispatch", async () => {
+	const fixture = await createFixture();
+	try {
+		const availableCommands = fixture.updates.find(
+			update => update.update.sessionUpdate === "available_commands_update",
+		)?.update as { availableCommands?: Array<{ name: string }> };
+		expect(availableCommands.availableCommands).toBeDefined();
+		const advertisedNames = new Set(availableCommands.availableCommands?.map(command => command.name));
+		for (const builtin of ACP_BUILTIN_SLASH_COMMANDS) expect(advertisedNames.has(builtin.name)).toBe(false);
+	} finally {
+		fixture.dispose();
+	}
+});
 
 for (const reason of ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"] as const) {
 	test(`ACP prompt preserves the ${reason} terminal stop reason`, async () => {
