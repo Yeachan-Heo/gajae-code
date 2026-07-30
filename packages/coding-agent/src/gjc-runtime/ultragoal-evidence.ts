@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
+import { isCompiledBinary } from "@gajae-code/utils/env";
 import {
 	evidenceKindMatches,
 	hasExistingNonEmptyArtifact,
@@ -466,7 +467,12 @@ function cliReplayAllowlistDescription(): string {
 	return '`bun --version` or deterministic `bun -e "console.log(...)"`; focused bun test execution is blocked and replayExempt still requires an existing screenshot, automation, or PTY structural fallback';
 }
 
-function resolveCliReplayCommand(command: string[]): string[] {
+export function resolveCliReplayCommand(command: string[], options?: { compiled?: boolean }): string[] {
+	if (options?.compiled ?? isCompiledBinary()) {
+		throw new Error(
+			"CLI replay execution is unavailable in the compiled GJC runtime because process.execPath is the GJC application, not a Bun CLI executable",
+		);
+	}
 	return [process.execPath, ...command.slice(1)];
 }
 

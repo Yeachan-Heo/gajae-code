@@ -25,6 +25,7 @@ import {
 	hashStructuredValue,
 	readUltragoalLedger,
 	readUltragoalPlan,
+	resolveCliReplayCommand,
 	resolveGitBase,
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
@@ -776,6 +777,12 @@ describe("ultragoal CLI replay validation", () => {
 		expect(await Bun.file(marker).exists()).toBe(false);
 	});
 
+	it("fails closed when process.execPath is the compiled GJC application", () => {
+		expect(() => resolveCliReplayCommand(["bun", "-e", 'console.log("safe")'], { compiled: true })).toThrow(
+			"compiled GJC runtime",
+		);
+		expect(resolveCliReplayCommand(["bun", "--version"], { compiled: false })[0]).toBe(process.execPath);
+	});
 	it("rejects string commands", async () => {
 		const stringRoot = await tempDir();
 		const stringError = await expectRejectedExecutorQa(

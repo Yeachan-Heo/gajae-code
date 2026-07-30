@@ -1843,6 +1843,7 @@ export async function readArtifactBytes(cwd: string, row: JsonObject, fieldName:
 
 import {
 	readCliReplayRecord,
+	resolveCliReplayCommand,
 	validateArtifactProof,
 	validateCliReplay,
 	validateLiveSurfaceProofPresence,
@@ -1854,6 +1855,7 @@ import {
 
 export type { ReplayProcessHandle } from "./ultragoal-evidence";
 export {
+	resolveCliReplayCommand,
 	validateArtifactProof,
 	validateCliReplay,
 	validateLiveSurfaceProofPresence,
