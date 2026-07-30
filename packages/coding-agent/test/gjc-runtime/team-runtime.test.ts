@@ -4120,7 +4120,10 @@ type ContinuationFixture = {
 };
 
 describe("stalled worker continuation protocol", () => {
-	async function prepareContinuation(teamName: string): Promise<ContinuationFixture> {
+	async function prepareContinuation(
+		teamName: string,
+		options: { workerCount?: number } = {},
+	): Promise<ContinuationFixture> {
 		cleanupRoot = await createGitRepo();
 		let nowMs = Date.now();
 		const dispatches: Array<{ command: string; args: string[] }> = [];
@@ -4134,7 +4137,7 @@ describe("stalled worker continuation protocol", () => {
 			GJC_TEAM_HEARTBEAT_STALE_MS: "60000",
 		};
 		const snapshot = await startGjcTeam({
-			workerCount: 1,
+			workerCount: options.workerCount ?? 1,
 			agentType: "executor",
 			task: "Continue stalled claim",
 			teamName,
@@ -4312,7 +4315,6 @@ describe("stalled worker continuation protocol", () => {
 			"task_status_changed",
 			"task_owner_changed",
 			"task_assignee_changed",
-			"task_version_changed",
 			"second_claim_added",
 		] as const) {
 			const fixture = await prepareContinuation(`continuation-pre-dispatch-${scenario}-team`);
@@ -4347,7 +4349,6 @@ describe("stalled worker continuation protocol", () => {
 								...(scenario === "task_status_changed" ? { status: "pending" } : {}),
 								...(scenario === "task_owner_changed" ? { owner: "other-worker" } : {}),
 								...(scenario === "task_assignee_changed" ? { assignee: "other-worker" } : {}),
-								...(scenario === "task_version_changed" ? { version: task.version + 1 } : {}),
 							})}\n`,
 						);
 					}
@@ -4357,6 +4358,43 @@ describe("stalled worker continuation protocol", () => {
 			expect(fixture.dispatches, scenario).toHaveLength(0);
 		}
 	}, 120_000);
+	it("acknowledges exactly once after a non-claim task version drifts between reservation and dispatch", async () => {
+		const fixture = await prepareContinuation("continuation-nonclaim-version-drift-team");
+		let ackCalls = 0;
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationBeforeDispatch: async () => {
+				const taskPath = path.join(fixture.stateDir, "tasks", "task-1.json");
+				const task = await Bun.file(taskPath).json();
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, version: task.version + 1 })}\n`);
+			},
+			continuationTmuxDispatch: async (command, args) => {
+				fixture.dispatches.push({ command, args: [...args] });
+				return { exitCode: 0 };
+			},
+			continuationAckPoll: async () => {
+				if (ackCalls++ > 0) return;
+				const prompt = fixture.dispatches.at(-1)?.args.find(arg => arg.includes("worker-continuation-ack"));
+				const match = prompt?.match(/--input '([^']+)' --json\.$/);
+				if (!match) throw new Error("expected generated continuation ACK command");
+				await executeGjcTeamApiOperation(
+					"worker-continuation-ack",
+					JSON.parse(match[1]!) as Record<string, unknown>,
+					cleanupRoot!,
+					fixture.env,
+				);
+			},
+		});
+		await fixture.monitor();
+		expect(ackCalls).toBe(1);
+		const root = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(root);
+		if (!incident) throw new Error("expected continuation incident");
+		const outcome = await Bun.file(path.join(root, incident, "attempt-01.outcome.json")).json();
+		expect(outcome).toMatchObject({ result: "sent", reason: "tmux_sent" });
+		const ack = await Bun.file(path.join(root, incident, "attempt-01.ack.json")).json();
+		expect(ack).toMatchObject({ attempt: 1, worker: "worker-1" });
+	});
 	it("does not honor a continuation recovery hold after canonical authority changes", async () => {
 		for (const scenario of [
 			"claim_deleted",

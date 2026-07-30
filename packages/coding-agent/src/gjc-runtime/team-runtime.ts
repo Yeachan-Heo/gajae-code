@@ -628,6 +628,7 @@ export interface GjcTeamRuntimeTestSeams {
 		args: readonly string[],
 	) => { exitCode?: number } | Promise<{ exitCode?: number }>;
 	continuationBeforeDispatch?: () => Promise<void>;
+	continuationBeforeReservation?: () => Promise<void>;
 	continuationAckPoll?: () => Promise<void>;
 }
 
@@ -4186,6 +4187,7 @@ async function validateGjcContinuationAckAuthority(
 	reservation: Record<string, unknown>,
 	incident: string,
 	attempt: number,
+	allowVersionDrift = false,
 ): Promise<string | null> {
 	let currentConfig: GjcTeamConfig;
 	try {
@@ -4199,6 +4201,10 @@ async function validateGjcContinuationAckAuthority(
 		return "provider_authority_changed";
 	}
 	const currentWorker = currentConfig.workers.find(candidate => candidate.id === worker.id);
+	const reservationTask =
+		allowVersionDrift && typeof reservation.task_version === "number"
+			? { ...task, version: reservation.task_version }
+			: task;
 	if (
 		!currentWorker?.pane_id ||
 		currentConfig.team_name !== config.team_name ||
@@ -4209,8 +4215,8 @@ async function validateGjcContinuationAckAuthority(
 			attempt,
 			currentConfig,
 			worker.id,
-			task,
-			task.claim!,
+			reservationTask,
+			reservationTask.claim!,
 			heartbeatAt,
 			currentWorker.pane_id,
 		)
@@ -4224,6 +4230,8 @@ async function validateGjcContinuationAckAuthority(
 		heartbeatAt,
 		staleMs,
 		env,
+		undefined,
+		allowVersionDrift,
 	);
 	if (reason) return reason;
 	const lifecycle = (await readLifecycleById(workerRuntime, dir, currentConfig))[worker.id];
@@ -4413,7 +4421,7 @@ async function continueStalledGjcTeamWorkers(
 		const holdUntil = new Date(reservedAtMs + holdMs).toISOString();
 		const leaseUntil = Date.parse(task.claim.leased_until);
 		if (!Number.isFinite(leaseUntil) || leaseUntil < Date.parse(holdUntil)) continue;
-		const reservation = {
+		let reservation = {
 			schema_version: 1,
 			incident_hash: incident,
 			team_name: config.team_name,
@@ -4440,6 +4448,8 @@ async function continueStalledGjcTeamWorkers(
 		const reservationPath = path.join(journalDir, `attempt-0${attempt}.reservation.json`);
 		let reservationSkipReason: string | null = null;
 		try {
+			if (gjcTeamRuntimeTestSeams?.continuationBeforeReservation)
+				await gjcTeamRuntimeTestSeams.continuationBeforeReservation();
 			await withGjcTeamTaskMutation(taskStore(dir), async () => {
 				const reservationReason = await validateGjcContinuationEligibility(
 					dir,
@@ -4483,7 +4493,7 @@ async function continueStalledGjcTeamWorkers(
 			if (error instanceof AlreadyExistsError) continue;
 			throw error;
 		}
-		if (reservationSkipReason !== null) return;
+		if (reservationSkipReason !== null) continue;
 		let result: "sent" | "unknown" = "unknown";
 		let outcomeReason = "tmux_missing_exit_code";
 		let tmuxExitCode: number | undefined;
@@ -4517,8 +4527,22 @@ async function continueStalledGjcTeamWorkers(
 				true,
 			);
 			if (revalidationReason) return { kind: "skipped" as const, reason: revalidationReason };
-			// Eligibility validation above proves the worker owns a real pane, but that
-			// runtime proof does not narrow the optional `pane_id` field for the type
+			// Eligibility validation above proves the worker owns a real pane.
+			const dispatchInventory = await readGjcContinuationAuthorityInventory(dir);
+			const dispatchAuthority = dispatchInventory.valid
+				? selectGjcContinuationWorkerAuthority(dispatchInventory, worker.id)
+				: { valid: false as const };
+			if (!dispatchAuthority.valid || dispatchAuthority.task.id !== task.id)
+				return { kind: "skipped" as const, reason: "claim_changed" };
+			if (dispatchAuthority.task.version !== reservation.task_version) {
+				reservation = { ...reservation, task_version: dispatchAuthority.task.version };
+				await writeJsonAtomic(
+					reservationPath,
+					reservation,
+					stateWriterOptions(reservationPath, "state", "continuation-reservation"),
+				);
+			}
+			// The runtime proof does not narrow the optional `pane_id` field for the type
 			// checker. Bind it to a proven non-empty local and dispatch through that, so
 			// the frozen argv is `readonly string[]` and both send operations address the
 			// identical pane. A missing pane id here is an eligibility gap, not a
@@ -4576,7 +4600,7 @@ async function continueStalledGjcTeamWorkers(
 					stateWriterOptions(skippedPath, "state", "continuation-outcome"),
 				);
 			});
-			return;
+			continue;
 		}
 		try {
 			if (attemptOutcome.kind === "threw") throw attemptOutcome.error;
@@ -4602,6 +4626,7 @@ async function continueStalledGjcTeamWorkers(
 						reservation,
 						incident,
 						attempt,
+						true,
 					);
 					if (ackAuthorityReason) {
 						outcomeReason = `continuation_${ackAuthorityReason}`;
@@ -4666,6 +4691,7 @@ async function continueStalledGjcTeamWorkers(
 					reservation,
 					incident,
 					attempt,
+					true,
 				);
 				const ack = await readContinuationJson<Record<string, unknown>>(
 					path.join(journalDir, `attempt-0${attempt}.ack.json`),
