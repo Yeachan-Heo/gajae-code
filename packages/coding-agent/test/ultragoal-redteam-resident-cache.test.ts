@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { sweepResidentCacheRoot } from "@gajae-code/coding-agent/session/blob-store";
 import { SessionManager, SessionManagerTestHooks } from "@gajae-code/coding-agent/session/session-manager";
+import * as native from "@gajae-code/natives";
 import { getAgentDir, getResidentCacheRootDir, setAgentDir } from "@gajae-code/utils";
 
 const MiB = 1024 * 1024;
@@ -37,6 +39,61 @@ function makeTempDir(prefix = "gjc-redteam-resident-"): string {
 function ensureOwnerOnlyDirectory(directory: string): void {
 	fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 	fs.chmodSync(directory, 0o700);
+}
+
+function installVerifiedNativeCleanup(): void {
+	vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+		if (
+			identity.parentDev === undefined ||
+			identity.parentIno === undefined ||
+			parent.dev !== identity.parentDev ||
+			parent.ino !== identity.parentIno
+		)
+			throw new Error("resident cleanup parent authority mismatch");
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		if (
+			stat.dev !== identity.dev ||
+			stat.ino !== identity.ino ||
+			stat.nlink !== identity.nlink ||
+			stat.size !== identity.size ||
+			stat.mtimeNs !== identity.mtimeNs
+		)
+			throw new Error("resident cleanup file identity mismatch");
+		if (identity.sha256) {
+			const digest = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+			if (digest !== identity.sha256) throw new Error("resident cleanup file digest mismatch");
+		}
+		if (identity.directory && identity.quarantineName) {
+			const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
+			fs.renameSync(pathname, detachedPath);
+			return { ok: true, detachedPath };
+		}
+		fs.rmSync(pathname, { force: true });
+		return { ok: true };
+	});
+	vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((pathname, snapshot, parentIdentity) => {
+		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+		if (!parentIdentity) throw new Error("resident tree cleanup parent authority missing");
+		if (parent.dev !== parentIdentity.dev || parent.ino !== parentIdentity.ino)
+			throw new Error("resident tree cleanup parent authority mismatch");
+		const current = native.snapshotDirectoryTree(pathname);
+		if (!current.ok || !current.snapshot || current.snapshot.entries.length !== snapshot.entries.length)
+			throw new Error("resident tree cleanup snapshot mismatch");
+		const expected = new Map(snapshot.entries.map(entry => [entry.relativePath, entry]));
+		for (const entry of current.snapshot.entries) {
+			const authorized = expected.get(entry.relativePath);
+			if (!authorized) throw new Error("resident tree cleanup snapshot mismatch");
+			if (entry.relativePath === "") {
+				if (entry.kind !== "directory" || entry.dev !== authorized.dev || entry.ino !== authorized.ino)
+					throw new Error("resident tree cleanup root identity mismatch");
+			} else if (JSON.stringify(entry) !== JSON.stringify(authorized)) {
+				throw new Error("resident tree cleanup child identity mismatch");
+			}
+		}
+		fs.rmSync(pathname, { recursive: true, force: true });
+		return { ok: true };
+	});
 }
 
 function createWorkspace(label: string): { root: string; cwd: string } {
@@ -293,6 +350,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 			expect(await Bun.file(path.join(forkedArtifacts, "kept.txt")).text()).toBe("keep");
 			expect(fs.existsSync(path.join(forkedArtifacts, "resident-cache"))).toBe(false);
 
+			installVerifiedNativeCleanup();
 			await manager.dropSession(forked.oldSessionFile);
 			expect(fs.existsSync(forked.oldSessionFile)).toBe(false);
 			expect(fs.existsSync(forked.oldSessionFile.slice(0, -6))).toBe(false);

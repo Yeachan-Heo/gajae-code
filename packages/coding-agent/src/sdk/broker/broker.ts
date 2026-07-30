@@ -24,7 +24,7 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
-import { executeLifecycle, isCanonicalSessionId } from "./lifecycle";
+import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
 import {
 	type LifecycleDurableEffectsReceipt,
@@ -71,6 +71,7 @@ export type BrokerErrorCode =
 export type BrokerCleanupIdentity = {
 	dev: string;
 	ino: string;
+	nlink?: string;
 	size: number;
 	mtimeNs: string;
 	sha256: string;
@@ -102,6 +103,7 @@ export type BrokerArtifactTree = {
 
 export type BrokerCleanupEvidence = {
 	phase: "artifacts" | "transcript" | "metadata" | "lifecycle";
+	cleanupReceiptVersion?: 1;
 	/** Ledger-bound deletion target; never reconstructed from a retry request. */
 	sessionsRoot?: string;
 	transcriptPath?: string;
@@ -110,6 +112,7 @@ export type BrokerCleanupEvidence = {
 	sessionId?: string;
 	artifactsIdentity?: BrokerCleanupIdentity;
 	transcriptIdentity?: BrokerCleanupIdentity;
+	transcriptParentIdentity?: { dev: string; ino: string };
 	/** Identity-bound lifecycle metadata marker retained when exact cleanup is deferred. */
 	metadataIdentity?: BrokerCleanupIdentity;
 	metadataPath?: string;
@@ -122,9 +125,17 @@ export type BrokerCleanupEvidence = {
 	/** Append-only terminal proof for lifecycle metadata cleanup. */
 	metadataCompleted?: true;
 	detachedArtifactsPath?: string;
+	retainedArtifactsSuccessorPath?: string;
+	retainedArtifactsPlaceholderPath?: string;
+	retainedArtifactsUnknownPath?: string;
+	retainedArtifactsSideAuthority?: "none" | "retained";
 	detachedTranscriptPath?: string;
+	retainedTranscriptSuccessorPath?: string;
+	retainedTranscriptPlaceholderPath?: string;
+	retainedTranscriptUnknownPath?: string;
 	/** Durable proof that artifact cleanup completed before transcript mutation. */
 	artifactsRemoved?: boolean;
+	artifactsAbsentAtAuthorization?: true;
 	/** Preauthorized no-replace artifact quarantine path persisted before detach. */
 	plannedArtifactsPath?: string;
 	/** Identity-bound artifact tree authority persisted before broker detach and replayed exactly. */
@@ -133,6 +144,7 @@ export type BrokerCleanupEvidence = {
 	plannedTranscriptPath?: string;
 	/** Fully identity-bound startup-failure cleanup plan, persisted before any detach. */
 	lifecycleFiles?: BrokerLifecycleCleanupFile[];
+	lifecycleParentIdentity?: { dev: string; ino: string };
 	/** Delete metadata receipts authorize only the canonical marker/ready sibling pair. */
 	lifecycleDeleteMetadata?: true;
 };
@@ -157,6 +169,14 @@ function isCleanupPending(response: BrokerResponse): boolean {
 	return !response.ok && response.error.code === "cleanup_pending" && response.error.cleanup !== undefined;
 }
 
+function cleanupFromResponse(response: unknown): BrokerCleanupEvidence | undefined {
+	return isBrokerResponse(response) && !response.ok ? response.error.cleanup : undefined;
+}
+function pendingCleanupSessionId(response: BrokerResponse): string | undefined {
+	if (response.ok || response.error.code !== "cleanup_pending") return undefined;
+	return typeof response.error.cleanup?.sessionId === "string" ? response.error.cleanup.sessionId : undefined;
+}
+
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
 	if (isCleanupPending(response)) return "effect_started";
@@ -165,8 +185,8 @@ function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
-function isBrokerResponse(value: InputNormalization): value is BrokerResponse {
-	return "ok" in value;
+function isBrokerResponse(value: unknown): value is BrokerResponse {
+	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
 
 function normalizeAliasedString(
@@ -224,11 +244,12 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 		typeof input.target === "object" && input.target !== null && !Array.isArray(input.target)
 			? (input.target as Record<string, unknown>)
 			: undefined;
+	const normalizeLifecycleDirectory = operation === "session.delete" ? canonicalDeleteLocatorPath : path.resolve;
 	const cwd = normalizeAliasedString(
 		{ cwd: input.cwd, path: input.path, targetPath: target?.path },
 		"cwd",
 		["path", "targetPath"],
-		value => path.resolve(value),
+		normalizeLifecycleDirectory,
 	);
 	if (cwd.error) return error("invalid_input", cwd.error);
 	if (cwd.value !== undefined) {
@@ -239,7 +260,7 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 		{ stateRoot: input.stateRoot, targetStateRoot: target?.stateRoot },
 		"stateRoot",
 		["targetStateRoot"],
-		value => path.resolve(value),
+		normalizeLifecycleDirectory,
 	);
 	if (stateRoot.error) return error("invalid_input", stateRoot.error);
 	if (stateRoot.value !== undefined && (!cwd.value || stateRoot.value !== path.join(cwd.value, ".gjc", "state")))
@@ -253,6 +274,11 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 		delete normalizedTarget.stateRoot;
 		if (Object.keys(normalizedTarget).length > 0) normalized.target = normalizedTarget;
 		else delete normalized.target;
+	}
+	if (operation === "session.delete") {
+		const sessionPath = normalizeAliasedString(input, "sessionPath", [], canonicalDeleteLocatorPath);
+		if (sessionPath.error) return error("invalid_input", sessionPath.error);
+		if (sessionPath.value !== undefined) normalized.sessionPath = sessionPath.value;
 	}
 	return { input: normalized };
 }
@@ -798,7 +824,61 @@ export class Broker {
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
-		const requestHash = createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
+		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
+		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
+			const entry = this.ledger.get(identity);
+			const cleanup = cleanupFromResponse(entry?.response) ?? cleanupFromResponse(entry?.unresolvedCleanupResponse);
+			reconstructedDeleteCleanup = cleanup;
+			const requestedSessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+			if (!cleanup) {
+				if (requestedSessionId && this.ledger.hasUncertainCleanupForSession(requestedSessionId, identity))
+					return error(
+						"terminal_uncertain",
+						"Session cleanup authority is uncertain and cannot be deleted safely",
+					);
+				const pending = requestedSessionId
+					? this.ledger.findCleanupPendingBySessionId(requestedSessionId, identity)
+					: undefined;
+				if (pending) {
+					const pendingResponse = cleanupFromResponse(pending.response)
+						? pending.response
+						: pending.unresolvedCleanupResponse;
+					if (isBrokerResponse(pendingResponse)) return pendingResponse;
+					return error(
+						"terminal_uncertain",
+						"Session cleanup authority is pending under another lifecycle identity",
+					);
+				}
+				if (entry) {
+					if (isBrokerResponse(entry.response)) return entry.response;
+					return error("terminal_uncertain", "Existing session.delete ledger evidence lacks replayable authority");
+				}
+				if (requestedSessionId) {
+					await this.index.refresh();
+					if (this.index.listSessions().sessions.some(session => session.sessionId === requestedSessionId))
+						return error(
+							"terminal_uncertain",
+							"Indexed session requires durable locator authority before deletion",
+						);
+				}
+				return { ok: true, result: requestedSessionId ? { sessionId: requestedSessionId } : undefined };
+			}
+			if (
+				cleanup &&
+				cleanup.sessionId === requestedSessionId &&
+				typeof cleanup.cwd === "string" &&
+				typeof cleanup.transcriptPath === "string"
+			)
+				input = {
+					sessionId: cleanup.sessionId,
+					cwd: cleanup.cwd,
+					stateRoot: path.join(cleanup.cwd, ".gjc", "state"),
+					sessionPath: cleanup.transcriptPath,
+				};
+		}
+		const storedRequestHash = reconstructedDeleteCleanup ? this.ledger.get(identity)?.requestHash : undefined;
+		const requestHash =
+			storedRequestHash ?? createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
 		const prev = this.#chains.get(target) ?? Promise.resolve();
 		let release!: () => void;
 		const current = new Promise<void>(resolve => (release = resolve));
@@ -812,8 +892,8 @@ export class Broker {
 			const begun = await this.ledger.begin(identity, requestHash);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
-				if (!(!replay.ok && replay.error.cleanup)) return replay;
-				const cleanup = replay.error.cleanup;
+				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
+				if (!cleanup) return replay;
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
@@ -828,11 +908,13 @@ export class Broker {
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			if (begun.kind === "terminal_uncertain") {
 				const replay = (begun.entry.response ?? beforeBegin?.response) as BrokerResponse | undefined;
-				if (!replay || replay.ok || !replay.error.cleanup)
+				const cleanup = (replay ? cleanupFromResponse(replay) : undefined) ?? reconstructedDeleteCleanup;
+				if (!cleanup)
 					return replay ?? error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
-				const outcome = await executeLifecycle(this, operation, input, identity, replay.error.cleanup);
+				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
+					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 					response,
 					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
@@ -844,6 +926,7 @@ export class Broker {
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
+				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 						? (response.result as { sessionId: string }).sessionId

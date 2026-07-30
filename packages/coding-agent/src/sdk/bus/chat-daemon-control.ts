@@ -39,13 +39,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * applies the current notification configuration directly when starting chat
  * daemon transports. Generation 16 applies Telegram sound-policy configuration
  * through shared notification parsing. Generation 17 bound managed-session
- * replacement to exact native filesystem authority; generation 18 retires that
- * binding (revert of #3489, which stalled POSIX artifact cleanup) while keeping
- * the lifecycle contract moving strictly forward.
+ * replacement to exact native filesystem authority; generation 18 retired that
+ * binding, and generation 19 binds exact cleanup to parent/link-count authority.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 18,
-	slack: 18,
+	discord: 20,
+	slack: 20,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -245,6 +244,9 @@ interface ChatDaemonOwnerLockLease {
 	ino: bigint;
 	size: bigint;
 	mtimeNs: bigint;
+	nlink: bigint;
+	parentDev: bigint;
+	parentIno: bigint;
 	sha256: string;
 }
 
@@ -892,6 +894,7 @@ async function createChatDaemonOwnerLock(
 			if (isAlreadyExists(error)) return undefined;
 			throw error;
 		}
+		await fs.promises.unlink(temporary);
 		return await captureChatDaemonOwnerLockLease(lock);
 	} finally {
 		await fs.promises.unlink(temporary).catch(() => undefined);
@@ -903,14 +906,22 @@ async function captureChatDaemonOwnerLockLease(lock: string): Promise<ChatDaemon
 		const handle = await fs.promises.open(lock, "r");
 		try {
 			const before = await handle.stat({ bigint: true });
+			const parentBefore = await fs.promises.lstat(path.dirname(lock), { bigint: true });
 			if (!before.isFile()) return undefined;
 			const content = await handle.readFile({ encoding: "utf8" });
 			const after = await handle.stat({ bigint: true });
 			const pathname = await fs.promises.lstat(lock, { bigint: true });
+			const parentAfter = await fs.promises.lstat(path.dirname(lock), { bigint: true });
 			if (
 				!after.isFile() ||
 				!pathname.isFile() ||
 				pathname.isSymbolicLink() ||
+				before.nlink !== 1n ||
+				pathname.nlink !== 1n ||
+				!parentBefore.isDirectory() ||
+				parentBefore.isSymbolicLink() ||
+				parentBefore.dev !== parentAfter.dev ||
+				parentBefore.ino !== parentAfter.ino ||
 				before.dev !== after.dev ||
 				before.ino !== after.ino ||
 				before.size !== after.size ||
@@ -927,6 +938,9 @@ async function captureChatDaemonOwnerLockLease(lock: string): Promise<ChatDaemon
 				ino: before.ino,
 				size: before.size,
 				mtimeNs: before.mtimeNs,
+				nlink: before.nlink,
+				parentDev: parentBefore.dev,
+				parentIno: parentBefore.ino,
 				sha256: crypto.createHash("sha256").update(content).digest("hex"),
 			};
 		} finally {
@@ -944,6 +958,9 @@ async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockL
 		current.ino === lease.ino &&
 		current.size === lease.size &&
 		current.mtimeNs === lease.mtimeNs &&
+		current.nlink === lease.nlink &&
+		current.parentDev === lease.parentDev &&
+		current.parentIno === lease.parentIno &&
 		current.content === lease.content
 	);
 }
@@ -952,7 +969,14 @@ async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockL
 function unlinkExactChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): boolean {
 	try {
 		const removed = native.exactUnlink(lock, {
-			...lease,
+			dev: lease.dev,
+			ino: lease.ino,
+			size: lease.size,
+			mtimeNs: lease.mtimeNs,
+			nlink: lease.nlink,
+			parentDev: lease.parentDev,
+			parentIno: lease.parentIno,
+			sha256: lease.sha256,
 			quarantineName: `.gjc-delete-chat-daemon-lock-${crypto.randomUUID()}`,
 		});
 		if (removed.ok) return true;

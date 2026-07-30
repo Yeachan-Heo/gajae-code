@@ -80,6 +80,11 @@ export interface LifecycleLedgerEntry {
 	endpointGeneration?: number;
 	responseDigest?: string;
 	response?: unknown;
+	unresolvedCleanupResponse?: unknown;
+	unresolvedCleanupResponseDigest?: string;
+	uncertainCleanupSessionId?: string;
+	uncertainCleanupSessionIds?: string[];
+	uncertainCleanupAllSessions?: true;
 	ts: number;
 }
 export type BeginResult =
@@ -95,6 +100,10 @@ export interface LifecycleLedgerLimits {
 	maxLineBytes?: number;
 	maxRows?: number;
 }
+function canonicalCleanupSessionId(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+}
+
 const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
 	maxBytes: 64 * 1024 * 1024,
 	maxLineBytes: 8 * 1024 * 1024,
@@ -143,20 +152,71 @@ function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const record = value as Record<string, unknown>;
 	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
 		.sort()
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
 }
+function pendingCleanupSessionId(response: unknown): string | undefined {
+	if (!response || typeof response !== "object") return undefined;
+	const cleanup = (response as { error?: { cleanup?: { sessionId?: unknown } } }).error?.cleanup;
+	return canonicalCleanupSessionId(cleanup?.sessionId) ? cleanup.sessionId : undefined;
+}
+
+function hasCleanupAuthorityShape(response: unknown): boolean {
+	if (!response || typeof response !== "object") return false;
+	const error = (response as { error?: unknown }).error;
+	return Boolean(error && typeof error === "object" && "cleanup" in error);
+}
 
 function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
-	if (!terminal(entry.state) && entry.state !== "terminal_uncertain") return true;
-	if (
-		(entry.state !== "terminal_uncertain" || entry.response !== undefined) &&
-		(entry.response === undefined ||
-			typeof entry.responseDigest !== "string" ||
-			entry.responseDigest !== createHash("sha256").update(canonicalJson(entry.response)).digest("hex"))
-	)
-		return false;
+	const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } } | undefined;
+	const cleanupPendingResponse =
+		response?.ok === false && response.error?.code === "cleanup_pending" && response.error.cleanup !== undefined;
+	const responseDigestRequired =
+		cleanupPendingResponse ||
+		((terminal(entry.state) || entry.state === "terminal_uncertain") &&
+			(entry.state !== "terminal_uncertain" || entry.response !== undefined));
+	if (cleanupPendingResponse) {
+		const cleanupSessionId = (response.error?.cleanup as { sessionId?: unknown }).sessionId;
+		if (!canonicalCleanupSessionId(entry.intendedSessionId) || cleanupSessionId !== entry.intendedSessionId)
+			return false;
+	}
+	const expectedResponseDigest =
+		entry.response === undefined
+			? undefined
+			: createHash("sha256")
+					.update(
+						canonicalJson(
+							cleanupPendingResponse
+								? { intendedSessionId: entry.intendedSessionId, response: entry.response }
+								: entry.response,
+						),
+					)
+					.digest("hex");
+	if (entry.responseDigest !== undefined) {
+		if (entry.response === undefined || entry.responseDigest !== expectedResponseDigest) return false;
+	} else if (responseDigestRequired) return false;
+	if (entry.unresolvedCleanupResponse !== undefined || entry.unresolvedCleanupResponseDigest !== undefined) {
+		const unresolvedResponse = entry.unresolvedCleanupResponse as {
+			error?: { cleanup?: { sessionId?: unknown } };
+		};
+		if (
+			entry.unresolvedCleanupResponse === undefined ||
+			typeof entry.unresolvedCleanupResponseDigest !== "string" ||
+			unresolvedResponse.error?.cleanup?.sessionId !== entry.intendedSessionId ||
+			entry.unresolvedCleanupResponseDigest !==
+				createHash("sha256")
+					.update(
+						canonicalJson({
+							intendedSessionId: entry.intendedSessionId,
+							response: entry.unresolvedCleanupResponse,
+						}),
+					)
+					.digest("hex")
+		)
+			return false;
+	}
 	if (!entry.durableEffects) return true;
 	const { digest, ...body } = entry.durableEffects;
 	return typeof digest === "string" && digest === createHash("sha256").update(canonicalJson(body)).digest("hex");
@@ -237,8 +297,31 @@ export class LifecycleLedger {
 					if (invalidHistory) {
 						await this.#quarantine(line);
 						invalidIdentities.add(entry.identity);
-						if (!syntheticUncertain.has(entry.identity))
-							syntheticUncertain.set(entry.identity, this.#uncertainFrom(prior ?? entry, prior !== undefined));
+						if (!syntheticUncertain.has(entry.identity)) {
+							const uncertain = this.#uncertainFrom(prior ?? entry, prior !== undefined);
+							const nestedCleanupSessionId =
+								pendingCleanupSessionId(entry.unresolvedCleanupResponse) ??
+								pendingCleanupSessionId(entry.response) ??
+								entry.intendedSessionId;
+							if (canonicalCleanupSessionId(nestedCleanupSessionId))
+								uncertain.uncertainCleanupSessionId = nestedCleanupSessionId;
+							uncertain.uncertainCleanupSessionIds = [
+								entry.intendedSessionId,
+								pendingCleanupSessionId(entry.response),
+								pendingCleanupSessionId(entry.unresolvedCleanupResponse),
+								nestedCleanupSessionId,
+							].filter(
+								(candidate, index, candidates): candidate is string =>
+									canonicalCleanupSessionId(candidate) && candidates.indexOf(candidate) === index,
+							);
+							if (
+								hasCleanupAuthorityShape(entry.response) ||
+								hasCleanupAuthorityShape(entry.unresolvedCleanupResponse) ||
+								(entry.state === "terminal_uncertain" && entry.response === undefined)
+							)
+								uncertain.uncertainCleanupAllSessions = true;
+							syntheticUncertain.set(entry.identity, uncertain);
+						}
 						continue;
 					}
 					this.#entries.push(entry);
@@ -334,6 +417,45 @@ export class LifecycleLedger {
 		const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } };
 		return (
 			response.ok === false && response.error?.code === "cleanup_pending" && response.error.cleanup !== undefined
+		);
+	}
+	#isSessionDeleteCleanupPending(entry: LifecycleLedgerEntry): boolean {
+		if (!this.#isCleanupPending(entry)) return false;
+		const response = entry.response as {
+			error?: {
+				cleanup?: {
+					phase?: unknown;
+					sessionId?: unknown;
+					sessionsRoot?: unknown;
+					transcriptPath?: unknown;
+					cwd?: unknown;
+				};
+			};
+		};
+		const cleanup = response.error?.cleanup;
+		return (
+			(cleanup?.phase === "artifacts" || cleanup?.phase === "transcript" || cleanup?.phase === "metadata") &&
+			typeof cleanup.sessionId === "string" &&
+			typeof cleanup.sessionsRoot === "string" &&
+			typeof cleanup.transcriptPath === "string" &&
+			typeof cleanup.cwd === "string"
+		);
+	}
+
+	#matchesSessionDeleteTarget(
+		entry: LifecycleLedgerEntry,
+		target: { sessionId: string; sessionsRoot?: string; transcriptPath: string; cwd: string },
+	): boolean {
+		if (!this.#isSessionDeleteCleanupPending(entry)) return false;
+		const response = entry.response as {
+			error: { cleanup: { sessionId: string; sessionsRoot: string; transcriptPath: string; cwd: string } };
+		};
+		const cleanup = response.error.cleanup;
+		return (
+			cleanup.sessionId === target.sessionId &&
+			(target.sessionsRoot === undefined || cleanup.sessionsRoot === target.sessionsRoot) &&
+			cleanup.transcriptPath === target.transcriptPath &&
+			cleanup.cwd === target.cwd
 		);
 	}
 
@@ -545,7 +667,37 @@ export class LifecycleLedger {
 			const previous = this.#byIdentity.get(identity);
 			if (!previous) throw new Error("Unknown lifecycle identity");
 			const next = { ...previous, ...fields, state, ts: Date.now() };
-			if (
+			if (this.#isCleanupPending(next)) {
+				next.unresolvedCleanupResponse = undefined;
+				next.unresolvedCleanupResponseDigest = undefined;
+			} else if (state === "terminal_ok") {
+				next.unresolvedCleanupResponse = undefined;
+				next.unresolvedCleanupResponseDigest = undefined;
+			} else if (this.#isCleanupPending(previous)) {
+				next.unresolvedCleanupResponse = previous.response;
+				next.unresolvedCleanupResponseDigest = createHash("sha256")
+					.update(
+						canonicalJson({
+							intendedSessionId: previous.intendedSessionId,
+							response: previous.response,
+						}),
+					)
+					.digest("hex");
+			}
+			if (this.#isCleanupPending(next)) {
+				const cleanupSessionId = (next.response as { error?: { cleanup?: { sessionId?: unknown } } }).error?.cleanup
+					?.sessionId;
+				if (!canonicalCleanupSessionId(cleanupSessionId))
+					throw new Error("Cleanup response lacks a canonical session fence");
+				if (next.intendedSessionId === undefined) next.intendedSessionId = cleanupSessionId;
+				else if (next.intendedSessionId !== cleanupSessionId)
+					throw new Error("Cleanup response session does not match its outer lifecycle fence");
+				next.responseDigest = createHash("sha256")
+					.update(canonicalJson({ intendedSessionId: next.intendedSessionId, response: next.response }))
+					.digest("hex");
+			} else if (fields.response !== undefined && fields.responseDigest === undefined)
+				next.responseDigest = createHash("sha256").update(canonicalJson(next.response)).digest("hex");
+			else if (
 				(terminal(state) || state === "terminal_uncertain") &&
 				next.response !== undefined &&
 				next.responseDigest === undefined
@@ -577,6 +729,70 @@ export class LifecycleLedger {
 			}
 		}
 	}
+	findCleanupPendingByDeleteTarget(
+		target: { sessionId: string; sessionsRoot?: string; transcriptPath: string; cwd: string },
+		excludingIdentity: string,
+	): LifecycleLedgerEntry | undefined {
+		let latestPending: LifecycleLedgerEntry | undefined;
+		for (const current of this.#byIdentity.values()) {
+			if (
+				current.identity === excludingIdentity ||
+				current.state === "terminal_ok" ||
+				current.intendedSessionId !== target.sessionId
+			)
+				continue;
+			if (current.unresolvedCleanupResponse !== undefined) {
+				const retained = { ...current, response: current.unresolvedCleanupResponse };
+				if (this.#matchesSessionDeleteTarget(retained, target)) {
+					if (!latestPending || retained.ts > latestPending.ts) latestPending = retained;
+					continue;
+				}
+			}
+			for (let index = this.#entries.length - 1; index >= 0; index -= 1) {
+				const historical = this.#entries[index];
+				if (
+					!historical ||
+					historical.identity !== current.identity ||
+					historical.intendedSessionId !== target.sessionId ||
+					!this.#matchesSessionDeleteTarget(historical, target)
+				)
+					continue;
+				if (!latestPending || historical.ts > latestPending.ts) latestPending = historical;
+				break;
+			}
+		}
+		return latestPending;
+	}
+
+	findCleanupPendingBySessionId(sessionId: string, excludingIdentity: string): LifecycleLedgerEntry | undefined {
+		for (const current of this.#byIdentity.values()) {
+			if (current.identity === excludingIdentity) continue;
+			if (pendingCleanupSessionId(current.response) === sessionId) return current;
+			if (pendingCleanupSessionId(current.unresolvedCleanupResponse) === sessionId) return current;
+		}
+		return undefined;
+	}
+
+	hasUncertainCleanupForSession(sessionId: string, excludingIdentity: string): boolean {
+		for (const current of this.#byIdentity.values()) {
+			if (current.state !== "terminal_uncertain") continue;
+			if (current.uncertainCleanupAllSessions === true) return true;
+			if (current.response === undefined) return true;
+			if (current.identity === excludingIdentity) continue;
+			const fencedSessions = [
+				current.uncertainCleanupSessionId,
+				current.intendedSessionId,
+				pendingCleanupSessionId(current.response),
+				pendingCleanupSessionId(current.unresolvedCleanupResponse),
+				...(current.uncertainCleanupSessionIds ?? []),
+			];
+			const boundSessions = fencedSessions.filter((value): value is string => typeof value === "string");
+			if (boundSessions.length === 0) return true;
+			if (fencedSessions.includes(sessionId)) return true;
+		}
+		return false;
+	}
+
 	get(identity: string): LifecycleLedgerEntry | undefined {
 		return this.#byIdentity.get(identity);
 	}

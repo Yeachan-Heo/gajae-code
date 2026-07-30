@@ -895,6 +895,7 @@ export interface ResumeSessionIdentity {
 	sessionId: string;
 	dev: bigint;
 	ino: bigint;
+	nlink?: bigint;
 	size: number;
 	mtimeMs: number;
 	mtimeNs: bigint;
@@ -1831,6 +1832,7 @@ function retainedTreeSnapshotEquals(
 				entry.kind === other.kind &&
 				entry.dev === other.dev &&
 				entry.ino === other.ino &&
+				entry.nlink === other.nlink &&
 				entry.size === other.size &&
 				entry.mtimeNs === other.mtimeNs &&
 				entry.ctimeNs === other.ctimeNs &&
@@ -1856,6 +1858,7 @@ function retainedTreeSnapshotEqualsAfterRename(
 				entry.kind === other.kind &&
 				entry.dev === other.dev &&
 				entry.ino === other.ino &&
+				entry.nlink === other.nlink &&
 				entry.size === other.size &&
 				entry.mtimeNs === other.mtimeNs &&
 				(entry.relativePath === "" || entry.ctimeNs === other.ctimeNs) &&
@@ -2147,6 +2150,7 @@ function sameResumeIdentity(left: ResumeSessionIdentity, right: ResumeSessionIde
 		left.sessionId === right.sessionId &&
 		left.dev === right.dev &&
 		left.ino === right.ino &&
+		left.nlink === right.nlink &&
 		left.size === right.size &&
 		left.mtimeMs === right.mtimeMs &&
 		left.mtimeNs === right.mtimeNs &&
@@ -2160,6 +2164,7 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 		right.isFile &&
 		left.dev === right.dev &&
 		left.ino === right.ino &&
+		left.nlink === right.nlink &&
 		left.size === right.size &&
 		left.mtimeMs === right.mtimeMs &&
 		left.mtimeNs === right.mtimeNs
@@ -2356,6 +2361,7 @@ function inspectResumeSessionFile(
 			sessionId: header.id,
 			dev: snapshot.dev,
 			ino: snapshot.ino,
+			nlink: snapshot.nlink,
 			size: snapshot.size,
 			mtimeMs: snapshot.mtimeMs,
 			mtimeNs: snapshot.mtimeNs,
@@ -2393,6 +2399,7 @@ function revalidateResumeSessionIdentity(
 		sessionId: expected.sessionId,
 		dev: snapshot.stat.dev,
 		ino: snapshot.stat.ino,
+		nlink: snapshot.stat.nlink,
 		size: snapshot.stat.size,
 		mtimeMs: snapshot.stat.mtimeMs,
 		mtimeNs: snapshot.stat.mtimeNs,

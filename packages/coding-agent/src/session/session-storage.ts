@@ -23,6 +23,7 @@ function canonicalPathSync(value: string): string {
 export interface SessionStorageStat {
 	dev: bigint;
 	ino: bigint;
+	nlink?: bigint;
 
 	size: number;
 	mtimeMs: number;
@@ -41,6 +42,7 @@ function statFromNode(stats: fs.BigIntStats): SessionStorageStat {
 	return {
 		dev: stats.dev,
 		ino: stats.ino,
+		nlink: stats.nlink,
 
 		size: Number(stats.size),
 		mtimeMs: Number(stats.mtimeMs),
@@ -210,6 +212,7 @@ export interface SessionStorage {
 export interface SessionStorageFileIdentity {
 	dev: bigint;
 	ino: bigint;
+	nlink?: bigint;
 	size: number;
 	mtimeNs: bigint;
 	sha256: string;
@@ -257,12 +260,14 @@ export interface VerifiedSessionDeleteTarget {
 	cwd: string;
 	/** Expected transcript file `(dev, ino)` captured at authorization. */
 	transcriptIdentity: SessionStorageFileIdentity;
+	transcriptParentIdentity?: { dev: bigint; ino: bigint };
 	/**
 	 * For retry after an `artifacts` `cleanup_pending`: the recorded artifact
 	 * directory identity to re-accept. A replacement/different artifact directory
 	 * fails closed. Omit on first attempt or to accept recorded absence.
 	 */
 	expectedArtifactsIdentity?: SessionStorageFileIdentity;
+	artifactsAbsentAtAuthorization?: true;
 	/** Stable native recursive-tree evidence captured before artifact detachment. */
 	expectedArtifactsTree?: NativeDirectoryTreeSnapshot;
 	/** Identity-bound quarantine path retained when recursive artifact cleanup failed. */
@@ -356,8 +361,11 @@ type NativeExactUnlink = (
 	identity: {
 		dev: bigint;
 		ino: bigint;
+		nlink?: bigint;
 		size: bigint;
 		mtimeNs: bigint;
+		parentDev?: bigint;
+		parentIno?: bigint;
 		/** Required for regular-file deletion; directories are identity-bound only. */
 		sha256?: string;
 		directory?: boolean;
@@ -371,10 +379,13 @@ function nativeExactUnlink(
 	identity: {
 		dev: bigint;
 		ino: bigint;
+		nlink?: bigint;
 		size: bigint;
 		mtimeNs: bigint;
 		/** Required for regular-file deletion; directories are identity-bound only. */
 		sha256?: string;
+		parentDev?: bigint;
+		parentIno?: bigint;
 		directory?: boolean;
 		quarantineName?: string;
 	},
@@ -387,6 +398,7 @@ type NativeDirectoryTreeEntry = {
 	kind: string;
 	dev: string;
 	ino: string;
+	nlink: string;
 	size: string;
 	mtimeNs: string;
 	ctimeNs: string;
@@ -402,7 +414,11 @@ type NativeDirectoryTreeResult =
 	| { ok: false; code: string; snapshot?: undefined };
 type NativeDirectoryTreeApi = {
 	snapshotDirectoryTree(pathname: string): NativeDirectoryTreeResult;
-	exactRemoveDirectoryTree(pathname: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult;
+	exactRemoveDirectoryTree(
+		pathname: string,
+		snapshot: NativeDirectoryTreeSnapshot,
+		parentIdentity: { dev: bigint; ino: bigint },
+	): NativeExactUnlinkResult;
 };
 function nativeDirectoryTreeApi(): NativeDirectoryTreeApi {
 	return native as unknown as NativeDirectoryTreeApi;
@@ -416,8 +432,25 @@ function snapshotDirectoryTree(pathname: string): NativeDirectoryTreeSnapshot {
 		);
 	return result.snapshot;
 }
-function removeDirectoryTreeExact(pathname: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult {
-	return nativeDirectoryTreeApi().exactRemoveDirectoryTree(pathname, snapshot);
+function retainedTreeDoesNotExpandAuthority(
+	expected: NativeDirectoryTreeSnapshot,
+	retained: NativeDirectoryTreeSnapshot,
+): boolean {
+	if (expected.rootDev !== retained.rootDev || expected.rootIno !== retained.rootIno) return false;
+	const expectedEntries = new Map(expected.entries.map(entry => [entry.relativePath, entry]));
+	return retained.entries.every(entry => {
+		if (entry.relativePath === "") return entry.kind === "directory";
+		const authorized = expectedEntries.get(entry.relativePath);
+		return authorized !== undefined && JSON.stringify(authorized) === JSON.stringify(entry);
+	});
+}
+
+function removeDirectoryTreeExact(
+	pathname: string,
+	snapshot: NativeDirectoryTreeSnapshot,
+	parentIdentity: { dev: bigint; ino: bigint },
+): NativeExactUnlinkResult {
+	return nativeDirectoryTreeApi().exactRemoveDirectoryTree(pathname, snapshot, parentIdentity);
 }
 
 function exactUnlinkFailure(result: NativeExactUnlinkResult): SessionDeleteVerificationError {
@@ -822,7 +855,9 @@ export class FileSessionStorage implements SessionStorage {
 			sessionId,
 			cwd,
 			transcriptIdentity,
+			transcriptParentIdentity,
 			expectedArtifactsIdentity,
+			artifactsAbsentAtAuthorization,
 			expectedArtifactsTree,
 			detachedArtifactsPath,
 			retainedArtifactsSuccessorPath,
@@ -893,21 +928,16 @@ export class FileSessionStorage implements SessionStorage {
 		const retainedArtifactRoot = (input: string): string =>
 			input.endsWith(".removing") ? input : `${input}.removing`;
 
-		const initial = hasDetachedTranscript ? undefined : this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
-		const initialStat = initial?.snapshot.stat;
-		const initialDigest = initial ? createHash("sha256").update(initial.snapshot.bytes).digest("hex") : undefined;
-		if (
-			initialStat &&
-			(initialStat.dev !== transcriptIdentity.dev ||
-				initialStat.ino !== transcriptIdentity.ino ||
-				initialStat.size !== transcriptIdentity.size ||
-				initialStat.mtimeNs !== transcriptIdentity.mtimeNs ||
-				initialDigest !== transcriptIdentity.sha256)
-		) {
-			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
-		}
-
 		const parentIdentity = this.#directoryIdentity(path.dirname(transcriptPath));
+		if (
+			transcriptParentIdentity &&
+			(parentIdentity.dev !== transcriptParentIdentity.dev || parentIdentity.ino !== transcriptParentIdentity.ino)
+		)
+			throw new SessionDeleteVerificationError(
+				"identity",
+				"Transcript parent identity does not match authorization",
+			);
+		const authorizedTranscriptParentIdentity = transcriptParentIdentity ?? parentIdentity;
 		if (detachedArtifactsPath) {
 			if (
 				!expectedArtifactsIdentity ||
@@ -930,13 +960,32 @@ export class FileSessionStorage implements SessionStorage {
 					"artifacts",
 					"Detached artifact cleanup requires a persisted tree snapshot",
 				);
-			const removal = removeDirectoryTreeExact(detachedArtifactsPath, expectedArtifactsTree);
+			const removal = removeDirectoryTreeExact(
+				detachedArtifactsPath,
+				expectedArtifactsTree,
+				authorizedTranscriptParentIdentity,
+			);
 			if (!removal.ok) {
 				const retainedRoot = removal.detachedPath ?? detachedArtifactsPath;
 				if (retainedRoot !== detachedArtifactsPath && retainedRoot !== retainedArtifactRoot(detachedArtifactsPath))
 					throw new SessionDeleteVerificationError(
 						"artifacts",
 						"Native artifact removal returned an unauthorized root",
+					);
+				const retainedTree = snapshotDirectoryTree(retainedRoot);
+				if (
+					retainedTree.rootDev !== String(expectedArtifactsIdentity.dev) ||
+					retainedTree.rootIno !== String(expectedArtifactsIdentity.ino)
+				)
+					throw new SessionDeleteVerificationError(
+						"artifacts",
+						"Retained artifact root identity changed during partial cleanup",
+					);
+
+				if (!retainedTreeDoesNotExpandAuthority(expectedArtifactsTree, retainedTree))
+					throw new SessionDeleteVerificationError(
+						"artifacts",
+						"Partial artifact cleanup expanded retained tree authority",
 					);
 				return {
 					kind: "cleanup_pending",
@@ -947,7 +996,7 @@ export class FileSessionStorage implements SessionStorage {
 					),
 					artifactsIdentity: expectedArtifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
-					artifactsTree: expectedArtifactsTree,
+					artifactsTree: retainedTree,
 					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
 						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
 						: {}),
@@ -960,10 +1009,36 @@ export class FileSessionStorage implements SessionStorage {
 					transcriptIdentity,
 				};
 			}
+			return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity };
+		}
+		if (transcriptIdentity.nlink === undefined || transcriptIdentity.nlink !== 1n)
+			throw new SessionDeleteVerificationError(
+				"identity",
+				"Single-link transcript authority is required for exact deletion",
+			);
+		const initial = hasDetachedTranscript ? undefined : this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
+		const initialStat = initial?.snapshot.stat;
+		const initialDigest = initial ? createHash("sha256").update(initial.snapshot.bytes).digest("hex") : undefined;
+		if (
+			initialStat &&
+			(initialStat.nlink === undefined ||
+				initialStat.dev !== transcriptIdentity.dev ||
+				initialStat.ino !== transcriptIdentity.ino ||
+				initialStat.nlink !== transcriptIdentity.nlink ||
+				initialStat.size !== transcriptIdentity.size ||
+				initialStat.mtimeNs !== transcriptIdentity.mtimeNs ||
+				initialDigest !== transcriptIdentity.sha256)
+		) {
+			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
 		}
 
 		const artifactsDir = transcriptPath.slice(0, -6);
 		const artifactsIdentity = this.#optionalDirectoryIdentity(artifactsDir);
+		if (artifactsAbsentAtAuthorization && artifactsIdentity)
+			throw new SessionDeleteVerificationError(
+				"artifacts",
+				"Artifact directory appeared after absence authorization",
+			);
 		if (artifactsRemoved && artifactsIdentity) {
 			throw new SessionDeleteVerificationError(
 				"artifacts",
@@ -1011,8 +1086,11 @@ export class FileSessionStorage implements SessionStorage {
 			const detach = nativeExactUnlink(artifactsDir, {
 				dev: artifactStat.dev,
 				ino: artifactStat.ino,
+				nlink: artifactStat.nlink,
 				size: artifactStat.size,
 				mtimeNs: artifactStat.mtimeNs,
+				parentDev: authorizedTranscriptParentIdentity.dev,
+				parentIno: authorizedTranscriptParentIdentity.ino,
 				directory: true,
 				quarantineName: path.basename(plannedArtifactsPath),
 			});
@@ -1058,13 +1136,32 @@ export class FileSessionStorage implements SessionStorage {
 					transcriptIdentity,
 				};
 			}
-			const removal = removeDirectoryTreeExact(detach.detachedPath, artifactsTree);
+			const removal = removeDirectoryTreeExact(
+				detach.detachedPath,
+				artifactsTree,
+				authorizedTranscriptParentIdentity,
+			);
 			if (!removal.ok) {
 				const retainedRoot = removal.detachedPath ?? detach.detachedPath;
 				if (retainedRoot !== detach.detachedPath && retainedRoot !== retainedArtifactRoot(detach.detachedPath))
 					throw new SessionDeleteVerificationError(
 						"artifacts",
 						"Native artifact removal returned an unauthorized root",
+					);
+				const retainedTree = snapshotDirectoryTree(retainedRoot);
+				if (
+					retainedTree.rootDev !== String(artifactsIdentity.dev) ||
+					retainedTree.rootIno !== String(artifactsIdentity.ino)
+				)
+					throw new SessionDeleteVerificationError(
+						"artifacts",
+						"Retained artifact root identity changed during partial cleanup",
+					);
+
+				if (!retainedTreeDoesNotExpandAuthority(artifactsTree, retainedTree))
+					throw new SessionDeleteVerificationError(
+						"artifacts",
+						"Partial artifact cleanup expanded retained tree authority",
 					);
 				return {
 					kind: "cleanup_pending",
@@ -1075,7 +1172,7 @@ export class FileSessionStorage implements SessionStorage {
 					),
 					artifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
-					artifactsTree,
+					artifactsTree: retainedTree,
 					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
 						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
 						: {}),
@@ -1117,8 +1214,11 @@ export class FileSessionStorage implements SessionStorage {
 			const deletion = nativeExactUnlink(cleanupTranscriptPath, {
 				dev: transcriptIdentity.dev,
 				ino: transcriptIdentity.ino,
+				nlink: transcriptIdentity.nlink,
 				size: BigInt(transcriptIdentity.size),
 				mtimeNs: transcriptIdentity.mtimeNs,
+				parentDev: authorizedTranscriptParentIdentity.dev,
+				parentIno: authorizedTranscriptParentIdentity.ino,
 				sha256: transcriptIdentity.sha256,
 				quarantineName: path.basename(plannedTranscriptPath),
 			});
@@ -1179,8 +1279,11 @@ export class FileSessionStorage implements SessionStorage {
 		const deletion = nativeExactUnlink(transcriptPath, {
 			dev: initialStat.dev,
 			ino: initialStat.ino,
+			nlink: initialStat.nlink,
 			size: BigInt(initialStat.size),
 			mtimeNs: initialStat.mtimeNs,
+			parentDev: authorizedTranscriptParentIdentity.dev,
+			parentIno: authorizedTranscriptParentIdentity.ino,
 			sha256: initialDigest,
 			quarantineName: path.basename(plannedTranscriptPath),
 		});
@@ -1282,7 +1385,14 @@ export class FileSessionStorage implements SessionStorage {
 		if (stat.isSymbolicLink() || !stat.isDirectory()) {
 			throw new SessionDeleteVerificationError("symlink", "Directory is a symlink or not a directory");
 		}
-		return { dev: stat.dev, ino: stat.ino, size: Number(stat.size), mtimeNs: stat.mtimeNs, sha256: "" };
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			size: Number(stat.size),
+			mtimeNs: stat.mtimeNs,
+			sha256: "",
+		};
 	}
 
 	#optionalDirectoryIdentity(dirPath: string): SessionStorageFileIdentity | undefined {
@@ -1305,7 +1415,14 @@ export class FileSessionStorage implements SessionStorage {
 			// Fail closed before any mutation.
 			throw new SessionDeleteVerificationError("artifacts", "Artifact path exists but is not a directory");
 		}
-		return { dev: stat.dev, ino: stat.ino, size: Number(stat.size), mtimeNs: stat.mtimeNs, sha256: "" };
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			size: Number(stat.size),
+			mtimeNs: stat.mtimeNs,
+			sha256: "",
+		};
 	}
 }
 
@@ -1436,6 +1553,7 @@ export class MemorySessionStorage implements SessionStorage {
 		return {
 			dev: 0n,
 			ino: entry.ino,
+			nlink: 1n,
 			size: entry.content.byteLength,
 			mtimeMs: entry.mtimeMs,
 			mtimeNs: BigInt(entry.mtimeMs) * 1_000_000n,
@@ -1573,7 +1691,11 @@ export class MemorySessionStorage implements SessionStorage {
 		const entry = this.#files.get(transcriptPath);
 		if (!entry) return Promise.resolve({ kind: "deleted" });
 		const snapshot = this.readSnapshotSync(transcriptPath);
-		if (snapshot.stat.dev !== transcriptIdentity.dev || snapshot.stat.ino !== transcriptIdentity.ino) {
+		if (
+			snapshot.stat.dev !== transcriptIdentity.dev ||
+			snapshot.stat.ino !== transcriptIdentity.ino ||
+			snapshot.stat.nlink !== transcriptIdentity.nlink
+		) {
 			return Promise.reject(new SessionDeleteVerificationError("identity", "Transcript identity mismatch"));
 		}
 		const header = parseFirstJsonlLine(snapshot.bytes);

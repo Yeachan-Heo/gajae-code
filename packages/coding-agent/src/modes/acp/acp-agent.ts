@@ -718,6 +718,7 @@ export class AcpAgent implements Agent {
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
+	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
@@ -918,24 +919,35 @@ export class AcpAgent implements Agent {
 
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
-		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
-		// ACP's delete request has no cwd. Only delete sessions this connection has
-		// already scoped through the broker; unknown ids remain the protocol no-op.
-		if (!cwd) return {};
+		const pendingLocator = this.#pendingDeleteLocators.get(params.sessionId);
+		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId) ?? pendingLocator?.cwd;
+		// ACP's delete request has no cwd. Unknown ids remain the protocol no-op,
+		// while the broker can reconstruct an authenticated pending locator from its durable ledger.
+		if (!cwd) {
+			await (await this.#brokerAdapter()).global(
+				"session.delete",
+				{ sessionId: params.sessionId },
+				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
+			);
+			return {};
+		}
 		this.#beginTeardown(params.sessionId);
 		try {
 			await this.#teardownSession(params.sessionId, "deleted", true);
-			let saved: string;
-			try {
-				saved = await this.#resolveSavedSession(params.sessionId, cwd);
-			} catch (error) {
-				if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
-					this.#knownSessionCwds.delete(params.sessionId);
-					this.#knownSessionMetadata.delete(params.sessionId);
-					return {};
+			let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
+			if (!saved) {
+				try {
+					saved = await this.#resolveSavedSession(params.sessionId, cwd);
+				} catch (error) {
+					if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
+						this.#knownSessionCwds.delete(params.sessionId);
+						this.#knownSessionMetadata.delete(params.sessionId);
+						return {};
+					}
+					throw error;
 				}
-				throw error;
 			}
+			this.#pendingDeleteLocators.set(params.sessionId, { cwd, path: saved });
 			await (await this.#brokerAdapter()).global(
 				"session.delete",
 				{ sessionId: params.sessionId, sessionPath: saved, cwd, target: { path: cwd } },
@@ -943,6 +955,7 @@ export class AcpAgent implements Agent {
 			);
 			this.#knownSessionCwds.delete(params.sessionId);
 			this.#knownSessionMetadata.delete(params.sessionId);
+			this.#pendingDeleteLocators.delete(params.sessionId);
 			return {};
 		} finally {
 			this.#finishTeardown(params.sessionId);
@@ -2168,6 +2181,7 @@ export class AcpAgent implements Agent {
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
 		this.#knownSessionMetadata.clear();
+		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#closing.size === 0) this.#closing.clear();
 		this.#tearingDown.clear();

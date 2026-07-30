@@ -2338,6 +2338,7 @@ fn tree_entry(
 		kind: kind.to_owned(),
 		dev: stat.st_dev.to_string(),
 		ino: stat.st_ino.to_string(),
+		nlink: stat.st_nlink.to_string(),
 		size: (stat.st_size as u64).to_string(),
 		mtime_ns: stat_mtime_ns(stat).to_string(),
 		ctime_ns: stat_ctime_ns(stat).to_string(),
@@ -2624,6 +2625,7 @@ fn tree_matches_after_rename(
 					&& left.kind == right.kind
 					&& left.dev == right.dev
 					&& left.ino == right.ino
+					&& left.nlink == right.nlink
 					&& left.size == right.size
 					&& left.mtime_ns == right.mtime_ns
 					&& (left.relative_path.is_empty() || left.ctime_ns == right.ctime_ns)

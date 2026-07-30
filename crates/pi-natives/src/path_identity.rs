@@ -129,6 +129,9 @@ pub struct NativeOwnerOnlySecurityResult {
 pub struct NativeExactFileIdentity {
 	pub dev:             BigInt,
 	pub ino:             BigInt,
+	pub nlink:           Option<BigInt>,
+	pub parent_dev:      Option<BigInt>,
+	pub parent_ino:      Option<BigInt>,
 	pub size:            BigInt,
 	pub mtime_ns:        BigInt,
 	/// When true, atomically detach a directory rather than deleting a regular
@@ -149,6 +152,9 @@ pub struct NativeExactFileIdentity {
 struct ExactFileIdentity {
 	dev:             u64,
 	ino:             u64,
+	nlink:           Option<u64>,
+	parent_dev:      Option<u64>,
+	parent_ino:      Option<u64>,
 	size:            u64,
 	mtime_ns:        i64,
 	directory:       bool,
@@ -277,6 +283,7 @@ pub struct NativeDirectoryTreeEntry {
 	pub kind:          String,
 	pub dev:           String,
 	pub ino:           String,
+	pub nlink:         String,
 	pub size:          String,
 	pub mtime_ns:      String,
 	pub ctime_ns:      String,
@@ -291,6 +298,12 @@ pub struct NativeDirectoryTreeSnapshot {
 	pub root_dev: String,
 	pub root_ino: String,
 	pub entries:  Vec<NativeDirectoryTreeEntry>,
+}
+
+#[napi(object)]
+pub struct NativeDirectoryParentIdentity {
+	pub dev: BigInt,
+	pub ino: BigInt,
 }
 
 #[napi(object)]
@@ -442,6 +455,29 @@ pub(crate) fn digest_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
 fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileIdentity> {
 	let (dev_negative, dev, dev_lossless) = identity.dev.get_u64();
 	let (ino_negative, ino, ino_lossless) = identity.ino.get_u64();
+	let nlink = match identity.nlink.as_ref() {
+		Some(value) => {
+			let (negative, value, lossless) = value.get_u64();
+			if negative || !lossless {
+				return None;
+			}
+			Some(value)
+		},
+		None => None,
+	};
+	let (parent_dev, parent_ino) = match (identity.parent_dev.as_ref(), identity.parent_ino.as_ref())
+	{
+		(Some(dev), Some(ino)) => {
+			let (dev_negative, dev, dev_lossless) = dev.get_u64();
+			let (ino_negative, ino, ino_lossless) = ino.get_u64();
+			if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+				return None;
+			}
+			(Some(dev), Some(ino))
+		},
+		(None, None) => (None, None),
+		_ => return None,
+	};
 	let (size_negative, size, size_lossless) = identity.size.get_u64();
 	let (mtime_ns, mtime_lossless) = identity.mtime_ns.get_i64();
 	if dev_negative
@@ -473,6 +509,9 @@ fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileId
 	Some(ExactFileIdentity {
 		dev,
 		ino,
+		nlink,
+		parent_dev,
+		parent_ino,
 		size,
 		mtime_ns,
 		directory: identity.directory.unwrap_or(false),
@@ -815,11 +854,23 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 pub fn exact_remove_directory_tree(
 	path: String,
 	snapshot: NativeDirectoryTreeSnapshot,
+	parent_identity: Option<NativeDirectoryParentIdentity>,
 ) -> NativeExactUnlinkResult {
 	if path.contains('\0') {
 		return NativeExactUnlinkResult::failure("io_error");
 	}
-	platform::exact_remove_directory_tree(Path::new(&path), &snapshot)
+	let parent_identity = match parent_identity {
+		Some(identity) => {
+			let (dev_negative, dev, dev_lossless) = identity.dev.get_u64();
+			let (ino_negative, ino, ino_lossless) = identity.ino.get_u64();
+			if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+			Some((dev, ino))
+		},
+		None => None,
+	};
+	platform::exact_remove_directory_tree(Path::new(&path), &snapshot, parent_identity)
 }
 
 #[cfg(unix)]
@@ -2755,6 +2806,23 @@ pub(crate) mod platform {
 			}
 			parent_fd = next_fd;
 		}
+		if let (Some(expected_dev), Some(expected_ino)) = (identity.parent_dev, identity.parent_ino) {
+			// SAFETY: libc::stat is a plain C output record; zero initialization creates a
+			// valid writable buffer for fstat to fill before any field is read.
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is the live directory descriptor owned by this branch, and
+			// parent_stat points to initialized writable storage for the complete fstat
+			// result.
+			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_dev
+				|| parent_stat.st_ino as u64 != expected_ino
+			{
+				// SAFETY: the mismatch branch still owns parent_fd and returns immediately
+				// after closing it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let Ok(name) = CString::new(name_bytes.as_slice()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
@@ -2793,6 +2861,9 @@ pub(crate) mod platform {
 		}
 		if named.st_dev as u64 != identity.dev
 			|| named.st_ino as u64 != identity.ino
+			|| identity
+				.nlink
+				.is_some_and(|nlink| named.st_nlink as u64 != nlink)
 			|| named.st_size as u64 != identity.size
 			|| stat_mtime_ns(&named) != i128::from(identity.mtime_ns)
 		{
@@ -2884,6 +2955,9 @@ pub(crate) mod platform {
 		} == 0 && detached.st_mode & libc::S_IFMT == expected_kind
 			&& detached.st_dev as u64 == identity.dev
 			&& detached.st_ino as u64 == identity.ino
+			&& identity
+				.nlink
+				.is_none_or(|nlink| detached.st_nlink as u64 == nlink)
 			&& detached.st_size as u64 == identity.size
 			&& stat_mtime_ns(&detached) == i128::from(identity.mtime_ns);
 		let digest_matches = identity.directory
@@ -3156,6 +3230,9 @@ pub(crate) mod platform {
 		} == 0 && detached.st_mode & libc::S_IFMT == expected_kind
 			&& detached.st_dev as u64 == identity.dev
 			&& detached.st_ino as u64 == identity.ino
+			&& identity
+				.nlink
+				.is_none_or(|nlink| detached.st_nlink as u64 == nlink)
 			&& detached.st_size as u64 == identity.size
 			&& stat_mtime_ns(&detached) == i128::from(identity.mtime_ns)
 			&& (identity.directory
@@ -3183,6 +3260,9 @@ pub(crate) mod platform {
 		} == 0 && restored.st_mode & libc::S_IFMT == expected_kind
 			&& restored.st_dev as u64 == identity.dev
 			&& restored.st_ino as u64 == identity.ino
+			&& identity
+				.nlink
+				.is_none_or(|nlink| restored.st_nlink as u64 == nlink)
 			&& restored.st_size as u64 == identity.size
 			&& stat_mtime_ns(&restored) == i128::from(identity.mtime_ns)
 			&& (identity.directory
@@ -3220,6 +3300,7 @@ pub(crate) mod platform {
 			kind: kind.to_owned(),
 			dev: stat.st_dev.to_string(),
 			ino: stat.st_ino.to_string(),
+			nlink: stat.st_nlink.to_string(),
 			size: (stat.st_size as u64).to_string(),
 			mtime_ns: stat_mtime_ns(stat).to_string(),
 			ctime_ns: stat_ctime_ns(stat).to_string(),
@@ -3320,12 +3401,17 @@ pub(crate) mod platform {
 				return Err(security_code(&std::io::Error::last_os_error()));
 			}
 			match stat.st_mode & libc::S_IFMT {
-				libc::S_IFREG => entries.push(entry_from_stat(
-					child_relative,
-					&stat,
-					"file",
-					Some(hex_digest(digest_openat(fd, &name).map_err(|_| "io_error")?)),
-				)),
+				libc::S_IFREG => {
+					if stat.st_nlink != 1 {
+						return Err("identity_mismatch");
+					}
+					entries.push(entry_from_stat(
+						child_relative,
+						&stat,
+						"file",
+						Some(hex_digest(digest_openat(fd, &name).map_err(|_| "io_error")?)),
+					));
+				},
 				libc::S_IFDIR => {
 					// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 					// valid.
@@ -3425,6 +3511,7 @@ pub(crate) mod platform {
 		if kind != expected.kind.as_str()
 			|| stat.st_dev as u64 != expected.dev.parse().ok().unwrap_or(u64::MAX)
 			|| stat.st_ino as u64 != expected.ino.parse().ok().unwrap_or(u64::MAX)
+			|| stat.st_nlink as u64 != expected.nlink.parse().ok().unwrap_or(u64::MAX)
 			|| (kind == "file"
 				&& (stat.st_size as u64 != expected.size.parse().ok().unwrap_or(u64::MAX)
 					|| stat_mtime_ns(&stat).to_string() != expected.mtime_ns))
@@ -3544,6 +3631,7 @@ pub(crate) mod platform {
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
+		expected_parent: Option<(u64, u64)>,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
 		let final_path = format!("{planned_path}.removing");
@@ -3551,6 +3639,22 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return *result,
 		};
+		if let Some((expected_dev, expected_ino)) = expected_parent {
+			// SAFETY: libc::stat is a plain C output record; zero initialization creates
+			// writable storage for fstat before any field is read.
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent is the live directory descriptor owned by this branch, and
+			// parent_stat is valid writable output storage.
+			if unsafe { libc::fstat(parent, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_dev
+				|| parent_stat.st_ino as u64 != expected_ino
+			{
+				// SAFETY: this mismatch branch owns parent and returns immediately after
+				// closing it exactly once.
+				unsafe { libc::close(parent) };
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let mut final_bytes = name.as_bytes().to_vec();
 		final_bytes.extend_from_slice(b".removing");
 		let Ok(final_name) = CString::new(final_bytes) else {
@@ -4050,11 +4154,12 @@ mod platform {
 		}
 	}
 
-	fn open_relative(
+	fn open_relative_with_share(
 		parent: HANDLE,
 		name: &std::ffi::OsStr,
 		desired_access: u32,
 		directory: bool,
+		share_access: u32,
 	) -> Result<HANDLE, &'static str> {
 		let mut name: Vec<u16> = name.encode_wide().collect();
 		if name.is_empty()
@@ -4095,7 +4200,7 @@ mod platform {
 				&mut status,
 				null_mut(),
 				FILE_ATTRIBUTE_NORMAL,
-				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				share_access,
 				FILE_OPEN,
 				options,
 				null_mut(),
@@ -4108,10 +4213,27 @@ mod platform {
 		Ok(handle)
 	}
 
-	fn open_exact(
+	fn open_relative(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		desired_access: u32,
+		directory: bool,
+	) -> Result<HANDLE, &'static str> {
+		open_relative_with_share(
+			parent,
+			name,
+			desired_access,
+			directory,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		)
+	}
+
+	fn open_exact_with_parent(
 		path: &Path,
 		kind: &str,
 		desired_access: u32,
+		expected_parent: Option<(u64, u64)>,
+		final_share_access: Option<u32>,
 	) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
@@ -4144,25 +4266,39 @@ mod platform {
 		for (index, name) in names.iter().enumerate() {
 			let final_component = index + 1 == names.len();
 			let parent = *ancestors.last().expect("volume root retained");
-			let handle = match open_relative(
-				parent,
-				name,
-				if final_component {
-					// Every final handle is validated with GetFileInformationByHandle before
-					// use, so its caller-requested authority must also include attribute reads.
-					desired_access | FILE_READ_ATTRIBUTES
-				} else {
-					// This retained directory becomes RootDirectory for the next
-					// descriptor-relative NtCreateFile, which requires traversal
-					// authority as well as attribute inspection.
-					FILE_READ_ATTRIBUTES | FILE_TRAVERSE
-				},
-				if final_component {
-					kind == "directory"
-				} else {
-					true
-				},
-			) {
+			if final_component {
+				if let Some((expected_dev, expected_ino)) = expected_parent {
+					let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+					if unsafe { GetFileInformationByHandle(parent, &mut information) } == 0
+						|| !expected_handle_identity_matches(&information, expected_dev, expected_ino)
+					{
+						close_retained(&mut ancestors);
+						return Err(NativeOwnerOnlySecurityResult::failure("parent_mismatch"));
+					}
+				}
+			}
+			let component_access = if final_component {
+				desired_access | FILE_READ_ATTRIBUTES
+			} else {
+				FILE_READ_ATTRIBUTES | FILE_TRAVERSE
+			};
+			let component_directory = if final_component {
+				kind == "directory"
+			} else {
+				true
+			};
+			let opened = if final_component {
+				open_relative_with_share(
+					parent,
+					name,
+					component_access,
+					component_directory,
+					final_share_access.unwrap_or(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+				)
+			} else {
+				open_relative(parent, name, component_access, component_directory)
+			};
+			let handle = match opened {
 				Ok(handle) => handle,
 				Err(code) => {
 					close_retained(&mut ancestors);
@@ -4201,6 +4337,14 @@ mod platform {
 			ancestors.push(handle);
 		}
 		unreachable!("absolute_components rejects a volume root target")
+	}
+
+	fn open_exact(
+		path: &Path,
+		kind: &str,
+		desired_access: u32,
+	) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
+		open_exact_with_parent(path, kind, desired_access, None, None)
 	}
 
 	fn open_directory_exact(path: &Path) -> Result<HeldExact, String> {
@@ -4242,6 +4386,9 @@ mod platform {
 		let mtime_ns = i128::from(filetime) * 100 - 11_644_473_600_000_000_000i128;
 		u64::from(information.dwVolumeSerialNumber) == identity.dev
 			&& ino == identity.ino
+			&& identity
+				.nlink
+				.is_none_or(|nlink| u64::from(information.nNumberOfLinks) == nlink)
 			&& size == identity.size
 			&& mtime_ns == i128::from(identity.mtime_ns)
 	}
@@ -4467,7 +4614,17 @@ mod platform {
 		} else {
 			FILE_READ_DATA
 		};
-		let handle = match open_exact(path, kind, desired_access) {
+		let handle = match open_exact_with_parent(
+			path,
+			kind,
+			desired_access,
+			identity.parent_dev.zip(identity.parent_ino),
+			if identity.directory || identity.detach_only {
+				None
+			} else {
+				Some(FILE_SHARE_READ)
+			},
+		) {
 			Ok(handle) => handle,
 			Err(result) => {
 				return NativeExactUnlinkResult {
@@ -5260,6 +5417,7 @@ mod platform {
 			kind: kind.to_owned(),
 			dev: u64::from(information.dwVolumeSerialNumber).to_string(),
 			ino: ino.to_string(),
+			nlink: u64::from(information.nNumberOfLinks).to_string(),
 			size: size.to_string(),
 			mtime_ns: mtime_ns.to_string(),
 			ctime_ns: mtime_ns.to_string(),
@@ -5305,8 +5463,14 @@ mod platform {
 			} else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
 				snapshot_tree_handle(child, &child_relative, entries)
 			} else {
-				entries.push(tree_entry(child, child_relative, kind)?);
-				Ok(())
+				match tree_entry(child, child_relative, kind) {
+					Ok(entry) if entry.nlink == "1" => {
+						entries.push(entry);
+						Ok(())
+					},
+					Ok(_) => Err("identity_mismatch"),
+					Err(code) => Err(code),
+				}
 			};
 			unsafe { CloseHandle(child) };
 			result?;
@@ -5331,6 +5495,7 @@ mod platform {
 		Ok(actual.kind == expected.kind
 			&& actual.dev == expected.dev
 			&& actual.ino == expected.ino
+			&& actual.nlink == expected.nlink
 			&& (kind == "directory"
 				|| (actual.size == expected.size
 					&& actual.mtime_ns == expected.mtime_ns
@@ -5502,10 +5667,22 @@ mod platform {
 				unsafe { CloseHandle(child) };
 				return Err("identity_mismatch");
 			}
-			let already_quarantined = name == tree_quarantine_name(expected_child);
+			let quarantine_name = tree_quarantine_name(expected_child);
+			let already_quarantined = name == quarantine_name;
 			if !already_quarantined {
-				quarantine_tree_child(child, handle, expected_child)?;
+				if let Err(error) = quarantine_tree_child(child, handle, expected_child) {
+					unsafe { CloseHandle(child) };
+					return Err(error);
+				}
 			}
+			unsafe { CloseHandle(child) };
+			let child = open_relative_with_share(
+				handle,
+				std::ffi::OsStr::new(&quarantine_name),
+				FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+				directory,
+				FILE_SHARE_READ,
+			)?;
 			if !tree_entry_matches(child, expected_child)? {
 				unsafe { CloseHandle(child) };
 				return Err("identity_mismatch");
@@ -5548,6 +5725,7 @@ mod platform {
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
+		expected_parent: Option<(u64, u64)>,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
 		let final_path = format!("{planned_path}.removing");
@@ -5562,17 +5740,21 @@ mod platform {
 		let mut final_candidate = PathBuf::from(path);
 		final_candidate.set_file_name(OsString::from_wide(&final_name));
 		let input_is_final = planned_path.ends_with(".removing");
-		let (root, retained_path, already_final) = match open_exact(
+		let (root, retained_path, already_final) = match open_exact_with_parent(
 			path,
 			"directory",
 			FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+			expected_parent,
+			None,
 		) {
 			Ok(root) => (root, planned_path.clone(), input_is_final),
 			Err(result) if !input_is_final && result.code.as_deref() == Some("not_found") => {
-				match open_exact(
+				match open_exact_with_parent(
 					&final_candidate,
 					"directory",
 					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+					expected_parent,
+					None,
 				) {
 					Ok(root) => (root, final_path.clone(), true),
 					Err(result) => {
@@ -5669,6 +5851,7 @@ mod platform {
 	pub(super) fn exact_remove_directory_tree(
 		_: &Path,
 		_: &NativeDirectoryTreeSnapshot,
+		_: Option<(u64, u64)>,
 	) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("tree_authority_unavailable")
 	}
@@ -6084,6 +6267,9 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
@@ -6140,6 +6326,9 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
@@ -6203,6 +6392,9 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
@@ -6271,6 +6463,9 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
@@ -6341,6 +6536,9 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev: metadata.dev(),
+			nlink: Some(metadata.nlink()),
+			parent_dev: None,
+			parent_ino: None,
 			ino: metadata.ino(),
 			size: metadata.size(),
 			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
@@ -6421,6 +6619,9 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
@@ -6545,7 +6746,7 @@ mod exact_unlink_placeholder_tests {
 			.expect("snapshot target");
 		let detached = root.join("target.removing");
 
-		let first = platform::exact_remove_directory_tree(&target, &snapshot);
+		let first = platform::exact_remove_directory_tree(&target, &snapshot, None);
 		assert_tree_replay_result(&first, &detached);
 		assert!(target.symlink_metadata().is_err());
 		assert!(
@@ -6558,7 +6759,7 @@ mod exact_unlink_placeholder_tests {
 			"first retained tree is replayable from the original snapshot"
 		);
 
-		let second = platform::exact_remove_directory_tree(&target, &snapshot);
+		let second = platform::exact_remove_directory_tree(&target, &snapshot, None);
 		assert_tree_replay_result(&second, &detached);
 		assert!(
 			same_tree_after_authorized_rename(
@@ -6604,7 +6805,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let aborted = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx.recv().expect("wait for aborted hook");
 		assert!(aborted.join().is_err(), "disconnected hook did not abort");
@@ -6618,8 +6819,9 @@ mod exact_unlink_placeholder_tests {
 		let (resume_tx, resume_rx) = mpsc::channel();
 		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
 		let next_for_remove = next.clone();
-		let removal =
-			thread::spawn(move || platform::exact_remove_directory_tree(&next_for_remove, &snapshot));
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&next_for_remove, &snapshot, None)
+		});
 		entered_rx.recv().expect("wait for next hook");
 		resume_tx.send(()).expect("resume next hook");
 		assert_eq!(
