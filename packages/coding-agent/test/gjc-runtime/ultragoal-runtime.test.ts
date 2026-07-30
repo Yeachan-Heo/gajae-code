@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -776,30 +777,27 @@ describe("ultragoal CLI replay validation", () => {
 		expect(stringError).toContain("argv string array");
 	});
 
-	it("accepts focused bun test replay and rejects arbitrary command execution", async () => {
-		const acceptedRoot = await tempDir();
+	it("rejects executable bun tests and arbitrary command execution", async () => {
+		const testRoot = await tempDir();
+		const marker = path.join(testRoot, "must-not-exist.txt");
 		await Bun.write(
-			path.join(acceptedRoot, "focused-replay.test.ts"),
-			'import { expect, test } from "bun:test"; test("replay", () => { console.log("BUN_TEST_REPLAY_OK"); expect(2 + 2).toBe(4); });\n',
+			path.join(testRoot, "model-authored.test.ts"),
+			`await Bun.write(${JSON.stringify(marker)}, "unsafe");`,
 		);
-		await expectAcceptedExecutorQa(
-			acceptedRoot,
-			cliExecutorQa([
-				cliReplayArtifact({
-					command: ["bun", "test", "focused-replay.test.ts"],
-					recordedStdout: "",
-					invariants: [{ type: "substring", value: "BUN_TEST_REPLAY_OK" }],
-				}),
-			]),
+		const testError = await expectRejectedExecutorQa(
+			testRoot,
+			cliExecutorQa([cliReplayArtifact({ command: ["bun", "test", "model-authored.test.ts"] })]),
 		);
+		expect(testError).toContain("deterministic CLI replay allowlist");
+		expect(await Bun.file(marker).exists()).toBe(false);
 
 		for (const command of [
 			["/bin/sh", "-c", "printf unsafe"],
 			["sh", "-c", "printf unsafe"],
 			["bun", "install"],
 			["bun", "-e", 'await Bun.write("unsafe", "x")'],
-			["bun", "test", "../outside.test.ts"],
-			["bun", "test", "--preload", "evil.ts", "focused-replay.test.ts"],
+			["git", "push"],
+			["curl", "https://example.invalid"],
 		]) {
 			const rejectedRoot = await tempDir();
 			const error = await expectRejectedExecutorQa(rejectedRoot, cliExecutorQa([cliReplayArtifact({ command })]));
@@ -845,6 +843,13 @@ describe("ultragoal CLI replay validation", () => {
 			cliExecutorQa([{ ...cliReplayArtifact(), path: "artifacts/replay.json" }]),
 		);
 		expect(ambiguousError).toContain("must not mix nested replay");
+
+		const mixedFieldRoot = await tempDir();
+		const mixedFieldError = await expectRejectedExecutorQa(
+			mixedFieldRoot,
+			cliExecutorQa([{ ...cliReplayArtifact(), recordedStderr: "ignored" }]),
+		);
+		expect(mixedFieldError).toContain("must not mix nested replay");
 
 		const malformedRoot = await tempDir();
 		const malformedError = await expectRejectedExecutorQa(
@@ -951,6 +956,15 @@ describe("ultragoal CLI replay validation", () => {
 			cliExecutorQa([cliReplayArtifact({ recordedStdout: "wrong\n" })]),
 		);
 		expect(error).toContain("stdout did not match");
+	});
+
+	it("rejects stderr mismatches", async () => {
+		const root = await tempDir();
+		const error = await expectRejectedExecutorQa(
+			root,
+			cliExecutorQa([cliReplayArtifact({ recordedStderr: "unexpected warning\n" })]),
+		);
+		expect(error).toContain("stderr did not match");
 	});
 
 	it("accepts audited replayExempt with structurally-valid fallback and rejects invalid exemptions", async () => {
@@ -1079,24 +1093,42 @@ describe("ultragoal CLI replay validation", () => {
 
 		const testReportRoot = await tempDir();
 		await fs.mkdir(path.join(testReportRoot, "artifacts"), { recursive: true });
+		await fs.mkdir(path.join(testReportRoot, "packages", "coding-agent", "test"), { recursive: true });
+		await Bun.write(
+			path.join(testReportRoot, "packages", "coding-agent", "test", "focused.test.ts"),
+			"// evidence only\n",
+		);
+		const testOutput = "1 pass\n0 fail\n";
+		await Bun.write(path.join(testReportRoot, "artifacts", "test-output.txt"), testOutput);
 		await Bun.write(
 			path.join(testReportRoot, "artifacts", "test-report.json"),
-			JSON.stringify({ command: ["bun", "test", "focused.test.ts"], total: 1, passed: 1, failed: 0 }),
+			JSON.stringify({
+				schemaVersion: 1,
+				kind: "bun-test-report",
+				command: ["bun", "test", "packages/coding-agent/test/focused.test.ts"],
+				total: 1,
+				passed: 1,
+				failed: 0,
+				skipped: 0,
+				exitCode: 0,
+				stdoutPath: "artifacts/test-output.txt",
+				stdoutSha256: crypto.createHash("sha256").update(testOutput).digest("hex"),
+			}),
 		);
-		const testReportError = await expectRejectedExecutorQa(
+		await expectAcceptedExecutorQa(
 			testReportRoot,
 			cliExecutorQa([
 				{
 					id: "cli-replay",
 					kind: "cli-replay",
-					description: "Replay exemption with test report fallback",
+					description: "Replay exemption with structured bun test report",
 					replay: {
 						schemaVersion: 1,
 						kind: "cli-replay",
 						replayExempt: {
-							reasonCode: "platform_unavailable",
+							reasonCode: "unsafe_side_effect",
 							reason:
-								"The focused test runner is unavailable on this platform and requires an audited fallback.",
+								"The quality gate must not execute model-authored test source without an operating-system sandbox.",
 							approvedBy: "executor-qa",
 							fallbackArtifactRefs: ["test-report"],
 						},
@@ -1104,13 +1136,75 @@ describe("ultragoal CLI replay validation", () => {
 				},
 				{
 					id: "test-report",
-					kind: "test-report",
+					kind: "bun-test-report",
 					path: "artifacts/test-report.json",
-					description: "Structured focused test report",
+					description: "Structured focused bun test report",
 				},
 			]),
 		);
-		expect(testReportError).toContain("requires at least one structurally-valid fallback artifact");
+	});
+
+	it("rejects malformed or failed bun test report fallbacks", async () => {
+		const rejectedReport = async (overrides: Record<string, unknown>): Promise<string> => {
+			const root = await tempDir();
+			await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+			await fs.mkdir(path.join(root, "packages", "coding-agent", "test"), { recursive: true });
+			await Bun.write(path.join(root, "packages", "coding-agent", "test", "focused.test.ts"), "// evidence only\n");
+			const testOutput = "1 pass\n0 fail\n";
+			await Bun.write(path.join(root, "artifacts", "test-output.txt"), testOutput);
+			await Bun.write(
+				path.join(root, "artifacts", "test-report.json"),
+				JSON.stringify({
+					schemaVersion: 1,
+					kind: "bun-test-report",
+					command: ["bun", "test", "packages/coding-agent/test/focused.test.ts"],
+					total: 1,
+					passed: 1,
+					failed: 0,
+					skipped: 0,
+					exitCode: 0,
+					stdoutPath: "artifacts/test-output.txt",
+					stdoutSha256: crypto.createHash("sha256").update(testOutput).digest("hex"),
+					...overrides,
+				}),
+			);
+			return expectRejectedExecutorQa(
+				root,
+				cliExecutorQa([
+					{
+						id: "cli-replay",
+						kind: "cli-replay",
+						description: "Unsafe replay exemption",
+						replay: {
+							schemaVersion: 1,
+							kind: "cli-replay",
+							replayExempt: {
+								reasonCode: "unsafe_side_effect",
+								reason: "The gate must not execute model-authored test code without a sandbox.",
+								approvedBy: "executor-qa",
+								fallbackArtifactRefs: ["test-report"],
+							},
+						},
+					},
+					{
+						id: "test-report",
+						kind: "bun-test-report",
+						path: "artifacts/test-report.json",
+						description: "Rejected structured bun test report",
+					},
+				]),
+			);
+		};
+
+		expect(await rejectedReport({ command: ["bun", "test", "../outside.test.ts"] })).toContain(
+			"focused bun test argv",
+		);
+		expect(await rejectedReport({ total: 2, passed: 1, failed: 1 })).toContain("zero-failure run");
+		expect(await rejectedReport({ stdoutSha256: "model-authored" })).toContain("lowercase SHA-256");
+		expect(await rejectedReport({ stdoutSha256: "f".repeat(64) })).toContain(
+			"must match the captured stdoutPath bytes",
+		);
+		expect(await rejectedReport({ kind: "test-report" })).toContain("kind must be bun-test-report");
 	});
 
 	it("honors substring regex and not_substring invariants instead of full stdout equality", async () => {
