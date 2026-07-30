@@ -350,6 +350,22 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 
 OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth.kimi.com`.
 
+### Kiro relay
+
+`kiro` reaches a paid Kiro subscription through a relay the user runs themselves (`kiro-go`, `kiro2api`), which speaks the Anthropic Messages API on `/v1/messages` and lists the account's entitled models on `/v1/models`. Nothing about the model list is bundled: entitlements follow the subscription tier, so the relay is the source of truth.
+
+| Variable         | Default / behavior                                                                                                                                             |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIRO_API_KEY`   | The key the user's own relay enforces. Any non-empty value opts an open relay into discovery; unset means no discovery request is made at all.                  |
+| `KIRO_BASE_URL`  | Relay endpoint, default `http://127.0.0.1:8080/v1`. Resolved through `$credentialEnv`, so a project `.env` cannot redirect authenticated traffic.               |
+
+Boundaries worth knowing before enabling it:
+
+- **Discovery is credential-gated, not unauthenticated.** The relays' default port `8080` is also llama.cpp's, so an unconditional probe could register an unrelated server's models as Kiro entitlements. Discovery runs only when `KIRO_API_KEY` is non-empty.
+- **No Kiro/AWS account credential is read, stored, or forwarded.** The only credential gjc holds is the relay key; the subscription token stays inside the relay the user operates.
+- **Per-token cost is reported as zero.** Kiro meters subscription credits per request (`rateMultiplier`), never per token, so any USD-per-token figure would make `gjc stats` report spend that never happened.
+- **Own subscription, own relay.** Account sharing, credential resale, and multi-account rotation against a single subscription are out of scope here and violate the upstream terms.
+
 ### Gemini CLI compatibility
 
 | Variable                   | Default / behavior                                              |
