@@ -3951,6 +3951,12 @@ class NdjsonFileWriter {
 		const line = `${JSON.stringify(entry)}\n`;
 		return this.#enqueue(() => this.#writeLine(line));
 	}
+	writeMany(entries: readonly (FileEntry | SessionPatchRecord)[]): Promise<void> {
+		if (this.#closed || this.#closing) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		const line = entries.map(entry => `${JSON.stringify(entry)}\n`).join("");
+		return this.#enqueue(() => this.#writeLine(line));
+	}
 
 	/**
 	 * Synchronously serialize and append the entry. Returns once `fs.writeSync` has handed
@@ -5436,6 +5442,7 @@ export class SessionManager {
 		writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#bytesSinceTitleAnchor = undefined;
 		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 	}
 
@@ -5470,6 +5477,7 @@ export class SessionManager {
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#bytesSinceTitleAnchor = undefined;
 	}
 
 	/** Initialize with a new session (used by factory methods). */
@@ -5569,6 +5577,7 @@ export class SessionManager {
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;
 				this.#ensuredOnDisk = true;
+				this.#bytesSinceTitleAnchor = undefined;
 				await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				return;
 			}
@@ -5629,6 +5638,7 @@ export class SessionManager {
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
+			this.#bytesSinceTitleAnchor = undefined;
 		} catch (error) {
 			managedTransition?.dispose();
 			throw error;
@@ -7401,6 +7411,7 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#bytesSinceTitleAnchor = undefined;
 	}
 
 	async #rewriteFile(): Promise<void> {
@@ -7419,6 +7430,7 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#bytesSinceTitleAnchor = undefined;
 	}
 
 	isPersisted(): boolean {
@@ -8147,19 +8159,27 @@ export class SessionManager {
 				// A title is user-visible metadata. A new session must have a canonical
 				// header before success is reported, even before its first assistant reply.
 				if (this.persist && this.#sessionFile && !this.storage.existsSync(this.#sessionFile)) {
-					this.#sessionName = sanitized;
-					this.#titleSource = source;
-					if (header) applyHeaderPatch(header, { title: sanitized, titleSource: source });
-					await this.ensureOnDisk();
+					const candidateEntries = this.#fileEntries.map(entry =>
+						entry === header ? { ...entry, title: sanitized, titleSource: source } : entry,
+					);
+					const persistedEntries = await Promise.all(
+						materializeResidentEntriesForPersistenceSync(candidateEntries, this.#residentBlobStores()).map(
+							entry => prepareEntryForPersistence(entry, this.#blobStore),
+						),
+					);
+					await this.#writeEntriesAtomically(persistedEntries);
+					this.#needsFullRewriteOnNextPersist = false;
+					this.#flushed = true;
+					this.#ensuredOnDisk = true;
 				} else {
 					await this.#persistPatch(
 						{ type: "header_patch", patch: { title: sanitized, titleSource: source } },
 						{ titleCommit: true },
 					);
-					this.#sessionName = sanitized;
-					this.#titleSource = source;
-					if (header) applyHeaderPatch(header, { title: sanitized, titleSource: source });
 				}
+				this.#sessionName = sanitized;
+				this.#titleSource = source;
+				if (header) applyHeaderPatch(header, { title: sanitized, titleSource: source });
 				this.#headerExportRevision++;
 				this.#bytesSinceTitleAnchor = 0;
 				applied = true;
@@ -8184,11 +8204,29 @@ export class SessionManager {
 		await this.#persistPatch({ type: "header_patch", patch });
 	}
 
-	#appendManagedRecordSync(record: FileEntry | SessionPatchRecord, anchor?: HeaderPatchRecord): void {
+	#recordsForPhysicalAppend(record: FileEntry | SessionPatchRecord): readonly (FileEntry | SessionPatchRecord)[] {
+		const recordBytes = Buffer.byteLength(`${JSON.stringify(record)}\n`, "utf8");
+		const commitsTitle =
+			record.type === "header_patch" &&
+			(typeof record.patch.title === "string" || record.patch.titleSource !== undefined);
+		const anchor =
+			!commitsTitle &&
+			this.#sessionName &&
+			(this.#bytesSinceTitleAnchor === undefined || this.#bytesSinceTitleAnchor + recordBytes >= 8 * 1024)
+				? {
+						type: "header_patch" as const,
+						patch: { title: this.#sessionName, titleSource: this.#titleSource },
+					}
+				: undefined;
+		this.#bytesSinceTitleAnchor = commitsTitle || anchor ? 0 : (this.#bytesSinceTitleAnchor ?? 0) + recordBytes;
+		return anchor ? [record, anchor] : [record];
+	}
+
+	#appendManagedRecordSync(record: FileEntry | SessionPatchRecord): void {
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		const store = this.#managedTranscriptStore();
 		const relativePath = path.basename(this.#sessionFile);
-		const records = anchor ? [record, anchor] : [record];
+		const records = this.#recordsForPhysicalAppend(record);
 		store.appendWithOutcomeSync(
 			relativePath,
 			Buffer.from(`${records.map(item => JSON.stringify(item)).join("\n")}\n`, "utf8"),
@@ -8196,9 +8234,16 @@ export class SessionManager {
 	}
 
 	async #persistPatch(record: SessionPatchRecord, options?: { titleCommit?: boolean }): Promise<void> {
-		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
+		if (!this.persist || !this.#sessionFile) return;
+		if (!this.storage.existsSync(this.#sessionFile)) {
+			if (options?.titleCommit)
+				throw new ManagedAppendOutcomeError("not_applied", "session_file_missing", undefined);
+			return;
+		}
 		await this.#queuePersistTask(
 			async () => {
+				if (!this.#sessionFile || !this.storage.existsSync(this.#sessionFile))
+					throw new ManagedAppendOutcomeError("not_applied", "session_file_missing", undefined);
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (
 					this.#needsFullRewriteOnNextPersist ||
@@ -8223,7 +8268,7 @@ export class SessionManager {
 				}
 				const writer = this.#ensurePersistWriter();
 				if (!writer) return this.#rewriteFileContents();
-				await writer.write(persistedRecord);
+				await writer.writeMany(this.#recordsForPhysicalAppend(persistedRecord));
 			},
 			{ recordError: !options?.titleCommit },
 		);
@@ -8274,17 +8319,7 @@ export class SessionManager {
 					new Map(),
 				);
 				const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
-				const entryBytes = Buffer.byteLength(`${JSON.stringify(persistedEntry)}\n`, "utf8");
-				const titleAnchor =
-					this.#sessionName &&
-					(this.#bytesSinceTitleAnchor === undefined || this.#bytesSinceTitleAnchor + entryBytes >= 8 * 1024)
-						? {
-								type: "header_patch" as const,
-								patch: { title: this.#sessionName, titleSource: this.#titleSource },
-							}
-						: undefined;
-				this.#appendManagedRecordSync(persistedEntry, titleAnchor);
-				this.#bytesSinceTitleAnchor = titleAnchor ? 0 : (this.#bytesSinceTitleAnchor ?? 0) + entryBytes;
+				this.#appendManagedRecordSync(persistedEntry);
 				return;
 			}
 			const writer = this.#ensurePersistWriter();
@@ -8302,18 +8337,7 @@ export class SessionManager {
 				new Map(),
 			);
 			const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
-			const entryBytes = Buffer.byteLength(`${JSON.stringify(persistedEntry)}\n`, "utf8");
-			const titleAnchor =
-				this.#sessionName &&
-				(this.#bytesSinceTitleAnchor === undefined || this.#bytesSinceTitleAnchor + entryBytes >= 8 * 1024)
-					? {
-							type: "header_patch" as const,
-							patch: { title: this.#sessionName, titleSource: this.#titleSource },
-						}
-					: undefined;
-			if (titleAnchor) writer.writeManySync([persistedEntry, titleAnchor]);
-			else writer.writeSync(persistedEntry);
-			this.#bytesSinceTitleAnchor = titleAnchor ? 0 : (this.#bytesSinceTitleAnchor ?? 0) + entryBytes;
+			writer.writeManySync(this.#recordsForPhysicalAppend(persistedEntry));
 		} catch (err) {
 			this.#recordPersistError(err);
 			throw this.#persistError ?? toError(err);

@@ -765,7 +765,7 @@ export class ManagedSessionDescendantStore {
 					existing.identity.sha256,
 				);
 				if (!appended.ok)
-					throw new ManagedAppendOutcomeError("not_applied", appended.code ?? "managed_append_failed", appended);
+					throw new ManagedAppendOutcomeError("ambiguous", appended.code ?? "managed_append_failed", appended);
 				this.#assertBound();
 				return "applied";
 			}

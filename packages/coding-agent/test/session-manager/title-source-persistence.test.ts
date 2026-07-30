@@ -9,7 +9,11 @@ import {
 	type SessionHeader,
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
-import { FileSessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	MemorySessionStorage,
+	type SessionStorageWriter,
+} from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
 import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
 import {
@@ -85,6 +89,20 @@ class CapturingWriterStorage extends FileSessionStorage {
 		};
 	}
 }
+class DisappearingTitleStorage extends MemorySessionStorage {
+	#titlePersistenceChecks = 0;
+	#armed = false;
+
+	armTitlePersistenceDeletion(): void {
+		this.#armed = true;
+		this.#titlePersistenceChecks = 0;
+	}
+
+	override existsSync(filePath: string): boolean {
+		if (this.#armed && ++this.#titlePersistenceChecks === 3) return false;
+		return super.existsSync(filePath);
+	}
+}
 
 describe("session title source persistence", () => {
 	let testAgentDir: string;
@@ -154,6 +172,52 @@ describe("session title source persistence", () => {
 		const reopened = await SessionManager.open(sessionFile!);
 		expect(reopened.getSessionName()).toBe("Fresh title");
 		expect(reopened.titleSource).toBe("auto");
+	});
+	it("keeps fresh title failures unpublished and distinguishes certified retry from ambiguous replay", async () => {
+		const certifiedStorage = new FileSessionStorage();
+		const certified = SessionManager.create(cwd, path.join(testAgentDir, "certified-sessions"), certifiedStorage);
+		const certifiedFile = certified.getSessionFile()!;
+		const certifiedRename = vi.spyOn(certifiedStorage, "rename").mockRejectedValueOnce(new Error("before rename"));
+		await expect(certified.setSessionName("Certified", "user")).rejects.toThrow("before rename");
+		expect(certified.getSessionName()).toBeUndefined();
+		expect(certified.titleSource).toBeUndefined();
+		expect(fs.existsSync(certifiedFile)).toBe(false);
+		certifiedRename.mockRestore();
+		await expect(certified.setSessionName("Certified retry", "user")).resolves.toBe(true);
+		expect(certified.getSessionName()).toBe("Certified retry");
+
+		const ambiguousCwd = path.join(cwd, "ambiguous");
+		fs.mkdirSync(ambiguousCwd, { recursive: true });
+		const ambiguousStorage = new FileSessionStorage();
+		const ambiguous = SessionManager.create(
+			ambiguousCwd,
+			path.join(testAgentDir, "ambiguous-sessions"),
+			ambiguousStorage,
+		);
+		const ambiguousFile = ambiguous.getSessionFile()!;
+		const rename = ambiguousStorage.rename.bind(ambiguousStorage);
+		const ambiguousRename = vi.spyOn(ambiguousStorage, "rename").mockImplementationOnce(async (from, to) => {
+			await rename(from, to);
+			throw new Error("after rename");
+		});
+		await expect(ambiguous.setSessionName("Ambiguous", "user")).rejects.toThrow("after rename");
+		expect(ambiguous.getSessionName()).toBeUndefined();
+		expect(ambiguous.titleSource).toBeUndefined();
+		expect(getHeader(await loadEntriesFromFile(ambiguousFile))?.title).toBe("Ambiguous");
+		ambiguousRename.mockRestore();
+		await expect(ambiguous.setSessionName("Ambiguous retry", "user")).rejects.toThrow("after rename");
+	});
+	it("rejects a title when its existing transcript disappears before the queued persistence turn", async () => {
+		const storage = new DisappearingTitleStorage();
+		const session = SessionManager.create(cwd, "memory-sessions", storage);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		storage.armTitlePersistenceDeletion();
+		await expect(session.setSessionName("Deleted", "user")).rejects.toThrow("session_file_missing");
+		expect(session.getSessionName()).toBeUndefined();
+		expect(session.titleSource).toBeUndefined();
 	});
 
 	it("serializes late auto titles behind a manual rename", async () => {
@@ -309,6 +373,73 @@ describe("session title source persistence", () => {
 		await expect(reopened.setSessionName("Manual title", "user")).resolves.toBe(true);
 		await expect(reopened.setSessionName("Generated title", "auto")).resolves.toBe(false);
 	});
+	it("anchors a replay-generated entry patch larger than the picker tail after a title", async () => {
+		const sessionFile = path.join(cwd, "large-entry-patch.jsonl");
+		const header = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "large-entry-patch",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd,
+			title: "Tail title",
+			titleSource: "user",
+		};
+		const entry = {
+			type: "message",
+			id: "assistant",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "x".repeat(20_000), thinkingSignature: "stale" }],
+				provider: "openai",
+				model: "gpt-5",
+				timestamp: 1,
+				providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [] },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		};
+		fs.writeFileSync(sessionFile, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+		await SessionManager.open(sessionFile);
+		const records = fs
+			.readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(Buffer.byteLength(JSON.stringify(records.at(-2)!))).toBeGreaterThan(16 * 1024);
+		expect(records.slice(-2).map(record => record.type)).toEqual(["entry_patch", "header_patch"]);
+		expect(records.at(-1)).toEqual({
+			type: "header_patch",
+			patch: { title: "Tail title", titleSource: "user" },
+		});
+		const listed = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+		expect(listed.find(candidate => candidate.path === sessionFile)?.title).toBe("Tail title");
+	});
+
+	it("resets title projection when setSessionFile adopts a buried legacy title", async () => {
+		const session = SessionManager.create(cwd);
+		const sessionDirectory = path.dirname(session.getSessionFile()!);
+		const sessionFile = path.join(sessionDirectory, "adopted-buried-title.jsonl");
+		fs.mkdirSync(sessionDirectory, { recursive: true });
+		fs.writeFileSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "adopted", timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n${JSON.stringify({ type: "header_patch", patch: { title: "Adopted legacy title" } })}\n${JSON.stringify({ type: "message", id: "large", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "x".repeat(20_000), timestamp: 1 } })}\n`,
+		);
+		fs.chmodSync(sessionFile, 0o600);
+		await session.setSessionFile(sessionFile);
+		expect(session.getSessionName()).toBe("Adopted legacy title");
+		session.appendMessage({ role: "user", content: "repair", timestamp: 2 });
+		await session.flush();
+		const records = fs
+			.readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(records.slice(-2).map(record => record.type)).toEqual(["message", "header_patch"]);
+		expect(records.at(-1)).toEqual({ type: "header_patch", patch: { title: "Adopted legacy title" } });
+		const listed = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+		expect(listed.find(candidate => candidate.path === sessionFile)?.title).toBe("Adopted legacy title");
+	});
 
 	it("throws without publishing a title when managed append is certified not applied", async () => {
 		const session = SessionManager.create(cwd);
@@ -350,7 +481,7 @@ describe("session title source persistence", () => {
 		expect(session.getSessionName()).toBe("later");
 	});
 
-	it("fails closed after a managed title append becomes ambiguous", async () => {
+	it("treats a native ok:false after replay-visible title bytes as ambiguous", async () => {
 		const session = SessionManager.create(cwd);
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
@@ -365,7 +496,7 @@ describe("session title source persistence", () => {
 				...args: Parameters<(typeof native.RecoveryFsRoot.prototype)["appendManaged"]>
 			) {
 				append.apply(this, args);
-				throw new Error("post_append_authority_verification_failed");
+				return { ok: false, code: "post_append_authority_verification_failed" };
 			});
 			restore = () => spy.mockRestore();
 		} else {
@@ -388,6 +519,15 @@ describe("session title source persistence", () => {
 		} finally {
 			restore();
 		}
+		const replayVisible = fs
+			.readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(replayVisible.at(-1)).toEqual({
+			type: "header_patch",
+			patch: { title: "ambiguous", titleSource: "user" },
+		});
 
 		const reopened = await SessionManager.open(sessionFile);
 		expect(reopened.getSessionName()).toBe("ambiguous");
