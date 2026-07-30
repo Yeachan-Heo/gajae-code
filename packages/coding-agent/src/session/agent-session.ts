@@ -3442,7 +3442,8 @@ export class AgentSession {
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
 		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
-		const maintenanceCheckpoint = event.type === "agent_end" && event.stopReason === "maintenance";
+		const maintenanceCheckpoint =
+			event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
 		const terminalClaim =
 			maintenanceCheckpoint || !terminalOwner
 				? undefined

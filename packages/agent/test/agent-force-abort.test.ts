@@ -94,10 +94,14 @@ describe("Agent.forceAbort", () => {
 			initialState: { model: model.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn,
 		});
+		const agentSessionClaimKey = {};
+		agent.resourceLedger.bindAgentSessionClaimKey(agentSessionClaimKey);
 		agent.setMaintainContext(async () => "pruned" as const);
 		let logicalHandle: string | undefined;
 		let logicalDomain = agent.resourceLedger.lookupDomain("missing");
 		let forcedTerminal: Extract<AgentEvent, { type: "agent_end" }> | undefined;
+		let forcedClaimOk: boolean | undefined;
+		let forcedClaimReason: string | undefined;
 		agent.subscribe(event => {
 			if (event.type !== "agent_end") return;
 			if (event.stopReason === "maintenance") {
@@ -106,6 +110,13 @@ describe("Agent.forceAbort", () => {
 				return;
 			}
 			forcedTerminal = event;
+			const owner = getAgentTerminalOwnerContext(event);
+			if (owner) {
+				const claim = agent.resourceLedger.claimProducer(owner.resourceRunId, owner.domain, agentSessionClaimKey);
+				forcedClaimOk = claim.ok;
+				if (claim.ok) claim.lease.closeDiscovery();
+				else forcedClaimReason = claim.reason;
+			}
 		});
 
 		await agent.prompt("run tool");
@@ -122,6 +133,8 @@ describe("Agent.forceAbort", () => {
 		const owner = forcedTerminal ? getAgentTerminalOwnerContext(forcedTerminal) : undefined;
 		expect(owner?.resourceRunId).toBe(logicalHandle);
 		expect(owner?.domain).toBe(logicalDomain);
+		expect(forcedClaimOk).toBe(true);
+		expect(forcedClaimReason).toBeUndefined();
 	});
 
 	it("forces an ignored abort back to idle and accepts a following prompt", async () => {

@@ -1168,6 +1168,7 @@ export class Agent {
 		const runId = this.#activeRunId;
 		const managedLogicalRunId = this.#managedLogicalRunOwner;
 		const activeResourceDomain = this.#activeResourceCancellationDomain;
+		const activeResourceRunId = this.#activeResourceRunId;
 		const hadActiveRun = runId !== undefined && (this.#runningPrompt !== undefined || this.#state.isStreaming);
 		if (!hadActiveRun) return false;
 
@@ -1178,7 +1179,6 @@ export class Agent {
 		this.#state.pendingToolCalls = new Set<string>();
 		this.#abortController = undefined;
 		this.#cursorToolResultBuffer = [];
-		if (this.#activeResourceRunId) this.resourceLedger.quarantine(this.#activeResourceRunId);
 		this.#managedLogicalRunOwner = undefined;
 
 		const resolve = this.#resolveRunningPrompt;
@@ -1194,6 +1194,7 @@ export class Agent {
 			undefined,
 			activeResourceDomain,
 		);
+		if (activeResourceRunId) this.resourceLedger.quarantine(activeResourceRunId);
 		return true;
 	}
 
