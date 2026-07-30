@@ -2,10 +2,10 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { supportManifest } from "../../protocol-source/support-manifest.generated";
 import { ConnectionState } from "../../router/connection-state";
 import { processInbound } from "../../server";
 import {
-	configReadHandler,
 	fsCreateDirectoryHandler,
 	fsGetMetadataHandler,
 	fsReadDirectoryHandler,
@@ -13,9 +13,9 @@ import {
 	fsRemoveHandler,
 	fsWriteFileHandler,
 	HandlerRegistry,
-	modelListHandler,
 	registerBuiltinHandlers,
 } from "../../suites/handlers";
+import { configReadHandler, modelListHandler } from "../../suites/model-config-handlers";
 import { ThreadRuntimeManager } from "../../thread-runtime/thread-runtime-manager";
 
 const tempDir = mkdtempSync(join(tmpdir(), "gjc-app-server-suites-"));
@@ -145,7 +145,14 @@ test("processInbound + handler registry: fs/readFile dispatched through the serv
 	const reg = new HandlerRegistry();
 	registerBuiltinHandlers(reg);
 	// Initialize handshake
-	await processInbound(s, mgr, enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'), undefined, "websocket", reg);
+	await processInbound(
+		s,
+		mgr,
+		enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'),
+		undefined,
+		"websocket",
+		reg,
+	);
 	await processInbound(s, mgr, enc('{"method":"initialized"}'), undefined, "websocket", reg);
 	// Dispatch fs/readFile through the handler registry
 	const result = await processInbound(
@@ -167,7 +174,14 @@ test("processInbound: unregistered method falls through to notSupported", async 
 	const mgr = new ThreadRuntimeManager();
 	const reg = new HandlerRegistry();
 	registerBuiltinHandlers(reg);
-	await processInbound(s, mgr, enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'), undefined, "websocket", reg);
+	await processInbound(
+		s,
+		mgr,
+		enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'),
+		undefined,
+		"websocket",
+		reg,
+	);
 	await processInbound(s, mgr, enc('{"method":"initialized"}'), undefined, "websocket", reg);
 	const result = await processInbound(
 		s,
@@ -181,7 +195,80 @@ test("processInbound: unregistered method falls through to notSupported", async 
 	expect((parsed.error as Record<string, unknown>).code).toBe(-32081);
 });
 
+test("processInbound: newly wired suite methods dispatch through the server", async () => {
+	const source = join(tempDir, "e2e-copy-source.txt");
+	writeFileSync(source, "copied through the server");
+	const destination = join(tempDir, "e2e-copy-dest.txt");
+	const s = new ConnectionState();
+	const mgr = new ThreadRuntimeManager();
+	const reg = new HandlerRegistry();
+	registerBuiltinHandlers(reg);
+	await processInbound(
+		s,
+		mgr,
+		enc('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"1"}}}'),
+		undefined,
+		"websocket",
+		reg,
+	);
+	await processInbound(s, mgr, enc('{"method":"initialized"}'), undefined, "websocket", reg);
+
+	const copied = await processInbound(
+		s,
+		mgr,
+		enc(
+			`{"id":2,"method":"fs/copy","params":{"sourcePath":"${source}","destinationPath":"${destination}","recursive":false}}`,
+		),
+		undefined,
+		"websocket",
+		reg,
+	);
+	const copyResponse = dec(copied.response)!;
+	expect(copyResponse.error, JSON.stringify(copyResponse)).toBeUndefined();
+	const { readFileSync } = require("node:fs");
+	expect(readFileSync(destination, "utf-8")).toBe("copied through the server");
+
+	const models = await processInbound(
+		s,
+		mgr,
+		enc('{"id":3,"method":"model/list","params":{}}'),
+		undefined,
+		"websocket",
+		reg,
+	);
+	const modelResponse = dec(models.response)!;
+	expect(modelResponse.error, JSON.stringify(modelResponse)).toBeUndefined();
+	expect(Array.isArray((modelResponse.result as Record<string, unknown>).data)).toBe(true);
+});
+
 test("cleanup temp dir", async () => {
 	rmSync(tempDir, { recursive: true, force: true });
 	expect(true).toBe(true);
+});
+
+// Support-manifest parity in BOTH directions: a row may not claim `implemented` without a
+// dispatchable seam, and a registered handler may not exist without an implemented row.
+// `thread/start`, `thread/resume` and `turn/start` are answered by the server itself rather
+// than the handler registry, so they are the only implemented rows without a registry entry.
+const SERVER_OWNED_METHODS = ["thread/resume", "thread/start", "turn/start"];
+
+test("support manifest and handler registry agree in both directions", () => {
+	const registry = new HandlerRegistry();
+	registerBuiltinHandlers(registry);
+	const registered = new Set(registry.registeredMethods);
+	const implemented = supportManifest.filter(row => row.support === "implemented").map(row => row.method);
+
+	expect(implemented.filter(method => !registered.has(method)).sort()).toEqual(SERVER_OWNED_METHODS);
+	expect([...registered].filter(method => !implemented.includes(method))).toEqual([]);
+
+	for (const method of implemented) {
+		const row = supportManifest.find(candidate => candidate.method === method);
+		expect(row?.gjcSeam, `${method} must name its production seam`).toBeTruthy();
+		expect(row?.gjcBackendPath, `${method} must name its backend path`).toBeTruthy();
+		expect(row?.testIds.length, `${method} must name covering test ids`).toBeGreaterThan(0);
+	}
+
+	for (const row of supportManifest.filter(candidate => candidate.support === "not_supported")) {
+		expect(registered.has(row.method), `${row.method} must not register a handler`).toBe(false);
+	}
 });

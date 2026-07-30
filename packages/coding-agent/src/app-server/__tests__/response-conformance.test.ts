@@ -8,7 +8,6 @@ import { stableValidators } from "../protocol-source/schema-validators.generated
 import { ConnectionState } from "../router/connection-state";
 import { processInbound } from "../server";
 import {
-	configReadHandler,
 	experimentalFeatureListHandler,
 	fsCreateDirectoryHandler,
 	fsGetMetadataHandler,
@@ -19,9 +18,9 @@ import {
 	HandlerRegistry,
 	type HandlerResult,
 	hooksListHandler,
-	modelListHandler,
 	skillsListHandler,
 } from "../suites/handlers";
+import { configReadHandler, modelListHandler } from "../suites/model-config-handlers";
 import { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
 
 const encoder = new TextEncoder();

@@ -6,7 +6,14 @@
 // marketplace, windowsSandbox, ChatGPT auth) return -32081 automatically by the
 // dispatcher (no handler registered = notSupported verdict from dispatchClientRequest).
 
+import { commandExecHandlers } from "./command-exec-handlers";
+import { fsWatchHandlers } from "./fs-watch-handlers";
+import { modelConfigHandlers } from "./model-config-handlers";
+import { processHandlers } from "./process-handlers";
+
 export interface HandlerContext {
+	/** Connection the request arrived on; notification handlers target it directly. */
+	readonly connectionId?: string;
 	respond?: (result: unknown) => void;
 	emitTo?: (connectionId: string, method: string, params: unknown) => void;
 	broadcastThread?: (threadId: string, method: string, params: unknown) => void;
@@ -153,37 +160,6 @@ export const fsRemoveHandler: MethodHandler = params => {
 	}
 };
 
-/** config/read: translate gjc config into codex ConfigReadResponse shape. */
-export const configReadHandler: MethodHandler = () => {
-	// Per vendored protocol: result = {config: Config, origins: HashMap<String,...>, layers?: ...}
-	// Translate gjc config into the codex Config shape. codexHome -> gjc agent dir.
-	const { homedir } = require("node:os");
-	const { join } = require("node:path");
-	const gjcAgentDir = process.env.GJC_AGENT_DIR ?? join(homedir(), ".gjc", "agent");
-	return {
-		ok: true,
-		result: {
-			config: {
-				codexHome: gjcAgentDir,
-				desktop: {},
-			},
-			origins: {},
-		},
-	};
-};
-
-/** model/list: translate gjc model catalog into codex ModelListResponse shape. */
-export const modelListHandler: MethodHandler = () => {
-	// Per vendored protocol: result = {data: Vec<Model>, nextCursor?: Option<String>}
-	return {
-		ok: true,
-		result: {
-			data: [],
-			nextCursor: null,
-		},
-	};
-};
-
 /** skills/list: list gjc skills for a cwd. */
 export const skillsListHandler: MethodHandler = () => {
 	// List gjc skills; the full skill-discovery integration is a later phase.
@@ -214,9 +190,11 @@ export function registerBuiltinHandlers(registry: HandlerRegistry): void {
 	registry.register("fs/readDirectory", fsReadDirectoryHandler);
 	registry.register("fs/createDirectory", fsCreateDirectoryHandler);
 	registry.register("fs/remove", fsRemoveHandler);
-	registry.register("config/read", configReadHandler);
-	registry.register("model/list", modelListHandler);
 	registry.register("skills/list", skillsListHandler);
 	registry.register("hooks/list", hooksListHandler);
 	registry.register("experimentalFeature/list", experimentalFeatureListHandler);
+	for (const [method, handler] of Object.entries(fsWatchHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(commandExecHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(processHandlers)) registry.register(method, handler);
+	for (const [method, handler] of Object.entries(modelConfigHandlers)) registry.register(method, handler);
 }
