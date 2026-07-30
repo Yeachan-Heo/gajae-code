@@ -1415,7 +1415,8 @@ describe("native GJC ultragoal runtime", () => {
 	it("validation batch deferred: explicit paths must exactly match the computed cumulative diff", async () => {
 		const root = await batchTempDir();
 		const actualPath = "packages/coding-agent/src/gjc-runtime/ultragoal-runtime.ts";
-		process.env.CI_DEV_CHANGED_PATHS = actualPath;
+		const secondPath = "packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts";
+		process.env.CI_DEV_CHANGED_PATHS = `${actualPath}\n${secondPath}`;
 		await createUltragoalPlan({
 			cwd: root,
 			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
@@ -1434,6 +1435,7 @@ describe("native GJC ultragoal runtime", () => {
 				changeSet: {
 					paths: [
 						{ path: actualPath, status: "unknown" },
+						{ path: secondPath, status: "unknown" },
 						{ path: "forged/not-in-cumulative-diff.ts", status: "added" },
 					],
 				},
@@ -1463,7 +1465,12 @@ describe("native GJC ultragoal runtime", () => {
 					commands: ["bun test targeted"],
 					evidence: "targeted suite passed for G001",
 				},
-				changeSet: { paths: [{ path: actualPath, status: "deleted" }] },
+				changeSet: {
+					paths: [
+						{ path: actualPath, status: "deleted" },
+						{ path: secondPath, status: "unknown" },
+					],
+				},
 			},
 		});
 		const wrongStatusValidation = await validateUltragoalQualityGateReadOnly({
@@ -1473,6 +1480,29 @@ describe("native GJC ultragoal runtime", () => {
 		});
 		expect(wrongStatusValidation.valid).toBe(false);
 		expect(wrongStatusValidation.errors.some(error => error.message.includes(actualPath))).toBe(true);
+
+		const gateWithReorderedPaths = JSON.stringify({
+			deferredToBatch: {
+				targetedVerification: {
+					status: "passed",
+					commands: ["bun test targeted"],
+					evidence: "targeted suite passed for G001",
+				},
+				changeSet: {
+					paths: [
+						{ path: secondPath, status: "unknown" },
+						{ path: actualPath, status: "unknown" },
+					],
+				},
+			},
+		});
+		const reorderedValidation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			goalId: "G001",
+			qualityGateJson: gateWithReorderedPaths,
+		});
+		expect(reorderedValidation.valid).toBe(false);
+		expect(reorderedValidation.errors.some(error => error.message.includes("must exactly match"))).toBe(true);
 	});
 
 	it("validation batch close: a minimal close gate is auto-hydrated from durable receipts", async () => {

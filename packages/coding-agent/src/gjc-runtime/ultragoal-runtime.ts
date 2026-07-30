@@ -2175,19 +2175,17 @@ function requireChangeSetCoverage(
 	fieldName: string,
 ): void {
 	if (!expected) return;
-	const expectedExactKeys = new Set(
-		expected.paths.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`),
-	);
-	const declaredExactKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`));
-	for (const row of expected.paths) {
-		const exactKey = `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`;
-		if (!declaredExactKeys.has(exactKey)) {
+	const expectedExactRows = expected.paths.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`);
+	const declaredExactRows = declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`);
+	const declaredExactKeys = new Set(declaredExactRows);
+	for (const [index, row] of expected.paths.entries()) {
+		if (!declaredExactKeys.has(expectedExactRows[index]!)) {
 			throw new Error(`${fieldName} does not cover computed checkpoint change-set path ${row.path}`);
 		}
 	}
 	if (
-		declared.length !== expected.paths.length ||
-		declared.some(row => !expectedExactKeys.has(`${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`))
+		declaredExactRows.length !== expectedExactRows.length ||
+		declaredExactRows.some((key, index) => key !== expectedExactRows[index])
 	) {
 		throw new Error(`${fieldName} must exactly match the computed checkpoint change set`);
 	}
