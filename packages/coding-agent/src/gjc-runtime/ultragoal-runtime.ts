@@ -1871,10 +1871,11 @@ async function validateSurfaceEvidence(
 	return idMap;
 }
 
-function validateAdversarialCases(
+async function validateAdversarialCases(
+	cwd: string,
 	executorQa: JsonObject,
 	artifactRefs: Map<string, JsonObject>,
-): Map<string, JsonObject> {
+): Promise<Map<string, JsonObject>> {
 	const rows = requireObjectArray(executorQa.adversarialCases, "executorQa.adversarialCases");
 	const idMap = buildRowIdMap(rows, "executorQa.adversarialCases");
 	for (const [index, row] of rows.entries()) {
@@ -1892,6 +1893,18 @@ function validateAdversarialCases(
 		}
 		const artifactIds = requireStringLinks(row.artifactRefs, `${fieldName}.artifactRefs`);
 		requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+		for (const artifactId of artifactIds) {
+			const artifact = artifactRefs.get(artifactId)!;
+			if (!(await hasExistingNonEmptyArtifact(cwd, artifact.path))) {
+				throw new Error(
+					`qualityGate executorQa.artifactRefs.${artifactId} adversarial evidence requires an existing non-empty file`,
+				);
+			}
+			await validateArtifactProof(cwd, artifact, `executorQa.artifactRefs.${artifactId}`, {
+				surfaceFamily: "native",
+				live: false,
+			});
+		}
 	}
 	return idMap;
 }
@@ -2055,7 +2068,7 @@ async function validateExecutorQaRedTeamEvidenceInternal(
 ): Promise<void> {
 	const artifactRefs = await validateArtifactRefs(cwd, executorQa);
 	const surfaceEvidence = await validateSurfaceEvidence(cwd, executorQa, artifactRefs);
-	const adversarialCases = validateAdversarialCases(executorQa, artifactRefs);
+	const adversarialCases = await validateAdversarialCases(cwd, executorQa, artifactRefs);
 	const contractCoverage = await validateContractCoverage(
 		cwd,
 		executorQa,

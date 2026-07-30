@@ -5237,6 +5237,41 @@ describe("native GJC ultragoal runtime", () => {
 		);
 	});
 
+	it("rejects fabricated receipt-only adversarial coverage without a file", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const qa = JSON.parse(passingQualityGate()).executorQa as Record<string, unknown>;
+		const artifactRefs = qa.artifactRefs as Array<Record<string, unknown>>;
+		artifactRefs.push({
+			id: "receipt-only-adversarial",
+			kind: "failure-mode-test",
+			description: "fabricated adversarial receipt",
+			verifiedReceipt: { type: "test-report", receiptId: "fabricated", status: "passed" },
+		});
+		qa.adversarialCases = [
+			{
+				id: "receipt-only-case",
+				contractRef: "approved-plan:goal",
+				scenario: "fabricated adversarial proof",
+				expectedBehavior: "must reject",
+				verdict: "passed",
+				artifactRefs: ["receipt-only-adversarial"],
+			},
+		];
+		qa.contractCoverage = [
+			{
+				id: "receipt-only-coverage",
+				contractRef: "approved-plan:goal",
+				obligation: "adversarial proof must be authoritative",
+				status: "covered",
+				adversarialCaseRefs: ["receipt-only-case"],
+			},
+		];
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, qa)).rejects.toThrow(
+			"adversarial evidence requires an existing non-empty file",
+		);
+	});
+
 	it("enforces not-applicable and surface artifact compatibility rules", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
