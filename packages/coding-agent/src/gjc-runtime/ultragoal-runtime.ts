@@ -1692,6 +1692,8 @@ function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | u
 			}
 			return true;
 		}
+		const touchesToolsIndex = isToolsIndexPath(row.path) || (row.oldPath ? isToolsIndexPath(row.oldPath) : false);
+		if (touchesToolsIndex && changeSet.rawDiff === undefined) return true;
 		return (
 			isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.path) ||
 			(row.oldPath ? isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.oldPath) : false)
