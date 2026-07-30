@@ -149,6 +149,7 @@ export type KnownProvider =
 	| "opencode-zen"
 	| "opengateway"
 	| "bizrouter"
+	| "mara"
 	| "synthetic"
 	| "cloudflare-ai-gateway"
 	| "huggingface"

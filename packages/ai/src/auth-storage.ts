@@ -2042,6 +2042,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "mara": {
+				const { loginMara } = await import("./utils/oauth/mara");
+				const apiKey = await loginMara(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "opengateway": {
 				const { loginOpenGateway } = await import("./utils/oauth/opengateway");
 				const apiKey = await loginOpenGateway(ctrl);

@@ -120,6 +120,7 @@ Providers:
   zenmux            ZenMux
   opengateway       OpenGateway by Sionic AI
   bizrouter         BizRouter
+  mara              Mara Cloud
   ollama-cloud      Ollama Cloud
 
 Examples:

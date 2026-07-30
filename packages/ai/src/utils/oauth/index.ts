@@ -246,6 +246,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "mara",
+		name: "Mara Cloud",
+		available: true,
+	},
+	{
 		id: "opengateway",
 		name: "OpenGateway by Sionic AI",
 		available: true,
@@ -393,6 +398,7 @@ export async function refreshOAuthToken(
 		case "moonshot":
 		case "kagi":
 		case "cloudflare-ai-gateway":
+		case "mara":
 		case "vercel-ai-gateway":
 		case "qwen-portal":
 		case "zenmux":

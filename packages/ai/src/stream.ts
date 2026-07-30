@@ -164,6 +164,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	zenmux: "ZENMUX_API_KEY",
 	opengateway: "OPENGATEWAY_API_KEY",
 	bizrouter: "BIZROUTER_API_KEY",
+	mara: "MARA_API_KEY",
 	venice: "VENICE_API_KEY",
 	vllm: "VLLM_API_KEY",
 	xiaomi: "XIAOMI_API_KEY",

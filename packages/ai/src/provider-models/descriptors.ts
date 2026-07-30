@@ -26,6 +26,7 @@ import {
 	kimiCodeModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
+	maraModelManagerOptions,
 	mistralModelManagerOptions,
 	moonshotModelManagerOptions,
 	nanoGptModelManagerOptions,
@@ -325,6 +326,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"anthropic/claude-sonnet-4.5",
 		config => bizrouterModelManagerOptions(config),
 		catalog("BizRouter", ["BIZROUTER_API_KEY"]),
+	),
+	catalogDescriptor(
+		"mara",
+		"DeepSeek-V3.1",
+		config => maraModelManagerOptions(config),
+		catalog("Mara Cloud", ["MARA_API_KEY"]),
 	),
 	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
 	catalogDescriptor(

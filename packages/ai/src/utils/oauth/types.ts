@@ -12,6 +12,7 @@ export type OAuthProvider =
 	| "alibaba-token-plan"
 	| "anthropic"
 	| "bizrouter"
+	| "mara"
 	| "cerebras"
 	| "cloudflare-ai-gateway"
 	| "cursor"

@@ -53,6 +53,7 @@ export const FAMOUS_PROVIDER_ORDER: readonly string[] = [
 	"xiaomi-token-plan-cn",
 	"opengateway",
 	"bizrouter",
+	"mara",
 	"github-copilot",
 	"cursor",
 ];

@@ -39882,6 +39882,94 @@
 			"maxTokens": 8888
 		}
 	},
+	"mara": {
+		"DeepSeek-V3.1": {
+			"id": "DeepSeek-V3.1",
+			"name": "DeepSeek V3.1",
+			"api": "openai-completions",
+			"provider": "mara",
+			"baseUrl": "https://api.cloud.mara.com/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.6,
+				"output": 1.7,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
+			"maxTokens": 16384,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"MiniMax-M2.5": {
+			"id": "MiniMax-M2.5",
+			"name": "MiniMax M2.5",
+			"api": "openai-completions",
+			"provider": "mara",
+			"baseUrl": "https://api.cloud.mara.com/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.3,
+				"output": 1.2,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 196608,
+			"maxTokens": 16384
+		},
+		"MiniMax-M2.7": {
+			"id": "MiniMax-M2.7",
+			"name": "MiniMax M2.7",
+			"api": "openai-completions",
+			"provider": "mara",
+			"baseUrl": "https://api.cloud.mara.com/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.3,
+				"output": 1.2,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 196608,
+			"maxTokens": 16384
+		},
+		"gpt-oss-120b": {
+			"id": "gpt-oss-120b",
+			"name": "GPT OSS 120B",
+			"api": "openai-completions",
+			"provider": "mara",
+			"baseUrl": "https://api.cloud.mara.com/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.15,
+				"output": 0.75,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
+			"maxTokens": 16384,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		}
+	},
 	"minimax": {
 		"MiniMax-M2": {
 			"id": "MiniMax-M2",

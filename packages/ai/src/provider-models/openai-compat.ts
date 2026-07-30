@@ -1181,6 +1181,22 @@ export function bizrouterModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// 10.5.3 Mara Cloud
+// ---------------------------------------------------------------------------
+
+export interface MaraModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+/**
+ * Mara Cloud — an OpenAI-compatible enterprise AI inference platform. Models
+ * are discovered from the OpenAI-compatible `/v1/models` endpoint.
+ */
+export function maraModelManagerOptions(config?: MaraModelManagerConfig): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("mara", "https://api.cloud.mara.com/v1", config);
+}
+// ---------------------------------------------------------------------------
 // 10.6 Kilo Gateway
 // ---------------------------------------------------------------------------
 

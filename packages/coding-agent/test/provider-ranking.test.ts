@@ -113,6 +113,7 @@ describe("famous provider list", () => {
 			"xiaomi-token-plan-cn",
 			"opengateway",
 			"bizrouter",
+			"mara",
 			"github-copilot",
 			"cursor",
 		];
