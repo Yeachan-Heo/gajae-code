@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
-import { kNoAuth } from "../../src/config/model-registry";
+import { TempDir } from "@gajae-code/utils";
+import { kNoAuth, ModelRegistry } from "../../src/config/model-registry";
 
 import { Settings } from "../../src/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "../../src/extensibility/extensions/types";
@@ -9,7 +11,7 @@ import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } from "../../src/session/agent-session";
-import type { AuthStorage } from "../../src/session/auth-storage";
+import { AuthStorage } from "../../src/session/auth-storage";
 import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
 
 import {
@@ -694,6 +696,64 @@ describe("runSubprocess yield reminders", () => {
 
 		expect(refreshSpy).not.toHaveBeenCalled();
 		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("routes a built-in Kiro model into a child session without extension injection", async () => {
+		const tempDir = TempDir.createSync("@gjc-kiro-subagent-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		try {
+			authStorage.setRuntimeApiKey(
+				"kiro",
+				JSON.stringify({
+					token: "test-token",
+					kiroProfileArn: "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+				}),
+			);
+			const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+			await registry.refresh("offline");
+			const kiroModel = registry.find("kiro", "claude-opus-5");
+			expect(kiroModel).toMatchObject({
+				api: "kiro-streaming",
+				provider: "kiro",
+				id: "claude-opus-5",
+			});
+			expect(kiroModel?.thinking).toMatchObject({ minLevel: Effort.Minimal, maxLevel: Effort.Max });
+
+			const session = createMockSession(({ emit }) => {
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-kiro-yield",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			});
+			const createAgentSessionSpy = mockCreateAgentSession(session);
+			const result = await runSubprocess({
+				...baseOptions,
+				cwd: tempDir.path(),
+				id: "subagent-native-kiro",
+				modelRegistry: registry,
+				modelOverride: "kiro/claude-opus-5:xhigh",
+			});
+
+			expect(result.exitCode).toBe(0);
+			const childOptions = createAgentSessionSpy.mock.calls[0]?.[0];
+			expect(childOptions?.model).toMatchObject({
+				api: "kiro-streaming",
+				provider: "kiro",
+				id: "claude-opus-5",
+			});
+			expect(childOptions?.thinkingLevel).toBe(Effort.XHigh);
+			expect(childOptions?.extensions).toBeUndefined();
+			expect(childOptions?.additionalExtensionPaths).toBeUndefined();
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
 	});
 
 	it("renders shared task context in subagent system prompt before now", async () => {

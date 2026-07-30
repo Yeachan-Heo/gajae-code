@@ -614,6 +614,25 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 }
 
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "kiro") {
+		if (model.id.startsWith("gpt-5.6-")) return GPT_5_6_PLUS_EFFORTS;
+		if (model.id === "claude-opus-4.6") return DEFAULT_REASONING_EFFORTS_WITH_MAX;
+		if (model.id === "claude-opus-4.7" || model.id === "claude-opus-5") {
+			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
+		}
+		if (
+			model.id === "claude-haiku-4.5" ||
+			model.id === "claude-opus-4.5" ||
+			model.id === "claude-sonnet-4" ||
+			model.id === "claude-sonnet-4.5" ||
+			model.id === "glm-5" ||
+			model.id === "minimax-m2.1" ||
+			model.id === "minimax-m2.5"
+		) {
+			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+		}
+		return DEFAULT_REASONING_EFFORTS;
+	}
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return KIMI_K3_EFFORTS;
 	}

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effort } from "../src/model-thinking";
+import { KIRO_STATIC_SEED } from "../src/provider-models/kiro";
 import { crc32 } from "../src/providers/aws-eventstream";
 import {
 	buildKiroRequest,
@@ -11,6 +12,7 @@ import {
 	streamKiro,
 } from "../src/providers/kiro";
 import { resolveLazyStreamFirstEventFallbackMs } from "../src/providers/register-builtins";
+import { streamSimple } from "../src/stream";
 import type { AssistantMessage, AssistantMessageEvent, Model, ProviderSessionState } from "../src/types";
 import { fetchKiroModels } from "../src/utils/discovery/kiro";
 
@@ -217,6 +219,28 @@ describe("Kiro provider", () => {
 			"AmazonCodeWhispererService.ListAvailableProfiles",
 			"AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 		]);
+	});
+
+	test("rejects an overridden runtime origin before transmitting the bearer", async () => {
+		const secret = "kiro-secret-must-not-leave";
+		const requests: Request[] = [];
+		const result = await streamKiro(
+			{ ...model, baseUrl: "https://attacker.invalid/collect" },
+			{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+			{
+				apiKey: secret,
+				profileArn: BUILDER_ID_PROFILE_ARN,
+				fetch: async (input, init) => {
+					requests.push(input instanceof Request ? new Request(input, init) : new Request(String(input), init));
+					return new Response(null, { status: 200 });
+				},
+			},
+		).result();
+
+		expect(requests).toHaveLength(0);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Kiro credentials may only be sent to https://runtime.us-east-1.kiro.dev");
+		expect(result.errorMessage).not.toContain(secret);
 	});
 
 	test("honors the request retry budget and emits accurate attempt headers", async () => {
@@ -564,6 +588,76 @@ describe("Kiro provider", () => {
 		});
 	});
 
+	test("passes selected thinking effort through the generic streamSimple path", async () => {
+		const payloads: KiroRequest[] = [];
+		const reasoningModel = KIRO_STATIC_SEED.find(entry => entry.id === "claude-opus-5");
+		if (!reasoningModel) throw new Error("Expected Kiro Opus 5 seed");
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(kiroEventFrame("metadataEvent", { stopReason: "END_TURN" }));
+						controller.close();
+					},
+				}),
+				{ status: 200 },
+			)) as unknown as typeof fetch;
+		try {
+			const result = await streamSimple(
+				reasoningModel,
+				{ messages: [{ role: "user", content: "Think", timestamp: 1 }] },
+				{
+					apiKey: JSON.stringify({ token: "test-token", kiroProfileArn: BUILDER_ID_PROFILE_ARN }),
+					reasoning: Effort.XHigh,
+					onPayload: payload => {
+						payloads.push(payload as KiroRequest);
+					},
+				},
+			).result();
+
+			expect(result.stopReason).toBe("stop");
+			expect(payloads[0]?.additionalModelRequestFields).toEqual({
+				thinking: { type: "adaptive", display: "summarized" },
+				reasoning: { effort: "xhigh" },
+			});
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("adds a private non-executable tool only for DeepSeek no-tool requests", () => {
+		const context = { messages: [{ role: "user" as const, content: "Answer", timestamp: 1 }] };
+		const deepSeekRequest = buildKiroRequest(
+			{ ...model, id: "deepseek-3.2", name: "DeepSeek 3.2" },
+			context,
+			BUILDER_ID_PROFILE_ARN,
+		);
+		const regularRequest = buildKiroRequest(model, context, BUILDER_ID_PROFILE_ARN);
+		const fallbackTools =
+			deepSeekRequest.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools;
+
+		expect(fallbackTools).toEqual([
+			{
+				toolSpecification: {
+					name: "dummy",
+					description:
+						"Dummy tool used only to satisfy the DeepSeek tool protocol when no executable tools are available. Do not call it.",
+					inputSchema: {
+						json: {
+							type: "object",
+							properties: {},
+							additionalProperties: false,
+						},
+					},
+				},
+			},
+		]);
+		expect(
+			regularRequest.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools,
+		).toBeUndefined();
+	});
+
 	test("repairs orphan tool calls before Kiro serialization", () => {
 		const orphan: AssistantMessage = {
 			role: "assistant",
@@ -646,7 +740,7 @@ describe("Kiro provider", () => {
 				api: "kiro-streaming",
 				provider: "kiro",
 				contextWindow: 200_000,
-				maxTokens: 64_000,
+				maxTokens: 32_000,
 			}),
 		]);
 		const body = JSON.parse(await requests[1]!.text()) as Record<string, unknown>;

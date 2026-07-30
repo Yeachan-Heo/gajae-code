@@ -824,7 +824,10 @@ function mapOptionsForApi<TApi extends Api>(
 		}
 
 		case "kiro-streaming":
-			return castApi<"kiro-streaming">(base);
+			return castApi<"kiro-streaming">({
+				...base,
+				reasoning: resolveOpenAiReasoningEffort(model, options),
+			});
 		case "openai-completions":
 			return castApi<"openai-completions">({
 				...base,

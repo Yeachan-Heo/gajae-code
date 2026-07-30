@@ -489,7 +489,7 @@ async function loginKiroSocial(method: "google" | "github", options: KiroLoginOp
 			};
 		}
 		if (status === "authorization_pending") continue;
-		throw new Error(`Kiro social login failed: ${status || "unknown status"}`);
+		throw new Error("Kiro social device flow failed");
 	}
 
 	throw new Error("Kiro social device flow timed out");
@@ -509,6 +509,7 @@ interface SocialRefreshResponse {
 export async function refreshKiroSocialToken(
 	credentials: OAuthCredentials,
 	method: KiroLoginMethod,
+	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	if (method !== "google" && method !== "github") {
 		throw new Error(`refreshKiroSocialToken: invalid method ${method}`);
@@ -521,7 +522,7 @@ export async function refreshKiroSocialToken(
 			"accept-encoding": "gzip",
 		},
 		body: JSON.stringify({ refreshToken: credentials.refresh }),
-		signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
+		signal: requestSignal(signal),
 	});
 	if (!response.ok) throw new Error(`Kiro social token refresh failed: ${redactedHttpErrorSummary(response)}`);
 	const payload = (await response.json()) as SocialRefreshResponse;
@@ -550,15 +551,19 @@ export async function refreshKiroSocialToken(
  * registration. Requires that the registered client secret has not expired
  * (~90-day lifetime); otherwise the user must re-run `/login kiro`.
  */
-export async function refreshKiroToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+export async function refreshKiroToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
 	const registration = await readRegistration();
 	if (!isRegistrationValid(registration)) {
 		throw new Error("Kiro client registration is missing or expired — run /login kiro again.");
 	}
-	const token = await postToken(registration, {
-		grantType: REFRESH_TOKEN_GRANT,
-		refreshToken: credentials.refresh,
-	});
+	const token = await postToken(
+		registration,
+		{
+			grantType: REFRESH_TOKEN_GRANT,
+			refreshToken: credentials.refresh,
+		},
+		signal,
+	);
 	if (typeof token.accessToken !== "string") {
 		throw new Error("Kiro token refresh failed");
 	}

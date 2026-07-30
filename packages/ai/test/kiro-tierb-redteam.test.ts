@@ -348,24 +348,43 @@ describe("TB Defect 9 - kiro_kv schema ownership", () => {
 });
 
 describe("TB Defect 11 - seed metadata claims", () => {
-	test("TB-22: seed metadata is complete and matches discovery fallbacks", () => {
-		const fields: Omit<Model<"kiro-streaming">, "id" | "name"> = {
-			api: "kiro-streaming",
-			provider: "kiro",
-			baseUrl: "https://runtime.us-east-1.kiro.dev/",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 200_000,
-			maxTokens: 64_000,
-		};
-		expect(KIRO_STATIC_SEED).toEqual(
-			["claude-opus-5", "claude-sonnet-5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].map(id => ({
-				id,
-				name: id,
-				...fields,
-			})),
-		);
+	test("TB-22: the offline catalog contains the verified 18 models with transport-safe limits", () => {
+		const expectedContextWindows = new Map<string, number>([
+			["auto", 1_000_000],
+			["claude-haiku-4.5", 200_000],
+			["claude-opus-4.5", 200_000],
+			["claude-opus-4.6", 1_000_000],
+			["claude-opus-4.7", 1_000_000],
+			["claude-opus-5", 1_000_000],
+			["claude-sonnet-4", 200_000],
+			["claude-sonnet-4.5", 200_000],
+			["claude-sonnet-4.6", 1_000_000],
+			["claude-sonnet-5", 1_000_000],
+			["deepseek-3.2", 164_000],
+			["glm-5", 200_000],
+			["gpt-5.6-luna", 272_000],
+			["gpt-5.6-sol", 272_000],
+			["gpt-5.6-terra", 272_000],
+			["minimax-m2.1", 196_000],
+			["minimax-m2.5", 196_000],
+			["qwen3-coder-next", 256_000],
+		]);
+
+		expect(KIRO_STATIC_SEED).toHaveLength(18);
+		expect(new Set(KIRO_STATIC_SEED.map(entry => entry.id))).toEqual(new Set(expectedContextWindows.keys()));
+		expect(KIRO_STATIC_SEED.some(entry => entry.id === "claude-opus-4.8")).toBe(false);
+		expect(KIRO_STATIC_SEED.some(entry => entry.id === "glm-5.2" || entry.id === "kimi-k3")).toBe(false);
+		for (const entry of KIRO_STATIC_SEED) {
+			expect(entry).toMatchObject({
+				api: "kiro-streaming",
+				provider: "kiro",
+				baseUrl: "https://runtime.us-east-1.kiro.dev/",
+				reasoning: true,
+				input: ["text"],
+				contextWindow: expectedContextWindows.get(entry.id),
+				maxTokens: 32_000,
+			});
+		}
 	});
 
 	test("TB-23: discovery falls back to the same 200k window when tokenLimits is absent", async () => {
@@ -382,5 +401,27 @@ describe("TB Defect 11 - seed metadata claims", () => {
 		const models = await fetchKiroModels({ accessToken: "token-fallback", fetcher });
 		expect(models?.[0]?.contextWindow).toBe(200_000);
 		expect(models?.[0]?.input).toEqual(["text"]);
+	});
+
+	test("TB-24: discovery excludes Opus 4.8 and caps output at the verified Kiro transport limit", async () => {
+		const fetcher = async (): Promise<Response> =>
+			Response.json({
+				models: [
+					{
+						modelId: "claude-opus-4.8",
+						modelName: "Claude Opus 4.8",
+						tokenLimits: { maxInputTokens: 1_000_000, maxOutputTokens: 64_000 },
+					},
+					{
+						modelId: "claude-opus-5",
+						modelName: "Claude Opus 5",
+						tokenLimits: { maxInputTokens: 1_000_000, maxOutputTokens: 64_000 },
+					},
+				],
+			});
+		const models = await fetchKiroModels({ accessToken: "token", profileArn: PROFILE_ARN, fetcher });
+
+		expect(models?.map(entry => entry.id)).toEqual(["claude-opus-5"]);
+		expect(models?.[0]?.maxTokens).toBe(32_000);
 	});
 });

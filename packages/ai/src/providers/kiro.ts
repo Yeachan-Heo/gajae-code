@@ -35,6 +35,26 @@ export const KIRO_MANAGEMENT_URL = `https://management.${KIRO_REGION}.kiro.dev/`
 // omitting this value therefore makes model discovery and usage fail with HTTP 400.
 export const KIRO_BUILDER_ID_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 export const KIRO_ORIGIN = "KIRO_CLI";
+const KIRO_RUNTIME_ORIGIN = new URL(KIRO_RUNTIME_URL).origin;
+
+export function resolveTrustedKiroRuntimeUrl(baseUrl: string | undefined): string {
+	const candidate = baseUrl || KIRO_RUNTIME_URL;
+	let url: URL;
+	try {
+		url = new URL(candidate);
+	} catch {
+		throw new Error("Kiro runtime endpoint is invalid");
+	}
+	if (
+		url.protocol !== "https:" ||
+		url.origin !== KIRO_RUNTIME_ORIGIN ||
+		url.username.length > 0 ||
+		url.password.length > 0
+	) {
+		throw new Error(`Kiro credentials may only be sent to ${KIRO_RUNTIME_ORIGIN}`);
+	}
+	return url.href;
+}
 
 /**
  * Header Kiro CLI uses to declare the user's upstream data-collection
@@ -334,6 +354,28 @@ function convertTools(tools: Tool[] | undefined): KiroUserInputMessage["userInpu
 		},
 	}));
 }
+
+const DEEPSEEK_FALLBACK_TOOL: NonNullable<KiroUserInputMessage["userInputMessageContext"]["tools"]>[number] = {
+	toolSpecification: {
+		name: "dummy",
+		description:
+			"Dummy tool used only to satisfy the DeepSeek tool protocol when no executable tools are available. Do not call it.",
+		inputSchema: {
+			json: {
+				type: "object",
+				properties: {},
+				additionalProperties: false,
+			},
+		},
+	},
+};
+
+function convertToolsForModel(
+	tools: Tool[] | undefined,
+	modelId: string,
+): KiroUserInputMessage["userInputMessageContext"]["tools"] {
+	return convertTools(tools) ?? (modelId === "deepseek-3.2" ? [DEEPSEEK_FALLBACK_TOOL] : undefined);
+}
 /**
  * Kiro requires tool-use ids to be at most 64 chars of `[A-Za-z0-9_-]`
  * (asserted by the existing wire tests). Ids Kiro itself issued already satisfy
@@ -423,7 +465,7 @@ export function buildKiroRequest(
 	reasoning?: KiroOptions["reasoning"],
 	conversationId: string = crypto.randomUUID(),
 ): KiroRequest {
-	const tools = convertTools(context.tools);
+	const tools = convertToolsForModel(context.tools, model.id);
 	const sourceMessages = [...context.messages];
 	for (const message of sourceMessages) {
 		if (message.role !== "toolResult") continue;
@@ -566,7 +608,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 			const replacementPayload = await options.onPayload?.(request, model);
 			if (replacementPayload !== undefined) request = replacementPayload as KiroRequest;
 			const maxAttempts = resolveRetryBudget(options.requestMaxRetries, 2) + 1;
-			const response = await fetchWithRetry(model.baseUrl || KIRO_RUNTIME_URL, {
+			const response = await fetchWithRetry(resolveTrustedKiroRuntimeUrl(model.baseUrl), {
 				method: "POST",
 				headers: {
 					...options.headers,

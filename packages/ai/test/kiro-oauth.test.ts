@@ -407,6 +407,38 @@ describe("Kiro OAuth error redaction adoption", () => {
 		expect(error instanceof Error ? error.message : String(error)).toBe("Kiro device flow failed");
 	});
 
+	test("redacts an unknown social polling status returned with HTTP 200", async () => {
+		await useTempAgentDir();
+		let call = 0;
+		stubFetch(async () => {
+			call += 1;
+			if (call === 1) {
+				return Response.json({
+					deviceCode: "device-code",
+					userCode: "USER-CODE",
+					verificationUriComplete: "https://example.invalid/verify",
+					intervalInMilliseconds: 1,
+					expiresInMilliseconds: 5000,
+				});
+			}
+			return Response.json({
+				status: "account 123456789012 requestId hostile-secret arn:aws:iam::123456789012:role/Leak",
+			});
+		});
+
+		const error = await loginKiro({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			method: "google",
+		}).catch((cause: unknown) => cause);
+		const message = error instanceof Error ? error.message : String(error);
+
+		expect(message).toBe("Kiro social device flow failed");
+		expect(message).not.toContain("123456789012");
+		expect(message).not.toContain("hostile-secret");
+		expect(message).not.toContain("arn:aws");
+	});
+
 	test("redacts a Builder ID refresh semantic error returned with HTTP 200", async () => {
 		await useTempAgentDir();
 		seedRegistration(validRegistration());
@@ -534,5 +566,123 @@ describe("Kiro social refresh resilience", () => {
 			"github",
 		);
 		expect(refreshed.expires).toBeGreaterThan(before + 7 * 60 * 60 * 1000);
+	});
+	test("aborts the underlying social refresh request when the caller aborts", async () => {
+		const started = Promise.withResolvers<void>();
+		let requestSignal: AbortSignal | undefined;
+		stubFetch(async request => {
+			requestSignal = request.signal;
+			started.resolve();
+			const pending = Promise.withResolvers<Response>();
+			const onAbort = (): void => pending.reject(request.signal.reason);
+			request.signal.addEventListener("abort", onAbort, { once: true });
+			return pending.promise.finally(() => request.signal.removeEventListener("abort", onAbort));
+		});
+		const controller = new AbortController();
+		const refresh = refreshKiroSocialToken(
+			{ access: "old-access", refresh: "rotating-refresh", expires: 1, kiroMethod: "google" },
+			"google",
+			controller.signal,
+		);
+
+		await started.promise;
+		controller.abort(new Error("caller stopped"));
+		await expect(refresh).rejects.toThrow("caller stopped");
+		expect(requestSignal?.aborted).toBe(true);
+	});
+
+	test("aborts the underlying Kiro refresh fetch when the storage refresh deadline expires", async () => {
+		await useTempAgentDir();
+		const storage = await AuthStorage.create(getAgentDbPath(), { oauthRefreshTimeoutMs: 25 });
+		try {
+			await storage.set("kiro", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "deadline-refresh",
+					expires: 1,
+					kiroMethod: "google",
+				},
+			]);
+			const started = Promise.withResolvers<void>();
+			let requestSignal: AbortSignal | undefined;
+			stubFetch(async request => {
+				requestSignal = request.signal;
+				started.resolve();
+				const pending = Promise.withResolvers<Response>();
+				const onAbort = (): void =>
+					pending.resolve(
+						Response.json({
+							accessToken: "late-access",
+							refreshToken: "late-deadline-rotation",
+							expiresIn: 28_800,
+						}),
+					);
+				request.signal.addEventListener("abort", onAbort, { once: true });
+				return pending.promise.finally(() => request.signal.removeEventListener("abort", onAbort));
+			});
+			const resolution = storage.getApiKey("kiro", "deadline-session");
+
+			await started.promise;
+			await expect(resolution).resolves.toBeUndefined();
+			expect(requestSignal?.aborted).toBe(true);
+			await storage.reload();
+			const persisted = storage.get("kiro");
+			expect(persisted?.type).toBe("oauth");
+			if (persisted?.type === "oauth") expect(persisted.refresh).toBe("deadline-refresh");
+		} finally {
+			storage.close();
+		}
+	});
+
+	test("propagates AuthStorage cancellation to the Kiro refresh fetch without losing the stored token", async () => {
+		await useTempAgentDir();
+		const storage = await AuthStorage.create(getAgentDbPath());
+		try {
+			await storage.set("kiro", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "rotating-refresh",
+					expires: 1,
+					kiroMethod: "google",
+				},
+			]);
+			const started = Promise.withResolvers<void>();
+			let requestSignal: AbortSignal | undefined;
+			stubFetch(async request => {
+				requestSignal = request.signal;
+				started.resolve();
+				const pending = Promise.withResolvers<Response>();
+				const onAbort = (): void =>
+					pending.resolve(
+						Response.json({
+							accessToken: "late-access",
+							refreshToken: "late-rotated-refresh",
+							expiresIn: 28_800,
+						}),
+					);
+				request.signal.addEventListener("abort", onAbort, { once: true });
+				return pending.promise.finally(() => request.signal.removeEventListener("abort", onAbort));
+			});
+			const controller = new AbortController();
+			const resolution = storage
+				.getApiKey("kiro", "abort-session", { signal: controller.signal })
+				.catch((error: unknown) => error);
+
+			await started.promise;
+			controller.abort();
+			const outcome = await resolution;
+			expect(outcome).toBeUndefined();
+			expect(requestSignal?.aborted).toBe(true);
+
+			await Bun.sleep(10);
+			await storage.reload();
+			const persisted = storage.get("kiro");
+			expect(persisted?.type).toBe("oauth");
+			if (persisted?.type === "oauth") expect(persisted.refresh).toBe("rotating-refresh");
+		} finally {
+			storage.close();
+		}
 	});
 });

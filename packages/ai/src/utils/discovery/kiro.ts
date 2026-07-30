@@ -10,6 +10,8 @@ import {
 import type { Model } from "../../types";
 
 const LIST_MODELS_TARGET = "AmazonCodeWhispererService.ListAvailableModels";
+const KIRO_EXCLUDED_MODEL_IDS = new Set(["claude-opus-4.8"]);
+const KIRO_MAX_OUTPUT_TOKENS = 32_000;
 
 interface KiroModelPayload {
 	modelId?: unknown;
@@ -61,12 +63,14 @@ export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Mo
 		return payload.models.flatMap(value => {
 			const model = value as KiroModelPayload;
 			if (typeof model.modelId !== "string" || !model.modelId) return [];
-			if (seenModelIds.has(model.modelId)) return [];
+			if (KIRO_EXCLUDED_MODEL_IDS.has(model.modelId) || seenModelIds.has(model.modelId)) return [];
 			seenModelIds.add(model.modelId);
 			const maxInput =
 				typeof model.tokenLimits?.maxInputTokens === "number" ? model.tokenLimits.maxInputTokens : 200_000;
 			const maxOutput =
-				typeof model.tokenLimits?.maxOutputTokens === "number" ? model.tokenLimits.maxOutputTokens : 64_000;
+				typeof model.tokenLimits?.maxOutputTokens === "number"
+					? Math.min(model.tokenLimits.maxOutputTokens, KIRO_MAX_OUTPUT_TOKENS)
+					: KIRO_MAX_OUTPUT_TOKENS;
 			const schema = model.additionalModelRequestFieldsSchema;
 			const properties =
 				typeof schema === "object" &&

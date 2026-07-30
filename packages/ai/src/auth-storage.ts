@@ -453,6 +453,8 @@ export type AuthStorageOptions = {
 	usageFetch?: typeof fetch;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
+	/** Maximum time allowed for an OAuth token refresh before its underlying request is aborted. */
+	oauthRefreshTimeoutMs?: number;
 	/**
 	 * Resolve a config value (API key, header value, etc.) to an actual value.
 	 * - coding-agent injects its resolveConfigValue (supports "!command" syntax via pi-natives)
@@ -842,6 +844,7 @@ export class AuthStorage {
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
 	#usageFetch: typeof fetch;
 	#usageRequestTimeoutMs: number;
+	#oauthRefreshTimeoutMs: number;
 	#credentialRankingMode: CredentialRankingMode = "balanced";
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
@@ -874,6 +877,7 @@ export class AuthStorage {
 		this.#usageCache = new AuthStorageUsageCache(this.#store);
 		this.#usageFetch = options.usageFetch ?? fetch;
 		this.#usageRequestTimeoutMs = options.usageRequestTimeoutMs ?? DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
+		this.#oauthRefreshTimeoutMs = options.oauthRefreshTimeoutMs ?? DEFAULT_OAUTH_REFRESH_TIMEOUT_MS;
 		this.#credentialRankingMode = options.credentialRankingMode ?? "balanced";
 		this.#refreshOAuthCredentialOverride = options.refreshOAuthCredential;
 		this.#fetchUsageReportsOverride = options.fetchUsageReports;
@@ -3202,11 +3206,11 @@ export class AuthStorage {
 		if (credentialId === undefined) {
 			return this.#refreshOAuthCredentialUnshared(provider, credential, undefined, signal);
 		}
-		const promise = this.#refreshOAuthCredentialUnshared(provider, credential, credentialId).finally(() => {
+		const promise = this.#refreshOAuthCredentialUnshared(provider, credential, credentialId, signal).finally(() => {
 			this.#oauthCredentialRefreshInFlight.delete(credentialId);
 		});
 		this.#oauthCredentialRefreshInFlight.set(credentialId, promise);
-		return raceCredentialRefreshWithSignal(promise, signal);
+		return promise;
 	}
 
 	async #refreshOAuthCredentialUnshared(
@@ -3215,50 +3219,56 @@ export class AuthStorage {
 		credentialId: number | undefined,
 		signal?: AbortSignal,
 	): Promise<OAuthCredentials> {
-		let refreshPromise: Promise<OAuthCredentials>;
-		// Caller override > store-level hook > local per-provider refresh.
-		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
-		// routes refresh through the broker without explicit wiring.
-		const storeRefresh = this.#store.refreshOAuthCredential?.bind(this.#store);
-		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
-		if (overrideRefresh && credentialId !== undefined) {
-			refreshPromise = overrideRefresh(provider, credentialId, credential, signal);
-		} else if (credential.mcpBinding) {
-			refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, signal);
-		} else {
-			const customProvider = getOAuthProvider(provider);
-			if (customProvider) {
-				if (!customProvider.refreshToken) {
-					throw new Error(`OAuth provider "${provider}" does not support token refresh`);
-				}
-				refreshPromise = customProvider.refreshToken(credential);
-			} else {
-				refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
+		const refreshController = new AbortController();
+		const abortFromCaller = (): void => {
+			if (!refreshController.signal.aborted) {
+				refreshController.abort(signal?.reason ?? new Error("OAuth token refresh aborted by caller"));
 			}
-		}
-		// Bound the refresh so a slow/hanging token endpoint cannot stall credential selection.
-		// Caller-driven abort jumps the gun on the timeout — the agent's ESC must
-		// take priority over the floor timeout.
-		let timeout: NodeJS.Timeout | undefined;
-		let onAbort: (() => void) | undefined;
-		const cancellation = Promise.withResolvers<never>();
-		timeout = setTimeout(
-			() => cancellation.reject(new Error(`OAuth token refresh timed out for provider: ${provider}`)),
-			DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
-		);
-		if (signal) {
-			if (signal.aborted) {
-				cancellation.reject(new Error("OAuth token refresh aborted by caller"));
-			} else {
-				onAbort = () => cancellation.reject(new Error("OAuth token refresh aborted by caller"));
-				signal.addEventListener("abort", onAbort, { once: true });
+		};
+		if (signal?.aborted) abortFromCaller();
+		else signal?.addEventListener("abort", abortFromCaller, { once: true });
+		const timeout = setTimeout(() => {
+			if (!refreshController.signal.aborted) {
+				refreshController.abort(new Error(`OAuth token refresh timed out for provider: ${provider}`));
 			}
-		}
+		}, this.#oauthRefreshTimeoutMs);
+		const aborted = Promise.withResolvers<never>();
+		const rejectOnAbort = (): void => {
+			aborted.reject(
+				refreshController.signal.reason instanceof Error
+					? refreshController.signal.reason
+					: new Error("OAuth token refresh aborted"),
+			);
+		};
+		if (refreshController.signal.aborted) rejectOnAbort();
+		else refreshController.signal.addEventListener("abort", rejectOnAbort, { once: true });
 		try {
-			return await Promise.race([refreshPromise, cancellation.promise]);
+			let refreshPromise: Promise<OAuthCredentials>;
+			// Caller override > store-level hook > local per-provider refresh.
+			// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
+			// routes refresh through the broker without explicit wiring.
+			const storeRefresh = this.#store.refreshOAuthCredential?.bind(this.#store);
+			const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
+			if (overrideRefresh && credentialId !== undefined) {
+				refreshPromise = overrideRefresh(provider, credentialId, credential, refreshController.signal);
+			} else if (credential.mcpBinding) {
+				refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, refreshController.signal);
+			} else {
+				const customProvider = getOAuthProvider(provider);
+				if (customProvider) {
+					if (!customProvider.refreshToken) {
+						throw new Error(`OAuth provider "${provider}" does not support token refresh`);
+					}
+					refreshPromise = customProvider.refreshToken(credential, refreshController.signal);
+				} else {
+					refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential, refreshController.signal);
+				}
+			}
+			return await Promise.race([refreshPromise, aborted.promise]);
 		} finally {
-			if (timeout) clearTimeout(timeout);
-			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+			clearTimeout(timeout);
+			signal?.removeEventListener("abort", abortFromCaller);
+			refreshController.signal.removeEventListener("abort", rejectOnAbort);
 		}
 	}
 
