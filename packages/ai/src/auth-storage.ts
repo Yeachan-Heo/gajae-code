@@ -1688,6 +1688,8 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		try {
 			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider);
+			if (this.hasRuntimeApiKey(storageProvider)) return true;
+			if (this.#configOverrides.has(storageProvider)) return true;
 			if (selectedCredential?.credential.type === "api_key") {
 				if (!this.#hasUsableResolvedStoredApiKey(storageProvider, selectedCredential.credential.key)) return false;
 			}
@@ -1695,7 +1697,10 @@ export class AuthStorage {
 				const apiKeys = this.#getCredentialsForProvider(storageProvider).filter(
 					credential => credential.type === "api_key",
 				);
-				if (apiKeys.length === 1 && !this.#hasUsableResolvedStoredApiKey(storageProvider, apiKeys[0].key)) {
+				if (
+					apiKeys.length > 0 &&
+					apiKeys.every(credential => !this.#hasUsableResolvedStoredApiKey(storageProvider, credential.key))
+				) {
 					return false;
 				}
 			}
@@ -3575,9 +3580,14 @@ export class AuthStorage {
 		const value = await this.#configValueResolver(key);
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const values = this.#resolvedStoredApiKeyValues.get(storageProvider) ?? new Map<string, string>();
+		const wasUsable = !values.has(key) || (values.get(key)?.length ?? 0) > 0;
 		values.set(key, value ?? "");
 		this.#resolvedStoredApiKeyValues.set(storageProvider, values);
 		this.#lastResolvedStoredApiKey.set(storageProvider, key);
+		const isUsable = (value?.length ?? 0) > 0;
+		if (key.startsWith("!") && wasUsable !== isUsable) {
+			this.#bumpGeneration("stored-api-key-usability", storageProvider);
+		}
 		return value;
 	}
 	#hasUsableResolvedStoredApiKey(provider: string, key: string): boolean {

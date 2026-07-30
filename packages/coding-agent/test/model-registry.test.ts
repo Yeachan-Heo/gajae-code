@@ -855,6 +855,92 @@ describe("ModelRegistry", () => {
 				else process.env.XAI_API_KEY = previous;
 			}
 		});
+		test("invalidates available models when a stored command key resolves undefined", async () => {
+			const restoreXaiKey = unsetEnvForTest("XAI_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				await authStorage.set("xai", [{ type: "api_key", key: "!missing-xai-key" }]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(true);
+
+				await expect(registry.peekApiKeyForProvider("xai")).resolves.toBeUndefined();
+
+				const available = registry.getAvailable();
+				expect(available).not.toBe(initial);
+				expect(available.some(model => model.provider === "xai")).toBe(false);
+			} finally {
+				restoreXaiKey();
+			}
+		});
+		test("keeps cached availability until every stored command key resolves undefined", async () => {
+			const restoreXaiKey = unsetEnvForTest("XAI_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				await authStorage.set("xai", [
+					{ type: "api_key", key: "!missing-xai-key-a" },
+					{ type: "api_key", key: "!missing-xai-key-b" },
+				]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(true);
+
+				await expect(registry.peekApiKeyForProvider("xai")).resolves.toBeUndefined();
+				const afterFirst = registry.getAvailable();
+				expect(afterFirst.some(model => model.provider === "xai")).toBe(true);
+
+				await expect(registry.peekApiKeyForProvider("xai")).resolves.toBeUndefined();
+				const available = registry.getAvailable();
+				expect(available).not.toBe(afterFirst);
+				expect(available.some(model => model.provider === "xai")).toBe(false);
+			} finally {
+				restoreXaiKey();
+			}
+		});
+		test("preserves mixed-credential and selector auth precedence after stored API-key resolution", async () => {
+			const restoreXaiKey = unsetEnvForTest("XAI_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				await authStorage.set("xai", [
+					{ type: "api_key", key: "!missing-xai-key" },
+					{
+						type: "oauth",
+						access: "selected-access",
+						refresh: "selected-refresh",
+						expires: Date.now() + 60_000,
+						email: "selected@example.com",
+					},
+				]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+				await expect(registry.peekApiKeyForProvider("xai")).resolves.toBeUndefined();
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(false);
+
+				authStorage.setRuntimeCredentialSelector("xai", {
+					kind: "email",
+					value: "selected@example.com",
+				});
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+
+				authStorage.removeRuntimeCredentialSelector("xai");
+				authStorage.setRuntimeApiKey("xai", "runtime-test-key");
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+			} finally {
+				restoreXaiKey();
+			}
+		});
 		test("rejects a dangling credential selector even when a runtime API-key override exists", async () => {
 			const previous = process.env.XAI_API_KEY;
 			delete process.env.XAI_API_KEY;
