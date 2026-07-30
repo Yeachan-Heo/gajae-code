@@ -1412,6 +1412,50 @@ describe("native GJC ultragoal runtime", () => {
 		expect(batch.changeSetHash).toMatch(/^[0-9a-f]{64}$/);
 	});
 
+	it("validation batch close: a minimal close gate is auto-hydrated from durable receipts", async () => {
+		const root = await batchTempDir();
+		await writeStructuralArtifacts(root);
+		let plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+			validationBatches: [
+				{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+			],
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "g001 deferred",
+			qualityGateJson: deferredBatchGate("G001", plan.goals[0]!.validationBatch!),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "g002 deferred",
+			qualityGateJson: deferredBatchGate("G002", plan.goals[1]!.validationBatch!),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const closed = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G003",
+			status: "complete",
+			evidence: "minimal close hydrated by the runtime",
+			qualityGateJson: JSON.stringify({
+				...JSON.parse(passingQualityGate()),
+				validationBatchClose: { coverageEvidence: "Union validation covered the validation batch." },
+			}),
+		});
+		const batch = closed.goals[2]!.completionVerification?.validationBatch;
+		if (batch?.role !== "batch-close") throw new Error("expected a batch-close receipt");
+		// unionHash and member hashes were derived by the runtime, not hand-computed.
+		expect(batch.unionHash).toMatch(/^[0-9a-f]{64}$/);
+		expect(Object.keys(batch.memberChangeSetHashes).sort()).toEqual(["G001", "G002", "G003"]);
+	});
+
 	it("boundary default: declaration and evidence must agree in both directions", async () => {
 		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);

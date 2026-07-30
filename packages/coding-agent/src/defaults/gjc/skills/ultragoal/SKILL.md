@@ -260,7 +260,7 @@ gjc ultragoal create-goals --brief-file <path> --validation-batch-json '[{"schem
 Checkpoint contract summary — the full contract lives in the `validation-batch-contracts` fragment (`skill-fragments/ultragoal/validation-batch-contracts.md`); load it before checkpointing any batch member:
 
 - **Non-final members** checkpoint `complete` with a single top-level `deferredToBatch` quality gate (kind `validation-batch-deferred`) proving targeted verification, a declaration-matched lane set, and a cumulative-since-base change set — never `architectReview`, `executorQa`, or `validationBatchClose`; deferring never manufactures fake review approvals.
-- **The final member** (`finalGoalId`) checkpoints `complete` with the normal full strict gate PLUS a top-level `validationBatchClose` proof covering all members; out-of-order close is rejected, close state is append-only proof on the final member only, and batch invalidation is fail-closed.
+- **The final member** (`finalGoalId`) checkpoints `complete` with the normal full strict gate PLUS a top-level `validationBatchClose` proof covering all members; out-of-order close is rejected, close state is append-only proof on the final member only, and batch invalidation is fail-closed. Like the deferred gate, every close field except `coverageEvidence` is auto-filled from durable receipts and the computed diff — the minimal close is `{"validationBatchClose":{"coverageEvidence":"..."}}` alongside the strict gate.
 
 ### Intra-goal validation-lane parallelism
 
