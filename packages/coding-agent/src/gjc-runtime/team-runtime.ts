@@ -4522,12 +4522,12 @@ async function continueStalledGjcTeamWorkers(
 					"send-keys",
 					"-l",
 					"-t",
-					worker.pane_id,
+					worker.pane_id!,
 					continuationPrompt,
 					";",
 					"send-keys",
 					"-t",
-					worker.pane_id,
+					worker.pane_id!,
 					"Enter",
 				]);
 				const dispatch = await (gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
