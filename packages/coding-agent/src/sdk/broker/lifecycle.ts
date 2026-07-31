@@ -1,4 +1,5 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { spawnDetachedChild } from "../../utils/detached-spawn";
 import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -3134,10 +3135,15 @@ async function executeLifecycleResponse(
 		let spawnedAuthority: EffectMarker | undefined;
 		try {
 			const cmd = command(broker);
-			const spawned = spawn(cmd.file, cmd.args, {
+			// hiddenConsole (not detached) is what actually suppresses the console
+			// windows: the session host runs shell tool calls in-process through the
+			// compiled @gajae-code/natives executor, and those children inherit the
+			// host's console. A detached host has none, so each one allocates a fresh
+			// visible console. The host's parent is this long-lived broker, so
+			// dropping detached does not shorten its life across a client quit.
+			const spawned = spawnDetachedChild(cmd.file, cmd.args, {
 				cwd: launch.cwd,
-				detached: true,
-				stdio: "ignore",
+				hiddenConsole: true,
 				env: {
 					...("kind" in cmd ? cmd.env : process.env),
 					GJC_AGENT_DIR: broker.settings.agentDir,

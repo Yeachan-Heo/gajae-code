@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { spawnDetachedChild } from "../../utils/detached-spawn";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 export interface EnsureBrokerSettings {
@@ -245,9 +246,10 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
-	const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
-		detached: true,
-		stdio: "ignore",
+	// spawnDetachedChild keeps the detached broker console-less on Windows; Bun's
+	// node:child_process ignores windowsHide for detached children and would
+	// otherwise flash a new console window on every broker spawn.
+	const child = spawnDetachedChild(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 		env: brokerSpawnEnvironment(command, settings.env),
 		...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 	});
