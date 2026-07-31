@@ -97,8 +97,9 @@ This keeps key parsing/editor mechanics in `packages/tui` and mode semantics in 
 3. Extract and strip `CURSOR_MARKER` from visible viewport lines.
 4. Append segment reset suffixes for non-image lines.
 5. Choose a viewport repaint, full repaint, or differential patch:
-   - real process terminals repaint the visible viewport for width/height changes, forced renders, and edits above the live viewport so native scrollback is not cleared/replayed; host markers refine policy only after this process-terminal capability is established;
-   - virtual/headless terminals retain full clear/replay regardless of inherited terminal-host environment markers, keeping historical buffer repair deterministic;
+   - real process terminals repaint the visible viewport for width/height changes, forced renders, and edits above the live viewport so native scrollback is not cleared/replayed;
+   - terminal multiplexer markers (`TMUX`/`STY`) also select viewport-only repaint, including for virtual terminals that inherit those markers; set `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER` to opt into the legacy clear/replay behavior;
+   - markerless virtual/headless terminals retain full clear/replay for ordinary redraws; forced renders deliberately use a viewport repaint because they synthesize a width change to invalidate layout state.
    - steady-state visible changes use differential patches, including viewport repaint when a contraction exposes earlier transcript rows.
 6. For differential updates, patch only changed line ranges and clear stale trailing lines when needed.
 7. Reposition hardware cursor for IME support.
@@ -148,8 +149,9 @@ Resize events are event-driven from `ProcessTerminal` to `TUI.requestResizeRende
 
 Effects:
 
-- Real process terminals repaint only the visible viewport on width/height changes, avoiding scrollback-hostile clear/replay cycles; known host markers and the legacy multiplexer override refine this process-terminal policy.
-- Virtual/headless terminals retain full redraw regardless of inherited host markers for deterministic buffer repair.
+- Real process terminals repaint only the visible viewport on width/height changes, avoiding scrollback-hostile clear/replay cycles.
+- Terminal multiplexer markers (`TMUX`/`STY`) also select viewport repaint for virtual terminals that inherit them; `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER` explicitly restores legacy clear/replay.
+- Virtual/headless terminals without a multiplexer marker retain full redraw for ordinary changes; forced renders use a viewport repaint because they invalidate the prior width.
 - Viewport/top tracking avoids invalid relative cursor math when content or terminal size changes.
 - Overlay visibility can depend on terminal dimensions (`OverlayOptions.visible`); focus is corrected when overlays become non-visible after resize.
 

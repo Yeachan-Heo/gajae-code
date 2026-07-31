@@ -1,3 +1,9 @@
+ Golden rich text                                                           
+                                                                            
+ │ Deterministic quote with link (https://example.test/golden).             
+                                                                            
+ - list alpha                                                               
+ - list beta with CJK 表示 and 한글 jamo 한                                 
  Golden rich text                                                                   
                                                                                     
  │ Deterministic quote with link (https://example.test/golden).                     
@@ -9,7 +15,7 @@
  | Glyph  | Value      |                                                            
  +--------+------------+                                                            
  | family | 👨‍👩‍👧‍👦         |                                                          
-  
+                                  ``ts                                              
  +--------+------------+                                                            
  | wide   | コンニチハ |                                                            
  +--------+------------+                                                            
@@ -17,5 +23,4 @@
  ```ts                                                                              
    const width = 'stable';                                                          
    console.log(width);                                                              
- ```                                                                                
  OSC8 link end                                                                      

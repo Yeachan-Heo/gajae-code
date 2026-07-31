@@ -7,6 +7,7 @@
 
 - Truncated text now shrinks horizontal padding when the viewport is narrower than the requested inset, keeping every rendered line within its width contract.
 - Select-list no-match rows now stay within the requested render width instead of wrapping into extra terminal lines after narrow resizes (#3600).
+- Preserve transcript rows when a resize/reflow is coalesced with appended output.
 
 ## [0.12.5] - 2026-07-30
 

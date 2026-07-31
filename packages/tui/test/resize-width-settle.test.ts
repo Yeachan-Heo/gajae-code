@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { Text } from "../src/components/text";
 import { TUI } from "../src/tui";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -216,5 +217,60 @@ describe("debounced full redraw on terminal width change", () => {
 		expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
 
 		tui.stop();
+	});
+	it("defers tab-width scrollback repair until manual history returns live", async () => {
+		const originalTabWidth = getDefaultTabWidth();
+		const term = new VirtualTerminal(COLS, 30);
+		const tui = new TUI(term);
+
+		try {
+			tui.start();
+			await term.waitForRender();
+			await buildTranscript(tui, term, 60);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.waitForRender();
+
+			const beforeTabWidthChange = tui.fullRedraws;
+			term.clearWriteLog();
+			setDefaultTabWidth(originalTabWidth === 8 ? 4 : 8);
+			await term.waitForRender();
+			expect(tui.fullRedraws).toBe(beforeTabWidthChange);
+
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.waitForRender();
+			const output = term.getWriteLog().join("");
+			expect(tui.fullRedraws).toBe(beforeTabWidthChange + 1);
+			expect(output).toContain("\x1b[2J\x1b[H\x1b[3J");
+		} finally {
+			tui.stop();
+			setDefaultTabWidth(originalTabWidth);
+		}
+	});
+	it("keeps a deferred tab-width repair across a temporary manual-history restart", async () => {
+		const originalTabWidth = getDefaultTabWidth();
+		const term = new VirtualTerminal(COLS, 30);
+		const tui = new TUI(term);
+
+		try {
+			tui.start();
+			await term.waitForRender();
+			await buildTranscript(tui, term, 60);
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.waitForRender();
+
+			setDefaultTabWidth(originalTabWidth === 8 ? 4 : 8);
+			await term.waitForRender();
+			tui.stop();
+			tui.start();
+			await term.waitForRender();
+
+			term.clearWriteLog();
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.waitForRender();
+			expect(term.getWriteLog().join("")).toContain("\x1b[2J\x1b[H\x1b[3J");
+		} finally {
+			tui.stop();
+			setDefaultTabWidth(originalTabWidth);
+		}
 	});
 });

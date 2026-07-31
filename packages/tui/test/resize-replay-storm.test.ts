@@ -6,9 +6,9 @@ import { VirtualTerminal } from "./virtual-terminal";
 // Regression test for the multiplexer scrollback replay storm.
 //
 // Symptom: in a terminal multiplexer (tmux/screen/zellij), resizing the
-// terminal — or any forced render — replayed the whole transcript from the
-// top of the screen down to the prompt at high speed. Invisible outside
-// multiplexers because the same path clears scrollback there.
+// terminal — or any forced render — must not replay the whole transcript from
+// the top of the screen down to the prompt at high speed. Native scrollback
+// remains durable while only the live viewport is repainted.
 //
 // Root cause (now fixed at the source): requestRender(true) resets
 // #previousWidth/#previousHeight to -1, so #doRender always sees widthChanged
@@ -30,6 +30,9 @@ import { VirtualTerminal } from "./virtual-terminal";
 // performs ONE full clear+replay ~1000ms after the last width change — that
 // single settled replay is the sanctioned exception to the per-event guard
 // pinned here, made safe by running once per settled sequence.
+// The renderer keeps the latest logical frame as transient state. Dimension
+// changes and historical mutations repaint the viewport rather than clearing or
+// replaying the transcript.
 
 const COLS = 100;
 
@@ -46,6 +49,17 @@ function distinctReplayedLineMarkers(out: string): number {
 }
 
 describe("multiplexer resize replay storm regression", () => {
+	let originalLegacyMultiplexerFullRender: string | undefined;
+
+	beforeEach(() => {
+		originalLegacyMultiplexerFullRender = process.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		delete process.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+	});
+
+	afterEach(() => {
+		if (originalLegacyMultiplexerFullRender === undefined) delete process.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		else process.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = originalLegacyMultiplexerFullRender;
+	});
 	describe("viewport-sensitive host detection", () => {
 		it("uses viewport repaint for native Windows even when WT_SESSION is missing", () => {
 			expect(shouldUseViewportRepaintForHost({ TERM: "xterm-256color" }, "win32")).toBe(true);
@@ -59,20 +73,21 @@ describe("multiplexer resize replay storm regression", () => {
 				}),
 			).toBe(true);
 		});
-
-		it("keeps the legacy full-render opt-in scoped to multiplexers", () => {
+		it("restores legacy full replay when explicitly enabled under a multiplexer", () => {
 			expect(
 				shouldUseViewportRepaintForHost(
-					{ TERM: "tmux-256color", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "1" },
-					"linux",
+					{ TMUX: "/tmp/fake-tmux,4242,0", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "1" },
+					"darwin",
+					{ includeProcessTerminal: true },
 				),
 			).toBe(false);
 			expect(
 				shouldUseViewportRepaintForHost(
-					{ WT_SESSION: "windows-terminal", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "1" },
-					"linux",
+					{ TERM: "screen-256color", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "yes" },
+					"darwin",
+					{ includeProcessTerminal: true },
 				),
-			).toBe(true);
+			).toBe(false);
 		});
 	});
 	describe("in a multiplexer (TMUX set)", () => {
@@ -129,7 +144,7 @@ describe("multiplexer resize replay storm regression", () => {
 			// now routes to viewport repaint: at most `rows` distinct lines, never the
 			// full 60-line transcript.
 			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
-			expect(out).toContain("\x1b[29A\r");
+			expect(out).not.toContain("\x1b[29A\r");
 
 			tui.stop();
 		});
@@ -155,7 +170,7 @@ describe("multiplexer resize replay storm regression", () => {
 
 			tui.stop();
 		});
-		it("keeps inherited multiplexer markers from changing headless forced renders", async () => {
+		it("uses a bounded viewport repaint for headless forced renders and resize", async () => {
 			const term = new VirtualTerminal(COLS, 30);
 			const tui = new TUI(term);
 			tui.start();
@@ -168,16 +183,16 @@ describe("multiplexer resize replay storm regression", () => {
 				await term.waitForRender();
 
 				const out = term.getWriteLog().join("");
-				expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
-				expect(out).toContain("\x1b[3J");
+				expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+				expect(out).not.toContain("\x1b[3J");
 			}
 
 			term.clearWriteLog();
 			term.resize(COLS, 20);
 			await term.waitForRender();
 			const resizeOut = term.getWriteLog().join("");
-			expect(distinctReplayedLineMarkers(resizeOut)).toBeGreaterThanOrEqual(55);
-			expect(resizeOut).toContain("\x1b[3J");
+			expect(distinctReplayedLineMarkers(resizeOut)).toBeLessThanOrEqual(term.rows + 2);
+			expect(resizeOut).not.toContain("\x1b[3J");
 
 			tui.stop();
 		});
@@ -245,7 +260,7 @@ describe("multiplexer resize replay storm regression", () => {
 
 			tui.stop();
 		});
-		it("keeps inherited Windows Terminal markers from changing headless forced renders", async () => {
+		it("uses a bounded viewport repaint for headless forced renders", async () => {
 			const term = new VirtualTerminal(COLS, 30);
 			const tui = new TUI(term);
 			tui.start();
@@ -257,8 +272,8 @@ describe("multiplexer resize replay storm regression", () => {
 			await term.waitForRender();
 
 			const out = term.getWriteLog().join("");
-			expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
-			expect(out).toContain("\x1b[3J");
+			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+			expect(out).not.toContain("\x1b[3J");
 
 			tui.stop();
 		});
@@ -358,7 +373,7 @@ describe("multiplexer resize replay storm regression", () => {
 
 			tui.stop();
 		});
-		it("keeps inherited Termux markers from changing headless height resizes", async () => {
+		it("uses a bounded viewport repaint for headless height resizes", async () => {
 			const term = new VirtualTerminal(COLS, 30);
 			const tui = new TUI(term);
 			tui.start();
@@ -370,8 +385,8 @@ describe("multiplexer resize replay storm regression", () => {
 			await term.waitForRender();
 
 			const out = term.getWriteLog().join("");
-			expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
-			expect(out).toContain("\x1b[3J");
+			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+			expect(out).not.toContain("\x1b[3J");
 
 			tui.stop();
 		});
@@ -437,19 +452,9 @@ describe("multiplexer resize replay storm regression", () => {
 			await term.waitForRender();
 
 			const out = term.getWriteLog().join("");
-			const shouldViewportRepaint = shouldUseViewportRepaintForHost({ TERM: "xterm-256color" }, process.platform, {
-				includeNativeWindows: false,
-			});
-			if (shouldViewportRepaint) {
-				expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
-				expect(out).not.toContain("\x1b[3J");
-			} else {
-				// Outside viewport-sensitive hosts, fullRender replays every line and
-				// 3J clears scrollback cleanly. This pins that non-Windows plain terminals
-				// keep the historical clear/replay path.
-				expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
-				expect(out).toContain("\x1b[3J");
-			}
+			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+			expect(out).not.toContain("\x1b[3J");
+			expect(out).not.toContain("\x1b[2J");
 
 			tui.stop();
 		});
