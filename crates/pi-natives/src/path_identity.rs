@@ -3365,10 +3365,25 @@ pub(crate) mod platform {
 						.into_owned(),
 				)
 			},
-			_ => NativeExactUnlinkResult::detached_failure_with_durable_payload(
-				"cleanup_pending",
-				detached_path,
-			),
+			ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
+				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+					"cleanup_pending",
+					detached_path,
+					path
+						.parent()
+						.unwrap_or_else(|| Path::new("."))
+						.join(retained_name.to_string_lossy().as_ref())
+						.to_string_lossy()
+						.into_owned(),
+				)
+			},
+			ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+					"cleanup_pending",
+					detached_path,
+					path.to_string_lossy().into_owned(),
+				)
+			},
 		};
 
 		// SAFETY: this branch owns the live descriptor and closes it exactly once.
