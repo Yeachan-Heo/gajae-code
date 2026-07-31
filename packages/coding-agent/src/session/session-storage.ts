@@ -434,14 +434,26 @@ function isVerifiedEmptyPlaceholder(
 	try {
 		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
 		const stat = fs.lstatSync(pathname, { bigint: true });
-		return (
-			!stat.isSymbolicLink() &&
-			stat.isFile() &&
-			stat.nlink === 1n &&
-			stat.size === 0n &&
-			parent.dev === parentIdentity.dev &&
-			parent.ino === parentIdentity.ino
+		if (
+			stat.isSymbolicLink() ||
+			!stat.isFile() ||
+			stat.nlink !== 1n ||
+			stat.size !== 0n ||
+			parent.dev !== parentIdentity.dev ||
+			parent.ino !== parentIdentity.ino
+		)
+			return false;
+		fs.unlinkSync(pathname);
+		const descriptor = fs.openSync(
+			path.dirname(pathname),
+			fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
 		);
+		try {
+			fs.fsyncSync(descriptor);
+		} finally {
+			fs.closeSync(descriptor);
+		}
+		return true;
 	} catch {
 		return false;
 	}
