@@ -284,6 +284,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.authCredentialType,
 				options?.requestMaxRetries,
 				options?.maxRetryDelayMs,
+				options?.attemptScope,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);

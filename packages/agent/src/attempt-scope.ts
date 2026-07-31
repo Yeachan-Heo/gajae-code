@@ -151,16 +151,18 @@ export function createAttemptScopeAuthority(): AttemptScopeAuthority {
 			evictRetiredIfNeeded();
 			return () => {
 				if (sideAuths.get(lineage) === auth) {
+					// Mark as retired but keep in maps until eviction.
+					// isCurrent returns false for retired lineages because
+					// the auth is still present but the scope is superseded
+					// by disposal (generation stays at its last value).
 					retiredSet.add(lineage);
-					sideAuths.delete(lineage);
-					const idx = sideOrder.indexOf(lineage);
-					if (idx >= 0) sideOrder.splice(idx, 1);
 					evictRetiredIfNeeded();
 				}
 			};
 		},
 		isCurrent(scope: AttemptScope): boolean {
 			if (scope.lineage === "main") return mainAuth.isCurrent(scope);
+			if (retiredSet.has(scope.lineage)) return false;
 			const auth = sideAuths.get(scope.lineage);
 			return auth ? auth.isCurrent(scope) : false;
 		},

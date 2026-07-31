@@ -93,8 +93,14 @@ export class AttemptRecordStore {
 			const oldest = this.#records.keys().next().value as string | undefined;
 			if (oldest === undefined) return;
 			const record = this.#records.get(oldest);
+			if (!record) {
+				this.#records.delete(oldest);
+				continue;
+			}
+			// Never evict a record whose scope is still current (live attempt).
+			if (this.#authority.isCurrent(record.scope)) break;
 			this.#records.delete(oldest);
-			if (record && record.scope.lineage !== "main") this.#authority.unregisterSide?.(record.scope.lineage);
+			if (record.scope.lineage !== "main") this.#authority.unregisterSide?.(record.scope.lineage);
 		}
 	}
 }

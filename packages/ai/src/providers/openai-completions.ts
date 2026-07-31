@@ -482,6 +482,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.requestMaxRetries,
 				options?.sessionId,
 				options?.maxRetryDelayMs,
+				options?.attemptScope,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			getCapturedErrorResponse = captureErrorResponse;

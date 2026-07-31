@@ -1687,9 +1687,9 @@ export async function instrumentedCompleteSimple<TApi extends Api>(
 	// for the cost / gateway hooks without stealing them from the caller.
 	let capturedHeaders: Readonly<Record<string, string>> | undefined;
 	const userOnResponse = options.onResponse;
-	const captureOnResponse: NonNullable<SimpleStreamOptions["onResponse"]> = (response, modelInfo) => {
+	const captureOnResponse: NonNullable<SimpleStreamOptions["onResponse"]> = (response, modelInfo, scope) => {
 		capturedHeaders = response.headers;
-		return userOnResponse?.(response, modelInfo);
+		return userOnResponse?.(response, modelInfo, scope);
 	};
 
 	try {
