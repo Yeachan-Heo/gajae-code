@@ -140,6 +140,46 @@ describe("OpenAI Codex responses tool choice capability", () => {
 		expectSingleCleanFallbackEvents(events);
 	});
 
+	it("retries once when a Codex SSE error rejects a named tool choice", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const testModel = model({ id: "runtime-codex-sse" });
+		const todoContext = {
+			...testContext,
+			tools: [{ ...testContext.tools![0]!, name: "todo_write" }],
+		};
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+				return bodies.length === 1
+					? createSseResponse([
+							{
+								type: "error",
+								code: "invalid_request_error",
+								message: "Tool choice 'todo_write' not found in 'tools' parameter.",
+							},
+						])
+					: okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		const stream = streamOpenAICodexResponses(testModel, todoContext, {
+			apiKey: codexToken,
+			preferWebsockets: false,
+			toolChoice: { type: "function", function: { name: "todo_write" } },
+			sessionId: "session-sse",
+		});
+		const events = await collectEvents(stream);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(2);
+		expect(bodies[0]?.tool_choice).toEqual({ type: "function", name: "todo_write" });
+		expect(bodies[1]?.tool_choice).toBeUndefined();
+		expect(bodies[1]?.prompt_cache_key).toBe(bodies[0]?.prompt_cache_key);
+		expect(getToolChoiceCapabilityOverride(testModel)).toBe("auto");
+		expectSingleCleanFallbackEvents(events);
+	});
+
 	it("does not retry forced tool choice in managed mode", async () => {
 		let calls = 0;
 		const testModel = model({ id: "managed-runtime-codex" });

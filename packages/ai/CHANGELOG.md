@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex named-tool rejections delivered as HTTP 200 SSE `invalid_request_error` events now trigger the same clean one-shot fallback as HTTP 400 responses, retrying without the forced `tool_choice` before any output is emitted (#3669).
+
 ## [0.12.6] - 2026-07-31
 
 ## [0.12.5] - 2026-07-30

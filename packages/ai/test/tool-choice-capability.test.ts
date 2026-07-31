@@ -178,6 +178,22 @@ describe("isForcedToolChoiceUnsupportedError", () => {
 		).toBe(true);
 	});
 
+	it("matches statusless semantic invalid-request errors without accepting other codes or statuses", () => {
+		const message = "Tool choice 'todo_write' not found in 'tools' parameter.";
+		expect(
+			isForcedToolChoiceUnsupportedError(Object.assign(new Error(message), { code: "invalid_request_error" }), true),
+		).toBe(true);
+		expect(
+			isForcedToolChoiceUnsupportedError(Object.assign(new Error(message), { code: "server_error" }), true),
+		).toBe(false);
+		expect(
+			isForcedToolChoiceUnsupportedError(
+				Object.assign(new Error(message), { code: "invalid_request_error", status: 500 }),
+				true,
+			),
+		).toBe(false);
+	});
+
 	it("rejects non-400 errors", () => {
 		expect(
 			isForcedToolChoiceUnsupportedError(

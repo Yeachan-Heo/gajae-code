@@ -165,7 +165,13 @@ export function resolveToolChoice(
 
 /** Detects provider errors indicating forced tool_choice is unsupported. */
 export function isForcedToolChoiceUnsupportedError(error: unknown, sentForcedToolChoice: boolean): boolean {
-	if (!sentForcedToolChoice || extractHttpStatusFromError(error) !== 400) return false;
+	const status = extractHttpStatusFromError(error);
+	if (
+		!sentForcedToolChoice ||
+		(status !== 400 && (status !== undefined || extractProviderErrorCode(error) !== "invalid_request_error"))
+	) {
+		return false;
+	}
 	const message = errorMessage(error);
 	return (
 		// `by <something>` continuations ("not supported by billing") describe a
@@ -178,6 +184,12 @@ export function isForcedToolChoiceUnsupportedError(error: unknown, sentForcedToo
 		/does\s+not\s+support\s+forced\s+tool[_\s-]?choices?/is.test(message) ||
 		/tool[_\s-]?choices?\s+['"`][^'"`\r\n]+['"`]\s+not\s+found\s+in\s+['"`]tools['"`]\s+parameter\b/is.test(message)
 	);
+}
+
+function extractProviderErrorCode(error: unknown): string | undefined {
+	if (!error || typeof error !== "object") return undefined;
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" ? code : undefined;
 }
 
 export type { ToolChoiceCompat, ToolChoiceSupport, ToolChoiceSupportSource } from "../types";
