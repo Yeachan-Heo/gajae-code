@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../src/sdk/bus/notification-service";
 import {
 	daemonPaths,
 	NOTIFICATION_LEAK_ARTIFACT_GRACE_MS,
@@ -42,8 +43,30 @@ function renameFailingFs(rootsPath: string): TelegramDaemonFs {
 	};
 }
 
+/**
+ * The production seam set: real filesystem plus the no-follow capture and
+ * identity-bound delete the reaper fences its removals with.
+ */
+function identityFencedFs(): TelegramDaemonFs {
+	return {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		readEndpointFile: readNotificationEndpointFile,
+		exactUnlink: async (file, identity, quarantineName) =>
+			exactUnlinkNotificationFile(
+				file,
+				identity,
+				quarantineName ?? ".gjc-delete-notification-staging-temp-test.json",
+			),
+	};
+}
+
 function stagingTempFiles(dir: string): string[] {
 	return fs.readdirSync(dir).filter(name => name.endsWith(".tmp"));
+}
+
+/** Reaper clock far enough ahead that the mtime grace window cannot retain a temp. */
+function pastGraceWindow(): number {
+	return Date.now() + NOTIFICATION_LEAK_ARTIFACT_GRACE_MS + 60_000;
 }
 
 /** Drive a publication failure so the writer abandons one staging temp on disk. */
@@ -59,6 +82,12 @@ async function leakOneStagingTemp(agentDir: string, sessionId: string): Promise<
 	).rejects.toThrow(/EPERM/);
 }
 
+function agentDirWithNotifications(): string {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	return agentDir;
+}
+
 test("the notification reaper reclaims staging temps abandoned by a failed publication", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
@@ -67,13 +96,17 @@ test("the notification reaper reclaims staging temps abandoned by a failed publi
 	// Precondition: publication really did abandon its staged temps.
 	expect(stagingTempFiles(paths.dir)).toHaveLength(3);
 
+	// The temps name this very test process as publisher, so abandonment is only
+	// provable once liveness reports that publisher dead.
+	//
 	// Advance the reaper's clock past the grace window rather than zeroing the
 	// window: a temp written in the same millisecond can carry a fractional mtime
 	// slightly ahead of an integer `Date.now()`, which reads as negative age and
 	// is treated as still-staging.
 	const result = await reapStaleNotificationArtifacts({
 		settings: isolatedSettings(agentDir),
-		now: () => Date.now() + NOTIFICATION_LEAK_ARTIFACT_GRACE_MS + 60_000,
+		now: pastGraceWindow,
+		pidAlive: () => false,
 	});
 
 	expect(stagingTempFiles(paths.dir)).toEqual([]);
@@ -89,8 +122,12 @@ test("the notification reaper leaves a staging temp younger than the grace windo
 	expect(fresh).toBeString();
 
 	// A concurrent publication that is still staging its temp must never have it
-	// reaped out from under the pending rename.
-	const result = await reapStaleNotificationArtifacts({ settings: isolatedSettings(agentDir) });
+	// reaped out from under the pending rename. Liveness is forced dead so the
+	// retention proves the grace window, not the liveness fence.
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		pidAlive: () => false,
+	});
 
 	expect(stagingTempFiles(paths.dir)).toEqual([fresh!]);
 	expect(result.removed).toEqual([]);
@@ -107,9 +144,156 @@ test("the notification reaper never removes a published notification file", asyn
 	const decoy = path.join(paths.dir, "telegram-daemon.roots.json.1.2.abc");
 	fs.writeFileSync(decoy, "{}\n");
 
-	const result = await reapStaleNotificationArtifacts({ settings: isolatedSettings(agentDir), graceMs: 0 });
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		graceMs: 0,
+		pidAlive: () => false,
+	});
 
 	expect(fs.existsSync(paths.roots)).toBe(true);
 	expect(fs.existsSync(decoy)).toBe(true);
 	expect(result.removed).toEqual([]);
+});
+
+test("a staging temp whose publisher is still alive is never reaped, however old it is", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
+	const paths = daemonPaths(agentDir);
+
+	await leakOneStagingTemp(agentDir, "session-live");
+	const [staged] = stagingTempFiles(paths.dir);
+	expect(staged).toBeString();
+	// The abandoned temp names this test process; the default liveness probe sees
+	// it running, which is exactly the live-publisher case age alone misreads.
+
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		now: pastGraceWindow,
+		graceMs: 0,
+	});
+
+	expect(stagingTempFiles(paths.dir)).toEqual([staged!]);
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBeGreaterThan(0);
+});
+
+test("a staging temp is retained when publisher liveness is indeterminate", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
+	const paths = daemonPaths(agentDir);
+
+	await leakOneStagingTemp(agentDir, "session-unknown");
+	const [staged] = stagingTempFiles(paths.dir);
+	expect(staged).toBeString();
+
+	// A probe that cannot answer (permission denied, unsupported platform) must
+	// fail closed rather than degrade to age-only deletion.
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		now: pastGraceWindow,
+		graceMs: 0,
+		pidAlive: () => {
+			throw new Error("EPERM: liveness probe denied");
+		},
+	});
+
+	expect(stagingTempFiles(paths.dir)).toEqual([staged!]);
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBeGreaterThan(0);
+});
+
+test("a staging temp with an unparseable publisher claim is retained", async () => {
+	const agentDir = agentDirWithNotifications();
+	const paths = daemonPaths(agentDir);
+	// Staging-temp shape, but pid 0 is not a valid publisher, so no claim can be
+	// proven dead and the temp must survive.
+	const malformed = path.join(paths.dir, "telegram-daemon.roots.json.0.1700000000000.abc123.tmp");
+	fs.writeFileSync(malformed, "{}\n");
+
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		now: pastGraceWindow,
+		graceMs: 0,
+		pidAlive: () => false,
+	});
+
+	expect(fs.existsSync(malformed)).toBe(true);
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBeGreaterThan(0);
+});
+
+test("a dead publisher's staging temp past the grace window is reaped through the identity fence", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
+	const paths = daemonPaths(agentDir);
+
+	await leakOneStagingTemp(agentDir, "session-dead");
+	const [staged] = stagingTempFiles(paths.dir);
+	expect(staged).toBeString();
+	const file = path.join(paths.dir, staged!);
+
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: identityFencedFs(),
+		now: pastGraceWindow,
+		pidAlive: () => false,
+	});
+
+	expect(fs.existsSync(file)).toBe(false);
+	expect(result.removed).toEqual([file]);
+});
+
+test("a staging temp replaced between identity capture and delete is not removed", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
+	const paths = daemonPaths(agentDir);
+
+	await leakOneStagingTemp(agentDir, "session-aba");
+	const [staged] = stagingTempFiles(paths.dir);
+	expect(staged).toBeString();
+	const file = path.join(paths.dir, staged!);
+
+	const base = identityFencedFs();
+	// ABA: the name is rewritten after the reaper captured its identity, so the
+	// delete must bind the captured inode contents and refuse the successor.
+	const racingFs: TelegramDaemonFs = {
+		...base,
+		readEndpointFile: async target => {
+			const endpoint = await base.readEndpointFile!(target);
+			if (target === file) fs.writeFileSync(file, "successor-staged-after-capture\n");
+			return endpoint;
+		},
+	};
+
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: racingFs,
+		now: pastGraceWindow,
+		pidAlive: () => false,
+	});
+
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBeGreaterThan(0);
+	expect(fs.existsSync(file)).toBe(true);
+	expect(fs.readFileSync(file, "utf8")).toBe("successor-staged-after-capture\n");
+});
+
+test("a symlink shaped like a staging temp is never followed or deleted", async () => {
+	const agentDir = agentDirWithNotifications();
+	const paths = daemonPaths(agentDir);
+	const victim = path.join(agentDir, "victim.json");
+	fs.writeFileSync(victim, '{"keep":true}\n');
+	const link = path.join(paths.dir, `telegram-daemon.roots.json.${process.pid + 1}.1700000000000.abc123.tmp`);
+	fs.symlinkSync(victim, link);
+
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: identityFencedFs(),
+		now: pastGraceWindow,
+		pidAlive: () => false,
+	});
+
+	// The no-follow capture rejects the link, so neither the link nor its target
+	// is unlinked.
+	expect(fs.existsSync(victim)).toBe(true);
+	expect(fs.readFileSync(victim, "utf8")).toBe('{"keep":true}\n');
+	expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBeGreaterThan(0);
 });
