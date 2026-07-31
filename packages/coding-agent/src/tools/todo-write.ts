@@ -1,4 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
@@ -61,6 +62,39 @@ const TodoOpEntry = z.object({
 	items: z.array(z.string().describe("task content")).min(1).optional().describe("tasks to append"),
 	text: z.string().optional().describe("note text"),
 });
+
+const TODO_WRITE_KEYS = new Set(["ops"]);
+const TODO_OP_KEYS = new Set(["op", "list", "task", "phase", "items", "text"]);
+const TODO_INIT_ENTRY_KEYS = new Set(["phase", "items"]);
+
+function hasUnknownKeys(value: object, allowed: Set<string>): boolean {
+	return Object.keys(value).some(key => !allowed.has(key));
+}
+
+function validateRawTodoArguments(arguments_: Record<string, unknown>): RawArgumentValidationResult {
+	if (hasUnknownKeys(arguments_, TODO_WRITE_KEYS)) return { outcome: "reject" };
+	if (!Array.isArray(arguments_.ops)) return { outcome: "passthrough" };
+	for (const entry of arguments_.ops) {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+		if (hasUnknownKeys(entry, TODO_OP_KEYS)) return { outcome: "reject" };
+		const record = entry as Record<string, unknown>;
+		if ((record.op === "done" || record.op === "drop") && !record.task && !record.phase) {
+			return { outcome: "reject" };
+		}
+		const list = record.list;
+		if (!Array.isArray(list)) continue;
+		for (const item of list) {
+			if (
+				typeof item === "object" &&
+				item !== null &&
+				!Array.isArray(item) &&
+				hasUnknownKeys(item, TODO_INIT_ENTRY_KEYS)
+			)
+				return { outcome: "reject" };
+		}
+	}
+	return { outcome: "passthrough" };
+}
 
 const todoWriteSchema = z
 	.object({
@@ -497,6 +531,7 @@ export class TodoWriteTool implements AgentTool<typeof todoWriteSchema, TodoWrit
 	readonly summary = "Write a structured todo list to track progress within a session";
 	readonly description: string;
 	readonly parameters = todoWriteSchema;
+	readonly rawArgumentValidation = validateRawTodoArguments;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
 	readonly loadMode = "discoverable";
@@ -512,6 +547,18 @@ export class TodoWriteTool implements AgentTool<typeof todoWriteSchema, TodoWrit
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<TodoWriteToolDetails>> {
 		const previousPhases = clonePhases(this.session.getTodoPhases?.() ?? []);
+		const missingTarget = params.ops.find(
+			entry => (entry.op === "done" || entry.op === "drop") && !entry.task && !entry.phase,
+		);
+		if (missingTarget) {
+			const storage = this.session.getSessionFile() ? "session" : "memory";
+			const errors = [`Missing task or phase for ${missingTarget.op} operation`];
+			return {
+				content: [{ type: "text", text: formatSummary(previousPhases, errors) }],
+				details: { phases: previousPhases, storage },
+				isError: true,
+			};
+		}
 		const { phases: updated, errors } = applyParams(previousPhases, params);
 		this.session.setTodoPhases?.(updated);
 		const storage = this.session.getSessionFile() ? "session" : "memory";

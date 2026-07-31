@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { validateToolArguments } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { type TodoPhase, TodoWriteTool } from "@gajae-code/coding-agent/tools";
+import { applyOpsToPhases, type TodoPhase, TodoWriteTool } from "@gajae-code/coding-agent/tools";
 
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	let phases = initialPhases;
@@ -166,6 +167,40 @@ describe("TodoWriteTool ops operations", () => {
 		const result = await tool.execute("call-2", { ops: [{ op: "done", phase: "Work" }] });
 		const allTasks = result.details?.phases.flatMap(phase => phase.tasks) ?? [];
 		expect(allTasks.map(task => task.status)).toEqual(["completed", "completed", "in_progress"]);
+	});
+
+	it("rejects unsupported keys and does not treat a bare done as complete-all", async () => {
+		const tool = new TodoWriteTool(createSession());
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-invalid",
+				name: tool.name,
+				arguments: { ops: [{ op: "done", id: "Second" }] },
+			}),
+		).toThrow('Validation failed for tool "todo_write"');
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-bare",
+				name: tool.name,
+				arguments: { ops: [{ op: "done" }] },
+			}),
+		).toThrow('Validation failed for tool "todo_write"');
+
+		await tool.execute("call-1", {
+			ops: [{ op: "init", list: [{ phase: "Work", items: ["First", "Second"] }] }],
+		});
+		const result = await tool.execute("call-2", { ops: [{ op: "done" }] });
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.phases[0]?.tasks.map(task => task.status)).toEqual(["in_progress", "pending"]);
+		const summary = result.content.find(part => part.type === "text");
+		if (summary?.type !== "text") throw new Error("Expected text summary");
+		expect(summary.text).toContain("Missing task or phase for done operation");
+
+		const slashResult = applyOpsToPhases(result.details?.phases ?? [], [{ op: "done" }]);
+		expect(slashResult.phases[0]?.tasks.map(task => task.status)).toEqual(["completed", "completed"]);
 	});
 
 	it("removes all tasks when rm omits task and phase", async () => {
