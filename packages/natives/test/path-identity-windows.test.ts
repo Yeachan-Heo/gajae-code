@@ -24,6 +24,11 @@ function sha256(contents: string): string {
 	return createHash("sha256").update(contents).digest("hex");
 }
 
+async function parentIdentity(pathname: string): Promise<{ parentDev: bigint; parentIno: bigint }> {
+	const parent = await fs.stat(path.dirname(pathname), { bigint: true });
+	return { parentDev: parent.dev, parentIno: parent.ino };
+}
+
 function expectRepairableOwnerOnlyMismatch(result: { ok: boolean; code?: string }): void {
 	expect(result.ok).toBe(false);
 	// Windows can assign a newly created object either to the token user SID or
@@ -112,7 +117,9 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await fs.writeFile(destination, "old-state");
 		const sourceStat = await fs.stat(source, { bigint: true });
 		const destinationStat = await fs.stat(destination, { bigint: true });
+		const parent = await parentIdentity(source);
 		const sourceIdentity = {
+			...parent,
 			dev: sourceStat.dev,
 			ino: sourceStat.ino,
 			size: sourceStat.size,
@@ -120,6 +127,7 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			sha256: sha256("new-state"),
 		};
 		const destinationIdentity = {
+			...parent,
 			dev: destinationStat.dev,
 			ino: destinationStat.ino,
 			size: destinationStat.size,
@@ -140,7 +148,9 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await fs.writeFile(destination, "old-state");
 		const sourceStat = await fs.stat(source, { bigint: true });
 		const destinationStat = await fs.stat(destination, { bigint: true });
+		const parent = await parentIdentity(source);
 		const sourceIdentity = {
+			...parent,
 			dev: sourceStat.dev,
 			ino: sourceStat.ino,
 			size: sourceStat.size,
@@ -148,6 +158,7 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			sha256: sha256("authorized-stage"),
 		};
 		const destinationIdentity = {
+			...parent,
 			dev: destinationStat.dev,
 			ino: destinationStat.ino,
 			size: destinationStat.size,
@@ -627,7 +638,9 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const detached = path.join(root, ".gjc-delete-state");
 		await fs.writeFile(original, "authorized");
 		const stat = await fs.stat(original, { bigint: true });
+		const parent = await parentIdentity(original);
 		const identity = {
+			...parent,
 			dev: stat.dev,
 			ino: stat.ino,
 			size: stat.size,
@@ -648,7 +661,9 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const detached = path.join(root, ".gjc-delete-state");
 		await fs.writeFile(original, "authorized");
 		const stat = await fs.stat(original, { bigint: true });
+		const parent = await parentIdentity(original);
 		const identity = {
+			...parent,
 			dev: stat.dev,
 			ino: stat.ino,
 			size: stat.size,
@@ -671,7 +686,9 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const detached = path.join(root, ".gjc-delete-state");
 		await fs.writeFile(original, "authorized");
 		const stat = await fs.stat(original, { bigint: true });
+		const parent = await parentIdentity(original);
 		const identity = {
+			...parent,
 			dev: stat.dev,
 			ino: stat.ino,
 			size: stat.size,
