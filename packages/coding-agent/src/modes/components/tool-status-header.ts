@@ -61,6 +61,7 @@ export interface StatusLineComponentOptions {
 	getKeybindings?: () => KeybindingsManager;
 	focusDomain?: FocusDomain;
 	keyDisplayContext?: KeyDisplayContext;
+	projectDir?: string;
 }
 
 export interface StatusLineActionHint {
@@ -167,6 +168,7 @@ export class StatusLineComponent implements Component {
 	#getKeybindings: (() => KeybindingsManager) | undefined;
 	#focusDomain: FocusDomain;
 	#keyDisplayContext: KeyDisplayContext | undefined;
+	#projectDirOverride: string | undefined;
 
 	#resolvedSettingsCache:
 		| (Required<Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">> &
@@ -215,6 +217,7 @@ export class StatusLineComponent implements Component {
 		this.#getKeybindings = options.getKeybindings;
 		this.#focusDomain = options.focusDomain ?? "composer";
 		this.#keyDisplayContext = options.keyDisplayContext;
+		this.#projectDirOverride = options.projectDir;
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
@@ -262,6 +265,26 @@ export class StatusLineComponent implements Component {
 		this.#skillHudLastFetch = Date.now();
 	}
 
+	setGitSnapshotForTest(snapshot: {
+		branch: string | null;
+		status: { staged: number; unstaged: number; untracked: number } | null;
+	}): void {
+		const now = Date.now();
+		this.#cachedBranch = snapshot.branch;
+		this.#cachedBranchRepoId = null;
+		this.#branchProjectDir = this.#projectDir();
+		this.#branchLastFetch = now;
+		this.#branchInFlight = false;
+		this.#cachedGitStatus = snapshot.status;
+		this.#gitStatusLastFetch = now;
+		this.#gitStatusInFlight = false;
+		this.#cachedPr = null;
+		this.#cachedPrContext = undefined;
+		this.#prLookupInFlight = false;
+		this.#defaultBranch = snapshot.branch ?? "main";
+		this.#renderedRowsCache = undefined;
+	}
+
 	setHookStatus(key: string, text: string | undefined): void {
 		if (text === undefined) {
 			this.#hookStatuses.delete(key);
@@ -275,13 +298,17 @@ export class StatusLineComponent implements Component {
 		this.#setupGitWatcher();
 	}
 
+	#projectDir(): string {
+		return this.#projectDirOverride ?? getProjectDir();
+	}
+
 	#setupGitWatcher(): void {
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
 		}
 
-		const gitHeadPath = git.repo.resolveSync(getProjectDir())?.headPath ?? null;
+		const gitHeadPath = git.repo.resolveSync(this.#projectDir())?.headPath ?? null;
 		if (!gitHeadPath) return;
 
 		try {
@@ -318,7 +345,7 @@ export class StatusLineComponent implements Component {
 	}
 	#getCurrentBranch(): string | null {
 		const now = Date.now();
-		const projectDir = getProjectDir();
+		const projectDir = this.#projectDir();
 		const withinTtl =
 			this.#cachedBranch !== undefined &&
 			this.#branchProjectDir === projectDir &&
@@ -349,7 +376,7 @@ export class StatusLineComponent implements Component {
 		if (this.#defaultBranch === undefined) {
 			this.#defaultBranch = "main";
 			(async () => {
-				const resolved = await git.branch.default(getProjectDir());
+				const resolved = await git.branch.default(this.#projectDir());
 				if (resolved) {
 					this.#defaultBranch = resolved;
 					if (this.#onBranchChange) {
@@ -370,7 +397,7 @@ export class StatusLineComponent implements Component {
 
 		(async () => {
 			try {
-				this.#cachedGitStatus = await git.status.summary(getProjectDir());
+				this.#cachedGitStatus = await git.status.summary(this.#projectDir());
 			} catch {
 				this.#cachedGitStatus = null;
 			} finally {
@@ -464,7 +491,7 @@ export class StatusLineComponent implements Component {
 		if (this.#skillHudInFlight || now - this.#skillHudLastFetch < 1000) return;
 		const getCwd = this.session.sessionManager?.getCwd;
 		const getSessionId = this.session.sessionManager?.getSessionId;
-		const cwd = typeof getCwd === "function" ? getCwd.call(this.session.sessionManager) : getProjectDir();
+		const cwd = typeof getCwd === "function" ? getCwd.call(this.session.sessionManager) : this.#projectDir();
 		const sessionId = typeof getSessionId === "function" ? getSessionId.call(this.session.sessionManager) : undefined;
 		this.#skillHudInFlight = true;
 		void readVisibleSkillActiveState(cwd, sessionId, { tier: "hud" })
@@ -624,6 +651,7 @@ export class StatusLineComponent implements Component {
 		return {
 			session: this.session,
 			width,
+			projectDir: this.#projectDir(),
 			options: effectiveSettings.segmentOptions ?? {},
 			planMode: this.#planModeStatus,
 			goalMode: this.#goalModeStatus,

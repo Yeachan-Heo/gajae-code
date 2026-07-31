@@ -171,6 +171,8 @@ export interface LightThemeComplianceRender {
 
 export const LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT = 180;
 export const LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT = LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT * 5;
+export const LIGHT_THEME_COMPLIANCE_STATUS_PROJECT_DIR = "/gjc-light-theme-evidence/gajae-code";
+export const LIGHT_THEME_COMPLIANCE_STATUS_BRANCH = "light-theme-showcase";
 
 const SHOWCASE_CLOCK = {
 	now: () => 1_700_000_042_000,
@@ -752,7 +754,10 @@ function renderSyntaxScene(viewport: LightThemeComplianceViewport): string {
 
 function renderStatusScene(viewport: LightThemeComplianceViewport): string {
 	const session = makeStatusSession();
-	const component = new StatusLineComponent(session, { version: "showcase" });
+	const component = new StatusLineComponent(session, {
+		version: "showcase",
+		projectDir: LIGHT_THEME_COMPLIANCE_STATUS_PROJECT_DIR,
+	});
 	component.updateSettings({
 		preset: "custom",
 		leftSegments: ["model", "path", "git"],
@@ -762,9 +767,13 @@ function renderStatusScene(viewport: LightThemeComplianceViewport): string {
 		showHookStatus: false,
 		sessionAccent: false,
 		segmentOptions: {
-			git: { showBranch: true, showStaged: true, showUnstaged: true, showUntracked: false },
+			git: { showBranch: true, showStaged: true, showUnstaged: true, showUntracked: true },
 			model: { showThinkingLevel: true },
 		},
+	});
+	component.setGitSnapshotForTest({
+		branch: LIGHT_THEME_COMPLIANCE_STATUS_BRANCH,
+		status: { staged: 1, unstaged: 1, untracked: 1 },
 	});
 	component.setSessionStartTime(SHOWCASE_CLOCK.now());
 	component.setSubagentCount(2);

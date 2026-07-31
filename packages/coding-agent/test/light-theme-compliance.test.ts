@@ -32,6 +32,7 @@ import {
 	LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT,
 	LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT,
 	LIGHT_THEME_COMPLIANCE_SCENE_IDS,
+	LIGHT_THEME_COMPLIANCE_STATUS_BRANCH,
 	LIGHT_THEME_COMPLIANCE_THEMES,
 	LIGHT_THEME_COMPLIANCE_VIEWPORTS,
 	type LightThemeComplianceEntry,
@@ -1158,6 +1159,57 @@ describe("GJC light-theme compliance fixture", () => {
 				expect(rendered.terminalAnsiText).not.toContain("\x1b");
 				expect(rendered.provenance.noColorCues?.length).toBeGreaterThan(1);
 			}
+		}
+	}, 30_000);
+
+	it("renders the status scene independently of ambient cwd and git state", async () => {
+		const fixtureUrl = new URL("./fixtures/tui/light-theme-compliance-showcase.ts", import.meta.url).href;
+		const entry = {
+			key: "red-claw-light/status/160x48/unicode-color",
+			theme: "red-claw-light",
+			sceneId: "status",
+			viewport: { id: "160x48", columns: 160, rows: 48 },
+			renderMode: "unicode-color",
+		} satisfies LightThemeComplianceEntry;
+		const script = [
+			`import { renderLightThemeComplianceShowcase } from ${JSON.stringify(fixtureUrl)};`,
+			`const rendered = await renderLightThemeComplianceShowcase(${JSON.stringify(entry)});`,
+			"process.stdout.write(rendered.terminalText);",
+		].join("\n");
+		const directories = await Promise.all([
+			fs.mkdtemp(path.join(os.tmpdir(), "gjc-status-cwd-a-")),
+			fs.mkdtemp(path.join(os.tmpdir(), "gjc-status-cwd-b-")),
+		]);
+		await Promise.all(
+			directories.map(async (directory, index) => {
+				await fs.mkdir(path.join(directory, ".git"));
+				await fs.writeFile(path.join(directory, ".git", "HEAD"), `ref: refs/heads/ambient-${index}\n`);
+			}),
+		);
+		const renderFrom = async (cwd: string): Promise<string> => {
+			const child = Bun.spawn([process.execPath, "-e", script], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			return stdout;
+		};
+
+		try {
+			const [first, second] = await Promise.all(directories.map(renderFrom));
+			expect(first).toBe(second);
+			expect(first).toContain(LIGHT_THEME_COMPLIANCE_STATUS_BRANCH);
+			expect(first).toContain("*1");
+			expect(first).toContain("+1");
+			expect(first).toContain("?1");
+		} finally {
+			await Promise.all(directories.map(directory => fs.rm(directory, { recursive: true, force: true })));
 		}
 	}, 30_000);
 

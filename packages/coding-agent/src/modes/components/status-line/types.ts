@@ -20,6 +20,7 @@ export type RGB = readonly [number, number, number];
 export interface SegmentContext {
 	session: AgentSession;
 	width: number;
+	projectDir?: string;
 	options: StatusLineSegmentOptions;
 	planMode: {
 		enabled: boolean;
