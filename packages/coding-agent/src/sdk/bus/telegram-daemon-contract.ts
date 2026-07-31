@@ -49,17 +49,19 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * user-created topic adoption (forum-topic folder picker). Generation 36 bound
  * managed-session replacement to exact native filesystem authority; generation
  * 37 retires that binding (revert of #3489, which stalled POSIX artifact
- * cleanup); generation 38 binds exact cleanup to parent and link-count authority.
- * Generation 39 applies rustfmt and clippy-equivalent cleanup to the pi-shell
- * process-tree authority (#3682); generation 40 hardens exact Bash process-tree
- * ownership, settlement, and descendant cleanup authority.
+ * cleanup); generation 38 binds exact cleanup to parent and link-count authority;
+ * generation 39 hardens exact Bash process-tree ownership, settlement, and
+ * descendant cleanup authority. Generation 40 extends exact cleanup lifecycle
+ * guarantees. Generation 41 adds cross-host topic-registry CAS convergence,
+ * host-and-epoch archive fencing, retained topic history, user-topic adoption
+ * provenance, and exact versionless shared-state upgrades with quarantined
+ * source snapshots.
  */
-export const DAEMON_GENERATION = 40;
+export const DAEMON_GENERATION = 41;
 
 /**
- * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
- * all builds published before this field existed; epoch 2 covered generation 29;
- * epoch 3 covered generation 30; bump this to force serving convergence and
- * reload of compatible live predecessors.
+ * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
+ * requires the complete generation-36 topic authority contract, so older
+ * epoch-4 daemons cannot keep serving across an upgrade.
  */
-export const SERVING_EPOCH = 4;
+export const SERVING_EPOCH = 5;

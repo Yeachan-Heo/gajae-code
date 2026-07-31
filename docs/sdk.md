@@ -546,6 +546,7 @@ revalidates the complete bot-token/chat identity immediately before polling and
 again before activation. A foreign or unknown owner is never killed, reloaded, or taken over;
 setup fails closed without saving or exposing the raw token.
 
+
 - [Telegram notification onboarding](./telegram-onboarding.md) documents
   `gjc notify setup` and private-chat pairing.
 - [Discord notification onboarding](./discord-onboarding.md) documents
