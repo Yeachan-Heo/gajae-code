@@ -107,6 +107,11 @@ export interface ChildBridgeOptions {
 	readonly manager: ThreadRuntimeManager;
 	/** Transactional injected lifecycle adapter. */
 	readonly create?: ChildCreate;
+	/**
+	 * Ownership the adapter's children have when the request does not state one. An in-process
+	 * child is `attached`: there is no separate endpoint process to fence with authority.
+	 */
+	readonly ownership?: ThreadOwnership;
 	/** Authority-only compatibility adapter. */
 	readonly spawn?: (threadId: string, ownership: ThreadOwnership) => Promise<EndpointAuthority | undefined>;
 	/** Authority-fenced close for legacy spawns or children without a local close hook. */
@@ -358,7 +363,7 @@ export async function loadThread(
 		typeof threadIdOrRequest === "string"
 			? { threadId: threadIdOrRequest, ownership: legacyOwnership, connectionId: legacyConnectionId }
 			: threadIdOrRequest;
-	const ownership = request.ownership ?? "spawned";
+	const ownership = request.ownership ?? opts.ownership ?? "spawned";
 	const adapter = opts.create;
 
 	wireCloseCallback(opts);

@@ -437,6 +437,21 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 		expect(initializeResponse?.error).toBeUndefined();
 		expect(isRecord(initializeResponse?.result)).toBe(true);
 		expect(selected.outbound.some(frame => frame.method === "initialized")).toBe(true);
+		// Creating a real GJC session for a thread takes seconds, so let every issued request be
+		// answered before the transcript is asserted; a still-pending id would otherwise look like
+		// a protocol violation rather than a slow-but-correct answer.
+		await waitUntil(
+			() => {
+				const current = selectedClientProcess(parseTranscript(readFileSync(transcriptPath, "utf8")));
+				if (!current) return false;
+				selected = current;
+				const issued = current.outbound.filter(frame => frame.id !== undefined).map(frame => String(frame.id));
+				const answered = new Set(current.inbound.map(frame => String(frame.id)));
+				return issued.length > 0 && issued.every(id => answered.has(id));
+			},
+			frameTimeoutMs,
+			"GJC to answer every request the real client issued",
+		).catch(() => undefined);
 		const requests = selected.outbound
 			.filter(frame => frame.id !== undefined && typeof frame.method === "string")
 			.map(frame => ({ id: frame.id as string | number, method: frame.method as string }));

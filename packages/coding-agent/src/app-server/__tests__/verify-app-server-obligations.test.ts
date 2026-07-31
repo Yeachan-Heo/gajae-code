@@ -109,7 +109,7 @@ test("obligations verifier rejects a manifest whose frozen digest was tampered",
 	const manifestPath = path.join(root, "src/app-server/obligations.manifest.json");
 	await fs.writeFile(
 		manifestPath,
-		(await fs.readFile(manifestPath, "utf8")).replace("actual t3.code", "forged t3.code"),
+		(await fs.readFile(manifestPath, "utf8")).replace("actual T3 Code", "forged T3 Code"),
 	);
 	expect(await verifyObligations(root)).toEqual({ verified: [], blocked: ["manifest"] });
 });

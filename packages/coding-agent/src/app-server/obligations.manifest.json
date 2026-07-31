@@ -21,8 +21,15 @@
 			"required": true,
 			"supersedable": false,
 			"receiptContract": {
-				"argv": ["bun", "../../scripts/verify-codex-app-server-oracle.ts", "--stable", "--verify-frozen-subtree-oids"],
-				"artifactPathPatterns": ["obligations.artifacts/oracle-stable/**"],
+				"argv": [
+					"bun",
+					"../../scripts/verify-codex-app-server-oracle.ts",
+					"--stable",
+					"--verify-frozen-subtree-oids"
+				],
+				"artifactPathPatterns": [
+					"obligations.artifacts/oracle-stable/**"
+				],
 				"outputArtifactPath": "obligations.artifacts/oracle-stable/stdout.txt",
 				"outputMarker": "stable schema oracle"
 			}
@@ -33,8 +40,14 @@
 			"required": true,
 			"supersedable": false,
 			"receiptContract": {
-				"argv": ["bun", "../../scripts/verify-codex-app-server-oracle.ts", "--experimental"],
-				"artifactPathPatterns": ["obligations.artifacts/oracle-experimental/**"],
+				"argv": [
+					"bun",
+					"../../scripts/verify-codex-app-server-oracle.ts",
+					"--experimental"
+				],
+				"artifactPathPatterns": [
+					"obligations.artifacts/oracle-experimental/**"
+				],
 				"outputArtifactPath": "obligations.artifacts/oracle-experimental/stdout.txt",
 				"outputMarker": "experimental schema oracle"
 			}
@@ -45,8 +58,14 @@
 			"required": true,
 			"supersedable": false,
 			"receiptContract": {
-				"argv": ["bun", "test", "src/app-server/__tests__/e2e/spawned-cli-json-rpc.test.ts"],
-				"artifactPathPatterns": ["obligations.artifacts/spawned-cli-blackbox/**"],
+				"argv": [
+					"bun",
+					"test",
+					"src/app-server/__tests__/e2e/spawned-cli-json-rpc.test.ts"
+				],
+				"artifactPathPatterns": [
+					"obligations.artifacts/spawned-cli-blackbox/**"
+				],
 				"outputArtifactPath": "obligations.artifacts/spawned-cli-blackbox/stdout.txt",
 				"outputMarker": "pass"
 			}
@@ -57,26 +76,34 @@
 			"required": true,
 			"supersedable": false,
 			"receiptContract": {
-				"argv": ["bun", "test", "src/app-server/__tests__/trace-replay.test.ts"],
-				"artifactPathPatterns": ["obligations.artifacts/trace-replay/**"],
+				"argv": [
+					"bun",
+					"test",
+					"src/app-server/__tests__/trace-replay.test.ts"
+				],
+				"artifactPathPatterns": [
+					"obligations.artifacts/trace-replay/**"
+				],
 				"outputArtifactPath": "obligations.artifacts/trace-replay/stdout.txt",
 				"outputMarker": "pass"
 			}
 		},
 		{
 			"id": "real-t3",
-			"obligation": "the actual t3.code v0.0.28 client binary driving GJC end to end, rather than a replay or hand-written protocol client.",
+			"obligation": "the actual T3 Code (Alpha) v0.0.28 client binary driving GJC end to end through the client's own spawn contract, rather than a replay or a hand-written protocol client.",
 			"required": true,
 			"supersedable": false,
 			"receiptContract": {
-				"argv": ["t3.code", "app-server", "--provider", "gjc"],
-				"externalExecutable": {
-					"path": "/usr/local/bin/t3.code",
-					"sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-				},
-				"artifactPathPatterns": ["obligations.artifacts/real-t3/**"],
+				"argv": [
+					"bun",
+					"test",
+					"src/app-server/__tests__/e2e/real-client-t3.test.ts"
+				],
+				"artifactPathPatterns": [
+					"obligations.artifacts/real-t3/**"
+				],
 				"outputArtifactPath": "obligations.artifacts/real-t3/stdout.txt",
-				"outputMarker": "app-server"
+				"outputMarker": "G3b REAL-CLIENT PASSED"
 			}
 		}
 	]

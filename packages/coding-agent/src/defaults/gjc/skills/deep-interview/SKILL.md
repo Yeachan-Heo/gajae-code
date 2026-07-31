@@ -91,7 +91,7 @@ source: "forked from upstream deep-interview skill and rebranded for GJC"
 
 ## Native Plugin Invocation Guard (Issue #3030)
 
-If this raw bundled skill is loaded by GJC's native skill loader through `/skill:deep-interview`, do not treat that path as permission to skip rendered GJC setup. The user-facing invocation is `/skill:deep-interview`; do not recommend or advertise CLI bridge commands as the deep-interview entrypoint. Regardless of invocation path, Phase 0 below remains blocking and must resolve `gjc.deepInterview.ambiguityThreshold` from pre-resolved native state or settings before any announcement, state write, question, or ambiguity score.
+If this raw bundled skill is loaded by GJC's native skill loader through `/skill:deep-interview`, do not treat that path as permission to skip rendered GJC setup. Two first-class entrypoints exist: `/skill:deep-interview` (agent-session invocation) and `gjc deep-interview` (native CLI for seeding runs, persisting specs, and handing off). The native CLI surface is: `--quick|--standard|--deep` (resolution mode), `--trace` (bounded trace pre-step), `--threshold=<value> --threshold-source=<value>` (override), `--session-id=<value>` (session routing), `--write --stage final --slug <slug> --spec <markdown-or-path>` (persist spec), `--deliberate` (shortcut for `--write` + hand off to ralplan deliberate mode), and `--force` (overwrite corrupt state during `--write`). Regardless of invocation path, Phase 0 below remains blocking and must resolve `gjc.deepInterview.ambiguityThreshold` from pre-resolved native state or settings before any announcement, state write, question, or ambiguity score.
 
 ## Corrupt current-session state recovery
 
@@ -824,8 +824,7 @@ gjc deep-interview read --json
 For a preselected deliberate ralplan path, prefer the single sanctioned bridge command instead:
 
 ```
-gjc \
-deep-interview --write --stage final --slug {slug} --spec <markdown-or-path> --deliberate --json
+gjc deep-interview --write --stage final --slug {slug} --spec <markdown-or-path> --deliberate --json
 ```
 
 That command persists `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`, seeds ralplan in deliberate mode, and performs the safe deep-interview → ralplan state handoff. Skipping spec persistence leaves the Phase 5 chain blocked by design.

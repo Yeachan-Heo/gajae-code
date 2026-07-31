@@ -4,16 +4,12 @@
 
 Faithful preimage and unified-diff construction is owned upstream at the permission seam. The adapter resolves a top-level `toolCall.fileChanges` map before raw-input maps, validates every member with `isFileChange`, and rejects malformed or empty maps with `missing_approval_field` (`packages/coding-agent/src/app-server/server-requests/permission-adapter.ts:220-250`). Raw mutation arguments without faithful evidence still fail closed; the only raw fallback is a move with both endpoints (`packages/coding-agent/src/app-server/server-requests/permission-adapter.ts:252-268`).
 
-This makes the adapter boundary honest, but it does not connect that boundary to a shipped app-server process.
+The adapter boundary remains honest, but the shipped transports now attach a production child bridge. `packages/coding-agent/src/app-server/thread-runtime/production-child.ts` creates a real in-process `AgentSession`, translates control/query operations through the existing SDK dispatch vocabulary, and forwards the session event stream to the app-server turn controller.
 
-## Transport gap
+All shipped transports attach this adapter:
 
-No shipped transport attaches a `threadStartAdapter` or a `PermissionAdapter`:
+- Stdio: `packages/coding-agent/src/app-server/cli/runtime.ts:123-128`.
+- WebSocket: `packages/coding-agent/src/commands/app-server.ts:158-163`.
+- Unix-socket WebSocket: `packages/coding-agent/src/commands/app-server.ts:225-228`.
 
-- Stdio constructs the runtime at `packages/coding-agent/src/app-server/cli/runtime.ts:124`.
-- WebSocket constructs the runtime at `packages/coding-agent/src/commands/app-server.ts:159`.
-- Unix-socket WebSocket constructs the runtime at `packages/coding-agent/src/commands/app-server.ts:227`.
-
-Each call passes admission and frame-codec options only; none supplies the optional runtime `threadStartAdapter` slot. A repository search also finds no production `childCreate` anywhere in the tree, so there is no production child factory to establish the permission reverse-request path.
-
-Therefore server-request approvals remain unreachable end to end and MUST NOT be claimed as working against a real client. Closing this gap requires a production child factory plus transport wiring that supplies the child/thread-start bridge and permission adapter to the shipped stdio, WebSocket, and Unix transports.
+This makes `thread/start`, turn prompting, projection operations, and lifecycle frame delivery reachable against a real GJC session. The production bridge deliberately does not yet attach the permission reverse-request adapter, so server-request approval remains unreachable end to end and MUST NOT be claimed as working against a real client. `--listen off` remains transport-free and does not construct a runtime.

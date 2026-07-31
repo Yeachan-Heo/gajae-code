@@ -21,6 +21,7 @@
 //   --ws-shared-secret-file --ws-issuer --ws-audience --ws-max-clock-skew-seconds
 
 import { createAppServerRuntime } from "../create-app-server";
+import { createProductionThreadStartAdapter } from "../thread-runtime/production-child";
 import { parseWsAuthFlags, type WsAuthConfig } from "../transport/auth";
 import { isLoopback, type ListenMode, parseListenUrl } from "../transport/listen";
 
@@ -119,11 +120,10 @@ export function writeStdioFrame(writer: StdioWriter, frame: Uint8Array): Promise
  * production stdio entry point.
  */
 export async function runStdioServer(config: ResolvedAppServerConfig): Promise<void> {
-	// No threadStartAdapter or PermissionAdapter is attached here; server-request approvals are NOT
-	// reachable through the shipped stdio transport today.
 	const runtime = createAppServerRuntime(
 		{ maxLoadedThreads: config.maxLoadedThreads },
 		{ maxFrameBytes: config.maxFrameBytes },
+		{ threadStartAdapter: createProductionThreadStartAdapter() },
 	);
 	const readline = require("node:readline");
 	const rl = readline.createInterface({ input: process.stdin, terminal: false });

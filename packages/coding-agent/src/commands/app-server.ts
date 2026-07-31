@@ -7,6 +7,7 @@ import {
 	runStdioServer,
 } from "../app-server/cli/runtime";
 import { type AppServerConnection, createAppServerRuntime } from "../app-server/create-app-server";
+import { createProductionThreadStartAdapter } from "../app-server/thread-runtime/production-child";
 import { checkWsAuth, type WsAuthConfig } from "../app-server/transport/auth";
 
 export interface AppServerWebSocket {
@@ -154,12 +155,12 @@ export default class AppServer extends Command {
 		// ws:// and unix:// listeners: bind a Bun WebSocket server.
 		if (config.mode.kind === "ws") {
 			const { host, port } = config.mode;
-			// No threadStartAdapter or PermissionAdapter is attached here; server-request approvals are NOT
-			// reachable through the shipped WebSocket transport today.
 			const runtime = createAppServerRuntime(
 				{ maxLoadedThreads: config.maxLoadedThreads },
 				{ maxFrameBytes: config.maxFrameBytes },
+				{ threadStartAdapter: createProductionThreadStartAdapter() },
 			);
+
 			const wsServer = Bun.serve({
 				port,
 				hostname: host,
@@ -222,11 +223,10 @@ export default class AppServer extends Command {
 		// unix:// — same WebSocket-over-Unix semantics.
 		if (config.mode.kind === "unix" && config.mode.path) {
 			const socketPath = config.mode.path;
-			// No threadStartAdapter or PermissionAdapter is attached here; server-request approvals are NOT
-			// reachable through the shipped Unix-socket transport today.
 			const runtime = createAppServerRuntime(
 				{ maxLoadedThreads: config.maxLoadedThreads },
 				{ maxFrameBytes: config.maxFrameBytes },
+				{ threadStartAdapter: createProductionThreadStartAdapter() },
 			);
 			const wsServer = Bun.serve({
 				unix: socketPath,
