@@ -164,6 +164,7 @@ const queries = [
 		"skill.invoke_status",
 		"Read the authoritative reconciliation status of a skill.invoke by command/turn IDs or clientRef.",
 	],
+	["providers.list/active", "List active providers."],
 ] as const;
 
 const reverse = [
@@ -243,7 +244,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }
@@ -306,7 +307,9 @@ export const OPERATIONS: readonly Operation[] = [
 			errorCodes:
 				id === "Q27"
 					? ["invalid_request", "resource_gone", "model_profile_registry_error"]
-					: ["invalid_request", "resource_gone"],
+					: id === "Q29"
+						? ["invalid_request", "resource_gone", "internal"]
+						: ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
 			adapterDispositions: queryDisposition(id),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],

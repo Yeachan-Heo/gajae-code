@@ -172,6 +172,62 @@ export function resolveOpenAIProviderBaseUrlForTest(
 	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
 }
 
+function appendUrlPath(baseUrl: string | undefined, path: string): string | undefined {
+	if (!baseUrl) return undefined;
+	const normalizedPath = path.replace(/^\/+/g, "");
+	try {
+		const parsed = new URL(baseUrl);
+		parsed.pathname = `${parsed.pathname.replace(/\/+$/g, "")}/${normalizedPath}`;
+		return parsed.toString();
+	} catch {
+		return `${baseUrl.replace(/\/+$/g, "")}/${normalizedPath}`;
+	}
+}
+
+type OpenAIResponsesQuery = string;
+
+function splitBaseUrlQuery(baseUrl: string | undefined): {
+	baseUrl: string | undefined;
+	query?: OpenAIResponsesQuery;
+} {
+	if (!baseUrl) return { baseUrl };
+	try {
+		const parsed = new URL(baseUrl);
+		if (!parsed.search) return { baseUrl };
+		const queryStart = baseUrl.indexOf("?");
+		const fragmentStart = baseUrl.indexOf("#", queryStart);
+		const query = baseUrl.slice(queryStart + 1, fragmentStart === -1 ? undefined : fragmentStart);
+		if (!query) return { baseUrl };
+		parsed.search = "";
+		return {
+			baseUrl: parsed.toString(),
+			query,
+		};
+	} catch {
+		return { baseUrl };
+	}
+}
+
+function appendRawQuery(url: string, query: OpenAIResponsesQuery | undefined): string {
+	if (!query) return url;
+	const fragmentStart = url.indexOf("#");
+	const beforeFragment = fragmentStart === -1 ? url : url.slice(0, fragmentStart);
+	const fragment = fragmentStart === -1 ? "" : url.slice(fragmentStart);
+	return `${beforeFragment}${beforeFragment.includes("?") ? "&" : "?"}${query}${fragment}`;
+}
+
+function buildRequestUrl(baseUrl: string | undefined, path: string, query?: OpenAIResponsesQuery): string | undefined {
+	const url = appendUrlPath(baseUrl, path);
+	return url ? appendRawQuery(url, query) : undefined;
+}
+
+function appendQueryToRequest(input: string | URL | Request, query?: OpenAIResponsesQuery): string | URL | Request {
+	if (!query) return input;
+	const url = appendRawQuery(input instanceof Request ? input.url : String(input), query);
+	if (input instanceof Request) return new Request(url, input as unknown as RequestInit);
+	return url;
+}
+
 const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
 	"response.created",
 	"response.output_item.added",
@@ -272,7 +328,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			// Keep request headers and prompt-cache routing on the same session-derived value.
 			const cacheSessionId = getOpenAIResponsesCacheSessionId(options);
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const { client, copilotPremiumRequests, baseUrl } = createClient(
+			const { client, copilotPremiumRequests, baseUrl, requestBaseUrl, requestQuery } = createClient(
 				model,
 				context,
 				apiKey,
@@ -296,7 +352,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				api: output.api,
 				model: model.id,
 				method: "POST",
-				url: `${baseUrl}/responses`,
+				url: buildRequestUrl(requestBaseUrl, "responses", requestQuery),
 				body: params,
 			};
 			const openaiStream = await callWithCopilotModelRetry(
@@ -439,6 +495,8 @@ function createClient(
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
 	baseUrl: string | undefined;
+	requestBaseUrl: string | undefined;
+	requestQuery: OpenAIResponsesQuery | undefined;
 } {
 	if (!apiKey) {
 		apiKey = $credentialEnv("OPENAI_API_KEY");
@@ -489,8 +547,15 @@ function createClient(
 		headers.session_id ??= sessionId;
 		headers["x-client-request-id"] ??= sessionId;
 	}
+	const { baseUrl: clientBaseUrl, query: endpointQuery } = splitBaseUrlQuery(baseUrl);
 	const baseFetch = fetchOverride ?? fetch;
-	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(baseFetch, maxRetryDelayMs);
+	const queryFetch = Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			return baseFetch(appendQueryToRequest(input, endpointQuery), init);
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
+	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(queryFetch, maxRetryDelayMs);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
 		boundedFetch,
 		model.requestTransform,
@@ -499,7 +564,7 @@ function createClient(
 	return {
 		client: new OpenAI({
 			apiKey,
-			baseURL: baseUrl,
+			baseURL: clientBaseUrl,
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
@@ -509,6 +574,8 @@ function createClient(
 		}),
 		copilotPremiumRequests,
 		baseUrl,
+		requestBaseUrl: clientBaseUrl,
+		requestQuery: endpointQuery,
 	};
 }
 

@@ -16,22 +16,24 @@ const commandInFlight = new Map<string, Promise<string | undefined>>();
  * Resolve a config value (API key, header value, etc.) to an actual value.
  * - If starts with "!", executes the rest as a shell command and uses stdout (cached)
  * - Otherwise checks environment variable first, then treats as literal (not cached)
+ * - `cacheScope` isolates command-cache entries when a caller rotates its config
  */
-export async function resolveConfigValue(config: string): Promise<string | undefined> {
+export async function resolveConfigValue(config: string, cacheScope?: string): Promise<string | undefined> {
 	if (config.startsWith("!")) {
-		return await executeCommand(config);
+		return await executeCommand(config, cacheScope);
 	}
 	const envValue = process.env[config];
 	return envValue || config;
 }
 
-async function executeCommand(commandConfig: string): Promise<string | undefined> {
-	const cached = commandResultCache.get(commandConfig);
+async function executeCommand(commandConfig: string, cacheScope?: string): Promise<string | undefined> {
+	const cacheKey = cacheScope === undefined ? commandConfig : `${cacheScope}\u0000${commandConfig}`;
+	const cached = commandResultCache.get(cacheKey);
 	if (cached !== undefined) {
 		return cached;
 	}
 
-	const existing = commandInFlight.get(commandConfig);
+	const existing = commandInFlight.get(cacheKey);
 	if (existing) {
 		return await existing;
 	}
@@ -40,15 +42,15 @@ async function executeCommand(commandConfig: string): Promise<string | undefined
 	const promise = runShellCommand(command, 10_000)
 		.then(result => {
 			if (result !== undefined) {
-				commandResultCache.set(commandConfig, result);
+				commandResultCache.set(cacheKey, result);
 			}
 			return result;
 		})
 		.finally(() => {
-			commandInFlight.delete(commandConfig);
+			commandInFlight.delete(cacheKey);
 		});
 
-	commandInFlight.set(commandConfig, promise);
+	commandInFlight.set(cacheKey, promise);
 	return await promise;
 }
 

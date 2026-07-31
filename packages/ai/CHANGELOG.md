@@ -5,6 +5,9 @@
 
 - Added read-only OpenCodex provider discovery with runtime-port resolution, identity-checked health probing, cached `/api/models` catalogs, raw wire model ids, and `/login opencodex` status reprobes without credential persistence.
 
+### Changed
+
+- OpenAI-compatible discovery and OpenAI Completions/Responses transports now preserve query-bearing endpoint routing, including repeated query parameters. Model resolution records whether a provider discovery result was fetched so consumers can distinguish current discovery evidence from cached data.
 
 ### Fixed
 

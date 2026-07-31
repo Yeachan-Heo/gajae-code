@@ -933,4 +933,15 @@ describe("AuthStorage claude oauth ranking", () => {
 			storage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "missing@example.com" }),
 		).toThrow("No credential found for anthropic matching email:missing@example.com");
 	});
+	test("returns unavailable evidence for a selector whose credential was removed", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const storage = authStorage;
+
+		await storage.set("anthropic", [{ type: "oauth", ...createCredential("acct-a", "a@example.com") }]);
+		storage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "a@example.com" });
+		await storage.set("anthropic", []);
+
+		expect(() => storage.getProviderEvidenceGeneration("anthropic")).not.toThrow();
+		expect(storage.hasUsableAuth("anthropic")).toBe(false);
+	});
 });

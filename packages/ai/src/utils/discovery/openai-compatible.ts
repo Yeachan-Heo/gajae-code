@@ -125,7 +125,7 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	let response: Response;
 	try {
-		response = await fetchImpl(`${baseUrl}${MODELS_PATH}`, {
+		response = await fetchImpl(buildModelsUrl(baseUrl), {
 			method: "GET",
 			headers: requestHeaders,
 			signal: options.signal,
@@ -193,7 +193,23 @@ function normalizeBaseUrl(baseUrl: string): string {
 	if (!trimmed) {
 		return "";
 	}
-	return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+	try {
+		const parsed = new URL(trimmed);
+		parsed.pathname = parsed.pathname.replace(/\/+$/g, "");
+		return parsed.toString();
+	} catch {
+		return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+	}
+}
+
+function buildModelsUrl(baseUrl: string): string {
+	try {
+		const parsed = new URL(baseUrl);
+		parsed.pathname = `${parsed.pathname.replace(/\/+$/g, "")}${MODELS_PATH}`;
+		return parsed.toString();
+	} catch {
+		return `${baseUrl}${MODELS_PATH}`;
+	}
 }
 
 function extractModelEntries(payload: unknown): ParsedOpenAICompatibleModelRecord[] | null {

@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+	ActiveProviderConnectionKind,
+	ActiveProviderDescriptor,
 	ModelProfileCatalogItem,
 	ModelProfileErrorDetails,
 	Q10CurrentThinkingLevel,
@@ -39,7 +41,10 @@ const sdkCapabilityDtoTypes:
 	  ]
 	| undefined = undefined;
 
+const q29DtoTypes: [ActiveProviderDescriptor, ActiveProviderConnectionKind] | undefined = undefined;
+
 void sdkCapabilityDtoTypes;
+void q29DtoTypes;
 
 describe("SDK package exports", () => {
 	it("preserves the session SDK surface and bus namespace after the namespace move", () => {
@@ -63,6 +68,8 @@ describe("SDK package exports", () => {
 		"@gajae-code/coding-agent/sdk/lifecycle-session.js",
 		"@gajae-code/coding-agent/sdk/startup-capability",
 		"@gajae-code/coding-agent/sdk/startup-capability.js",
+		"@gajae-code/coding-agent/sdk/providers",
+		"@gajae-code/coding-agent/sdk/providers.js",
 	])("rejects resolution of the private %s subpath", async subpath => {
 		const child = Bun.spawn([process.execPath, "-e", `await import(${JSON.stringify(subpath)})`], {
 			cwd: import.meta.dir,
@@ -115,6 +122,8 @@ describe("SDK package exports", () => {
 			"./sdk/lifecycle-session.js",
 			"./sdk/startup-capability",
 			"./sdk/startup-capability.js",
+			"./sdk/providers",
+			"./sdk/providers.js",
 		] as const)
 			expect(packageJson.exports[subpath]).toBeNull();
 	});

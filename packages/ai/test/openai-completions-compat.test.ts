@@ -473,6 +473,85 @@ describe("openai-completions compatibility", () => {
 		expect(assistantObject ? Reflect.get(assistantObject, "reasoning_text") : undefined).toBe("inspect tool output");
 		expect(assistantObject ? Reflect.get(assistantObject, "reasoning_content") : undefined).toBeUndefined();
 	});
+	it("preserves duplicate endpoint query parameters across SDK requests", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://example.invalid/v1?scope=read&scope=write&sig=a%2fb%20c",
+		};
+		const requests: string[] = [];
+		let attempt = 0;
+		const fetch = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				attempt++;
+				if (attempt === 1) {
+					return new Response("retry", { status: 500, headers: { "retry-after-ms": "0" } });
+				}
+				return createSseResponse(["[DONE]"]);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch,
+			requestMaxRetries: 1,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			expect(new URL(request).searchParams.getAll("scope")).toEqual(["read", "write"]);
+			expect(request).toContain("sig=a%2fb%20c");
+		}
+	});
+	it("preserves a percent-encoded explicit Azure API version from the endpoint", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://example.openai.azure.com/openai/v1?api%2Dversion=2025-04-01-preview",
+		};
+		const requests: string[] = [];
+		const fetch = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				return createSseResponse(["[DONE]"]);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key", fetch }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(1);
+		expect(new URL(requests[0]!).searchParams.getAll("api-version")).toEqual(["2025-04-01-preview"]);
+		expect(requests[0]).toContain("?api%2Dversion=2025-04-01-preview");
+	});
+	it("appends the default Azure API version after endpoint query entries", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://example.openai.azure.com/openai/v1?scope=read&scope=write",
+		};
+		const requests: string[] = [];
+		const fetch = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				return createSseResponse(["[DONE]"]);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key", fetch }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(1);
+		expect(new URL(requests[0]!).search).toStartWith("?scope=read&scope=write&api-version=");
+	});
 });
 
 describe("kimi model detection via detectCompat", () => {

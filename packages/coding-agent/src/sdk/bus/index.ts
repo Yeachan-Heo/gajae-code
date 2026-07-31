@@ -67,6 +67,7 @@ import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } fro
 import { projectQ10Models } from "../models.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -2101,6 +2102,13 @@ function sdkQuerySurface(
 			promptTerminalOutcomeVersion: 1,
 		}),
 		getAuthProviders: () => [...new Set(ctx.modelRegistry.getAll().map(model => model.provider))],
+		getActiveProviders: () => {
+			try {
+				return ctx.modelRegistry.getActiveProviders();
+			} catch {
+				throw new ActiveProviderResolutionError();
+			}
+		},
 		getTools: () => {
 			const tools = typeof (ctx as Partial<ExtensionContext>).getAllTools === "function" ? ctx.getAllTools() : [];
 			return tools.length > 0 ? tools : (getInstalledDefinitions("host_tools") ?? []);

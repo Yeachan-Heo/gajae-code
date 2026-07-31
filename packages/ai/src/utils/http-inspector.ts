@@ -267,6 +267,7 @@ export function rewriteCopilotError(errorMessage: string, error: unknown, provid
 function sanitizeDump(dump: RawHttpRequestDump): RawHttpRequestDump {
 	return {
 		...dump,
+		url: redactRequestUrl(dump.url),
 		headers: redactHeaders(dump.headers),
 		body: sanitizeDumpBody(dump.body),
 	};

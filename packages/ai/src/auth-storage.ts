@@ -8,6 +8,7 @@
  * - `SqliteAuthCredentialStore`: concrete SQLite-backed implementation
  */
 import { Database, type Statement } from "bun:sqlite";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
@@ -456,8 +457,9 @@ export type AuthStorageOptions = {
 	 * Resolve a config value (API key, header value, etc.) to an actual value.
 	 * - coding-agent injects its resolveConfigValue (supports "!command" syntax via pi-natives)
 	 * - Default: checks environment variable first, then treats as literal
+	 * `cacheScope` changes whenever the provider credential configuration changes.
 	 */
-	configValueResolver?: (config: string) => Promise<string | undefined>;
+	configValueResolver?: (config: string, cacheScope?: string) => Promise<string | undefined>;
 	/**
 	 * Optional callback fired when AuthStorage automatically disables a
 	 * credential because something detected it as no longer usable — today
@@ -844,7 +846,9 @@ export class AuthStorage {
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#store: AuthCredentialStore;
-	#configValueResolver: (config: string) => Promise<string | undefined>;
+	#configValueResolver: (config: string, cacheScope?: string) => Promise<string | undefined>;
+	#resolvedStoredApiKeyValues: Map<string, Map<string, { fingerprint: string; usable: boolean }>> = new Map();
+	#storedApiKeyResolutionInFlight: Map<string, Map<string, Promise<string | undefined>>> = new Map();
 	#refreshOAuthCredentialOverride?: AuthStorageOptions["refreshOAuthCredential"];
 	#fetchUsageReportsOverride?: AuthStorageOptions["fetchUsageReports"];
 	#sourceLabel?: string;
@@ -859,6 +863,9 @@ export class AuthStorage {
 	 */
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
 	#generation = 1;
+	#providerGenerations = new Map<string, number>();
+	#providerConfigurationGenerations = new Map<string, number>();
+	#providerOAuthRefreshGenerations = new Map<string, number>();
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<OAuthCredentials>> = new Map();
@@ -915,7 +922,66 @@ export class AuthStorage {
 	getGeneration(): number {
 		return this.#generation;
 	}
-
+	getProviderConfigurationGeneration(provider: string): number {
+		return this.#getProviderConfigurationGeneration(provider);
+	}
+	getProviderOAuthRefreshGeneration(provider: string): number {
+		return this.#providerOAuthRefreshGenerations.get(resolveOAuthStorageProvider(provider)) ?? 0;
+	}
+	#getProviderGeneration(provider: string): number {
+		return this.#providerGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	#getProviderConfigurationGeneration(provider: string): number {
+		return this.#providerConfigurationGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	getProviderEvidenceGeneration(provider: string, resolvedApiKey?: string): string {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const evidenceApiKey = resolvedApiKey;
+		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
+		try {
+			selectedCredential = this.#resolveSelectedStoredCredential(provider);
+		} catch {
+			return crypto
+				.createHash("sha256")
+				.update(`${this.#getProviderGeneration(storageProvider)}\u0000unavailable-selector`)
+				.digest("hex");
+		}
+		const credentials = selectedCredential
+			? [selectedCredential.credential]
+			: this.#getCredentialsForProvider(provider);
+		const hasApiKey = credentials.some(credential => credential.type === "api_key");
+		const hasUsableOAuth = credentials.some(
+			credential =>
+				credential.type === "oauth" && Number.isFinite(credential.expires) && credential.expires > Date.now(),
+		);
+		const effectiveEnvKey =
+			this.#runtimeOverrides.get(provider) || this.#configOverrides.get(provider) || hasApiKey || hasUsableOAuth
+				? undefined
+				: getEnvApiKey(provider);
+		const storedApiKeyFingerprint = credentials
+			.filter(
+				(credential): credential is Extract<AuthCredential, { type: "api_key" }> => credential.type === "api_key",
+			)
+			.map(credential => {
+				const resolved = this.#resolvedStoredApiKeyValues.get(storageProvider)?.get(credential.key);
+				return `${credential.key}\u0000${
+					credential.key.startsWith("!")
+						? (resolved?.fingerprint ?? "")
+						: (process.env[credential.key] ?? credential.key)
+				}`;
+			})
+			.join("\u0001");
+		const storedOAuthFingerprint = credentials
+			.filter((credential): credential is Extract<AuthCredential, { type: "oauth" }> => credential.type === "oauth")
+			.map(credential => `${credential.expires}\u0000${credential.expires > Date.now() ? "usable" : "expired"}`)
+			.join("\u0001");
+		return crypto
+			.createHash("sha256")
+			.update(
+				`${this.#getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceApiKey ?? ""}`,
+			)
+			.digest("hex");
+	}
 	onGenerationChanged(listener: (generation: number) => void): () => void {
 		this.#generationListeners.add(listener);
 		return () => {
@@ -927,8 +993,18 @@ export class AuthStorage {
 		this.#generationListeners.delete(listener);
 	}
 
-	#bumpGeneration(reason: string): void {
+	#bumpGeneration(reason: string, provider?: string): void {
 		this.#generation += 1;
+		if (provider) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			this.#providerGenerations.set(storageProvider, this.#getProviderGeneration(storageProvider) + 1);
+			if (reason !== "stored-api-key-usability") {
+				this.#providerConfigurationGenerations.set(
+					storageProvider,
+					this.#getProviderConfigurationGeneration(storageProvider) + 1,
+				);
+			}
+		}
 		for (const listener of [...this.#generationListeners]) {
 			try {
 				listener(this.#generation);
@@ -977,7 +1053,7 @@ export class AuthStorage {
 	 */
 	setRuntimeApiKey(provider: string, apiKey: string): void {
 		this.#runtimeOverrides.set(provider, apiKey);
-		this.#bumpGeneration("set-runtime-api-key");
+		this.#bumpGeneration("set-runtime-api-key", provider);
 	}
 
 	/**
@@ -988,20 +1064,24 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		this.#assertCredentialSelectorUsable(storageProvider, selector);
 		this.#runtimeCredentialSelectors.set(storageProvider, selector);
+		this.#bumpGeneration("set-runtime-credential-selector", provider);
 	}
 
 	/**
 	 * Remove a runtime credential selector.
 	 */
 	removeRuntimeCredentialSelector(provider: string): void {
-		this.#runtimeCredentialSelectors.delete(resolveOAuthStorageProvider(provider));
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeCredentialSelectors.delete(storageProvider)) {
+			this.#bumpGeneration("remove-runtime-credential-selector", provider);
+		}
 	}
 
 	/**
 	 * Remove a runtime API key override.
 	 */
 	removeRuntimeApiKey(provider: string): void {
-		if (this.#runtimeOverrides.delete(provider)) this.#bumpGeneration("remove-runtime-api-key");
+		if (this.#runtimeOverrides.delete(provider)) this.#bumpGeneration("remove-runtime-api-key", provider);
 	}
 
 	/** Whether a provider is currently authenticated by a runtime API-key override. */
@@ -1021,14 +1101,14 @@ export class AuthStorage {
 	 */
 	setConfigApiKey(provider: string, apiKey: string): void {
 		this.#configOverrides.set(provider, apiKey);
-		this.#bumpGeneration("set-config-api-key");
+		this.#bumpGeneration("set-config-api-key", provider);
 	}
 
 	/**
 	 * Remove a single config-sourced API key override.
 	 */
 	removeConfigApiKey(provider: string): void {
-		if (this.#configOverrides.delete(provider)) this.#bumpGeneration("remove-config-api-key");
+		if (this.#configOverrides.delete(provider)) this.#bumpGeneration("remove-config-api-key", provider);
 	}
 
 	/**
@@ -1036,9 +1116,10 @@ export class AuthStorage {
 	 * re-parsing `models.yml` so removed entries actually disappear.
 	 */
 	clearConfigApiKeys(): void {
-		if (this.#configOverrides.size === 0) return;
+		const providers = [...this.#configOverrides.keys()];
+		if (providers.length === 0) return;
 		this.#configOverrides.clear();
-		this.#bumpGeneration("clear-config-api-keys");
+		for (const provider of providers) this.#bumpGeneration("clear-config-api-keys", provider);
 	}
 
 	/**
@@ -1098,12 +1179,14 @@ export class AuthStorage {
 	#setStoredCredentials(provider: string, credentials: StoredCredential[]): void {
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return;
+		this.#resolvedStoredApiKeyValues.delete(provider);
+		this.#storedApiKeyResolutionInFlight.delete(provider);
 		if (credentials.length === 0) {
 			this.#data.delete(provider);
 		} else {
 			this.#data.set(provider, credentials);
 		}
-		this.#bumpGeneration("credentials");
+		this.#bumpGeneration("credentials", provider);
 	}
 
 	#resolveOAuthDedupeIdentityKey(provider: string, credential: OAuthCredential): string | null {
@@ -1356,6 +1439,7 @@ export class AuthStorage {
 		provider: string,
 		type: T,
 		sessionId?: string,
+		isUsable?: (credential: Extract<AuthCredential, { type: T }>, index: number) => boolean,
 	): { credential: Extract<AuthCredential, { type: T }>; index: number } | undefined {
 		const credentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
@@ -1373,7 +1457,10 @@ export class AuthStorage {
 
 		for (const idx of order) {
 			const candidate = credentials[idx];
-			if (!this.#isCredentialBlocked(providerKey, candidate.index)) {
+			if (
+				!this.#isCredentialBlocked(providerKey, candidate.index) &&
+				(isUsable === undefined || isUsable(candidate.credential, candidate.index))
+			) {
 				return candidate;
 			}
 		}
@@ -1408,6 +1495,19 @@ export class AuthStorage {
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		this.#setStoredCredentials(provider, updated);
+		if (
+			credential.type === "oauth" &&
+			target.credential.type === "oauth" &&
+			(credential.access !== target.credential.access ||
+				credential.refresh !== target.credential.refresh ||
+				credential.expires !== target.credential.expires)
+		) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			this.#providerOAuthRefreshGenerations.set(
+				storageProvider,
+				this.getProviderOAuthRefreshGeneration(storageProvider) + 1,
+			);
+		}
 	}
 
 	/**
@@ -1628,14 +1728,74 @@ export class AuthStorage {
 	 * Check if any form of auth is configured for a provider.
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
-	hasAuth(provider: string): boolean {
-		const storageProvider = resolveOAuthStorageProvider(provider);
-		if (this.#runtimeOverrides.has(storageProvider)) return true;
+	#hasConfiguredAuth(storageProvider: string): boolean {
+		if (this.hasRuntimeApiKey(storageProvider)) return true;
 		if (this.#configOverrides.has(storageProvider)) return true;
 		if (this.#getCredentialsForProvider(storageProvider).length > 0) return true;
 		if (getEnvApiKey(storageProvider)) return true;
 		if (this.#fallbackResolver?.(storageProvider)) return true;
 		return false;
+	}
+
+	hasAuth(provider: string): boolean {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		try {
+			this.#resolveSelectedStoredCredential(storageProvider);
+		} catch {
+			return false;
+		}
+		return this.#hasConfiguredAuth(storageProvider);
+	}
+
+	/**
+	 * Check whether configured auth is currently usable without resolving credentials.
+	 */
+	hasUsableAuth(provider: string): boolean {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		try {
+			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider);
+			if (this.hasRuntimeApiKey(storageProvider)) return true;
+			if (this.#configOverrides.has(storageProvider)) return true;
+			if (selectedCredential) {
+				if (selectedCredential.credential.type === "api_key") {
+					return (
+						!this.#isCredentialBlocked(
+							this.#getProviderTypeKey(storageProvider, selectedCredential.credential.type),
+							selectedCredential.index,
+						) && this.#hasUsableResolvedStoredApiKey(storageProvider, selectedCredential.credential.key)
+					);
+				}
+				return !this.#isCredentialBlocked(
+					this.#getProviderTypeKey(storageProvider, selectedCredential.credential.type),
+					selectedCredential.index,
+				);
+			}
+
+			const credentials = this.#getCredentialsForProvider(storageProvider);
+			let hasStoredApiKey = false;
+			let hasSelectableApiKey = false;
+			let hasUsableApiKey = false;
+			for (const [index, credential] of credentials.entries()) {
+				if (credential.type !== "api_key") continue;
+				hasStoredApiKey = true;
+				if (this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, credential.type), index)) continue;
+				hasSelectableApiKey = true;
+				hasUsableApiKey ||= this.#hasUsableResolvedStoredApiKey(storageProvider, credential.key);
+			}
+			if (hasStoredApiKey) return hasSelectableApiKey && hasUsableApiKey;
+			if (
+				this.#getCredentialsForProvider(storageProvider).some(
+					(credential, index) =>
+						credential.type === "oauth" &&
+						!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, credential.type), index),
+				)
+			) {
+				return true;
+			}
+		} catch {
+			return false;
+		}
+		return Boolean(getEnvApiKey(storageProvider) || this.#fallbackResolver?.(storageProvider));
 	}
 
 	/**
@@ -3504,6 +3664,64 @@ export class AuthStorage {
 		return undefined;
 	}
 
+	async #resolveStoredApiKey(provider: string, key: string): Promise<string | undefined> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const configurationGeneration = this.#getProviderConfigurationGeneration(storageProvider);
+		const resolutions =
+			this.#storedApiKeyResolutionInFlight.get(storageProvider) ?? new Map<string, Promise<string | undefined>>();
+		this.#storedApiKeyResolutionInFlight.set(storageProvider, resolutions);
+		const existing = resolutions.get(key);
+		if (existing) return existing;
+
+		const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
+		resolutions.set(key, promise);
+		const publish = (value: string | undefined) => {
+			if (
+				configurationGeneration !== this.#getProviderConfigurationGeneration(storageProvider) ||
+				this.#storedApiKeyResolutionInFlight.get(storageProvider) !== resolutions ||
+				resolutions.get(key) !== promise
+			) {
+				return;
+			}
+			const values =
+				this.#resolvedStoredApiKeyValues.get(storageProvider) ??
+				new Map<string, { fingerprint: string; usable: boolean }>();
+			const wasUsable = !values.has(key) || values.get(key)?.usable === true;
+			const isUsable = (value?.length ?? 0) > 0;
+			values.set(key, {
+				fingerprint: value ? crypto.createHash("sha256").update(value).digest("hex") : "",
+				usable: isUsable,
+			});
+			this.#resolvedStoredApiKeyValues.set(storageProvider, values);
+			if (key.startsWith("!") && wasUsable !== isUsable) {
+				this.#bumpGeneration("stored-api-key-usability", storageProvider);
+			}
+		};
+		void (async () => {
+			try {
+				const value = await this.#configValueResolver(key, String(configurationGeneration));
+				publish(value);
+				resolve(value);
+			} catch (error) {
+				publish(undefined);
+				reject(error);
+			} finally {
+				if (
+					this.#storedApiKeyResolutionInFlight.get(storageProvider) === resolutions &&
+					resolutions.get(key) === promise
+				) {
+					resolutions.delete(key);
+					if (resolutions.size === 0) this.#storedApiKeyResolutionInFlight.delete(storageProvider);
+				}
+			}
+		})();
+		return promise;
+	}
+	#hasUsableResolvedStoredApiKey(provider: string, key: string): boolean {
+		const resolved = this.#resolvedStoredApiKeyValues.get(resolveOAuthStorageProvider(provider))?.get(key);
+		return key.startsWith("!") ? resolved?.usable === true : true;
+	}
+
 	/**
 	 * Peek at API key for a provider without refreshing OAuth tokens.
 	 * Used for model discovery where we only need to know if credentials exist
@@ -3512,21 +3730,38 @@ export class AuthStorage {
 	 */
 	async peekApiKey(provider: string): Promise<string | undefined> {
 		const runtimeKey = this.#runtimeOverrides.get(provider);
-		if (runtimeKey) {
-			return runtimeKey;
-		}
+		if (runtimeKey) return runtimeKey;
 
 		const configKey = this.#configOverrides.get(provider);
-		if (configKey) {
-			return configKey;
-		}
+		if (configKey) return configKey;
 
-		const apiKeySelection = this.#selectCredentialByType(provider, "api_key");
-		if (apiKeySelection) {
-			return this.#configValueResolver(apiKeySelection.credential.key);
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider);
+		if (selectedCredential?.credential.type === "api_key") {
+			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 		}
 
 		// Return current OAuth access token only if it is not already expired.
+		if (selectedCredential?.credential.type === "oauth") {
+			const expiresAt = selectedCredential.credential.expires;
+			if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+				if (provider === "github-copilot") {
+					return JSON.stringify({
+						token: selectedCredential.credential.access,
+						enterpriseUrl: selectedCredential.credential.enterpriseUrl,
+					});
+				}
+				return selectedCredential.credential.access;
+			}
+			return undefined;
+		}
+
+		const apiKeySelection = this.#selectCredentialByType(provider, "api_key", undefined, credential =>
+			this.#hasUsableResolvedStoredApiKey(provider, credential.key),
+		);
+		if (apiKeySelection) {
+			return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+		}
+
 		const oauthSelection = this.#selectCredentialByType(provider, "oauth");
 		if (oauthSelection) {
 			const expiresAt = oauthSelection.credential.expires;
@@ -3541,10 +3776,7 @@ export class AuthStorage {
 			}
 		}
 
-		const envKey = getEnvApiKey(provider);
-		if (envKey) return envKey;
-
-		return this.#fallbackResolver?.(provider) ?? undefined;
+		return getEnvApiKey(provider) || this.#fallbackResolver?.(provider);
 	}
 
 	/**
@@ -3578,14 +3810,16 @@ export class AuthStorage {
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
-			return this.#configValueResolver(selectedCredential.credential.key);
+			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 		}
 
 		if (!selectedCredential) {
-			const apiKeySelection = this.#selectCredentialByType(provider, "api_key", sessionId);
+			const apiKeySelection = this.#selectCredentialByType(provider, "api_key", sessionId, credential =>
+				this.#hasUsableResolvedStoredApiKey(provider, credential.key),
+			);
 			if (apiKeySelection) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
-				return this.#configValueResolver(apiKeySelection.credential.key);
+				return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 			}
 		}
 
@@ -3654,9 +3888,14 @@ export class AuthStorage {
 		}
 	}
 
-	async #credentialMatchesApiKey(credential: AuthCredential, apiKey: string): Promise<boolean> {
+	async #credentialMatchesApiKey(provider: string, credential: AuthCredential, apiKey: string): Promise<boolean> {
 		if (credential.type === "api_key") {
-			return (await this.#configValueResolver(credential.key)) === apiKey;
+			return (
+				(await this.#configValueResolver(
+					credential.key,
+					String(this.#getProviderConfigurationGeneration(provider)),
+				)) === apiKey
+			);
 		}
 		if (credential.access === apiKey) return true;
 		return this.#extractStructuredApiKeyToken(apiKey) === credential.access;
@@ -3679,7 +3918,7 @@ export class AuthStorage {
 		let matched: { id: number; type: AuthCredential["type"]; index: number } | undefined;
 		for (let index = 0; index < stored.length; index++) {
 			const entry = stored[index];
-			if (entry && (await this.#credentialMatchesApiKey(entry.credential, apiKey))) {
+			if (entry && (await this.#credentialMatchesApiKey(provider, entry.credential, apiKey))) {
 				matched = { id: entry.id, type: entry.credential.type, index };
 				break;
 			}

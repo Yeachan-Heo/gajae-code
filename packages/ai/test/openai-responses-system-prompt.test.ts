@@ -165,3 +165,42 @@ describe("openai-responses system prompt routing", () => {
 		});
 	});
 });
+describe("openai-responses endpoint query routing", () => {
+	it("keeps duplicate endpoint query values on path-first client retries", async () => {
+		const model: Model<"openai-responses"> = {
+			...gpt4oMiniModel,
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://proxy.example.com/v1?scope=read&scope=write&sig=a%2fb%20c",
+		};
+		const requests: string[] = [];
+		let attempt = 0;
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				attempt++;
+				if (attempt === 1) {
+					return new Response("retry", { status: 500, headers: { "retry-after-ms": "0" } });
+				}
+				return createSseResponse();
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAIResponses(
+			model,
+			{
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{ apiKey: "test-key", fetch: fetchMock, requestMaxRetries: 1 },
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			const url = new URL(request);
+			expect(url.pathname).toBe("/v1/responses");
+			expect(url.searchParams.getAll("scope")).toEqual(["read", "write"]);
+			expect(request).toContain("sig=a%2fb%20c");
+		}
+	});
+});

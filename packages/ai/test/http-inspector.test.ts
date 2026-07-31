@@ -64,7 +64,7 @@ describe("HTTP 400 request dump sanitization", () => {
 			api: "anthropic-messages",
 			model: "claude-sonnet-4-6",
 			method: "POST",
-			url: "https://api.anthropic.com/v1/messages",
+			url: "https://api.anthropic.com/v1/messages?sig=synthetic-query-secret",
 			headers: {
 				"X-Api-Key": "synthetic-key",
 			},
@@ -103,6 +103,8 @@ describe("HTTP 400 request dump sanitization", () => {
 		expect(saved).not.toContain(syntheticSignature);
 		expect(saved).not.toContain(syntheticRedacted);
 		expect(saved).not.toContain("synthetic-key");
+		expect(saved).not.toContain("synthetic-query-secret");
+		expect(saved).toContain("https://api.anthropic.com/v1/messages");
 		expect(saved).toContain("visible text");
 		expect(saved).toContain("[redacted]");
 	});

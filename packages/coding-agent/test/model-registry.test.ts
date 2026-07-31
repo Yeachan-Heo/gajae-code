@@ -2,7 +2,17 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@gajae-code/ai";
+import {
+	type Api,
+	type Context,
+	Effort,
+	type Model,
+	type OpenAICompat,
+	readModelCache,
+	type ThinkingConfig,
+	writeModelCache,
+} from "@gajae-code/ai";
+import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
@@ -246,6 +256,24 @@ describe("ModelRegistry", () => {
 				expect(openaiModels.length).toBeGreaterThan(0);
 				expect(openaiModels.every(model => model.baseUrl === "https://openai-proxy.example.com/v1")).toBe(true);
 				expect(registry.getProviderBaseUrl("openai")).toBe("https://openai-proxy.example.com/v1");
+			} finally {
+				restore();
+			}
+		});
+		test("reloads bundled OpenAI models when OPENAI_BASE_URL changes without a models config", async () => {
+			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-first.example.com/v1");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(
+					getModelsForProvider(registry, "openai").every(model => model.baseUrl === Bun.env.OPENAI_BASE_URL),
+				).toBe(true);
+
+				Bun.env.OPENAI_BASE_URL = "https://openai-second.example.com/v1";
+				await registry.refresh("offline");
+
+				expect(
+					getModelsForProvider(registry, "openai").every(model => model.baseUrl === Bun.env.OPENAI_BASE_URL),
+				).toBe(true);
 			} finally {
 				restore();
 			}
@@ -855,6 +883,147 @@ describe("ModelRegistry", () => {
 				else process.env.XAI_API_KEY = previous;
 			}
 		});
+		test("keeps normal availability while excluding a failed stored command key from Q29", async () => {
+			const restoreXaiKey = unsetEnvForTest("XAI_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				await authStorage.set("xai", [{ type: "api_key", key: "!missing-xai-key" }]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(true);
+				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
+
+				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
+
+				const available = registry.getAvailable();
+				expect(available).not.toBe(initial);
+				expect(available.some(model => model.provider === "xai")).toBe(true);
+				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
+			} finally {
+				restoreXaiKey();
+			}
+		});
+		test("recovers a failed stored command key through ordinary provider key lookup", async () => {
+			const restoreXaiKey = unsetEnvForTest("XAI_API_KEY");
+			let resolvedKey: string | undefined;
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async config => (config === "!recovering-xai-key" ? resolvedKey : undefined),
+				});
+				await authStorage.set("xai", [{ type: "api_key", key: "!recovering-xai-key" }]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
+				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
+
+				resolvedKey = "recovered-xai-key";
+				await expect(registry.getApiKeyForProvider("xai")).resolves.toBe("recovered-xai-key");
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "xai",
+					connectionKind: "credential",
+				});
+			} finally {
+				restoreXaiKey();
+			}
+		});
+		test("keeps normal availability after every stored command key resolves undefined", async () => {
+			const restoreXaiKey = unsetEnvForTest("XAI_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				await authStorage.set("xai", [
+					{ type: "api_key", key: "!missing-xai-key-a" },
+					{ type: "api_key", key: "!missing-xai-key-b" },
+				]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(true);
+
+				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
+				const afterFirst = registry.getAvailable();
+				expect(afterFirst.some(model => model.provider === "xai")).toBe(true);
+
+				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
+				const available = registry.getAvailable();
+				expect(available).not.toBe(afterFirst);
+				expect(available.some(model => model.provider === "xai")).toBe(true);
+				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
+			} finally {
+				restoreXaiKey();
+			}
+		});
+		test("preserves mixed-credential and selector auth precedence after stored API-key resolution", async () => {
+			const restoreXaiKey = unsetEnvForTest("XAI_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				await authStorage.set("xai", [
+					{ type: "api_key", key: "!missing-xai-key" },
+					{
+						type: "oauth",
+						access: "selected-access",
+						refresh: "selected-refresh",
+						expires: Date.now() + 60_000,
+						email: "selected@example.com",
+					},
+				]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
+
+				authStorage.setRuntimeCredentialSelector("xai", {
+					kind: "email",
+					value: "selected@example.com",
+				});
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+
+				authStorage.removeRuntimeCredentialSelector("xai");
+				authStorage.setRuntimeApiKey("xai", "runtime-test-key");
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+			} finally {
+				restoreXaiKey();
+			}
+		});
+		test("rejects a dangling credential selector even when a runtime API-key override exists", async () => {
+			const previous = process.env.XAI_API_KEY;
+			delete process.env.XAI_API_KEY;
+			try {
+				await authStorage.set("xai", [
+					{
+						type: "oauth",
+						access: "selected-access",
+						refresh: "selected-refresh",
+						expires: Date.now() + 60_000,
+						email: "selected@example.com",
+					},
+				]);
+				authStorage.setRuntimeCredentialSelector("xai", {
+					kind: "email",
+					value: "selected@example.com",
+				});
+				await authStorage.set("xai", []);
+				authStorage.setRuntimeApiKey("xai", "runtime-test-key");
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(false);
+			} finally {
+				if (previous === undefined) delete process.env.XAI_API_KEY;
+				else process.env.XAI_API_KEY = previous;
+			}
+		});
 
 		test("refreshes available models when an API-key environment variable changes", async () => {
 			await Settings.init({ inMemory: true });
@@ -870,6 +1039,56 @@ describe("ModelRegistry", () => {
 			} finally {
 				if (previous === undefined) delete process.env.XAI_API_KEY;
 				else process.env.XAI_API_KEY = previous;
+			}
+		});
+		test("refresh reloads custom apiKeyEnv presence changes without a models file change", async () => {
+			const keyEnv = `GJC_TEST_REFRESH_PROVIDER_KEY_${Snowflake.next()}`;
+			const restoreKey = unsetEnvForTest(keyEnv);
+			try {
+				writeRawModelsJson({
+					"env-provider": {
+						baseUrl: "https://env-provider.example/v1",
+						api: "openai-responses",
+						apiKeyEnv: keyEnv,
+						models: [{ id: "env-model" }],
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getAvailable().some(model => model.provider === "env-provider")).toBe(false);
+
+				Bun.env[keyEnv] = "refresh-env-key";
+				await registry.refresh("offline");
+				expect(registry.getAvailable().some(model => model.provider === "env-provider")).toBe(true);
+				await expect(registry.getApiKeyForProvider("env-provider")).resolves.toBe("refresh-env-key");
+
+				delete Bun.env[keyEnv];
+				await registry.refresh("offline");
+				expect(registry.getAvailable().some(model => model.provider === "env-provider")).toBe(false);
+				await expect(registry.getApiKeyForProvider("env-provider")).resolves.toBeUndefined();
+			} finally {
+				restoreKey();
+			}
+		});
+		test("refresh reloads custom apiKey environment-name values without a models file change", async () => {
+			const keyEnv = `GJC_TEST_REFRESH_PROVIDER_API_KEY_${Snowflake.next()}`;
+			const restoreKey = setEnvForTest(keyEnv, "initial-env-key");
+			try {
+				writeRawModelsJson({
+					"api-key-provider": {
+						baseUrl: "https://api-key-provider.example/v1",
+						api: "openai-responses",
+						apiKey: keyEnv,
+						models: [{ id: "api-key-model" }],
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await expect(registry.getApiKeyForProvider("api-key-provider")).resolves.toBe("initial-env-key");
+				Bun.env[keyEnv] = "rotated-env-key";
+				await registry.refresh("offline");
+				await expect(registry.getApiKeyForProvider("api-key-provider")).resolves.toBe("rotated-env-key");
+			} finally {
+				restoreKey();
 			}
 		});
 
@@ -2200,6 +2419,8 @@ describe("ModelRegistry", () => {
 
 			expect(registry.getAvailable().some(model => model.provider === "github-copilot")).toBe(false);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
+			expect(registry.getActiveProviders().some(provider => provider.provider === "github-copilot")).toBe(false);
+			expect(registry.getActiveProviders().some(provider => provider.provider === "ollama")).toBe(false);
 		});
 
 		test("refresh skips discovery probes for disabled local providers", async () => {
@@ -2223,11 +2444,63 @@ describe("ModelRegistry", () => {
 			);
 			expect(disabledProbeUrls).toEqual([]);
 		});
+		test("rebuilds implicit discovery when disabled providers change without models.json", async () => {
+			await Settings.init({
+				inMemory: true,
+				overrides: {
+					disabledProviders: ["llama.cpp", "lm-studio", "ollama"],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
+
+			settings.override("disabledProviders", []);
+			await registry.refresh("offline");
+
+			expect(registry.getDiscoverableProviders()).toContain("ollama");
+		});
+		test("rebuilds implicit discovery when endpoint environment changes without models.json", async () => {
+			const firstBaseUrl = "http://127.0.0.1:21334";
+			const secondBaseUrl = "http://127.0.0.1:21434";
+			const requestedUrls: string[] = [];
+			using _hook = hookFetch((input, init, next) => {
+				const url = String(input);
+				if (url === `${firstBaseUrl}/api/tags` || url === `${secondBaseUrl}/api/tags`) {
+					requestedUrls.push(url);
+					return new Response(JSON.stringify({ models: [{ name: "phi4-mini" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === `${firstBaseUrl}/api/show` || url === `${secondBaseUrl}/api/show`) {
+					requestedUrls.push(url);
+					return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return next(input, init);
+			});
+
+			const restoreInitialBaseUrl = setEnvForTest("OLLAMA_BASE_URL", firstBaseUrl);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const firstRefresh = registry.refreshProvider("ollama", "online");
+			restoreInitialBaseUrl();
+			await firstRefresh;
+			const restoreChangedBaseUrl = setEnvForTest("OLLAMA_BASE_URL", secondBaseUrl);
+			const refresh = registry.refreshProvider("ollama", "online");
+			restoreChangedBaseUrl();
+			await refresh;
+
+			expect(requestedUrls).toContain(`${firstBaseUrl}/api/tags`);
+			expect(requestedUrls).toContain(`${secondBaseUrl}/api/tags`);
+		});
 	});
 	describe("runtime discovery", () => {
 		test("auto-discovers ollama models without provider config", async () => {
 			using _hook = mockOllamaDiscovery(["phi4-mini"]);
-			const _restoreOllamaKey = unsetEnvForTest("OLLAMA_API_KEY");
+			const restoreOllamaBaseUrl = setEnvForTest("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+			const restoreOllamaKey = unsetEnvForTest("OLLAMA_API_KEY");
 			try {
 				const registry = new ModelRegistry(authStorage, modelsJsonPath);
 				await registry.refresh();
@@ -2235,8 +2508,43 @@ describe("ModelRegistry", () => {
 				expect(ollamaModels.some(m => m.id === "phi4-mini")).toBe(true);
 				expect(registry.getAvailable().some(m => m.provider === "ollama" && m.id === "phi4-mini")).toBe(true);
 				expect(await registry.getApiKey(ollamaModels[0])).toBe(kNoAuth);
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "ollama",
+					connectionKind: "credentialless",
+				});
 			} finally {
-				_restoreOllamaKey();
+				restoreOllamaKey();
+				restoreOllamaBaseUrl();
+			}
+		});
+		test("uses credentials for implicit Ollama discovery and model requests", async () => {
+			const restoreOllamaKey = setEnvForTest("OLLAMA_API_KEY", "implicit-ollama-key");
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:11434/api/tags") {
+					expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer implicit-ollama-key");
+					return new Response(JSON.stringify({ models: [{ name: "phi4-mini" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "http://127.0.0.1:11434/api/show") {
+					expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer implicit-ollama-key");
+					return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh();
+
+				const ollamaModel = getModelsForProvider(registry, "ollama")[0];
+				expect(await registry.getApiKey(ollamaModel)).toBe("implicit-ollama-key");
+			} finally {
+				restoreOllamaKey();
 			}
 		});
 		test("discovers ollama-cloud through built-in descriptor flow without regressing local implicit ollama", async () => {
@@ -2691,6 +2999,476 @@ describe("ModelRegistry", () => {
 			const llamaModels = getModelsForProvider(registry, "llama.cpp");
 			const apiKey = await registry.getApiKey(llamaModels[0]);
 			expect(apiKey).toBe(kNoAuth);
+		});
+		test("llama.cpp implicit optional auth rechecks credentials added after startup", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				authStorage.setRuntimeApiKey("llama.cpp", "added-after-startup-key");
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "http://127.0.0.1:8080/models" || url === "http://127.0.0.1:8080/props") {
+						const headers = new Headers(init?.headers);
+						expect(headers.get("Authorization")).toBe("Bearer added-after-startup-key");
+						if (url.endsWith("/props")) {
+							return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 65536 } }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(JSON.stringify({ data: [{ id: "Q29-llama-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
+
+				await registry.refresh();
+
+				expect(registry.find("llama.cpp", "Q29-llama-model")).toBeDefined();
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "llama.cpp",
+					connectionKind: "credential",
+				});
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("llama.cpp implicit optional auth falls back to credentialless discovery when stored auth is unusable", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				await authStorage.set("llama.cpp", [
+					{
+						type: "oauth",
+						access: "expired-llama-access",
+						refresh: "expired-llama-refresh",
+						expires: Date.now() - 60_000,
+						email: "llama@example.com",
+					},
+				]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(await authStorage.peekApiKey("llama.cpp")).toBeUndefined();
+
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "http://127.0.0.1:8080/models" || url === "http://127.0.0.1:8080/props") {
+						expect(new Headers(init?.headers).get("Authorization")).toBeNull();
+						if (url.endsWith("/props")) {
+							return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 65536 } }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(JSON.stringify({ data: [{ id: "Q29-llama-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
+
+				await registry.refresh();
+
+				expect(registry.find("llama.cpp", "Q29-llama-model")).toBeDefined();
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "llama.cpp",
+					connectionKind: "credentialless",
+				});
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("llama.cpp optional-auth fallback follows credential evidence without a second discovery refresh", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				let unavailable = false;
+				await authStorage.set("llama.cpp", [{ type: "api_key", key: "!missing-llama-key" }]);
+				const requestApiKeys: string[] = [];
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (unavailable) return new Response("unavailable", { status: 503 });
+					if (url === "http://127.0.0.1:8080/models" || url === "http://127.0.0.1:8080/props") {
+						requestApiKeys.push(new Headers(init?.headers).get("Authorization") ?? "");
+						if (url.endsWith("/props")) {
+							return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 65536 } }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(JSON.stringify({ data: [{ id: "Q29-fallback-llama-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("llama.cpp", "online");
+
+				const activeLlama = () =>
+					registry.getActiveProviders().filter(provider => provider.provider === "llama.cpp");
+				expect(activeLlama()).toEqual([{ provider: "llama.cpp", connectionKind: "credentialless" }]);
+				await expect(registry.getApiKeyForProvider("llama.cpp")).resolves.toBe(kNoAuth);
+				unavailable = true;
+				await registry.refreshProvider("llama.cpp", "online");
+				expect(registry.getProviderDiscoveryState("llama.cpp")?.status).toBe("cached");
+				expect(activeLlama()).toEqual([]);
+
+				unavailable = false;
+
+				authStorage.setRuntimeApiKey("llama.cpp", "added-after-fallback-key");
+
+				expect(activeLlama()).toEqual([]);
+				await expect(registry.getApiKeyForProvider("llama.cpp")).resolves.toBe("added-after-fallback-key");
+
+				await registry.refreshProvider("llama.cpp", "online");
+
+				expect(requestApiKeys).toEqual([
+					"",
+					"",
+					"Bearer added-after-fallback-key",
+					"Bearer added-after-fallback-key",
+				]);
+				expect(registry.find("llama.cpp", "Q29-fallback-llama-model")).toBeDefined();
+				expect(activeLlama()).toEqual([{ provider: "llama.cpp", connectionKind: "credential" }]);
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("llama.cpp optional-auth preflight retries a recovered command credential", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			let resolvedKey: string | undefined;
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async config => (config === "!recovering-llama-key" ? resolvedKey : undefined),
+				});
+				await authStorage.set("llama.cpp", [{ type: "api_key", key: "!recovering-llama-key" }]);
+				const requestApiKeys: string[] = [];
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "http://127.0.0.1:8080/models" || url === "http://127.0.0.1:8080/props") {
+						requestApiKeys.push(new Headers(init?.headers).get("Authorization") ?? "");
+						if (url.endsWith("/props")) {
+							return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 65536 } }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(JSON.stringify({ data: [{ id: "recovered-llama-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("llama.cpp", "online");
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "llama.cpp",
+					connectionKind: "credentialless",
+				});
+				await expect(
+					registry.getApiKeyForProvider("llama.cpp", undefined, undefined, {
+						credentialSelector: { kind: "email", value: "missing@example.com" },
+					}),
+				).rejects.toThrow("No credential found");
+
+				resolvedKey = "recovered-llama-key";
+				await expect(registry.getApiKeyForProvider("llama.cpp")).resolves.toBe("recovered-llama-key");
+				await registry.refreshProvider("llama.cpp", "online");
+
+				expect(requestApiKeys).toEqual(["", "", "Bearer recovered-llama-key", "Bearer recovered-llama-key"]);
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "llama.cpp",
+					connectionKind: "credential",
+				});
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("llama.cpp implicit optional auth reuses the preflight credential for discovery", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async config => (config === "!working-llama-key" ? "working-llama-key" : undefined),
+				});
+				await authStorage.set("llama.cpp", [
+					{ type: "api_key", key: "!working-llama-key" },
+					{ type: "api_key", key: "!dangling-llama-key" },
+				]);
+
+				const requestApiKeys: string[] = [];
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "http://127.0.0.1:8080/models" || url === "http://127.0.0.1:8080/props") {
+						requestApiKeys.push(new Headers(init?.headers).get("Authorization") ?? "");
+						if (url.endsWith("/props")) {
+							return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 65536 } }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(JSON.stringify({ data: [{ id: "preflight-llama-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh();
+
+				expect(requestApiKeys).toEqual(["Bearer working-llama-key", "Bearer working-llama-key"]);
+				expect(registry.find("llama.cpp", "preflight-llama-model")).toBeDefined();
+				expect(registry.getProviderDiscoveryState("llama.cpp")?.status).toBe("ok");
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "llama.cpp",
+					connectionKind: "credential",
+				});
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("llama.cpp optional-auth preflight uses a refresh-aware OAuth credential for discovery", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				await authStorage.set("llama.cpp", [
+					{
+						type: "oauth",
+						access: "expiring-llama-access",
+						refresh: "refresh-llama-access",
+						expires: Date.now() + 30_000,
+						email: "llama@example.com",
+					},
+				]);
+				const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockResolvedValue("refreshed-llama-access");
+				const requestApiKeys: string[] = [];
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "http://127.0.0.1:8080/models" || url === "http://127.0.0.1:8080/props") {
+						requestApiKeys.push(new Headers(init?.headers).get("Authorization") ?? "");
+						if (url.endsWith("/props")) {
+							return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 65536 } }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(JSON.stringify({ data: [{ id: "refresh-aware-llama-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
+				try {
+					const registry = new ModelRegistry(authStorage, modelsJsonPath);
+					await registry.refreshProvider("llama.cpp", "online");
+
+					expect(getApiKeySpy).toHaveBeenCalledWith("llama.cpp", undefined, {
+						baseUrl: "http://127.0.0.1:8080",
+					});
+					expect(requestApiKeys).toEqual(["Bearer refreshed-llama-access", "Bearer refreshed-llama-access"]);
+				} finally {
+					getApiKeySpy.mockRestore();
+				}
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("does not retain credentialless fallback after optional OAuth preflight failure", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				await authStorage.set("llama.cpp", [
+					{
+						type: "oauth",
+						access: "expiring-llama-access",
+						refresh: "refresh-llama-access",
+						expires: Date.now() + 30_000,
+						email: "llama@example.com",
+					},
+				]);
+				const getApiKeySpy = vi
+					.spyOn(authStorage, "getApiKey")
+					.mockRejectedValueOnce(new Error("transient refresh failure"))
+					.mockResolvedValue("recovered-llama-access");
+				try {
+					const registry = new ModelRegistry(authStorage, modelsJsonPath);
+					await registry.refreshProvider("llama.cpp", "online");
+
+					expect(await registry.getApiKeyForProvider("llama.cpp")).toBe("recovered-llama-access");
+				} finally {
+					getApiKeySpy.mockRestore();
+				}
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("does not advertise optional discovery after its selected credential is removed", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				await authStorage.set("llama.cpp", [
+					{
+						type: "oauth",
+						access: "selected-llama-access",
+						refresh: "selected-llama-refresh",
+						expires: Date.now() + 60_000,
+						email: "selected@example.com",
+					},
+				]);
+				authStorage.setRuntimeCredentialSelector("llama.cpp", {
+					kind: "email",
+					value: "selected@example.com",
+				});
+				await authStorage.set("llama.cpp", [{ type: "api_key", key: "other-llama-key" }]);
+				using _hook = hookFetch(() => {
+					throw new Error("optional discovery must not fall back after a selector failure");
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("llama.cpp", "online");
+
+				expect(registry.getActiveProviders().filter(provider => provider.provider === "llama.cpp")).toEqual([]);
+				await expect(registry.getApiKeyForProvider("llama.cpp")).rejects.toThrow("No credential found");
+			} finally {
+				authStorage.removeRuntimeCredentialSelector("llama.cpp");
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("newer optional-auth preflight state wins when overlapping refreshes finish out of order", async () => {
+			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				await authStorage.set("llama.cpp", [
+					{
+						type: "oauth",
+						access: "valid-llama-access",
+						refresh: "valid-llama-refresh",
+						expires: Date.now() + 60_000,
+						email: "llama@example.com",
+					},
+				]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const olderCredential = Promise.withResolvers<string | undefined>();
+				const newerCredential = Promise.withResolvers<string | undefined>();
+				let credentialCalls = 0;
+				const credentialSpy = vi.spyOn(authStorage, "getApiKey").mockImplementation(async () => {
+					credentialCalls += 1;
+					return credentialCalls === 1 ? olderCredential.promise : newerCredential.promise;
+				});
+				try {
+					const olderRefresh = registry.refreshProvider("llama.cpp", "offline");
+					while (credentialCalls < 1) await Bun.sleep(0);
+
+					const newerRefresh = registry.refreshProvider("llama.cpp", "offline");
+					while (credentialCalls < 2) await Bun.sleep(0);
+
+					newerCredential.resolve(undefined);
+					await newerRefresh;
+					expect(await registry.getApiKeyForProvider("llama.cpp")).toBe(kNoAuth);
+
+					olderCredential.resolve("older-preflight-key");
+					await olderRefresh;
+					expect(await registry.getApiKeyForProvider("llama.cpp")).toBe(kNoAuth);
+				} finally {
+					credentialSpy.mockRestore();
+				}
+			} finally {
+				restoreLlamaBaseUrl();
+				restoreLlamaKey();
+			}
+		});
+		test("credentialless OpenAI-compatible and llama.cpp discovery bypass dangling credential selectors", async () => {
+			writeRawModelsJson({
+				"credentialless-openai": {
+					baseUrl: "https://credentialless-openai.example/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+				"credentialless-llama": {
+					baseUrl: "https://credentialless-llama.example/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "llama.cpp" },
+				},
+			});
+			for (const provider of ["credentialless-openai", "credentialless-llama"]) {
+				await authStorage.set(provider, [
+					{
+						type: "oauth",
+						access: "stale-access",
+						refresh: "stale-refresh",
+						expires: Date.now() + 60_000,
+						email: `${provider}@example.com`,
+					},
+				]);
+				authStorage.setRuntimeCredentialSelector(provider, {
+					kind: "email",
+					value: `${provider}@example.com`,
+				});
+				await authStorage.set(provider, []);
+			}
+
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://credentialless-openai.example/v1/models") {
+					return new Response(JSON.stringify({ data: [{ id: "openai-local-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://credentialless-llama.example/v1/models") {
+					return new Response(JSON.stringify({ data: [{ id: "llama-local-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://credentialless-llama.example/props") {
+					return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 32768 } }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			const getApiKey = vi.spyOn(authStorage, "getApiKey").mockRejectedValue(new Error("dangling selector"));
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("credentialless-openai", "online");
+				await registry.refreshProvider("credentialless-llama", "online");
+
+				expect(registry.find("credentialless-openai", "openai-local-model")).toBeDefined();
+				expect(registry.find("credentialless-llama", "llama-local-model")).toBeDefined();
+				expect(getApiKey).not.toHaveBeenCalled();
+			} finally {
+				getApiKey.mockRestore();
+			}
 		});
 		test("llama.cpp discovery reads context window from props n_ctx", async () => {
 			using _hook = hookFetch(input => {
@@ -3543,6 +4321,1936 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("http://127.0.0.1:1234/v1");
 			expect(getOpenAICompat(model)?.supportsStore).toBe(false);
 			expect(await registry.getApiKeyForProvider("local")).toBe("LOCAL_TEST_KEY");
+		});
+		test("uses stored credentials for OpenAI-compatible providers without inline auth", async () => {
+			await authStorage.set("local", [{ type: "api_key", key: "STORED_TEST_KEY" }]);
+			writeRawModelsJson({
+				local: {
+					openaiCompat: {
+						baseUrl: "http://127.0.0.1:1234",
+					},
+				},
+			});
+			using _hook = hookFetch((input, init) => {
+				expect(String(input)).toBe("http://127.0.0.1:1234/v1/models");
+				expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer STORED_TEST_KEY");
+				return new Response(JSON.stringify({ data: [{ id: "local-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+
+			expect(registry.getActiveProviders()).toEqual([{ provider: "local", connectionKind: "credential" }]);
+			expect(await registry.getApiKeyForProvider("local")).toBe("STORED_TEST_KEY");
+			await authStorage.set("local", []);
+
+			expect(registry.find("local", "local-model")).toBeDefined();
+			expect(registry.getActiveProviders()).toEqual([]);
+		});
+	});
+	describe("active provider resolution", () => {
+		const activeRowsFor = (registry: ModelRegistry, providerIds: readonly string[]) => {
+			const selected = new Set(providerIds);
+			return registry.getActiveProviders().filter(provider => selected.has(provider.provider));
+		};
+		test("rechecks non-fingerprinted environment credentials for active providers", () => {
+			const previous = process.env.GITLAB_TOKEN;
+			delete process.env.GITLAB_TOKEN;
+			try {
+				writeRawModelsJson({
+					"gitlab-duo": {
+						baseUrl: "https://gitlab.example.com/v1",
+						api: "openai-completions",
+						models: [{ id: "duo-chat" }],
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getAvailable().some(model => model.provider === "gitlab-duo")).toBe(false);
+				expect(activeRowsFor(registry, ["gitlab-duo"])).toEqual([]);
+
+				process.env.GITLAB_TOKEN = "gitlab-token";
+				expect(activeRowsFor(registry, ["gitlab-duo"])).toEqual([
+					{ provider: "gitlab-duo", connectionKind: "credential" },
+				]);
+
+				delete process.env.GITLAB_TOKEN;
+				expect(activeRowsFor(registry, ["gitlab-duo"])).toEqual([]);
+			} finally {
+				if (previous === undefined) delete process.env.GITLAB_TOKEN;
+				else process.env.GITLAB_TOKEN = previous;
+			}
+		});
+		test("does not advertise a static optional provider after its selected credential is removed", async () => {
+			writeRawModelsJson({
+				local: {
+					openaiCompat: { baseUrl: "http://127.0.0.1:1234" },
+					models: [{ id: "static-local-model" }],
+				},
+			});
+			await authStorage.set("local", [
+				{
+					type: "oauth",
+					access: "selected-local-access",
+					refresh: "selected-local-refresh",
+					expires: Date.now() + 60_000,
+					email: "selected@example.com",
+				},
+			]);
+			authStorage.setRuntimeCredentialSelector("local", {
+				kind: "email",
+				value: "selected@example.com",
+			});
+			await authStorage.set("local", [{ type: "api_key", key: "other-local-key" }]);
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				expect(activeRowsFor(registry, ["local"])).toEqual([]);
+				await expect(registry.getApiKeyForProvider("local")).rejects.toThrow("No credential found");
+			} finally {
+				authStorage.removeRuntimeCredentialSelector("local");
+			}
+		});
+		test("keeps credentialless discovery active with an irrelevant dangling selector", async () => {
+			writeRawModelsJson({
+				"credentialless-provider": {
+					baseUrl: "https://credentialless.example.com/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("credentialless-provider", [
+				{
+					type: "oauth",
+					access: "stale-access",
+					refresh: "stale-refresh",
+					expires: Date.now() + 60_000,
+					email: "stale@example.com",
+				},
+			]);
+			authStorage.setRuntimeCredentialSelector("credentialless-provider", {
+				kind: "email",
+				value: "stale@example.com",
+			});
+
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://credentialless.example.com/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "credentialless-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("credentialless-provider", "online");
+			await authStorage.set("credentialless-provider", []);
+
+			expect(registry.getActiveProviders()).toEqual([
+				{ provider: "credentialless-provider", connectionKind: "credentialless" },
+			]);
+			expect(registry.getAvailable().some(model => model.provider === "credentialless-provider")).toBe(true);
+			await expect(registry.getApiKeyForProvider("credentialless-provider")).resolves.toBe(kNoAuth);
+		});
+		test("resolves active providers from credentials and configured credentialless models without I/O", () => {
+			writeRawModelsJson({
+				"zeta.provider": {
+					baseUrl: "https://zeta.example.com/v1",
+					api: "openai-responses",
+					apiKey: "ZETA_KEY",
+					models: [{ id: "zeta-model" }],
+				},
+				"alpha-provider": {
+					baseUrl: "https://alpha.example.com/v1",
+					api: "openai-responses",
+					apiKey: "ALPHA_KEY",
+					models: [{ id: "alpha-model" }],
+				},
+				"local-provider": {
+					baseUrl: "http://127.0.0.1:1234/v1",
+					api: "openai-responses",
+					auth: "none",
+					models: [{ id: "local-model" }],
+				},
+			});
+			using _hook = hookFetch(() => {
+				throw new Error("active-provider resolution must not perform I/O");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(activeRowsFor(registry, ["alpha-provider", "local-provider", "zeta.provider"])).toEqual([
+				{ provider: "alpha-provider", connectionKind: "credential" },
+				{ provider: "local-provider", connectionKind: "credentialless" },
+				{ provider: "zeta.provider", connectionKind: "credential" },
+			]);
+		});
+		test("keeps bundled credentialed providers active when discovery is configured", () => {
+			writeRawModelsJson({
+				openai: {
+					baseUrl: "https://openai.example.com/v1",
+					apiKey: "OPENAI_TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					models: [],
+				},
+			});
+			using _hook = hookFetch(() => {
+				throw new Error("active-provider resolution must not perform discovery I/O");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.getProviderDiscoveryState("openai")?.status).toBe("idle");
+			expect(registry.find("openai", "gpt-4o-mini")).toBeDefined();
+			expect(activeRowsFor(registry, ["openai"])).toEqual([{ provider: "openai", connectionKind: "credential" }]);
+		});
+		test("excludes bundled providers when the selected stored key resolver returns undefined", async () => {
+			authStorage.close();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async () => undefined,
+			});
+			await authStorage.set("anthropic", [{ type: "api_key", key: "!missing-anthropic-key" }]);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+
+			expect(registry.getAll().some(model => model.provider === "anthropic")).toBe(true);
+			expect(activeRowsFor(registry, ["anthropic"])).toEqual([]);
+		});
+
+		test("tracks credential addition, replacement, removal, dedupe, and registry-only exclusions", async () => {
+			writeRawModelsJson({
+				"tracked-provider": {
+					baseUrl: "https://tracked.example.com/v1",
+					api: "openai-responses",
+					apiKeyEnv: "GJC_TEST_MISSING_TRACKED_PROVIDER_KEY",
+					models: [{ id: "tracked-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const trackedRows = () => activeRowsFor(registry, ["tracked-provider"]);
+
+			expect(registry.find("tracked-provider", "tracked-model")).toBeDefined();
+			expect(trackedRows()).toEqual([]);
+			authStorage.setRuntimeApiKey("tracked-provider", "");
+			expect(trackedRows()).toEqual([]);
+
+			await authStorage.set("tracked-provider", [
+				{ type: "api_key", key: "account-a" },
+				{ type: "api_key", key: "account-b" },
+			]);
+			expect(trackedRows()).toEqual([{ provider: "tracked-provider", connectionKind: "credential" }]);
+
+			await authStorage.set("tracked-provider", [{ type: "api_key", key: "replacement" }]);
+			expect(trackedRows()).toEqual([{ provider: "tracked-provider", connectionKind: "credential" }]);
+
+			authStorage.setRuntimeApiKey("unknown-provider", "unknown-provider-key");
+			expect(registry.getActiveProviders().some(provider => provider.provider === "unknown-provider")).toBe(false);
+
+			await authStorage.set("tracked-provider", []);
+			expect(trackedRows()).toEqual([]);
+		});
+
+		test("does not advertise a fresh configured-discovery cache reused without a probe", async () => {
+			const cachedModel: Model<"openai-responses"> = {
+				id: "cached-model",
+				name: "Cached Model",
+				api: "openai-responses",
+				provider: "discovery-provider",
+				baseUrl: "http://127.0.0.1:1234/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "http://127.0.0.1:1234/v1",
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			writeModelCache("discovery-provider", Date.now(), [cachedModel], true, "", cacheDbPath);
+			using _hook = hookFetch(() => {
+				throw new Error("online-if-uncached must reuse the fresh cache");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("ok");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+		});
+		test("advertises credentialless cached discovery without credential evidence", () => {
+			const cachedModel: Model<"openai-responses"> = {
+				id: "cached-model",
+				name: "Cached Model",
+				api: "openai-responses",
+				provider: "credentialless-provider",
+				baseUrl: "http://127.0.0.1:1234/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				"credentialless-provider": {
+					baseUrl: "http://127.0.0.1:1234/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			writeModelCache("credentialless-provider", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.getProviderDiscoveryState("credentialless-provider")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["credentialless-provider"])).toEqual([
+				{ provider: "credentialless-provider", connectionKind: "credentialless" },
+			]);
+		});
+		test("normalizes cached LM Studio root endpoints for custom providers", () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-model",
+				name: "Cached Model",
+				api: "openai-completions",
+				provider: "custom-lm-studio",
+				baseUrl: "http://127.0.0.1:1234/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				"custom-lm-studio": {
+					baseUrl: "http://127.0.0.1:1234",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "lm-studio" },
+				},
+			});
+			writeModelCache("custom-lm-studio", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(activeRowsFor(registry, ["custom-lm-studio"])).toEqual([
+				{ provider: "custom-lm-studio", connectionKind: "credentialless" },
+			]);
+		});
+		test("advertises configured vLLM cached discovery without descriptor evidence", () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-model",
+				name: "Cached Model",
+				api: "openai-completions",
+				provider: "vllm",
+				baseUrl: "http://127.0.0.1:8000/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				vllm: {
+					baseUrl: "http://127.0.0.1:8000/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			writeModelCache("vllm", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.getProviderDiscoveryState("vllm")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credentialless" }]);
+		});
+		test("does not advertise credentialless cached discovery from an obsolete endpoint", () => {
+			const cachedModel: Model<"openai-responses"> = {
+				id: "cached-model",
+				name: "Cached Model",
+				api: "openai-responses",
+				provider: "credentialless-provider",
+				baseUrl: "http://127.0.0.1:1234/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				"credentialless-provider": {
+					baseUrl: "http://127.0.0.1:5678/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			writeModelCache("credentialless-provider", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.getProviderDiscoveryState("credentialless-provider")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["credentialless-provider"])).toEqual([]);
+		});
+		test("does not advertise cached Ollama models without credentialless discovery provenance", () => {
+			const restoreBaseUrl = setEnvForTest("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+			const restoreApiKey = unsetEnvForTest("OLLAMA_API_KEY");
+			try {
+				const cachedModel: Model<"openai-completions"> = {
+					id: "cached-ollama-model",
+					name: "Cached Ollama Model",
+					api: "openai-completions",
+					provider: "ollama",
+					baseUrl: "http://127.0.0.1:11434/v1",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				};
+				writeModelCache("ollama", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				expect(registry.getProviderDiscoveryState("ollama")?.status).toBe("cached");
+				expect(activeRowsFor(registry, ["ollama"])).toEqual([]);
+			} finally {
+				restoreApiKey();
+				restoreBaseUrl();
+			}
+		});
+		test("does not advertise cached LM Studio models without credentialless discovery provenance", () => {
+			const restoreBaseUrl = setEnvForTest("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234");
+			const restoreApiKey = unsetEnvForTest("LM_STUDIO_API_KEY");
+			try {
+				const cachedModel: Model<"openai-completions"> = {
+					id: "cached-lm-studio-model",
+					name: "Cached LM Studio Model",
+					api: "openai-completions",
+					provider: "lm-studio",
+					baseUrl: "http://127.0.0.1:1234/v1",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				};
+				writeModelCache("lm-studio", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				expect(registry.getProviderDiscoveryState("lm-studio")?.status).toBe("cached");
+				expect(activeRowsFor(registry, ["lm-studio"])).toEqual([]);
+			} finally {
+				restoreApiKey();
+				restoreBaseUrl();
+			}
+		});
+		test("keeps signed LM Studio endpoint queries out of the model cache", async () => {
+			const restoreBaseUrl = setEnvForTest("LM_STUDIO_BASE_URL", "https://lm-studio.example?sig=lm-studio-secret");
+			const restoreApiKey = unsetEnvForTest("LM_STUDIO_API_KEY");
+			try {
+				using _hook = hookFetch(input => {
+					expect(String(input)).toBe("https://lm-studio.example/v1/models?sig=lm-studio-secret");
+					return new Response(JSON.stringify({ data: [{ id: "lm-studio-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("lm-studio", "online");
+
+				expect(registry.find("lm-studio", "lm-studio-model")?.baseUrl).toBe(
+					"https://lm-studio.example?sig=lm-studio-secret",
+				);
+				const cached = readModelCache<Api>("lm-studio", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+				expect(cached?.models[0]?.baseUrl).toBe("https://lm-studio.example/v1");
+				expect(JSON.stringify(cached)).not.toContain("lm-studio-secret");
+			} finally {
+				restoreApiKey();
+				restoreBaseUrl();
+			}
+		});
+		test("records configured discovery evidence after resolving a stored command key", async () => {
+			authStorage.close();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async config => (config === "!discovery-key" ? "resolved-discovery-key" : undefined),
+			});
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("discovery-provider", [{ type: "api_key", key: "!discovery-key" }]);
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online");
+
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("ok");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
+		test("forces an online configured discovery probe after the credential changes", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			let requests = 0;
+			using _hook = hookFetch(() => {
+				requests++;
+				return new Response(JSON.stringify({ data: [{ id: `discovered-model-${requests}` }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online");
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-b");
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+
+			expect(requests).toBe(2);
+			expect(registry.find("discovery-provider", "discovered-model-2")).toBeDefined();
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
+		test("refreshes configured discovery when round-robin credentials change", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("discovery-provider", [
+				{ type: "api_key", key: "credential-a" },
+				{ type: "api_key", key: "credential-b" },
+			]);
+			const requestKeys: string[] = [];
+			using _hook = hookFetch((_input, init) => {
+				const key = (init?.headers as Record<string, string>).Authorization;
+				requestKeys.push(key);
+				return new Response(JSON.stringify({ data: [{ id: `discovered-model-${requestKeys.length}` }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online");
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+
+			expect(requestKeys).toEqual(["Bearer credential-a", "Bearer credential-b"]);
+			expect(registry.find("discovery-provider", "discovered-model-2")).toBeDefined();
+		});
+		test("keeps selected discovery evidence local to each registry", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("discovery-provider", [
+				{ type: "api_key", key: "credential-a" },
+				{ type: "api_key", key: "credential-b" },
+			]);
+			const requestKeys: string[] = [];
+			using _hook = hookFetch((_input, init) => {
+				requestKeys.push((init?.headers as Record<string, string>).Authorization);
+				return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const firstRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			await firstRegistry.refreshProvider("discovery-provider", "online");
+
+			const secondRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			await secondRegistry.refreshProvider("discovery-provider", "online");
+
+			expect(requestKeys).toEqual(["Bearer credential-a", "Bearer credential-b"]);
+			expect(activeRowsFor(firstRegistry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+			expect(activeRowsFor(secondRegistry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
+		test("does not publish a command-backed discovery after its credentials are replaced during preflight", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.close();
+			const firstKeyResolution = Promise.withResolvers<string | undefined>();
+			const firstKeyRequested = Promise.withResolvers<void>();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async config => {
+					if (config === "!credential-a") {
+						firstKeyRequested.resolve();
+						return firstKeyResolution.promise;
+					}
+					return config === "!credential-b" ? "credential-b" : undefined;
+				},
+			});
+			await authStorage.set("discovery-provider", [{ type: "api_key", key: "!credential-a" }]);
+			const requestKeys: string[] = [];
+			using _hook = hookFetch((_input, init) => {
+				requestKeys.push((init?.headers as Record<string, string>).Authorization);
+				return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const staleRefresh = registry.refreshProvider("discovery-provider", "online");
+			await firstKeyRequested.promise;
+			await authStorage.set("discovery-provider", [{ type: "api_key", key: "!credential-b" }]);
+			firstKeyResolution.resolve("credential-a");
+			await staleRefresh;
+
+			expect(requestKeys).toEqual([]);
+			expect(registry.find("discovery-provider", "discovered-model")).toBeUndefined();
+
+			await registry.refreshProvider("discovery-provider", "online");
+
+			expect(requestKeys).toEqual(["Bearer credential-b"]);
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
+		test("does not retain configured discovery evidence after an in-flight credential change", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
+			using _hook = hookFetch(() => response);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const refresh = registry.refreshProvider("discovery-provider", "online");
+			await Bun.sleep(0);
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-b");
+			resolveResponse(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await refresh;
+
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+			expect(registry.find("discovery-provider", "discovered-model")).toBeUndefined();
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("idle");
+		});
+		test("discards a completed configured discovery after another provider delays the aggregate refresh", async () => {
+			writeRawModelsJson({
+				"first-discovery-provider": {
+					baseUrl: "https://first-discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+				"second-discovery-provider": {
+					baseUrl: "https://second-discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("first-discovery-provider", "credential-a");
+			authStorage.setRuntimeApiKey("second-discovery-provider", "credential-b");
+			const { promise: secondResponse, resolve: resolveSecondResponse } = Promise.withResolvers<Response>();
+			using _hook = hookFetch(input => {
+				switch (String(input)) {
+					case "https://first-discovery.example.com/v1/models":
+						return new Response(JSON.stringify({ data: [{ id: "first-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					case "https://second-discovery.example.com/v1/models":
+						return secondResponse;
+					default:
+						throw new Error(`Unexpected URL: ${input}`);
+				}
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const refresh = registry.refresh();
+			await Bun.sleep(0);
+			authStorage.setRuntimeApiKey("first-discovery-provider", "credential-a-rotated");
+			resolveSecondResponse(
+				new Response(JSON.stringify({ data: [{ id: "second-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await refresh;
+
+			expect(registry.find("first-discovery-provider", "first-model")).toBeUndefined();
+			expect(registry.find("second-discovery-provider", "second-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["first-discovery-provider"])).toEqual([]);
+			expect(registry.getProviderDiscoveryState("first-discovery-provider")).toBeUndefined();
+		});
+		test("invalidates a completed discovery state after an aggregate environment credential change", async () => {
+			const restoreFirstKey = setEnvForTest("GJC_TEST_FIRST_DISCOVERY_KEY", "credential-a");
+			try {
+				writeRawModelsJson({
+					"first-discovery-provider": {
+						baseUrl: "https://first-discovery.example.com/v1",
+						api: "openai-responses",
+						discovery: { type: "openai-models-list" },
+					},
+					"second-discovery-provider": {
+						baseUrl: "https://second-discovery.example.com/v1",
+						api: "openai-responses",
+						discovery: { type: "openai-models-list" },
+					},
+				});
+				await authStorage.set("first-discovery-provider", [
+					{ type: "api_key", key: "GJC_TEST_FIRST_DISCOVERY_KEY" },
+				]);
+				authStorage.setRuntimeApiKey("second-discovery-provider", "credential-b");
+				const { promise: secondResponse, resolve: resolveSecondResponse } = Promise.withResolvers<Response>();
+				using _hook = hookFetch(input => {
+					switch (String(input)) {
+						case "https://first-discovery.example.com/v1/models":
+							return new Response(JSON.stringify({ data: [{ id: "first-model" }] }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						case "https://second-discovery.example.com/v1/models":
+							return secondResponse;
+						default:
+							throw new Error(`Unexpected URL: ${input}`);
+					}
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				const refresh = registry.refresh();
+				await Bun.sleep(0);
+				process.env.GJC_TEST_FIRST_DISCOVERY_KEY = "credential-a-rotated";
+				resolveSecondResponse(
+					new Response(JSON.stringify({ data: [{ id: "second-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+				await refresh;
+
+				expect(registry.find("first-discovery-provider", "first-model")).toBeUndefined();
+				expect(registry.getProviderDiscoveryState("first-discovery-provider")).toBeUndefined();
+			} finally {
+				restoreFirstKey();
+			}
+		});
+		test("does not retain configured discovery evidence after an in-flight endpoint change", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const restore = setEnvForTest("DISCOVERY_PROVIDER_BASE_URL", "https://tenant-a.example.com/v1");
+			try {
+				const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
+				using _hook = hookFetch(() => response);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				const refresh = registry.refreshProvider("discovery-provider", "online");
+				await Bun.sleep(0);
+				Bun.env.DISCOVERY_PROVIDER_BASE_URL = "https://tenant-b.example.com/v1";
+				resolveResponse(
+					new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+				await refresh;
+
+				expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+				expect(registry.find("discovery-provider", "discovered-model")).toBeUndefined();
+				expect(readModelCache("discovery-provider", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+			} finally {
+				restore();
+			}
+		});
+		test("does not let a stale configured refresh clear newer credential evidence", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			const { promise: olderResponse, resolve: resolveOlder } = Promise.withResolvers<Response>();
+			const { promise: newerResponse, resolve: resolveNewer } = Promise.withResolvers<Response>();
+			let calls = 0;
+			using _hook = hookFetch(() => (calls++ === 0 ? olderResponse : newerResponse));
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const olderRefresh = registry.refreshProvider("discovery-provider", "online");
+			await Bun.sleep(0);
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-b");
+			const newerRefresh = registry.refreshProvider("discovery-provider", "online");
+			await Bun.sleep(0);
+			resolveNewer(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await newerRefresh;
+			resolveOlder(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await olderRefresh;
+
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
+		test("retains configured discovery proof across an offline cache refresh", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online");
+			await registry.refreshProvider("discovery-provider", "offline");
+
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+		});
+		test("invalidates configured discovery proof when its environment endpoint changes", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const restore = setEnvForTest("DISCOVERY_PROVIDER_BASE_URL", "https://tenant-a.example.com/v1");
+			try {
+				using _hook = hookFetch(input => {
+					expect(String(input)).toBe("https://tenant-a.example.com/v1/models");
+					return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("discovery-provider", "online");
+				Bun.env.DISCOVERY_PROVIDER_BASE_URL = "https://tenant-b.example.com/v1";
+				await registry.refreshProvider("discovery-provider", "offline");
+
+				expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+			} finally {
+				restore();
+			}
+		});
+		test("re-resolves an environment endpoint before an online configured discovery", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const restore = setEnvForTest("DISCOVERY_PROVIDER_BASE_URL", "https://tenant-a.example.com/v1");
+			try {
+				const requestedUrls: string[] = [];
+				using _hook = hookFetch(input => {
+					requestedUrls.push(String(input));
+					return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("discovery-provider", "online");
+				Bun.env.DISCOVERY_PROVIDER_BASE_URL = "https://tenant-b.example.com/v1";
+				await registry.refreshProvider("discovery-provider", "online");
+
+				expect(requestedUrls).toEqual([
+					"https://tenant-a.example.com/v1/models",
+					"https://tenant-b.example.com/v1/models",
+				]);
+			} finally {
+				restore();
+			}
+		});
+		test("clears configured discovery proof after a failed online probe", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			let available = true;
+			using _hook = hookFetch(() =>
+				available
+					? new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						})
+					: new Response("unavailable", { status: 503 }),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online");
+			available = false;
+			await registry.refreshProvider("discovery-provider", "online");
+
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+		});
+		test("uses the runtime endpoint query for configured discovery and completion", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://configured.example.com/v1",
+					api: "openai-completions",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const discoveryUrl = "https://runtime.example.com/v1/models?sig=runtime-secret";
+			const completionUrl = "https://runtime.example.com/v1/chat/completions?sig=runtime-secret";
+			const requestedUrls: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				requestedUrls.push(url);
+				if (url === discoveryUrl) {
+					return new Response(JSON.stringify({ data: [{ id: "runtime-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === completionUrl) {
+					const body = [
+						`data: ${JSON.stringify({
+							id: "chatcmpl-query",
+							object: "chat.completion.chunk",
+							created: 0,
+							model: "runtime-model",
+							choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+						})}`,
+						`data: ${JSON.stringify({
+							id: "chatcmpl-query",
+							object: "chat.completion.chunk",
+							created: 0,
+							model: "runtime-model",
+							choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+							usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+						})}`,
+						"data: [DONE]",
+						"",
+					].join("\n\n");
+					return new Response(body, {
+						status: 200,
+						headers: { "Content-Type": "text/event-stream" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("discovery-provider", {
+				baseUrl: "https://runtime.example.com/v1?sig=runtime-secret",
+			});
+
+			await registry.refreshProvider("discovery-provider", "online");
+
+			const model = registry.find("discovery-provider", "runtime-model");
+			expect(model?.baseUrl).toBe("https://runtime.example.com/v1?sig=runtime-secret");
+			const cached = readModelCache<Api>("discovery-provider", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+			expect(cached?.models).toHaveLength(1);
+			expect(cached?.models[0]?.baseUrl).toBe("https://runtime.example.com/v1");
+			expect(JSON.stringify(cached)).not.toContain("runtime-secret");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+			]);
+
+			const result = await streamOpenAICompletions(
+				model as Model<"openai-completions">,
+				{
+					messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+				} satisfies Context,
+				{ apiKey: "DISCOVERY_KEY" },
+			).result();
+			expect(result.stopReason).toBe("stop");
+			expect(requestedUrls).toEqual([discoveryUrl, completionUrl]);
+			const cachedRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			cachedRegistry.registerProvider("discovery-provider", {
+				baseUrl: "https://runtime.example.com/v1?sig=runtime-secret",
+			});
+			expect(cachedRegistry.find("discovery-provider", "runtime-model")?.baseUrl).toBe(
+				"https://runtime.example.com/v1?sig=runtime-secret",
+			);
+		});
+		test("does not restore configured discovery evidence after a transport override", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
+			using _hook = hookFetch(() => response);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const refresh = registry.refreshProvider("discovery-provider", "online");
+			await Bun.sleep(0);
+			registry.registerProvider("discovery-provider", { baseUrl: "https://override.example.com/v1" });
+			resolveResponse(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await refresh;
+
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+		});
+		test("does not advertise authenticated descriptor-only cached models without activity evidence", () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-vllm-model",
+				name: "Cached vLLM Model",
+				api: "openai-completions",
+				provider: "vllm",
+				baseUrl: "http://127.0.0.1:8000/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeModelCache("vllm", Date.now(), [cachedModel], true, "", cacheDbPath);
+			authStorage.setRuntimeApiKey("vllm", "cached-vllm-key");
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("vllm", "cached-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("does not treat descriptor overrides as configured static models", () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-vllm-model",
+				name: "Cached vLLM Model",
+				api: "openai-completions",
+				provider: "vllm",
+				baseUrl: "http://127.0.0.1:8000/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				vllm: { baseUrl: "http://127.0.0.1:8000/v1", apiKey: "configured-vllm-key" },
+			});
+			writeModelCache("vllm", Date.now(), [cachedModel], true, "", cacheDbPath);
+			authStorage.setRuntimeApiKey("vllm", "cached-vllm-key");
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("vllm", "cached-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("does not advertise descriptor-only providers from a fresh cache reused offline", async () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-vllm-model",
+				name: "Cached vLLM Model",
+				api: "openai-completions",
+				provider: "vllm",
+				baseUrl: "http://127.0.0.1:8000/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeModelCache("vllm", Date.now(), [cachedModel], true, "", cacheDbPath);
+			authStorage.setRuntimeApiKey("vllm", "cached-vllm-key");
+			using _hook = hookFetch(() => {
+				throw new Error("online-if-uncached must reuse the fresh cache");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("discovers OpenCodex as credentialless when the local proxy is healthy", async () => {
+			const restoreOpenCodexHome = setEnvForTest("OPENCODEX_HOME", tempDir);
+			await Bun.write(
+				path.join(tempDir, "runtime-port.json"),
+				JSON.stringify({ hostname: "127.0.0.1", port: 10201 }),
+			);
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:10201/healthz") {
+					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
+				}
+				if (url === "http://127.0.0.1:10201/api/models") {
+					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("opencodex", "online");
+
+				expect(registry.find("opencodex", "opencodex/provider/model")).toBeDefined();
+				expect(registry.getAvailable().map(model => `${model.provider}/${model.id}`)).toContain(
+					"opencodex/opencodex/provider/model",
+				);
+				expect(activeRowsFor(registry, ["opencodex"])).toEqual([
+					{ provider: "opencodex", connectionKind: "credentialless" },
+				]);
+			} finally {
+				restoreOpenCodexHome();
+			}
+		});
+		test("discovers OpenCodex as credentialless after a command credential resolves empty", async () => {
+			authStorage.close();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async () => undefined,
+			});
+			await authStorage.set("opencodex", [{ type: "api_key", key: "!missing-opencodex-key" }]);
+			const restoreOpenCodexHome = setEnvForTest("OPENCODEX_HOME", tempDir);
+			await Bun.write(
+				path.join(tempDir, "runtime-port.json"),
+				JSON.stringify({ hostname: "127.0.0.1", port: 10201 }),
+			);
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:10201/healthz") {
+					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
+				}
+				if (url === "http://127.0.0.1:10201/api/models") {
+					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("opencodex", "online");
+
+				expect(activeRowsFor(registry, ["opencodex"])).toEqual([
+					{ provider: "opencodex", connectionKind: "credentialless" },
+				]);
+				await expect(registry.getApiKeyForProvider("opencodex")).resolves.toBe(kNoAuth);
+			} finally {
+				restoreOpenCodexHome();
+			}
+		});
+		test("advertises descriptor-only providers after a fresh online-if-uncached discovery", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(registry.find("vllm", "fresh-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
+		test("discovers Xiaomi token-plan models at their credential-derived endpoint", async () => {
+			authStorage.setRuntimeApiKey("xiaomi", "tp-sgp-token");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://token-plan-sgp.xiaomimimo.com/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "token-plan-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("xiaomi", "online");
+
+			expect(registry.find("xiaomi", "token-plan-model")?.baseUrl).toBe("https://token-plan-sgp.xiaomimimo.com/v1");
+			expect(activeRowsFor(registry, ["xiaomi"])).toEqual([{ provider: "xiaomi", connectionKind: "credential" }]);
+		});
+		test("keeps signed descriptor endpoints out of the model cache", async () => {
+			const restoreBaseUrl = setEnvForTest("VLLM_BASE_URL", "https://vllm.example.com/v1?sig=descriptor-secret");
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://vllm.example.com/v1/models?sig=descriptor-secret");
+				return new Response(JSON.stringify({ data: [{ id: "signed-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("vllm", "online");
+
+				expect(registry.find("vllm", "signed-vllm-model")?.baseUrl).toBe(
+					"https://vllm.example.com/v1?sig=descriptor-secret",
+				);
+				const cached = readModelCache<Api>("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+				expect(cached?.models[0]?.baseUrl).toBe("https://vllm.example.com/v1");
+				expect(JSON.stringify(cached)).not.toContain("descriptor-secret");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("keeps signed models.dev descriptor rows out of the model cache", async () => {
+			const restoreBaseUrl = setEnvForTest(
+				"ANTHROPIC_BASE_URL",
+				"https://anthropic.example.com/v1?sig=models-dev-secret",
+			);
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(
+						JSON.stringify({
+							anthropic: {
+								models: {
+									"models-dev-only": {
+										name: "Models.dev Only",
+										tool_call: true,
+										modalities: { input: ["text"] },
+										cost: { input: 1, output: 1 },
+										limit: { context: 128000, output: 8192 },
+									},
+								},
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://anthropic.example.com/v1/models?sig=models-dev-secret") {
+					return new Response(JSON.stringify({ data: [] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("anthropic", "online");
+
+				const cached = readModelCache<Api>("anthropic", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+				expect(cached?.models.find(model => model.id === "models-dev-only")?.baseUrl).toBe(
+					"https://anthropic.example.com/v1",
+				);
+				expect(JSON.stringify(cached)).not.toContain("models-dev-secret");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("discovers descriptor-only providers on the first refresh with a stored API key", async () => {
+			await authStorage.set("vllm", [{ type: "api_key", key: "stored-vllm-key" }]);
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "stored-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(registry.find("vllm", "stored-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
+		test("does not publish descriptor discovery after its command credential is replaced during preflight", async () => {
+			authStorage.close();
+			const firstKeyResolution = Promise.withResolvers<string | undefined>();
+			const firstKeyRequested = Promise.withResolvers<void>();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async config => {
+					if (config === "!vllm-key-a") {
+						firstKeyRequested.resolve();
+						return firstKeyResolution.promise;
+					}
+					return config === "!vllm-key-b" ? "vllm-key-b" : undefined;
+				},
+			});
+			await authStorage.set("vllm", [{ type: "api_key", key: "!vllm-key-a" }]);
+			const requestApiKeys: string[] = [];
+			using _hook = hookFetch((_input, init) => {
+				requestApiKeys.push(new Headers(init?.headers).get("Authorization") ?? "");
+				return new Response(JSON.stringify({ data: [{ id: "command-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const staleRefresh = registry.refreshProvider("vllm", "online");
+			await firstKeyRequested.promise;
+			await authStorage.set("vllm", [{ type: "api_key", key: "!vllm-key-b" }]);
+			firstKeyResolution.resolve("vllm-key-a");
+			await staleRefresh;
+
+			expect(requestApiKeys).toEqual([]);
+			expect(registry.find("vllm", "command-vllm-model")).toBeUndefined();
+			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+
+			await registry.refreshProvider("vllm", "online");
+
+			expect(requestApiKeys).toEqual(["Bearer vllm-key-b"]);
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
+		test("discovers descriptor-only providers with the first stored command-backed key", async () => {
+			authStorage.close();
+			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+				configValueResolver: async config => {
+					if (config === "!vllm-key-a") return "vllm-key-a";
+					if (config === "!vllm-key-b") return "vllm-key-b";
+					return undefined;
+				},
+			});
+			await authStorage.set("vllm", [
+				{ type: "api_key", key: "!vllm-key-a" },
+				{ type: "api_key", key: "!vllm-key-b" },
+			]);
+
+			const requestApiKeys: string[] = [];
+			using _hook = hookFetch((input, init) => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				requestApiKeys.push(new Headers(init?.headers).get("Authorization") ?? "");
+				return new Response(JSON.stringify({ data: [{ id: "command-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(requestApiKeys).toEqual(["Bearer vllm-key-a"]);
+			expect(registry.find("vllm", "command-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
+		test("preserves descriptor discovery evidence across an offline refresh", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			await registry.refreshProvider("vllm", "offline");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
+		test("preserves descriptor discovery evidence with a normalized endpoint across an offline refresh", async () => {
+			const restore = setEnvForTest("VLLM_BASE_URL", "https://gateway.example/v1/");
+			try {
+				authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+				using _hook = hookFetch(input => {
+					expect(String(input)).toBe("https://gateway.example/v1/models");
+					return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("vllm", "online");
+				await registry.refreshProvider("vllm", "offline");
+
+				expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+			} finally {
+				restore();
+			}
+		});
+		test("forces an online descriptor probe when its endpoint query changes", async () => {
+			const restore = setEnvForTest("VLLM_BASE_URL", "https://gateway.example/v1?tenant=a/&scope=one&scope=two");
+			try {
+				authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+				const requestedUrls: string[] = [];
+				using _hook = hookFetch(input => {
+					requestedUrls.push(String(input));
+					return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("vllm", "online");
+				Bun.env.VLLM_BASE_URL = "https://gateway.example/v1?tenant=b/&scope=one&scope=two";
+				await registry.refreshProvider("vllm", "online-if-uncached");
+
+				expect(requestedUrls).toEqual([
+					"https://gateway.example/v1/models?tenant=a/&scope=one&scope=two",
+					"https://gateway.example/v1/models?tenant=b/&scope=one&scope=two",
+				]);
+				expect(registry.find("vllm", "fresh-vllm-model")?.baseUrl).toBe(
+					"https://gateway.example/v1?tenant=b/&scope=one&scope=two",
+				);
+				expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+			} finally {
+				restore();
+			}
+		});
+		test("discards an in-flight descriptor discovery after its endpoint changes", async () => {
+			const restore = setEnvForTest("VLLM_BASE_URL", "https://tenant-a.example.com/v1");
+			try {
+				authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+				const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
+				using _hook = hookFetch(() => response);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				const refresh = registry.refreshProvider("vllm", "online");
+				await Bun.sleep(0);
+				Bun.env.VLLM_BASE_URL = "https://tenant-b.example.com/v1";
+				resolveResponse(
+					new Response(JSON.stringify({ data: [{ id: "tenant-a-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+				await refresh;
+
+				expect(registry.find("vllm", "tenant-a-model")).toBeUndefined();
+				expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+				expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+			} finally {
+				restore();
+			}
+		});
+		test("clears descriptor discovery evidence after a failed conditional online probe", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			let calls = 0;
+			using _hook = hookFetch(() =>
+				calls++ === 0
+					? new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						})
+					: new Response("unavailable", { status: 503 }),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+
+			writeModelCache("vllm", Date.now() - 5 * 60 * 1000, [], false, "", cacheDbPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("invalidates descriptor discovery evidence when the credential changes", async () => {
+			authStorage.setRuntimeApiKey("vllm", "credential-a");
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			authStorage.setRuntimeApiKey("vllm", "credential-b");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("invalidates descriptor discovery evidence after a transport override", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			registry.registerProvider("vllm", { baseUrl: "http://127.0.0.1:9000/v1" });
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("invalidates descriptor discovery evidence after an OAuth-only registration", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+
+			registry.registerProvider(
+				"vllm",
+				{
+					oauth: {
+						name: "VLLM",
+						login: async () => "unused",
+					},
+				},
+				"test-vllm-oauth",
+			);
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+			registry.clearSourceRegistrations("test-vllm-oauth");
+		});
+		test("does not restore descriptor evidence after an in-flight discovery is invalidated", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return response;
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const refresh = registry.refreshProvider("vllm", "online");
+			await Bun.sleep(0);
+			registry.registerProvider("vllm", { baseUrl: "http://127.0.0.1:9000/v1" });
+			resolveResponse(
+				new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await refresh;
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("does not let an older descriptor refresh overwrite a newer failed probe", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			let calls = 0;
+			const { promise: olderResponse, resolve: resolveOlder } = Promise.withResolvers<Response>();
+			const { promise: newerResponse, resolve: resolveNewer } = Promise.withResolvers<Response>();
+			using _hook = hookFetch(() => (calls++ === 0 ? olderResponse : newerResponse));
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const olderRefresh = registry.refreshProvider("vllm", "online");
+			await Bun.sleep(0);
+			const newerRefresh = registry.refreshProvider("vllm", "online");
+			await Bun.sleep(0);
+			resolveNewer(new Response("unavailable", { status: 503 }));
+			await newerRefresh;
+			resolveOlder(
+				new Response(JSON.stringify({ data: [{ id: "older-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await olderRefresh;
+			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).toEqual([]);
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("invalidates descriptor discovery evidence after a config reload", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			writeRawModelsJson({ vllm: { baseUrl: "http://127.0.0.1:9000/v1", apiKey: "fresh-vllm-key" } });
+			const updatedAt = new Date(Date.now() + 1000);
+			fs.utimesSync(modelsJsonPath, updatedAt, updatedAt);
+			await registry.refreshProvider("openai", "offline");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("requires fresh exact discovery evidence while static models stay active", async () => {
+			let response: "empty" | "unavailable" | "ok" = "empty";
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+				mixed: {
+					baseUrl: "https://mixed.example.com/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+					models: [{ id: "mixed-static" }],
+				},
+				"unauthenticated-provider": {
+					baseUrl: "https://unauthenticated.example.com/v1",
+					api: "openai-responses",
+					apiKeyEnv: "GJC_TEST_MISSING_ACTIVE_PROVIDER_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url.includes("unauthenticated.example.com"))
+					throw new Error("unauthenticated discovery must not fetch");
+				if (response === "unavailable") return new Response("unavailable", { status: 503 });
+				return new Response(JSON.stringify({ data: response === "ok" ? [{ id: "fresh-model" }] : [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("idle");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			await registry.refreshProvider("discovery-provider", "online");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("empty");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			response = "unavailable";
+			await registry.refreshProvider("discovery-provider", "online");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("unavailable");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			await registry.refreshProvider("unauthenticated-provider", "online");
+			expect(registry.getProviderDiscoveryState("unauthenticated-provider")?.status).toBe("unauthenticated");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			response = "ok";
+			await registry.refreshProvider("discovery-provider", "online");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("ok");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+		});
+		test("normalizes credentialless custom discovery endpoints for Q29", async () => {
+			let hasModels = true;
+			writeRawModelsJson({
+				"credentialless-discovery": {
+					baseUrl: "https://credentialless-discovery.example.com",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			using _hook = hookFetch(input => {
+				if (String(input) !== "https://credentialless-discovery.example.com/v1/models") {
+					throw new Error(`Unexpected URL: ${input}`);
+				}
+				return new Response(JSON.stringify({ data: hasModels ? [{ id: "discovered-model" }] : [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("credentialless-discovery", "online");
+			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([
+				{ provider: "credentialless-discovery", connectionKind: "credentialless" },
+			]);
+
+			hasModels = false;
+			await registry.refreshProvider("credentialless-discovery", "online");
+
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("empty");
+			expect(registry.find("credentialless-discovery", "discovered-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([]);
+		});
+		test("uses the default endpoint for credentialed custom discovery evidence", async () => {
+			writeRawModelsJson({
+				"default-endpoint-discovery": {
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("default-endpoint-discovery", "credential");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:1234/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("default-endpoint-discovery", "online");
+
+			expect(activeRowsFor(registry, ["default-endpoint-discovery"])).toEqual([
+				{ provider: "default-endpoint-discovery", connectionKind: "credential" },
+			]);
+		});
+		test("does not advertise credentialless cached discovery after a failed probe", async () => {
+			let unauthorized = false;
+			writeRawModelsJson({
+				"credentialless-discovery": {
+					baseUrl: "https://credentialless-discovery.example.com/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			using _hook = hookFetch(() => {
+				if (unauthorized) return new Response("unauthorized", { status: 401 });
+				return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("credentialless-discovery", "online");
+			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([
+				{ provider: "credentialless-discovery", connectionKind: "credentialless" },
+			]);
+
+			unauthorized = true;
+			await registry.refreshProvider("credentialless-discovery", "online");
+
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.error).toContain("401");
+			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([]);
+		});
+		test("redacts signed discovery endpoint queries from errors", async () => {
+			writeRawModelsJson({
+				"redacted-discovery": {
+					baseUrl: "https://gateway.example.com/v1?sig=discovery-secret",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://gateway.example.com/v1/models?sig=discovery-secret");
+				return new Response("unavailable", { status: 503 });
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("redacted-discovery", "online");
+
+			const error = registry.getProviderDiscoveryState("redacted-discovery")?.error;
+			expect(error).toContain("https://gateway.example.com/v1/models");
+			expect(error).not.toContain("discovery-secret");
+		});
+		test("uses refresh-aware OAuth credentials for configured discovery", async () => {
+			writeRawModelsJson({
+				"oauth-discovery": {
+					baseUrl: "https://oauth-discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("oauth-discovery", [
+				{
+					type: "oauth",
+					access: "expiring-access",
+					refresh: "refresh-access",
+					expires: Date.now() + 30_000,
+					email: "oauth@example.com",
+				},
+			]);
+			let fetchCalls = 0;
+			let oauthRefreshGeneration = 0;
+			const getOAuthRefreshGenerationSpy = vi
+				.spyOn(authStorage, "getProviderOAuthRefreshGeneration")
+				.mockImplementation(() => oauthRefreshGeneration);
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				await authStorage.set("oauth-discovery", [
+					{
+						type: "oauth",
+						access: "refreshed-access",
+						refresh: "refresh-access",
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "oauth@example.com",
+					},
+				]);
+				oauthRefreshGeneration += 1;
+				return "refreshed-access";
+			});
+			using _hook = hookFetch((input, init) => {
+				expect(String(input)).toBe("https://oauth-discovery.example.com/v1/models");
+				expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer refreshed-access");
+				fetchCalls += 1;
+				return new Response(JSON.stringify({ data: [{ id: "oauth-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("oauth-discovery", "online");
+
+				expect(getApiKeySpy).toHaveBeenCalledWith("oauth-discovery", undefined, {
+					baseUrl: "https://oauth-discovery.example.com/v1",
+				});
+				expect(getApiKeySpy).toHaveBeenCalledTimes(1);
+				expect(fetchCalls).toBe(1);
+			} finally {
+				getApiKeySpy.mockRestore();
+				getOAuthRefreshGenerationSpy.mockRestore();
+			}
+		});
+		test("discards configured discovery when a runtime credential changes during OAuth preflight", async () => {
+			writeRawModelsJson({
+				"oauth-discovery": {
+					baseUrl: "https://oauth-discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("oauth-discovery", [
+				{
+					type: "oauth",
+					access: "expiring-access",
+					refresh: "refresh-access",
+					expires: Date.now() + 30_000,
+					email: "oauth@example.com",
+				},
+			]);
+			let oauthRefreshGeneration = 0;
+			const getOAuthRefreshGenerationSpy = vi
+				.spyOn(authStorage, "getProviderOAuthRefreshGeneration")
+				.mockImplementation(() => oauthRefreshGeneration);
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				await authStorage.set("oauth-discovery", [
+					{
+						type: "oauth",
+						access: "refreshed-access",
+						refresh: "refresh-access",
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "oauth@example.com",
+					},
+				]);
+				oauthRefreshGeneration += 1;
+				authStorage.setRuntimeApiKey("oauth-discovery", "runtime-access");
+				return "refreshed-access";
+			});
+			using _hook = hookFetch(() => {
+				throw new Error("stale OAuth preflight must not start discovery");
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await registry.refreshProvider("oauth-discovery", "online");
+
+				expect(getApiKeySpy).toHaveBeenCalledTimes(1);
+				expect(registry.find("oauth-discovery", "oauth-model")).toBeUndefined();
+				expect(readModelCache("oauth-discovery", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+			} finally {
+				getApiKeySpy.mockRestore();
+				getOAuthRefreshGenerationSpy.mockRestore();
+			}
+		});
+		test("keeps configured discovery provider-local when OAuth preflight fails", async () => {
+			writeRawModelsJson({
+				"failing-oauth-discovery": {
+					baseUrl: "https://failing-oauth.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			await authStorage.set("failing-oauth-discovery", [
+				{
+					type: "oauth",
+					access: "expiring-access",
+					refresh: "refresh-access",
+					expires: Date.now() + 30_000,
+					email: "oauth@example.com",
+				},
+			]);
+			authStorage.setRuntimeCredentialSelector("failing-oauth-discovery", {
+				kind: "email",
+				value: "oauth@example.com",
+			});
+			const getApiKeySpy = vi
+				.spyOn(authStorage, "getApiKey")
+				.mockRejectedValue(new Error("OAuth refresh unavailable"));
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await expect(registry.refreshProvider("failing-oauth-discovery", "online")).resolves.toBeUndefined();
+
+				expect(registry.getProviderDiscoveryState("failing-oauth-discovery")?.status).toBe("unauthenticated");
+				expect(activeRowsFor(registry, ["failing-oauth-discovery"])).toEqual([]);
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
 		});
 	});
 });
