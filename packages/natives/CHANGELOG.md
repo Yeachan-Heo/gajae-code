@@ -11,6 +11,10 @@
 
 ## [0.12.6] - 2026-07-31
 
+### Fixed
+
+- Retained managed publication and detachment now release their staging descriptor between the `linkat(2)` fallback's publishing link and its staging unlink, so the fallback added in 0.12.0 actually works on the filesystems it was written for. NFS silly-renames a still-open name on `unlinkat` instead of removing it, so the staging link survived as `.nfsXXXX`, the object kept a second link, and the terminal proof rejected it (`st_nlink != 1` → `hard_link`). Two launch failures followed on an NFS home directory: the first publish into a scope reported a correctly committed write as `rollback_unavailable`, and every later launch failed in `remove_managed` while reconciling the staged file after a publish that legitimately lost the no-replace race — that detach error replaced the benign `destination_conflict`, surfacing as `Could not prepare managed session scope (binding_invalid: prepare:binding_publish)`. Descriptor authority is still held across publication itself, and `remove_managed` re-proves the detached object from its quarantined name, so neither path is weaker than the `renameat2` primitive it stands in for.
+
 ## [0.12.5] - 2026-07-30
 
 ## [0.12.4] - 2026-07-30
