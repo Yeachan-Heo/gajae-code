@@ -11253,6 +11253,54 @@ test("session_closed revokes persisted ask aliases and pending replies before se
 	releaseDelete.resolve();
 	await close;
 });
+test("a concurrent delete re-fence keeps a definite remote delete under durable supervision", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const deleteStarted = Promise.withResolvers<void>();
+	const releaseDelete = Promise.withResolvers<void>();
+	const call = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method === "deleteForumTopic") {
+			bot.calls.push({ method, body, options });
+			deleteStarted.resolve();
+			await releaseDelete.promise;
+			return { ok: true, result: true };
+		}
+		return call(method, body, options);
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		rich: { enabled: false },
+	});
+	daemon.connectSession("S", "ws://s", "token");
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "action_needed",
+		kind: "ask",
+		id: "ask",
+		question: "Continue?",
+		options: ["yes"],
+	});
+	const topicId = String((daemon as any).topics.get("S").topicId);
+
+	const deleting = (daemon as any).deleteTopic("S");
+	await deleteStarted.promise;
+	(daemon as any).topics.beginDelete("S");
+	releaseDelete.resolve();
+
+	await expect(deleting).resolves.toBe("post_dispatch_pending");
+	expect((daemon as any).topics.get("S")).toMatchObject({
+		topicId,
+		authorityState: "delete_pending",
+	});
+	const persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics.S).toMatchObject({ topicId, authorityState: "delete_pending" });
+});
 test("closing endpoint stays fenced after delete settlement until final persistence and teardown", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();

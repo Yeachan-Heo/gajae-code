@@ -6842,17 +6842,19 @@ export class TelegramNotificationDaemon {
 							// against a `delete_pending` disk state.
 							if (topicDeleteSettled(deletion)) {
 								const settled = this.topics.settleDelete(sessionId, acceptedTopicId, fencedCreateEpoch);
-								try {
-									await this.persistTopics();
-									if (settled) {
-										this.topics.commitSettledDelete(settled);
-										acceptedTopicCompensated = true;
-									}
-								} catch {
-									if (settled) this.topics.rollbackSettledDelete(settled);
+								if (!settled) {
 									this.#superviseCompensationFence(sessionId);
 									await this.#persistTopicsWithRetry().catch(() => undefined);
-								}
+								} else
+									try {
+										await this.persistTopics();
+										this.topics.commitSettledDelete(settled);
+										acceptedTopicCompensated = true;
+									} catch {
+										this.topics.rollbackSettledDelete(settled);
+										this.#superviseCompensationFence(sessionId);
+										await this.#persistTopicsWithRetry().catch(() => undefined);
+									}
 							} else {
 								this.#superviseCompensationFence(sessionId);
 								await this.#persistTopicsWithRetry().catch(() => undefined);
@@ -6956,14 +6958,18 @@ export class TelegramNotificationDaemon {
 						});
 						if (topicDeleteSettled(deletion)) {
 							const settled = this.topics.settleDelete(sessionId, acceptedTopicId, fencedCompensationEpoch);
-							try {
-								await this.persistTopics();
-								if (settled) this.topics.commitSettledDelete(settled);
-							} catch {
-								if (settled) this.topics.rollbackSettledDelete(settled);
+							if (!settled) {
 								this.#superviseCompensationFence(sessionId);
 								await this.#persistTopicsWithRetry().catch(() => undefined);
-							}
+							} else
+								try {
+									await this.persistTopics();
+									this.topics.commitSettledDelete(settled);
+								} catch {
+									this.topics.rollbackSettledDelete(settled);
+									this.#superviseCompensationFence(sessionId);
+									await this.#persistTopicsWithRetry().catch(() => undefined);
+								}
 						} else {
 							this.#superviseCompensationFence(sessionId);
 							await this.#persistTopicsWithRetry().catch(() => undefined);
@@ -7043,6 +7049,10 @@ export class TelegramNotificationDaemon {
 				// Phase 1: drop the record but keep the topic id quarantined. Routes are
 				// only republished by `commitSettledDelete` once the clear is durable.
 				const settled = this.topics.settleDelete(sessionId, record.topicId, dispatchedAuthorityEpoch);
+				if (!settled) {
+					await this.#persistTopicsWithRetry().catch(() => undefined);
+					return "post_dispatch_pending";
+				}
 				for (const k of [...this.liveMessages.keys()])
 					if (k.startsWith(`${sessionId}:`)) {
 						this.liveMessages.delete(k);
@@ -7054,10 +7064,10 @@ export class TelegramNotificationDaemon {
 				this.pendingThreadedFrames.delete(sessionId);
 				try {
 					await this.persistTopics();
-					if (settled) this.topics.commitSettledDelete(settled);
+					this.topics.commitSettledDelete(settled);
 					return "settled";
 				} catch {
-					if (settled) this.topics.rollbackSettledDelete(settled);
+					this.topics.rollbackSettledDelete(settled);
 					await this.#persistTopicsWithRetry().catch(() => undefined);
 					return "post_dispatch_pending";
 				}
@@ -7068,6 +7078,10 @@ export class TelegramNotificationDaemon {
 			})) as { ok?: boolean };
 			if (!topicDeleteSettled(res)) return "post_dispatch_pending";
 			const settled = this.topics.settleDelete(sessionId, record.topicId, dispatchedAuthorityEpoch);
+			if (!settled) {
+				await this.#persistTopicsWithRetry().catch(() => undefined);
+				return "post_dispatch_pending";
+			}
 			for (const k of [...this.liveMessages.keys()])
 				if (k.startsWith(`${sessionId}:`)) {
 					this.liveMessages.delete(k);
@@ -7079,10 +7093,10 @@ export class TelegramNotificationDaemon {
 			this.pendingThreadedFrames.delete(sessionId);
 			try {
 				await this.persistTopics();
-				if (settled) this.topics.commitSettledDelete(settled);
+				this.topics.commitSettledDelete(settled);
 				return "settled";
 			} catch {
-				if (settled) this.topics.rollbackSettledDelete(settled);
+				this.topics.rollbackSettledDelete(settled);
 				await this.#persistTopicsWithRetry().catch(() => undefined);
 				return "post_dispatch_pending";
 			}
