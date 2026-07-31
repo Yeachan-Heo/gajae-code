@@ -646,6 +646,44 @@ describe("notification orchestration blocked activation", () => {
 		expect(commits).toEqual([[{ path: "notifications.enabled", op: "set", value: true }]]);
 	});
 
+	test.each([
+		"inactive",
+		"blocked",
+	] as const)("global enable leaves %s Telegram activation markers inactive while activating safe siblings", state => {
+		const telegram = snapshot().telegram;
+		const marker = createTelegramActivationMarker({
+			botToken: telegram.botToken!,
+			chatId: telegram.chatId!,
+			state,
+			reason: state === "inactive" ? "saved_inactive" : "identity_mismatch",
+		});
+		const configured = snapshot({
+			enabled: true,
+			telegram: { ...telegram, enabled: true, activation: { [marker.identity]: marker } },
+			discord: {
+				enabled: true,
+				botToken: "discord-token",
+				applicationId: "app",
+				guildId: "guild",
+				parentChannelId: "parent",
+			},
+		});
+		const { writer: settings } = writer({ snapshot: configured });
+		const activated: string[] = [];
+		return setGlobalNotificationsEnabled({
+			settings,
+			enabled: true,
+			runtime: {
+				activate: async provider => {
+					activated.push(provider);
+				},
+				deactivate: async () => {},
+			},
+		}).then(result => {
+			expect(result.status).toBe("saved");
+			expect(activated).toEqual(["discord"]);
+		});
+	});
 	test("required secret removal disables only the selected provider in one batch", async () => {
 		const { writer: settings, commits } = writer();
 		const deactivated: string[] = [];

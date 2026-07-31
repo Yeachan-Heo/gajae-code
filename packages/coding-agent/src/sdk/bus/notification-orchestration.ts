@@ -2,6 +2,7 @@ import type { CasRestoreResult } from "../../config/atomic-yaml-patch";
 import type { RawSettings, SettingsAtomicPatch, SettingsAtomicReceipt } from "../../config/settings";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import {
+	getCurrentTelegramActivationMarker,
 	getNotificationConfig,
 	hasNonBlankValue,
 	isProviderEffectivelyEnabled,
@@ -811,6 +812,7 @@ export async function setGlobalNotificationsEnabled(input: {
 		const cfg = getNotificationConfig(input.settings);
 		for (const provider of ["telegram", "discord", "slack"] as const) {
 			if (!isProviderEffectivelyEnabled(cfg, provider)) continue;
+			if (provider === "telegram" && getCurrentTelegramActivationMarker(cfg)) continue;
 			try {
 				await input.runtime.activate(provider);
 			} catch {
