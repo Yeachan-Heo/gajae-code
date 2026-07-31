@@ -1612,6 +1612,9 @@ export function replaceManagedFileSync(
 		}
 		assertManagedDirectoryRoot(root);
 		assertFence?.();
+		if (process.platform !== "win32" && expectedDestination) {
+			throw new Error("managed_replace_exact_unavailable");
+		}
 		if (process.platform === "win32" && expectedDestination) {
 			const parentIdentity = fs.lstatSync(parent, { bigint: true });
 			const replaced = exactReplacePath(

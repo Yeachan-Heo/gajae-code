@@ -5491,7 +5491,7 @@ mod platform {
 				Ok(()) => NativeExactUnlinkResult::success(),
 				Err(code) => NativeExactUnlinkResult::detached_failure_with_successor_and_placeholder(
 					code,
-					retained_path_string,
+					predecessor_path_string.clone(),
 					destination_path.to_string_lossy().into_owned(),
 					predecessor_path_string,
 				),
