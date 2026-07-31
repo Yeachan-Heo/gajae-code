@@ -20,6 +20,9 @@
 - Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
 
 ## [0.12.5] - 2026-07-30
+### Fixed
+
+- ACP and SDK broker session deletion no longer promotes a non-empty retained artifact quarantine to transcript deletion. `cleanup_pending` keeps transcript and exact quarantine authority across retries and restarts while payload bytes survive; root-only transcript preauthorization remains replay-bound and is revalidated after ledger persistence immediately before mutation, while ordinary completion still requires an empty identity-bound root or `artifacts_removed`.
 
 ## [0.12.4] - 2026-07-30
 

@@ -393,6 +393,7 @@ type CleanupEvidence = BrokerCleanupEvidence;
 type CleanupIdentity = {
 	dev: bigint;
 	ino: bigint;
+	nlink?: bigint;
 	size: number;
 	mtimeNs: bigint;
 	sha256: string;
@@ -402,6 +403,7 @@ function serializeCleanupIdentity(identity: CleanupIdentity): BrokerCleanupIdent
 	return {
 		dev: identity.dev.toString(),
 		ino: identity.ino.toString(),
+		...(identity.nlink !== undefined ? { nlink: identity.nlink.toString() } : {}),
 		size: identity.size,
 		mtimeNs: identity.mtimeNs.toString(),
 		sha256: identity.sha256,
@@ -1039,7 +1041,7 @@ async function readLifecycleFailureArtifact(
 			artifact: LifecycleFailureArtifact;
 			bytes: Buffer;
 			digest: string;
-			identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string };
+			identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string; nlink: bigint };
 	  }
 	| undefined
 > {
@@ -1047,7 +1049,7 @@ async function readLifecycleFailureArtifact(
 	try {
 		handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
 		const stat = await handle.stat({ bigint: true });
-		if (!stat.isFile() || stat.size > 4096n) return undefined;
+		if (!stat.isFile() || stat.nlink !== 1n || stat.size > 4096n) return undefined;
 		const bytes = Buffer.alloc(Number(stat.size) + 1);
 		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
 		if (bytesRead > 4096) return undefined;
@@ -1066,6 +1068,7 @@ async function readLifecycleFailureArtifact(
 			identity: {
 				dev: stat.dev,
 				ino: stat.ino,
+				nlink: stat.nlink,
 				size: stat.size,
 				mtimeNs: stat.mtimeNs,
 				sha256: createHash("sha256").update(raw).digest("hex"),
@@ -1080,16 +1083,21 @@ async function readLifecycleFailureArtifact(
 
 function exactUnlinkLifecycleFile(
 	file: string,
-	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string },
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string; nlink: bigint },
 	plannedPath: string,
+	parentIdentity?: { dev: bigint; ino: bigint },
 ): NativeExactUnlinkResult {
-	return native.exactUnlink(file, { ...identity, quarantineName: path.basename(plannedPath) });
+	return native.exactUnlink(file, {
+		...identity,
+		quarantineName: path.basename(plannedPath),
+		...(parentIdentity ? { parentDev: parentIdentity.dev, parentIno: parentIdentity.ino } : {}),
+	});
 }
 
 type LifecycleCleanupFile = NonNullable<BrokerCleanupEvidence["lifecycleFiles"]>[number];
 
 function sameLifecycleCleanupIdentity(
-	left: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string },
+	left: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string; nlink: bigint },
 	right: BrokerCleanupIdentity,
 ): boolean {
 	return (
@@ -1097,17 +1105,30 @@ function sameLifecycleCleanupIdentity(
 		left.ino.toString() === right.ino &&
 		left.size === BigInt(right.size) &&
 		left.mtimeNs.toString() === right.mtimeNs &&
-		left.sha256 === right.sha256
+		left.sha256 === right.sha256 &&
+		(right.nlink === undefined || left.nlink.toString() === right.nlink)
 	);
+}
+
+function lifecycleParentIdentity(directory: string): { dev: string; ino: string } | undefined {
+	try {
+		const stat = fsSync.lstatSync(directory, { bigint: true });
+		if (!stat.isDirectory()) return undefined;
+		return { dev: stat.dev.toString(), ino: stat.ino.toString() };
+	} catch {
+		return undefined;
+	}
 }
 
 function lifecycleCleanupPlan(
 	root: string,
 	id: string,
 	expected: EffectMarker,
-	evidence: { identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string } },
+	evidence: { identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string; nlink: bigint } },
 ): CleanupEvidence {
 	const directory = path.join(root, "sdk");
+	const parentIdentity = lifecycleParentIdentity(directory);
+	if (!parentIdentity) throw new Error("Lifecycle cleanup parent identity is unavailable.");
 	const candidates = [
 		lifecycleFailurePath(root, id, expected.effectMarker),
 		path.join(directory, `${id}.json`),
@@ -1162,7 +1183,13 @@ function lifecycleCleanupPlan(
 			},
 		];
 	});
-	return { phase: "lifecycle", sessionId: id, metadataRoot: root, lifecycleFiles: files };
+	return {
+		phase: "lifecycle",
+		sessionId: id,
+		metadataRoot: root,
+		lifecycleParentIdentity: parentIdentity,
+		lifecycleFiles: files,
+	};
 }
 
 function escapeRegExp(value: string): string {
@@ -1196,14 +1223,21 @@ function isCleanupIdentity(value: unknown): value is BrokerCleanupIdentity {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const identity = value as Record<string, unknown>;
 	return (
-		Object.keys(identity).length === 5 &&
+		(Object.keys(identity).length === 5 || Object.keys(identity).length === 6) &&
 		Object.keys(identity).every(
-			key => key === "dev" || key === "ino" || key === "size" || key === "mtimeNs" || key === "sha256",
+			key =>
+				key === "dev" ||
+				key === "ino" ||
+				key === "nlink" ||
+				key === "size" ||
+				key === "mtimeNs" ||
+				key === "sha256",
 		) &&
 		typeof identity.dev === "string" &&
 		/^\d+$/.test(identity.dev) &&
 		typeof identity.ino === "string" &&
 		/^\d+$/.test(identity.ino) &&
+		(identity.nlink === undefined || (typeof identity.nlink === "string" && /^\d+$/.test(identity.nlink))) &&
 		typeof identity.size === "number" &&
 		Number.isSafeInteger(identity.size) &&
 		identity.size >= 0 &&
@@ -1226,6 +1260,9 @@ function isLifecycleCleanupFile(value: unknown): value is LifecycleCleanupFile {
 		file.plannedPath.length > 0 &&
 		isCleanupIdentity(file.identity) &&
 		typeof file.attempt === "number" &&
+		(file.completed === true ||
+			(typeof (file.identity as BrokerCleanupIdentity).nlink === "string" &&
+				(file.identity as BrokerCleanupIdentity).nlink === "1")) &&
 		Number.isSafeInteger(file.attempt) &&
 		file.attempt > 0 &&
 		(file.detachedPath === undefined || (typeof file.detachedPath === "string" && file.detachedPath.length > 0)) &&
@@ -1236,7 +1273,15 @@ function isLifecycleCleanupFile(value: unknown): value is LifecycleCleanupFile {
 function isLifecycleCleanupEvidence(cleanup: CleanupEvidence): boolean {
 	if (typeof cleanup !== "object" || cleanup === null || Array.isArray(cleanup)) return false;
 	const record = cleanup as Record<string, unknown>;
-	const allowed = new Set(["phase", "sessionId", "metadataRoot", "lifecycleDeleteMetadata", "lifecycleFiles"]);
+	const allowed = new Set([
+		"phase",
+		"sessionId",
+		"metadataRoot",
+		"lifecycleDeleteMetadata",
+		"lifecycleParentIdentity",
+		"lifecycleFiles",
+	]);
+	const parentIdentity = record.lifecycleParentIdentity as Record<string, unknown> | undefined;
 	return (
 		Object.keys(record).every(key => allowed.has(key)) &&
 		record.phase === "lifecycle" &&
@@ -1244,6 +1289,11 @@ function isLifecycleCleanupEvidence(cleanup: CleanupEvidence): boolean {
 		isCanonicalSessionId(record.sessionId) &&
 		typeof record.metadataRoot === "string" &&
 		record.metadataRoot.length > 0 &&
+		!!parentIdentity &&
+		typeof parentIdentity.dev === "string" &&
+		/^\d+$/.test(parentIdentity.dev) &&
+		typeof parentIdentity.ino === "string" &&
+		/^\d+$/.test(parentIdentity.ino) &&
 		Array.isArray(record.lifecycleFiles) &&
 		record.lifecycleFiles.length > 0 &&
 		record.lifecycleFiles.length <= 4 &&
@@ -1487,6 +1537,8 @@ function legacyMetadataCleanupPlan(cleanup: CleanupEvidence): CleanupEvidence | 
 		return undefined;
 	const root = path.resolve(cleanup.metadataRoot);
 	const directory = path.join(root, "sdk");
+	const parentIdentity = lifecycleParentIdentity(directory);
+	if (!parentIdentity) return undefined;
 	const markerPath = lifecycleMarkerPath(root, cleanup.sessionId);
 	const readyPath = lifecycleReadyPath(root, cleanup.sessionId);
 	const metadataPath = path.resolve(cleanup.metadataPath);
@@ -1501,7 +1553,7 @@ function legacyMetadataCleanupPlan(cleanup: CleanupEvidence): CleanupEvidence | 
 			(!Number.isSafeInteger(cleanup.metadataAttempt) || cleanup.metadataAttempt < 1))
 	)
 		return undefined;
-	const persistedIdentity = cleanupIdentity(cleanup.metadataIdentity);
+	const persistedIdentity = cleanupIdentity(cleanup.metadataIdentity, false, false);
 	if (!persistedIdentity) return undefined;
 
 	const captureExactRegular = (
@@ -1569,6 +1621,7 @@ function legacyMetadataCleanupPlan(cleanup: CleanupEvidence): CleanupEvidence | 
 		sessionId: cleanup.sessionId,
 		metadataRoot: root,
 		lifecycleDeleteMetadata: true,
+		lifecycleParentIdentity: parentIdentity,
 		lifecycleFiles: [
 			{
 				path: metadataPath,
@@ -1603,16 +1656,28 @@ function lifecycleDeleteMetadataCleanupPlan(
 	id: string,
 	files: ReadonlyArray<{ metadataPath: string; metadata: LifecycleFileCapture }>,
 ): CleanupEvidence {
+	if (files.length === 0)
+		return {
+			phase: "lifecycle",
+			sessionId: id,
+			metadataRoot,
+			lifecycleDeleteMetadata: true,
+			lifecycleFiles: [],
+		};
+	const parentIdentity = lifecycleParentIdentity(path.join(metadataRoot, "sdk"));
+	if (!parentIdentity) throw new Error("Lifecycle cleanup parent identity is unavailable.");
 	return {
 		phase: "lifecycle",
 		sessionId: id,
 		metadataRoot,
 		lifecycleDeleteMetadata: true,
+		lifecycleParentIdentity: parentIdentity,
 		lifecycleFiles: files.map(({ metadataPath, metadata }) => ({
 			path: metadataPath,
 			identity: serializeCleanupIdentity({
 				dev: metadata.identity.dev,
 				ino: metadata.identity.ino,
+				nlink: metadata.identity.nlink,
 				size: Number(metadata.identity.size),
 				mtimeNs: metadata.identity.mtimeNs,
 				sha256: metadata.identity.sha256,
@@ -1795,6 +1860,8 @@ async function reconcileLifecycleCleanup(
 		const currentFile = activeCleanup.lifecycleFiles![index];
 		const result = native.exactUnlink(activePath, {
 			...captured.identity,
+			parentDev: BigInt(activeCleanup.lifecycleParentIdentity!.dev),
+			parentIno: BigInt(activeCleanup.lifecycleParentIdentity!.ino),
 			quarantineName: path.basename(currentFile.plannedPath),
 		});
 		if (!result.ok) {
@@ -1900,7 +1967,7 @@ async function hasOwnedReadinessEvidence(
 
 type LifecycleFileCapture = {
 	bytes: Buffer;
-	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string };
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string; nlink: bigint };
 	digest: string;
 };
 
@@ -1919,6 +1986,7 @@ function captureLifecycleFile(file: string, requireRegular = false, bounded = fa
 		const stat = fsSync.fstatSync(descriptor, { bigint: true });
 		if (
 			!stat.isFile() ||
+			stat.nlink !== 1n ||
 			(bounded &&
 				(stat.size === 0n ||
 					stat.size > BigInt(MAX_LIFECYCLE_METADATA_BYTES) ||
@@ -1945,6 +2013,7 @@ function captureLifecycleFile(file: string, requireRegular = false, bounded = fa
 				dev: stat.dev,
 				ino: stat.ino,
 				size: stat.size,
+				nlink: stat.nlink,
 				mtimeNs: stat.mtimeNs,
 				sha256: createHash("sha256").update(bytes).digest("hex"),
 			},
@@ -1982,7 +2051,8 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 		}
 	});
 	const endpoint = endpointSource ? captureLifecycleFile(endpointSource) : undefined;
-	if (endpoint && endpointSource) {
+	const endpointParent = endpointSource ? lifecycleParentIdentity(path.dirname(endpointSource)) : undefined;
+	if (endpoint && endpointSource && endpointParent) {
 		let parsed: { pid?: unknown };
 		try {
 			parsed = parseLifecycleJson(endpoint.bytes) as { pid?: unknown };
@@ -1999,6 +2069,7 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 				: endpointSource === plannedEndpointPath
 					? retryEndpointPath
 					: finalEndpointPath,
+			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
 		if (!endpointRemoval.ok) return false;
 	}
@@ -2444,15 +2515,18 @@ type ValidatedDelete = {
 	storage: FileSessionStorage;
 	target: VerifiedSessionDeleteTarget;
 	metadataRoot: string;
+	transcriptParentIdentity: { dev: string; ino: string };
 };
 function cleanupIdentity(
 	identity: BrokerCleanupEvidence["transcriptIdentity"],
 	allowEmptySha256 = false,
-): SessionStorageFileIdentity | undefined {
+	requireNlink = true,
+): CleanupIdentity | undefined {
 	if (
 		!identity ||
 		!/^[0-9]+$/.test(identity.dev) ||
 		!/^[0-9]+$/.test(identity.ino) ||
+		(requireNlink && (typeof identity.nlink !== "string" || !/^[0-9]+$/.test(identity.nlink))) ||
 		!Number.isSafeInteger(identity.size) ||
 		identity.size < 0 ||
 		!/^[0-9]+$/.test(identity.mtimeNs) ||
@@ -2463,6 +2537,7 @@ function cleanupIdentity(
 	return {
 		dev: BigInt(identity.dev),
 		ino: BigInt(identity.ino),
+		...(typeof identity.nlink === "string" ? { nlink: BigInt(identity.nlink) } : {}),
 		size: identity.size,
 		mtimeNs: BigInt(identity.mtimeNs),
 		sha256: identity.sha256,
@@ -2470,7 +2545,12 @@ function cleanupIdentity(
 }
 
 function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerResponse {
-	const transcriptIdentity = cleanupIdentity(cleanup.transcriptIdentity);
+	const parsedTranscriptIdentity = cleanupIdentity(cleanup.transcriptIdentity);
+	const transcriptIdentity: SessionStorageFileIdentity | undefined =
+		parsedTranscriptIdentity?.nlink !== undefined
+			? { ...parsedTranscriptIdentity, nlink: parsedTranscriptIdentity.nlink }
+			: undefined;
+	const transcriptParentIdentity = cleanup.transcriptParentIdentity;
 	if (
 		(cleanup.phase !== "artifacts" && cleanup.phase !== "transcript") ||
 		!cleanup.sessionId ||
@@ -2479,20 +2559,74 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 		!cleanup.transcriptPath ||
 		!cleanup.cwd ||
 		!cleanup.metadataRoot ||
-		!transcriptIdentity
+		!transcriptIdentity ||
+		!transcriptParentIdentity ||
+		!/^[0-9]+$/.test(transcriptParentIdentity.dev) ||
+		!/^[0-9]+$/.test(transcriptParentIdentity.ino)
 	) {
 		return fail("terminal_uncertain", "Cleanup replay lacks a complete ledger-bound deletion target.");
 	}
-	const artifactsIdentity = cleanupIdentity(cleanup.artifactsIdentity, true);
-	const artifactTreeIdentity =
-		cleanup.artifactsRemoved === true || !cleanup.artifactTree
-			? undefined
-			: cleanupIdentity(cleanup.artifactTree.identity, true);
-	if (cleanup.artifactsRemoved !== true && cleanup.artifactTree && !artifactTreeIdentity)
+	const artifactsIdentity = cleanupIdentity(cleanup.artifactsIdentity, true, false);
+	const artifactTreeIdentity = cleanup.artifactTree
+		? cleanupIdentity(cleanup.artifactTree.identity, true, false)
+		: undefined;
+	if (cleanup.artifactsAbsentAtAuthorization !== undefined && cleanup.artifactsAbsentAtAuthorization !== true)
+		return fail("terminal_uncertain", "Artifact absence authority is malformed.");
+	if (
+		cleanup.artifactsAbsentAtAuthorization === true &&
+		(cleanup.artifactsRemoved === true || artifactsIdentity !== undefined || cleanup.artifactTree !== undefined)
+	)
+		return fail("terminal_uncertain", "Artifact absence authority contradicts retained or completed artifacts.");
+	if (cleanup.artifactTree && !artifactTreeIdentity)
 		return fail("terminal_uncertain", "Artifact tree cleanup lacks its ledger-bound identity.");
+	if (cleanup.artifactsRemoved !== true && (artifactsIdentity !== undefined) !== (artifactTreeIdentity !== undefined))
+		return fail("terminal_uncertain", "Artifact cleanup receipt lacks its immutable tree snapshot.");
+	if (cleanup.artifactsRemoved === true && (artifactsIdentity !== undefined) !== (artifactTreeIdentity !== undefined))
+		return fail("terminal_uncertain", "Artifacts-removed cleanup receipt dropped its immutable tree authority.");
+	if (
+		artifactsIdentity &&
+		artifactTreeIdentity &&
+		(artifactsIdentity.dev !== artifactTreeIdentity.dev || artifactsIdentity.ino !== artifactTreeIdentity.ino)
+	)
+		return fail("terminal_uncertain", "Artifact cleanup tree does not match its ledger-bound root identity.");
+	if (cleanup.phase === "artifacts" && cleanup.artifactsRemoved === true)
+		return fail("terminal_uncertain", "Artifacts-phase cleanup receipt falsely claims artifact completion.");
+	if (
+		cleanup.artifactsRemoved === true &&
+		cleanup.artifactTree &&
+		(cleanup.artifactTree.completed !== true || cleanup.artifactTree.detachedPath !== undefined)
+	)
+		return fail("terminal_uncertain", "Artifacts-removed cleanup receipt retains unfinished nested authority.");
+	if (cleanup.phase === "transcript" && cleanup.artifactsRemoved !== true)
+		return fail("terminal_uncertain", "Transcript cleanup lacks durable artifact completion proof.");
 
-	if (cleanup.detachedArtifactsPath && !artifactsIdentity)
-		return fail("terminal_uncertain", "Detached artifact cleanup lacks its ledger-bound identity.");
+	const retainedArtifactSidePaths = [
+		cleanup.retainedArtifactsSuccessorPath,
+		cleanup.retainedArtifactsPlaceholderPath,
+		cleanup.retainedArtifactsUnknownPath,
+	];
+	const retainedArtifactSideAuthority = cleanup.retainedArtifactsSideAuthority;
+	const cleanupReceiptVersion = cleanup.cleanupReceiptVersion;
+	const hasRetainedArtifactSidePath = retainedArtifactSidePaths.some(
+		candidate => typeof candidate === "string" && candidate.length > 0,
+	);
+	if ((cleanup.phase === "artifacts" || cleanup.phase === "transcript") && cleanupReceiptVersion !== 1)
+		return fail("terminal_uncertain", "Cleanup replay lacks supported versioned authority.");
+	if (
+		cleanup.artifactsRemoved === true &&
+		(cleanup.detachedArtifactsPath !== undefined ||
+			retainedArtifactSidePaths.some(Boolean) ||
+			retainedArtifactSideAuthority === "retained")
+	)
+		return fail("terminal_uncertain", "Artifacts-removed cleanup receipt retains contradictory artifact authority.");
+	if (
+		cleanup.artifactsRemoved !== true &&
+		((retainedArtifactSideAuthority !== "none" && retainedArtifactSideAuthority !== "retained") ||
+			(retainedArtifactSideAuthority === "retained") !== hasRetainedArtifactSidePath)
+	)
+		return fail("terminal_uncertain", "Retained artifact side authority receipt is incomplete or corrupt.");
+	if ((cleanup.detachedArtifactsPath || retainedArtifactSidePaths.some(Boolean)) && !artifactsIdentity)
+		return fail("terminal_uncertain", "Retained artifact cleanup lacks its ledger-bound identity.");
 	const plannedArtifactsPath = cleanup.plannedArtifactsPath;
 	const plannedTranscriptPath = cleanup.plannedTranscriptPath;
 	if (
@@ -2502,22 +2636,17 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 		(plannedTranscriptPath &&
 			(path.dirname(plannedTranscriptPath) !== path.dirname(cleanup.transcriptPath) ||
 				!path.basename(plannedTranscriptPath).startsWith(".gjc-delete-"))) ||
-		(cleanup.artifactsRemoved !== true &&
-			cleanup.artifactTree &&
+		(cleanup.artifactTree &&
 			(path.dirname(cleanup.artifactTree.plannedPath) !== path.dirname(cleanup.transcriptPath) ||
 				!path.basename(cleanup.artifactTree.plannedPath).startsWith(".gjc-delete-") ||
 				(cleanup.artifactTree.detachedPath !== undefined &&
-					path.dirname(cleanup.artifactTree.detachedPath) !== path.dirname(cleanup.transcriptPath))))
-	)
-		return fail("terminal_uncertain", "Cleanup replay has invalid preauthorized quarantine paths.");
-	if (
-		cleanup.phase === "transcript" &&
-		cleanup.artifactsRemoved === true &&
-		![cleanup.transcriptPath, cleanup.detachedTranscriptPath, plannedTranscriptPath].some(
-			candidate => typeof candidate === "string" && fsSync.existsSync(candidate),
+					path.dirname(cleanup.artifactTree.detachedPath) !== path.dirname(cleanup.transcriptPath)))) ||
+		retainedArtifactSidePaths.some(
+			candidate =>
+				typeof candidate === "string" && path.dirname(candidate) !== path.dirname(cleanup.transcriptPath!),
 		)
 	)
-		return { ok: true, result: { sessionId: cleanup.sessionId } };
+		return fail("terminal_uncertain", "Cleanup replay has invalid preauthorized quarantine paths.");
 	const artifactRemovingPath =
 		cleanup.artifactsRemoved === true
 			? undefined
@@ -2536,6 +2665,8 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 						fsSync.existsSync(plannedArtifactsPath)
 					? plannedArtifactsPath
 					: undefined;
+	const replayPlannedArtifactsPath =
+		plannedArtifactsPath !== recoveredDetachedArtifactsPath ? plannedArtifactsPath : undefined;
 	const recoveredDetachedTranscriptPath =
 		cleanup.detachedTranscriptPath && fsSync.existsSync(cleanup.detachedTranscriptPath)
 			? cleanup.detachedTranscriptPath
@@ -2552,27 +2683,74 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 			sessionId: cleanup.sessionId,
 			cwd: cleanup.cwd,
 			transcriptIdentity,
+			transcriptParentIdentity: {
+				dev: BigInt(cleanup.transcriptParentIdentity!.dev),
+				ino: BigInt(cleanup.transcriptParentIdentity!.ino),
+			},
 			...(cleanup.artifactsRemoved === true ? { artifactsRemoved: true } : {}),
+			...(cleanup.artifactsAbsentAtAuthorization === true ? { artifactsAbsentAtAuthorization: true as const } : {}),
 			...(cleanup.artifactsRemoved !== true && artifactsIdentity
 				? { expectedArtifactsIdentity: artifactsIdentity }
 				: {}),
 			...(cleanup.artifactsRemoved !== true && recoveredDetachedArtifactsPath
 				? { detachedArtifactsPath: recoveredDetachedArtifactsPath }
 				: {}),
+			...(cleanup.artifactsRemoved !== true && cleanup.retainedArtifactsSuccessorPath
+				? { retainedArtifactsSuccessorPath: cleanup.retainedArtifactsSuccessorPath }
+				: {}),
+			...(cleanup.artifactsRemoved !== true && cleanup.retainedArtifactsPlaceholderPath
+				? { retainedArtifactsPlaceholderPath: cleanup.retainedArtifactsPlaceholderPath }
+				: {}),
+			...(cleanup.artifactsRemoved !== true && cleanup.retainedArtifactsUnknownPath
+				? { retainedArtifactsUnknownPath: cleanup.retainedArtifactsUnknownPath }
+				: {}),
 			...(recoveredDetachedTranscriptPath ? { detachedTranscriptPath: recoveredDetachedTranscriptPath } : {}),
-			...(plannedArtifactsPath ? { plannedArtifactsPath } : {}),
+			...(cleanup.retainedTranscriptSuccessorPath
+				? { retainedTranscriptSuccessorPath: cleanup.retainedTranscriptSuccessorPath }
+				: {}),
+			...(cleanup.retainedTranscriptPlaceholderPath
+				? { retainedTranscriptPlaceholderPath: cleanup.retainedTranscriptPlaceholderPath }
+				: {}),
+			...(cleanup.retainedTranscriptUnknownPath
+				? { retainedTranscriptUnknownPath: cleanup.retainedTranscriptUnknownPath }
+				: {}),
+			...(replayPlannedArtifactsPath ? { plannedArtifactsPath: replayPlannedArtifactsPath } : {}),
 			...(plannedTranscriptPath ? { plannedTranscriptPath } : {}),
 			...(cleanup.artifactsRemoved !== true && cleanup.artifactTree && artifactTreeIdentity
 				? {
 						expectedArtifactsIdentity: artifactTreeIdentity,
 						expectedArtifactsTree: cleanup.artifactTree.snapshot,
 						detachedArtifactsPath: cleanup.artifactTree.detachedPath ?? recoveredDetachedArtifactsPath,
-						plannedArtifactsPath: cleanup.artifactTree.plannedPath,
+						...(replayPlannedArtifactsPath ? { plannedArtifactsPath: replayPlannedArtifactsPath } : {}),
 					}
 				: {}),
 		},
 		metadataRoot: cleanup.metadataRoot,
+		transcriptParentIdentity: cleanup.transcriptParentIdentity!,
 	};
+}
+
+function canonicalExistingPath(pathname: string): string {
+	try {
+		return fsSync.realpathSync.native(pathname);
+	} catch {
+		return path.resolve(pathname);
+	}
+}
+
+export function canonicalDeleteLocatorPath(pathname: string): string {
+	let current = path.resolve(pathname);
+	const suffix: string[] = [];
+	for (;;) {
+		try {
+			return path.join(fsSync.realpathSync.native(current), ...suffix.reverse());
+		} catch {
+			const parent = path.dirname(current);
+			if (parent === current) return path.resolve(pathname);
+			suffix.push(path.basename(current));
+			current = parent;
+		}
+	}
 }
 
 async function validateDeletePath(
@@ -2582,25 +2760,46 @@ async function validateDeletePath(
 	record: { locator: { repo: string; stateRoot: string } } | undefined,
 	cleanup?: CleanupEvidence,
 ): Promise<ValidatedDelete | BrokerResponse> {
-	if (cleanup) return replayDeleteTarget(cleanup);
 	const sessionPath = text(input.sessionPath);
-	const cwd = lifecycleCwd(input);
-	if (!sessionPath || !cwd)
+	const lexicalCwd = lifecycleCwd(input);
+	if (!sessionPath || !lexicalCwd)
 		return fail("invalid_input", "session.delete requires sessionPath and its configured cwd.");
-	const requestedRoot = stateRoot(input, cwd);
-	if (!requestedRoot || !hasDefaultStateRoot(cwd, requestedRoot))
+	const requestedRoot = stateRoot(input, lexicalCwd);
+	if (!requestedRoot || !hasDefaultStateRoot(lexicalCwd, requestedRoot))
 		return fail("invalid_input", "stateRoot must be the default .gjc/state for cwd.");
+	const cwd = canonicalExistingPath(lexicalCwd);
+	const canonicalRequestedRoot = canonicalExistingPath(requestedRoot);
 	if (
 		record &&
-		(path.resolve(record.locator.repo) !== cwd || path.resolve(record.locator.stateRoot) !== requestedRoot)
+		(canonicalExistingPath(record.locator.repo) !== cwd ||
+			canonicalExistingPath(record.locator.stateRoot) !== canonicalRequestedRoot)
 	)
 		return fail("invalid_input", "session.delete locator does not match the indexed session.");
-
+	const candidatePath = canonicalDeleteLocatorPath(sessionPath);
+	let transcriptParentStat: fsSync.BigIntStats;
+	try {
+		transcriptParentStat = fsSync.lstatSync(path.dirname(candidatePath), { bigint: true });
+		if (!transcriptParentStat.isDirectory())
+			return fail("invalid_input", "session.delete transcript parent is not a directory.");
+	} catch {
+		return fail("invalid_input", "session.delete transcript parent cannot be authorized.");
+	}
+	if (cleanup) {
+		const replay = replayDeleteTarget(cleanup);
+		if ("ok" in replay) return replay;
+		if (
+			replay.target.sessionId !== id ||
+			canonicalDeleteLocatorPath(replay.target.transcriptPath) !== candidatePath ||
+			canonicalExistingPath(replay.target.cwd) !== cwd ||
+			canonicalExistingPath(replay.metadataRoot) !== canonicalRequestedRoot
+		)
+			return fail("invalid_input", "Cleanup receipt does not match the requested saved-session locator.");
+		return replay;
+	}
 	const inventory = await managedCandidates(broker, cwd, "Saved");
 	if ("ok" in inventory) return inventory;
-	const candidatePath = path.resolve(sessionPath);
 	const matches = inventory.candidates.filter(
-		candidate => candidate.path === candidatePath && candidate.sessionId === id,
+		candidate => canonicalExistingPath(candidate.path) === candidatePath && candidate.sessionId === id,
 	);
 	if (matches.length !== 1)
 		return fail("invalid_input", "session.delete path is not an owned managed session for the configured cwd.");
@@ -2619,27 +2818,45 @@ async function validateDeletePath(
 	if (
 		snapshot.stat.dev !== match.identity.dev ||
 		snapshot.stat.ino !== match.identity.ino ||
+		snapshot.stat.nlink !== 1n ||
 		snapshot.stat.size !== match.identity.size ||
 		snapshot.stat.mtimeNs !== match.identity.mtimeNs ||
 		digest !== match.identity.sha256
 	)
 		return fail("invalid_input", "session.delete session changed after managed ownership was verified.");
+	try {
+		const currentParent = fsSync.lstatSync(path.dirname(candidatePath), { bigint: true });
+		if (
+			!currentParent.isDirectory() ||
+			currentParent.dev !== transcriptParentStat.dev ||
+			currentParent.ino !== transcriptParentStat.ino
+		)
+			return fail("invalid_input", "session.delete transcript parent changed during authorization.");
+	} catch {
+		return fail("invalid_input", "session.delete transcript parent changed during authorization.");
+	}
 	return {
 		storage,
 		target: {
-			sessionsRoot: inventory.scope.sessionsRoot,
+			sessionsRoot: canonicalExistingPath(inventory.scope.sessionsRoot),
 			transcriptPath: candidatePath,
 			sessionId: id,
 			cwd,
 			transcriptIdentity: {
 				dev: snapshot.stat.dev,
 				ino: snapshot.stat.ino,
+				nlink: snapshot.stat.nlink,
 				size: snapshot.stat.size,
 				mtimeNs: snapshot.stat.mtimeNs,
 				sha256: digest,
 			},
+			transcriptParentIdentity: { dev: transcriptParentStat.dev, ino: transcriptParentStat.ino },
 		},
-		metadataRoot: requestedRoot,
+		metadataRoot: canonicalRequestedRoot,
+		transcriptParentIdentity: {
+			dev: transcriptParentStat.dev.toString(),
+			ino: transcriptParentStat.ino.toString(),
+		},
 	};
 }
 type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
@@ -2762,6 +2979,12 @@ async function executeLifecycleResponse(
 	const requestedSessionId = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (requestedSessionId !== undefined && !isCanonicalSessionId(requestedSessionId))
 		return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (
+		operation === "session.delete" &&
+		requestedSessionId &&
+		broker.ledger.hasUncertainCleanupForSession(requestedSessionId, identity)
+	)
+		return fail("terminal_uncertain", "Prior cleanup authority for this session is corrupt or incomplete.");
 	const requestedSourceSessionId = text(input.sourceSessionId) ?? text(input.sourceId);
 	if (requestedSourceSessionId !== undefined && !isCanonicalSessionId(requestedSourceSessionId))
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
@@ -3153,6 +3376,27 @@ async function executeLifecycleResponse(
 		if (record?.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be deleted safely.");
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
+		if (cleanup === undefined) {
+			const requestedTranscriptPath = text(input.sessionPath);
+			const requestedCwd = lifecycleCwd(input);
+			if (requestedTranscriptPath && requestedCwd) {
+				const transcriptPath = canonicalExistingPath(requestedTranscriptPath);
+				const foreignCleanup = broker.ledger.findCleanupPendingByDeleteTarget(
+					{
+						sessionId: id,
+						transcriptPath,
+						cwd: canonicalExistingPath(requestedCwd),
+					},
+					identity,
+				);
+				if (foreignCleanup) {
+					const response = foreignCleanup.response as BrokerResponse | undefined;
+					if (!response || response.ok || response.error.code !== "cleanup_pending" || !response.error.cleanup)
+						return fail("terminal_uncertain", "Session cleanup authority is incomplete or corrupt.");
+					return response;
+				}
+			}
+		}
 		const validated = await validateDeletePath(broker, input, id, record, cleanup);
 		if ("ok" in validated) return validated;
 		const metadataPreflight = preflightLifecycleDeleteMetadata(validated.metadataRoot, id, record, value =>
@@ -3207,36 +3451,264 @@ async function executeLifecycleResponse(
 				};
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				cleanupTarget = { ...cleanupTarget, artifactsAbsentAtAuthorization: true };
 			}
 		}
+		const pathIsAbsent = (candidate: string | undefined): boolean => {
+			if (!candidate) return true;
+			try {
+				fsSync.lstatSync(candidate);
+				return false;
+			} catch (error) {
+				return (error as NodeJS.ErrnoException).code === "ENOENT";
+			}
+		};
+		const transcriptParentIdentity = cleanup?.transcriptParentIdentity ?? validated.transcriptParentIdentity;
+		const durableArtifactsPlan =
+			cleanup?.artifactTree?.plannedPath ?? cleanup?.plannedArtifactsPath ?? cleanupTarget.plannedArtifactsPath;
 		const preauthorizedCleanup: CleanupEvidence = {
+			cleanupReceiptVersion: 1,
 			phase: cleanupTarget.artifactsRemoved ? "transcript" : "artifacts",
 			sessionId: cleanupTarget.sessionId,
 			sessionsRoot: cleanupTarget.sessionsRoot,
 			transcriptPath: cleanupTarget.transcriptPath,
 			cwd: cleanupTarget.cwd,
 			...(cleanupTarget.artifactsRemoved ? { artifactsRemoved: true } : {}),
+			...(cleanupTarget.artifactsAbsentAtAuthorization ? { artifactsAbsentAtAuthorization: true as const } : {}),
 			metadataRoot: validated.metadataRoot,
 			transcriptIdentity: serializeCleanupIdentity(cleanupTarget.transcriptIdentity),
+			transcriptParentIdentity,
 			...(cleanupTarget.expectedArtifactsIdentity
 				? { artifactsIdentity: serializeCleanupIdentity(cleanupTarget.expectedArtifactsIdentity) }
 				: {}),
-			...(cleanupTarget.expectedArtifactsIdentity && cleanupTarget.plannedArtifactsPath
+			...(cleanupTarget.expectedArtifactsIdentity && durableArtifactsPlan
 				? {
 						artifactTree: {
 							identity: serializeCleanupIdentity(cleanupTarget.expectedArtifactsIdentity),
 							snapshot: cleanupTarget.expectedArtifactsTree!,
-							plannedPath: cleanupTarget.plannedArtifactsPath,
+							plannedPath: durableArtifactsPlan,
 							...(cleanupTarget.detachedArtifactsPath
 								? { detachedPath: cleanupTarget.detachedArtifactsPath }
 								: {}),
 						},
 					}
 				: {}),
+			...(cleanup?.artifactTree ? { artifactTree: cleanup.artifactTree } : {}),
+			...(cleanup?.artifactsIdentity ? { artifactsIdentity: cleanup.artifactsIdentity } : {}),
+			...(cleanupTarget.retainedArtifactsSuccessorPath
+				? { retainedArtifactsSuccessorPath: cleanupTarget.retainedArtifactsSuccessorPath }
+				: {}),
+			...(cleanupTarget.retainedArtifactsPlaceholderPath
+				? { retainedArtifactsPlaceholderPath: cleanupTarget.retainedArtifactsPlaceholderPath }
+				: {}),
+			...(cleanupTarget.retainedArtifactsUnknownPath
+				? { retainedArtifactsUnknownPath: cleanupTarget.retainedArtifactsUnknownPath }
+				: {}),
+			retainedArtifactsSideAuthority: [
+				cleanupTarget.retainedArtifactsSuccessorPath,
+				cleanupTarget.retainedArtifactsPlaceholderPath,
+				cleanupTarget.retainedArtifactsUnknownPath,
+			].some(candidate => candidate !== undefined)
+				? "retained"
+				: "none",
+			...(cleanupTarget.detachedTranscriptPath
+				? { detachedTranscriptPath: cleanupTarget.detachedTranscriptPath }
+				: {}),
+			...(cleanupTarget.retainedTranscriptSuccessorPath
+				? { retainedTranscriptSuccessorPath: cleanupTarget.retainedTranscriptSuccessorPath }
+				: {}),
+			...(cleanupTarget.retainedTranscriptPlaceholderPath
+				? { retainedTranscriptPlaceholderPath: cleanupTarget.retainedTranscriptPlaceholderPath }
+				: {}),
+			...(cleanupTarget.retainedTranscriptUnknownPath
+				? { retainedTranscriptUnknownPath: cleanupTarget.retainedTranscriptUnknownPath }
+				: {}),
 
 			...(cleanupTarget.plannedArtifactsPath ? { plannedArtifactsPath: cleanupTarget.plannedArtifactsPath } : {}),
 			...(cleanupTarget.plannedTranscriptPath ? { plannedTranscriptPath: cleanupTarget.plannedTranscriptPath } : {}),
 		};
+		const publishChangedArtifactRoot = async (
+			retainedPath: string | undefined,
+			message = "Saved session cleanup is pending in artifacts: retained artifact root changed before exact removal.",
+		): Promise<BrokerResponse> => {
+			const artifactPhaseCleanup: CleanupEvidence = {
+				...preauthorizedCleanup,
+				phase: "artifacts",
+				...(retainedPath ? { detachedArtifactsPath: retainedPath } : {}),
+				...(retainedPath && preauthorizedCleanup.artifactTree
+					? {
+							artifactTree: {
+								...preauthorizedCleanup.artifactTree,
+								detachedPath: retainedPath,
+							},
+						}
+					: {}),
+			};
+			const changedRoot = fail("cleanup_pending", message, artifactPhaseCleanup);
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: changedRoot,
+			});
+			return changedRoot;
+		};
+		const publishCanonicalArtifactReappearance = async (
+			transcriptPhaseCleanup: CleanupEvidence,
+			message = "Saved session cleanup is pending in artifacts: canonical artifact path reappeared before transcript reconciliation.",
+		): Promise<BrokerResponse> => {
+			const pending = fail("cleanup_pending", message, transcriptPhaseCleanup);
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: pending,
+			});
+			return pending;
+		};
+		const publishRetainedTranscriptSideAuthority = async (): Promise<BrokerResponse> => {
+			const pending = fail(
+				"cleanup_pending",
+				"Saved session cleanup is pending in transcript side authority.",
+				preauthorizedCleanup,
+			);
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: pending,
+			});
+			return pending;
+		};
+		const canonicalArtifactsPath = cleanupTarget.transcriptPath.slice(0, -6);
+		const transcriptCleanupAuthorityIsAbsent = (): boolean =>
+			[
+				cleanupTarget.transcriptPath,
+				cleanupTarget.detachedTranscriptPath,
+				cleanupTarget.plannedTranscriptPath,
+				cleanupTarget.plannedTranscriptPath ? `${cleanupTarget.plannedTranscriptPath}.removing` : undefined,
+				cleanupTarget.retainedTranscriptSuccessorPath,
+				cleanupTarget.retainedTranscriptPlaceholderPath,
+				cleanupTarget.retainedTranscriptUnknownPath,
+			].every(pathIsAbsent);
+		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean => {
+			const authorizedPlans = [
+				cleanup?.plannedArtifactsPath,
+				cleanup?.artifactTree?.plannedPath,
+				cleanupTarget.plannedArtifactsPath,
+			].filter((candidate): candidate is string => candidate !== undefined);
+			return authorizedPlans.every(plannedPath =>
+				[plannedPath, `${plannedPath}.removing`].every(
+					aliasPath =>
+						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) || pathIsAbsent(aliasPath),
+				),
+			);
+		};
+		const retainedArtifactReplayHasNoSideAuthority = [
+			cleanupTarget.retainedArtifactsSuccessorPath,
+			cleanupTarget.retainedArtifactsPlaceholderPath,
+			cleanupTarget.retainedArtifactsUnknownPath,
+		].every(candidate => candidate === undefined);
+		if (cleanup && !retainedArtifactReplayHasNoSideAuthority) {
+			const retainedPath = cleanupTarget.detachedArtifactsPath;
+			return await publishChangedArtifactRoot(
+				retainedPath,
+				"Saved session cleanup is pending in artifacts: retained artifact side authority remains before transcript cleanup.",
+			);
+		}
+		const retainedTranscriptSidePaths = [
+			cleanupTarget.retainedTranscriptSuccessorPath,
+			cleanupTarget.retainedTranscriptPlaceholderPath,
+			cleanupTarget.retainedTranscriptUnknownPath,
+		];
+		const transcriptParentMatchesPersistedIdentity = (): boolean => {
+			const expectedParent = preauthorizedCleanup.transcriptParentIdentity;
+			try {
+				const stat = fsSync.lstatSync(path.dirname(cleanupTarget.transcriptPath), { bigint: true });
+				return (
+					stat.isDirectory() &&
+					expectedParent !== undefined &&
+					stat.dev.toString() === expectedParent.dev &&
+					stat.ino.toString() === expectedParent.ino
+				);
+			} catch {
+				return false;
+			}
+		};
+		const retainedTranscriptIdentityIsAbsentFromParent = (): boolean => {
+			const transcriptParent = path.dirname(cleanupTarget.transcriptPath);
+			const expectedParent = preauthorizedCleanup.transcriptParentIdentity;
+			const pendingDirectories = [transcriptParent];
+			const snapshots: Array<{ path: string; stat: fsSync.BigIntStats }> = [];
+			let entryCount = 0;
+			try {
+				while (pendingDirectories.length > 0) {
+					const directory = pendingDirectories.pop();
+					if (!directory) return false;
+					const before = fsSync.lstatSync(directory, { bigint: true });
+					if (!before.isDirectory()) return false;
+					if (
+						directory === transcriptParent &&
+						(!expectedParent ||
+							before.dev.toString() !== expectedParent.dev ||
+							before.ino.toString() !== expectedParent.ino)
+					)
+						return false;
+					snapshots.push({ path: directory, stat: before });
+					const entries = fsSync.readdirSync(directory);
+					entryCount += entries.length;
+					if (entryCount > 10_000) return false;
+					for (const entry of entries) {
+						const pathname = path.join(directory, entry);
+						let stat: fsSync.BigIntStats;
+						try {
+							stat = fsSync.lstatSync(pathname, { bigint: true });
+						} catch {
+							return false;
+						}
+						if (
+							stat.dev === cleanupTarget.transcriptIdentity.dev &&
+							stat.ino === cleanupTarget.transcriptIdentity.ino
+						)
+							return false;
+						if (stat.isDirectory()) pendingDirectories.push(pathname);
+					}
+				}
+				for (const snapshot of snapshots) {
+					const after = fsSync.lstatSync(snapshot.path, { bigint: true });
+					if (
+						!after.isDirectory() ||
+						after.dev !== snapshot.stat.dev ||
+						after.ino !== snapshot.stat.ino ||
+						after.mtimeNs !== snapshot.stat.mtimeNs ||
+						after.ctimeNs !== snapshot.stat.ctimeNs
+					)
+						return false;
+				}
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		const retainedTranscriptReplayHasNoSideAuthority = retainedTranscriptSidePaths.every(
+			candidate => candidate === undefined,
+		);
+		const retainedTranscriptSideAuthorityIsProvenAbsent =
+			retainedTranscriptSidePaths.every(pathIsAbsent) &&
+			(cleanupTarget.detachedTranscriptPath ? true : retainedTranscriptIdentityIsAbsentFromParent());
+		if (cleanup && !retainedTranscriptReplayHasNoSideAuthority) {
+			if (!retainedTranscriptSideAuthorityIsProvenAbsent) return await publishRetainedTranscriptSideAuthority();
+			cleanupTarget.retainedTranscriptSuccessorPath = undefined;
+			cleanupTarget.retainedTranscriptPlaceholderPath = undefined;
+			cleanupTarget.retainedTranscriptUnknownPath = undefined;
+			preauthorizedCleanup.retainedTranscriptSuccessorPath = undefined;
+			preauthorizedCleanup.retainedTranscriptPlaceholderPath = undefined;
+			preauthorizedCleanup.retainedTranscriptUnknownPath = undefined;
+		}
+		if (cleanup?.phase === "artifacts" && !artifactQuarantineAliasesAreAbsent(true))
+			return await publishChangedArtifactRoot(
+				cleanupTarget.detachedArtifactsPath,
+				"Saved session cleanup is pending in artifacts: another authorized quarantine alias remains.",
+			);
+		if (cleanup?.phase === "transcript" && !artifactQuarantineAliasesAreAbsent(false))
+			return await publishCanonicalArtifactReappearance(
+				preauthorizedCleanup,
+				"Saved session cleanup is pending in artifacts: a planned quarantine alias reappeared before transcript reconciliation.",
+			);
 		await broker.ledger.transition(identity, "effect_started", {
 			intendedSessionId: id,
 			effectMarker: randomUUID(),
@@ -3248,40 +3720,87 @@ async function executeLifecycleResponse(
 		});
 		let deleted: VerifiedSessionDeleteResult;
 		try {
-			deleted = await validated.storage.deleteSessionVerified(cleanupTarget);
+			const completedArtifactReplay = cleanup?.phase === "transcript" && cleanup.artifactsRemoved === true;
+			if (completedArtifactReplay && !pathIsAbsent(canonicalArtifactsPath))
+				return await publishCanonicalArtifactReappearance(preauthorizedCleanup);
+			if (
+				completedArtifactReplay &&
+				transcriptCleanupAuthorityIsAbsent() &&
+				retainedTranscriptIdentityIsAbsentFromParent()
+			)
+				return fail(
+					"cleanup_pending",
+					"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
+					preauthorizedCleanup,
+				);
+			else {
+				if (!transcriptParentMatchesPersistedIdentity())
+					return fail(
+						"cleanup_pending",
+						"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
+						preauthorizedCleanup,
+					);
+				deleted = await validated.storage.deleteSessionVerified(cleanupTarget);
+			}
 		} catch (error) {
-			if (error instanceof SessionDeleteVerificationError)
+			if (error instanceof SessionDeleteVerificationError) {
+				if (cleanup?.phase === "artifacts")
+					return await publishChangedArtifactRoot(
+						cleanupTarget.detachedArtifactsPath,
+						`Saved session cleanup remains pending in exact artifact authority: ${error.message}`,
+					);
+				if (cleanup?.phase === "transcript" && cleanup.artifactsRemoved === true && error.kind === "artifacts")
+					return await publishCanonicalArtifactReappearance(preauthorizedCleanup);
 				return fail(
 					"invalid_input",
 					`Saved session deletion verification failed (${error.kind}): ${error.message}`,
 				);
+			}
 			return fail(
 				"unavailable",
 				`Unable to delete saved session artifacts: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
-		const retainedArtifactsCleanup =
-			deleted.kind === "cleanup_pending" &&
-			deleted.phase === "artifacts" &&
-			deleted.detachedArtifactsPath !== undefined &&
-			cleanupTarget.plannedArtifactsPath !== undefined &&
-			(deleted.detachedArtifactsPath === cleanupTarget.plannedArtifactsPath ||
-				deleted.detachedArtifactsPath === `${cleanupTarget.plannedArtifactsPath}.removing`);
-		if (deleted.kind === "artifacts_removed" || retainedArtifactsCleanup) {
-			const transcriptPhaseCleanup = {
+		if (
+			deleted.kind === "deleted" &&
+			cleanup?.phase === "transcript" &&
+			cleanup.artifactsRemoved === true &&
+			!pathIsAbsent(canonicalArtifactsPath)
+		)
+			return await publishCanonicalArtifactReappearance(preauthorizedCleanup);
+		if (
+			deleted.kind === "deleted" &&
+			cleanup?.phase === "transcript" &&
+			cleanup.artifactsRemoved === true &&
+			!artifactQuarantineAliasesAreAbsent(false)
+		)
+			return await publishCanonicalArtifactReappearance(
+				preauthorizedCleanup,
+				"Saved session cleanup is pending in artifacts: a planned quarantine alias reappeared during transcript cleanup.",
+			);
+		if (deleted.kind === "artifacts_removed") {
+			if (!artifactQuarantineAliasesAreAbsent(false))
+				return await publishChangedArtifactRoot(
+					cleanupTarget.detachedArtifactsPath,
+					"Saved session cleanup is pending in artifacts: an authorized quarantine alias remains after exact removal.",
+				);
+			const transcriptPhaseCleanup: CleanupEvidence = {
 				...preauthorizedCleanup,
-				phase: "transcript" as const,
+				phase: "transcript",
 				artifactsRemoved: true,
-				...(deleted.kind === "cleanup_pending" && deleted.phase === "artifacts"
-					? {
-							detachedArtifactsPath: deleted.detachedArtifactsPath,
-							...(deleted.artifactsIdentity
-								? { artifactsIdentity: serializeCleanupIdentity(deleted.artifactsIdentity) }
-								: {}),
-						}
-					: {}),
+				detachedArtifactsPath: undefined,
+				retainedArtifactsSuccessorPath: undefined,
+				retainedArtifactsPlaceholderPath: undefined,
+				retainedArtifactsUnknownPath: undefined,
+				retainedArtifactsSideAuthority: "none",
 				...(preauthorizedCleanup.artifactTree
-					? { artifactTree: { ...preauthorizedCleanup.artifactTree, completed: true as const } }
+					? {
+							artifactTree: {
+								...preauthorizedCleanup.artifactTree,
+								detachedPath: undefined,
+								completed: true as const,
+							},
+						}
 					: {}),
 			};
 
@@ -3293,25 +3812,64 @@ async function executeLifecycleResponse(
 					transcriptPhaseCleanup,
 				),
 			});
-			deleted = await validated.storage.deleteSessionVerified({
-				...cleanupTarget,
-				expectedArtifactsIdentity: undefined,
-				detachedArtifactsPath: undefined,
-				artifactsRemoved: true,
-			});
+			if (!pathIsAbsent(canonicalArtifactsPath))
+				return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
+			if (transcriptCleanupAuthorityIsAbsent() && retainedTranscriptIdentityIsAbsentFromParent())
+				return fail(
+					"cleanup_pending",
+					"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
+					transcriptPhaseCleanup,
+				);
+			else {
+				if (!transcriptParentMatchesPersistedIdentity())
+					return fail(
+						"cleanup_pending",
+						"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
+						transcriptPhaseCleanup,
+					);
+				try {
+					deleted = await validated.storage.deleteSessionVerified({
+						...cleanupTarget,
+						expectedArtifactsIdentity: undefined,
+						detachedArtifactsPath: undefined,
+						artifactsRemoved: true,
+					});
+				} catch (error) {
+					if (error instanceof SessionDeleteVerificationError && error.kind === "artifacts")
+						return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
+					if (error instanceof SessionDeleteVerificationError)
+						return fail(
+							"invalid_input",
+							`Saved session deletion verification failed (${error.kind}): ${error.message}`,
+						);
+					return fail(
+						"unavailable",
+						`Unable to delete saved session transcript: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			}
+			if (deleted.kind === "deleted" && !pathIsAbsent(canonicalArtifactsPath))
+				return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
+			if (deleted.kind === "deleted" && !artifactQuarantineAliasesAreAbsent(false))
+				return await publishCanonicalArtifactReappearance(
+					transcriptPhaseCleanup,
+					"Saved session cleanup is pending in artifacts: a planned quarantine alias reappeared during transcript cleanup.",
+				);
 		}
-		if (
-			deleted.kind === "cleanup_pending" &&
-			!(
-				deleted.phase === "transcript" &&
-				deleted.detachedTranscriptPath !== undefined &&
-				deleted.detachedTranscriptPath === cleanupTarget.plannedTranscriptPath
-			)
-		)
+		if (deleted.kind === "deleted" && !artifactQuarantineAliasesAreAbsent(false))
+			return await publishCanonicalArtifactReappearance(
+				preauthorizedCleanup,
+				"Saved session cleanup is pending in artifacts: a planned quarantine alias remains before terminal completion.",
+			);
+		if (deleted.kind === "deleted" && !retainedTranscriptIdentityIsAbsentFromParent())
+			return await publishRetainedTranscriptSideAuthority();
+		const retainedRootArtifactsPlan = durableArtifactsPlan;
+		if (deleted.kind === "cleanup_pending")
 			return fail(
 				"cleanup_pending",
 				`Saved session cleanup is pending in ${deleted.phase}: ${deleted.error.message}`,
 				{
+					cleanupReceiptVersion: 1,
 					phase: deleted.phase,
 					sessionId: validated.target.sessionId,
 					sessionsRoot: validated.target.sessionsRoot,
@@ -3319,32 +3877,71 @@ async function executeLifecycleResponse(
 					cwd: validated.target.cwd,
 					metadataRoot: validated.metadataRoot,
 					transcriptIdentity: serializeCleanupIdentity(deleted.transcriptIdentity),
+					transcriptParentIdentity: preauthorizedCleanup.transcriptParentIdentity,
 					...(deleted.phase === "artifacts" && deleted.artifactsIdentity
 						? { artifactsIdentity: serializeCleanupIdentity(deleted.artifactsIdentity) }
 						: {}),
-					...(deleted.phase === "artifacts" && deleted.artifactsIdentity && cleanupTarget.plannedArtifactsPath
+					...(deleted.phase === "artifacts" && deleted.artifactsIdentity && durableArtifactsPlan
 						? {
 								artifactTree: {
 									identity: serializeCleanupIdentity(deleted.artifactsIdentity),
 									snapshot: deleted.artifactsTree,
-									plannedPath: cleanupTarget.plannedArtifactsPath,
+									plannedPath: durableArtifactsPlan,
 									...(deleted.detachedArtifactsPath ? { detachedPath: deleted.detachedArtifactsPath } : {}),
 								},
 							}
 						: {}),
 					...(deleted.phase === "artifacts" ? { detachedArtifactsPath: deleted.detachedArtifactsPath } : {}),
+					...(deleted.phase === "artifacts" && deleted.retainedSuccessorPath
+						? { retainedArtifactsSuccessorPath: deleted.retainedSuccessorPath }
+						: {}),
+					...(deleted.phase === "artifacts" && deleted.retainedPlaceholderPath
+						? { retainedArtifactsPlaceholderPath: deleted.retainedPlaceholderPath }
+						: {}),
+					...(deleted.phase === "artifacts" && deleted.retainedUnknownPath
+						? { retainedArtifactsUnknownPath: deleted.retainedUnknownPath }
+						: {}),
+					...(deleted.phase === "artifacts"
+						? {
+								retainedArtifactsSideAuthority: [
+									deleted.retainedSuccessorPath,
+									deleted.retainedPlaceholderPath,
+									deleted.retainedUnknownPath,
+								].some(candidate => candidate !== undefined)
+									? ("retained" as const)
+									: ("none" as const),
+							}
+						: {}),
 					...(deleted.phase === "transcript" && deleted.detachedTranscriptPath
 						? { detachedTranscriptPath: deleted.detachedTranscriptPath }
 						: {}),
+					...(deleted.phase === "transcript" && deleted.retainedSuccessorPath
+						? { retainedTranscriptSuccessorPath: deleted.retainedSuccessorPath }
+						: {}),
+					...(deleted.phase === "transcript" && deleted.retainedPlaceholderPath
+						? { retainedTranscriptPlaceholderPath: deleted.retainedPlaceholderPath }
+						: {}),
+					...(deleted.phase === "transcript" && deleted.retainedUnknownPath
+						? { retainedTranscriptUnknownPath: deleted.retainedUnknownPath }
+						: {}),
 					...(deleted.phase === "transcript" ? { artifactsRemoved: true } : {}),
 					...(deleted.phase === "transcript" &&
-					cleanupTarget.plannedArtifactsPath &&
+					retainedRootArtifactsPlan &&
 					cleanupTarget.expectedArtifactsIdentity
 						? {
 								artifactTree: {
 									identity: serializeCleanupIdentity(cleanupTarget.expectedArtifactsIdentity),
 									snapshot: cleanupTarget.expectedArtifactsTree!,
-									plannedPath: cleanupTarget.plannedArtifactsPath,
+									plannedPath: retainedRootArtifactsPlan,
+									completed: true as const,
+								},
+							}
+						: {}),
+					...(deleted.phase === "transcript" && preauthorizedCleanup.artifactTree
+						? {
+								artifactTree: {
+									...preauthorizedCleanup.artifactTree,
+									detachedPath: undefined,
 									completed: true as const,
 								},
 							}
@@ -3456,19 +4053,21 @@ function validateLifecycleDeleteMetadataBinding(
 	const requestedId = sessionId(input);
 	const cwd = lifecycleCwd(input);
 	const requestedRoot = stateRoot(input, cwd);
+	const canonicalRequestedRoot = requestedRoot ? canonicalExistingPath(requestedRoot) : undefined;
 	if (
 		!requestedId ||
 		!isCanonicalSessionId(requestedId) ||
 		!cwd ||
 		!requestedRoot ||
 		!hasDefaultStateRoot(cwd, requestedRoot) ||
+		!canonicalRequestedRoot ||
 		cleanup.sessionId !== requestedId ||
 		!cleanup.metadataRoot ||
-		path.resolve(cleanup.metadataRoot) !== requestedRoot
+		canonicalExistingPath(cleanup.metadataRoot) !== canonicalRequestedRoot
 	)
 		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup does not match the normalized request.");
 	const recordedRoot = broker.ledger.get(identity)?.effectIntent?.stateRoot;
-	if (recordedRoot && path.resolve(recordedRoot) !== requestedRoot)
+	if (recordedRoot && canonicalExistingPath(recordedRoot) !== canonicalRequestedRoot)
 		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup does not match the recorded workspace.");
 	return undefined;
 }

@@ -89,6 +89,7 @@ function sameDirectoryTreeSnapshotAfterRename(
 				entry.kind === other.kind &&
 				entry.dev === other.dev &&
 				entry.ino === other.ino &&
+				entry.nlink === other.nlink &&
 				entry.size === other.size &&
 				entry.mtimeNs === other.mtimeNs &&
 				(entry.relativePath === "" || entry.ctimeNs === other.ctimeNs) &&

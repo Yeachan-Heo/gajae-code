@@ -274,7 +274,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 		}
 	}, 60_000);
 
-	it("create → list → artifact → delete → absence → repeat/unknown no-op over stdio", async () => {
+	it("create → list → no-artifact delete stays pending until retained transcript authority clears", async () => {
 		const oracle = await spawnOracle();
 		const { connection, workspace, root } = oracle;
 		try {
@@ -301,33 +301,68 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			expect(transcripts).toHaveLength(1);
 			const sessionPath = transcripts[0]!;
 
-			// Artifact creation in the sibling artifacts directory (strip ".jsonl").
-			const artifactsDir = sessionPath.slice(0, -6);
-			await fs.promises.mkdir(artifactsDir, { recursive: true });
-			const artifactPath = path.join(artifactsDir, "oracle.txt");
-			await fs.promises.writeFile(artifactPath, "artifact");
-			expect(fs.existsSync(artifactPath)).toBe(true);
+			// POSIX cannot descriptor-bind the final unlink. The broker must surface
+			// cleanup_pending while identity-bound detached transcript authority remains.
+			await expect(connection.deleteSession({ sessionId })).rejects.toThrow("cleanup is pending in transcript");
 
-			// Delete it.
-			const deleteResult = await connection.deleteSession({ sessionId });
-			expect(deleteResult).toEqual({});
-
-			// Post-delete scoped list no longer includes it.
-			const listAfter = await connection.listSessions({ cwd: workspace });
-			expect(listAfter.sessions.map(session => session.sessionId)).not.toContain(sessionId);
-
-			// Transcript and its artifacts directory (and artifact) are gone.
+			// The canonical transcript is detached and no longer appears in scoped saved
+			// inventory, while the stable delete identity retains cleanup authority.
+			const listAfterPending = await connection.listSessions({ cwd: workspace });
+			expect(listAfterPending.sessions.map(session => session.sessionId)).not.toContain(sessionId);
 			expect(fs.existsSync(sessionPath)).toBe(false);
-			expect(fs.existsSync(artifactsDir)).toBe(false);
-			expect(fs.existsSync(artifactPath)).toBe(false);
+			await expect(connection.deleteSession({ sessionId })).rejects.toThrow("cleanup is pending in transcript");
 
-			// Repeat delete of the now-absent id is a no-op {}.
-			const repeatDelete = await connection.deleteSession({ sessionId });
-			expect(repeatDelete).toEqual({});
-
-			// Delete of an id that never existed is also {}.
+			// Delete of an id that never existed remains a no-op {}.
 			const unknownDelete = await connection.deleteSession({ sessionId: "never-existed" });
 			expect(unknownDelete).toEqual({});
+		} catch (error) {
+			rethrowWithStderr(oracle, error);
+		}
+	}, 60_000);
+
+	it("fails closed when artifact payload deletion remains cleanup_pending", async () => {
+		const oracle = await spawnOracle();
+		const { connection, workspace, root } = oracle;
+		try {
+			await connection.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const { sessionId } = await connection.newSession({ cwd: workspace, mcpServers: [] });
+			const transcripts = await Array.fromAsync(
+				new Bun.Glob("**/*.jsonl").scan({
+					cwd: path.join(root, "agent", "sessions"),
+					absolute: true,
+					onlyFiles: true,
+				}),
+			);
+			expect(transcripts).toHaveLength(1);
+			const sessionPath = transcripts[0]!;
+			const artifactsDir = sessionPath.slice(0, -6);
+			await fs.promises.mkdir(artifactsDir, { recursive: true });
+			await fs.promises.writeFile(path.join(artifactsDir, ".oracle.txt"), "artifact");
+
+			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
+				"Saved session cleanup is pending in artifacts",
+			);
+			expect(fs.existsSync(sessionPath)).toBe(true);
+			expect(fs.existsSync(artifactsDir)).toBe(false);
+			const retainedPayloads = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
+				entry => entry.endsWith(".oracle.txt"),
+			);
+			expect(retainedPayloads).toHaveLength(1);
+			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe(
+				"artifact",
+			);
+
+			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
+				"Saved session cleanup is pending in artifacts",
+			);
+			expect(fs.existsSync(sessionPath)).toBe(true);
+			const payloadsAfterRetry = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
+				entry => entry.endsWith(".oracle.txt"),
+			);
+			expect(payloadsAfterRetry).toHaveLength(1);
+			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe(
+				"artifact",
+			);
 		} catch (error) {
 			rethrowWithStderr(oracle, error);
 		}

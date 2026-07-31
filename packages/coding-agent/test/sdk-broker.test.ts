@@ -9,7 +9,7 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
-import { Broker } from "../src/sdk/broker/broker";
+import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	type BrokerDiscovery,
@@ -34,10 +34,15 @@ import {
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 } from "../src/sdk/broker/lifecycle";
+import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
-import { FileSessionStorage, type VerifiedSessionDeleteTarget } from "../src/session/session-storage";
+import {
+	FileSessionStorage,
+	SessionDeleteVerificationError,
+	type VerifiedSessionDeleteTarget,
+} from "../src/session/session-storage";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-"));
 async function managedSessionPath(agentDir: string, cwd: string, sessionId: string): Promise<string> {
@@ -49,6 +54,65 @@ async function managedSessionPath(agentDir: string, cwd: string, sessionId: stri
 	if (prepared.kind !== "resolved") throw new Error(prepared.message);
 	return path.join(prepared.scope.directoryPath, `${sessionId}.jsonl`);
 }
+async function settleRetainedTranscriptForTest(
+	broker: Broker,
+	input: { sessionId: string; sessionPath: string; cwd: string },
+	key: string,
+	response: BrokerResponse,
+	fallbackExactUnlink?: typeof native.exactUnlink,
+): Promise<BrokerResponse> {
+	let current = response;
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		if (current.ok || current.error.code !== "cleanup_pending" || current.error.cleanup?.phase !== "transcript")
+			return current;
+		const cleanup = current.error.cleanup;
+		if (cleanup.retainedTranscriptPlaceholderPath && syncFs.existsSync(cleanup.retainedTranscriptPlaceholderPath)) {
+			const placeholder = syncFs.lstatSync(cleanup.retainedTranscriptPlaceholderPath, { bigint: true });
+			const parent = syncFs.lstatSync(path.dirname(cleanup.retainedTranscriptPlaceholderPath), { bigint: true });
+			if (
+				!placeholder.isFile() ||
+				placeholder.nlink !== 1n ||
+				placeholder.size !== 0n ||
+				!cleanup.transcriptParentIdentity ||
+				parent.dev.toString() !== cleanup.transcriptParentIdentity.dev ||
+				parent.ino.toString() !== cleanup.transcriptParentIdentity.ino
+			)
+				throw new Error("Broker test placeholder lacks exact native authority");
+			syncFs.rmSync(cleanup.retainedTranscriptPlaceholderPath);
+		}
+		const previousExactUnlink = fallbackExactUnlink ?? native.exactUnlink.bind(native);
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (path.dirname(pathname) !== path.dirname(input.sessionPath)) return previousExactUnlink(pathname, identity);
+			const parent = syncFs.lstatSync(path.dirname(pathname), { bigint: true });
+			const stat = syncFs.lstatSync(pathname, { bigint: true });
+			if (
+				identity.parentDev === undefined ||
+				identity.parentIno === undefined ||
+				parent.dev !== identity.parentDev ||
+				parent.ino !== identity.parentIno ||
+				stat.dev !== identity.dev ||
+				stat.ino !== identity.ino ||
+				stat.nlink !== identity.nlink ||
+				stat.size !== identity.size ||
+				stat.mtimeNs !== identity.mtimeNs
+			)
+				throw new Error("Broker test cleanup lacks exact native authority");
+			if (identity.sha256) {
+				const digest = createHash("sha256").update(syncFs.readFileSync(pathname)).digest("hex");
+				if (digest !== identity.sha256) throw new Error("Broker test cleanup digest changed");
+			}
+			syncFs.rmSync(pathname, { force: true });
+			return { ok: true };
+		});
+		try {
+			current = await broker.handleRequest("session.delete", input, key);
+		} finally {
+			unlink.mockRestore();
+		}
+	}
+	return current;
+}
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const brokerEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 const BROKER_PROCESS_STARTUP_TIMEOUT_MS = 10_000;
@@ -342,6 +406,87 @@ describe("broker process completion", () => {
 		);
 		expect(exit).not.toHaveBeenCalled();
 	});
+});
+
+it("keeps unresolved session cleanup authority through lifecycle ledger compaction", async () => {
+	const dir = await temp();
+	const ledger = await new LifecycleLedger(dir, { maxRows: 2 }).open();
+	const deleteTarget = {
+		sessionId: "compacted-session",
+		sessionsRoot: "/sessions",
+		transcriptPath: "/sessions/compacted-session.jsonl",
+		cwd: "/workspace/a",
+	};
+	const pendingResponse = {
+		ok: false,
+		error: {
+			code: "cleanup_pending",
+			message: "retained cleanup",
+			cleanup: { phase: "artifacts", ...deleteTarget },
+		},
+	};
+	await ledger.begin("cleanup-a", "hash-a");
+	await ledger.transition("cleanup-a", "effect_started", {
+		intendedSessionId: "compacted-session",
+		response: pendingResponse,
+	});
+	await ledger.transition("cleanup-a", "terminal_uncertain", {
+		response: { ok: false, error: { code: "terminal_uncertain", message: "reproof failed" } },
+	});
+	const retained = ledger.findCleanupPendingByDeleteTarget(deleteTarget, "cleanup-b");
+	expect(retained?.response).toEqual(pendingResponse);
+	expect(
+		ledger.findCleanupPendingByDeleteTarget({ ...deleteTarget, sessionId: "other-session" }, "cleanup-b"),
+	).toBeUndefined();
+	expect(
+		ledger.findCleanupPendingByDeleteTarget(
+			{ ...deleteTarget, transcriptPath: "/sessions/duplicate/compacted-session.jsonl" },
+			"cleanup-b",
+		),
+	).toBeUndefined();
+	expect(
+		ledger.findCleanupPendingByDeleteTarget({ ...deleteTarget, cwd: "/workspace/b" }, "cleanup-b"),
+	).toBeUndefined();
+	const persisted = await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8");
+	expect(persisted.trim().split("\n")).toHaveLength(2);
+	expect(persisted).toContain('"unresolvedCleanupResponse"');
+	expect(persisted).toContain('"unresolvedCleanupResponseDigest"');
+	const compactedRows = persisted
+		.trim()
+		.split("\n")
+		.map(line => JSON.parse(line) as Record<string, unknown>);
+	compactedRows[compactedRows.length - 1]!.intendedSessionId = "other-session";
+	await fs.writeFile(
+		path.join(dir, "sdk", "lifecycle-ledger.jsonl"),
+		`${compactedRows.map(row => JSON.stringify(row)).join("\n")}\n`,
+	);
+	const tamperedLedger = await new LifecycleLedger(dir, { maxRows: 2 }).open();
+	expect(await tamperedLedger.begin("cleanup-a", "hash-a")).toMatchObject({ kind: "terminal_uncertain" });
+	expect(tamperedLedger.hasUncertainCleanupForSession("compacted-session", "fresh-delete")).toBe(true);
+	expect(tamperedLedger.hasUncertainCleanupForSession("other-session", "fresh-delete")).toBe(true);
+	expect(tamperedLedger.hasUncertainCleanupForSession("unrelated-session", "fresh-delete")).toBe(true);
+	const startupLedger = await new LifecycleLedger(path.join(dir, "startup")).open();
+	await startupLedger.begin("startup-a", "startup-hash");
+	await startupLedger.transition("startup-a", "effect_started", {
+		intendedSessionId: "compacted-session",
+		response: {
+			ok: false,
+			error: {
+				code: "cleanup_pending",
+				message: "startup cleanup",
+				cleanup: { phase: "lifecycle", ...deleteTarget },
+			},
+		},
+	});
+	expect(startupLedger.findCleanupPendingByDeleteTarget(deleteTarget, "delete-b")).toBeUndefined();
+	await startupLedger.begin("mismatched-cleanup", "mismatched-hash");
+	await expect(
+		startupLedger.transition("mismatched-cleanup", "effect_started", {
+			intendedSessionId: "other-session",
+			response: pendingResponse,
+		}),
+	).rejects.toThrow("Cleanup response session does not match its outer lifecycle fence");
+	await fs.rm(dir, { recursive: true, force: true });
 });
 describe("SDK broker identity and discovery", () => {
 	it("atomically publishes one identity key for concurrent callers", async () => {
@@ -1145,6 +1290,40 @@ describe("SDK broker identity and discovery", () => {
 			});
 			expect(await fs.readFile(external, "utf8")).toContain('"requested"');
 			expect((await fs.stat(externalArtifacts)).isDirectory()).toBe(true);
+			const legacyDirectory = path.join(getSessionsDir(dir), `--${cwd.replace(/^\//, "").replace(/[/:]/g, "-")}--`);
+			const legacyReplayPath = path.join(legacyDirectory, "legacy-replay.jsonl");
+			await fs.mkdir(legacyDirectory, { recursive: true });
+			await fs.writeFile(
+				legacyReplayPath,
+				`${JSON.stringify({ type: "session", id: "legacy-replay", timestamp: new Date().toISOString(), cwd })}\n`,
+			);
+			const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+			let legacyReplayCalls = 0;
+			FileSessionStorage.prototype.deleteSessionVerified = async target => {
+				legacyReplayCalls += 1;
+				return {
+					kind: "cleanup_pending" as const,
+					phase: "transcript" as const,
+					error: new Error("legacy replay remains pending"),
+					transcriptIdentity: target.transcriptIdentity,
+					detachedTranscriptPath: target.plannedTranscriptPath,
+					retainedUnknownPath: target.plannedTranscriptPath,
+				};
+			};
+			try {
+				const input = { sessionId: "legacy-replay", sessionPath: legacyReplayPath, cwd };
+				expect(await broker.handleRequest("session.delete", input, "legacy-cleanup-key")).toMatchObject({
+					ok: false,
+					error: { code: "cleanup_pending", cleanup: { sessionsRoot: getSessionsDir(dir) } },
+				});
+				expect(await broker.handleRequest("session.delete", input, "legacy-cleanup-key-b")).toMatchObject({
+					ok: false,
+					error: { code: "cleanup_pending" },
+				});
+				expect(legacyReplayCalls).toBe(1);
+			} finally {
+				FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
+			}
 		} finally {
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
@@ -1199,7 +1378,7 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 
-	it("uses verified deletion to remove the exact transcript, artifacts, and indexed authority", async () => {
+	it("fails closed on retained artifacts across retry without deleting transcript authority", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
 		const stateRoot = path.join(cwd, ".gjc", "state");
@@ -1210,7 +1389,7 @@ describe("SDK broker identity and discovery", () => {
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
 		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
 		await fs.mkdir(artifactsDir);
-		await fs.writeFile(path.join(artifactsDir, "artifact.txt"), "artifact");
+		await fs.writeFile(path.join(artifactsDir, ".artifact.txt"), "artifact");
 		await broker.start();
 		try {
 			await broker.index.append({
@@ -1220,16 +1399,547 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
-			expect(
-				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "verified-delete-key"),
-			).toEqual({ ok: true, result: { sessionId } });
+			const pending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"verified-delete-key",
+			);
+			expect(pending).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
+			});
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+			await expect(fs.stat(artifactsDir)).rejects.toThrow();
+			const retainedPayloads = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
+				entry.endsWith(".artifact.txt"),
+			);
+			expect(retainedPayloads).toHaveLength(1);
+			expect(await fs.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe("artifact");
+
+			const retried = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"verified-delete-key",
+			);
+			expect(retried).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
+			});
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+			const payloadsAfterRetry = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
+				entry.endsWith(".artifact.txt"),
+			);
+			expect(payloadsAfterRetry).toHaveLength(1);
+			expect(await fs.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe(
+				"artifact",
+			);
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("removes an authorized root-only artifact quarantine before transcript cleanup", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "root-only-retained-artifacts";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let calls = 0;
+		let transcriptPhase = false;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(artifactsDir);
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (calls === 1) {
+				if (!target.plannedArtifactsPath || !target.expectedArtifactsIdentity)
+					throw new Error("Expected preauthorized artifact quarantine");
+				await fs.rename(artifactsDir, target.plannedArtifactsPath);
+				const tree = native.snapshotDirectoryTree(target.plannedArtifactsPath);
+				if (!tree.ok || !tree.snapshot) throw new Error("Expected authorized root tree snapshot");
+				return {
+					kind: "cleanup_pending",
+					phase: "artifacts",
+					error: new Error("authorized root-only quarantine"),
+					artifactsIdentity: target.expectedArtifactsIdentity,
+					artifactsTree: tree.snapshot,
+					detachedArtifactsPath: target.plannedArtifactsPath,
+					transcriptIdentity: target.transcriptIdentity,
+				};
+			}
+			if (calls === 2) {
+				if (!target.detachedArtifactsPath) throw new Error("Expected retained artifact root retry");
+				await fs.rmdir(target.detachedArtifactsPath);
+				return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity: target.transcriptIdentity };
+			}
+			transcriptPhase = target.artifactsRemoved === true;
+			if (!transcriptPhase) throw new Error("Expected transcript-phase cleanup");
+			await fs.unlink(target.transcriptPath);
+			return { kind: "deleted" };
+		};
+		try {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: cwd, stateRoot },
+				endpointGeneration: 1,
+				pid: 999_999_999,
+			});
+			const pending = await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "root-only-key");
+			expect(pending).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
+			});
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+			expect(await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "root-only-key")).toEqual(
+				{ ok: true, result: { sessionId } },
+			);
+			expect(calls).toBe(3);
+			expect(transcriptPhase).toBe(true);
 			await expect(fs.stat(sessionPath)).rejects.toThrow();
 			await expect(fs.stat(artifactsDir)).rejects.toThrow();
-			expect(await broker.handleRequest("session.list", {})).toMatchObject({
-				ok: true,
-				result: { sessions: [] },
-			});
 		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps transcript authority when a sibling quarantine alias survives exact removal", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const sessionId = "artifact-sibling-after-removal";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let calls = 0;
+		let siblingAlias: string | undefined;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(artifactsDir);
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (calls === 1) {
+				if (!target.plannedArtifactsPath || !target.expectedArtifactsIdentity)
+					throw new Error("Expected preauthorized artifact quarantine");
+				await fs.rename(artifactsDir, target.plannedArtifactsPath);
+				const tree = native.snapshotDirectoryTree(target.plannedArtifactsPath);
+				if (!tree.ok || !tree.snapshot) throw new Error("Expected root-only tree snapshot");
+				return {
+					kind: "cleanup_pending",
+					phase: "artifacts",
+					error: new Error("root-only pending"),
+					artifactsIdentity: target.expectedArtifactsIdentity,
+					artifactsTree: tree.snapshot,
+					detachedArtifactsPath: target.plannedArtifactsPath,
+					transcriptIdentity: target.transcriptIdentity,
+				};
+			}
+			if (!target.detachedArtifactsPath) throw new Error("Expected retained artifact root");
+			await fs.rmdir(target.detachedArtifactsPath);
+			siblingAlias = `${target.detachedArtifactsPath}.removing`;
+			await fs.mkdir(siblingAlias);
+			await fs.writeFile(path.join(siblingAlias, ".payload"), "payload");
+			return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity: target.transcriptIdentity };
+		};
+		try {
+			expect(
+				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "artifact-sibling-key"),
+			).toMatchObject({ ok: false, error: { code: "cleanup_pending", cleanup: { phase: "artifacts" } } });
+			const replay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"artifact-sibling-key",
+			);
+			expect(replay).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
+			});
+			expect(calls).toBe(2);
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+			if (!siblingAlias) throw new Error("Expected sibling quarantine alias");
+			expect(await fs.readFile(path.join(siblingAlias, ".payload"), "utf8")).toBe("payload");
+		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps transcript completion pending through canonical artifact reappearance", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "canonical-after-artifacts-removed";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		const transition = broker.ledger.transition.bind(broker.ledger);
+		let calls = 0;
+		let canonicalInjected = false;
+		let plannedArtifactAlias: string | undefined;
+		let postOperationArtifactAlias: string | undefined;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(artifactsDir);
+		await broker.start();
+		const transitionSpy = vi.spyOn(broker.ledger, "transition").mockImplementation(async (...args) => {
+			const result = await transition(...args);
+			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts were removed")) {
+				canonicalInjected = true;
+				await fs.mkdir(artifactsDir);
+				await fs.writeFile(path.join(artifactsDir, ".reappeared"), "reappeared");
+			}
+			return result;
+		});
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (calls === 1) {
+				plannedArtifactAlias = target.plannedArtifactsPath;
+				await fs.rmdir(artifactsDir);
+				return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity: target.transcriptIdentity };
+			}
+			if (calls === 2)
+				throw new SessionDeleteVerificationError(
+					"artifacts",
+					"Artifact path reappeared after durable artifact-phase completion",
+				);
+			await fs.unlink(target.transcriptPath);
+			if (!postOperationArtifactAlias) throw new Error("Expected current planned artifact alias");
+			await fs.mkdir(postOperationArtifactAlias);
+			await fs.writeFile(path.join(postOperationArtifactAlias, ".post-delete-payload"), "payload");
+			return { kind: "deleted" };
+		};
+		try {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: cwd, stateRoot },
+				endpointGeneration: 1,
+				pid: 999_999_999,
+			});
+			const pending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"canonical-after-removed-key",
+			);
+			expect(pending).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { artifactsRemoved: true, phase: "transcript", sessionId } },
+			});
+			expect(JSON.stringify(pending)).not.toContain('"retainedArtifactsRootOnly":true');
+			expect(await fs.readFile(path.join(artifactsDir, ".reappeared"), "utf8")).toBe("reappeared");
+			const repeatedPending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"canonical-after-removed-key",
+			);
+			expect(repeatedPending).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { artifactsRemoved: true, phase: "transcript", sessionId } },
+			});
+			expect(calls).toBe(1);
+			await fs.rm(artifactsDir, { recursive: true, force: true });
+			if (!plannedArtifactAlias) throw new Error("Expected planned artifact alias");
+			await fs.mkdir(plannedArtifactAlias);
+			await fs.writeFile(path.join(plannedArtifactAlias, ".payload"), "payload");
+			const aliasPending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"canonical-after-removed-key",
+			);
+			expect(aliasPending).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { artifactsRemoved: true, phase: "transcript", sessionId } },
+			});
+			expect(calls).toBe(1);
+			expect(await fs.readFile(path.join(plannedArtifactAlias, ".payload"), "utf8")).toBe("payload");
+			await fs.rm(plannedArtifactAlias, { recursive: true, force: true });
+			const racedPending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"canonical-after-removed-key",
+			);
+			expect(racedPending).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { artifactsRemoved: true, phase: "transcript", sessionId } },
+			});
+			if (racedPending.ok) throw new Error("Expected raced pending cleanup");
+			postOperationArtifactAlias = racedPending.error.cleanup?.plannedArtifactsPath;
+			if (!postOperationArtifactAlias) throw new Error("Expected persisted transcript-phase artifact plan");
+			expect(calls).toBe(2);
+			const postOperationPending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"canonical-after-removed-key",
+			);
+			expect(syncFs.existsSync(postOperationArtifactAlias)).toBe(true);
+			expect(postOperationPending).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { artifactsRemoved: true, phase: "transcript", sessionId } },
+			});
+			expect(calls).toBe(3);
+			expect(await fs.readFile(path.join(postOperationArtifactAlias, ".post-delete-payload"), "utf8")).toBe(
+				"payload",
+			);
+			await fs.rm(postOperationArtifactAlias, { recursive: true, force: true });
+			expect(
+				await broker.handleRequest(
+					"session.delete",
+					{ sessionId, sessionPath, cwd },
+					"canonical-after-removed-key",
+				),
+			).toMatchObject({ ok: false, error: { code: "cleanup_pending", cleanup: { phase: "transcript" } } });
+			expect(calls).toBe(3);
+		} finally {
+			transitionSpy.mockRestore();
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("retains artifact side-path authority instead of promoting an empty detached root", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const cwdAlias = path.join(dir, "workspace-alias");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "retained-artifact-side-path";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let calls = 0;
+		let retainedSidePath: string | undefined;
+		await fs.mkdir(stateRoot, { recursive: true });
+		await fs.symlink(cwd, cwdAlias, "dir");
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(artifactsDir);
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (calls > 1) {
+				await fs.unlink(target.transcriptPath);
+				return { kind: "deleted" };
+			}
+			if (!target.plannedArtifactsPath || !target.expectedArtifactsIdentity)
+				throw new Error("Expected preauthorized artifact quarantine");
+			await fs.rename(artifactsDir, target.plannedArtifactsPath);
+			retainedSidePath = `${target.plannedArtifactsPath}.unknown`;
+			await fs.mkdir(retainedSidePath);
+			await fs.writeFile(path.join(retainedSidePath, ".payload"), "payload");
+			const tree = native.snapshotDirectoryTree(target.plannedArtifactsPath);
+			if (!tree.ok || !tree.snapshot) throw new Error("Expected authorized root tree snapshot");
+			return {
+				kind: "cleanup_pending",
+				phase: "artifacts",
+				error: new Error("retained side authority"),
+				artifactsIdentity: target.expectedArtifactsIdentity,
+				artifactsTree: tree.snapshot,
+				detachedArtifactsPath: target.plannedArtifactsPath,
+				retainedUnknownPath: retainedSidePath,
+				transcriptIdentity: target.transcriptIdentity,
+			};
+		};
+		try {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: cwd, stateRoot },
+				endpointGeneration: 1,
+				pid: 999_999_999,
+			});
+			const response = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-side-path-key",
+			);
+			expect(response).toMatchObject({
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					cleanup: { phase: "artifacts", sessionId, retainedArtifactsUnknownPath: retainedSidePath },
+				},
+			});
+			expect(calls).toBe(1);
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+			if (!retainedSidePath) throw new Error("Expected retained side path");
+			expect(await fs.readFile(path.join(retainedSidePath, ".payload"), "utf8")).toBe("payload");
+			const crossKey = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd: cwdAlias },
+				"retained-side-path-key-b",
+			);
+			expect(crossKey).toMatchObject({
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					cleanup: { retainedArtifactsUnknownPath: retainedSidePath },
+				},
+			});
+			expect(calls).toBe(1);
+			const replay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-side-path-key",
+			);
+			expect(replay).toMatchObject({
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					message:
+						"Saved session cleanup is pending in artifacts: retained artifact side authority remains before transcript cleanup.",
+					cleanup: { retainedArtifactsUnknownPath: retainedSidePath },
+				},
+			});
+			expect(calls).toBe(1);
+			await fs.rm(retainedSidePath, { recursive: true, force: true });
+			const absentPathReplay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-side-path-key",
+			);
+			expect(absentPathReplay).toMatchObject({
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					cleanup: { retainedArtifactsUnknownPath: retainedSidePath },
+				},
+			});
+			expect(calls).toBe(1);
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+			const rows = (await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as { identity: string; intendedSessionId?: string; response?: unknown });
+			const pendingIdentity = rows.findLast(
+				row => row.intendedSessionId === sessionId && JSON.stringify(row.response).includes('"cleanup_pending"'),
+			)?.identity;
+			if (!pendingIdentity) throw new Error("Expected durable pending cleanup identity");
+			const corruptResponse = JSON.parse(JSON.stringify(absentPathReplay)) as {
+				ok: false;
+				error: { cleanup: Record<string, unknown> };
+			};
+			corruptResponse.error.cleanup.retainedArtifactsSideAuthority = "corrupt";
+			corruptResponse.error.cleanup.artifactsRemoved = true;
+			await broker.ledger.transition(pendingIdentity, "effect_started", { response: corruptResponse });
+			const corruptReplay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-side-path-key",
+			);
+			expect(corruptReplay).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			const fencedAfterUncertainty = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-side-path-key-c",
+			);
+			expect(fencedAfterUncertainty).toMatchObject({
+				ok: false,
+				error: {
+					code: "terminal_uncertain",
+					message:
+						"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
+				},
+			});
+			expect(calls).toBe(1);
+		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses an out-of-plan root-only artifact quarantine across replay", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "foreign-root-only-artifacts";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const foreignRoot = path.join(path.dirname(sessionPath), ".foreign-empty-artifacts");
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let calls = 0;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(artifactsDir);
+		await fs.writeFile(path.join(artifactsDir, ".artifact.txt"), "artifact");
+		await fs.mkdir(foreignRoot);
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (calls === 2) throw new SessionDeleteVerificationError("artifacts", "retained identity changed");
+			const stat = await fs.lstat(foreignRoot, { bigint: true });
+			const tree = native.snapshotDirectoryTree(foreignRoot);
+			if (!tree.ok || !tree.snapshot) throw new Error("Expected foreign root tree snapshot");
+			return {
+				kind: "cleanup_pending",
+				phase: "artifacts",
+				error: new Error("foreign empty quarantine"),
+				artifactsIdentity: {
+					dev: stat.dev,
+					ino: stat.ino,
+					nlink: stat.nlink,
+					size: Number(stat.size),
+					mtimeNs: stat.mtimeNs,
+					sha256: "",
+				},
+				artifactsTree: tree.snapshot,
+				detachedArtifactsPath: foreignRoot,
+				transcriptIdentity: target.transcriptIdentity,
+			};
+		};
+		try {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: cwd, stateRoot },
+				endpointGeneration: 1,
+				pid: 999_999_999,
+			});
+			const first = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"foreign-root-only-key",
+			);
+			expect(first).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
+			});
+			const retried = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"foreign-root-only-key",
+			);
+			expect(retried).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
+			});
+			expect(calls).toBe(2);
+			const crossKey = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"foreign-root-only-key-b",
+			);
+			expect(crossKey).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
+			});
+			expect(calls).toBe(2);
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+			expect(await fs.readFile(path.join(artifactsDir, ".artifact.txt"), "utf8")).toBe("artifact");
+		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
@@ -1253,10 +1963,10 @@ describe("SDK broker identity and discovery", () => {
 				kind: "cleanup_pending" as const,
 				phase: "artifacts" as const,
 				error: new Error("artifact cleanup denied"),
-				artifactsIdentity: { dev: 7n, ino: 8n, size: 9, mtimeNs: 10n, sha256: "a".repeat(64) },
+				artifactsIdentity: { dev: 7n, ino: 8n, nlink: 1n, size: 9, mtimeNs: 10n, sha256: "a".repeat(64) },
 				artifactsTree: { rootDev: "7", rootIno: "8", entries: [] },
 				detachedArtifactsPath,
-				transcriptIdentity: { dev: 5n, ino: 6n, size: 7, mtimeNs: 8n, sha256: "b".repeat(64) },
+				transcriptIdentity: { dev: 5n, ino: 6n, nlink: 1n, size: 7, mtimeNs: 8n, sha256: "b".repeat(64) },
 			};
 		};
 		try {
@@ -1277,8 +1987,8 @@ describe("SDK broker identity and discovery", () => {
 						sessionsRoot: path.join(dir, "sessions"),
 						transcriptPath: sessionPath,
 						metadataRoot: path.join(cwd, ".gjc", "state"),
-						artifactsIdentity: { dev: "7", ino: "8", size: 9, mtimeNs: "10", sha256: "a".repeat(64) },
-						transcriptIdentity: { dev: "5", ino: "6", size: 7, mtimeNs: "8", sha256: "b".repeat(64) },
+						artifactsIdentity: { dev: "7", ino: "8", nlink: "1", size: 9, mtimeNs: "10", sha256: "a".repeat(64) },
+						transcriptIdentity: { dev: "5", ino: "6", nlink: "1", size: 7, mtimeNs: "8", sha256: "b".repeat(64) },
 						detachedArtifactsPath,
 					},
 				},
@@ -1308,16 +2018,25 @@ describe("SDK broker identity and discovery", () => {
 	it("replays transcript cleanup after artifact completion without reattaching completed artifact authority", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
+		const stateRoot = path.join(cwd, ".gjc", "state");
 		const sessionId = "artifacts-removed-replay";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
 		const broker = new Broker({ agentDir: dir });
 		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
-		const transcriptIdentity = { dev: 5n, ino: 6n, size: 7, mtimeNs: 8n, sha256: "b".repeat(64) };
+		const transcriptIdentity = { dev: 5n, ino: 6n, nlink: 1n, size: 7, mtimeNs: 8n, sha256: "b".repeat(64) };
 		const deleteTargets: VerifiedSessionDeleteTarget[] = [];
 		let calls = 0;
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
 		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
 		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: cwd, stateRoot },
+			endpointGeneration: 1,
+			pid: 999_999_999,
+		});
 		FileSessionStorage.prototype.deleteSessionVerified = async target => {
 			deleteTargets.push(target);
 			calls++;
@@ -1345,17 +2064,176 @@ describe("SDK broker identity and discovery", () => {
 				},
 			});
 			await fs.unlink(sessionPath);
+			await fs.mkdir(artifactsDir);
+			await fs.writeFile(path.join(artifactsDir, ".reappeared"), "payload");
+			const blocked = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"artifacts-removed-replay-key",
+			);
+			expect(blocked).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { artifactsRemoved: true, phase: "transcript" } },
+			});
+			expect(broker.index.listSessions().sessions.some(session => session.sessionId === sessionId)).toBe(true);
+			expect(await fs.readFile(path.join(artifactsDir, ".reappeared"), "utf8")).toBe("payload");
+			await fs.rm(artifactsDir, { recursive: true, force: true });
 			const replayed = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },
 				"artifacts-removed-replay-key",
 			);
-			expect(replayed).toMatchObject({ ok: true, result: { sessionId } });
+			expect(replayed).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "transcript" } },
+			});
+			expect(broker.index.listSessions().sessions.some(session => session.sessionId === sessionId)).toBe(true);
 			expect(deleteTargets).toHaveLength(2);
 			expect(deleteTargets[1]).toMatchObject({ artifactsRemoved: true });
 			expect(deleteTargets[1]?.expectedArtifactsIdentity).toBeUndefined();
 			expect(deleteTargets[1]?.expectedArtifactsTree).toBeUndefined();
 			expect(deleteTargets[1]?.detachedArtifactsPath).toBeUndefined();
+		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps retained transcript side authority pending across same-key and cross-key replay", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const sessionId = "retained-transcript-side";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const retainedSidePath = path.join(path.dirname(sessionPath), ".gjc-transcript-retained-unknown");
+		const retainedHardlinkPath = path.join(
+			path.dirname(sessionPath),
+			".retained-hardlink-nested",
+			"deeper",
+			"link.jsonl",
+		);
+		const transcriptParentAlias = path.join(dir, "transcript-parent-alias");
+		const aliasedSessionPath = path.join(transcriptParentAlias, path.basename(sessionPath));
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let calls = 0;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(path.dirname(retainedHardlinkPath), { recursive: true });
+		if (process.platform !== "win32") await fs.symlink(path.dirname(sessionPath), transcriptParentAlias, "dir");
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (calls === 1)
+				return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity: target.transcriptIdentity };
+			if (!syncFs.existsSync(retainedHardlinkPath)) syncFs.linkSync(target.transcriptPath, retainedHardlinkPath);
+			await fs.unlink(target.transcriptPath);
+			await fs.mkdir(retainedSidePath);
+			await fs.writeFile(path.join(retainedSidePath, ".payload"), "payload");
+			return {
+				kind: "cleanup_pending",
+				phase: "transcript",
+				error: new Error("retained transcript side authority"),
+				transcriptIdentity: target.transcriptIdentity,
+				detachedTranscriptPath: target.plannedTranscriptPath,
+				retainedUnknownPath: retainedSidePath,
+			};
+		};
+		try {
+			const pending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-transcript-side-key",
+			);
+			expect(pending).toMatchObject({
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					cleanup: { phase: "transcript", retainedTranscriptUnknownPath: retainedSidePath },
+				},
+			});
+			expect(calls).toBe(2);
+			if (process.platform !== "win32") {
+				const aliasReplay = await broker.handleRequest(
+					"session.delete",
+					{ sessionId, sessionPath: aliasedSessionPath, cwd },
+					"retained-transcript-side-key",
+				);
+				expect(aliasReplay).toMatchObject({
+					ok: false,
+					error: { code: "cleanup_pending", cleanup: { retainedTranscriptUnknownPath: retainedSidePath } },
+				});
+				expect(calls).toBe(2);
+			}
+			const reconnectReplay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId },
+				"retained-transcript-side-key",
+			);
+			expect(reconnectReplay).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { retainedTranscriptUnknownPath: retainedSidePath } },
+			});
+			expect(calls).toBe(2);
+			const replay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-transcript-side-key",
+			);
+			expect(replay).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { retainedTranscriptUnknownPath: retainedSidePath } },
+			});
+			expect(calls).toBe(2);
+			const transcriptParent = path.dirname(sessionPath);
+			const renamedTranscriptParent = `${transcriptParent}.renamed`;
+			await fs.rename(transcriptParent, renamedTranscriptParent);
+			await fs.mkdir(transcriptParent);
+			const replacedParentReplay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-transcript-side-key",
+			);
+			expect(replacedParentReplay).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "transcript" } },
+			});
+			expect(calls).toBe(2);
+			await fs.rm(transcriptParent, { recursive: true, force: true });
+			await fs.rename(renamedTranscriptParent, transcriptParent);
+			expect(await fs.readFile(path.join(retainedSidePath, ".payload"), "utf8")).toBe("payload");
+			await fs.rm(retainedSidePath, { recursive: true, force: true });
+			const importedReplay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-transcript-side-key-b",
+			);
+			expect(importedReplay).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { retainedTranscriptUnknownPath: retainedSidePath } },
+			});
+			const nestedHardlinkReplay = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-transcript-side-key-b",
+			);
+			expect(nestedHardlinkReplay).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "transcript" } },
+			});
+			expect(calls).toBe(2);
+			await fs.rm(path.join(path.dirname(sessionPath), ".retained-hardlink-nested"), {
+				recursive: true,
+				force: true,
+			});
+			expect(
+				await broker.handleRequest(
+					"session.delete",
+					{ sessionId, sessionPath, cwd },
+					"retained-transcript-side-key-b",
+				),
+			).toMatchObject({ ok: false, error: { code: "cleanup_pending", cleanup: { phase: "transcript" } } });
+			expect(calls).toBe(2);
 		} finally {
 			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
 			await broker.stop();
@@ -1381,19 +2259,22 @@ describe("SDK broker identity and discovery", () => {
 			JSON.stringify({ pid: 2_147_483_647, effectMarker: "metadata", incarnation: "test" }),
 		);
 		await broker.start();
-		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		const metadataUnlink: typeof native.exactUnlink = (pathname, identity) => {
 			if (pathname === markerPath) {
 				detachedQ1 = path.join(path.dirname(markerPath), identity.quarantineName!);
 				syncFs.renameSync(markerPath, detachedQ1);
 				return { ok: false, code: "io_error", detachedPath: detachedQ1 };
 			}
 			return originalUnlink(pathname, identity);
-		});
+		};
 		try {
-			const pending = await broker.handleRequest(
-				"session.delete",
-				{ sessionId, sessionPath, cwd },
+			const deleteInput = { sessionId, sessionPath, cwd };
+			const pending = await settleRetainedTranscriptForTest(
+				broker,
+				deleteInput,
 				"metadata-cleanup-pending-key",
+				await broker.handleRequest("session.delete", deleteInput, "metadata-cleanup-pending-key"),
+				metadataUnlink,
 			);
 			expect(structuredClone(pending)).toMatchObject({
 				ok: false,
@@ -1517,20 +2398,22 @@ describe("SDK broker identity and discovery", () => {
 		);
 		await broker.start();
 		try {
-			const response = await broker.handleRequest(
-				"session.delete",
-				{ sessionId, sessionPath, cwd },
+			const deleteInput = { sessionId, sessionPath, cwd };
+			const response = await settleRetainedTranscriptForTest(
+				broker,
+				deleteInput,
 				"retained-authority-key",
+				await broker.handleRequest("session.delete", deleteInput, "retained-authority-key"),
 			);
 			expect(response).toMatchObject({ ok: true, result: { sessionId } });
 			// Canonical objects are durably absent.
 			expect(await fs.stat(sessionPath).catch(() => undefined)).toBeUndefined();
 			expect(await fs.stat(markerPath).catch(() => undefined)).toBeUndefined();
-			// Typed retained evidence remains only at authorized quarantine names.
+			// Operator-reconciled transcript aliases are gone; metadata retains only its
+			// separately authorized lifecycle quarantine evidence.
 			const sessionEntries = await fs.readdir(path.dirname(sessionPath));
 			const retainedTranscript = sessionEntries.filter(entry => entry.endsWith("-transcript"));
-			expect(retainedTranscript.length).toBeGreaterThan(0);
-			expect(retainedTranscript.every(entry => entry.startsWith(".gjc-delete-"))).toBe(true);
+			expect(retainedTranscript).toHaveLength(0);
 			const sdkEntries = await fs.readdir(path.dirname(markerPath));
 			const retainedMetadata = sdkEntries.filter(entry => entry.endsWith(".lifecycle.json"));
 			expect(retainedMetadata.length).toBeGreaterThan(0);

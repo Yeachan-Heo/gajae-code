@@ -840,7 +840,7 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
  * caller-planned root remains in place while its opened descriptor is
  * authoritative throughout recursive removal.
  */
-export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult
+export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): NativeExactUnlinkResult
 
 /**
  * Restore only the detached object that still has the supplied platform
@@ -1659,6 +1659,11 @@ export type NativeCanonicalDirectoryIdentity =
 			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
 
+export interface NativeDirectoryParentIdentity {
+  dev: bigint
+  ino: bigint
+}
+
 /**
  * A deterministic, no-follow description of a directory tree. `relative_path`
  * is UTF-8, uses `/` separators, and is empty only for the root entry.
@@ -1668,6 +1673,7 @@ export interface NativeDirectoryTreeEntry {
   kind: string
   dev: string
   ino: string
+  nlink: string
   size: string
   mtimeNs: string
   ctimeNs: string
@@ -1697,6 +1703,9 @@ export interface NativeDirectoryTreeSnapshot {
 export interface NativeExactFileIdentity {
   dev: bigint
   ino: bigint
+  nlink?: bigint
+  parentDev?: bigint
+  parentIno?: bigint
   size: bigint
   mtimeNs: bigint
   /**

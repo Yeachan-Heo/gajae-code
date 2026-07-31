@@ -891,7 +891,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const brokerRequestCount = brokerRequests.length;
 	expect(await bounded(observer.closeSession({ sessionId: created.sessionId }), "observer close")).toEqual({});
 	expect(await bounded(observer.deleteSession({ sessionId: created.sessionId }), "observer delete")).toEqual({});
-	expect(brokerRequests).toHaveLength(brokerRequestCount);
+	expect(brokerRequests).toHaveLength(brokerRequestCount + 1);
+	expect(brokerRequests.at(-1)).toMatchObject({
+		operation: "session.delete",
+		input: { sessionId: created.sessionId },
+		idempotencyKey: `acp:session.delete:${created.sessionId}`,
+	});
 	observerAbort.abort();
 
 	await bounded(agent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }), "owned session reload");

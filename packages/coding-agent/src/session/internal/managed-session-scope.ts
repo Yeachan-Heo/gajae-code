@@ -692,6 +692,7 @@ function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): Manage
 			named.isSymbolicLink() ||
 			named.dev !== snapshot.identity.dev ||
 			named.ino !== snapshot.identity.ino ||
+			named.nlink !== 1n ||
 			Number(named.size) !== snapshot.identity.size ||
 			named.mtimeNs !== snapshot.identity.mtimeNs
 		)
@@ -706,6 +707,7 @@ function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): Manage
 				canonicalPath: path.resolve(filePath),
 				sessionId: header.id,
 				...snapshot.identity,
+				nlink: named.nlink,
 				mtimeMs: Number(named.mtimeMs),
 				sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
 			},
@@ -1138,6 +1140,7 @@ function sameCandidate(left: ManagedCandidate, right: ManagedCandidate): boolean
 		left.path === right.path &&
 		left.identity.dev === right.identity.dev &&
 		left.identity.ino === right.identity.ino &&
+		left.identity.nlink === right.identity.nlink &&
 		left.identity.size === right.identity.size &&
 		left.identity.mtimeNs === right.identity.mtimeNs &&
 		left.identity.sha256 === right.identity.sha256
@@ -1150,6 +1153,7 @@ function matchesExpectedResumeIdentity(candidate: ManagedCandidate, expected: Re
 		candidate.identity.sessionId === expected.sessionId &&
 		candidate.identity.dev === expected.dev &&
 		candidate.identity.ino === expected.ino &&
+		candidate.identity.nlink === expected.nlink &&
 		candidate.identity.size === expected.size &&
 		candidate.identity.mtimeMs === expected.mtimeMs &&
 		candidate.identity.mtimeNs === expected.mtimeNs &&
@@ -1364,7 +1368,27 @@ function preparedReceiptMatches(
 	}
 }
 
-type RetiredTarget = ManagedCandidate;
+type RetiredTarget = ManagedCandidate & { transcriptParentIdentity: { dev: bigint; ino: bigint } };
+
+function authorizeRetiredTarget(scope: ManagedScope, candidate: ManagedCandidate): RetiredTarget | undefined {
+	try {
+		const before = fs.lstatSync(path.dirname(candidate.path), { bigint: true });
+		if (!before.isDirectory()) return undefined;
+		const verified = validateCandidateForScope(scope, candidate);
+		const after = fs.lstatSync(path.dirname(candidate.path), { bigint: true });
+		if (
+			!verified ||
+			!sameCandidate(verified, candidate) ||
+			!after.isDirectory() ||
+			after.dev !== before.dev ||
+			after.ino !== before.ino
+		)
+			return undefined;
+		return { ...candidate, transcriptParentIdentity: { dev: before.dev, ino: before.ino } };
+	} catch {
+		return undefined;
+	}
+}
 
 function retiredTargets(scope: ManagedScope, pathname: string): readonly RetiredTarget[] | undefined {
 	try {
@@ -1385,6 +1409,14 @@ function retiredTargets(scope: ManagedScope, pathname: string): readonly Retired
 			const identity = item.identity;
 			if (!identity || typeof identity !== "object" || Array.isArray(identity)) return undefined;
 			const fields = identity as Record<string, unknown>;
+			const transcriptParentIdentity = item.transcriptParentIdentity;
+			if (
+				!transcriptParentIdentity ||
+				typeof transcriptParentIdentity !== "object" ||
+				Array.isArray(transcriptParentIdentity)
+			)
+				return undefined;
+			const parentFields = transcriptParentIdentity as Record<string, unknown>;
 			if (
 				typeof item.path !== "string" ||
 				typeof item.sessionId !== "string" ||
@@ -1394,10 +1426,13 @@ function retiredTargets(scope: ManagedScope, pathname: string): readonly Retired
 				typeof fields.canonicalPath !== "string" ||
 				typeof fields.dev !== "string" ||
 				typeof fields.ino !== "string" ||
+				typeof fields.nlink !== "string" ||
 				typeof fields.size !== "number" ||
 				typeof fields.mtimeMs !== "number" ||
 				typeof fields.mtimeNs !== "string" ||
-				typeof fields.sha256 !== "string"
+				typeof fields.sha256 !== "string" ||
+				typeof parentFields.dev !== "string" ||
+				typeof parentFields.ino !== "string"
 			)
 				return undefined;
 			const provenance =
@@ -1416,11 +1451,16 @@ function retiredTargets(scope: ManagedScope, pathname: string): readonly Retired
 					canonicalPath: fields.canonicalPath,
 					dev: BigInt(fields.dev),
 					ino: BigInt(fields.ino),
+					nlink: BigInt(fields.nlink as string),
 					size: fields.size,
 					mtimeMs: fields.mtimeMs,
 					mtimeNs: BigInt(fields.mtimeNs),
 					sha256: fields.sha256,
 					sessionId: item.sessionId,
+				},
+				transcriptParentIdentity: {
+					dev: BigInt(parentFields.dev as string),
+					ino: BigInt(parentFields.ino as string),
 				},
 			});
 		}
@@ -1498,7 +1538,9 @@ function retainedArtifactsRootMatches(record: Record<string, unknown>): boolean 
 type CleanupReceipt = {
 	attempt: number;
 	target: RetiredTarget;
+	transcriptParentIdentity: { dev: bigint; ino: bigint };
 	expectedArtifactsIdentity?: SessionStorageFileIdentity;
+	artifactsAbsentAtAuthorization?: true;
 	expectedArtifactsTree?: NativeDirectoryTreeSnapshot;
 	detachedArtifactsPath?: string;
 	detachedTranscriptPath?: string;
@@ -1538,7 +1580,12 @@ function cleanupReceipt(scope: ManagedScope, tombstone: string, receipt: Cleanup
 			cwd: receipt.target.cwd,
 			identity: receipt.target.identity,
 		},
+		transcriptParentIdentity: {
+			dev: receipt.transcriptParentIdentity.dev.toString(),
+			ino: receipt.transcriptParentIdentity.ino.toString(),
+		},
 		...(receipt.expectedArtifactsIdentity ? { expectedArtifactsIdentity: receipt.expectedArtifactsIdentity } : {}),
+		...(receipt.artifactsAbsentAtAuthorization ? { artifactsAbsentAtAuthorization: true as const } : {}),
 		...(receipt.expectedArtifactsTree ? { expectedArtifactsTree: receipt.expectedArtifactsTree } : {}),
 		...(receipt.detachedArtifactsPath ? { detachedArtifactsPath: receipt.detachedArtifactsPath } : {}),
 		...(receipt.detachedTranscriptPath ? { detachedTranscriptPath: receipt.detachedTranscriptPath } : {}),
@@ -1670,15 +1717,49 @@ function transcriptRootMatchesTarget(pathname: string, target: RetiredTarget): b
 	}
 }
 
-function cleanupRootsAbsent(tombstone: string, target: RetiredTarget, pending: CleanupReceipt): boolean {
+function cleanupTranscriptParentMatches(target: RetiredTarget, pending: CleanupReceipt): boolean {
+	try {
+		const stat = fs.lstatSync(path.dirname(target.path), { bigint: true });
+		return (
+			stat.isDirectory() &&
+			stat.dev === pending.transcriptParentIdentity.dev &&
+			stat.ino === pending.transcriptParentIdentity.ino
+		);
+	} catch {
+		return false;
+	}
+}
+
+function cleanupRootsAbsent(
+	tombstone: string,
+	target: RetiredTarget,
+	pending: CleanupReceipt,
+	includeTranscriptAuthority = true,
+): boolean {
+	const transcriptParent = path.dirname(target.path);
+	const transcriptParentMatches = (): boolean => {
+		try {
+			const stat = fs.lstatSync(transcriptParent, { bigint: true });
+			return (
+				stat.isDirectory() &&
+				stat.dev === pending.transcriptParentIdentity.dev &&
+				stat.ino === pending.transcriptParentIdentity.ino
+			);
+		} catch {
+			return false;
+		}
+	};
+	if (!transcriptParentMatches()) return false;
 	const prefix = `${path.basename(tombstone, ".json")}.${stableOperationName(target)}.cleanup-pending-`;
-	const activeTranscriptRoots = new Set(
-		[pending.plannedTranscriptPath, pending.detachedTranscriptPath].filter((pathname): pathname is string =>
-			isQuarantinePath(target, pathname),
-		),
-	);
+	const activeTranscriptRoots = includeTranscriptAuthority
+		? new Set(
+				[pending.plannedTranscriptPath, pending.detachedTranscriptPath].filter((pathname): pathname is string =>
+					isQuarantinePath(target, pathname),
+				),
+			)
+		: new Set<string>();
 	const roots = new Set<string>([
-		target.path,
+		...(includeTranscriptAuthority ? [target.path] : []),
 		target.path.slice(0, -6),
 		pending.plannedArtifactsPath,
 		deterministicRemovalRoot(pending.plannedArtifactsPath),
@@ -1746,7 +1827,52 @@ function cleanupRootsAbsent(tombstone: string, target: RetiredTarget, pending: C
 		if (!transcriptRootMatchesTarget(pathname, target)) throw new Error("durability_failed");
 		return false;
 	}
-	return true;
+	if (!includeTranscriptAuthority) return true;
+	const pendingDirectories = [transcriptParent];
+	const snapshots: Array<{ path: string; stat: fs.BigIntStats }> = [];
+	let entryCount = 0;
+	try {
+		while (pendingDirectories.length > 0) {
+			const directory = pendingDirectories.pop();
+			if (!directory) return false;
+			const before = fs.lstatSync(directory, { bigint: true });
+			if (!before.isDirectory()) return false;
+			if (
+				directory === transcriptParent &&
+				(before.dev !== pending.transcriptParentIdentity.dev || before.ino !== pending.transcriptParentIdentity.ino)
+			)
+				return false;
+			snapshots.push({ path: directory, stat: before });
+			const entries = fs.readdirSync(directory);
+			entryCount += entries.length;
+			if (entryCount > MANAGED_ARTIFACT_MAX_FILES) return false;
+			for (const name of entries) {
+				const pathname = path.join(directory, name);
+				let stat: fs.BigIntStats;
+				try {
+					stat = fs.lstatSync(pathname, { bigint: true });
+				} catch {
+					return false;
+				}
+				if (stat.dev === target.identity.dev && stat.ino === target.identity.ino) return false;
+				if (stat.isDirectory()) pendingDirectories.push(pathname);
+			}
+		}
+		for (const snapshot of snapshots) {
+			const after = fs.lstatSync(snapshot.path, { bigint: true });
+			if (
+				!after.isDirectory() ||
+				after.dev !== snapshot.stat.dev ||
+				after.ino !== snapshot.stat.ino ||
+				after.mtimeNs !== snapshot.stat.mtimeNs ||
+				after.ctimeNs !== snapshot.stat.ctimeNs
+			)
+				return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function sameArtifactRootIdentity(left: SessionStorageFileIdentity, right: SessionStorageFileIdentity): boolean {
@@ -1757,7 +1883,16 @@ function sameArtifactTreeSnapshot(left: NativeDirectoryTreeSnapshot, right: Nati
 	if (left.rootDev !== right.rootDev || left.rootIno !== right.rootIno || left.entries.length !== right.entries.length)
 		return false;
 	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
-		JSON.stringify([entry.relativePath, entry.kind, entry.dev, entry.ino, entry.size, entry.mtimeNs, entry.sha256]);
+		JSON.stringify([
+			entry.relativePath,
+			entry.kind,
+			entry.dev,
+			entry.ino,
+			entry.nlink,
+			entry.size,
+			entry.mtimeNs,
+			entry.sha256,
+		]);
 	const leftEntries = left.entries.map(entryKey).sort();
 	const rightEntries = right.entries.map(entryKey).sort();
 	return leftEntries.every((entry, index) => entry === rightEntries[index]);
@@ -1839,6 +1974,7 @@ function artifactTreeSnapshot(value: unknown): NativeDirectoryTreeSnapshot | und
 				(item.kind === "file" || item.kind === "directory") &&
 				typeof item.dev === "string" &&
 				typeof item.ino === "string" &&
+				typeof item.nlink === "string" &&
 				typeof item.size === "string" &&
 				typeof item.mtimeNs === "string" &&
 				typeof item.ctimeNs === "string" &&
@@ -1886,6 +2022,14 @@ function pendingCleanupReceipt(
 			const attempt = record.attempt;
 			const recorded = record.target as Record<string, unknown> | undefined;
 			const identity = recorded?.identity as Record<string, unknown> | undefined;
+			const transcriptParentIdentity = record.transcriptParentIdentity as Record<string, unknown> | undefined;
+			if (
+				typeof transcriptParentIdentity?.dev === "string" &&
+				typeof transcriptParentIdentity?.ino === "string" &&
+				(transcriptParentIdentity.dev !== target.transcriptParentIdentity.dev.toString() ||
+					transcriptParentIdentity.ino !== target.transcriptParentIdentity.ino.toString())
+			)
+				throw new Error("durability_failed");
 			if (
 				record.schemaVersion !== 2 ||
 				record.state !== "cleanup_pending" ||
@@ -1899,9 +2043,20 @@ function pendingCleanupReceipt(
 				recorded.cwd !== target.cwd ||
 				identity?.dev !== String(target.identity.dev) ||
 				identity.ino !== String(target.identity.ino) ||
+				identity.nlink !== String(target.identity.nlink) ||
 				identity.size !== target.identity.size ||
 				identity.mtimeNs !== String(target.identity.mtimeNs) ||
 				identity.sha256 !== target.identity.sha256 ||
+				!transcriptParentIdentity ||
+				typeof transcriptParentIdentity.dev !== "string" ||
+				typeof transcriptParentIdentity.ino !== "string" ||
+				!/^[0-9]+$/.test(transcriptParentIdentity.dev) ||
+				!/^[0-9]+$/.test(transcriptParentIdentity.ino) ||
+				transcriptParentIdentity.dev !== target.transcriptParentIdentity.dev.toString() ||
+				transcriptParentIdentity.ino !== target.transcriptParentIdentity.ino.toString() ||
+				(latest !== undefined &&
+					(transcriptParentIdentity.dev !== latest.transcriptParentIdentity.dev.toString() ||
+						transcriptParentIdentity.ino !== latest.transcriptParentIdentity.ino.toString())) ||
 				!isQuarantinePath(target, record.plannedArtifactsPath) ||
 				!isQuarantinePath(target, record.plannedTranscriptPath) ||
 				record.plannedArtifactsPath === record.plannedTranscriptPath ||
@@ -1923,6 +2078,8 @@ function pendingCleanupReceipt(
 					!isRetainedNativePath(target, record.retainedTranscriptUnknownPath))
 			)
 				throw new Error("durability_failed");
+			if (record.artifactsAbsentAtAuthorization !== undefined && record.artifactsAbsentAtAuthorization !== true)
+				throw new Error("durability_failed");
 			const artifact = record.expectedArtifactsIdentity as Record<string, unknown> | undefined;
 			const expectedArtifactsIdentity = artifact
 				? typeof artifact.dev === "string" &&
@@ -1940,6 +2097,8 @@ function pendingCleanupReceipt(
 					: undefined
 				: undefined;
 			if (artifact && !expectedArtifactsIdentity) throw new Error("durability_failed");
+			if (record.artifactsAbsentAtAuthorization === true && expectedArtifactsIdentity)
+				throw new Error("durability_failed");
 			const expectedArtifactsTree =
 				record.expectedArtifactsTree === undefined ? undefined : artifactTreeSnapshot(record.expectedArtifactsTree);
 			if (record.expectedArtifactsTree !== undefined && !expectedArtifactsTree) throw new Error("durability_failed");
@@ -1958,7 +2117,12 @@ function pendingCleanupReceipt(
 			latest = {
 				attempt,
 				target,
+				transcriptParentIdentity: {
+					dev: BigInt(transcriptParentIdentity.dev as string),
+					ino: BigInt(transcriptParentIdentity.ino as string),
+				},
 				expectedArtifactsIdentity,
+				artifactsAbsentAtAuthorization: record.artifactsAbsentAtAuthorization === true ? true : undefined,
 				expectedArtifactsTree,
 				detachedArtifactsPath: record.detachedArtifactsPath as string | undefined,
 				detachedTranscriptPath: record.detachedTranscriptPath as string | undefined,
@@ -1983,7 +2147,13 @@ function artifactIdentityForCleanup(target: RetiredTarget): SessionStorageFileId
 	try {
 		const stat = fs.lstatSync(target.path.slice(0, -6), { bigint: true });
 		if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe_artifacts");
-		return { dev: stat.dev, ino: stat.ino, size: Number(stat.size), mtimeNs: stat.mtimeNs, sha256: "" };
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			size: Number(stat.size),
+			mtimeNs: stat.mtimeNs,
+			sha256: "",
+		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
@@ -2005,6 +2175,7 @@ function snapshotArtifactTree(pathname: string): NativeDirectoryTreeSnapshot {
 function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | undefined): CleanupReceipt {
 	const attempt = (pending?.attempt ?? 0) + 1;
 	const directory = path.dirname(target.path);
+	const transcriptParentIdentity = pending?.transcriptParentIdentity ?? target.transcriptParentIdentity;
 	const operation = stableOperationName(target);
 	const expectedArtifactsIdentity = pending?.expectedArtifactsIdentity ?? artifactIdentityForCleanup(target);
 	const expectedArtifactsTree =
@@ -2014,7 +2185,10 @@ function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | und
 	return {
 		attempt,
 		target,
+		transcriptParentIdentity,
 		expectedArtifactsIdentity,
+		artifactsAbsentAtAuthorization:
+			pending?.artifactsAbsentAtAuthorization ?? (expectedArtifactsIdentity ? undefined : true),
 		expectedArtifactsTree,
 		detachedArtifactsPath: pending?.detachedArtifactsPath,
 		retainedArtifactsSuccessorPath: pending?.retainedArtifactsSuccessorPath,
@@ -2407,6 +2581,7 @@ function sameArtifactTree(
 			entry.kind,
 			entry.dev,
 			entry.ino,
+			entry.nlink,
 			entry.size,
 			entry.mtimeNs,
 			entry.ctimeNs,
@@ -2889,11 +3064,8 @@ export async function reconcileManagedTombstones(
 							if (
 								cleanupArtifactsRemoved(scope, tombstone, target, observedPending.attempt) &&
 								cleanupRootsAbsent(tombstone, target, observedPending)
-							) {
-								fsyncManagedParent(target.path);
-								await publishCleanupCompleted(scope, tombstone, target, lock);
+							)
 								continue;
-							}
 						} else throw error;
 					}
 					const verified = observedPending ? target : validateCandidateForScope(scope, target);
@@ -2908,13 +3080,16 @@ export async function reconcileManagedTombstones(
 							: (observedPending ?? nextCleanupReceipt(target, undefined));
 					if (!observedPending || discoveredDetach || requiresFreshCleanupPlan(observedPending))
 						await publishCleanupPending(scope, tombstone, active, lock);
+					if (!cleanupTranscriptParentMatches(target, active)) continue;
 					let deletion = await new FileSessionStorage().deleteSessionVerified({
 						sessionsRoot: scope.sessionsRoot,
 						transcriptPath: target.path,
 						sessionId: target.sessionId,
 						cwd: target.cwd,
 						transcriptIdentity: target.identity,
+						transcriptParentIdentity: target.transcriptParentIdentity,
 						expectedArtifactsIdentity: active.expectedArtifactsIdentity,
+						artifactsAbsentAtAuthorization: active.artifactsAbsentAtAuthorization,
 						expectedArtifactsTree: active.expectedArtifactsTree,
 						detachedArtifactsPath:
 							active.detachedArtifactsPath ??
@@ -2940,6 +3115,8 @@ export async function reconcileManagedTombstones(
 							: {}),
 					});
 					if (deletion.kind === "artifacts_removed") {
+						if (!cleanupRootsAbsent(tombstone, target, active, false)) continue;
+						if (!cleanupTranscriptParentMatches(target, active)) continue;
 						await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
 						deletion = await new FileSessionStorage().deleteSessionVerified({
 							sessionsRoot: scope.sessionsRoot,
@@ -2947,6 +3124,7 @@ export async function reconcileManagedTombstones(
 							sessionId: target.sessionId,
 							cwd: target.cwd,
 							transcriptIdentity: target.identity,
+							transcriptParentIdentity: target.transcriptParentIdentity,
 							plannedArtifactsPath: active.plannedArtifactsPath,
 							plannedTranscriptPath: active.plannedTranscriptPath,
 							detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
@@ -3010,6 +3188,7 @@ export async function reconcileManagedTombstones(
 						);
 						continue;
 					}
+					if (!cleanupRootsAbsent(tombstone, target, active)) continue;
 					fsyncManagedParent(target.path);
 					await publishCleanupCompleted(scope, tombstone, target, lock);
 				} catch (error) {
@@ -3432,7 +3611,11 @@ export async function deleteManagedSessionCandidate(
 		let targets = retiredTargets(scope, tombstone);
 		if (!targets) {
 			if (!current) throw new Error("source_changed");
-			targets = [current, ...(paired ? [paired] : [])];
+			const authorizedTargets = [current, ...(paired ? [paired] : [])].map(target =>
+				authorizeRetiredTarget(scope, target),
+			);
+			if (authorizedTargets.some(target => target === undefined)) throw new Error("source_changed");
+			targets = authorizedTargets as RetiredTarget[];
 			lock.assertOwned();
 			try {
 				await publishManagedTombstone(
@@ -3447,6 +3630,10 @@ export async function deleteManagedSessionCandidate(
 							cwd: target.cwd,
 							provenance: target.provenance,
 							identity: target.identity,
+							transcriptParentIdentity: {
+								dev: target.transcriptParentIdentity.dev.toString(),
+								ino: target.transcriptParentIdentity.ino.toString(),
+							},
 						})),
 					},
 					lock.assertOwned,
@@ -3462,6 +3649,7 @@ export async function deleteManagedSessionCandidate(
 			lock.assertOwned();
 			const pending = pendingCleanupReceipt(scope, tombstone, target);
 			const observedPending = pending ? probePlannedCleanupDetach(target, pending) : undefined;
+			if (cleanupCompleted(scope, tombstone, target)) continue;
 			try {
 				fs.lstatSync(target.path);
 			} catch (error) {
@@ -3470,14 +3658,16 @@ export async function deleteManagedSessionCandidate(
 					if (
 						cleanupArtifactsRemoved(scope, tombstone, target, observedPending.attempt) &&
 						cleanupRootsAbsent(tombstone, target, observedPending)
-					) {
-						fsyncManagedParent(target.path);
-						await publishCleanupCompleted(scope, tombstone, target, lock);
-						continue;
-					}
+					)
+						return {
+							kind: "cleanup_pending",
+							tombstonePath: tombstone,
+							phase: "transcript",
+							message:
+								"Exact cleanup remains pending because transcript authority disappeared without native deletion proof.",
+						};
 				} else throw error;
 			}
-			if (cleanupCompleted(scope, tombstone, target)) continue;
 			deletedAny = true;
 			const verified = observedPending ? target : validateCandidateForScope(scope, target);
 			if (!verified || !sameCandidate(verified, target)) throw new Error("source_changed");
@@ -3491,13 +3681,24 @@ export async function deleteManagedSessionCandidate(
 					: (observedPending ?? nextCleanupReceipt(target, undefined));
 			if (!observedPending || discoveredDetach || requiresFreshCleanupPlan(observedPending))
 				await publishCleanupPending(scope, tombstone, active, lock);
+			if (!cleanupTranscriptParentMatches(target, active))
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: cleanupArtifactsRemoved(scope, tombstone, target, pending?.attempt ?? active.attempt)
+						? "transcript"
+						: "artifacts",
+					message: "Exact cleanup remains pending because transcript parent identity changed before mutation.",
+				};
 			let deletion = await new FileSessionStorage().deleteSessionVerified({
 				sessionsRoot: scope.sessionsRoot,
 				transcriptPath: target.path,
 				sessionId: target.sessionId,
 				cwd: target.cwd,
 				transcriptIdentity: target.identity,
+				transcriptParentIdentity: target.transcriptParentIdentity,
 				expectedArtifactsIdentity: active.expectedArtifactsIdentity,
+				artifactsAbsentAtAuthorization: active.artifactsAbsentAtAuthorization,
 				expectedArtifactsTree: active.expectedArtifactsTree,
 				detachedArtifactsPath: active.detachedArtifactsPath ?? observedPending?.detachedArtifactsPath,
 				detachedTranscriptPath:
@@ -3517,6 +3718,20 @@ export async function deleteManagedSessionCandidate(
 					: {}),
 			});
 			if (deletion.kind === "artifacts_removed") {
+				if (!cleanupRootsAbsent(tombstone, target, active, false))
+					return {
+						kind: "cleanup_pending",
+						tombstonePath: tombstone,
+						phase: "artifacts",
+						message: "Exact cleanup remains pending because artifact or side-path authority is retained.",
+					};
+				if (!cleanupTranscriptParentMatches(target, active))
+					return {
+						kind: "cleanup_pending",
+						tombstonePath: tombstone,
+						phase: "transcript",
+						message: "Exact cleanup remains pending because transcript parent identity changed before mutation.",
+					};
 				await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
 				deletion = await new FileSessionStorage().deleteSessionVerified({
 					sessionsRoot: scope.sessionsRoot,
@@ -3524,6 +3739,7 @@ export async function deleteManagedSessionCandidate(
 					sessionId: target.sessionId,
 					cwd: target.cwd,
 					transcriptIdentity: target.identity,
+					transcriptParentIdentity: target.transcriptParentIdentity,
 					plannedArtifactsPath: active.plannedArtifactsPath,
 					plannedTranscriptPath: active.plannedTranscriptPath,
 					detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
@@ -3549,51 +3765,20 @@ export async function deleteManagedSessionCandidate(
 					throw new Error("durability_failed");
 				const retry = nextCleanupReceipt(target, active);
 				await publishCleanupPending(scope, tombstone, cleanupPendingEvidence(retry, active, deletion), lock);
-				if (deletion.phase === "artifacts") {
-					// A typed retained artifact root proves durable canonical absence; advance
-					// to the transcript phase instead of stalling on the retained evidence.
-					await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
-					deletion = await new FileSessionStorage().deleteSessionVerified({
-						sessionsRoot: scope.sessionsRoot,
-						transcriptPath: target.path,
-						sessionId: target.sessionId,
-						cwd: target.cwd,
-						transcriptIdentity: target.identity,
-						plannedArtifactsPath: active.plannedArtifactsPath,
-						plannedTranscriptPath: active.plannedTranscriptPath,
-						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
-						retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
-						retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
-						retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
-						retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
-						retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
-						retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
-						artifactsRemoved: true,
-					});
-					if (deletion.kind === "cleanup_pending") {
-						const followup = nextCleanupReceipt(target, active);
-						await publishCleanupPending(
-							scope,
-							tombstone,
-							cleanupPendingEvidence(followup, active, deletion),
-							lock,
-						);
-						if (
-							deletion.phase !== "transcript" ||
-							deletion.detachedTranscriptPath !== active.plannedTranscriptPath
-						)
-							return {
-								kind: "cleanup_pending",
-								tombstonePath: tombstone,
-								phase: deletion.phase,
-								message:
-									"Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
-							};
-					}
-				}
-				// A typed retained transcript quarantine is durable canonical-absence
-				// evidence — never a terminal byte-deletion claim; complete the receipt.
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: deletion.phase,
+					message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
+				};
 			}
+			if (!cleanupRootsAbsent(tombstone, target, active))
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: "transcript",
+					message: "Exact cleanup remains pending because transcript or artifact authority is retained.",
+				};
 			fsyncManagedParent(target.path);
 			await publishCleanupCompleted(scope, tombstone, target, lock);
 		}
