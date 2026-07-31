@@ -1301,6 +1301,8 @@ export class FileSessionStorage implements SessionStorage {
 					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 					deletion.retainedSuccessorPath === undefined &&
 					deletion.retainedUnknownPath === undefined &&
+					(deletion.detachedPath === undefined ||
+						isVerifiedEmptyPlaceholder(deletion.detachedPath, authorizedTranscriptParentIdentity)) &&
 					(deletion.retainedPlaceholderPath === undefined ||
 						isVerifiedEmptyPlaceholder(deletion.retainedPlaceholderPath, authorizedTranscriptParentIdentity))
 				)
@@ -1378,6 +1380,8 @@ export class FileSessionStorage implements SessionStorage {
 				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 				deletion.retainedSuccessorPath === undefined &&
 				deletion.retainedUnknownPath === undefined &&
+				(deletion.detachedPath === undefined ||
+					isVerifiedEmptyPlaceholder(deletion.detachedPath, authorizedTranscriptParentIdentity)) &&
 				(deletion.retainedPlaceholderPath === undefined ||
 					isVerifiedEmptyPlaceholder(deletion.retainedPlaceholderPath, authorizedTranscriptParentIdentity))
 			)
