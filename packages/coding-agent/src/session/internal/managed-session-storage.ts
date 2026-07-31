@@ -6,6 +6,8 @@ import {
 	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
 	exactRemoveDirectoryTree,
+	exactReplacePath,
+	exactRestore,
 	exactUnlink,
 	type NativeDirectoryTreeSnapshot,
 	type NativeOwnerOnlySecurityResult,
@@ -1599,7 +1601,7 @@ export function replaceManagedFileSync(
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.replacement`);
 	let fd: number | undefined;
 	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
-	const preserveStaging = false;
+	let preserveStaging = false;
 	try {
 		fd = fs.openSync(
 			staging,
@@ -1613,21 +1615,70 @@ export function replaceManagedFileSync(
 		secureFileDescriptor(staging, fd, "verify");
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: staged.dev, ino: staged.ino };
+		if (process.platform === "win32" && expectedDestination) {
+			fs.closeSync(fd);
+			fd = undefined;
+		}
 		assertManagedDirectoryRoot(root);
 		assertFence?.();
 		if (process.platform === "win32" && expectedDestination) {
-			throw new Error("managed_replace_exact_unavailable");
-		}
-		fs.renameSync(staging, destination);
+			const parentIdentity = fs.lstatSync(parent, { bigint: true });
+			const replaced = exactReplacePath(
+				staging,
+				destination,
+				{
+					dev: staged.dev,
+					ino: staged.ino,
+					nlink: staged.nlink,
+					parentDev: parentIdentity.dev,
+					parentIno: parentIdentity.ino,
+					size: staged.size,
+					mtimeNs: staged.mtimeNs,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+				},
+				{
+					dev: expectedDestination.dev,
+					ino: expectedDestination.ino,
+					nlink: expectedDestination.nlink,
+					parentDev: parentIdentity.dev,
+					parentIno: parentIdentity.ino,
+					size: BigInt(expectedDestination.size),
+					mtimeNs: expectedDestination.mtimeNs,
+					sha256: expectedDestination.sha256,
+				},
+			);
+			if (!replaced.ok) {
+				if (replaced.detachedPath) {
+					const restored = exactRestore(replaced.detachedPath, staging, {
+						dev: staged.dev,
+						ino: staged.ino,
+						nlink: staged.nlink,
+						parentDev: parentIdentity.dev,
+						parentIno: parentIdentity.ino,
+						size: staged.size,
+						mtimeNs: staged.mtimeNs,
+						sha256: createHash("sha256").update(bytes).digest("hex"),
+					});
+					if (restored.ok) preserveStaging = true;
+					if (!restored.ok)
+						throw new Error(
+							`managed_replace_failed:${replaced.code ?? "unknown"}:retained=${replaced.detachedPath}:restore=${restored.code ?? "unknown"}`,
+						);
+				}
+				throw new Error(`managed_replace_failed:${replaced.code ?? "unknown"}`);
+			}
+		} else fs.renameSync(staging, destination);
 		assertFence?.();
 		assertManagedDirectoryRoot(root);
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
 			throw new Error("destination_identity_changed");
 		}
-		secureFileDescriptor(destination, fd, "verify");
-		fs.closeSync(fd);
-		fd = undefined;
+		if (fd !== undefined) {
+			secureFileDescriptor(destination, fd, "verify");
+			fs.closeSync(fd);
+			fd = undefined;
+		}
 		fsyncDirectory(parent);
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
