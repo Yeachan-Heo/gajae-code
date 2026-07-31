@@ -494,6 +494,30 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	fn success_with_placeholder(path: String) -> Self {
+		Self {
+			ok: true,
+			code: None,
+			payload_durable: Some(true),
+			detached_path: None,
+			retained_successor_path: None,
+			retained_placeholder_path: Some(path),
+			retained_unknown_path: None,
+		}
+	}
+
+	fn success_with_unknown(path: String) -> Self {
+		Self {
+			ok: true,
+			code: None,
+			payload_durable: Some(true),
+			detached_path: None,
+			retained_successor_path: None,
+			retained_placeholder_path: None,
+			retained_unknown_path: Some(path),
+		}
+	}
+
 	fn failure(code: &str) -> Self {
 		Self {
 			ok: false,
@@ -3627,14 +3651,24 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
-		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &detached_name, &original_name) {
+		let placeholder =
+			match create_exchange_placeholder(parent_fd, &original_name, identity.directory) {
+				Ok(placeholder) => placeholder,
+				Err(code) => {
+					// SAFETY: this branch owns the live descriptor and closes it exactly once.
+					unsafe { libc::close(parent_fd) };
+					return NativeExactUnlinkResult::failure(if code == "quarantine_collision" {
+						"collision"
+					} else {
+						code
+					});
+				},
+			};
+		if let Err(code) = rename_exchange(parent_fd, parent_fd, &detached_name, &original_name) {
+			let _ = remove_exchange_placeholder(parent_fd, &original_name, placeholder);
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
-			return NativeExactUnlinkResult::failure(if code == "quarantine_collision" {
-				"collision"
-			} else {
-				code
-			});
+			return NativeExactUnlinkResult::failure(code);
 		}
 		// SAFETY: zero is a valid initialized representation for this output struct.
 		let mut restored: libc::stat = unsafe { std::mem::zeroed() };
@@ -3659,6 +3693,24 @@ pub(crate) mod platform {
 			} else {
 				"restore_failed"
 			});
+		}
+		match remove_exchange_placeholder(parent_fd, &detached_name, placeholder) {
+			ExchangePlaceholderRemoval::Removed => {},
+			ExchangePlaceholderRemoval::RetainedMismatch(retained_name)
+			| ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::success_with_placeholder(
+					retained_name.to_string_lossy().into_owned(),
+				);
+			},
+			ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::success_with_unknown(
+					detached_path.to_string_lossy().into_owned(),
+				);
+			},
 		}
 		// SAFETY: this branch owns the live descriptor and closes it exactly once.
 		unsafe { libc::close(parent_fd) };
