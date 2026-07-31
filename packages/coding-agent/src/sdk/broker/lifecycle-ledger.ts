@@ -666,7 +666,13 @@ export class LifecycleLedger {
 		return this.#mutate(async () => {
 			const previous = this.#byIdentity.get(identity);
 			if (!previous) throw new Error("Unknown lifecycle identity");
-			const next = { ...previous, ...fields, state, ts: Date.now() };
+			const next = {
+				...previous,
+				...fields,
+				state,
+				ts: Date.now(),
+				...(fields.response !== undefined ? { response: fields.response } : {}),
+			};
 			if (this.#isCleanupPending(next)) {
 				next.unresolvedCleanupResponse = undefined;
 				next.unresolvedCleanupResponseDigest = undefined;

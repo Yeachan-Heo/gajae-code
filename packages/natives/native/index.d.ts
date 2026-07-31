@@ -841,7 +841,7 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
  * detached descriptor remains authoritative throughout payload scrubbing and
  * replay.
  */
-export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult
+export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): NativeExactUnlinkResult
 
 /**
  * Replace a staged regular file only after validating the exact staged source
@@ -1671,6 +1671,11 @@ export type NativeCanonicalDirectoryIdentity =
 			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
 
+export interface NativeDirectoryParentIdentity {
+  dev: bigint
+  ino: bigint
+}
+
 /**
  * A deterministic, no-follow description of a directory tree. `relative_path`
  * is UTF-8, uses `/` separators, and is empty only for the root entry.
@@ -1710,6 +1715,9 @@ export interface NativeDirectoryTreeSnapshot {
 export interface NativeExactFileIdentity {
   dev: bigint
   ino: bigint
+  nlink?: bigint
+  parentDev?: bigint
+  parentIno?: bigint
   size: bigint
   mtimeNs: bigint
   /**
@@ -2001,6 +2009,7 @@ export declare function readImageFromClipboard(): Promise<ClipboardImage | undef
 export interface RecoveryFsIdentity {
   dev: string
   ino: string
+  nlink: string
   size: string
   mtimeNs: string
   ctimeNs: string

@@ -554,12 +554,18 @@
   },
   "nativeAuthoritySha256": {
 <<<<<<< HEAD
+<<<<<<< HEAD
     "crates/pi-natives/src/path_identity.rs": "90a5ac813f53dee0f9a81002f5971594c07f8a9bdf8d5f262737be1d8203aae1",
 ||||||| parent of 7818b36d2 (fix(session): complete proven descriptor cleanup)
     "crates/pi-natives/src/path_identity.rs": "b088cba689dc0196ec2a6a5cef65f91bfcccbd6254c48e24ed155ac670ae04ba",
 =======
     "crates/pi-natives/src/path_identity.rs": "cde97e7f2178229570e275cd529df778ddb7e22103603111ee37298acd0d148b",
 >>>>>>> 7818b36d2 (fix(session): complete proven descriptor cleanup)
+||||||| parent of 47d7de9a6 (fix(session): preserve exact cleanup authority across platforms)
+    "crates/pi-natives/src/path_identity.rs": "04fa50618869be047410ffd62bd4105d2097a185581a072b61e9237119aa39f2",
+=======
+    "crates/pi-natives/src/path_identity.rs": "41c718a7f48a5843558214ec8992f6ab26f4b6d6afa164a97dcbdddf4fee5bfb",
+>>>>>>> 47d7de9a6 (fix(session): preserve exact cleanup authority across platforms)
     "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
     "crates/pi-shell/src/process.rs": "45b222432a70eb056807507f8b4d28cf5fb73a7441ee9a0e28349ec85ef9b177",
     "crates/pi-shell/src/shell.rs": "66cacfe63d495b23156d023f2f34f354b657534ee3cdaf01e30d6694af253982",

@@ -335,9 +335,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			await fs.promises.mkdir(artifactsDir, { recursive: true });
 			await fs.promises.writeFile(path.join(artifactsDir, ".oracle.txt"), "artifact");
 
-			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Saved session cleanup is pending in artifacts",
-			);
+			await expect(connection.deleteSession({ sessionId })).rejects.toThrow("Partial artifact cleanup expanded retained tree authority");
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			expect(fs.existsSync(artifactsDir)).toBe(false);
 			const retainedPayloads = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
@@ -348,9 +346,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 				"artifact",
 			);
 
-			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Saved session cleanup is pending in artifacts",
-			);
+			await expect(connection.deleteSession({ sessionId })).rejects.toThrow("Partial artifact cleanup expanded retained tree authority");
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			const payloadsAfterRetry = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
 				entry => entry.endsWith(".oracle.txt"),

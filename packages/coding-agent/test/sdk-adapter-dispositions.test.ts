@@ -101,7 +101,6 @@ const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.fork": "invalid_input",
 	"session.resume": "invalid_input",
 	"session.close": "invalid_input",
-	"session.delete": "invalid_input",
 };
 function expectSemanticResult(operation: Operation, result: unknown): void {
 	const code = expectedDomainErrors[operation.sdkId];
