@@ -150,6 +150,29 @@ export interface ManagedFileSnapshot {
 	};
 }
 
+type ReplacementCleanupReceipt = {
+	version: 1;
+	predecessor: string;
+	successor: string;
+	identity: {
+		dev: string;
+		ino: string;
+		nlink: string;
+		size: string;
+		mtimeNs: string;
+		ctimeNs: string;
+		sha256: string;
+	};
+};
+
+const U64_MAX = 18_446_744_073_709_551_615n;
+
+function parseCanonicalU64(value: unknown): bigint | undefined {
+	if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return undefined;
+	const parsed = BigInt(value);
+	return parsed <= U64_MAX ? parsed : undefined;
+}
+
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
 const ACL_CLEAR_EVIDENCE = new Set(["cleared", "already_absent", "unsupported", "not_run"]);
 const GENERAL_FAILURE_CODES = new Set([
@@ -495,6 +518,7 @@ export class ManagedSessionDescendantStore {
 	readonly #authority: RecoveryFsRoot | undefined;
 	#ownsAuthority = false;
 	#closed = false;
+	#reconcilingReplacementCleanup = false;
 	readonly #authorityBaseDir: string;
 	/** Logical profile root inherited by nested managed session destinations. */
 	readonly #profileAgentDir: string;
@@ -670,7 +694,86 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#reconcileReplacementCleanupReceipts(): void {
+		if (this.#reconcilingReplacementCleanup) return;
+		this.#reconcilingReplacementCleanup = true;
+		try {
+			for (const name of fs.readdirSync(this.#baseDir)) {
+				const match = /^\.gjc-replace-cleanup-([0-9a-f]+)-([0-9a-f]+)\.json$/.exec(name);
+				if (!match) continue;
+				const receiptPath = path.join(this.#baseDir, name);
+				const parsed = JSON.parse(
+					captureManagedFileNoFollow(receiptPath).bytes.toString("utf8"),
+				) as Partial<ReplacementCleanupReceipt>;
+				const identity = parsed.identity;
+				const dev = parseCanonicalU64(identity?.dev);
+				const ino = parseCanonicalU64(identity?.ino);
+				const nlink = parseCanonicalU64(identity?.nlink);
+				const size = parseCanonicalU64(identity?.size);
+				const mtimeNs = parseCanonicalU64(identity?.mtimeNs);
+				const ctimeNs = parseCanonicalU64(identity?.ctimeNs);
+				const expectedPredecessor =
+					dev !== undefined && ino !== undefined
+						? path.join(this.#baseDir, `.gjc-exact-replace-destination-${dev.toString(16)}-${ino.toString(16)}`)
+						: undefined;
+				if (
+					parsed.version !== 1 ||
+					dev === undefined ||
+					ino === undefined ||
+					nlink === undefined ||
+					size === undefined ||
+					mtimeNs === undefined ||
+					ctimeNs === undefined ||
+					typeof identity?.sha256 !== "string" ||
+					!match[1] ||
+					!match[2] ||
+					BigInt(`0x${match[1]}`) !== dev ||
+					BigInt(`0x${match[2]}`) !== ino ||
+					typeof parsed.predecessor !== "string" ||
+					path.resolve(parsed.predecessor) !== expectedPredecessor ||
+					typeof parsed.successor !== "string" ||
+					path.dirname(path.resolve(parsed.successor)) !== this.#baseDir
+				)
+					throw new Error("managed_replace_cleanup_receipt_invalid");
+				const retired = exactUnlink(expectedPredecessor, {
+					dev,
+					ino,
+					nlink,
+					parentDev: this.#subtreeRoot.dev,
+					parentIno: this.#subtreeRoot.ino,
+					size,
+					mtimeNs,
+					sha256: identity.sha256,
+					quarantineName: `.gjc-replace-retry-${dev.toString(16)}-${ino.toString(16)}`,
+				});
+				if (!retired.ok) throw new Error(`managed_replace_cleanup_pending:${retired.code ?? "unknown"}`);
+				const receipt = captureManagedFileNoFollow(receiptPath);
+				const removed = exactUnlink(receiptPath, {
+					dev: receipt.identity.dev,
+					ino: receipt.identity.ino,
+					nlink: receipt.identity.nlink,
+					parentDev: this.#subtreeRoot.dev,
+					parentIno: this.#subtreeRoot.ino,
+					size: BigInt(receipt.identity.size),
+					mtimeNs: receipt.identity.mtimeNs,
+					sha256: receipt.identity.sha256,
+					quarantineName: `.gjc-receipt-remove-${receipt.identity.dev.toString(16)}-${receipt.identity.ino.toString(16)}`,
+				});
+				if (!removed.ok) throw new Error(`managed_replace_receipt_cleanup_pending:${removed.code ?? "unknown"}`);
+			}
+		} finally {
+			this.#reconcilingReplacementCleanup = false;
+		}
+	}
+
+	#beforeMutation(): void {
+		this.#assertBound();
+		this.#reconcileReplacementCleanupReceipts();
+		this.#assertBound();
+	}
+
 	ensureDirectory(relativePath = ""): ManagedDirectoryRoot {
+		this.#beforeMutation();
 		this.#assertBound();
 		if (this.#authority) {
 			const relative = this.#relative(this.#resolve(relativePath));
@@ -690,6 +793,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	async publishNoReplace(relativePath: string, bytes: Uint8Array): Promise<void> {
+		this.#beforeMutation();
 		const resolved = this.#resolve(relativePath);
 		if (this.#authority) {
 			this.#assertBound();
@@ -701,6 +805,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): void {
+		this.#beforeMutation();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
 			publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
@@ -713,6 +818,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	async replace(relativePath: string, bytes: Uint8Array): Promise<void> {
+		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
@@ -732,6 +838,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
+		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
@@ -769,6 +876,7 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 	replaceSync(relativePath: string, bytes: Uint8Array): void {
+		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
@@ -787,6 +895,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	appendSync(relativePath: string, bytes: Uint8Array): void {
+		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		let existing = this.readExpected(relativePath);
@@ -995,6 +1104,7 @@ export class ManagedSessionDescendantStore {
 
 	/** Remove an exact captured file without reopening its pathname as authority. */
 	removeExpected(relativePath: string, expected: ManagedFileSnapshot): void {
+		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
 			const removed = exactUnlink(this.#resolve(relativePath), {
@@ -1034,6 +1144,7 @@ export class ManagedSessionDescendantStore {
 	}
 	/** Read and remove one managed descendant through retained authority. */
 	async consume(relativePath: string): Promise<Uint8Array | null> {
+		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (this.#authority) {
@@ -1072,6 +1183,7 @@ export class ManagedSessionDescendantStore {
 
 	/** Remove one managed descendant through retained authority when it exists. */
 	async remove(relativePath: string): Promise<void> {
+		this.#beforeMutation();
 		await this.consume(relativePath);
 	}
 
@@ -1095,6 +1207,7 @@ export class ManagedSessionDescendantStore {
 		destinationRelativePath: string,
 		snapshot: NativeDirectoryTreeSnapshot,
 	): Promise<void> {
+		this.#beforeMutation();
 		const actual = this.captureTree(sourceRelativePath);
 		if (JSON.stringify(actual) !== JSON.stringify(snapshot)) throw new Error("artifact_source_changed");
 		this.ensureDirectory(destinationRelativePath);
@@ -1141,6 +1254,7 @@ export class ManagedSessionDescendantStore {
 		destinationRelativePath: string,
 		expected: NativeDirectoryTreeSnapshot,
 	): NativeDirectoryTreeSnapshot {
+		this.#beforeMutation();
 		this.#assertBound();
 		const moved = this.#authority
 			? this.#authority.renameManagedTreeNoReplace(
@@ -1168,6 +1282,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	removeTreeExpected(relativePath: string, expected: NativeDirectoryTreeSnapshot): void {
+		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
 			const removed = exactRemoveDirectoryTree(this.#resolve(relativePath), expected);
@@ -1180,6 +1295,7 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 	fsyncTree(): NativeDirectoryTreeSnapshot {
+		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) return fsyncManagedArtifactTree(this.#baseDir);
 		const baseRelative = this.#relative(this.#baseDir);
