@@ -6,6 +6,7 @@ import {
 	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
 	exactRemoveDirectoryTree,
+	exactReplacePath,
 	exactUnlink,
 	type NativeDirectoryTreeSnapshot,
 	type NativeOwnerOnlySecurityResult,
@@ -733,15 +734,22 @@ export class ManagedSessionDescendantStore {
 			const current = captureManagedFileNoFollow(resolved);
 			if (!sameIdentity(current.identity, expected.identity) || current.identity.sha256 !== expected.identity.sha256)
 				throw new Error("managed_replace_identity_mismatch");
-			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, () => {
-				fence.assertOwned();
-				const currentAtCommit = captureManagedFileNoFollow(resolved);
-				if (
-					!sameIdentity(currentAtCommit.identity, expected.identity) ||
-					currentAtCommit.identity.sha256 !== expected.identity.sha256
-				)
-					throw new Error("managed_replace_identity_mismatch");
-			});
+			replaceManagedFileSync(
+				resolved,
+				bytes,
+				this.#subtreeRoot,
+				this.#policy,
+				() => {
+					fence.assertOwned();
+					const currentAtCommit = captureManagedFileNoFollow(resolved);
+					if (
+						!sameIdentity(currentAtCommit.identity, expected.identity) ||
+						currentAtCommit.identity.sha256 !== expected.identity.sha256
+					)
+						throw new Error("managed_replace_identity_mismatch");
+				},
+				expected.identity,
+			);
 			fence.assertOwned();
 			return;
 		}
@@ -1568,6 +1576,8 @@ export function replaceManagedFileSync(
 	bytes: Uint8Array,
 	root: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
+	assertFence?: () => void,
+	expectedDestination?: ManagedFileSnapshot["identity"],
 ): void {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
@@ -1588,7 +1598,36 @@ export function replaceManagedFileSync(
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: staged.dev, ino: staged.ino };
 		assertManagedDirectoryRoot(root);
-		fs.renameSync(staging, destination);
+		assertFence?.();
+		if (process.platform === "win32" && expectedDestination) {
+			const parentIdentity = fs.lstatSync(parent, { bigint: true });
+			const replaced = exactReplacePath(
+				staging,
+				destination,
+				{
+					dev: staged.dev,
+					ino: staged.ino,
+					nlink: staged.nlink,
+					parentDev: parentIdentity.dev,
+					parentIno: parentIdentity.ino,
+					size: staged.size,
+					mtimeNs: staged.mtimeNs,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+				},
+				{
+					dev: expectedDestination.dev,
+					ino: expectedDestination.ino,
+					nlink: expectedDestination.nlink,
+					parentDev: parentIdentity.dev,
+					parentIno: parentIdentity.ino,
+					size: BigInt(expectedDestination.size),
+					mtimeNs: expectedDestination.mtimeNs,
+					sha256: expectedDestination.sha256,
+				},
+			);
+			if (!replaced.ok) throw new Error(`managed_replace_failed:${replaced.code ?? "unknown"}`);
+		} else fs.renameSync(staging, destination);
+		assertFence?.();
 		assertManagedDirectoryRoot(root);
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
