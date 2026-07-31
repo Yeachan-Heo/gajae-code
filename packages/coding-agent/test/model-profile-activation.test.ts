@@ -572,6 +572,16 @@ describe("model profile activation", () => {
 			},
 		],
 		[
+			"lunamaxxing",
+			{
+				default: "openai-codex/gpt-5.6-luna:medium",
+				executor: "openai-codex/gpt-5.6-luna:max",
+				planner: "openai-codex/gpt-5.6-luna:max",
+				critic: "openai-codex/gpt-5.6-luna:xhigh",
+				architect: "openai-codex/gpt-5.6-luna:max",
+			},
+		],
+		[
 			"codex-opencodego",
 			{
 				default: "openai-codex/gpt-5.6-sol:low",

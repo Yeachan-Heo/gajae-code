@@ -92,6 +92,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "openai-codex/gpt-5.6-sol:max",
 		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
+	profile("lunamaxxing", ["openai-codex"], {
+		default: "openai-codex/gpt-5.6-luna:medium",
+		executor: "openai-codex/gpt-5.6-luna:max",
+		planner: "openai-codex/gpt-5.6-luna:max",
+		critic: "openai-codex/gpt-5.6-luna:xhigh",
+		architect: "openai-codex/gpt-5.6-luna:max",
+	}),
 	profile("opencodego", ["opencode-go"], {
 		default: "opencode-go/kimi-k2.6",
 		executor: "opencode-go/deepseek-v4-flash",
@@ -327,6 +334,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-eco": { displayName: "Codex Eco", providerGroup: "CODEX" },
 	"codex-medium": { displayName: "Codex Medium", providerGroup: "CODEX" },
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
+	lunamaxxing: { displayName: "LunaMaxxing", providerGroup: "CODEX" },
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
 	"claude-opus": { displayName: "Claude Opus", providerGroup: "CLAUDE" },
 	"claude-fable": { displayName: "Claude Fable", providerGroup: "CLAUDE" },

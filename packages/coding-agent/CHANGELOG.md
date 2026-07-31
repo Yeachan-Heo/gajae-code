@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added the bundled `lunamaxxing` OpenAI Codex profile, mapping every role to GPT-5.6 Luna with medium default reasoning, maximum executor/planner/architect reasoning, and xhigh critic reasoning.
+
 ### Fixed
 
 - Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
