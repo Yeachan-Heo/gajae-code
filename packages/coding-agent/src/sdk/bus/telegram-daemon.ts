@@ -1298,6 +1298,28 @@ export function isPermanentMissingPathError(error: unknown): boolean {
 	return code === "ENOENT" || code === "ENOTDIR";
 }
 
+/**
+ * Shape of an abandoned `writeJsonAtomic` staging file:
+ * `<published-name>.<pid>.<epoch-ms>.<base36-suffix>.tmp`.
+ *
+ * Publication stages a sibling temp and then renames it over the destination.
+ * If the staging write or the rename fails, or the process dies between the
+ * two, that temp is never published and never read again — no prefix in
+ * {@link NOTIFICATION_LEAK_ARTIFACT_PREFIXES} claimed it, so it accumulated in
+ * the agent notifications directory permanently, once per failed attempt.
+ *
+ * Reaping it here (rather than only unwinding in the writer) also reclaims
+ * temps orphaned by a crash or power loss, which no writer-side cleanup can
+ * reach. The caller's mtime grace window is what makes this safe: a temp that
+ * an in-flight publication is still staging is far younger than the grace, so
+ * only genuinely abandoned files are removed.
+ */
+const NOTIFICATION_STAGING_TEMP_PATTERN = /^.+\.\d+\.\d+\.[0-9a-z]+\.tmp$/;
+
+/** True when `name` is an abandoned publication staging temp. */
+export function isNotificationStagingTempName(name: string): boolean {
+	return NOTIFICATION_STAGING_TEMP_PATTERN.test(name);
+}
 export function isNotificationLeakArtifactName(name: string): boolean {
 	return NOTIFICATION_LEAK_ARTIFACT_PREFIXES.some(prefix => name.startsWith(prefix));
 }
@@ -1433,7 +1455,7 @@ export async function reapStaleNotificationArtifacts(input: {
 		throw error;
 	}
 	for (const name of names) {
-		if (!isNotificationLeakArtifactName(name)) continue;
+		if (!isNotificationLeakArtifactName(name) && !isNotificationStagingTempName(name)) continue;
 		const file = path.join(paths.dir, name);
 		try {
 			const stat = fsImpl.stat ? await fsImpl.stat(file) : undefined;
