@@ -86,7 +86,7 @@ describe("AgentSession message pipeline", () => {
 			...(payload as Record<string, unknown>),
 			session: true,
 		}));
-		const requestOnPayload = vi.fn(async () => undefined);
+		const requestOnPayload = vi.fn(async (_payload: unknown) => undefined);
 		const session = new AgentSession({
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
@@ -103,13 +103,15 @@ describe("AgentSession message pipeline", () => {
 		const prepared = session.prepareSimpleStreamOptions(options);
 		const result = await prepared.onPayload?.({ original: true });
 
-		expect(sessionOnPayload).toHaveBeenCalledWith({ original: true }, undefined);
-		expect(requestOnPayload).toHaveBeenCalledWith({ original: true, session: true }, undefined);
+		expect(sessionOnPayload.mock.calls.length).toBe(1);
+		expect(sessionOnPayload.mock.calls[0]?.[0]).toEqual({ original: true });
+		expect(requestOnPayload.mock.calls.length).toBe(1);
+		expect(requestOnPayload.mock.calls[0]?.[0]).toEqual({ original: true, session: true });
 		expect(result).toEqual({ original: true, session: true });
 	});
 
 	it("records raw SSE diagnostics into the session buffer before request hooks", async () => {
-		const requestOnSseEvent = vi.fn();
+		const requestOnSseEvent = vi.fn((_event: unknown) => {});
 		const session = new AgentSession({
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
@@ -123,10 +125,12 @@ describe("AgentSession message pipeline", () => {
 		prepared.onSseEvent?.({ event: "message", data: "{}", raw: ["event: message", "data: {}"] });
 
 		expect(session.rawSseDebugBuffer.snapshot().totalEvents).toBe(1);
-		expect(requestOnSseEvent).toHaveBeenCalledWith(
-			{ event: "message", data: "{}", raw: ["event: message", "data: {}"] },
-			undefined,
-		);
+		expect(requestOnSseEvent.mock.calls.length).toBe(1);
+		expect(requestOnSseEvent.mock.calls[0]?.[0]).toEqual({
+			event: "message",
+			data: "{}",
+			raw: ["event: message", "data: {}"],
+		});
 	});
 
 	it("emits message_update to session listeners before slow extension handlers finish", async () => {
@@ -198,7 +202,19 @@ describe("AgentSession message pipeline", () => {
 	});
 
 	it("forwards stop reasons and reasoning summaries to extension handlers", async () => {
-		const extensionEmit = vi.fn(async () => {});
+		const extensionEmit = vi.fn(
+			async (
+				_event: {
+					type: string;
+					messages?: unknown[];
+					stopReason?: string;
+					contentIndex?: number;
+					content?: string;
+				},
+				_continueWhile?: () => boolean,
+				_scope?: unknown,
+			) => {},
+		);
 		const session = new AgentSession({
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
@@ -225,15 +241,17 @@ describe("AgentSession message pipeline", () => {
 		await Bun.sleep(0);
 		await Bun.sleep(0);
 
-		expect(extensionEmit).toHaveBeenCalledWith({ type: "agent_end", messages: [], stopReason: "cancelled" });
-		expect(extensionEmit).toHaveBeenCalledWith(
+		const emittedEvents = extensionEmit.mock.calls.map(([event]) => event);
+		expect(emittedEvents).toContainEqual({ type: "agent_end", messages: [], stopReason: "cancelled" });
+		const reasoningCall = extensionEmit.mock.calls.find(([event]) => event?.type === "reasoning_summary_end");
+		expect(reasoningCall?.[0]).toEqual(
 			expect.objectContaining({
 				type: "reasoning_summary_end",
 				contentIndex: 0,
 				content: "safe summary",
 			}),
-			expect.any(Function),
 		);
+		expect(typeof reasoningCall?.[1]).toBe("function");
 	});
 
 	it("drains pre-terminal reasoning summaries through slow extension handlers and drops post-terminal updates", async () => {
