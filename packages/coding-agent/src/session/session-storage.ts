@@ -1227,7 +1227,7 @@ export class FileSessionStorage implements SessionStorage {
 			if (!deletion.ok) {
 				if (
 					deletion.code === "cleanup_pending" &&
-					deletion.payloadDurable === true &&
+					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 					deletion.retainedSuccessorPath === undefined &&
 					deletion.retainedUnknownPath === undefined
 				)
@@ -1299,7 +1299,7 @@ export class FileSessionStorage implements SessionStorage {
 		if (!deletion.ok) {
 			if (
 				deletion.code === "cleanup_pending" &&
-				deletion.payloadDurable === true &&
+				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 				deletion.retainedSuccessorPath === undefined &&
 				deletion.retainedUnknownPath === undefined
 			)
