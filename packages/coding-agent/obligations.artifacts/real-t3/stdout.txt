@@ -1,0 +1,10 @@
+bun test v1.3.14 (0d9b296a)
+G3b REAL-CLIENT PASSED: version=0.0.28 bin.mjs.sha256=c69b9ebf8ddf0b30194616b49163bc5b6e3670be5549b81567b56f3dcd7aebd3 {"evidence":"turn/start observed"}
+
+src/app-server/__tests__/e2e/real-client-t3.test.ts:
+(pass) G3b REAL-CLIENT gate: T3 Code 0.0.28 drives GJC through its spawn contract <duration>
+
+ 1 pass
+ 0 fail
+ 24 expect() calls
+Ran 1 test across 1 file. <duration>
