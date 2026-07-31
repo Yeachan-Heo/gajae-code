@@ -3066,7 +3066,9 @@ export function restorePreparedArtifactRoot(
 		typeof identity.dev !== "string" ||
 		typeof identity.ino !== "string" ||
 		typeof identity.size !== "string" ||
-		typeof identity.mtimeNs !== "string"
+		typeof identity.mtimeNs !== "string" ||
+		typeof identity.parentDev !== "string" ||
+		typeof identity.parentIno !== "string"
 	)
 		throw new Error("durability_failed");
 	const artifactIdentity = {
@@ -3074,6 +3076,8 @@ export function restorePreparedArtifactRoot(
 		ino: BigInt(identity.ino),
 		size: BigInt(identity.size),
 		mtimeNs: BigInt(identity.mtimeNs),
+		parentDev: BigInt(identity.parentDev),
+		parentIno: BigInt(identity.parentIno),
 	};
 	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
 	const assertPreparedTree = (pathname: string): void => {
