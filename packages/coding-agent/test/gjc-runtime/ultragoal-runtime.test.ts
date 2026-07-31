@@ -4639,7 +4639,14 @@ describe("native GJC ultragoal runtime", () => {
 		await startNextUltragoalGoal({ cwd: root });
 		const qualityGateJson = await protectedPassingQualityGate(root);
 		protectedVerifierRestore?.();
-		protectedVerifierRestore = undefined;
+		const roots: Array<string | undefined> = [];
+		const verifierSpy = spyOn(obligationsVerifier, "verifyObligations").mockImplementation(
+			async (verifierRoot?: string) => {
+				roots.push(verifierRoot);
+				return { verified: [], blocked: ["oracle-stable"] };
+			},
+		);
+		protectedVerifierRestore = () => verifierSpy.mockRestore();
 		await expect(
 			checkpointUltragoalGoal({
 				cwd: root,
@@ -4649,6 +4656,9 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson,
 			}),
 		).rejects.toThrow("runtime obligations verifier blocked oracle-stable");
+		// The protected gate must evaluate the frozen manifest inside the GJC package, so the
+		// runtime passes no root at all: a consuming project's cwd can never supply its own.
+		expect(roots).toEqual([undefined]);
 	});
 
 	it("refuses protected membership in a deferred validation batch before accepting deferred evidence", async () => {
