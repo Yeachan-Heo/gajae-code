@@ -705,11 +705,11 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		const artifacts = await storage.deleteSessionVerified(target);
 		if (artifacts.kind !== "cleanup_pending" || artifacts.phase !== "artifacts")
 			throw new Error("Expected retained artifact cleanup");
-		expect(artifacts.detachedArtifactsPath).toBe(plannedArtifactsPath);
+		expect(artifacts.detachedArtifactsPath).toBe(`${plannedArtifactsPath}.removing`);
 
-		expect(artifacts.retainedPlaceholderPath).toEqual(expect.any(String));
+		expect(artifacts.retainedPlaceholderPath).toBeUndefined();
 		expect(fs.existsSync(artifactsDir)).toBe(false);
-		expect(fs.existsSync(plannedArtifactsPath)).toBe(true);
+		expect(fs.existsSync(`${plannedArtifactsPath}.removing`)).toBe(true);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
@@ -774,8 +774,8 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 
 			const error = await storage.deleteSessionVerified(target).catch(value => value);
 
-			expect(error).toBeInstanceOf(SessionDeleteVerificationError);
-			expect((error as SessionDeleteVerificationError).kind).toBe("artifacts");
+			expect(error).toMatchObject({ kind: "cleanup_pending", phase: "artifacts" });
+			expect((error as { error?: SessionDeleteVerificationError }).error?.kind).toBe("artifacts");
 			expect(fs.existsSync(transcriptPath)).toBe(true);
 			expect(fs.existsSync(artifactsDir)).toBe(false);
 		},
@@ -830,10 +830,10 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			});
 			if (result.kind !== "cleanup_pending" || result.phase !== "artifacts")
 				throw new Error("Expected pending tree cleanup");
-			expect(remove).not.toHaveBeenCalled();
-			expect(result.detachedArtifactsPath).toBe(plannedArtifactsPath);
+			expect(remove).toHaveBeenCalledTimes(1);
+			expect(result.detachedArtifactsPath).toBe(`${plannedArtifactsPath}.removing`);
 			expect(await fsp.stat(artifactsDir).catch(() => undefined)).toBeUndefined();
-			expect(await fsp.stat(plannedArtifactsPath)).toBeDefined();
+			expect(await fsp.stat(`${plannedArtifactsPath}.removing`)).toBeDefined();
 		} finally {
 			remove.mockRestore();
 		}
@@ -856,8 +856,8 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		const pending = await storage.deleteSessionVerified(target);
 		if (pending.kind !== "cleanup_pending" || pending.phase !== "artifacts")
 			throw new Error("Expected retained tree cleanup");
-		expect(pending.detachedArtifactsPath).toBe(plannedArtifactsPath);
-		expect(await fsp.stat(plannedArtifactsPath)).toBeDefined();
+		expect(pending.detachedArtifactsPath).toBe(`${plannedArtifactsPath}.removing`);
+		expect(await fsp.stat(`${plannedArtifactsPath}.removing`)).toBeDefined();
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
@@ -931,7 +931,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		if (partial.kind !== "cleanup_pending") throw new Error("unreachable");
 		expect(partial.phase).toBe("artifacts");
 		expect(partial.error).toBeInstanceOf(Error);
-		expect(partial.error.message).toBe("Exact artifact detach retained: cleanup_pending");
+		expect(partial.error.message).toBe("Exact detached artifact removal rejected: cleanup_pending");
 
 		// Exact retry evidence includes the full transcript snapshot and detached artifact path.
 		expect(partial.transcriptIdentity).toMatchObject({ dev: stat.dev, ino: stat.ino });
@@ -944,7 +944,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 		expect(fs.existsSync(artifactCleanup.detachedArtifactsPath)).toBe(true);
-		expect(artifactCleanup.retainedPlaceholderPath).toEqual(expect.any(String));
+		expect(artifactCleanup.retainedPlaceholderPath).toBeUndefined();
 	});
 
 	it("exactly removes a retained artifact root before reconciling an absent transcript", async () => {
@@ -1156,7 +1156,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		const artifactsPending = await storage.deleteSessionVerified(target);
 		if (artifactsPending.kind !== "cleanup_pending" || artifactsPending.phase !== "artifacts")
 			throw new Error("Expected retained artifact cleanup");
-		expect(artifactsPending.retainedPlaceholderPath).toEqual(expect.any(String));
+		expect(artifactsPending.detachedArtifactsPath).toEqual(expect.any(String));
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
@@ -1468,7 +1468,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		const artifactsPending = await storage.deleteSessionVerified(target);
 		if (artifactsPending.kind !== "cleanup_pending" || artifactsPending.phase !== "artifacts")
 			throw new Error("Expected retained artifact cleanup");
-		expect(artifactsPending.retainedPlaceholderPath).toEqual(expect.any(String));
+		expect(artifactsPending.detachedArtifactsPath).toEqual(expect.any(String));
 		expect(await fsp.readFile(transcriptPath, "utf8")).not.toContain('"raced"');
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 	});

@@ -803,6 +803,38 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 #[cfg_attr(clippy, doc = "")]
 /// identity. The detached and original paths must retain the same validated
 /// parent, and restoration never replaces an existing original path.
+/// Replace one exact destination with one exact staged source on Windows.
+#[napi]
+pub fn exact_replace_path(
+	source_path: String,
+	destination_path: String,
+	expected_source: NativeExactFileIdentity,
+	expected_destination: NativeExactFileIdentity,
+) -> NativeExactUnlinkResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	let Some(expected_source) = exact_file_identity(&expected_source) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	let Some(expected_destination) = exact_file_identity(&expected_destination) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	#[cfg(windows)]
+	{
+		platform::exact_replace_path(
+			Path::new(&source_path),
+			Path::new(&destination_path),
+			&expected_source,
+			&expected_destination,
+		)
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = (source_path, destination_path, expected_source, expected_destination);
+		NativeExactUnlinkResult::failure("unsupported_platform")
+	}
+}
 #[napi]
 pub fn exact_restore(
 	detached_path: String,
@@ -2710,9 +2742,26 @@ pub(crate) mod platform {
 				Err(_) => ExchangePlaceholderRemoval::RetainedMismatch(detached_name),
 			};
 		}
-		// POSIX only unlinks by mutable name. The identity proof cannot authorize
-		// a later unlinkat because a same-kind replacement may win that race.
-		ExchangePlaceholderRemoval::RetainedFailure(detached_name, "cleanup_pending")
+		// The detached entry is the exact empty internal placeholder just verified by
+		// device, inode, and kind; remove that bound name before returning success.
+		let flags = if expected.directory {
+			libc::AT_REMOVEDIR
+		} else {
+			0
+		};
+		// SAFETY: `parent_fd` and `detached_name` bind the verified detached
+		// placeholder.
+		if unsafe { libc::unlinkat(parent_fd, detached_name.as_ptr(), flags) } != 0 {
+			return ExchangePlaceholderRemoval::RetainedFailure(
+				detached_name,
+				security_code(&std::io::Error::last_os_error()),
+			);
+		}
+		// SAFETY: `parent_fd` remains live and synchronizes placeholder removal.
+		if unsafe { libc::fsync(parent_fd) } != 0 {
+			return ExchangePlaceholderRemoval::RetainedFailure(detached_name, "durability_failed");
+		}
+		ExchangePlaceholderRemoval::Removed
 	}
 
 	fn digest_openat(parent_fd: libc::c_int, name: &CString) -> Result<[u8; 32], &'static str> {
@@ -2727,6 +2776,75 @@ pub(crate) mod platform {
 		// SAFETY: this uniquely transfers the live descriptor to `File` ownership.
 		let mut file = unsafe { File::from_raw_fd(fd) };
 		digest_reader(&mut file).map_err(|_| "io_error")
+	}
+
+	fn scrub_regular_file_openat(
+		parent_fd: libc::c_int,
+		name: &CString,
+		identity: &ExactFileIdentity,
+	) -> Result<(), &'static str> {
+		// SAFETY: `parent_fd` and `name` are live and opened without following links.
+		let fd = unsafe {
+			libc::openat(parent_fd, name.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		};
+		if fd < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		let result = (|| {
+			for _ in 0..2 {
+				// SAFETY: zero is a valid initialized representation for `fstat` output.
+				let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+				// SAFETY: `fd` is live and `stat` is writable.
+				if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+					return Err(security_code(&std::io::Error::last_os_error()));
+				}
+				if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+					|| stat.st_dev as u64 != identity.dev
+					|| stat.st_ino as u64 != identity.ino
+					|| stat.st_nlink != 1
+					|| stat.st_size as u64 != identity.size
+					|| stat_mtime_ns(&stat) != i128::from(identity.mtime_ns)
+				{
+					return Err("identity_mismatch");
+				}
+				// SAFETY: `fd` is live and seeking resets the digest offset.
+				if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+					return Err(security_code(&std::io::Error::last_os_error()));
+				}
+				// SAFETY: `fd` is live; the duplicate transfers exactly once to `File`.
+				let duplicated = unsafe { libc::dup(fd) };
+				if duplicated < 0 {
+					return Err(security_code(&std::io::Error::last_os_error()));
+				}
+				// SAFETY: `duplicated` is uniquely owned here.
+				let mut file = unsafe { File::from_raw_fd(duplicated) };
+				if digest_reader(&mut file).ok().as_ref() != identity.sha256.as_ref() {
+					return Err("identity_mismatch");
+				}
+			}
+			// Unlink the twice-verified namespace before truncating the still-open
+			// descriptor. SAFETY: `parent_fd` and `name` bind the exact opened no-follow
+			// entry.
+			if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } != 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			// SAFETY: `parent_fd` remains live for durable namespace commit.
+			if unsafe { libc::fsync(parent_fd) } != 0 {
+				return Err("durability_failed");
+			}
+			// SAFETY: `fd` is the live now-unlinked exact transcript descriptor.
+			if unsafe { libc::ftruncate(fd, 0) } != 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			// SAFETY: `fd` remains live and synchronizes the scrubbed payload.
+			if unsafe { libc::fsync(fd) } != 0 {
+				return Err("durability_failed");
+			}
+			Ok(())
+		})();
+		// SAFETY: this function owns `fd` and closes it once.
+		unsafe { libc::close(fd) };
+		result
 	}
 
 	pub(super) fn exact_unlink(
@@ -3066,24 +3184,20 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return result;
 		}
-		// POSIX has no descriptor-bound unlink. Retain the proven detached object
-		// and exchange placeholder rather than risk unlinking a replacement.
+		if let Err(code) = scrub_regular_file_openat(parent_fd, &quarantine, identity) {
+			// SAFETY: this error branch owns `parent_fd` and closes it exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::detached_failure(code, detached_path);
+		}
 		let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
-			ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
-				NativeExactUnlinkResult::detached_failure_with_placeholder(
-					code,
-					detached_path,
-					path
-						.parent()
-						.unwrap_or_else(|| Path::new("."))
-						.join(retained_name.to_string_lossy().as_ref())
-						.to_string_lossy()
-						.into_owned(),
-				)
+			ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
+			ExchangePlaceholderRemoval::RetainedFailure(_, code) => {
+				NativeExactUnlinkResult::failure(code)
 			},
-			_ => NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path),
+			ExchangePlaceholderRemoval::RetainedMismatch(_)
+			| ExchangePlaceholderRemoval::RestoredMismatch
+			| ExchangePlaceholderRemoval::Failed => NativeExactUnlinkResult::failure("cleanup_pending"),
 		};
-
 		// SAFETY: this branch owns the live descriptor and closes it exactly once.
 		unsafe { libc::close(parent_fd) };
 		result
@@ -3852,8 +3966,8 @@ mod platform {
 	use sha2::{Digest, Sha256};
 	use windows_sys::Win32::{
 		Foundation::{
-			CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError,
-			HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
+			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -3944,6 +4058,18 @@ mod platform {
 			return Err(last_error_code());
 		}
 		Ok(handle)
+	}
+
+	fn duplicate_process_handle(handle: HANDLE) -> Result<HANDLE, &'static str> {
+		let process = unsafe { GetCurrentProcess() };
+		let mut duplicate = INVALID_HANDLE_VALUE;
+		if unsafe {
+			DuplicateHandle(process, handle, process, &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS)
+		} == 0
+		{
+			return Err(last_error_code());
+		}
+		Ok(duplicate)
 	}
 
 	fn handle_attributes(handle: HANDLE) -> Result<u32, &'static str> {
@@ -4420,6 +4546,18 @@ mod platform {
 			&& mtime_ns == i128::from(identity.mtime_ns)
 	}
 
+	fn handles_same_object_checked(left: HANDLE, right: HANDLE) -> Result<bool, &'static str> {
+		let mut left_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let mut right_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(left, &mut left_information) } == 0
+			|| unsafe { GetFileInformationByHandle(right, &mut right_information) } == 0
+		{
+			return Err(last_error_code());
+		}
+		Ok(left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
+			&& left_information.nFileIndexHigh == right_information.nFileIndexHigh
+			&& left_information.nFileIndexLow == right_information.nFileIndexLow)
+	}
 	fn handles_same_object(left: HANDLE, right: HANDLE) -> bool {
 		let mut left_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		let mut right_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -4617,6 +4755,185 @@ mod platform {
 		match rename_handle_no_replace(source.target, destination_parent.target, &destination_name) {
 			Ok(()) => NativeExactUnlinkResult::success(),
 			Err(code) => NativeExactUnlinkResult::failure(code),
+		}
+	}
+	pub(super) fn exact_replace_path(
+		source_path: &Path,
+		destination_path: &Path,
+		expected_source: &ExactFileIdentity,
+		expected_destination: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		if expected_source.directory
+			|| expected_source.detach_only
+			|| expected_destination.directory
+			|| expected_destination.detach_only
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let source_path = match lexical_absolute_path(source_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		if source_path.parent() != destination_path.parent() {
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let source = match open_exact(
+			&source_path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+		) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+			},
+		};
+		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut source_information) } == 0
+			|| source_information.dwFileAttributes
+				& (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+				!= 0 || !handle_identity_matches(&source_information, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if source_information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let Some(parent_handle) = source.parent() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let Some(destination_name) = destination_path.file_name() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		// The destination is opened relative to the source's retained no-follow parent;
+		// no destination pathname is reopened after this point.
+		let destination_handle = match open_relative_with_share(
+			parent_handle,
+			destination_name,
+			FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
+			false,
+			FILE_SHARE_READ,
+		) {
+			Ok(handle) => handle,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let destination = HeldExact { target: destination_handle, ancestors: Vec::new() };
+
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return NativeExactUnlinkResult::failure("reparse_point");
+		}
+		if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+			|| !handle_identity_matches(&information, expected_destination)
+			|| digest_handle(destination.target).ok().as_ref() != expected_destination.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let mut revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut revalidated) } == 0
+			|| !handle_identity_matches(&revalidated, expected_destination)
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if revalidated.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		match handles_same_object_checked(source.target, destination.target) {
+			Ok(true) => return NativeExactUnlinkResult::failure("identity_mismatch"),
+			Ok(false) => {},
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		}
+		let mut source_revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut source_revalidated) } == 0
+			|| !handle_identity_matches(&source_revalidated, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if source_revalidated.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let retained_name_string =
+			format!(".gjc-exact-replace-source-{:x}-{:x}", expected_source.dev, expected_source.ino);
+		let retained_path = source_path.with_file_name(&retained_name_string);
+		let retained_name: Vec<u16> = retained_name_string.encode_utf16().collect();
+		if let Err(code) = rename_handle_no_replace(source.target, parent_handle, &retained_name) {
+			return NativeExactUnlinkResult::failure(code);
+		}
+		let retained_path_string = retained_path.to_string_lossy().into_owned();
+		let exclusive_parent = match duplicate_process_handle(parent_handle) {
+			Ok(handle) => handle,
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path_string),
+		};
+		drop(source);
+		let exclusive_source_handle = match open_relative_with_share(
+			exclusive_parent,
+			Path::new(&retained_name_string).as_os_str(),
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			false,
+			FILE_SHARE_READ,
+		) {
+			Ok(handle) => handle,
+			Err(code) => {
+				unsafe { CloseHandle(exclusive_parent) };
+				return NativeExactUnlinkResult::detached_failure(code, retained_path_string);
+			},
+		};
+		let source =
+			HeldExact { target: exclusive_source_handle, ancestors: vec![exclusive_parent] };
+		let parent_handle = exclusive_parent;
+		let mut retained_source: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut retained_source) } == 0
+			|| !handle_identity_matches(&retained_source, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::detached_failure(
+				"identity_mismatch",
+				retained_path_string,
+			);
+		}
+		if retained_source.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::detached_failure(
+				"hard_link_unsupported",
+				retained_path_string,
+			);
+		}
+		let mut destination_revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut destination_revalidated) }
+			== 0 || !handle_identity_matches(&destination_revalidated, expected_destination)
+			|| digest_handle(destination.target).ok().as_ref() != expected_destination.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::detached_failure(
+				"identity_mismatch",
+				retained_path_string,
+			);
+		}
+		if destination_revalidated.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::detached_failure(
+				"hard_link_unsupported",
+				retained_path_string,
+			);
+		}
+		if let Err(code) = delete_handle(destination.target) {
+			return NativeExactUnlinkResult::detached_failure(code, retained_path_string);
+		}
+		drop(destination);
+		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
+		match rename_handle_no_replace(source.target, parent_handle, &destination_name) {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			// Destination deletion committed, but the verified source remains at its
+			// deterministic retained path for bounded recovery.
+			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path_string),
 		}
 	}
 	pub(super) fn exact_unlink(
@@ -6322,10 +6639,10 @@ mod exact_unlink_placeholder_tests {
 		let result = unlink.join().expect("exact unlink thread");
 		platform::set_after_exchange_hook(None);
 		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
-		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+		assert!(matches!(result.code.as_deref(), Some("cleanup_pending" | "identity_mismatch")));
+		assert!(result.detached_path.is_none());
 		assert_eq!(fs::read(&target).expect("successor preserved"), b"live successor");
-		assert_eq!(fs::read(&stale).expect("stale quarantine retained"), b"stale");
+		assert!(!stale.exists(), "scrubbed stale quarantine was retained");
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
@@ -6378,10 +6695,11 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_exchange_hook(None);
 		assert!(!result.ok);
 		assert!(matches!(result.code.as_deref(), Some("cleanup_pending" | "identity_mismatch")));
-
-		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+		assert_eq!(result.detached_path.is_some(), target_is_directory);
 		assert_eq!(fs::metadata(&target).expect("stat successor").is_dir(), target_is_directory);
-		assert!(stale.exists(), "stale quarantine was not retained");
+		if !target_is_directory {
+			assert!(!stale.exists(), "scrubbed stale quarantine was retained");
+		}
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
@@ -6513,20 +6831,12 @@ mod exact_unlink_placeholder_tests {
 		resume_tx.send(()).expect("resume unlink");
 		let result = unlink.join().expect("exact unlink thread");
 		platform::set_after_placeholder_detach_hook(None);
-		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
-		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
-		let retained = result
-			.retained_placeholder_path
-			.expect("retained placeholder path");
-		assert_eq!(
-			fs::metadata(&retained)
-				.expect("stat retained placeholder")
-				.is_dir(),
-			target_is_directory
-		);
+		assert!(result.ok);
+		assert!(result.code.is_none());
+		assert_eq!(result.detached_path.is_some(), target_is_directory);
+		assert!(result.retained_placeholder_path.is_none());
 		assert_eq!(fs::metadata(&target).expect("stat successor").is_dir(), target_is_directory);
-		assert!(stale.exists(), "stale quarantine was not retained");
+		assert_eq!(stale.exists(), target_is_directory, "unexpected retained stale authority");
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
@@ -6602,9 +6912,9 @@ mod exact_unlink_placeholder_tests {
 
 		assert!(!result.ok);
 		assert!(matches!(result.code.as_deref(), Some("cleanup_pending" | "identity_mismatch")));
-		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+		assert!(result.detached_path.is_none());
 		assert_eq!(fs::read(&target).expect("read second successor"), b"second");
-		assert_eq!(fs::read(&stale).expect("read detached stale object"), b"stale");
+		assert!(!stale.exists(), "scrubbed stale object was retained");
 		let retained = fs::read_dir(&root)
 			.expect("read temporary directory")
 			.map(|entry| entry.expect("read temporary entry").path())
@@ -6693,14 +7003,11 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_placeholder_detach_hook(None);
 
 		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("cleanup_failed"));
+		assert_eq!(result.code.as_deref(), Some("io_error"));
 		assert!(result.detached_path.is_none());
 		assert!(result.retained_successor_path.is_none());
-		assert_eq!(
-			result.retained_placeholder_path.as_deref(),
-			Some(retained.to_string_lossy().as_ref())
-		);
-		assert!(retained.is_file(), "retained cleanup path is not a regular placeholder");
+		assert!(result.retained_placeholder_path.is_none());
+		assert!(!retained.exists(), "verified cleanup placeholder was retained");
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 

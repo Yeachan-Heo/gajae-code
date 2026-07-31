@@ -846,7 +846,10 @@ export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeD
  * Restore only the detached object that still has the supplied platform
  * identity. The detached and original paths must retain the same validated
  * parent, and restoration never replaces an existing original path.
+ * Replace one exact destination with one exact staged source on Windows.
  */
+export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
+
 export declare function exactRestore(detachedPath: string, originalPath: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
@@ -1988,6 +1991,7 @@ export declare function readImageFromClipboard(): Promise<ClipboardImage | undef
 export interface RecoveryFsIdentity {
   dev: string
   ino: string
+  nlink: string
   size: string
   mtimeNs: string
   ctimeNs: string

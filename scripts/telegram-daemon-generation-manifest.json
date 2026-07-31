@@ -553,7 +553,13 @@
     "telegram:packages/coding-agent/src/sdk/host/host.ts:TOOL_ACTIVITY_CAPABILITY": "547f80bd6b3bd1c615fc3d885e507aba4418e6c4c54c47d36938b8b2e5d2abd7"
   },
   "nativeAuthoritySha256": {
+<<<<<<< HEAD
     "crates/pi-natives/src/path_identity.rs": "90a5ac813f53dee0f9a81002f5971594c07f8a9bdf8d5f262737be1d8203aae1",
+||||||| parent of 7818b36d2 (fix(session): complete proven descriptor cleanup)
+    "crates/pi-natives/src/path_identity.rs": "b088cba689dc0196ec2a6a5cef65f91bfcccbd6254c48e24ed155ac670ae04ba",
+=======
+    "crates/pi-natives/src/path_identity.rs": "cde97e7f2178229570e275cd529df778ddb7e22103603111ee37298acd0d148b",
+>>>>>>> 7818b36d2 (fix(session): complete proven descriptor cleanup)
     "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
     "crates/pi-shell/src/process.rs": "45b222432a70eb056807507f8b4d28cf5fb73a7441ee9a0e28349ec85ef9b177",
     "crates/pi-shell/src/shell.rs": "66cacfe63d495b23156d023f2f34f354b657534ee3cdaf01e30d6694af253982",

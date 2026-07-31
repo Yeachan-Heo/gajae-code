@@ -210,6 +210,7 @@ fn sync_parent(parent: &File) -> std::io::Result<()> {
 pub struct RecoveryFsIdentity {
 	pub dev:      String,
 	pub ino:      String,
+	pub nlink:    String,
 	pub size:     String,
 	pub mtime_ns: String,
 	pub ctime_ns: String,
@@ -1287,6 +1288,7 @@ fn identity(file: &File) -> Result<RecoveryFsIdentity, &'static str> {
 	Ok(RecoveryFsIdentity {
 		dev:      stat.st_dev.to_string(),
 		ino:      stat.st_ino.to_string(),
+		nlink:    stat.st_nlink.to_string(),
 		size:     (stat.st_size as u64).to_string(),
 		mtime_ns: stat_mtime_ns(&stat).to_string(),
 		ctime_ns: stat_ctime_ns(&stat).to_string(),
@@ -1314,6 +1316,7 @@ fn regular_identity(file: &File) -> Result<RecoveryFsIdentity, &'static str> {
 	Ok(RecoveryFsIdentity {
 		dev:      stat.st_dev.to_string(),
 		ino:      stat.st_ino.to_string(),
+		nlink:    stat.st_nlink.to_string(),
 		size:     (stat.st_size as u64).to_string(),
 		mtime_ns: stat_mtime_ns(&stat).to_string(),
 		ctime_ns: stat_ctime_ns(&stat).to_string(),

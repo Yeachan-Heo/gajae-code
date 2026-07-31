@@ -779,6 +779,7 @@ function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): Manage
 				canonicalPath: path.resolve(filePath),
 				sessionId: header.id,
 				...snapshot.identity,
+				nlink: snapshot.identity.nlink,
 				mtimeMs: Number(named.mtimeMs),
 				sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
 			},
@@ -3376,12 +3377,14 @@ export async function reconcileManagedTombstones(
 							: (observedPending ?? nextCleanupReceipt(target, undefined));
 					if (!observedPending || discoveredDetach || requiresFreshCleanupPlan(observedPending))
 						await publishCleanupPending(scope, tombstone, active, lock);
+					const initialTarget = validateCandidateForScope(scope, target);
+					if (!initialTarget) throw new Error("source_changed");
 					let deletion = await deleteSessionVerifiedWithFence("reconcile", "initial", lock, {
 						sessionsRoot: scope.sessionsRoot,
 						transcriptPath: target.path,
 						sessionId: target.sessionId,
 						cwd: target.cwd,
-						transcriptIdentity: target.identity,
+						transcriptIdentity: initialTarget.identity,
 						expectedArtifactsIdentity: active.expectedArtifactsIdentity,
 						expectedArtifactsTree: active.expectedArtifactsTree,
 						detachedArtifactsPath:
@@ -3418,6 +3421,8 @@ export async function reconcileManagedTombstones(
 					if (deletion.kind === "artifacts_removed") {
 						await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
 						active = { ...active, artifactsRemovedAttempt: active.attempt };
+						const refreshedTarget = validateCandidateForScope(scope, target);
+						if (!refreshedTarget) throw new Error("source_changed");
 						deletion = await deleteSessionVerifiedWithFence(
 							"reconcile",
 							"transcript-after-artifacts-removed",
@@ -3427,7 +3432,7 @@ export async function reconcileManagedTombstones(
 								transcriptPath: target.path,
 								sessionId: target.sessionId,
 								cwd: target.cwd,
-								transcriptIdentity: target.identity,
+								transcriptIdentity: refreshedTarget.identity,
 								plannedArtifactsPath: active.plannedArtifactsPath,
 								plannedTranscriptPath: active.plannedTranscriptPath,
 								detachedTranscriptPath:
@@ -3478,6 +3483,8 @@ export async function reconcileManagedTombstones(
 								pendingEvidence.artifactsRemovedAttempt ?? pendingEvidence.attempt,
 							);
 							if (!retainedProof) throw new Error("durability_failed");
+							const refreshedTarget = validateCandidateForScope(scope, target);
+							if (!refreshedTarget) throw new Error("source_changed");
 							deletion = await deleteSessionVerifiedWithFence(
 								"reconcile",
 								"transcript-after-artifacts-removed",
@@ -3487,7 +3494,7 @@ export async function reconcileManagedTombstones(
 									transcriptPath: target.path,
 									sessionId: target.sessionId,
 									cwd: target.cwd,
-									transcriptIdentity: target.identity,
+									transcriptIdentity: refreshedTarget.identity,
 									plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
 									plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
 									detachedTranscriptPath:
@@ -4057,12 +4064,14 @@ async function deleteManagedSessionCandidateInternal(
 					: (observedPending ?? nextCleanupReceipt(target, undefined));
 			if (!observedPending || discoveredDetach || requiresFreshCleanupPlan(observedPending))
 				await publishCleanupPending(scope, tombstone, active, lock);
+			const initialTarget = validateCandidateForScope(scope, target);
+			if (!initialTarget) throw new Error("source_changed");
 			let deletion = await deleteSessionVerifiedWithFence("direct", "initial", lock, {
 				sessionsRoot: scope.sessionsRoot,
 				transcriptPath: target.path,
 				sessionId: target.sessionId,
 				cwd: target.cwd,
-				transcriptIdentity: target.identity,
+				transcriptIdentity: initialTarget.identity,
 				expectedArtifactsIdentity: active.expectedArtifactsIdentity,
 				expectedArtifactsTree: active.expectedArtifactsTree,
 				detachedArtifactsPath: active.detachedArtifactsPath ?? observedPending?.detachedArtifactsPath,
@@ -4090,12 +4099,14 @@ async function deleteManagedSessionCandidateInternal(
 			if (deletion.kind === "artifacts_removed") {
 				await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
 				active = { ...active, artifactsRemovedAttempt: active.attempt };
+				const refreshedTarget = validateCandidateForScope(scope, target);
+				if (!refreshedTarget) throw new Error("source_changed");
 				deletion = await deleteSessionVerifiedWithFence("direct", "transcript-after-artifacts-removed", lock, {
 					sessionsRoot: scope.sessionsRoot,
 					transcriptPath: target.path,
 					sessionId: target.sessionId,
 					cwd: target.cwd,
-					transcriptIdentity: target.identity,
+					transcriptIdentity: refreshedTarget.identity,
 					plannedArtifactsPath: active.plannedArtifactsPath,
 					plannedTranscriptPath: active.plannedTranscriptPath,
 					detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
@@ -4148,6 +4159,8 @@ async function deleteManagedSessionCandidateInternal(
 						pendingEvidence.artifactsRemovedAttempt ?? pendingEvidence.attempt,
 					);
 					if (!retainedProof) throw new Error("durability_failed");
+					const refreshedTarget = validateCandidateForScope(scope, target);
+					if (!refreshedTarget) throw new Error("source_changed");
 					deletion = await deleteSessionVerifiedWithFence(
 						"direct",
 						"transcript-after-artifacts-removed",
@@ -4157,7 +4170,7 @@ async function deleteManagedSessionCandidateInternal(
 							transcriptPath: target.path,
 							sessionId: target.sessionId,
 							cwd: target.cwd,
-							transcriptIdentity: target.identity,
+							transcriptIdentity: refreshedTarget.identity,
 							plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
 							plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
 							detachedTranscriptPath:
