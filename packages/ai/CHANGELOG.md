@@ -4,6 +4,7 @@
 ### Fixed
 
 - Alibaba Token Plan requests now carry Qwen Code's canonical DashScope request fingerprint on both transports. The built-in `alibaba-token-plan` provider (openai-responses `qwen3.8-max-preview` and openai-completions `glm-5.2`/`deepseek-v4-pro`) now emits the four upstream identity/cache/auth headers (`User-Agent`, `X-DashScope-CacheControl: enable`, `X-DashScope-UserAgent`, `X-DashScope-AuthType: openai`) matching `QwenLM/qwen-code` v0.21.1 (commit `f4cd6e1`) exactly, via a shared helper. DashScope is compatibility-sensitive to this client fingerprint, so a non-identical set can cause request instability and affect first-event latency. Caller headers still win per key (upstream `{...default, ...customHeaders}` precedence); non-Alibaba providers are byte-unchanged (#3557).
+- AWS EventStream decoding now bounds standard payload and header sizes, validates preludes before waiting for frame bodies, rejects malformed or duplicate typed headers, and cancels invalid streams.
 
 ### Added
 

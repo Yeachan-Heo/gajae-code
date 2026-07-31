@@ -22,6 +22,27 @@ const PRELUDE_CRC_LEN = 4;
 const MESSAGE_CRC_LEN = 4;
 const HEADER_BLOCK_OFFSET = PRELUDE_LEN + PRELUDE_CRC_LEN;
 const MIN_MESSAGE_LEN = HEADER_BLOCK_OFFSET + MESSAGE_CRC_LEN;
+// AWS EventStream permits 24 MiB payloads and 128 KiB headers. These
+// protocol-compatible bounds prevent an unfinished hostile frame from retaining
+// unbounded memory, while rejecting only nonstandard larger messages.
+const MAX_PAYLOAD_LEN = 24 * 1024 * 1024;
+const MAX_HEADERS_LEN = 128 * 1024;
+const MAX_MESSAGE_LEN = MAX_PAYLOAD_LEN + MAX_HEADERS_LEN + MIN_MESSAGE_LEN;
+const MAX_VARIABLE_HEADER_VALUE_LEN = 32_767;
+
+function validateFrameLengths(total: number, headersLen?: number): void {
+	if (total < MIN_MESSAGE_LEN) throw new Error(`eventstream: total length ${total} below minimum`);
+	if (total > MAX_MESSAGE_LEN)
+		throw new Error(`eventstream: total length ${total} exceeds maximum ${MAX_MESSAGE_LEN}`);
+	if (headersLen === undefined) return;
+	if (headersLen > MAX_HEADERS_LEN)
+		throw new Error(`eventstream: header length ${headersLen} exceeds maximum ${MAX_HEADERS_LEN}`);
+	const payloadLen = total - headersLen - MIN_MESSAGE_LEN;
+	if (payloadLen < 0)
+		throw new Error(`eventstream: header length ${headersLen} exceeds frame body ${total - MIN_MESSAGE_LEN}`);
+	if (payloadLen > MAX_PAYLOAD_LEN)
+		throw new Error(`eventstream: payload length ${payloadLen} exceeds maximum ${MAX_PAYLOAD_LEN}`);
+}
 
 export interface EventStreamMessage {
 	/** Lower-cased copy is *not* applied — Bedrock uses casing like `:event-type` verbatim. */
@@ -56,8 +77,9 @@ export function decodeMessage(frame: Uint8Array): EventStreamMessage {
 	if (frame.length < MIN_MESSAGE_LEN) throw new Error("eventstream: frame too short");
 	const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
 	const total = view.getUint32(0, false);
-	if (total !== frame.length) throw new Error(`eventstream: framed length ${total} != buffer ${frame.length}`);
 	const headersLen = view.getUint32(4, false);
+	validateFrameLengths(total, headersLen);
+	if (total !== frame.length) throw new Error(`eventstream: framed length ${total} != buffer ${frame.length}`);
 	const preludeCrc = view.getUint32(8, false);
 	const computedPreludeCrc = crc32(frame.subarray(0, PRELUDE_LEN));
 	if (computedPreludeCrc !== preludeCrc) throw new Error("eventstream: prelude CRC mismatch");
@@ -73,66 +95,88 @@ export function decodeMessage(frame: Uint8Array): EventStreamMessage {
 function parseHeaders(buf: Uint8Array): Record<string, string> {
 	const out: Record<string, string> = {};
 	const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-	const decoder = new TextDecoder();
+	const decoder = new TextDecoder("utf-8", { fatal: true });
 	let p = 0;
+
+	const take = (length: number, description: string): Uint8Array => {
+		if (length > buf.length - p) throw new Error(`eventstream: truncated ${description}`);
+		const value = buf.subarray(p, p + length);
+		p += length;
+		return value;
+	};
+	const readInteger = (length: number, description: string): DataView => {
+		const bytes = take(length, description);
+		return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	};
+	const decodeUtf8 = (bytes: Uint8Array, description: string): string => {
+		try {
+			return decoder.decode(bytes);
+		} catch {
+			throw new Error(`eventstream: invalid UTF-8 ${description}`);
+		}
+	};
+	const readVariableLength = (description: string): number => {
+		const length = readInteger(2, `${description} length`).getUint16(0, false);
+		if (length < 1 || length > MAX_VARIABLE_HEADER_VALUE_LEN)
+			throw new Error(`eventstream: ${description} length ${length} outside 1..${MAX_VARIABLE_HEADER_VALUE_LEN}`);
+		return length;
+	};
+	const setHeader = (name: string, value: string): void => {
+		Object.defineProperty(out, name, { value, enumerable: true, writable: true, configurable: true });
+	};
+
 	while (p < buf.length) {
 		const nameLen = view.getUint8(p);
 		p += 1;
-		const name = decoder.decode(buf.subarray(p, p + nameLen));
-		p += nameLen;
+		if (nameLen === 0) throw new Error("eventstream: empty header name");
+		const name = decodeUtf8(take(nameLen, "header name"), "header name");
+		if (Object.hasOwn(out, name)) throw new Error(`eventstream: duplicate header "${name}"`);
+		if (p >= buf.length) throw new Error("eventstream: truncated header value type");
 		const type = view.getUint8(p);
 		p += 1;
 		switch (type) {
 			case 0: // bool true
-				out[name] = "true";
+				setHeader(name, "true");
 				break;
 			case 1: // bool false
-				out[name] = "false";
+				setHeader(name, "false");
 				break;
 			case 2: // byte
-				out[name] = String(view.getInt8(p));
-				p += 1;
+				setHeader(name, String(readInteger(1, "byte header value").getInt8(0)));
 				break;
 			case 3: // short
-				out[name] = String(view.getInt16(p, false));
-				p += 2;
+				setHeader(name, String(readInteger(2, "short header value").getInt16(0, false)));
 				break;
 			case 4: // integer
-				out[name] = String(view.getInt32(p, false));
-				p += 4;
+				setHeader(name, String(readInteger(4, "integer header value").getInt32(0, false)));
 				break;
 			case 5: // long — surface as decimal string to avoid precision loss
-				out[name] = bigIntFromBytes(buf.subarray(p, p + 8)).toString();
-				p += 8;
+				setHeader(name, bigIntFromBytes(take(8, "long header value")).toString());
 				break;
 			case 6: {
 				// byte array — base64 for safe transport
-				const len = view.getUint16(p, false);
-				p += 2;
-				out[name] = Buffer.from(buf.buffer, buf.byteOffset + p, len).toString("base64");
-				p += len;
+				const len = readVariableLength("byte array header value");
+				setHeader(name, Buffer.from(take(len, "byte array header value")).toString("base64"));
 				break;
 			}
 			case 7: {
 				// string
-				const len = view.getUint16(p, false);
-				p += 2;
-				out[name] = decoder.decode(buf.subarray(p, p + len));
-				p += len;
+				const len = readVariableLength("string header value");
+				setHeader(name, decodeUtf8(take(len, "string header value"), "string header value"));
 				break;
 			}
 			case 8: // timestamp (ms since epoch as i64)
-				out[name] = new Date(Number(bigIntFromBytes(buf.subarray(p, p + 8)))).toISOString();
-				p += 8;
+				setHeader(name, new Date(Number(bigIntFromBytes(take(8, "timestamp header value")))).toISOString());
 				break;
 			case 9: {
 				// uuid
-				const u = buf.subarray(p, p + 16);
+				const u = take(16, "uuid header value");
 				const hex: string[] = [];
 				for (let i = 0; i < 16; i++) hex.push(u[i].toString(16).padStart(2, "0"));
-				out[name] =
-					`${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
-				p += 16;
+				setHeader(
+					name,
+					`${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`,
+				);
 				break;
 			}
 			default:
@@ -158,27 +202,96 @@ function bigIntFromBytes(b: Uint8Array): bigint {
  */
 export async function* decodeEventStream(source: ReadableStream<Uint8Array>): AsyncGenerator<EventStreamMessage> {
 	const reader = source.getReader();
-	// Single growable buffer; we slide a read cursor along it and compact when a
-	// complete prefix has been consumed. Avoids per-message Uint8Array copies.
-	let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+	// Keep source chunks until a whole frame is available. This avoids repeated
+	// whole-buffer copies under one-byte fragmentation; only split frames copy once.
+	const chunks: Uint8Array[] = [];
+	let chunkStart = 0;
+	let bufferedLength = 0;
+
+	const byteAt = (offset: number): number => {
+		for (let i = chunkStart; i < chunks.length; i++) {
+			const chunk = chunks[i];
+			if (offset < chunk.length) return chunk[offset];
+			offset -= chunk.length;
+		}
+		throw new Error("eventstream: internal buffer underflow");
+	};
+	const readUint32 = (offset: number): number =>
+		(byteAt(offset) * 0x1000000 + (byteAt(offset + 1) << 16) + (byteAt(offset + 2) << 8) + byteAt(offset + 3)) >>> 0;
+	const prefix = (length: number): Uint8Array => {
+		const first = chunks[chunkStart];
+		if (first.length >= length) return first.subarray(0, length);
+		const result = new Uint8Array(length);
+		let offset = 0;
+		for (let i = chunkStart; i < chunks.length; i++) {
+			const chunk = chunks[i];
+			const copied = Math.min(chunk.length, length - offset);
+			result.set(chunk.subarray(0, copied), offset);
+			offset += copied;
+			if (offset === length) return result;
+		}
+		throw new Error("eventstream: internal buffer underflow");
+	};
+	const consume = (length: number): void => {
+		bufferedLength -= length;
+		while (length > 0) {
+			const chunk = chunks[chunkStart];
+			if (length < chunk.length) {
+				chunks[chunkStart] = chunk.subarray(length);
+				if (chunkStart > 1024 && chunkStart * 2 > chunks.length) {
+					chunks.splice(0, chunkStart);
+					chunkStart = 0;
+				}
+				return;
+			}
+			length -= chunk.length;
+			chunkStart += 1;
+		}
+		if (chunkStart > 1024 && chunkStart * 2 > chunks.length) {
+			chunks.splice(0, chunkStart);
+			chunkStart = 0;
+		}
+	};
+
 	try {
 		while (true) {
 			const { value, done } = await reader.read();
-			if (value && value.length > 0) buf = buf.length === 0 ? value : Buffer.concat([buf, value]);
-			let offset = 0;
-			while (buf.length - offset >= 4) {
-				const dv = new DataView(buf.buffer, buf.byteOffset + offset, buf.length - offset);
-				const total = dv.getUint32(0, false);
-				if (total < MIN_MESSAGE_LEN) throw new Error(`eventstream: total length ${total} below minimum`);
-				if (buf.length - offset < total) break;
-				const frame = buf.subarray(offset, offset + total);
-				yield decodeMessage(frame);
-				offset += total;
+			if (value && value.length > 0) {
+				chunks.push(value);
+				bufferedLength += value.length;
 			}
-			if (offset > 0) buf = buf.slice(offset);
+
+			while (bufferedLength >= 4) {
+				const total = readUint32(0);
+				validateFrameLengths(total);
+				if (bufferedLength < HEADER_BLOCK_OFFSET) break;
+
+				const headersLen = readUint32(4);
+				validateFrameLengths(total, headersLen);
+				const prelude = prefix(HEADER_BLOCK_OFFSET);
+				const preludeCrc = new DataView(prelude.buffer, prelude.byteOffset, prelude.byteLength).getUint32(
+					PRELUDE_LEN,
+					false,
+				);
+				if (crc32(prelude.subarray(0, PRELUDE_LEN)) !== preludeCrc)
+					throw new Error("eventstream: prelude CRC mismatch");
+
+				if (bufferedLength < total) break;
+				const frame = prefix(total);
+				const message = decodeMessage(frame);
+				consume(total);
+				yield message;
+			}
 			if (done) break;
 		}
-		if (buf.length > 0) throw new Error("eventstream: truncated message at end of stream");
+		if (bufferedLength > 0) throw new Error("eventstream: truncated message at end of stream");
+	} catch (error) {
+		try {
+			await reader.cancel(error);
+		} catch {
+			// Preserve the framing error if cancellation itself fails.
+		}
+		throw error;
 	} finally {
 		reader.releaseLock();
 	}
