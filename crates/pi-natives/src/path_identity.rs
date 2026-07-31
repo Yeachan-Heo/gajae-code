@@ -5489,7 +5489,12 @@ mod platform {
 		match rename_handle(source.target, parent_handle, &destination_name, false) {
 			Ok(()) => match delete_handle(destination.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
-				Err(_) => NativeExactUnlinkResult::success(),
+				Err(code) => NativeExactUnlinkResult::detached_failure_with_successor_and_placeholder(
+					code,
+					retained_path_string,
+					destination_path.to_string_lossy().into_owned(),
+					predecessor_path_string,
+				),
 			},
 			Err(code) => {
 				let restored_destination =

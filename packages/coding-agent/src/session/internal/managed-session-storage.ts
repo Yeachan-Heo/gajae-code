@@ -1656,7 +1656,17 @@ export function replaceManagedFileSync(
 							`managed_replace_failed:${replaced.code ?? "unknown"}:retained=${replaced.detachedPath}:restore=${restored.code ?? "unknown"}`,
 						);
 				}
-				throw new Error(`managed_replace_failed:${replaced.code ?? "unknown"}`);
+				const retained = [
+					replaced.detachedPath,
+					replaced.retainedSuccessorPath,
+					replaced.retainedPlaceholderPath,
+					replaced.retainedUnknownPath,
+				]
+					.filter((pathname): pathname is string => typeof pathname === "string")
+					.join(",");
+				throw new Error(
+					`managed_replace_failed:${replaced.code ?? "unknown"}${retained ? `:retained=${retained}` : ""}`,
+				);
 			}
 		} else fs.renameSync(staging, destination);
 		assertFence?.();
