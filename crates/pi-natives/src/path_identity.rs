@@ -3160,7 +3160,9 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
-		if !identity.directory && (named.st_nlink != 1 || identity.nlink != Some(1)) {
+		if !identity.directory
+			&& (named.st_nlink != 1 || identity.nlink.is_some_and(|nlink| nlink != 1))
+		{
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
