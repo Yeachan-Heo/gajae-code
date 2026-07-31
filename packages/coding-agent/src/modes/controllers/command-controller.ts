@@ -1177,11 +1177,8 @@ export class CommandController {
 			}
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
-		const bashComponent = this.ctx.bashComponent;
-		if (isDeferred && bashComponent && this.ctx.pendingBashComponents.includes(bashComponent)) {
-			this.ctx.pendingMessagesContainer.detachChild(bashComponent);
-		}
-
+		// Deferred components stay pending until the next prompt persists their session messages
+		// and moves the same component into the chat transcript.
 		this.ctx.bashComponent = undefined;
 		this.ctx.ui.requestRender();
 	}
