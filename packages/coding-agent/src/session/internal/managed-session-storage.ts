@@ -716,8 +716,13 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			const expected = captureManagedFileNoFollow(resolved);
-			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
+			try {
+				const expected = captureManagedFileNoFollow(resolved);
+				replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				await publishManagedFileNoReplace(resolved, bytes, undefined, this.#subtreeRoot, this.#policy);
+			}
 			this.#assertBound();
 			return;
 		}
@@ -767,8 +772,13 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			const expected = captureManagedFileNoFollow(resolved);
-			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
+			try {
+				const expected = captureManagedFileNoFollow(resolved);
+				replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				publishManagedFileNoReplaceSync(resolved, bytes, this.#subtreeRoot, this.#policy);
+			}
 			this.#assertBound();
 			return;
 		}
