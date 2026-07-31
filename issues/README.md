@@ -28,3 +28,13 @@ dogfood (issues 01–08, 11–21) plus low-fruit fixes #3594 and #3470:
 
 Historical issue descriptions remain in `archive/` for provenance only; they are
 not active work.
+
+## Stage 12 residual defect triage (durable goal G010)
+
+| Issue | Disposition | Summary |
+| --- | --- | --- |
+| [22](22-verified-delete-partial-cleanup-evidence.md) | FIX — enforced, coverage proven | The named verified-delete defect does not reproduce at this commit; the typed `cleanup_pending` guarantee is enforced and the test is proven load-bearing by a mutation red→green receipt. |
+| [23](23-broker-child-spawn-environment-block.md) | ENVIRONMENT BLOCK | The sandbox denies the broker child spawn (`spawn_failed`, then `terminal_uncertain`). Labelled honestly; no silent skip. |
+| [24](24-cli-command-surface-missing-app-server.md) | FIXED | The CLI inventory guard did not list the shipped `app-server` command. Red→green receipt included; the guard keeps its exact-list strength. |
+| [25](25-managed-migration-receipt-guards-residual.md) | FIX, owned elsewhere | Two managed-migration guard failures in `session-manager-resume-readonly`: source-identity drift is not rejected, and the wrong fail-closed guard fires on replaced authority. Owned by managed-session storage. |
+| [26](26-stage12-residual-defect-inventory.md) | INVENTORY | All 46 full-suite failures across 23 suites with exact commands, plus the isolation runs that separate real defects from full-run interference and environment blocks. |
