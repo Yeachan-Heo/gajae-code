@@ -30,6 +30,7 @@ export const LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS = [
 ] as const;
 
 export type LightThemeConsumerAtlasViewport = (typeof LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS)[number];
+export const LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM = "darwin" as const;
 
 export const LIGHT_THEME_CONSUMER_ATLAS_PRODUCTION_IMPORTS = [
 	"packages/coding-agent/src/modes/components/provider-onboarding-selector.ts",
@@ -236,6 +237,9 @@ export function renderLightThemeConsumerAtlas(viewport: LightThemeConsumerAtlasV
 			[{ name: "atlas-session", timeAgo: "1m" }],
 			[],
 			"ascii",
+			{
+				keyDisplayContext: { platform: LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM },
+			},
 		);
 		disposables.push(welcome);
 		lines.push(...renderComponent(welcome, viewport.columns));

@@ -630,6 +630,7 @@ repeated in metadata, the HTML theme declaration, the SVG display list, PNG
 sentinel samples, and the manifest. Unknown names, duplicate theme sentinel
 hashes, or any requested/resolved/key/role/sentinel mismatch fail before a
 complete entry is written.
+Production evidence fixtures must inject every host-sensitive display input while still rendering the real production component. The status scene fixes its project directory and Git snapshot; the consumer atlas passes an explicit Darwin `KeyDisplayContext` to `WelcomeComponent`. Neither scene may derive retained text from the validator host's clone path, branch, worktree state, or `process.platform`. Regression coverage must render the canonical labels on non-Darwin replay hosts rather than weakening the production plain/ANSI byte comparison.
 
 ### PNG, fonts, and capture environment
 

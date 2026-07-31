@@ -38,7 +38,10 @@ import {
 	type LightThemeComplianceEntry,
 	renderLightThemeComplianceShowcase,
 } from "./fixtures/tui/light-theme-compliance-showcase";
-import { LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS } from "./fixtures/tui/light-theme-consumer-atlas";
+import {
+	LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM,
+	LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS,
+} from "./fixtures/tui/light-theme-consumer-atlas";
 
 interface ArtifactFile {
 	path: string;
@@ -1213,6 +1216,19 @@ describe("GJC light-theme compliance fixture", () => {
 		}
 	}, 30_000);
 
+	it("pins consumer-atlas key labels independently of the replay host platform", async () => {
+		expect(LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM).toBe("darwin");
+		const entries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas");
+		for (const entry of entries) {
+			const rendered = await renderLightThemeComplianceShowcase(entry);
+			expect(rendered.terminalText, entry.key).toContain("⌃L model");
+			expect(rendered.terminalText, entry.key).toContain("⇧⇥ reasoning");
+			expect(rendered.terminalText, entry.key).toContain("⇥ complete");
+			expect(rendered.terminalText, entry.key).toContain("⌃J newline");
+			expect(rendered.terminalText, entry.key).toContain("⌃C clear");
+			expect(rendered.terminalText, entry.key).not.toContain("Ctrl+L model");
+		}
+	});
 	it("renders deterministic 256-color downsampling with unchanged text and non-color cues", async () => {
 		const ansi256Entries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.renderMode === "unicode-256-color");
 		for (const entry of ansi256Entries) {
