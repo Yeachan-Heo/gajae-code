@@ -2871,6 +2871,11 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
+		if !identity.directory && named.st_nlink != 1 {
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
 		if !identity.directory
 			&& digest_openat(parent_fd, &name).ok().as_ref() != identity.sha256.as_ref()
 		{
@@ -2959,7 +2964,8 @@ pub(crate) mod platform {
 				.nlink
 				.is_none_or(|nlink| detached.st_nlink as u64 == nlink)
 			&& detached.st_size as u64 == identity.size
-			&& stat_mtime_ns(&detached) == i128::from(identity.mtime_ns);
+			&& stat_mtime_ns(&detached) == i128::from(identity.mtime_ns)
+			&& (identity.directory || detached.st_nlink == 1);
 		let digest_matches = identity.directory
 			|| digest_openat(parent_fd, &quarantine).ok().as_ref() == identity.sha256.as_ref();
 		let detached_path = path
@@ -2968,6 +2974,14 @@ pub(crate) mod platform {
 			.join(quarantine.to_string_lossy().as_ref())
 			.to_string_lossy()
 			.into_owned();
+		let mismatch_code = if !identity.directory
+			&& detached.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& detached.st_nlink != 1
+		{
+			"hard_link_unsupported"
+		} else {
+			"identity_mismatch"
+		};
 		if !matches || !digest_matches {
 			// Do not exchange an untrusted detached object over the canonical name.
 			// Detach the canonical entry first; this preserves a successor at its
@@ -2975,18 +2989,18 @@ pub(crate) mod platform {
 			// object remains available at its quarantine path.
 			let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => {
-					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
+					NativeExactUnlinkResult::detached_failure(mismatch_code, detached_path)
 				},
 				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
 					NativeExactUnlinkResult::detached_failure_with_unknown(
-						"identity_mismatch",
+						mismatch_code,
 						detached_path,
 						path.to_string_lossy().into_owned(),
 					)
 				},
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
 					NativeExactUnlinkResult::detached_failure_with_unknown(
-						"identity_mismatch",
+						mismatch_code,
 						detached_path,
 						path
 							.parent()
@@ -3225,9 +3239,16 @@ pub(crate) mod platform {
 		let mut detached: libc::stat = unsafe { std::mem::zeroed() };
 		// SAFETY: the descriptor and CString are live; the initialized output struct is
 		// writable.
-		let matches = unsafe {
+		let detached_stat_ok = unsafe {
 			libc::fstatat(parent_fd, detached_name.as_ptr(), &mut detached, libc::AT_SYMLINK_NOFOLLOW)
-		} == 0 && detached.st_mode & libc::S_IFMT == expected_kind
+		} == 0;
+		if detached_stat_ok && !identity.directory && detached.st_nlink != 1 {
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let matches = detached_stat_ok
+			&& detached.st_mode & libc::S_IFMT == expected_kind
 			&& detached.st_dev as u64 == identity.dev
 			&& detached.st_ino as u64 == identity.ino
 			&& identity
@@ -3255,9 +3276,13 @@ pub(crate) mod platform {
 		let mut restored: libc::stat = unsafe { std::mem::zeroed() };
 		// SAFETY: the descriptor and CString are live; the initialized output struct is
 		// writable.
-		let restored_matches = unsafe {
+		let restored_stat_ok = unsafe {
 			libc::fstatat(parent_fd, original_name.as_ptr(), &mut restored, libc::AT_SYMLINK_NOFOLLOW)
-		} == 0 && restored.st_mode & libc::S_IFMT == expected_kind
+		} == 0;
+		let restored_linked = restored_stat_ok && !identity.directory && restored.st_nlink != 1;
+		let restored_matches = restored_stat_ok
+			&& restored.st_mode & libc::S_IFMT == expected_kind
+			&& (identity.directory || restored.st_nlink == 1)
 			&& restored.st_dev as u64 == identity.dev
 			&& restored.st_ino as u64 == identity.ino
 			&& identity
@@ -3272,7 +3297,9 @@ pub(crate) mod platform {
 				rename_no_replace(parent_fd, parent_fd, &original_name, &detached_name).is_ok();
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
-			return NativeExactUnlinkResult::failure(if restored {
+			return NativeExactUnlinkResult::failure(if restored_linked {
+				"hard_link_unsupported"
+			} else if restored {
 				"identity_mismatch"
 			} else {
 				"restore_failed"
