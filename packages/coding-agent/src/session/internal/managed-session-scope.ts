@@ -1519,7 +1519,11 @@ function retainedArtifactsRootReceipt(receipt: CleanupReceipt): RetainedArtifact
 	if (!isQuarantinePath(receipt.target, pathname) || !receipt.expectedArtifactsIdentity)
 		throw new Error("durability_failed");
 	const identity = artifactIdentityAt(pathname);
-	if (!identity || !sameArtifactRootIdentity(identity, receipt.expectedArtifactsIdentity))
+	if (
+		!identity ||
+		identity.dev !== receipt.expectedArtifactsIdentity.dev ||
+		identity.ino !== receipt.expectedArtifactsIdentity.ino
+	)
 		throw new Error("durability_failed");
 	const tree = snapshotArtifactTree(pathname);
 	if (!artifactTreePayloadAbsent(tree)) throw new Error("durability_failed");
@@ -4072,6 +4076,10 @@ async function deleteManagedSessionCandidateInternal(
 				sessionId: target.sessionId,
 				cwd: target.cwd,
 				transcriptIdentity: initialTarget.identity,
+				transcriptParentIdentity: (() => {
+					const parent = fs.lstatSync(path.dirname(target.path), { bigint: true });
+					return { dev: parent.dev, ino: parent.ino };
+				})(),
 				expectedArtifactsIdentity: active.expectedArtifactsIdentity,
 				expectedArtifactsTree: active.expectedArtifactsTree,
 				detachedArtifactsPath: active.detachedArtifactsPath ?? observedPending?.detachedArtifactsPath,
