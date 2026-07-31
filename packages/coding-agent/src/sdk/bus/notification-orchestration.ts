@@ -445,10 +445,19 @@ export async function reconcileCommittedTelegramConfiguration(input: {
 	try {
 		return await reconcileCommittedTelegramConfigurationUnsafe(input);
 	} catch {
+		let fenced = false;
+		try {
+			await input.activation.controller.enterBlockedRuntime();
+			fenced = true;
+		} catch {
+			fenced = false;
+		}
 		return {
 			status: "activation_failed",
 			receipt: input.receipt,
-			message: "Configuration and desired intent were saved, but post-commit activation or reconciliation failed.",
+			message: fenced
+				? "Configuration and desired intent were saved, but post-commit activation or reconciliation failed; the current runtime was fenced."
+				: "Configuration and desired intent were saved, but post-commit activation or reconciliation failed and the current runtime could not be fenced.",
 		};
 	}
 }

@@ -730,6 +730,39 @@ describe("notification settings controller adapter", () => {
 		);
 	});
 
+	it("refuses generic Telegram desired-on while an exact activation marker remains", async () => {
+		const marker = createTelegramActivationMarker({
+			botToken: TOKEN,
+			chatId: "stored-chat",
+			state: "inactive",
+			reason: "saved_inactive",
+		});
+		const currentSnapshot = snapshot({
+			telegram: { ...snapshot().telegram, enabled: true, activation: { [marker.identity]: marker } },
+		});
+		let commits = 0;
+		const settings = {
+			getAgentDir: () => "/tmp/gjc-settings-controller-marker",
+			getNotificationSettingsSnapshot: () => structuredClone(currentSnapshot),
+			commitAtomicBatch: async () => {
+				commits++;
+				return receipt();
+			},
+			commitAtomicBatchWithCurrent: async () => receipt(),
+		} as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: {},
+				sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
+			} as unknown as NotificationsEditorAdapterContext,
+			{ getCurrentTelegramActivationMarker: () => marker },
+		);
+		const result = await operations.setProviderDesired("telegram", true);
+		expect(result).toMatchObject({ outcome: "failed" });
+		expect(result.message).toContain("activation marker");
+		expect(commits).toBe(0);
+	});
 	it("enters controller-owned blocked runtime before reporting a blocked committed identity", async () => {
 		const events: string[] = [];
 		const controller = {

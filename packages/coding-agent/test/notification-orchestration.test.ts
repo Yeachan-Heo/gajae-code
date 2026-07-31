@@ -539,6 +539,39 @@ describe("notification orchestration blocked activation", () => {
 		expect(await result.restore()).toEqual({ status: "still_blocked" });
 		expect(events).toEqual(["blocked", "persist-blocked", "persist-blocked", "blocked"]);
 	});
+	test("fences the current runtime when post-commit reconnect throws", async () => {
+		let fenced = false;
+		const { writer: settings } = writer();
+		const committed = await saveTelegramConfiguration({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			saveInactive: false,
+			preflight: async () => ({ status: "absent" }),
+			activation: {
+				controller: {
+					enterBlockedRuntime: async () => {
+						fenced = true;
+					},
+					clearBlockedRuntime: async () => {},
+					reconcileCurrentSession: async () => {},
+				},
+				reconnect: async () => {
+					throw new Error("reconnect failed");
+				},
+				persistInactive: async () => receipt(),
+				clearInactive: async () => {},
+				marker: createTelegramActivationMarker({
+					botToken: TOKEN,
+					chatId: "new-chat",
+					state: "blocked",
+				}),
+			},
+		});
+		expect(fenced).toBe(true);
+		expect(committed).toMatchObject({ status: "activation_failed", receipt: expect.anything() });
+		expect("message" in committed && committed.message).toContain("runtime was fenced");
+	});
 	test("retains observer and activation failures beside the durable provider receipt", async () => {
 		const { writer: settings, commits } = writer();
 		const result = await mutateNotificationProvider({

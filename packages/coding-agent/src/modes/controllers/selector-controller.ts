@@ -52,6 +52,7 @@ import {
 } from "../../modes/types";
 import { ChatDaemonController } from "../../sdk/bus/chat-daemon-control";
 import {
+	getCurrentTelegramActivationMarker,
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
 	isTelegramComplete,
@@ -247,6 +248,7 @@ type TelegramDaemonStopResult = {
 
 export interface NotificationsEditorOperationDependencies {
 	getNotificationConfig: typeof getNotificationConfig;
+	getCurrentTelegramActivationMarker: typeof getCurrentTelegramActivationMarker;
 	maskToken: typeof maskToken;
 	buildNotificationStatusReport: typeof buildNotificationStatusReport;
 	checkNotificationHealth: typeof checkNotificationHealth;
@@ -276,6 +278,7 @@ export interface NotificationsEditorOperationDependencies {
 
 const notificationEditorOperationDependencies: NotificationsEditorOperationDependencies = {
 	getNotificationConfig,
+	getCurrentTelegramActivationMarker,
 	maskToken,
 	buildNotificationStatusReport,
 	checkNotificationHealth,
@@ -892,6 +895,16 @@ export function createNotificationsEditorOperations(
 		},
 
 		setProviderDesired: async (provider, enabled) => {
+			if (provider === "telegram" && enabled) {
+				const config = services.getNotificationConfig(ctx.settings);
+				if (services.getCurrentTelegramActivationMarker(config)) {
+					return {
+						outcome: "failed",
+						message:
+							"Telegram remains inactive because its exact activation marker must be restored or cleared after safe owner readiness.",
+					};
+				}
+			}
 			const mutation: NotificationProviderConfigurationMutation =
 				provider === "telegram"
 					? { provider, botToken: { action: "keep" } }

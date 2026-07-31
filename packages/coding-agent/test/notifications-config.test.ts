@@ -1820,7 +1820,7 @@ describe("notifications config", () => {
 			const chatEndpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", `${sessionId}.json`);
 			try {
 				await sessionStart({}, context);
-				expect(providerEnsures).toBe(1);
+				expect(providerEnsures).toBe(2);
 				expect(fs.existsSync(standardEndpoint)).toBe(false);
 				expect(fs.existsSync(chatEndpoint)).toBe(true);
 			} finally {

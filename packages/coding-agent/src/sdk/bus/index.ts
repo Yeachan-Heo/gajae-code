@@ -659,21 +659,10 @@ export class PresentationArbiter {
 	}
 
 	constructor(
-		private server: NotificationServer,
+		private readonly server: NotificationServer,
 		private readonly redact: () => boolean,
 		private readonly tag: string,
 	) {}
-
-	replaceServer(server: NotificationServer): void {
-		const active = this.active;
-		if (active) {
-			this.routes.delete(active.actionId);
-			if (!this.queue.includes(active.gateId)) this.queue.unshift(active.gateId);
-			this.active = undefined;
-		}
-		this.server = server;
-		this.#promote();
-	}
 
 	retain(presentation: UnattendedGatePresentation): void {
 		const existing = this.presentations.get(presentation.gateId);
@@ -3572,7 +3561,7 @@ export function createNotificationsExtension(
 				isolateChatEndpoint = identity.status === "foreign" || identity.status === "unknown";
 			}
 		}
-		let endpointStateRoot = isolateChatEndpoint ? path.join(stateRoot, "chat") : stateRoot;
+		const endpointStateRoot = isolateChatEndpoint ? path.join(stateRoot, "chat") : stateRoot;
 		const lifecycleAgentDir = lifecycleRequired ? settings?.getAgentDir?.() : undefined;
 		if (lifecycleRequired && !lifecycleAgentDir)
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
@@ -5064,11 +5053,12 @@ export function createNotificationsExtension(
 						return result;
 					}
 					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
-						isolateChatEndpoint = true;
-						endpointStateRoot = path.join(stateRoot, "chat");
-						server = new NotificationServer(id, token, endpointStateRoot, true);
-						runtime.server = server;
-						gatePresentations.replaceServer(server);
+						await cleanupAbandonedStartup();
+						if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
+						forceIsolatedChatSessions.add(id);
+						const result = await startSession(ctx);
+						finishStartup(result);
+						return result;
 					}
 					if (registrationToken !== undefined) {
 						runtime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
@@ -5352,7 +5342,7 @@ export function createNotificationsExtension(
 		isolateTelegram: async binding => {
 			const runtime = runtimes.get(binding.sessionId);
 			if (runtime) {
-				const stopped = await stopSession(binding.sessionId, "notifications", runtime);
+				const stopped = await stopSession(binding.sessionId, "session", runtime);
 				if (!stopped || runtimes.has(binding.sessionId) || cleanupRetries.has(binding.sessionId)) return "failed";
 			}
 			forceIsolatedChatSessions.add(binding.sessionId);
