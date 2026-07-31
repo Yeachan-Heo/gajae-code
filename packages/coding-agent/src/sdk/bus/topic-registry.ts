@@ -94,6 +94,18 @@ export interface TopicDeleteAuthoritySnapshot {
 	record?: TopicRecord;
 }
 
+/**
+ * Proof that a definite delete was settled in memory and still owes its durable
+ * commit. Handed back only by a settlement that actually happened, so a refused
+ * settlement structurally cannot be followed by a rollback.
+ */
+export interface TopicSettledDelete {
+	sessionId: string;
+	topicId: string;
+	/** Authority epoch proven current when the record was removed. */
+	settledEpoch: number;
+}
+
 function isValidBindingString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
 }
@@ -136,6 +148,16 @@ function isValidTopicId(value: unknown): value is string {
 	);
 }
 
+/**
+ * Monotonic epoch successor that saturates instead of leaving the safe-integer
+ * range. Past `Number.MAX_SAFE_INTEGER` two distinct generations collapse onto
+ * the same IEEE-754 double, which would let a stale settlement clear a newer
+ * fence; settlement refuses the saturated value instead of overflowing past it.
+ */
+function nextAuthorityEpoch(current: number): number {
+	return current >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : current + 1;
+}
+
 export function emptyTopicRegistryState(): TopicRegistryState {
 	return { topics: {} };
 }
@@ -161,6 +183,8 @@ export class TopicRegistry {
 	private readonly creatingBindings = new Map<string, TopicEndpointBinding>();
 	/** Monotonic authority epochs, including deletion fences for absent records. */
 	private readonly epochs = new Map<string, number>();
+	/** Phase-1 settlements awaiting their durable clear; their topic ids stay quarantined. */
+	readonly #settling = new Map<string, { topicId: string; settledEpoch: number; record: TopicRecord }>();
 
 	constructor(state: TopicRegistryState = emptyTopicRegistryState()) {
 		this.topics = new Map();
@@ -173,6 +197,7 @@ export class TopicRegistry {
 		this.byTopic.clear();
 		this.#ambiguousTopicIds.clear();
 		this.epochs.clear();
+		this.#settling.clear();
 		this.load(state);
 	}
 
@@ -259,6 +284,10 @@ export class TopicRegistry {
 	private rebuildInboundRoutes(): void {
 		this.byTopic.clear();
 		this.#ambiguousTopicIds.clear();
+		// A settled-but-not-yet-durable clear keeps its topic id quarantined: the
+		// clear is not authoritative until persisted, so no colliding survivor may
+		// become routable and no settled id may become adoptable during that write.
+		for (const settling of this.#settling.values()) this.#ambiguousTopicIds.add(settling.topicId);
 		const activeByTopic = new Map<string, string>();
 
 		for (const [sessionId, record] of this.topics) {
@@ -276,6 +305,13 @@ export class TopicRegistry {
 		for (const [topicId, sessionId] of activeByTopic) {
 			if (!this.#ambiguousTopicIds.has(topicId)) this.byTopic.set(topicId, sessionId);
 		}
+	}
+
+	/** Advance and publish the session authority epoch, saturating at the safe-integer bound. */
+	#advanceAuthorityEpoch(sessionId: string, base: number): number {
+		const epoch = nextAuthorityEpoch(base);
+		this.epochs.set(sessionId, epoch);
+		return epoch;
 	}
 
 	/** Resolve the owning session for a topic id (for fail-closed inbound routing). */
@@ -676,7 +712,7 @@ export class TopicRegistry {
 	/** Restore a failed delete fence only while its exact authority mutation remains current. */
 	restoreDeleteAuthority(snapshot: TopicDeleteAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
-		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
+		const deleteEpoch = nextAuthorityEpoch(Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0));
 		if (this.epochs.get(snapshot.sessionId) !== deleteEpoch) return false;
 		if (snapshot.topicId === undefined) {
 			if (record) return false;
@@ -707,7 +743,7 @@ export class TopicRegistry {
 	 */
 	restoreDeleteFence(snapshot: TopicDeleteAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
-		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
+		const deleteEpoch = nextAuthorityEpoch(Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0));
 		if (snapshot.topicId === undefined) {
 			if (record) return false;
 		} else if (!record) {
@@ -731,8 +767,10 @@ export class TopicRegistry {
 	/** Fence new work before the remote delete starts, including an absent in-flight create. */
 	beginDelete(sessionId: string): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
-		const epoch = Math.max(this.epochs.get(sessionId) ?? 0, record?.authorityEpoch ?? 0) + 1;
-		this.epochs.set(sessionId, epoch);
+		const epoch = this.#advanceAuthorityEpoch(
+			sessionId,
+			Math.max(this.epochs.get(sessionId) ?? 0, record?.authorityEpoch ?? 0),
+		);
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
 		record.authorityState = "delete_pending";
@@ -807,7 +845,8 @@ export class TopicRegistry {
 	}
 
 	/**
-	 * Remove only after a definite remote deletion; ambiguity deliberately retains its fence.
+	 * Phase 1 of settling a definite remote delete: remove the record while
+	 * deliberately RETAINING its topic-id quarantine.
 	 *
 	 * `dispatchedAuthorityEpoch` is the authority epoch the caller held when it
 	 * dispatched the remote delete. Settlement requires that epoch to still equal
@@ -817,17 +856,73 @@ export class TopicRegistry {
 	 * delete was dispatched, the stale definite result is refused and the newer
 	 * `delete_pending` record plus its topic-id quarantine stay intact.
 	 *
-	 * Derived routing tables are rebuilt on success because once the record is
-	 * gone its topic id no longer collides: a surviving colliding record becomes
-	 * routable and a settled id becomes adoptable immediately, without waiting for
-	 * a daemon restart to rebuild them from the persisted snapshot.
+	 * An epoch outside the safe-integer range cannot identify a generation, and at
+	 * `Number.MAX_SAFE_INTEGER` epoch advancement has saturated so distinct
+	 * generations are no longer distinguishable. Both fail closed: settlement can
+	 * no longer be proven fresh, so the fence is kept.
+	 *
+	 * Derived routing tables are deliberately NOT rebuilt here. Until the cleared
+	 * snapshot is durably persisted the clear is not authoritative, so publishing
+	 * routes now would make a colliding survivor routable (and the settled id
+	 * adoptable) during the held write, and a failed persist would re-quarantine
+	 * too late. Publish with {@link commitSettledDelete} once the persist
+	 * succeeds, or undo with {@link rollbackSettledDelete} when it fails.
 	 */
-	settleDelete(sessionId: string, topicId: string, dispatchedAuthorityEpoch: number): boolean {
+	settleDelete(sessionId: string, topicId: string, dispatchedAuthorityEpoch: number): TopicSettledDelete | undefined {
+		if (!Number.isSafeInteger(dispatchedAuthorityEpoch) || dispatchedAuthorityEpoch < 0) return undefined;
+		if (this.#settling.has(sessionId)) return undefined;
 		const record = this.topics.get(sessionId);
-		if (!record || record.topicId !== topicId || record.authorityState !== "delete_pending") return false;
-		if ((record.authorityEpoch ?? 0) !== dispatchedAuthorityEpoch) return false;
-		if (this.authorityEpoch(sessionId) !== dispatchedAuthorityEpoch) return false;
+		if (!record || record.topicId !== topicId || record.authorityState !== "delete_pending") return undefined;
+		if ((record.authorityEpoch ?? 0) !== dispatchedAuthorityEpoch) return undefined;
+		const currentEpoch = this.authorityEpoch(sessionId);
+		if (currentEpoch !== dispatchedAuthorityEpoch) return undefined;
+		if (currentEpoch >= Number.MAX_SAFE_INTEGER) return undefined;
 		this.topics.delete(sessionId);
+		this.#settling.set(sessionId, { topicId, settledEpoch: dispatchedAuthorityEpoch, record: { ...record } });
+		this.#ambiguousTopicIds.add(topicId);
+		if (this.byTopic.get(topicId) === sessionId) this.byTopic.delete(topicId);
+		return { sessionId, topicId, settledEpoch: dispatchedAuthorityEpoch };
+	}
+
+	/**
+	 * Phase 2: publish derived routing tables once the cleared state is durable.
+	 *
+	 * Only here does the settled topic id lose its quarantine, so a surviving
+	 * colliding record becomes routable and a settled id becomes adoptable without
+	 * waiting for a daemon restart.
+	 */
+	commitSettledDelete(settled: TopicSettledDelete): boolean {
+		const pending = this.#settling.get(settled.sessionId);
+		if (!pending || pending.topicId !== settled.topicId || pending.settledEpoch !== settled.settledEpoch)
+			return false;
+		this.#settling.delete(settled.sessionId);
+		this.rebuildInboundRoutes();
+		return true;
+	}
+
+	/**
+	 * Compare-and-swap undo for a settlement whose durable clear failed.
+	 *
+	 * Restoration applies only while the registry still holds exactly the state
+	 * that this settlement produced: the settlement is still awaiting commit, the
+	 * session still has no record, and the session epoch is still the settled
+	 * epoch. Any mismatch means a newer generation intervened, so the restore is
+	 * refused and the newer state is left untouched. A refused settlement produced
+	 * no token, so it can never reach this path.
+	 */
+	rollbackSettledDelete(settled: TopicSettledDelete): boolean {
+		const pending = this.#settling.get(settled.sessionId);
+		if (!pending || pending.topicId !== settled.topicId || pending.settledEpoch !== settled.settledEpoch)
+			return false;
+		if (this.topics.has(settled.sessionId)) return false;
+		if (this.authorityEpoch(settled.sessionId) !== settled.settledEpoch) return false;
+		this.#settling.delete(settled.sessionId);
+		this.topics.set(settled.sessionId, {
+			...pending.record,
+			authorityEpoch: settled.settledEpoch,
+			authorityState: "delete_pending",
+		});
+		this.epochs.set(settled.sessionId, settled.settledEpoch);
 		this.rebuildInboundRoutes();
 		return true;
 	}
@@ -836,7 +931,7 @@ export class TopicRegistry {
 	delete(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
 		if (!record) return false;
-		this.epochs.set(sessionId, Math.max(this.epochs.get(sessionId) ?? 0, record.authorityEpoch ?? 0) + 1);
+		this.#advanceAuthorityEpoch(sessionId, Math.max(this.epochs.get(sessionId) ?? 0, record.authorityEpoch ?? 0));
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		return this.topics.delete(sessionId);
 	}
