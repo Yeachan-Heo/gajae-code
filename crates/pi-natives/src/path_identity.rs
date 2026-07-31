@@ -5244,6 +5244,13 @@ mod platform {
 		{
 			return NativeExactUnlinkResult::failure("invalid_request");
 		}
+		if expected_source.parent_dev.is_none()
+			|| expected_source.parent_ino.is_none()
+			|| expected_destination.parent_dev.is_none()
+			|| expected_destination.parent_ino.is_none()
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
 		let source_path = match lexical_absolute_path(source_path) {
 			Ok(path) => path,
 			Err(code) => return NativeExactUnlinkResult::failure(code),
@@ -5608,6 +5615,9 @@ mod platform {
 		}
 		if !identity.directory && information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if identity.parent_dev.is_none() || identity.parent_ino.is_none() {
+			return NativeExactUnlinkResult::failure("parent_mismatch");
 		}
 		let Some(source_name) = detached_path.file_name() else {
 			return NativeExactUnlinkResult::failure("io_error");
