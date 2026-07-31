@@ -54,7 +54,7 @@ import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
-import { prepareTranscriptRebuild } from "../utils/ui-helpers";
+import { addChatChild, prepareTranscriptRebuild } from "../utils/ui-helpers";
 
 function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
 	ctx.chatContainer.addChild(new Spacer(1));
@@ -1180,6 +1180,10 @@ export class CommandController {
 		const bashComponent = this.ctx.bashComponent;
 		if (isDeferred && bashComponent && this.ctx.pendingBashComponents.includes(bashComponent)) {
 			this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+			addChatChild(this.ctx, bashComponent);
+			this.ctx.pendingBashComponents = this.ctx.pendingBashComponents.filter(
+				component => component !== bashComponent,
+			);
 		}
 
 		this.ctx.bashComponent = undefined;

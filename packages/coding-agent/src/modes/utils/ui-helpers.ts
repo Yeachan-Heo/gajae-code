@@ -261,6 +261,19 @@ function isActiveChatChild(ctx: InteractiveModeContext, component: Component): b
 	return component === ctx.bashComponent || component === ctx.pythonComponent || component === ctx.streamingComponent;
 }
 
+function detachPendingExecutionComponents(ctx: InteractiveModeContext): Component[] {
+	const attached = new Set(ctx.pendingMessagesContainer.children);
+	const components = [...(ctx.pendingBashComponents ?? []), ...(ctx.pendingPythonComponents ?? [])].filter(component =>
+		attached.has(component),
+	);
+	for (const component of components) ctx.pendingMessagesContainer.detachChild(component);
+	return components;
+}
+
+function restorePendingExecutionComponents(ctx: InteractiveModeContext, components: Component[]): void {
+	for (const component of components) ctx.pendingMessagesContainer.addChild(component);
+}
+
 function getChatChildTime(component: Component): number {
 	return chatChildAddedAt.get(component) ?? Date.now();
 }
@@ -899,10 +912,9 @@ export class UiHelpers {
 		// This path is used to rebuild the visible chat transcript (e.g. after custom/debug UI).
 		// Clear existing rendered chat first to avoid duplicating the full session in the container.
 		const preservedChatChildren = options.preserveExistingChat ? this.ctx.chatContainer.children : undefined;
+		const pendingExecutionComponents = detachPendingExecutionComponents(this.ctx);
 		this.ctx.chatContainer.clear();
 		this.ctx.pendingMessagesContainer.clear();
-		this.ctx.pendingBashComponents = [];
-		this.ctx.pendingPythonComponents = [];
 
 		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.
 		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
@@ -910,6 +922,7 @@ export class UiHelpers {
 			updateFooter: true,
 			populateHistory: true,
 		});
+		restorePendingExecutionComponents(this.ctx, pendingExecutionComponents);
 
 		// Show compaction info if session was compacted
 		const allEntries = this.ctx.sessionManager.getEntries();
@@ -979,6 +992,7 @@ export class UiHelpers {
 	}
 
 	updatePendingMessagesDisplay(): void {
+		const pendingExecutionComponents = detachPendingExecutionComponents(this.ctx);
 		this.ctx.pendingMessagesContainer.clear();
 		const queuedMessages = this.ctx.session.getQueuedMessages() as QueuedMessages;
 
@@ -1015,6 +1029,7 @@ export class UiHelpers {
 				this.ctx.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 			}
 		}
+		restorePendingExecutionComponents(this.ctx, pendingExecutionComponents);
 	}
 
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
