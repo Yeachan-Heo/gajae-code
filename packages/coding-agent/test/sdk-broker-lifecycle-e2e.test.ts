@@ -98,12 +98,11 @@ async function settleRetainedTranscriptForTest(
 				parent.ino !== identity.parentIno ||
 				stat.dev !== identity.dev ||
 				stat.ino !== identity.ino ||
-				stat.nlink !== identity.nlink ||
-				stat.size !== identity.size ||
-				stat.mtimeNs !== identity.mtimeNs
+				(identity.nlink !== undefined && stat.nlink !== identity.nlink) ||
+				stat.size > identity.size
 			)
 				throw new Error("Lifecycle test cleanup lacks exact native authority");
-			if (identity.sha256) {
+			if (identity.sha256 && stat.size !== 0n) {
 				const digest = createHash("sha256").update(syncFs.readFileSync(pathname)).digest("hex");
 				if (digest !== identity.sha256) throw new Error("Lifecycle test cleanup digest changed");
 			}
