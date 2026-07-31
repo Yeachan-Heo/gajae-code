@@ -1835,18 +1835,7 @@ function transcriptRootMatchesTarget(pathname: string, target: RetiredTarget): b
 function reconcileScrubbedTranscriptPlaceholder(pathname: string): boolean {
 	try {
 		const stat = fs.lstatSync(pathname);
-		if (stat.isSymbolicLink()) return false;
-		if (stat.isFile() && stat.size === 0 && stat.nlink === 1) {
-			fs.unlinkSync(pathname);
-			fsyncManagedParent(pathname);
-			return true;
-		}
-		if (stat.isDirectory() && fs.readdirSync(pathname).length === 0) {
-			fs.rmdirSync(pathname);
-			fsyncManagedParent(pathname);
-			return true;
-		}
-		return false;
+		return !stat.isSymbolicLink() && stat.isFile() && stat.size === 0 && stat.nlink === 1;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ENOENT";
 	}
