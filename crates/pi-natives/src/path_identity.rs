@@ -5280,6 +5280,24 @@ mod platform {
 		let Some(parent_handle) = source.parent() else {
 			return NativeExactUnlinkResult::failure("io_error");
 		};
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			expected_source.parent_dev.zip(expected_source.parent_ino)
+		{
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(parent_handle, &mut parent_information) } == 0
+				|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
+		if expected_source.parent_dev != expected_destination.parent_dev
+			|| expected_source.parent_ino != expected_destination.parent_ino
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
 		let Some(destination_name) = destination_path.file_name() else {
 			return NativeExactUnlinkResult::failure("io_error");
 		};

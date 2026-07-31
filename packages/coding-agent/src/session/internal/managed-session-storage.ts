@@ -7,6 +7,7 @@ import {
 	applyOwnerOnlyPathSecurity,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
+	exactRestore,
 	exactUnlink,
 	type NativeDirectoryTreeSnapshot,
 	type NativeOwnerOnlySecurityResult,
@@ -1625,7 +1626,25 @@ export function replaceManagedFileSync(
 					sha256: expectedDestination.sha256,
 				},
 			);
-			if (!replaced.ok) throw new Error(`managed_replace_failed:${replaced.code ?? "unknown"}`);
+			if (!replaced.ok) {
+				if (replaced.detachedPath) {
+					const restored = exactRestore(replaced.detachedPath, staging, {
+						dev: staged.dev,
+						ino: staged.ino,
+						nlink: staged.nlink,
+						parentDev: parentIdentity.dev,
+						parentIno: parentIdentity.ino,
+						size: staged.size,
+						mtimeNs: staged.mtimeNs,
+						sha256: createHash("sha256").update(bytes).digest("hex"),
+					});
+					if (!restored.ok)
+						throw new Error(
+							`managed_replace_failed:${replaced.code ?? "unknown"}:retained=${replaced.detachedPath}:restore=${restored.code ?? "unknown"}`,
+						);
+				}
+				throw new Error(`managed_replace_failed:${replaced.code ?? "unknown"}`);
+			}
 		} else fs.renameSync(staging, destination);
 		assertFence?.();
 		assertManagedDirectoryRoot(root);

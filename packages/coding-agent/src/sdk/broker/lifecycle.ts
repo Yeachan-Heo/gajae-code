@@ -865,7 +865,7 @@ export async function writeSessionLifecycleReady(root: string, id: string, effec
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
 	await fs.mkdir(path.join(root, "sdk"), { recursive: true, mode: 0o700 });
-	await fs.writeFile(lifecycleReadyPath(root, id), JSON.stringify({ pid: process.pid, effectMarker, incarnation }), {
+	await fs.writeFile(lifecycleReadyPath(root, id), canonicalJson({ pid: process.pid, effectMarker, incarnation }), {
 		mode: 0o600,
 	});
 }
