@@ -273,6 +273,34 @@ test("a staging temp replaced between identity capture and delete is not removed
 	expect(fs.existsSync(file)).toBe(true);
 	expect(fs.readFileSync(file, "utf8")).toBe("successor-staged-after-capture\n");
 });
+test("a retained staging quarantine replacement is not removed by the generic reaper", async () => {
+	const agentDir = agentDirWithNotifications();
+	const paths = daemonPaths(agentDir);
+	const file = path.join(paths.dir, ".gjc-delete-notification-staging-temp-retained.json");
+	fs.writeFileSync(file, "retained-original\n");
+
+	const base = identityFencedFs();
+	const racingFs: TelegramDaemonFs = {
+		...base,
+		readEndpointFile: async target => {
+			const endpoint = await base.readEndpointFile!(target);
+			if (target === file) fs.writeFileSync(file, "retained-successor\n");
+			return endpoint;
+		},
+	};
+
+	const result = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: racingFs,
+		now: pastGraceWindow,
+		graceMs: 0,
+		pidAlive: () => false,
+	});
+
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBeGreaterThan(0);
+	expect(fs.readFileSync(file, "utf8")).toBe("retained-successor\n");
+});
 
 test("a symlink shaped like a staging temp is never followed or deleted", async () => {
 	const agentDir = agentDirWithNotifications();

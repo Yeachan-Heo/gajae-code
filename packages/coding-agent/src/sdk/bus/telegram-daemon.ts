@@ -1537,6 +1537,26 @@ async function reapAbandonedNotificationStagingTemp(input: {
 	);
 }
 
+/** Reap one retained delete quarantine without following or unlinking a successor. */
+async function reapNotificationLeakArtifact(input: {
+	fs: TelegramDaemonFs;
+	file: string;
+	now: number;
+	graceMs: number;
+}): Promise<boolean> {
+	if (!input.fs.readEndpointFile || !input.fs.exactUnlink) return false;
+	const endpoint = await input.fs.readEndpointFile(input.file);
+	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return false;
+	const age = input.now - Number(endpoint.identity.mtimeNs / 1_000_000n);
+	if (age < input.graceMs) return false;
+	return await exactUnlinkAcceptedWithRetainedEvidence(
+		input.fs,
+		input.file,
+		endpoint.identity,
+		`.gjc-exact-unlink-placeholder-${crypto.randomUUID()}.json`,
+	);
+}
+
 /**
  * Reap retained exact-unlink / ownership-transition quarantine files older than
  * the grace window from the notifications directory, plus publication staging
@@ -1583,14 +1603,8 @@ export async function reapStaleNotificationArtifacts(input: {
 				else skipped += 1;
 				continue;
 			}
-			const stat = fsImpl.stat ? await fsImpl.stat(file) : undefined;
-			const age = stat ? now - stat.mtimeMs : Number.POSITIVE_INFINITY;
-			if (Number.isFinite(age) && age < graceMs) {
-				skipped += 1;
-				continue;
-			}
-			await fsImpl.unlink(file);
-			removed.push(file);
+			if (await reapNotificationLeakArtifact({ fs: fsImpl, file, now, graceMs })) removed.push(file);
+			else skipped += 1;
 		} catch (error) {
 			if (isPermanentMissingPathError(error)) continue;
 			// Best-effort: a busy file must not fail daemon ownership.
