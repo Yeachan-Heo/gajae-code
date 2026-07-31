@@ -945,7 +945,7 @@ export class FileSessionStorage implements SessionStorage {
 				"Transcript parent identity does not match authorization",
 			);
 		const authorizedTranscriptParentIdentity = transcriptParentIdentity ?? parentIdentity;
-		if (detachedArtifactsPath) {
+		if (detachedArtifactsPath && !artifactsRemoved) {
 			if (
 				!expectedArtifactsIdentity ||
 				path.dirname(detachedArtifactsPath) !== path.dirname(transcriptPath) ||
@@ -1249,6 +1249,7 @@ export class FileSessionStorage implements SessionStorage {
 					deletion.code === "cleanup_pending" &&
 					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 					deletion.retainedSuccessorPath === undefined &&
+					deletion.retainedPlaceholderPath === undefined &&
 					deletion.retainedUnknownPath === undefined
 				)
 					return { kind: "deleted" };
@@ -1263,6 +1264,9 @@ export class FileSessionStorage implements SessionStorage {
 					kind: "cleanup_pending",
 					phase: "transcript",
 					error,
+					...((deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true
+						? { transcriptPayloadDurable: true as const }
+						: {}),
 					transcriptIdentity,
 					detachedTranscriptPath: deletion.detachedPath ?? detachedTranscriptPath,
 					...((deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath)
@@ -1321,6 +1325,7 @@ export class FileSessionStorage implements SessionStorage {
 				deletion.code === "cleanup_pending" &&
 				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 				deletion.retainedSuccessorPath === undefined &&
+				deletion.retainedPlaceholderPath === undefined &&
 				deletion.retainedUnknownPath === undefined
 			)
 				return { kind: "deleted" };
@@ -1335,6 +1340,9 @@ export class FileSessionStorage implements SessionStorage {
 				kind: "cleanup_pending",
 				phase: "transcript",
 				error,
+				...((deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true
+					? { transcriptPayloadDurable: true as const }
+					: {}),
 				transcriptIdentity,
 				detachedTranscriptPath: deletion.detachedPath,
 				...((deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath)
