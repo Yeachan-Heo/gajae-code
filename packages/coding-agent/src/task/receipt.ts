@@ -2,6 +2,7 @@ import {
 	hasCompleteUsageCostBreakdown,
 	type ReviewFindingsArtifactRef,
 	type SingleResult,
+	type TaskRoutingEvidence,
 	type TaskToolDetails,
 } from "./types";
 export interface TaskRoi {
@@ -33,6 +34,7 @@ export interface TaskResultReceipt {
 	contextTokens?: number;
 	contextWindow?: number;
 	modelOverride?: string | string[];
+	routing?: TaskRoutingEvidence;
 	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
 	fastMode?: boolean;
 	usage?: SingleResult["usage"];
@@ -284,6 +286,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		contextWindow: raw.contextWindow,
 		modelOverride: raw.modelOverride,
 		modelSubstitutionWarning: raw.modelSubstitutionWarning,
+		routing: raw.routing,
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
 		usageCostBreakdownComplete:

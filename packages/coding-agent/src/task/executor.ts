@@ -67,6 +67,7 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	assertRoutingEvidenceInvariant,
 	createSetupFailureSummary,
 	hasCompleteUsageCostBreakdown,
 	MAX_OUTPUT_BYTES,
@@ -78,6 +79,7 @@ import {
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
+	type TaskRoutingEvidence,
 	type TaskToolDetails,
 } from "./types";
 import { type ExecutorExecutionMode, resolveUltragoalRedTeamActivation } from "./ultragoal-redteam-activation";
@@ -211,6 +213,8 @@ export interface ExecutorOptions {
 	executionMode?: ExecutorExecutionMode;
 	context?: string;
 	description?: string;
+	routing?: TaskRoutingEvidence;
+
 	index: number;
 	id: string;
 	modelOverride?: string | string[];
@@ -808,6 +812,38 @@ export function createSubagentSettings(baseSettings: Settings, inheritedServiceT
 }
 
 /**
+ * Finalize routing evidence at the executor return boundary: the effective
+ * model is the terminal provider-reported model when present, otherwise the
+ * auth-resolved model; substitution causes are appended in order.
+ */
+export function finalizeRoutingEvidence(
+	routing: TaskRoutingEvidence | undefined,
+	state: {
+		resolvedModelString: string | undefined;
+		lastAssistantModelString: string | undefined;
+		authFallbackUsed: boolean;
+		assistantModelMismatch: boolean;
+	},
+): TaskRoutingEvidence | undefined {
+	if (!routing) return undefined;
+	const effectiveModel = state.lastAssistantModelString ?? state.resolvedModelString;
+	if (!effectiveModel) return undefined;
+	const substitutions: TaskRoutingEvidence["substitutions"] = [];
+	if (state.authFallbackUsed) substitutions.push("auth_substituted");
+	if (state.assistantModelMismatch) substitutions.push("assistant_model_mismatch");
+	const evidence = {
+		...routing,
+		effectiveModel,
+		...(state.resolvedModelString && state.resolvedModelString !== effectiveModel
+			? { authResolvedModel: state.resolvedModelString }
+			: {}),
+		substitutions,
+	};
+	assertRoutingEvidenceInvariant(evidence);
+	return evidence;
+}
+
+/**
  * Run a single agent in-process.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
@@ -948,6 +984,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let pauseRequested = false;
 	let paused = false;
 	let modelSubstitutionWarning: ModelSubstitutionWarning | undefined;
+	let authFallbackUsed = false;
+	let assistantModelMismatch = false;
 	let resolvedModelString: string | undefined;
 	let lastAssistantModelString: string | undefined;
 	let activeProviderModelString: string | undefined;
@@ -1384,6 +1422,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 								effective: assistantModel,
 								reason: "assistant_model_mismatch",
 							};
+							assistantModelMismatch = true;
+
 							progress.modelSubstitutionWarning = modelSubstitutionWarning;
 							activeSession?.sessionManager.appendModelChange(assistantModel, undefined, {
 								previousModel: resolvedModelString,
@@ -1528,7 +1568,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				model,
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
-				authFallbackUsed,
+				authFallbackUsed: resolvedAuthFallbackUsed,
 				requestedModel,
 				fallbackReason,
 				activeIndex,
@@ -1548,6 +1588,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					canonicalChildScope,
 				),
 			);
+			authFallbackUsed = resolvedAuthFallbackUsed;
 			if (model) {
 				resolvedModelString = formatModelString(model);
 				activeProviderModelString = resolvedModelString;
@@ -2111,6 +2152,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					reason: "assistant_model_mismatch",
 				};
 				progress.modelSubstitutionWarning = modelSubstitutionWarning;
+				assistantModelMismatch = true;
 			}
 		} catch (err) {
 			exitCode = 1;
@@ -2288,6 +2330,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		});
 	}
 
+	const routingEvidence = finalizeRoutingEvidence(options.routing, {
+		resolvedModelString,
+		lastAssistantModelString,
+		authFallbackUsed,
+		assistantModelMismatch,
+	});
+
 	return {
 		index,
 		id,
@@ -2304,6 +2353,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		durationMs: Date.now() - startTime,
 		tokens: progress.tokens,
 		contextTokens: progress.contextTokens,
+		routing: routingEvidence,
 		contextWindow: progress.contextWindow,
 		modelOverride,
 		modelSubstitutionWarning,

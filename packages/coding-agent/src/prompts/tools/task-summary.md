@@ -5,6 +5,7 @@
 <agent id="{{id}}" agent="{{agent}}">
 <status>{{status}}</status>
 {{#if meta}}<meta lines="{{meta.lineCount}}" size="{{meta.charSize}}" />{{/if}}
+{{#if routing}}<routing tier="{{routing.tier}}" model="{{routing.effectiveModel}}" note="{{routing.note}}" />{{/if}}
 <synopsis{{#if outputUri}} ref="{{outputUri}}"{{/if}}>
 {{synopsis}}
 </synopsis>

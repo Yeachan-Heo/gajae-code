@@ -913,6 +913,10 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 			)}`,
 		);
 	}
+	if (result.routing) {
+		const model = result.routing.effectiveModel ?? "not-executed";
+		lines.push(`${continuePrefix}${theme.fg("dim", `Routing: ${model} ${result.routing.note ?? ""}`)}`);
+	}
 	if (result.roi?.lowRoi) {
 		lines.push(`${continuePrefix}${theme.fg("warning", "low ROI: produced no material contribution")}`);
 	}

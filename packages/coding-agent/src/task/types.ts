@@ -97,6 +97,10 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 		id: z.string().max(48).refine(isValidTaskId, TASK_ID_DESCRIPTION).describe("filesystem-safe task identifier"),
 		description: z.string().describe("ui label, not seen by subagent"),
 		assignment: z.string().describe(assignmentDescription),
+		tier: z
+			.enum(["fast", "balanced", "strong"])
+			.optional()
+			.describe("Advisory unless autorouting is enabled; omitted routes as balanced."),
 		executionMode: z
 			.enum(["default", "ultragoal-red-team"])
 			.optional()
@@ -447,6 +451,30 @@ export interface TaskPersistenceResult {
 	recoveryRef?: TaskRecoveryArtifactRef;
 }
 
+export type RoutingSubstitution = "auth_substituted" | "assistant_model_mismatch";
+
+export interface TaskRoutingEvidence {
+	tier: "fast" | "balanced" | "strong";
+	requestedTier?: "fast" | "balanced" | "strong";
+	defaultTierApplied?: true;
+	source: "tiers" | { preset: string };
+	requestedSelector: string;
+	authResolvedModel?: string;
+	effectiveModel?: string;
+	notExecuted?: true;
+	substitutions: RoutingSubstitution[];
+	manualFallbackReason?: "tier_unmatched" | "tier_missing_in_map";
+	freshOnResume?: true;
+	note?: string;
+}
+
+export function assertRoutingEvidenceInvariant(evidence: TaskRoutingEvidence): void {
+	if (!evidence.notExecuted && (!evidence.effectiveModel || evidence.effectiveModel.length > 256))
+		throw new Error("Invalid effective routing model.");
+	if (evidence.authResolvedModel && evidence.authResolvedModel === evidence.effectiveModel)
+		throw new Error("authResolvedModel must differ from effectiveModel when present.");
+}
+
 /** Result from a single agent execution */
 export interface SingleResult {
 	index: number;
@@ -468,6 +496,8 @@ export interface SingleResult {
 	contextTokens?: number;
 	/** Model's context window in tokens, when known. */
 	contextWindow?: number;
+	routing?: TaskRoutingEvidence;
+
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: ModelSubstitutionWarning;
 	/** Whether the resolved subagent model ran under the effective fast service tier. */

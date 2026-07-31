@@ -4,6 +4,13 @@ import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS, EDIT_MODES, type EditMode } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
+import {
+	AUTOROUTING_SELECTOR_DESCRIPTION,
+	AUTOROUTING_SELECTOR_PATTERN,
+	AUTOROUTING_TIERS,
+	type AutoroutingTierMapInput,
+	validateAutoroutingLocal,
+} from "./autorouting-contract";
 import type { ModelSelectorValue } from "./model-selector-value";
 import { UPDATE_CHANNELS } from "./update-channel";
 
@@ -183,6 +190,21 @@ interface ArrayDef<T> {
 
 type RecordValueDef = { type: "model-selector-value" } | { type: "string-enum"; values: readonly string[] };
 
+interface ConstrainedRecordValueDef {
+	type: "autorouting-selector-value";
+	pattern: string;
+	description: string;
+}
+
+interface ConstrainedRecordDef<T> {
+	type: "constrained-record";
+	default: T;
+	keys: readonly string[];
+	valueSchema: ConstrainedRecordValueDef;
+	description?: string;
+	ui?: UiBase;
+}
+
 interface RecordDef<T> {
 	type: "record";
 	default: Record<string, T>;
@@ -196,7 +218,8 @@ type SettingDef =
 	| NumberDef
 	| EnumDef<readonly string[]>
 	| ArrayDef<unknown>
-	| RecordDef<unknown>;
+	| RecordDef<unknown>
+	| ConstrainedRecordDef<unknown>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Schema Definition
@@ -3469,6 +3492,28 @@ export const SETTINGS_SCHEMA = {
 		valueSchema: MODEL_SELECTOR_VALUE_SCHEMA,
 	},
 
+	"task.autorouting.enabled": {
+		type: "boolean",
+		default: false,
+	},
+
+	"task.autorouting.preset": {
+		type: "string",
+		default: "",
+	},
+
+	"task.autorouting.tiers": {
+		type: "constrained-record",
+		default: {} as AutoroutingTierMapInput,
+		keys: AUTOROUTING_TIERS,
+		valueSchema: {
+			type: "autorouting-selector-value",
+			pattern: AUTOROUTING_SELECTOR_PATTERN,
+			description: AUTOROUTING_SELECTOR_DESCRIPTION,
+		},
+		description: AUTOROUTING_SELECTOR_DESCRIPTION,
+	},
+
 	"tasks.todoClearDelay": {
 		type: "number",
 		default: 60,
@@ -3815,7 +3860,9 @@ export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boo
 						? D
 						: Schema[P] extends { type: "record"; default: infer D }
 							? D
-							: never;
+							: Schema[P] extends { type: "constrained-record"; default: infer D }
+								? D
+								: never;
 
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
@@ -3889,7 +3936,7 @@ function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
 		const path = prefix ? `${prefix}.${key}` : key;
 		const definition = SETTINGS_SCHEMA[path as SettingPath];
 		// Records intentionally accept user-defined keys; validate their entries below.
-		if (definition?.type === "record") {
+		if (definition?.type === "record" || definition?.type === "constrained-record") {
 			paths.push(path);
 		} else if (child && typeof child === "object" && !Array.isArray(child)) {
 			paths.push(...schemaPaths(child as Record<string, unknown>, path));
@@ -3925,7 +3972,10 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 			(definition.values as readonly string[]).includes(value)) ||
 		(definition.type === "array" &&
 			validArraySettingValue(value, "items" in definition ? definition.items?.enum : undefined)) ||
-		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
+		((definition.type === "record" || definition.type === "constrained-record") &&
+			!!value &&
+			typeof value === "object" &&
+			!Array.isArray(value))
 	);
 }
 
@@ -4015,6 +4065,16 @@ export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 		if (next !== value) {
 			schemaSetAtPath(settings, path, next);
 			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
+		}
+		if (definition.type === "constrained-record") {
+			for (const localIssue of validateAutoroutingLocal(schemaValueAtPath(settings, "task.autorouting"))) {
+				issues.push({
+					path: localIssue.path ? `task.autorouting.${localIssue.path}` : "task.autorouting",
+					kind: "invalid",
+					detail: localIssue.detail,
+				});
+			}
+			continue;
 		}
 		if (!validSettingValue(definition, next)) {
 			const arrayItemEnum =

@@ -23,6 +23,7 @@ type JsonSchemaObject = {
 	minLength?: number;
 	pattern?: string;
 	anyOf?: JsonSchema[];
+	not?: JsonSchema;
 };
 
 type SettingsSchema = typeof SETTINGS_SCHEMA;
@@ -147,7 +148,30 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 				type: "object",
 				additionalProperties: recordValueSchema("valueSchema" in definition ? definition.valueSchema : undefined),
 			};
+		case "constrained-record": {
+			const selector = constrainedRecordSelectorSchema(definition.valueSchema);
+			const properties = Object.fromEntries(
+				definition.keys.map(key => [
+					key,
+					{ anyOf: [selector, { type: "array", minItems: 1, items: selector }] },
+				]),
+			);
+			return { type: "object", properties, additionalProperties: false };
+		}
 	}
+}
+
+function constrainedRecordSelectorSchema(valueSchema: {
+	readonly pattern: string;
+	readonly description: string;
+}): JsonSchemaObject {
+	return {
+		type: "string",
+		minLength: 1,
+		pattern: valueSchema.pattern,
+		not: { pattern: "^\\s*[pP][iI]/" },
+		description: valueSchema.description,
+	};
 }
 
 function recordValueSchema(

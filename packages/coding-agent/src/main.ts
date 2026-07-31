@@ -173,6 +173,9 @@ const ACP_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"task.maxRecursionDepth",
 	"task.disabledAgents",
 	"task.agentModelOverrides",
+	"task.autorouting.enabled",
+	"task.autorouting.preset",
+	"task.autorouting.tiers",
 	// Memory subsystems are off-by-default for embedded (ACP) hosts; embedders
 	// that want memory should opt in explicitly through their own settings layer.
 	"memory.backend",
