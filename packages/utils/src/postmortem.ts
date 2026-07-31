@@ -456,25 +456,43 @@ export function cleanup(): Promise<void> {
 }
 
 /**
- * Bounded wait for a stream's buffered writes to flush so a following
- * process.exit() cannot truncate them. The race against a fixed deadline
- * keeps a wedged or unread pipe from deadlocking the exit path.
+ * Bounded wait for all streams' buffered writes to flush so a following
+ * process.exit() cannot truncate them. Both drains share one deadline; a
+ * wedged or unread pipe cannot deadlock the exit path, and listeners are
+ * removed when the wait completes or times out.
  */
-async function drainStreamBeforeExit(stream: NodeJS.WriteStream): Promise<void> {
-	if (stream.writableLength === 0) return;
+async function drainStreamsBeforeExit(streams: readonly NodeJS.WriteStream[]): Promise<void> {
+	const pendingStreams = streams.filter(stream => stream.writableLength > 0);
+	if (pendingStreams.length === 0) return;
+
 	const { promise, resolve } = Promise.withResolvers<void>();
-	stream.once("drain", resolve);
-	await Promise.race([promise, Bun.sleep(5000)]);
+	let remaining = pendingStreams.length;
+	const listeners = pendingStreams.map(stream => {
+		const onDrain = (): void => {
+			remaining -= 1;
+			if (remaining === 0) resolve();
+		};
+		stream.once("drain", onDrain);
+		return [stream, onDrain] as const;
+	});
+
+	try {
+		await Promise.race([promise, Bun.sleep(5000)]);
+	} finally {
+		for (const [stream, onDrain] of listeners) {
+			stream.removeListener("drain", onDrain);
+		}
+	}
 }
 
 /**
  * Runs all cleanup callbacks and exits.
  *
- * In main thread: waits for stdout and stderr to drain (each bounded), then
- * calls process.exit(). The stderr drain matters for diagnostics written via
- * console.error (e.g. startup timings) immediately before a governed exit:
- * with a redirected/backpressured stderr pipe, process.exit() would otherwise
- * truncate the final lines.
+ * In main thread: waits for stdout and stderr to drain (under one shared
+ * deadline), then calls process.exit(). The stderr drain matters for
+ * diagnostics written via console.error (e.g. startup timings) immediately
+ * before a governed exit: with a redirected/backpressured stderr pipe,
+ * process.exit() would otherwise truncate the final lines.
  * In workers: runs cleanup only (process.exit would kill entire process).
  */
 export async function quit(code: number = 0): Promise<void> {
@@ -489,8 +507,7 @@ export async function quit(code: number = 0): Promise<void> {
 
 	const exitAfterCleanup = async (): Promise<void> => {
 		await awaitCleanupWithDeadline(Reason.MANUAL);
-		await drainStreamBeforeExit(process.stdout);
-		await drainStreamBeforeExit(process.stderr);
+		await drainStreamsBeforeExit([process.stdout, process.stderr]);
 		process.exit(code);
 	};
 
