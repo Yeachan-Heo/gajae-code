@@ -2382,11 +2382,14 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(recorder).not.toHaveBeenCalled();
 	});
 
-	it("leaves non-deep-interview selector prompts without scroll-title opt-in", async () => {
+	it("opts ordinary selector prompts into local prompt scrolling", async () => {
 		const tool = new AskTool(createSession());
 		const select = vi.fn(
-			async (_prompt: string, options: string[], _dialogOptions?: { scrollTitleRows?: number; helpText?: string }) =>
-				options[0],
+			async (
+				_prompt: string,
+				options: string[],
+				_dialogOptions?: { scrollTitleRows?: number; helpText?: string; outline?: boolean; wrapFocused?: boolean },
+			) => options[0],
 		);
 		const context = createContext({ select });
 
@@ -2407,8 +2410,11 @@ describe("AskTool deep-interview rendering middleware", () => {
 		);
 
 		const dialogOptions = select.mock.calls[0]?.[2];
-		expect(dialogOptions?.scrollTitleRows).toBeUndefined();
-		expect(dialogOptions?.helpText).not.toContain("scroll question");
+		expect(dialogOptions?.scrollTitleRows).toBe(Number.MAX_SAFE_INTEGER);
+		expect(dialogOptions?.helpText).toContain("PgUp/PgDn/Ctrl+u/d: question");
+		expect(dialogOptions?.helpText).toContain("Wheel: transcript");
+		expect(dialogOptions?.outline).toBe(true);
+		expect(dialogOptions?.wrapFocused).toBe(true);
 	});
 
 	it("recognizes topology questions even when the agent prepends an intro", async () => {

@@ -48,6 +48,21 @@ export interface HookSelectorOptions {
 	wrapFocused?: boolean;
 	scrollTitleRows?: number;
 	/**
+	 * Maximum visible rows for the inline editor in bounded scroll-title selectors.
+	 * The editor keeps the full draft and scrolls within this height.
+	 */
+	inlineEditorMaxHeight?: number;
+	/**
+	 * Maximum visible autocomplete rows for the inline editor in a bounded selector.
+	 * The Editor retains its normal minimum and scroll indicator behavior.
+	 */
+	inlineAutocompleteMaxVisible?: number;
+	/**
+	 * Compact bounded-selector chrome while the inline editor is active.
+	 * Used only when the terminal cannot fit the normal editor and dropdown rows.
+	 */
+	compactInlineInput?: boolean;
+	/**
 	 * Inline free-text entry for the option with this label (e.g. the ask
 	 * tool's "Other (type your own)"). Selecting it keeps the title and option
 	 * list on screen and opens a prompt-style editor below the list instead of
@@ -103,6 +118,7 @@ class ScrollableTitle extends Container {
 	#maxRows: number;
 	#scrollOffset = 0;
 	#lastMaxScrollOffset = 0;
+	#lastRenderWidth?: number;
 
 	constructor(title: string, maxRows: number) {
 		super();
@@ -110,9 +126,15 @@ class ScrollableTitle extends Container {
 		this.#markdown = new Markdown(title, 1, 0, getMarkdownTheme(), { color: t => theme.fg("accent", t) });
 	}
 
-	setText(text: string): void {
+	setText(text: string, resetScroll = true): void {
 		this.#markdown.setText(text);
-		this.#scrollOffset = 0;
+		if (resetScroll) this.#scrollOffset = 0;
+		this.invalidate();
+	}
+	setMaxRows(maxRows: number): void {
+		const wasAtBottom = this.#lastMaxScrollOffset > 0 && this.#scrollOffset >= this.#lastMaxScrollOffset;
+		this.#maxRows = Math.max(1, Math.floor(maxRows));
+		if (wasAtBottom) this.#scrollOffset = Number.MAX_SAFE_INTEGER;
 		this.invalidate();
 	}
 
@@ -125,7 +147,30 @@ class ScrollableTitle extends Container {
 	}
 
 	render(width: number): string[] {
-		const lines = this.#markdown.render(width);
+		const wasAtBottom = this.#lastMaxScrollOffset > 0 && this.#scrollOffset >= this.#lastMaxScrollOffset;
+		let lines: string[];
+		if (this.#lastRenderWidth !== undefined && this.#lastRenderWidth !== width) {
+			const previous = this.#markdown.renderWithViewportAnchorSource(this.#lastRenderWidth, { id: "title" });
+			const previousOffset = Math.min(this.#scrollOffset, previous.anchors.length - 1);
+			const previousAnchor =
+				previous.anchors[previousOffset] ??
+				previous.anchors.slice(previousOffset + 1).find(anchor => anchor !== null) ??
+				previous.anchors.slice(0, previousOffset).findLast(anchor => anchor !== null);
+			const reflowed = this.#markdown.renderWithViewportAnchorSource(width, { id: "title" });
+			lines = reflowed.lines;
+			if (previousAnchor) {
+				const anchoredLine = reflowed.anchors.findIndex(
+					anchor =>
+						anchor !== null &&
+						anchor.graphemeStart <= previousAnchor.graphemeStart &&
+						previousAnchor.graphemeStart < anchor.graphemeEnd,
+				);
+				if (anchoredLine >= 0) this.#scrollOffset = anchoredLine;
+			}
+		} else {
+			lines = this.#markdown.render(width);
+		}
+		this.#lastRenderWidth = width;
 		if (lines.length <= this.#maxRows) {
 			this.#lastMaxScrollOffset = 0;
 			this.#scrollOffset = 0;
@@ -137,22 +182,17 @@ class ScrollableTitle extends Container {
 			this.#lastMaxScrollOffset = maxScrollOffset;
 			this.#scrollOffset = Math.max(0, Math.min(this.#scrollOffset, maxScrollOffset));
 
-			const visibleLines = lines.slice(this.#scrollOffset, this.#scrollOffset + this.#maxRows);
-			const indicator =
-				this.#scrollOffset === 0
-					? theme.fg("dim", " PgDn↓")
-					: this.#scrollOffset >= maxScrollOffset
-						? theme.fg("dim", " PgUp↑")
-						: theme.fg("dim", " PgUp/PgDn↕");
-			const lastIndex = visibleLines.length - 1;
-			const availableWidth = Math.max(1, width - visibleWidth(indicator));
-			const fittedLine = truncateToWidth(visibleLines[lastIndex] ?? "", availableWidth);
-			visibleLines[lastIndex] = `${fittedLine}${indicator}`;
-			return visibleLines;
+			return lines.slice(this.#scrollOffset, this.#scrollOffset + this.#maxRows);
 		}
 
+		if (wasAtBottom) {
+			// The previous render may have reached the bottom after converging
+			// away the bottom indicator. Re-anchor before recomputing indicators
+			// so a timer repaint cannot resurrect a stale `▼ more` row.
+			this.#scrollOffset = Math.max(0, lines.length - (this.#maxRows - 1));
+		}
 		let showTopIndicator = this.#scrollOffset > 0;
-		let showBottomIndicator = true;
+		let showBottomIndicator = !wasAtBottom;
 		let contentRows = 1;
 		let maxScrollOffset = 0;
 
@@ -234,12 +274,14 @@ class FocusAwareList extends Container {
 		);
 		const focusedWrappedSegments = wrapTextWithAnsi(focusedLabel, availableLabelWidth);
 
-		// Reserve one row for the option position marker only when the focused
-		// block itself must be compacted. Moderate focused labels keep the legacy
-		// wrap-focused behavior and spend the full viewport on label context.
+		// Reserve one row when a non-full focused block and its sibling window
+		// cannot both fit. A full focused block keeps its existing priority.
 		const totalOptions = this.#options.length;
 		const mustCompactFocused = focusedWrappedSegments.length > this.#maxVisibleRows;
-		const positionMarkerSlot = mustCompactFocused && totalOptions > 1 ? 1 : 0;
+		const mustMarkClippedSiblings =
+			focusedWrappedSegments.length < this.#maxVisibleRows &&
+			focusedWrappedSegments.length + totalOptions - 1 > this.#maxVisibleRows;
+		const positionMarkerSlot = (mustCompactFocused || mustMarkClippedSiblings) && totalOptions > 1 ? 1 : 0;
 		const focusedBudget = Math.max(1, this.#maxVisibleRows - positionMarkerSlot);
 		const focusedSegments = this.#capFocusedSegments(focusedWrappedSegments, focusedBudget, availableLabelWidth);
 		const focusedRows = Math.max(1, focusedSegments.length);
@@ -296,7 +338,7 @@ class FocusAwareList extends Container {
 		if (rows.length <= budget) return rows;
 
 		if (budget === 1) {
-			return [truncateToWidth(`… ${rows.length - 1} wrapped rows omitted …`, availableLabelWidth)];
+			return [truncateToWidth(rows[0] ?? "", availableLabelWidth)];
 		}
 
 		if (budget === 2) {
@@ -347,6 +389,7 @@ export class HookSelectorComponent extends Container {
 	#wrapFocused: boolean;
 	#outline: boolean;
 	#scrollTitleRows: number | undefined;
+	#inlineEditorMaxHeight: number | undefined;
 	#customInput: { optionLabel: string; onSubmit: (text: string) => void } | undefined;
 	#clarificationInput: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
 	#activeInput: { onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
@@ -357,6 +400,10 @@ export class HookSelectorComponent extends Container {
 	#tui: TUI | undefined;
 	#autocompleteProvider: AutocompleteProvider | undefined;
 	#acceleratorMap: Readonly<Record<string, string>> | undefined;
+	#inlineAutocompleteMaxVisible: number | undefined;
+	#compactInlineInput: boolean;
+	#titleSpacer: Spacer;
+	#inputSpacer: Spacer;
 	constructor(
 		title: string,
 		options: string[],
@@ -368,7 +415,6 @@ export class HookSelectorComponent extends Container {
 
 		this.#options = options;
 		this.#selectedIndex = Math.min(opts?.initialIndex ?? 0, options.length - 1);
-		this.#maxVisible = Math.max(3, opts?.maxVisible ?? 12);
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
 		this.#baseTitle = title;
@@ -382,13 +428,21 @@ export class HookSelectorComponent extends Container {
 		this.#tui = opts?.tui;
 		this.#autocompleteProvider = opts?.autocompleteProvider;
 		this.#acceleratorMap = opts?.acceleratorMap;
+		this.#inlineAutocompleteMaxVisible =
+			opts?.inlineAutocompleteMaxVisible === undefined
+				? undefined
+				: Math.max(3, Math.floor(opts.inlineAutocompleteMaxVisible));
+		this.#compactInlineInput = opts?.compactInlineInput === true;
 
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 
 		const scrollTitleRows =
 			opts?.scrollTitleRows === undefined ? undefined : Math.max(1, Math.floor(opts.scrollTitleRows));
+		this.#maxVisible = Math.max(scrollTitleRows === undefined ? 3 : 1, opts?.maxVisible ?? 12);
 		this.#scrollTitleRows = scrollTitleRows;
+		this.#inlineEditorMaxHeight =
+			opts?.inlineEditorMaxHeight === undefined ? undefined : Math.max(1, Math.floor(opts.inlineEditorMaxHeight));
 		if (scrollTitleRows === undefined) {
 			this.#titleComponent = new Markdown(title, 1, 0, getMarkdownTheme(), { color: t => theme.fg("accent", t) });
 		} else {
@@ -396,13 +450,20 @@ export class HookSelectorComponent extends Container {
 			this.#titleComponent = this.#scrollableTitle;
 		}
 		this.addChild(this.#titleComponent);
-		this.addChild(new Spacer(1));
+		this.#titleSpacer = new Spacer(1);
+		this.addChild(this.#titleSpacer);
 
 		if (opts?.timeout && opts.timeout > 0 && opts.tui) {
 			this.#countdown = new CountdownTimer(
 				opts.timeout,
 				opts.tui,
-				s => this.#titleComponent.setText(`${this.#baseTitle} (${s}s)`),
+				s => {
+					if (this.#scrollableTitle) {
+						this.#scrollableTitle.setText(`${this.#baseTitle} (${s}s)`, false);
+					} else {
+						this.#titleComponent.setText(`${this.#baseTitle} (${s}s)`);
+					}
+				},
 				() => {
 					opts?.onTimeout?.();
 					// Auto-select current option on timeout (typically the first/recommended option)
@@ -431,7 +492,8 @@ export class HookSelectorComponent extends Container {
 		}
 		this.#inputArea = new Container();
 		this.addChild(this.#inputArea);
-		this.addChild(new Spacer(1));
+		this.#inputSpacer = new Spacer(1);
+		this.addChild(this.#inputSpacer);
 		this.#baseHelpText = opts?.helpText ?? "up/down navigate  enter select  esc cancel";
 		this.#helpTextComponent = new Text(theme.fg("dim", this.#baseHelpText), 1, 0);
 		this.addChild(this.#helpTextComponent);
@@ -443,6 +505,38 @@ export class HookSelectorComponent extends Container {
 
 	hasActiveInlineInput(): boolean {
 		return this.#inlineEditor !== undefined;
+	}
+	/**
+	 * Update the bounded selector's title/list row budgets after a terminal resize.
+	 * The existing title scroll offset, option focus, and inline editor remain intact.
+	 */
+	setLayoutBudget(
+		maxVisible: number,
+		scrollTitleRows: number,
+		inlineEditorMaxHeight = this.#inlineEditorMaxHeight,
+		inlineAutocompleteMaxVisible = this.#inlineAutocompleteMaxVisible,
+		compactInlineInput = this.#compactInlineInput,
+	): void {
+		if (!this.#scrollableTitle) return;
+		const titleRows = Math.max(1, Math.floor(scrollTitleRows));
+		this.#maxVisible = Math.max(1, Math.floor(maxVisible));
+		this.#scrollTitleRows = titleRows;
+		this.#inlineEditorMaxHeight =
+			inlineEditorMaxHeight === undefined ? undefined : Math.max(1, Math.floor(inlineEditorMaxHeight));
+		this.#inlineAutocompleteMaxVisible =
+			inlineAutocompleteMaxVisible === undefined ? undefined : Math.max(3, Math.floor(inlineAutocompleteMaxVisible));
+		this.#compactInlineInput = compactInlineInput;
+		if (this.#inlineEditor) {
+			this.#inlineEditor.setMaxHeight(this.#inlineEditorMaxHeight);
+			if (this.#inlineAutocompleteMaxVisible !== undefined) {
+				this.#inlineEditor.setAutocompleteMaxVisible(this.#inlineAutocompleteMaxVisible);
+			}
+			this.#inlineEditor.setAutocompleteProvider(this.#compactInlineInput ? undefined : this.#autocompleteProvider);
+		}
+		this.#setCompactInputSpacing(this.#inlineEditor !== undefined && this.#compactInlineInput);
+		this.#scrollableTitle.setMaxRows(titleRows);
+		this.#updateList();
+		this.invalidate();
 	}
 
 	#updateList(): void {
@@ -489,21 +583,24 @@ export class HookSelectorComponent extends Container {
 		// Reset countdown on any interaction
 		this.#countdown?.reset();
 
-		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageUp")) {
-			this.#scrollableTitle?.scrollBy(-this.#scrollTitleRows);
-			return;
-		}
-		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageDown")) {
-			this.#scrollableTitle?.scrollBy(this.#scrollTitleRows);
-			return;
-		}
-		if (!this.#inlineEditor && this.#scrollTitleRows !== undefined && matchesKey(keyData, "ctrl+u")) {
-			this.#scrollableTitle?.scrollBy(-this.#scrollTitleRows);
-			return;
-		}
-		if (!this.#inlineEditor && this.#scrollTitleRows !== undefined && matchesKey(keyData, "ctrl+d")) {
-			this.#scrollableTitle?.scrollBy(this.#scrollTitleRows);
-			return;
+		if (this.#scrollTitleRows !== undefined && !this.#inlineEditor?.isAutocompleteOpen()) {
+			const titlePageRows = Math.max(1, this.#scrollTitleRows - 2);
+			if (matchesKey(keyData, "pageUp")) {
+				this.#scrollableTitle?.scrollBy(-titlePageRows);
+				return;
+			}
+			if (matchesKey(keyData, "pageDown")) {
+				this.#scrollableTitle?.scrollBy(titlePageRows);
+				return;
+			}
+			if (!this.#inlineEditor && matchesKey(keyData, "ctrl+u")) {
+				this.#scrollableTitle?.scrollBy(-titlePageRows);
+				return;
+			}
+			if (!this.#inlineEditor && matchesKey(keyData, "ctrl+d")) {
+				this.#scrollableTitle?.scrollBy(titlePageRows);
+				return;
+			}
 		}
 		if (this.#inlineEditor) {
 			this.#handleInputModeKey(keyData, this.#inlineEditor);
@@ -573,6 +670,10 @@ export class HookSelectorComponent extends Container {
 		editor.handleInput(keyData);
 	}
 
+	#setCompactInputSpacing(compact: boolean): void {
+		this.#titleSpacer.setLines(compact ? 0 : 1);
+		this.#inputSpacer.setLines(compact ? 0 : 1);
+	}
 	#enterInputMode(input: { onSubmit: (text: string) => void; allowEmpty?: boolean }): void {
 		if (this.#inlineEditor) return;
 		this.#activeInput = input;
@@ -581,28 +682,37 @@ export class HookSelectorComponent extends Container {
 		if (this.#countdown) {
 			this.#countdown.dispose();
 			this.#countdown = undefined;
-			this.#titleComponent.setText(this.#baseTitle);
+			if (this.#scrollableTitle) {
+				this.#scrollableTitle.setText(this.#baseTitle, false);
+			} else {
+				this.#titleComponent.setText(this.#baseTitle);
+			}
 		}
 		const editor = new Editor(getEditorTheme());
 		editor.setBorderVisible(false);
 		editor.setPromptGutter("> ");
 		editor.disableSubmit = true;
+		editor.setMaxHeight(this.#inlineEditorMaxHeight);
+		if (this.#inlineAutocompleteMaxVisible !== undefined) {
+			editor.setAutocompleteMaxVisible(this.#inlineAutocompleteMaxVisible);
+		}
 		// Mark the inline editor focused only when mirroring the app's hardware-cursor
 		// mode, so it emits CURSOR_MARKER at the input caret for IME preedit anchoring
 		// without changing legacy non-hardware-cursor layout.
 		const useTerminalCursor = this.#tui?.getShowHardwareCursor() ?? false;
 		editor.focused = useTerminalCursor;
 		editor.setUseTerminalCursor(useTerminalCursor);
-		if (this.#autocompleteProvider) {
+		if (this.#autocompleteProvider && !this.#compactInlineInput) {
 			editor.setAutocompleteProvider(this.#autocompleteProvider);
 		}
 		this.#inlineEditor = editor;
-		this.#inputArea.addChild(new Spacer(1));
+		this.#setCompactInputSpacing(this.#compactInlineInput);
+		if (!this.#compactInlineInput) this.#inputArea.addChild(new Spacer(1));
 		this.#inputArea.addChild(editor);
 		const helpText =
 			this.#scrollTitleRows === undefined
 				? "enter submit  esc back to options  ctrl+g external editor"
-				: "enter submit  esc back to options  PgUp/PgDn: question · Wheel: transcript";
+				: "enter submit  esc back to options  ctrl+g external editor  PgUp/PgDn: question · Wheel: transcript";
 		this.#helpTextComponent.setText(theme.fg("dim", helpText));
 		this.invalidate();
 	}
@@ -612,6 +722,7 @@ export class HookSelectorComponent extends Container {
 		this.#inlineEditor = undefined;
 		this.#activeInput = undefined;
 		this.#inputArea.clear();
+		this.#setCompactInputSpacing(false);
 		this.#helpTextComponent.setText(theme.fg("dim", this.#baseHelpText));
 		this.invalidate();
 	}

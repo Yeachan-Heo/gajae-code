@@ -23,7 +23,12 @@ interface Callbacks {
 	submitted: string[];
 }
 
-function createSelector(opts?: { scrollTitleRows?: number; autocompleteProvider?: AutocompleteProvider; tui?: TUI }): {
+function createSelector(opts?: {
+	scrollTitleRows?: number;
+	autocompleteProvider?: AutocompleteProvider;
+	tui?: TUI;
+	timeout?: number;
+}): {
 	component: HookSelectorComponent;
 	calls: Callbacks;
 } {
@@ -41,6 +46,7 @@ function createSelector(opts?: { scrollTitleRows?: number; autocompleteProvider?
 			scrollTitleRows: opts?.scrollTitleRows,
 			autocompleteProvider: opts?.autocompleteProvider,
 			tui: opts?.tui,
+			timeout: opts?.timeout,
 		},
 	);
 	return { component, calls };
@@ -255,6 +261,41 @@ describe("HookSelectorComponent inline custom input", () => {
 		const after = renderText(component);
 		expect(after).not.toContain("Deep Interview question body");
 		expect(after).toContain("esc back to options");
+	});
+	it("preserves title scroll position when entering input after a countdown reset", () => {
+		const { component } = createSelector({
+			scrollTitleRows: 2,
+			timeout: 60_000,
+			tui: { requestRender() {}, getShowHardwareCursor: () => false } as TUI,
+		});
+
+		renderText(component);
+		component.handleInput("\x1b[6~");
+		moveToOther(component);
+		component.handleInput("\r");
+
+		expect(renderText(component)).not.toContain("Deep Interview question body");
+		component.dispose();
+	});
+	it("keeps an open autocomplete dropdown ahead of title paging", async () => {
+		const { component, calls } = createSelector({ scrollTitleRows: 2, autocompleteProvider: new AtFileProvider() });
+		moveToOther(component);
+		component.handleInput("\r");
+		component.handleInput("@");
+		await Bun.sleep(0);
+
+		component.handleInput("\x1b[6~");
+		component.handleInput("\r");
+
+		expect(renderText(component)).toContain("@src/app.ts");
+		expect(calls.submitted).toEqual([]);
+	});
+	it("retains the external-editor hint with scrollable inline input", () => {
+		const { component } = createSelector({ scrollTitleRows: 2 });
+		moveToOther(component);
+		component.handleInput("\r");
+
+		expect(renderText(component)).toContain("ctrl+g external editor");
 	});
 
 	it("opens @ file autocomplete in the inline input and applies it with enter", async () => {

@@ -1613,7 +1613,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					signal,
 					initialSelection,
 					navigation: options?.navigation,
-					scrollTitleRows: isDeepInterviewQuestion ? DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS : undefined,
+					scrollTitleRows: DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					otherOptionLabel,
 					autoSelectOnTimeout: !intentContract(q.deepInterview) && !intentReview(q.deepInterview),
 					clarificationOptionLabel,

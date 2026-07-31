@@ -1,7 +1,7 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { HookSelectorComponent } from "@gajae-code/coding-agent/modes/components/hook-selector";
 import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { visibleWidth } from "@gajae-code/tui";
+import { type TUI, visibleWidth } from "@gajae-code/tui";
 
 // =============================================================================
 // Helpers shared across required tests.
@@ -225,7 +225,30 @@ describe("HookSelectorComponent", () => {
 		// Marker is present because the window omits at least one option.
 		expect(rendered).toContain("(3/6)");
 	});
+	it("reserves a position marker when the option window is clipped", () => {
+		const options = Array.from({ length: 9 }, (_, index) => `option-${index + 1}`);
+		const rendered = renderStripped(
+			120,
+			{ outline: true, initialIndex: 3, maxVisible: 7, wrapFocused: true },
+			options,
+		);
 
+		expect(rendered).toContain("(4/9)");
+		const visibleOptions = options.filter(option => rendered.includes(option));
+		expect(visibleOptions).toHaveLength(6);
+	});
+
+	it("reserves a position marker when focused wrapping clips siblings", () => {
+		const rendered = renderStripped(24, { outline: true, initialIndex: 1, maxVisible: 3, wrapFocused: true }, [
+			"above option",
+			"focused option wraps across rows",
+			"below option",
+		]);
+
+		expect(rendered).toContain("(2/3)");
+		expect(rendered).not.toContain("above option");
+		expect(rendered).not.toContain("below option");
+	});
 	it("Required Test 6 — non-outline parity (wrapFocused:true, outline:false)", () => {
 		const longLabel =
 			"Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango";
@@ -358,6 +381,45 @@ describe("HookSelectorComponent", () => {
 		expect(rendered).toContain("▼ more");
 	});
 
+	it("caps a wrapped ordinary-ask premise at a narrow width", () => {
+		const title =
+			"Ordinary ask premise: review migration constraints, compatibility risks, rollback plans, and user-visible behavior before selecting an option.";
+		const component = new HookSelectorComponent(
+			title,
+			["answer-a", "answer-b"],
+			() => {},
+			() => {},
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: 3,
+				maxVisible: 2,
+				helpText: "↑/↓ select  enter  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript",
+			},
+		);
+
+		const renderedRows = component.render(32);
+		const rendered = Bun.stripANSI(renderedRows.join("\n"));
+		const titleRows = rendered
+			.split("\n")
+			.filter(line =>
+				["Ordinary", "premise", "constraints", "compatibility", "rollback", "behavior"].some(token =>
+					line.includes(token),
+				),
+			);
+
+		expect(renderedRows.every(line => visibleWidth(line) <= 32)).toBe(true);
+		expect(titleRows.length).toBeGreaterThan(0);
+		expect(titleRows.length).toBeLessThanOrEqual(3);
+		expect(rendered).toContain("Ordinary ask premise");
+		expect(rendered).toContain("answer-a");
+		expect(rendered).toContain("answer-b");
+		expect(rendered).toContain("▼ more");
+
+		for (let page = 0; page < 10; page++) component.handleInput("\x1b[6~");
+		expect(Bun.stripANSI(component.render(32).join("\n"))).toContain("behavior before selecting");
+	});
+
 	it("uses selector-local PageUp/PageDown for title scrolling without moving option focus", () => {
 		const title = Array.from({ length: 8 }, (_, index) => `Question segment ${index + 1}`).join("\n\n");
 		let selected: string | undefined;
@@ -376,7 +438,7 @@ describe("HookSelectorComponent", () => {
 		expect(initial).not.toContain("Question segment 8");
 		expect(initial).toContain("first-choice");
 
-		for (let i = 0; i < 8; i++) component.handleInput("\x1b[6~");
+		for (let i = 0; i < 16; i++) component.handleInput("\x1b[6~");
 		const afterPageDown = Bun.stripANSI(component.render(56).join("\n"));
 		expect(afterPageDown).not.toContain("Question segment 1");
 		expect(afterPageDown).toContain("Question segment 8");
@@ -385,9 +447,106 @@ describe("HookSelectorComponent", () => {
 		component.handleInput("\n");
 		expect(selected).toBe("first-choice");
 
-		for (let i = 0; i < 8; i++) component.handleInput("\x1b[5~");
+		for (let i = 0; i < 16; i++) component.handleInput("\x1b[5~");
 		const afterPageUp = Bun.stripANSI(component.render(56).join("\n"));
 		expect(afterPageUp).toContain("Question segment 1");
+	});
+	it("keeps the visible premise anchored across title reflow", () => {
+		const title = Array.from(
+			{ length: 8 },
+			(_, index) => `Premise segment ${index + 1} has a distinct marker for width reflow.`,
+		).join("\n\n");
+		const component = new HookSelectorComponent(
+			title,
+			["first-choice", "second-choice"],
+			() => {},
+			() => {},
+			{ outline: true, wrapFocused: true, scrollTitleRows: 4, maxVisible: 2 },
+		);
+
+		component.render(80);
+		component.handleInput("\x1b[6~");
+		const wide = Bun.stripANSI(component.render(80).join("\n"));
+		expect(wide).toContain("Premise segment 2");
+		expect(wide).toContain("first-choice");
+
+		const narrow = Bun.stripANSI(component.render(30).join("\n"));
+		expect(narrow).toContain("Premise segment 2");
+		expect(narrow).toContain("first-choice");
+
+		const wideAgain = Bun.stripANSI(component.render(80).join("\n"));
+		expect(wideAgain).toContain("Premise segment 2");
+		expect(wideAgain).toContain("first-choice");
+	});
+	it("pages through every premise row despite overflow indicators", () => {
+		const title = Array.from({ length: 20 }, (_, index) => `Premise row ${index + 1}`).join("\n");
+		const component = new HookSelectorComponent(
+			title,
+			["first-choice", "second-choice"],
+			() => {},
+			() => {},
+			{ outline: true, wrapFocused: true, scrollTitleRows: 10, maxVisible: 2 },
+		);
+		const seenRows = new Set<string>();
+
+		for (let page = 0; page < 4; page++) {
+			const renderedRows = new Set(
+				Bun.stripANSI(component.render(56).join("\n"))
+					.split("\n")
+					.map(line => line.trim()),
+			);
+			for (let row = 1; row <= 20; row++) {
+				const premiseRow = `Premise row ${row}`;
+				if (renderedRows.has(premiseRow)) seenRows.add(premiseRow);
+			}
+			component.handleInput("\x1b[6~");
+		}
+
+		expect([...seenRows]).toEqual(Array.from({ length: 20 }, (_, index) => `Premise row ${index + 1}`));
+	});
+	it("keeps each premise line intact in a one-row title viewport", () => {
+		const component = new HookSelectorComponent(
+			"Premise content 1\nPremise content 2",
+			["first-choice", "second-choice"],
+			() => {},
+			() => {},
+			{ outline: true, wrapFocused: true, scrollTitleRows: 1, maxVisible: 1 },
+		);
+
+		expect(Bun.stripANSI(component.render(24).join("\n"))).toContain("Premise content 1");
+		component.handleInput("\x1b[6~");
+		expect(Bun.stripANSI(component.render(24).join("\n"))).toContain("Premise content 2");
+	});
+	it("keeps the bottom premise page stable across a countdown repaint", () => {
+		vi.useFakeTimers();
+		const title = Array.from({ length: 20 }, (_, index) => `Timed premise row ${index + 1}`).join("\n");
+		const tui = { requestRender() {} } as unknown as TUI;
+		const component = new HookSelectorComponent(
+			title,
+			["first-choice", "second-choice"],
+			() => {},
+			() => {},
+			{ outline: true, wrapFocused: true, scrollTitleRows: 10, maxVisible: 2, timeout: 60_000, tui },
+		);
+
+		try {
+			component.render(56);
+			component.handleInput("\x1b[6~");
+			component.render(56);
+			component.handleInput("\x1b[6~");
+
+			const beforeTick = Bun.stripANSI(component.render(56).join("\n"));
+			expect(beforeTick).toContain("Timed premise row 20");
+
+			vi.advanceTimersByTime(1_000);
+
+			const afterTick = Bun.stripANSI(component.render(56).join("\n"));
+			expect(afterTick).toContain("Timed premise row 20");
+			expect(afterTick).not.toContain("▼ more");
+		} finally {
+			component.dispose();
+			vi.useRealTimers();
+		}
 	});
 	it("uses selector-local Ctrl+u/Ctrl+d aliases for title scrolling without moving option focus", () => {
 		const title = Array.from({ length: 8 }, (_, index) => `Ctrl segment ${index + 1}`).join("\n\n");
@@ -406,7 +565,7 @@ describe("HookSelectorComponent", () => {
 		expect(initial).toContain("Ctrl segment 1");
 		expect(initial).not.toContain("Ctrl segment 8");
 
-		for (let i = 0; i < 8; i++) component.handleInput("\x04");
+		for (let i = 0; i < 16; i++) component.handleInput("\x04");
 		const afterCtrlD = Bun.stripANSI(component.render(56).join("\n"));
 		expect(afterCtrlD).not.toContain("Ctrl segment 1");
 		expect(afterCtrlD).toContain("Ctrl segment 8");
@@ -415,7 +574,7 @@ describe("HookSelectorComponent", () => {
 		component.handleInput("\n");
 		expect(selected).toBe("first-choice");
 
-		for (let i = 0; i < 8; i++) component.handleInput("\x15");
+		for (let i = 0; i < 16; i++) component.handleInput("\x15");
 		const afterCtrlU = Bun.stripANSI(component.render(56).join("\n"));
 		expect(afterCtrlU).toContain("Ctrl segment 1");
 	});

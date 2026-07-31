@@ -46,7 +46,7 @@ type TestContext = InteractiveModeContext & {
 	};
 };
 
-function createControllerContext() {
+function createControllerContext(rows = 30, columns = 120) {
 	const editor = { id: "core-editor" };
 	const editorContainer = {
 		children: [] as unknown[],
@@ -68,7 +68,7 @@ function createControllerContext() {
 		setFocus: vi.fn(),
 		start: vi.fn(),
 		stop: vi.fn(),
-		terminal: { columns: 120, rows: 30, write: vi.fn() },
+		terminal: { columns, rows, write: vi.fn() },
 	} as unknown as TestContext["ui"] & {
 		setFocus: ReturnType<typeof vi.fn>;
 		requestRender: ReturnType<typeof vi.fn>;
@@ -428,7 +428,312 @@ describe("ExtensionUiController hook editor abort", () => {
 		expect(await promise).toBe("Alpha");
 		expect(ui.terminal.write).not.toHaveBeenCalledWith("\x1b[?1000l\x1b[?1006l");
 	});
+	it("reserves the expanded option list when bounding a selector title", async () => {
+		const { ctx } = createControllerContext(20);
+		const controller = new ExtensionUiController(ctx);
+		Object.assign(ctx.editor, { getAutocompleteProvider: () => undefined });
+		Object.assign(ctx.ui, { getShowHardwareCursor: () => false });
+		const options = [...Array.from({ length: 8 }, (_, index) => `Choice ${index + 1}`), "Other"];
+		const abortController = new AbortController();
+		const promise = controller.showHookSelector(
+			Array.from({ length: 40 }, (_, index) => `Prompt row ${index + 1}`).join("\n"),
+			options,
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: Number.MAX_SAFE_INTEGER,
+				customInput: { optionLabel: "Other", onSubmit: () => {} },
+				signal: abortController.signal,
+			},
+		);
 
+		for (let index = 0; index < options.length - 1; index++) ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\n");
+
+		const rendered = Bun.stripANSI(ctx.hookSelector!.render(80).join("\n"));
+		expect(rendered.split("\n").length).toBeLessThanOrEqual(20);
+		expect(rendered).toContain("Prompt row 1");
+		expect(rendered).toContain("Other");
+		expect(rendered).toContain("> ");
+		expect(rendered).toContain("enter submit");
+		abortController.abort();
+		expect(await promise).toBeUndefined();
+	});
+	it("bounds multiline inline input and autocomplete within the scroll-title viewport", async () => {
+		const { ctx } = createControllerContext(20);
+		Object.assign(ctx.ui, { getShowHardwareCursor: () => false });
+		const submitted: string[] = [];
+		const autocompleteProvider = {
+			async getSuggestions(lines: string[], cursorLine: number, cursorCol: number) {
+				const prefix = (lines[cursorLine] ?? "").slice(0, cursorCol);
+				if (!prefix.endsWith("@")) return null;
+				return {
+					prefix: "@",
+					items: Array.from({ length: 8 }, (_, index) => ({
+						value: `@file${index}`,
+						label: `file${index}`,
+					})),
+				};
+			},
+			applyCompletion(
+				lines: string[],
+				cursorLine: number,
+				cursorCol: number,
+				item: { value: string },
+				prefix: string,
+			) {
+				const line = lines[cursorLine] ?? "";
+				const start = cursorCol - prefix.length;
+				const nextLine = line.slice(0, start) + item.value + line.slice(cursorCol);
+				return {
+					lines: lines.map((value, index) => (index === cursorLine ? nextLine : value)),
+					cursorLine,
+					cursorCol: start + item.value.length,
+				};
+			},
+		};
+		Object.assign(ctx.editor, { getAutocompleteProvider: () => autocompleteProvider });
+		const controller = new ExtensionUiController(ctx);
+		const promise = controller.showHookSelector(
+			Array.from({ length: 40 }, (_, index) => `Prompt row ${index + 1}`).join("\n"),
+			["Alpha", "Beta", "Other"],
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: Number.MAX_SAFE_INTEGER,
+				customInput: { optionLabel: "Other", onSubmit: text => submitted.push(text) },
+			},
+		);
+
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\n");
+		ctx.hookSelector!.handleInput("\x1b[200~line1\nline2\nline3\n\x1b[201~");
+		ctx.hookSelector!.handleInput("@");
+		await Bun.sleep(150);
+
+		const rendered = Bun.stripANSI(ctx.hookSelector!.render(120).join("\n"));
+		expect(rendered.split("\n").length).toBeLessThanOrEqual(20);
+		expect(rendered).toContain("line3");
+		expect(rendered).toContain("file0");
+
+		ctx.hookSelector!.handleInput("\r");
+		ctx.hookSelector!.handleInput("\r");
+		expect(await promise).toBe("Other");
+		expect(submitted).toEqual(["line1\nline2\nline3\n@file0"]);
+	});
+
+	it("accounts for wrapped scroll help in the title viewport budget", async () => {
+		const { ctx } = createControllerContext(20, 40);
+		const controller = new ExtensionUiController(ctx);
+		const abortController = new AbortController();
+		const promise = controller.showHookSelector(
+			Array.from({ length: 40 }, (_, index) => `Prompt row ${index + 1}`).join("\n"),
+			["Alpha", "Beta", "Gamma"],
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: Number.MAX_SAFE_INTEGER,
+				helpText: "↑/↓ select  enter  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript",
+				signal: abortController.signal,
+			},
+		);
+
+		const rendered = Bun.stripANSI(ctx.hookSelector!.render(40).join("\n"));
+		expect(rendered.split("\n")).toHaveLength(20);
+		expect(rendered).toContain("Prompt row 1");
+		expect(rendered).toContain("Alpha");
+		expect(rendered).toContain("Gamma");
+		expect(rendered).toContain("PgUp/PgDn/Ctrl+u/d: question");
+		abortController.abort();
+		expect(await promise).toBeUndefined();
+	});
+	it("accounts for wrapped inline-input help in the title viewport budget", async () => {
+		const { ctx } = createControllerContext(20, 19);
+		Object.assign(ctx.editor, { getAutocompleteProvider: () => undefined });
+		Object.assign(ctx.ui, { getShowHardwareCursor: () => false });
+		const controller = new ExtensionUiController(ctx);
+		const abortController = new AbortController();
+		const promise = controller.showHookSelector(
+			Array.from({ length: 40 }, (_, index) => `Prompt row ${index + 1}`).join("\n"),
+			["A deliberately long focused option that wraps", "Beta", "Other"],
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: Number.MAX_SAFE_INTEGER,
+				helpText: "↑/↓ select  enter  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript",
+				customInput: { optionLabel: "Other", onSubmit: () => {} },
+				signal: abortController.signal,
+			},
+		);
+		const optionsRendered = Bun.stripANSI(ctx.hookSelector!.render(19).join("\n"));
+		expect(optionsRendered).toContain("A deliberately");
+
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\n");
+		const rendered = Bun.stripANSI(ctx.hookSelector!.render(19).join("\n"));
+		expect(rendered.split("\n").length).toBeLessThanOrEqual(20);
+		expect(rendered).toContain("> ");
+		expect(rendered).toContain("ctrl+g external");
+		abortController.abort();
+		expect(await promise).toBeUndefined();
+	});
+	it("keeps compact inline input within the 20-row selector viewport", async () => {
+		const { ctx } = createControllerContext(20, 19);
+		Object.assign(ctx.ui, { getShowHardwareCursor: () => false });
+		const autocompleteProvider = {
+			async getSuggestions(lines: string[], cursorLine: number, cursorCol: number) {
+				const prefix = (lines[cursorLine] ?? "").slice(0, cursorCol);
+				if (!prefix.endsWith("@")) return null;
+				return {
+					prefix: "@",
+					items: Array.from({ length: 8 }, (_, index) => ({
+						value: `@file${index}`,
+						label: `file${index}`,
+					})),
+				};
+			},
+			applyCompletion(
+				lines: string[],
+				cursorLine: number,
+				cursorCol: number,
+				item: { value: string },
+				prefix: string,
+			) {
+				const line = lines[cursorLine] ?? "";
+				const start = cursorCol - prefix.length;
+				const nextLine = line.slice(0, start) + item.value + line.slice(cursorCol);
+				return {
+					lines: lines.map((value, index) => (index === cursorLine ? nextLine : value)),
+					cursorLine,
+					cursorCol: start + item.value.length,
+				};
+			},
+		};
+		Object.assign(ctx.editor, { getAutocompleteProvider: () => autocompleteProvider });
+		const controller = new ExtensionUiController(ctx);
+		const abortController = new AbortController();
+		const promise = controller.showHookSelector(
+			Array.from({ length: 40 }, (_, index) => `Prompt row ${index + 1}`).join("\n"),
+			["Alpha", "Beta", "Other"],
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: Number.MAX_SAFE_INTEGER,
+				helpText: "↑/↓ select  enter  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript",
+				customInput: { optionLabel: "Other", onSubmit: () => {} },
+				signal: abortController.signal,
+			},
+		);
+
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\n");
+		ctx.hookSelector!.handleInput("@");
+		await Bun.sleep(150);
+
+		const rendered = Bun.stripANSI(ctx.hookSelector!.render(19).join("\n"));
+		expect(rendered.split("\n").length).toBeLessThanOrEqual(20);
+		expect(rendered).not.toContain("file0");
+
+		Object.assign(ctx.ui.terminal, { columns: 120 });
+		process.stdout.emit("resize");
+		ctx.hookSelector!.handleInput("\x7f");
+		ctx.hookSelector!.handleInput("@");
+		await Bun.sleep(150);
+		const expanded = Bun.stripANSI(ctx.hookSelector!.render(120).join("\n"));
+		expect(expanded).toContain("file0");
+		expect(expanded.split("\n").length).toBeLessThanOrEqual(20);
+
+		abortController.abort();
+		expect(await promise).toBeUndefined();
+	});
+	it("recomputes the bounded selector budget when the terminal shrinks", async () => {
+		const { ctx } = createControllerContext(30);
+		Object.assign(ctx.editor, { getAutocompleteProvider: () => undefined });
+		Object.assign(ctx.ui, { getShowHardwareCursor: () => false });
+		const controller = new ExtensionUiController(ctx);
+		const abortController = new AbortController();
+		const promise = controller.showHookSelector(
+			Array.from({ length: 40 }, (_, index) => `Prompt row ${index + 1}`).join("\n"),
+			["Alpha", "Beta", "Other"],
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: Number.MAX_SAFE_INTEGER,
+				customInput: { optionLabel: "Other", onSubmit: () => {} },
+				signal: abortController.signal,
+			},
+		);
+
+		const beforeResize = Bun.stripANSI(ctx.hookSelector!.render(80).join("\n"));
+		expect(beforeResize.split("\n").length).toBeGreaterThan(20);
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\n");
+		for (const character of "draft") ctx.hookSelector!.handleInput(character);
+
+		Object.assign(ctx.ui.terminal, { rows: 20 });
+		process.stdout.emit("resize");
+
+		const afterResize = Bun.stripANSI(ctx.hookSelector!.render(80).join("\n"));
+		expect(afterResize.split("\n").length).toBeLessThanOrEqual(20);
+		expect(afterResize).toContain("Prompt row 1");
+		expect(afterResize).toContain("Other");
+		expect(afterResize).toContain("draft");
+		expect(afterResize).toContain("enter submit");
+
+		abortController.abort();
+		expect(await promise).toBeUndefined();
+	});
+	it("keeps the bottom title line anchored when resize leaves a one-row title", async () => {
+		const { ctx } = createControllerContext(30);
+		const controller = new ExtensionUiController(ctx);
+		const abortController = new AbortController();
+		const promise = controller.showHookSelector(
+			Array.from({ length: 20 }, (_, index) => `Prompt row ${index + 1}`).join("\n"),
+			["Alpha", "Beta", "Gamma"],
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: Number.MAX_SAFE_INTEGER,
+				signal: abortController.signal,
+			},
+		);
+
+		ctx.hookSelector!.render(80);
+		for (let index = 0; index < 4; index++) ctx.hookSelector!.handleInput("\x1b[6~");
+		const beforeResize = Bun.stripANSI(ctx.hookSelector!.render(80).join("\n"));
+		expect(beforeResize).toContain("Prompt row 20");
+
+		Object.assign(ctx.ui.terminal, { rows: 12 });
+		process.stdout.emit("resize");
+
+		const afterResize = Bun.stripANSI(ctx.hookSelector!.render(80).join("\n"));
+		expect(afterResize.split("\n").length).toBeLessThanOrEqual(12);
+		expect(afterResize).toContain("Prompt row 20");
+
+		abortController.abort();
+		expect(await promise).toBeUndefined();
+	});
+	it("removes the bounded selector resize listener when disposed", () => {
+		const { ctx } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		const initialListeners = process.stdout.listenerCount("resize");
+		Object.assign(ctx, {
+			hookWidgetContainerAbove: { detachAll: vi.fn() },
+			hookWidgetContainerBelow: { detachAll: vi.fn() },
+		});
+
+		void controller.showHookSelector("Pick one", ["Alpha", "Beta"], {
+			scrollTitleRows: Number.MAX_SAFE_INTEGER,
+		});
+
+		expect(process.stdout.listenerCount("resize")).toBe(initialListeners + 1);
+		controller.dispose();
+		expect(process.stdout.listenerCount("resize")).toBe(initialListeners);
+	});
 	it("restores the composer via the pet-aware restoreComposer when available", async () => {
 		const { ctx, editor, editorContainer, ui } = createControllerContext();
 		// Simulate InteractiveMode's pet-aware restore: re-mounts the framed editor

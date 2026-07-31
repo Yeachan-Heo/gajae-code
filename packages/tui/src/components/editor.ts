@@ -522,8 +522,13 @@ export class Editor implements Component, Focusable {
 		this.#disposeTabWidthListener = undefined;
 	}
 
-	setAutocompleteProvider(provider: AutocompleteProvider): void {
+	setAutocompleteProvider(provider: AutocompleteProvider | undefined): void {
 		this.#autocompleteProvider = provider;
+		if (provider === undefined) {
+			this.#cancelAutocomplete();
+			this.onAutocompleteUpdate?.();
+		}
+		this.invalidate();
 	}
 
 	getAutocompleteProvider(): AutocompleteProvider | undefined {

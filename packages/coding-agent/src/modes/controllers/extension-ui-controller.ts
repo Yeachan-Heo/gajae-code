@@ -1,6 +1,14 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Component, OverlayHandle, TUI } from "@gajae-code/tui";
-import { Container, Spacer, Text } from "@gajae-code/tui";
+import {
+	type Component,
+	Container,
+	type OverlayHandle,
+	replaceTabs,
+	Spacer,
+	Text,
+	type TUI,
+	wrapTextWithAnsi,
+} from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import { KeybindingsManager } from "../../config/keybindings";
 import type {
@@ -39,7 +47,15 @@ import { prepareTranscriptRebuild } from "../utils/ui-helpers";
 const MAX_WIDGET_LINES = 10;
 const HOOK_SELECTOR_CHROME_ROWS = 7;
 const HOOK_SELECTOR_OUTLINE_ROWS = 2;
-const HOOK_SELECTOR_INLINE_INPUT_ROWS = 2;
+const HOOK_SELECTOR_INLINE_EDITOR_ROWS = 2;
+const HOOK_SELECTOR_INLINE_AUTOCOMPLETE_ROWS = 6;
+const HOOK_SELECTOR_INLINE_INPUT_ROWS = 1 + HOOK_SELECTOR_INLINE_EDITOR_ROWS + HOOK_SELECTOR_INLINE_AUTOCOMPLETE_ROWS;
+const HOOK_SELECTOR_INLINE_COMPACT_EDITOR_ROWS = 1;
+const HOOK_SELECTOR_INLINE_COMPACT_AUTOCOMPLETE_MAX_VISIBLE = 3;
+const HOOK_SELECTOR_INLINE_COMPACT_AUTOCOMPLETE_ROWS = 4;
+const HOOK_SELECTOR_INLINE_COMPACT_INPUT_ROWS =
+	1 + HOOK_SELECTOR_INLINE_COMPACT_EDITOR_ROWS + HOOK_SELECTOR_INLINE_COMPACT_AUTOCOMPLETE_ROWS;
+const HOOK_SELECTOR_INLINE_COMPACT_CHROME_ROWS = 2;
 
 const EXTENSION_ACTION_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"sendMessage",
@@ -91,6 +107,7 @@ export class ExtensionUiController {
 	#activeHookCustomOverlay?: OverlayHandle;
 	#activeHookCustomCancel?: () => void;
 
+	#hookSelectorResizeHandler?: () => void;
 	constructor(private ctx: InteractiveModeContext) {}
 
 	#clearActiveHookCustom(): void {
@@ -363,6 +380,11 @@ export class ExtensionUiController {
 	/** Re-mount the pet-aware composer after a transient hook UI closes. */
 	#restoreComposerEditor(): void {
 		this.ctx.restoreComposer();
+	}
+	#removeHookSelectorResizeHandler(): void {
+		if (!this.#hookSelectorResizeHandler) return;
+		process.stdout.removeListener("resize", this.#hookSelectorResizeHandler);
+		this.#hookSelectorResizeHandler = undefined;
 	}
 
 	#isStopped(): boolean {
@@ -1165,19 +1187,75 @@ export class ExtensionUiController {
 			dialogOptions?.signal,
 		);
 		const requestedTitleRows = dialogOptions?.scrollTitleRows;
-		const baseMaxVisible = Math.max(4, Math.min(15, this.ctx.ui.terminal.rows - 12));
-		const scrollOptionRows = Math.max(1, Math.min(baseMaxVisible, options.length));
-		const maxVisible =
-			requestedTitleRows === undefined ? baseMaxVisible : Math.min(15, Math.max(3, scrollOptionRows + 1));
 		const listChromeRows = dialogOptions?.outline === true ? HOOK_SELECTOR_OUTLINE_ROWS : 0;
 		// Reserve rows for the inline custom-input editor so opening it doesn't
 		// push the scrollable title past the viewport into terminal scrollback.
-		const inlineInputRows =
-			dialogOptions?.customInput || dialogOptions?.clarificationInput ? HOOK_SELECTOR_INLINE_INPUT_ROWS : 0;
-		const availableTitleRows =
-			this.ctx.ui.terminal.rows - scrollOptionRows - listChromeRows - inlineInputRows - HOOK_SELECTOR_CHROME_ROWS;
-		const scrollTitleRows =
-			requestedTitleRows === undefined ? undefined : Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
+		const hasInlineInput =
+			dialogOptions?.customInput !== undefined || dialogOptions?.clarificationInput !== undefined;
+		const inlineInputRows = hasInlineInput ? HOOK_SELECTOR_INLINE_INPUT_ROWS : 0;
+		const helpText = dialogOptions?.helpText ?? "up/down navigate  enter select  esc cancel";
+		const inlineInputHelpText =
+			requestedTitleRows === undefined
+				? "enter submit  esc back to options  ctrl+g external editor"
+				: "enter submit  esc back to options  ctrl+g external editor  PgUp/PgDn: question · Wheel: transcript";
+		const computeBudget = (): {
+			maxVisible: number;
+			scrollTitleRows: number | undefined;
+			inlineEditorMaxHeight: number | undefined;
+			inlineAutocompleteMaxVisible: number | undefined;
+			compactInlineInput: boolean;
+		} => {
+			const baseMaxVisible = Math.max(4, Math.min(15, this.ctx.ui.terminal.rows - 12));
+			const scrollOptionRows = Math.max(1, Math.min(baseMaxVisible, options.length));
+			const helpWidth = Math.max(1, this.ctx.ui.terminal.columns - 2);
+			const helpTextRows = Math.max(
+				wrapTextWithAnsi(replaceTabs(helpText), helpWidth).length,
+				hasInlineInput ? wrapTextWithAnsi(replaceTabs(inlineInputHelpText), helpWidth).length : 0,
+				1,
+			);
+			const baseChromeRows = HOOK_SELECTOR_CHROME_ROWS - 1 + helpTextRows;
+			const compactInlineInput =
+				requestedTitleRows !== undefined &&
+				hasInlineInput &&
+				this.ctx.ui.terminal.rows < baseChromeRows + listChromeRows + inlineInputRows + 2;
+			const chromeRows = baseChromeRows - (compactInlineInput ? HOOK_SELECTOR_INLINE_COMPACT_CHROME_ROWS : 0);
+			const effectiveInlineInputRows = compactInlineInput
+				? HOOK_SELECTOR_INLINE_COMPACT_INPUT_ROWS
+				: inlineInputRows;
+			const maxVisible =
+				requestedTitleRows === undefined
+					? baseMaxVisible
+					: Math.max(
+							1,
+							Math.min(
+								15,
+								scrollOptionRows,
+								this.ctx.ui.terminal.rows - listChromeRows - effectiveInlineInputRows - chromeRows - 1,
+							),
+						);
+			const availableTitleRows =
+				this.ctx.ui.terminal.rows - maxVisible - listChromeRows - effectiveInlineInputRows - chromeRows;
+			const scrollTitleRows =
+				requestedTitleRows === undefined
+					? undefined
+					: Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
+			return {
+				maxVisible,
+				scrollTitleRows,
+				inlineEditorMaxHeight:
+					requestedTitleRows !== undefined && hasInlineInput
+						? compactInlineInput
+							? HOOK_SELECTOR_INLINE_COMPACT_EDITOR_ROWS
+							: HOOK_SELECTOR_INLINE_EDITOR_ROWS
+						: undefined,
+				inlineAutocompleteMaxVisible: compactInlineInput
+					? HOOK_SELECTOR_INLINE_COMPACT_AUTOCOMPLETE_MAX_VISIBLE
+					: undefined,
+				compactInlineInput,
+			};
+		};
+		const { maxVisible, scrollTitleRows, inlineEditorMaxHeight, inlineAutocompleteMaxVisible, compactInlineInput } =
+			computeBudget();
 
 		ringTerminalBell(classifyHookSelectorBellEvent(title));
 
@@ -1213,8 +1291,6 @@ export class ExtensionUiController {
 				timeout: dialogOptions?.timeout,
 				onTimeout: dialogOptions?.onTimeout,
 				tui: this.ctx.ui,
-				// Share the main prompt editor's autocomplete provider so the
-				// inline "Other (type your own)" editor supports `@` file links.
 				autocompleteProvider:
 					dialogOptions?.customInput || dialogOptions?.clarificationInput
 						? this.ctx.editor.getAutocompleteProvider()
@@ -1223,6 +1299,9 @@ export class ExtensionUiController {
 				wrapFocused: dialogOptions?.wrapFocused,
 				scrollTitleRows,
 				maxVisible,
+				inlineEditorMaxHeight,
+				inlineAutocompleteMaxVisible,
+				compactInlineInput,
 				customInput: dialogOptions?.customInput
 					? {
 							optionLabel: dialogOptions.customInput.optionLabel,
@@ -1255,6 +1334,24 @@ export class ExtensionUiController {
 		this.ctx.editorContainer.addChild(this.ctx.hookSelector);
 		this.ctx.ui.setFocus(this.ctx.hookSelector);
 		this.ctx.ui.requestRender();
+		if (requestedTitleRows !== undefined) {
+			this.#removeHookSelectorResizeHandler();
+			const resizeHandler = () => {
+				const selector = this.ctx.hookSelector;
+				const nextBudget = computeBudget();
+				if (!selector || nextBudget.scrollTitleRows === undefined) return;
+				selector.setLayoutBudget(
+					nextBudget.maxVisible,
+					nextBudget.scrollTitleRows,
+					nextBudget.inlineEditorMaxHeight,
+					nextBudget.inlineAutocompleteMaxVisible,
+					nextBudget.compactInlineInput,
+				);
+				this.ctx.ui.requestRender();
+			};
+			this.#hookSelectorResizeHandler = resizeHandler;
+			process.stdout.on("resize", resizeHandler);
+		}
 		attachAbort();
 		return promise;
 	}
@@ -1263,6 +1360,7 @@ export class ExtensionUiController {
 	 * Hide the hook selector.
 	 */
 	hideHookSelector(): void {
+		this.#removeHookSelectorResizeHandler();
 		this.ctx.hookSelector?.dispose();
 		this.ctx.hookSelector = undefined;
 		if (this.#isStopped()) return;
@@ -1509,6 +1607,7 @@ export class ExtensionUiController {
 	}
 
 	dispose(): void {
+		this.#removeHookSelectorResizeHandler();
 		this.#extensionErrorUnsubscribe?.();
 		this.#extensionErrorUnsubscribe = undefined;
 		this.#activeHookCustomCancel?.();
