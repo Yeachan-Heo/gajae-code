@@ -338,7 +338,11 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 
 			expectDetachedCleanupPending(exactUnlink(original, identity), detached);
 
-			expect(exactRestore(detached, original, identity)).toMatchObject({ ok: true, payloadDurable: true });
+			expect(exactRestore(detached, original, identity)).toMatchObject({
+				ok: false,
+				code: "cleanup_pending",
+				retainedPlaceholderPath: expect.any(String),
+			});
 			expect(await fs.readFile(original, "utf8")).toBe("authorized");
 		},
 	);

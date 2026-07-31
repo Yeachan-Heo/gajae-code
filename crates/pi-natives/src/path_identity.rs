@@ -494,30 +494,6 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
-	fn success_with_placeholder(path: String) -> Self {
-		Self {
-			ok: true,
-			code: None,
-			payload_durable: Some(true),
-			detached_path: None,
-			retained_successor_path: None,
-			retained_placeholder_path: Some(path),
-			retained_unknown_path: None,
-		}
-	}
-
-	fn success_with_unknown(path: String) -> Self {
-		Self {
-			ok: true,
-			code: None,
-			payload_durable: Some(true),
-			detached_path: None,
-			retained_successor_path: None,
-			retained_placeholder_path: None,
-			retained_unknown_path: Some(path),
-		}
-	}
-
 	fn failure(code: &str) -> Self {
 		Self {
 			ok: false,
@@ -3700,14 +3676,16 @@ pub(crate) mod platform {
 			| ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
 				// SAFETY: this branch owns the live descriptor and closes it exactly once.
 				unsafe { libc::close(parent_fd) };
-				return NativeExactUnlinkResult::success_with_placeholder(
+				return NativeExactUnlinkResult::retained_placeholder_failure(
+					"cleanup_pending",
 					retained_name.to_string_lossy().into_owned(),
 				);
 			},
 			ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
 				// SAFETY: this branch owns the live descriptor and closes it exactly once.
 				unsafe { libc::close(parent_fd) };
-				return NativeExactUnlinkResult::success_with_unknown(
+				return NativeExactUnlinkResult::retained_unknown_failure(
+					"cleanup_pending",
 					detached_path.to_string_lossy().into_owned(),
 				);
 			},

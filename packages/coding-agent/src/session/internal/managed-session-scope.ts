@@ -3170,7 +3170,7 @@ export function restorePreparedArtifactRoot(
 		...artifactIdentity,
 		directory: true,
 	});
-	if (!result.ok) throw new Error("durability_failed");
+	if (!result.ok && result.code !== "cleanup_pending") throw new Error("durability_failed");
 }
 
 function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot, cleanup?: SourceArtifactCleanup): void {
@@ -3180,7 +3180,7 @@ function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot, cleanup?: S
 		...detached.identity,
 		directory: true,
 	});
-	if (!result.ok) throw new Error("durability_failed");
+	if (!result.ok && result.code !== "cleanup_pending") throw new Error("durability_failed");
 }
 
 async function copyArtifacts(
