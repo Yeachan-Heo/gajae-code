@@ -4643,18 +4643,6 @@ mod platform {
 		Ok(handle)
 	}
 
-	fn duplicate_process_handle(handle: HANDLE) -> Result<HANDLE, &'static str> {
-		let process = unsafe { GetCurrentProcess() };
-		let mut duplicate = INVALID_HANDLE_VALUE;
-		if unsafe {
-			DuplicateHandle(process, handle, process, &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS)
-		} == 0
-		{
-			return Err(last_error_code());
-		}
-		Ok(duplicate)
-	}
-
 	fn handle_attributes(handle: HANDLE) -> Result<u32, &'static str> {
 		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
@@ -5301,7 +5289,7 @@ mod platform {
 			&source_path,
 			"file",
 			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
-			FILE_SHARE_READ | FILE_SHARE_WRITE,
+			FILE_SHARE_READ,
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
@@ -5406,27 +5394,6 @@ mod platform {
 			return NativeExactUnlinkResult::failure(code);
 		}
 		let retained_path_string = retained_path.to_string_lossy().into_owned();
-		let exclusive_parent = match duplicate_process_handle(parent_handle) {
-			Ok(handle) => handle,
-			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path_string),
-		};
-		drop(source);
-		let exclusive_source_handle = match open_relative_with_share(
-			exclusive_parent,
-			Path::new(&retained_name_string).as_os_str(),
-			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
-			false,
-			FILE_SHARE_READ,
-		) {
-			Ok(handle) => handle,
-			Err(code) => {
-				unsafe { CloseHandle(exclusive_parent) };
-				return NativeExactUnlinkResult::detached_failure(code, retained_path_string);
-			},
-		};
-		let source =
-			HeldExact { target: exclusive_source_handle, ancestors: vec![exclusive_parent] };
-		let parent_handle = exclusive_parent;
 		let mut retained_source: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(source.target, &mut retained_source) } == 0
 			|| !handle_identity_matches(&retained_source, expected_source)
