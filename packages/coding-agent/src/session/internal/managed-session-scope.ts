@@ -2491,6 +2491,10 @@ async function continueDetachedArtifactCleanup(
 		sessionId: target.sessionId,
 		cwd: target.cwd,
 		transcriptIdentity: target.identity,
+		transcriptParentIdentity: (() => {
+			const parent = fs.lstatSync(path.dirname(target.path), { bigint: true });
+			return { dev: parent.dev, ino: parent.ino };
+		})(),
 		expectedArtifactsIdentity: pendingEvidence.expectedArtifactsIdentity,
 		expectedArtifactsTree: pendingEvidence.expectedArtifactsTree,
 		detachedArtifactsPath: pendingEvidence.detachedArtifactsPath,

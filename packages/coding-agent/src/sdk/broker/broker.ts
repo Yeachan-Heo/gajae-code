@@ -925,7 +925,7 @@ export class Broker {
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
-			const persisted = await this.ledger.transition(identity, lifecycleResponseState(response), {
+			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
@@ -937,6 +937,7 @@ export class Broker {
 				...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 			});
 			if (isCleanupPending(response)) return response;
+			const persisted = await this.ledger.readTerminal(identity, requestHash);
 			const persistenceVerified =
 				persisted !== undefined &&
 				canonicalJson(persisted.response) === canonicalJson(response) &&

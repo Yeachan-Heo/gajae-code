@@ -3672,7 +3672,11 @@ async function executeLifecycleResponse(
 				cleanupTarget.retainedTranscriptSuccessorPath,
 				cleanupTarget.retainedTranscriptUnknownPath,
 			].some(candidate => candidate !== undefined && !pathIsAbsent(candidate));
-			if (successorOrUnknownRemains || !pathIsAbsent(cleanupTarget.retainedTranscriptPlaceholderPath))
+			if (
+				successorOrUnknownRemains ||
+				!pathIsAbsent(cleanupTarget.retainedTranscriptPlaceholderPath) ||
+				(!cleanupTarget.detachedTranscriptPath && !retainedTranscriptIdentityIsAbsentFromParent())
+			)
 				return await publishRetainedTranscriptSideAuthority();
 			cleanupTarget.retainedTranscriptSuccessorPath = undefined;
 			cleanupTarget.retainedTranscriptPlaceholderPath = undefined;
