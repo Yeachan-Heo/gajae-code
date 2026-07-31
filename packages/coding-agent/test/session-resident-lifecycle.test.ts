@@ -218,15 +218,13 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		expect(fs.existsSync(sessionFile)).toBe(true);
 	});
 
-	it("keeps managed deletion pending without descriptor-bound final cleanup authority", async () => {
+	it("completes managed deletion with descriptor-bound final cleanup authority", async () => {
 		const survivor = await makeLargeSession(`pending delete survivor ${"v".repeat(2048)}`);
 		await survivor.sm.close();
 		const deletion = await makeLargeSession(`pending delete cleanup ${"n".repeat(2048)}`);
 		await deletion.sm.setSessionFile(survivor.sessionFile);
 
-		await expect(deletion.sm.dropSession(deletion.sessionFile)).rejects.toThrow(
-			"Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
-		);
+		await expect(deletion.sm.dropSession(deletion.sessionFile)).resolves.toBeUndefined();
 		expect(fs.existsSync(deletion.sessionFile)).toBe(false);
 		expect(fs.existsSync(deletion.artifactsDir)).toBe(false);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
