@@ -111,8 +111,20 @@ async function runSmoke(): Promise<Surface> {
 			name?: string;
 			version?: string;
 		};
-		if (await fs.realpath(installedAgentPackagePath) !== await fs.realpath(path.join(tempDir, "node_modules", "@gajae-code", "agent-core"))) {
-			throw new Error("packed smoke resolved agent-core through an unexpected path");
+		const installedAgentRealpath = await fs.realpath(installedAgentPackagePath);
+		const tempRealpath = await fs.realpath(tempDir);
+		const sourceAgentRealpath = await fs.realpath(agentPackageDir);
+		if (!installedAgentRealpath.startsWith(`${tempRealpath}${path.sep}`) || installedAgentRealpath.startsWith(`${sourceAgentRealpath}${path.sep}`)) {
+			throw new Error("packed smoke resolved agent-core outside the temporary packed installation");
+		}
+		const packedAgentInspectDir = path.join(tempDir, "packed-agent-inspect");
+		await fs.mkdir(packedAgentInspectDir);
+		const extract = Bun.spawnSync(["tar", "xzf", agentTarballPath, "-C", packedAgentInspectDir], { stdout: "pipe", stderr: "pipe" });
+		if (extract.exitCode !== 0) throw new Error(`could not inspect packed agent-core tarball: ${extract.stderr.toString()}`);
+		const packedAgentPackageJson = await fs.readFile(path.join(packedAgentInspectDir, "package", "package.json"), "utf8");
+		const installedAgentPackageJson = await fs.readFile(installedAgentPackageJsonPath, "utf8");
+		if (installedAgentPackageJson !== packedAgentPackageJson) {
+			throw new Error("packed smoke installed agent-core content different from the packed tarball");
 		}
 		if (installedAgentPackage.name !== expectedAgentPackage.name || installedAgentPackage.version !== expectedAgentPackage.version) {
 			throw new Error("packed smoke installed a mismatched agent-core package");
