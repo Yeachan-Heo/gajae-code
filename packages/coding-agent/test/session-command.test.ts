@@ -173,11 +173,24 @@ describe("gjc session command", () => {
 		process.env.GJC_COORDINATOR_SESSION_STATE_FILE = path.join(stateRoot, "state.json");
 		const plannedExecutions: string[][] = [];
 		const probedSockets = injectSafeAbsentToSafeOwnerProof(plannedExecutions);
+		// Production re-reads every `@gjc-*` option it just wrote and requires an exact
+		// round-trip (`createdTmuxMetadataMatches`). Real tmux persists user options, so
+		// model that here: record what the guarded mutation writes and serve it back to
+		// `show-options -qv`. Returning "" for unmodelled reads would fail the round-trip
+		// on stub fidelity, not on behavior.
+		const writtenOptions = new Map<string, string>();
 		mockSpawnSync((cmd: string[]) => {
 			calls.push(cmd);
 			const [tmuxCommand] = cmd;
 			expect(tmuxCommand).toBe("tmux");
-			if (cmd.includes("if-shell")) return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+			if (cmd.includes("if-shell")) {
+				for (const arg of cmd)
+					for (const [, option, value] of arg.matchAll(/"(@gjc-[^"]+)" "([^"]*)"/g))
+						writtenOptions.set(option!, value!);
+				return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+			}
+			if (cmd.includes("show-options") && cmd.includes("-qv"))
+				return spawnResult(0, `${writtenOptions.get(cmd.at(-1) ?? "") ?? ""}\n`);
 			if (cmd.includes("list-sessions")) return spawnResult(0, sessionLine("custom_session"));
 			if (cmd.includes("display-message") && cmd.includes("#{session_id}\t#{session_name}"))
 				return spawnResult(0, "$0\tcustom_session\n");
@@ -273,7 +286,7 @@ describe("gjc session command", () => {
 		expect(payload.ok).toBe(false);
 		expect(payload.reason).toBe("gjc_tmux_session_untagged");
 		expect(typeof payload.detail).toBe("string");
-		expect(payload.detail).toContain("not fully supported");
+		expect(payload.detail).toContain("did not return GJC's @gjc-profile ownership tag");
 		expect(payload.detail).not.toContain(" — ");
 	});
 	it("awaits force-close before reporting JSON success", async () => {

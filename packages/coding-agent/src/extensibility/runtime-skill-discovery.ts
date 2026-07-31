@@ -132,15 +132,13 @@ function isAllowedByPolicy(
 	return true;
 }
 function matchesQuery(candidate: RuntimeSkillDiscoveryCandidate, query: string): boolean {
-	const normalized = query.trim().toLowerCase();
-	if (!normalized) return true;
+	const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+	if (terms.length === 0) return true;
+	if (terms.includes(candidate.name.toLowerCase())) return true;
 	const haystack = [candidate.name, candidate.description, candidate.source, ...(candidate.useWhen ?? [])]
 		.join("\n")
 		.toLowerCase();
-	return normalized
-		.split(/\s+/)
-		.filter(Boolean)
-		.every(term => haystack.includes(term));
+	return terms.every(term => haystack.includes(term));
 }
 
 async function realPathOrSelf(filePath: string): Promise<string> {

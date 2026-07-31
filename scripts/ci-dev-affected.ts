@@ -701,8 +701,11 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	const tasks = new Map<string, Task>();
 	// Mirror of the docs-index gate in planTargetedTasks: docs/ is the source the
 	// embedded index is generated from, so either side changing must run its gate.
+	// The gate loads the generated corpus through the package barrel, so it is a
+	// native consumer and must bring its own producer.
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
+		addNativeBuild(tasks);
 	}
 	const touchedPackages = findTouchedPackages(paths, packages);
 	const rootPackageReleaseHarnessOnly = isRootPackageReleaseHarnessOnly(paths);
@@ -811,6 +814,9 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 	}
 	if (relevant.length === 0) {
+		// The shared ensureNativeBuild escalation is past this return, and the gate is
+		// a native consumer, so apply it here or the shard ships with no producer.
+		ensureNativeBuild(tasks);
 		return [...tasks.values()];
 	}
 

@@ -83,7 +83,7 @@ type OverlayMouseBounds = {
 	termHeight: number;
 };
 
-type MouseSelectionPoint = {
+export type MouseSelectionPoint = {
 	line: number;
 	column: number;
 };
@@ -176,6 +176,18 @@ export { visibleWidth };
 
 /** Durable source identifier for a semantically anchored viewport row. */
 export type ViewportAnchorId = string;
+/** Immutable renderer-owned details of the most recently rendered viewport. */
+export interface TuiViewportObservation {
+	transcriptCapacity: number;
+	pinBoundary: { row: number; pinned: boolean };
+	manualHistory: boolean;
+	newOutputNoticeVisible: boolean;
+	outputRevision: string | null;
+	focused: boolean;
+	cursor: { row: number; col: number; visible: boolean } | null;
+	selection: { start: MouseSelectionPoint; end: MouseSelectionPoint } | null;
+	semanticAnchor: (ViewportAnchorRow & { frameRow: number }) | null;
+}
 
 export interface ViewportAnchorRow {
 	id: ViewportAnchorId;
@@ -731,6 +743,7 @@ export class TUI extends Container {
 	#manualViewportFallbackAnchors: ManualViewportAnchor[] = [];
 	#reconcileMissingViewportAnchor = false;
 	#lastCursorPosition: { row: number; col: number } | null = null;
+	#latestViewportObservation: TuiViewportObservation | null = null;
 	#sixelProbePendingDa = false;
 	#sixelProbePendingGraphics = false;
 	#sixelProbeBuffer = "";
@@ -890,6 +903,61 @@ export class TUI extends Container {
 			component.focused = true;
 		}
 	}
+	/** Returns the currently focused component without exposing mutable focus state. */
+	getFocusedComponent(): Component | null {
+		return this.#focusedComponent;
+	}
+
+	/** Returns a defensive snapshot of the latest renderer-owned viewport anchors. */
+	getViewportAnchorSnapshot(): { startRow: number; anchors: Array<ViewportAnchorRow | null> } | null {
+		if (this.#viewportAnchorFrame === null) return null;
+		return {
+			startRow: this.#viewportAnchorFrame.startRow,
+			anchors: this.#viewportAnchorFrame.anchors.map(anchor => (anchor ? { ...anchor } : null)),
+		};
+	}
+
+	/** Returns a defensive snapshot of renderer-owned viewport geometry. */
+	getViewportObservation(): TuiViewportObservation | null {
+		const observation = this.#latestViewportObservation;
+		return observation
+			? {
+					...observation,
+					pinBoundary: { ...observation.pinBoundary },
+					cursor: observation.cursor ? { ...observation.cursor } : null,
+					selection: observation.selection
+						? { start: { ...observation.selection.start }, end: { ...observation.selection.end } }
+						: null,
+					semanticAnchor: observation.semanticAnchor ? { ...observation.semanticAnchor } : null,
+				}
+			: null;
+	}
+
+	/** Selects a zero-based painted viewport cell range using the same renderer path as mouse dragging. */
+	setViewportSelection(start: MouseSelectionPoint, end: MouseSelectionPoint): void {
+		if (!this.options.copySelection) return;
+		// Non-finite coordinates would survive the clamp below as NaN, latch
+		// #mouseSelectionDragged, and force a repaint every frame while reporting a
+		// NaN selection through getViewportObservation(). Reject them the same way
+		// scrollViewportBy does rather than storing an unpaintable selection.
+		if (![start.line, start.column, end.line, end.column].every(value => Number.isFinite(value))) return;
+		const map = (point: MouseSelectionPoint): MouseSelectionPoint | null => {
+			const row = Math.max(0, Math.min(this.terminal.rows - 1, point.line));
+			const column = Math.max(0, Math.min(this.terminal.columns - 1, point.column));
+			return this.#mouseSelectionPoint({ x: column + 1, y: row + 1, kind: "drag" });
+		};
+		const mappedStart = map(start);
+		const mappedEnd = map(end);
+		if (mappedStart === null || mappedEnd === null) {
+			this.#clearMouseSelection();
+			this.requestRender(false, "selection");
+			return;
+		}
+		this.#mouseSelectionStart = mappedStart;
+		this.#mouseSelectionEnd = mappedEnd;
+		this.#mouseSelectionDragged = true;
+		this.requestRender(false, "selection");
+	}
 
 	override removeChild(component: Component): void {
 		this.#invalidateFocusForRemovedTree(component);
@@ -951,6 +1019,10 @@ export class TUI extends Container {
 		if (this.#viewportAnchorComponent === component) return;
 		this.#viewportAnchorComponent = component;
 		this.#viewportAnchorFrame = null;
+	}
+	/** Returns the direct component registered as the semantic viewport anchor source. */
+	getViewportAnchorComponent(): Component | null {
+		return this.#viewportAnchorComponent;
 	}
 
 	/** Clear manual viewport ownership before replacing the transcript identity namespace. */
@@ -2439,7 +2511,7 @@ export class TUI extends Container {
 			if (markerIndex !== -1) {
 				// Calculate visual column (width of text before marker)
 				const beforeMarker = line.slice(0, markerIndex);
-				const col = visibleWidth(beforeMarker);
+				const col = Math.max(0, Math.min(Math.max(0, this.terminal.columns - 1), visibleWidth(beforeMarker)));
 
 				// Strip marker from the line
 				lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
@@ -2909,6 +2981,8 @@ export class TUI extends Container {
 				emittedRegions,
 			);
 			onPainted?.();
+			this.#paintedManualOutputNotice = paintManual && this.#manualOutputNotice;
+			this.#recordPaintedViewportObservation(nextViewportTop, height, paintManual);
 		});
 		if (!contentWritten) return false;
 
@@ -2917,6 +2991,63 @@ export class TUI extends Container {
 			this.#appendDebugRedrawLog(msg);
 		}
 		return writeSucceeded;
+	}
+	#recordPaintedViewportObservation(viewportTop: number, height: number, paintManual: boolean): void {
+		const transcriptCapacity = this.#manualTranscriptCapacity(height);
+		const anchorFrame = this.#viewportAnchorFrame;
+		const semanticAnchor =
+			anchorFrame === null
+				? null
+				: (this.#committedTranscriptRows
+						.map((transcriptRow, screenRow) => {
+							if (transcriptRow === null) return null;
+							const anchor = anchorFrame.anchors[transcriptRow - anchorFrame.startRow];
+							return anchor ? { ...anchor, frameRow: screenRow } : null;
+						})
+						.find(anchor => anchor !== null) ?? null);
+		const cursor = this.#lastCursorPosition;
+		let cursorRow: number | null = null;
+		if (cursor !== null) {
+			if (paintManual && cursor.row >= this.#manualTranscriptLineCount) {
+				const noticeRows = this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
+				cursorRow = transcriptCapacity + noticeRows + (cursor.row - this.#manualTranscriptLineCount);
+			} else if (paintManual) {
+				cursorRow = this.#committedTranscriptRows.indexOf(cursor.row);
+			} else {
+				cursorRow = cursor.row - viewportTop;
+			}
+		}
+		const cursorVisible = cursorRow !== null && cursorRow >= 0 && cursorRow < height;
+		const selectedRange = this.#mouseSelectionDragged ? this.#orderedMouseSelection() : null;
+		const paintedSelection =
+			selectedRange === null
+				? null
+				: {
+						start: { line: selectedRange.start.line - viewportTop, column: selectedRange.start.column },
+						end: { line: selectedRange.end.line - viewportTop, column: selectedRange.end.column },
+					};
+		this.#latestViewportObservation = {
+			transcriptCapacity,
+			pinBoundary: { row: transcriptCapacity, pinned: this.#bottomPinnedComponent !== null },
+			manualHistory: paintManual,
+			newOutputNoticeVisible: paintManual && this.#paintedManualOutputNotice,
+			outputRevision: this.#viewportOutputSource?.revision.toString() ?? null,
+			focused: this.#focusedComponent !== null,
+			cursor: cursor
+				? { row: cursorVisible ? cursorRow! : cursor.row, col: cursor.col, visible: cursorVisible }
+				: null,
+			selection: paintedSelection,
+			semanticAnchor,
+		};
+	}
+
+	#refreshPaintedLiveViewportObservation(height: number): void {
+		this.#committedTranscriptRows = Array.from({ length: height }, (_, screenRow) => {
+			const transcriptRow = this.#viewportTopRow + screenRow;
+			return transcriptRow < this.#manualTranscriptLineCount ? transcriptRow : null;
+		});
+		this.#paintedManualOutputNotice = false;
+		this.#recordPaintedViewportObservation(this.#viewportTopRow, height, false);
 	}
 
 	#doRender(): void {
@@ -3147,6 +3278,7 @@ export class TUI extends Container {
 			}
 			const nextViewportTop = resolvedAnchorTop ?? this.#manualViewportTop;
 			if (
+				!this.#mouseSelectionDragged &&
 				this.#previousWidth === width &&
 				this.#previousHeight === height &&
 				nextViewportTop === this.#manualViewportTop &&
@@ -3248,6 +3380,7 @@ export class TUI extends Container {
 					);
 					this.#manualTranscriptLineCount = nextTranscriptLineCount;
 					this.#manualSuffixLineCount = nextSuffixLineCount;
+					this.#refreshPaintedLiveViewportObservation(height);
 				})
 			)
 				return;
@@ -3310,6 +3443,7 @@ export class TUI extends Container {
 				);
 				this.#manualTranscriptLineCount = nextTranscriptLineCount;
 				this.#manualSuffixLineCount = nextSuffixLineCount;
+				this.#refreshPaintedLiveViewportObservation(height);
 			});
 			if (!contentWritten) return false;
 
@@ -3436,8 +3570,8 @@ export class TUI extends Container {
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
-			this.#writeCursorPosition(cursorPos, newLines.length);
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+			if (this.#writeCursorPosition(cursorPos, newLines.length)) this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
 
@@ -3548,6 +3682,7 @@ export class TUI extends Container {
 						);
 						this.#manualTranscriptLineCount = nextTranscriptLineCount;
 						this.#manualSuffixLineCount = nextSuffixLineCount;
+						this.#refreshPaintedLiveViewportObservation(height);
 					})
 				)
 					return;
@@ -3559,6 +3694,7 @@ export class TUI extends Container {
 			this.#viewportTopRow = Math.max(0, newLines.length - height);
 			this.#manualTranscriptLineCount = nextTranscriptLineCount;
 			this.#manualSuffixLineCount = nextSuffixLineCount;
+			this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
 
@@ -3724,6 +3860,7 @@ export class TUI extends Container {
 				);
 				this.#manualTranscriptLineCount = nextTranscriptLineCount;
 				this.#manualSuffixLineCount = nextSuffixLineCount;
+				this.#refreshPaintedLiveViewportObservation(height);
 			})
 		)
 			return;

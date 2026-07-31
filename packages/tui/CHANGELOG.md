@@ -1,10 +1,30 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Select-list no-match rows now stay within the requested render width instead of wrapping into extra terminal lines after narrow resizes (#3600).
 
 ## [0.12.5] - 2026-07-30
 
 ## [0.12.4] - 2026-07-30
+
+## [0.12.3] - 2026-07-30
+
+## [0.12.2] - 2026-07-30
+
+## [0.12.1] - 2026-07-29
+### Added
+
+- `Tui` now exposes renderer-owned viewport observations so tests and evidence capture can assert against committed paint state instead of re-deriving geometry: `getViewportObservation()` (returns a defensive copy of the latest committed observation), `getViewportAnchorSnapshot()`, `getViewportAnchorComponent()`, `getFocusedComponent()`, and `setViewportSelection()`, plus the `TuiViewportObservation` and `MouseSelectionPoint` types.
+
+### Changed
+
+- Alternate-scroll mode (`DECSET 1007`) is now explicitly disabled at startup, on every mouse-capture toggle, at stop, and during emergency restore, so no host translates wheel input into cursor keys. While mouse capture is off this leaves wheel scrollback to the host terminal or multiplexer; while capture is on GJC consumes SGR wheel reports itself, and the reset removes a conflicting second translation path. Hosts that never answer a `DECRQM ?1007$p` query (Apple Terminal among them) cannot report this mode, so it is reset unconditionally rather than conditionally on a reported state.
+
+### Fixed
+
+- The renderer's reported cursor column is now clamped to the last real cell, so it always names a column that exists in the current terminal width. On the wire this is unchanged (a terminal already clamps `CHA` to the last column), but the reported value is now truthful for callers reading it through the viewport observation.
 
 ## [0.12.3] - 2026-07-30
 

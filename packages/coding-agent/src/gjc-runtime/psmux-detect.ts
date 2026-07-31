@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 
 /**
@@ -62,8 +63,32 @@ export type ExecutableIdentityResolver = (path: string) => string | null;
 const DEFAULT_EXECUTABLE_IDENTITY_RESOLVER: ExecutableIdentityResolver = executablePath => {
 	try {
 		const realPath = fs.realpathSync.native(executablePath);
-		const stat = fs.statSync(realPath);
-		return stat.ino === 0 ? realPath.toLowerCase() : `${stat.dev}:${stat.ino}`;
+		const fd = fs.openSync(realPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		try {
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile() || before.dev === 0n || before.ino === 0n) return null;
+			const bytes = fs.readFileSync(fd);
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(realPath, { bigint: true });
+			if (
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				named.size !== before.size ||
+				named.mtimeNs !== before.mtimeNs ||
+				named.ctimeNs !== before.ctimeNs
+			)
+				return null;
+			return `${before.dev}:${before.ino}:${before.size}:${before.mtimeNs}:${before.ctimeNs}:${createHash("sha256").update(bytes).digest("hex")}`;
+		} finally {
+			fs.closeSync(fd);
+		}
 	} catch {
 		return null;
 	}
@@ -151,6 +176,14 @@ function isNamedPsmuxCommand(command: string): boolean {
 
 function resolveBinaryPath(candidate: string): string | null {
 	return activeBinaryResolver(candidate);
+}
+/** Resolve through the same identity-aware seams used by Windows alias detection. */
+export function resolveGjcTmuxExecutablePath(command: string): string | null {
+	return resolveBinaryPath(command);
+}
+
+export function resolveGjcTmuxExecutableIdentity(executablePath: string): string | null {
+	return activeExecutableIdentityResolver(executablePath);
 }
 
 function detectPsmuxForCommand(command: string, runner: PsmuxSpawnRunner): boolean {
@@ -291,11 +324,24 @@ export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}):
 		return { command: explicit, isPsmux, viaExplicitOverride: true };
 	}
 	if (platform === "win32") {
+		const candidates: Array<{ command: string; identity: string }> = [];
 		for (const candidate of PSMUX_BINARY_NAMES) {
-			if (resolveBinaryPath(candidate)) {
-				const isPsmux = classifyWindowsTmuxAlias(candidate, env, runner);
-				return { command: candidate, isPsmux, viaExplicitOverride: false };
-			}
+			const executablePath = resolveBinaryPath(candidate);
+			if (!executablePath) continue;
+			const isPsmuxAlias = candidate !== "tmux" || detectPsmuxForCommand(candidate, runner);
+			if (!isPsmuxAlias) continue;
+			const identity = activeExecutableIdentityResolver(executablePath);
+			if (!identity)
+				throw new Error(`gjc_tmux_provider_ambiguous: Windows ${candidate} executable identity is unavailable`);
+			candidates.push({ command: candidate, identity });
+		}
+		if (candidates.length > 0) {
+			const identities = new Set(candidates.map(candidate => candidate.identity));
+			if (identities.size !== 1)
+				throw new Error("gjc_tmux_provider_ambiguous: Windows psmux aliases resolve to different executables");
+			// The order is the canonical provider spelling, then its compatibility
+			// aliases. Identity equality above makes PATH-order alias selection safe.
+			return { command: candidates[0]!.command, isPsmux: true, viaExplicitOverride: false };
 		}
 	}
 	const tmuxPath = resolveBinaryPath("tmux");

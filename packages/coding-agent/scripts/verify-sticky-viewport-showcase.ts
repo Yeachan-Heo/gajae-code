@@ -1,6 +1,21 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { ansiToHtml, xterm256Color } from "./capture-sticky-viewport-showcase";
+import {
+	SEMANTIC_ANCHOR_DOMAIN,
+	STICKY_VIEWPORT_FRAME_TEXT_WITNESS,
+	type StickyViewportShowcaseKey,
+	semanticAnchorDigest,
+	semanticAnchorNamespace,
+} from "../test/fixtures/tui/sticky-viewport-showcase";
+import {
+	ansiToHtml,
+	captureProvenance,
+	committedBlobSha256,
+	gitObjectType,
+	PROVENANCE_DIFF_SCOPE,
+	resolveRepositoryPath,
+	xterm256Color,
+} from "./capture-sticky-viewport-showcase";
 
 const KEYS = [
 	"live-overflow/80x24/unicode-color",
@@ -64,6 +79,48 @@ const INDEPENDENT_REVIEW_KEYS = [
 const INDEPENDENT_REVIEW_RESULT_KEYS = ["key", "result", "notes", "artifact_checks"] as const;
 const INDEPENDENT_REVIEW_DEFECT_KEYS = ["description", "accepted"] as const;
 const ARTIFACT_CHECK_KEYS = ["terminal_txt", "terminal_ansi_txt", "terminal_html", "metadata_json"] as const;
+const SEMANTIC_ANCHOR_KEYS = [
+	"domain",
+	"id",
+	"namespace",
+	"grapheme_start",
+	"grapheme_end",
+	"cell_start",
+	"cell_end",
+	"frame_start_row",
+	"row_text_sha256",
+	"frame_sha256",
+	"frame_text_sha256",
+] as const;
+const SEMANTIC_ROOT_IDS = [
+	"irc-split",
+	"pending-messages",
+	"status-container",
+	"todos",
+	"btw",
+	"status-line",
+	"hooks-above",
+	"editor-container",
+	"pet-floor",
+	"hooks-below",
+] as const;
+const STATE_KEYS = [
+	"manual",
+	"notice",
+	"observed_output_revision",
+	"transcript_capacity",
+	"composer_visible",
+	"resize_probes",
+	"visible_empty_irc_frame",
+	"root_order",
+	"pin_boundary",
+	"focused_component",
+	"cursor",
+	"selection",
+	"semantic_anchor",
+	"cjk_contiguous_semantics",
+	"coverage",
+] as const;
 type Style = {
 	foreground: string;
 	background: string;
@@ -78,7 +135,52 @@ type Style = {
 	overline: boolean;
 };
 type Run = { text: string; style: Style };
-const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const hash = (value: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const cellWidth = (grapheme: string) => {
+	const scalar = grapheme.codePointAt(0)!;
+	if (scalar === 0x200d || (scalar >= 0x300 && scalar <= 0x36f) || (scalar >= 0xfe00 && scalar <= 0xfe0f)) return 0;
+	return (scalar >= 0x1100 && scalar <= 0x115f) ||
+		(scalar >= 0x2e80 && scalar <= 0xa4cf) ||
+		(scalar >= 0xac00 && scalar <= 0xd7a3) ||
+		(scalar >= 0xf900 && scalar <= 0xfaff) ||
+		(scalar >= 0xff01 && scalar <= 0xff60) ||
+		(scalar >= 0xffe0 && scalar <= 0xffe6)
+		? 2
+		: 1;
+};
+const terminalRows = (text: string, columns: number) =>
+	text
+		.slice(0, -1)
+		.split("\n")
+		.map(text => {
+			const cells = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].map(item => ({
+				grapheme: item.segment,
+				width: cellWidth(item.segment),
+			}));
+			const width = cells.reduce((total, cell) => total + cell.width, 0);
+			if (width > columns) fail(`terminal row exceeds ${columns} cells`);
+			return { text, cells, width };
+		});
+const verifyCjkCellOracle = (text: string, columns: number, pinRow: unknown, cursorRow: unknown) => {
+	if (!Number.isInteger(pinRow) || !Number.isInteger(cursorRow)) fail("narrow CJK lane geometry missing");
+	const pinnedRow = pinRow as number;
+	const editorRow = cursorRow as number;
+	const rows = terminalRows(text, columns);
+	const phrase = CJK[1];
+	const row = rows.findIndex(candidate => candidate.text.includes(phrase));
+	if (row < 0) fail("narrow CJK cell oracle missing canonical phrase");
+	const candidate = rows[row]!;
+	const phraseIndex = candidate.text.indexOf(phrase);
+	const prefix = candidate.text.slice(0, phraseIndex);
+	const phraseCells = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(phrase)];
+	const phraseStart = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(prefix)].reduce(
+		(total, item) => total + cellWidth(item.segment),
+		0,
+	);
+	const phraseWidth = phraseCells.reduce((total, item) => total + cellWidth(item.segment), 0);
+	if (phraseStart + phraseWidth > columns || row >= pinnedRow || row === editorRow)
+		fail("narrow CJK cell oracle lane overlap");
+};
 const fail = (message: string): never => {
 	throw new Error(`Sticky viewport evidence invalid: ${message}`);
 };
@@ -281,79 +383,328 @@ const normalized = (runs: Run[]) => {
 	return merged;
 };
 const equalRuns = (left: Run[], right: Run[]) => JSON.stringify(normalized(left)) === JSON.stringify(normalized(right));
-const transcriptCapacity = (text: string) => {
-	const row = text.split("\n").findIndex(line => line.includes("status:"));
-	return row < 0 ? fail("frame omits pinned status row") : row;
+const hasColorSgr = (ansi: string) =>
+	[...ansi.matchAll(/\x1b\[([0-9;]*)m/g)].some(match => {
+		const codes = (match[1] || "0").split(";").map(Number);
+		return codes.some(
+			code =>
+				(code >= 30 && code <= 37) ||
+				(code >= 40 && code <= 47) ||
+				(code >= 90 && code <= 107) ||
+				code === 38 ||
+				code === 48,
+		);
+	});
+// Independent, frame-derived transcript geometry. The renderer assigns
+// `transcriptCapacity` and `pinBoundary.row` from one local (tui.ts), so
+// comparing those two to each other can never fail. These derivations read the
+// committed paint instead, so a renderer reporting stale geometry is rejected.
+const STATUS_ROW_MARKER = "⬢";
+const NOTICE_MARKER = "New output — type to follow";
+const frameGeometry = (key: string, text: string) => {
+	const rows = text.split("\n").slice(0, -1);
+	const statusRows = rows.filter(row => row.includes(STATUS_ROW_MARKER));
+	if (statusRows.length !== 1) fail(`entry ${key} status row cardinality is not exactly one`);
+	const statusRow = rows.findIndex(row => row.includes(STATUS_ROW_MARKER));
+	const noticeRows = text.split(NOTICE_MARKER).length - 1;
+	if (noticeRows > 1) fail(`entry ${key} notice row cardinality exceeds one`);
+	// The notice, when present, occupies the first row below the transcript, so
+	// the painted status row sits one lower than the transcript capacity.
+	return { capacity: statusRow - noticeRows, statusRow, noticeRows };
 };
-const expectedState = (state: string) => ({
-	manual: state !== "live-overflow",
-	notice: state === "manual-new-output",
-	status: state === "live-overflow" ? "status: live follow" : "status: manual history · composer pinned",
-	multiline: state === "multiline-editor-hooks-pet",
-});
-function validateOracle(
-	key: string,
-	text: string,
-	metadata: Record<string, unknown>,
-	stateEvidence: Record<string, unknown>,
-) {
-	const state = key.split("/")[0]!;
-	const expected = expectedState(state);
-	const lines = text.split("\n");
-	if (stateEvidence.manual !== expected.manual || stateEvidence.notice !== expected.notice)
-		fail(`immutable state oracle mismatch for ${key}`);
-	if (lines.filter(line => line.includes(expected.status)).length !== 1)
-		fail(`exact status oracle mismatch for ${key}`);
-	const markers = [
-		expected.status,
-		...(expected.multiline
-			? ["hook: ready", "completed: visual proof", "pet: ◕‿◕", "> ", "first composer line", "second composer line"]
-			: ["> "]),
-	];
-	let position = -1;
-	for (const marker of markers) {
-		const next = text.indexOf(marker, position + 1);
-		if (next < 0) fail(`ordered suffix oracle missing ${marker} for ${key}`);
-		position = next;
+// Immutable per-entry anchor expectation. A recomputed digest only proves internal
+// consistency: the producer chooses `frame_start_row` and the geometry, so it can
+// mint a cryptographically valid id for a RELOCATED or TRANSPLANTED anchor. This
+// table is the independent witness. It lives in verifier source, not in the bundle,
+// and this file's own sha256 is inside `source_sha256`, so a bundle author cannot
+// restate it. Geometry was measured identical across indexed-color and truecolor
+// hosts, so pinning it costs no host portability.
+// Files that OWN the verification contract itself: the expectation table, the
+// anchor digest function, and every guard below. `source_sha256` cannot protect
+// these, because it is produced by `captureProvenance()` from the worktree -- an
+// author who edits an oracle and restamps provenance gets a self-consistent
+// bundle. So these two are pinned to their committed blobs at the bundle's own
+// `git_head` instead. Product-source diffs stay permitted for staged current-dev
+// integration; oracle diffs do not.
+const ORACLE_SOURCES = [
+	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+] as const;
+// The reviewed PR commit, supplied out-of-band by the verifying operator.
+// `provenance.git_head` is `git rev-parse HEAD`, which is NOT the reviewed commit
+// during an uncommitted synthetic merge: there HEAD is the integration base while
+// the running oracle is the staged PR version. Comparing against HEAD alone
+// therefore rejects an honest bundle before any evidence guard runs. This value is
+// environment-supplied rather than bundle-supplied, so a bundle author cannot
+// choose which commit vouches for the oracle.
+const ORACLE_COMMIT_ENV = "GJC_STICKY_VIEWPORT_ORACLE_COMMIT";
+const verifyOracleIntegrity = async (gitHead: string, declaredProvenanceCommit: unknown) => {
+	// Authority is exactly one commit. Reachability is NOT authority: bytes
+	// committed on an unrelated local or remote-tracking ref are reachable via
+	// `--all` yet were never reviewed, so enumerating refs would let any pushed
+	// or fetched branch authorize the oracle. The reviewed commit is therefore
+	// either declared out-of-band by the review harness or it is `git_head`.
+	const declared = process.env[ORACLE_COMMIT_ENV]?.trim();
+	if (declared !== undefined && !/^[0-9a-f]{40}$/.test(declared))
+		fail(`oracle integrity: ${ORACLE_COMMIT_ENV} must be a full 40-hex commit id`);
+	const authority = declared ?? gitHead;
+	// Fail closed when the authority is not a readable commit object.
+	if ((await gitObjectType(authority)) !== "commit")
+		fail(`oracle integrity: authority ${authority} is not a readable commit object`);
+	// The bundle records which commit it claimed; a mismatch means the bundle was
+	// captured against a different authority than the one being verified.
+	if (declaredProvenanceCommit !== authority)
+		fail(
+			`oracle integrity: provenance oracle_commit ${String(declaredProvenanceCommit)} is not the authority ${authority}`,
+		);
+	// Both oracle files must resolve at that same commit; per-file provenance
+	// from different refs is not accepted.
+	for (const source of ORACLE_SOURCES) {
+		const committed = await committedBlobSha256(authority, source);
+		if (committed === null) fail(`oracle integrity: ${source} has no committed blob at ${authority}`);
+		const running = hash(new Uint8Array(await fs.readFile(resolveRepositoryPath(source))));
+		if (running !== committed) fail(`oracle integrity: ${source} differs from its committed blob at ${authority}`);
 	}
-	if (text.split("New output — type to follow").length - 1 !== (expected.notice ? 1 : 0))
-		fail(`notice cardinality oracle mismatch for ${key}`);
+};
+const SEMANTIC_ANCHOR_EXPECTATION: Readonly<
+	Record<string, { frameRow: number; graphemeStart: number; graphemeEnd: number; cellStart: number; cellEnd: number }>
+> = Object.freeze({
+	"live-overflow/80x24/unicode-color": {
+		frameRow: 2,
+		graphemeStart: 0,
+		graphemeEnd: 1638400,
+		cellStart: 0,
+		cellEnd: 1638400,
+	},
+	"live-overflow/120x36/unicode-color": {
+		frameRow: 2,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"manual-history/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"manual-history/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"manual-new-output/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"manual-new-output/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"multiline-editor-hooks-pet/80x24/unicode-color": {
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 1638400,
+		cellStart: 0,
+		cellEnd: 1638400,
+	},
+	"multiline-editor-hooks-pet/120x36/unicode-color": {
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"capacity-many/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"capacity-many/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"capacity-one/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 1605632,
+		cellStart: 0,
+		cellEnd: 1605632,
+	},
+	"capacity-one/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3211264,
+		cellStart: 0,
+		cellEnd: 3211264,
+	},
+	"selection-boundary/80x24/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"selection-boundary/120x36/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 0,
+		graphemeEnd: 3276800,
+		cellStart: 0,
+		cellEnd: 3276800,
+	},
+	"manual-new-output/80x24/ascii-no-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"multiline-editor-hooks-pet/48x10/unicode-color": {
+		frameRow: 0,
+		graphemeStart: 1638400,
+		graphemeEnd: 3276800,
+		cellStart: 1638400,
+		cellEnd: 3276800,
+	},
+	"narrow-cjk/48x10/unicode-color": {
+		frameRow: 3,
+		graphemeStart: 0,
+		graphemeEnd: 589824,
+		cellStart: 0,
+		cellEnd: 589824,
+	},
+});
+// Semantic anchor identity guard. The persisted `semantic_anchor.id` is the only
+// durable handle on WHICH painted row the evidence anchors, so it must be
+// unforgeable rather than merely well-formed. A geometry-only digest failed both
+// ways: distinct entries painting different content at equal offsets collapsed
+// onto one id, and an 8-hex truncation is brute-forceable. This recomputes the
+// full domain-separated digest from the persisted inputs plus the committed paint
+// and rejects arbitrary, transplanted, aliased, malformed, and truncated ids. It
+// runs BEFORE every downstream metadata check so a forged id can never ride
+// through on an earlier-passing path.
+const verifySemanticAnchor = (
+	key: string,
+	state: string,
+	value: unknown,
+	text: string,
+	ansiSha256: string,
+	seen: Map<string, string>,
+) => {
+	if (state === "capacity-zero") {
+		if (value !== null) fail(`semantic anchor guard: ${key} must not carry an anchor at zero capacity`);
+		return;
+	}
+	const anchor = object(value, `semantic anchor ${key}`);
+	exactKeys(anchor, SEMANTIC_ANCHOR_KEYS, `semantic anchor ${key}`);
+	if (anchor.domain !== SEMANTIC_ANCHOR_DOMAIN)
+		fail(`semantic anchor guard: ${key} domain separation literal mismatch`);
+	const id = anchor.id;
+	const namespace = anchor.namespace;
+	if (typeof id !== "string" || typeof namespace !== "string" || !namespace)
+		fail(`semantic anchor guard: ${key} id or namespace is not a nonempty string`);
+	const geometry = ["grapheme_start", "grapheme_end", "cell_start", "cell_end", "frame_start_row"] as const;
+	for (const field of geometry)
+		if (!Number.isInteger(anchor[field]) || (anchor[field] as number) < 0)
+			fail(`semantic anchor guard: ${key} ${field} is not a nonnegative integer`);
+	const graphemeStart = anchor.grapheme_start as number;
+	const graphemeEnd = anchor.grapheme_end as number;
+	const cellStart = anchor.cell_start as number;
+	const cellEnd = anchor.cell_end as number;
+	const frameRow = anchor.frame_start_row as number;
+	if (graphemeEnd <= graphemeStart || cellEnd <= cellStart)
+		fail(`semantic anchor guard: ${key} geometry span is empty or inverted`);
+	// Independent witness: reject relocation/transplant even when every digest and
+	// provenance field is internally consistent.
+	const expectation = SEMANTIC_ANCHOR_EXPECTATION[key];
+	if (!expectation) fail(`semantic anchor guard: ${key} has no immutable anchor expectation`);
 	if (
-		expected.multiline !==
-		(text.includes("hook: ready") &&
-			text.includes("pet: ◕‿◕") &&
-			text.includes("first composer line") &&
-			text.includes("second composer line"))
+		frameRow !== expectation!.frameRow ||
+		graphemeStart !== expectation!.graphemeStart ||
+		graphemeEnd !== expectation!.graphemeEnd ||
+		cellStart !== expectation!.cellStart ||
+		cellEnd !== expectation!.cellEnd
 	)
-		fail(`multiline editor/hooks/pet oracle mismatch for ${key}`);
-	if (metadata.output_revision !== (expected.notice ? "1" : "0")) fail(`manual notice invariant mismatch for ${key}`);
-	if (state === "selection-boundary") {
-		const copied = stateEvidence.selection_copied_text;
-		if (
-			stateEvidence.selection_scope !== "transcript" ||
-			typeof copied !== "string" ||
-			!copied.trim() ||
-			copied.includes("status:") ||
-			copied.includes("> ") ||
-			!lines.some(line => line.includes(copied.trim()))
-		)
-			fail(`selection oracle mismatch for ${key}`);
-	} else if (stateEvidence.selection_scope !== "none" || stateEvidence.selection_copied_text !== "")
-		fail(`selection oracle mismatch for ${key}`);
-	const historicalRows = stateEvidence.manual_historical_rows;
-	const preOutputCapacity = stateEvidence.manual_pre_output_capacity;
-	if (expected.manual) {
-		if (
-			!Number.isInteger(preOutputCapacity) ||
-			(preOutputCapacity as number) < 0 ||
-			!Array.isArray(historicalRows) ||
-			historicalRows.length !== ((preOutputCapacity as number) > 0 ? 1 : 0) ||
-			historicalRows.some(row => typeof row !== "string" || !row.trim() || !lines.includes(row))
-		)
-			fail(`manual historical transcript evidence mismatch for ${key}`);
-	} else if (preOutputCapacity !== 0 || !Array.isArray(historicalRows) || historicalRows.length !== 0)
-		fail(`manual historical transcript evidence mismatch for ${key}`);
-}
+		fail(`semantic anchor guard: ${key} anchor row or geometry does not match its immutable expectation`);
+	// The row text is read from the committed paint, never from metadata, so the id
+	// stays bound to what the artifact actually renders at the recorded row.
+	const rows = text.split("\n");
+	const rowText = rows[frameRow];
+	if (rowText === undefined) fail(`semantic anchor guard: ${key} frame_start_row is outside the committed paint`);
+	if (anchor.row_text_sha256 !== hash(rowText as string))
+		fail(`semantic anchor guard: ${key} row content digest does not match the painted anchor row`);
+	if (anchor.frame_sha256 !== ansiSha256)
+		fail(`semantic anchor guard: ${key} frame digest does not match the committed frame`);
+	const frameTextSha256 = hash(Bun.stripANSI(text));
+	if (anchor.frame_text_sha256 !== frameTextSha256)
+		fail(`semantic anchor guard: ${key} frame text digest does not match the committed paint`);
+	if (semanticAnchorNamespace(id as string) !== namespace)
+		fail(`semantic anchor guard: ${key} id namespace does not match the persisted namespace`);
+	const expected = `${namespace}:${semanticAnchorDigest({
+		entryKey: key,
+		namespace: namespace as string,
+		rowText: rowText as string,
+		graphemeStart,
+		graphemeEnd,
+		cellStart,
+		cellEnd,
+		frameRow,
+		frameTextSha256,
+	})}`;
+	if (id !== expected) fail(`semantic anchor guard: ${key} id is not the digest of its own persisted inputs`);
+	// No silent aliasing: distinct evidence entries are distinct anchors by
+	// construction, because the entry key is inside the preimage. A repeat here can
+	// only mean a transplanted id, so it is a hard failure rather than an
+	// equivalence to be tolerated.
+	const owner = seen.get(id as string);
+	if (owner !== undefined) fail(`semantic anchor guard: ${key} id aliases the anchor already claimed by ${owner}`);
+	seen.set(id as string, key);
+};
+// Whole-frame content witness. The semantic anchor guard above pins exactly ONE
+// painted row per entry, and `anchor.frame_sha256` is recomputed from the
+// bundle's OWN artifact, so it only proves internal consistency: a producer who
+// rewrites a non-anchor row and coordinately rehashes every dependent digest --
+// artifacts, metadata, manifest entry, provenance blocks, review-input binding --
+// stayed self-consistent and was ACCEPTED. In an 80x24 frame 13 rows carry
+// content while one is anchored, so the transcript rows carrying the bundle's own
+// evidence text were rewritable at will.
+//
+// This compares the painted frame against a value committed in oracle source,
+// which no bundle can reach. It is invoked LAST in the per-entry loop, after the
+// anchor guard and after every geometry, marker, and CJK oracle, so a mutation
+// those already attribute keeps its narrower message and only the rows no other
+// oracle inspects surface here.
+//
+// The digest is over the ANSI-STRIPPED paint. `frame_sha256` stays untouched as
+// the artifact digest and legitimately diverges between an indexed-color and a
+// truecolor host; the stripped paint does not, so it is the only frame-wide
+// surface that a single committed value can pin on both hosts.
+export const stickyViewportFrameTextDigest = (frame: string): string => hash(Bun.stripANSI(frame));
+const verifyFrameTextWitness = (key: string, text: string) => {
+	// Fail closed: an unwitnessed key is an unpinned frame, not a pass.
+	const expected: string | undefined = STICKY_VIEWPORT_FRAME_TEXT_WITNESS[key as StickyViewportShowcaseKey];
+	if (expected === undefined) fail(`frame content guard: ${key} has no committed frame text witness`);
+	const observed = stickyViewportFrameTextDigest(text);
+	if (observed !== expected)
+		fail(
+			`frame content guard: ${key} painted frame digest is ${observed} but the committed witness pins ${expected}`,
+		);
+};
 export async function verifyStickyViewportShowcase(rootInput: string, requireIndependentReview = false): Promise<void> {
 	const root = path.resolve(rootInput);
 	const manifestText = await fs.readFile(path.join(root, "manifest.json"), "utf8");
@@ -370,6 +721,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		fail("manifest schema or provenance literals mismatch");
 	strings(manifest.ordered_keys, KEYS, "manifest ordered_keys");
 	const provenance = object(manifest.provenance, "manifest provenance");
+	const expectedProvenance = await captureProvenance();
 	if (
 		provenance.capture_mode !== "production-tui-virtual-terminal" ||
 		provenance.live_pty !== false ||
@@ -381,8 +733,24 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 		!provenance.executor_identity.trim()
 	)
 		fail("manifest provenance mismatch");
+	// `git_diff_scope` is compared against the verifier's own constant, so a bundle
+	// cannot narrow the covered surface to dodge the digest: claiming a smaller
+	// scope than the verifier requires is itself a staleness rejection.
+	if (
+		provenance.git_head !== expectedProvenance.git_head ||
+		JSON.stringify(provenance.git_diff_scope) !== JSON.stringify(PROVENANCE_DIFF_SCOPE) ||
+		provenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
+		JSON.stringify(provenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256)
+	)
+		fail("manifest capture provenance is stale");
+	// Runs before every entry check: a rewritten oracle would otherwise decide
+	// what "valid" means for all of them.
+	await verifyOracleIntegrity(provenance.git_head as string, provenance.oracle_commit);
 	const entries = array(manifest.entries, "manifest entries");
 	if (entries.length !== KEYS.length) fail("manifest entries must contain exactly 20 entries");
+	// Cross-entry anchor identity ledger. Uniqueness is a hard contract, not a
+	// tolerance: every distinct evidence entry must own a distinct anchor id.
+	const anchorIds = new Map<string, string>();
 	for (let index = 0; index < KEYS.length; index += 1) {
 		const key = KEYS[index]!;
 		const entry = object(entries[index], `entry ${index}`);
@@ -422,21 +790,12 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			!equalRuns(ansiStyleRuns, htmlStyleRuns)
 		)
 			fail(`entry ${key} ANSI/HTML style-run mismatch`);
-		if (state === "multiline-editor-hooks-pet" && (!ansi.includes("\x1b[9m") || !html.includes("line-through")))
-			fail(`entry ${key} strikethrough evidence missing`);
-		if (state === "selection-boundary" && !ansi.includes("\x1b[7m"))
-			fail(`entry ${key} inverse selection evidence missing`);
-		if (state === "narrow-cjk" && CJK.some(boundary => !text.includes(boundary)))
-			fail("narrow CJK visible terminal evidence missing");
-		if (
-			text
-				.split("\n")
-				.slice(0, -1)
-				.some(row => Bun.stringWidth(row) !== columns) ||
-			text.split("\n").length - 1 !== rows
-		)
-			fail(`entry ${key} terminal dimensions mismatch`);
-		if (mode === "ascii-no-color" ? /\x1b\[/.test(ansi) : !/\x1b\[[0-9;]*(?:3[0-9]|38;)/.test(ansi))
+		if (text.split("\n").length - 1 !== rows) fail(`entry ${key} terminal row count mismatch`);
+		// `ascii-no-color` artifacts must contain no escape sequence at all, which is
+		// host-independent. The color branch keeps the widened check below because the
+		// prior `3[0-9]|38;` regex missed background (40-47/100-107) and bright (90-97)
+		// color, so a frame carrying only those would have passed as "no color".
+		if (mode === "ascii-no-color" ? /\x1b\[/.test(ansi) : !hasColorSgr(ansi))
 			fail(`entry ${key} ANSI mode/color mismatch`);
 		const metadata = await readJson(path.join(root, key, "metadata.json"), `metadata ${key}`);
 		exactKeys(
@@ -476,7 +835,7 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			metadata.fixture_source !== FIXTURE ||
 			metadata.render_mode !== mode ||
 			metadata.ansi_mode !== (mode === "unicode-color") ||
-			metadata.source_revision !== "production-tui-virtual-terminal-v2" ||
+			metadata.source_revision !== "production-tui-virtual-terminal-v3" ||
 			terminal.id !== id ||
 			terminal.columns !== columns ||
 			terminal.rows !== rows ||
@@ -488,22 +847,182 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 			metaProvenance.fixed_clock !== true ||
 			metaProvenance.author_identity !== provenance.author_identity ||
 			metaProvenance.executor_identity !== provenance.executor_identity ||
+			metaProvenance.git_head !== expectedProvenance.git_head ||
+			JSON.stringify(metaProvenance.git_diff_scope) !== JSON.stringify(PROVENANCE_DIFF_SCOPE) ||
+			metaProvenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
+			JSON.stringify(metaProvenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256) ||
 			stateEvidence.composer_visible !== true
 		)
 			fail(`metadata schema mismatch for ${key}`);
-		if (stateEvidence.transcript_capacity !== transcriptCapacity(text))
+		// Anchor identity is validated here, before any downstream metadata check, so
+		// a forged, transplanted, or aliased id cannot ride through on an
+		// earlier-passing path.
+		verifySemanticAnchor(key, state!, stateEvidence.semantic_anchor, text, hash(ansi), anchorIds);
+		// Frame-derived geometry must AGREE with the renderer's self-report, which is
+		// strictly stronger than either alone. `transcript_capacity` and
+		// `pin_boundary.row` both come from one renderer local, so they can only be
+		// falsified against the committed paint: a renderer reporting stale capacity
+		// or pin geometry now fails here instead of passing self-consistently.
+		const frameGeom = frameGeometry(key, text);
+		if (
+			!Number.isInteger(stateEvidence.transcript_capacity) ||
+			stateEvidence.transcript_capacity !== frameGeom.capacity ||
+			frameGeom.noticeRows !== (state === "manual-new-output" ? 1 : 0)
+		)
 			fail(`capacity metadata/frame mismatch for ${key}`);
-		validateOracle(key, text, metadata, stateEvidence);
-		if (state === "capacity-zero" && transcriptCapacity(text) !== 0)
-			fail(`zero capacity frame invariant mismatch for ${key}`);
-		if (state === "capacity-one" && transcriptCapacity(text) !== 1)
-			fail(`one capacity frame invariant mismatch for ${key}`);
-		if (state === "capacity-many" && transcriptCapacity(text) < 2)
-			fail(`many capacity frame invariant mismatch for ${key}`);
+		// Ordered suffix markers follow the production root order: status-line (5),
+		// hooks-above (6), editor-container (7). Painted order, not reported order.
+		let markerPosition = -1;
+		for (const marker of [STATUS_ROW_MARKER, "hook: ready", "> "]) {
+			const next = text.indexOf(marker, markerPosition + 1);
+			if (next < 0) fail(`entry ${key} ordered suffix marker missing: ${marker}`);
+			markerPosition = next;
+		}
+		const observations = array(stateEvidence.resize_probes, `metadata ${key} resize observations`);
+		const probeWidths = [64, 65, 80, 120, 160, 120, 80, 65, 64];
+		const rootOrder = array(stateEvidence.root_order, `metadata ${key} root order`);
+		const pinBoundary = object(stateEvidence.pin_boundary, `metadata ${key} pin boundary`);
+		const cursor = object(stateEvidence.cursor, `metadata ${key} cursor`);
+		const selection = stateEvidence.selection;
+		const expectedManual = state !== "live-overflow" && state !== "capacity-zero";
+		const expectedNotice = state === "manual-new-output";
+		const expectedRevision = expectedNotice ? "1" : "0";
+		if (
+			stateEvidence.manual !== expectedManual ||
+			stateEvidence.notice !== expectedNotice ||
+			stateEvidence.observed_output_revision !== expectedRevision ||
+			metadata.output_revision !== stateEvidence.observed_output_revision
+		)
+			fail(`renderer-owned viewport state mismatch for ${key}`);
+		const visibleEmpty = object(stateEvidence.visible_empty_irc_frame, `metadata ${key} visible empty IRC frame`);
+		exactKeys(stateEvidence, STATE_KEYS, `metadata ${key} state`);
+		strings(rootOrder, SEMANTIC_ROOT_IDS, `metadata ${key} semantic root IDs`);
+		const coverage = object(stateEvidence.coverage, `metadata ${key} coverage`);
+		exactKeys(
+			coverage,
+			["irc", "todo", "widths", "heights", "viewport", "chrome", "evidence"],
+			`metadata ${key} coverage`,
+		);
+		strings(coverage.irc, ["empty", "streaming", "long"], `metadata ${key} IRC coverage`);
+		strings(
+			coverage.todo,
+			["empty", "populated", "long", "multi-phase", "collapsed", "expanded"],
+			`metadata ${key} todo coverage`,
+		);
+		const emptyText = visibleEmpty.text as string;
+		const capacityConstrained = state === "capacity-one" || state === "capacity-zero";
+		if (
+			JSON.stringify(coverage.widths) !== JSON.stringify(probeWidths) ||
+			emptyText.includes("worker → you") ||
+			emptyText.includes("long IRC observation") ||
+			observations.length !== probeWidths.length ||
+			observations.some((value, index) => {
+				const probe = object(value, `metadata ${key} resize observation`);
+				const frame = object(probe.frame, `metadata ${key} resize frame`);
+				const split = probeWidths[index]! >= 65;
+				return (
+					probe.columns !== probeWidths[index] ||
+					probe.effective_lane !== (split ? "split" : "transcript") ||
+					probe.separator_width !== (split ? 3 : 0) ||
+					(probe.left_width as number) + (probe.separator_width as number) + (probe.right_width as number) !==
+						probeWidths[index] ||
+					probe.irc_records !== (split ? 1 : 0) ||
+					probe.todo_rows !== (split ? 1 : 0) ||
+					probe.todo_expanded !== (probe.columns as number) >= 80 ||
+					typeof frame.ansi !== "string" ||
+					frame.text !== Bun.stripANSI(frame.ansi) ||
+					frame.sha256 !== hash(frame.ansi) ||
+					// Required ASCII metadata frames must be escape-free too, or the bundle
+					// digest stays host-dependent even when the top-level payload is canonical.
+					(mode === "ascii-no-color" && /\x1b\[/.test(frame.ansi as string)) ||
+					(!capacityConstrained && split && !frame.text.includes("│")) ||
+					(!capacityConstrained &&
+						!split &&
+						(frame.text.includes("worker → you") || frame.text.includes("Todos"))) ||
+					(!capacityConstrained &&
+						(probe.columns as number) >= 80 &&
+						(!frame.text.includes("long IRC observation") ||
+							!frame.text.includes("☑ verify production todo") ||
+							!frame.text.includes("☐ expanded production todo"))) ||
+					(!capacityConstrained && (probe.columns as number) >= 120 && !frame.text.includes("worker → you"))
+				);
+			}) ||
+			typeof visibleEmpty.ansi !== "string" ||
+			visibleEmpty.text !== Bun.stripANSI(visibleEmpty.ansi) ||
+			visibleEmpty.sha256 !== hash(visibleEmpty.ansi) ||
+			(mode === "ascii-no-color" && /\x1b\[/.test(visibleEmpty.ansi as string)) ||
+			JSON.stringify(rootOrder) !==
+				JSON.stringify([
+					"irc-split",
+					"pending-messages",
+					"status-container",
+					"todos",
+					"btw",
+					"status-line",
+					"hooks-above",
+					"editor-container",
+					"pet-floor",
+					"hooks-below",
+				]) ||
+			pinBoundary.component !== "status-line" ||
+			pinBoundary.index !== 5 ||
+			pinBoundary.row !== frameGeom.capacity ||
+			pinBoundary.pinned !== true ||
+			stateEvidence.focused_component !== "editor" ||
+			!Number.isInteger(cursor.row) ||
+			(cursor.row as number) < 0 ||
+			(cursor.row as number) >= rows ||
+			!Number.isInteger(cursor.col) ||
+			(cursor.col as number) < 0 ||
+			(cursor.col as number) >= columns ||
+			cursor.frame_sha256 !== hash(ansi) ||
+			cursor.blink !== true
+		)
+			fail(`runtime observation mismatch for ${key}`);
+		if (
+			(state === "capacity-many" && (stateEvidence.transcript_capacity as number) <= 1) ||
+			(state === "capacity-one" && stateEvidence.transcript_capacity !== 1) ||
+			(state === "capacity-zero" && stateEvidence.transcript_capacity !== 0)
+		)
+			fail(`capacity scenario mismatch for ${key}`);
+		if (state === "selection-boundary") {
+			const selected = object(selection, `metadata ${key} selection`);
+			const start = object(selected.start, `metadata ${key} selection start`);
+			const end = object(selected.end, `metadata ${key} selection end`);
+			if (
+				!Number.isInteger(start.row) ||
+				!Number.isInteger(start.col) ||
+				!Number.isInteger(end.row) ||
+				!Number.isInteger(end.col) ||
+				(start.row as number) < 0 ||
+				(end.row as number) >= (stateEvidence.transcript_capacity as number) ||
+				((start.row as number) === (end.row as number) && (start.col as number) >= (end.col as number))
+			)
+				fail(`selection boundary evidence missing for ${key}`);
+		} else if (selection !== null) fail(`unexpected selection evidence for ${key}`);
 		if (state === "narrow-cjk") {
 			strings(metadata.cjk_phrase_boundaries, CJK, "narrow CJK boundaries");
-			if (CJK.some(boundary => !text.includes(boundary))) fail("narrow CJK visible terminal evidence missing");
+			const probeTexts = observations.map(value => {
+				const probe = object(value, `metadata ${key} resize observation`);
+				return object(probe.frame, `metadata ${key} resize frame`).text;
+			});
+			if (
+				CJK.some(
+					boundary => ![text, ...probeTexts].some(frame => typeof frame === "string" && frame.includes(boundary)),
+				)
+			)
+				fail("narrow CJK visible terminal evidence missing");
+			verifyCjkCellOracle(text, columns, pinBoundary.row, cursor.row);
 		} else strings(metadata.cjk_phrase_boundaries, [], `non-narrow CJK boundaries for ${key}`);
+		// Whole-frame pin, LAST in the per-entry loop. It runs after the semantic
+		// anchor guard so an anchor-row mutation keeps its narrower anchor
+		// attribution, and after the geometry, marker, and CJK oracles so a case that
+		// mutates the paint to reach one of those keeps its own attribution too.
+		// Ordering costs nothing here: every check above reads the same painted frame
+		// this pins, so none of them can be subverted by a paint this guard would
+		// reject. What lands here is the residue -- rows no other oracle looks at,
+		// which is precisely the unpinned surface this guard exists to close.
+		verifyFrameTextWitness(key, text);
 	}
 	const required = new Set([
 		"manifest.json",
@@ -513,6 +1032,14 @@ export async function verifyStickyViewportShowcase(rootInput: string, requireInd
 	]);
 	for (const file of await allFiles(root)) if (!required.has(file)) fail(`unexpected file ${file}`);
 	const reviewInput = await readJson(path.join(root, "review-input.json"), "review input");
+	const reviewProvenance = object(reviewInput.provenance, "review input provenance");
+	if (
+		reviewProvenance.git_head !== expectedProvenance.git_head ||
+		JSON.stringify(reviewProvenance.git_diff_scope) !== JSON.stringify(PROVENANCE_DIFF_SCOPE) ||
+		reviewProvenance.git_diff_binary_sha256 !== expectedProvenance.git_diff_binary_sha256 ||
+		JSON.stringify(reviewProvenance.source_sha256) !== JSON.stringify(expectedProvenance.source_sha256)
+	)
+		fail("review input capture provenance is stale");
 	if (
 		reviewInput.schema_version !== 2 ||
 		reviewInput.manifest_sha256 !== hash(manifestText) ||

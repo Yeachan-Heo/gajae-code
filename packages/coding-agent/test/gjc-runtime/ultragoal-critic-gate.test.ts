@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
 import { verifyUltragoalDurableCompletionState } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
@@ -27,20 +28,35 @@ import {
 
 const TEST_SESSION_ID = "ultragoal-critic-gate-test-session";
 const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
+// Temp dirs live outside the enclosing git work tree (os.tmpdir) so
+// computeCheckpointChangeSet falls through to the CI_DEV_CHANGED_PATHS-only
+// path. Pin a non-computer path so the mandatory computer red-team suite is
+// not falsely triggered by captureIncomplete or git-command timeouts under
+// parallel shard load.
+const ORIGINAL_CI_DEV_CHANGED_PATHS = process.env.CI_DEV_CHANGED_PATHS;
 const tempRoots: string[] = [];
 
 async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-critic-gate-"));
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-critic-gate-"));
 	tempRoots.push(dir);
 	return dir;
 }
 
+beforeEach(() => {
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-runtime/ultragoal-critic-gate.test.ts";
+});
+
 afterEach(async () => {
-	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
-	else process.env.GJC_SESSION_ID = ORIGINAL_GJC_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
+afterAll(() => {
+	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
+	else process.env.GJC_SESSION_ID = ORIGINAL_GJC_SESSION_ID;
+	if (ORIGINAL_CI_DEV_CHANGED_PATHS === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+	else process.env.CI_DEV_CHANGED_PATHS = ORIGINAL_CI_DEV_CHANGED_PATHS;
+});
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {
 	let crc = index;

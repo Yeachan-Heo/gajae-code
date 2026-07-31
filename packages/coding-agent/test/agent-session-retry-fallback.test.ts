@@ -112,6 +112,37 @@ function typedUsageLimitStream(model: Model, retryAfterMs = 60_000): AssistantMe
 	});
 	return stream;
 }
+function canonicalFirstEventTimeoutStream(
+	model: Model,
+	content: AssistantMessage["content"] = [],
+	transportFailure?: AssistantMessage["transportFailure"],
+): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content,
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+			...(transportFailure === undefined ? {} : { transportFailure }),
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 
 function makeExtensionRunner(handlers: string[], cwd: string, sm: SessionManager, mr: ModelRegistry): ExtensionRunner {
 	const handlerMap = new Map<string, Array<() => Promise<void>>>();
@@ -703,6 +734,322 @@ describe("AgentSession retry fallback", () => {
 		expect(new Set(requestedKeys).size).toBe(6);
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 	});
+	it("recovers a clean canonical timeout through bounded managed fallback", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const requestedModels: string[] = [];
+		let primaryCalls = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				if (requestedModel.provider === primary.provider) {
+					primaryCalls++;
+					return canonicalFirstEventTimeoutStream(requestedModel);
+				}
+				return createMockModel({ responses: [{ content: ["Fallback recovered"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 2,
+			"retry.maxRetries": 9,
+			"retry.baseDelayMs": 1,
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") switches.push(event);
+		});
+
+		await session.prompt("recover canonical timeout through fallback");
+		await session.waitForIdle();
+
+		expect(primaryCalls).toBe(2);
+		expect(requestedModels).toEqual([
+			`${primary.provider}/${primary.id}`,
+			`${primary.provider}/${primary.id}`,
+			`${fallback.provider}/${fallback.id}`,
+		]);
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.every(event => event.maxAttempts === 2 && event.unbounded === false)).toBe(true);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(switches).toEqual([
+			expect.objectContaining({
+				from: `${primary.provider}/${primary.id}`,
+				to: `${fallback.provider}/${fallback.id}`,
+				reason: "server",
+				attemptsUsed: 2,
+			}),
+		]);
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
+	});
+
+	it("bounds all-provider canonical timeout exhaustion", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return canonicalFirstEventTimeoutStream(requestedModel);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.maxRetries": 9,
+			"retry.baseDelayMs": 1,
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		const fallbackNotices: Extract<AgentSessionEvent, { type: "notice" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "fallback") fallbackNotices.push(event);
+		});
+
+		await session.prompt("exhaust canonical timeout fallback chain");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]).toMatchObject({ maxAttempts: 1, unbounded: false });
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false })]);
+		expect(fallbackNotices).toEqual([
+			expect.objectContaining({
+				level: "error",
+				message: expect.stringContaining("Model fallback chain exhausted"),
+			}),
+		]);
+		expect(fallbackNotices[0]?.message).toContain(`${primary.provider}/${primary.id}`);
+		expect(fallbackNotices[0]?.message).toContain(`${fallback.provider}/${fallback.id}`);
+		expect(getLastAssistantMessage(session).errorMessage).toBe(
+			"Error: Provider stream timed out while waiting for the first event",
+		);
+	});
+
+	it("does not rotate a managed canonical timeout after partial output", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return canonicalFirstEventTimeoutStream(requestedModel, [{ type: "text", text: "already visible" }]);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 1 });
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const { retryStartEvents } = trackRetryEvents(session);
+		const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") switches.push(event);
+		});
+
+		await session.prompt("do not rotate after partial timeout output");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(switches).toHaveLength(0);
+		expect(getLastAssistantMessage(session)).toMatchObject({
+			stopReason: "error",
+			content: [{ type: "text", text: "already visible" }],
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+		});
+	});
+
+	it("returns a valid managed terminal decision for a typed timeout with tool content", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return canonicalFirstEventTimeoutStream(
+					requestedModel,
+					[{ type: "toolCall", id: "unsafe-tool", name: "unsafe", arguments: {} }],
+					{ kind: "transport", providerCode: "stream_first_event_timeout" },
+				);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 1 });
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const { retryStartEvents } = trackRetryEvents(session);
+		const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") switches.push(event);
+		});
+
+		await session.prompt("do not rotate typed timeout with tool content");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(switches).toHaveLength(0);
+		expect(getLastAssistantMessage(session)).toMatchObject({
+			stopReason: "error",
+			content: [{ type: "toolCall", id: "unsafe-tool", name: "unsafe", arguments: {} }],
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+		});
+	});
+
+	it("does not rotate a typed managed timeout when a provider lifecycle handler is registered", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const requestedModels: string[] = [];
+		const sessionManager = SessionManager.inMemory();
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return canonicalFirstEventTimeoutStream(requestedModel, [], {
+					kind: "transport",
+					providerCode: "stream_first_event_timeout",
+				});
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 1 });
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			extensionRunner: makeExtensionRunner(["context"], tempDir.path(), sessionManager, modelRegistry),
+		});
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const { retryStartEvents } = trackRetryEvents(session);
+		const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") switches.push(event);
+		});
+
+		await session.prompt("do not rotate typed timeout with a registered lifecycle handler");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(switches).toHaveLength(0);
+		expect(getLastAssistantMessage(session)).toMatchObject({
+			stopReason: "error",
+			content: [],
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+		});
+	});
+
+	it("keeps wrapped terminal-provider timeouts out of managed fallback", async () => {
+		const kimi = getBundledModel("kimi-code", "kimi-k2.5");
+		const alibabaResponses = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const alibabaCompletions = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!kimi || !alibabaResponses || !alibabaCompletions || !fallback) {
+			throw new Error("Expected bundled terminal-provider and fallback models");
+		}
+		authStorage.setRuntimeApiKey("kimi-code", "kimi-test-key");
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		for (const model of [kimi, alibabaResponses, alibabaCompletions]) {
+			const requestedModels: string[] = [];
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: requestedModel => {
+					requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+					return canonicalFirstEventTimeoutStream(
+						requestedModel,
+						[],
+						requestedModel.provider === "alibaba-token-plan" ? { kind: "transport", status: 503 } : undefined,
+					);
+				},
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"fallback.maxAttempts": 2,
+				"retry.baseDelayMs": 1,
+			});
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+			session.setConfiguredModelChain(
+				"default",
+				[`${model.provider}/${model.id}`, `${fallback.provider}/${fallback.id}`],
+				"test",
+			);
+			const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+			const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+			session.subscribe(event => {
+				if (event.type === "model_fallback_switched") switches.push(event);
+			});
+
+			await session.prompt("do not replay wrapped terminal-provider timeout");
+			await session.waitForIdle();
+
+			expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(retryEndEvents).toHaveLength(0);
+			expect(switches).toHaveLength(0);
+			expect(waitSpy).not.toHaveBeenCalled();
+			expect(session.model).toMatchObject({ provider: model.provider, id: model.id });
+			expect(getLastAssistantMessage(session)).toMatchObject({
+				provider: model.provider,
+				api: model.api,
+				stopReason: "error",
+				errorMessage: "Error: Provider stream timed out while waiting for the first event",
+			});
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
+	});
 
 	it("does not replay a Kimi Code first-event timeout through a managed fallback chain", async () => {
 		const primary = getBundledModel("kimi-code", "kimi-k2.5");
@@ -986,7 +1333,7 @@ describe("AgentSession retry fallback", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						stopReason: "error",
-						errorMessage: "Provider stream timed out while waiting for the first event",
+						errorMessage: "Error: Provider stream timed out while waiting for the first event",
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial: failure });
@@ -1015,7 +1362,7 @@ describe("AgentSession retry fallback", () => {
 		expect(getLastAssistantMessage(session)).toMatchObject({
 			provider: fallback.provider,
 			stopReason: "error",
-			errorMessage: "Provider stream timed out while waiting for the first event",
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
 		});
 
 		await session.prompt("Keep the sticky fallback on the next turn");

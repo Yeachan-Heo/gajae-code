@@ -387,7 +387,7 @@ function processProxyEvent(
 					partial,
 				};
 			}
-			return undefined;
+			throw new Error("Received toolcall_end for non-toolCall content");
 		}
 
 		case "done":

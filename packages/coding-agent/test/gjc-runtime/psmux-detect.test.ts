@@ -1,4 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
 import {
 	__setBinaryResolverForTests,
 	__setExecutableIdentityResolverForTests,
@@ -10,8 +14,26 @@ import {
 	PSMUX_BINARY_NAMES,
 	probePsmux,
 	resolveGjcTmuxBinary,
+	resolveGjcTmuxExecutableIdentity,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
-import { resolveGjcTmuxCommand } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
+import {
+	assertGjcTmuxMutationAuthoritySync,
+	bindGjcTmuxProviderAuthority,
+	buildTmuxProviderCommand,
+	hasGjcTmuxProviderAuthoritySync,
+	persistGjcTmuxProviderAuthoritySync,
+	readGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxCommand,
+	resolveGjcTmuxProviderContext,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
+import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import {
+	__setTmuxProviderAuthorityPlatformForTests,
+	assertGjcTmuxStagedMutationAuthoritySync,
+} from "../../src/gjc-runtime/tmux-provider-context";
+import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
+
+setDefaultTimeout(10_000);
 
 function psmuxVersionOutput(): string {
 	return "psmux 3.3.0\n";
@@ -31,6 +53,19 @@ function buildRunner(versionOutput: string | null) {
 		return { exitCode: 0, stdout: versionOutput, stderr: "" };
 	};
 }
+function publishGeneration(root: string, sessionId: string, generation: string): void {
+	const paths = lifecyclePaths(root, sessionId, generation);
+	prepareManagedDirectoryRoot(paths.root);
+	fs.writeFileSync(
+		paths.generationFile,
+		`${JSON.stringify({
+			schema_version: 1,
+			session_id: sessionId,
+			generation,
+			published_at: "2026-07-28T00:00:00.000Z",
+		})}\n`,
+	);
+}
 
 beforeEach(() => {
 	clearPsmuxDetectionCache();
@@ -41,13 +76,15 @@ beforeEach(() => {
 	__setBinaryResolverForTests(candidate =>
 		candidate === "psmux" || candidate === "pmux" || candidate === "tmux" ? `/usr/bin/${candidate}` : null,
 	);
-	__setExecutableIdentityResolverForTests(path => path.toLowerCase());
+	__setExecutableIdentityResolverForTests(() => "test-psmux-alias");
+	__setTmuxProviderAuthorityPlatformForTests("win32");
 });
 
 afterEach(() => {
 	clearPsmuxDetectionCache();
 	__setBinaryResolverForTests(null);
 	__setExecutableIdentityResolverForTests(null);
+	__setTmuxProviderAuthorityPlatformForTests(null);
 });
 
 describe("PSMUX_BINARY_NAMES", () => {
@@ -55,6 +92,315 @@ describe("PSMUX_BINARY_NAMES", () => {
 		expect(PSMUX_BINARY_NAMES).toContain("psmux");
 		expect(PSMUX_BINARY_NAMES).toContain("pmux");
 		expect(PSMUX_BINARY_NAMES).toContain("tmux");
+	});
+	describe("Windows provider context", () => {
+		it("uses one identity-anchored namespace for psmux aliases and emits structured argv", () => {
+			__setBinaryResolverForTests(candidate =>
+				candidate === "psmux" || candidate === "pmux" || candidate === "tmux"
+					? `C:\\psmux\\${candidate}.exe`
+					: null,
+			);
+			__setExecutableIdentityResolverForTests(() => "volume:42");
+			const context = resolveGjcTmuxProviderContext({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(psmuxVersionOutput()),
+			});
+
+			expect(context.kind).toBe("windows-psmux");
+			expect(context.commandPrefix[0]).toBe("-L");
+			const namespace = context.namespace;
+			if (!namespace) throw new Error("missing psmux namespace");
+			expect(namespace).toMatch(/^gjc-[a-f0-9]{32}$/);
+			expect(context.command).toBe("C:\\psmux\\psmux.exe");
+			expect(buildTmuxProviderCommand(context, "has-session", ["-t", "managed"])).toEqual([
+				"-L",
+				namespace,
+				"has-session",
+				"-t",
+				"managed",
+			]);
+		});
+		it("rejects an explicitly classified psmux command on non-Windows platforms", () => {
+			expect(() =>
+				resolveGjcTmuxProviderContext({
+					platform: "linux",
+					binary: { command: "/usr/bin/psmux", isPsmux: true, viaExplicitOverride: true },
+				}),
+			).toThrow("gjc_tmux_provider_ambiguous: selected psmux command requires Windows");
+		});
+
+		it("refuses Windows aliases with conflicting canonical identities", () => {
+			__setExecutableIdentityResolverForTests(executable => executable);
+			expect(() =>
+				resolveGjcTmuxProviderContext({
+					platform: "win32",
+					env: {},
+					runner: buildRunner(psmuxVersionOutput()),
+				}),
+			).toThrow("gjc_tmux_provider_ambiguous");
+		});
+		it("persists authority and rejects invalid sidecars before mutation", () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-provider-"));
+			try {
+				__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\psmux\\psmux.exe" : null));
+				__setExecutableIdentityResolverForTests(() => "volume:42");
+				const authority = bindGjcTmuxProviderAuthority(
+					resolveGjcTmuxProviderContext({
+						platform: "win32",
+						env: { GJC_TMUX_COMMAND: "psmux" },
+						runner: buildRunner(psmuxVersionOutput()),
+					}),
+					{ stateDir: root, sessionId: "team", generation: "generation-a" },
+				);
+				persistGjcTmuxProviderAuthoritySync(authority);
+				publishGeneration(root, authority.sessionId, authority.generation);
+				assertGjcTmuxMutationAuthoritySync(authority);
+				expect(
+					hasGjcTmuxProviderAuthoritySync({
+						stateDir: root,
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+					}),
+				).toBe(true);
+				fs.writeFileSync(
+					lifecyclePaths(root, authority.sessionId, authority.generation).generationFile,
+					`${JSON.stringify({
+						schema_version: 1,
+						session_id: authority.sessionId,
+						generation: authority.generation,
+						published_at: "2026-07-28T00:00:00+00:00",
+					})}\n`,
+				);
+				expect(() => assertGjcTmuxMutationAuthoritySync(authority)).toThrow(
+					"gjc_tmux_provider_authority_generation_mismatch",
+				);
+				publishGeneration(root, authority.sessionId, authority.generation);
+				const sidecar = path.join(
+					lifecyclePaths(root, "team", "generation-a").root,
+					"provider-authority-generation-a.json",
+				);
+				fs.writeFileSync(sidecar, "{");
+				expect(() => assertGjcTmuxMutationAuthoritySync(authority)).toThrow(
+					"gjc_tmux_provider_authority_invalid_record",
+				);
+				expect(() =>
+					hasGjcTmuxProviderAuthoritySync({
+						stateDir: root,
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+					}),
+				).toThrow("gjc_tmux_provider_authority_invalid_record");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+		it("treats Windows authority as absent for native probing while direct reads reject off Windows", () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-off-windows-"));
+			try {
+				__setBinaryResolverForTests(candidate => candidate);
+				const authority = bindGjcTmuxProviderAuthority(
+					resolveGjcTmuxProviderContext({
+						platform: "win32",
+						binary: { command: "C:\\psmux\\psmux.exe", isPsmux: true, viaExplicitOverride: true },
+					}),
+					{ stateDir: root, sessionId: "team", generation: "generation-a" },
+				);
+				persistGjcTmuxProviderAuthoritySync(authority);
+				publishGeneration(root, authority.sessionId, authority.generation);
+				__setTmuxProviderAuthorityPlatformForTests("linux");
+				expect(
+					hasGjcTmuxProviderAuthoritySync({
+						stateDir: authority.stateDir,
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+					}),
+				).toBe(false);
+				expect(() =>
+					readGjcTmuxProviderAuthoritySync({
+						stateDir: authority.stateDir,
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+					}),
+				).toThrow("gjc_tmux_provider_authority_windows_required");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+		it("reports an absent provider authority as absent", () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-provider-"));
+			try {
+				publishGeneration(root, "team", "generation-a");
+				expect(
+					hasGjcTmuxProviderAuthoritySync({
+						stateDir: root,
+						sessionId: "team",
+						generation: "generation-a",
+					}),
+				).toBe(false);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+		it("rejects stale authority generations without mutating the successor pointer", () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-provider-"));
+			try {
+				__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\psmux\\psmux.exe" : null));
+				__setExecutableIdentityResolverForTests(() => "volume:42");
+				const context = resolveGjcTmuxProviderContext({
+					platform: "win32",
+					env: { GJC_TMUX_COMMAND: "psmux" },
+					runner: buildRunner(psmuxVersionOutput()),
+				});
+				const first = bindGjcTmuxProviderAuthority(context, {
+					stateDir: root,
+					sessionId: "team",
+					generation: "generation-a",
+				});
+				const second = bindGjcTmuxProviderAuthority(context, {
+					stateDir: root,
+					sessionId: "team",
+					generation: "generation-b",
+				});
+				persistGjcTmuxProviderAuthoritySync(first);
+				persistGjcTmuxProviderAuthoritySync(second);
+				assertGjcTmuxStagedMutationAuthoritySync(second);
+				expect(() => persistGjcTmuxProviderAuthoritySync(first)).toThrow();
+				publishGeneration(root, second.sessionId, second.generation);
+				expect(() => assertGjcTmuxMutationAuthoritySync(first)).toThrow(
+					"gjc_tmux_provider_authority_generation_mismatch",
+				);
+				assertGjcTmuxMutationAuthoritySync(second);
+				const sidecar = path.join(
+					lifecyclePaths(root, "team", "generation-b").root,
+					"provider-authority-generation-b.json",
+				);
+				expect(
+					(JSON.parse(fs.readFileSync(sidecar, "utf8")) as { owner_generation: string }).owner_generation,
+				).toBe("generation-b");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+		it("does not displace an expired lock whose independent owner is still live", () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-provider-"));
+			try {
+				__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\psmux\\psmux.exe" : null));
+				__setExecutableIdentityResolverForTests(() => "volume:42");
+				const context = resolveGjcTmuxProviderContext({
+					platform: "win32",
+					env: { GJC_TMUX_COMMAND: "psmux" },
+					runner: buildRunner(psmuxVersionOutput()),
+				});
+				const first = bindGjcTmuxProviderAuthority(context, {
+					stateDir: root,
+					sessionId: "team",
+					generation: "generation-a",
+				});
+				const successor = bindGjcTmuxProviderAuthority(context, {
+					stateDir: root,
+					sessionId: "team",
+					generation: "generation-b",
+				});
+				persistGjcTmuxProviderAuthoritySync(first);
+				const lifecycleRoot = lifecyclePaths(root, "team", "generation-a").root;
+				const lockPath = path.join(
+					lifecycleRoot,
+					"provider-authority-locks",
+					"provider-authority-generation-b.json.lock",
+				);
+				fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+				fs.writeFileSync(
+					lockPath,
+					JSON.stringify({
+						attemptId: "paused-independent-writer",
+						pid: process.pid,
+						processStartId: "test-start",
+						createdAt: 0,
+						heartbeatAt: 0,
+						leaseExpiresAt: 0,
+					}),
+				);
+
+				expect(() => persistGjcTmuxProviderAuthoritySync(successor)).toThrow("migration_busy");
+				const sidecar = path.join(lifecycleRoot, "provider-authority-generation-a.json");
+				expect(
+					(JSON.parse(fs.readFileSync(sidecar, "utf8")) as { owner_generation: string }).owner_generation,
+				).toBe("generation-a");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+		it("rejects a same-path executable replacement before a provider mutation", () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-provider-"));
+			try {
+				let executableIdentity = "volume:42:file:100";
+				__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\psmux\\psmux.exe" : null));
+				__setExecutableIdentityResolverForTests(() => executableIdentity);
+				const authority = bindGjcTmuxProviderAuthority(
+					resolveGjcTmuxProviderContext({
+						platform: "win32",
+						env: { GJC_TMUX_COMMAND: "psmux" },
+						runner: buildRunner(psmuxVersionOutput()),
+					}),
+					{ stateDir: root, sessionId: "team", generation: "generation-a" },
+				);
+				persistGjcTmuxProviderAuthoritySync(authority);
+				publishGeneration(root, authority.sessionId, authority.generation);
+				executableIdentity = "volume:42:file:101";
+				expect(() => assertGjcTmuxMutationAuthoritySync(authority)).toThrow(
+					"gjc_tmux_provider_authority_executable_changed",
+				);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+		it("rejects a pointer swap to another valid owner generation", () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-provider-"));
+			try {
+				__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\psmux\\psmux.exe" : null));
+				__setExecutableIdentityResolverForTests(() => "volume:42:file:100");
+				const authority = bindGjcTmuxProviderAuthority(
+					resolveGjcTmuxProviderContext({
+						platform: "win32",
+						env: { GJC_TMUX_COMMAND: "psmux" },
+						runner: buildRunner(psmuxVersionOutput()),
+					}),
+					{ stateDir: root, sessionId: "team", generation: "generation-a" },
+				);
+				persistGjcTmuxProviderAuthoritySync(authority);
+				publishGeneration(root, authority.sessionId, authority.generation);
+				const sidecar = path.join(
+					lifecyclePaths(root, "team", "generation-a").root,
+					"provider-authority-generation-a.json",
+				);
+				const swapped = JSON.parse(fs.readFileSync(sidecar, "utf8")) as Record<string, unknown>;
+				swapped.owner_generation = "generation-b";
+				fs.writeFileSync(sidecar, JSON.stringify(swapped));
+				expect(() => assertGjcTmuxMutationAuthoritySync(authority)).toThrow("gjc_tmux_provider_authority_mismatch");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+	});
+});
+describe("executable identity", () => {
+	it("captures file identity rather than accepting a same-path replacement", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-identity-"));
+		const executable = path.join(root, "psmux.exe");
+		try {
+			fs.writeFileSync(executable, "first");
+			__setExecutableIdentityResolverForTests(null);
+			const first = resolveGjcTmuxExecutableIdentity(executable);
+			fs.writeFileSync(executable, "replacement");
+			const second = resolveGjcTmuxExecutableIdentity(executable);
+			expect(first).not.toBeNull();
+			expect(second).not.toBeNull();
+			expect(second).not.toBe(first);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			__setExecutableIdentityResolverForTests(() => "test-psmux-alias");
+		}
 	});
 });
 

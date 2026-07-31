@@ -5,11 +5,17 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 
 import { GitCommandError, worktree } from "../utils/git";
 import type { GcCollectResult, GcContext, GcPruneOutcome, GcRecord, GcStoreAdapter } from "./gc-runtime";
-import { readTerminalRuntimeStateMarker } from "./session-state-sidecar";
-import { GJC_TMUX_PROFILE_VALUE, GJC_TMUX_SESSION_PREFIX } from "./tmux-common";
+import {
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+	readTerminalRuntimeStateMarker,
+} from "./session-state-sidecar";
+import { GJC_TMUX_PROFILE_VALUE, GJC_TMUX_SESSION_PREFIX, hasGjcTmuxProviderAuthoritySync } from "./tmux-common";
 import {
 	type GjcTmuxSessionStatus,
 	type GjcTmuxSessionsForGc,
@@ -29,6 +35,9 @@ type CollectedTmuxIdentity = {
 	sessionStateFile: string;
 	project: string;
 	createdAt: string;
+	providerKind: "native-tmux" | "windows-psmux";
+	psmuxIncarnation?: string;
+	providerCommand?: string;
 };
 
 const collectedIdentities = new WeakMap<GcRecord, CollectedTmuxIdentity>();
@@ -43,6 +52,15 @@ function collectedIdentity(session: GjcTmuxSessionStatus): CollectedTmuxIdentity
 		!session.createdAt
 	)
 		return undefined;
+	const stateDir = path.dirname(session.sessionStateFile);
+	const providerKind = hasGjcTmuxProviderAuthoritySync({
+		stateDir,
+		sessionId: session.sessionId,
+		generation: session.ownerGeneration,
+	})
+		? "windows-psmux"
+		: "native-tmux";
+	if (providerKind === "windows-psmux" && !session.psmuxIncarnation) return undefined;
 	return {
 		nativeSessionId: session.nativeSessionId,
 		ownerGeneration: session.ownerGeneration,
@@ -50,6 +68,19 @@ function collectedIdentity(session: GjcTmuxSessionStatus): CollectedTmuxIdentity
 		sessionStateFile: session.sessionStateFile,
 		project: session.project,
 		createdAt: session.createdAt,
+		psmuxIncarnation: session.psmuxIncarnation,
+		providerKind,
+		providerCommand: session.providerAuthority?.command,
+	};
+}
+function authorityEnv(identity: CollectedTmuxIdentity, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	if (identity.providerKind !== "windows-psmux") return env;
+	return {
+		...env,
+		GJC_TMUX_COMMAND: identity.providerCommand,
+		[GJC_COORDINATOR_SESSION_ID_ENV]: identity.sessionId,
+		[GJC_TMUX_OWNER_GENERATION_ENV]: identity.ownerGeneration,
+		[GJC_TMUX_OWNER_STATE_DIR_ENV]: path.dirname(identity.sessionStateFile),
 	};
 }
 
@@ -204,14 +235,15 @@ async function revalidateRemovable(
 	identity: CollectedTmuxIdentity,
 	env: NodeJS.ProcessEnv,
 ): Promise<boolean> {
-	const tags = readTmuxSessionTagsForGc(record.id, env);
+	const tags = readTmuxSessionTagsForGc(record.id, authorityEnv(identity, env));
 	if (
 		tags.nativeSessionId !== identity.nativeSessionId ||
 		tags.ownerGeneration !== identity.ownerGeneration ||
 		tags.sessionId !== identity.sessionId ||
 		tags.sessionStateFile !== identity.sessionStateFile ||
 		tags.project !== identity.project ||
-		tags.createdAt !== identity.createdAt
+		tags.createdAt !== identity.createdAt ||
+		tags.psmuxIncarnation !== identity.psmuxIncarnation
 	)
 		return false;
 	if (tags.attached || (tags.panePids?.length ?? 0) > 0) return false;
@@ -273,7 +305,7 @@ export const tmuxSessionsGcAdapter: GcStoreAdapter = {
 			if (!identity || !(await revalidateRemovable(record, identity, ctx.env))) {
 				return { removed: false, skipped: TOCTOU_SKIP };
 			}
-			removeGjcTmuxSession(record.id, ctx.env, identity);
+			removeGjcTmuxSession(record.id, authorityEnv(identity, ctx.env), identity);
 			return { removed: true };
 		} catch (error) {
 			return { removed: false, error: error instanceof Error ? error.message : String(error) };

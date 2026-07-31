@@ -153,6 +153,7 @@ export async function fetchWithRetry(
 		if (hint !== undefined && hint > maxDelayMs) return response;
 
 		const delayMs = Math.min(hint ?? resolveDefaultDelay(defaultDelayMs, attempt, maxDelayMs), maxDelayMs);
+		void response.body?.cancel().catch(() => undefined);
 		await scheduler.wait(delayMs, { signal });
 	}
 }

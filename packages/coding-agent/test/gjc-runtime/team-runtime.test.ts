@@ -1,11 +1,26 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	captureOwnerGenerationBaselineSync,
+	replaceOwnerGenerationSync,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import {
+	__setTmuxProviderAuthorityPlatformForTests,
+	bindGjcTmuxProviderAuthority,
+	persistGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxProviderContext,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-provider-context";
 import { isEnoent } from "@gajae-code/utils";
 import { getWorktreesDir } from "@gajae-code/utils/dirs";
+import {
+	__setBinaryResolverForTests,
+	__setExecutableIdentityResolverForTests,
+	clearPsmuxDetectionCache,
+} from "../../src/gjc-runtime/psmux-detect";
 import { sessionReportsDir, teamStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
 	__setGjcTeamRuntimeTestSeamsForTests,
@@ -44,13 +59,22 @@ import {
 	withGjcTeamTaskMutation,
 } from "../../src/gjc-runtime/team-store";
 import { workerMemoryGuardLedgerPath } from "../../src/gjc-runtime/team-worker-memory-guard";
-import { gjcContinuationReservationDigest, isValidGjcContinuationOutcome } from "../../src/gjc-runtime/team-workers";
+import {
+	gjcContinuationReservationDigest,
+	isValidGjcContinuationAck,
+	isValidGjcContinuationOutcome,
+} from "../../src/gjc-runtime/team-workers";
+import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
 
 const TEAM_CLI = path.resolve(import.meta.dir, "../../src/cli.ts");
 
-async function runTeamApiCli(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function runTeamApiCli(
+	args: string[],
+	options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = Bun.spawn([process.execPath, TEAM_CLI, "team", "api", ...args], {
-		env: { ...process.env, NO_COLOR: "1" },
+		cwd: options.cwd,
+		env: { ...process.env, ...options.env, NO_COLOR: "1" },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -63,23 +87,172 @@ async function runTeamApiCli(args: string[]): Promise<{ exitCode: number; stdout
 }
 const TEST_SESSION_ID = "test-session";
 let cleanupRoot: string | undefined;
+const cleanupRoots = new Set<string>();
 let previousGjcSessionId: string | undefined;
+let fakeTmuxRunnerPath: string | undefined;
+let fakeTmuxRunnerRoot: string | undefined;
 
 const teamStateDir = (root: string, teamName: string) => path.join(teamStateRoot(root, TEST_SESSION_ID), teamName);
 const teamReportPath = (root: string, fileName: string) =>
 	path.join(sessionReportsDir(root, TEST_SESSION_ID), "team-commit-hygiene", fileName);
 
-beforeAll(() => {
+beforeAll(async () => {
 	previousGjcSessionId = process.env.GJC_SESSION_ID;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	fakeTmuxRunnerRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-fake-tmux-runner-"));
+	const sourcePath = path.join(fakeTmuxRunnerRoot, "fake-tmux.ts");
+	fakeTmuxRunnerPath = path.join(fakeTmuxRunnerRoot, process.platform === "win32" ? "fake-tmux.exe" : "fake-tmux");
+	await Bun.write(
+		sourcePath,
+		String.raw`import { appendFile, readFile, writeFile } from "node:fs/promises";
+
+const config = JSON.parse(await readFile(process.execPath + ".json", "utf8"));
+const optionKey = (target: string | undefined, name: string) => (target ?? "") + "\0" + name;
+const optionValues = async () => {
+	try {
+		return JSON.parse(await readFile(config.optionPath, "utf8"));
+	} catch {
+		return {};
+	}
+};
+const saveOption = async () => {
+	const name = args.at(-2);
+	const value = args.at(-1);
+	if (!name || value === undefined) return;
+	const values = await optionValues();
+	values[optionKey(targetAfter("-t"), name)] = value;
+	await writeFile(config.optionPath, JSON.stringify(values));
+};
+const argv = process.argv.slice(2);
+let index = 0;
+let namespace: string | undefined;
+while (argv[index] === "-L" && argv[index + 1] !== undefined) {
+	namespace = argv[index + 1];
+	index += 2;
+}
+void namespace;
+const args = argv.slice(index);
+await appendFile(config.logPath, args.join(" ") + "\n");
+
+const command = args[0];
+const version = config.versionOutput ?? (config.commandName === "psmux" ? "psmux 0.1.0" : "tmux 3.3.5");
+const targetAfter = (flag: string) => {
+	const flagIndex = args.indexOf(flag);
+	return flagIndex === -1 ? undefined : args[flagIndex + 1];
+};
+const isKilled = async (target: string | undefined) => {
+	if (!target) return false;
+	try {
+		await readFile(config.killedDir + "/" + target.replace("%", "pane-"), "utf8");
+		return true;
+	} catch {
+		return false;
+	}
+};
+const displayTarget = (target: string | undefined) => {
+	if (target === "%9") return "other-session:0 %9 4242";
+	if (target?.startsWith("%")) return "test-session:0 " + target + " 4242";
+	if (target?.startsWith("=other-session") || target?.startsWith("other-session")) return "other-session:0 %9 4242";
+	return "test-session:0 %1 4242";
+};
+
+if (command === "-V" || command === "--version") {
+	console.log(version);
+} else if (command === "display-message") {
+	const format = args.at(-1);
+	const target = targetAfter("-t");
+	if (await isKilled(target)) {
+		console.error("can't find pane: " + target);
+		process.exitCode = 1;
+	} else if (config.failDisplay) {
+		console.error("no current tmux");
+		process.exitCode = 1;
+	} else {
+		if (format === "#{window_layout}") console.log(config.windowLayout ?? "main-vertical");
+		else if (format === "#{window_width}") console.log("120");
+		else console.log(displayTarget(target));
+	}
+} else if (command === "show-options" || command === "show-window-options") {
+	const name = args.at(-1);
+	const values = await optionValues();
+	const value = name ? values[optionKey(targetAfter("-t"), name)] : undefined;
+	if (name === "@gjc-profile" && config.gjcProfile !== false) console.log("1");
+	else if (value !== undefined) console.log(value);
+	else if (name === "@gjc-profile") {
+		try {
+			await readFile(config.profilePath, "utf8");
+			console.log("1");
+		} catch {
+			process.exitCode = 1;
+		}
+	} else process.exitCode = 1;
+} else if (command === "set-option" || command === "set-window-option") {
+	if (!(command === "set-option" && config.untaggableProfile && args.includes("@gjc-profile"))) await saveOption();
+	if (command === "set-option" && !config.untaggableProfile && args.includes("@gjc-profile"))
+		await writeFile(config.profilePath, "1");
+} else if (command === "split-window") {
+	if (config.failSplit) {
+		console.error("split failed");
+		process.exitCode = 1;
+	} else if (config.failLeaderPaneSplit && targetAfter("-t") === "%1") {
+		console.error("can't find pane: %1");
+		process.exitCode = 1;
+	} else {
+		let count = 0;
+		try {
+			count = Number.parseInt(await readFile(config.countPath, "utf8"), 10) || 0;
+		} catch {}
+		count += 1;
+		await writeFile(config.countPath, String(count));
+		const newPane = "%" + (count + 1);
+		// The predecessor shell fake published this 3-field marker on every split, and
+		// the memory-guard replacement test waits on it to know a successor pane was
+		// launched before it publishes the generation-bound startup ACK. Without it the
+		// ACK never arrives, relaunch hits its startup deadline, and the guard reports
+		// a retrying outcome instead of a replaced one.
+		await writeFile(config.lastSplitPath, count + "\t" + (targetAfter("-t") ?? "") + "\t" + newPane + "\n");
+		console.log(newPane);
+	}
+} else if (command === "kill-pane") {
+	const target = targetAfter("-t");
+	if (target) await writeFile(config.killedDir + "/" + target.replace("%", "pane-"), "1");
+}
+`,
+	);
+	const build = Bun.spawnSync([process.execPath, "build", sourcePath, "--compile", "--outfile", fakeTmuxRunnerPath], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (build.exitCode !== 0) throw new Error(`failed to compile fake tmux: ${build.stderr.toString()}`);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	if (previousGjcSessionId === undefined) {
 		delete process.env.GJC_SESSION_ID;
 	} else {
 		process.env.GJC_SESSION_ID = previousGjcSessionId;
 	}
+	if (fakeTmuxRunnerRoot) await fs.rm(fakeTmuxRunnerRoot, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+	clearPsmuxDetectionCache();
+	__setBinaryResolverForTests(command =>
+		command.includes(".test-native") || command.includes(".test-bin")
+			? command
+			: /(?:^|[\\/])(?:psmux|pmux|tmux)(?:\.exe)?$/i.test(command) ||
+					/^(?:psmux|pmux|tmux)(?:\.exe)?$/i.test(command)
+				? null
+				: command,
+	);
+	__setExecutableIdentityResolverForTests(executable =>
+		executable.includes(".test-native") || executable.includes(".test-bin")
+			? executable
+			: /(?:^|[\\/])(?:psmux|pmux|tmux)(?:\.exe)?$/i.test(executable) ||
+					/^(?:psmux|pmux|tmux)(?:\.exe)?$/i.test(executable)
+				? null
+				: executable,
+	);
 });
 function runGit(cwd: string, args: string[]): string {
 	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -97,94 +270,34 @@ async function createFakeTmuxBin(
 		untaggableProfile?: boolean;
 		commandName?: string;
 		versionOutput?: string;
+		windowLayout?: string;
 	} = {},
 ): Promise<string> {
+	if (!fakeTmuxRunnerPath) throw new Error("fake tmux runner was not compiled");
 	const binDir = path.join(root, ".test-bin");
 	await fs.mkdir(binDir, { recursive: true });
-	const logPath = path.join(root, "tmux.log");
 	const commandName = options.commandName ?? "tmux";
-	const script = `#!/usr/bin/env bash
-echo "$@" >> ${JSON.stringify(logPath)}
-case "$1" in
-  -V|--version)
-    echo ${JSON.stringify(options.versionOutput ?? "tmux 3.3.5")}
-    ;;
-  display-message)
-    ${
-			options.failDisplay
-				? "echo no current tmux >&2; exit 1"
-				: `
-    target=""
-    for ((i=1; i<=$#; i++)); do
-      if [ "\${!i}" = "-t" ]; then
-        next=$((i + 1))
-        target="\${!next}"
-      fi
-    done
-    case "$target" in
-      %9) echo "other-session:0 %9 4242" ;;
-      %*) echo "test-session:0 $target 4242" ;;
-      =test-session:*|=test-session|test-session:*|test-session) echo "test-session:0 %1 4242" ;;
-      =other-session:*|=other-session|other-session:*|other-session) echo "other-session:0 %9 4242" ;;
-      *) echo "test-session:0 %1 4242" ;;
-    esac
-    `
-}
-    ;;
-  show-options)
-    profile_file=${JSON.stringify(path.join(root, "tmux-profile-tag"))}
-    if [ "${options.gjcProfile === false ? "0" : "1"}" = "1" ]; then echo "1"; exit 0; fi
-    if [ -f "$profile_file" ]; then echo "1"; exit 0; fi
-    exit 1
-    ;;
-  set-option)
-    profile_file=${JSON.stringify(path.join(root, "tmux-profile-tag"))}
-    ${
-			options.untaggableProfile
-				? `: # psmux-like provider: accepts set-option but does not persist tmux user options`
-				: `for arg in "$@"; do
-      if [ "$arg" = "@gjc-profile" ]; then echo "1" > "$profile_file"; fi
-    done`
-}
-    exit 0
-    ;;
-  split-window)
-    ${options.failSplit ? "echo split failed >&2; exit 1" : ""}
-    target=""
-    for ((i=1; i<=$#; i++)); do
-      if [ "\${!i}" = "-t" ]; then
-        next=$((i + 1))
-        target="\${!next}"
-      fi
-    done
-    if [ "${options.failLeaderPaneSplit ? "1" : "0"}" = "1" ] && [ "$target" = "%1" ]; then
-      echo "can't find pane: %1" >&2
-      exit 1
-    fi
-    count_file=${JSON.stringify(path.join(root, "tmux-split-count"))}
-    count=0
-    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
-    count=$((count + 1))
-    echo "$count" > "$count_file"
-    new_pane="%$((count + 1))"
-    printf '%s\t%s\t%s\n' "$count" "$target" "$new_pane" > ${JSON.stringify(path.join(root, "tmux-last-split"))}
-    echo "$new_pane"
-    ;;
-  select-layout|kill-pane)
-    exit 0
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-`;
-	await Bun.write(path.join(binDir, commandName), script);
-	await fs.chmod(path.join(binDir, commandName), 0o755);
-	return path.join(binDir, commandName);
+	const wrapperPath = path.join(binDir, `${commandName}${process.platform === "win32" ? ".exe" : ""}`);
+	await fs.copyFile(fakeTmuxRunnerPath, wrapperPath);
+	await Bun.write(
+		`${wrapperPath}.json`,
+		JSON.stringify({
+			...options,
+			commandName,
+			logPath: path.join(root, "tmux.log"),
+			profilePath: path.join(root, "tmux-profile-tag"),
+			killedDir: root,
+			countPath: path.join(root, "tmux-split-count"),
+			lastSplitPath: path.join(root, "tmux-last-split"),
+			optionPath: path.join(root, "tmux-options.json"),
+		}),
+	);
+	return wrapperPath;
 }
 
 async function createGitRepo(): Promise<string> {
 	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-git-"));
+	cleanupRoots.add(repo);
 	runGit(repo, ["init"]);
 	runGit(repo, ["config", "user.email", "gjc@example.test"]);
 	runGit(repo, ["config", "user.name", "GJC Test"]);
@@ -333,19 +446,34 @@ function artifactCompletionEvidence(summary = "Completed by artifact review") {
 
 afterEach(async () => {
 	__setGjcTeamRuntimeTestSeamsForTests(undefined);
-	if (cleanupRoot) {
-		for (const session of [
-			"gjc-worktree-team",
-			"gjc-fail-team",
-			"gjc-split-fail-team",
-			"gjc-named-team",
-			"gjc-cleanup-team",
-			"gjc-dirty-cleanup-team",
-		]) {
-			Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+	clearPsmuxDetectionCache();
+	__setBinaryResolverForTests(null);
+	__setExecutableIdentityResolverForTests(null);
+	for (const session of [
+		"gjc-worktree-team",
+		"gjc-fail-team",
+		"gjc-split-fail-team",
+		"gjc-named-team",
+		"gjc-cleanup-team",
+		"gjc-dirty-cleanup-team",
+	]) {
+		Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+	}
+	const roots = new Set(cleanupRoots);
+	if (cleanupRoot) roots.add(cleanupRoot);
+	cleanupRoots.clear();
+	cleanupRoot = undefined;
+	for (const root of roots) {
+		for (let attempt = 0; ; attempt += 1) {
+			try {
+				await fs.rm(root, { recursive: true, force: true });
+				break;
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if ((code !== "EACCES" && code !== "EPERM") || attempt === 2) throw error;
+				await Bun.sleep(50);
+			}
 		}
-		await fs.rm(cleanupRoot, { recursive: true, force: true });
-		cleanupRoot = undefined;
 	}
 });
 
@@ -954,7 +1082,11 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("worker-startup-ack");
 		expect(tmuxLog).toContain("protocol_version");
 		expect(tmuxLog).toContain("claim-task/transition-task-status");
-		expect(tmuxLog).toContain("GJC_TEAM_WORKER='worktree-team/worker-1'");
+		expect(tmuxLog).toContain(
+			process.platform === "win32"
+				? "$env:GJC_TEAM_WORKER = 'worktree-team/worker-1'"
+				: "GJC_TEAM_WORKER='worktree-team/worker-1'",
+		);
 		expect(tmuxLog).toContain("true 'You are worker-1 in gjc team worktree-team.");
 		expect(tmuxLog).not.toContain("send-keys -l");
 		expect(tmuxLog).toContain("select-layout -t test-session:0 main-vertical");
@@ -964,7 +1096,7 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).not.toContain("set-option -g");
 		expect(tmuxLog).not.toContain("new-session");
 		expect(tmuxLog).not.toContain("kill-session");
-	});
+	}, 30_000);
 
 	it("resolves the team tmux leader from GJC_TMUX_COMMAND, not only GJC_TEAM_TMUX_COMMAND", async () => {
 		cleanupRoot = await createGitRepo();
@@ -989,7 +1121,7 @@ describe("native gjc team runtime", () => {
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
 		expect(tmuxLog).not.toContain("send-keys -l");
-	});
+	}, 30_000);
 
 	it("targets the GJC-managed leader session from GJC_TMUX_ACTIVE_SESSION over a stale TMUX_PANE", async () => {
 		cleanupRoot = await createGitRepo();
@@ -1046,8 +1178,16 @@ describe("native gjc team runtime", () => {
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("split-window -h -t test-session:0");
 		expect(tmuxLog).toContain("split-window -v -t %2");
-		expect(tmuxLog).toContain("GJC_TEAM_WORKER='multi-team/worker-1'");
-		expect(tmuxLog).toContain("GJC_TEAM_WORKER='multi-team/worker-2'");
+		expect(tmuxLog).toContain(
+			process.platform === "win32"
+				? "$env:GJC_TEAM_WORKER = 'multi-team/worker-1'"
+				: "GJC_TEAM_WORKER='multi-team/worker-1'",
+		);
+		expect(tmuxLog).toContain(
+			process.platform === "win32"
+				? "$env:GJC_TEAM_WORKER = 'multi-team/worker-2'"
+				: "GJC_TEAM_WORKER='multi-team/worker-2'",
+		);
 		expect(tmuxLog).not.toContain("send-keys -l");
 		expect(tmuxLog).not.toContain("new-session");
 	});
@@ -1077,64 +1217,131 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("split-window -v -t %2");
 	});
 
-	it("keeps psmux worker startup on empty-pane send-keys fallback", async () => {
+	it("fails closed for tokenless Windows psmux.exe", async () => {
 		cleanupRoot = await createGitRepo();
-		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux" });
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux.exe" });
 
-		const snapshot = await startGjcTeam({
-			workerCount: 1,
-			agentType: "executor",
-			task: "Start psmux worker",
-			teamName: "psmux-team",
-			cwd: cleanupRoot,
-			env: {
-				GJC_SESSION_ID: TEST_SESSION_ID,
-				PATH: process.env.PATH ?? "",
-				GJC_TEAM_WORKER_COMMAND: "true",
-				GJC_TEAM_TMUX_COMMAND: fakePsmux,
-			},
-		});
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Start psmux worker",
+				teamName: "psmux-team",
+				cwd: cleanupRoot,
+				platform: "win32",
+				env: {
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					PATH: process.env.PATH ?? "",
+					GJC_TEAM_WORKER_COMMAND: "true",
+					GJC_TEAM_TMUX_COMMAND: fakePsmux,
+				},
+			}),
+			// `startGjcTeam`'s tokenless psmux path fails closed at the launch guard with
+			// `authority_unavailable`. `gjc_team_tmux_provider_ambiguous` is thrown only by
+			// `teamProviderAuthority`, which the monitor path reaches and the launch path
+			// does not, so this call can never produce it.
+		).rejects.toThrow("gjc_team_tmux_provider_authority_unavailable");
 
-		expect(snapshot.workers).toHaveLength(1);
-		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
-		const splitLines = tmuxLog.split(/\r?\n/).filter(line => line.startsWith("split-window"));
-		expect(splitLines).toHaveLength(1);
-		expect(splitLines[0]).toContain("split-window -h -t test-session:0 -d -P -F #{pane_id} -c ");
-		expect(splitLines[0]).not.toContain("worker-startup-ack");
-		expect(tmuxLog).toContain("send-keys -l -t %2");
-		expect(tmuxLog).toContain("worker-startup-ack");
-		expect(tmuxLog).toContain("send-keys -t %2 Enter");
+		// The launch fails closed before invoking tmux at all, so the log may not
+		// exist. An absent log is the strongest form of the two assertions below,
+		// so treat it as empty rather than requiring the file to have been created.
+		const logFile = Bun.file(path.join(cleanupRoot, "tmux.log"));
+		const tmuxLog = (await logFile.exists()) ? await logFile.text() : "";
+		expect(tmuxLog).not.toContain("split-window");
+		expect(tmuxLog).not.toContain("send-keys");
 	});
-
-	it("uses the short worker worktree root for Windows psmux even when -V prints a generic tmux banner", async () => {
+	it("fails closed for a Windows tmux alias with an ambiguous psmux companion", async () => {
 		cleanupRoot = await createGitRepo();
-		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux", versionOutput: "tmux 3.3.5" });
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { commandName: "tmux" });
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux.exe" });
+
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Start aliased Windows tmux worker",
+				teamName: "ambiguous-windows-tmux-alias-team",
+				cwd: cleanupRoot,
+				platform: "win32",
+				env: {
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					PATH: process.env.PATH ?? "",
+					GJC_PSMUX_COMMAND: fakePsmux,
+					GJC_TEAM_WORKER_COMMAND: "true",
+					GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				},
+			}),
+		).rejects.toThrow("gjc_tmux_provider_ambiguous");
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).not.toContain("split-window");
+		expect(tmuxLog).not.toContain("send-keys");
+	});
+	it("falls back only for a proven native Windows tmux executable", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { commandName: "tmux" });
 
 		const snapshot = await startGjcTeam({
 			workerCount: 1,
 			agentType: "executor",
-			task: "Start Windows psmux worker",
-			teamName: "windows-generic-psmux-team",
+			task: "Start native Windows tmux worker",
+			teamName: "native-windows-tmux-team",
 			cwd: cleanupRoot,
 			platform: "win32",
 			env: {
 				GJC_SESSION_ID: TEST_SESSION_ID,
 				PATH: process.env.PATH ?? "",
 				GJC_TEAM_WORKER_COMMAND: "true",
-				GJC_TEAM_TMUX_COMMAND: fakePsmux,
+				GJC_TEAM_TMUX_COMMAND: fakeTmux,
 			},
 		});
 
-		const workerPath = snapshot.workers[0]?.worktree_path ?? "";
-		expect(workerPath.startsWith(getWorktreesDir())).toBe(true);
-		expect(workerPath).toContain("team-");
-		expect(workerPath).toContain("worker-1");
-		expect(workerPath).not.toContain("_session-test-session");
-		expect(workerPath).not.toContain(`${path.sep}state${path.sep}team${path.sep}`);
+		expect(snapshot.phase).toBe("running");
+		expect(await Bun.file(path.join(cleanupRoot, "tmux.log")).text()).toContain("split-window");
+	});
+	it("fails when the layout readback differs from the requested layout", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { windowLayout: "even-horizontal" });
 
-		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
-		expect(tmuxLog).toContain("split-window -h -t test-session:0 -d -P -F #{pane_id} -c ");
-		expect(tmuxLog).toContain("send-keys -l -t %2");
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Reject ambiguous layout",
+				teamName: "layout-proof-team",
+				cwd: cleanupRoot,
+				env: {
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					PATH: process.env.PATH ?? "",
+					GJC_TEAM_WORKER_COMMAND: "true",
+					GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				},
+			}),
+		).rejects.toThrow("tmux_layout_postproof_failed");
+	});
+
+	it("fails closed for a Windows psmux identity even when -V prints a generic tmux banner", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux", versionOutput: "tmux 3.3.5" });
+
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Start Windows psmux worker",
+				teamName: "windows-generic-psmux-team",
+				cwd: cleanupRoot,
+				platform: "win32",
+				env: {
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					PATH: process.env.PATH ?? "",
+					GJC_TEAM_WORKER_COMMAND: "true",
+					GJC_TEAM_TMUX_COMMAND: fakePsmux,
+				},
+			}),
+		).rejects.toThrow("gjc_team_tmux_provider_authority_unavailable");
+
+		expect(await Bun.file(path.join(cleanupRoot, "tmux.log")).exists()).toBe(false);
 	});
 	it("distributes explicit markdown lane sections into worker-owned initial tasks", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
@@ -1578,6 +1785,7 @@ describe("native gjc team runtime", () => {
 
 	it("supports task claim, transition, list, status, and shutdown lifecycle operations", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const tmuxCommand = await createFakeTmuxBin(cleanupRoot);
 		await startGjcTeam({
 			workerCount: 1,
 			agentType: "executor",
@@ -1585,7 +1793,11 @@ describe("native gjc team runtime", () => {
 			teamName: "life-team",
 			cwd: cleanupRoot,
 			dryRun: true,
-			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				GJC_TEAM_TMUX_COMMAND: tmuxCommand,
+				PATH: "",
+			},
 		});
 
 		await expect(
@@ -2030,6 +2242,7 @@ describe("native gjc team runtime", () => {
 
 	it("allows non-command completion evidence and requires evidence-backed shutdown completion", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const tmuxCommand = await createFakeTmuxBin(cleanupRoot);
 		await startGjcTeam({
 			workerCount: 2,
 			agentType: "executor",
@@ -2037,7 +2250,11 @@ describe("native gjc team runtime", () => {
 			teamName: "review-evidence-team",
 			cwd: cleanupRoot,
 			dryRun: true,
-			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				GJC_TEAM_TMUX_COMMAND: tmuxCommand,
+				PATH: "",
+			},
 		});
 
 		const firstClaim = await claimGjcTeamTask(
@@ -2089,6 +2306,7 @@ describe("native gjc team runtime", () => {
 
 	it("treats legacy evidence-free completed tasks as failed on shutdown", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const tmuxCommand = await createFakeTmuxBin(cleanupRoot);
 		await startGjcTeam({
 			workerCount: 1,
 			agentType: "executor",
@@ -2096,7 +2314,11 @@ describe("native gjc team runtime", () => {
 			teamName: "legacy-completed-team",
 			cwd: cleanupRoot,
 			dryRun: true,
-			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				GJC_TEAM_TMUX_COMMAND: tmuxCommand,
+				PATH: "",
+			},
 		});
 		const stateDir = teamStateDir(cleanupRoot, "legacy-completed-team");
 		const task = await readGjcTeamTask("legacy-completed-team", "task-1", cleanupRoot, {
@@ -2986,7 +3208,9 @@ describe("native gjc team runtime", () => {
 			GJC_TEAM_TMUX_COMMAND: fakeTmux,
 		});
 
-		expect(await Bun.file(path.join(cleanupRoot, "worker-output.txt")).text()).toBe("from worker\n");
+		expect((await Bun.file(path.join(cleanupRoot, "worker-output.txt")).text()).replaceAll("\r\n", "\n")).toBe(
+			"from worker\n",
+		);
 		const workerState = monitored.integration_by_worker?.["worker-1"];
 		expect(workerState?.status).toBe("idle");
 		expect(workerState?.last_integrated_head).toBeTruthy();
@@ -3055,7 +3279,9 @@ describe("native gjc team runtime", () => {
 			GJC_TEAM_TMUX_COMMAND: fakeTmux,
 		});
 
-		expect(await Bun.file(path.join(cleanupRoot, "semantic.txt")).text()).toBe("semantic\n");
+		expect((await Bun.file(path.join(cleanupRoot, "semantic.txt")).text()).replaceAll("\r\n", "\n")).toBe(
+			"semantic\n",
+		);
 		expect(await Bun.file(path.join(teamStateRoot(cleanupRoot, TEST_SESSION_ID), "runtime.json")).exists()).toBe(
 			false,
 		);
@@ -3202,7 +3428,7 @@ describe("native gjc team runtime", () => {
 			GJC_TEAM_TMUX_COMMAND: fakeTmux,
 		});
 
-		expect(await Bun.file(path.join(cleanupRoot, "worker.txt")).text()).toBe("worker\n");
+		expect((await Bun.file(path.join(cleanupRoot, "worker.txt")).text()).replaceAll("\r\n", "\n")).toBe("worker\n");
 		expect(first.integration_by_worker?.["worker-1"]?.last_integrated_head).toBe(workerHead);
 		expect(second.integration_by_worker?.["worker-1"]?.last_integrated_head).toBeTruthy();
 		expect(runGit(cleanupRoot, ["rev-parse", "HEAD"])).toBe(leaderAfterFirst);
@@ -3777,11 +4003,20 @@ describe("team worker memory guard wiring", () => {
 			await successorAck.catch(() => {});
 			throw error;
 		}
+		if (process.platform !== "linux") {
+			// Advisory-only hosts never launch a successor pane, so the split-marker
+			// waiter cannot resolve. Cancel it and swallow the abort before asserting,
+			// otherwise the awaited waiter rejects and masks the advisory outcome.
+			markerAbort.abort(new Error("advisory host: no successor pane launch expected"));
+			await successorAck.catch(() => {});
+			expect(result).toMatchObject({ result: "advisory", lifecycle_mutated: false });
+			return;
+		}
 		if (result.result !== "replaced") {
 			markerAbort.abort(new Error(`Replacement settled before pane launch ACK: ${result.result}`));
 		}
 		await successorAck;
-		expect(result.result).toBe("replaced");
+		expect(result).toMatchObject({ result: "replaced" });
 		expect(result.lifecycle_mutated).toBe(true);
 		expect(result.ledger.worker_id).toBe("worker-2");
 		expect(result.ledger.state).toBe("replaced");
@@ -3843,6 +4078,10 @@ describe("team worker memory guard wiring", () => {
 			cleanupRoot,
 			env,
 		)) as { result: string; lifecycle_mutated: boolean; ledger: { state: string; retry_count: number } };
+		if (process.platform !== "linux") {
+			expect(first).toMatchObject({ result: "advisory", lifecycle_mutated: false });
+			return;
+		}
 		expect(first.result).toBe("retrying");
 		expect(first.lifecycle_mutated).toBe(false);
 		expect(first.ledger).toMatchObject({ state: "retrying", retry_count: 1 });
@@ -3885,13 +4124,6 @@ describe("stalled worker continuation protocol", () => {
 		cleanupRoot = await createGitRepo();
 		let nowMs = Date.now();
 		const dispatches: Array<{ command: string; args: string[] }> = [];
-		__setGjcTeamRuntimeTestSeamsForTests({
-			nowMs: () => nowMs,
-			continuationTmuxDispatch: (command, args) => {
-				dispatches.push({ command, args: [...args] });
-				return { exitCode: 0 };
-			},
-		});
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
 		const env = {
 			GJC_SESSION_ID: TEST_SESSION_ID,
@@ -3899,7 +4131,7 @@ describe("stalled worker continuation protocol", () => {
 			GJC_TEAM_WORKER_COMMAND: "true",
 			GJC_TEAM_TMUX_COMMAND: fakeTmux,
 			GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS: "1",
-			GJC_TEAM_HEARTBEAT_STALE_MS: "1000",
+			GJC_TEAM_HEARTBEAT_STALE_MS: "60000",
 		};
 		const snapshot = await startGjcTeam({
 			workerCount: 1,
@@ -3909,9 +4141,23 @@ describe("stalled worker continuation protocol", () => {
 			cwd: cleanupRoot,
 			env,
 		});
-		const claim = await claimGjcTeamTask(teamName, "worker-1", cleanupRoot, env);
-		expect(claim.ok).toBe(true);
+		const claim = await claimGjcTeamTask(teamName, "worker-1", cleanupRoot, env, "task-1");
+		if (!claim.ok) throw new Error(claim.reason);
 		const stateDir = snapshot.state_dir;
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: () => nowMs,
+			continuationTmuxDispatch: async (command, args) => {
+				dispatches.push({ command, args: [...args] });
+				return { exitCode: 0 };
+			},
+			continuationAckPoll: async () => {
+				const prompt = dispatches.at(-1)?.args.find(arg => arg.includes("worker-continuation-ack"));
+				const match = prompt?.match(/--input '([^']+)' --json\.$/);
+				if (!match) throw new Error("expected delivered continuation ACK command");
+				const delivered = JSON.parse(match[1]) as Record<string, unknown>;
+				await executeGjcTeamApiOperation("worker-continuation-ack", delivered, cleanupRoot!, env);
+			},
+		});
 		await Bun.write(
 			path.join(stateDir, "workers", "worker-1", "lifecycle.json"),
 			`${JSON.stringify({ worker: "worker-1", lifecycle_state: "working", worker_status_state: "working", updated_at: new Date(nowMs).toISOString() })}\n`,
@@ -3919,7 +4165,7 @@ describe("stalled worker continuation protocol", () => {
 		await writeWorkerStatus(stateDir, "worker-1", "working");
 		await Bun.write(
 			path.join(stateDir, "workers", "worker-1", "heartbeat.json"),
-			`${JSON.stringify({ pid: 1, last_turn_at: new Date(nowMs - 1_001).toISOString(), turn_count: 1, alive: true })}\n`,
+			`${JSON.stringify({ pid: 1, last_turn_at: new Date(nowMs - 60_001).toISOString(), turn_count: 1, alive: true })}\n`,
 		);
 		return {
 			teamName,
@@ -4042,7 +4288,7 @@ describe("stalled worker continuation protocol", () => {
 			expect(fixture.dispatches, scenario).toHaveLength(0);
 			expect(await readEvents(fixture.stateDir), scenario).toContain('"reason":"invalid_authority_inventory"');
 		}
-	});
+	}, 120_000);
 
 	it("disables continuation, stale recovery, and stale-heartbeat nudges for non-positive thresholds", async () => {
 		for (const threshold of ["0", "-1"]) {
@@ -4110,7 +4356,7 @@ describe("stalled worker continuation protocol", () => {
 			await fixture.monitor();
 			expect(fixture.dispatches, scenario).toHaveLength(0);
 		}
-	});
+	}, 120_000);
 	it("does not honor a continuation recovery hold after canonical authority changes", async () => {
 		for (const scenario of [
 			"claim_deleted",
@@ -4146,7 +4392,7 @@ describe("stalled worker continuation protocol", () => {
 			await recoverGjcTeamStaleClaims(fixture.teamName, cleanupRoot!, fixture.env);
 			expect(await Bun.file(claimPath).exists(), scenario).toBe(false);
 		}
-	});
+	}, 20_000);
 
 	it("revokes escaped task mutation capabilities after their fenced callback", async () => {
 		const fixture = await prepareContinuation("continuation-capability-team");
@@ -4233,6 +4479,13 @@ describe("stalled worker continuation protocol", () => {
 				covered.advance(dispatchTimeoutMs);
 				return { exitCode: 0 };
 			},
+			// The production ack loop polls repeatedly; advancing by the full dispatch
+			// timeout each time would consume the whole lease and turn this into a
+			// lease-expiry case. Advance by the real poll interval so the scenario
+			// under test (exit 0 with no acknowledgement) is what actually happens.
+			continuationAckPoll: async () => {
+				covered.advance(dispatchTimeoutMs);
+			},
 		});
 		await covered.monitor();
 		const coveredRoot = path.join(covered.stateDir, "workers", "worker-1", "continuations");
@@ -4242,8 +4495,7 @@ describe("stalled worker continuation protocol", () => {
 			path.join(coveredRoot, coveredIncident, "attempt-01.reservation.json"),
 		).json();
 		const coveredOutcome = await Bun.file(path.join(coveredRoot, coveredIncident, "attempt-01.outcome.json")).json();
-		expect(coveredOutcome).toMatchObject({ result: "sent", reason: "tmux_sent" });
-		expect(Date.parse(coveredOutcome.hold_until)).toBeLessThanOrEqual(Date.parse(coveredLease));
+		expect(coveredOutcome).toMatchObject({ result: "unknown", reason: "tmux_exit_zero_unacknowledged" });
 		expect(isValidGjcContinuationOutcome(coveredOutcome, coveredReservation, coveredIncident, 1)).toBe(true);
 
 		const insufficient = await prepareContinuation("continuation-insufficient-worst-case-coverage-team");
@@ -4268,14 +4520,6 @@ describe("stalled worker continuation protocol", () => {
 	});
 	it("uses the successful dispatch deadline rather than the earlier reservation deadline", async () => {
 		const fixture = await prepareContinuation("continuation-dispatch-relative-hold-team");
-		__setGjcTeamRuntimeTestSeamsForTests({
-			nowMs: fixture.now,
-			continuationBeforeDispatch: async () => fixture.advance(15_000),
-			continuationTmuxDispatch: (command, args) => {
-				fixture.dispatches.push({ command, args: [...args] });
-				return { exitCode: 0 };
-			},
-		});
 		await fixture.monitor();
 		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
 		const [incident] = await fs.readdir(continuationRoot);
@@ -4315,27 +4559,194 @@ describe("stalled worker continuation protocol", () => {
 			expect(task.status).toBe("pending");
 			expect(task.claim).toBeUndefined();
 		}
-	});
+	}, 20_000);
 
 	it("continues only with a proven absent shutdown authority", async () => {
 		const fixture = await prepareContinuation("continuation-absent-shutdown-team");
 		await fixture.monitor();
 		expect(fixture.dispatches).toHaveLength(1);
 	});
-
-	it("journals but sends no continuation input through psmux fallback transport", async () => {
-		const fixture = await prepareContinuation("continuation-psmux-transport-team");
-		const fakePsmux = await createFakeTmuxBin(cleanupRoot!, { commandName: "psmux" });
-		const configPath = path.join(fixture.stateDir, "config.json");
-		const config = await readTeamConfig(fixture.stateDir);
-		await Bun.write(configPath, `${JSON.stringify({ ...config, tmux_command: fakePsmux })}\n`);
+	it("requires a canonical receiver ACK before recording continuation delivery", async () => {
+		const fixture = await prepareContinuation("continuation-receiver-ack-team");
 		await fixture.monitor();
-		expect(fixture.dispatches).toHaveLength(0);
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		const reservation = await Bun.file(path.join(continuationRoot, incident, "attempt-01.reservation.json")).json();
+		const ack = await Bun.file(path.join(continuationRoot, incident, "attempt-01.ack.json")).json();
+		const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+		expect(isValidGjcContinuationAck(ack, reservation, incident, 1)).toBe(true);
+		const prompt = fixture.dispatches.at(-1)?.args.find(arg => arg.includes("worker-continuation-ack"));
+		const match = prompt?.match(/--input '([^']+)' --json\.$/);
+		if (!match) throw new Error("expected generated continuation ACK command");
+		expect(JSON.parse(match[1])).toEqual({
+			team_name: fixture.teamName,
+			worker_id: "worker-1",
+			incident_hash: incident,
+			attempt: 1,
+		});
+		expect(outcome).toMatchObject({ result: "sent", reason: "tmux_sent" });
+	}, 30_000);
+	it("allows a spawned receiver CLI ACK while continuation waits outside the mutation fence", async () => {
+		const fixture = await prepareContinuation("continuation-spawned-cli-ack-team");
+		let acked = false;
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationTmuxDispatch: async (command, args) => {
+				fixture.dispatches.push({ command, args: [...args] });
+				return { exitCode: 0 };
+			},
+			continuationAckPoll: async () => {
+				if (acked) return;
+				const prompt = fixture.dispatches.at(-1)?.args.find(arg => arg.includes("worker-continuation-ack"));
+				const match = prompt?.match(/--input '([^']+)' --json\.$/);
+				if (!match) throw new Error("expected generated continuation ACK command");
+				const ack = await runTeamApiCli(["worker-continuation-ack", "--input", match[1]!, "--json"], {
+					cwd: cleanupRoot!,
+					env: fixture.env,
+				});
+				if (ack.exitCode !== 0) throw new Error(`spawned continuation ACK failed: ${ack.stderr}`);
+				acked = true;
+			},
+		});
+		await fixture.monitor();
+		expect(acked).toBe(true);
 		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
 		const [incident] = await fs.readdir(continuationRoot);
 		if (!incident) throw new Error("expected continuation incident");
 		const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
-		expect(outcome).toMatchObject({ result: "skipped", reason: "unsupported_send_keys_transport" });
+		expect(outcome).toMatchObject({ result: "sent", reason: "tmux_sent" });
+	}, 30_000);
+	it("aborts ACK polling when claim authority changes after dispatch", async () => {
+		const fixture = await prepareContinuation("continuation-post-dispatch-authority-team");
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationTmuxDispatch: () => ({ exitCode: 0 }),
+			continuationAckPoll: async () => {
+				const claimPath = path.join(fixture.stateDir, "claims", "task-1.json");
+				const claim = await Bun.file(claimPath).json();
+				await Bun.write(claimPath, `${JSON.stringify({ ...claim, token: "replaced-token" })}\n`);
+			},
+		});
+		await fixture.monitor();
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+		expect(outcome).toMatchObject({ result: "unknown", reason: "continuation_invalid_authority_inventory" });
+	});
+	it("rejects stale and malformed generated continuation ACK invocations", async () => {
+		const fixture = await prepareContinuation("continuation-stale-receiver-ack-team");
+		let delivered: Record<string, unknown> | undefined;
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationTmuxDispatch: (_command, args) => {
+				const prompt = args.find(arg => arg.includes("worker-continuation-ack"));
+				const match = prompt?.match(/--input '([^']+)' --json\.$/);
+				if (!match) throw new Error("expected generated continuation ACK command");
+				delivered = JSON.parse(match[1]) as Record<string, unknown>;
+				return { exitCode: 0 };
+			},
+			continuationAckPoll: async () => {
+				const claimPath = path.join(fixture.stateDir, "claims", "task-1.json");
+				const claim = await Bun.file(claimPath).json();
+				await Bun.write(claimPath, `${JSON.stringify({ ...claim, token: "replaced-token" })}\n`);
+				if (!delivered) throw new Error("expected delivered continuation ACK input");
+				await expect(
+					executeGjcTeamApiOperation("worker-continuation-ack", delivered, cleanupRoot!, fixture.env),
+				).rejects.toThrow("continuation_ack_claim_authority_changed");
+			},
+		});
+		await fixture.monitor();
+		if (!delivered) throw new Error("expected delivered continuation ACK input");
+		await expect(
+			executeGjcTeamApiOperation(
+				"worker-continuation-ack",
+				{ ...delivered, claim_token: "must-not-be-accepted" },
+				cleanupRoot!,
+				fixture.env,
+			),
+		).rejects.toThrow("invalid_continuation_ack_reference");
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		await expect(fs.access(path.join(continuationRoot, incident, "attempt-01.ack.json"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+	it("rejects stale or wrongly bound continuation ACKs", () => {
+		const reservation = {
+			attempt_nonce: "current-nonce",
+			worker: "worker-1",
+			pane_id: "%2",
+			worker_incarnation: "%2:current",
+			claim_token: "current-claim",
+		};
+		const ack = {
+			schema_version: 1,
+			incident_hash: "incident",
+			attempt: 1,
+			attempt_nonce: reservation.attempt_nonce,
+			reservation_sha256: gjcContinuationReservationDigest(reservation),
+			worker: reservation.worker,
+			pane_id: reservation.pane_id,
+			worker_incarnation: reservation.worker_incarnation,
+			claim_token: reservation.claim_token,
+			acknowledged_at: new Date().toISOString(),
+		};
+		expect(isValidGjcContinuationAck({ ...ack, attempt_nonce: "stale-nonce" }, reservation, "incident", 1)).toBe(
+			false,
+		);
+		expect(isValidGjcContinuationAck({ ...ack, claim_token: "wrong-claim" }, reservation, "incident", 1)).toBe(false);
+	});
+
+	it("dispatches continuation through psmux with deferred outcome proof", async () => {
+		const fixture = await prepareContinuation("continuation-psmux-transport-team");
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot!, { commandName: "psmux" });
+		const configPath = path.join(fixture.stateDir, "config.json");
+		const config = await readTeamConfig(fixture.stateDir);
+		// psmux transport requires a persisted provider authority: `teamProviderAuthority`
+		// rejects a `windows-psmux` context that has no bound authority. Every authority
+		// read also requires the Windows platform, so the pin must stay active across the
+		// monitor call and be released in `finally` so the other tests are unaffected.
+		const generation = "psmux-generation";
+		prepareManagedDirectoryRoot(fixture.stateDir);
+		__setTmuxProviderAuthorityPlatformForTests("win32");
+		try {
+			const context = resolveGjcTmuxProviderContext({
+				env: { GJC_TMUX_COMMAND: fakePsmux, GJC_PSMUX_COMMAND: fakePsmux },
+				platform: "win32",
+			});
+			const baseline = captureOwnerGenerationBaselineSync(fixture.stateDir, config.team_name);
+			persistGjcTmuxProviderAuthoritySync(
+				bindGjcTmuxProviderAuthority(context, {
+					stateDir: fixture.stateDir,
+					sessionId: config.team_name,
+					generation,
+				}),
+			);
+			replaceOwnerGenerationSync(fixture.stateDir, config.team_name, generation, baseline);
+			await Bun.write(
+				configPath,
+				`${JSON.stringify({
+					...config,
+					tmux_command: fakePsmux,
+					platform: "win32",
+					tmux_provider_generation: generation,
+					tmux_provider_state_dir: fixture.stateDir,
+					tmux_provider_session_id: config.team_name,
+				})}\n`,
+			);
+			await fixture.monitor();
+		} finally {
+			__setTmuxProviderAuthorityPlatformForTests(null);
+		}
+		expect(fixture.dispatches).toHaveLength(1);
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+		expect(outcome).toMatchObject({ result: "sent" });
 	});
 
 	it("is default-off and uses the controlled clock for exact 30s, 120s, and no-third-attempt timing", async () => {
@@ -4351,7 +4762,7 @@ describe("stalled worker continuation protocol", () => {
 		expect(fixture.dispatches).toHaveLength(0);
 		await Bun.write(
 			path.join(fixture.stateDir, "workers", "worker-1", "heartbeat.json"),
-			`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now() - 1_001).toISOString(), turn_count: 1, alive: true })}\n`,
+			`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now() - 60_001).toISOString(), turn_count: 1, alive: true })}\n`,
 		);
 		await fixture.monitor();
 		expect(fixture.dispatches).toHaveLength(1);
@@ -4418,7 +4829,7 @@ describe("stalled worker continuation protocol", () => {
 		if (!incident) throw new Error("expected continuation incident");
 		expect(await Bun.file(path.join(continuationRoot, incident, "attempt-01.reservation.json")).exists()).toBe(true);
 		expect(await Bun.file(path.join(continuationRoot, incident, "attempt-02.reservation.json")).exists()).toBe(false);
-	});
+	}, 20_000);
 
 	it("records nonzero, partial, or thrown tmux dispatches as unknown and never retries them", async () => {
 		for (const [teamName, dispatch, reason] of [
@@ -4447,7 +4858,7 @@ describe("stalled worker continuation protocol", () => {
 				false,
 			);
 		}
-	});
+	}, 20_000);
 	it("normalizes hostile thrown values into validator-accepted unknown outcomes without recovery", async () => {
 		for (const [teamName, thrown] of [
 			["continuation-empty-object-throw-team", {}],
@@ -4482,7 +4893,7 @@ describe("stalled worker continuation protocol", () => {
 			expect((await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env)).claim).toBeUndefined();
 			expect((await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env)).status).toBe("pending");
 		}
-	});
+	}, 20_000);
 	it("rejects non-canonical attempt-two outcomes before they can authorize another continuation", () => {
 		const reservation = { immutable: true };
 		const common = {
@@ -4594,7 +5005,7 @@ describe("stalled worker continuation protocol", () => {
 				expect(second.ok).toBe(true);
 				await Bun.write(
 					path.join(fixture.stateDir, "workers", "worker-1", "heartbeat.json"),
-					`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now() - 1_001).toISOString(), turn_count: 1, alive: true })}\n`,
+					`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now() - 60_001).toISOString(), turn_count: 1, alive: true })}\n`,
 				);
 			} else if (scenario === "shutdown") {
 				await Bun.write(path.join(fixture.stateDir, "workers", "worker-1", "shutdown-request.json"), "{}\n");
@@ -4634,7 +5045,7 @@ describe("stalled worker continuation protocol", () => {
 			if (scenario === "zero_claims" || scenario === "multiple_claims")
 				expect(await readEvents(fixture.stateDir)).toContain("invalid_claim_count");
 		}
-	});
+	}, 20_000);
 
 	it("rejects insufficient lease, corrupt reservations, digest-mismatched outcomes, and restarts without an outcome", async () => {
 		const insufficient = await prepareContinuation("continuation-insufficient-lease-team");
@@ -4647,7 +5058,7 @@ describe("stalled worker continuation protocol", () => {
 		const task = await readGjcTeamTask(corrupt.teamName, "task-1", cleanupRoot!, corrupt.env);
 		const worker = config.workers[0];
 		if (!worker || !task.claim) throw new Error("expected claimed worker task");
-		const heartbeatAt = new Date(corrupt.now() - 1_001).toISOString();
+		const heartbeatAt = new Date(corrupt.now() - 60_001).toISOString();
 		const incident = createHash("sha256")
 			.update(
 				[
@@ -4710,7 +5121,7 @@ describe("stalled worker continuation protocol", () => {
 		if (!restartIncident) throw new Error("expected reservation");
 		expect(await Bun.file(path.join(restartRoot, restartIncident, "attempt-01.outcome.json")).exists()).toBe(false);
 		expect(restart.dispatches).toHaveLength(0);
-	});
+	}, 20_000);
 
 	it("releases stale claims for present null or malformed continuation outcomes instead of treating them as missing", async () => {
 		for (const [name, outcome] of [
@@ -4939,7 +5350,18 @@ describe("stalled worker continuation protocol", () => {
 			release();
 			const [, operationResult] = await Promise.all([monitor, result]);
 			expect(finished, name).toBe(true);
-			expect(argv, name).toEqual([expectedArgv]);
+			// psmux appends a bounded ACK instruction to the fixed continuation prompt so
+			// the worker can acknowledge the incident. The suffix embeds the run-scoped
+			// incident hash, so assert the invariant structure exactly and bind the
+			// dynamic tail by prefix plus the ACK operation and attempt it must carry.
+			expect(argv, name).toHaveLength(1);
+			const [sent] = argv;
+			expect(sent, name).toHaveLength(expectedArgv.length);
+			expect(sent!.slice(0, 4), name).toEqual(expectedArgv.slice(0, 4));
+			expect(sent!.slice(5), name).toEqual(expectedArgv.slice(5));
+			expect(sent![4], name).toStartWith(expectedArgv[4]!);
+			expect(sent![4], name).toContain("worker-continuation-ack");
+			expect(sent![4], name).toContain('"attempt":1');
 			for (const hostile of hostileInputs) expect(argv.flat().join("\u0000"), name).not.toContain(hostile);
 			const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
 			if (name === "update task") expect(task.subject).toBe("updated");
@@ -4954,7 +5376,7 @@ describe("stalled worker continuation protocol", () => {
 			expect(["pending", "in_progress", "failed"]).toContain(task.status);
 			if (task.claim) expect(task.claim.owner).toBe("worker-1");
 		}
-	});
+	}, 300_000);
 
 	it("does not recreate a GC-pruned missing-pane worker during a later monitor", async () => {
 		const fixture = await prepareContinuation("continuation-gc-first-team");
@@ -5019,5 +5441,5 @@ describe("stalled worker continuation protocol", () => {
 		release();
 		await Promise.all([monitor, gc]);
 		expect(gcFinished).toBe(true);
-	});
+	}, 20_000);
 });

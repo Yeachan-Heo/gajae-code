@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
@@ -26,12 +27,21 @@ const tempRoots: string[] = [];
 
 let savedSessionId: string | undefined;
 let savedSessionFile: string | undefined;
+let savedCiDevChangedPaths: string | undefined;
 
 beforeEach(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
 	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	delete process.env.GJC_SESSION_FILE;
+	// Temp dirs live outside the enclosing git work tree (os.tmpdir) so
+	// computeCheckpointChangeSet falls through to the CI_DEV_CHANGED_PATHS-only
+	// path. Pin a non-computer path so the mandatory computer red-team suite is
+	// not falsely triggered by captureIncomplete or git-command timeouts under
+	// parallel shard load.
+	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+	process.env.CI_DEV_CHANGED_PATHS =
+		"packages/coding-agent/test/gjc-runtime/ultragoal-durable-completion-release.test.ts";
 });
 
 afterEach(async () => {
@@ -39,11 +49,13 @@ afterEach(async () => {
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	if (savedSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 	else process.env.GJC_SESSION_FILE = savedSessionFile;
+	if (savedCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+	else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-durable-release-"));
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-durable-release-"));
 	tempRoots.push(dir);
 	return dir;
 }

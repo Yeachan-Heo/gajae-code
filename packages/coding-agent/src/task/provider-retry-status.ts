@@ -3,6 +3,7 @@ import type { AgentProgress, TaskToolDetails } from "./types";
 export type ProviderRetryKind = NonNullable<AgentProgress["retryState"]>["kind"];
 
 const FIRST_EVENT_TIMEOUT_PATTERN = /stream timed out while waiting for the first event/i;
+const FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_MESSAGE = "Provider stream timed out while waiting for first event";
 const IDLE_STREAM_STALL_PATTERN = /stream stalled while waiting for the next event/i;
 const STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE = "stream_first_event_timeout";
 
@@ -22,7 +23,9 @@ export function classifyProviderRetryFromTransport(facts: {
 		return "first_event_timeout";
 	}
 	const errorMessage = facts.errorMessage ?? "";
-	if (FIRST_EVENT_TIMEOUT_PATTERN.test(errorMessage)) return "first_event_timeout";
+	if (FIRST_EVENT_TIMEOUT_PATTERN.test(errorMessage) || errorMessage === FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_MESSAGE) {
+		return "first_event_timeout";
+	}
 	if (IDLE_STREAM_STALL_PATTERN.test(errorMessage)) return "idle_stream_stall";
 	return "provider_error";
 }

@@ -1,4 +1,5 @@
 /** File-backed team task store, claims, leases, and completion evidence. */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -324,15 +325,32 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
 }
 
 /**
- * Serializes mutable team facts across processes. Callers must not re-enter this
- * fence; use unlocked helpers when composing operations under one transaction.
+ * Serializes mutable team facts across processes. Nested operations inherit the
+ * outer filesystem lock and execute directly; independent callers queue locally
+ * before contending for the cross-process lock.
  */
+const teamMutationFenceTails = new Map<string, Promise<void>>();
+const activeTeamMutationFences = new AsyncLocalStorage<ReadonlySet<string>>();
+
 export async function withGjcTeamMutationFence<T>(dir: string, fn: () => Promise<T>): Promise<T> {
-	return withWorkflowStateLock(
-		path.join(dir, "operations", "team-mutation.json"),
-		fn,
-		writerOptions(path.join(dir, "operations", "team-mutation.json"), "state", "mutation-fence"),
-	);
+	const lockPath = path.join(dir, "operations", "team-mutation.json");
+	const active = activeTeamMutationFences.getStore();
+	if (active?.has(lockPath)) return await fn();
+	const previous = teamMutationFenceTails.get(lockPath) ?? Promise.resolve();
+	let releaseQueue!: () => void;
+	const queued = new Promise<void>(resolve => {
+		releaseQueue = resolve;
+	});
+	teamMutationFenceTails.set(lockPath, queued);
+	await previous;
+	try {
+		return await activeTeamMutationFences.run(new Set([...(active ?? []), lockPath]), () =>
+			withWorkflowStateLock(lockPath, fn, writerOptions(lockPath, "state", "mutation-fence")),
+		);
+	} finally {
+		releaseQueue();
+		if (teamMutationFenceTails.get(lockPath) === queued) teamMutationFenceTails.delete(lockPath);
+	}
 }
 function optionalString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;

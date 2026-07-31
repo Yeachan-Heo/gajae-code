@@ -3744,6 +3744,11 @@ function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
 	return paths;
 }
 
+function validArraySettingValue(value: unknown, allowedValues: readonly string[] | undefined): boolean {
+	if (!Array.isArray(value)) return false;
+	return !allowedValues || value.every(item => typeof item === "string" && allowedValues.includes(item));
+}
+
 function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
 	return (
 		(definition.type === "boolean" && typeof value === "boolean") ||
@@ -3755,7 +3760,8 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 		(definition.type === "enum" &&
 			typeof value === "string" &&
 			(definition.values as readonly string[]).includes(value)) ||
-		(definition.type === "array" && Array.isArray(value)) ||
+		(definition.type === "array" &&
+			validArraySettingValue(value, "items" in definition ? definition.items?.enum : undefined)) ||
 		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
 	);
 }
@@ -3792,8 +3798,16 @@ export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 			schemaSetAtPath(settings, path, next);
 			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
 		}
-		if (!validSettingValue(definition, next))
-			issues.push({ path, kind: "invalid", detail: `Expected ${definition.type}.` });
+		if (!validSettingValue(definition, next)) {
+			const arrayItemEnum =
+				definition.type === "array" && Array.isArray(next) && "items" in definition
+					? definition.items?.enum
+					: undefined;
+			const detail = arrayItemEnum
+				? `Expected array items to be one of: ${arrayItemEnum.join(", ")}.`
+				: `Expected ${definition.type}.`;
+			issues.push({ path, kind: "invalid", detail });
+		}
 		if (
 			definition.type === "record" &&
 			"valueSchema" in definition &&

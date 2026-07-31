@@ -1,6 +1,19 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
+- Ultragoal validation-batch hydration now fails closed unless deferred and final-close evidence exactly matches a complete authoritative cumulative Git/CI inventory and durable batch tuple. Explicit malformed, partial, unknown, reordered, or stale receipt data is rejected; Git path capture is byte-safe, NUL-delimited, and includes untracked files; incomplete capture conservatively requires computer-control QA; shared settings and tool registries cannot use partial diffs to bypass that suite; validate/checkpoint replacement hydration is identical; and current/replacement receipts are byte-bound to ledger payloads (#3541).
+- Fixture quality gates that complete intermediate Ultragoal stories now write file-backed adversarial artifact proof; skill-state hooks and computer red-team fixtures match the unconditional adversarial path check so #3543 CI stays fail-closed without weakening hydration exactness (#3543).
+- Runtime settings reconciliation now validates every `web_search.fallback` entry against the declared provider enum instead of accepting unsupported or non-string array items (#3601).
+- Ultragoal critic-gate, dogfood, review, durable-completion, and runtime test suites now pin `CI_DEV_CHANGED_PATHS` hermetically in their setup/teardown. Their temp checkpoints live inside the enclosing git work tree, so the CI planner's changed paths (which include computer control surface paths on branches that touch them) previously leaked into the computed change set and falsely triggered the mandatory computer red-team suite (`COMPUTER_REDTEAM_CASE_MISSING: … must include kill-switch-bypass`). The production kill-switch-bypass gate is unchanged; only the test fixtures now isolate their own contract from the host branch's diff (#3533).
+- Ultragoal critic-gate, dogfood, review, durable-completion, and runtime test suites now relocate temp dirs to `os.tmpdir()` (outside the enclosing git work tree) and pin `CI_DEV_CHANGED_PATHS` to a non-computer test path. The prior in-repo temp dirs caused `computeCheckpointChangeSet` to return `captureIncomplete=true` under parallel shard load (git command timeouts), which unconditionally triggered the mandatory computer red-team suite even when no computer surface was touched. The production kill-switch-bypass gate is unchanged; the `.tmp-*` gitignore entry prevents in-repo test artifacts from polluting untracked-file inventory (#3533).
+
+### Fixed
+
+- Canonical wrapped first-event timeouts now continue the same clean turn through bounded retries and configured fallback rotation, while preserving replay-safety, cancellation, provider-terminal policies, exact attempt diagnostics, and task/subagent retry-status truth (#3553).
+- Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
 
 ## [0.12.5] - 2026-07-30
 
@@ -48,10 +61,12 @@
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 - Kitty/Ghostty inline images no longer remain visually pinned when transcript, pinned, or overlay rows are replaced, removed, scrolled, resized, or fully repainted. The TUI now parses only bounded named placements, soft-deletes overwritten placements from the previously committed physical frame, retains transmitted pixels, and restores placements from application scrollback without retransmitting image data.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
+- Bash output-tail initialization now tolerates constrained `ToolSession` settings adapters that expose `get()` without `has()`, preserving the 1 KiB default and explicit head/tail overrides instead of crashing restricted and interceptor Bash execution.
 - Managed-session startup failures now include their bounded preparation classification (and path-free native durability diagnostic when available), so Windows launch crashes no longer collapse to an unactionable generic error while filesystem paths and raw OS messages remain redacted (#3383).
 - Single-model sessions now rotate immediately to another stored provider credential after a content-free quota or rate-limit failure, without requiring a synthetic model fallback chain. Credential rotation is replay-safe for content-free failures regardless of extension lifecycle participation, and traverses the full credential pool independent of `retry.maxRetries` (#3491).
 - External credential discovery now follows `CLAUDE_CONFIG_DIR` and `CODEX_HOME` instead of always reading `~/.claude` and `~/.codex`, so importing from an account switcher (or any relocated Claude Code / Codex CLI config root) picks up the account the launching shell selected. Both variables resolve through the credential env trust boundary and must be absolute; redacted summaries name the variable, never the resolved path.
 - The `acp_conformance` CI job runs again. The pinned upstream `acpx` checkout resolves its own imports (`@agentclientprotocol/sdk`, `zod`) from its own tree, but its dependencies were never installed, so the corpus runner aborted with `Cannot find module 'zod/v4'` before executing a single case. The checkout is now installed after provenance verification, and the reused warm cache still skips the reinstall.
+- ACP prompt terminalization now binds each accepted execution handle to one immutable cancellation domain, reserves producer ownership before terminal publication, and quarantines only the exact run when settlement cannot be proven. The fixed 10-second fail-closed external error remains unchanged while internal diagnostics report only bounded resource kinds, hashed labels, clamped ages, and omitted counts.
 
 ### Added
 

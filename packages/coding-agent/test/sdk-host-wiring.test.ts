@@ -40,7 +40,7 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { createNotificationsExtension, PresentationArbiter } from "../src/sdk/bus";
+import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
@@ -278,6 +278,37 @@ function context(
 	};
 }
 
+test("prompt settlement diagnostics are bounded and redact raw resource labels", () => {
+	const now = 100_000_000;
+	const labels = Array.from({ length: 10 }, (_, index) => `secret-provider-tool-label-${index}`);
+	const diagnostic = formatPromptSettlementDiagnostic(
+		{
+			status: "unfenced",
+			reason: "resources_pending",
+			pending: labels.map((label, index) => ({
+				id: String(index),
+				kind: index % 2 === 0 ? "provider_iterator" : "tool",
+				label,
+				registeredAt: index === 0 ? now + 1_000 : index === 1 ? now - 100_000_000 : now - index,
+			})),
+		},
+		now,
+	);
+	const parsed = JSON.parse(diagnostic) as {
+		reason: string;
+		pending: Array<{ kind: string; labelHash: string; ageMs: number }>;
+		omitted: number;
+	};
+
+	expect(parsed.reason).toBe("resources_pending");
+	expect(parsed.pending).toHaveLength(8);
+	expect(parsed.omitted).toBe(2);
+	expect(parsed.pending[0]?.ageMs).toBe(0);
+	expect(parsed.pending[1]?.ageMs).toBe(86_400_000);
+	expect(parsed.pending.every(entry => /^[0-9a-f]{16}$/.test(entry.labelHash))).toBe(true);
+	expect(labels.every(label => !diagnostic.includes(label))).toBe(true);
+	expect(new TextEncoder().encode(diagnostic).byteLength).toBeLessThanOrEqual(2_048);
+});
 test("shared ask-gate schema and stage-state authority preserves generic producer inputs", () => {
 	const labels = Array.from({ length: 33 }, (_, index) => (index === 32 ? "option-0" : `option-${index}`));
 	const question = { id: "generic-ask", multi: true, allowEmpty: false };

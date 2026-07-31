@@ -92,6 +92,10 @@ function lifecycleRoot(): {
 function commandDigest(command: readonly string[]): string {
 	return crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex");
 }
+async function managedOwnerProcessProvenance(pid: number): Promise<string | null> {
+	if (process.platform === "linux") return await readLinuxProcStartTime(pid);
+	return Process.fromPid(pid)?.incarnation ?? null;
+}
 
 async function writeDurableExclusive(file: string, value: object): Promise<void> {
 	const handle = await fs.open(file, "wx", 0o600);
@@ -132,7 +136,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	};
 	process.removeAllListeners("SIGTERM");
 	process.on("SIGTERM", captureEarlySigterm);
-	const supervisorStartTime = await readLinuxProcStartTime(process.pid);
+	const supervisorStartTime = await managedOwnerProcessProvenance(process.pid);
 	if (!supervisorStartTime) throw new Error("managed_owner_supervisor_start_time_unavailable");
 	await fs.mkdir(root, { recursive: true, mode: 0o700 });
 	const childToken = crypto.randomUUID();
@@ -157,7 +161,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		stderr: "inherit",
 		env: { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken },
 	});
-	const childStartTime = await readLinuxProcStartTime(child.pid);
+	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) throw new Error("managed_owner_child_start_time_unavailable");
 	const childProcess = Process.fromPid(child.pid);
 	if (!childProcess) throw new Error("managed_owner_child_reference_unavailable");

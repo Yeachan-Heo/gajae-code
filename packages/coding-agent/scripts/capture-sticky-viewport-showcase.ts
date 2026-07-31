@@ -1,11 +1,16 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+
 import {
 	renderStickyViewportShowcase,
 	STICKY_VIEWPORT_SHOWCASE_ENTRIES,
 	STICKY_VIEWPORT_SHOWCASE_KEYS,
 	type StickyViewportShowcaseEntry,
 } from "../test/fixtures/tui/sticky-viewport-showcase";
+
+export const REPOSITORY_ROOT = path.resolve(import.meta.dir, "../../..");
+export const resolveRepositoryPath = (repositoryRelativePath: string): string =>
+	path.join(REPOSITORY_ROOT, repositoryRelativePath);
 
 const COMMAND =
 	"bun packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts --out .gjc/qa/sticky-viewport-<run>";
@@ -168,17 +173,126 @@ export function ansiToHtml(value: string): string {
 	return `<!doctype html><html lang="en"><meta charset="utf-8"><title>Sticky viewport showcase</title><style>body{margin:0;background:#110b0b;color:#ffe7dc}pre{white-space:pre;font-family:ui-monospace,monospace}@keyframes blink{50%{visibility:hidden}}</style><pre>${body}</pre></html>\n`;
 }
 const json = (value: unknown) => `${JSON.stringify(value, null, 2)}\n`;
-const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const hash = (value: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+const PROVENANCE_SOURCES = [
+	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+	"packages/coding-agent/src/modes/interactive-mode.ts",
+	"packages/coding-agent/src/modes/components/irc-sidebar.ts",
+	"packages/tui/src/tui.ts",
+] as const;
+// Working-tree scope for `git_diff_binary_sha256`, persisted alongside the digest
+// as `git_diff_scope` so a reviewer reads the covered surface off the bundle
+// instead of inferring it.
+//
+// This digest used to hash `git diff --binary HEAD --` over the ENTIRE worktree.
+// The verifier recomputes it live at verify time, so that coupled bundle validity
+// to every tracked file in the repo: an unrelated edit anywhere — a doc typo,
+// another package's test — retroactively made every already-captured bundle
+// "stale". Those are false positives, and they are nondeterministic, because any
+// write landing in the capture→verify window flips the digest mid-run and masks
+// whichever guard was actually under test.
+//
+// The scope below is the transitive render-dependency closure of the fixture:
+// every workspace package the capture reaches (coding-agent → agent, ai,
+// bridge-client, natives, stats, tui, utils), the fixture plus the virtual
+// terminal it paints into, both showcase scripts, and the lockfile pinning the
+// installed dependency versions. Uncommitted edits inside this closure still
+// invalidate a bundle — that is the property the staleness guard exists to
+// enforce. Edits outside it no longer can, because they cannot change the paint.
+export const PROVENANCE_DIFF_SCOPE = [
+	"Cargo.lock",
+	"Cargo.toml",
+	"bun.lock",
+	"crates",
+
+	"packages/agent/src",
+	"packages/ai/src",
+	"packages/bridge-client/src",
+	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+	"packages/coding-agent/src",
+	"packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+	"packages/natives/native",
+	"packages/stats/src",
+	"packages/tui/src",
+	"packages/tui/test/virtual-terminal.ts",
+	"packages/utils/src",
+] as const;
+async function git(args: string[]): Promise<Uint8Array> {
+	const result = Bun.spawn(["git", ...args], { cwd: REPOSITORY_ROOT, stdout: "pipe", stderr: "pipe" });
+	if ((await result.exited) !== 0)
+		throw new Error(`git ${args.join(" ")} failed: ${await new Response(result.stderr).text()}`);
+	return new Uint8Array(await new Response(result.stdout).arrayBuffer());
+}
+
+// Digest of a path's COMMITTED blob at a given commit, read straight out of the
+// object database. This is the only provenance input a bundle author cannot
+// restamp: `captureProvenance()` hashes the worktree, so mutating an oracle file
+// and re-running it yields a self-consistent stamp. The committed blob is fixed
+// by the commit id, so changing it requires a new commit -- which changes
+// `git_head` and is therefore visible to the reviewer.
+/** sha256 of every distinct blob this path has ever had in any ref-reachable commit. */
+export async function gitObjectType(commitish: string): Promise<string | null> {
+	try {
+		const out = new TextDecoder().decode(await git(["cat-file", "-t", commitish])).trim();
+		return out || null;
+	} catch {
+		return null;
+	}
+}
+export async function committedBlobSha256(commit: string, filePath: string): Promise<string | null> {
+	const result = Bun.spawn(["git", "cat-file", "blob", `${commit}:${filePath}`], {
+		cwd: REPOSITORY_ROOT,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const bytes = new Uint8Array(await new Response(result.stdout).arrayBuffer());
+	if ((await result.exited) !== 0) return null;
+	return hash(bytes);
+}
+export type CaptureProvenance = {
+	git_head: string;
+	oracle_commit: string;
+	git_diff_scope: readonly string[];
+	git_diff_binary_sha256: string;
+	source_sha256: Record<string, string>;
+};
+
+// Single source of truth: the verifier imports this so capture and verify can
+// never drift into computing the field two different ways.
+export async function captureProvenance(): Promise<CaptureProvenance> {
+	const gitHead = new TextDecoder().decode(await git(["rev-parse", "HEAD"])).trim();
+	const sourceSha256 = Object.fromEntries(
+		await Promise.all(
+			PROVENANCE_SOURCES.map(async source => [
+				source,
+				hash(new Uint8Array(await Bun.file(resolveRepositoryPath(source)).arrayBuffer())),
+			]),
+		),
+	);
+	return {
+		git_head: gitHead,
+		oracle_commit: process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT?.trim() ?? gitHead,
+		git_diff_scope: PROVENANCE_DIFF_SCOPE,
+		git_diff_binary_sha256: hash(await git(["diff", "--binary", "HEAD", "--", ...PROVENANCE_DIFF_SCOPE])),
+		source_sha256: sourceSha256,
+	};
+}
 function out(args: string[]): string {
 	if (args.length !== 2 || args[0] !== "--out" || !args[1]) throw new Error(`Usage: ${COMMAND}`);
 	return args[1];
 }
-async function capture(entry: StickyViewportShowcaseEntry, root: string) {
+async function capture(entry: StickyViewportShowcaseEntry, root: string, sourceProvenance: CaptureProvenance) {
 	const rendered = await renderStickyViewportShowcase(entry);
 	if (!rendered.state.composer_visible)
 		throw new Error(`${entry.key}: focused composer was not visible in production frame`);
-	if (entry.stateId === "manual-new-output" && rendered.state.notice !== true)
-		throw new Error(`${entry.key}: manual output notice precondition failed`);
+	if (
+		(entry.stateId === "manual-new-output" && rendered.state.notice !== true) ||
+		(entry.stateId !== "manual-new-output" && rendered.state.notice !== false)
+	)
+		throw new Error(`${entry.key}: renderer-owned output notice precondition failed`);
 	if (
 		JSON.stringify(rendered.cjkPhraseBoundaries) !==
 		JSON.stringify(entry.stateId === "narrow-cjk" ? CJK_PHRASE_BOUNDARIES : [])
@@ -210,6 +324,7 @@ async function capture(entry: StickyViewportShowcaseEntry, root: string) {
 			fixed_clock: true,
 			author_identity: "capture-sticky-viewport-showcase",
 			executor_identity: "capture-sticky-viewport-showcase",
+			...sourceProvenance,
 		},
 		cjk_phrase_boundaries: rendered.cjkPhraseBoundaries,
 	});
@@ -241,8 +356,9 @@ async function capture(entry: StickyViewportShowcaseEntry, root: string) {
 async function main() {
 	const root = path.resolve(out(process.argv.slice(2)));
 	await fs.mkdir(root, { recursive: true });
+	const sourceProvenance = await captureProvenance();
 	const entries = [];
-	for (const entry of STICKY_VIEWPORT_SHOWCASE_ENTRIES) entries.push(await capture(entry, root));
+	for (const entry of STICKY_VIEWPORT_SHOWCASE_ENTRIES) entries.push(await capture(entry, root, sourceProvenance));
 	const manifest = json({
 		schema_version: 2,
 		fixture_revision: REVISION,
@@ -258,6 +374,7 @@ async function main() {
 			fixed_clock: true,
 			author_identity: "capture-sticky-viewport-showcase",
 			executor_identity: "capture-sticky-viewport-showcase",
+			...sourceProvenance,
 		},
 		review_input_file: "review-input.json",
 		entries,
@@ -281,6 +398,15 @@ async function main() {
 			acceptance_version: ACCEPTANCE_VERSION,
 			design_version: DESIGN_VERSION,
 			host_matrix: HOST_MATRIX,
+			provenance: {
+				capture_mode: "production-tui-virtual-terminal",
+				live_pty: false,
+				network: false,
+				fixed_clock: true,
+				author_identity: "capture-sticky-viewport-showcase",
+				executor_identity: "capture-sticky-viewport-showcase",
+				...sourceProvenance,
+			},
 			narrow_cjk: {
 				entry_key: "narrow-cjk/48x10/unicode-color",
 				phrase_boundaries: ["의미 있는 문장 경계", "意味のある文の境界", "保留语义短语边界"],

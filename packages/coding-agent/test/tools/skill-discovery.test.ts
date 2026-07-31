@@ -78,6 +78,28 @@ describe("SkillDiscoveryTool", () => {
 		expect(details!.candidates[0]?.useWhen).toContain("**/*.ts");
 	});
 
+	it("preserves exact skill-name tokens without broadening unnamed partial matches", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-exact-name-skill-"));
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "aws", "Cloud operations router");
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "harbor", "Container registry router");
+		const tool = new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() }));
+
+		const exact = await tool.execute("call", { query: "aws" });
+		expect(exact.details?.candidates.map(candidate => candidate.name)).toEqual(["aws"]);
+
+		const exactWithExtraTerms = await tool.execute("call", { query: "AWS ec2 cloudwatch production health" });
+		expect(exactWithExtraTerms.details?.candidates.map(candidate => candidate.name)).toEqual(["aws"]);
+
+		const existingAllTermMatch = await tool.execute("call", { query: "cloud operations" });
+		expect(existingAllTermMatch.details?.candidates.map(candidate => candidate.name)).toEqual(["aws"]);
+
+		const partialWithoutExactName = await tool.execute("call", { query: "cloud production health" });
+		expect(partialWithoutExactName.details?.candidates).toEqual([]);
+
+		const unrelated = await tool.execute("call", { query: "database latency" });
+		expect(unrelated.details?.candidates).toEqual([]);
+	});
+
 	it("discovers user runtime skills from ~/.gjc/skills", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-cwd-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-home-"));

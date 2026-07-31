@@ -2,6 +2,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SPAWN_PROVENANCE_ENV } from "../sdk/bus/config";
 import { resolveSessionIdFromSources } from "./session-resolution";
+import {
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+} from "./session-state-sidecar";
 import type {
 	GjcTeamConfig,
 	GjcTeamSnapshot,
@@ -13,6 +18,12 @@ import type {
 	GjcTeamWorktreeMode,
 } from "./team-runtime";
 import { createInitialGjcTeamWorkerMemoryGuardLedger, workerMemoryGuardLedgerPath } from "./team-worker-memory-guard";
+import {
+	bindGjcTmuxProviderAuthority,
+	type ProviderAuthority,
+	readGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxProviderContext,
+} from "./tmux-provider-context";
 
 /** Launch-specific option wiring kept separate from runtime dispatch. */
 export function withTeamLaunchTransport(
@@ -97,6 +108,7 @@ export function buildWorkerCommand(
 interface GjcTmuxBinary {
 	command: string;
 	isPsmux: boolean;
+	viaExplicitOverride: boolean;
 }
 
 interface GjcTmuxLeaderContext {
@@ -115,7 +127,11 @@ export interface GjcTeamLaunchRuntime {
 	teamDir(stateRoot: string, teamName: string): string;
 	resolveDefaultWorktreeMode(mode?: GjcTeamWorktreeMode): GjcTeamWorktreeMode;
 	resolveTmuxBinary(input: { env: NodeJS.ProcessEnv; platform: NodeJS.Platform }): GjcTmuxBinary;
-	readTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext;
+	readTmuxLeaderContext(
+		tmuxCommand: string,
+		env: NodeJS.ProcessEnv,
+		authority: ProviderAuthority,
+	): GjcTmuxLeaderContext;
 	buildWorkers(workerCount: number, agentType: string, stateRoot: string): GjcTeamWorker[];
 	buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[];
 	ensureWorkerWorktree(
@@ -217,9 +233,32 @@ export async function startGjcTeamLaunch(
 	const platform = options.platform ?? process.platform;
 	const tmuxBinary = runtime.resolveTmuxBinary({ env, platform });
 	const tmuxCommand = tmuxBinary.command;
+	const tmuxProviderGeneration =
+		tmuxBinary.isPsmux && platform === "win32" ? env[GJC_TMUX_OWNER_GENERATION_ENV]?.trim() : undefined;
+	const tmuxProvider = resolveGjcTmuxProviderContext({ binary: tmuxBinary, env, platform });
+	if (tmuxProvider.binary.command !== tmuxCommand) throw new Error("gjc_team_tmux_provider_command_mismatch");
+	const launchSessionId =
+		env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || env.GJC_SESSION_ID?.trim() || gjcSessionId?.trim();
+	const launchStateDir = env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim();
+	const tmuxAuthority =
+		tmuxBinary.isPsmux && platform === "win32" && !options.dryRun
+			? launchSessionId && launchStateDir && tmuxProviderGeneration
+				? readGjcTmuxProviderAuthoritySync({
+						stateDir: launchStateDir,
+						sessionId: launchSessionId,
+						generation: tmuxProviderGeneration,
+					})
+				: (() => {
+						throw new Error("gjc_team_tmux_provider_authority_unavailable");
+					})()
+			: bindGjcTmuxProviderAuthority(tmuxProvider, {
+					stateDir: stateRoot,
+					sessionId: teamName,
+					generation: "native-tmux",
+				});
 	const tmuxContext = options.dryRun
 		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
-		: runtime.readTmuxLeaderContext(tmuxCommand, env);
+		: runtime.readTmuxLeaderContext(tmuxCommand, env, tmuxAuthority);
 	const initialWorkers = runtime.buildWorkers(options.workerCount, options.agentType, stateRoot);
 	const initialTasks = runtime.buildInitialTasks(options.task, initialWorkers);
 	const workers: GjcTeamWorker[] = [];
@@ -267,9 +306,17 @@ export async function startGjcTeamLaunch(
 		...(gjcSessionId ? { gjc_session_id: gjcSessionId } : {}),
 		worker_cli_plan: workerCliPlan,
 		tmux_command: tmuxCommand,
+		platform,
 		tmux_session: tmuxContext.sessionName,
 		tmux_session_name: tmuxContext.sessionName,
 		tmux_target: tmuxContext.target,
+		...(tmuxProviderGeneration
+			? {
+					tmux_provider_generation: tmuxProviderGeneration,
+					tmux_provider_state_dir: launchStateDir!,
+					tmux_provider_session_id: launchSessionId!,
+				}
+			: {}),
 		workspace_mode: worktreeMode.enabled ? "worktree" : "direct",
 		dry_run: options.dryRun ?? false,
 		leader: {
@@ -296,6 +343,7 @@ export async function startGjcTeamLaunch(
 		worker_command: config.worker_command,
 		worker_cli_plan: config.worker_cli_plan,
 		tmux_command: config.tmux_command,
+		tmux_provider_generation: config.tmux_provider_generation,
 		leader: config.leader,
 		workers: config.workers,
 		workspace_mode: config.workspace_mode,
