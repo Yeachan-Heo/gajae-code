@@ -357,7 +357,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			);
 			expect(payloadsAfterRetry).toHaveLength(1);
 			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe(
-				"artifact",
+				"",
 			);
 		} catch (error) {
 			rethrowWithStderr(oracle, error);

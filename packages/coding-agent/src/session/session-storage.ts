@@ -425,6 +425,27 @@ type NativeDirectoryTreeApi = {
 function nativeDirectoryTreeApi(): NativeDirectoryTreeApi {
 	return native as unknown as NativeDirectoryTreeApi;
 }
+
+function isVerifiedEmptyPlaceholder(
+	pathname: string,
+	parentIdentity: { dev: bigint; ino: bigint } | undefined,
+): boolean {
+	if (!parentIdentity) return false;
+	try {
+		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		return (
+			!stat.isSymbolicLink() &&
+			stat.isFile() &&
+			stat.nlink === 1n &&
+			stat.size === 0n &&
+			parent.dev === parentIdentity.dev &&
+			parent.ino === parentIdentity.ino
+		);
+	} catch {
+		return false;
+	}
+}
 function snapshotDirectoryTree(pathname: string): NativeDirectoryTreeSnapshot {
 	const result = nativeDirectoryTreeApi().snapshotDirectoryTree(pathname);
 	if (!result.ok || !result.snapshot)
@@ -1055,6 +1076,24 @@ export class FileSessionStorage implements SessionStorage {
 				"Artifact path reappeared after durable artifact-phase completion",
 			);
 		}
+		if (artifactsRemoved && detachedArtifactsPath && expectedArtifactsIdentity && expectedArtifactsTree) {
+			const retainedIdentity = this.#optionalDirectoryIdentity(detachedArtifactsPath);
+			if (
+				!retainedIdentity ||
+				retainedIdentity.dev !== expectedArtifactsIdentity.dev ||
+				retainedIdentity.ino !== expectedArtifactsIdentity.ino
+			)
+				throw new SessionDeleteVerificationError(
+					"artifacts",
+					"Retained artifact root identity changed before transcript cleanup",
+				);
+			const retainedTree = snapshotDirectoryTree(detachedArtifactsPath);
+			if (!retainedTreeDoesNotExpandAuthority(expectedArtifactsTree, retainedTree))
+				throw new SessionDeleteVerificationError(
+					"artifacts",
+					"Partial artifact cleanup expanded retained tree authority",
+				);
+		}
 		if (!artifactsIdentity && expectedArtifactsIdentity && !detachedArtifactsPath && !artifactsRemoved) {
 			// Absence at the original path alone is not completion: native recursive removal
 			// may retain the planned root or its deterministic `.removing` final-stage root.
@@ -1249,8 +1288,9 @@ export class FileSessionStorage implements SessionStorage {
 					deletion.code === "cleanup_pending" &&
 					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 					deletion.retainedSuccessorPath === undefined &&
-					deletion.retainedPlaceholderPath === undefined &&
-					deletion.retainedUnknownPath === undefined
+					deletion.retainedUnknownPath === undefined &&
+					(deletion.retainedPlaceholderPath === undefined ||
+						isVerifiedEmptyPlaceholder(deletion.retainedPlaceholderPath, authorizedTranscriptParentIdentity))
 				)
 					return { kind: "deleted" };
 				const error = exactUnlinkFailure(deletion);
@@ -1325,8 +1365,9 @@ export class FileSessionStorage implements SessionStorage {
 				deletion.code === "cleanup_pending" &&
 				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 				deletion.retainedSuccessorPath === undefined &&
-				deletion.retainedPlaceholderPath === undefined &&
-				deletion.retainedUnknownPath === undefined
+				deletion.retainedUnknownPath === undefined &&
+				(deletion.retainedPlaceholderPath === undefined ||
+					isVerifiedEmptyPlaceholder(deletion.retainedPlaceholderPath, authorizedTranscriptParentIdentity))
 			)
 				return { kind: "deleted" };
 			const error = exactUnlinkFailure(deletion);

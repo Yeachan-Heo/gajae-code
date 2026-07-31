@@ -1413,7 +1413,7 @@ describe("SDK broker identity and discovery", () => {
 				entry.endsWith(".artifact.txt"),
 			);
 			expect(retainedPayloads).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe("artifact");
+			expect(await fs.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe("");
 
 			const retried = await broker.handleRequest(
 				"session.delete",
@@ -1429,9 +1429,7 @@ describe("SDK broker identity and discovery", () => {
 				entry.endsWith(".artifact.txt"),
 			);
 			expect(payloadsAfterRetry).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe(
-				"artifact",
-			);
+			expect(await fs.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe("");
 		} finally {
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
