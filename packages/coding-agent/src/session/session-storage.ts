@@ -1004,6 +1004,9 @@ export class FileSessionStorage implements SessionStorage {
 					artifactsIdentity: expectedArtifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
 					artifactsTree: retainedTree,
+					...((removal as typeof removal & { payloadDurable?: boolean }).payloadDurable === true
+						? { artifactsPayloadDurable: true as const }
+						: {}),
 					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
 						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
 						: {}),
