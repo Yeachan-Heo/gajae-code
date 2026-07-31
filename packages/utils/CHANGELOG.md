@@ -5,6 +5,8 @@
 ## [0.12.6] - 2026-07-31
 ### Fixed
 
+- `postmortem.quit()` now waits for buffered stderr to drain (bounded, like the existing stdout drain) before exiting, so diagnostics written via `console.error` — such as `GJC_TIMING` startup timings — survive a governed exit when stderr is a redirected or backpressured pipe, and a wedged stream still cannot deadlock the exit (#3621).
+
 - Positive-integer environment helpers now reject malformed, fractional, exponent-form, non-positive, and unsafe values instead of silently accepting their numeric prefixes (#3593).
 
 ### Fixed
