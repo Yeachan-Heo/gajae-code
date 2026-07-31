@@ -50,8 +50,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * managed-session replacement to exact native filesystem authority; generation
  * 37 retires that binding (revert of #3489, which stalled POSIX artifact
  * cleanup); generation 38 binds exact cleanup to parent and link-count authority.
+ * Generation 39 applies rustfmt and clippy-equivalent cleanup to the pi-shell
+ * process-tree authority (#3682).
  */
-export const DAEMON_GENERATION = 38;
+export const DAEMON_GENERATION = 39;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers

@@ -63,8 +63,8 @@ mod platform {
 			self.children_observed().unwrap_or_default()
 		}
 
-		/// `None` when this process is live but its `/proc` task list could not be
-		/// read, i.e. the child set is unknown rather than empty.
+		/// `None` when this process is live but its `/proc` task list could not
+		/// be read, i.e. the child set is unknown rather than empty.
 		pub fn children_observed(&self) -> Option<Vec<Self>> {
 			// The pidfd-backed status is authoritative and errs toward `Running`, so
 			// `Exited` is real evidence the process is gone and genuinely has no
@@ -91,7 +91,11 @@ mod platform {
 				// failure. `live_identity()` must not be used here: it also reports
 				// false for an unreadable start time, which is exactly the
 				// failure-as-empty hole this function exists to close.
-				return if self.status() == ProcessStatus::Exited { Some(Vec::new()) } else { None };
+				return if self.status() == ProcessStatus::Exited {
+					Some(Vec::new())
+				} else {
+					None
+				};
 			};
 
 			let mut seen: HashSet<i32> = HashSet::new();
@@ -103,9 +107,7 @@ mod platform {
 					return None;
 				};
 				let name = entry.file_name();
-				let Some(tid_str) = name.to_str() else {
-					return None;
-				};
+				let tid_str = name.to_str()?;
 				if tid_str.parse::<i32>().is_err() {
 					// Non-numeric entries are not tasks; skipping them loses nothing.
 					continue;
@@ -249,7 +251,8 @@ mod platform {
 			self.descendants_into(&mut out, &mut visited).then_some(out)
 		}
 
-		/// Returns `false` when a `/proc` read failed, making the walk incomplete.
+		/// Returns `false` when a `/proc` read failed, making the walk
+		/// incomplete.
 		fn descendants_into(&self, out: &mut Vec<Self>, visited: &mut HashSet<i32>) -> bool {
 			let Some(children) = self.children_observed() else {
 				return false;
@@ -488,8 +491,9 @@ mod platform {
 			self.descendants_observed().unwrap_or_default()
 		}
 
-		/// `None` when the process table could not be observed at all. Callers that
-		/// terminate descendants MUST NOT treat that as an empty descendant set.
+		/// `None` when the process table could not be observed at all. Callers
+		/// that terminate descendants MUST NOT treat that as an empty
+		/// descendant set.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
 			// One process-table snapshot per walk — building it inside the recursion
 			// would re-scan every pid for every visited node, producing an `O(N · D)`
@@ -997,8 +1001,9 @@ mod platform {
 			self.descendants_observed().unwrap_or_default()
 		}
 
-		/// `None` when the Toolhelp snapshot could not be taken at all. Callers that
-		/// terminate descendants MUST NOT treat that as an empty descendant set.
+		/// `None` when the Toolhelp snapshot could not be taken at all. Callers
+		/// that terminate descendants MUST NOT treat that as an empty
+		/// descendant set.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
 			let tree = build_process_tree()?;
 			let Ok(root) = u32::try_from(self.pid) else {

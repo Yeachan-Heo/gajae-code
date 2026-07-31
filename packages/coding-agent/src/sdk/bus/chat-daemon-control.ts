@@ -41,9 +41,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * through shared notification parsing. Generation 17 bound managed-session
  * replacement to exact native filesystem authority; generation 18 retired that
  * binding, and generation 19 binds exact cleanup to parent/link-count authority.
+ * Discord generation 21 applies rustfmt and clippy-equivalent cleanup to the
+ * pi-shell process-tree authority (#3682).
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 20,
+	discord: 21,
 	slack: 20,
 };
 
