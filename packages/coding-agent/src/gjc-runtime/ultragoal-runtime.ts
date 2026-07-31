@@ -1818,6 +1818,41 @@ export function nonEmptyStringArray(value: unknown): string[] | null {
 	return strings.length === value.length && strings.length > 0 ? strings : null;
 }
 
+/**
+ * Command strings that assert nothing. A completion gate names the commands whose execution the
+ * evidence rests on, so a placeholder is worse than an empty array: it reads as a real invocation
+ * while proving nothing. Red-teaming minted a genuine receipt with `commands: ["never-ran"]`.
+ *
+ * This does not make a command string trustworthy - a fabricator can still write a plausible
+ * command - so it is a floor, not verification. The residual weakness is recorded in
+ * issues/28-fabricated-quality-gate-hardening.md.
+ */
+const PLACEHOLDER_COMMAND_TOKENS = [
+	"never-ran",
+	"never ran",
+	"not-run",
+	"not run",
+	"notrun",
+	"n/a",
+	"none",
+	"todo",
+	"tbd",
+	"placeholder",
+	"fake",
+	"fabricated",
+	"example-command",
+	"your-command-here",
+];
+
+/** Returns the offending command when a command array carries a placeholder instead of an invocation. */
+export function placeholderCommand(commands: readonly string[]): string | undefined {
+	return commands.find(command => {
+		const normalized = command.trim().toLowerCase();
+		if (normalized.length < 3) return true;
+		return PLACEHOLDER_COMMAND_TOKENS.some(token => normalized === token || normalized.startsWith(`${token} `));
+	});
+}
+
 export interface UltragoalQualityGateDiagnostic {
 	path: string;
 	code: string;
@@ -2954,8 +2989,14 @@ function validateDeferredCompletionQualityGate(
 			"deferredToBatch.deferredLanes must be architectReview and executorQa (or omitted; the runtime fills it)",
 		);
 	const targeted = qualityGateObject(deferred.targetedVerification);
-	if (!targeted || targeted.status !== PASSED_STATUS || !nonEmptyStringArray(targeted.commands))
+	const targetedCommands = targeted ? nonEmptyStringArray(targeted.commands) : null;
+	if (!targeted || targeted.status !== PASSED_STATUS || !targetedCommands)
 		throw new Error("deferredToBatch.targetedVerification must pass with non-empty commands");
+	const targetedPlaceholder = placeholderCommand(targetedCommands);
+	if (targetedPlaceholder !== undefined)
+		throw new Error(
+			`deferredToBatch.targetedVerification.commands names the placeholder ${JSON.stringify(targetedPlaceholder)} instead of a command that was run`,
+		);
 	requireNonEmptyString(targeted.evidence, "deferredToBatch.targetedVerification.evidence");
 	// The ai-slop-cleaner pass and a full verification rerun are no longer
 	// mandatory per subgoal; they are boundary duties. When either is supplied it
@@ -2968,8 +3009,13 @@ function validateDeferredCompletionQualityGate(
 	const iteration = qualityGateObject(deferred.iteration);
 	if (iteration) {
 		if (iteration.status !== PASSED_STATUS) throw new Error("deferredToBatch.iteration must pass when present");
-		if (!nonEmptyStringArray(iteration.rerunCommands))
-			throw new Error("deferredToBatch.iteration.rerunCommands must be non-empty");
+		const deferredRerun = nonEmptyStringArray(iteration.rerunCommands);
+		if (!deferredRerun) throw new Error("deferredToBatch.iteration.rerunCommands must be non-empty");
+		const deferredPlaceholder = placeholderCommand(deferredRerun);
+		if (deferredPlaceholder !== undefined)
+			throw new Error(
+				`deferredToBatch.iteration.rerunCommands names the placeholder ${JSON.stringify(deferredPlaceholder)} instead of a command that was run`,
+			);
 		requireNonEmptyString(iteration.evidence, "deferredToBatch.iteration.evidence");
 		requireEmptyBlockers(iteration.blockers, "deferredToBatch.iteration.blockers");
 	}
@@ -3208,12 +3254,21 @@ async function validateCompletionQualityGate(
 			"checkpoint --status complete requires architect review approval: architectReview architecture/product/code must be CLEAR and recommendation must be APPROVE",
 		);
 	}
-	if (!nonEmptyStringArray(architectReview.commands)) {
+	const architectCommands = nonEmptyStringArray(architectReview.commands);
+	if (!architectCommands) {
 		found.add(
 			"architectReview.commands",
 			"missing_command_array",
 			"qualityGate architectReview.commands must be a non-empty string array",
 		);
+	} else {
+		const placeholder = placeholderCommand(architectCommands);
+		if (placeholder !== undefined)
+			found.add(
+				"architectReview.commands",
+				"placeholder_command",
+				`qualityGate architectReview.commands names the placeholder ${JSON.stringify(placeholder)} instead of a command that was run`,
+			);
 	}
 	found.check("architectReview.evidence", "missing_evidence", () =>
 		requireNonEmptyString(architectReview.evidence, "architectReview.evidence"),
@@ -3232,12 +3287,22 @@ async function validateCompletionQualityGate(
 			"qualityGate executorQa status, e2eStatus, and redTeamStatus must be passed",
 		);
 	}
-	if (!nonEmptyStringArray(executorQa.e2eCommands) || !nonEmptyStringArray(executorQa.redTeamCommands)) {
+	const e2eCommands = nonEmptyStringArray(executorQa.e2eCommands);
+	const redTeamCommands = nonEmptyStringArray(executorQa.redTeamCommands);
+	if (!e2eCommands || !redTeamCommands) {
 		found.add(
 			"executorQa.e2eCommands",
 			"missing_command_array",
 			"qualityGate executorQa e2eCommands and redTeamCommands must be non-empty string arrays",
 		);
+	} else {
+		const placeholder = placeholderCommand([...e2eCommands, ...redTeamCommands]);
+		if (placeholder !== undefined)
+			found.add(
+				"executorQa.e2eCommands",
+				"placeholder_command",
+				`qualityGate executorQa commands name the placeholder ${JSON.stringify(placeholder)} instead of a command that was run`,
+			);
 	}
 	found.check("executorQa.evidence", "missing_evidence", () =>
 		requireNonEmptyString(executorQa.evidence, "executorQa.evidence"),
@@ -3251,7 +3316,17 @@ async function validateCompletionQualityGate(
 	if (iteration.status !== PASSED_STATUS || iteration.fullRerun !== true) {
 		found.add("iteration", "iteration_not_passed", "qualityGate iteration must be passed with fullRerun true");
 	}
-	if (!nonEmptyStringArray(iteration.rerunCommands)) {
+	const rerunCommands = nonEmptyStringArray(iteration.rerunCommands);
+	if (rerunCommands) {
+		const placeholder = placeholderCommand(rerunCommands);
+		if (placeholder !== undefined)
+			found.add(
+				"iteration.rerunCommands",
+				"placeholder_command",
+				`qualityGate iteration.rerunCommands names the placeholder ${JSON.stringify(placeholder)} instead of a command that was run`,
+			);
+	}
+	if (!rerunCommands) {
 		found.add(
 			"iteration.rerunCommands",
 			"missing_command_array",

@@ -4212,10 +4212,13 @@ describe("native GJC ultragoal runtime", () => {
 				description: "Fabricated report with no executed command binding",
 			},
 		]);
-		fabricatedGate.architectReview!.commands = ["never-ran"];
-		fabricatedGate.executorQa.e2eCommands = ["never-ran"];
-		fabricatedGate.executorQa.redTeamCommands = ["never-ran"];
-		fabricatedGate.iteration!.rerunCommands = ["never-ran"];
+		// Plausible-looking commands on purpose: this test targets the protected-execution
+		// artifact binding, and an obvious placeholder would now be rejected earlier by the
+		// placeholder-command check (covered by its own test).
+		fabricatedGate.architectReview!.commands = ["bun test packages/coding-agent/test"];
+		fabricatedGate.executorQa.e2eCommands = ["bun test:e2e"];
+		fabricatedGate.executorQa.redTeamCommands = ["bun test:red-team"];
+		fabricatedGate.iteration!.rerunCommands = ["bun test:e2e"];
 		const result = await runNativeUltragoalCommand(
 			[
 				"checkpoint",
@@ -4233,6 +4236,44 @@ describe("native GJC ultragoal runtime", () => {
 
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain("protectedExecution.artifactRefs");
+		expect((await readUltragoalPlan(root))?.goals[0]?.status).toBe("active");
+	});
+
+	it("refuses an ordinary completion gate whose commands are placeholders instead of real invocations", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: Ordinary story\nDo the ordinary work.\n\n@goal: Follow-up\nComplete follow-up.",
+		});
+		await writePlan(root, plan);
+		await startNextUltragoalGoal({ cwd: root });
+		const fabricated = JSON.parse(await passingLiveQualityGate(root)) as Record<
+			string,
+			Record<string, unknown> | undefined
+		>;
+		// The red-team payload: every named command is a literal that was never executed.
+		(fabricated.architectReview as Record<string, unknown>).commands = ["never-ran"];
+		(fabricated.executorQa as Record<string, unknown>).e2eCommands = ["never-ran"];
+		(fabricated.executorQa as Record<string, unknown>).redTeamCommands = ["never-ran"];
+		(fabricated.iteration as Record<string, unknown>).rerunCommands = ["never-ran"];
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"fabricated completion on an ordinary goal",
+				"--quality-gate-json",
+				JSON.stringify(fabricated),
+			],
+			root,
+		);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("placeholder");
 		expect((await readUltragoalPlan(root))?.goals[0]?.status).toBe("active");
 	});
 
