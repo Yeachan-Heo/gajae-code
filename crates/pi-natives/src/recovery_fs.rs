@@ -1820,6 +1820,14 @@ fn rename_managed_file_no_replace_inner(
 	if !same_expected(&source_file, dev, ino, size, mtime_ns, ctime_ns, sha256)? {
 		return Err("identity_mismatch".into());
 	}
+	// The staged identity is proven; release the descriptor before publishing. An
+	// open descriptor makes the `linkat(2)` fallback's `unlinkat` silly-rename the
+	// staging name on NFS instead of removing it, leaving a second link to the
+	// published inode until this process closes the file. The terminal re-open then
+	// observes `st_nlink == 2` and fails a committed publish as unprovable. Closing
+	// first does not weaken authority: the destination is re-proven below against
+	// the same dev/ino/size/mtime/digest this descriptor just verified.
+	drop(source_file);
 
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
@@ -2223,6 +2231,10 @@ fn install_inner(
 ) -> Result<RecoveryFsResult, RetainedPublishError> {
 	let source_file = open_existing(root, source, false)?;
 	let source_identity = regular_identity(&source_file)?;
+	// Release the staged descriptor before publishing; see the matching note in
+	// `rename_managed_file_no_replace_inner`. The installed object is re-proven
+	// against `source_identity` below, so closing early keeps the same authority.
+	drop(source_file);
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
 	let result =
@@ -3232,6 +3244,75 @@ mod tests {
 			fs::read(dir.join("destination")).expect("destination unchanged on collision"),
 			b"payload"
 		);
+
+		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// Opt-in end-to-end regression for the managed publish path on a filesystem
+	/// whose `renameat2` rejects `RENAME_NOREPLACE`. Point `GJC_TEST_NFS_DIR` at
+	/// a writable directory on such a mount (e.g. an `NFSv4` home directory).
+	///
+	/// Unlike `linkat_no_replace_is_atomic_on_a_real_filesystem`, which
+	/// exercises the raw helper with no descriptor open, this drives the whole
+	/// publish. That distinction is the defect: the publish path held the
+	/// staging descriptor open across the fallback, so `unlinkat` silly-renamed
+	/// the staging name to `.nfsXXXX` instead of removing it. The published
+	/// inode kept a second link, the terminal re-open rejected it as
+	/// `hard_link`, and a committed publish was reported as
+	/// `rollback_unavailable` — crashing startup on every NFS home.
+	#[test]
+	fn managed_publish_commits_on_a_filesystem_without_rename_flags() {
+		let Some(base) = std::env::var_os("GJC_TEST_NFS_DIR") else {
+			return;
+		};
+		let dir = PathBuf::from(base).join(format!(
+			"pi-recovery-fs-publish-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("clock before epoch")
+				.as_nanos(),
+		));
+		fs::create_dir(&dir).expect("create real-filesystem test root");
+		fs::set_permissions(
+			&dir,
+			<fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+		)
+		.expect("restrict real-filesystem test root");
+		let root = File::open(&dir).expect("open real-filesystem root");
+
+		let contents = b"binding";
+		let identity = managed_file(&root, "staged", contents);
+		let result = rename_managed_file_no_replace(
+			&root,
+			"staged",
+			"published",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(contents),
+		);
+
+		assert!(
+			result.ok,
+			"publish must commit and prove itself (code={:?} reason={} phase={})",
+			result.code, result.reason, result.phase
+		);
+		assert_eq!(result.reason, "none");
+		assert_eq!(result.phase, "complete");
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "proven");
+		assert_eq!(fs::read(dir.join("published")).expect("published contents"), contents);
+		let published =
+			fs::symlink_metadata(dir.join("published")).expect("published destination metadata");
+		assert_eq!(
+			std::os::unix::fs::MetadataExt::nlink(&published),
+			1,
+			"no silly-renamed staging sibling may survive the publish"
+		);
+		assert!(!dir.join("staged").exists(), "staging name removed after publish");
 
 		let _ = fs::remove_dir_all(&dir);
 	}

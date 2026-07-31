@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Retained managed publication now releases the staging descriptor before publishing, so the `linkat(2)` no-replace fallback added in 0.12.0 actually works on the filesystems it was written for. NFS silly-renames a still-open name on `unlinkat` instead of removing it, so the staging link survived as `.nfsXXXX`, the published inode kept a second link, and the terminal re-open rejected it (`st_nlink != 1` → `hard_link`). A correctly committed publish was therefore reported as `rollback_unavailable`, and every launch with a session store on an NFS home directory crashed with `Could not prepare managed session scope (binding_invalid: prepare:binding_publish)`. The staged identity is still proven before the publish and re-proven against the destination afterwards, so no authority is weakened.
+
 ## [0.12.5] - 2026-07-30
 
 ## [0.12.4] - 2026-07-30
