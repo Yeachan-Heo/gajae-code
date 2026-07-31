@@ -88,7 +88,7 @@ function agentDirWithNotifications(): string {
 	return agentDir;
 }
 
-test("the notification reaper reclaims staging temps abandoned by a failed publication", async () => {
+test("the notification reaper detaches dead-publisher staging temps without claiming terminal removal", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
@@ -110,7 +110,11 @@ test("the notification reaper reclaims staging temps abandoned by a failed publi
 	});
 
 	expect(stagingTempFiles(paths.dir)).toEqual([]);
-	expect(result.removed).toHaveLength(3);
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBe(3);
+	expect(
+		fs.readdirSync(paths.dir).filter(name => name.startsWith(".gjc-delete-notification-staging-temp-")),
+	).toHaveLength(3);
 });
 
 test("the notification reaper leaves a staging temp younger than the grace window alone", async () => {
@@ -220,7 +224,7 @@ test("a staging temp with an unparseable publisher claim is retained", async () 
 	expect(result.skipped).toBeGreaterThan(0);
 });
 
-test("a dead publisher's staging temp past the grace window is reaped through the identity fence", async () => {
+test("a dead publisher's staging temp stays retained under stable exact authority on POSIX", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
@@ -237,7 +241,50 @@ test("a dead publisher's staging temp past the grace window is reaped through th
 	});
 
 	expect(fs.existsSync(file)).toBe(false);
-	expect(result.removed).toEqual([file]);
+	expect(result.removed).toEqual([]);
+	expect(result.skipped).toBeGreaterThan(0);
+	const [detachedName] = fs
+		.readdirSync(paths.dir)
+		.filter(name => name.startsWith(".gjc-delete-notification-staging-temp-"));
+	expect(detachedName).toBeString();
+	const detachedPath = path.join(paths.dir, detachedName!);
+	const retainedBytes = fs.readFileSync(detachedPath);
+
+	const normalized = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: identityFencedFs(),
+		now: pastGraceWindow,
+		graceMs: 0,
+		pidAlive: () => false,
+	});
+	expect(normalized.removed).toEqual([]);
+	expect(normalized.skipped).toBeGreaterThan(0);
+	expect(fs.existsSync(detachedPath)).toBe(false);
+	const placeholderNames = fs
+		.readdirSync(paths.dir)
+		.filter(name => name.startsWith(".gjc-exact-unlink-placeholder-"))
+		.sort();
+	const payloadPlaceholderName = placeholderNames.find(name => name.endsWith(".json"));
+	expect(payloadPlaceholderName).toBeString();
+	const payloadPlaceholderPath = path.join(paths.dir, payloadPlaceholderName!);
+	expect(fs.readFileSync(payloadPlaceholderPath)).toEqual(retainedBytes);
+
+	const stable = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: identityFencedFs(),
+		now: pastGraceWindow,
+		graceMs: 0,
+		pidAlive: () => false,
+	});
+	expect(stable.removed).toEqual([]);
+	expect(stable.skipped).toBeGreaterThan(0);
+	expect(
+		fs
+			.readdirSync(paths.dir)
+			.filter(name => name.startsWith(".gjc-exact-unlink-placeholder-"))
+			.sort(),
+	).toEqual(placeholderNames);
+	expect(fs.readFileSync(payloadPlaceholderPath)).toEqual(retainedBytes);
 });
 
 test("a staging temp replaced between identity capture and delete is not removed", async () => {
