@@ -42,6 +42,13 @@ const memoryControlKeys = [
 ] as const;
 const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
 const logicalBenchmarkPath = "packages/coding-agent/bench/perf-corpus.bench.ts";
+const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+function checkedOutHead(): string {
+	const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+	if (revision.exitCode !== 0) throw new Error("git revision unavailable");
+	return new TextDecoder().decode(revision.stdout).trim();
+}
+
 function runPerfCorpusBenchmark(_options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
 	const result = Bun.spawnSync([process.execPath, ...process.execArgv, canonicalBenchmarkPath], {
 		cwd: path.resolve(import.meta.dir, "../../.."),
@@ -176,9 +183,8 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 	test("prefers checked-out HEAD over workflow SHA provenance", () => {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
-		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
+		const expectedSha = checkedOutHead();
+
 		const previousGitSha = process.env.GITHUB_SHA;
 		process.env.GITHUB_SHA = "b".repeat(40);
 		try {
@@ -199,9 +205,7 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 	test("resolves provenance from the benchmark checkout instead of the caller cwd", () => {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
-		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
+		const expectedSha = checkedOutHead();
 		const previousCwd = process.cwd();
 		try {
 			process.chdir(os.tmpdir());
