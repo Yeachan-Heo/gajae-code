@@ -1365,15 +1365,6 @@ function lifecycleMetadataReplayFiles(cleanup: CleanupEvidence): LifecycleCleanu
 	return cleanup.lifecycleFiles?.length ? cleanup.lifecycleFiles : undefined;
 }
 
-function absentLifecyclePath(file: string): boolean {
-	try {
-		fsSync.lstatSync(file);
-		return false;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ENOENT";
-	}
-}
-
 function isLifecycleCleanupResponse(value: LifecycleFileCapture | BrokerResponse | undefined): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value;
 }
@@ -1471,20 +1462,6 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 		return fail("terminal_uncertain", "Lifecycle metadata siblings do not share one owner marker.");
 	}
 	return undefined;
-}
-
-function lifecycleMetadataReplayAbsent(cleanup: CleanupEvidence): boolean {
-	const files = lifecycleMetadataReplayFiles(cleanup);
-	if (!files) return true;
-	const root = path.resolve(cleanup.metadataRoot!);
-	const id = cleanup.sessionId!;
-	const required = new Set<string>([lifecycleMarkerPath(root, id), lifecycleReadyPath(root, id)]);
-	for (const file of files) for (const candidate of lifecycleCleanupCandidates(file)) required.add(candidate);
-	for (const candidate of required) {
-		if (absentLifecyclePath(candidate)) continue;
-		return false;
-	}
-	return true;
 }
 
 /**
