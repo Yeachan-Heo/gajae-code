@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
-import { postmortem, TempDir } from "@gajae-code/utils";
+import { getProjectDir, postmortem, setProjectDir, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
@@ -14,6 +14,7 @@ import {
 	type StartupUpdateRoute,
 } from "../src/main";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
+import { runRlmCommand } from "../src/rlm";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -430,7 +431,7 @@ describe("startup update contract", () => {
 		let quitCalls = 0;
 		try {
 			process.exitCode = 0;
-			await runRootCommand(rootArgs({ mode: "text" }), [], {
+			const outcome = await runRootCommand(rootArgs({ mode: "text" }), [], {
 				createAgentSession: async () => sessionResult,
 				discoverAuthStorage: async () => authStorage,
 				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
@@ -449,11 +450,183 @@ describe("startup update contract", () => {
 			expect(disposeCalls).toBe(1);
 			expect(exitSpy).not.toHaveBeenCalled();
 			expect(quitCalls).toBe(0);
-			expect(process.exitCode).toBe(1);
+			expect(outcome).toEqual({ kind: "early-exit", exitCode: 1 });
+			expect(process.exitCode).toBe(0);
 		} finally {
 			exitSpy.mockRestore();
 			process.exitCode = originalExitCode ?? 0;
 			authStorage.close();
+		}
+	});
+	it("returns typed exits for suppressed model, credential, and API-key validation", async () => {
+		const cases: Array<{ name: string; args: Partial<Args>; expectedMessage: string }> = [
+			{
+				name: "unknown qualified model",
+				args: { provider: "missing-provider", model: "missing-model" },
+				expectedMessage: 'Unknown provider "missing-provider"',
+			},
+			{
+				name: "mutually exclusive credential sources",
+				args: { apiKey: "secret", credential: "email:me@example.com" },
+				expectedMessage: "--api-key and --credential cannot be used together",
+			},
+			{
+				name: "malformed credential selector",
+				args: { credential: "not-a-selector" },
+				expectedMessage: "Invalid --credential selector",
+			},
+			{
+				name: "API key without a model",
+				args: { apiKey: "secret" },
+				expectedMessage: "--api-key requires a model",
+			},
+		];
+		const originalExitCode = process.exitCode;
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((code?: number): never => {
+			throw new Error(`unexpected process.exit(${code ?? "undefined"})`);
+		});
+		try {
+			process.exitCode = 0;
+			for (const testCase of cases) {
+				using tempDir = TempDir.createSync("@gjc-suppressed-root-validation-");
+				const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+				const closeSpy = vi.spyOn(authStorage, "close").mockImplementation(() => {});
+				const stderr: string[] = [];
+				const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+					stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+					return true;
+				});
+				try {
+					const outcome = await runRootCommand(rootArgs({ mode: "text", ...testCase.args }), [], {
+						discoverAuthStorage: async () => authStorage,
+						settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+						initTheme: async () => {},
+						readPipedInput: async () => undefined,
+						runStartupCredentialAutoImportIfNeeded: async () => undefined,
+						suppressProcessExit: true,
+					});
+
+					expect(outcome, testCase.name).toEqual({ kind: "early-exit", exitCode: 1 });
+					expect(stderr.join(""), testCase.name).toContain(testCase.expectedMessage);
+					expect(closeSpy, testCase.name).toHaveBeenCalledTimes(1);
+					expect(process.exitCode, testCase.name).toBe(0);
+				} finally {
+					stderrSpy.mockRestore();
+					closeSpy.mockRestore();
+					authStorage.close();
+				}
+			}
+			expect(exitSpy).not.toHaveBeenCalled();
+		} finally {
+			exitSpy.mockRestore();
+			process.exitCode = originalExitCode ?? 0;
+		}
+	});
+	it("lets autonomous RLM finalize kernels and reports after credential validation exits", async () => {
+		const cases: Array<{ name: string; args: string[]; expectedMessage: string }> = [
+			{
+				name: "malformed credential selector",
+				args: ["--credential", "not-a-selector"],
+				expectedMessage: "Invalid --credential selector",
+			},
+			{
+				name: "API key without a model",
+				args: ["--api-key", "secret"],
+				expectedMessage: "--api-key requires a model",
+			},
+		];
+		const originalProjectDir = getProjectDir();
+		const originalSessionId = process.env.GJC_SESSION_ID;
+		const originalExitCode = process.exitCode;
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((code?: number): never => {
+			throw new Error(`unexpected process.exit(${code ?? "undefined"})`);
+		});
+		try {
+			for (const [index, testCase] of cases.entries()) {
+				using tempDir = TempDir.createSync("@gjc-rlm-validation-finalizer-");
+				setProjectDir(tempDir.path());
+				process.env.GJC_SESSION_ID = `rlm-validation-owner-${index}`;
+				process.exitCode = 0;
+				const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+				const closeSpy = vi.spyOn(authStorage, "close").mockImplementation(() => {});
+				const disposedOwners: string[] = [];
+				const stderr: string[] = [];
+				const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+					stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+					return true;
+				});
+				try {
+					const outcome = await runRlmCommand(
+						[
+							"--mode",
+							"text",
+							"--no-session",
+							"--no-skills",
+							"--no-rules",
+							"--no-tools",
+							"--no-lsp",
+							...testCase.args,
+						],
+						{
+							rootCommandDependencies: {
+								createAgentSession: async () => {
+									throw new Error("validation must finish before session creation");
+								},
+								discoverAuthStorage: async () => authStorage,
+								settings: Settings.isolated({
+									"marketplace.autoUpdate": "off",
+									"startup.checkUpdate": false,
+								}),
+								initTheme: async () => {},
+								readPipedInput: async () => undefined,
+								runStartupCredentialAutoImportIfNeeded: async () => undefined,
+							},
+							disposeKernelSessionsByOwner: async owner => {
+								disposedOwners.push(owner);
+							},
+						},
+					);
+
+					expect(outcome, testCase.name).toEqual({ kind: "early-exit", exitCode: 1 });
+					expect(stderr.join(""), testCase.name).toContain(testCase.expectedMessage);
+					expect(closeSpy, testCase.name).toHaveBeenCalledTimes(1);
+					expect(disposedOwners, testCase.name).toHaveLength(1);
+					expect(disposedOwners[0], testCase.name).toStartWith("rlm:");
+					expect(process.exitCode, testCase.name).toBe(1);
+
+					const reportPaths: string[] = [];
+					for await (const reportPath of new Bun.Glob("**/report.md").scan({
+						cwd: tempDir.path(),
+						absolute: true,
+						dot: true,
+					})) {
+						reportPaths.push(reportPath);
+					}
+					const metadataPaths: string[] = [];
+					for await (const metadataPath of new Bun.Glob("**/metadata.json").scan({
+						cwd: tempDir.path(),
+						absolute: true,
+						dot: true,
+					})) {
+						metadataPaths.push(metadataPath);
+					}
+					expect(reportPaths, testCase.name).toHaveLength(1);
+					expect(metadataPaths, testCase.name).toHaveLength(1);
+					expect(await Bun.file(reportPaths[0]!).text(), testCase.name).toContain("RLM research session");
+					expect(await Bun.file(metadataPaths[0]!).json(), testCase.name).toMatchObject({ mode: "autonomous" });
+				} finally {
+					stderrSpy.mockRestore();
+					closeSpy.mockRestore();
+					authStorage.close();
+				}
+			}
+			expect(exitSpy).not.toHaveBeenCalled();
+		} finally {
+			exitSpy.mockRestore();
+			setProjectDir(originalProjectDir);
+			if (originalSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = originalSessionId;
+			process.exitCode = originalExitCode ?? 0;
 		}
 	});
 	it("preserves print-mode status, cleans up owners, and does not dispose the session twice", async () => {
