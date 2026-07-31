@@ -350,7 +350,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			const endpoints = baseUrl ? [baseUrl] : isAntigravity ? ANTIGRAVITY_ENDPOINT_FALLBACKS : [DEFAULT_ENDPOINT];
 
 			let requestBody = buildRequest(model, context, projectId, options, isAntigravity);
-			const replacementPayload = await options?.onPayload?.(requestBody, model);
+			const replacementPayload = await options?.onPayload?.(requestBody, model, options?.attemptScope);
 			if (replacementPayload !== undefined) {
 				requestBody = replacementPayload as typeof requestBody;
 			}
@@ -483,7 +483,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				for await (const chunk of readSseJson<CloudCodeAssistResponseChunk>(
 					activeResponse.body!,
 					options?.signal,
-					event => options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
+					event =>
+						options?.onSseEvent?.(
+							{ event: event.event, data: event.data, raw: [...event.raw] },
+							model,
+							options?.attemptScope,
+						),
 				)) {
 					const responseData = chunk.response;
 					if (!responseData) continue;

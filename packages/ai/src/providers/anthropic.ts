@@ -1386,7 +1386,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (dropFastMode) {
 					dropAnthropicFastMode(nextParams);
 				}
-				const replacementPayload = await options?.onPayload?.(nextParams, model);
+				const replacementPayload = await options?.onPayload?.(nextParams, model, options?.attemptScope);
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
 				}
@@ -1489,7 +1489,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					} = await getAnthropicStreamResponse(
 						anthropicRequest,
 						requestSignal,
-						options?.client ? event => options?.onSseEvent?.(event, model) : undefined,
+						options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
 					);
 					await notifyProviderResponse(options, response, model, requestId);
 					let sawEvent = false;

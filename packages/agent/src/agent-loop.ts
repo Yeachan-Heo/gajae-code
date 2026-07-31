@@ -2022,9 +2022,9 @@ async function streamAssistantResponse(
 	// stealing them from the configured hook.
 	let capturedHeaders: Readonly<Record<string, string>> | undefined;
 	const userOnResponse = config.onResponse;
-	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
+	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo, scope) => {
 		capturedHeaders = response.headers;
-		return userOnResponse?.(response, modelInfo);
+		return userOnResponse?.(response, modelInfo, scope);
 	};
 
 	const finishChat = async (message: AssistantMessage): Promise<void> => {

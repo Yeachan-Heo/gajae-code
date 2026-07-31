@@ -705,6 +705,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onSseEvent: options?.onSseEvent,
+		attemptScope: options?.attemptScope,
 		execHandlers: options?.execHandlers,
 		[managedAttemptValidated]: hasValidatedManagedAttempt(options),
 	};

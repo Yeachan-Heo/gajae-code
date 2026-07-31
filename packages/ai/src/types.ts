@@ -437,6 +437,8 @@ export interface StreamOptions {
 	authCredentialType?: "api_key" | "oauth";
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
+	/** Per-attempt identity for execution attribution. Threaded into onPayload/onResponse calls. */
+	attemptScope?: AttemptScopeRef;
 }
 
 /**
@@ -490,8 +492,6 @@ export interface SimpleStreamOptions extends StreamOptions {
 	syntheticApiFormat?: "openai" | "anthropic";
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
-	/** Per-attempt identity for execution attribution. Threaded into onPayload/onResponse calls. */
-	attemptScope?: AttemptScopeRef;
 }
 
 // Generic StreamFunction with typed options
