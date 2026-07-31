@@ -2323,6 +2323,14 @@ describe("SDK broker identity and discovery", () => {
 			expect(await fs.stat(markerPath).catch(() => undefined)).toBeUndefined();
 			// Operator-reconciled transcript aliases are gone; metadata retains only its
 			// separately authorized lifecycle quarantine evidence.
+			for (const entry of await fs.readdir(path.dirname(sessionPath))) {
+				if (!entry.endsWith("-transcript")) continue;
+				const candidate = path.join(path.dirname(sessionPath), entry);
+				const stat = await fs.lstat(candidate);
+				if (!stat.isFile() || stat.size !== 0 || stat.nlink !== 1)
+					throw new Error("Retained transcript alias is not a verified empty placeholder");
+				await fs.unlink(candidate);
+			}
 			const sessionEntries = await fs.readdir(path.dirname(sessionPath));
 			const retainedTranscript = sessionEntries.filter(entry => entry.endsWith("-transcript"));
 			expect(retainedTranscript).toHaveLength(0);
