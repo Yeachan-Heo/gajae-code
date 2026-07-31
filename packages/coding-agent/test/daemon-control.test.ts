@@ -1511,6 +1511,9 @@ describe("ChatDaemonController ownership safety", () => {
 				...input,
 			} as any);
 
+		const forbiddenProbe = () => {
+			throw new Error("process probes must not run before durable owner identity matches");
+		};
 		for (const input of [
 			{ ownerId: "wrong-owner" },
 			{ pid: undefined },
@@ -1518,6 +1521,12 @@ describe("ChatDaemonController ownership safety", () => {
 			{ incarnation: undefined },
 			{ incarnation: "wrong" },
 			{ incarnation: "stale" },
+		]) {
+			restore();
+			await release({ ...input, pidAlive: forbiddenProbe, pidIncarnation: forbiddenProbe });
+			unchanged();
+		}
+		for (const input of [
 			{ pidIncarnation: () => "linux:12346" },
 			{ pidIncarnation: () => undefined },
 			{ pidAlive: () => false, pidIncarnation: () => "linux:12345" },
