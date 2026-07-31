@@ -43,6 +43,41 @@ export type SharedLifecycleFixture = {
 	cleanup: () => Promise<void>;
 };
 
+/**
+ * Asserts the saved-session delete contract for a transcript that still holds
+ * identity-bound cleanup authority.
+ *
+ * POSIX has no descriptor-bound unlink, so the native exact-unlink of a regular
+ * transcript file always ends in a retained detached object rather than a proven
+ * byte deletion. `session.delete` therefore fails closed with `cleanup_pending`
+ * instead of ever claiming terminal success. The user-visible effect the topology
+ * cares about still holds and is asserted here: the canonical transcript and its
+ * artifact sibling are both gone, and the bytes survive only beneath an
+ * authorized `.gjc-delete-*-transcript` quarantine whose header still binds to
+ * this exact session id.
+ */
+export async function expectRetainedAuthorityDeleteStaysPending(
+	response: { ok: boolean; error?: { code?: string } },
+	sessionId: string,
+	sessionPath: string,
+): Promise<void> {
+	expect(response).toMatchObject({ ok: false, error: { code: "cleanup_pending" } });
+	await expect(fs.access(sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.access(sessionPath.slice(0, -6))).rejects.toMatchObject({ code: "ENOENT" });
+	const retained = await retainedTranscriptQuarantines(sessionPath);
+	expect(retained).toHaveLength(1);
+	const quarantinePath = path.join(path.dirname(sessionPath), retained[0]!);
+	expect((await fs.lstat(quarantinePath)).isFile()).toBe(true);
+	const header = (await fs.readFile(quarantinePath, "utf8")).split("\n", 1)[0]!;
+	expect(JSON.parse(header)).toMatchObject({ type: "session", id: sessionId });
+}
+
+/** Authorized detached-transcript quarantine names beside a canonical transcript. */
+async function retainedTranscriptQuarantines(sessionPath: string): Promise<string[]> {
+	const entries = await fs.readdir(path.dirname(sessionPath));
+	return entries.filter(entry => entry.startsWith(".gjc-delete-") && entry.endsWith("-transcript")).sort();
+}
+
 async function managedWorkspace(
 	root: string,
 	agentDir: string,
@@ -404,34 +439,16 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
 				"delete-key",
 			);
-			expect(deleted).toMatchObject({
-				type: "broker_response",
-				ok: true,
-				result: { sessionId: forkId },
-			});
-			expect(
-				await fs.access(forkPath).then(
-					() => true,
-					() => false,
-				),
-			).toBe(false);
-			expect(
-				await fs.access(forkPath.slice(0, -6)).then(
-					() => true,
-					() => false,
-				),
-			).toBe(false);
+			await expectRetainedAuthorityDeleteStaysPending(deleted, forkId, forkPath);
+			// Re-issuing the same key replays the stored cleanup authority and drives
+			// the continuation, which must stay pending — never claim terminal success —
+			// while the detached transcript quarantine is still retained.
 			const replayed = await global(
 				"session.delete",
 				{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
 				"delete-key",
 			);
-			expect(replayed).toMatchObject({ type: "broker_response", ok: true, result: { sessionId: forkId } });
-			const deletedFrameId = (deleted as { id?: unknown }).id;
-			const replayedFrameId = (replayed as { id?: unknown }).id;
-			expect(typeof deletedFrameId).toBe("string");
-			expect(typeof replayedFrameId).toBe("string");
-			expect(replayedFrameId).not.toBe(deletedFrameId);
+			await expectRetainedAuthorityDeleteStaysPending(replayed, forkId, forkPath);
 			expect(
 				await global(
 					"session.delete",
@@ -439,6 +456,8 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 					"delete-key",
 				),
 			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+			// The rejected conflicting request must leave the source transcript untouched.
+			await expect(fs.access(sourcePath)).resolves.toBeNull();
 		},
 		async cleanup() {
 			await cleanupFixtureRoot(cleanup);

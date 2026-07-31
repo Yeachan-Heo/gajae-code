@@ -7,6 +7,7 @@ import { listManagedSessionCandidates } from "../src/sdk/session-directory";
 import {
 	createLifecycleFixture,
 	createSharedLifecycleFixture,
+	expectRetainedAuthorityDeleteStaysPending,
 	type LifecycleFixture,
 	type SharedLifecycleFixture,
 } from "./helpers/sdk-lifecycle-fixture";
@@ -36,16 +37,6 @@ function result(value: unknown): {
 		result?: Record<string, unknown>;
 		error?: { code?: string; message?: string };
 	};
-}
-
-async function expectRetainedAuthorityDeleteSucceeded(
-	response: ReturnType<typeof result>,
-	sessionId: string,
-	sessionPath: string,
-): Promise<void> {
-	expect(response).toMatchObject({ type: "broker_response", ok: true, result: { sessionId } });
-	await expect(fs.access(sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
-	await expect(fs.access(sessionPath.slice(0, -6))).rejects.toMatchObject({ code: "ENOENT" });
 }
 
 async function mcpGlobal(
@@ -435,7 +426,7 @@ test("shared-agent distinct saved-source IDs remain isolated across inverted MCP
 				`delete-${suffix}-${sessionId}`,
 				life.environment,
 			);
-			await expectRetainedAuthorityDeleteSucceeded(deletion, sessionId, sessionPath);
+			await expectRetainedAuthorityDeleteStaysPending(deletion, sessionId, sessionPath);
 		}
 	};
 	await run("mcp", "daemon", "d1");
@@ -615,7 +606,7 @@ test("shared-agent equal saved IDs select one owner without cross-workspace effe
 			`delete-collision-${suffix}`,
 			life.environment,
 		);
-		await expectRetainedAuthorityDeleteSucceeded(deletion, A.source.id, winner.source.path);
+		await expectRetainedAuthorityDeleteStaysPending(deletion, A.source.id, winner.source.path);
 		expect((await managedCandidatePaths(loser)).includes(loser.source.path)).toBe(true);
 	};
 	await run("mcp", "daemon", "d1");
