@@ -421,6 +421,68 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
+	it("component-encodes listing hrefs and follows delimiter and literal-percent siblings", async () => {
+		await withTempDir(async tempDir => {
+			const sessionId = `encoded-listing-${path.basename(tempDir)}`;
+			await withLocalRoot(sessionId, async localRoot => {
+				await Bun.write(path.join(localRoot, "report%3Araw.txt"), "literal-percent");
+				await Bun.write(path.join(localRoot, "report:raw.txt"), "colon-sibling");
+				await Bun.write(path.join(localRoot, "report).txt"), "root-delimiter");
+				await fs.mkdir(path.join(localRoot, "batch(1)"));
+				await Bun.write(path.join(localRoot, "batch(1)", "report).txt"), "nested-delimiter");
+				await Bun.write(path.join(localRoot, "report](other.txt"), "root-label-delimiter");
+				await fs.mkdir(path.join(localRoot, "batch[1]"));
+				await Bun.write(path.join(localRoot, "batch[1]", "report](other.txt"), "nested-label-delimiter");
+				LocalProtocolHandler.setOverride(localOptions(sessionId, path.join(tempDir, "artifacts")));
+				const router = InternalUrlRouter.instance();
+				const listing = await router.resolve("local://");
+				expect(listing.content).toContain("[report%3Araw.txt](local://report%253Araw.txt)");
+				expect(listing.content).toContain("[report:raw.txt](local://report%3Araw.txt)");
+				expect(listing.content).toContain("[report).txt](local://report%29.txt)");
+				expect(listing.content).toContain("[batch(1)/report).txt](local://batch%281%29/report%29.txt)");
+				expect(listing.content).toContain("[report\\](other.txt](local://report%5D%28other.txt)");
+				expect(listing.content).toContain(
+					"[batch\\[1\\]/report\\](other.txt](local://batch%5B1%5D/report%5D%28other.txt)",
+				);
+				expect((await router.resolve("local://report%253Araw.txt")).content).toBe("literal-percent");
+				expect((await router.resolve("local://report%3Araw.txt")).content).toBe("colon-sibling");
+				expect((await router.resolve("local://report%29.txt")).content).toBe("root-delimiter");
+				expect((await router.resolve("local://batch%281%29/report%29.txt")).content).toBe("nested-delimiter");
+				expect((await router.resolve("local://report%5D%28other.txt")).content).toBe("root-label-delimiter");
+				expect((await router.resolve("local://batch%5B1%5D/report%5D%28other.txt")).content).toBe(
+					"nested-label-delimiter",
+				);
+				expect((await router.resolve("LOCAL://report%5D%28other.txt")).content).toBe("root-label-delimiter");
+				await expect(router.resolve("local://report%2Graw.txt")).rejects.toThrow(
+					"Invalid URL encoding in local:// path",
+				);
+			});
+		});
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"keeps CR and LF filenames on one listing bullet and follows exact hrefs",
+		async () => {
+			await withTempDir(async tempDir => {
+				const sessionId = `multiline-listing-${path.basename(tempDir)}`;
+				await withLocalRoot(sessionId, async localRoot => {
+					await Bun.write(path.join(localRoot, "line\nbreak.txt"), "line-feed");
+					await fs.mkdir(path.join(localRoot, "batch\rname"));
+					await Bun.write(path.join(localRoot, "batch\rname", "report\nraw.txt"), "nested-controls");
+					LocalProtocolHandler.setOverride(localOptions(sessionId, path.join(tempDir, "artifacts")));
+					const router = InternalUrlRouter.instance();
+					const listing = await router.resolve("local://");
+					const bullets = listing.content.split("\n").filter(line => line.startsWith("- ["));
+					expect(bullets).toHaveLength(2);
+					expect(bullets).toContain("- [line\\nbreak.txt](local://line%0Abreak.txt)");
+					expect(bullets).toContain("- [batch\\rname/report\\nraw.txt](local://batch%0Dname/report%0Araw.txt)");
+					expect((await router.resolve("local://line%0Abreak.txt")).content).toBe("line-feed");
+					expect((await router.resolve("local://batch%0Dname/report%0Araw.txt")).content).toBe("nested-controls");
+				});
+			});
+		},
+	);
+
 	it("blocks path traversal attempts", async () => {
 		await withTempDir(async tempDir => {
 			const sessionId = `session-c-${path.basename(tempDir)}`;
