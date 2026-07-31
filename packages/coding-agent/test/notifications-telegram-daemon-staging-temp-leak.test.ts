@@ -302,7 +302,7 @@ test("a retained staging quarantine replacement is not removed by the generic re
 	expect(fs.readFileSync(file, "utf8")).toBe("retained-successor\n");
 });
 
-test("a retained quarantine cleanup_pending successor stays visible and self-heals on the next scan", async () => {
+test("a retained cleanup_pending successor stays surfaced without pathname churn", async () => {
 	const agentDir = agentDirWithNotifications();
 	const paths = daemonPaths(agentDir);
 	const file = path.join(paths.dir, ".gjc-delete-notification-staging-temp-retained.json");
@@ -328,7 +328,8 @@ test("a retained quarantine cleanup_pending successor stays visible and self-hea
 		pidAlive: () => false,
 	});
 
-	expect(retained.removed).toEqual([file]);
+	expect(retained.removed).toEqual([]);
+	expect(retained.skipped).toBeGreaterThan(0);
 	expect(fs.existsSync(file)).toBe(false);
 	expect(detachedPath).toBeString();
 	expect(path.basename(detachedPath!)).toStartWith(".gjc-exact-unlink-placeholder-");
@@ -342,8 +343,16 @@ test("a retained quarantine cleanup_pending successor stays visible and self-hea
 		pidAlive: () => false,
 	});
 
-	expect(healed.removed).toEqual([detachedPath!]);
-	expect(fs.existsSync(detachedPath!)).toBe(false);
+	expect(healed.removed).toEqual([]);
+	expect(healed.skipped).toBeGreaterThan(0);
+	expect(fs.existsSync(detachedPath!)).toBe(true);
+	expect(fs.readFileSync(detachedPath!, "utf8")).toBe("retained-original\n");
+	expect(
+		fs
+			.readdirSync(paths.dir)
+			.filter(name => name.startsWith(".gjc-exact-unlink-placeholder-"))
+			.map(name => path.join(paths.dir, name)),
+	).toEqual([detachedPath!]);
 });
 
 test("a symlink shaped like a staging temp is never followed or deleted", async () => {

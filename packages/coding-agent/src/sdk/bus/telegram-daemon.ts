@@ -957,6 +957,27 @@ async function exactUnlinkAcceptedWithRetainedEvidence(
 	);
 }
 
+type NotificationArtifactReapOutcome = "removed" | "retained" | "unchanged";
+
+/** Distinguish terminal removal from a safely detached artifact that still needs authority-preserving cleanup. */
+async function reapNotificationArtifactExactly(
+	fsImpl: TelegramDaemonFs,
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+	quarantineName: string,
+): Promise<NotificationArtifactReapOutcome> {
+	const removed = await fsImpl.exactUnlink!(file, identity, quarantineName);
+	if (removed.ok) return "removed";
+	if (
+		removed.code === "cleanup_pending" &&
+		typeof removed.detachedPath === "string" &&
+		removed.detachedPath.length > 0 &&
+		(await fsImpl.readEndpointFile!(file).catch(() => undefined)) === undefined
+	)
+		return "retained";
+	return "unchanged";
+}
+
 async function unlinkOwnershipLockExactly(
 	fsImpl: TelegramDaemonFs,
 	file: string,
@@ -1509,27 +1530,27 @@ async function reapAbandonedNotificationStagingTemp(input: {
 	now: number;
 	graceMs: number;
 	pidAlive: (pid: number) => boolean;
-}): Promise<boolean> {
+}): Promise<NotificationArtifactReapOutcome> {
 	// A live or blocked publisher can hold a staged temp far past any grace
 	// window; only a provably dead publisher's claim is abandoned. `unknown`
 	// (throwing probe) fails closed.
-	if (classifyNotificationStagingPublisher(input.claim, input.pidAlive) !== "dead") return false;
+	if (classifyNotificationStagingPublisher(input.claim, input.pidAlive) !== "dead") return "unchanged";
 	const readEndpointFile = input.fs.readEndpointFile;
 	// Both seams are optional; without them there is no no-follow capture and no
 	// identity-bound delete, so retain rather than unlink unfenced.
-	if (!readEndpointFile || !input.fs.exactUnlink) return false;
+	if (!readEndpointFile || !input.fs.exactUnlink) return "unchanged";
 	// No-follow capture: rejects symlinks, directories, and anything that changes
 	// while it is read. A reparse point or dangling link is therefore retained.
 	const endpoint = await readEndpointFile(input.file);
-	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return false;
+	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return "unchanged";
 	// Age from the captured (no-follow) mtime rather than a second path-following
 	// stat, so the grace decision and the delete bind the same inode. Integer ns
 	// truncation only ever ages the file, never rejuvenates it.
 	const age = input.now - Number(endpoint.identity.mtimeNs / 1_000_000n);
-	if (age < input.graceMs) return false;
+	if (age < input.graceMs) return "unchanged";
 	// The native verifies dev+ino+size+mtimeNs+sha256 before unlinking, so a
 	// readdir/capture -> replacement ABA cannot delete the fresh generation.
-	return await exactUnlinkAcceptedWithRetainedEvidence(
+	return await reapNotificationArtifactExactly(
 		input.fs,
 		input.file,
 		endpoint.identity,
@@ -1543,13 +1564,14 @@ async function reapNotificationLeakArtifact(input: {
 	file: string;
 	now: number;
 	graceMs: number;
-}): Promise<boolean> {
-	if (!input.fs.readEndpointFile || !input.fs.exactUnlink) return false;
+}): Promise<NotificationArtifactReapOutcome> {
+	if (path.basename(input.file).startsWith(".gjc-exact-unlink-placeholder-")) return "retained";
+	if (!input.fs.readEndpointFile || !input.fs.exactUnlink) return "unchanged";
 	const endpoint = await input.fs.readEndpointFile(input.file);
-	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return false;
+	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return "unchanged";
 	const age = input.now - Number(endpoint.identity.mtimeNs / 1_000_000n);
-	if (age < input.graceMs) return false;
-	return await exactUnlinkAcceptedWithRetainedEvidence(
+	if (age < input.graceMs) return "unchanged";
+	return await reapNotificationArtifactExactly(
 		input.fs,
 		input.file,
 		endpoint.identity,
@@ -1598,12 +1620,20 @@ export async function reapStaleNotificationArtifacts(input: {
 					skipped += 1;
 					continue;
 				}
-				if (await reapAbandonedNotificationStagingTemp({ fs: fsImpl, file, claim, now, graceMs, pidAlive }))
-					removed.push(file);
+				const outcome = await reapAbandonedNotificationStagingTemp({
+					fs: fsImpl,
+					file,
+					claim,
+					now,
+					graceMs,
+					pidAlive,
+				});
+				if (outcome === "removed") removed.push(file);
 				else skipped += 1;
 				continue;
 			}
-			if (await reapNotificationLeakArtifact({ fs: fsImpl, file, now, graceMs })) removed.push(file);
+			const outcome = await reapNotificationLeakArtifact({ fs: fsImpl, file, now, graceMs });
+			if (outcome === "removed") removed.push(file);
 			else skipped += 1;
 		} catch (error) {
 			if (isPermanentMissingPathError(error)) continue;
