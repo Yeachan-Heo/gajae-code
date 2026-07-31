@@ -2762,7 +2762,7 @@ function manifestContains(transcriptPath: string, manifest: readonly ArtifactMan
 type DetachedArtifactRoot = {
 	originalPath: string;
 	detachedPath: string;
-	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint };
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; parentDev: bigint; parentIno: bigint };
 	tree: NativeDirectoryTreeSnapshot;
 };
 
@@ -2779,6 +2779,7 @@ function planArtifactRootForMigration(sourceTranscript: string, operation: strin
 	const tree = snapshotArtifactTree(originalPath);
 	const root = tree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
 	if (!root) throw new Error("unsafe_artifacts");
+	const parent = fs.lstatSync(path.dirname(originalPath), { bigint: true });
 	return {
 		originalPath,
 		detachedPath: path.join(path.dirname(originalPath), `.gjc-migrate-${operation}-artifacts`),
@@ -2787,6 +2788,8 @@ function planArtifactRootForMigration(sourceTranscript: string, operation: strin
 			ino: stat.ino,
 			size: process.platform === "win32" ? BigInt(root.size) : stat.size,
 			mtimeNs: process.platform === "win32" ? BigInt(root.mtimeNs) : stat.mtimeNs,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
 		},
 		tree,
 	};
