@@ -3557,6 +3557,10 @@ export async function reconcileManagedTombstones(
 								pendingEvidence = cleanupPendingEvidence(followup, pendingEvidence, deletion);
 								await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 							}
+							if (deletion.kind === "deleted" && fs.existsSync(pendingEvidence.plannedTranscriptPath)) {
+								if (!reconcileScrubbedTranscriptPlaceholder(pendingEvidence.plannedTranscriptPath))
+									throw new Error("durability_failed");
+							}
 						}
 						if (
 							deletion.kind === "cleanup_pending" &&
