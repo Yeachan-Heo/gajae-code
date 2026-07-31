@@ -1836,10 +1836,17 @@ function reconcileScrubbedTranscriptPlaceholder(pathname: string): boolean {
 	try {
 		const stat = fs.lstatSync(pathname);
 		if (stat.isSymbolicLink()) return false;
-		return (
-			(stat.isFile() && stat.size === 0 && stat.nlink === 1) ||
-			(stat.isDirectory() && fs.readdirSync(pathname).length === 0)
-		);
+		if (stat.isFile() && stat.size === 0 && stat.nlink === 1) {
+			fs.unlinkSync(pathname);
+			fsyncManagedParent(pathname);
+			return true;
+		}
+		if (stat.isDirectory() && fs.readdirSync(pathname).length === 0) {
+			fs.rmdirSync(pathname);
+			fsyncManagedParent(pathname);
+			return true;
+		}
+		return false;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ENOENT";
 	}
@@ -3396,7 +3403,11 @@ export async function reconcileManagedTombstones(
 						transcriptPath: target.path,
 						sessionId: target.sessionId,
 						cwd: target.cwd,
-						transcriptIdentity: initialTarget.identity,
+						transcriptIdentity: {
+							...initialTarget.identity,
+							nlink: fs.lstatSync(observedPending?.detachedTranscriptPath ?? target.path, { bigint: true })
+								.nlink,
+						},
 						expectedArtifactsIdentity: active.expectedArtifactsIdentity,
 						expectedArtifactsTree: active.expectedArtifactsTree,
 						detachedArtifactsPath:

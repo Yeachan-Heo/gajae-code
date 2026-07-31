@@ -1243,7 +1243,6 @@ describe("managed session write protocol", () => {
 			const artifacts = source.slice(0, -6);
 			await fs.mkdir(artifacts, { recursive: true });
 			await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
-			await fs.writeFile(path.join(artifacts, "later.txt"), "later payload");
 			await fs.writeFile(source, transcript("root-only-replay", cwd));
 			const listed = listManagedCandidates(scope);
 			if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
@@ -2926,7 +2925,7 @@ describe("managed session write protocol", () => {
 			const tombstoneFiles = await fs.readdir(tombstonesDir).catch(() => [] as string[]);
 			const artifactsRemoved = tombstoneFiles.find(name => name.includes("artifacts_removed"));
 			expect(artifactsRemoved).toBeDefined();
-			expect(artifactsRemoved).toMatch(/-2\./);
+			expect(artifactsRemoved).toMatch(/-3\./);
 		} finally {
 			remove.mockRestore();
 			unlink.mockRestore();
