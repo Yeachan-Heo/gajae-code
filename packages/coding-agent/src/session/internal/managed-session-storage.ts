@@ -723,6 +723,41 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
+	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) {
+			const fence = this.#portableMutationFence;
+			if (!fence) throw new Error("managed_replace_exact_unavailable");
+			fence.assertOwned();
+			const current = captureManagedFileNoFollow(resolved);
+			if (!sameIdentity(current.identity, expected.identity) || current.identity.sha256 !== expected.identity.sha256)
+				throw new Error("managed_replace_identity_mismatch");
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, () => {
+				fence.assertOwned();
+				const currentAtCommit = captureManagedFileNoFollow(resolved);
+				if (
+					!sameIdentity(currentAtCommit.identity, expected.identity) ||
+					currentAtCommit.identity.sha256 !== expected.identity.sha256
+				)
+					throw new Error("managed_replace_identity_mismatch");
+			});
+			fence.assertOwned();
+			return;
+		}
+		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
+			this.#relative(resolved),
+			bytes,
+			expected.identity.dev.toString(),
+			expected.identity.ino.toString(),
+			String(expected.identity.size),
+			expected.identity.mtimeNs.toString(),
+			expected.identity.ctimeNs.toString(),
+			expected.identity.sha256,
+		);
+		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		this.#assertBound();
+	}
 	replaceSync(relativePath: string, bytes: Uint8Array): void {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
