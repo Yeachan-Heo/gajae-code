@@ -5628,6 +5628,19 @@ mod platform {
 		if !handles_same_object(detached_parent_handle, original_parent.target) {
 			return NativeExactUnlinkResult::failure("parent_mismatch");
 		}
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			identity.parent_dev.zip(identity.parent_ino)
+		{
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(original_parent.target, &mut parent_information) }
+				== 0 || u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let result = detach_directory(
 			handle.target,
 			original_parent.target,
