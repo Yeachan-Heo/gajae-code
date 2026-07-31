@@ -426,38 +426,6 @@ function nativeDirectoryTreeApi(): NativeDirectoryTreeApi {
 	return native as unknown as NativeDirectoryTreeApi;
 }
 
-function isVerifiedEmptyPlaceholder(
-	pathname: string,
-	parentIdentity: { dev: bigint; ino: bigint } | undefined,
-): boolean {
-	if (!parentIdentity) return false;
-	try {
-		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
-		const stat = fs.lstatSync(pathname, { bigint: true });
-		if (
-			stat.isSymbolicLink() ||
-			!stat.isFile() ||
-			stat.nlink !== 1n ||
-			stat.size !== 0n ||
-			parent.dev !== parentIdentity.dev ||
-			parent.ino !== parentIdentity.ino
-		)
-			return false;
-		fs.unlinkSync(pathname);
-		const descriptor = fs.openSync(
-			path.dirname(pathname),
-			fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
-		);
-		try {
-			fs.fsyncSync(descriptor);
-		} finally {
-			fs.closeSync(descriptor);
-		}
-		return true;
-	} catch {
-		return false;
-	}
-}
 function snapshotDirectoryTree(pathname: string): NativeDirectoryTreeSnapshot {
 	const result = nativeDirectoryTreeApi().snapshotDirectoryTree(pathname);
 	if (!result.ok || !result.snapshot)
@@ -476,12 +444,17 @@ function retainedTreeDoesNotExpandAuthority(
 	return retained.entries.every(entry => {
 		if (entry.relativePath === "") return entry.kind === "directory";
 		const authorized = expectedEntries.get(entry.relativePath);
-		return (
-			authorized !== undefined &&
-			authorized.kind === entry.kind &&
-			authorized.dev === entry.dev &&
-			authorized.ino === entry.ino
-		);
+		if (
+			authorized === undefined ||
+			authorized.kind !== entry.kind ||
+			authorized.dev !== entry.dev ||
+			authorized.ino !== entry.ino ||
+			authorized.nlink !== entry.nlink
+		)
+			return false;
+		if (entry.kind !== "file") return entry.size === authorized.size;
+		const scrubbed = entry.size === "0" && entry.sha256 === createHash("sha256").update("").digest("hex");
+		return scrubbed || (entry.size === authorized.size && entry.sha256 === authorized.sha256);
 	});
 }
 
@@ -1301,10 +1274,8 @@ export class FileSessionStorage implements SessionStorage {
 					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 					deletion.retainedSuccessorPath === undefined &&
 					deletion.retainedUnknownPath === undefined &&
-					(deletion.detachedPath === undefined ||
-						isVerifiedEmptyPlaceholder(deletion.detachedPath, authorizedTranscriptParentIdentity)) &&
-					(deletion.retainedPlaceholderPath === undefined ||
-						isVerifiedEmptyPlaceholder(deletion.retainedPlaceholderPath, authorizedTranscriptParentIdentity))
+					(deletion.detachedPath === undefined || false) &&
+					(deletion.retainedPlaceholderPath === undefined || false)
 				)
 					return { kind: "deleted" };
 				const error = exactUnlinkFailure(deletion);
@@ -1380,10 +1351,8 @@ export class FileSessionStorage implements SessionStorage {
 				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 				deletion.retainedSuccessorPath === undefined &&
 				deletion.retainedUnknownPath === undefined &&
-				(deletion.detachedPath === undefined ||
-					isVerifiedEmptyPlaceholder(deletion.detachedPath, authorizedTranscriptParentIdentity)) &&
-				(deletion.retainedPlaceholderPath === undefined ||
-					isVerifiedEmptyPlaceholder(deletion.retainedPlaceholderPath, authorizedTranscriptParentIdentity))
+				(deletion.detachedPath === undefined || false) &&
+				(deletion.retainedPlaceholderPath === undefined || false)
 			)
 				return { kind: "deleted" };
 			const error = exactUnlinkFailure(deletion);
