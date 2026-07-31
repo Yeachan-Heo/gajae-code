@@ -406,7 +406,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			const baseUrl = normalizeBaseUrl(model.baseUrl);
 			let body = createChatBody(model, context, options);
 			const sentForcedToolChoice = body.tool_choice === "required";
-			const replacementPayload = await options.onPayload?.(body, model);
+			const replacementPayload = await options.onPayload?.(body, model, options?.attemptScope);
 			if (replacementPayload !== undefined) {
 				body = replacementPayload as typeof body;
 			}

@@ -1348,7 +1348,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					dynamicHeaders: copilotDynamicHeaders?.headers,
 					isOAuth: options?.isOAuth,
 					hasTools: !!context.tools?.length,
-					onSseEvent: options?.onSseEvent,
+					onSseEvent: options?.onSseEvent
+						? event => options.onSseEvent!(event, model, options?.attemptScope)
+						: undefined,
 					fetch: options?.fetch,
 					requestMaxRetries: options?.requestMaxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,

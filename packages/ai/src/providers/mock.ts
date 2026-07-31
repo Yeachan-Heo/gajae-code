@@ -327,6 +327,7 @@ async function runMock(
 					...(response.responseRequestId !== undefined ? { requestId: response.responseRequestId } : {}),
 				},
 				model,
+				options.attemptScope,
 			);
 		} catch (err) {
 			stream.fail(err);

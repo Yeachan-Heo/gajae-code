@@ -126,7 +126,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			const { baseUrl } = resolveAzureConfig(model, options);
 			const params = buildParams(model, context, options, deploymentName, baseUrl);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
-			options?.onPayload?.(params);
+			options?.onPayload?.(params, model, options?.attemptScope);
 			rawRequestDump = {
 				provider: model.provider,
 				api: output.api,
@@ -312,7 +312,9 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 		maxRetries: resolveRetryBudget(options?.requestMaxRetries, 5),
 		defaultHeaders: headers,
 		baseURL: baseUrl,
-		fetch: onSseEvent ? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model)) : baseFetch,
+		fetch: onSseEvent
+			? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model, options?.attemptScope))
+			: baseFetch,
 	});
 }
 

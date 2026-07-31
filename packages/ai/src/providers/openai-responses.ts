@@ -433,6 +433,7 @@ function createClient(
 	authCredentialType?: OpenAIResponsesOptions["authCredentialType"],
 	requestMaxRetries?: number,
 	maxRetryDelayMs?: number,
+	attemptScope?: import("../types.js").AttemptScopeRef,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -502,7 +503,7 @@ function createClient(
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
 			fetch: onSseEvent
-				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
+				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model, attemptScope))
 				: transformedFetch,
 		}),
 		copilotPremiumRequests,

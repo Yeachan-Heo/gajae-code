@@ -835,7 +835,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 		try {
 			const plan = await prepare();
 			let params = plan.params;
-			const replacement = await options?.onPayload?.(params, model);
+			const replacement = await options?.onPayload?.(params, model, options?.attemptScope);
 			if (replacement !== undefined) {
 				params = replacement as GenerateContentParameters;
 			}
@@ -915,7 +915,11 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			}
 
 			const googleStream = readSseJson<GenerateContentResponse>(response.body, options?.signal, event =>
-				options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
+				options?.onSseEvent?.(
+					{ event: event.event, data: event.data, raw: [...event.raw] },
+					model,
+					options?.attemptScope,
+				),
 			);
 
 			stream.push({ type: "start", partial: output });
