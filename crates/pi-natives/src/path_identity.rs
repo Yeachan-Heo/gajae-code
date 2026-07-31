@@ -5317,7 +5317,7 @@ mod platform {
 			destination_name,
 			FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
 			false,
-			FILE_SHARE_READ,
+			FILE_SHARE_READ | FILE_SHARE_DELETE,
 		) {
 			Ok(handle) => handle,
 			Err(code) => return NativeExactUnlinkResult::failure(code),
