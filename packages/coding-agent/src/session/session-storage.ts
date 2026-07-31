@@ -1273,9 +1273,7 @@ export class FileSessionStorage implements SessionStorage {
 					deletion.code === "cleanup_pending" &&
 					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 					deletion.retainedSuccessorPath === undefined &&
-					deletion.retainedUnknownPath === undefined &&
-					(deletion.detachedPath === undefined || false) &&
-					(deletion.retainedPlaceholderPath === undefined || false)
+					deletion.retainedUnknownPath === undefined
 				)
 					return { kind: "deleted" };
 				const error = exactUnlinkFailure(deletion);
@@ -1350,9 +1348,7 @@ export class FileSessionStorage implements SessionStorage {
 				deletion.code === "cleanup_pending" &&
 				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 				deletion.retainedSuccessorPath === undefined &&
-				deletion.retainedUnknownPath === undefined &&
-				(deletion.detachedPath === undefined || false) &&
-				(deletion.retainedPlaceholderPath === undefined || false)
+				deletion.retainedUnknownPath === undefined
 			)
 				return { kind: "deleted" };
 			const error = exactUnlinkFailure(deletion);

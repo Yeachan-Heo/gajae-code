@@ -2442,7 +2442,10 @@ describe("managed session write protocol", () => {
 		}
 		expect(q2).toEqual(expect.any(String));
 		expect(await fs.stat(q1).catch(() => undefined)).toBeUndefined();
-		expect(await fs.stat(q2!).catch(() => undefined)).toBeUndefined();
+		const q2Retained = await fs.stat(q2!, { bigint: true });
+		expect(q2Retained.isFile()).toBe(true);
+		expect(q2Retained.nlink).toBe(1n);
+		expect(q2Retained.size).toBe(0n);
 		expect(listManagedCandidates(scope)).toMatchObject({ kind: "complete", owned: [] });
 	});
 
