@@ -394,6 +394,37 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(windows)]
+	fn detached_failure_with_successor_and_placeholder(
+		code: &str,
+		detached_path: String,
+		successor_path: String,
+		placeholder_path: String,
+	) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: None,
+			detached_path: Some(detached_path),
+			retained_successor_path: Some(successor_path),
+			retained_placeholder_path: Some(placeholder_path),
+			retained_unknown_path: None,
+		}
+	}
+
+	#[cfg(windows)]
+	fn retained_successor_failure(code: &str, successor_path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: None,
+			detached_path: None,
+			retained_successor_path: Some(successor_path),
+			retained_placeholder_path: None,
+			retained_unknown_path: None,
+		}
+	}
+
 	#[cfg(unix)]
 	fn detached_failure_with_placeholder(
 		code: &str,
@@ -5427,9 +5458,38 @@ mod platform {
 			);
 		}
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
-		match rename_handle(source.target, parent_handle, &destination_name, true) {
-			Ok(()) => NativeExactUnlinkResult::success(),
-			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path_string),
+		let predecessor_name_string = format!(
+			".gjc-exact-replace-destination-{:x}-{:x}",
+			expected_destination.dev, expected_destination.ino
+		);
+		let predecessor_path = destination_path.with_file_name(&predecessor_name_string);
+		let predecessor_name: Vec<u16> = predecessor_name_string.encode_utf16().collect();
+		if let Err(code) = rename_handle(destination.target, parent_handle, &predecessor_name, false)
+		{
+			return NativeExactUnlinkResult::detached_failure(code, retained_path_string);
+		}
+		let predecessor_path_string = predecessor_path.to_string_lossy().into_owned();
+		match rename_handle(source.target, parent_handle, &destination_name, false) {
+			Ok(()) => match delete_handle(destination.target) {
+				Ok(()) => NativeExactUnlinkResult::success(),
+				Err(code) => {
+					NativeExactUnlinkResult::retained_successor_failure(code, predecessor_path_string)
+				},
+			},
+			Err(code) => {
+				let restored_destination =
+					rename_handle(destination.target, parent_handle, &destination_name, false).is_ok();
+				if restored_destination {
+					NativeExactUnlinkResult::detached_failure(code, retained_path_string)
+				} else {
+					NativeExactUnlinkResult::detached_failure_with_successor_and_placeholder(
+						code,
+						retained_path_string,
+						destination_path.to_string_lossy().into_owned(),
+						predecessor_path_string,
+					)
+				}
+			},
 		}
 	}
 
