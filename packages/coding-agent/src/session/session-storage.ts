@@ -441,6 +441,7 @@ function retainedTreeDoesNotExpandAuthority(
 ): boolean {
 	if (expected.rootDev !== retained.rootDev || expected.rootIno !== retained.rootIno) return false;
 	const expectedEntries = new Map(expected.entries.map(entry => [entry.relativePath, entry]));
+	if (retained.entries.length !== expected.entries.length) return false;
 	return retained.entries.every(entry => {
 		if (entry.relativePath === "") return entry.kind === "directory";
 		const authorized = expectedEntries.get(entry.relativePath);

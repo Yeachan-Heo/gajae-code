@@ -1645,34 +1645,36 @@ export function replaceManagedFileSync(
 				const committedWithPredecessor =
 					replaced.detachedPath === replaced.retainedPlaceholderPath &&
 					replaced.retainedSuccessorPath === destination;
-				if (replaced.detachedPath && !committedWithPredecessor) {
-					const restored = exactRestore(replaced.detachedPath, staging, {
-						dev: staged.dev,
-						ino: staged.ino,
-						nlink: staged.nlink,
-						parentDev: parentIdentity.dev,
-						parentIno: parentIdentity.ino,
-						size: staged.size,
-						mtimeNs: staged.mtimeNs,
-						sha256: createHash("sha256").update(bytes).digest("hex"),
-					});
-					if (restored.ok) preserveStaging = true;
-					if (!restored.ok)
-						throw new Error(
-							`managed_replace_failed:${replaced.code ?? "unknown"}:retained=${replaced.detachedPath}:restore=${restored.code ?? "unknown"}`,
-						);
+				if (!committedWithPredecessor) {
+					if (replaced.detachedPath) {
+						const restored = exactRestore(replaced.detachedPath, staging, {
+							dev: staged.dev,
+							ino: staged.ino,
+							nlink: staged.nlink,
+							parentDev: parentIdentity.dev,
+							parentIno: parentIdentity.ino,
+							size: staged.size,
+							mtimeNs: staged.mtimeNs,
+							sha256: createHash("sha256").update(bytes).digest("hex"),
+						});
+						if (restored.ok) preserveStaging = true;
+						if (!restored.ok)
+							throw new Error(
+								`managed_replace_failed:${replaced.code ?? "unknown"}:retained=${replaced.detachedPath}:restore=${restored.code ?? "unknown"}`,
+							);
+					}
+					const retained = [
+						replaced.detachedPath,
+						replaced.retainedSuccessorPath,
+						replaced.retainedPlaceholderPath,
+						replaced.retainedUnknownPath,
+					]
+						.filter((pathname): pathname is string => typeof pathname === "string")
+						.join(",");
+					throw new Error(
+						`managed_replace_failed:${replaced.code ?? "unknown"}${retained ? `:retained=${retained}` : ""}`,
+					);
 				}
-				const retained = [
-					replaced.detachedPath,
-					replaced.retainedSuccessorPath,
-					replaced.retainedPlaceholderPath,
-					replaced.retainedUnknownPath,
-				]
-					.filter((pathname): pathname is string => typeof pathname === "string")
-					.join(",");
-				throw new Error(
-					`managed_replace_failed:${replaced.code ?? "unknown"}${retained ? `:retained=${retained}` : ""}`,
-				);
 			}
 		} else fs.renameSync(staging, destination);
 		assertFence?.();
