@@ -3527,11 +3527,14 @@ pub(crate) mod platform {
 		if let Some((expected_parent_dev, expected_parent_ino)) =
 			identity.parent_dev.zip(identity.parent_ino)
 		{
+			// SAFETY: zero is valid initialized storage for fstat output.
 			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is the live retained parent descriptor.
 			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
 				|| parent_stat.st_dev as u64 != expected_parent_dev
 				|| parent_stat.st_ino as u64 != expected_parent_ino
 			{
+				// SAFETY: this branch owns parent_fd exactly once.
 				unsafe { libc::close(parent_fd) };
 				return NativeExactUnlinkResult::failure("parent_mismatch");
 			}
@@ -3573,6 +3576,25 @@ pub(crate) mod platform {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		// Revalidate the name immediately before commit; rename_no_replace remains the
+		// only namespace mutation and any observed substitution fails closed.
+		// SAFETY: zero is valid initialized storage for fstatat output.
+		let mut current: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd and detached_name remain live for this no-follow probe.
+		let current_matches = unsafe {
+			libc::fstatat(parent_fd, detached_name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW)
+		} == 0 && current.st_mode & libc::S_IFMT == expected_kind
+			&& current.st_dev as u64 == identity.dev
+			&& current.st_ino as u64 == identity.ino
+			&& current.st_size as u64 == identity.size
+			&& stat_mtime_ns(&current) == i128::from(identity.mtime_ns)
+			&& (identity.directory
+				|| digest_openat(parent_fd, &detached_name).ok().as_ref() == identity.sha256.as_ref());
+		if !current_matches {
+			// SAFETY: this branch owns the live parent descriptor exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &detached_name, &original_name) {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
