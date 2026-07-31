@@ -5094,10 +5094,11 @@ mod platform {
 		handles_same_object_checked(left, right).unwrap_or(false)
 	}
 
-	fn rename_handle_no_replace(
+	fn rename_handle(
 		handle: HANDLE,
 		parent_handle: HANDLE,
 		name: &[u16],
+		replace_if_exists: bool,
 	) -> Result<(), &'static str> {
 		let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or("io_error")?;
 		let file_name_offset = std::mem::offset_of!(HandleRenameInformation, file_name);
@@ -5120,7 +5121,7 @@ mod platform {
 		// computed from the field offset rather than from the one-element flexible
 		// array member, so the copy never creates an out-of-bounds array reference.
 		unsafe {
-			(*rename).replace_if_exists = 0;
+			(*rename).replace_if_exists = u8::from(replace_if_exists);
 			(*rename).root_directory = parent_handle;
 			(*rename).file_name_length = u32::try_from(name_bytes).map_err(|_| "io_error")?;
 			let file_name = storage
@@ -5162,7 +5163,7 @@ mod platform {
 	) -> NativeExactUnlinkResult {
 		let name_wide: Vec<u16> = quarantine_name.encode_utf16().collect();
 		let original_name_wide: Vec<u16> = source_name.encode_wide().collect();
-		let result = match rename_handle_no_replace(handle, parent_handle, &name_wide) {
+		let result = match rename_handle(handle, parent_handle, &name_wide, false) {
 			Ok(()) => {
 				let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 				let matches = unsafe { GetFileInformationByHandle(handle, &mut information) } != 0
@@ -5172,7 +5173,7 @@ mod platform {
 							&& digest_handle(handle).ok().as_ref() == identity.sha256.as_ref()));
 				if matches {
 					NativeExactUnlinkResult::detached(detached_path)
-				} else if rename_handle_no_replace(handle, parent_handle, &original_name_wide).is_ok() {
+				} else if rename_handle(handle, parent_handle, &original_name_wide, false).is_ok() {
 					NativeExactUnlinkResult::failure("identity_mismatch")
 				} else {
 					NativeExactUnlinkResult::detached_failure("restore_failed", detached_path)
@@ -5262,10 +5263,11 @@ mod platform {
 		if source_path.parent() != destination_path.parent() {
 			return NativeExactUnlinkResult::failure("parent_mismatch");
 		}
-		let source = match open_exact(
+		let source = match open_exact_with_share(
 			&source_path,
 			"file",
 			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			FILE_SHARE_READ,
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
@@ -5366,7 +5368,7 @@ mod platform {
 			format!(".gjc-exact-replace-source-{:x}-{:x}", expected_source.dev, expected_source.ino);
 		let retained_path = source_path.with_file_name(&retained_name_string);
 		let retained_name: Vec<u16> = retained_name_string.encode_utf16().collect();
-		if let Err(code) = rename_handle_no_replace(source.target, parent_handle, &retained_name) {
+		if let Err(code) = rename_handle(source.target, parent_handle, &retained_name, false) {
 			return NativeExactUnlinkResult::failure(code);
 		}
 		let retained_path_string = retained_path.to_string_lossy().into_owned();
@@ -5423,15 +5425,9 @@ mod platform {
 				retained_path_string,
 			);
 		}
-		if let Err(code) = delete_handle(destination.target) {
-			return NativeExactUnlinkResult::detached_failure(code, retained_path_string);
-		}
-		drop(destination);
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
-		match rename_handle_no_replace(source.target, parent_handle, &destination_name) {
+		match rename_handle(source.target, parent_handle, &destination_name, true) {
 			Ok(()) => NativeExactUnlinkResult::success(),
-			// Destination deletion committed, but the verified source remains at its
-			// deterministic retained path for bounded recovery.
 			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path_string),
 		}
 	}
@@ -5476,7 +5472,7 @@ mod platform {
 			Err(code) => return NativeExactUnlinkResult::failure(&code),
 		};
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
-		match rename_handle_no_replace(source.target, destination_parent.target, &destination_name) {
+		match rename_handle(source.target, destination_parent.target, &destination_name, false) {
 			Ok(()) => NativeExactUnlinkResult::success(),
 			Err(code) => NativeExactUnlinkResult::failure(code),
 		}
@@ -6651,7 +6647,7 @@ mod platform {
 		expected: &NativeDirectoryTreeEntry,
 	) -> Result<(), &'static str> {
 		let name: Vec<u16> = tree_quarantine_name(expected).encode_utf16().collect();
-		rename_handle_no_replace(handle, parent, &name)
+		rename_handle(handle, parent, &name, false)
 	}
 
 	fn set_handle_attributes(handle: HANDLE, attributes: u32) -> Result<(), &'static str> {
@@ -6897,22 +6893,18 @@ mod platform {
 		}
 		let parent = *root.ancestors.last().expect("directory parent retained");
 		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) if !already_final => {
-				match rename_handle_no_replace(root.target, parent, &final_name) {
-					Ok(()) => match tree_entry(root.target, String::new(), "directory") {
-						Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
-							match delete_handle(root.target) {
-								Ok(()) => NativeExactUnlinkResult::success(),
-								Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-							}
-						},
-						Ok(_) => {
-							NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path)
-						},
-						Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
+			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
+				Ok(()) => match tree_entry(root.target, String::new(), "directory") {
+					Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
+						match delete_handle(root.target) {
+							Ok(()) => NativeExactUnlinkResult::success(),
+							Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
+						}
 					},
-					Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
-				}
+					Ok(_) => NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path),
+					Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
+				},
+				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
 			},
 			Ok(()) => match delete_handle(root.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
