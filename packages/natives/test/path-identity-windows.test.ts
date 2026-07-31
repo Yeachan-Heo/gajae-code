@@ -211,12 +211,14 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			fs.stat(source, { bigint: true }),
 			fs.stat(destination, { bigint: true }),
 		]);
+		const parent = await parentIdentity(source);
 
 		expect(
 			exactReplacePath(
 				source,
 				destination,
 				{
+					...parent,
 					dev: sourceStat.dev,
 					ino: sourceStat.ino,
 					size: sourceStat.size,
@@ -224,6 +226,7 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 					sha256: sha256("new-state"),
 				},
 				{
+					...parent,
 					dev: destinationStat.dev,
 					ino: destinationStat.ino,
 					size: destinationStat.size,
@@ -249,12 +252,14 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			fs.stat(source, { bigint: true }),
 			fs.stat(destination, { bigint: true }),
 		]);
+		const parent = await parentIdentity(source);
 
 		expect(
 			exactReplacePath(
 				source,
 				destination,
 				{
+					...parent,
 					dev: sourceStat.dev,
 					ino: sourceStat.ino,
 					size: sourceStat.size,
@@ -262,6 +267,7 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 					sha256: sha256("new-state"),
 				},
 				{
+					...parent,
 					dev: destinationStat.dev,
 					ino: destinationStat.ino,
 					size: destinationStat.size,
@@ -284,9 +290,11 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await fs.writeFile(detached, contents);
 		await fs.link(detached, alias);
 		const stat = await fs.stat(detached, { bigint: true });
+		const parent = await parentIdentity(detached);
 
 		expect(
 			exactRestore(detached, original, {
+				...parent,
 				dev: stat.dev,
 				ino: stat.ino,
 				size: stat.size,
@@ -346,10 +354,12 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const original = path.join(root, "contended.jsonl");
 		await fs.writeFile(detached, "retained content");
 		const stat = await fs.stat(detached, { bigint: true });
+		const parent = await parentIdentity(detached);
 		const writer = await fs.open(detached, "r+");
 		try {
 			expect(
 				exactRestore(detached, original, {
+					...parent,
 					dev: stat.dev,
 					ino: stat.ino,
 					size: stat.size,
@@ -389,7 +399,9 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await fs.mkdir(managed);
 		await fs.writeFile(original, "authorized");
 		const stat = await fs.stat(original, { bigint: true });
+		const parent = await parentIdentity(original);
 		const identity = {
+			...parent,
 			dev: stat.dev,
 			ino: stat.ino,
 			size: stat.size,
