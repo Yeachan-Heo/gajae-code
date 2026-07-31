@@ -717,14 +717,7 @@ export class ManagedSessionDescendantStore {
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
 			const expected = captureManagedFileNoFollow(resolved);
-			replaceManagedFileSync(
-				resolved,
-				bytes,
-				this.#subtreeRoot,
-				this.#policy,
-				this.#portableMutationFence ? () => this.#portableMutationFence?.assertOwned() : undefined,
-				expected.identity,
-			);
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
 			this.#assertBound();
 			return;
 		}
@@ -737,9 +730,6 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			const fence = this.#portableMutationFence;
-			if (!fence) throw new Error("managed_replace_exact_unavailable");
-			fence.assertOwned();
 			const current = captureManagedFileNoFollow(resolved);
 			if (!sameIdentity(current.identity, expected.identity) || current.identity.sha256 !== expected.identity.sha256)
 				throw new Error("managed_replace_identity_mismatch");
@@ -749,7 +739,6 @@ export class ManagedSessionDescendantStore {
 				this.#subtreeRoot,
 				this.#policy,
 				() => {
-					fence.assertOwned();
 					const currentAtCommit = captureManagedFileNoFollow(resolved);
 					if (
 						!sameIdentity(currentAtCommit.identity, expected.identity) ||
@@ -759,7 +748,6 @@ export class ManagedSessionDescendantStore {
 				},
 				expected.identity,
 			);
-			fence.assertOwned();
 			return;
 		}
 		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
@@ -780,14 +768,7 @@ export class ManagedSessionDescendantStore {
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
 			const expected = captureManagedFileNoFollow(resolved);
-			replaceManagedFileSync(
-				resolved,
-				bytes,
-				this.#subtreeRoot,
-				this.#policy,
-				this.#portableMutationFence ? () => this.#portableMutationFence?.assertOwned() : undefined,
-				expected.identity,
-			);
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
 			this.#assertBound();
 			return;
 		}
