@@ -1567,14 +1567,9 @@ function retainedArtifactsRootMatches(record: Record<string, unknown>): boolean 
 	const observed = artifactIdentityAt(retained.path);
 	if (
 		!observed ||
-		!sameArtifactRootIdentity(observed, {
-			dev: BigInt(artifactIdentity.dev),
-			ino: BigInt(artifactIdentity.ino),
-			size: artifactIdentity.size,
-			mtimeNs: BigInt(artifactIdentity.mtimeNs),
-			sha256: artifactIdentity.sha256,
-		}) ||
-		JSON.stringify(snapshotArtifactTree(retained.path)) !== JSON.stringify(tree)
+		observed.dev !== BigInt(artifactIdentity.dev) ||
+		observed.ino !== BigInt(artifactIdentity.ino) ||
+		!artifactTreePayloadAbsent(snapshotArtifactTree(retained.path))
 	)
 		throw new Error("durability_failed");
 	return true;
@@ -2104,9 +2099,12 @@ function assertRetainedArtifactsAuthority(pending: CleanupReceipt): void {
 	const observedTree = snapshotArtifactTree(pending.detachedArtifactsPath);
 	if (
 		!observed ||
-		!sameArtifactRootIdentity(observed, pending.expectedArtifactsIdentity) ||
-		(!artifactTreeReplayCompatible(observedTree, pending.expectedArtifactsTree) &&
-			!(pending.artifactsPayloadDurable === true && artifactTreePayloadAbsent(observedTree)))
+		(pending.artifactsPayloadDurable === true
+			? observed.dev !== pending.expectedArtifactsIdentity.dev ||
+				observed.ino !== pending.expectedArtifactsIdentity.ino ||
+				!artifactTreePayloadAbsent(observedTree)
+			: !sameArtifactRootIdentity(observed, pending.expectedArtifactsIdentity) ||
+				!artifactTreeReplayCompatible(observedTree, pending.expectedArtifactsTree))
 	)
 		throw new Error("binding_invalid");
 }
@@ -2128,8 +2126,12 @@ function probePlannedCleanupDetach(target: RetiredTarget, pending: CleanupReceip
 		const observedTree = snapshotArtifactTree(pathname);
 		if (
 			!observed ||
-			!sameArtifactRootIdentity(observed, pending.expectedArtifactsIdentity) ||
-			!artifactTreeReplayCompatible(observedTree, pending.expectedArtifactsTree)
+			(pending.artifactsPayloadDurable === true
+				? observed.dev !== pending.expectedArtifactsIdentity.dev ||
+					observed.ino !== pending.expectedArtifactsIdentity.ino ||
+					!artifactTreePayloadAbsent(observedTree)
+				: !sameArtifactRootIdentity(observed, pending.expectedArtifactsIdentity) ||
+					!artifactTreeReplayCompatible(observedTree, pending.expectedArtifactsTree))
 		)
 			throw new Error("durability_failed");
 		if (detachedArtifactsPath && detachedArtifactsPath !== pathname && fs.existsSync(detachedArtifactsPath))
