@@ -3812,6 +3812,16 @@ export class TUI extends Container {
 			if (restartAppendProven && rawLines.length > this.#restartDurableLineCount) {
 				const appendBuffer = `\x1b[?2026h${newLines.slice(this.#restartDurableLineCount).join("\r\n")}\x1b[?2026l`;
 				if (!this.#writeTerminal(appendBuffer)) return;
+				// The append already reached native scrollback. Advance both the live
+				// frontier and the retained restart baseline before the viewport write:
+				// a subsequent terminal failure must not re-admit this suffix on restart.
+				this.#durableLineCount = newLines.length;
+				this.#durableRenderedLines = newLines.slice();
+				this.#durableRawLines = rawLines.slice();
+				this.#restartDurableLineCount = newLines.length;
+				this.#restartDurableRenderedLines = newLines.slice();
+				this.#restartDurableRawLines = rawLines.slice();
+				this.#restartDurableWidth = width;
 			}
 			if (viewportRepaint("restart after temporary stop")) {
 				if (restartAppendProven) {

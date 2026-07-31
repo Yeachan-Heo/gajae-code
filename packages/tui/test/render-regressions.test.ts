@@ -148,6 +148,10 @@ class FaultingVirtualTerminal implements Terminal {
 		return this.#available;
 	}
 
+	get isProcessTerminal(): boolean | undefined {
+		return this.terminal.isProcessTerminal;
+	}
+
 	get columns(): number {
 		return this.terminal.columns;
 	}
@@ -2935,6 +2939,43 @@ describe("TUI terminal-state regressions", () => {
 					expect(
 						scrollback.filter(line => line.trim() === row),
 						`${row} should appear exactly once`,
+					).toHaveLength(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("does not re-admit restart rows when the viewport repaint write fails", async () => {
+			const backingTerminal = new VirtualTerminal(32, 5, { isProcessTerminal: true });
+			const terminal = new FaultingVirtualTerminal(backingTerminal);
+			const tui = new TUI(terminal);
+			const initialRows = rows("restart-", 20);
+			const stoppedRows = rows("stopped-", 8);
+			const component = new MutableLinesComponent(initialRows);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(backingTerminal);
+
+				tui.stop();
+				component.setLines([...initialRows, ...stoppedRows]);
+				tui.start();
+				// start() has completed its synchronous terminal setup. Let the suffix
+				// append succeed, then fail the following viewport paint.
+				terminal.setWriteFailureAt(terminal.writeCount + 2);
+				await settle(backingTerminal);
+				expect(terminal.available).toBe(false);
+
+				terminal.setWriteFailureAt(undefined);
+				tui.start();
+				await settle(backingTerminal);
+
+				const scrollback = backingTerminal.getScrollBuffer();
+				for (const row of stoppedRows) {
+					expect(
+						scrollback.filter(line => line.trim() === row),
+						`${row} should be admitted once`,
 					).toHaveLength(1);
 				}
 			} finally {
