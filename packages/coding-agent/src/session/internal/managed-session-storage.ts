@@ -1645,6 +1645,11 @@ export function replaceManagedFileSync(
 				const committedWithPredecessor =
 					replaced.detachedPath === replaced.retainedPlaceholderPath &&
 					replaced.retainedSuccessorPath === destination;
+				if (committedWithPredecessor) {
+					throw new Error(
+						`managed_replace_cleanup_pending:predecessor=${replaced.retainedPlaceholderPath}:successor=${destination}`,
+					);
+				}
 				if (!committedWithPredecessor) {
 					if (replaced.detachedPath) {
 						const restored = exactRestore(replaced.detachedPath, staging, {
