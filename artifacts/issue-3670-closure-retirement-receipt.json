@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "kind": "issue-closure-retirement-receipt",
+  "generatedAt": "2026-07-31",
+  "status": "terminal",
+  "issue": 3670,
+  "title": "Repair current-dev shard-2 async queue and fork-context fixtures plus AI cache evidence",
+  "resolution": {
+    "pr": 3681,
+    "mergeCommitSha": "699a6341f0326d8089c48921b298efb299d47d69",
+    "mergedAt": "2026-07-31T18:33:19Z",
+    "devHeadObserved": "87920ba4a0c72ba2011220c47dc9c7550140b9cb",
+    "currentDevContainsMerge": true
+  },
+  "scope": {
+    "asyncDelivery": "poll acknowledgement suppresses already staged completion before flush without duplicate follow-up",
+    "forkContext": "detached dispatch freezes inherited seed synchronously",
+    "aiCacheProvenance": "fixture source/blob/SHA provenance is deterministic and issue-scoped",
+    "excluded": "architecture-2383 artifact drift and Telegram guard manifest mutations"
+  },
+  "verification": {
+    "currentDevRootTests": {
+      "status": "passed",
+      "tests": 66,
+      "failures": 0,
+      "command": "bun test packages/coding-agent/test/async-yield-queue.test.ts packages/coding-agent/test/session/yield-queue.test.ts packages/coding-agent/test/task-fork-context.test.ts packages/coding-agent/test/task/fork-context-advisory.test.ts packages/coding-agent/test/task/fork-context-seed.test.ts"
+    },
+    "mergedDevRun": {
+      "runId": 30655615693,
+      "classification": "integration-held",
+      "productRootFailures": 0,
+      "note": "unrelated MCP/daemon lifecycle shard failures occurred downstream; #3670 async/fork roots passed"
+    },
+    "build": "bun run build passed before merge",
+    "prChecks": "#3681 exact head was 22/22 green and CLEAN before merge"
+  },
+  "evidence": {
+    "focusedArtifact": "artifacts/issue-3670-focused-tests.json",
+    "cacheArtifact": "artifacts/issue-3670-anthropic-cache-eval.json",
+    "ralplanGap": "Detached RALPLAN planners failed SessionResolutionError; recorded as GJC product-gap follow-up"
+  },
+  "closure": {
+    "issueState": "ready-to-close",
+    "reason": "completed",
+    "noFurtherMutationOwnedByLane": true
+  }
+}
