@@ -1085,6 +1085,12 @@ export interface RunRootCommandDependencies {
 	getChangelogForDisplay?: typeof getChangelogForDisplay;
 	createInteractiveMode?: CreateInteractiveMode;
 	runPrintMode?: RunPrintMode;
+	/**
+	 * Governed process exit used after a successful print-mode run (defaults to
+	 * `postmortem.quit`). Injectable so in-process callers/tests can observe the
+	 * exit request instead of having the process terminated under them.
+	 */
+	quit?: (code: number) => Promise<void>;
 	isResumePickerTerminal?: ResumePickerTerminalCheck;
 	listForResumePickerReadOnly?: ListForResumePickerReadOnly;
 	listManagedForResumePickerReadOnly?: ListManagedForResumePickerReadOnly;
@@ -1686,6 +1692,17 @@ export async function runRootCommand(
 				stopThemeWatcher();
 				authStorage.close();
 				if (!deps.suppressProcessExit) await postmortem.cleanup();
+			}
+			// Cleanup has run, but a print run that executed tools can leave native
+			// handles that pin the Bun event loop for 30–300s after the final
+			// output, so `gjc -p` hangs instead of returning to the shell. Mirror
+			// the commit-command exit pattern (postmortem.quit, issue #1041): flush
+			// stdout and exit with the already-recorded exit code. Success path
+			// only — a thrown error still propagates to the caller's reporting;
+			// callers that own their finalization (rlm autonomous) pass
+			// suppressProcessExit and are exempt.
+			if (!deps.suppressProcessExit) {
+				await (deps.quit ?? postmortem.quit)(typeof process.exitCode === "number" ? process.exitCode : 0);
 			}
 		}
 	}

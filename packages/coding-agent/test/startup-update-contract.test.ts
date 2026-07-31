@@ -276,6 +276,7 @@ describe("startup update contract", () => {
 			const originalNoTitle = Bun.env.PI_NO_TITLE;
 			let checks = 0;
 			const runners: string[] = [];
+			const quitCalls: number[] = [];
 			let pipedInputReads = 0;
 			let sessionOptions: CreateAgentSessionOptions | undefined;
 			let initialMessage: string | undefined;
@@ -311,8 +312,14 @@ describe("startup update contract", () => {
 						runners.push("print");
 						initialMessage = options.initialMessage;
 					},
+					quit: async code => {
+						quitCalls.push(code);
+					},
 				});
 				expect(checks, testCase.name).toBe(0);
+				// Callers that own their finalization suppress the governed
+				// post-print exit; runRootCommand must not request it for them.
+				expect(quitCalls, testCase.name).toEqual([]);
 				expect(runners, testCase.name).toEqual([testCase.expectedRunner]);
 				expect(pipedInputReads, testCase.name).toBe(testCase.expectedRunner === "acp" ? 0 : 1);
 				expect(initialMessage, testCase.name).toBe(testCase.expectedInitialMessage);
@@ -420,6 +427,7 @@ describe("startup update contract", () => {
 			disposeCalls += 1;
 		};
 
+		const quitCalls: number[] = [];
 		try {
 			process.exitCode = 0;
 			await runRootCommand(rootArgs({ mode: "text" }), [], {
@@ -433,11 +441,17 @@ describe("startup update contract", () => {
 					process.exitCode = 78;
 					await session.dispose();
 				},
+				quit: async code => {
+					quitCalls.push(code);
+				},
 			});
 
 			expect(disposeCalls).toBe(1);
 			expect(cleanupSpy).toHaveBeenCalledTimes(1);
 			expect(process.exitCode).toBe(78);
+			// A successful print run must request a governed exit with the recorded
+			// status so lingering native handles cannot pin the process afterwards.
+			expect(quitCalls).toEqual([78]);
 		} finally {
 			vi.restoreAllMocks();
 			process.exitCode = originalExitCode ?? 0;
