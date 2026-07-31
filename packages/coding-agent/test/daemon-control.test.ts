@@ -1510,6 +1510,9 @@ describe("ChatDaemonController ownership safety", () => {
 				incarnation: "linux:12345",
 				...input,
 			} as any);
+		const unexpectedLiveProbe = (): never => {
+			throw new Error("static ownership mismatches must not consult live process authority");
+		};
 
 		for (const input of [
 			{ ownerId: "wrong-owner" },
@@ -1518,6 +1521,13 @@ describe("ChatDaemonController ownership safety", () => {
 			{ incarnation: undefined },
 			{ incarnation: "wrong" },
 			{ incarnation: "stale" },
+		]) {
+			restore();
+			await release({ pidAlive: unexpectedLiveProbe, pidIncarnation: unexpectedLiveProbe, ...input });
+			unchanged();
+		}
+
+		for (const input of [
 			{ pidIncarnation: () => "linux:12346" },
 			{ pidIncarnation: () => undefined },
 			{ pidAlive: () => false, pidIncarnation: () => "linux:12345" },

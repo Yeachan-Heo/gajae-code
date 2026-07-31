@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Chat daemon ownership release now rejects mismatched persisted identity before native PID/incarnation probes, keeping Windows shutdown bounded while preserving exact live-owner fencing.
+
 ## [0.12.6] - 2026-07-31
 ### Added
 
