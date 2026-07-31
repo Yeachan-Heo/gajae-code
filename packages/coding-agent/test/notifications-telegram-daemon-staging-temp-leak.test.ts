@@ -302,6 +302,50 @@ test("a retained staging quarantine replacement is not removed by the generic re
 	expect(fs.readFileSync(file, "utf8")).toBe("retained-successor\n");
 });
 
+test("a retained quarantine cleanup_pending successor stays visible and self-heals on the next scan", async () => {
+	const agentDir = agentDirWithNotifications();
+	const paths = daemonPaths(agentDir);
+	const file = path.join(paths.dir, ".gjc-delete-notification-staging-temp-retained.json");
+	fs.writeFileSync(file, "retained-original\n");
+
+	const base = identityFencedFs();
+	let detachedPath: string | undefined;
+	const retainingFs: TelegramDaemonFs = {
+		...base,
+		exactUnlink: async (target, _identity, quarantineName) => {
+			if (!quarantineName) throw new Error("expected a retained quarantine name");
+			detachedPath = path.join(path.dirname(target), quarantineName);
+			fs.renameSync(target, detachedPath);
+			return { ok: false, code: "cleanup_pending", detachedPath };
+		},
+	};
+
+	const retained = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: retainingFs,
+		now: pastGraceWindow,
+		graceMs: 0,
+		pidAlive: () => false,
+	});
+
+	expect(retained.removed).toEqual([file]);
+	expect(fs.existsSync(file)).toBe(false);
+	expect(detachedPath).toBeString();
+	expect(path.basename(detachedPath!)).toStartWith(".gjc-exact-unlink-placeholder-");
+	expect(fs.readFileSync(detachedPath!, "utf8")).toBe("retained-original\n");
+
+	const healed = await reapStaleNotificationArtifacts({
+		settings: isolatedSettings(agentDir),
+		fs: base,
+		now: pastGraceWindow,
+		graceMs: 0,
+		pidAlive: () => false,
+	});
+
+	expect(healed.removed).toEqual([detachedPath!]);
+	expect(fs.existsSync(detachedPath!)).toBe(false);
+});
+
 test("a symlink shaped like a staging temp is never followed or deleted", async () => {
 	const agentDir = agentDirWithNotifications();
 	const paths = daemonPaths(agentDir);
