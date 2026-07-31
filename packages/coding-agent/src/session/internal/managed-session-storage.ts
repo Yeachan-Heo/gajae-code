@@ -1658,31 +1658,36 @@ export function replaceManagedFileSync(
 						quarantineName: `.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}`,
 					});
 					if (!retired.ok) {
-						if (retired.code === "cleanup_pending") {
-							const predecessor =
-								retired.detachedPath ?? retired.retainedPlaceholderPath ?? replaced.retainedPlaceholderPath;
-							const receiptPath = path.join(
-								parent,
-								`.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}.json`,
-							);
-							publishManagedFileNoReplaceSync(
-								receiptPath,
-								Buffer.from(
-									JSON.stringify({
-										version: 1,
-										predecessor,
-										successor: destination,
-										identity: expectedDestination,
-									}),
-								),
-								root,
-								policy,
-							);
-							throw new Error(
-								`managed_replace_cleanup_pending:receipt=${receiptPath}:predecessor=${predecessor}:successor=${destination}`,
-							);
-						}
-						throw new Error(`managed_replace_cleanup_failed:${retired.code ?? "unknown"}`);
+						const predecessor =
+							retired.detachedPath ?? retired.retainedPlaceholderPath ?? replaced.retainedPlaceholderPath;
+						const receiptPath = path.join(
+							parent,
+							`.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}.json`,
+						);
+						publishManagedFileNoReplaceSync(
+							receiptPath,
+							Buffer.from(
+								JSON.stringify({
+									version: 1,
+									predecessor,
+									successor: destination,
+									identity: {
+										dev: expectedDestination.dev.toString(),
+										ino: expectedDestination.ino.toString(),
+										nlink: expectedDestination.nlink.toString(),
+										size: String(expectedDestination.size),
+										mtimeNs: expectedDestination.mtimeNs.toString(),
+										ctimeNs: expectedDestination.ctimeNs.toString(),
+										sha256: expectedDestination.sha256,
+									},
+								}),
+							),
+							root,
+							policy,
+						);
+						throw new Error(
+							`managed_replace_cleanup_pending:receipt=${receiptPath}:predecessor=${predecessor}:successor=${destination}:code=${retired.code ?? "unknown"}`,
+						);
 					}
 				}
 				if (!committedWithPredecessor) {
