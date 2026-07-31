@@ -697,7 +697,14 @@ export class TopicRegistry {
 		return true;
 	}
 
-	/** Restore the exact delete fence after a failed compensation publication. */
+	/**
+	 * Restore the exact delete fence after a failed compensation publication.
+	 *
+	 * Settlement rebuilds derived routes, which can make a surviving colliding
+	 * record routable. Rebuild again on successful restoration so the reinstated
+	 * fence re-quarantines the topic id instead of leaving inbound routing open to
+	 * the collision partner despite the restored fence.
+	 */
 	restoreDeleteFence(snapshot: TopicDeleteAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
 		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
@@ -715,9 +722,9 @@ export class TopicRegistry {
 		} else {
 			record.authorityEpoch = deleteEpoch;
 			record.authorityState = "delete_pending";
-			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
 		}
 		this.epochs.set(snapshot.sessionId, deleteEpoch);
+		this.rebuildInboundRoutes();
 		return true;
 	}
 
@@ -799,11 +806,29 @@ export class TopicRegistry {
 		await this.inflight.get(sessionId)?.catch(() => undefined);
 	}
 
-	/** Remove only after a definite remote deletion; ambiguity deliberately retains its fence. */
-	settleDelete(sessionId: string, topicId: string): boolean {
+	/**
+	 * Remove only after a definite remote deletion; ambiguity deliberately retains its fence.
+	 *
+	 * `dispatchedAuthorityEpoch` is the authority epoch the caller held when it
+	 * dispatched the remote delete. Settlement requires that epoch to still equal
+	 * both the record's own authority epoch and the registry's current epoch for
+	 * the session, so a held earlier delete can never settle a newer fence: if a
+	 * scan or close-started delete re-fenced the same session/topic after this
+	 * delete was dispatched, the stale definite result is refused and the newer
+	 * `delete_pending` record plus its topic-id quarantine stay intact.
+	 *
+	 * Derived routing tables are rebuilt on success because once the record is
+	 * gone its topic id no longer collides: a surviving colliding record becomes
+	 * routable and a settled id becomes adoptable immediately, without waiting for
+	 * a daemon restart to rebuild them from the persisted snapshot.
+	 */
+	settleDelete(sessionId: string, topicId: string, dispatchedAuthorityEpoch: number): boolean {
 		const record = this.topics.get(sessionId);
 		if (!record || record.topicId !== topicId || record.authorityState !== "delete_pending") return false;
+		if ((record.authorityEpoch ?? 0) !== dispatchedAuthorityEpoch) return false;
+		if (this.authorityEpoch(sessionId) !== dispatchedAuthorityEpoch) return false;
 		this.topics.delete(sessionId);
+		this.rebuildInboundRoutes();
 		return true;
 	}
 
