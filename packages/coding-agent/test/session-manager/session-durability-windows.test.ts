@@ -235,6 +235,7 @@ describe("managed session Windows durability", () => {
 		stat.size = 0n;
 		stat.mtimeNs = BigInt(nativeRoot.mtimeNs);
 		vi.spyOn(syncFs, "lstatSync").mockReturnValue(stat);
+		const parentStat = syncFs.lstatSync(path.dirname(retainedPath), { bigint: true });
 		const cleanup = {
 			state: "cleanup_pending" as const,
 			role: "exchange_placeholder" as const,
@@ -244,6 +245,8 @@ describe("managed session Windows durability", () => {
 				ino: BigInt(nativeRoot.ino),
 				size: 4096n,
 				mtimeNs: BigInt(nativeRoot.mtimeNs),
+				parentDev: parentStat.dev,
+				parentIno: parentStat.ino,
 			},
 			tree: expectedTree,
 		};
@@ -323,6 +326,8 @@ describe("managed session Windows durability", () => {
 					ino: stat.ino,
 					size: BigInt(treeRoot.size),
 					mtimeNs: BigInt(treeRoot.mtimeNs),
+					parentDev: syncFs.lstatSync(path.dirname(originalPath), { bigint: true }).dev,
+					parentIno: syncFs.lstatSync(path.dirname(originalPath), { bigint: true }).ino,
 				},
 				tree: tree.snapshot,
 			},

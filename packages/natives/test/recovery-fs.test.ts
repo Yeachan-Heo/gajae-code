@@ -69,7 +69,7 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 		expect(authority.read("link", 1024)).toMatchObject({ ok: false, code: "reparse_point" });
 		expect(authority.stat("receipt.fifo")).toMatchObject({ ok: false, code: "not_regular_file" });
 		expect(authority.stat("hard-link")).toMatchObject({ ok: false, code: "hard_link" });
-		expect(authority.create("too-large", Buffer.alloc(1024 * 1024 + 1))).toMatchObject({
+		expect(authority.create("too-large", Buffer.alloc(64 * 1024 * 1024 + 1))).toMatchObject({
 			ok: false,
 			code: "content_too_large",
 		});

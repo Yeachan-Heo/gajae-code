@@ -1285,7 +1285,14 @@ function receiptMatches(
 				state?: unknown;
 				role?: unknown;
 				retainedPath?: unknown;
-				identity?: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown };
+				identity?: {
+					dev?: unknown;
+					ino?: unknown;
+					size?: unknown;
+					mtimeNs?: unknown;
+					parentDev?: unknown;
+					parentIno?: unknown;
+				};
 				tree?: unknown;
 			};
 		};
@@ -1342,6 +1349,8 @@ function receiptMatches(
 				cleanupIdentity.ino !== undefined &&
 				cleanupIdentity.size !== undefined &&
 				cleanupIdentity.mtimeNs !== undefined &&
+				cleanupIdentity.parentDev !== undefined &&
+				cleanupIdentity.parentIno !== undefined &&
 				!!cleanupTree &&
 				cleanupAuthorityMatches(
 					{
@@ -1353,6 +1362,8 @@ function receiptMatches(
 							ino: BigInt(String(cleanupIdentity.ino)),
 							size: BigInt(String(cleanupIdentity.size)),
 							mtimeNs: BigInt(String(cleanupIdentity.mtimeNs)),
+							parentDev: BigInt(String(cleanupIdentity.parentDev)),
+							parentIno: BigInt(String(cleanupIdentity.parentIno)),
 						},
 						tree: cleanupTree,
 					},
@@ -2907,12 +2918,15 @@ export function cleanupAuthorityMatches(
 ): boolean {
 	try {
 		const stat = fs.lstatSync(cleanup.retainedPath, { bigint: true });
+		const parentStat = fs.lstatSync(parent, { bigint: true });
 		if (
 			path.dirname(cleanup.retainedPath) !== parent ||
 			!stat.isDirectory() ||
 			stat.isSymbolicLink() ||
 			stat.dev !== cleanup.identity.dev ||
-			stat.ino !== cleanup.identity.ino
+			stat.ino !== cleanup.identity.ino ||
+			parentStat.dev !== cleanup.identity.parentDev ||
+			parentStat.ino !== cleanup.identity.parentIno
 		)
 			return false;
 		const snapshot = native.snapshotDirectoryTree(cleanup.retainedPath);
@@ -2988,6 +3002,7 @@ export function detachArtifactRootForMigration(
 		entry => entry.relativePath === "" && entry.kind === "directory",
 	);
 	if (!placeholderRoot) throw new Error("durability_failed");
+	const parent = fs.lstatSync(path.dirname(placeholder), { bigint: true });
 	const cleanup: SourceArtifactCleanup = {
 		state: "cleanup_pending",
 		role: "exchange_placeholder",
@@ -2997,6 +3012,8 @@ export function detachArtifactRootForMigration(
 			ino: stat.ino,
 			size: platform === "win32" ? BigInt(placeholderRoot.size) : stat.size,
 			mtimeNs: platform === "win32" ? BigInt(placeholderRoot.mtimeNs) : stat.mtimeNs,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
 		},
 		tree: snapshot.snapshot,
 	};
@@ -3101,6 +3118,8 @@ export function restorePreparedArtifactRoot(
 				typeof cleanupIdentity.ino !== "string" ||
 				typeof cleanupIdentity.size !== "string" ||
 				typeof cleanupIdentity.mtimeNs !== "string" ||
+				typeof cleanupIdentity.parentDev !== "string" ||
+				typeof cleanupIdentity.parentIno !== "string" ||
 				!cleanupTree ||
 				!cleanupAuthorityMatches(
 					{
@@ -3112,6 +3131,8 @@ export function restorePreparedArtifactRoot(
 							ino: BigInt(cleanupIdentity.ino),
 							size: BigInt(cleanupIdentity.size),
 							mtimeNs: BigInt(cleanupIdentity.mtimeNs),
+							parentDev: BigInt(cleanupIdentity.parentDev),
+							parentIno: BigInt(cleanupIdentity.parentIno),
 						},
 						tree: cleanupTree,
 					},
