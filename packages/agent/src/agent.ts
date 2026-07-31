@@ -1179,18 +1179,17 @@ export class Agent {
 	 * did not drain. The abandoned provider/tool stream may still settle later, so
 	 * #runLoop guards every state mutation with a run id.
 	 */
-	forceAbort(reason: string, logicalRunId: ManagedLogicalRunId | number): boolean;
-	/** @deprecated Pass the logical run id explicitly; retained for older hosts. */
-	forceAbort(reason?: string): boolean;
 	forceAbort(reason = "Force aborted", logicalRunId?: ManagedLogicalRunId | number): boolean {
 		const targetLogicalRunId = logicalRunId ?? this.#managedLogicalRunOwner ?? this.#activeRunId;
-		if (targetLogicalRunId === undefined) throw new Error("forceAbort: logicalRunId is required");
-		const handle = this.#runHandles.get(targetLogicalRunId);
-		if (!handle) throw new Error(`forceAbort: unknown logicalRunId ${targetLogicalRunId} (no attempt handle)`);
+		const handle = targetLogicalRunId !== undefined ? this.#runHandles.get(targetLogicalRunId) : undefined;
 		const runId = this.#activeRunId;
 		const managedLogicalRunId = this.#managedLogicalRunOwner;
 		const activeLogicalRunId = managedLogicalRunId ?? runId;
-		if (activeLogicalRunId !== undefined && activeLogicalRunId !== targetLogicalRunId) {
+		if (
+			targetLogicalRunId !== undefined &&
+			activeLogicalRunId !== undefined &&
+			activeLogicalRunId !== targetLogicalRunId
+		) {
 			throw new Error(`forceAbort: logicalRunId ${targetLogicalRunId} does not match the active run`);
 		}
 		const activeResourceDomain = this.#activeResourceCancellationDomain;
@@ -1216,8 +1215,13 @@ export class Agent {
 		this.#activeResourceCancellationDomain = undefined;
 		resolve?.();
 		this.#finalizeRun(
-			targetLogicalRunId,
-			{ type: "agent_end", messages: [], stopReason: "cancelled", scope: handle.scope },
+			activeLogicalRunId ?? runId!,
+			{
+				type: "agent_end",
+				messages: [],
+				stopReason: "cancelled",
+				scope: handle?.scope,
+			},
 			undefined,
 			activeResourceDomain,
 		);

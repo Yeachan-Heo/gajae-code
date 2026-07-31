@@ -2701,8 +2701,9 @@ export class AgentSession {
 		this.#extensionRunner = config.extensionRunner;
 		this.#attemptAuthority = this.agent.getAttemptScopeAuthority();
 		this.#attemptRecordStore = new AttemptRecordStore(this.#attemptAuthority);
-		if (this.#extensionRunner && typeof this.#extensionRunner.setAttemptRecordStore === "function")
+		if (this.#extensionRunner && typeof this.#extensionRunner.setAttemptRecordStore === "function") {
 			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
+		}
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
 		this.#customCommands = config.customCommands ?? [];
@@ -6017,7 +6018,15 @@ export class AgentSession {
 			),
 			Bun.sleep(2_000).then(() => false),
 		]);
-		if (!disposeIdleSettled) this.agent.forceAbort("Session disposed", this.#activeLogicalRunId!);
+		if (!disposeIdleSettled) {
+			try {
+				this.agent.forceAbort("Session disposed", this.#activeLogicalRunId);
+			} catch {
+				// AttemptScope handle may not be registered for sessions
+				// that don't participate in the facility (e.g. test mocks).
+				this.agent.forceAbort("Session disposed");
+			}
+		}
 		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
@@ -9895,8 +9904,13 @@ export class AgentSession {
 			if (outcome.kind === "timeout") {
 				this.#abandonPostPromptTasks();
 				const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
-				if (forceAbortLogicalRunId !== undefined)
-					this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
+				try {
+					if (forceAbortLogicalRunId !== undefined)
+						this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
+					else this.agent.forceAbort("Abort cleanup timed out");
+				} catch {
+					this.agent.forceAbort("Abort cleanup timed out");
+				}
 				this.emitNotice(
 					"warning",
 					"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
