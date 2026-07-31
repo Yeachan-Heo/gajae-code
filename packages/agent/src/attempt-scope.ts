@@ -1,16 +1,16 @@
 /**
  * Per-attempt scope identity for request-scoped execution attribution.
  *
- * An AttemptScope is an immutable value allocated by {@link createAttemptMinter}
- * before every observable lifecycle emission for a single provider/agent attempt.
- * It carries a stable `attemptId`, a monotonic `generation` (per-lineage), and
- * a `lineage` discriminator that distinguishes the main attempt from concurrent
- * side attempts (IRC background, ephemeral/btw turns).
+ * An AttemptScope is an immutable, frozen value allocated before every
+ * observable lifecycle emission for a single provider/agent attempt.
+ * It carries a stable `attemptId`, a monotonic `generation` (per-lineage),
+ * and a `lineage` discriminator that distinguishes the main attempt from
+ * concurrent side attempts (IRC background, ephemeral/btw turns).
  *
  * The `attemptId` + `generation` + `lineage` form the comparable identity.
- * AttemptScope is structurally assignable to {@link AttemptScopeRef} in
- * `packages/ai` so it can be carried through `SimpleStreamOptions` and provider
- * hook signatures without a reverse dependency.
+ * AttemptScope is structurally assignable to AttemptScopeRef in
+ * `packages/ai` so it can be carried through `SimpleStreamOptions` and
+ * provider hook signatures without a reverse dependency.
  */
 export type AttemptLineage = "main" | `side:${string}`;
 
@@ -33,23 +33,26 @@ export interface LineageCurrentness {
 	readonly lineage: AttemptLineage;
 	/** True iff no successor scope with a greater generation was allocated in this lineage. */
 	isCurrent(scope: AttemptScope): boolean;
+	/** Allocate the next generation for the given attempt identity in this lineage. */
+	advance(attemptId: string): number;
 	/** Allocate the next generation in this lineage. */
-	advance(): number;
 	/** Current generation value for this lineage. */
 	readonly current: number;
 }
 
 export function createLineageCurrentness(lineage: AttemptLineage): LineageCurrentness {
 	let current = 0;
+	let currentAttemptId: string | undefined;
 	return {
 		lineage,
 		get current() {
 			return current;
 		},
 		isCurrent(scope: AttemptScope): boolean {
-			return scope.lineage === lineage && scope.generation === current;
+			return scope.lineage === lineage && scope.generation === current && scope.attemptId === currentAttemptId;
 		},
-		advance(): number {
+		advance(attemptId: string): number {
+			currentAttemptId = attemptId;
 			return ++current;
 		},
 	};
@@ -60,9 +63,9 @@ export function createLineageCurrentness(lineage: AttemptLineage): LineageCurren
  * side lineages are registered/removed with bounded lifecycle.
  *
  * This is the SINGLE source of currentness truth injected into
- * {@link AttemptRecordStore} (packages/coding-agent). Every store operation
- * calls `authority.isCurrent(scope)` and fails closed when the authority is
- * missing or the scope is superseded.
+ * AttemptRecordStore (packages/coding-agent). Every store operation
+ * calls `authority.isCurrent(scope)` and fails closed when the authority
+ * is missing or the scope is superseded.
  */
 export interface AttemptScopeAuthority {
 	/** Register a side-lineage authority. Returns an unregister function. */
@@ -86,16 +89,16 @@ export interface AttemptMinter {
 }
 
 export function createAttemptMinter(): AttemptMinter {
+	const generations = new Map<AttemptLineage, number>();
 	return {
 		mint(lineage: AttemptLineage): AttemptScope {
-			// Placeholder — the real minting goes through AttemptScopeAuthority
-			// which owns the lineage maps. This standalone minter is for tests
-			// that don't need authority-backed currentness.
-			return {
+			const gen = (generations.get(lineage) ?? 0) + 1;
+			generations.set(lineage, gen);
+			return Object.freeze({
 				attemptId: crypto.randomUUID(),
-				generation: 0,
+				generation: gen,
 				lineage,
-			};
+			});
 		},
 	};
 }
@@ -104,43 +107,55 @@ const SIDE_LRU_CAP = 1024;
 
 /**
  * Create the Agent-owned authority. Owns the main lineage and a bounded
- * (LRU-capped) map of side lineages.
+ * (LRU-capped) map of side lineages. Only RETIRED side authorities are
+ * eligible for LRU eviction; a live side attempt is never silently
+ * invalidated by a newer side registration.
  */
 export function createAttemptScopeAuthority(): AttemptScopeAuthority {
 	const mainAuth = createLineageCurrentness("main");
 	const sideAuths = new Map<AttemptLineage, LineageCurrentness>();
 	const sideOrder: AttemptLineage[] = [];
+	const retiredSet = new Set<AttemptLineage>();
 
-	function evictSideIfNeeded(): void {
+	function evictRetiredIfNeeded(): void {
+		// Only evict RETIRED side authorities. A live side attempt is never
+		// evicted by a newer registration.
 		while (sideOrder.length > SIDE_LRU_CAP) {
-			const oldest = sideOrder.shift();
-			if (oldest) sideAuths.delete(oldest);
+			const retiredIdx = sideOrder.findIndex(l => retiredSet.has(l));
+			if (retiredIdx < 0) break;
+			const [removed] = sideOrder.splice(retiredIdx, 1);
+			if (removed) {
+				sideAuths.delete(removed);
+				retiredSet.delete(removed);
+			}
 		}
 	}
 
 	function mintFor(lineage: AttemptLineage, auth: LineageCurrentness): AttemptScope {
-		return {
-			attemptId: crypto.randomUUID(),
-			generation: auth.advance(),
+		const attemptId = crypto.randomUUID();
+		return Object.freeze({
+			attemptId,
+			generation: auth.advance(attemptId),
 			lineage,
-		};
+		});
 	}
 
 	return {
 		registerSide(lineage: AttemptLineage, auth: LineageCurrentness): () => void {
-			// If re-registering (shouldn't happen for unique side UUIDs), remove old entry first
 			if (sideAuths.has(lineage)) {
 				const idx = sideOrder.indexOf(lineage);
 				if (idx >= 0) sideOrder.splice(idx, 1);
 			}
 			sideAuths.set(lineage, auth);
 			sideOrder.push(lineage);
-			evictSideIfNeeded();
+			evictRetiredIfNeeded();
 			return () => {
 				if (sideAuths.get(lineage) === auth) {
+					retiredSet.add(lineage);
 					sideAuths.delete(lineage);
 					const idx = sideOrder.indexOf(lineage);
 					if (idx >= 0) sideOrder.splice(idx, 1);
+					evictRetiredIfNeeded();
 				}
 			};
 		},
@@ -150,7 +165,10 @@ export function createAttemptScopeAuthority(): AttemptScopeAuthority {
 			return auth ? auth.isCurrent(scope) : false;
 		},
 		advanceMain(): number {
-			return mainAuth.advance();
+			// Advance main lineage to a fresh attemptId so any previously-minted
+			// main scope becomes non-current. The next mintMain() will set the
+			// real attemptId for the new attempt.
+			return mainAuth.advance(crypto.randomUUID());
 		},
 		mintMain(): AttemptScope {
 			return mintFor("main", mainAuth);
