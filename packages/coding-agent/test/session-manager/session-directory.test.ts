@@ -830,7 +830,7 @@ describe("managed session write protocol", () => {
 			]),
 		);
 	});
-	it("retains cleanup-pending placeholder authority in the committed migration receipt", async () => {
+	it("completes verified placeholder cleanup in the committed migration receipt", async () => {
 		if (process.platform === "win32") return;
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
@@ -860,7 +860,7 @@ describe("managed session write protocol", () => {
 			},
 		});
 	});
-	it("persists cleanup-pending placeholder authority and fails closed when it is replaced during replay", async () => {
+	it("does not persist removed placeholder authority during replay", async () => {
 		if (process.platform === "win32") return;
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
