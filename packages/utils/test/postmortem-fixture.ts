@@ -294,6 +294,52 @@ async function runCleanupDeadlineFatal(): Promise<void> {
 	await throwFromTimer(new Error("fixture: fatal with hung cleanup"));
 }
 
+/**
+ * Replaces process.stderr with a backpressured fake whose drain is released
+ * by the returned trigger. Writes delegate to the real stderr so the drain
+ * marker below is observable by the parent process.
+ */
+function installBackpressuredStderr(): { releaseDrain: () => void } {
+	const realStderr = process.stderr;
+	const pending: { drain?: () => void } = {};
+	let released = false;
+	const fakeStderr = Object.create(realStderr) as NodeJS.WriteStream;
+	fakeStderr.write = ((...args: unknown[]) =>
+		(realStderr.write as (...inner: unknown[]) => unknown)(...args)) as NodeJS.WriteStream["write"];
+	Object.defineProperty(fakeStderr, "writableLength", {
+		get: () => (released ? 0 : 1),
+	});
+	fakeStderr.once = ((event: string, listener: () => void) => {
+		if (event === "drain") pending.drain = listener;
+		return fakeStderr;
+	}) as NodeJS.WriteStream["once"];
+	Object.defineProperty(process, "stderr", { value: fakeStderr, configurable: true });
+	return {
+		releaseDrain: () => {
+			const drain = pending.drain;
+			released = true;
+			pending.drain = undefined;
+			realStderr.write("fixture: stderr drained before exit\n");
+			drain?.();
+		},
+	};
+}
+
+async function runQuitDrainsBackpressuredStderr(): Promise<void> {
+	const { releaseDrain } = installBackpressuredStderr();
+	// The drain marker is written only when the release timer fires; if quit()
+	// exits without waiting for the drain, the marker never reaches stderr.
+	setTimeout(releaseDrain, 50);
+	await postmortem.quit(3);
+}
+
+async function runQuitBoundsUndrainedStderr(): Promise<void> {
+	installBackpressuredStderr();
+	// The drain is never released; quit() must still exit once its bounded
+	// wait expires instead of deadlocking on the wedged stream.
+	await postmortem.quit(3);
+}
+
 const scenario = process.argv[2];
 switch (scenario) {
 	case "exit-reentry-while-running":
@@ -341,6 +387,9 @@ switch (scenario) {
 	case "quiet-cleanup-late-registration":
 		await runQuietCleanupLateRegistration(process.argv[3]);
 		break;
+	case "quit-bounds-undrained-stderr":
+		await runQuitBoundsUndrainedStderr();
+		break;
 	case "ordinary-fatal-then-broken-pipe":
 		await runOrdinaryFatalThenBrokenPipe(process.argv[3]);
 		break;
@@ -370,6 +419,9 @@ switch (scenario) {
 		break;
 	case "non-pipe-unhandled-rejection":
 		await runNonPipeUnhandledRejection();
+		break;
+	case "quit-drains-backpressured-stderr":
+		await runQuitDrainsBackpressuredStderr();
 		break;
 	default:
 		throw new Error(`unknown postmortem fixture scenario: ${scenario ?? "(missing)"}`);

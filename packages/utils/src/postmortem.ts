@@ -456,9 +456,25 @@ export function cleanup(): Promise<void> {
 }
 
 /**
+ * Bounded wait for a stream's buffered writes to flush so a following
+ * process.exit() cannot truncate them. The race against a fixed deadline
+ * keeps a wedged or unread pipe from deadlocking the exit path.
+ */
+async function drainStreamBeforeExit(stream: NodeJS.WriteStream): Promise<void> {
+	if (stream.writableLength === 0) return;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	stream.once("drain", resolve);
+	await Promise.race([promise, Bun.sleep(5000)]);
+}
+
+/**
  * Runs all cleanup callbacks and exits.
  *
- * In main thread: waits for stdout drain, then calls process.exit().
+ * In main thread: waits for stdout and stderr to drain (each bounded), then
+ * calls process.exit(). The stderr drain matters for diagnostics written via
+ * console.error (e.g. startup timings) immediately before a governed exit:
+ * with a redirected/backpressured stderr pipe, process.exit() would otherwise
+ * truncate the final lines.
  * In workers: runs cleanup only (process.exit would kill entire process).
  */
 export async function quit(code: number = 0): Promise<void> {
@@ -473,11 +489,8 @@ export async function quit(code: number = 0): Promise<void> {
 
 	const exitAfterCleanup = async (): Promise<void> => {
 		await awaitCleanupWithDeadline(Reason.MANUAL);
-		if (process.stdout.writableLength > 0) {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			process.stdout.once("drain", resolve);
-			await Promise.race([promise, Bun.sleep(5000)]);
-		}
+		await drainStreamBeforeExit(process.stdout);
+		await drainStreamBeforeExit(process.stderr);
 		process.exit(code);
 	};
 
