@@ -24,6 +24,7 @@ export interface WelcomeComponentOptions {
 	collapseChangelog?: boolean;
 	buildLabel?: string;
 	keyDisplayContext?: KeyDisplayContext;
+	trueColor?: boolean;
 }
 
 const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
@@ -536,9 +537,11 @@ export class WelcomeComponent implements Component {
 
 	/** Pick the logo frame for the current intro phase, or the resting frame. */
 	#currentLogoFrame(logoLines: readonly string[]): readonly string[] {
-		if (this.#animStart == null) return REST_FRAMES[this.logoMode];
+		const trueColor = this.options.trueColor ?? TERMINAL.trueColor;
+		const restFrame = REST_FRAMES[trueColor ? "trueColor" : "ansi256"][this.logoMode];
+		if (this.#animStart == null) return restFrame;
 		const elapsed = performance.now() - this.#animStart;
-		if (elapsed >= INTRO_MS) return REST_FRAMES[this.logoMode];
+		if (elapsed >= INTRO_MS) return restFrame;
 		// Ease-out cubic so the spin decelerates into the resting state.
 		const progress = elapsed / INTRO_MS;
 		const eased = 1 - (1 - progress) ** 3;
@@ -550,7 +553,7 @@ export class WelcomeComponent implements Component {
 		// the same ease-out curve so the highlight is gone by the resting frame.
 		const shinePos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
 		const shineStrength = (1 - eased) ** 1.5;
-		return gradientLogo(logoLines, phase, { strength: shineStrength, pos: shinePos });
+		return gradientLogo(logoLines, phase, { strength: shineStrength, pos: shinePos }, trueColor);
 	}
 
 	#logoLines(): readonly string[] {
@@ -617,7 +620,12 @@ interface ShineConfig {
  * gradient along the diagonal, wrapping at 1. When `shine` is provided, a soft
  * white highlight is composited on top, centered at `shine.pos`.
  */
-function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineConfig): string[] {
+function gradientLogo(
+	lines: readonly string[],
+	phase = 0,
+	shine?: ShineConfig,
+	trueColor = TERMINAL.trueColor,
+): string[] {
 	const reset = "\x1b[0m";
 	const rows = lines.length;
 	const cols = Math.max(...lines.map(l => l.length));
@@ -626,7 +634,7 @@ function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineConfig):
 	const span = Math.max(1, cols + rows - 1);
 	const shineStrength = shine && shine.strength > 0 ? shine.strength : 0;
 	const shinePos = shine ? shine.pos : 0;
-	const colorAt = TERMINAL.trueColor
+	const colorAt = trueColor
 		? (t: number): string => {
 				// 5-stop palette widens the visible color range and avoids the
 				// deep-blue valley a naive HSL lerp falls into.
@@ -695,9 +703,16 @@ const INTRO_SWEEPS = 2.5;
 /** Number of times the shine highlight crosses the diagonal across the intro. */
 const INTRO_SHINE_TRAVERSALS = 3;
 
-/** Resting gradient frames, cached for re-renders outside of the intro. */
-const REST_FRAMES: Record<WelcomeLogoMode, readonly string[]> = {
-	unicode: gradientLogo(RED_CLAW_LOGO, 0),
-	square: gradientLogo(SQUARE_CLAW_LOGO, 0),
-	ascii: gradientLogo(ASCII_CLAW_LOGO, 0),
+/** Resting gradient frames for each terminal capability, cached outside of the intro. */
+const REST_FRAMES: Record<"trueColor" | "ansi256", Record<WelcomeLogoMode, readonly string[]>> = {
+	trueColor: {
+		unicode: gradientLogo(RED_CLAW_LOGO, 0, undefined, true),
+		square: gradientLogo(SQUARE_CLAW_LOGO, 0, undefined, true),
+		ascii: gradientLogo(ASCII_CLAW_LOGO, 0, undefined, true),
+	},
+	ansi256: {
+		unicode: gradientLogo(RED_CLAW_LOGO, 0, undefined, false),
+		square: gradientLogo(SQUARE_CLAW_LOGO, 0, undefined, false),
+		ascii: gradientLogo(ASCII_CLAW_LOGO, 0, undefined, false),
+	},
 };

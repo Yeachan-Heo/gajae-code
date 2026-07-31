@@ -40,6 +40,7 @@ import {
 } from "./fixtures/tui/light-theme-compliance-showcase";
 import {
 	LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM,
+	LIGHT_THEME_CONSUMER_ATLAS_TRUE_COLOR,
 	LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS,
 } from "./fixtures/tui/light-theme-consumer-atlas";
 
@@ -1216,8 +1217,9 @@ describe("GJC light-theme compliance fixture", () => {
 		}
 	}, 30_000);
 
-	it("pins consumer-atlas key labels independently of the replay host platform", async () => {
+	it("pins consumer-atlas host-sensitive inputs independently of the replay environment", async () => {
 		expect(LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM).toBe("darwin");
+		expect(LIGHT_THEME_CONSUMER_ATLAS_TRUE_COLOR).toBe(true);
 		const entries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas");
 		for (const entry of entries) {
 			const rendered = await renderLightThemeComplianceShowcase(entry);
@@ -1227,6 +1229,9 @@ describe("GJC light-theme compliance fixture", () => {
 			expect(rendered.terminalText, entry.key).toContain("⌃J newline");
 			expect(rendered.terminalText, entry.key).toContain("⌃C clear");
 			expect(rendered.terminalText, entry.key).not.toContain("Ctrl+L model");
+			if (entry.renderMode === "unicode-color") {
+				expect(rendered.terminalAnsiText, entry.key).toMatch(/\x1b\[(?:\d+;)*38;2;/);
+			}
 		}
 	});
 	it("renders deterministic 256-color downsampling with unchanged text and non-color cues", async () => {

@@ -26,6 +26,22 @@ describe("welcome intro cadence", () => {
 		expect(resolveWelcomeIntroTickMs("linux", "tmux,1,0")).toBe(33);
 	});
 });
+describe("welcome terminal capability", () => {
+	it("honors an explicit logo color capability independently of the host terminal", () => {
+		const trueColor = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
+			trueColor: true,
+		}).render(120);
+		const ansi256 = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
+			trueColor: false,
+		}).render(120);
+		const trueColorText = trueColor.join("\n");
+		const ansi256Text = ansi256.join("\n");
+		const count = (text: string, pattern: RegExp): number => text.match(pattern)?.length ?? 0;
+
+		expect(count(trueColorText, /\x1b\[38;2;/g)).toBeGreaterThan(count(ansi256Text, /\x1b\[38;2;/g));
+		expect(count(ansi256Text, /\x1b\[38;5;/g)).toBeGreaterThan(count(trueColorText, /\x1b\[38;5;/g));
+	});
+});
 
 function stripRenderControls(line: string): string {
 	return stripVTControlCharacters(line);

@@ -31,6 +31,7 @@ export const LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS = [
 
 export type LightThemeConsumerAtlasViewport = (typeof LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS)[number];
 export const LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM = "darwin" as const;
+export const LIGHT_THEME_CONSUMER_ATLAS_TRUE_COLOR = true;
 
 export const LIGHT_THEME_CONSUMER_ATLAS_PRODUCTION_IMPORTS = [
 	"packages/coding-agent/src/modes/components/provider-onboarding-selector.ts",
@@ -239,6 +240,7 @@ export function renderLightThemeConsumerAtlas(viewport: LightThemeConsumerAtlasV
 			"ascii",
 			{
 				keyDisplayContext: { platform: LIGHT_THEME_CONSUMER_ATLAS_KEY_DISPLAY_PLATFORM },
+				trueColor: LIGHT_THEME_CONSUMER_ATLAS_TRUE_COLOR,
 			},
 		);
 		disposables.push(welcome);
