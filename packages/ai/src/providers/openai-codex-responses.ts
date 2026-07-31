@@ -66,6 +66,7 @@ import {
 	toolWireSchema,
 } from "../utils/schema";
 import {
+	isCodexStatuslessNamedToolChoiceNotFoundError,
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
 	resolveToolChoice,
@@ -247,9 +248,7 @@ async function retryCodexInitialTransportWithoutToolChoice(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
-	if (
-		!isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(requestContext.transformedBody.tool_choice))
-	) {
+	if (!isCodexForcedToolChoiceUnsupportedError(error, requestContext.transformedBody)) {
 		throw error;
 	}
 	const reason = await finalizeErrorMessage(error, requestContext.rawRequestDump);
@@ -1527,7 +1526,7 @@ async function tryRetryWithoutForcedToolChoice(
 		context.output.content.length > 0 ||
 		context.firstTokenTime !== undefined ||
 		context.options?.signal?.aborted ||
-		!isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(runtime.requestBodyForState.tool_choice))
+		!isCodexForcedToolChoiceUnsupportedError(error, runtime.requestBodyForState)
 	) {
 		return false;
 	}
@@ -1578,6 +1577,30 @@ async function tryRetryWithoutForcedToolChoice(
 
 function isForcedCodexToolChoice(choice: RequestBody["tool_choice"]): boolean {
 	return !!choice && choice !== "none" && choice !== "auto";
+}
+function isCodexForcedToolChoiceUnsupportedError(error: unknown, body: RequestBody): boolean {
+	if (isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(body.tool_choice))) {
+		return true;
+	}
+	return isCodexStatuslessNamedToolChoiceNotFoundError(
+		error,
+		codexNamedFunctionToolChoiceName(body.tool_choice),
+		codexSerializedToolNames(body.tools),
+	);
+}
+
+function codexNamedFunctionToolChoiceName(choice: RequestBody["tool_choice"]): string | undefined {
+	if (!choice || typeof choice !== "object") return undefined;
+	const namedChoice = choice as { type?: unknown; name?: unknown };
+	return namedChoice.type === "function" && typeof namedChoice.name === "string" ? namedChoice.name : undefined;
+}
+
+function codexSerializedToolNames(tools: RequestBody["tools"]): string[] {
+	if (!Array.isArray(tools)) return [];
+	return tools.flatMap(tool => {
+		const name = (tool as { name?: unknown }).name;
+		return typeof name === "string" ? [name] : [];
+	});
 }
 
 /**

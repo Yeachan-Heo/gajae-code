@@ -165,7 +165,10 @@ export function resolveToolChoice(
 
 /** Detects provider errors indicating forced tool_choice is unsupported. */
 export function isForcedToolChoiceUnsupportedError(error: unknown, sentForcedToolChoice: boolean): boolean {
-	if (!sentForcedToolChoice || extractHttpStatusFromError(error) !== 400) return false;
+	const status = extractHttpStatusFromError(error);
+	if (!sentForcedToolChoice || status !== 400) {
+		return false;
+	}
 	const message = errorMessage(error);
 	return (
 		// `by <something>` continuations ("not supported by billing") describe a
@@ -178,6 +181,35 @@ export function isForcedToolChoiceUnsupportedError(error: unknown, sentForcedToo
 		/does\s+not\s+support\s+forced\s+tool[_\s-]?choices?/is.test(message) ||
 		/tool[_\s-]?choices?\s+['"`][^'"`\r\n]+['"`]\s+not\s+found\s+in\s+['"`]tools['"`]\s+parameter\b/is.test(message)
 	);
+}
+/**
+ * Detects Codex's statusless SSE rejection for a named function tool choice.
+ * This is intentionally separate from the shared HTTP-400 classifier.
+ */
+export function isCodexStatuslessNamedToolChoiceNotFoundError(
+	error: unknown,
+	forcedToolName: string | undefined,
+	sentToolNames: readonly string[],
+): boolean {
+	if (
+		extractHttpStatusFromError(error) !== undefined ||
+		extractProviderErrorCode(error) !== "invalid_request_error" ||
+		!forcedToolName
+	) {
+		return false;
+	}
+	const match =
+		/^Tool choice '([^']+)' not found in 'tools' parameter\.$/.exec(errorMessage(error)) ??
+		/^Codex error event: Tool choice '([^']+)' not found in 'tools' parameter\. \(code=invalid_request_error\)$/.exec(
+			errorMessage(error),
+		);
+	return match?.[1] === forcedToolName && sentToolNames.includes(forcedToolName);
+}
+
+function extractProviderErrorCode(error: unknown): string | undefined {
+	if (!error || typeof error !== "object") return undefined;
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" ? code : undefined;
 }
 
 export type { ToolChoiceCompat, ToolChoiceSupport, ToolChoiceSupportSource } from "../types";

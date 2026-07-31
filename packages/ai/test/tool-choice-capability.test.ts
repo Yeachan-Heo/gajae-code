@@ -4,6 +4,7 @@ import {
 	clearToolChoiceIncapabilityRegistryForTests,
 	deriveToolChoiceSupport,
 	getToolChoiceCapabilityOverride,
+	isCodexStatuslessNamedToolChoiceNotFoundError,
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
 	resolveToolChoice,
@@ -176,6 +177,38 @@ describe("isForcedToolChoiceUnsupportedError", () => {
 				true,
 			),
 		).toBe(true);
+	});
+
+	it("keeps statusless invalid-request errors Codex-scoped", () => {
+		const message = "Tool choice 'todo_write' not found in 'tools' parameter.";
+		const error = Object.assign(new Error(message), { code: "invalid_request_error" });
+		expect(isForcedToolChoiceUnsupportedError(error, true)).toBe(false);
+		expect(isCodexStatuslessNamedToolChoiceNotFoundError(error, "todo_write", ["todo_write"])).toBe(true);
+		expect(isCodexStatuslessNamedToolChoiceNotFoundError(error, "other", ["todo_write"])).toBe(false);
+		expect(isCodexStatuslessNamedToolChoiceNotFoundError(error, "todo_write", ["search"])).toBe(false);
+		expect(
+			isCodexStatuslessNamedToolChoiceNotFoundError(
+				Object.assign(new Error("tool_choice forces tool use is not compatible with this model"), {
+					code: "invalid_request_error",
+				}),
+				"todo_write",
+				["todo_write"],
+			),
+		).toBe(false);
+		expect(
+			isCodexStatuslessNamedToolChoiceNotFoundError(
+				Object.assign(new Error(message), { code: "server_error" }),
+				"todo_write",
+				["todo_write"],
+			),
+		).toBe(false);
+		expect(
+			isCodexStatuslessNamedToolChoiceNotFoundError(
+				Object.assign(new Error(message), { code: "invalid_request_error", status: 500 }),
+				"todo_write",
+				["todo_write"],
+			),
+		).toBe(false);
 	});
 
 	it("rejects non-400 errors", () => {
