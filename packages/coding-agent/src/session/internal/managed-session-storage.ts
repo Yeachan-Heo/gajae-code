@@ -1646,17 +1646,16 @@ export function replaceManagedFileSync(
 					replaced.detachedPath === replaced.retainedPlaceholderPath &&
 					replaced.retainedSuccessorPath === destination;
 				if (committedWithPredecessor) {
-					const predecessor = captureManagedFileNoFollow(replaced.retainedPlaceholderPath!);
 					const retired = exactUnlink(replaced.retainedPlaceholderPath!, {
-						dev: predecessor.identity.dev,
-						ino: predecessor.identity.ino,
-						nlink: predecessor.identity.nlink,
+						dev: expectedDestination.dev,
+						ino: expectedDestination.ino,
+						nlink: expectedDestination.nlink,
 						parentDev: parentIdentity.dev,
 						parentIno: parentIdentity.ino,
-						size: BigInt(predecessor.identity.size),
-						mtimeNs: predecessor.identity.mtimeNs,
-						sha256: predecessor.identity.sha256,
-						quarantineName: `.gjc-replace-cleanup-${predecessor.identity.dev.toString(16)}-${predecessor.identity.ino.toString(16)}`,
+						size: BigInt(expectedDestination.size),
+						mtimeNs: expectedDestination.mtimeNs,
+						sha256: expectedDestination.sha256,
+						quarantineName: `.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}`,
 					});
 					if (!retired.ok && retired.code !== "cleanup_pending")
 						throw new Error(`managed_replace_cleanup_failed:${retired.code ?? "unknown"}`);
