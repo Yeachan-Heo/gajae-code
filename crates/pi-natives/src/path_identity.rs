@@ -5267,7 +5267,7 @@ mod platform {
 			&source_path,
 			"file",
 			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
-			FILE_SHARE_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE,
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
@@ -5539,6 +5539,19 @@ mod platform {
 			let Some(parent_handle) = handle.parent() else {
 				return NativeExactUnlinkResult::failure("io_error");
 			};
+			if let Some((expected_parent_dev, expected_parent_ino)) =
+				identity.parent_dev.zip(identity.parent_ino)
+			{
+				let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+				if unsafe { GetFileInformationByHandle(parent_handle, &mut parent_information) } == 0
+					|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+					|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+						| u64::from(parent_information.nFileIndexLow))
+						!= expected_parent_ino
+				{
+					return NativeExactUnlinkResult::failure("parent_mismatch");
+				}
+			}
 			let Some(original_name) = path.file_name() else {
 				return NativeExactUnlinkResult::failure("io_error");
 			};
@@ -6892,6 +6905,17 @@ mod platform {
 			return NativeExactUnlinkResult::detached_failure(code, retained_path);
 		}
 		let parent = *root.ancestors.last().expect("directory parent retained");
+		if let Some((expected_parent_dev, expected_parent_ino)) = expected_parent {
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(parent, &mut parent_information) } == 0
+				|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::detached_failure("parent_mismatch", retained_path);
+			}
+		}
 		match remove_tree_handle(root.target, "", &expected.entries) {
 			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
 				Ok(()) => match tree_entry(root.target, String::new(), "directory") {

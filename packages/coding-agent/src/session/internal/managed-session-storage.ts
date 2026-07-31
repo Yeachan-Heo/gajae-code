@@ -716,7 +716,15 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			await replaceManagedFile(resolved, bytes, this.#subtreeRoot, this.#policy);
+			const expected = captureManagedFileNoFollow(resolved);
+			replaceManagedFileSync(
+				resolved,
+				bytes,
+				this.#subtreeRoot,
+				this.#policy,
+				this.#portableMutationFence ? () => this.#portableMutationFence?.assertOwned() : undefined,
+				expected.identity,
+			);
 			this.#assertBound();
 			return;
 		}
