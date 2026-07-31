@@ -57,9 +57,9 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["openai-codex"],
 		mapping: {
 			default: "openai-codex/gpt-5.6-luna:medium",
-			executor: "openai-codex/gpt-5.6-luna:max",
+			executor: "openai-codex/gpt-5.6-luna:xhigh",
 			planner: "openai-codex/gpt-5.6-luna:max",
-			critic: "openai-codex/gpt-5.6-luna:xhigh",
+			critic: "openai-codex/gpt-5.6-luna:max",
 			architect: "openai-codex/gpt-5.6-luna:max",
 		},
 	},

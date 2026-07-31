@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Added
 
-- Added the bundled `lunamaxxing` OpenAI Codex profile, mapping every role to GPT-5.6 Luna with medium default reasoning, maximum executor/planner/architect reasoning, and xhigh critic reasoning.
+- Added the bundled `lunamaxxing` OpenAI Codex profile, mapping every role to GPT-5.6 Luna with medium default reasoning, xhigh executor reasoning, and maximum planner/critic/architect reasoning.
 
 ### Fixed
 

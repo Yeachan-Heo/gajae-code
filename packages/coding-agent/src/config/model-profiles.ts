@@ -94,9 +94,9 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	}),
 	profile("lunamaxxing", ["openai-codex"], {
 		default: "openai-codex/gpt-5.6-luna:medium",
-		executor: "openai-codex/gpt-5.6-luna:max",
+		executor: "openai-codex/gpt-5.6-luna:xhigh",
 		planner: "openai-codex/gpt-5.6-luna:max",
-		critic: "openai-codex/gpt-5.6-luna:xhigh",
+		critic: "openai-codex/gpt-5.6-luna:max",
 		architect: "openai-codex/gpt-5.6-luna:max",
 	}),
 	profile("opencodego", ["opencode-go"], {
