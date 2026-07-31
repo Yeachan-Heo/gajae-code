@@ -383,9 +383,11 @@ describe("InteractiveMode goal mode integration", () => {
 		const extensionError = new TypeError(
 			'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received undefined',
 		);
-		const emit = vi.fn(async (event: { type: string }) => {
-			if (event.type === "goal_updated") throw extensionError;
-		});
+		const emit = vi.fn(
+			async (event: { type: string; goal?: { status?: string } | null; state?: { mode?: string } }) => {
+				if (event.type === "goal_updated") throw extensionError;
+			},
+		);
 		harness = await createGoalHarness({
 			extensionRunner: { emit, getRegisteredCommands: () => [] } as unknown as ExtensionRunner,
 		});
@@ -398,7 +400,11 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(result.details?.goal?.status).toBe("complete");
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("complete");
 		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
-		expect(emit).toHaveBeenCalledWith(expect.objectContaining({ type: "goal_updated" }));
+		const goalUpdates = emit.mock.calls.map(([event]) => event).filter(event => event.type === "goal_updated");
+		expect(goalUpdates.length).toBeGreaterThan(0);
+		const terminalUpdate = goalUpdates[goalUpdates.length - 1];
+		expect(terminalUpdate?.goal?.status).toBe("complete");
+		expect(terminalUpdate?.state?.mode).toBe("exiting");
 	});
 
 	it("does not loop AgentBusyError when a busy/orphaned session triggers goal continuation", async () => {
