@@ -336,7 +336,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			await fs.promises.writeFile(path.join(artifactsDir, ".oracle.txt"), "artifact");
 
 			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Partial artifact cleanup expanded retained tree authority",
+				"Exact detached artifact removal rejected: cleanup_pending",
 			);
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			expect(fs.existsSync(artifactsDir)).toBe(false);
@@ -345,11 +345,11 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			);
 			expect(retainedPayloads).toHaveLength(1);
 			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe(
-				"artifact",
+				"",
 			);
 
 			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Partial artifact cleanup expanded retained tree authority",
+				"Exact detached artifact removal rejected: cleanup_pending",
 			);
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			const payloadsAfterRetry = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
