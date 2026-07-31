@@ -65,4 +65,48 @@ describe("model manager Codex GPT-5.6 cap", () => {
 		);
 		expect(result.models[0]?.contextWindow).toBe(200_000);
 	});
+
+	it("applies GPT-5.6 pricing to dynamically discovered models without a static entry", async () => {
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId: "openai-codex",
+				staticModels: [],
+				cacheDbPath,
+				fetchDynamicModels: async () => [codexModel(272_000)],
+			},
+			"online",
+		);
+
+		expect(result.models[0]?.cost).toEqual({
+			input: 5,
+			output: 30,
+			cacheRead: 0.5,
+			cacheWrite: 6.25,
+		});
+		expect(result.models[0]?.longContextPricing).toEqual({
+			threshold: 272_000,
+			cost: { input: 10, output: 45, cacheRead: 1, cacheWrite: 12.5 },
+		});
+	});
+
+	it("does not trust long-context rates from dynamic discovery", async () => {
+		const model = codexModel(272_000);
+		model.id = "custom-model";
+		model.longContextPricing = {
+			threshold: 1,
+			cost: { input: Infinity, output: 0, cacheRead: 0, cacheWrite: 0 },
+		};
+
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId: "openai-codex",
+				staticModels: [],
+				cacheDbPath,
+				fetchDynamicModels: async () => [model],
+			},
+			"online",
+		);
+
+		expect(result.models[0]?.longContextPricing).toBeUndefined();
+	});
 });

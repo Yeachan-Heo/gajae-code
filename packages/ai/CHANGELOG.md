@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Updated GPT-5.6 Sol, Terra, and Luna to current OpenAI Standard pricing, including Responses API cache-write attribution and full-request long-context pricing above 272K input tokens.
+
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31

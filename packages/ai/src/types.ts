@@ -989,6 +989,19 @@ export interface ModelRequestTransform {
 	extraBody?: Record<string, unknown>;
 }
 
+export interface ModelCost {
+	input: number; // $/million tokens
+	output: number; // $/million tokens
+	cacheRead: number; // $/million tokens
+	cacheWrite: number; // $/million tokens
+}
+
+export interface LongContextPricing {
+	/** Input-token count above which the long-context rates apply to the full request. */
+	threshold: number;
+	cost: ModelCost;
+}
+
 export interface Model<TApi extends Api = any> {
 	id: string;
 	name: string;
@@ -1005,12 +1018,9 @@ export interface Model<TApi extends Api = any> {
 	 * provider/id heuristics.
 	 */
 	output?: ("text" | "image")[];
-	cost: {
-		input: number; // $/million tokens
-		output: number; // $/million tokens
-		cacheRead: number; // $/million tokens
-		cacheWrite: number; // $/million tokens
-	};
+	cost: ModelCost;
+	/** Optional long-context rates selected from the request's total input-token count. */
+	longContextPricing?: LongContextPricing;
 	/** Premium Copilot requests charged per user-initiated request (defaults to 1). */
 	premiumMultiplier?: number;
 	contextWindow: number;

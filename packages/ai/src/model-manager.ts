@@ -403,9 +403,12 @@ function normalizeModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 	const models: Model<TApi>[] = [];
 	for (const item of value) {
 		if (isModelLike(item) && !isRetiredModel(item)) {
-			models.push(enrichModelThinking(item as Model<TApi>));
+			const model = enrichModelThinking(item as Model<TApi>);
+			model.longContextPricing = undefined;
+			models.push(model);
 		}
 	}
+	applyGeneratedModelPolicies(models as Model<Api>[]);
 	return applyFinalCodexGpt56ContextCap(models);
 }
 

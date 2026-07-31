@@ -1,4 +1,5 @@
 import { CODEX_GPT_5_6_CONTEXT_CAP, isCodexGpt56Tier, isCodexProductTransport } from "./context-cap-policy";
+import { applyOpenAIModelPricing } from "./model-pricing";
 import { resolveOpenAICompat } from "./providers/openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
@@ -377,6 +378,7 @@ function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi
 }
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
+	applyOpenAIModelPricing(model);
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {
 		model.contextWindow = copilotLimits.contextWindow;
