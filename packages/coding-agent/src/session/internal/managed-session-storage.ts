@@ -1658,10 +1658,30 @@ export function replaceManagedFileSync(
 						quarantineName: `.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}`,
 					});
 					if (!retired.ok) {
-						if (retired.code === "cleanup_pending")
-							throw new Error(
-								`managed_replace_cleanup_pending:predecessor=${retired.detachedPath ?? retired.retainedPlaceholderPath ?? replaced.retainedPlaceholderPath}:successor=${destination}`,
+						if (retired.code === "cleanup_pending") {
+							const predecessor =
+								retired.detachedPath ?? retired.retainedPlaceholderPath ?? replaced.retainedPlaceholderPath;
+							const receiptPath = path.join(
+								parent,
+								`.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}.json`,
 							);
+							publishManagedFileNoReplaceSync(
+								receiptPath,
+								Buffer.from(
+									JSON.stringify({
+										version: 1,
+										predecessor,
+										successor: destination,
+										identity: expectedDestination,
+									}),
+								),
+								root,
+								policy,
+							);
+							throw new Error(
+								`managed_replace_cleanup_pending:receipt=${receiptPath}:predecessor=${predecessor}:successor=${destination}`,
+							);
+						}
 						throw new Error(`managed_replace_cleanup_failed:${retired.code ?? "unknown"}`);
 					}
 				}
