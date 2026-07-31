@@ -272,3 +272,23 @@ describe("postmortem process stdout EPIPE policy", () => {
 		expectOrdinaryFatal(rejection, "Unhandled Rejection", "fixture: genuine rejected fatal error");
 	}, 15_000);
 });
+
+describe("postmortem quit stream drain", () => {
+	it("waits for a backpressured stderr drain before exiting so buffered diagnostics survive", async () => {
+		const result = await runScenario("quit-drains-backpressured-stderr");
+
+		expect(result.exitCode).toBe(3);
+		// The fixture writes the marker only when its delayed drain fires; an
+		// exit that did not wait for the drain would cut the marker off.
+		expect(result.stderr).toContain("fixture: stderr drained before exit");
+	}, 15_000);
+
+	it("still exits when stderr never drains, instead of deadlocking on a wedged stream", async () => {
+		const started = Date.now();
+		const result = await runScenario("quit-bounds-undrained-stderr");
+
+		expect(result.exitCode).toBe(3);
+		// The bounded wait must expire well inside the scenario timeout.
+		expect(Date.now() - started).toBeLessThan(10_000);
+	}, 15_000);
+});
