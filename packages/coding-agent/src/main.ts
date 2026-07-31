@@ -1613,6 +1613,10 @@ export async function runRootCommand(
 			);
 			await session.dispose();
 			stopThemeWatcher();
+			if (deps.suppressProcessExit) {
+				process.exitCode = 1;
+				return;
+			}
 			await postmortem.quit(1);
 			process.exit(1);
 		}

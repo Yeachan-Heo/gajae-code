@@ -48,8 +48,8 @@ function rootArgs(overrides: Partial<Args> = {}): Args {
 	};
 }
 
-function fakeSessionResult(): CreateAgentSessionResult {
-	let activeModel = testModel;
+function fakeSessionResult(model: typeof testModel | null = testModel): CreateAgentSessionResult {
+	let activeModel = model ?? undefined;
 	const session = {
 		get model() {
 			return activeModel;
@@ -57,8 +57,8 @@ function fakeSessionResult(): CreateAgentSessionResult {
 		extensionRunner: undefined,
 		getConfiguredModelChain: () => undefined,
 		setConfiguredModelChain: () => {},
-		setModelTemporary: async (model: typeof testModel) => {
-			activeModel = model;
+		setModelTemporary: async (nextModel: typeof testModel) => {
+			if (activeModel !== undefined) activeModel = nextModel;
 		},
 		dispose: async () => {},
 	} as unknown as AgentSession;
@@ -415,6 +415,47 @@ describe("startup update contract", () => {
 		}
 	});
 
+	it("does not let suppressed no-model startup exit before its owner finalizer runs", async () => {
+		using tempDir = TempDir.createSync("@gjc-no-model-suppressed-exit-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const originalExitCode = process.exitCode;
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((code?: number): never => {
+			throw new Error(`unexpected process.exit(${code ?? "undefined"})`);
+		});
+		const sessionResult = fakeSessionResult(null);
+		let disposeCalls = 0;
+		sessionResult.session.dispose = async () => {
+			disposeCalls += 1;
+		};
+		let quitCalls = 0;
+		try {
+			process.exitCode = 0;
+			await runRootCommand(rootArgs({ mode: "text" }), [], {
+				createAgentSession: async () => sessionResult,
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				initTheme: async () => {},
+				readPipedInput: async () => undefined,
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				runPrintMode: async () => {
+					throw new Error("print mode must not run without a model");
+				},
+				suppressProcessExit: true,
+				quit: async () => {
+					quitCalls += 1;
+				},
+			});
+
+			expect(disposeCalls).toBe(1);
+			expect(exitSpy).not.toHaveBeenCalled();
+			expect(quitCalls).toBe(0);
+			expect(process.exitCode).toBe(1);
+		} finally {
+			exitSpy.mockRestore();
+			process.exitCode = originalExitCode ?? 0;
+			authStorage.close();
+		}
+	});
 	it("preserves print-mode status, cleans up owners, and does not dispose the session twice", async () => {
 		using tempDir = TempDir.createSync("@gjc-print-exit-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));

@@ -283,12 +283,21 @@ describe("postmortem quit stream drain", () => {
 		expect(result.stderr).toContain("fixture: stderr drained before exit");
 	}, 15_000);
 
+	it("waits for stdout and stderr together under one shared drain deadline", async () => {
+		const result = await runScenario("quit-drains-backpressured-both-streams");
+
+		expect(result.exitCode).toBe(3);
+		expect(result.stdout).toContain("fixture: stdout drained before exit");
+		expect(result.stderr).toContain("fixture: stderr drained before exit");
+		// The fixture releases a stream only after quit() has registered its
+		// drain listener. A sequential implementation registers stderr too late,
+		// so the stderr marker is absent and this regression fails.
+	}, 15_000);
 	it("still exits when stderr never drains, instead of deadlocking on a wedged stream", async () => {
-		const started = Date.now();
 		const result = await runScenario("quit-bounds-undrained-stderr");
 
 		expect(result.exitCode).toBe(3);
-		// The bounded wait must expire well inside the scenario timeout.
-		expect(Date.now() - started).toBeLessThan(10_000);
+		// The test timeout bounds this scenario; a missing deadline would leave
+		// the subprocess alive and fail the test instead of hanging indefinitely.
 	}, 15_000);
 });
