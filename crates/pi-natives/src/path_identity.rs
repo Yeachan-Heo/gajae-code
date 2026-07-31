@@ -3524,6 +3524,18 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return *result,
 		};
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			identity.parent_dev.zip(identity.parent_ino)
+		{
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_parent_dev
+				|| parent_stat.st_ino as u64 != expected_parent_ino
+			{
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let Some(original_name_bytes) = original_path.file_name().map(|name| name.as_bytes()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };

@@ -3280,14 +3280,19 @@ function detachedReceiptMatches(receipt: string, expected: Uint8Array): boolean 
 }
 
 async function removeStagedReceipts(scope: ManagedScope, candidate: ManagedCandidate): Promise<void> {
+	const authority = boundManagedWriteAuthorities.get(scope);
+	const rootAuthority = authority?.rootAuthority ?? scopeRoot(scope);
+	const store = authority?.retainedAuthority
+		? new ManagedSessionDescendantStore(rootAuthority, scope.directoryPath, {
+				authority: authority.retainedAuthority,
+				authorityBaseDir: scope.directoryPath,
+			})
+		: new ManagedSessionDescendantStore(rootAuthority, scope.directoryPath);
 	for (const state of ["prepared", "detached", "published"] as const) {
 		const pathname = receiptPathFor(scope, candidate, state);
 		try {
-			const stat = fs.lstatSync(pathname);
-			if (stat.isFile() || stat.isSymbolicLink()) {
-				await fs.promises.unlink(pathname);
-				fsyncManagedParent(pathname);
-			}
+			const snapshot = captureManagedFileNoFollow(pathname);
+			store.removeExpected(path.relative(scope.directoryPath, pathname), snapshot);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
