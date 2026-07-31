@@ -1461,7 +1461,7 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 	if (!markerEntry)
 		return fail("terminal_uncertain", "Lifecycle readiness metadata lacks canonical marker authority.");
 	if (!marker) {
-		if (createHash("sha256").update(canonicalJson(readyMarker)).digest("hex") !== markerEntry.identity.sha256)
+		if (createHash("sha256").update(ready.bytes).digest("hex") !== markerEntry.identity.sha256)
 			return fail(
 				"terminal_uncertain",
 				"Lifecycle readiness metadata is not bound to the completed marker authority.",
