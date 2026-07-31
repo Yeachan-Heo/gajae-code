@@ -1414,6 +1414,19 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 			try {
 				current = captureLifecycleFile(candidate, true, true);
 			} catch {
+				if (
+					file.completed &&
+					[file.detachedPath, file.plannedPath].some(
+						bound => bound && path.resolve(candidate) === path.resolve(bound),
+					)
+				) {
+					try {
+						const stat = fsSync.lstatSync(candidate);
+						if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size === 0) continue;
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					}
+				}
 				return fail("terminal_uncertain", "Lifecycle metadata candidate could not be safely inspected.");
 			}
 			if (!current) continue;
@@ -1579,7 +1592,7 @@ function legacyMetadataCleanupPlan(cleanup: CleanupEvidence): CleanupEvidence | 
 			return undefined;
 		}
 		if (marker && !sameEffectMarker(marker, readyMarker)) return undefined;
-		if (!marker && createHash("sha256").update(canonicalJson(readyMarker)).digest("hex") !== persistedIdentity.sha256)
+		if (!marker && createHash("sha256").update(ready.capture.bytes).digest("hex") !== persistedIdentity.sha256)
 			return undefined;
 	}
 
