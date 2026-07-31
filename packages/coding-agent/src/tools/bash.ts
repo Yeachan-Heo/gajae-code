@@ -20,17 +20,17 @@ import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
 import {
+	createStreamOutputUpdates,
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	OutputSink,
 	type OutputSummary,
-	streamTailUpdates,
+	type StreamingOutputDelta,
 	TailBuffer,
 	type TerminalArtifactPublisher,
 	type TerminalArtifactPublishResult,
 	truncateHeadBytes,
 	truncateTailBytes,
 } from "../session/streaming-output";
-
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
@@ -395,6 +395,8 @@ export interface BashToolDetails {
 	timeoutSeconds?: number;
 	requestedTimeoutSeconds?: number;
 	terminalId?: string;
+	/** Append-only user-facing output delta; never used as the LLM result body. */
+	streamingOutput?: StreamingOutputDelta;
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -1536,8 +1538,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 		const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 
-		// Track output for streaming updates (tail only)
+		// Keep the bounded tail for tool consumers, and forward append-only
+		// deltas separately so expanded UI output preserves the entire stream.
 		const tailBuffer = new TailBuffer(spillThreshold);
+		const streamUpdates = createStreamOutputUpdates(tailBuffer, onUpdate, text => ({
+			streamingOutput: { kind: "append" as const, text },
+		}));
 
 		// Allocate artifact for truncated output storage
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
@@ -1549,36 +1555,42 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: canUseInteractiveBashPty(pty, ctx)
 					? ctx?.ui
 					: undefined;
-		const result: BashResult | BashInteractiveResult = interactiveUi
-			? await runInteractiveBashPty(interactiveUi, {
-					command,
-					cwd: commandCwd,
-					timeoutMs,
-					signal,
-					env: resolvedEnv,
-					artifactPath,
-					artifactId,
-					artifactPublisher,
-					spillThreshold,
-					headBytes,
-				})
-			: await executeBash(command, {
-					cwd: commandCwd,
-					sessionKey: this.session.getSessionId?.() ?? undefined,
-					oneShot: this.session.bashRestrictionProfile === "read-only",
-					timeout: timeoutMs,
-					signal,
-					env: resolvedEnv,
-					artifactPath,
-					artifactId,
-					artifactPublisher,
-					spillThreshold,
-					headBytes,
-					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
-					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
-				});
+		let result: BashResult | BashInteractiveResult;
+		try {
+			result = interactiveUi
+				? await runInteractiveBashPty(interactiveUi, {
+						command,
+						cwd: commandCwd,
+						timeoutMs,
+						signal,
+						env: resolvedEnv,
+						artifactPath,
+						artifactId,
+						artifactPublisher,
+						spillThreshold,
+						headBytes,
+					})
+				: await executeBash(command, {
+						cwd: commandCwd,
+						sessionKey: this.session.getSessionId?.() ?? undefined,
+						oneShot: this.session.bashRestrictionProfile === "read-only",
+						timeout: timeoutMs,
+						signal,
+						env: resolvedEnv,
+						artifactPath,
+						artifactId,
+						artifactPublisher,
+						spillThreshold,
+						headBytes,
+						onChunk: streamUpdates.onChunk,
+						onRawChunk: streamUpdates.onRawChunk,
+						onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
+						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
+						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+					});
+		} finally {
+			streamUpdates.flush();
+		}
 		if (result.cancelled) {
 			const failureText = formatBashFailureMessage(
 				result,

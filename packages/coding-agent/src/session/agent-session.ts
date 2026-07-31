@@ -15168,7 +15168,10 @@ export class AgentSession {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean },
+		options?: {
+			excludeFromContext?: boolean;
+			onRawChunk?: (chunk: string) => void;
+		},
 	): Promise<BashResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
@@ -15197,6 +15200,7 @@ export class AgentSession {
 		try {
 			const result = await executeBashCommand(command, {
 				onChunk,
+				onRawChunk: options?.onRawChunk,
 				signal: abortController.signal,
 				sessionKey: this.sessionId,
 				cwd,

@@ -85,6 +85,31 @@ it("lets untouched components follow automatic expansion", () => {
 	expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("Args");
 });
 
+it("keeps the complete streamed bash output available after the final result is tail-truncated", () => {
+	const component = new ToolExecutionComponent("bash", { command: "emit output" }, {}, undefined, uiStub);
+	const fullOutput = Array.from({ length: 30 }, (_, index) => `stream-line-${index + 1}`).join("\n");
+
+	component.updateResult(
+		{
+			content: [{ type: "text", text: "stream-line-30" }],
+			details: { streamingOutput: { kind: "append", text: fullOutput } },
+		},
+		true,
+	);
+	component.updateResult(
+		{
+			content: [{ type: "text", text: "stream-line-30" }],
+			isError: false,
+		},
+		false,
+	);
+	component.setExpanded(true);
+
+	const rendered = Bun.stripANSI(component.render(120).join("\n"));
+	expect(rendered).toContain("stream-line-1");
+	expect(rendered).toContain("stream-line-30");
+});
+
 it("replaces generic SIXEL output while the IRC sidebar is visible and restores passthrough when hidden", () => {
 	terminal.imageProtocol = ImageProtocol.Sixel;
 	Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";

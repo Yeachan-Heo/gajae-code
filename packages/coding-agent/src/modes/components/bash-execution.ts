@@ -33,7 +33,7 @@ import {
 
 // Preview line limit when not expanded (matches tool execution behavior)
 const PREVIEW_LINES = 20;
-const STREAMING_LINE_CAP = PREVIEW_LINES * 5;
+const STREAMING_PREVIEW_LINE_CAP = PREVIEW_LINES * 5;
 const MAX_DISPLAY_LINE_CHARS = 4000;
 // Minimum interval between processing incoming chunks for display (ms).
 // Chunks arriving faster than this are accumulated and processed in one batch.
@@ -41,6 +41,11 @@ const CHUNK_THROTTLE_MS = 50;
 
 export class BashExecutionComponent extends Container {
 	#outputLines: string[] = [];
+	#fullOutputChunks: string[] = [];
+	#fullOutputText?: string;
+	#fullOutputLines?: string[];
+	#pendingOutputChunks: string[] = [];
+	#flushTimer?: NodeJS.Timeout;
 	#status: ExecutionStatus = "running";
 	#exitCode: number | undefined = undefined;
 	#loader: Loader;
@@ -48,9 +53,9 @@ export class BashExecutionComponent extends Container {
 	#expanded = false;
 	#displayDirty = false;
 	#displayBuiltWithGraphicsFallback: boolean | undefined;
-	#chunkGate = false;
 	#contentContainer: Container;
 	#headerText: Text;
+	#ui: TUI;
 
 	constructor(
 		private readonly command: string,
@@ -58,6 +63,7 @@ export class BashExecutionComponent extends Container {
 		excludeFromContext = false,
 	) {
 		super();
+		this.#ui = ui;
 
 		// Use dim border for excluded-from-context commands (!! prefix)
 		const colorKey = excludeFromContext ? "dim" : "bashMode";
@@ -94,15 +100,27 @@ export class BashExecutionComponent extends Container {
 	}
 
 	appendOutput(chunk: string): void {
-		// During high-throughput output (e.g. seq 1 500M), processing every
-		// chunk would saturate the event loop. Instead, accept one chunk per
-		// throttle window and drop the rest — the OutputSink captures everything
-		// for the artifact, and setComplete() replaces with the final output.
-		if (this.#chunkGate) return;
-		this.#chunkGate = true;
-		setTimeout(() => {
-			this.#chunkGate = false;
+		const clean = sanitizeWithOptionalSixelPassthrough(chunk, sanitizeText);
+		if (clean.length === 0) return;
+
+		// Keep every chunk for expanded output. Only the preview update is
+		// throttled; dropping chunks here makes live output lose arbitrary middle
+		// sections even when the executor captured them successfully.
+		this.#fullOutputChunks.push(clean);
+		this.#fullOutputText = undefined;
+		this.#fullOutputLines = undefined;
+		this.#pendingOutputChunks.push(clean);
+		if (this.#flushTimer) return;
+		this.#flushTimer = setTimeout(() => {
+			this.#flushTimer = undefined;
+			this.#flushPendingOutput();
 		}, CHUNK_THROTTLE_MS);
+	}
+
+	#flushPendingOutput(): void {
+		if (this.#pendingOutputChunks.length === 0) return;
+		const chunk = this.#pendingOutputChunks.join("");
+		this.#pendingOutputChunks = [];
 
 		const incomingLines = chunk.split("\n");
 		if (this.#outputLines.length > 0 && incomingLines.length > 0) {
@@ -115,12 +133,14 @@ export class BashExecutionComponent extends Container {
 			this.#outputLines.push(...this.#clampLinesPreservingSixel(incomingLines));
 		}
 
-		// Cap stored lines during streaming to avoid unbounded memory growth
-		if (this.#outputLines.length > STREAMING_LINE_CAP) {
-			this.#outputLines = this.#outputLines.slice(-STREAMING_LINE_CAP);
+		// Keep the collapsed preview bounded. The complete stream remains in
+		// #fullOutputChunks for expanded rendering and getOutput().
+		if (this.#outputLines.length > STREAMING_PREVIEW_LINE_CAP) {
+			this.#outputLines = this.#outputLines.slice(-STREAMING_PREVIEW_LINE_CAP);
 		}
 
 		this.#displayDirty = true;
+		this.#ui.requestRender();
 	}
 
 	setComplete(
@@ -128,10 +148,15 @@ export class BashExecutionComponent extends Container {
 		cancelled: boolean,
 		options?: { output?: string; truncation?: TruncationMeta },
 	): void {
+		if (this.#flushTimer) {
+			clearTimeout(this.#flushTimer);
+			this.#flushTimer = undefined;
+		}
+		this.#flushPendingOutput();
 		this.#exitCode = exitCode;
 		this.#status = resolveExecutionStatus(exitCode, cancelled);
 		this.#truncation = options?.truncation;
-		if (options?.output !== undefined) {
+		if (options?.output !== undefined && this.#fullOutputChunks.length === 0) {
 			this.#setOutput(options.output);
 		}
 
@@ -150,9 +175,18 @@ export class BashExecutionComponent extends Container {
 		return super.render(width);
 	}
 
+	override dispose(): void {
+		if (this.#flushTimer) {
+			clearTimeout(this.#flushTimer);
+			this.#flushTimer = undefined;
+		}
+		this.#pendingOutputChunks = [];
+		super.dispose();
+	}
+
 	#updateDisplay(): void {
 		const fallbackActive = isTerminalGraphicsFallbackActive();
-		const availableLines = this.#outputLines;
+		const availableLines = this.#expanded ? this.#getFullOutputLines() : this.#outputLines;
 		const sixelLineMask =
 			fallbackActive || (TERMINAL.imageProtocol === ImageProtocol.Sixel && isSixelPassthroughEnabled())
 				? getSixelLineMask(availableLines)
@@ -243,14 +277,32 @@ export class BashExecutionComponent extends Container {
 
 	#setOutput(output: string): void {
 		const clean = sanitizeWithOptionalSixelPassthrough(output, sanitizeText);
-		this.#outputLines = clean ? this.#clampLinesPreservingSixel(clean.split("\n")) : [];
+		this.#fullOutputChunks = clean ? [clean] : [];
+		this.#fullOutputText = clean;
+		this.#fullOutputLines = clean ? this.#clampLinesPreservingSixel(clean.split("\n")) : [];
+		this.#outputLines = this.#fullOutputLines.slice(-STREAMING_PREVIEW_LINE_CAP);
+	}
+
+	#getFullOutput(): string {
+		if (this.#fullOutputText === undefined) {
+			this.#fullOutputText = this.#fullOutputChunks.join("");
+		}
+		return this.#fullOutputText;
+	}
+
+	#getFullOutputLines(): string[] {
+		if (this.#fullOutputLines === undefined) {
+			const fullOutput = this.#getFullOutput();
+			this.#fullOutputLines = fullOutput ? this.#clampLinesPreservingSixel(fullOutput.split("\n")) : [];
+		}
+		return this.#fullOutputLines;
 	}
 
 	/**
 	 * Get the raw output for creating BashExecutionMessage.
 	 */
 	getOutput(): string {
-		return this.#outputLines.join("\n");
+		return this.#getFullOutputLines().join("\n");
 	}
 
 	/**

@@ -1154,15 +1154,14 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 
 		try {
-			const result = await this.ctx.session.executeBash(
-				command,
-				chunk => {
+			const result = await this.ctx.session.executeBash(command, undefined, {
+				excludeFromContext,
+				onRawChunk: chunk => {
 					if (this.ctx.bashComponent) {
 						this.ctx.bashComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext },
-			);
+			});
 
 			if (this.ctx.bashComponent) {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();

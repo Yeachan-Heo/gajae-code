@@ -76,6 +76,18 @@ export interface OutputSummary {
 	artifactFailureDiagnostic?: string;
 }
 
+/**
+ * Incremental output carried only for the interactive renderer.
+ *
+ * The tool result itself is intentionally allowed to remain bounded. The
+ * renderer consumes these append-only deltas so a user can expand the live
+ * output without inheriting the LLM-facing tail truncation policy.
+ */
+export interface StreamingOutputDelta {
+	kind: "append";
+	text: string;
+}
+
 export interface OutputSinkOptions {
 	/**
 	 * Deprecated managed artifact pathname. Bare paths are deliberately ignored:
@@ -1585,6 +1597,68 @@ export class OutputSink {
 			artifactId,
 		};
 	}
+}
+
+// =============================================================================
+// User-facing live output updates
+// =============================================================================
+
+export interface StreamOutputUpdateCallbacks {
+	onChunk: (chunk: string) => void;
+	onRawChunk: (chunk: string) => void;
+	flush: () => void;
+}
+
+/**
+ * Build callbacks that keep the bounded tail snapshot for tool consumers while
+ * forwarding every sanitized process chunk to the interactive renderer as an
+ * append-only delta. `OutputSink` throttles `onChunk`, so raw chunks are queued
+ * there and flushed at the existing UI cadence; `flush()` closes the final
+ * throttle window after the process exits.
+ */
+export function createStreamOutputUpdates<TDetails, TInput = unknown>(
+	tailBuffer: TailBuffer,
+	onUpdate: AgentToolUpdateCallback<TDetails, TInput> | undefined,
+	createDetails: (delta: string) => TDetails,
+): StreamOutputUpdateCallbacks {
+	if (!onUpdate) {
+		return {
+			onChunk: () => {},
+			onRawChunk: () => {},
+			flush: () => {},
+		};
+	}
+
+	let pending: string[] = [];
+
+	const flush = (): void => {
+		if (pending.length === 0) return;
+		const delta = pending.join("");
+		pending = [];
+		onUpdate({
+			content: [{ type: "text", text: tailBuffer.text() }],
+			details: createDetails(delta),
+		});
+	};
+
+	return {
+		onRawChunk: chunk => {
+			if (chunk.length === 0) return;
+			tailBuffer.append(chunk);
+			pending.push(chunk);
+		},
+		onChunk: chunk => {
+			// Keep compatibility with callers/tests that provide only onChunk. In
+			// the normal executor path onRawChunk runs first, so this branch does
+			// not duplicate data.
+			if (pending.length === 0 && chunk.length > 0) {
+				tailBuffer.append(chunk);
+				pending.push(chunk);
+			}
+			flush();
+		},
+		flush,
+	};
 }
 
 // =============================================================================

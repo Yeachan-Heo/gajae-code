@@ -213,43 +213,37 @@ describe("BashExecutionComponent streaming throttle", () => {
 		setThemeInstance(theme!);
 	});
 
-	it("caps stored lines during streaming", () => {
+	it("keeps the complete stream while the collapsed preview stays bounded", () => {
 		const component = new BashExecutionComponent("test", ui, false);
 
-		// Flood with 500 lines in one chunk (exceeds STREAMING_LINE_CAP of 100)
+		// Flood with more lines than the collapsed preview retains.
 		const lines = Array.from({ length: 500 }, (_, i) => `line${i}`).join("\n");
 		component.appendOutput(lines);
+		component.setComplete(0, false);
 
-		// Internal lines should be capped (we can't read #outputLines directly,
-		// but getOutput() returns the joined lines — it should have at most ~100 lines)
 		const output = component.getOutput();
 		const outputLineCount = output.split("\n").length;
-		expect(outputLineCount).toBeLessThanOrEqual(101); // 100 cap + possible partial
-		// Should retain the tail, not the head
+		expect(outputLineCount).toBe(500);
+		// The complete stream is available for expansion.
+		expect(output).toContain("line0\n");
 		expect(output).toContain("line499");
-		expect(output).not.toContain("line0\n");
 	});
 
-	it("gate drops rapid chunks", async () => {
+	it("retains rapid chunks while throttling preview updates", async () => {
 		const component = new BashExecutionComponent("test", ui, false);
 
-		// Send 100 chunks rapidly (all in same tick, before setTimeout fires)
+		// Send 100 chunks rapidly (all in the same tick).
 		for (let i = 0; i < 100; i++) {
 			component.appendOutput(`chunk${i}\n`);
 		}
 
-		// Only the first chunk should have been processed (gate blocks the rest)
+		await Bun.sleep(60); // CHUNK_THROTTLE_MS is 50
 		const output = component.getOutput();
 		expect(output).toContain("chunk0");
-		expect(output).not.toContain("chunk99");
-
-		// After the gate timer expires, the next chunk is accepted
-		await Bun.sleep(60); // CHUNK_THROTTLE_MS is 50
-		component.appendOutput("after_gate\n");
-		expect(component.getOutput()).toContain("after_gate");
+		expect(output).toContain("chunk99");
 	});
 
-	it("setComplete replaces streaming output with final output", () => {
+	it("keeps streamed output when the final result is tail-bounded", () => {
 		const component = new BashExecutionComponent("test", ui, false);
 
 		// Stream some partial output
@@ -259,9 +253,8 @@ describe("BashExecutionComponent streaming throttle", () => {
 		component.setComplete(0, false, { output: "final_line_1\nfinal_line_2" });
 
 		const output = component.getOutput();
-		expect(output).toContain("final_line_1");
-		expect(output).toContain("final_line_2");
-		// Streaming output is replaced, not appended
-		expect(output).not.toContain("streaming_line");
+		expect(output).toContain("streaming_line");
+		// The bounded final snapshot must not replace the complete live stream.
+		expect(output).not.toContain("final_line_1");
 	});
 });

@@ -3,10 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	createStreamOutputUpdates,
 	formatHeadTruncationNotice,
 	formatMiddleElisionMarker,
 	formatTailTruncationNotice,
 	OutputSink,
+	type StreamingOutputDelta,
 	TailBuffer,
 	truncateContent,
 	truncateHead,
@@ -181,6 +183,31 @@ describe("TailBuffer", () => {
 		tail.append("x");
 		expect(tail.text()).toBe("x");
 		expect(tail.bytes()).toBe(1);
+	});
+
+	test("keeps every raw chunk in renderer deltas while the result snapshot stays bounded", () => {
+		const updates: Array<{ snapshot: string; delta?: StreamingOutputDelta }> = [];
+		const callbacks = createStreamOutputUpdates<{ streamingOutput: StreamingOutputDelta }>(
+			new TailBuffer(5),
+			update => {
+				const first = update.content[0];
+				updates.push({
+					snapshot: first?.type === "text" ? first.text : "",
+					delta: update.details?.streamingOutput,
+				});
+			},
+			text => ({ streamingOutput: { kind: "append", text } }),
+		);
+
+		callbacks.onRawChunk("head\n");
+		callbacks.onChunk("head\n");
+		callbacks.onRawChunk("middle\n");
+		callbacks.onRawChunk("tail\n");
+		callbacks.flush();
+
+		expect(updates).toHaveLength(2);
+		expect(updates.map(update => update.delta?.text).join("")).toBe("head\nmiddle\ntail\n");
+		expect(updates[1]?.snapshot).toBe("tail\n");
 	});
 });
 

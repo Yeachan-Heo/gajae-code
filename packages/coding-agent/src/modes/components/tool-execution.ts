@@ -19,6 +19,7 @@ import { getProjectDir, logger, sanitizeText } from "@gajae-code/utils";
 import { EDIT_MODE_STRATEGIES, type EditMode, type PerFileDiffPreview } from "../../edit";
 import type { Theme } from "../../modes/theme/theme";
 import { theme } from "../../modes/theme/theme";
+import type { StreamingOutputDelta } from "../../session/streaming-output";
 import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
 import { EVAL_DEFAULT_PREVIEW_LINES } from "../../tools/eval";
 import {
@@ -84,6 +85,15 @@ function argsCanBeSharedWithRenderer(toolName: string, tool: AgentTool | undefin
 function partialJsonLength(args: unknown): number {
 	const value = args && typeof args === "object" ? (args as { __partialJson?: unknown }).__partialJson : undefined;
 	return typeof value === "string" ? value.length : -1;
+}
+
+function readStreamingOutputDelta(details: unknown): StreamingOutputDelta | undefined {
+	if (typeof details !== "object" || details === null) return undefined;
+	const candidate = (details as { streamingOutput?: unknown }).streamingOutput;
+	if (typeof candidate !== "object" || candidate === null) return undefined;
+	const delta = candidate as { kind?: unknown; text?: unknown };
+	if (delta.kind !== "append" || typeof delta.text !== "string" || delta.text.length === 0) return undefined;
+	return { kind: "append", text: delta.text };
 }
 
 /**
@@ -211,6 +221,7 @@ export class ToolExecutionComponent extends Container {
 	#editAllowFuzzy: boolean | undefined;
 	#hashlineAutoDropPureInsertDuplicates: boolean | undefined;
 	#isPartial = true;
+	#streamingOutput = "";
 	#tool?: AgentTool;
 	#ui: TUI;
 	#cwd: string;
@@ -402,6 +413,12 @@ export class ToolExecutionComponent extends Container {
 	): void {
 		if (this.#isPartial === isPartial && Bun.deepEquals(this.#result, result)) return;
 		this.#textOutputCache = undefined;
+		if (this.#toolName === "bash" && isPartial) {
+			const delta = readStreamingOutputDelta(result.details);
+			if (delta?.kind === "append") {
+				this.#streamingOutput += sanitizeWithOptionalSixelPassthrough(delta.text, sanitizeText);
+			}
+		}
 		this.#result = result;
 		this.#invalidateStaleKittyConversions();
 		this.#isPartial = isPartial;
@@ -885,8 +902,16 @@ export class ToolExecutionComponent extends Container {
 			// plus this context to keep the inline command preview visible while tool-call JSON is still streaming.
 			if (this.#result) {
 				// Pass raw output and expanded state - renderer handles width-aware truncation
-				const output = this.#getTextOutput().trimEnd();
+				const streamedOutput =
+					this.#streamingOutput.length > 0
+						? isTerminalGraphicsFallbackActive()
+							? replaceSixelOutputForGraphicsFallback(this.#streamingOutput)
+							: this.#streamingOutput
+						: undefined;
+				const useStreamedOutput = this.#expanded && streamedOutput !== undefined;
+				const output = (useStreamedOutput ? streamedOutput : this.#getTextOutput()).trimEnd();
 				context.output = output;
+				if (useStreamedOutput) context.isFullOutput = true;
 			}
 			context.expanded = this.#expanded;
 			context.previewLines = BASH_DEFAULT_PREVIEW_LINES;
