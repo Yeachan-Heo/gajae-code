@@ -4140,8 +4140,10 @@ async function deleteManagedSessionCandidateInternal(
 				await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 				if (deletion.phase === "artifacts") {
 					if (
-						deletion.detachedArtifactsPath === active.plannedArtifactsPath &&
-						!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath)
+						(deletion.artifactsPayloadDurable === true &&
+							retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath)) ||
+						(deletion.detachedArtifactsPath === active.plannedArtifactsPath &&
+							!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath))
 					) {
 						({ deletion, pendingEvidence } = await continueDetachedArtifactCleanup(
 							scope,
