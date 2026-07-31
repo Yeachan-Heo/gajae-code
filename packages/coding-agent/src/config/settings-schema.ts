@@ -153,7 +153,6 @@ interface BooleanDef {
 	ui?: UiBoolean;
 }
 
-
 interface StringDef {
 	type: "string";
 	default: string | undefined;

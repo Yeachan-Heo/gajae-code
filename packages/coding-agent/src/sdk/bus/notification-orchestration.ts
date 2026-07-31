@@ -4,9 +4,10 @@ import { isProcessIncarnation, processIncarnation } from "../broker/process-inca
 import {
 	getNotificationConfig,
 	hasNonBlankValue,
+	isProviderEffectivelyEnabled,
 	type NotificationProvider,
-	type ProviderSecretDisposition,
 	type NotificationSettingsReader,
+	type ProviderSecretDisposition,
 	readTelegramActivationMarkers,
 	type TelegramActivationMarker,
 	type TelegramActivationMarkers,
@@ -137,7 +138,7 @@ export async function proposedTelegramIdentity(
 
 export interface NotificationConfigurationWriter extends NotificationSettingsReader {
 	commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<SettingsAtomicReceipt>;
-	commitAtomicBatchWithCurrent?(
+	commitAtomicBatchWithCurrent(
 		buildPatches: (
 			current: Readonly<RawSettings>,
 		) => Promise<readonly SettingsAtomicPatch[]> | readonly SettingsAtomicPatch[],
@@ -182,16 +183,7 @@ async function commitNotificationBatchWithCurrent(
 		current: Readonly<RawSettings>,
 	) => Promise<readonly SettingsAtomicPatch[]> | readonly SettingsAtomicPatch[],
 ): Promise<SettingsAtomicReceipt> {
-	if (settings.commitAtomicBatchWithCurrent) return settings.commitAtomicBatchWithCurrent(buildPatches);
-	const snapshot = settings.getNotificationSettingsSnapshot();
-	const current: RawSettings = {
-		notifications: {
-			telegram: {
-				activation: snapshot.telegram.activation,
-			},
-		},
-	};
-	return settings.commitAtomicBatch(await buildPatches(current));
+	return settings.commitAtomicBatchWithCurrent(buildPatches);
 }
 
 function sameActivationMarker(left: TelegramActivationMarker, right: TelegramActivationMarker): boolean {
@@ -231,7 +223,6 @@ export async function clearTelegramActivationMarker(
 	});
 	receipt.discard();
 }
-
 
 export type SaveTelegramInactiveAvailability = { available: true };
 
@@ -322,9 +313,20 @@ export interface TelegramPostCommitActivation {
 }
 
 export type PostCommitTelegramActivationResult =
-	| { status: "activated"; reconnect: Exclude<TelegramDaemonReconnectOutcome, "blocked_identity"> }
+	| {
+			status: "activated";
+			receipt: SettingsAtomicReceipt;
+			reconnect: Exclude<TelegramDaemonReconnectOutcome, "blocked_identity" | "disabled">;
+	  }
+	| {
+			status: "activation_failed";
+			receipt: SettingsAtomicReceipt;
+			reconnect?: TelegramDaemonReconnectOutcome;
+			message: string;
+	  }
 	| {
 			status: "blocked_identity";
+			receipt: SettingsAtomicReceipt;
 			message: string;
 			restore(): Promise<BlockedTelegramRestoreResult>;
 			retainCommitted(): void;
@@ -390,7 +392,7 @@ async function restoreBlockedConfiguration(input: {
  * owner race stops the endpoint, durably marks only that Telegram identity
  * inactive, then exposes an ordered CAS restore/retain choice.
  */
-export async function reconcileCommittedTelegramConfiguration(input: {
+async function reconcileCommittedTelegramConfigurationUnsafe(input: {
 	receipt: SettingsAtomicReceipt;
 	activation: TelegramPostCommitActivation;
 	inactiveMarkerToClear?: TelegramActivationMarker;
@@ -400,6 +402,7 @@ export async function reconcileCommittedTelegramConfiguration(input: {
 		await input.activation.controller.enterBlockedRuntime();
 		const inactiveReceipt = await input.activation.persistInactive(input.activation.marker);
 		return {
+			receipt: input.receipt,
 			status: "blocked_identity",
 			message:
 				"Configuration saved inactive; activation blocked; foreign daemon untouched. Current session stopped because Telegram activation was blocked by a foreign daemon.",
@@ -408,6 +411,15 @@ export async function reconcileCommittedTelegramConfiguration(input: {
 				inactiveReceipt.discard();
 				input.receipt.discard();
 			},
+		};
+	}
+	if (reconnect === "disabled") {
+		await input.activation.controller.enterBlockedRuntime();
+		return {
+			receipt: input.receipt,
+			status: "activation_failed",
+			reconnect,
+			message: "Configuration and desired intent were saved, but Telegram runtime activation did not become ready.",
 		};
 	}
 
@@ -421,7 +433,23 @@ export async function reconcileCommittedTelegramConfiguration(input: {
 	}
 	await input.activation.controller.clearBlockedRuntime();
 	await input.activation.controller.reconcileCurrentSession();
-	return { status: "activated", reconnect };
+	return { status: "activated", receipt: input.receipt, reconnect };
+}
+
+export async function reconcileCommittedTelegramConfiguration(input: {
+	receipt: SettingsAtomicReceipt;
+	activation: TelegramPostCommitActivation;
+	inactiveMarkerToClear?: TelegramActivationMarker;
+}): Promise<PostCommitTelegramActivationResult> {
+	try {
+		return await reconcileCommittedTelegramConfigurationUnsafe(input);
+	} catch {
+		return {
+			status: "activation_failed",
+			receipt: input.receipt,
+			message: "Configuration and desired intent were saved, but post-commit activation or reconciliation failed.",
+		};
+	}
 }
 
 export type SaveTelegramConfigurationResult =
@@ -504,10 +532,7 @@ export async function saveTelegramConfiguration(input: {
 	});
 }
 
-export type ProviderSecretMutation =
-	| { action: "keep" }
-	| { action: "replace"; value: string }
-	| { action: "remove" };
+export type ProviderSecretMutation = { action: "keep" } | { action: "replace"; value: string } | { action: "remove" };
 
 export interface TelegramProviderConfigurationMutation {
 	provider: "telegram";
@@ -546,11 +571,10 @@ export interface NotificationProviderRuntimeAuthority {
 }
 
 export type NotificationProviderMutationResult =
-	| { status: "saved"; receipt: SettingsAtomicReceipt }
-	| { status: "activated"; receipt: SettingsAtomicReceipt }
-	| { status: "observer_failed"; receipt: SettingsAtomicReceipt }
-	| { status: "activation_failed"; receipt: SettingsAtomicReceipt }
-	| { status: "deactivation_failed"; receipt: SettingsAtomicReceipt }
+	| { status: "saved"; receipt: SettingsAtomicReceipt; observerFailed: boolean }
+	| { status: "activated"; receipt: SettingsAtomicReceipt; observerFailed: boolean }
+	| { status: "activation_failed"; receipt: SettingsAtomicReceipt; observerFailed: boolean }
+	| { status: "deactivation_failed"; receipt: SettingsAtomicReceipt; observerFailed: boolean }
 	| { status: "commit_failed" };
 
 function secretMutationPatches(
@@ -609,7 +633,8 @@ function providerDesiredPath(provider: NotificationProvider): SettingsAtomicPatc
 }
 
 function mutationRemovesRequiredSecret(mutation: NotificationProviderConfigurationMutation): boolean {
-	if (mutation.provider === "telegram" || mutation.provider === "discord") return mutation.botToken.action === "remove";
+	if (mutation.provider === "telegram" || mutation.provider === "discord")
+		return mutation.botToken.action === "remove";
 	return mutation.botToken.action === "remove" || mutation.appToken.action === "remove";
 }
 
@@ -648,32 +673,34 @@ export async function mutateNotificationProvider(input: {
 	} catch {
 		return { status: "commit_failed" };
 	}
+	let observerFailed = false;
 	try {
 		await input.notifyConfigChanged?.();
 	} catch {
-		if (desiredEnabled !== false) return { status: "observer_failed", receipt };
+		observerFailed = true;
 	}
-	if (!input.runtime) return { status: "saved", receipt };
+	if (!input.runtime) return { status: "saved", receipt, observerFailed };
 	try {
 		if (activate || desiredEnabled === true) {
 			await input.runtime.activate(provider);
-			return { status: "activated", receipt };
+			return { status: "activated", receipt, observerFailed };
 		}
 		if (desiredEnabled === false) {
 			await input.runtime.deactivate(provider);
 		}
-		return { status: "saved", receipt };
+		return { status: "saved", receipt, observerFailed };
 	} catch {
 		return {
 			status: activate || desiredEnabled === true ? "activation_failed" : "deactivation_failed",
 			receipt,
+			observerFailed,
 		};
 	}
 }
 
 export type NotificationProviderRemovalResult =
-	| { status: "removed"; receipt: SettingsAtomicReceipt }
-	| { status: "deactivation_failed" }
+	| { status: "removed"; receipt: SettingsAtomicReceipt; observerFailed: boolean }
+	| { status: "deactivation_failed"; receipt?: SettingsAtomicReceipt; observerFailed?: boolean }
 	| { status: "commit_failed_after_teardown" }
 	| { status: "commit_failed" };
 
@@ -725,25 +752,36 @@ export async function removeNotificationProvider(input: {
 	} catch {
 		return { status: input.provider === "telegram" ? "commit_failed_after_teardown" : "commit_failed" };
 	}
+	let observerFailed = false;
 	try {
 		await input.notifyConfigChanged?.();
 	} catch {
-		// The receipt remains authoritative; removal still proceeds to safe teardown.
+		observerFailed = true;
 	}
 	if (input.provider !== "telegram") {
 		try {
 			await input.runtime.deactivate(input.provider);
 		} catch {
-			return { status: "deactivation_failed" };
+			return { status: "deactivation_failed", receipt, observerFailed };
 		}
 	}
-	return { status: "removed", receipt };
+	return { status: "removed", receipt, observerFailed };
 }
 
 export type GlobalNotificationMutationResult =
-	| { status: "saved"; receipt: SettingsAtomicReceipt }
-	| { status: "observer_failed"; receipt: SettingsAtomicReceipt }
-	| { status: "global_deactivation_partial"; receipt: SettingsAtomicReceipt; failed: readonly NotificationProvider[] }
+	| { status: "saved"; receipt: SettingsAtomicReceipt; observerFailed: boolean }
+	| {
+			status: "global_deactivation_partial";
+			receipt: SettingsAtomicReceipt;
+			failed: readonly NotificationProvider[];
+			observerFailed: boolean;
+	  }
+	| {
+			status: "global_activation_partial";
+			receipt: SettingsAtomicReceipt;
+			failed: readonly NotificationProvider[];
+			observerFailed: boolean;
+	  }
 	| { status: "commit_failed" };
 
 /** Toggle only the global master. Provider configuration and desired intent are preserved. */
@@ -761,13 +799,28 @@ export async function setGlobalNotificationsEnabled(input: {
 	} catch {
 		return { status: "commit_failed" };
 	}
+	let observerFailed = false;
 	try {
 		await input.notifyConfigChanged?.();
 	} catch {
-		if (input.enabled) return { status: "observer_failed", receipt };
+		observerFailed = true;
 	}
-	if (input.enabled || !input.runtime) return { status: "saved", receipt };
+	if (!input.runtime) return { status: "saved", receipt, observerFailed };
 	const failed: NotificationProvider[] = [];
+	if (input.enabled) {
+		const cfg = getNotificationConfig(input.settings);
+		for (const provider of ["telegram", "discord", "slack"] as const) {
+			if (!isProviderEffectivelyEnabled(cfg, provider)) continue;
+			try {
+				await input.runtime.activate(provider);
+			} catch {
+				failed.push(provider);
+			}
+		}
+		return failed.length === 0
+			? { status: "saved", receipt, observerFailed }
+			: { status: "global_activation_partial", receipt, failed, observerFailed };
+	}
 	for (const provider of ["telegram", "discord", "slack"] as const) {
 		try {
 			await input.runtime.deactivate(provider);
@@ -775,7 +828,9 @@ export async function setGlobalNotificationsEnabled(input: {
 			failed.push(provider);
 		}
 	}
-	return failed.length === 0 ? { status: "saved", receipt } : { status: "global_deactivation_partial", receipt, failed };
+	return failed.length === 0
+		? { status: "saved", receipt, observerFailed }
+		: { status: "global_deactivation_partial", receipt, failed, observerFailed };
 }
 
 /** Safe helper for UI contracts that must retain only the disposition, never replacement material. */

@@ -73,6 +73,9 @@
 				"telegram": {
 					"type": "object",
 					"properties": {
+						"enabled": {
+							"type": "boolean"
+						},
 						"botToken": {
 							"type": "string"
 						},
@@ -162,6 +165,9 @@
 				"discord": {
 					"type": "object",
 					"properties": {
+						"enabled": {
+							"type": "boolean"
+						},
 						"botToken": {
 							"type": "string"
 						},
@@ -180,6 +186,9 @@
 				"slack": {
 					"type": "object",
 					"properties": {
+						"enabled": {
+							"type": "boolean"
+						},
 						"botToken": {
 							"type": "string"
 						},

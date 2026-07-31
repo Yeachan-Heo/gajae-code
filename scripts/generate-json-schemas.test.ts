@@ -57,12 +57,14 @@ describe("generated JSON Schemas", () => {
 			notifications: {
 				enabled: true,
 				discord: {
+					enabled: true,
 					botToken: "discord-bot-token",
 					applicationId: "discord-application-id",
 					guildId: "discord-guild-id",
 					parentChannelId: "discord-parent-channel-id",
 				},
 				slack: {
+					enabled: false,
 					botToken: "slack-bot-token",
 					appToken: "slack-app-token",
 					workspaceId: "slack-workspace-id",
@@ -72,6 +74,13 @@ describe("generated JSON Schemas", () => {
 		};
 
 		expect(acceptsJsonSchemaFixture(schema, completeConfig)).toBe(true);
+		const typedSchema = schema as {
+			properties: { notifications: { properties: Record<string, { properties?: Record<string, unknown> }> } };
+		};
+		const notifications = typedSchema.properties.notifications.properties;
+		expect(notifications.telegram?.properties?.enabled).toEqual({ type: "boolean" });
+		expect(notifications.discord?.properties?.enabled).toEqual({ type: "boolean" });
+		expect(notifications.slack?.properties?.enabled).toEqual({ type: "boolean" });
 		expect(acceptsJsonSchemaFixture(schema, {
 			...completeConfig,
 			notifications: { ...completeConfig.notifications, discord: { ...completeConfig.notifications.discord, unknown: "value" } },

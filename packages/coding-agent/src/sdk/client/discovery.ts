@@ -33,8 +33,10 @@ export class SdkDiscoveryError extends Error {
 	}
 }
 
-function endpointDirectory(repo: string): string {
-	return path.join(repo, ".gjc", "state", "sdk");
+export type SdkSessionEndpointScope = "default" | "chat";
+
+function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "default"): string {
+	return scope === "chat" ? path.join(repo, ".gjc", "state", "chat", "sdk") : path.join(repo, ".gjc", "state", "sdk");
 }
 
 function parseEndpoint(sessionId: string, file: string, value: unknown): SdkSessionEndpoint {
@@ -101,9 +103,13 @@ export async function listSdkSessionEndpoints(repo: string): Promise<SdkSessionE
 }
 
 /** Resolves one per-session SDK endpoint discovery file. */
-export async function readSdkSessionEndpoint(repo: string, sessionId: string): Promise<SdkSessionEndpoint | null> {
+export async function readSdkSessionEndpoint(
+	repo: string,
+	sessionId: string,
+	scope: SdkSessionEndpointScope = "default",
+): Promise<SdkSessionEndpoint | null> {
 	if (!sessionId || sessionId.includes(path.sep) || sessionId.includes("/")) return null;
-	const file = path.join(endpointDirectory(repo), `${sessionId}.json`);
+	const file = path.join(endpointDirectory(repo, scope), `${sessionId}.json`);
 	try {
 		return parseEndpoint(sessionId, file, JSON.parse(await fs.readFile(file, "utf8")));
 	} catch (error) {

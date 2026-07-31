@@ -37,14 +37,14 @@ secret mechanism rather than placing them in shell history, files committed to
 the repository, chat transcripts, or screenshots. The setup command writes:
 
 - `notifications.enabled = true`
+- `notifications.discord.enabled = true` (durable desired intent)
 - `notifications.discord.botToken`
 - `notifications.discord.applicationId`
 - `notifications.discord.guildId`
 - `notifications.discord.parentChannelId`
 - `notifications.redact = true` when requested
 
-`gjc notify status` shows configured Discord identifiers and masks token values.
-It must not be used as a way to recover a token.
+`gjc notify status` reports Discord completeness, repair/quarantine state, desired intent, effective enablement, destination identifiers, and a masked token. It must not be used as a way to recover a token. A successful durable save is not rolled back when later daemon activation fails; the command reports the saved-but-runtime-degraded outcome and exits nonzero so the configuration can be repaired or reactivated explicitly. In `/settings`, secret edits are explicit `keep`, `replace`, or `remove`; removing the required bot token turns Discord desired intent off without changing Telegram, Slack, or the global master.
 
 ## Threads, resume, and replies
 

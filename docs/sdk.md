@@ -546,6 +546,10 @@ revalidates the complete bot-token/chat identity immediately before polling and
 again before activation. A foreign or unknown owner is never killed, reloaded, or taken over;
 setup fails closed without saving or exposing the raw token.
 
+Configuration completeness, provider-local quarantine, durable desired intent, effective enablement, runtime readiness, and delivery outcomes are separate contracts. The global `notifications.enabled` master never erases provider credentials or desired flags. `/settings` edits secrets through explicit `keep`, `replace`, or `remove` actions, commits only the selected provider in one CAS batch, and reports post-commit observer or activation failures without pretending the durable save rolled back. Malformed provider-local values are quarantined for explicit repair while safe sibling providers remain usable; malformed global notification structure remains fail-closed.
+
+`GJC_NOTIFICATIONS=0` suppresses only automatic generic current-session admission. Explicit `/notify on` can opt the current session back in without mutating durable provider state, and direct provider APIs remain governed by provider effectiveness and their own runtime readiness. If Telegram ownership is proven foreign while Discord or Slack is effective, GJC publishes the chat daemon endpoint under the isolated `.gjc/state/chat/sdk/` discovery path; the blocked Telegram scanner never receives the shared endpoint token.
+
 - [Telegram notification onboarding](./telegram-onboarding.md) documents
   `gjc notify setup` and private-chat pairing.
 - [Discord notification onboarding](./discord-onboarding.md) documents
@@ -555,10 +559,7 @@ setup fails closed without saving or exposing the raw token.
   `gjc notify setup slack`, Socket Mode configuration, immediate envelope ack,
   and thread lifecycle.
 
-`gjc notify status` reports configured providers while masking every token. The
-Discord and Slack setup commands are non-interactive and require their documented
-identifier and token flags; supply secrets through an approved local mechanism,
-not examples, committed files, shell history, logs, or chat.
+`gjc notify status` reports provider completeness, repair/quarantine state, desired intent, effective enablement, and masked tokens. Destination identifiers remain visible and may be sensitive. The Discord and Slack setup commands are non-interactive and require their documented identifier and token flags; supply secrets through an approved local mechanism, not examples, committed files, shell history, logs, or chat. `gjc notify health --provider <provider> --probe` performs a provider-owned REST diagnostic even when complete credentials are intentionally inactive, while `gjc notify test --provider <provider>` additionally requires effective enablement and runtime readiness.
 
 The daemon/session engine is shared. Session discovery, WebSocket protocol,
 redaction decisions, rate-limit pooling, reply routing, singleton ownership, and

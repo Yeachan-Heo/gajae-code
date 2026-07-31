@@ -11,7 +11,7 @@ import {
 } from "../test/fixtures/tui/notifications-settings-showcase";
 
 const CANONICAL_COMMAND =
-	"bun packages/coding-agent/scripts/capture-notifications-settings-showcase.ts --output .gjc/qa/issue-2050-notifications";
+	"bun packages/coding-agent/scripts/capture-notifications-settings-showcase.ts --output .gjc/qa/issue-3570-notifications";
 const DETERMINISTIC_CAPTURE_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 const CAPTURE_TOOL_VERSION = "notifications-settings-showcase-live-settings-selector-v3";
 

@@ -9,11 +9,14 @@ import type {
 	NotificationsEditorState,
 	NotificationsMutationResult,
 	NotificationsPreflightResult,
+	NotificationsProviderSetupInput,
 	NotificationsSaveInactiveResult,
+	PreparedNotificationProviderConfiguration,
 	PreparedTelegramConfiguration,
 } from "../../../src/modes/components/notifications-settings-editor";
 import { SettingsSelectorComponent } from "../../../src/modes/components/settings-selector";
 import { initTheme } from "../../../src/modes/theme/theme";
+import type { NotificationProvider } from "../../../src/sdk/bus/config";
 import type { TelegramDaemonReconnectOutcome } from "../../../src/sdk/bus/notification-orchestration";
 import type {
 	NotificationHealthReport,
@@ -130,20 +133,20 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATES: readonly NotificationsSetti
 		stateId: "home-unconfigured",
 		title: "Notifications are not configured",
 		copy: {
-			english: "Choose Configure Telegram to add a notification destination.",
-			korean: "알림 대상이 없습니다. Telegram 설정을 선택해 알림 대상을 추가하세요.",
-			japanese: "通知先がありません。Telegram を設定して通知先を追加してください。",
-			chinese: "尚未设置通知目标。请选择配置 Telegram 以添加通知目标。",
+			english: "Configure Telegram, Discord, or Slack.",
+			korean: "Telegram, Discord, Slack 알림 설정.",
+			japanese: "Telegram、Discord、Slack を設定。",
+			chinese: "配置 Telegram、Discord、Slack。",
 		},
 	},
 	{
 		stateId: "home-configured-inactive",
 		title: "Notifications are configured but inactive",
 		copy: {
-			english: "Telegram is saved. Turn notifications on for this session when you are ready.",
-			korean: "Telegram 설정이 저장되었습니다. 준비되면 이 세션의 알림을 켜세요.",
-			japanese: "Telegram の設定は保存されています。準備ができたらこのセッションの通知をオンにします。",
-			chinese: "Telegram 配置已保存。准备就绪后，请为当前会话开启通知。",
+			english: "Settings saved; session inactive.",
+			korean: "설정 저장됨; 세션 비활성.",
+			japanese: "設定済み、セッション無効。",
+			chinese: "设置已保存；会话停用。",
 		},
 	},
 	{
@@ -190,30 +193,30 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATES: readonly NotificationsSetti
 		stateId: "home-discord-only",
 		title: "Discord notifications are configured",
 		copy: {
-			english: "Discord is the active global adapter; Telegram setup is optional.",
-			korean: "Discord가 활성 전역 어댑터입니다. Telegram 설정은 선택 사항입니다.",
-			japanese: "Discord が有効なグローバルアダプターです。Telegram の設定は任意です。",
-			chinese: "Discord 是当前启用的全局适配器；Telegram 设置为可选项。",
+			english: "Discord effective; Telegram optional.",
+			korean: "Discord 유효; Telegram 선택.",
+			japanese: "Discord 有効、Telegram 任意。",
+			chinese: "Discord 有效；Telegram 可选。",
 		},
 	},
 	{
 		stateId: "home-slack-only",
 		title: "Slack notifications are configured",
 		copy: {
-			english: "Slack is the active global adapter; Telegram setup is optional.",
-			korean: "Slack이 활성 전역 어댑터입니다. Telegram 설정은 선택 사항입니다.",
-			japanese: "Slack が有効なグローバルアダプターです。Telegram の設定は任意です。",
-			chinese: "Slack 是当前启用的全局适配器；Telegram 设置为可选项。",
+			english: "Slack effective; Telegram optional.",
+			korean: "Slack 유효; Telegram 선택.",
+			japanese: "Slack 有効、Telegram 任意。",
+			chinese: "Slack 有效；Telegram 可选。",
 		},
 	},
 	{
 		stateId: "setup-provider",
 		title: "Choose a notification provider",
 		copy: {
-			english: "Telegram setup is selected. Discord and Slack credentials are managed elsewhere.",
-			korean: "Telegram 설정이 선택되었습니다. Discord와 Slack 자격 증명은 다른 곳에서 관리합니다.",
-			japanese: "Telegram の設定が選択されています。Discord と Slack の認証情報は別の場所で管理します。",
-			chinese: "已选择 Telegram 设置。Discord 和 Slack 凭据在其他位置管理。",
+			english: "Choose Telegram, Discord, or Slack.",
+			korean: "Telegram, Discord 또는 Slack 선택.",
+			japanese: "Telegram、Discord、Slack を選択。",
+			chinese: "选择 Telegram、Discord 或 Slack。",
 		},
 	},
 	{
@@ -260,10 +263,10 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATES: readonly NotificationsSetti
 		stateId: "setup-review",
 		title: "Review notification setup",
 		copy: {
-			english: "Review the provider, masked credential status, and destination before saving.",
-			korean: "저장하기 전에 제공자, 마스킹된 자격 증명 상태 및 대상을 검토하세요.",
-			japanese: "保存前に、プロバイダー、マスク済み認証情報の状態、通知先を確認してください。",
-			chinese: "保存前，请检查提供商、遮蔽的凭据状态和通知目标。",
+			english: "Review provider, secrets, intent, target.",
+			korean: "제공자, 비밀, 의도, 대상 확인.",
+			japanese: "提供元、秘密、意図、通知先を確認。",
+			chinese: "检查提供商、密钥、意图和目标。",
 		},
 	},
 	{
@@ -360,10 +363,10 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATES: readonly NotificationsSetti
 		stateId: "confirmation-disable",
 		title: "Disable notifications globally?",
 		copy: {
-			english: "Global disable stops configured adapters. Confirm before applying this change.",
-			korean: "전역 비활성화는 구성된 어댑터를 중지합니다. 변경을 적용하기 전에 확인하세요.",
-			japanese: "グローバル無効化は設定済みアダプターを停止します。適用前に確認してください。",
-			chinese: "全局禁用会停止已配置的适配器。应用更改前请确认。",
+			english: "Stop delivery; keep settings and intent.",
+			korean: "전송 중지; 설정과 의도 보존.",
+			japanese: "配信停止、設定と意図を保持。",
+			chinese: "停止投递；保留设置和意图。",
 		},
 	},
 	{
@@ -390,10 +393,10 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATES: readonly NotificationsSetti
 		stateId: "foreign-blocked",
 		title: "Telegram activation is blocked by another owner",
 		copy: {
-			english: "Configuration may be saved, but this session stopped before sending to a foreign daemon.",
-			korean: "설정은 저장될 수 있지만 다른 데몬으로 전송하기 전에 이 세션이 중지되었습니다.",
-			japanese: "設定は保存されている場合がありますが、外部デーモンへ送信する前にこのセッションは停止されました。",
-			chinese: "配置可能已保存，但当前会话已在向外部守护进程发送前停止。",
+			english: "Telegram isolated; chat stays available.",
+			korean: "Telegram 격리; 채팅은 사용 가능.",
+			japanese: "Telegram 分離、チャット利用可。",
+			chinese: "Telegram 隔离；聊天仍可用。",
 		},
 	},
 	{
@@ -534,7 +537,31 @@ function showcaseState(stateId: NotificationsSettingsShowcaseStateId): Notificat
 }
 
 function configuredAdapter(channel: string): NotificationStatusReport["discord"] {
-	return { botTokenMasked: "••••••••", channel, configured: true };
+	return {
+		botTokenMasked: "••••••••",
+		channel,
+		configured: true,
+		quarantined: false,
+		desiredEnabled: true,
+		desiredSource: "legacy",
+		effectiveEnabled: true,
+		issues: [],
+		runtime: "ready",
+	};
+}
+
+function unconfiguredAdapter(): NotificationStatusReport["discord"] {
+	return {
+		botTokenMasked: "(not set)",
+		channel: undefined,
+		configured: false,
+		quarantined: false,
+		desiredEnabled: false,
+		desiredSource: "legacy",
+		effectiveEnabled: false,
+		issues: [],
+		runtime: "inactive",
+	};
 }
 
 function fixedHealth(
@@ -593,21 +620,22 @@ function fixedEditorState(
 		redact: false,
 		verbosity: "lean",
 		globallyConfigured: true,
+		anyProviderComplete: true,
+		anyProviderEffective: true,
 		telegram: {
+			...configuredAdapter("1001"),
 			botTokenMasked: "••••••••",
-			channel: "1001",
-			configured: true,
 			tokenFingerprint: "telegram:2050feed",
 		},
-		discord: { botTokenMasked: "(not set)", channel: undefined, configured: false },
-		slack: { botTokenMasked: "(not set)", channel: undefined, configured: false },
+		discord: unconfiguredAdapter(),
+		slack: unconfiguredAdapter(),
 	};
 	let session: NotificationSessionStatus = {
 		eligible: true,
 		locallyEnabled: true,
-		effectiveEnabled: true,
+		genericSessionEnabled: true,
+		genericEligibilitySource: "configured_provider",
 		running: true,
-		environment: "default",
 	};
 	const preferences: NotificationsEditorPreferences = {
 		redact: false,
@@ -635,61 +663,55 @@ function fixedEditorState(
 			status.enabled = false;
 			status.globallyConfigured = false;
 			status.telegram = {
-				botTokenMasked: "(not set)",
-				channel: undefined,
-				configured: false,
+				...unconfiguredAdapter(),
 				tokenFingerprint: undefined,
 			};
-			session = { ...session, locallyEnabled: false, effectiveEnabled: false, running: false };
+			status.anyProviderEffective = false;
+			session = { ...session, locallyEnabled: false, genericSessionEnabled: false, running: false };
 			break;
 		case "home-configured-inactive":
 			status.enabled = false;
-			session = { ...session, locallyEnabled: false, effectiveEnabled: false, running: false };
+			session = { ...session, locallyEnabled: false, genericSessionEnabled: false, running: false };
 			break;
 		case "home-local-off":
-			session = { ...session, locallyEnabled: false, effectiveEnabled: false, running: false };
+			session = { ...session, locallyEnabled: false, genericSessionEnabled: false, running: false };
 			break;
 		case "home-env-off":
 			session = {
 				eligible: false,
 				locallyEnabled: false,
-				effectiveEnabled: false,
+				genericSessionEnabled: false,
+				genericEligibilitySource: "hard_opt_out",
 				running: false,
-				environment: "off",
 			};
 			break;
 		case "home-env-on":
 			status.enabled = false;
 			status.globallyConfigured = false;
 			status.telegram = {
-				botTokenMasked: "(not set)",
-				channel: undefined,
-				configured: false,
+				...unconfiguredAdapter(),
 				tokenFingerprint: undefined,
 			};
-			session = { ...session, environment: "explicit" };
+			status.anyProviderEffective = false;
+			session = { ...session, genericEligibilitySource: "explicit_env" };
 			break;
 		case "home-discord-only":
 			status.telegram = {
-				botTokenMasked: "(not set)",
-				channel: undefined,
-				configured: false,
+				...unconfiguredAdapter(),
 				tokenFingerprint: undefined,
 			};
 			status.discord = configuredAdapter("discord-channel");
 			break;
 		case "home-slack-only":
 			status.telegram = {
-				botTokenMasked: "(not set)",
-				channel: undefined,
-				configured: false,
+				...unconfiguredAdapter(),
 				tokenFingerprint: undefined,
 			};
 			status.slack = configuredAdapter("slack-channel");
 			break;
 		case "foreign-blocked":
 		case "blocked-restore-retain":
-			session = { ...session, effectiveEnabled: false, running: false };
+			session = { ...session, genericSessionEnabled: false, running: false };
 			break;
 		default:
 			break;
@@ -707,6 +729,20 @@ function fixedEditorState(
 
 function unresolved<T>(): Promise<T> {
 	return new Promise<T>(() => {});
+}
+
+async function waitForEditorSurface(
+	component: SettingsSelectorComponent,
+	predicate: (plain: string) => boolean,
+	label: string,
+): Promise<void> {
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		const plain = Bun.stripANSI(component.render(160).join("\n"));
+		if (predicate(plain)) return;
+		await Promise.resolve();
+		await Bun.sleep(0);
+	}
+	throw new Error(`Notifications showcase did not reach ${label}`);
 }
 
 class DeterministicNotificationsEditorOperations implements NotificationsEditorOperations {
@@ -746,7 +782,7 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 		return {
 			ok: true,
 			adapter: "telegram",
-			chatId: this.#state.status.telegram.channel,
+			destination: this.#state.status.telegram.channel,
 			detail: "delivered to showcase chat",
 		};
 	}
@@ -802,10 +838,10 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 				...this.#state.status,
 				enabled: true,
 				globallyConfigured: true,
+				anyProviderComplete: true,
 				telegram: {
+					...configuredAdapter("1001"),
 					botTokenMasked: "••••••••",
-					channel: "1001",
-					configured: true,
 					tokenFingerprint: "telegram:2050feed",
 				},
 			},
@@ -828,9 +864,59 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 
 	discardConfigureDraft(_draft: PreparedTelegramConfiguration): void {}
 
+	async prepareProviderConfiguration(
+		input: NotificationsProviderSetupInput,
+	): Promise<PreparedNotificationProviderConfiguration> {
+		input.botToken.value?.consume();
+		input.appToken?.value?.consume();
+		return input.provider === "discord"
+			? {
+					provider: "discord",
+					botTokenDisposition: input.botToken.action,
+					botTokenMask: "••••••••",
+					applicationId: input.applicationId ?? "application",
+					guildId: input.guildId ?? "guild",
+					parentChannelId: input.parentChannelId ?? "discord-channel",
+				}
+			: {
+					provider: "slack",
+					botTokenDisposition: input.botToken.action,
+					botTokenMask: "••••••••",
+					appTokenDisposition: input.appToken?.action ?? "keep",
+					appTokenMask: "••••••••",
+					workspaceId: input.workspaceId ?? "workspace",
+					channelId: input.channelId ?? "slack-channel",
+					authorizedUserId: input.authorizedUserId,
+				};
+	}
+
+	async commitProviderConfiguration(
+		draft: PreparedNotificationProviderConfiguration,
+	): Promise<NotificationsMutationResult> {
+		this.#state.status[draft.provider] = configuredAdapter(draft.channelId ?? draft.parentChannelId ?? "channel");
+		return { receipt: SHOWCASE_RECEIPT, message: `${draft.provider} saved.` };
+	}
+
+	discardProviderConfiguration(_draft: PreparedNotificationProviderConfiguration): void {}
+
+	async setProviderDesired(provider: NotificationProvider, enabled: boolean): Promise<NotificationsMutationResult> {
+		this.#state.status[provider].desiredEnabled = enabled;
+		this.#state.status[provider].effectiveEnabled = enabled && this.#state.status.enabled;
+		return { receipt: SHOWCASE_RECEIPT, message: `${provider} desired intent updated.` };
+	}
+
+	async removeProvider(provider: NotificationProvider): Promise<NotificationsMutationResult> {
+		if (provider !== "telegram") this.#state.status[provider] = unconfiguredAdapter();
+		return { receipt: SHOWCASE_RECEIPT, message: `${provider} removed.` };
+	}
+
 	async enableGlobally(): Promise<NotificationsMutationResult> {
 		this.#state = { ...this.#state, status: { ...this.#state.status, enabled: true } };
-		return { message: "Global notifications enabled using stored credentials." };
+		return {
+			receipt: SHOWCASE_RECEIPT,
+			outcome: "success",
+			message: "Global notifications enabled using stored credentials.",
+		};
 	}
 
 	async disableGlobally(): Promise<NotificationsMutationResult> {
@@ -844,9 +930,7 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 			status: {
 				...this.#state.status,
 				telegram: {
-					botTokenMasked: "(not set)",
-					channel: undefined,
-					configured: false,
+					...unconfiguredAdapter(),
 					tokenFingerprint: undefined,
 				},
 			},
@@ -855,7 +939,12 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 	}
 
 	async setSessionLocal(enabled: boolean): Promise<NotificationSessionReconcileResult> {
-		const status = { ...this.#state.session, locallyEnabled: enabled, effectiveEnabled: enabled, running: enabled };
+		const status = {
+			...this.#state.session,
+			locallyEnabled: enabled,
+			genericSessionEnabled: enabled,
+			running: enabled,
+		};
 		this.#state = { ...this.#state, session: status };
 		return { outcome: enabled ? "started" : "stopped", status };
 	}
@@ -889,6 +978,7 @@ function selectNotifications(component: SettingsSelectorComponent): void {
 function enterTelegramSetup(component: SettingsSelectorComponent): void {
 	component.handleInput("\n");
 	component.handleInput("\n");
+	component.handleInput("\n");
 }
 
 function enterTokenEntry(component: SettingsSelectorComponent): void {
@@ -920,12 +1010,19 @@ async function navigateToState(
 			return ["home:Configure Telegram"];
 		case "setup-chat-entry":
 			enterTelegramSetup(component);
+			await waitForEditorSurface(component, text => text.includes("private chat ID"), "private-chat entry");
 			return ["home:Configure Telegram", "provider-selection:Telegram", "chat-entry:private chat ID"];
 		case "setup-token-entry":
 			enterTokenEntry(component);
+			await waitForEditorSurface(component, text => text.includes("masked bot token"), "masked-token entry");
 			return ["home:Configure Telegram", "provider-selection:Telegram", "chat-entry:private chat ID (blank)"];
 		case "setup-validating":
 			startPrivateChatValidation(component);
+			await waitForEditorSurface(
+				component,
+				text => text.includes("Validating Telegram") || text.includes("PENDING"),
+				"Telegram validation",
+			);
 			return [
 				"home:Configure Telegram",
 				"provider-selection:Telegram",
@@ -936,7 +1033,11 @@ async function navigateToState(
 		case "setup-threaded-warning":
 		case "setup-review":
 			startPairingDiscovery(component);
-			await settleEditor();
+			await waitForEditorSurface(
+				component,
+				text => text.includes("Review Telegram") || text.includes("Save configuration"),
+				"Telegram review",
+			);
 			return [
 				"home:Configure Telegram",
 				"provider-selection:Telegram",
@@ -946,6 +1047,11 @@ async function navigateToState(
 			];
 		case "setup-pairing":
 			startPairingDiscovery(component);
+			await waitForEditorSurface(
+				component,
+				text => text.includes("PENDING") || text.includes("Pairing"),
+				"Telegram discovery",
+			);
 			return [
 				"home:Configure Telegram",
 				"provider-selection:Telegram",
@@ -955,8 +1061,9 @@ async function navigateToState(
 			];
 		case "saving":
 			startPairingDiscovery(component);
-			await settleEditor();
+			await waitForEditorSurface(component, text => text.includes("Save configuration"), "Telegram review");
 			component.handleInput("\n");
+			await waitForEditorSurface(component, text => text.includes("Saving Telegram configuration"), "durable save");
 			return [
 				"home:Configure Telegram",
 				"provider-selection:Telegram",
@@ -966,19 +1073,22 @@ async function navigateToState(
 			];
 		case "blocked-restore-retain":
 			startPairingDiscovery(component);
-			await settleEditor();
+			await waitForEditorSurface(component, text => text.includes("Save configuration"), "Telegram review");
 			component.handleInput("\n");
-			await settleEditor();
+			await waitForEditorSurface(
+				component,
+				text => text.includes("Restore previous configuration") && text.includes("Keep saved (inactive)"),
+				"blocked restore/retain confirmation",
+			);
 			component.handleInput("\t");
 			component.handleInput("\x1b[C");
-			component.dispose();
 			return [
 				"home:Configure Telegram",
 				"provider-selection:Telegram",
 				"chat-entry:private chat ID",
 				"token-entry:masked token",
 				"review:Save configuration",
-				"blocked:Tab, Right, and dispose leave restore/retain unresolved",
+				"blocked:Tab and Right leave restore/retain unresolved",
 			];
 		case "health-probing":
 			selectAction(component, 5);

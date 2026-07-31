@@ -390,7 +390,13 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 					signal,
 				});
 			} catch {
-				throw new SlackProviderError("connection", operation);
+				throw new SlackProviderError(
+					"connection",
+					operation,
+					undefined,
+					undefined,
+					operation === "chat.postMessage",
+				);
 			}
 			let parsed: unknown;
 			try {

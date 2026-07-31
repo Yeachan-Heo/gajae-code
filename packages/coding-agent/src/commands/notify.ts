@@ -44,7 +44,7 @@ export default class Notify extends Command {
 			description: "notify health/test: select telegram, discord, or slack",
 			options: ["telegram", "discord", "slack"],
 		}),
-		probe: Flags.boolean({ description: "notify health: probe Telegram reachability (getMe)" }),
+		probe: Flags.boolean({ description: "notify health: run the selected provider's REST diagnostic" }),
 		message: Flags.string({ description: "notify test: custom message body" }),
 		"owner-id": Flags.string({ description: "Internal: daemon owner id" }),
 		"agent-dir": Flags.string({ description: "Internal: agent dir for the daemon" }),

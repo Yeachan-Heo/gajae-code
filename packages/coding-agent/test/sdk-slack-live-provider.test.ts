@@ -191,6 +191,12 @@ describe("SlackLiveProvider fake Socket Mode protocol", () => {
 		expect(JSON.stringify(error)).not.toContain("xoxb-secret");
 	});
 
+	it("marks a one-shot transport rejection uncertain after POST dispatch", async () => {
+		const fixture = setup([new Error("connection lost")]);
+		await expect(
+			fixture.provider.sendOneShotTest({ channel: "C1", message: "hello", idempotencyKey: "client-1" }),
+		).resolves.toMatchObject({ ok: false, uncertain: true, detail: "chat.postMessage failed (connection)" });
+	});
 	it("stops a pending reconnect before it can open another Socket Mode connection", async () => {
 		let releaseSleep: (() => void) | undefined;
 		const sleepStarted = new Promise<void>(resolve => {

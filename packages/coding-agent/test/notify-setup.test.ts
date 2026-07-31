@@ -457,7 +457,7 @@ describe("notify setup cli", () => {
 		const { stdout } = await captureOutput(() => runNotifyCommand({ action: "status", rawArgs: [] }, { settings }));
 		expect(stdout).toContain("enabled: true");
 		expect(stdout).toContain(maskToken(token));
-		expect(stdout).toContain("chatId: 12345");
+		expect(stdout).toContain("telegram.destination: 12345");
 		expect(stdout).toContain("redact: true");
 		expect(stdout).not.toContain(token);
 	});
@@ -602,7 +602,7 @@ describe("notify setup cli", () => {
 						ensureTelegramDaemon,
 					}),
 				),
-			).rejects.toThrow("daemon readiness failed");
+			).rejects.toThrow("settings were saved, but activation or recovery failed");
 			expect(ensureTelegramDaemon).toHaveBeenCalledTimes(1);
 		});
 
@@ -1453,7 +1453,7 @@ test("CLI setup reports configured Discord daemon readiness before success", asy
 	expect(ensured).toBe(true);
 	expect(exitCode).toBeUndefined();
 	expect(stderr).toBe("");
-	expect(stdout).toContain("Discord notifications enabled.");
+	expect(stdout).toContain("Discord configuration saved and activated.");
 });
 
 test("CLI setup preserves configured Slack daemon readiness diagnostics and withholds success", async () => {
@@ -1482,7 +1482,7 @@ test("CLI setup preserves configured Slack daemon readiness diagnostics and with
 		),
 	);
 	expect(exitCode).toBe(1);
-	expect(stdout).not.toContain("Slack notifications enabled.");
+	expect(stdout).not.toContain("Slack configuration saved and activated.");
 	expect(stderr).toContain("Slack daemon did not become ready: Slack socket connection rejected by workspace");
 });
 

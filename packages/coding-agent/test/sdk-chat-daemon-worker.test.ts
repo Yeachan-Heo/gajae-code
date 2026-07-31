@@ -510,6 +510,120 @@ describe("chat daemon worker", () => {
 		expect(provider.stopped).toBe(true);
 	}, 20_000);
 
+	it("uses the broker-authorized isolated chat endpoint", async () => {
+		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-isolated-endpoint-"));
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const endpointPath = path.join(stateRoot, "chat", "sdk", "session.json");
+		const defaultEndpointPath = path.join(stateRoot, "sdk", "session.json");
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "chat-only-token" }),
+		);
+		await fs.mkdir(path.dirname(defaultEndpointPath), { recursive: true });
+		await fs.writeFile(
+			defaultEndpointPath,
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:2", token: "shared-token" }),
+		);
+		const index = await new SessionIndex(agentDir).open();
+		await index.append({
+			type: "host_registered",
+			sessionId: "session",
+			locator: { repo: root, stateRoot: path.join(stateRoot, "chat") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		const provider = new FakeDiscordProvider();
+		const client = new FakeSdkClient();
+		let attachedToken: string | undefined;
+		const runtime = new ChatDaemonRuntime(
+			{
+				kind: "discord",
+				agentDir,
+				config: {
+					identity: "fingerprint-only",
+					notifications: {
+						discord: { botToken: "bot-token", applicationId: "app", guildId: "guild", parentChannelId: "parent" },
+					},
+				},
+			},
+			{
+				createDiscordProvider: () => provider,
+				createClient: async endpoint => {
+					attachedToken = endpoint.token;
+					return client;
+				},
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
+			},
+		);
+		await runtime.start();
+		expect(attachedToken).toBe("chat-only-token");
+		await runtime.stop();
+	});
+
+	it("rejects a discovery record replaced after broker registration", async () => {
+		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-endpoint-mtime-"));
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const endpointPath = path.join(stateRoot, "sdk", "session.json");
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "authorized-token" }),
+		);
+		const authorizedMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const index = await new SessionIndex(agentDir).open();
+		await index.append({
+			type: "host_registered",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: authorizedMtimeMs,
+		});
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:2", token: "substituted-token" }),
+		);
+		const later = new Date(authorizedMtimeMs + 2_000);
+		await fs.utimes(endpointPath, later, later);
+		let connected = false;
+		const runtime = new ChatDaemonRuntime(
+			{
+				kind: "discord",
+				agentDir,
+				config: {
+					identity: "fingerprint-only",
+					notifications: {
+						discord: {
+							botToken: "bot-token",
+							applicationId: "app",
+							guildId: "guild",
+							parentChannelId: "parent",
+						},
+					},
+				},
+			},
+			{
+				createDiscordProvider: () => new FakeDiscordProvider(),
+				createClient: async () => {
+					connected = true;
+					return new FakeSdkClient();
+				},
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
+			},
+		);
+		await runtime.start();
+		expect(connected).toBe(false);
+		await runtime.stop();
+	});
+
 	it("fails closed when a replacement client cannot connect", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-replace-"));
 		const agentDir = path.join(root, "agent");

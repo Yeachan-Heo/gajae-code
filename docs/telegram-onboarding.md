@@ -160,16 +160,14 @@ options remain readable because they must be answerable remotely.
 gjc notify status
 ```
 
-The status command reads the typed notification settings and prints:
-
-- `enabled`
-- masked `botToken`
-- paired `chatId`
-- `redact`
-
-It uses the same masking helper as setup (`first 4 chars + … + length`), so it is
-safe to paste into a support thread if the chat id itself is not sensitive in
-your environment.
+The status command reports the global master plus each provider's independent
+configuration completeness, repair/quarantine state, durable desired-intent
+source, and effective enablement. Stored tokens are masked with the shared
+`first 4 chars + … + length` helper. Destination identifiers such as Telegram
+chat IDs remain visible and may be sensitive, so redact them before pasting a
+status report into a public support thread. Runtime readiness and actual
+delivery outcomes remain separate; use `gjc notify health --provider telegram`
+and `gjc notify test --provider telegram` for those checks.
 
 ## 5. Global configuration, adapters, and precedence
 
@@ -183,17 +181,13 @@ notification identity.
 layer:
 
 - `notifications.enabled = true`
+- `notifications.telegram.enabled = true` (durable desired intent)
 - `notifications.telegram.botToken = <token>`
 - `notifications.telegram.chatId = <paired chat id>`
 - `notifications.redact = true` only when `--redact` was passed
 - `notifications.telegram.streaming.enabled = true` by default; set it to `false` to disable durable live Telegram assistant-output updates globally. `GJC_NOTIFICATIONS_STREAM=1` forces process-local streaming, while `0`, `off`, or `false` forces it off.
 
-A complete global configuration is `notifications.enabled` plus at least one
-complete adapter. Telegram needs its bot token and private-chat id; Discord and
-Slack each need their own credential and destination. Removing Telegram in
-`/settings` is adapter-local: it preserves a complete Discord or Slack adapter
-and global enablement, and disables global notifications only when Telegram was
-the last complete adapter.
+Provider completeness, malformed-state quarantine, desired intent, effective enablement, runtime readiness, and delivery outcome are separate status dimensions. Telegram is complete when its bot token and private-chat id are valid; it is effective only when it is complete, not quarantined, desired on, and the global master is on. Provider-local malformed values are quarantined without erasing safe sibling values or secrets. Removing Telegram is adapter-local: it removes only Telegram credentials and sets Telegram desired intent off without changing `notifications.enabled` or any Discord/Slack state.
 
 
 Three lifecycle gates keep SDK hosting, setup, and managed delivery separate:
@@ -221,7 +215,7 @@ hosted SDK endpoints:
 
 1. `GJC_NOTIFY=off`, `0`, or `false` prevents the notification control surface
    for that process.
-2. `GJC_NOTIFICATIONS=0` is a hard managed-delivery opt-out.
+2. `GJC_NOTIFICATIONS=0` suppresses automatic generic current-session admission; explicit `/notify on` may override that suppression only for the current session.
 3. Local `/notify off` disables managed delivery only for the current session.
 4. `GJC_NOTIFICATIONS=1` or `GJC_NOTIFICATIONS_TOKEN` enables the legacy
    explicit managed-delivery path.
@@ -393,15 +387,10 @@ Inside a running GJC session, `/notify` controls the current session only; it
 does not edit global config or credentials:
 
 - `/notify status` reports current session notification status without secrets;
-- `/notify off` disables the current session endpoint and removes its discovery
-  record without changing global setup;
-- `/notify on` re-enables the current session when a complete global
-  configuration or explicit environment path is available, unless
-  `GJC_NOTIFICATIONS=0` is forcing opt-out.
+- `/notify off` disables the current session endpoint and removes its discovery record without changing global setup;
+- `/notify on` explicitly re-enables the current generic session when a complete effective provider or another explicit environment path is available.
 
-Neither command changes `GJC_NOTIFY` or `GJC_NOTIFICATIONS` precedence. A
-process with `GJC_NOTIFY=off`, `0`, or `false` has no notification control
-surface to override.
+`GJC_NOTIFICATIONS=0` suppresses automatic generic current-session admission only. An explicit `/notify on` may override that one automatic-admission suppression for the current session; it does not alter durable provider intent or enable a direct provider API. `GJC_NOTIFY=off`, `0`, or `false` remains the hard process-level opt-out and exposes no notification control surface to override.
 
 ## 9. Debug-only manual bridge
 
@@ -463,10 +452,10 @@ recovery removes only dead-owner artifacts and never touches a live owner.
 
 Check, in order:
 
-1. `gjc notify status`
-2. `GJC_NOTIFICATIONS` is not set to `0`
-3. the session has not run `/notify off`
-4. the repo has `.gjc/state/sdk/<sessionId>.json`
+1. `gjc notify status` and confirm the selected provider is complete, not quarantined, desired on, and effective
+2. the session has not run `/notify off`; when `GJC_NOTIFICATIONS=0` suppresses automatic admission, run `/notify on` explicitly
+3. the repo has `.gjc/state/sdk/<sessionId>.json`, or `.gjc/state/chat/sdk/<sessionId>.json` when a proven foreign Telegram owner is isolated while Discord/Slack remains effective
+4. the selected provider runtime is ready or attached
 5. the managed daemon state is fresh under the GJC agent notifications directory
 
 Do not paste endpoint discovery files into public issues; they contain the

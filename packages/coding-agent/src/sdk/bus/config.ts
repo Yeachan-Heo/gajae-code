@@ -52,12 +52,7 @@ export function readTelegramActivationMarkers(value?: unknown): TelegramActivati
 export type NotificationProvider = "telegram" | "discord" | "slack";
 export type NotificationRuntime = "inactive" | "starting" | "ready" | "attached" | "blocked" | "failed";
 export type ProviderSecretDisposition = "keep" | "replace" | "remove";
-export type ProviderResolutionIssueCode =
-	| "missing"
-	| "blank"
-	| "wrong_type"
-	| "invalid_container"
-	| "contradictory";
+export type ProviderResolutionIssueCode = "missing" | "blank" | "wrong_type" | "invalid_container" | "contradictory";
 
 export interface ProviderResolutionIssue {
 	path: string;
@@ -147,7 +142,11 @@ function providerObject(value: unknown, pathName: string, issues: ProviderResolu
 	return value as NotificationObject;
 }
 
-function addProviderIssue(issues: ProviderResolutionIssue[], pathName: string, code: ProviderResolutionIssueCode): void {
+function addProviderIssue(
+	issues: ProviderResolutionIssue[],
+	pathName: string,
+	code: ProviderResolutionIssueCode,
+): void {
 	if (!issues.some(issue => issue.path === pathName && issue.code === code)) issues.push({ path: pathName, code });
 }
 
@@ -247,9 +246,10 @@ function addMissingRequiredProviderIssues(
 	required: readonly string[],
 	basePath: string,
 	issues: ProviderResolutionIssue[],
+	explicitlyEnabled: boolean,
 ): void {
 	const anyRequiredPresent = required.some(key => container[key] !== undefined);
-	if (!anyRequiredPresent) return;
+	if (!anyRequiredPresent && !explicitlyEnabled) return;
 	for (const key of required) {
 		if (container[key] === undefined) addProviderIssue(issues, `${basePath}.${key}`, "missing");
 	}
@@ -279,52 +279,85 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 	const streaming = providerObject(telegram.streaming, "notifications.telegram.streaming", telegramIssues);
 	const activation = providerActivation(telegram, "notifications.telegram.activation", telegramIssues);
 	const daemon = notificationObject(notifications.daemon);
+	const telegramEnabled = providerEnabled(telegram, "notifications.telegram.enabled", telegramIssues);
+	const discordEnabled = providerEnabled(discord, "notifications.discord.enabled", discordIssues);
+	const slackEnabled = providerEnabled(slack, "notifications.slack.enabled", slackIssues);
 	addMissingRequiredProviderIssues(
 		telegram,
 		["botToken", "chatId"],
 		"notifications.telegram",
 		telegramIssues,
+		telegramEnabled === true,
 	);
 	addMissingRequiredProviderIssues(
 		discord,
 		["botToken", "applicationId", "guildId", "parentChannelId"],
 		"notifications.discord",
 		discordIssues,
+		discordEnabled === true,
 	);
 	addMissingRequiredProviderIssues(
 		slack,
 		["botToken", "appToken", "workspaceId", "channelId"],
 		"notifications.slack",
 		slackIssues,
+		slackEnabled === true,
 	);
-	const telegramEnabled = providerEnabled(telegram, "notifications.telegram.enabled", telegramIssues);
-	const discordEnabled = providerEnabled(discord, "notifications.discord.enabled", discordIssues);
-	const slackEnabled = providerEnabled(slack, "notifications.slack.enabled", slackIssues);
 	const telegramSnapshot: NotificationSettingsSnapshot["telegram"] = {
 		...(telegramEnabled === undefined ? {} : { enabled: telegramEnabled }),
 		botToken: providerString(telegram, "botToken", "notifications.telegram.botToken", telegramIssues),
 		chatId: providerString(telegram, "chatId", "notifications.telegram.chatId", telegramIssues),
 		...(activation === undefined ? {} : { activation }),
-		sound: providerChoice(telegram, "sound", "notifications.telegram.sound", "all", ["all", "important", "none"], telegramIssues),
+		sound: providerChoice(
+			telegram,
+			"sound",
+			"notifications.telegram.sound",
+			"all",
+			["all", "important", "none"],
+			telegramIssues,
+		),
 		btw: { enabled: providerBoolean(btw, "enabled", "notifications.telegram.btw.enabled", true, telegramIssues) },
 		rich: { enabled: providerBoolean(rich, "enabled", "notifications.telegram.rich.enabled", true, telegramIssues) },
 		richDraft: {
-			enabled: providerBoolean(richDraft, "enabled", "notifications.telegram.richDraft.enabled", false, telegramIssues),
-	},
-	toolActivity: {
-		enabled: providerBoolean(toolActivity, "enabled", "notifications.telegram.toolActivity.enabled", false, telegramIssues),
-	},
-	streaming: {
-		enabled: providerBoolean(streaming, "enabled", "notifications.telegram.streaming.enabled", true, telegramIssues),
-	},
-	topics: providerTopics(telegram, "notifications.telegram.topics", telegramIssues),
+			enabled: providerBoolean(
+				richDraft,
+				"enabled",
+				"notifications.telegram.richDraft.enabled",
+				false,
+				telegramIssues,
+			),
+		},
+		toolActivity: {
+			enabled: providerBoolean(
+				toolActivity,
+				"enabled",
+				"notifications.telegram.toolActivity.enabled",
+				false,
+				telegramIssues,
+			),
+		},
+		streaming: {
+			enabled: providerBoolean(
+				streaming,
+				"enabled",
+				"notifications.telegram.streaming.enabled",
+				true,
+				telegramIssues,
+			),
+		},
+		topics: providerTopics(telegram, "notifications.telegram.topics", telegramIssues),
 	};
 	const discordSnapshot: NotificationSettingsSnapshot["discord"] = {
 		...(discordEnabled === undefined ? {} : { enabled: discordEnabled }),
 		botToken: providerString(discord, "botToken", "notifications.discord.botToken", discordIssues),
 		applicationId: providerString(discord, "applicationId", "notifications.discord.applicationId", discordIssues),
 		guildId: providerString(discord, "guildId", "notifications.discord.guildId", discordIssues),
-		parentChannelId: providerString(discord, "parentChannelId", "notifications.discord.parentChannelId", discordIssues),
+		parentChannelId: providerString(
+			discord,
+			"parentChannelId",
+			"notifications.discord.parentChannelId",
+			discordIssues,
+		),
 	};
 	const slackSnapshot: NotificationSettingsSnapshot["slack"] = {
 		...(slackEnabled === undefined ? {} : { enabled: slackEnabled }),
@@ -467,7 +500,10 @@ export function hasNonBlankValue(value: string | undefined): boolean {
 	return typeof value === "string" && value.trim().length > 0;
 }
 
-function providerRequiredFields(cfg: NotificationConfig, provider: NotificationProvider): Readonly<Record<string, unknown>> {
+function providerRequiredFields(
+	cfg: NotificationConfig,
+	provider: NotificationProvider,
+): Readonly<Record<string, unknown>> {
 	if (provider === "telegram") return { botToken: cfg.botToken, chatId: cfg.chatId };
 	if (provider === "discord") {
 		return {
@@ -485,7 +521,10 @@ function providerRequiredFields(cfg: NotificationConfig, provider: NotificationP
 	};
 }
 
-function providerOptionalFields(cfg: NotificationConfig, provider: NotificationProvider): Readonly<Record<string, unknown>> {
+function providerOptionalFields(
+	cfg: NotificationConfig,
+	provider: NotificationProvider,
+): Readonly<Record<string, unknown>> {
 	return provider === "slack" ? { authorizedUserId: cfg.slack.authorizedUserId } : {};
 }
 
@@ -495,19 +534,26 @@ function providerConfigEnabled(cfg: NotificationConfig, provider: NotificationPr
 	return cfg.slack.enabled;
 }
 
-function providerStoredIssues(cfg: NotificationConfig, provider: NotificationProvider): readonly ProviderResolutionIssue[] {
+function providerStoredIssues(
+	cfg: NotificationConfig,
+	provider: NotificationProvider,
+): readonly ProviderResolutionIssue[] {
 	return cfg.providerIssues?.[provider] ?? [];
 }
 
 function uniqueProviderIssues(issues: readonly ProviderResolutionIssue[]): ProviderResolutionIssue[] {
 	const result: ProviderResolutionIssue[] = [];
 	for (const issue of issues) {
-		if (!result.some(existing => existing.path === issue.path && existing.code === issue.code)) result.push({ ...issue });
+		if (!result.some(existing => existing.path === issue.path && existing.code === issue.code))
+			result.push({ ...issue });
 	}
 	return result;
 }
 
-function providerFacts(cfg: NotificationConfig, provider: NotificationProvider): {
+function providerFacts(
+	cfg: NotificationConfig,
+	provider: NotificationProvider,
+): {
 	configured: boolean;
 	quarantined: boolean;
 	issues: ProviderResolutionIssue[];
@@ -516,10 +562,11 @@ function providerFacts(cfg: NotificationConfig, provider: NotificationProvider):
 	const optional = providerOptionalFields(cfg, provider);
 	const issues = [...providerStoredIssues(cfg, provider)];
 	const anyRequiredPresent = Object.values(required).some(value => value !== undefined);
+	const explicitlyEnabled = providerConfigEnabled(cfg, provider) === true;
 	for (const [key, value] of Object.entries(required)) {
 		const pathName = `notifications.${provider}.${key}`;
 		if (value === undefined) {
-			if (anyRequiredPresent) issues.push({ path: pathName, code: "missing" });
+			if (anyRequiredPresent || explicitlyEnabled) issues.push({ path: pathName, code: "missing" });
 		} else if (typeof value !== "string") issues.push({ path: pathName, code: "wrong_type" });
 		else if (value.trim().length === 0) issues.push({ path: pathName, code: "blank" });
 	}
@@ -530,42 +577,44 @@ function providerFacts(cfg: NotificationConfig, provider: NotificationProvider):
 		else if (value.trim().length === 0) issues.push({ path: pathName, code: "blank" });
 	}
 	const uniqueIssues = uniqueProviderIssues(issues);
-	const configured =
-		Object.values(required).every(value => typeof value === "string" && value.trim().length > 0) && uniqueIssues.length === 0;
-	return { configured, quarantined: uniqueIssues.length > 0, issues: uniqueIssues };
+	const configured = Object.values(required).every(value => typeof value === "string" && value.trim().length > 0);
+	const quarantined = uniqueIssues.some(issue => issue.code !== "missing");
+	return { configured, quarantined, issues: uniqueIssues };
 }
 
 export function isProviderComplete(cfg: NotificationConfig, provider: NotificationProvider): boolean {
 	return providerFacts(cfg, provider).configured;
 }
 
-export function isTelegramComplete(cfg: NotificationConfig): cfg is NotificationConfig & { botToken: string; chatId: string } {
+export function isTelegramComplete(
+	cfg: NotificationConfig,
+): cfg is NotificationConfig & { botToken: string; chatId: string } {
 	return isProviderComplete(cfg, "telegram");
 }
 
-export function isDiscordComplete(
-	cfg: NotificationConfig,
-): cfg is NotificationConfig & {
+export function isDiscordComplete(cfg: NotificationConfig): cfg is NotificationConfig & {
 	discord: { botToken: string; applicationId: string; guildId: string; parentChannelId: string };
 } {
 	return isProviderComplete(cfg, "discord");
 }
 
-export function isSlackComplete(
-	cfg: NotificationConfig,
-): cfg is NotificationConfig & {
+export function isSlackComplete(cfg: NotificationConfig): cfg is NotificationConfig & {
 	slack: { botToken: string; appToken: string; workspaceId: string; channelId: string };
 } {
 	return isProviderComplete(cfg, "slack");
 }
 
-export function resolveNotificationProvider(cfg: NotificationConfig, provider: NotificationProvider): ProviderResolution {
+export function resolveNotificationProvider(
+	cfg: NotificationConfig,
+	provider: NotificationProvider,
+): ProviderResolution {
 	const facts = providerFacts(cfg, provider);
 	const configuredEnabled = providerConfigEnabled(cfg, provider);
 	const explicitIssue = facts.issues.some(issue => issue.path === `notifications.${provider}.enabled`);
 	const explicit = typeof configuredEnabled === "boolean" ? configuredEnabled : undefined;
-	const desiredSource: ProviderResolution["desiredSource"] = explicit !== undefined || explicitIssue ? "explicit" : "legacy";
-	const desiredEnabled = explicit ?? (facts.configured && !facts.quarantined);
+	const desiredSource: ProviderResolution["desiredSource"] =
+		explicit !== undefined || explicitIssue ? "explicit" : "legacy";
+	const desiredEnabled = explicitIssue ? false : (explicit ?? (facts.configured && !facts.quarantined));
 	return {
 		provider,
 		configured: facts.configured,
@@ -589,7 +638,6 @@ export function hasAnyEffectivelyEnabledProvider(cfg: NotificationConfig): boole
 	return NOTIFICATION_PROVIDERS.some(provider => isProviderEffectivelyEnabled(cfg, provider));
 }
 
-
 /**
  * Resolve generic live-stream policy. This policy only governs automatic
  * current-session frames; it never changes durable provider eligibility.
@@ -608,7 +656,12 @@ export interface GenericNotificationSessionEligibility {
 	source: GenericNotificationSessionSource;
 }
 
-export type GenericNotificationStreamSource = "session_not_admitted" | "env_on" | "env_off" | "durable_telegram" | "none";
+export type GenericNotificationStreamSource =
+	| "session_not_admitted"
+	| "env_on"
+	| "env_off"
+	| "durable_telegram"
+	| "none";
 
 export interface GenericNotificationStreamPolicy {
 	enabled: boolean;
@@ -708,7 +761,6 @@ export function shouldRegisterGenericNotificationsExtension(input: GenericNotifi
 export function isGenericNotificationSessionEnabled(input: GenericNotificationSessionEligibilityInput): boolean {
 	return resolveGenericNotificationSessionEligibility(input).enabled;
 }
-
 
 /** Mask a bot token for display: first 4 chars + "…" + "(len N)"; "(unset)" when undefined/empty. Never reveal full token. */
 export function maskToken(token: string | undefined): string {

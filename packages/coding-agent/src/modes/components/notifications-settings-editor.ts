@@ -9,6 +9,7 @@ import {
 	wrapTextWithAnsi,
 } from "@gajae-code/tui";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
+import type { NotificationProvider, ProviderSecretDisposition } from "../../sdk/bus/config";
 import type {
 	BlockedTelegramRestoreResult,
 	ProposedTelegramIdentity,
@@ -21,7 +22,6 @@ import type {
 	NotificationTestResult,
 } from "../../sdk/bus/notification-service";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../../sdk/bus/session-control";
-import type { NotificationProvider, ProviderSecretDisposition } from "../../sdk/bus/config";
 import { theme } from "../theme/theme";
 
 /** Safe scalar notification preferences. Credentials and destination IDs are deliberately absent. */
@@ -99,6 +99,12 @@ export interface PreparedNotificationProviderConfiguration {
 	workspaceId?: string;
 	channelId?: string;
 	authorizedUserId?: string;
+	applicationIdDisplay?: string;
+	guildIdDisplay?: string;
+	parentChannelIdDisplay?: string;
+	workspaceIdDisplay?: string;
+	channelIdDisplay?: string;
+	authorizedUserIdDisplay?: string;
 }
 
 export interface NotificationsPreflightResult {
@@ -112,6 +118,7 @@ export interface NotificationsPreflightResult {
 /** A successful configuration save always carries an opaque CAS receipt. */
 export type NotificationsConfigureCommitResult =
 	| { status: "saved"; receipt: CasReceipt; message: string }
+	| { status: "activation_failed" | "observer_failed"; receipt: CasReceipt; message: string }
 	| {
 			status: "blocked_identity";
 			receipt: CasReceipt;
@@ -123,10 +130,12 @@ export type NotificationsConfigureCommitResult =
 export interface NotificationsMutationResult {
 	message: string;
 	receipt?: CasReceipt;
+	outcome?: "success" | "degraded" | "failed";
 }
 
 export type NotificationsSaveInactiveResult =
 	| { status: "saved_inactive"; receipt: CasReceipt; message: string }
+	| { status: "observer_failed"; receipt: CasReceipt; message: string }
 	| { status: "unavailable"; guidance: string };
 
 /**
@@ -161,9 +170,7 @@ export interface NotificationsEditorOperations {
 	prepareProviderConfiguration(
 		input: NotificationsProviderSetupInput,
 	): Promise<PreparedNotificationProviderConfiguration>;
-	commitProviderConfiguration(
-		draft: PreparedNotificationProviderConfiguration,
-	): Promise<NotificationsMutationResult>;
+	commitProviderConfiguration(draft: PreparedNotificationProviderConfiguration): Promise<NotificationsMutationResult>;
 	discardProviderConfiguration(draft: PreparedNotificationProviderConfiguration): void;
 	setProviderDesired(provider: NotificationProvider, enabled: boolean): Promise<NotificationsMutationResult>;
 	removeProvider(provider: NotificationProvider): Promise<NotificationsMutationResult>;
@@ -258,6 +265,7 @@ function emptyState(): NotificationsEditorState {
 			redact: false,
 			verbosity: "lean",
 			globallyConfigured: false,
+			anyProviderComplete: false,
 			anyProviderEffective: false,
 			telegram: {
 				botTokenMasked: "(not set)",
@@ -313,6 +321,12 @@ function emptyState(): NotificationsEditorState {
 
 function statusLabel(level: "ok" | "warn" | "error"): "OK" | "WARNING" | "ERROR" {
 	return level === "ok" ? "OK" : level === "warn" ? "WARNING" : "ERROR";
+}
+
+function mutationStatus(result: NotificationsMutationResult): "OK" | "WARNING" | "ERROR" {
+	if (result.outcome === "degraded") return "WARNING";
+	if (result.outcome === "failed") return "ERROR";
+	return result.receipt || result.outcome === "success" ? "OK" : "ERROR";
 }
 
 function safeDetail(value: string | undefined, fallback: string): string {
@@ -413,7 +427,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 	}
 
 	dispose(): void {
-		if (this.#disposed || this.navigationLocked) return;
+		if (this.#disposed) return;
 		this.#disposed = true;
 		this.#abortController.abort();
 		this.#clearDrafts(true);
@@ -743,7 +757,12 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 					return;
 				}
 				this.#providerFormDraft.botToken = { action };
-				this.#providerFormStep = action === "replace" ? "bot-secret" : this.#selectedProvider === "slack" ? "app-action" : "application-id";
+				this.#providerFormStep =
+					action === "replace"
+						? "bot-secret"
+						: this.#selectedProvider === "slack"
+							? "app-action"
+							: "application-id";
 				this.#status =
 					action === "replace"
 						? "INFO — Enter the replacement bot token; only bullets are rendered."
@@ -851,6 +870,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#selectedIndex = 0;
 				this.#status = `INFO — Review secret-safe ${draft.provider} configuration before saving.`;
 			},
+			draft => this.operations.discardProviderConfiguration(draft),
 		);
 	}
 
@@ -954,14 +974,22 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		);
 	}
 
-	#runGuarded<T>(pending: string, work: () => Promise<T>, complete: (result: T) => Promise<void> | void): void {
+	#runGuarded<T>(
+		pending: string,
+		work: () => Promise<T>,
+		complete: (result: T) => Promise<void> | void,
+		disposeResult?: (result: T) => Promise<void> | void,
+	): void {
 		if (this.#guarded || this.#disposed) return;
 		this.#guarded = true;
 		this.#status = `PENDING — ${pending} Navigation is locked; it may already have started or delivered.`;
 		void (async () => {
 			try {
 				const result = await work();
-				if (this.#disposed) return;
+				if (this.#disposed) {
+					await disposeResult?.(result);
+					return;
+				}
 				await complete(result);
 			} catch {
 				if (!this.#disposed) {
@@ -974,20 +1002,32 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 	}
 
 	async #afterDurableMutation(): Promise<boolean> {
-		await this.operations.reconcileCurrentSession();
-		const health = await this.operations.refreshHealth({ probe: false });
-		if (this.#disposed) return false;
-		this.#state = { ...this.#state, health };
-		await this.#loadState();
-		return !this.#disposed;
+		try {
+			await this.operations.reconcileCurrentSession();
+			const health = await this.operations.refreshHealth({ probe: false });
+			if (this.#disposed) return false;
+			this.#state = { ...this.#state, health };
+			await this.#loadState();
+			return !this.#disposed;
+		} catch {
+			if (!this.#disposed) {
+				this.#status = "WARNING — Configuration was saved, but post-commit reconciliation or refresh failed.";
+			}
+			return false;
+		}
 	}
 
 	async #refreshAfterOperation(): Promise<boolean> {
-		const health = await this.operations.refreshHealth({ probe: false });
-		if (this.#disposed) return false;
-		this.#state = { ...this.#state, health };
-		await this.#loadState();
-		return !this.#disposed;
+		try {
+			const health = await this.operations.refreshHealth({ probe: false });
+			if (this.#disposed) return false;
+			this.#state = { ...this.#state, health };
+			await this.#loadState();
+			return !this.#disposed;
+		} catch {
+			if (!this.#disposed) this.#status = "WARNING — The operation completed, but state refresh failed.";
+			return false;
+		}
 	}
 
 	#enableGlobally(): void {
@@ -997,7 +1037,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			async result => {
 				if (!(await this.#afterDurableMutation())) return;
 
-				this.#status = `OK — ${safeDetail(result.message, "Global notifications enabled using stored credentials.")}`;
+				this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Global notifications enabled using stored credentials.")}`;
 			},
 		);
 	}
@@ -1012,7 +1052,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				if (!(await this.#afterDurableMutation())) return;
 				this.#mode = "provider-actions";
 				this.#selectedIndex = 0;
-				this.#status = `${result.receipt ? "OK" : "ERROR"} — ${safeDetail(result.message, "Provider intent updated.")}`;
+				this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Provider intent updated.")}`;
 			},
 		);
 	}
@@ -1032,7 +1072,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				if (!(await this.#afterDurableMutation())) return;
 				this.#mode = "provider-actions";
 				this.#selectedIndex = 0;
-				this.#status = `${result.receipt ? "OK" : "ERROR"} — ${safeDetail(result.message, "Provider configuration updated.")}`;
+				this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Provider configuration updated.")}`;
 			},
 		);
 	}
@@ -1046,7 +1086,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				if (!(await this.#afterDurableMutation())) return;
 				this.#mode = "home";
 				this.#selectedIndex = 0;
-				this.#status = `${result.receipt ? "OK" : "ERROR"} — ${safeDetail(result.message, "Provider removal completed.")}`;
+				this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Provider removal completed.")}`;
 			},
 		);
 	}
@@ -1062,7 +1102,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 					if (!(await this.#afterDurableMutation())) return;
 					this.#mode = "home";
 					this.#selectedIndex = 0;
-					this.#status = `OK — ${safeDetail(result.message, "Notifications disabled globally.")}`;
+					this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Notifications disabled globally.")}`;
 				},
 			);
 			return;
@@ -1075,11 +1115,9 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 					if (!(await this.#afterDurableMutation())) return;
 					this.#mode = "home";
 					this.#selectedIndex = 0;
-					this.#status = `OK — ${safeDetail(
+					this.#status = `${mutationStatus(result)} — ${safeDetail(
 						result.message,
-						result.globallyDisabled
-							? "Telegram removed and global notifications disabled."
-							: "Telegram removed; other adapters remain enabled.",
+						"Telegram removed without changing the global master or sibling providers.",
 					)}`;
 				},
 			);
@@ -1227,7 +1265,6 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#clearDrafts();
 				if (result.status === "blocked_identity") {
 					this.#blockedCommit = result;
-					if (!(await this.#refreshAfterOperation())) return;
 					this.#confirmation = "blocked_identity";
 					this.#mode = "confirmation";
 					this.#selectedIndex = 0;
@@ -1235,6 +1272,14 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 						result.message,
 						"Configuration saved but activation blocked by a foreign daemon.",
 					)}`;
+					await this.#refreshAfterOperation();
+					return;
+				}
+				if (result.status === "activation_failed" || result.status === "observer_failed") {
+					if (!(await this.#afterDurableMutation())) return;
+					this.#mode = "home";
+					this.#selectedIndex = 0;
+					this.#status = `WARNING — ${safeDetail(result.message, "Telegram configuration was saved with a post-commit failure.")}`;
 					return;
 				}
 				if (!(await this.#afterDurableMutation())) return;
@@ -1262,7 +1307,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#clearDrafts();
 				this.#mode = "home";
 				this.#selectedIndex = 0;
-				this.#status = `OK — ${safeDetail(result.message, "Telegram configuration saved inactive; foreign daemon untouched.")}`;
+				this.#status = `${result.status === "observer_failed" ? "WARNING" : "OK"} — ${safeDetail(result.message, "Telegram configuration saved inactive; foreign daemon untouched.")}`;
 			},
 		);
 	}
@@ -1341,7 +1386,11 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		return [
 			{
 				id: "provider-configure",
-				label: view.quarantined ? `Repair ${this.#selectedProvider}` : view.configured ? `Edit ${this.#selectedProvider}` : `Configure ${this.#selectedProvider}`,
+				label: view.quarantined
+					? `Repair ${this.#selectedProvider}`
+					: view.configured
+						? `Edit ${this.#selectedProvider}`
+						: `Configure ${this.#selectedProvider}`,
 				description: "Use explicit keep, replace, or remove secret actions and selected-provider CAS persistence.",
 			},
 			{
@@ -1362,7 +1411,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			{
 				id: "provider-remove",
 				label: `Remove ${this.#selectedProvider}`,
-				description: "Remove only this provider after explicit confirmation; siblings and the global master remain unchanged.",
+				description:
+					"Remove only this provider after explicit confirmation; siblings and the global master remain unchanged.",
 			},
 			{ id: "cancel", label: "Back to Notifications", description: "Return without changing settings." },
 		];
@@ -1380,7 +1430,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			{
 				id: "configure",
 				label: "Configure notification providers",
-				description: "Open first-class Telegram, Discord, and Slack configuration and repair flows.",
+				description: "Set up or repair Telegram, Discord, and Slack.",
 			},
 			{
 				id: "enable",
@@ -1593,7 +1643,9 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 
 	#renderProviderReview(width: number): string[] {
 		const draft = this.#providerPrepared;
-		const lines = [theme.bold(theme.fg("accent", `Review ${draft?.provider ?? this.#selectedProvider} configuration`))];
+		const lines = [
+			theme.bold(theme.fg("accent", `Review ${draft?.provider ?? this.#selectedProvider} configuration`)),
+		];
 		if (draft) {
 			lines.push(
 				this.#truncate(
@@ -1603,8 +1655,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			);
 			const routing =
 				draft.provider === "discord"
-					? `application ${draft.applicationId} · guild ${draft.guildId} · parent ${draft.parentChannelId}`
-					: `workspace ${draft.workspaceId} · channel ${draft.channelId} · authorized user ${draft.authorizedUserId ?? "(unchanged)"}`;
+					? `application ${draft.applicationIdDisplay ?? "(unset)"} · guild ${draft.guildIdDisplay ?? "(unset)"} · parent ${draft.parentChannelIdDisplay ?? "(unset)"}`
+					: `workspace ${draft.workspaceIdDisplay ?? "(unset)"} · channel ${draft.channelIdDisplay ?? "(unset)"} · authorized user ${draft.authorizedUserIdDisplay ?? "(unset)"}`;
 			lines.push(this.#truncate(`  ${routing}`, width));
 		}
 		lines.push("");
@@ -1768,13 +1820,14 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		for (const provider of ["telegram", "discord", "slack"] as const) {
 			const view = status[provider];
 			const checkedHealth = health?.provider === provider ? statusLabel(health.overall) : "not checked";
-			const test = this.#lastTest?.adapter === provider
-				? this.#lastTest.ok
-					? "OK"
-					: this.#lastTest.uncertain
-						? "UNCERTAIN"
-						: "ERROR"
-				: "not run";
+			const test =
+				this.#lastTest?.adapter === provider
+					? this.#lastTest.ok
+						? "OK"
+						: this.#lastTest.uncertain
+							? "UNCERTAIN"
+							: "ERROR"
+					: "not run";
 			lines.push(
 				this.#truncate(
 					`  ${provider}: ${view.quarantined ? "NEEDS REPAIR" : view.configured ? "configured" : "not configured"} · desired ${view.desiredEnabled ? "on" : "off"} (${view.desiredSource}) · effective ${view.effectiveEnabled ? "yes" : "no"} · runtime ${view.runtime ?? "inactive"} · health ${checkedHealth} · test ${test} · destination ${view.channel ?? "(unset)"}`,
@@ -1819,7 +1872,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		if (this.#lastTest && width >= 120) {
 			lines.push(
 				this.#truncate(
-					`  Last in-editor test: ${this.#lastTest.ok ? "OK" : "ERROR"} — ${safeDetail(this.#lastTest.detail, "No detail returned.")}`,
+					`  Last in-editor test: ${this.#lastTest.ok ? "OK" : this.#lastTest.uncertain ? "UNCERTAIN" : "ERROR"} — ${safeDetail(this.#lastTest.detail, "No detail returned.")}`,
 					width,
 				),
 			);
@@ -1830,11 +1883,12 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 	#renderActionList(lines: string[], width: number, actions: readonly Action[]): void {
 		if (actions.length === 0) return;
 		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, actions.length - 1));
+		const visibleActions = width < 100 ? 2 : VISIBLE_ACTIONS;
 		const start = Math.max(
 			0,
-			Math.min(this.#selectedIndex - Math.floor(VISIBLE_ACTIONS / 2), actions.length - VISIBLE_ACTIONS),
+			Math.min(this.#selectedIndex - Math.floor(visibleActions / 2), actions.length - visibleActions),
 		);
-		const end = Math.min(actions.length, start + VISIBLE_ACTIONS);
+		const end = Math.min(actions.length, start + visibleActions);
 		for (let index = start; index < end; index += 1) {
 			const action = actions[index];
 			if (!action) continue;

@@ -15,6 +15,8 @@ const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-contr
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
+const chatRuntime = "packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts";
+const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
 const inventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
@@ -73,8 +75,26 @@ const chatTakeoverHelpers = [
 ] as const;
 const chatCliHelpers = ["defaultPidAlive", "loadConfig", "ownerPid"] as const;
 const chatConfigHelpers = {
-	discord: ["getNotificationConfig", "notificationConfigFromFile", "isDiscordConfigured", "tokenFingerprint"],
-	slack: ["getNotificationConfig", "notificationConfigFromFile", "isSlackConfigured", "tokenFingerprint"],
+	discord: [
+		"getNotificationConfig",
+		"notificationConfigFromFile",
+		"resolveNotificationProvider",
+		"isDiscordComplete",
+		"isProviderEffectivelyEnabled",
+		"tokenFingerprint",
+	],
+	slack: [
+		"getNotificationConfig",
+		"notificationConfigFromFile",
+		"resolveNotificationProvider",
+		"isSlackComplete",
+		"isProviderEffectivelyEnabled",
+		"tokenFingerprint",
+	],
+} as const;
+const chatEndpointHelpers = {
+	[chatRuntime]: ["attach"],
+	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 const telegramToolActivityDeclarations = {
 	[config]: ["parseNotificationSettingsSnapshot"],
@@ -271,6 +291,9 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 		...telegramHandoffHelpers.map(name => ({ family: "telegram" as const, file: telegramDaemon, name })),
 		...(["discord", "slack"] as const).flatMap(family => chatCliHelpers.map(name => ({ family, file: chatCli, name }))),
 		...(["discord", "slack"] as const).flatMap(family => chatConfigHelpers[family].map(name => ({ family, file: config, name }))),
+		...(["discord", "slack"] as const).flatMap(family =>
+			Object.entries(chatEndpointHelpers).flatMap(([file, names]) => names.map(name => ({ family, file, name }))),
+		),
 	];
 	for (const helper of helpers) {
 		const missing = mappedHelperMutation({ ...helper, generationBumped: false });
@@ -668,8 +691,11 @@ test("fails closed when a protected native authority declaration is missing or m
 		cli.discord[chatCli] = cli.discord[chatCli]!.filter(name => name !== "ownerPid");
 		expect(() => validateInventory(cli)).toThrow("chat CLI ownership primitives");
 		const providerConfig = mutableInventory();
-		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackConfigured");
+		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackComplete");
 		expect(() => validateInventory(providerConfig)).toThrow("chat configuration primitives");
+		const endpointDiscovery = mutableInventory();
+		delete endpointDiscovery.discord[chatRuntime];
+		expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
 	});
 
 	test("protects Telegram provenance and signaling authorities", () => {
@@ -733,6 +759,9 @@ test("fails closed when a protected native authority declaration is missing or m
 			expect(cli).toEqual(expect.arrayContaining(chatCliHelpers));
 			const providerConfig = protectedInventory[family][config] ?? [];
 			expect(providerConfig).toEqual(expect.arrayContaining(chatConfigHelpers[family]));
+			for (const [file, declarations] of Object.entries(chatEndpointHelpers)) {
+				expect(protectedInventory[family][file] ?? []).toEqual(expect.arrayContaining(declarations));
+			}
 		}
 	});
 

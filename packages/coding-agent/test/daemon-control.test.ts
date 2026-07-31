@@ -1930,6 +1930,24 @@ describe("ChatDaemonController ownership safety", () => {
 			return crypto.createHash("sha256").update(values.join("\0")).digest("hex").slice(0, 16);
 		}
 
+		test("never spawns a complete provider whose durable desired intent is off", async () => {
+			const agentDir = tempAgentDir();
+			const settings = configuredSettings(agentDir);
+			settings.set(`notifications.${kind}.enabled`, false);
+			let spawns = 0;
+			const controller = new ChatDaemonController(settings, kind, {
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			});
+			expect(await controller.ensure()).toBe("disabled");
+			const result = await controller.reload();
+			expect(result.ok).toBe(false);
+			expect(result.message).toContain("not enabled");
+			expect(spawns).toBe(0);
+		});
+
 		test.each([
 			["lower", chatDaemonGeneration(kind) - 1, "owner_spawned", "stale"],
 			["equal", chatDaemonGeneration(kind), "attached", "running"],
@@ -2915,6 +2933,32 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 	function workerArgs(agentDir: string): string[] {
 		return ["--agent-dir", agentDir, "--owner-id", `${process.pid}-heartbeat-test`];
 	}
+
+	test("returns cleanly without constructing a desired-off provider runtime", async () => {
+		const agentDir = tempAgentDir();
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			[
+				"notifications:",
+				"  enabled: true",
+				"  discord:",
+				"    enabled: false",
+				"    botToken: discord-token",
+				"    applicationId: app",
+				"    guildId: guild",
+				"    parentChannelId: parent",
+				"",
+			].join("\n"),
+		);
+		let constructed = false;
+		await runChatDaemonInternal("discord", workerArgs(agentDir), {
+			createRuntime: () => {
+				constructed = true;
+				throw new Error("runtime should not be constructed");
+			},
+		});
+		expect(constructed).toBe(false);
+	});
 
 	test("does not start the transport when its initial heartbeat renewal fails", async () => {
 		const agentDir = tempAgentDir();

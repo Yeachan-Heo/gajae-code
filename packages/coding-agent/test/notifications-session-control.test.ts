@@ -148,6 +148,11 @@ const discordConfig = (): NotificationConfig => ({
 	},
 });
 
+const mixedTelegramDiscordConfig = (): NotificationConfig => ({
+	...telegramConfig(),
+	discord: discordConfig().discord,
+});
+
 const slackConfig = (): NotificationConfig => ({
 	...BASE_CONFIG,
 	enabled: true,
@@ -361,7 +366,11 @@ test("installs restrictive policy before a malformed reload and fails closed", a
 	const result = await controller.reconcileCurrentSession(context);
 
 	expect(result.outcome).toBe("failed");
-	expect(result.status).toMatchObject({ effectiveEnabled: false, running: false, environment: "off" });
+	expect(result.status).toMatchObject({
+		genericSessionEnabled: false,
+		genericEligibilitySource: "none",
+		running: false,
+	});
 	expect(policies.at(-1)).toMatchObject({ redact: true, verbosity: "lean", stream: false, mode: "provisional" });
 });
 test("bounds repeated config churn and leaves the runtime at the restrictive policy", async () => {
@@ -459,11 +468,77 @@ describe("NotificationSessionController", () => {
 		const result = await controller.reconcileCurrentSession(createContext().context);
 
 		expect(result.outcome).toBe("disabled");
-		expect(result.status.effectiveEnabled).toBe(false);
+		expect(result.status.genericSessionEnabled).toBe(false);
 		expect(calls).toEqual([]);
 		expect(client.frames).toEqual([]);
 	});
 
+	test("rotates a blocked Telegram runtime into isolated sibling scope", async () => {
+		let running = true;
+		let isolated = 0;
+		let stopped = 0;
+		let activated = 0;
+		const controller = new NotificationSessionController({
+			eligible: true,
+			getConfig: mixedTelegramDiscordConfig,
+			env: {},
+		});
+		controller.attachRuntime({
+			isRunning: () => running,
+			start: async () => "already",
+			stop: async () => {
+				stopped++;
+				running = false;
+				return true;
+			},
+			isolateTelegram: async () => {
+				isolated++;
+				running = true;
+				return "started";
+			},
+			refreshPolicy: () => {},
+			activate: () => activated++,
+		});
+
+		await expect(controller.enterBlockedRuntime(createContext().context)).resolves.toBe(true);
+		expect({ running, isolated, stopped, activated }).toEqual({
+			running: true,
+			isolated: 1,
+			stopped: 0,
+			activated: 1,
+		});
+	});
+
+	test("reconciliation isolates safe siblings when Telegram owner readiness is blocked", async () => {
+		let running = false;
+		let isolated = 0;
+		const controller = new NotificationSessionController({
+			eligible: true,
+			getConfig: mixedTelegramDiscordConfig,
+			env: {},
+		});
+		controller.attachRuntime({
+			isRunning: () => running,
+			start: async () => "already",
+			stop: async () => {
+				running = false;
+				return true;
+			},
+			ensureTelegramDaemon: async () => "blocked_identity",
+			isolateTelegram: async () => {
+				isolated++;
+				running = true;
+				return "started";
+			},
+			refreshPolicy: () => {},
+			activate: () => {},
+		});
+
+		const result = await controller.reconcileCurrentSession(createContext().context);
+		expect(result.outcome).toBe("already");
+		expect(result.status.running).toBe(true);
+		expect(isolated).toBe(1);
+	});
 	test("after a non-deferred blocked_identity commit, reconciliation keeps the endpoint stopped and emits no foreign-client frames", async () => {
 		const calls: Call[] = [];
 		const client = createConnectedFakeClient();
@@ -679,7 +754,7 @@ describe("NotificationSessionController", () => {
 		]);
 	});
 
-	test("preserves authoritative GJC_NOTIFICATIONS=0 and explicit GJC_NOTIFICATIONS=1 precedence", async () => {
+	test("suppresses automatic admission with GJC_NOTIFICATIONS=0 while allowing explicit session opt-in", async () => {
 		const offCalls: Call[] = [];
 		const offController = new NotificationSessionController({
 			eligible: true,
@@ -687,8 +762,11 @@ describe("NotificationSessionController", () => {
 			env: { GJC_NOTIFICATIONS: "0" },
 		});
 		offController.attachRuntime(createRuntime(offCalls));
-		expect((await offController.setLocalEnabled(createContext().context, true)).outcome).toBe("disabled");
+		const offHost = createContext();
+		expect((await offController.reconcileCurrentSession(offHost.context)).outcome).toBe("disabled");
 		expect(offCalls).toEqual([]);
+		expect((await offController.setLocalEnabled(offHost.context, true)).outcome).toBe("started");
+		expect(offCalls.map(call => call.kind)).toEqual(["daemon", "start"]);
 
 		const explicitCalls: Call[] = [];
 		const explicitController = new NotificationSessionController({

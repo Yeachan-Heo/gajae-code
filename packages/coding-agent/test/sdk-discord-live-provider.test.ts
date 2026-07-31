@@ -44,6 +44,7 @@ function provider(
 			requests.push({ path: String(input), init: init ?? {} });
 			const path = String(input);
 			if (path.endsWith("/users/@me")) return response({ id: "bot" });
+			if (path.endsWith("/applications/@me")) return response({ id: "app" });
 			if (path.endsWith("/gateway/bot")) return response({ url: "wss://gateway.test" });
 			if (path.includes("/threads/active"))
 				return response({ threads: [{ id: "thread", parent_id: "parent", thread_metadata: { archived: false } }] });
@@ -95,6 +96,19 @@ describe("DiscordLiveProvider protocol", () => {
 		expect(thread.init.method).toBe("POST");
 	});
 
+	test("probes the bot and current application endpoints", async () => {
+		const requests: Array<{ path: string; init: RequestInit }> = [];
+		const live = provider(requests, []);
+		await expect(live.probeConfiguration()).resolves.toEqual({
+			ok: true,
+			detail: "Discord bot and application credentials are valid.",
+			botUserId: "bot",
+		});
+		expect(requests.map(request => request.path)).toEqual([
+			"https://discord.test/api/users/@me",
+			"https://discord.test/api/applications/@me",
+		]);
+	});
 	test("reconciles an accepted uncertain create through its parent nonce without a duplicate thread", async () => {
 		const sockets: FakeSocket[] = [];
 		let threadCreated = false;

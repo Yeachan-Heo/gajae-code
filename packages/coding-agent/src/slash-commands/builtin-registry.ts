@@ -29,6 +29,8 @@ import {
 	canApplyComposerSubmission,
 	type InteractiveModeContext,
 } from "../modes/types";
+import { ChatDaemonController } from "../sdk/bus/chat-daemon-control";
+import type { NotificationProvider } from "../sdk/bus/config";
 import {
 	buildNotificationStatusReport,
 	checkNotificationHealth,
@@ -39,6 +41,7 @@ import {
 	recoverNotifications,
 	sendNotificationTest,
 } from "../sdk/bus/notification-service";
+import { TelegramDaemonController } from "../sdk/bus/telegram-daemon-control";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
@@ -498,6 +501,48 @@ function buildChangelogCommandOutput(showFull: boolean): string {
 	return `${title}\n\n${changelogMarkdown}${hint}`;
 }
 
+type NotifyServiceArgs = { provider?: NotificationProvider; probe: boolean; message?: string } | { error: string };
+
+function isNotificationProvider(value: string): value is NotificationProvider {
+	return value === "telegram" || value === "discord" || value === "slack";
+}
+
+function parseNotifyServiceArgs(input: string, allowMessage: boolean): NotifyServiceArgs {
+	const tokens = input.trim().split(/\s+/).filter(Boolean);
+	let provider: NotificationProvider | undefined;
+	let probe = false;
+	const message: string[] = [];
+	for (let index = 0; index < tokens.length; index += 1) {
+		const token = tokens[index]!;
+		if (token === "--probe") {
+			if (allowMessage) return { error: "--probe is valid only for /notify health." };
+			probe = true;
+			continue;
+		}
+		if (token === "--provider" || token.startsWith("--provider=")) {
+			const value = token === "--provider" ? tokens[++index] : token.slice("--provider=".length);
+			if (!value || !isNotificationProvider(value)) {
+				return { error: "--provider must be telegram, discord, or slack." };
+			}
+			if (provider && provider !== value) return { error: "Conflicting notification providers were supplied." };
+			provider = value;
+			continue;
+		}
+		if (!provider && message.length === 0 && isNotificationProvider(token)) {
+			provider = token;
+			continue;
+		}
+		if (token.startsWith("--")) return { error: `Unknown notification option: ${token}` };
+		message.push(token);
+	}
+	if (!allowMessage && message.length > 0) return { error: "Health accepts only a provider and --probe." };
+	return {
+		...(provider ? { provider } : {}),
+		probe,
+		...(message.length > 0 ? { message: message.join(" ") } : {}),
+	};
+}
+
 const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashCommandRuntime): SlashCommandResult => {
 	runtime.ctx.editor.setText("");
 	void runtime.ctx.shutdown();
@@ -514,8 +559,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "on", description: "Enable notifications for this session" },
 			{ name: "off", description: "Disable notifications for this session" },
 			{ name: "status", description: "Show notification configuration (no secrets)" },
-			{ name: "health", description: "Config, daemon-ownership and endpoint health" },
-			{ name: "test", description: "Send a test notification", usage: "[message]" },
+			{
+				name: "health",
+				description: "Config, ownership, endpoint, and selected-provider health",
+				usage: "[provider] [--probe]",
+			},
+			{ name: "test", description: "Send a test notification", usage: "[provider|--provider provider] [message]" },
 			{ name: "recovery", description: "Clear dead-owner locks and stale endpoint files" },
 			{ name: "setup", description: "How to pair a Telegram bot (run in a terminal)" },
 		],
@@ -541,12 +590,41 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					await runtime.output(formatNotificationStatusReport(buildNotificationStatusReport(runtime.settings)));
 					return commandConsumed();
 				case "health": {
-					const report = await checkNotificationHealth({ settings: runtime.settings, stateRoot });
+					const parsed = parseNotifyServiceArgs(rest, false);
+					if ("error" in parsed) {
+						return usage(`Usage: /notify health [telegram|discord|slack] [--probe]\n${parsed.error}`, runtime);
+					}
+					const report = await checkNotificationHealth({
+						settings: runtime.settings,
+						stateRoot,
+						provider: parsed.provider,
+						probe: parsed.probe,
+					});
 					await runtime.output(formatNotificationHealthReport(report));
 					return commandConsumed();
 				}
 				case "test": {
-					const result = await sendNotificationTest({ settings: runtime.settings, text: rest || undefined });
+					const parsed = parseNotifyServiceArgs(rest, true);
+					if ("error" in parsed) {
+						return usage(
+							`Usage: /notify test [telegram|discord|slack|--provider provider] [message]\n${parsed.error}`,
+							runtime,
+						);
+					}
+					const result = await sendNotificationTest({
+						settings: runtime.settings,
+						provider: parsed.provider,
+						text: parsed.message,
+						deps: {
+							providerRuntimeStatus: async provider => {
+								const status =
+									provider === "telegram"
+										? await new TelegramDaemonController(runtime.settings).status()
+										: await new ChatDaemonController(runtime.settings, provider).status();
+								return status.health === "running" ? "ready" : "inactive";
+							},
+						},
+					});
 					await runtime.output(formatNotificationTestResult(result));
 					return commandConsumed();
 				}

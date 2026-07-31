@@ -12,10 +12,10 @@ import {
 import { type ChatDaemonRuntimeConfig, ChatDaemonRuntime as DefaultChatDaemonRuntime } from "./chat-daemon-runtime";
 import {
 	isDiscordComplete,
-	isProviderEffectivelyEnabled,
 	isSlackComplete,
 	loadNotificationConfigFile,
 	notificationConfigFromFile,
+	resolveNotificationProvider,
 } from "./config";
 
 export interface ChatDaemonRuntimeHandle {
@@ -61,7 +61,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 	const config = notificationConfigFromFile(loaded.value);
 	if (!config.enabled) return undefined;
 	if (kind === "discord") {
-		if (!isProviderEffectivelyEnabled(config, "discord") || !isDiscordComplete(config)) {
+		const resolution = resolveNotificationProvider(config, "discord");
+		if (!resolution.desiredEnabled) return undefined;
+		if (resolution.quarantined) throw new Error("Discord notification configuration needs repair");
+		if (!resolution.configured || !isDiscordComplete(config)) {
 			throw new Error("Discord notifications are enabled but configuration is incomplete");
 		}
 		const discord = config.discord;
@@ -79,7 +82,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			presentation: { redact: config.redact, verbosity: config.verbosity },
 		};
 	}
-	if (!isProviderEffectivelyEnabled(config, "slack") || !isSlackComplete(config)) {
+	const resolution = resolveNotificationProvider(config, "slack");
+	if (!resolution.desiredEnabled) return undefined;
+	if (resolution.quarantined) throw new Error("Slack notification configuration needs repair");
+	if (!resolution.configured || !isSlackComplete(config)) {
 		throw new Error("Slack notifications are enabled but configuration is incomplete");
 	}
 	const slack = config.slack;

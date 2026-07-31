@@ -299,7 +299,7 @@ describe("notification-service health", () => {
 		expect(formatNotificationHealthReport(report)).toBe(
 			[
 				"Notification health: OK",
-				"  [ok] config: enabled with at least one configured adapter",
+				"  [ok] config: telegram is effective",
 				"  [ok] daemon: daemon pid 1000 alive with a fresh heartbeat",
 				"  [ok] endpoints: 1 live, 0 unverified endpoint file(s)",
 			].join("\n"),
@@ -461,7 +461,7 @@ describe("notification-service health", () => {
 			expect(formatNotificationHealthReport(report)).toBe(
 				[
 					"Notification health: WARN",
-					"  [ok] config: enabled with at least one configured adapter",
+					"  [ok] config: telegram is effective",
 					"  [warn] daemon: daemon pid 1000 heartbeat is stale",
 					"  [ok] endpoints: 0 live, 0 unverified endpoint file(s)",
 				].join("\n"),
@@ -573,7 +573,7 @@ describe("notification-service test delivery", () => {
 		const result = await sendNotificationTest({ settings, deps: { fetchImpl } });
 		expect(result.ok).toBe(false);
 		expect(called).toBe(false);
-		expect(result.detail).toContain("not configured");
+		expect(result.detail).toContain("No notification provider is effective");
 	});
 
 	test("delivers through the configured Telegram adapter", async () => {
@@ -592,10 +592,14 @@ describe("notification-service test delivery", () => {
 		const result = await sendNotificationTest({
 			settings,
 			text: "hi",
-			deps: { fetchImpl, apiBase: "https://api.telegram.org" },
+			deps: {
+				fetchImpl,
+				apiBase: "https://api.telegram.org",
+				providerRuntimeStatus: () => "ready",
+			},
 		});
 		expect(result.ok).toBe(true);
-		expect(result.chatId).toBe("12345");
+		expect(result.destination).toBe("12345");
 		expect(calls[0]).toContain(`/bot${TOKEN}/sendMessage`);
 	});
 });
@@ -1066,7 +1070,10 @@ describe("notification-service diagnostic sanitization (secret-safe)", () => {
 		const fetchImpl = (async (_url: string | URL | Request) => {
 			throw new Error(`request to https://api.telegram.org/bot${TOKEN}/sendMessage failed`);
 		}) as unknown as typeof fetch;
-		const result = await sendNotificationTest({ settings, deps: { fetchImpl } });
+		const result = await sendNotificationTest({
+			settings,
+			deps: { fetchImpl, providerRuntimeStatus: () => "ready" },
+		});
 		expect(result.ok).toBe(false);
 		expect(result.detail).not.toContain(TOKEN);
 		expect(result.detail).toContain("<redacted>");
@@ -1089,5 +1096,186 @@ describe("notification-service diagnostic sanitization (secret-safe)", () => {
 		});
 		expect(report.reachability.detail).not.toContain(TOKEN);
 		expect(report.reachability.detail).toContain("<redacted>");
+	});
+	test("one-shot delivery fails closed without runtime readiness evidence", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": TOKEN,
+			"notifications.telegram.chatId": "12345",
+		});
+		let called = false;
+		const result = await sendNotificationTest({
+			settings,
+			deps: {
+				fetchImpl: (async () => {
+					called = true;
+					return new Response();
+				}) as unknown as typeof fetch,
+			},
+		});
+		expect(result).toMatchObject({ ok: false, adapter: "telegram" });
+		expect(result.detail).toContain("runtime is not ready");
+		expect(called).toBe(false);
+	});
+
+	test("Discord health and one-shot diagnostics redact the selected provider token", async () => {
+		const secret = "discord-secret-value";
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.discord.enabled": true,
+			"notifications.discord.botToken": secret,
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "parent",
+		});
+		const diagnostic = {
+			probeConfiguration: async () => ({ ok: false, detail: `probe rejected ${secret}` }),
+			sendOneShotTest: async () => ({ ok: false, detail: `send rejected ${secret}` }),
+		};
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-discord-probe",
+			provider: "discord",
+			probe: true,
+			deps: { fs: mockFs({}).fs, createDiscordDiagnostic: () => diagnostic },
+		});
+		expect(report.reachability.detail).toBe("probe rejected <redacted>");
+		const result = await sendNotificationTest({
+			settings,
+			provider: "discord",
+			deps: {
+				createDiscordDiagnostic: () => diagnostic,
+				providerRuntimeStatus: () => "ready",
+			},
+		});
+		expect(result.detail).toBe("send rejected <redacted>");
+	});
+
+	test("Slack health and one-shot diagnostics redact both selected provider tokens", async () => {
+		const botToken = "xoxb-slack-secret";
+		const appToken = "xapp-slack-secret";
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.slack.enabled": true,
+			"notifications.slack.botToken": botToken,
+			"notifications.slack.appToken": appToken,
+			"notifications.slack.workspaceId": "workspace",
+			"notifications.slack.channelId": "channel",
+		});
+		const diagnostic = {
+			probeConfiguration: async () => ({ ok: false, detail: `probe ${botToken} ${appToken}` }),
+			sendOneShotTest: async () => ({ ok: false, detail: `send ${botToken} ${appToken}` }),
+		};
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-slack-probe",
+			provider: "slack",
+			probe: true,
+			deps: { fs: mockFs({}).fs, createSlackDiagnostic: () => diagnostic },
+		});
+		expect(report.reachability.detail).toBe("probe <redacted> <redacted>");
+		const result = await sendNotificationTest({
+			settings,
+			provider: "slack",
+			deps: {
+				createSlackDiagnostic: () => diagnostic,
+				providerRuntimeStatus: () => "ready",
+			},
+		});
+		expect(result.detail).toBe("send <redacted> <redacted>");
+	});
+	test("Slack health rejects credentials bound to a different workspace", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.slack.enabled": true,
+			"notifications.slack.botToken": "xoxb-secret",
+			"notifications.slack.appToken": "xapp-secret",
+			"notifications.slack.workspaceId": "expected-workspace",
+			"notifications.slack.channelId": "channel",
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-slack-workspace-probe",
+			provider: "slack",
+			probe: true,
+			deps: {
+				fs: mockFs({}).fs,
+				createSlackDiagnostic: () => ({
+					probeConfiguration: async () => ({
+						ok: true,
+						detail: "valid",
+						teamId: "foreign-workspace",
+						userId: "bot",
+					}),
+					sendOneShotTest: async () => ({ ok: true, detail: "unused" }),
+				}),
+			},
+		});
+		expect(report.reachability).toEqual({
+			probed: true,
+			ok: false,
+			detail: "Slack workspace identity does not match the configured workspace ID.",
+		});
+	});
+
+	test("one-shot readiness and factory failures are sanitized", async () => {
+		const secret = "discord-secret-value";
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.discord.enabled": true,
+			"notifications.discord.botToken": secret,
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "parent",
+		});
+		let factoryCalled = false;
+		const readiness = await sendNotificationTest({
+			settings,
+			provider: "discord",
+			deps: {
+				providerRuntimeStatus: async () => {
+					throw new Error(`readiness rejected ${secret}`);
+				},
+				createDiscordDiagnostic: () => {
+					factoryCalled = true;
+					throw new Error("unused");
+				},
+			},
+		});
+		expect(readiness.detail).toBe("readiness rejected <redacted>");
+		expect(factoryCalled).toBe(false);
+
+		const factory = await sendNotificationTest({
+			settings,
+			provider: "discord",
+			deps: {
+				providerRuntimeStatus: () => "ready",
+				createDiscordDiagnostic: () => {
+					throw new Error(`factory rejected ${secret}`);
+				},
+			},
+		});
+		expect(factory).toMatchObject({ ok: false, adapter: "discord", uncertain: true });
+		expect(factory.detail).toBe("factory rejected <redacted>");
+	});
+
+	test("Telegram treats an accepted response without a message receipt as uncertain", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": TOKEN,
+			"notifications.telegram.chatId": "12345",
+		});
+		const result = await sendNotificationTest({
+			settings,
+			deps: {
+				providerRuntimeStatus: () => "ready",
+				fetchImpl: (async () =>
+					new Response(JSON.stringify({ ok: true }), {
+						headers: { "content-type": "application/json" },
+					})) as unknown as typeof fetch,
+			},
+		});
+		expect(result).toMatchObject({ ok: false, adapter: "telegram", uncertain: true });
+		expect(result.detail).toContain("no usable message receipt");
 	});
 });

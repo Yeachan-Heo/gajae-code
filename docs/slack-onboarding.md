@@ -34,6 +34,7 @@ API calls.
 Without `--slack-authorized-user-id`, the adapter remains outbound-only: every inbound envelope is acknowledged but denied before it can create a durable claim or reach an SDK endpoint. The user ID is an identifier, not a secret. It also accepts `--redact`. Provide secret values from an approved local secret mechanism, not shell history, committed configuration, tickets, screenshots, or chat. Setup writes:
 
 - `notifications.enabled = true`
+- `notifications.slack.enabled = true` (durable desired intent)
 - `notifications.slack.botToken`
 - `notifications.slack.appToken`
 - `notifications.slack.workspaceId`
@@ -41,8 +42,7 @@ Without `--slack-authorized-user-id`, the adapter remains outbound-only: every i
 - `notifications.slack.authorizedUserId` when configured
 - `notifications.redact = true` when requested
 
-`gjc notify status` masks all token values. It is status output, not a credential
-recovery mechanism.
+`gjc notify status` reports Slack completeness, repair/quarantine state, desired intent, effective enablement, destination identifiers, and masked token values. It is status output, not a credential recovery mechanism. A successful durable save is not rolled back when later daemon activation fails; the command reports the saved-but-runtime-degraded outcome and exits nonzero. In `/settings`, bot/app secret edits are explicit `keep`, `replace`, or `remove`; removing either required token turns Slack desired intent off without changing Telegram, Discord, or the global master.
 
 ## Socket Mode, threads, and resume
 

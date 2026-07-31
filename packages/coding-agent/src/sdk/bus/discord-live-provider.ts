@@ -244,7 +244,7 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 			const currentUser = await this.#request("/users/@me", { signal });
 			const botUserId = this.#string(currentUser, "id");
 			if (!botUserId) return { ok: false, detail: "Discord returned an invalid bot identity." };
-			const application = await this.#request("/oauth2/applications/@me", { signal });
+			const application = await this.#request("/applications/@me", { signal });
 			const applicationId = this.#string(application, "id");
 			if (!applicationId || applicationId !== this.applicationId) {
 				return { ok: false, detail: "Discord application identity does not match the configured application ID." };

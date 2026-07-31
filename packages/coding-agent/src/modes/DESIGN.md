@@ -187,21 +187,21 @@ combine, or substitute them.
 
 | State ID | Required condition represented |
 | --- | --- |
-| `home-unconfigured` | No configured notification destination. |
-| `home-configured-inactive` | Credentials/configuration exist; current session is inactive. |
+| `home-unconfigured` | No complete notification provider. |
+| `home-configured-inactive` | Provider configuration and desired intent exist; current session is inactive. |
 | `home-runtime-active` | Current session endpoint is active. |
 | `home-local-off` | Current session is explicitly locally disabled. |
-| `home-env-off` | Environment hard-off suppresses the surface/runtime. |
-| `home-env-on` | Explicit environment opt-in enables the current session. |
-| `home-discord-only` | Global Discord configuration without Telegram setup. |
-| `home-slack-only` | Global Slack configuration without Telegram setup. |
-| `setup-provider` | Provider choice is focused. |
+| `home-env-off` | Process-level environment hard-off suppresses the surface/runtime. |
+| `home-env-on` | Explicit environment opt-in enables automatic current-session admission. |
+| `home-discord-only` | Discord is complete, desired on, and effective without Telegram. |
+| `home-slack-only` | Slack is complete, desired on, and effective without Telegram. |
+| `setup-provider` | First-class Telegram, Discord, and Slack provider choice is focused. |
 | `setup-chat-entry` | Telegram chat ID field is focused. |
 | `setup-token-entry` | Masked Telegram token field is focused. |
 | `setup-validating` | Token/destination validation is pending. |
 | `setup-threaded-warning` | Threaded mode compatibility warning is visible. |
 | `setup-pairing` | Cancellable private-chat pairing/discovery is pending. |
-| `setup-review` | Sanitized setup choices await explicit save. |
+| `setup-review` | Sanitized provider, secret action, desired intent, and destination await explicit save. |
 | `saving` | Durable atomic save is in progress and guarded. |
 | `health-probing` | Non-cancellable health probe is in progress and guarded. |
 | `health-ok` | Health report is successful. |
@@ -211,12 +211,12 @@ combine, or substitute them.
 | `recovering` | Recovery action is in progress and guarded. |
 | `reconnecting` | Reconnect action is in progress and guarded. |
 | `navigation-locked` | A guarded operation explains why Tab/Escape cannot leave. |
-| `confirmation-remove` | Adapter-local Telegram removal awaits confirmation. |
-| `confirmation-disable` | Global disable awaits confirmation. |
+| `confirmation-remove` | Adapter-local Telegram removal awaits confirmation; sibling/global state is preserved. |
+| `confirmation-disable` | Global disable awaits confirmation and preserves provider credentials/intent. |
 | `success` | A completed operation has concise success copy. |
 | `preferences` | Notification preferences are visible and editable. |
 | `error` | A sanitized operation failure has recovery guidance. |
-| `foreign-blocked` | A foreign/unknown daemon identity blocks activation safely. |
+| `foreign-blocked` | Telegram is excluded from the shared endpoint while effective chat siblings use isolated discovery. |
 | `blocked-restore-retain` | A blocked post-save identity race requires Restore or Retain before navigation. |
 | `cancellation` | A cancellable setup/pairing action was cancelled and restored. |
 | `narrow-cjk` | Narrow localized CJK content exercises semantic line wrapping. |

@@ -10,6 +10,8 @@ import type {
 	NotificationsEditorState,
 	NotificationsMutationResult,
 	NotificationsPreflightResult,
+	NotificationsProviderSetupInput,
+	PreparedNotificationProviderConfiguration,
 } from "@gajae-code/coding-agent/modes/components/notifications-settings-editor";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import {
@@ -18,7 +20,11 @@ import {
 	type NotificationsEditorOperationDependencies,
 } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { getNotificationConfig, type NotificationSettingsSnapshot } from "@gajae-code/coding-agent/sdk/bus/config";
+import {
+	getNotificationConfig,
+	type NotificationProvider,
+	type NotificationSettingsSnapshot,
+} from "@gajae-code/coding-agent/sdk/bus/config";
 import {
 	createTelegramActivationMarker,
 	telegramActivationIdentity,
@@ -26,6 +32,7 @@ import {
 import type {
 	NotificationHealthReport,
 	NotificationRecoveryReport,
+	NotificationStatusReport,
 } from "@gajae-code/coding-agent/sdk/bus/notification-service";
 import type {
 	NotificationSessionReconcileResult,
@@ -105,13 +112,26 @@ function recovery(): NotificationRecoveryReport {
 	};
 }
 
+function adapterState(configured = false, channel?: string): NotificationStatusReport["discord"] {
+	return {
+		botTokenMasked: configured ? "••••" : "(unset)",
+		channel,
+		configured,
+		quarantined: false,
+		desiredEnabled: configured,
+		desiredSource: "legacy",
+		effectiveEnabled: configured,
+		issues: [],
+	};
+}
+
 function sessionStatus(): NotificationSessionStatus {
 	return {
 		eligible: true,
 		locallyEnabled: true,
-		effectiveEnabled: true,
+		genericSessionEnabled: true,
+		genericEligibilitySource: "configured_provider",
 		running: true,
-		environment: "default",
 	};
 }
 
@@ -142,9 +162,11 @@ function editorState(): NotificationsEditorState {
 			redact: false,
 			verbosity: "lean",
 			globallyConfigured: false,
-			telegram: { botTokenMasked: "(unset)", channel: undefined, configured: false, tokenFingerprint: undefined },
-			discord: { botTokenMasked: "(unset)", channel: undefined, configured: false },
-			slack: { botTokenMasked: "(unset)", channel: undefined, configured: false },
+			anyProviderComplete: false,
+			anyProviderEffective: false,
+			telegram: { ...adapterState(), tokenFingerprint: undefined },
+			discord: adapterState(),
+			slack: adapterState(),
 		},
 		session: sessionStatus(),
 		preferences: {
@@ -179,6 +201,37 @@ function selectorOperations(
 		commitConfigure: async () => ({ status: "saved", receipt: receipt(), message: "saved" }),
 		saveInactive: async () => ({ status: "saved_inactive", receipt: receipt(), message: "saved" }),
 		discardConfigureDraft: () => {},
+		prepareProviderConfiguration: async (
+			input: NotificationsProviderSetupInput,
+		): Promise<PreparedNotificationProviderConfiguration> => {
+			input.botToken.value?.consume();
+			input.appToken?.value?.consume();
+			return input.provider === "discord"
+				? {
+						provider: "discord",
+						botTokenDisposition: input.botToken.action,
+						botTokenMask: "••••",
+						applicationId: input.applicationId ?? "application",
+						guildId: input.guildId ?? "guild",
+						parentChannelId: input.parentChannelId ?? "channel",
+					}
+				: {
+						provider: "slack",
+						botTokenDisposition: input.botToken.action,
+						botTokenMask: "••••",
+						appTokenDisposition: input.appToken?.action ?? "keep",
+						appTokenMask: "••••",
+						workspaceId: input.workspaceId ?? "workspace",
+						channelId: input.channelId ?? "channel",
+					};
+		},
+		commitProviderConfiguration: async () => ({ receipt: receipt(), message: "provider saved" }),
+		discardProviderConfiguration: () => {},
+		setProviderDesired: async (_provider: NotificationProvider, _enabled: boolean) => ({
+			receipt: receipt(),
+			message: "provider intent updated",
+		}),
+		removeProvider: async (_provider: NotificationProvider) => ({ receipt: receipt(), message: "provider removed" }),
 		enableGlobally: async () => await (input.enableGlobally?.() ?? Promise.resolve({ message: "enabled" })),
 		disableGlobally: async () => ({ message: "disabled" }),
 		removeTelegram: async () => ({ message: "removed" }),
@@ -265,25 +318,36 @@ describe("notification settings controller adapter", () => {
 			enterBlockedRuntime: vi.fn(async () => true),
 			clearBlockedRuntime: vi.fn(async () => undefined),
 		};
+		const commitAtomicBatch = async (patches: unknown[]) => {
+			events.push("commit");
+			batches.push(structuredClone(patches));
+			for (const patch of patches as Array<{ path?: string; value?: unknown }>) {
+				if (patch.path === "notifications.telegram.toolActivity.enabled" && typeof patch.value === "boolean") {
+					currentSnapshot.telegram.toolActivity.enabled = patch.value;
+				}
+			}
+			return receipt();
+		};
 		const settings = {
 			getAgentDir: () => "/tmp/gjc-settings-controller",
 			getNotificationSettingsSnapshot: () => structuredClone(currentSnapshot),
-			commitAtomicBatch: async (patches: unknown[]) => {
-				events.push("commit");
-				batches.push(structuredClone(patches));
-				for (const patch of patches as Array<{ path?: string; value?: unknown }>) {
-					if (patch.path === "notifications.telegram.toolActivity.enabled" && typeof patch.value === "boolean") {
-						currentSnapshot.telegram.toolActivity.enabled = patch.value;
-					}
-				}
-				return receipt();
-			},
+			commitAtomicBatch,
+			commitAtomicBatchWithCurrent: async (
+				build: (current: Record<string, unknown>) => Promise<readonly unknown[]> | readonly unknown[],
+			) =>
+				await commitAtomicBatch([
+					...(await build({ notifications: { telegram: { activation: currentSnapshot.telegram.activation } } })),
+				]),
 		} as unknown as Settings;
+		let notifyFailure = false;
 		const ctx = {
 			settings,
 			session: { notificationSessionController: controller },
 			sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
-			notifyConfigChanged: async () => events.push("notify"),
+			notifyConfigChanged: async () => {
+				if (notifyFailure) throw new Error("observer failed");
+				events.push("notify");
+			},
 		} as unknown as NotificationsEditorAdapterContext;
 		const healthCalls: Array<Record<string, unknown>> = [];
 		const setupCalls: Array<Record<string, unknown>> = [];
@@ -303,8 +367,8 @@ describe("notification settings controller adapter", () => {
 			},
 			sendNotificationTest: async input => {
 				serviceCalls.push("test");
-				expect(input).toEqual({ settings });
-				return { ok: true, adapter: "telegram", chatId: "chat", detail: "delivered" };
+				expect(input).toEqual(expect.objectContaining({ settings }));
+				return { ok: true, adapter: "telegram", destination: "chat", detail: "delivered" };
 			},
 			recoverNotifications: async input => {
 				serviceCalls.push("recover");
@@ -355,7 +419,15 @@ describe("notification settings controller adapter", () => {
 				events.push("reconcile");
 				expect(input.activation.reconnect).toBeDefined();
 				expect(input.inactiveMarkerToClear).toEqual(staleMarker);
-				return { status: "activated", reconnect: "attached" };
+				return { status: "activated", receipt: input.receipt, reconnect: "attached" };
+			},
+			providerRuntime: {
+				activate: async provider => {
+					events.push(`activate-${provider}`);
+				},
+				deactivate: async provider => {
+					events.push(`deactivate-${provider}`);
+				},
 			},
 		};
 		const operations = createNotificationsEditorOperations(ctx, dependencies);
@@ -416,6 +488,7 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.botToken", op: "set", value: TOKEN },
 			{ path: "notifications.telegram.chatId", op: "set", value: "validated-chat" },
+			{ path: "notifications.telegram.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.rich.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: false },
 			{ path: "notifications.telegram.streaming.enabled", op: "set", value: true },
@@ -433,11 +506,15 @@ describe("notification settings controller adapter", () => {
 			new AbortController().signal,
 		);
 		if (!secondPreflight.draft) throw new Error("Expected prepared Telegram draft.");
-		await operations.saveInactive(secondPreflight.draft);
+		notifyFailure = true;
+		const inactiveResult = await operations.saveInactive(secondPreflight.draft);
+		expect(inactiveResult).toMatchObject({ status: "observer_failed", receipt: expect.anything() });
+		notifyFailure = false;
 		const inactiveIdentity = telegramActivationIdentity(TOKEN, "validated-chat");
 		expect(batches[1]).toEqual([
 			{ path: "notifications.telegram.botToken", op: "set", value: TOKEN },
 			{ path: "notifications.telegram.chatId", op: "set", value: "validated-chat" },
+			{ path: "notifications.telegram.enabled", op: "set", value: false },
 			{
 				path: "notifications.telegram.activation",
 				op: "set",
@@ -451,7 +528,6 @@ describe("notification settings controller adapter", () => {
 					},
 				},
 			},
-			{ path: "notifications.enabled", op: "set", value: false },
 		]);
 
 		await operations.enableGlobally();
@@ -470,6 +546,7 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.telegram.botToken", op: "unset" },
 			{ path: "notifications.telegram.chatId", op: "unset" },
 			{ path: "notifications.telegram.activation", op: "unset" },
+			{ path: "notifications.telegram.enabled", op: "set", value: false },
 		]);
 		currentSnapshot = snapshot({
 			slack: {
@@ -484,7 +561,42 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.telegram.botToken", op: "unset" },
 			{ path: "notifications.telegram.chatId", op: "unset" },
 			{ path: "notifications.telegram.activation", op: "unset" },
+			{ path: "notifications.telegram.enabled", op: "set", value: false },
 		]);
+		currentSnapshot = snapshot({
+			discord: {
+				enabled: true,
+				botToken: "discord-token",
+				applicationId: "stored-app",
+				guildId: "stored-guild",
+				parentChannelId: "stored-parent",
+			},
+		});
+		const providerDraft = await operations.prepareProviderConfiguration({
+			provider: "discord",
+			botToken: { action: "keep" },
+			applicationId: "",
+			guildId: "",
+			parentChannelId: "",
+		});
+		expect(providerDraft).toMatchObject({
+			provider: "discord",
+			applicationIdDisplay: "stored-app",
+			guildIdDisplay: "stored-guild",
+			parentChannelIdDisplay: "stored-parent",
+		});
+		expect(Object.hasOwn(providerDraft, "applicationId")).toBe(false);
+		expect(Object.hasOwn(providerDraft, "guildId")).toBe(false);
+		expect(Object.hasOwn(providerDraft, "parentChannelId")).toBe(false);
+		currentSnapshot.discord.applicationId = "concurrent-app";
+		currentSnapshot.discord.guildId = "concurrent-guild";
+		currentSnapshot.discord.parentChannelId = "concurrent-parent";
+		await operations.commitProviderConfiguration(providerDraft);
+		expect(batches.at(-1)).toEqual([
+			{ path: "notifications.enabled", op: "set", value: true },
+			{ path: "notifications.discord.enabled", op: "set", value: true },
+		]);
+		expect(events.slice(-2)).toEqual(["notify", "activate-discord"]);
 
 		await operations.setSessionLocal(false);
 		await operations.reconcileCurrentSession();
@@ -630,12 +742,19 @@ describe("notification settings controller adapter", () => {
 			},
 			clearBlockedRuntime: async () => undefined,
 		};
+		const commitAtomicBatch = async () => {
+			events.push("commit");
+			return receipt();
+		};
 		const settings = {
 			getAgentDir: () => "/tmp/gjc-settings-controller",
 			getNotificationSettingsSnapshot: () => snapshot(),
-			commitAtomicBatch: async () => {
-				events.push("commit");
-				return receipt();
+			commitAtomicBatch,
+			commitAtomicBatchWithCurrent: async (
+				build: (current: Record<string, unknown>) => Promise<readonly unknown[]> | readonly unknown[],
+			) => {
+				await build({ notifications: { telegram: { activation: {} } } });
+				return await commitAtomicBatch();
 			},
 		} as unknown as Settings;
 		const operations = createNotificationsEditorOperations(
@@ -643,7 +762,10 @@ describe("notification settings controller adapter", () => {
 				settings,
 				session: { notificationSessionController: controller },
 				sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
-				notifyConfigChanged: async () => events.push("notify"),
+				notifyConfigChanged: async () => {
+					events.push("notify");
+					throw new Error("observer failed");
+				},
 			} as unknown as NotificationsEditorAdapterContext,
 			{
 				runTelegramSetup: async () => ({
@@ -674,6 +796,7 @@ describe("notification settings controller adapter", () => {
 		if (!result.draft) throw new Error("Expected prepared Telegram draft.");
 		const committed = await operations.commitConfigure(result.draft);
 		expect(committed).toMatchObject({ status: "blocked_identity" });
+		expect(committed.message).toContain("settings observer also failed");
 		if (committed.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
 		expect(typeof committed.restore).toBe("function");
 		expect(typeof committed.retainCommitted).toBe("function");
@@ -697,6 +820,8 @@ describe("notification settings controller adapter", () => {
 						currentSnapshot.telegram.chatId = undefined;
 					if (patch.path === "notifications.enabled" && patch.op === "set")
 						currentSnapshot.enabled = patch.value === true;
+					if (patch.path === "notifications.telegram.enabled" && patch.op === "set")
+						currentSnapshot.telegram.enabled = patch.value === true;
 				}
 				return receipt();
 			},
@@ -739,7 +864,8 @@ describe("notification settings controller adapter", () => {
 				token: undefined,
 			});
 			expect(events).toEqual(["blocked", "stop", "commit", "cleared"]);
-			expect(currentSnapshot.enabled).toBe(false);
+			expect(currentSnapshot.enabled).toBe(true);
+			expect(currentSnapshot.telegram.enabled).toBe(false);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
@@ -841,6 +967,7 @@ describe("notification settings selector lifecycle", () => {
 		await flush();
 		component.handleInput("\n"); // Configure
 		component.handleInput("\n"); // select Telegram provider
+		component.handleInput("\n"); // select Configure Telegram
 		component.handleInput("12345"); // supplied private-chat ID -> validation path
 		component.handleInput("\n");
 		component.handleInput(TOKEN);

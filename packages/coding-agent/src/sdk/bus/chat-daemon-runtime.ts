@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { type IndexedSession, SessionIndex } from "../broker/session-index";
 import { SdkClient, SdkClientError } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
@@ -275,8 +277,20 @@ export class ChatDaemonRuntime {
 	}
 
 	private async attach(indexed: IndexedSession): Promise<void> {
-		const endpoint = await readSdkSessionEndpoint(indexed.locator.repo, indexed.sessionId);
-		if (!endpoint) return;
+		const repo = path.resolve(indexed.locator.repo);
+		const defaultStateRoot = path.join(repo, ".gjc", "state");
+		const indexedStateRoot = path.resolve(indexed.locator.stateRoot);
+		const scope =
+			indexedStateRoot === defaultStateRoot
+				? "default"
+				: indexedStateRoot === path.join(defaultStateRoot, "chat")
+					? "chat"
+					: undefined;
+		if (!scope || indexed.endpointMtimeMs === undefined) return;
+		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope);
+		if (!endpoint || endpoint.stale) return;
+		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
+		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return;
 		const existing = this.#sessions.get(indexed.sessionId);
 		if (
 			existing &&

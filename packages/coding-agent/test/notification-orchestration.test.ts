@@ -10,12 +10,15 @@ import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
 	getSaveTelegramInactiveAvailability,
+	mutateNotificationProvider,
 	type NotificationConfigurationWriter,
 	persistTelegramActivationMarker,
 	proposedTelegramIdentity,
+	removeNotificationProvider,
 	removeTelegramConfiguration,
 	saveTelegramConfiguration,
 	saveTelegramInactive,
+	setGlobalNotificationsEnabled,
 	type TelegramActivationMarker,
 	type TelegramActivationMarkers,
 	telegramActivationIdentity,
@@ -182,6 +185,7 @@ describe("notification orchestration ownership", () => {
 			[
 				{ path: "notifications.telegram.botToken", op: "set", value: TOKEN },
 				{ path: "notifications.telegram.chatId", op: "set", value: "new-chat" },
+				{ path: "notifications.telegram.enabled", op: "set", value: false },
 				{
 					path: "notifications.telegram.activation",
 					op: "set",
@@ -212,14 +216,14 @@ describe("notification orchestration ownership", () => {
 			},
 		});
 
-		expect(result.globallyDisabled).toBe(true);
+		expect(result.globallyDisabled).toBe(false);
 		expect(events).toEqual(["stop-and-unregister", "commit"]);
 		expect(commits).toEqual([
 			[
 				{ path: "notifications.telegram.botToken", op: "unset" },
 				{ path: "notifications.telegram.chatId", op: "unset" },
 				{ path: "notifications.telegram.activation", op: "unset" },
-				{ path: "notifications.enabled", op: "set", value: false },
+				{ path: "notifications.telegram.enabled", op: "set", value: false },
 			],
 		]);
 	});
@@ -331,6 +335,7 @@ describe("notification orchestration blocked activation", () => {
 				{ path: "notifications.telegram.botToken", op: "set", value: TOKEN },
 				{ path: "notifications.telegram.chatId", op: "set", value: "new-chat" },
 				{ path: "notifications.enabled", op: "set", value: true },
+				{ path: "notifications.telegram.enabled", op: "set", value: true },
 			],
 		]);
 		if (result.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
@@ -533,5 +538,139 @@ describe("notification orchestration blocked activation", () => {
 		if (result.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
 		expect(await result.restore()).toEqual({ status: "still_blocked" });
 		expect(events).toEqual(["blocked", "persist-blocked", "persist-blocked", "blocked"]);
+	});
+	test("retains observer and activation failures beside the durable provider receipt", async () => {
+		const { writer: settings, commits } = writer();
+		const result = await mutateNotificationProvider({
+			settings,
+			mutation: {
+				provider: "discord",
+				botToken: { action: "replace", value: "discord-secret" },
+				applicationId: "app",
+				guildId: "guild",
+				parentChannelId: "parent",
+			},
+			configureAndActivate: true,
+			notifyConfigChanged: async () => {
+				throw new Error("observer failed");
+			},
+			runtime: {
+				activate: async () => {
+					throw new Error("activation failed");
+				},
+				deactivate: async () => {},
+			},
+		});
+		expect(result).toMatchObject({ status: "activation_failed", observerFailed: true });
+		expect("receipt" in result).toBe(true);
+		expect(commits).toEqual([
+			[
+				{ path: "notifications.discord.botToken", op: "set", value: "discord-secret" },
+				{ path: "notifications.discord.applicationId", op: "set", value: "app" },
+				{ path: "notifications.discord.guildId", op: "set", value: "guild" },
+				{ path: "notifications.discord.parentChannelId", op: "set", value: "parent" },
+				{ path: "notifications.enabled", op: "set", value: true },
+				{ path: "notifications.discord.enabled", op: "set", value: true },
+			],
+		]);
+	});
+
+	test("returns the removal receipt when chat teardown and observation fail after commit", async () => {
+		const { writer: settings, commits } = writer();
+		const result = await removeNotificationProvider({
+			settings,
+			provider: "slack",
+			notifyConfigChanged: async () => {
+				throw new Error("observer failed");
+			},
+			runtime: {
+				activate: async () => {},
+				deactivate: async () => {
+					throw new Error("teardown failed");
+				},
+			},
+		});
+		expect(result).toMatchObject({ status: "deactivation_failed", observerFailed: true });
+		expect("receipt" in result && result.receipt).toBeDefined();
+		expect(commits[0]).toEqual([
+			{ path: "notifications.slack.botToken", op: "unset" },
+			{ path: "notifications.slack.appToken", op: "unset" },
+			{ path: "notifications.slack.workspaceId", op: "unset" },
+			{ path: "notifications.slack.channelId", op: "unset" },
+			{ path: "notifications.slack.authorizedUserId", op: "unset" },
+			{ path: "notifications.slack.enabled", op: "set", value: false },
+		]);
+	});
+
+	test("global enable activates only effective desired providers and reports every degraded side effect", async () => {
+		const configured = snapshot({
+			enabled: true,
+			telegram: { ...snapshot().telegram, enabled: false },
+			discord: {
+				enabled: true,
+				botToken: "discord-token",
+				applicationId: "app",
+				guildId: "guild",
+				parentChannelId: "parent",
+			},
+			slack: {
+				enabled: false,
+				botToken: "slack-token",
+				appToken: "slack-app-token",
+				workspaceId: "workspace",
+				channelId: "channel",
+			},
+		});
+		const { writer: settings, commits } = writer({ snapshot: configured });
+		const activated: string[] = [];
+		const result = await setGlobalNotificationsEnabled({
+			settings,
+			enabled: true,
+			notifyConfigChanged: async () => {
+				throw new Error("observer failed");
+			},
+			runtime: {
+				activate: async provider => {
+					activated.push(provider);
+					throw new Error("activation failed");
+				},
+				deactivate: async () => {},
+			},
+		});
+		expect(result).toMatchObject({
+			status: "global_activation_partial",
+			failed: ["discord"],
+			observerFailed: true,
+		});
+		expect(activated).toEqual(["discord"]);
+		expect(commits).toEqual([[{ path: "notifications.enabled", op: "set", value: true }]]);
+	});
+
+	test("required secret removal disables only the selected provider in one batch", async () => {
+		const { writer: settings, commits } = writer();
+		const deactivated: string[] = [];
+		const result = await mutateNotificationProvider({
+			settings,
+			mutation: {
+				provider: "slack",
+				botToken: { action: "remove" },
+				appToken: { action: "keep" },
+			},
+			desiredEnabled: true,
+			runtime: {
+				activate: async () => {},
+				deactivate: async provider => {
+					deactivated.push(provider);
+				},
+			},
+		});
+		expect(result).toMatchObject({ status: "saved", observerFailed: false });
+		expect(deactivated).toEqual(["slack"]);
+		expect(commits).toEqual([
+			[
+				{ path: "notifications.slack.botToken", op: "unset" },
+				{ path: "notifications.slack.enabled", op: "set", value: false },
+			],
+		]);
 	});
 });

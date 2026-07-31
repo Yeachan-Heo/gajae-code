@@ -6,10 +6,17 @@ import {
 	type NotificationsEditorSetupInput,
 	type NotificationsEditorState,
 	type NotificationsPreflightResult,
+	type NotificationsProviderSetupInput,
+	type NotificationsSaveInactiveResult,
 	NotificationsSettingsEditorComponent,
+	type PreparedNotificationProviderConfiguration,
 } from "@gajae-code/coding-agent/modes/components/notifications-settings-editor";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { NotificationHealthReport } from "@gajae-code/coding-agent/sdk/bus/notification-service";
+import type { NotificationProvider } from "@gajae-code/coding-agent/sdk/bus/config";
+import type {
+	NotificationHealthReport,
+	NotificationStatusReport,
+} from "@gajae-code/coding-agent/sdk/bus/notification-service";
 
 beforeAll(async () => {
 	await initTheme();
@@ -54,6 +61,19 @@ function health(overall: "ok" | "warn" | "error" = "warn"): NotificationHealthRe
 	};
 }
 
+function adapterState(configured: boolean, channel: string | undefined): NotificationStatusReport["discord"] {
+	return {
+		botTokenMasked: configured ? "••••" : "(not set)",
+		channel,
+		configured,
+		quarantined: false,
+		desiredEnabled: configured,
+		desiredSource: "legacy",
+		effectiveEnabled: configured,
+		issues: [],
+	};
+}
+
 function state(): NotificationsEditorState {
 	return {
 		status: {
@@ -61,16 +81,23 @@ function state(): NotificationsEditorState {
 			redact: false,
 			verbosity: "lean",
 			globallyConfigured: true,
+			anyProviderComplete: true,
+			anyProviderEffective: true,
 			telegram: {
+				...adapterState(true, "1001"),
 				botTokenMasked: "••••••••",
-				channel: "1001",
-				configured: true,
 				tokenFingerprint: "telegram:deadbeef",
 			},
-			discord: { botTokenMasked: "••••", channel: "discord-channel", configured: true },
-			slack: { botTokenMasked: "••••", channel: "slack-channel", configured: true },
+			discord: adapterState(true, "discord-channel"),
+			slack: adapterState(true, "slack-channel"),
 		},
-		session: { eligible: true, locallyEnabled: true, effectiveEnabled: true, running: true, environment: "default" },
+		session: {
+			eligible: true,
+			locallyEnabled: true,
+			genericSessionEnabled: true,
+			genericEligibilitySource: "configured_provider",
+			running: true,
+		},
 		preferences: {
 			redact: false,
 			verbosity: "lean",
@@ -91,7 +118,10 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	preflightGate: Deferred<NotificationsPreflightResult> | undefined;
 	healthGate: Deferred<NotificationHealthReport> | undefined;
 	recoverFailure = false;
-	testGate: Deferred<{ ok: boolean; adapter: "telegram"; chatId: string | undefined; detail: string }> | undefined;
+	refreshFailure = false;
+	testGate:
+		| Deferred<{ ok: boolean; adapter: "telegram"; destination: string | undefined; detail: string }>
+		| undefined;
 	preflightSignal: AbortSignal | undefined;
 	healthSignal: AbortSignal | undefined;
 	removedTelegram = false;
@@ -109,6 +139,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 
 	async refreshHealth(input: { probe: boolean; signal?: AbortSignal }): Promise<NotificationHealthReport> {
 		this.healthSignal = input.signal;
+		if (this.refreshFailure) throw new Error("refresh failed");
 		if (this.healthGate) return await this.healthGate.promise;
 		const next = health(input.probe ? "ok" : "warn");
 		next.reachability = input.probe ? { probed: true, ok: true, detail: "reachable" } : next.reachability;
@@ -118,7 +149,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 
 	async sendTest() {
 		if (this.testGate) return await this.testGate.promise;
-		return { ok: true, adapter: "telegram" as const, chatId: "1001", detail: "delivered to chat 1001" };
+		return { ok: true, adapter: "telegram" as const, destination: "1001", detail: "delivered to chat 1001" };
 	}
 
 	async recover() {
@@ -163,7 +194,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 		return this.commitResult;
 	}
 
-	async saveInactive() {
+	async saveInactive(): Promise<NotificationsSaveInactiveResult> {
 		return {
 			status: "unavailable" as const,
 			guidance: "Discord and Slack remain enabled; inactive save is unavailable.",
@@ -172,6 +203,50 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 
 	discardConfigureDraft(): void {
 		// The fake holds no credential material; real adapters clear their opaque draft here.
+	}
+
+	async prepareProviderConfiguration(
+		input: NotificationsProviderSetupInput,
+	): Promise<PreparedNotificationProviderConfiguration> {
+		input.botToken.value?.consume();
+		input.appToken?.value?.consume();
+		return input.provider === "discord"
+			? {
+					provider: "discord",
+					botTokenDisposition: input.botToken.action,
+					botTokenMask: "••••",
+					applicationId: input.applicationId ?? "application",
+					guildId: input.guildId ?? "guild",
+					parentChannelId: input.parentChannelId ?? "channel",
+				}
+			: {
+					provider: "slack",
+					botTokenDisposition: input.botToken.action,
+					botTokenMask: "••••",
+					appTokenDisposition: input.appToken?.action ?? "keep",
+					appTokenMask: "••••",
+					workspaceId: input.workspaceId ?? "workspace",
+					channelId: input.channelId ?? "channel",
+					authorizedUserId: input.authorizedUserId,
+				};
+	}
+
+	async commitProviderConfiguration(draft: PreparedNotificationProviderConfiguration) {
+		this.state.status[draft.provider] = adapterState(true, draft.channelId ?? draft.parentChannelId);
+		return { receipt: {} as never, message: `${draft.provider} saved.` };
+	}
+
+	discardProviderConfiguration(): void {}
+
+	async setProviderDesired(provider: NotificationProvider, enabled: boolean) {
+		this.state.status[provider].desiredEnabled = enabled;
+		this.state.status[provider].effectiveEnabled = enabled && this.state.status.enabled;
+		return { receipt: {} as never, message: `${provider} desired intent updated.` };
+	}
+
+	async removeProvider(provider: NotificationProvider) {
+		if (provider !== "telegram") this.state.status[provider] = adapterState(false, undefined);
+		return { receipt: {} as never, message: `${provider} removed.` };
 	}
 
 	async enableGlobally() {
@@ -187,9 +262,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	async removeTelegram() {
 		this.removedTelegram = true;
 		this.state.status.telegram = {
-			botTokenMasked: "(not set)",
-			channel: undefined,
-			configured: false,
+			...adapterState(false, undefined),
 			tokenFingerprint: undefined,
 		};
 		return { message: "Telegram removed; Discord and Slack remain enabled.", globallyDisabled: false };
@@ -199,7 +272,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 		this.state.session = {
 			...this.state.session,
 			locallyEnabled: enabled,
-			effectiveEnabled: enabled,
+			genericSessionEnabled: enabled,
 			running: enabled,
 		};
 		return { outcome: enabled ? ("started" as const) : ("stopped" as const), status: this.state.session };
@@ -230,12 +303,14 @@ function select(component: NotificationsSettingsEditorComponent, index: number):
 function enterTelegramToken(component: NotificationsSettingsEditorComponent, token: string): void {
 	component.handleInput("\n");
 	component.handleInput("\n");
+	component.handleInput("\n");
 	component.handleInput("1001");
 	component.handleInput("\n");
 	component.handleInput(token);
 }
 
 function enterTelegramTokenWithoutChat(component: NotificationsSettingsEditorComponent, token: string): void {
+	component.handleInput("\n");
 	component.handleInput("\n");
 	component.handleInput("\n");
 	component.handleInput("\n");
@@ -261,6 +336,9 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("Choose a notification provider");
 		expect(render(component)).toContain("Telegram");
 
+		component.handleInput("\n");
+		expect(component.mode).toBe("provider-actions");
+		expect(render(component)).toContain("telegram notification settings");
 		component.handleInput("\n");
 		expect(component.mode).toBe("chat-entry");
 		expect(render(component)).toContain("private chat ID (optional)");
@@ -468,7 +546,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("PENDING");
 		component.handleInput("\x1b");
 		expect(render(component)).toContain("Navigation is locked");
-		operations.testGate.resolve({ ok: true, adapter: "telegram", chatId: "1001", detail: "delivered" });
+		operations.testGate.resolve({ ok: true, adapter: "telegram", destination: "1001", detail: "delivered" });
 		await flush();
 		expect(component.navigationLocked).toBe(false);
 		expect(render(component, 160)).toContain("Last in-editor test: OK");
@@ -522,5 +600,108 @@ describe("NotificationsSettingsEditorComponent", () => {
 		await flush();
 		expect(probe.navigationLocked).toBe(false);
 		expect(render(probe)).toContain("probe completed");
+	});
+	it("renders observer failure as a warning after a durable Telegram save", async () => {
+		const operations = new FakeNotificationsOperations();
+		operations.commitResult = {
+			status: "observer_failed",
+			receipt: {} as never,
+			message: "Telegram configuration was saved, but the settings observer failed.",
+		};
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+		enterTelegramToken(component, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		const output = render(component, 240);
+		expect(output).toContain("WARNING");
+		expect(output).toContain("Telegram configuration was saved, but the settings observer failed.");
+	});
+
+	it("retains durable-save truth when post-commit reconciliation refresh fails", async () => {
+		const operations = new FakeNotificationsOperations();
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+		enterTelegramToken(component, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		component.handleInput("\n");
+		await flush();
+		operations.refreshFailure = true;
+		component.handleInput("\n");
+		await flush();
+		const output = render(component, 240);
+		expect(output).toContain("WARNING");
+		expect(output).toContain("Configuration was saved, but post-commit reconciliation or refresh failed.");
+	});
+	it("renders inactive-save observer failure without claiming success", async () => {
+		const operations = new FakeNotificationsOperations();
+		operations.preflightProposedIdentity = async input => {
+			input.token.consume();
+			return {
+				status: "ready",
+				identity: { status: "foreign" },
+				message: "A foreign Telegram owner is active.",
+				pairingSource: "provided",
+				draft: {
+					chatId: input.chatId ?? "1001",
+					tokenMask: "••••••••",
+					tokenFingerprint: "telegram:cafefeed",
+					richEnabled: input.richEnabled,
+					richDraftEnabled: input.richDraftEnabled,
+					streamingEnabled: input.streamingEnabled,
+				},
+			};
+		};
+		operations.saveInactive = async () => ({
+			status: "observer_failed",
+			receipt: {} as never,
+			message: "Telegram configuration was saved inactive, but the settings observer failed.",
+		});
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+		enterTelegramToken(component, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		component.handleInput("\n");
+		await flush();
+		expect(component.mode).toBe("review");
+		component.handleInput("\n");
+		await flush();
+		const output = render(component, 240);
+		expect(output).toContain("WARNING");
+		expect(output).toContain("Telegram configuration was saved inactive, but the settings observer failed.");
+	});
+	it("revokes an in-flight prepared provider draft when disposed", async () => {
+		const operations = new FakeNotificationsOperations();
+		const gate = deferred<PreparedNotificationProviderConfiguration>();
+		let discarded = 0;
+		operations.prepareProviderConfiguration = async () => await gate.promise;
+		operations.discardProviderConfiguration = () => {
+			discarded++;
+		};
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+
+		component.handleInput("\n");
+		component.handleInput("\x1b[B");
+		component.handleInput("\n");
+		component.handleInput("\n");
+		component.handleInput("keep");
+		component.handleInput("\n");
+		component.handleInput("\n");
+		component.handleInput("\n");
+		component.handleInput("\n");
+		expect(component.navigationLocked).toBe(true);
+
+		component.dispose();
+		gate.resolve({
+			provider: "discord",
+			botTokenDisposition: "keep",
+			botTokenMask: "••••",
+			applicationIdDisplay: "application",
+			guildIdDisplay: "guild",
+			parentChannelIdDisplay: "channel",
+		});
+		await flush();
+		expect(discarded).toBe(1);
 	});
 });

@@ -17,13 +17,13 @@ import { getNotificationConfig, maskToken, tokenFingerprint } from "../sdk/bus/c
 import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
+	mutateNotificationProvider,
+	type NotificationProviderRuntimeAuthority,
 	observedTelegramActivationMarker,
 	type ProposedTelegramIdentity,
 	persistTelegramActivationMarker,
 	proposedTelegramIdentity,
 	reconcileCommittedTelegramConfiguration,
-	mutateNotificationProvider,
-	type NotificationProviderRuntimeAuthority,
 } from "../sdk/bus/notification-orchestration";
 import {
 	buildNotificationStatusReport,
@@ -41,8 +41,8 @@ import {
 	ensureTelegramDaemonRunningDetailed,
 	resolveTelegramSetupPreflight,
 } from "../sdk/bus/telegram-daemon";
-import { TelegramDaemonController } from "../sdk/bus/telegram-daemon-control";
 import { runDaemonInternal } from "../sdk/bus/telegram-daemon-cli";
+import { TelegramDaemonController } from "../sdk/bus/telegram-daemon-control";
 import {
 	runTelegramSetup as runTelegramPairingSetup,
 	type TelegramSetupPreflight,
@@ -304,11 +304,19 @@ async function runDiscordSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps):
 		deps,
 	);
 	const settings = await getSettings(deps);
+	let activationFailure: string | undefined;
+	let activationOutcome: EnsureChatDaemonResult | undefined;
 	const runtime: NotificationProviderRuntimeAuthority = {
 		activate: async provider => {
 			if (provider !== "discord") throw new Error("Unexpected provider activation request.");
-			const result = await ensureConfiguredProviderDaemon("discord", settings, deps);
-			if (result === "disabled") throw new Error("Discord runtime did not activate.");
+			try {
+				const result = await ensureConfiguredProviderDaemon("discord", settings, deps);
+				if (result === "disabled") throw new Error("Discord runtime did not activate.");
+				activationOutcome = result;
+			} catch (error) {
+				activationFailure = error instanceof Error ? error.message : "Discord runtime activation failed.";
+				throw error;
+			}
 		},
 		deactivate: async () => undefined,
 	};
@@ -325,9 +333,17 @@ async function runDiscordSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps):
 		...(cmd.redact ? { redact: true } : {}),
 		runtime,
 	});
-	if (result.status === "commit_failed") throw new Error("Discord configuration was not saved because the CAS commit failed.");
+	if (result.status === "commit_failed")
+		throw new Error("Discord configuration was not saved because the CAS commit failed.");
+	if (result.status !== "activated") {
+		const detail = `runtime activation failed: ${activationFailure ?? result.status}`;
+		process.stderr.write(`Discord configuration saved, but ${detail}.\n`);
+		if (deps.setExitCode) deps.setExitCode(1);
+		else process.exitCode = 1;
+		return;
+	}
 	process.stdout.write(
-		`Discord configuration saved. botToken=${maskToken(botToken)} applicationId=${applicationId} guildId=${guildId} parentChannelId=${parentChannelId} result=${result.status}\n`,
+		`Discord configuration saved and activated. botToken=${maskToken(botToken)} applicationId=${applicationId} guildId=${guildId} parentChannelId=${parentChannelId} daemon=${activationOutcome ?? "attached"}\n`,
 	);
 }
 
@@ -338,11 +354,19 @@ async function runSlackSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): P
 	const channelId = await promptSetupValue(cmd.slackChannelId, "--slack-channel-id", false, deps);
 	const authorizedUserId = cmd.slackAuthorizedUserId?.trim() || undefined;
 	const settings = await getSettings(deps);
+	let activationFailure: string | undefined;
+	let activationOutcome: EnsureChatDaemonResult | undefined;
 	const runtime: NotificationProviderRuntimeAuthority = {
 		activate: async provider => {
 			if (provider !== "slack") throw new Error("Unexpected provider activation request.");
-			const result = await ensureConfiguredProviderDaemon("slack", settings, deps);
-			if (result === "disabled") throw new Error("Slack runtime did not activate.");
+			try {
+				const result = await ensureConfiguredProviderDaemon("slack", settings, deps);
+				if (result === "disabled") throw new Error("Slack runtime did not activate.");
+				activationOutcome = result;
+			} catch (error) {
+				activationFailure = error instanceof Error ? error.message : "Slack runtime activation failed.";
+				throw error;
+			}
 		},
 		deactivate: async () => undefined,
 	};
@@ -360,9 +384,17 @@ async function runSlackSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): P
 		...(cmd.redact ? { redact: true } : {}),
 		runtime,
 	});
-	if (result.status === "commit_failed") throw new Error("Slack configuration was not saved because the CAS commit failed.");
+	if (result.status === "commit_failed")
+		throw new Error("Slack configuration was not saved because the CAS commit failed.");
+	if (result.status !== "activated") {
+		const detail = `runtime activation failed: ${activationFailure ?? result.status}`;
+		process.stderr.write(`Slack configuration saved, but ${detail}.\n`);
+		if (deps.setExitCode) deps.setExitCode(1);
+		else process.exitCode = 1;
+		return;
+	}
 	process.stdout.write(
-		`Slack configuration saved. botToken=${maskToken(botToken)} appToken=${maskToken(appToken)} workspaceId=${workspaceId} channelId=${channelId} authorizedUserId=${authorizedUserId ?? "(unset; inbound denied)"} result=${result.status}\n`,
+		`Slack configuration saved and activated. botToken=${maskToken(botToken)} appToken=${maskToken(appToken)} workspaceId=${workspaceId} channelId=${channelId} authorizedUserId=${authorizedUserId ?? "(unset; inbound denied)"} daemon=${activationOutcome ?? "attached"}\n`,
 	);
 }
 
@@ -418,6 +450,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 	if (result.pairingSource === "provided") {
 		process.stdout.write(`Using provided chat id ${result.chatId} (non-interactive).\n`);
 	}
+	let settingsCommitted = false;
 	try {
 		const proposedIdentity = deps.setupPreflight
 			? proposedIdentityFromSetupPreflight(deps.setupPreflight, token.trim(), result.chatId)
@@ -442,6 +475,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		];
 		if (deps.setupRedact ?? cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
 		const receipt = await settings.commitAtomicBatch(patches);
+		settingsCommitted = true;
 		const activationMarker = createTelegramActivationMarker({
 			botToken: token.trim(),
 			chatId: result.chatId,
@@ -476,6 +510,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		});
 		if (activation.status === "blocked_identity") {
 			const restored = await activation.restore();
+			if (restored.status === "restored" || restored.status === "still_blocked") settingsCommitted = false;
 			const detail =
 				restored.status === "restored"
 					? "Telegram activation was blocked by a foreign daemon; previous settings were restored."
@@ -486,9 +521,18 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 							: "Telegram activation was blocked; refusing to report setup success.";
 			throw new Error(detail);
 		}
+		if (activation.status === "activation_failed") {
+			receipt.discard();
+			throw new Error(activation.message);
+		}
+		receipt.discard();
 	} catch (error) {
 		const detail = sanitizeDiagnostic(error instanceof Error ? error.message : "unknown persistence failure", token);
-		throw new Error(`Unable to persist and activate Telegram notification settings: ${detail}`);
+		throw new Error(
+			settingsCommitted
+				? `Telegram notification settings were saved, but activation or recovery failed: ${detail}`
+				: `Unable to persist and activate Telegram notification settings: ${detail}`,
+		);
 	}
 	process.stdout.write(
 		`Notifications enabled. botToken=${maskToken(token)} chatId=${result.chatId} threaded=${result.threadedLabel}\n`,

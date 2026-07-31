@@ -19,7 +19,7 @@ import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from ".
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import { selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
-import { type Settings, settings } from "../../config/settings";
+import { type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -50,6 +50,7 @@ import {
 	stopInteractiveActivityIndicator,
 	suspendInteractiveActivityIndicator,
 } from "../../modes/types";
+import { ChatDaemonController } from "../../sdk/bus/chat-daemon-control";
 import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
@@ -57,11 +58,12 @@ import {
 	maskToken,
 	type NotificationProvider,
 } from "../../sdk/bus/config";
-import { ChatDaemonController } from "../../sdk/bus/chat-daemon-control";
 import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
 	mutateNotificationProvider,
+	type NotificationProviderConfigurationMutation,
+	type NotificationProviderRuntimeAuthority,
 	observedTelegramActivationMarker,
 	persistTelegramActivationMarker,
 	proposedTelegramIdentity,
@@ -70,8 +72,6 @@ import {
 	removeTelegramConfiguration,
 	saveTelegramInactive,
 	setGlobalNotificationsEnabled,
-	type NotificationProviderConfigurationMutation,
-	type NotificationProviderRuntimeAuthority,
 } from "../../sdk/bus/notification-orchestration";
 import {
 	buildNotificationStatusReport,
@@ -271,6 +271,7 @@ export interface NotificationsEditorOperationDependencies {
 	reloadTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
 	restartTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
 	stopTelegramDaemon(settings: Settings): Promise<TelegramDaemonStopResult>;
+	providerRuntime?: NotificationProviderRuntimeAuthority;
 }
 
 const notificationEditorOperationDependencies: NotificationsEditorOperationDependencies = {
@@ -357,7 +358,7 @@ export function createNotificationsEditorOperations(
 		});
 	const telegramSetupPreflight = async (): Promise<TelegramSetupPreflight> =>
 		await services.resolveTelegramSetupPreflight(ctx.settings);
-	const providerRuntime: NotificationProviderRuntimeAuthority = {
+	const providerRuntime: NotificationProviderRuntimeAuthority = services.providerRuntime ?? {
 		activate: async provider => {
 			if (provider === "telegram") {
 				const result = await reconnect();
@@ -601,12 +602,14 @@ export function createNotificationsEditorOperations(
 		commitConfigure: async draft => {
 			const token = drafts.get(draft);
 			if (!token) throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+			let receipt: SettingsAtomicReceipt | undefined;
 			try {
 				const inactiveMarkerToClear = observedTelegramActivationMarker(ctx.settings, token, draft.chatId);
-				const receipt = await ctx.settings.commitAtomicBatch([
+				receipt = await ctx.settings.commitAtomicBatch([
 					{ path: "notifications.enabled", op: "set", value: true },
 					{ path: "notifications.telegram.botToken", op: "set", value: token },
 					{ path: "notifications.telegram.chatId", op: "set", value: draft.chatId },
+					{ path: "notifications.telegram.enabled", op: "set", value: true },
 					{ path: "notifications.telegram.rich.enabled", op: "set", value: draft.richEnabled },
 					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: draft.richDraftEnabled },
 					{ path: "notifications.telegram.streaming.enabled", op: "set", value: draft.streamingEnabled },
@@ -641,12 +644,20 @@ export function createNotificationsEditorOperations(
 						marker: activationMarker,
 					},
 				});
-				await notifyAfterDurableCommit();
+				let observerFailed = false;
+				try {
+					await notifyAfterDurableCommit();
+				} catch {
+					observerFailed = true;
+				}
 				if (activation.status === "blocked_identity") {
 					return {
 						status: "blocked_identity" as const,
 						receipt,
-						message: services.sanitizeDiagnostic(activation.message, token),
+						message: services.sanitizeDiagnostic(
+							`${activation.message}${observerFailed ? " The settings observer also failed after the durable commit." : ""}`,
+							token,
+						),
 						restore: async () => {
 							const restored = await activation.restore();
 							if (restored.status === "restored" || restored.status === "still_blocked") {
@@ -657,12 +668,36 @@ export function createNotificationsEditorOperations(
 						retainCommitted: () => activation.retainCommitted(),
 					};
 				}
+				if (activation.status === "activation_failed") {
+					return {
+						status: "activation_failed" as const,
+						receipt,
+						message: services.sanitizeDiagnostic(
+							`${activation.message}${observerFailed ? " The settings observer also failed after the durable commit." : ""}`,
+							token,
+						),
+					};
+				}
+				if (observerFailed) {
+					return {
+						status: "observer_failed" as const,
+						receipt,
+						message: "Telegram configuration was saved and activated, but the settings observer failed.",
+					};
+				}
 				return {
 					status: "saved" as const,
 					receipt,
 					message: services.sanitizeDiagnostic("Telegram configuration saved and reconciled.", token),
 				};
 			} catch (error) {
+				if (receipt) {
+					return {
+						status: "activation_failed" as const,
+						receipt,
+						message: "Telegram configuration was saved, but post-commit activation failed.",
+					};
+				}
 				throw notificationOperationError(services, error, token);
 			}
 		},
@@ -677,7 +712,15 @@ export function createNotificationsEditorOperations(
 					chatId: draft.chatId,
 				});
 				drafts.delete(draft);
-				await notifyAfterDurableCommit();
+				try {
+					await notifyAfterDurableCommit();
+				} catch {
+					return {
+						status: "observer_failed" as const,
+						receipt: result.receipt,
+						message: "Telegram configuration was saved inactive, but the settings observer failed.",
+					};
+				}
 				return {
 					status: "saved_inactive" as const,
 					receipt: result.receipt,
@@ -708,34 +751,48 @@ export function createNotificationsEditorOperations(
 				throw new Error("A non-blank Slack app token replacement is required.");
 			}
 			if (input.provider === "discord") {
-				const applicationId = input.applicationId?.trim() || cfg.discord.applicationId;
-				const guildId = input.guildId?.trim() || cfg.discord.guildId;
-				const parentChannelId = input.parentChannelId?.trim() || cfg.discord.parentChannelId;
-				if (!applicationId || !guildId || !parentChannelId) {
+				const applicationId = input.applicationId?.trim() || undefined;
+				const guildId = input.guildId?.trim() || undefined;
+				const parentChannelId = input.parentChannelId?.trim() || undefined;
+				const resolvedApplicationId = applicationId ?? cfg.discord.applicationId;
+				const resolvedGuildId = guildId ?? cfg.discord.guildId;
+				const resolvedParentChannelId = parentChannelId ?? cfg.discord.parentChannelId;
+				const removesSecret = input.botToken.action === "remove";
+				if (!removesSecret && (!resolvedApplicationId || !resolvedGuildId || !resolvedParentChannelId)) {
 					throw new Error("Discord application, guild, and parent channel IDs are required.");
 				}
-				if (input.botToken.action === "keep" && !cfg.discord.botToken) {
+				if (!removesSecret && input.botToken.action === "keep" && !cfg.discord.botToken) {
 					throw new Error("Discord has no stored bot token to keep.");
 				}
 				const draft: PreparedNotificationProviderConfiguration = {
 					provider: "discord",
 					botTokenDisposition: input.botToken.action,
 					botTokenMask: maskToken(botToken ?? cfg.discord.botToken),
-					applicationId,
-					guildId,
-					parentChannelId,
+					...(applicationId === undefined ? {} : { applicationId }),
+					...(guildId === undefined ? {} : { guildId }),
+					...(parentChannelId === undefined ? {} : { parentChannelId }),
+					applicationIdDisplay: resolvedApplicationId,
+					guildIdDisplay: resolvedGuildId,
+					parentChannelIdDisplay: resolvedParentChannelId,
 				};
 				providerDrafts.set(draft, { ...(botToken === undefined ? {} : { botToken }) });
 				return draft;
 			}
-			const workspaceId = input.workspaceId?.trim() || cfg.slack.workspaceId;
-			const channelId = input.channelId?.trim() || cfg.slack.channelId;
-			if (!workspaceId || !channelId) throw new Error("Slack workspace and channel IDs are required.");
-			if (input.botToken.action === "keep" && !cfg.slack.botToken) {
+			const workspaceId = input.workspaceId?.trim() || undefined;
+			const channelId = input.channelId?.trim() || undefined;
+			const authorizedUserId = input.authorizedUserId?.trim() || undefined;
+			const resolvedWorkspaceId = workspaceId ?? cfg.slack.workspaceId;
+			const resolvedChannelId = channelId ?? cfg.slack.channelId;
+			const resolvedAuthorizedUserId = authorizedUserId ?? cfg.slack.authorizedUserId;
+			const appDisposition = input.appToken?.action ?? "keep";
+			const removesSecret = input.botToken.action === "remove" || appDisposition === "remove";
+			if (!removesSecret && (!resolvedWorkspaceId || !resolvedChannelId)) {
+				throw new Error("Slack workspace and channel IDs are required.");
+			}
+			if (!removesSecret && input.botToken.action === "keep" && !cfg.slack.botToken) {
 				throw new Error("Slack has no stored bot token to keep.");
 			}
-			const appDisposition = input.appToken?.action ?? "keep";
-			if (appDisposition === "keep" && !cfg.slack.appToken) {
+			if (!removesSecret && appDisposition === "keep" && !cfg.slack.appToken) {
 				throw new Error("Slack has no stored app token to keep.");
 			}
 			const draft: PreparedNotificationProviderConfiguration = {
@@ -744,9 +801,12 @@ export function createNotificationsEditorOperations(
 				botTokenMask: maskToken(botToken ?? cfg.slack.botToken),
 				appTokenDisposition: appDisposition,
 				appTokenMask: maskToken(appToken ?? cfg.slack.appToken),
-				workspaceId,
-				channelId,
-				...(input.authorizedUserId?.trim() ? { authorizedUserId: input.authorizedUserId.trim() } : {}),
+				...(workspaceId === undefined ? {} : { workspaceId }),
+				...(channelId === undefined ? {} : { channelId }),
+				...(authorizedUserId === undefined ? {} : { authorizedUserId }),
+				workspaceIdDisplay: resolvedWorkspaceId,
+				channelIdDisplay: resolvedChannelId,
+				authorizedUserIdDisplay: resolvedAuthorizedUserId,
 			};
 			providerDrafts.set(draft, {
 				...(botToken === undefined ? {} : { botToken }),
@@ -787,8 +847,7 @@ export function createNotificationsEditorOperations(
 						authorizedUserId: draft.authorizedUserId,
 					};
 				}
-				const removesSecret =
-					draft.botTokenDisposition === "remove" || draft.appTokenDisposition === "remove";
+				const removesSecret = draft.botTokenDisposition === "remove" || draft.appTokenDisposition === "remove";
 				const result = await mutateNotificationProvider({
 					settings: ctx.settings,
 					mutation,
@@ -797,18 +856,31 @@ export function createNotificationsEditorOperations(
 					notifyConfigChanged: notifyAfterDurableCommit,
 					runtime: providerRuntime,
 				});
+				const outcome =
+					result.status === "commit_failed"
+						? "failed"
+						: result.status === "activation_failed" ||
+								result.status === "deactivation_failed" ||
+								result.observerFailed
+							? "degraded"
+							: "success";
+				const observerSuffix =
+					result.status !== "commit_failed" && result.observerFailed
+						? " The settings observer also failed after the durable commit."
+						: "";
 				return {
 					...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
+					outcome,
 					message:
-						result.status === "activated"
+						(result.status === "activated"
 							? `${draft.provider} configuration saved and activated.`
 							: result.status === "activation_failed"
 								? `${draft.provider} configuration and desired intent were saved, but runtime activation failed.`
-								: result.status === "observer_failed"
-									? `${draft.provider} configuration was saved, but the settings observer failed.`
+								: result.status === "deactivation_failed"
+									? `${draft.provider} desired-off configuration was saved, but runtime deactivation failed.`
 									: result.status === "commit_failed"
 										? `${draft.provider} configuration was not saved because the CAS commit failed.`
-										: `${draft.provider} configuration saved.`,
+										: `${draft.provider} configuration saved.`) + observerSuffix,
 				};
 			} finally {
 				providerDrafts.delete(draft);
@@ -833,16 +905,28 @@ export function createNotificationsEditorOperations(
 				notifyConfigChanged: notifyAfterDurableCommit,
 				runtime: providerRuntime,
 			});
+			const outcome =
+				result.status === "commit_failed"
+					? "failed"
+					: result.status === "activation_failed" ||
+							result.status === "deactivation_failed" ||
+							result.observerFailed
+						? "degraded"
+						: "success";
 			return {
 				...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
+				outcome,
 				message:
-					result.status === "activation_failed"
+					(result.status === "activation_failed"
 						? `${provider} desired intent was saved, but activation failed.`
 						: result.status === "deactivation_failed"
 							? `${provider} desired-off intent was saved, but deactivation failed.`
 							: result.status === "commit_failed"
 								? `${provider} desired intent was not saved because the CAS commit failed.`
-								: `${provider} desired intent ${enabled ? "enabled" : "disabled"}.`,
+								: `${provider} desired intent ${enabled ? "enabled" : "disabled"}.`) +
+					(result.status !== "commit_failed" && result.observerFailed
+						? " The settings observer also failed after the durable commit."
+						: ""),
 			};
 		},
 
@@ -856,14 +940,25 @@ export function createNotificationsEditorOperations(
 				runtime: providerRuntime,
 				notifyConfigChanged: notifyAfterDurableCommit,
 			});
+			const degraded =
+				result.status === "deactivation_failed" || ("observerFailed" in result && result.observerFailed);
 			return {
-				...(result.status === "removed" ? { receipt: result.receipt } : {}),
+				...("receipt" in result && result.receipt ? { receipt: result.receipt } : {}),
+				outcome:
+					result.status === "commit_failed" || result.status === "commit_failed_after_teardown"
+						? "failed"
+						: degraded
+							? "degraded"
+							: "success",
 				message:
-					result.status === "removed"
+					(result.status === "removed"
 						? `${provider} configuration removed.`
 						: result.status === "deactivation_failed"
-							? `${provider} configuration changed, but runtime deactivation failed.`
-							: `${provider} configuration removal failed.`,
+							? `${provider} configuration was removed, but runtime deactivation failed.`
+							: `${provider} configuration removal failed.`) +
+					("observerFailed" in result && result.observerFailed
+						? " The settings observer also failed after the durable commit."
+						: ""),
 			};
 		},
 
@@ -872,15 +967,22 @@ export function createNotificationsEditorOperations(
 				settings: ctx.settings,
 				enabled: true,
 				notifyConfigChanged: notifyAfterDurableCommit,
+				runtime: providerRuntime,
 			});
+			const degraded =
+				result.status === "global_activation_partial" || ("observerFailed" in result && result.observerFailed);
 			return {
 				...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
+				outcome: result.status === "commit_failed" ? "failed" : degraded ? "degraded" : "success",
 				message:
-					result.status === "observer_failed"
-						? "Global notifications were enabled, but the settings observer failed."
+					(result.status === "global_activation_partial"
+						? `Global notifications were enabled, but activation failed for ${result.failed.join(", ")}.`
 						: result.status === "commit_failed"
 							? "Global notifications were not enabled because the CAS commit failed."
-							: "Global notifications enabled using stored provider intent.",
+							: "Global notifications enabled using stored provider intent.") +
+					(result.status !== "commit_failed" && result.observerFailed
+						? " The settings observer also failed after the durable commit."
+						: ""),
 			};
 		},
 
@@ -891,14 +993,20 @@ export function createNotificationsEditorOperations(
 				notifyConfigChanged: notifyAfterDurableCommit,
 				runtime: providerRuntime,
 			});
+			const degraded =
+				result.status === "global_deactivation_partial" || ("observerFailed" in result && result.observerFailed);
 			return {
 				...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
+				outcome: result.status === "commit_failed" ? "failed" : degraded ? "degraded" : "success",
 				message:
-					result.status === "global_deactivation_partial"
+					(result.status === "global_deactivation_partial"
 						? `Global notifications were disabled, but teardown failed for ${result.failed.join(", ")}.`
 						: result.status === "commit_failed"
 							? "Global notifications were not disabled because the CAS commit failed."
-							: "Global notifications disabled; provider configuration and desired intent were preserved.",
+							: "Global notifications disabled; provider configuration and desired intent were preserved.") +
+					(result.status !== "commit_failed" && result.observerFailed
+						? " The settings observer also failed after the durable commit."
+						: ""),
 			};
 		},
 
@@ -932,17 +1040,27 @@ export function createNotificationsEditorOperations(
 						},
 					},
 				});
+				const postCommitFailures: string[] = [];
 				if (runtimePrepared && controller) {
-					await controller.clearBlockedRuntime(sessionContext());
-					await controller.reconcileCurrentSession(sessionContext());
+					try {
+						await controller.clearBlockedRuntime(sessionContext());
+						await controller.reconcileCurrentSession(sessionContext());
+					} catch {
+						postCommitFailures.push("current-session reconciliation failed");
+					}
 				}
-				await notifyAfterDurableCommit();
+				try {
+					await notifyAfterDurableCommit();
+				} catch {
+					postCommitFailures.push("settings observer failed");
+				}
 				return {
 					receipt: result.receipt,
+					outcome: postCommitFailures.length === 0 ? "success" : "degraded",
 					globallyDisabled: result.globallyDisabled,
-					message: result.globallyDisabled
-						? "Telegram configuration removed and global notifications disabled."
-						: "Telegram configuration removed; Discord or Slack configuration was preserved.",
+					message: `Telegram configuration removed without changing the global master.${
+						postCommitFailures.length === 0 ? "" : ` Post-commit ${postCommitFailures.join(" and ")}.`
+					}`,
 				};
 			} catch (error) {
 				if (runtimePrepared) {
@@ -984,7 +1102,7 @@ export function createNotificationsEditorOperations(
 					daemonWasRunningForDisable = stopped.before?.health === "running";
 				}
 
-				let receipt: Awaited<ReturnType<typeof ctx.settings.commitAtomicBatch>>;
+				let receipt: SettingsAtomicReceipt;
 				try {
 					receipt = await ctx.settings.commitAtomicBatch([
 						{ path: "notifications.redact", op: "set", value: preferences.redact },
@@ -1017,16 +1135,31 @@ export function createNotificationsEditorOperations(
 					throw error;
 				}
 
+				const postCommitFailures: string[] = [];
 				const config = services.getNotificationConfig(ctx.settings);
 				if (isProviderEffectivelyEnabled(config, "telegram") && isTelegramComplete(config)) {
-					const reload = daemonWasRunningForDisable
-						? await services.restartTelegramDaemon(ctx.settings)
-						: await services.reloadTelegramDaemon(ctx.settings);
-					if (!reload.ok)
-						throw new Error(`Notification preferences were saved, but daemon reload failed: ${reload.message}`);
+					try {
+						const reload = daemonWasRunningForDisable
+							? await services.restartTelegramDaemon(ctx.settings)
+							: await services.reloadTelegramDaemon(ctx.settings);
+						if (!reload.ok) postCommitFailures.push(`daemon reload failed: ${reload.message}`);
+					} catch {
+						postCommitFailures.push("daemon reload failed");
+					}
 				}
-				await notifyAfterDurableCommit();
-				return { receipt, message: "Notification preferences saved atomically." };
+				try {
+					await notifyAfterDurableCommit();
+				} catch {
+					postCommitFailures.push("settings observer failed");
+				}
+				return {
+					receipt,
+					outcome: postCommitFailures.length === 0 ? "success" : "degraded",
+					message:
+						postCommitFailures.length === 0
+							? "Notification preferences saved atomically."
+							: `Notification preferences were saved, but post-commit ${postCommitFailures.join(" and ")}.`,
+				};
 			} catch (error) {
 				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
 			}

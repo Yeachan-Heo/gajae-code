@@ -16,6 +16,8 @@ const sdkHost = "packages/coding-agent/src/sdk/host/host.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
+const chatRuntime = "packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts";
+const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -60,11 +62,12 @@ type GuardManifest = {
 
 
 /**
- * This is a deliberately small, exact lifecycle contract. Do not include session
- * endpoint or provider generations: they do not replace daemon owners.
+ * This is a deliberately small, exact lifecycle contract. Per-session endpoint
+ * generation counters remain separate, while daemon-owned endpoint discovery is
+ * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "caea0dbab69af5b4eb3d94bfbeec64ec1c30a9b0894054cb7005bde687ee961b";
+const PROTECTED_INVENTORY_SHA256 = "1bbef1183dfd65b613e8c7a3399bc4ac4dac6d46f788a2e82fd81ba019d608d6";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -112,8 +115,28 @@ export const CHAT_CLI_PROTECTED_DECLARATIONS = ["defaultPidAlive", "loadConfig",
 
 /** Provider credentials configure daemon ownership and must stay family-scoped. */
 export const CHAT_CONFIG_PROTECTED_DECLARATIONS = {
-	discord: ["getNotificationConfig", "notificationConfigFromFile", "isDiscordConfigured", "tokenFingerprint"],
-	slack: ["getNotificationConfig", "notificationConfigFromFile", "isSlackConfigured", "tokenFingerprint"],
+	discord: [
+		"getNotificationConfig",
+		"notificationConfigFromFile",
+		"resolveNotificationProvider",
+		"isDiscordComplete",
+		"isProviderEffectivelyEnabled",
+		"tokenFingerprint",
+	],
+	slack: [
+		"getNotificationConfig",
+		"notificationConfigFromFile",
+		"resolveNotificationProvider",
+		"isSlackComplete",
+		"isProviderEffectivelyEnabled",
+		"tokenFingerprint",
+	],
+} as const;
+
+/** Chat-only endpoint isolation must replace daemon owners that cannot discover it. */
+export const CHAT_ENDPOINT_DISCOVERY_PROTECTED_DECLARATIONS = {
+	[chatRuntime]: ["attach"],
+	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 
 /** Telegram tool-activity defaults and delivery admission must stay generation-fenced. */
@@ -179,6 +202,19 @@ function validateChatConfigInventory(inventory: Inventory): void {
 	}
 }
 
+function validateChatEndpointDiscoveryInventory(inventory: Inventory): void {
+	for (const family of ["discord", "slack"] as const) {
+		for (const [file, required] of Object.entries(CHAT_ENDPOINT_DISCOVERY_PROTECTED_DECLARATIONS)) {
+			const symbols = inventory[family][file];
+			if (!symbols || required.some(symbol => !symbols.includes(symbol))) {
+				throw new Error(
+					`telegram-daemon-generation-guard: isolated chat endpoint discovery must be protected by the ${family} generation contract`,
+				);
+			}
+		}
+	}
+}
+
 function validateTelegramToolActivityInventory(inventory: Inventory): void {
 	for (const [file, required] of Object.entries(TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS)) {
 		const symbols = inventory.telegram[file];
@@ -233,6 +269,7 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateChatOwnerLockInventory(inventory);
 	validateChatCliInventory(inventory);
 	validateChatConfigInventory(inventory);
+	validateChatEndpointDiscoveryInventory(inventory);
 	validateTelegramToolActivityInventory(inventory);
 }
 

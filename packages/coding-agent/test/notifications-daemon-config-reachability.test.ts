@@ -6,9 +6,9 @@ import { YAML } from "bun";
 import { Settings } from "../src/config/settings";
 import {
 	getNotificationConfig,
-	isDiscordConfigured,
-	isGloballyConfigured,
-	isSlackConfigured,
+	hasAnyEffectivelyEnabledProvider,
+	isDiscordComplete,
+	isSlackComplete,
 } from "../src/sdk/bus/config";
 import { createLightweightDaemonSettings, loadLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 
@@ -46,13 +46,19 @@ describe("notifications daemon config reachability (rich)", () => {
 		expect(cfg.rich).toEqual({ enabled: true });
 	});
 
-	test("explicit malformed booleans throw a sanitized configuration error", () => {
-		expect(() => cfgFromRaw({ notifications: { telegram: { rich: { enabled: "yes" } } } })).toThrow(
-			"gjc_notify_daemon_invalid_configuration",
-		);
-		expect(() => cfgFromRaw(YAML.parse('notifications:\n  telegram:\n    btw:\n      enabled: "false"\n'))).toThrow(
-			"gjc_notify_daemon_invalid_configuration",
-		);
+	test("provider-local malformed booleans are quarantined with safe defaults", () => {
+		const rich = cfgFromRaw({ notifications: { telegram: { rich: { enabled: "yes" } } } });
+		expect(rich.rich.enabled).toBe(true);
+		expect(rich.providerIssues?.telegram).toContainEqual({
+			path: "notifications.telegram.rich.enabled",
+			code: "wrong_type",
+		});
+		const btw = cfgFromRaw(YAML.parse('notifications:\n  telegram:\n    btw:\n      enabled: "false"\n'));
+		expect(btw.btw.enabled).toBe(true);
+		expect(btw.providerIssues?.telegram).toContainEqual({
+			path: "notifications.telegram.btw.enabled",
+			code: "wrong_type",
+		});
 	});
 
 	test("stale richFinal config is ignored", () => {
@@ -78,10 +84,13 @@ describe("notifications daemon config reachability (rich)", () => {
 		expect(cfgFromRaw({ notifications: { enabled: true } }).topics.nameTemplate).toBeUndefined();
 	});
 
-	test("rejects an explicitly malformed topics.nameTemplate", () => {
-		expect(() => cfgFromRaw({ notifications: { telegram: { topics: { nameTemplate: 42 } } } })).toThrow(
-			"gjc_notify_daemon_invalid_configuration",
-		);
+	test("quarantines an explicitly malformed topics.nameTemplate", () => {
+		const cfg = cfgFromRaw({ notifications: { telegram: { topics: { nameTemplate: 42 } } } });
+		expect(cfg.topics.nameTemplate).toBeUndefined();
+		expect(cfg.providerIssues?.telegram).toContainEqual({
+			path: "notifications.telegram.topics.nameTemplate",
+			code: "wrong_type",
+		});
 	});
 });
 
@@ -94,12 +103,17 @@ describe("notifications daemon config reachability (streaming)", () => {
 		});
 	});
 
-	test("rejects malformed streaming containers and enabled values", () => {
-		for (const rawConfig of [
-			{ notifications: { telegram: { streaming: true } } },
-			{ notifications: { telegram: { streaming: { enabled: "false" } } } },
-		]) {
-			expect(() => cfgFromRaw(rawConfig)).toThrow("gjc_notify_daemon_invalid_configuration");
+	test("quarantines malformed streaming containers and enabled values", () => {
+		for (const [rawConfig, pathName] of [
+			[{ notifications: { telegram: { streaming: true } } }, "notifications.telegram.streaming"],
+			[
+				{ notifications: { telegram: { streaming: { enabled: "false" } } } },
+				"notifications.telegram.streaming.enabled",
+			],
+		] as const) {
+			const cfg = cfgFromRaw(rawConfig);
+			expect(cfg.streaming).toEqual({ enabled: true });
+			expect((cfg.providerIssues?.telegram ?? []).some(issue => issue.path === pathName)).toBe(true);
 		}
 	});
 });
@@ -108,14 +122,17 @@ describe("notifications daemon config reachability (btw)", () => {
 		expect(Settings.isolated({}).getNotificationSettingsSnapshot().telegram.btw).toEqual({ enabled: true });
 		expect(cfgFromRaw({}).btw).toEqual({ enabled: true });
 	});
-	test("rejects scalar roots and malformed notification containers instead of applying defaults", () => {
-		for (const rawConfig of [
-			true,
-			{ notifications: true },
-			{ notifications: { telegram: [] } },
-			{ notifications: { telegram: { btw: true } } },
-		]) {
+	test("rejects malformed global roots and quarantines malformed Telegram containers", () => {
+		for (const rawConfig of [true, { notifications: true }]) {
 			expect(() => cfgFromRaw(rawConfig)).toThrow("gjc_notify_daemon_invalid_configuration");
+		}
+		for (const [rawConfig, pathName] of [
+			[{ notifications: { telegram: [] } }, "notifications.telegram"],
+			[{ notifications: { telegram: { btw: true } } }, "notifications.telegram.btw"],
+		] as const) {
+			const cfg = cfgFromRaw(rawConfig);
+			expect(cfg.btw).toEqual({ enabled: true });
+			expect((cfg.providerIssues?.telegram ?? []).some(issue => issue.path === pathName)).toBe(true);
 		}
 	});
 	test("explicit malformed idle timeout throws instead of silently defaulting", () => {
@@ -160,11 +177,11 @@ describe("notifications daemon config reachability (providers)", () => {
 				discord: { botToken: "discord-secret", applicationId: "app", guildId: "guild", parentChannelId: "parent" },
 			},
 		});
-		expect(isDiscordConfigured(completeDiscord)).toBe(true);
-		expect(isGloballyConfigured(completeDiscord)).toBe(true);
+		expect(isDiscordComplete(completeDiscord)).toBe(true);
+		expect(hasAnyEffectivelyEnabledProvider(completeDiscord)).toBe(true);
 		const partialDiscord = cfgFromRaw({ notifications: { enabled: true, discord: { botToken: "discord-secret" } } });
-		expect(isDiscordConfigured(partialDiscord)).toBe(false);
-		expect(isGloballyConfigured(partialDiscord)).toBe(false);
+		expect(isDiscordComplete(partialDiscord)).toBe(false);
+		expect(hasAnyEffectivelyEnabledProvider(partialDiscord)).toBe(false);
 
 		const completeSlack = cfgFromRaw({
 			notifications: {
@@ -177,13 +194,13 @@ describe("notifications daemon config reachability (providers)", () => {
 				},
 			},
 		});
-		expect(isSlackConfigured(completeSlack)).toBe(true);
-		expect(isGloballyConfigured(completeSlack)).toBe(true);
+		expect(isSlackComplete(completeSlack)).toBe(true);
+		expect(hasAnyEffectivelyEnabledProvider(completeSlack)).toBe(true);
 		const partialSlack = cfgFromRaw({
 			notifications: { enabled: true, slack: { botToken: "slack-bot-secret", appToken: "slack-app-secret" } },
 		});
-		expect(isSlackConfigured(partialSlack)).toBe(false);
-		expect(isGloballyConfigured(partialSlack)).toBe(false);
+		expect(isSlackComplete(partialSlack)).toBe(false);
+		expect(hasAnyEffectivelyEnabledProvider(partialSlack)).toBe(false);
 	});
 });
 

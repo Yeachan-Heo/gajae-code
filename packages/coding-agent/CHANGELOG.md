@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Notification settings now expose first-class Telegram, Discord, and Slack configuration, desired-intent toggles, provider-local quarantine and repair guidance, explicit `keep | replace | remove` secret actions, provider-specific health/test diagnostics, and truthful saved-but-runtime-degraded outcomes. The global master preserves provider credentials and intent, `GJC_NOTIFICATIONS=0` suppresses only automatic generic-session admission, and blocked Telegram ownership uses an isolated chat-only endpoint so verified Discord or Slack siblings can continue without exposing the shared endpoint.
+
 ### Fixed
 
 - Ordinary `ask` selectors now bound long question premises and page through every premise row without skipping rows hidden by overflow indicators (#3675).

@@ -128,8 +128,9 @@ function start(
 		cwd: string;
 		sessionId: string;
 		onRegistered?: (registration: telegramDaemon.RegisterNotificationRootResult) => void;
-	}) => Promise<"attached">,
+	}) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
+	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -162,7 +163,9 @@ function start(
 		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
 	createNotificationsExtension(
 		api,
-		effectiveSettings ? { settings: effectiveSettings, ensureTelegramDaemon, controller } : undefined,
+		effectiveSettings
+			? { settings: effectiveSettings, ensureTelegramDaemon, ensureProviderDaemon, controller }
+			: undefined,
 	);
 	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
@@ -578,6 +581,87 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 	}
 }, 60_000);
 
+test("Telegram cleanup is never retained without a registration token", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-tokenless-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-tokenless-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async () => "attached",
+		);
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).not.toHaveBeenCalled();
+	} finally {
+		unregister.mockRestore();
+	}
+}, 60_000);
+
+test("Telegram ownership races publish safe siblings only in broker-authorized chat scope", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
+	dirs.push(cwd);
+	const agentDir = path.join(cwd, "agent");
+	const sessionId = `telegram-sibling-isolation-${Date.now()}`;
+	const base = Settings.isolated({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:token",
+		"notifications.telegram.chatId": "42",
+		"notifications.discord.enabled": true,
+		"notifications.discord.botToken": "discord-token",
+		"notifications.discord.applicationId": "discord-app",
+		"notifications.discord.guildId": "discord-guild",
+		"notifications.discord.parentChannelId": "discord-parent",
+	});
+	const settings = new Proxy(base, {
+		get(target, prop) {
+			if (prop === "getAgentDir") return () => agentDir;
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		settings,
+		() => {},
+		false,
+		new Map(),
+		{ startupCapability: capability, lifecycleRequired: true },
+		false,
+		async () => "blocked",
+		undefined,
+		async () => "attached",
+	);
+	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+	await expect(capability.promise).resolves.toEqual({ status: "started" });
+	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
+	const chatEndpoint = path.join(chatStateRoot, "sdk", `${sessionId}.json`);
+	expect(fs.existsSync(defaultEndpoint)).toBe(false);
+	expect(fs.existsSync(chatEndpoint)).toBe(true);
+	const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
+	expect(sessions).toContainEqual(
+		expect.objectContaining({
+			sessionId,
+			locator: { repo: path.resolve(cwd), stateRoot: chatStateRoot },
+			endpointMtimeMs: fs.statSync(chatEndpoint).mtimeMs,
+		}),
+	);
+	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
 test("Telegram root ownership is recorded when reconciliation configures Telegram after startup", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-reconcile-"));
 	dirs.push(cwd);
