@@ -312,6 +312,7 @@ export type VerifiedSessionDeleteResult =
 			artifactsIdentity: SessionStorageFileIdentity | undefined;
 			/** Identity-bound quarantine path retained when recursive cleanup failed. */
 			detachedArtifactsPath: string;
+			artifactsPayloadDurable?: true;
 			/** Native snapshot required for an identity-bound recursive retry. */
 			artifactsTree: NativeDirectoryTreeSnapshot;
 			/** Transcript identity (unchanged) for retry binding. */
@@ -328,6 +329,7 @@ export type VerifiedSessionDeleteResult =
 			transcriptIdentity: SessionStorageFileIdentity;
 			/** Optional identity-bound transcript quarantine path for restart cleanup. */
 			detachedTranscriptPath?: string;
+			transcriptPayloadDurable?: true;
 			retainedSuccessorPath?: string;
 			retainedPlaceholderPath?: string;
 			retainedUnknownPath?: string;

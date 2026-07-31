@@ -2441,13 +2441,21 @@ function cleanupPendingEvidence(
 			deletion.phase === "artifacts" ? deletion.artifactsIdentity : active.expectedArtifactsIdentity,
 		expectedArtifactsTree: deletion.phase === "artifacts" ? deletion.artifactsTree : active.expectedArtifactsTree,
 		artifactsPayloadDurable:
-			deletion.phase === "artifacts" ? deletion.artifactsPayloadDurable : active.artifactsPayloadDurable,
+			deletion.phase === "artifacts"
+				? deletion.artifactsPayloadDurable
+					? true
+					: undefined
+				: active.artifactsPayloadDurable,
 		detachedArtifactsPath:
 			deletion.phase === "artifacts" ? deletion.detachedArtifactsPath : active.detachedArtifactsPath,
 		detachedTranscriptPath:
 			deletion.phase === "transcript" ? deletion.detachedTranscriptPath : active.detachedTranscriptPath,
 		transcriptPayloadDurable:
-			deletion.phase === "transcript" ? deletion.transcriptPayloadDurable : active.transcriptPayloadDurable,
+			deletion.phase === "transcript"
+				? deletion.transcriptPayloadDurable
+					? true
+					: undefined
+				: active.transcriptPayloadDurable,
 		retainedArtifactsSuccessorPath:
 			deletion.phase === "artifacts" ? deletion.retainedSuccessorPath : active.retainedArtifactsSuccessorPath,
 		retainedArtifactsPlaceholderPath:

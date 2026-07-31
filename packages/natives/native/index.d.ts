@@ -835,24 +835,12 @@ export declare enum Ellipsis {
 export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, targetHeightPx: number): string
 
 /**
- * Remove a directory tree only when a fresh descriptor-relative snapshot
- * exactly equals the persisted snapshot. POSIX first no-replace detaches the
- * verified root to its deterministic `.removing` sibling; the reopened
- * detached descriptor remains authoritative throughout payload scrubbing and
- * replay.
+ * Remove an already durably planned detached directory only when a fresh
+ * descriptor-relative snapshot exactly equals the persisted snapshot. The
+ * caller-planned root remains in place while its opened descriptor is
+ * authoritative throughout recursive removal.
  */
 export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): NativeExactUnlinkResult
-
-/**
- * Replace a staged regular file only after validating the exact staged source
- * and deleting the exact expected destination.
- *
- * Both identities must describe regular files, not directories or detach-only
- * requests. Publication uses the retained verified source handle and a
- * no-replace rename, so source substitution is rejected and a destination
- * successor is preserved.
- */
-export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
  * Restore only the detached object that still has the supplied platform
@@ -1747,15 +1735,6 @@ export interface NativeExactFileIdentity {
 export interface NativeExactUnlinkResult {
   ok: boolean
   code?: string
-  /**
-   * True only when retained directory payloads were descriptor-scrubbed and
-   * every file plus containing directory namespace was fsynced before return.
-   */
-  payloadDurable?: boolean
-  /**
-   * On Windows this is returned in the caller's namespace; retained handle
-   * operations continue to use the volume-GUID canonical path internally.
-   */
   detachedPath?: string
   retainedSuccessorPath?: string
   /**

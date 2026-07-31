@@ -48,6 +48,7 @@ export type NativePublishIdentity = {
 	readonly dev: string;
 	readonly ino: string;
 	readonly size: string;
+	readonly nlink?: string;
 	readonly mtimeNs: string;
 	readonly ctimeNs: string;
 	readonly sha256?: string;
@@ -126,12 +127,13 @@ const malformed: NativePublishOutcome = Object.freeze({
 
 function validIdentity(value: unknown): boolean {
 	if (value === undefined) return true;
-	if (!ownPlainRecord(value) || !exactKeys(value, ["dev", "ino", "size", "mtimeNs", "ctimeNs", "sha256"]))
+	if (!ownPlainRecord(value) || !exactKeys(value, ["dev", "ino", "nlink", "size", "mtimeNs", "ctimeNs", "sha256"]))
 		return false;
 	const decimal = (field: unknown) => typeof field === "string" && /^-?[0-9]{1,32}$/.test(field);
 	return (
 		decimal(value.dev) &&
 		decimal(value.ino) &&
+		(value.nlink === undefined || decimal(value.nlink)) &&
 		decimal(value.size) &&
 		decimal(value.mtimeNs) &&
 		decimal(value.ctimeNs) &&

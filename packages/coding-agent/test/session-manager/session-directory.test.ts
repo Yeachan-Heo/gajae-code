@@ -423,12 +423,22 @@ describe("managed session write protocol", () => {
 			rootDev: "1",
 			rootIno: "2",
 			entries: [
-				{ relativePath: "", kind: "directory" as const, dev: "1", ino: "2", size: "0", mtimeNs: "1", ctimeNs: "1" },
+				{
+					relativePath: "",
+					kind: "directory" as const,
+					dev: "1",
+					ino: "2",
+					nlink: "1",
+					size: "0",
+					mtimeNs: "1",
+					ctimeNs: "1",
+				},
 				{
 					relativePath: "a.bin",
 					kind: "file" as const,
 					dev: "1",
 					ino: "3",
+					nlink: "1",
 					size: "4",
 					mtimeNs: "2",
 					ctimeNs: "2",
@@ -439,6 +449,7 @@ describe("managed session write protocol", () => {
 					kind: "file" as const,
 					dev: "1",
 					ino: "4",
+					nlink: "1",
 					size: "5",
 					mtimeNs: "3",
 					ctimeNs: "3",
@@ -449,6 +460,7 @@ describe("managed session write protocol", () => {
 					kind: "directory" as const,
 					dev: "1",
 					ino: "5",
+					nlink: "1",
 					size: "0",
 					mtimeNs: "4",
 					ctimeNs: "4",
@@ -458,6 +470,7 @@ describe("managed session write protocol", () => {
 					kind: "file" as const,
 					dev: "1",
 					ino: "6",
+					nlink: "1",
 					size: "3",
 					mtimeNs: "5",
 					ctimeNs: "5",
@@ -1268,7 +1281,8 @@ describe("managed session write protocol", () => {
 				.spyOn(native, "exactRemoveDirectoryTree")
 				.mockImplementationOnce((pathname, snapshot) => {
 					const result = exactRemoveDirectoryTree(pathname, snapshot);
-					if (result.payloadDurable !== true) throw new Error("Missing native durable payload proof");
+					if (!(result as { payloadDurable?: boolean }).payloadDurable)
+						throw new Error("Missing native durable payload proof");
 					return result;
 				});
 			const verifiedDelete = FileSessionStorage.prototype.deleteSessionVerified;
