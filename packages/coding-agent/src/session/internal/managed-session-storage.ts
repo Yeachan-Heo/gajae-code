@@ -1642,7 +1642,10 @@ export function replaceManagedFileSync(
 				},
 			);
 			if (!replaced.ok) {
-				if (replaced.detachedPath) {
+				const committedWithPredecessor =
+					replaced.detachedPath === replaced.retainedPlaceholderPath &&
+					replaced.retainedSuccessorPath === destination;
+				if (replaced.detachedPath && !committedWithPredecessor) {
 					const restored = exactRestore(replaced.detachedPath, staging, {
 						dev: staged.dev,
 						ino: staged.ino,
