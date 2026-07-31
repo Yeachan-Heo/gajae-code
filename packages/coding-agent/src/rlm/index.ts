@@ -12,7 +12,7 @@ import { type Args, parseArgs } from "../cli/args";
 import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { resolveSessionIdFromSources, writeSessionActivityMarker } from "../gjc-runtime/session-resolution";
-import { type RlmPreset, runRootCommand } from "../main";
+import { type RlmPreset, type RunRootCommandDependencies, type RunRootCommandOutcome, runRootCommand } from "../main";
 import rlmReportCommandPrompt from "../prompts/system/rlm-report-command.md" with { type: "text" };
 import type { CreateAgentSessionOptions } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
@@ -55,6 +55,12 @@ interface RlmRunController {
 	completed: boolean;
 	finalSummary: string | undefined;
 	session: AgentSession | undefined;
+}
+
+export interface RunRlmCommandDependencies {
+	runRootCommand?: typeof runRootCommand;
+	rootCommandDependencies?: Omit<RunRootCommandDependencies, "rlmPreset" | "suppressProcessExit">;
+	disposeKernelSessionsByOwner?: typeof disposeKernelSessionsByOwner;
 }
 
 function parseNonNegativeIntegerFlag(name: string, value: string | undefined): number {
@@ -258,7 +264,10 @@ export function ensureRlmGjcSessionId(): string {
 	process.env.GJC_SESSION_ID = generated;
 	return generated;
 }
-export async function runRlmCommand(argv: string[]): Promise<void> {
+export async function runRlmCommand(
+	argv: string[],
+	deps: RunRlmCommandDependencies = {},
+): Promise<RunRootCommandOutcome> {
 	const cwd = getProjectDir();
 	ensureRlmGjcSessionId();
 	const { dataPath, resumeSessionId, minSuccessfulRuns, rest } = extractRlmFlags(argv);
@@ -327,8 +336,13 @@ export async function runRlmCommand(argv: string[]): Promise<void> {
 	}
 
 	let runError: unknown;
+	let rootOutcome: RunRootCommandOutcome = { kind: "completed" };
 	try {
-		await runRootCommand(parsed, rest, { rlmPreset: preset, suppressProcessExit: autonomous });
+		rootOutcome = await (deps.runRootCommand ?? runRootCommand)(parsed, rest, {
+			...deps.rootCommandDependencies,
+			rlmPreset: preset,
+			suppressProcessExit: autonomous,
+		});
 	} catch (error) {
 		runError = error;
 		throw error;
@@ -336,7 +350,7 @@ export async function runRlmCommand(argv: string[]): Promise<void> {
 		// The RLM python tool owns a retained kernel keyed by `rlm:<sessionId>`; the
 		// session's own dispose targets a different owner id, so release it here so
 		// the persistent kernel subprocess is reaped on every exit path.
-		await disposeKernelSessionsByOwner(`rlm:${sessionId}`).catch(() => {});
+		await (deps.disposeKernelSessionsByOwner ?? disposeKernelSessionsByOwner)(`rlm:${sessionId}`).catch(() => {});
 		await writeRlmReport({
 			paths,
 			notebook,
@@ -359,7 +373,12 @@ export async function runRlmCommand(argv: string[]): Promise<void> {
 			successfulRuns: countSuccessfulNotebookRuns(notebook.document),
 		});
 	}
+	if (rootOutcome.kind === "early-exit") {
+		if (rootOutcome.exitCode !== 0) process.exitCode = rootOutcome.exitCode;
+		return rootOutcome;
+	}
 	if (autonomous && !controller.completed && runError === undefined) {
 		throw new Error("RLM autonomous session ended before complete_research finalized the report.");
 	}
+	return rootOutcome;
 }
