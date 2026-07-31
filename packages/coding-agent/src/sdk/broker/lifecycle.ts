@@ -1752,11 +1752,11 @@ async function reconcileLifecycleCleanup(
 					file.detachedPath &&
 					path.resolve(candidate) === path.resolve(file.detachedPath) &&
 					stat.isFile() &&
-					!stat.isSymbolicLink()
-				) {
-					const current = captureLifecycleFile(candidate, true, true);
-					if (current && sameLifecycleCleanupIdentity(current.identity, file.identity)) continue;
-				}
+					!stat.isSymbolicLink() &&
+					stat.nlink === 1 &&
+					stat.size === 0
+				)
+					continue;
 				return fail(
 					"terminal_uncertain",
 					"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
