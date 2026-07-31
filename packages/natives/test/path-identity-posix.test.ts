@@ -29,6 +29,7 @@ function expectTreeCleanupPending(result: ReturnType<typeof exactRemoveDirectory
 	expect(result).toEqual({
 		ok: false,
 		code: "cleanup_pending",
+		payloadDurable: true,
 		detachedPath: `${plannedPath}.removing`,
 	});
 }
