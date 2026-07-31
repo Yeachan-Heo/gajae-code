@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Chat daemon ownership release now rejects mismatched persisted identity before native PID/incarnation probes, keeping Windows shutdown bounded while preserving exact live-owner fencing.
 - Print mode (`gjc -p`) no longer idles 30–300s after the final output when the run executed tool calls: after the existing cleanup, a successful print run now requests a governed `postmortem.quit(process.exitCode)` exit, mirroring the commit-command pattern from #1041. `suppressProcessExit` callers (RLM autonomous runs) are exempt, the thrown-error path still propagates to the caller, and the exit is injectable via `deps.quit` for in-process callers and tests (#3621).
 - Embedded and autonomous root-command owners now receive a typed early-exit outcome for model, credential-selector, API-key, and no-model validation failures when process exit is suppressed. Autonomous RLM propagates the nonzero status only after retained kernels are reaped and report metadata is written (#3621).
 

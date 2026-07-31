@@ -40,11 +40,14 @@ export type ChatDaemonAction = "stop" | "reload";
  * daemon transports. Generation 16 applies Telegram sound-policy configuration
  * through shared notification parsing. Generation 17 bound managed-session
  * replacement to exact native filesystem authority; generation 18 retired that
- * binding, and generation 19 binds exact cleanup to parent/link-count authority.
+ * binding, generation 19 bound exact cleanup to parent/link-count authority,
+ * and generation 20 refreshed retained cleanup semantics. Generation 21 rejects
+ * static ownership mismatches before consulting live process authority so
+ * release remains bounded on Windows.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 20,
-	slack: 20,
+	discord: 21,
+	slack: 21,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -1124,18 +1127,17 @@ export async function releaseChatDaemonOwnership(input: {
 	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
 	await withStateWriteLock(paths.state, async () => {
 		const state = await readJson<unknown>(paths.state);
-		const currentIncarnation = pidIncarnation(input.pid);
 		if (
 			!hasSafeChatDaemonStateShape(state) ||
 			!hasProcessIncarnationAuthority(input.incarnation) ||
 			state.ownerId !== input.ownerId ||
 			state.pid !== input.pid ||
-			state.incarnation !== input.incarnation ||
-			!pidAlive(input.pid) ||
-			!hasProcessIncarnationAuthority(currentIncarnation) ||
-			currentIncarnation !== input.incarnation
+			state.incarnation !== input.incarnation
 		)
 			return;
+		if (!pidAlive(input.pid)) return;
+		const currentIncarnation = pidIncarnation(input.pid);
+		if (!hasProcessIncarnationAuthority(currentIncarnation) || currentIncarnation !== input.incarnation) return;
 		await writeJson(paths.state, { ...state, stoppedAt: Date.now(), transportHealthy: false });
 		const lock = await captureChatDaemonOwnerLockLease(paths.lock);
 		let owner: unknown;
