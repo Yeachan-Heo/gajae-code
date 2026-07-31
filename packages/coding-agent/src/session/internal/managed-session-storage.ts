@@ -1657,8 +1657,13 @@ export function replaceManagedFileSync(
 						sha256: expectedDestination.sha256,
 						quarantineName: `.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}`,
 					});
-					if (!retired.ok && retired.code !== "cleanup_pending")
+					if (!retired.ok) {
+						if (retired.code === "cleanup_pending")
+							throw new Error(
+								`managed_replace_cleanup_pending:predecessor=${retired.detachedPath ?? retired.retainedPlaceholderPath ?? replaced.retainedPlaceholderPath}:successor=${destination}`,
+							);
 						throw new Error(`managed_replace_cleanup_failed:${retired.code ?? "unknown"}`);
+					}
 				}
 				if (!committedWithPredecessor) {
 					if (replaced.detachedPath) {
