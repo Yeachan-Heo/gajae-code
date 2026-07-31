@@ -2911,15 +2911,16 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 39 pi-shell authority cleanup", () => {
+	test("keeps wire protocol 3 through generation 40 process authority hardening", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
 		// generation 37 retired that binding, generation 38 binds exact cleanup
-		// to parent and link-count authority, and generation 39 applies rustfmt and
-		// clippy-equivalent cleanup to the pi-shell process-tree authority — none
-		// change the wire protocol.
-		expect(DAEMON_GENERATION).toBe(39);
+		// to parent and link-count authority, generation 39 applies rustfmt and
+		// clippy-equivalent cleanup to the pi-shell process-tree authority, and
+		// generation 40 hardens exact Bash process-tree ownership — none change
+		// the wire protocol.
+		expect(DAEMON_GENERATION).toBe(40);
 	});
 	test.each([
 		"1",

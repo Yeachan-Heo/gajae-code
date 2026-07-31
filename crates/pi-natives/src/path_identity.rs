@@ -2935,26 +2935,7 @@ pub(crate) mod platform {
 				Err(_) => ExchangePlaceholderRemoval::RetainedMismatch(detached_name),
 			};
 		}
-		// The detached entry is the exact empty internal placeholder verified above.
-		// Remove that bound name immediately and durably before returning success.
-		let flags = if expected.directory {
-			libc::AT_REMOVEDIR
-		} else {
-			0
-		};
-		// SAFETY: `parent_fd` and `detached_name` bind the verified no-follow
-		// placeholder.
-		if unsafe { libc::unlinkat(parent_fd, detached_name.as_ptr(), flags) } != 0 {
-			return ExchangePlaceholderRemoval::RetainedFailure(
-				detached_name,
-				security_code(&std::io::Error::last_os_error()),
-			);
-		}
-		// SAFETY: `parent_fd` remains live and durably commits namespace removal.
-		if unsafe { libc::fsync(parent_fd) } != 0 {
-			return ExchangePlaceholderRemoval::RetainedFailure(detached_name, "durability_failed");
-		}
-		ExchangePlaceholderRemoval::Removed
+		ExchangePlaceholderRemoval::RetainedFailure(detached_name, "cleanup_pending")
 	}
 
 	fn digest_openat(parent_fd: libc::c_int, name: &CString) -> Result<[u8; 32], &'static str> {
@@ -3121,6 +3102,19 @@ pub(crate) mod platform {
 			}
 			parent_fd = next_fd;
 		}
+		if let Some((expected_dev, expected_ino)) = identity.parent_dev.zip(identity.parent_ino) {
+			// SAFETY: zero is valid initialized storage for `fstat` output.
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: `parent_fd` is the retained walked parent descriptor.
+			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_dev
+				|| parent_stat.st_ino as u64 != expected_ino
+			{
+				// SAFETY: this branch owns `parent_fd` exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let Ok(name) = CString::new(name_bytes.as_slice()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
@@ -3166,7 +3160,7 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
-		if !identity.directory && named.st_nlink != 1 {
+		if !identity.directory && (named.st_nlink != 1 || identity.nlink != Some(1)) {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
@@ -4163,7 +4157,7 @@ pub(crate) mod platform {
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
-		_expected_parent: Option<(u64, u64)>,
+		expected_parent: Option<(u64, u64)>,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
 		let final_path = format!("{planned_path}.removing");
@@ -4171,6 +4165,19 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return *result,
 		};
+		if let Some((expected_dev, expected_ino)) = expected_parent {
+			// SAFETY: zero is valid initialized storage for `fstat` output.
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: `parent` is the retained no-follow parent descriptor.
+			if unsafe { libc::fstat(parent, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_dev
+				|| parent_stat.st_ino as u64 != expected_ino
+			{
+				// SAFETY: this branch owns `parent` exactly once.
+				unsafe { libc::close(parent) };
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let mut final_bytes = name.as_bytes().to_vec();
 		final_bytes.extend_from_slice(b".removing");
 		let Ok(final_name) = CString::new(final_bytes) else {
@@ -7312,6 +7319,9 @@ mod exact_unlink_placeholder_tests {
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
 			ino:             metadata.ino(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       false,
@@ -7373,6 +7383,9 @@ mod exact_unlink_placeholder_tests {
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
 			ino:             metadata.ino(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       target_is_directory,
@@ -7436,6 +7449,9 @@ mod exact_unlink_placeholder_tests {
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
 			ino:             metadata.ino(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       target_is_directory,
@@ -7504,6 +7520,9 @@ mod exact_unlink_placeholder_tests {
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
 			ino:             metadata.ino(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       target_is_directory,
@@ -7574,6 +7593,9 @@ mod exact_unlink_placeholder_tests {
 		let identity = ExactFileIdentity {
 			dev: metadata.dev(),
 			ino: metadata.ino(),
+			nlink: Some(metadata.nlink()),
+			parent_dev: None,
+			parent_ino: None,
 			size: metadata.size(),
 			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory: false,
@@ -7670,6 +7692,9 @@ mod exact_unlink_placeholder_tests {
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
 			ino:             metadata.ino(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       false,
@@ -7800,7 +7825,7 @@ mod exact_unlink_placeholder_tests {
 			.expect("snapshot target");
 		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
 
-		let first = platform::exact_remove_directory_tree(&target, &snapshot);
+		let first = platform::exact_remove_directory_tree(&target, &snapshot, None);
 		assert_tree_replay_result(&first, &detached);
 		let first_snapshot = platform::snapshot_directory_tree(&detached)
 			.snapshot
@@ -7810,7 +7835,7 @@ mod exact_unlink_placeholder_tests {
 			"first retained tree contains no authorized payload",
 		);
 
-		let second = platform::exact_remove_directory_tree(&target, &snapshot);
+		let second = platform::exact_remove_directory_tree(&target, &snapshot, None);
 		assert_tree_replay_result(&second, &detached);
 		let second_snapshot = platform::snapshot_directory_tree(&detached)
 			.snapshot
@@ -7851,7 +7876,7 @@ mod exact_unlink_placeholder_tests {
 			let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
 
 			platform::inject_root_parent_fsync_failure(fail_on_call);
-			let interrupted = platform::exact_remove_directory_tree(&target, &snapshot);
+			let interrupted = platform::exact_remove_directory_tree(&target, &snapshot, None);
 			assert!(!interrupted.ok);
 			assert_eq!(interrupted.code.as_deref(), Some("io_error"));
 			assert_eq!(
@@ -7861,7 +7886,7 @@ mod exact_unlink_placeholder_tests {
 			assert_eq!(interrupted.payload_durable, None);
 
 			platform::inject_root_parent_fsync_failure(0);
-			let replayed = platform::exact_remove_directory_tree(&target, &snapshot);
+			let replayed = platform::exact_remove_directory_tree(&target, &snapshot, None);
 			assert_tree_replay_result(&replayed, &detached);
 			let replayed_snapshot = platform::snapshot_directory_tree(&detached)
 				.snapshot
@@ -7896,7 +7921,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_before_tree_root_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx.recv().expect("wait for root validation");
 		let retained_stale = root.join("retained-stale-root");
@@ -7949,7 +7974,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_before_tree_root_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx.recv().expect("wait for root validation");
 		let retained_stale = root.join("retained-stale-root");
@@ -7997,7 +8022,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_scrub_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx
 			.recv()
@@ -8062,7 +8087,7 @@ mod exact_unlink_placeholder_tests {
 			.expect("snapshot unlinked tree");
 		let alias = root.join("raced-alias.bin");
 		fs::hard_link(raced.join("payload.bin"), &alias).expect("link raced alias");
-		let result = platform::exact_remove_directory_tree(&raced, &raced_snapshot);
+		let result = platform::exact_remove_directory_tree(&raced, &raced_snapshot, None);
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("hard_link_unsupported"));
 		assert_eq!(result.payload_durable, None);
@@ -8103,7 +8128,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_file_link_check_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx
 			.recv()
@@ -8150,7 +8175,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_file_link_check_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx
 			.recv()
@@ -8199,7 +8224,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_before_tree_child_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx.recv().expect("wait for child rename boundary");
 		let retained_stale = detached.join("retained-stale");
@@ -8258,7 +8283,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let aborted = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
 		});
 		entered_rx.recv().expect("wait for aborted hook");
 		assert!(aborted.join().is_err(), "disconnected hook did not abort");
@@ -8272,8 +8297,9 @@ mod exact_unlink_placeholder_tests {
 		let (resume_tx, resume_rx) = mpsc::channel();
 		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
 		let next_for_remove = next.clone();
-		let removal =
-			thread::spawn(move || platform::exact_remove_directory_tree(&next_for_remove, &snapshot));
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&next_for_remove, &snapshot, None)
+		});
 		entered_rx.recv().expect("wait for next hook");
 		resume_tx.send(()).expect("resume next hook");
 		assert_eq!(

@@ -1225,6 +1225,13 @@ export class FileSessionStorage implements SessionStorage {
 				quarantineName: path.basename(plannedTranscriptPath),
 			});
 			if (!deletion.ok) {
+				if (
+					deletion.code === "cleanup_pending" &&
+					deletion.payloadDurable === true &&
+					deletion.retainedSuccessorPath === undefined &&
+					deletion.retainedUnknownPath === undefined
+				)
+					return { kind: "deleted" };
 				const error = exactUnlinkFailure(deletion);
 				const retainedAuthority =
 					deletion.detachedPath ||
@@ -1290,6 +1297,13 @@ export class FileSessionStorage implements SessionStorage {
 			quarantineName: path.basename(plannedTranscriptPath),
 		});
 		if (!deletion.ok) {
+			if (
+				deletion.code === "cleanup_pending" &&
+				deletion.payloadDurable === true &&
+				deletion.retainedSuccessorPath === undefined &&
+				deletion.retainedUnknownPath === undefined
+			)
+				return { kind: "deleted" };
 			const error = exactUnlinkFailure(deletion);
 			const retainedAuthority =
 				deletion.detachedPath ||
