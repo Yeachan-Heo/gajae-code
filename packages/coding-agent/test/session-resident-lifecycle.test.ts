@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -39,6 +40,60 @@ function failedNativeRename(): native.NativeNoReplaceResult {
 		phase: "rename",
 		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
 	};
+}
+function installVerifiedNativeCleanup(): void {
+	vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+		if (
+			identity.parentDev === undefined ||
+			identity.parentIno === undefined ||
+			parent.dev !== identity.parentDev ||
+			parent.ino !== identity.parentIno
+		)
+			throw new Error("resident cleanup parent authority mismatch");
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		if (
+			stat.dev !== identity.dev ||
+			stat.ino !== identity.ino ||
+			stat.nlink !== identity.nlink ||
+			stat.size !== identity.size ||
+			stat.mtimeNs !== identity.mtimeNs
+		)
+			throw new Error("resident cleanup file identity mismatch");
+		if (identity.sha256) {
+			const digest = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+			if (digest !== identity.sha256) throw new Error("resident cleanup file digest mismatch");
+		}
+		if (identity.directory && identity.quarantineName) {
+			const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
+			fs.renameSync(pathname, detachedPath);
+			return { ok: true, detachedPath };
+		}
+		fs.rmSync(pathname, { force: true });
+		return { ok: true };
+	});
+	vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((pathname, snapshot, parentIdentity) => {
+		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+		if (!parentIdentity) throw new Error("resident tree cleanup parent authority missing");
+		if (parent.dev !== parentIdentity.dev || parent.ino !== parentIdentity.ino)
+			throw new Error("resident tree cleanup parent authority mismatch");
+		const current = native.snapshotDirectoryTree(pathname);
+		if (!current.ok || !current.snapshot || current.snapshot.entries.length !== snapshot.entries.length)
+			throw new Error("resident tree cleanup snapshot mismatch");
+		const expected = new Map(snapshot.entries.map(entry => [entry.relativePath, entry]));
+		for (const entry of current.snapshot.entries) {
+			const authorized = expected.get(entry.relativePath);
+			if (!authorized) throw new Error("resident tree cleanup snapshot mismatch");
+			if (entry.relativePath === "") {
+				if (entry.kind !== "directory" || entry.dev !== authorized.dev || entry.ino !== authorized.ino)
+					throw new Error("resident tree cleanup root identity mismatch");
+			} else if (JSON.stringify(entry) !== JSON.stringify(authorized)) {
+				throw new Error("resident tree cleanup child identity mismatch");
+			}
+		}
+		fs.rmSync(pathname, { recursive: true, force: true });
+		return { ok: true };
+	});
 }
 
 function assistant(text: string): AssistantMessage {
@@ -152,6 +207,7 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		fs.writeFileSync(path.join(foreignArtifactsDir, "foreign.txt"), "foreign artifact");
 		await deletion.sm.setSessionFile(sessionFile);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
+		installVerifiedNativeCleanup();
 		await deletion.sm.dropSession(deletion.sessionFile);
 		expect(fs.existsSync(deletion.artifactsDir)).toBe(false);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
@@ -160,6 +216,21 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		expect(fs.existsSync(foreignArtifactsDir)).toBe(true);
 		expect(fs.existsSync(path.join(foreignArtifactsDir, "foreign.txt"))).toBe(true);
 		expect(fs.existsSync(sessionFile)).toBe(true);
+	});
+
+	it("keeps managed deletion pending without descriptor-bound final cleanup authority", async () => {
+		const survivor = await makeLargeSession(`pending delete survivor ${"v".repeat(2048)}`);
+		await survivor.sm.close();
+		const deletion = await makeLargeSession(`pending delete cleanup ${"n".repeat(2048)}`);
+		await deletion.sm.setSessionFile(survivor.sessionFile);
+
+		await expect(deletion.sm.dropSession(deletion.sessionFile)).rejects.toThrow(
+			"Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
+		);
+		expect(fs.existsSync(deletion.sessionFile)).toBe(false);
+		expect(fs.existsSync(deletion.artifactsDir)).toBe(false);
+		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
+		expect(fs.existsSync(survivor.sessionFile)).toBe(true);
 	});
 
 	it("fork re-externalizes resident text into an independent cache and keeps both managers readable", async () => {
