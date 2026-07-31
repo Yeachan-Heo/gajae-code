@@ -48,7 +48,7 @@ export {
 	terminalCriticGateOverridden,
 } from "./ultragoal-receipt-freshness";
 
-import { gjcRoot, sessionUltragoalDir } from "./session-layout";
+import { auditPath, gjcRoot, sessionUltragoalDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
@@ -58,6 +58,7 @@ import {
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { reconcileWorkflowSkillState } from "./state-runtime";
 import {
+	appendAuditEntry,
 	appendJsonl,
 	persistedStateRevision,
 	withWorkflowStateLock,
@@ -729,6 +730,20 @@ export async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: st
 	// Establish witnesses before persisting their protected rows. A failed plan write can
 	// leave an extra witness, but it cannot leave a protected row without its witness.
 	for (const witness of newWitnesses) await appendLedger(cwd, witness, resolvedSessionId, false);
+	// Record the ever-protected signal on the session audit journal, which lives outside
+	// goals.json and ledger.jsonl. A coordinated scrub of the plan and the ledger alone can no
+	// longer make a protected plan look like a legacy one: the marker still says it was protected.
+	if (newWitnesses.length > 0)
+		await appendAuditEntry(cwd, resolvedSessionId, {
+			ts: new Date().toISOString(),
+			skill: "ultragoal",
+			category: "security",
+			verb: ULTRAGOAL_EVER_PROTECTED_VERB,
+			owner: "gjc-runtime",
+			mutation_id: crypto.randomUUID(),
+			forced: false,
+			paths: [paths.goalsPath],
+		});
 	const ledgerAfterWitnesses = newWitnesses.length > 0 ? await readUltragoalLedger(cwd, resolvedSessionId) : ledger;
 	plan.ledgerIntegrity = ledgerHead(ledgerAfterWitnesses);
 	await writeArtifact(paths.briefPath, `${plan.brief.trim()}\n`, {
@@ -751,6 +766,35 @@ export async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: st
  * legacy plan with no protected gate and no witness has nothing to protect, so hard-failing it
  * would lock every pre-existing run out of the runtime instead of guarding anything.
  */
+/**
+ * Audit verb recording that this session's ultragoal plan was protected at least once.
+ *
+ * The marker lives on the session audit journal (`.gjc/_session-<id>/state/audit.jsonl`), a
+ * separate surface from goals.json and ledger.jsonl, so a coordinated scrub of the plan and the
+ * ledger cannot by itself make a protected plan indistinguishable from a legacy one.
+ */
+export const ULTRAGOAL_EVER_PROTECTED_VERB = "ultragoal-protected-gate-established";
+
+/** True when the session audit journal says this plan was protected at some point. */
+async function wasEverProtected(cwd: string, sessionId: string): Promise<boolean> {
+	try {
+		const file = Bun.file(auditPath(path.resolve(cwd), sessionId));
+		if (!(await file.exists())) return false;
+		for (const line of (await file.text()).split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line) as { category?: unknown; verb?: unknown };
+				if (entry.category === "security" && entry.verb === ULTRAGOAL_EVER_PROTECTED_VERB) return true;
+			} catch {
+				// A malformed audit line is not itself evidence either way; keep scanning.
+			}
+		}
+	} catch {
+		// An unreadable journal cannot prove protection; the plan-side checks still apply.
+	}
+	return false;
+}
+
 function resolveProtectedGateGeneration(plan: UltragoalPlan, ledger: readonly UltragoalLedgerEvent[]): string {
 	const generation = plan.protectedGateGeneration;
 	if (typeof generation === "string" && generation.trim()) return generation;
@@ -1376,6 +1420,17 @@ export async function readUltragoalPlan(cwd: string, sessionId?: string | null):
 	try {
 		const plan = normalizePlan(await Bun.file(getUltragoalPaths(cwd, resolvedSessionId).goalsPath).json());
 		const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+		// Legacy admission is anchored in trusted provenance rather than inferred from absent
+		// fields: a plan the audit journal says was protected may not present itself as legacy.
+		if (
+			plan.protectedGateGeneration === undefined &&
+			!plan.goals.some(goal => goal.supersedable === false) &&
+			!ledger.some(event => String(event.event).startsWith("protected_gate_")) &&
+			(await wasEverProtected(cwd, resolvedSessionId))
+		)
+			throw new Error(
+				"Ultragoal plan tampering detected: this session's audit journal records an established protected gate, but goals.json and ledger.jsonl carry no protection. Restore the protected gate, its generation and its witnesses before continuing.",
+			);
 		assertLedgerHeadIntegrity(plan, ledger);
 		assertProtectedGateIntegrity(plan, ledger);
 		return plan;

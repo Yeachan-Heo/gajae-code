@@ -3891,6 +3891,42 @@ describe("native GJC ultragoal runtime", () => {
 		}
 	});
 
+	it("fails closed when a coordinated scrub tries to disguise a protected plan as legacy", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: Required gate\nPass the gate.\n\n@goal: Follow-up\nComplete follow-up.",
+		});
+		plan.goals[0]!.supersedable = false;
+		await writePlan(root, plan);
+
+		// The scrub the architect described: remove the protected row, the generation, the
+		// integrity head, and every witness row, so the plan looks like a pre-protection plan.
+		const ultragoalDir = sessionUltragoalDir(root, TEST_SESSION_ID);
+		const goalsPath = path.join(ultragoalDir, "goals.json");
+		const ledgerPath = path.join(ultragoalDir, "ledger.jsonl");
+		const scrubbed = JSON.parse(await Bun.file(goalsPath).text()) as Record<string, unknown> & {
+			goals: Array<Record<string, unknown>>;
+		};
+		scrubbed.goals[0]!.supersedable = undefined;
+		scrubbed.protectedGateGeneration = undefined;
+		scrubbed.protectedGateIntegrityVersion = undefined;
+		scrubbed.ledgerIntegrity = undefined;
+		await Bun.write(goalsPath, JSON.stringify(scrubbed));
+		const survivingLedger = (await Bun.file(ledgerPath).text())
+			.split("\n")
+			.filter(line => line.trim() && !(JSON.parse(line) as { event?: string }).event?.startsWith("protected_gate_"))
+			.join("\n");
+		await Bun.write(ledgerPath, survivingLedger.length > 0 ? `${survivingLedger}\n` : "");
+
+		const result = await runNativeUltragoalCommand(["status"], root);
+
+		// The session audit journal still records that this plan was protected, so legacy
+		// admission is refused instead of being inferred from the now-absent fields.
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("audit journal records an established protected gate");
+	});
+
 	it("fails closed when a protected gate status is edited without a matching ledger transition", async () => {
 		for (const status of ["superseded", "complete", "failed"] as const) {
 			const root = await tempDir();
