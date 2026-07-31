@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS executable discovery now honors explicit `PATH` and `cwd` lookup overrides instead of silently searching the process environment.
+
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31
