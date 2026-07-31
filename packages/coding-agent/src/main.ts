@@ -468,10 +468,15 @@ export async function applyStartupModelProfiles(args: StartupModelProfileArgs): 
 	await applyStartupModelProfilesWithPolicy(args);
 }
 
-async function exitForStartupModelProfileError(args: StartupModelProfileArgs, error: unknown): Promise<never> {
+async function exitForStartupModelProfileError(
+	args: StartupModelProfileArgs,
+	error: unknown,
+	suppressProcessExit = false,
+): Promise<number> {
 	const message = error instanceof Error ? error.message : String(error);
 	process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 	await args.session.dispose();
+	if (suppressProcessExit) return 1;
 	process.exit(1);
 }
 
@@ -506,18 +511,29 @@ export async function applyStartupModelProfilesForRoot(
 		initialMessage: string | undefined;
 		initialMessages: readonly string[];
 		resumeAction: "continue-tail" | "open-idle" | undefined;
+		suppressProcessExit?: boolean;
 	},
-): Promise<{ recoverableErrors: string[] }> {
+): Promise<{ recoverableErrors: string[]; exitCode?: number }> {
 	if (!isStartupModelProfileCredentialRecoveryEligible(args)) {
-		await applyStartupModelProfilesOrExit(args);
-		return { recoverableErrors: [] };
+		try {
+			await applyStartupModelProfiles(args);
+			return { recoverableErrors: [] };
+		} catch (error) {
+			return {
+				recoverableErrors: [],
+				exitCode: await exitForStartupModelProfileError(args, error, args.suppressProcessExit),
+			};
+		}
 	}
 
 	const recoverableErrors: string[] = [];
 	try {
 		await applyStartupModelProfilesWithPolicy(args, error => recoverableErrors.push(error.message));
 	} catch (error) {
-		await exitForStartupModelProfileError(args, error);
+		return {
+			recoverableErrors: [],
+			exitCode: await exitForStartupModelProfileError(args, error, args.suppressProcessExit),
+		};
 	}
 	return { recoverableErrors };
 }
@@ -915,7 +931,7 @@ async function buildSessionOptions(
 	sessionManager: SessionManager | undefined,
 	modelRegistry: ModelRegistry,
 	activeSettings: Settings,
-): Promise<{ options: CreateAgentSessionOptions }> {
+): Promise<{ options: CreateAgentSessionOptions; exitCode?: number }> {
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 	};
@@ -956,7 +972,7 @@ async function buildSessionOptions(
 				options.modelPattern = parsed.model;
 			} else {
 				process.stderr.write(`${chalk.red(resolved.error)}\n`);
-				process.exit(1);
+				return { options, exitCode: 1 };
 			}
 		} else if (resolved.model) {
 			options.model = resolved.model;
@@ -1101,6 +1117,16 @@ export interface RunRootCommandDependencies {
 	loadSettingsForScope?: typeof Settings.loadForScope;
 }
 
+export type RunRootCommandOutcome = { kind: "completed" } | { kind: "early-exit"; exitCode: number };
+
+function rootCommandCompleted(): RunRootCommandOutcome {
+	return { kind: "completed" };
+}
+
+function rootCommandEarlyExit(exitCode: number): RunRootCommandOutcome {
+	return { kind: "early-exit", exitCode };
+}
+
 export interface ModelRoleOverrides {
 	smol?: string;
 	slow?: string;
@@ -1153,7 +1179,7 @@ export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = {},
-): Promise<void> {
+): Promise<RunRootCommandOutcome> {
 	const parsedArgs = parsed;
 	let initialThemeInitialized = false;
 	let autoChdirApplied = false;
@@ -1164,12 +1190,12 @@ export async function runRootCommand(
 		if (hasBareResumeConflict(parsedArgs)) {
 			process.stderr.write(`${BARE_RESUME_CONFLICT_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
-			return;
+			return rootCommandEarlyExit(1);
 		}
 		if (!isNormalLocalInteractiveRoute(parsedArgs) || !(deps.isResumePickerTerminal ?? hasResumePickerTerminal)()) {
 			process.stderr.write(`${BARE_RESUME_INTERACTIVE_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
-			return;
+			return rootCommandEarlyExit(1);
 		}
 
 		logger.startTiming();
@@ -1193,13 +1219,13 @@ export async function runRootCommand(
 				);
 		if (sessions.length === 0) {
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
-			return;
+			return rootCommandCompleted();
 		}
 		const selection = deps.selectResumeSession
 			? await deps.selectResumeSession(sessions)
 			: await selectSession(sessions, parsedArgs.sessionDir);
 		if (selection.kind === "cancelled") {
-			return;
+			return rootCommandCompleted();
 		}
 		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
 		const resumeMigrationPolicy =
@@ -1217,12 +1243,12 @@ export async function runRootCommand(
 		} catch {
 			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
-			return;
+			return rootCommandEarlyExit(1);
 		}
 		if (opened.kind === "error") {
 			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
-			return;
+			return rootCommandEarlyExit(1);
 		}
 		bareResumeSessionManager = opened.manager;
 		bareResumeAction = selection.action;
@@ -1244,10 +1270,18 @@ export async function runRootCommand(
 	// Create AuthStorage and ModelRegistry upfront
 	const authStorage = await logger.time("discoverModels", deps.discoverAuthStorage ?? discoverAuthStorage);
 	const modelRegistry = new ModelRegistry(authStorage);
+	const exitOrReturnToOwner = (exitCode: number): RunRootCommandOutcome => {
+		if (deps.suppressProcessExit) {
+			authStorage.close();
+			stopThemeWatcher();
+			return rootCommandEarlyExit(exitCode);
+		}
+		process.exit(exitCode);
+	};
 
 	if (parsedArgs.version) {
 		process.stdout.write(`${VERSION}\n`);
-		process.exit(0);
+		return exitOrReturnToOwner(0);
 	}
 
 	if (parsedArgs.listModels !== undefined) {
@@ -1264,7 +1298,7 @@ export async function runRootCommand(
 			disableExtensionDiscovery: true,
 			searchPattern,
 		});
-		process.exit(0);
+		return exitOrReturnToOwner(0);
 	}
 
 	if (parsedArgs.export) {
@@ -1275,10 +1309,10 @@ export async function runRootCommand(
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : "Failed to export session";
 			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
-			process.exit(1);
+			return exitOrReturnToOwner(1);
 		}
 		process.stdout.write(`Exported to: ${result}\n`);
-		process.exit(0);
+		return exitOrReturnToOwner(0);
 	}
 
 	const cwd = getProjectDir();
@@ -1322,7 +1356,7 @@ export async function runRootCommand(
 	});
 	if (disposition.nonInteractiveError) {
 		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
-		process.exit(1);
+		return exitOrReturnToOwner(1);
 	}
 	const autoPrint = disposition.autoPrint;
 	const startupUpdateRoute = classifyStartupUpdateRoute(parsedArgs, autoPrint);
@@ -1409,7 +1443,7 @@ export async function runRootCommand(
 		}
 	}
 
-	const { options: sessionOptions } = await logger.time(
+	const sessionOptionsOutcome = await logger.time(
 		"buildSessionOptions",
 		buildSessionOptions,
 		parsedArgs,
@@ -1418,6 +1452,10 @@ export async function runRootCommand(
 		modelRegistry,
 		settingsInstance,
 	);
+	if (sessionOptionsOutcome.exitCode !== undefined) {
+		return exitOrReturnToOwner(sessionOptionsOutcome.exitCode);
+	}
+	const sessionOptions = sessionOptionsOutcome.options;
 	// Resolve the token-log dir lazily on the first chat-usage event: a fresh
 	// launch's session dir does not exist yet at this point (the SDK creates it),
 	// so eager resolution would miss it. Re-resolve when the SessionManager id
@@ -1473,7 +1511,7 @@ export async function runRootCommand(
 	// Handle CLI --api-key as runtime override (not persisted)
 	if (parsedArgs.apiKey && parsedArgs.credential) {
 		process.stderr.write(`${chalk.red("--api-key and --credential cannot be used together")}\n`);
-		process.exit(1);
+		return exitOrReturnToOwner(1);
 	}
 
 	if (parsedArgs.credential) {
@@ -1482,7 +1520,7 @@ export async function runRootCommand(
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			process.stderr.write(`${chalk.red(message)}\n`);
-			process.exit(1);
+			return exitOrReturnToOwner(1);
 		}
 	}
 	if (parsedArgs.apiKey) {
@@ -1490,7 +1528,7 @@ export async function runRootCommand(
 			process.stderr.write(
 				`${chalk.red("--api-key requires a model to be specified via --model, --provider/--model, or --models")}\n`,
 			);
-			process.exit(1);
+			return exitOrReturnToOwner(1);
 		}
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, sessionOptions.model);
 	}
@@ -1517,7 +1555,7 @@ export async function runRootCommand(
 		authStorage.close();
 		stopThemeWatcher();
 		await postmortem.cleanup();
-		return;
+		return rootCommandEarlyExit(1);
 	}
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
@@ -1565,7 +1603,7 @@ export async function runRootCommand(
 		}
 
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
-			const { recoverableErrors } = await applyStartupModelProfilesForRoot({
+			const startupModelProfileOutcome = await applyStartupModelProfilesForRoot({
 				session,
 				settings: settingsInstance,
 				modelRegistry,
@@ -1577,8 +1615,12 @@ export async function runRootCommand(
 				initialMessage,
 				initialMessages: parsedArgs.messages,
 				resumeAction: bareResumeAction,
+				suppressProcessExit: deps.suppressProcessExit,
 			});
-			for (const recoverableError of recoverableErrors) {
+			if (startupModelProfileOutcome.exitCode !== undefined) {
+				return exitOrReturnToOwner(startupModelProfileOutcome.exitCode);
+			}
+			for (const recoverableError of startupModelProfileOutcome.recoverableErrors) {
 				notifs.push({ kind: "error", message: recoverableError });
 			}
 		}
@@ -1612,11 +1654,10 @@ export async function runRootCommand(
 				`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
 			);
 			await session.dispose();
-			stopThemeWatcher();
 			if (deps.suppressProcessExit) {
-				process.exitCode = 1;
-				return;
+				return exitOrReturnToOwner(1);
 			}
+			stopThemeWatcher();
 			await postmortem.quit(1);
 			process.exit(1);
 		}
@@ -1677,7 +1718,7 @@ export async function runRootCommand(
 
 			if (exitForTiming) {
 				await session.dispose();
-				process.exit(0);
+				return exitOrReturnToOwner(0);
 			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
@@ -1710,6 +1751,7 @@ export async function runRootCommand(
 			}
 		}
 	}
+	return rootCommandCompleted();
 }
 
 export async function main(args: string[]): Promise<void> {
