@@ -443,7 +443,12 @@ function retainedTreeDoesNotExpandAuthority(
 	return retained.entries.every(entry => {
 		if (entry.relativePath === "") return entry.kind === "directory";
 		const authorized = expectedEntries.get(entry.relativePath);
-		return authorized !== undefined && JSON.stringify(authorized) === JSON.stringify(entry);
+		return (
+			authorized !== undefined &&
+			authorized.kind === entry.kind &&
+			authorized.dev === entry.dev &&
+			authorized.ino === entry.ino
+		);
 	});
 }
 
@@ -1118,12 +1123,22 @@ export class FileSessionStorage implements SessionStorage {
 						throw new Error("parent_changed");
 					fs.fsyncSync(descriptor);
 				} catch (error) {
-					throw new SessionDeleteVerificationError("artifacts", "durability_failed", { cause: toError(error) });
+					return {
+						kind: "cleanup_pending",
+						phase: "artifacts",
+						error: new SessionDeleteVerificationError("artifacts", "durability_failed", {
+							cause: toError(error),
+						}),
+						artifactsIdentity,
+						detachedArtifactsPath: detach.detachedPath,
+						artifactsTree,
+						transcriptIdentity,
+					};
 				} finally {
 					if (descriptor !== undefined) fs.closeSync(descriptor);
 				}
 			}
-			if (!detach.ok) {
+			if (!detach.ok && process.platform === "win32") {
 				return {
 					kind: "cleanup_pending",
 					phase: "artifacts",
@@ -1134,7 +1149,6 @@ export class FileSessionStorage implements SessionStorage {
 					...(detach.retainedSuccessorPath ? { retainedSuccessorPath: detach.retainedSuccessorPath } : {}),
 					...(detach.retainedPlaceholderPath ? { retainedPlaceholderPath: detach.retainedPlaceholderPath } : {}),
 					...(detach.retainedUnknownPath ? { retainedUnknownPath: detach.retainedUnknownPath } : {}),
-
 					transcriptIdentity,
 				};
 			}

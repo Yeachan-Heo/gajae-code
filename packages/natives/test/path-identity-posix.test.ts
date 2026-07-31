@@ -21,8 +21,12 @@ function sha256(contents: string): string {
 }
 
 function expectDetachedCleanupPending(result: ReturnType<typeof exactUnlink>, detachedPath: string): void {
-	expect(result).toMatchObject({ ok: true });
-	expect(result.detachedPath === undefined || result.detachedPath === detachedPath).toBe(true);
+	expect(result).toMatchObject({
+		ok: false,
+		code: "cleanup_pending",
+		detachedPath,
+		retainedPlaceholderPath: expect.stringMatching(/\.gjc-exact-unlink-placeholder-/),
+	});
 }
 
 function expectTreeCleanupPending(result: ReturnType<typeof exactRemoveDirectoryTree>, plannedPath: string): void {
