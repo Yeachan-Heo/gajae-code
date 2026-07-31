@@ -3536,7 +3536,8 @@ export async function reconcileManagedTombstones(
 							if (deletion.kind === "cleanup_pending") {
 								if (
 									deletion.phase !== "transcript" ||
-									deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath
+									(deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath &&
+										deletion.transcriptPayloadDurable !== true)
 								)
 									throw new Error("durability_failed");
 								const followup = nextCleanupReceipt(target, pendingEvidence);
