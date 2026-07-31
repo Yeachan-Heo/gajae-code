@@ -3387,7 +3387,9 @@ export async function reconcileManagedTombstones(
 							: (observedPending ?? nextCleanupReceipt(target, undefined));
 					if (!observedPending || discoveredDetach || requiresFreshCleanupPlan(observedPending))
 						await publishCleanupPending(scope, tombstone, active, lock);
-					const initialTarget = validateCandidateForScope(scope, target);
+					const initialTarget = observedPending?.detachedTranscriptPath
+						? target
+						: validateCandidateForScope(scope, target);
 					if (!initialTarget) throw new Error("source_changed");
 					let deletion = await deleteSessionVerifiedWithFence("reconcile", "initial", lock, {
 						sessionsRoot: scope.sessionsRoot,
