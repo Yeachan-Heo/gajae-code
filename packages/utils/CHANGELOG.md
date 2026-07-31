@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- macOS executable discovery now honors explicit `PATH` and `cwd` lookup overrides instead of silently searching the process environment.
 - Positive-integer environment helpers now reject malformed, fractional, exponent-form, non-positive, and unsafe values instead of silently accepting their numeric prefixes (#3593).
 
 ### Fixed
