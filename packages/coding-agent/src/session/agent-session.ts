@@ -2068,7 +2068,10 @@ export class AgentSession {
 	#attemptAuthority!: AttemptScopeAuthority;
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
-	#acceptRunHandle(handle: AttemptRunHandle): void {
+	#acceptRunHandle(handle: AttemptRunHandle | undefined): void {
+		// Integration doubles can accept a run without minting a handle; keep the
+		// previously recorded run id rather than throwing inside the callback.
+		if (!handle) return;
 		this.#activeLogicalRunId = handle.logicalRunId;
 	}
 
