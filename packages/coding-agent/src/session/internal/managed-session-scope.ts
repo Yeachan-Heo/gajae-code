@@ -3493,8 +3493,6 @@ export async function reconcileManagedTombstones(
 								pendingEvidence.artifactsRemovedAttempt ?? pendingEvidence.attempt,
 							);
 							if (!retainedProof) throw new Error("durability_failed");
-							const refreshedTarget = validateCandidateForScope(scope, target);
-							if (!refreshedTarget) throw new Error("source_changed");
 							deletion = await deleteSessionVerifiedWithFence(
 								"reconcile",
 								"transcript-after-artifacts-removed",
@@ -3504,7 +3502,10 @@ export async function reconcileManagedTombstones(
 									transcriptPath: target.path,
 									sessionId: target.sessionId,
 									cwd: target.cwd,
-									transcriptIdentity: refreshedTarget.identity,
+									transcriptIdentity: {
+										...target.identity,
+										nlink: fs.lstatSync(target.path, { bigint: true }).nlink,
+									},
 									plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
 									plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
 									detachedTranscriptPath:
@@ -4175,8 +4176,6 @@ async function deleteManagedSessionCandidateInternal(
 						pendingEvidence.artifactsRemovedAttempt ?? pendingEvidence.attempt,
 					);
 					if (!retainedProof) throw new Error("durability_failed");
-					const refreshedTarget = validateCandidateForScope(scope, target);
-					if (!refreshedTarget) throw new Error("source_changed");
 					deletion = await deleteSessionVerifiedWithFence(
 						"direct",
 						"transcript-after-artifacts-removed",
@@ -4186,7 +4185,10 @@ async function deleteManagedSessionCandidateInternal(
 							transcriptPath: target.path,
 							sessionId: target.sessionId,
 							cwd: target.cwd,
-							transcriptIdentity: refreshedTarget.identity,
+							transcriptIdentity: {
+								...target.identity,
+								nlink: fs.lstatSync(target.path, { bigint: true }).nlink,
+							},
 							plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
 							plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
 							detachedTranscriptPath:
