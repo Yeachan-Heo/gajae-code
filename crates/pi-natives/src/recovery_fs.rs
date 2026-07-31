@@ -143,11 +143,21 @@ const fn rename_flags_unsupported(errno: Option<i32>) -> bool {
 /// preserves — never weakens — no-replace authority. The staging source link is
 /// then removed so the destination is the sole link, matching a successful
 /// rename (`st_nlink == 1`).
+///
+/// `release_source_authority` runs after the link has published the destination
+/// and before the staging name is unlinked. Callers that hold a descriptor on
+/// the staged object must release it there: NFS silly-renames a still-open name
+/// to `.nfsXXXX` instead of removing it, which leaves a second link to the
+/// published inode and defeats the `st_nlink == 1` proof this fallback exists
+/// to preserve. Releasing only after the link commits keeps descriptor
+/// authority across publication itself, so the fallback is never weaker than
+/// the `renameat2` primitive it stands in for.
 fn linkat_no_replace(
 	source_parent: &File,
 	source_name: &CString,
 	destination_parent: &File,
 	destination_name: &CString,
+	release_source_authority: impl FnOnce(),
 ) -> std::io::Result<()> {
 	// SAFETY: both parents own valid fds and both names are live NUL-terminated
 	// strings for this syscall; flags are 0, so a symlink source is linked as-is.
@@ -163,6 +173,10 @@ fn linkat_no_replace(
 	if linked != 0 {
 		return Err(std::io::Error::last_os_error());
 	}
+	// Publication has committed: the destination is an independent link to the
+	// verified inode. Only now may the staged descriptor be released, and it must
+	// be released before the unlink below (see the note above).
+	release_source_authority();
 	// SAFETY: the source parent fd and name remain valid; the destination now
 	// owns an independent hard link to the same inode.
 	let unlinked = unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name.as_ptr(), 0) };
@@ -179,17 +193,27 @@ fn linkat_no_replace(
 /// `rename_flags_unsupported`). Directory publishes must not use this helper:
 /// `linkat` cannot hard-link a directory, so tree renames keep calling
 /// `renameat2_no_replace` directly.
+///
+/// `release_source_authority` is only invoked on the `linkat` path, between the
+/// publishing link and the staging unlink; see `linkat_no_replace`. `renameat2`
+/// removes the staging name as part of the same atomic step, so there is no
+/// window in which a held descriptor could block it and nothing to release.
 fn rename_file_no_replace(
 	source_parent: &File,
 	source_name: &CString,
 	destination_parent: &File,
 	destination_name: &CString,
+	release_source_authority: impl FnOnce(),
 ) -> std::io::Result<()> {
 	match renameat2_no_replace(source_parent, source_name, destination_parent, destination_name) {
 		Ok(()) => Ok(()),
-		Err(error) if rename_flags_unsupported(error.raw_os_error()) => {
-			linkat_no_replace(source_parent, source_name, destination_parent, destination_name)
-		},
+		Err(error) if rename_flags_unsupported(error.raw_os_error()) => linkat_no_replace(
+			source_parent,
+			source_name,
+			destination_parent,
+			destination_name,
+			release_source_authority,
+		),
 		Err(error) => Err(error),
 	}
 }
@@ -1820,19 +1844,18 @@ fn rename_managed_file_no_replace_inner(
 	if !same_expected(&source_file, dev, ino, size, mtime_ns, ctime_ns, sha256)? {
 		return Err("identity_mismatch".into());
 	}
-	// The staged identity is proven; release the descriptor before publishing. An
-	// open descriptor makes the `linkat(2)` fallback's `unlinkat` silly-rename the
-	// staging name on NFS instead of removing it, leaving a second link to the
-	// published inode until this process closes the file. The terminal re-open then
-	// observes `st_nlink == 2` and fails a committed publish as unprovable. Closing
-	// first does not weaken authority: the destination is re-proven below against
-	// the same dev/ino/size/mtime/digest this descriptor just verified.
-	drop(source_file);
-
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
-	let result =
-		rename_file_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
+	// The staged descriptor stays open across publication and is released only
+	// between the fallback's link and its staging unlink, so NFS removes the
+	// staging name instead of silly-renaming it. See `linkat_no_replace`.
+	let result = rename_file_no_replace(
+		&source_parent,
+		&source_name,
+		&destination_parent,
+		&destination_name,
+		move || drop(source_file),
+	);
 	if let Err(error) = result {
 		return Err(
 			match error.raw_os_error() {
@@ -1935,7 +1958,16 @@ fn remove_managed(
 	// The parent is retained, the names are validated, and the quarantine publish
 	// is atomic no-replace: renameat2(RENAME_NOREPLACE) where supported, else a
 	// linkat(2) fallback for filesystems (e.g. NFS) that reject rename flags.
-	if let Err(error) = rename_file_no_replace(&source_parent, &name, &recovery_parent, &quarantine)
+	//
+	// No authority is released here: `authorized` is the detach proof and is read
+	// again after the quarantine publish, so on a filesystem without rename flags
+	// the staging name is silly-renamed and the detached object stays
+	// double-linked. Resolving that means re-proving the detached object from the
+	// quarantined name instead of the retained descriptor, which is
+	// descriptor-bound cleanup work and belongs to that lane rather than this
+	// fallback fix.
+	if let Err(error) =
+		rename_file_no_replace(&source_parent, &name, &recovery_parent, &quarantine, || ())
 	{
 		return Err(match error.raw_os_error() {
 			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
@@ -2231,14 +2263,17 @@ fn install_inner(
 ) -> Result<RecoveryFsResult, RetainedPublishError> {
 	let source_file = open_existing(root, source, false)?;
 	let source_identity = regular_identity(&source_file)?;
-	// Release the staged descriptor before publishing; see the matching note in
-	// `rename_managed_file_no_replace_inner`. The installed object is re-proven
-	// against `source_identity` below, so closing early keeps the same authority.
-	drop(source_file);
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
-	let result =
-		rename_file_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
+	// Released between the fallback's link and unlink; see the matching note in
+	// `rename_managed_file_no_replace_inner`.
+	let result = rename_file_no_replace(
+		&source_parent,
+		&source_name,
+		&destination_parent,
+		&destination_name,
+		move || drop(source_file),
+	);
 	if let Err(error) = result {
 		return Err(
 			match error.raw_os_error() {
@@ -2872,6 +2907,7 @@ mod tests {
 	}
 
 	use std::{
+		cell::Cell,
 		fs,
 		path::PathBuf,
 		time::{SystemTime, UNIX_EPOCH},
@@ -3229,14 +3265,14 @@ mod tests {
 		let destination_name = CString::new("destination").expect("destination name");
 
 		fs::write(dir.join("source"), b"payload").expect("seed source");
-		linkat_no_replace(&parent, &source_name, &parent, &destination_name)
+		linkat_no_replace(&parent, &source_name, &parent, &destination_name, || ())
 			.expect("link publish on the real filesystem");
 		assert_eq!(fs::read(dir.join("destination")).expect("published destination"), b"payload");
 		assert!(!dir.join("source").exists(), "staging source removed after publish");
 
 		fs::write(dir.join("collision"), b"other").expect("seed collision source");
 		let collision_name = CString::new("collision").expect("collision name");
-		let error = linkat_no_replace(&parent, &collision_name, &parent, &destination_name)
+		let error = linkat_no_replace(&parent, &collision_name, &parent, &destination_name, || ())
 			.expect_err("no-replace must refuse an existing destination");
 		assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
 		assert!(dir.join("collision").exists(), "source is untouched on collision");
@@ -3246,6 +3282,37 @@ mod tests {
 		);
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// The staged descriptor must be released between the publishing link and
+	/// the staging unlink. Releasing earlier would publish without descriptor
+	/// authority; releasing later is exactly what leaves a silly-renamed sibling
+	/// on NFS. This pins that order deterministically on any filesystem, so the
+	/// contract is covered without depending on an external mount.
+	#[test]
+	fn linkat_fallback_releases_source_authority_between_link_and_unlink() {
+		let temporary = TempDir::new();
+		let parent = temporary.root();
+		let source_name = CString::new("source").expect("source name");
+		let destination_name = CString::new("destination").expect("destination name");
+		fs::write(temporary.0.join("source"), b"payload").expect("seed source");
+
+		let observed = Cell::new(None);
+		linkat_no_replace(&parent, &source_name, &parent, &destination_name, || {
+			observed.set(Some((
+				temporary.0.join("destination").exists(),
+				temporary.0.join("source").exists(),
+			)));
+		})
+		.expect("link publish");
+
+		assert_eq!(
+			observed.get(),
+			Some((true, true)),
+			"authority must be released after the destination is published and before the staging \
+			 name is unlinked"
+		);
+		assert!(!temporary.0.join("source").exists(), "staging name removed after release");
 	}
 
 	/// Opt-in end-to-end regression for the managed publish path on a filesystem
@@ -3280,6 +3347,26 @@ mod tests {
 		)
 		.expect("restrict real-filesystem test root");
 		let root = File::open(&dir).expect("open real-filesystem root");
+
+		// Prove this mount actually lacks renameat2 rename flags. Without it the
+		// test would also pass on a filesystem where `RENAME_NOREPLACE` works and
+		// the `linkat` fallback — the whole point of this case — is never reached.
+		fs::write(dir.join("probe-source"), b"probe").expect("seed probe source");
+		let probe_error = renameat2_no_replace(
+			&root,
+			&CString::new("probe-source").expect("probe source name"),
+			&root,
+			&CString::new("probe-destination").expect("probe destination name"),
+		)
+		.expect_err(
+			"GJC_TEST_NFS_DIR must point at a filesystem whose renameat2 rejects RENAME_NOREPLACE",
+		);
+		assert!(
+			rename_flags_unsupported(probe_error.raw_os_error()),
+			"GJC_TEST_NFS_DIR must point at a filesystem without renameat2 rename flags (errno {:?})",
+			probe_error.raw_os_error()
+		);
+		fs::remove_file(dir.join("probe-source")).expect("remove probe source");
 
 		let contents = b"binding";
 		let identity = managed_file(&root, "staged", contents);
