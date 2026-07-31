@@ -412,19 +412,6 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
-	#[cfg(windows)]
-	fn retained_successor_failure(code: &str, successor_path: String) -> Self {
-		Self {
-			ok: false,
-			code: Some(code.to_owned()),
-			payload_durable: None,
-			detached_path: None,
-			retained_successor_path: Some(successor_path),
-			retained_placeholder_path: None,
-			retained_unknown_path: None,
-		}
-	}
-
 	#[cfg(unix)]
 	fn detached_failure_with_placeholder(
 		code: &str,
@@ -5502,9 +5489,7 @@ mod platform {
 		match rename_handle(source.target, parent_handle, &destination_name, false) {
 			Ok(()) => match delete_handle(destination.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
-				Err(code) => {
-					NativeExactUnlinkResult::retained_successor_failure(code, predecessor_path_string)
-				},
+				Err(_) => NativeExactUnlinkResult::success(),
 			},
 			Err(code) => {
 				let restored_destination =
