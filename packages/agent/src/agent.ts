@@ -344,7 +344,11 @@ export class Agent {
 	#listeners = new Set<(e: AgentEvent) => void>();
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScope) => Promise<AgentMessage[]>;
+	#transformContext?: (
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		scope?: AttemptScope,
+	) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
