@@ -73,7 +73,15 @@ async function sendRequest(
 async function runScenario(
 	decision: JsonObject | undefined,
 	approvalPolicy?: "never" | "on-request",
-	mode: "bash" | "patchRename" | "editUpdate" | "write" = "bash",
+	mode:
+		| "bash"
+		| "patchRename"
+		| "patchDelete"
+		| "editUpdate"
+		| "write"
+		| "sequenceMixed"
+		| "mixedEdit"
+		| "astEdit" = "bash",
 ): Promise<{
 	approvalMethod: string | undefined;
 	approvalRequestCount: number;
@@ -93,18 +101,49 @@ async function runScenario(
 		"packages/coding-agent/src/app-server/__tests__/fixtures/stub-model-provider.ts",
 	);
 	const command = `printf approved > ${marker}`;
-	const toolName = mode === "bash" ? "bash" : mode === "write" ? "write" : "edit";
+	const toolName = mode === "bash" ? "bash" : mode === "write" ? "write" : mode === "astEdit" ? "ast_edit" : "edit";
 	const toolArguments: JsonObject =
 		mode === "patchRename"
 			? {
 					path: patchSource,
 					edits: [{ op: "update", rename: patchDestination, diff: "@@ -1 +1 @@\n-before\n+after\n" }],
 				}
-			: mode === "editUpdate"
-				? { path: patchSource, edits: [{ old_text: "before", new_text: "after" }] }
-				: mode === "write"
-					? { path: patchSource, content: "after\n" }
-					: { command };
+			: mode === "patchDelete"
+				? { path: patchSource, edits: [{ op: "delete" }] }
+				: mode === "mixedEdit"
+					? {
+							path: patchSource,
+							edits: [
+								{ op: "update", diff: "@@ -1 +1 @@\n-before\n+one\n" },
+								{ op: "update", diff: "@@ -1 +1 @@\n-one\n+two\n" },
+							],
+						}
+					: mode === "astEdit"
+						? { paths: [patchSource], ops: [{ pat: "before", out: "after" }] }
+						: mode === "editUpdate"
+							? { path: patchSource, edits: [{ old_text: "before", new_text: "after" }] }
+							: mode === "write"
+								? { path: patchSource, content: "after\n" }
+								: { command };
+	const toolSequence =
+		mode === "sequenceMixed"
+			? [
+					{
+						name: "edit",
+						arguments: { path: patchSource, edits: [{ op: "update", diff: "@@ -1 +1 @@\n-before\n+one\n" }] },
+					},
+					{
+						name: "edit",
+						arguments: {
+							path: patchSource,
+							edits: [
+								{ op: "update", diff: "@@ -1 +1 @@\n-one\n+two\n" },
+								{ op: "update", diff: "@@ -1 +1 @@\n-two\n+three\n" },
+							],
+						},
+					},
+				]
+			: undefined;
 	if (mode !== "bash") await Bun.write(patchSource, "before\n");
 	mkdirSync(agentDir);
 	const child = Bun.spawn([process.execPath, "packages/coding-agent/src/cli.ts", "app-server", "--stdio"], {
@@ -119,7 +158,8 @@ async function runScenario(
 			GJC_TEST_MODEL_TOOL_NAME: toolName,
 			GJC_TEST_MODEL_TOOL_ARGS: JSON.stringify(toolArguments),
 			GJC_TEST_MODEL_TOOL_COMMAND: command,
-			...(mode === "patchRename"
+			...(toolSequence ? { GJC_TEST_MODEL_TOOL_SEQUENCE: JSON.stringify(toolSequence) } : {}),
+			...(mode === "patchRename" || mode === "patchDelete" || mode === "sequenceMixed" || mode === "mixedEdit"
 				? { GJC_EDIT_VARIANT: "patch" }
 				: mode === "editUpdate"
 					? { GJC_EDIT_VARIANT: "replace" }
@@ -259,6 +299,33 @@ test("real patch-mode edit routes a schema-shaped applyPatchApproval exactly onc
 	expect(denied.patchDestinationContent).toBeUndefined();
 }, 120_000);
 
+test("real patch-mode delete routes a schema-shaped applyPatchApproval with the preimage", async () => {
+	for (const approvalPolicy of [undefined, "on-request"] as const) {
+		const label = `${approvalPolicy ?? "default"}:patchDelete`;
+		const approved = await runScenario({ decision: "approved" }, approvalPolicy, "patchDelete");
+		expect(approved.approvalMethod, label).toBe("applyPatchApproval");
+		expect(approved.approvalRequestCount, label).toBe(1);
+		expect(approved.patchSourceContent, label).toBeUndefined();
+		const approvedFileChanges = approved.approvalParams?.fileChanges;
+		expect(isRecord(approvedFileChanges), label).toBe(true);
+		if (!isRecord(approvedFileChanges)) continue;
+		const approvedChange = Object.values(approvedFileChanges)[0];
+		expect(isRecord(approvedChange), label).toBe(true);
+		if (!isRecord(approvedChange)) continue;
+		expect(approvedChange.type, label).toBe("delete");
+		expect(approvedChange.content, label).toBe("before\n");
+
+		const denied = await runScenario(
+			{ decision: { denied: { rejection: "not allowed" } } },
+			approvalPolicy,
+			"patchDelete",
+		);
+		expect(denied.approvalMethod, label).toBe("applyPatchApproval");
+		expect(denied.approvalRequestCount, label).toBe(1);
+		expect(denied.patchSourceContent, label).toBe("before\n");
+	}
+}, 180_000);
+
 test("real ordinary edit and write mutations require applyPatchApproval and honor approve or deny", async () => {
 	for (const approvalPolicy of [undefined, "on-request"] as const) {
 		for (const mode of ["editUpdate", "write"] as const) {
@@ -286,3 +353,58 @@ test("real ordinary edit and write mutations require applyPatchApproval and hono
 		}
 	}
 }, 180_000);
+
+test("valid edit approval cannot authorize a later mixed edit", async () => {
+	const result = await runScenario({ decision: "approved_for_session" }, undefined, "sequenceMixed");
+	expect(result.approvalMethod).toBe("applyPatchApproval");
+	expect(result.approvalRequestCount).toBe(1);
+	expect(result.patchSourceContent).toBe("one\n");
+	expect(result.patchDestinationContent).toBeUndefined();
+}, 180_000);
+
+test("mixed patch edits fail closed before any entry under every approval policy", async () => {
+	for (const approvalPolicy of [undefined, "on-request", "never"] as const) {
+		const result = await runScenario(undefined, approvalPolicy, "mixedEdit");
+		const label = `${approvalPolicy ?? "default"}:mixedEdit`;
+		expect(result.approvalMethod, label).toBeUndefined();
+		expect(result.approvalRequestCount, label).toBe(0);
+		expect(result.patchSourceContent, label).toBe("before\n");
+		expect(result.patchDestinationContent, label).toBeUndefined();
+	}
+}, 180_000);
+
+test("real child mutation policy matrix remains fail-closed and atomic", async () => {
+	const modes = ["editUpdate", "write", "patchDelete", "patchRename", "astEdit", "mixedEdit"] as const;
+	const policies = [undefined, "on-request", "never"] as const;
+	for (const mode of modes) {
+		for (const approvalPolicy of policies) {
+			const gated = mode !== "astEdit" && mode !== "mixedEdit";
+			const decision = gated && approvalPolicy !== "never" ? { decision: "approved" } : undefined;
+			const result = await runScenario(decision, approvalPolicy, mode);
+			const label = `${approvalPolicy ?? "default"}:${mode}`;
+			const expectedSource =
+				mode === "mixedEdit" || mode === "astEdit"
+					? "before\n"
+					: mode === "patchDelete" || mode === "patchRename"
+						? undefined
+						: "after\n";
+			const expectedDestination = mode === "patchRename" ? "after\n" : undefined;
+			console.log(
+				`MUTATION_MATRIX ${JSON.stringify({
+					policy: approvalPolicy ?? "default",
+					mode,
+					approvalMethod: result.approvalMethod ?? null,
+					approvalRequestCount: result.approvalRequestCount,
+					source: result.patchSourceContent ?? null,
+					destination: result.patchDestinationContent ?? null,
+				})}`,
+			);
+			expect(result.approvalMethod, label).toBe(
+				gated && approvalPolicy !== "never" ? "applyPatchApproval" : undefined,
+			);
+			expect(result.approvalRequestCount, label).toBe(gated && approvalPolicy !== "never" ? 1 : 0);
+			expect(result.patchSourceContent, label).toBe(expectedSource);
+			expect(result.patchDestinationContent, label).toBe(expectedDestination);
+		}
+	}
+}, 360_000);

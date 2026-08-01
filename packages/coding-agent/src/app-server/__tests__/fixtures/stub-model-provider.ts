@@ -5,9 +5,27 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 export const providerName = "gjc-app-server-stub";
 export const api = "gjc-app-server-stub-api";
 
-let toolCallEmitted = false;
+let toolCallCount = 0;
 
 function configuredToolCall(): { name: string; arguments: Record<string, unknown> } | undefined {
+	const rawSequence = process.env.GJC_TEST_MODEL_TOOL_SEQUENCE;
+	if (rawSequence) {
+		const parsed: unknown = JSON.parse(rawSequence);
+		if (!Array.isArray(parsed)) throw new Error("GJC_TEST_MODEL_TOOL_SEQUENCE must encode a JSON array");
+		const candidate = parsed[toolCallCount];
+		if (candidate === undefined) return undefined;
+		if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+			throw new Error("GJC_TEST_MODEL_TOOL_SEQUENCE entries must be JSON objects");
+		}
+		const name = candidate.name;
+		const args = candidate.arguments;
+		if (typeof name !== "string" || typeof args !== "object" || args === null || Array.isArray(args)) {
+			throw new Error("GJC_TEST_MODEL_TOOL_SEQUENCE entries require name and object arguments");
+		}
+		return { name, arguments: args as Record<string, unknown> };
+	}
+	if (toolCallCount > 0) return undefined;
+
 	const name = process.env.GJC_TEST_MODEL_TOOL_NAME;
 	const rawArguments = process.env.GJC_TEST_MODEL_TOOL_ARGS;
 	if (name && rawArguments) {
@@ -24,9 +42,9 @@ function configuredToolCall(): { name: string; arguments: Record<string, unknown
 export function streamSimple(model: Model) {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
-		const configured = !toolCallEmitted ? configuredToolCall() : undefined;
+		const configured = configuredToolCall();
 		if (configured) {
-			toolCallEmitted = true;
+			toolCallCount++;
 			const toolCall = {
 				type: "toolCall" as const,
 				id: "stub-tool-call",

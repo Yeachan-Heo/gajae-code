@@ -6775,6 +6775,20 @@ export class AgentSession {
 					ctx: never,
 				) => {
 					const requireReverseFileApproval = this.#sdkPermissionProvider !== undefined;
+					const isReverseFileMutation = requireReverseFileApproval && REVERSE_FILE_APPROVAL_TOOLS.has(target.name);
+					let fileChanges: Awaited<ReturnType<typeof planPermissionFileChanges>>;
+					if (isReverseFileMutation) {
+						try {
+							fileChanges = await planPermissionFileChanges(target.name, args, this.sessionManager.getCwd());
+						} catch {
+							fileChanges = undefined;
+						}
+						if (!fileChanges) {
+							throw new ToolError(
+								`Tool call rejected because ${target.name} could not be represented for approval`,
+							);
+						}
+					}
 					const permissionIntent = getPermissionIntent(target.name, args, { requireReverseFileApproval });
 					if (!permissionIntent) {
 						if (requireReverseFileApproval && REVERSE_FILE_APPROVAL_TOOLS.has(target.name)) {
@@ -6804,7 +6818,7 @@ export class AgentSession {
 							`Tool call rejected because no permission provider is connected (${target.name})`,
 						);
 					}
-					// Short-circuit on persisted decisions.
+					// Short-circuit on persisted decisions only after this call's file-change evidence is valid.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
@@ -6814,12 +6828,6 @@ export class AgentSession {
 					}
 					if (signal?.aborted) {
 						throw new ToolAbortError("Permission request cancelled");
-					}
-					let fileChanges: Awaited<ReturnType<typeof planPermissionFileChanges>>;
-					try {
-						fileChanges = await planPermissionFileChanges(target.name, args, this.sessionManager.getCwd());
-					} catch {
-						fileChanges = undefined;
 					}
 					type PermissionRaceResult =
 						| { kind: "permission"; outcome: ClientBridgePermissionOutcome }

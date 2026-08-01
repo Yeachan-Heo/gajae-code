@@ -129,6 +129,24 @@ describe("planPermissionFileChanges", () => {
 		});
 	});
 
+	test("mixed patch entries refuse before execution planning", async () => {
+		await Bun.write(path.join(cwd, "mixed.txt"), "before\n");
+		expect(
+			await planPermissionFileChanges(
+				"edit",
+				{
+					path: "mixed.txt",
+					edits: [
+						{ op: "update", diff: "@@ -1 +1 @@\n-before\n+one\n" },
+						{ op: "update", diff: "@@ -1 +1 @@\n-one\n+two\n" },
+					],
+				},
+				cwd,
+			),
+		).toBeUndefined();
+		expect(await Bun.file(path.join(cwd, "mixed.txt")).text()).toBe("before\n");
+	});
+
 	test("unrelated tools have no file-change representation", async () => {
 		expect(await planPermissionFileChanges("bash", { command: "rm file" }, cwd)).toBeUndefined();
 	});
