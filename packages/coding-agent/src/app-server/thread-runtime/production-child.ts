@@ -148,9 +148,6 @@ function assertReasoningEffortSupported(model: Record<string, unknown> | undefin
 	if (!model) throw new Error("The child did not expose a current model for reasoning-effort validation.");
 	const supported = supportedReasoningEfforts(model);
 	if (supported.has(effort)) return;
-	// T3 0.0.28 sends medium even for the non-reasoning compatibility stub. The child
-	// truthfully resolves that request to off; higher efforts remain hard failures.
-	if (effort === "medium" && model.reasoning === false) return;
 	throw new Error(
 		`Reasoning effort "${effort}" is not supported by the child model "${String(model.provider)}/${String(model.id)}".`,
 	);
@@ -606,11 +603,9 @@ export function createProductionThreadStartAdapter(
 							const supported = session
 								.getAvailableThinkingLevels()
 								.some(level => String(level) === policy.reasoningEffort);
-							const compatibilityMedium =
-								policy.reasoningEffort === "medium" && session.model?.reasoning === false;
-							if (policy.reasoningEffort !== "off" && !supported && !compatibilityMedium)
+							if (policy.reasoningEffort !== "off" && !supported)
 								throw new Error(
-									`Reasoning effort "${policy.reasoningEffort}" is not supported by the child model.`,
+									`Reasoning effort "${policy.reasoningEffort}" is not supported by the child model "${String(session.model?.provider)}/${String(session.model?.id)}".`,
 								);
 							await session.setThinkingLevelForControl(policy.reasoningEffort as never, false);
 						}

@@ -100,6 +100,7 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		semanticGaps: [],
 		translationNotes: [
 			"Only nonempty text UserInput entries are admitted; an optional model override is resolved by the retained child and restored after the turn.",
+			"Per-turn reasoning effort is admitted only when the retained child reports the selected model as supporting that level; unsupported efforts fail before prompting.",
 		],
 		owner: "app-server",
 		testIds: [

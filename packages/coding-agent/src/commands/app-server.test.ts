@@ -36,6 +36,25 @@ async function runFailureInjectedShutdown(listen: string, label: string): Promis
 	expect(process.exitCode).toBe(1);
 }
 
+test("listener shutdown settles once with a verified success code", async () => {
+	const close = vi.fn().mockResolvedValue(undefined);
+	vi.spyOn(appServerRuntimeModule, "createAppServerRuntime").mockReturnValue({ close } as never);
+	const stop = vi.fn();
+	vi.spyOn(Bun, "serve").mockImplementation((() => ({ stop })) as never);
+	const priorSigtermListeners = process.listeners("SIGTERM");
+	const running = new AppServer(["--listen", "ws://127.0.0.1:12345"], cliConfig).run();
+	await Bun.sleep(0);
+	const shutdown = process.listeners("SIGTERM").at(-1);
+	if (!shutdown) throw new Error("app-server did not install a SIGTERM shutdown handler");
+	(shutdown as () => void)();
+	(shutdown as () => void)();
+	await running;
+	expect(close).toHaveBeenCalledTimes(1);
+	expect(stop).toHaveBeenCalledTimes(1);
+	expect(process.exitCode).toBe(0);
+	expect(process.listeners("SIGTERM")).toEqual(priorSigtermListeners);
+});
+
 describe("app-server listener shutdown", () => {
 	test("websocket shutdown rejects the aggregated cleanup failure", async () => {
 		await runFailureInjectedShutdown("ws://127.0.0.1:12345", "websocket");

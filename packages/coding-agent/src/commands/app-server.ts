@@ -64,6 +64,76 @@ function handleTransportFailure(connection: AppServerConnection, error: unknown)
 	process.stderr.write(`app-server: transport connection failed: ${String(error)}\n`);
 }
 
+/**
+ * Make listener shutdown own SIGINT/SIGTERM for the lifetime of the listener.
+ *
+ * The CLI bootstrap installs postmortem signal handlers before loading commands. Those handlers
+ * intentionally exit with 128 + signal after a bounded cleanup wait, which would pre-empt this
+ * listener's verified runtime teardown. Save and temporarily remove all existing handlers so a
+ * listener signal cannot pre-empt graceful teardown; restore them once shutdown settles.
+ */
+function installListenerSignalShutdown(
+	stopServer: () => void,
+	closeRuntime: () => Promise<void>,
+	resolve: () => void,
+	reject: (error: unknown) => void,
+): void {
+	const prior = {
+		SIGINT: process.listeners("SIGINT"),
+		SIGTERM: process.listeners("SIGTERM"),
+	};
+	for (const signal of ["SIGINT", "SIGTERM"] as const) {
+		for (const listener of prior[signal]) process.removeListener(signal, listener);
+	}
+
+	let shutdownPromise: Promise<void> | undefined;
+	let keepAlive: ReturnType<typeof setInterval> | undefined;
+	let restored = false;
+	const restore = (): void => {
+		if (restored) return;
+		restored = true;
+		if (keepAlive) clearInterval(keepAlive);
+		process.removeListener("SIGINT", onSignal);
+		process.removeListener("SIGTERM", onSignal);
+		for (const signal of ["SIGINT", "SIGTERM"] as const) {
+			for (const listener of prior[signal]) process.on(signal, listener as (...args: any[]) => void);
+		}
+	};
+	const onSignal = (): void => {
+		if (shutdownPromise) return;
+		keepAlive = setInterval(() => undefined, 1_000);
+		shutdownPromise = (async () => {
+			process.exitCode = 0;
+			let stopError: unknown;
+			try {
+				stopServer();
+			} catch (error) {
+				stopError = error;
+			}
+			try {
+				await closeRuntime();
+			} catch (error) {
+				if (stopError !== undefined) throw new AggregateError([stopError, error], "Listener shutdown failed.");
+				throw error;
+			}
+			if (stopError !== undefined) throw stopError;
+		})();
+		void shutdownPromise.then(
+			() => {
+				restore();
+				resolve();
+			},
+			error => {
+				process.exitCode = 1;
+				restore();
+				reject(error);
+			},
+		);
+	};
+	process.on("SIGINT", onSignal);
+	process.on("SIGTERM", onSignal);
+}
+
 function unauthorizedUpgradeResponse(request: Request, wsAuth: WsAuthConfig | undefined): Response | undefined {
 	if (!wsAuth) return undefined;
 	try {
@@ -223,18 +293,12 @@ export default class AppServer extends Command {
 			});
 			process.stderr.write(`app-server: ws:// listening on ${host}:${port}\n`);
 			return new Promise<void>((resolve, reject) => {
-				let shuttingDown = false;
-				const shutdown = (): void => {
-					if (shuttingDown) return;
-					shuttingDown = true;
-					wsServer.stop();
-					void serverRuntime.close().then(resolve, error => {
-						process.exitCode = 1;
-						reject(error);
-					});
-				};
-				process.on("SIGTERM", shutdown);
-				process.on("SIGINT", shutdown);
+				installListenerSignalShutdown(
+					() => wsServer.stop(),
+					() => serverRuntime.close(),
+					resolve,
+					reject,
+				);
 			});
 		}
 		// unix:// — same WebSocket-over-Unix semantics.
@@ -301,18 +365,12 @@ export default class AppServer extends Command {
 			});
 			process.stderr.write(`app-server: unix:// listening on ${socketPath}\n`);
 			return new Promise<void>((resolve, reject) => {
-				let shuttingDown = false;
-				const shutdown = (): void => {
-					if (shuttingDown) return;
-					shuttingDown = true;
-					wsServer.stop();
-					void serverRuntime.close().then(resolve, error => {
-						process.exitCode = 1;
-						reject(error);
-					});
-				};
-				process.on("SIGTERM", shutdown);
-				process.on("SIGINT", shutdown);
+				installListenerSignalShutdown(
+					() => wsServer.stop(),
+					() => serverRuntime.close(),
+					resolve,
+					reject,
+				);
 			});
 		}
 	}

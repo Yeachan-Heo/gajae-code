@@ -1,4 +1,5 @@
 import type { AssistantMessage, Model } from "@gajae-code/ai";
+import { Effort } from "@gajae-code/ai/model-thinking";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 
 export const providerName = "gjc-app-server-stub";
@@ -77,7 +78,8 @@ export const models = [
 		provider: providerName,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		reasoning: false,
+		reasoning: true,
+		thinking: { minLevel: Effort.Medium, maxLevel: Effort.Medium, levels: [Effort.Medium], mode: "effort" as const },
 		contextWindow: 1_000_000,
 		maxTokens: 4_096,
 	},

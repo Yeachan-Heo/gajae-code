@@ -146,11 +146,11 @@ test("the production child reuses one commandId/turnId pair for prompt acknowled
 			})) as Record<string, unknown>;
 			expect(status.commandId).toBe(acknowledgement.commandId);
 			expect(status.turnId).toBe(acknowledgement.turnId);
-			const restoreMedium = await active.client.setTurnPolicyForTurn?.({ reasoningEffort: "medium" });
-			expect(restoreMedium).toEqual(expect.any(Function));
-			await restoreMedium?.();
+			await expect(active.client.setTurnPolicyForTurn?.({ reasoningEffort: "medium" })).rejects.toThrow(
+				/Reasoning effort "medium" is not supported by the child model "correlation-provider\/correlation-model"\./,
+			);
 			await expect(active.client.setTurnPolicyForTurn?.({ reasoningEffort: "high" })).rejects.toThrow(
-				/not supported by the child model/,
+				/Reasoning effort "high" is not supported by the child model "correlation-provider\/correlation-model"\./,
 			);
 		} finally {
 			unsubscribe();
