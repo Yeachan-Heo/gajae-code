@@ -74,6 +74,12 @@ class FakeSessionClient implements SessionClient {
 		return {};
 	}
 
+	async setModelForTurn(requestedModel: string): Promise<() => Promise<void>> {
+		this.calls.push({ operation: "turn.modelOverride", input: { model: requestedModel } });
+		return async () => {
+			this.calls.push({ operation: "turn.modelOverride.restore", input: { model: requestedModel } });
+		};
+	}
 	async close(): Promise<void> {}
 }
 
@@ -193,6 +199,25 @@ test("turn controller preserves response barrier, durable item ordering, complet
 	const completedIndex = notifications.findIndex(notification => notification.method === "turn/completed");
 	const usageIndex = notifications.findIndex(notification => notification.method === "thread/tokenUsage/updated");
 	expect(usageIndex).toBeGreaterThan(completedIndex);
+});
+test("per-turn model override is restored after the child terminalizes", async () => {
+	const client = new FakeSessionClient();
+	const manager = managerWithClient(client);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => "app-turn-model" });
+	const handle = await controller.start({
+		threadId: THREAD_ID,
+		params: { text: "modelled", model: "provider/turn-model" },
+	});
+	await handle.responseDelivered();
+	controller.acceptFrame(THREAD_ID, lifecycleFrame("agent_end", { messages: [], stopReason: "completed" }));
+	await flush();
+	expect(client.calls.map(call => call.operation)).toEqual([
+		"turn.modelOverride",
+		"turn.prompt",
+		"projection.append",
+		"projection.append",
+		"turn.modelOverride.restore",
+	]);
 });
 
 test("synchronous child terminal is buffered until the response is delivered", async () => {

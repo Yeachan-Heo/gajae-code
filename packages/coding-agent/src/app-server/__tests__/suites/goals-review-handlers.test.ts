@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { buildSessionContext, loadEntriesFromFile } from "../../../session/session-manager";
 import { stableValidators } from "../../protocol-source/schema-validators.generated";
 import {
+	feedbackUploadHandler,
 	goalsReviewHandlers,
+	reviewStartHandler,
 	threadGoalClearHandler,
 	threadGoalGetHandler,
 	threadGoalSetHandler,
@@ -136,7 +138,84 @@ test("thread/goal/clear drops the persisted goal and get reports no goal", async
 	expect(persistedContext.mode).toBe("none");
 });
 
-test("goalsReviewHandlers exposes only the three genuinely backed goal methods", () => {
-	expect(Object.keys(goalsReviewHandlers)).toEqual(["thread/goal/get", "thread/goal/set", "thread/goal/clear"]);
+test("review/start translates targets into a native turn.prompt and returns inline turn", async () => {
+	const turn = {
+		id: "turn-review-1",
+		items: [],
+		itemsView: "full",
+		status: "inProgress",
+		error: null,
+		startedAt: 1,
+		completedAt: null,
+		durationMs: null,
+	};
+	let delivered = false;
+	const context = {
+		connectionId: "review-connection",
+		turnController: {
+			start: async (input: { threadId: string; params: Record<string, unknown> }) => {
+				expect(input.threadId).toBe(threadId);
+				expect(input.params.text).toContain("base branch main");
+				return {
+					response: { turn },
+					responseDelivered: async () => {
+						delivered = true;
+					},
+				};
+			},
+		},
+	} as unknown as HandlerContext;
+	const params = { threadId, target: { type: "baseBranch", branch: "main" }, delivery: "inline" };
+	expect(stableValidators.clientRequestParams["review/start"]?.(params)).toBe(true);
+	const result = await reviewStartHandler(params, context);
+	expect(result).toEqual({ ok: true, result: { turn, reviewThreadId: threadId } });
+	expect(delivered).toBe(true);
+	expect(stableValidators.clientRequestResults["review/start"]?.(result.ok ? result.result : undefined)).toBe(true);
+});
+
+test("review/start rejects detached delivery because GJC has no detached review runner", async () => {
+	const result = await reviewStartHandler(
+		{ threadId, target: { type: "uncommittedChanges" }, delivery: "detached" },
+		contextFor(),
+	);
+	expect(result).toEqual({ ok: false, errorKey: "notSupported" });
+});
+
+test("feedback/upload persists a real GJC session custom entry and returns thread id", async () => {
+	const params = {
+		classification: "bug",
+		reason: "The review panel lost its findings.",
+		threadId,
+		includeLogs: false,
+		tags: { surface: "review" },
+	};
+	expect(stableValidators.clientRequestParams["feedback/upload"]?.(params)).toBe(true);
+	const result = await feedbackUploadHandler(params, contextFor());
+	expect(result).toEqual({ ok: true, result: { threadId } });
+	expect(stableValidators.clientRequestResults["feedback/upload"]?.(result.ok ? result.result : undefined)).toBe(true);
+	const persisted = await loadEntriesFromFile(sessionFile);
+	const feedback = persisted.find(
+		entry => entry.type === "custom" && entry.customType === "app-server:feedback/upload",
+	);
+	expect(feedback).toMatchObject({
+		type: "custom",
+		customType: "app-server:feedback/upload",
+		data: { threadId, classification: "bug", reason: params.reason, includeLogs: false, tags: params.tags },
+	});
+});
+
+test("feedback/upload refuses log upload without a GJC sink", async () => {
+	const result = await feedbackUploadHandler({ classification: "bug", threadId, includeLogs: true }, contextFor());
+	expect(result).toEqual({ ok: false, errorKey: "notSupported" });
+});
+
+test("goalsReviewHandlers exposes the backed goal, review, and feedback methods", () => {
+	expect(Object.keys(goalsReviewHandlers)).toEqual([
+		"thread/goal/get",
+		"thread/goal/set",
+		"thread/goal/clear",
+		"review/start",
+		"feedback/upload",
+	]);
 	expect(resultOf({ ok: true, result: { supported: true } })).toEqual({ supported: true });
 });

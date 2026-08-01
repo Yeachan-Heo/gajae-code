@@ -132,10 +132,22 @@ export async function runStdioServer(config: ResolvedAppServerConfig): Promise<v
 		"stdio",
 		() => rl.close(),
 	);
+	let signalClose: Promise<void> | undefined;
+	const onSignal = (): void => {
+		process.exitCode = 0;
+		rl.close();
+		signalClose ??= connection.close();
+	};
+	process.on("SIGINT", onSignal);
+	process.on("SIGTERM", onSignal);
 	try {
 		for await (const line of rl) await connection.process(new TextEncoder().encode(line));
 	} finally {
+		process.off("SIGINT", onSignal);
+		process.off("SIGTERM", onSignal);
+		rl.close();
 		await connection.close();
+		await signalClose;
 	}
 }
 

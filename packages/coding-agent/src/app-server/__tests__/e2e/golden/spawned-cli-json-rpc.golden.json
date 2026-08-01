@@ -28,5 +28,39 @@
 		"id": 6,
 		"method": "app/list",
 		"bytes": "{\n\t\"error\": {\n\t\t\"code\": -32081,\n\t\t\"message\": \"Not supported\"\n\t},\n\t\"id\": 6\n}"
+	},
+	{
+		"id": 7,
+		"method": "thread/start",
+		"bytes": "{\n\t\"id\": 7,\n\t\"result\": {\n\t\t\"approvalPolicy\": \"on-request\",\n\t\t\"approvalsReviewer\": \"user\",\n\t\t\"cwd\": \"<normalized>\",\n\t\t\"instructionSources\": [],\n\t\t\"model\": \"gjc-app-server-stub-model\",\n\t\t\"modelProvider\": \"gjc-app-server-stub\",\n\t\t\"reasoningEffort\": null,\n\t\t\"sandbox\": {\n\t\t\t\"type\": \"dangerFullAccess\"\n\t\t},\n\t\t\"serviceTier\": null,\n\t\t\"thread\": {\n\t\t\t\"agentNickname\": null,\n\t\t\t\"agentRole\": null,\n\t\t\t\"cliVersion\": \"0.12.0\",\n\t\t\t\"createdAt\": \"<normalized>\",\n\t\t\t\"cwd\": \"<normalized>\",\n\t\t\t\"ephemeral\": false,\n\t\t\t\"forkedFromId\": null,\n\t\t\t\"gitInfo\": null,\n\t\t\t\"id\": \"<normalized>\",\n\t\t\t\"isPinned\": false,\n\t\t\t\"modelProvider\": \"gjc-app-server-stub\",\n\t\t\t\"name\": null,\n\t\t\t\"parentThreadId\": null,\n\t\t\t\"path\": null,\n\t\t\t\"preview\": \"\",\n\t\t\t\"recencyAt\": null,\n\t\t\t\"sessionId\": \"<normalized>\",\n\t\t\t\"source\": \"appServer\",\n\t\t\t\"status\": {\n\t\t\t\t\"type\": \"idle\"\n\t\t\t},\n\t\t\t\"threadSource\": null,\n\t\t\t\"turns\": [],\n\t\t\t\"updatedAt\": \"<normalized>\"\n\t\t}\n\t}\n}"
+	},
+	{
+		"id": 8,
+		"method": "turn/start",
+		"bytes": "{\n\t\"id\": 8,\n\t\"result\": {\n\t\t\"turn\": {\n\t\t\t\"completedAt\": null,\n\t\t\t\"durationMs\": null,\n\t\t\t\"error\": null,\n\t\t\t\"id\": \"<normalized>\",\n\t\t\t\"items\": [],\n\t\t\t\"itemsView\": \"full\",\n\t\t\t\"startedAt\": \"<normalized>\",\n\t\t\t\"status\": \"inProgress\"\n\t\t}\n\t}\n}"
+	},
+	{
+		"method": "turn/started",
+		"bytes": "{\n\t\"method\": \"turn/started\",\n\t\"params\": {\n\t\t\"threadId\": \"<normalized>\",\n\t\t\"turn\": {\n\t\t\t\"completedAt\": null,\n\t\t\t\"durationMs\": null,\n\t\t\t\"error\": null,\n\t\t\t\"id\": \"<normalized>\",\n\t\t\t\"items\": [],\n\t\t\t\"itemsView\": \"full\",\n\t\t\t\"startedAt\": \"<normalized>\",\n\t\t\t\"status\": \"inProgress\"\n\t\t}\n\t}\n}"
+	},
+	{
+		"method": "item/started",
+		"bytes": "{\n\t\"method\": \"item/started\",\n\t\"params\": {\n\t\t\"item\": {\n\t\t\t\"id\": \"<normalized>\",\n\t\t\t\"memoryCitation\": null,\n\t\t\t\"phase\": null,\n\t\t\t\"text\": \"Stub response.\",\n\t\t\t\"type\": \"agentMessage\"\n\t\t},\n\t\t\"startedAtMs\": \"<normalized>\",\n\t\t\"threadId\": \"<normalized>\",\n\t\t\"turnId\": \"<normalized>\"\n\t}\n}"
+	},
+	{
+		"method": "item/agentMessage/delta",
+		"bytes": "{\n\t\"method\": \"item/agentMessage/delta\",\n\t\"params\": {\n\t\t\"delta\": \"Stub \",\n\t\t\"itemId\": \"<normalized>\",\n\t\t\"threadId\": \"<normalized>\",\n\t\t\"turnId\": \"<normalized>\"\n\t}\n}"
+	},
+	{
+		"method": "item/agentMessage/delta",
+		"bytes": "{\n\t\"method\": \"item/agentMessage/delta\",\n\t\"params\": {\n\t\t\"delta\": \"response.\",\n\t\t\"itemId\": \"<normalized>\",\n\t\t\"threadId\": \"<normalized>\",\n\t\t\"turnId\": \"<normalized>\"\n\t}\n}"
+	},
+	{
+		"method": "item/completed",
+		"bytes": "{\n\t\"method\": \"item/completed\",\n\t\"params\": {\n\t\t\"completedAtMs\": \"<normalized>\",\n\t\t\"item\": {\n\t\t\t\"id\": \"<normalized>\",\n\t\t\t\"memoryCitation\": null,\n\t\t\t\"phase\": null,\n\t\t\t\"text\": \"Stub response.\",\n\t\t\t\"type\": \"agentMessage\"\n\t\t},\n\t\t\"threadId\": \"<normalized>\",\n\t\t\"turnId\": \"<normalized>\"\n\t}\n}"
+	},
+	{
+		"method": "turn/completed",
+		"bytes": "{\n\t\"method\": \"turn/completed\",\n\t\"params\": {\n\t\t\"threadId\": \"<normalized>\",\n\t\t\"turn\": {\n\t\t\t\"completedAt\": \"<normalized>\",\n\t\t\t\"durationMs\": \"<normalized>\",\n\t\t\t\"error\": null,\n\t\t\t\"id\": \"<normalized>\",\n\t\t\t\"items\": [\n\t\t\t\t{\n\t\t\t\t\t\"id\": \"<normalized>\",\n\t\t\t\t\t\"memoryCitation\": null,\n\t\t\t\t\t\"phase\": null,\n\t\t\t\t\t\"text\": \"Stub response.\",\n\t\t\t\t\t\"type\": \"agentMessage\"\n\t\t\t\t}\n\t\t\t],\n\t\t\t\"itemsView\": \"full\",\n\t\t\t\"startedAt\": \"<normalized>\",\n\t\t\t\"status\": \"completed\"\n\t\t}\n\t}\n}"
 	}
 ]

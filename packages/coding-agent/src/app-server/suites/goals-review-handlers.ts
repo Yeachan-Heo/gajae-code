@@ -9,6 +9,7 @@ import {
 	loadEntriesFromFile,
 	type ModeChangeEntry,
 	type SessionEntry,
+	SessionManager,
 } from "../../session/session-manager";
 import type { HandlerContext, HandlerResult, MethodHandler } from "./handlers";
 
@@ -528,8 +529,136 @@ export const threadGoalClearHandler: MethodHandler = async (params, context) => 
 	}
 };
 
+function reviewPrompt(target: unknown): string | undefined {
+	const value = record(target);
+	if (!value || typeof value.type !== "string") return undefined;
+	switch (value.type) {
+		case "uncommittedChanges":
+			return "Perform a code review of the current working tree, including staged, unstaged, and untracked changes. Report concrete findings with file and line evidence.";
+		case "baseBranch":
+			return typeof value.branch === "string" && value.branch.trim().length > 0
+				? `Perform a code review of the changes against base branch ${value.branch.trim()}. Report concrete findings with file and line evidence.`
+				: undefined;
+		case "commit":
+			return typeof value.sha === "string" && value.sha.trim().length > 0
+				? `Perform a code review of commit ${value.sha.trim()}. Report concrete findings with file and line evidence.`
+				: undefined;
+		case "custom":
+			return typeof value.instructions === "string" && value.instructions.trim().length > 0
+				? `Perform a code review using these instructions:\n${value.instructions.trim()}`
+				: undefined;
+		default:
+			return undefined;
+	}
+}
+
+function errorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error
+		? typeof (error as { code?: unknown }).code === "string"
+			? (error as { code: string }).code
+			: undefined
+		: undefined;
+}
+
+/** Start an inline review as a native GJC turn.prompt operation. Detached review threads have no GJC seam. */
+export const reviewStartHandler: MethodHandler = async (params, context) => {
+	const p = record(params);
+	if (!p || typeof p.threadId !== "string" || p.threadId.trim().length === 0) return invalidParams();
+	if (p.delivery !== undefined && p.delivery !== "inline" && p.delivery !== "detached") return invalidParams();
+	if (p.delivery === "detached") return notSupported();
+	const text = reviewPrompt(p.target);
+	if (!text) return invalidParams();
+	const controller = context?.turnController;
+	if (!controller) return notSupported();
+	try {
+		const handle = await controller.start({ threadId: p.threadId, params: { text } });
+		await handle.responseDelivered();
+		return { ok: true, result: { turn: handle.response.turn, reviewThreadId: p.threadId } };
+	} catch (error) {
+		return errorCode(error) === "busy" ? { ok: false, errorKey: "busy" } : { ok: false, errorKey: "internalError" };
+	}
+};
+
+type FeedbackContext = HandlerContext & { sessionFile?: unknown };
+
+function feedbackThreadId(params: RecordValue, context?: HandlerContext): string | undefined {
+	if (Object.hasOwn(params, "threadId")) {
+		if (typeof params.threadId !== "string" || params.threadId.trim().length === 0) return undefined;
+		return params.threadId.trim();
+	}
+	const manager = context?.manager;
+	if (!manager) return undefined;
+	const candidates = manager
+		.loaded()
+		.filter(thread => context?.connectionId === undefined || thread.connectionId === context.connectionId);
+	return candidates.length === 1 ? candidates[0]?.threadId : undefined;
+}
+
+function feedbackSessionFile(threadId: string, context?: HandlerContext): string | undefined {
+	const candidate = (context ?? {}) as FeedbackContext;
+	if (typeof candidate.sessionFile === "string" && candidate.sessionFile.length > 0) return candidate.sessionFile;
+	const managed = context?.manager?.get(threadId);
+	const path = managed?.effectiveSettings?.thread.path;
+	return typeof path === "string" && path.length > 0 ? path : undefined;
+}
+
+function stringMap(value: unknown): Record<string, string> | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (!record(value)) return undefined;
+	const output: Record<string, string> = {};
+	for (const [key, item] of Object.entries(value)) {
+		if (typeof item !== "string") return undefined;
+		output[key] = item;
+	}
+	return output;
+}
+
+/** Persist feedback in the native GJC session journal; remote log uploads are not emulated. */
+export const feedbackUploadHandler: MethodHandler = async (params, context) => {
+	const p = record(params);
+	const classification = p?.classification;
+	if (!p || typeof classification !== "string" || classification.trim().length === 0) return invalidParams();
+	if (typeof p.includeLogs !== "boolean") return invalidParams();
+	if (p.includeLogs || p.extraLogFiles !== undefined) return notSupported();
+	if (p.reason !== undefined && p.reason !== null && typeof p.reason !== "string") return invalidParams();
+	const tags = stringMap(p.tags);
+	if (p.tags !== undefined && p.tags !== null && !tags) return invalidParams();
+	const threadId = feedbackThreadId(p, context);
+	if (!threadId) return invalidParams();
+	const sessionFile = feedbackSessionFile(threadId, context);
+	if (!sessionFile) return notFound();
+	return await withPersistedFileLock(sessionFile, async () => {
+		let entries: FileEntry[];
+		try {
+			entries = await loadEntriesFromFile(sessionFile);
+		} catch {
+			return notFound();
+		}
+		const header = entries.find(entry => entry.type === "session");
+		if (!header || header.id !== threadId) return notFound();
+		let session: SessionManager | undefined;
+		try {
+			session = await SessionManager.open(sessionFile);
+			session.appendCustomEntry("app-server:feedback/upload", {
+				threadId,
+				classification: classification.trim(),
+				...(typeof p.reason === "string" && p.reason.trim().length > 0 ? { reason: p.reason.trim() } : {}),
+				includeLogs: false,
+				...(tags ? { tags } : {}),
+			});
+			return { ok: true, result: { threadId } };
+		} catch {
+			return { ok: false, errorKey: "internalError" };
+		} finally {
+			await session?.close().catch(() => undefined);
+		}
+	});
+};
+
 export const goalsReviewHandlers: Record<string, MethodHandler> = {
 	"thread/goal/get": threadGoalGetHandler,
 	"thread/goal/set": threadGoalSetHandler,
 	"thread/goal/clear": threadGoalClearHandler,
+	"review/start": reviewStartHandler,
+	"feedback/upload": feedbackUploadHandler,
 };

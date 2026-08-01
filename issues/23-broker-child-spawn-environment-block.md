@@ -1,12 +1,32 @@
-# 23 — sandbox-blocked broker child spawn (environment block, not a code defect)
+# 23 — sandbox-blocked broker child spawn (RESOLVED: the block was not real)
 
 - **Site:** `packages/coding-agent/src/sdk/broker/lifecycle.ts` — `spawn_failed` at
   `:3546`/`:3649`, then `terminal_uncertain` from post-child persistence
   verification at `:3659`
 - **Owner stage:** Stage 12 residual defect triage (durable goal G010)
-- **Disposition:** ACCEPT AS ENVIRONMENT BLOCK — explicitly labelled, never silently skipped
+- **Disposition:** SUPERSEDED — re-probed and disproven; a real broker child does
+  spawn and persist its endpoint in this environment
 
-## What is blocked
+
+## Resolution (2026-08-01)
+
+The environment-block claim below was re-tested directly rather than trusted. A probe
+that drives the real broker lifecycle returned a ready endpoint
+(`{"verdict":"ready","endpoint":{"url":"ws://127.0.0.1:57326","pid":23549,...}}`, exit
+code 0), so process spawn and endpoint persistence are both permitted here.
+
+The `spawn_failed` symptom had a different cause: the authority-gated test model
+provider failed registration (`Provider gjc-app-server-stub: "baseUrl" is required when
+defining custom models.`), which aborted child startup before readiness. With
+`streamSimple` providers exempted from the base-URL/credential requirement and the
+child's model selection fixed, `gjc app-server --stdio` now drives a real broker child
+through a complete turn.
+
+The original record is kept below for provenance.
+
+## Original record (disproven)
+
+### What is blocked
 
 Spawning a real broker child requires process-spawn and endpoint-persistence
 permissions the sandboxed execution environment does not grant. The lifecycle code
@@ -16,7 +36,7 @@ cleanup, it degrades to `terminal_uncertain` ("Lifecycle startup cleanup could n
 be proven; retained artifacts require reconciliation.") rather than claiming
 success.
 
-## Why this is not reclassified as a code defect
+### Why this is not reclassified as a code defect
 
 The failure is produced by the environment denying the spawn, not by a wrong branch
 in the lifecycle state machine: with the spawn denied there is no child endpoint to
@@ -29,7 +49,7 @@ Reclassifying this as FIX would require asserting that a real broker child can b
 spawned here, which is false in this environment. Per the Stage 12 contract, any
 reclassification requires an independent triage verdict.
 
-## Why it is not silently skipped
+### Why it is not silently skipped
 
 No `test.skip` was added for this. The limitation is recorded here and is visible in
 the code paths named above; the app-server acceptance tiers that genuinely need a
@@ -38,7 +58,7 @@ live child use the production in-process child bridge
 of the sandbox-blocked broker spawn, and the real-client gate exercises that path
 end to end.
 
-## What would close it
+### What would close it
 
 A host environment that permits child process spawn plus endpoint state
 persistence, after which the broker-child startup path can be exercised for real

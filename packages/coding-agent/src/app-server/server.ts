@@ -108,18 +108,14 @@ const turnStartUnsupportedOverrides = [
 	"environments",
 	"cwd",
 	"runtimeWorkspaceRoots",
-	"approvalPolicy",
 	"approvalsReviewer",
 	"sandbox",
-	"sandboxPolicy",
 	"permissions",
-	"model",
 	"serviceTier",
 	"effort",
 	"summary",
 	"personality",
 	"outputSchema",
-	"collaborationMode",
 	"multiAgentMode",
 ] as const;
 
@@ -147,8 +143,18 @@ function hasNonNullProperty(record: Record<string, unknown>, key: string): boole
 	return Object.hasOwn(record, key) && record[key] !== undefined && record[key] !== null;
 }
 
+function supportsTurnStartDefaults(params: Record<string, unknown>): boolean {
+	if (hasNonNullProperty(params, "approvalPolicy") && params.approvalPolicy !== "never") return false;
+	if (hasNonNullProperty(params, "sandboxPolicy")) {
+		const policy = params.sandboxPolicy;
+		if (!isRecord(policy) || policy.type !== "dangerFullAccess") return false;
+	}
+	return true;
+}
+
 function supportsTurnStart(params: Record<string, unknown>): boolean {
 	if (turnStartUnsupportedOverrides.some(key => hasNonNullProperty(params, key))) return false;
+	if (!supportsTurnStartDefaults(params)) return false;
 	if (!Array.isArray(params.input) || params.input.length === 0) return false;
 	return params.input.every(item => {
 		if (!isRecord(item) || item.type !== "text") return false;
@@ -242,6 +248,10 @@ async function handleTurnStart(
 			} catch {
 				// Preserve the original controller or validation failure.
 			}
+		}
+		if (turnControllerCode(error) === "model_override") {
+			const message = error instanceof Error ? error.message : "Turn model override could not be honoured.";
+			return { response: serializeError(id, "invalidParams", transport, message) ?? undefined };
 		}
 		return { response: serializeError(id, turnControllerErrorKey(error), transport) ?? undefined };
 	}

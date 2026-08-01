@@ -143,6 +143,7 @@ function registerBrokerOwner(
 ): BrokerOwner {
 	const incarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
 	let state: "starting" | "ready" | "cleanup-unverified" = "starting";
+	let stopping: Promise<void> | undefined;
 	const matches = (discovery: BrokerDiscovery | null): boolean =>
 		Boolean(
 			discovery &&
@@ -152,14 +153,23 @@ function registerBrokerOwner(
 				discovery.incarnation === incarnation,
 		);
 	const owner: BrokerOwner = {
-		async stop(): Promise<void> {
-			try {
-				await reapSpawnedBroker(child, timing);
-			} catch (error) {
-				state = "cleanup-unverified";
+		stop(): Promise<void> {
+			stopping ??= (async () => {
+				try {
+					await reapSpawnedBroker(child, timing);
+				} catch (error) {
+					state = "cleanup-unverified";
+					throw error;
+				}
+				if (owners.get(agentDir) === owner) owners.delete(agentDir);
+			})().catch(error => {
+				// Retain the owner after an unverified reap, but allow a later exact-owner
+				// attempt to retry the signal sequence. Concurrent callers still share the
+				// in-flight attempt through `stopping`.
+				stopping = undefined;
 				throw error;
-			}
-			if (owners.get(agentDir) === owner) owners.delete(agentDir);
+			});
+			return stopping;
 		},
 		canReuse(discovery): boolean {
 			return state === "ready" && matches(discovery);
@@ -371,6 +381,10 @@ export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBroker
 /** Test hook: returns a stop handle for the detached broker this process spawned. */
 export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 	return owners.get(agentDir);
+}
+/** Stop the broker process started by this process for an agent directory, if any. */
+export async function stopOwnedBroker(agentDir: string): Promise<void> {
+	await owners.get(agentDir)?.stop();
 }
 /** Test hook: drives the detached-broker reap on a controllable child surface. */
 export function reapSpawnedBrokerForTest(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {

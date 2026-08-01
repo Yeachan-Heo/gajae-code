@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
-import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, getSessionsDir, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
 	isModelProfileError,
@@ -58,12 +58,12 @@ import {
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 
 export {
+	endpointIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 };
-export { endpointIncarnation };
 
 const READY_TIMEOUT_MS = 10_000;
 const MIN_READY_TIMEOUT_MS = 4_000;
@@ -228,6 +228,8 @@ export interface SessionLifecycleLaunchRequest {
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
 	/** Broker-issued effect marker which the child echoes only after host readiness. */
 	effectMarker?: string;
+	/** Exact provider/model selector requested by an app-server child. */
+	modelId?: string;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
 	worktree?: SessionLifecycleWorktreeTarget;
@@ -365,6 +367,7 @@ export function readSessionLifecycleLaunchRequest(
 		(request.sessionIdentity !== undefined && !isSessionLifecycleTranscriptIdentity(request.sessionIdentity)) ||
 		(request.effectMarker !== undefined &&
 			(typeof request.effectMarker !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(request.effectMarker))) ||
+		(request.modelId !== undefined && (typeof request.modelId !== "string" || !request.modelId.trim())) ||
 		(request.modelPreset !== undefined && (typeof request.modelPreset !== "string" || !request.modelPreset)) ||
 		(request.mcpServers !== undefined && !isSessionLifecycleMcpServers(request.mcpServers)) ||
 		!hasValidLifecycleDeadlines(
@@ -400,6 +403,7 @@ type SessionLaunch = {
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
+	modelId?: string;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
 	worktree?: SessionLifecycleWorktreeTarget;
@@ -2468,6 +2472,9 @@ async function launchInput(
 	const requested = sessionId(input);
 	if (requested !== undefined && !isCanonicalSessionId(requested))
 		return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (input.modelId !== undefined && (typeof input.modelId !== "string" || !input.modelId.trim()))
+		return fail("invalid_input", "modelId must be a non-empty provider/model selector.");
+	const modelId = text(input.modelId);
 	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
 		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
 	const modelPreset = text(input.modelPreset);
@@ -2491,6 +2498,7 @@ async function launchInput(
 			id: randomUUID(),
 			cwd,
 			root: resolvedRoot,
+			modelId,
 			modelPreset,
 			mcpServers,
 			worktree,
@@ -2509,6 +2517,7 @@ async function launchInput(
 			root: resolvedRoot,
 			sessionPath: saved.path,
 			sessionIdentity: saved.identity,
+			modelId,
 			modelPreset,
 			mcpServers,
 			worktree,
@@ -2531,6 +2540,7 @@ async function launchInput(
 		sourceSessionPath: source.path,
 		sourceSessionIdentity: source.identity,
 		sourceCwd,
+		modelId,
 		modelPreset,
 		mcpServers,
 		worktree,
@@ -2543,6 +2553,7 @@ type ValidatedDelete = {
 	target: VerifiedSessionDeleteTarget;
 	metadataRoot: string;
 	transcriptParentIdentity: { dev: string; ino: string };
+	evidenceSessionsRoot?: string;
 };
 function cleanupIdentity(
 	identity: BrokerCleanupEvidence["transcriptIdentity"],
@@ -2702,10 +2713,16 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 					fsSync.existsSync(plannedTranscriptPath)
 				? plannedTranscriptPath
 				: undefined;
+	let canonicalSessionsRoot = cleanup.sessionsRoot;
+	try {
+		canonicalSessionsRoot = fsSync.realpathSync.native(cleanup.sessionsRoot);
+	} catch {
+		canonicalSessionsRoot = path.resolve(cleanup.sessionsRoot);
+	}
 	return {
 		storage: new FileSessionStorage(),
 		target: {
-			sessionsRoot: cleanup.sessionsRoot,
+			sessionsRoot: canonicalSessionsRoot,
 			transcriptPath: cleanup.transcriptPath,
 			sessionId: cleanup.sessionId,
 			cwd: cleanup.cwd,
@@ -2754,6 +2771,7 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 		},
 		metadataRoot: cleanup.metadataRoot,
 		transcriptParentIdentity: cleanup.transcriptParentIdentity!,
+		evidenceSessionsRoot: cleanup.sessionsRoot,
 	};
 }
 
@@ -2884,6 +2902,7 @@ async function validateDeletePath(
 			dev: transcriptParentStat.dev.toString(),
 			ino: transcriptParentStat.ino.toString(),
 		},
+		evidenceSessionsRoot: getSessionsDir(broker.settings.agentDir),
 	};
 }
 export type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
@@ -2894,8 +2913,6 @@ export type CloseRecord = {
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
 };
-
-
 
 function requestedCloseAuthority(input: Input): { authority: CloseAuthority | undefined } | { error: BrokerResponse } {
 	const endpointGeneration = input.endpointGeneration;
@@ -3135,6 +3152,7 @@ async function executeLifecycleResponse(
 			...(launch.sourceCwd ? { sourceCwd: launch.sourceCwd } : {}),
 			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
 			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
+			...(launch.modelId ? { modelId: launch.modelId } : {}),
 			...(launch.modelPreset ? { modelPreset: launch.modelPreset } : {}),
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
@@ -3145,10 +3163,13 @@ async function executeLifecycleResponse(
 		try {
 			const cmd = command(broker);
 			const inheritedEnv = "kind" in cmd ? cmd.env : process.env;
-			const { GJC_TEST_MODEL_PROVIDER: _testModelProvider, GJC_TEST_MODEL_PROVIDER_AUTHORITY: _testModelProviderAuthority, ...childEnv } =
-				inheritedEnv;
+			const {
+				GJC_TEST_MODEL_PROVIDER: _testModelProvider,
+				GJC_TEST_MODEL_PROVIDER_AUTHORITY: _testModelProviderAuthority,
+				...childEnv
+			} = inheritedEnv;
 			const testProviderEnv =
-				process.env.GJC_TEST_MODEL_PROVIDER_AUTHORITY === "1"
+				inheritedEnv.GJC_TEST_MODEL_PROVIDER_AUTHORITY === "1"
 					? {
 							GJC_TEST_MODEL_PROVIDER: inheritedEnv.GJC_TEST_MODEL_PROVIDER,
 							GJC_TEST_MODEL_PROVIDER_AUTHORITY: "1",
@@ -3529,7 +3550,7 @@ async function executeLifecycleResponse(
 			cleanupReceiptVersion: 1,
 			phase: cleanupTarget.artifactsRemoved ? "transcript" : "artifacts",
 			sessionId: cleanupTarget.sessionId,
-			sessionsRoot: cleanupTarget.sessionsRoot,
+			sessionsRoot: validated.evidenceSessionsRoot ?? cleanupTarget.sessionsRoot,
 			transcriptPath: cleanupTarget.transcriptPath,
 			cwd: cleanupTarget.cwd,
 			...(cleanupTarget.artifactsRemoved ? { artifactsRemoved: true } : {}),
@@ -3935,7 +3956,7 @@ async function executeLifecycleResponse(
 					cleanupReceiptVersion: 1,
 					phase: deleted.phase,
 					sessionId: validated.target.sessionId,
-					sessionsRoot: validated.target.sessionsRoot,
+					sessionsRoot: validated.evidenceSessionsRoot ?? validated.target.sessionsRoot,
 					transcriptPath: validated.target.transcriptPath,
 					cwd: validated.target.cwd,
 					metadataRoot: validated.metadataRoot,

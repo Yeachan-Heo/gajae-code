@@ -1,17 +1,29 @@
 import { expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { AuthStorage } from "../../../session/auth-storage";
+import { experimentalValidators } from "../../protocol-source/schema-validators.generated";
 import { assertTranscript, type TranscriptHeader } from "./oracle-contract";
 
 const repoRoot = path.resolve(import.meta.dir, "../../../../../..");
 const appBundlePath = "/Applications/T3 Code (Alpha).app";
 const infoPlistPath = path.join(appBundlePath, "Contents/Info.plist");
 const serverBundlePath = path.join(appBundlePath, "Contents/Resources/app.asar.unpacked/apps/server/dist/bin.mjs");
-const expectedClientVersion = "0.0.28";
+const expectedClientVersion = "0.0.28"; // T3 app bundle version pinned by Info.plist.
+const expectedWireClientVersion = "0.1.0"; // T3 app-server initialize clientInfo.version pin.
 const expectedServerSha256 = "c69b9ebf8ddf0b30194616b49163bc5b6e3670be5549b81567b56f3dcd7aebd3";
 const nodeBinary = "/opt/homebrew/bin/node";
 const bunBinary = "/opt/homebrew/bin/bun";
@@ -150,6 +162,7 @@ function selectedClientProcess(records: Map<string, ProcessRecord>):
 			readonly malformedInbound: string[];
 	  }
 	| undefined {
+	let selected: SelectedClientProcess | undefined;
 	for (const record of records.values()) {
 		const outbound = decodeJsonLines(record.stdin);
 		const inbound = decodeJsonLines(record.stdout);
@@ -160,17 +173,100 @@ function selectedClientProcess(records: Map<string, ProcessRecord>):
 				isRecord(frame.params.clientInfo) &&
 				frame.params.clientInfo.version === expectedClientVersion,
 		);
-		if (initialize) {
-			return {
-				record,
-				outbound: outbound.frames,
-				inbound: inbound.frames,
-				malformedOutbound: outbound.malformed,
-				malformedInbound: inbound.malformed,
-			};
-		}
+		if (!initialize) continue;
+		if (selected) return undefined;
+		selected = {
+			record,
+			outbound: outbound.frames,
+			inbound: inbound.frames,
+			malformedOutbound: outbound.malformed,
+			malformedInbound: inbound.malformed,
+		};
 	}
-	return undefined;
+	return selected;
+}
+
+function initializeVersions(records: Map<string, ProcessRecord>): string[] {
+	const versions: string[] = [];
+	for (const record of records.values()) {
+		const initialize = decodeJsonLines(record.stdin).frames.find(frame => frame.method === "initialize");
+		const clientInfo = isRecord(initialize?.params) ? initialize.params.clientInfo : undefined;
+		if (isRecord(clientInfo) && typeof clientInfo.version === "string") versions.push(clientInfo.version);
+	}
+	return versions;
+}
+
+type SelectedClientProcess = NonNullable<ReturnType<typeof selectedClientProcess>>;
+
+function assertExperimentalInboundFrames(frames: readonly JsonObject[]): void {
+	for (const frame of frames) {
+		if (typeof frame.method !== "string") continue;
+		const isServerRequest = frame.id !== undefined && frame.result === undefined && frame.error === undefined;
+		const validator = isServerRequest
+			? experimentalValidators.serverRequestParams[frame.method]
+			: experimentalValidators.serverNotificationParams[frame.method];
+		expect(
+			validator,
+			`${isServerRequest ? "server request" : "server notification"} ${frame.method} has a validator`,
+		).toBeDefined();
+		expect(validator?.(frame.params), `${frame.method} params satisfy the experimental validator`).toBe(true);
+	}
+}
+
+function transcriptEvidence(
+	transcriptPath: string,
+	records: Map<string, ProcessRecord>,
+	selected: SelectedClientProcess | undefined,
+): JsonObject {
+	return {
+		rawTranscript: existsSync(transcriptPath) ? readFileSync(transcriptPath, "utf8") : "",
+		processCount: records.size,
+		observedOutboundMethods: selected?.outbound.map(frame => frame.method).filter(value => typeof value === "string"),
+		observedInboundMethods: selected?.inbound.map(frame => frame.method).filter(value => typeof value === "string"),
+		observedOutbound: selected?.outbound ?? [],
+		observedInbound: selected?.inbound ?? [],
+	};
+}
+
+function captureIsolatedLogs(root: string): Array<{ path: string; content: string }> {
+	const logs: Array<{ path: string; content: string }> = [];
+	const visit = (directory: string): void => {
+		if (!existsSync(directory)) return;
+		for (const entry of readdirSync(directory, { withFileTypes: true })) {
+			const entryPath = path.join(directory, entry.name);
+			if (entry.isDirectory()) {
+				visit(entryPath);
+				continue;
+			}
+			if (!entry.isFile() || !/(?:\.log|\.txt|\.jsonl)$/.test(entry.name)) continue;
+			try {
+				logs.push({ path: entryPath, content: readFileSync(entryPath, "utf8") });
+			} catch {
+				// Ignore non-text or concurrently removed files in the isolated temp root.
+			}
+		}
+	};
+	visit(root);
+	return logs;
+}
+
+function assertExperimentalOutboundFrames(frames: readonly JsonObject[]): void {
+	for (const frame of frames) {
+		if (typeof frame.method !== "string") continue;
+		const isClientRequest = frame.id !== undefined && frame.result === undefined && frame.error === undefined;
+		const validator = isClientRequest
+			? experimentalValidators.clientRequestParams[frame.method]
+			: experimentalValidators.clientNotificationParams[frame.method];
+		expect(
+			validator,
+			`${isClientRequest ? "client request" : "client notification"} ${frame.method} has a validator`,
+		).toBeDefined();
+		expect(validator?.(frame.params), `${frame.method} params satisfy the experimental validator`).toBe(true);
+	}
+}
+
+function nextNotificationIndex(frames: readonly JsonObject[], method: string, after: number): number {
+	return frames.findIndex((frame, index) => index > after && frame.id === undefined && frame.method === method);
 }
 
 function killPid(pid: number | undefined, signal: NodeJS.Signals): void {
@@ -249,16 +345,23 @@ test("G3b REAL-CLIENT gate: T3 Code 0.0.28 drives GJC through its spawn contract
 		GJC_AGENT_DIR: agentDir,
 		GJC_CODING_AGENT_DIR: agentDir,
 		PI_CODING_AGENT_DIR: agentDir,
+		GJC_TEST_MODEL_PROVIDER: path.join(
+			repoRoot,
+			"packages/coding-agent/src/app-server/__tests__/fixtures/stub-model-provider.ts",
+		),
+		GJC_TEST_MODEL_PROVIDER_AUTHORITY: "1",
 	};
 	const header: TranscriptHeader = {
 		gateId: "real-t3",
 		transportMode: "spawned-stdio",
 		executionMode: "real-broker-child",
-		profile: "stable",
+		profile: "experimental",
 		clientVersion: expectedClientVersion,
 	};
 	let server: ChildProcess | undefined;
 	let report: JsonObject;
+	let probeModelIdsObserved: string[] = [];
+	let probeResponsesValidated = false;
 	try {
 		writeFileSync(
 			shimPath,
@@ -272,7 +375,7 @@ const child = spawn(${JSON.stringify(bunBinary)}, [${JSON.stringify(path.join(re
   env: process.env,
   stdio: ["pipe", "pipe", "inherit"],
 });
-append("META " + JSON.stringify({ pid: process.pid, child: child.pid, argv: process.argv.slice(2), codexHome: process.env.CODEX_HOME }) + "\\n");
+append("META " + JSON.stringify({ pid: process.pid, child: child.pid, argv: process.argv.slice(2), codexHome: process.env.CODEX_HOME, agentDir: process.env.GJC_AGENT_DIR, testProvider: process.env.GJC_TEST_MODEL_PROVIDER, testProviderAuthority: process.env.GJC_TEST_MODEL_PROVIDER_AUTHORITY }) + "\\n");
 process.stdin.on("data", chunk => {
   append("I " + process.pid + " " + Buffer.from(chunk).toString("base64") + "\\n");
   child.stdin.write(chunk);
@@ -301,6 +404,36 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 						codex: { enabled: true, binaryPath: shimPath, homePath: codexHome },
 					},
 					textGenerationModelSelection: { instanceId: "codex", model: "gpt-5.4-mini" },
+				},
+				null,
+				2,
+			),
+			"utf8",
+		);
+		const authStorage = await AuthStorage.create(path.join(agentDir, "auth.db"));
+		await authStorage.set("openai", { type: "api_key", key: "gjc-g3b-test-api-key" });
+		authStorage.close();
+		writeFileSync(
+			path.join(agentDir, "models.yml"),
+			JSON.stringify(
+				{
+					providers: {
+						"gjc-app-server-stub": {
+							baseUrl: "http://127.0.0.1:9/v1",
+							api: "openai-completions",
+							apiKey: "gjc-g3b-test-api-key",
+							models: [
+								{
+									id: "gjc-app-server-stub-model",
+									name: "GJC app-server stub",
+									reasoning: false,
+									input: ["text"],
+									contextWindow: 1_000_000,
+									maxTokens: 4_096,
+								},
+							],
+						},
+					},
 				},
 				null,
 				2,
@@ -353,7 +486,7 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 			throw new GateBlocked("T3 pairing token could not be exchanged for a bearer session.", { tokenPayload });
 		const bearer = tokenPayload.access_token;
 		const now = () => new Date().toISOString();
-		const modelSelection = { instanceId: "codex", model: "gpt-5.4-mini" };
+		const modelSelection = { instanceId: "codex", model: "gjc-app-server-stub/gjc-app-server-stub-model" };
 		const projectDispatch = await postJson(`http://127.0.0.1:${port}/api/orchestration/dispatch`, bearer, {
 			type: "project.create",
 			commandId: "real-t3-project-command",
@@ -394,35 +527,38 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 
 		let records = new Map<string, ProcessRecord>();
 		let selected = selectedClientProcess(records);
-		await waitUntil(
-			() => {
-				if (!existsSync(transcriptPath)) return false;
-				records = parseTranscript(readFileSync(transcriptPath, "utf8"));
-				selected = selectedClientProcess(records);
-				if (!selected) return false;
-				const initialize = selected.outbound.find(
-					frame =>
-						frame.method === "initialize" &&
-						frame.id !== undefined &&
-						isRecord(frame.params) &&
-						isRecord(frame.params.clientInfo) &&
-						frame.params.clientInfo.version === expectedClientVersion,
-				);
-				return (
-					initialize !== undefined && selected.inbound.some(frame => String(frame.id) === String(initialize.id))
-				);
-			},
-			frameTimeoutMs,
-			"the pinned T3 initialize handshake",
-		);
+		try {
+			await waitUntil(
+				() => {
+					if (!existsSync(transcriptPath)) return false;
+					records = parseTranscript(readFileSync(transcriptPath, "utf8"));
+					selected = selectedClientProcess(records);
+					if (!selected) return false;
+					const initialize = selected.outbound.find(
+						frame =>
+							frame.method === "initialize" &&
+							frame.id !== undefined &&
+							isRecord(frame.params) &&
+							isRecord(frame.params.clientInfo),
+					);
+					return (
+						initialize !== undefined && selected.inbound.some(frame => String(frame.id) === String(initialize.id))
+					);
+				},
+				frameTimeoutMs,
+				"the pinned T3 initialize handshake",
+			);
+		} catch (error) {
+			if (!(error instanceof GateBlocked)) throw error;
+			throw new GateBlocked(error.message, {
+				...error.evidence,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		}
 		if (!selected)
 			throw new GateBlocked("No pinned T3 initialize handshake was captured.", { records: records.size });
 		const initialize = selected.outbound.find(
-			frame =>
-				frame.method === "initialize" &&
-				isRecord(frame.params) &&
-				isRecord(frame.params.clientInfo) &&
-				frame.params.clientInfo.version === expectedClientVersion,
+			frame => frame.method === "initialize" && isRecord(frame.params) && isRecord(frame.params.clientInfo),
 		);
 		if (!initialize || initialize.id === undefined) throw new Error("Pinned initialize request was not captured.");
 		const initializeParams = initialize.params as JsonObject;
@@ -430,13 +566,115 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 		expect(initializeParams.clientInfo).toMatchObject({
 			name: "t3code_desktop",
 			title: "T3 Code Desktop",
-			version: expectedClientVersion,
 		});
+		expect((initializeParams.clientInfo as JsonObject).version).toBe(expectedClientVersion);
 		const initializeResponse = selected.inbound.find(frame => String(frame.id) === String(initialize.id));
 		expect(initializeResponse).toBeDefined();
 		expect(initializeResponse?.error).toBeUndefined();
 		expect(isRecord(initializeResponse?.result)).toBe(true);
 		expect(selected.outbound.some(frame => frame.method === "initialized")).toBe(true);
+		try {
+			await waitUntil(
+				() => {
+					records = parseTranscript(readFileSync(transcriptPath, "utf8"));
+					const versions = initializeVersions(records);
+					return (
+						versions.filter(version => version === expectedClientVersion).length === 1 &&
+						versions.filter(version => version === expectedWireClientVersion).length === 1
+					);
+				},
+				frameTimeoutMs,
+				"both pinned T3 provider-probe and turn-driving client versions",
+			);
+		} catch (error) {
+			if (!(error instanceof GateBlocked)) throw error;
+			throw new GateBlocked(error.message, {
+				...error.evidence,
+				initializeVersions: initializeVersions(records),
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		}
+		try {
+			await waitUntil(
+				() => {
+					records = parseTranscript(readFileSync(transcriptPath, "utf8"));
+					const probe = [...records.values()].find(record => {
+						const initializeFrame = decodeJsonLines(record.stdin).frames.find(
+							frame => frame.method === "initialize",
+						);
+						const clientInfo = isRecord(initializeFrame?.params) ? initializeFrame.params.clientInfo : undefined;
+						return isRecord(clientInfo) && clientInfo.version === expectedWireClientVersion;
+					});
+					if (!probe) return false;
+					const outbound = decodeJsonLines(probe.stdin).frames;
+					const inbound = decodeJsonLines(probe.stdout).frames;
+					const issued = outbound.filter(frame => frame.id !== undefined).map(frame => String(frame.id));
+					const answered = new Set(inbound.map(frame => String(frame.id)));
+					return issued.length > 0 && issued.every(id => answered.has(id));
+				},
+				frameTimeoutMs,
+				"T3 provider-probe requests",
+			);
+		} catch (error) {
+			if (!(error instanceof GateBlocked)) throw error;
+			throw new GateBlocked(error.message, {
+				...error.evidence,
+				initializeVersions: initializeVersions(records),
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		}
+		const probeRecord = [...records.values()].find(record => {
+			const initializeFrame = decodeJsonLines(record.stdin).frames.find(frame => frame.method === "initialize");
+			const clientInfo = isRecord(initializeFrame?.params) ? initializeFrame.params.clientInfo : undefined;
+			return isRecord(clientInfo) && clientInfo.version === expectedWireClientVersion;
+		});
+		if (!probeRecord)
+			throw new GateBlocked("The pinned 0.1.0 T3 provider-probe process was not captured.", {
+				initializeVersions: initializeVersions(records),
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		const probeOutbound = decodeJsonLines(probeRecord.stdin).frames;
+		const probeInbound = decodeJsonLines(probeRecord.stdout).frames;
+		const probeModelListRequest = probeOutbound.find(frame => frame.method === "model/list");
+		const probeModelListResponse = probeModelListRequest
+			? probeInbound.find(frame => String(frame.id) === String(probeModelListRequest.id))
+			: undefined;
+		const probeModelListResult = probeModelListResponse?.result;
+		if (
+			!isRecord(probeModelListResult) ||
+			!experimentalValidators.clientRequestResults["model/list"]?.(probeModelListResult)
+		)
+			throw new GateBlocked("T3 provider-probe model/list returned a malformed result.", {
+				probeModelListRequest,
+				probeModelListResponse,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		const probeModelIds = Array.isArray(probeModelListResult.data)
+			? probeModelListResult.data
+					.filter(isRecord)
+					.map(model => model.id)
+					.filter((id): id is string => typeof id === "string")
+			: [];
+		if (!probeModelIds.includes("gjc-app-server-stub/gjc-app-server-stub-model"))
+			throw new GateBlocked("T3 provider-probe model/list did not expose the configured stub model.", {
+				probeModelIds,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		const probeSkillsRequest = probeOutbound.find(frame => frame.method === "skills/list");
+		const probeSkillsResponse = probeSkillsRequest
+			? probeInbound.find(frame => String(frame.id) === String(probeSkillsRequest.id))
+			: undefined;
+		if (
+			!isRecord(probeSkillsResponse?.result) ||
+			!experimentalValidators.clientRequestResults["skills/list"]?.(probeSkillsResponse.result)
+		)
+			throw new GateBlocked("T3 provider-probe skills/list returned a malformed result.", {
+				probeSkillsRequest,
+				probeSkillsResponse,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		probeModelIdsObserved = probeModelIds;
+		probeResponsesValidated = true;
 		// Creating a real GJC session for a thread takes seconds, so let every issued request be
 		// answered before the transcript is asserted; a still-pending id would otherwise look like
 		// a protocol violation rather than a slow-but-correct answer.
@@ -452,6 +690,121 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 			frameTimeoutMs,
 			"GJC to answer every request the real client issued",
 		).catch(() => undefined);
+		if (!selected)
+			throw new GateBlocked(
+				"The pinned T3 process disappeared before the turn transcript was captured.",
+				transcriptEvidence(transcriptPath, records, selected),
+			);
+		expect(selected.record.argv?.[0]).toBe("app-server");
+		expect(selected.record.codexHome).toBe(codexHome);
+
+		const threadStart = selected.outbound.find(frame => frame.method === "thread/start");
+		if (!threadStart || threadStart.id === undefined)
+			throw new GateBlocked(
+				"T3 completed initialize but did not attempt thread/start.",
+				transcriptEvidence(transcriptPath, records, selected),
+			);
+		const threadStartResponse = selected.inbound.find(frame => String(frame.id) === String(threadStart.id));
+		if (!threadStartResponse)
+			throw new GateBlocked("GJC did not answer T3 thread/start within the gate timeout.", {
+				threadStart,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		if (isRecord(threadStartResponse.error))
+			throw new GateBlocked(`T3 thread/start failed: ${threadStartResponse.error.message ?? "unknown error"}.`, {
+				threadStartRequest: threadStart,
+				threadStartResponse,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		const threadResult = threadStartResponse.result;
+		expect(isRecord(threadResult)).toBe(true);
+		const thread = isRecord(threadResult) ? threadResult.thread : undefined;
+		expect(isRecord(thread)).toBe(true);
+		if (isRecord(thread) && thread.modelProvider !== "gjc-app-server-stub")
+			throw new GateBlocked("T3 thread/start selected a model provider other than the stub.", {
+				threadStartRequest: threadStart,
+				threadStartResponse,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+
+		let turnStart: JsonObject | undefined;
+		const turnRequestDeadline = Date.now() + frameTimeoutMs;
+		while (!turnStart && Date.now() < turnRequestDeadline) {
+			records = parseTranscript(readFileSync(transcriptPath, "utf8"));
+			selected = selectedClientProcess(records);
+			turnStart = selected?.outbound.find(frame => frame.method === "turn/start");
+			if (!turnStart) await sleep(100);
+		}
+		if (!selected || !turnStart || turnStart.id === undefined)
+			throw new GateBlocked(
+				"T3 did not issue turn/start after a successful thread/start.",
+				transcriptEvidence(transcriptPath, records, selected),
+			);
+
+		let terminalSequence: number[] | undefined;
+		const completionDeadline = Date.now() + frameTimeoutMs;
+		while (!terminalSequence && Date.now() < completionDeadline) {
+			records = parseTranscript(readFileSync(transcriptPath, "utf8"));
+			selected = selectedClientProcess(records);
+			if (!selected) {
+				await sleep(100);
+				continue;
+			}
+			const turnResponseIndex = selected.inbound.findIndex(frame => String(frame.id) === String(turnStart.id));
+			if (turnResponseIndex < 0) {
+				await sleep(100);
+				continue;
+			}
+			const turnStartResponse = selected.inbound[turnResponseIndex]!;
+			if (turnStartResponse.error !== undefined)
+				throw new GateBlocked("T3 turn/start returned an error instead of starting a turn.", {
+					turnStartRequest: turnStart,
+					turnStartResponse,
+					probeStubModelSeen: probeModelIdsObserved.includes("gjc-app-server-stub/gjc-app-server-stub-model"),
+					probeModelCount: probeModelIdsObserved.length,
+					probeResponsesValidated,
+					...transcriptEvidence(transcriptPath, records, selected),
+				});
+			const turnStartedIndex = nextNotificationIndex(selected.inbound, "turn/started", turnResponseIndex);
+			const itemStartedIndex = nextNotificationIndex(selected.inbound, "item/started", turnStartedIndex);
+			const deltaIndex = nextNotificationIndex(selected.inbound, "item/agentMessage/delta", itemStartedIndex);
+			const itemCompletedIndex = nextNotificationIndex(selected.inbound, "item/completed", deltaIndex);
+			const turnCompletedIndex = nextNotificationIndex(selected.inbound, "turn/completed", itemCompletedIndex);
+			const usageIndex = nextNotificationIndex(selected.inbound, "thread/tokenUsage/updated", turnCompletedIndex);
+			if (
+				[turnStartedIndex, itemStartedIndex, deltaIndex, itemCompletedIndex, turnCompletedIndex, usageIndex].every(
+					index => index >= 0,
+				)
+			) {
+				terminalSequence = [
+					turnResponseIndex,
+					turnStartedIndex,
+					itemStartedIndex,
+					deltaIndex,
+					itemCompletedIndex,
+					turnCompletedIndex,
+					usageIndex,
+				];
+				break;
+			}
+			await sleep(100);
+		}
+		if (!terminalSequence || !selected)
+			throw new GateBlocked("T3 did not complete the required turn sequence before the gate timeout.", {
+				expectedSequence: [
+					"turn/start response",
+					"turn/started",
+					"item/started",
+					"item/agentMessage/delta",
+					"item/completed",
+					"turn/completed",
+					"thread/tokenUsage/updated",
+				],
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+
+		assertExperimentalOutboundFrames(selected.outbound);
+		assertExperimentalInboundFrames(selected.inbound);
 		const requests = selected.outbound
 			.filter(frame => frame.id !== undefined && typeof frame.method === "string")
 			.map(frame => ({ id: frame.id as string | number, method: frame.method as string }));
@@ -461,77 +814,59 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 		expect(selected.malformedOutbound).toEqual([]);
 		expect(selected.malformedInbound).toEqual([]);
 		expect(assertTranscript({ header, requests, responses })).toEqual([]);
-		expect(selected.record.argv?.[0]).toBe("app-server");
-		expect(selected.record.codexHome).toBe(codexHome);
-
-		const threadStart = selected.outbound.find(frame => frame.method === "thread/start");
-		if (!threadStart || threadStart.id === undefined)
-			throw new GateBlocked("T3 completed initialize but did not attempt thread/start.", {
-				observedMethods: selected.outbound.map(frame => frame.method).filter(value => typeof value === "string"),
-			});
-		const threadStartResponse = selected.inbound.find(frame => String(frame.id) === String(threadStart.id));
-		if (!threadStartResponse)
-			throw new GateBlocked("GJC did not answer T3 thread/start within the gate timeout.", { threadStart });
-		if (
-			isRecord(threadStartResponse.error) &&
-			threadStartResponse.error.code === -32081 &&
-			threadStartResponse.error.message === "Not supported"
-		) {
-			report = {
-				status: "BLOCKED",
-				gateId: header.gateId,
-				clientVersion: expectedClientVersion,
-				appBundlePath,
-				serverBundleSha256: serverSha256,
-				header,
-				counts: {
-					projectDispatches: 1,
-					threadDispatches: 1,
-					turnDispatches: 1,
-					providerProcesses: records.size,
-					requests: requests.length,
-					responses: responses.length,
-				},
-				blocker: {
-					reason:
-						"GJC app-server stdio has no threadStartAdapter, so the real T3 client receives Not supported for thread/start and cannot issue turn/start.",
-					evidence: { threadStartRequest: threadStart, threadStartResponse, turnStartObserved: false },
-					unblockSteps: [
-						"Launch GJC app-server with a real threadStartAdapter/child bridge (not the stdio runtime default).",
-						"Rerun this gate and require T3 to emit turn/start and receive its completion notifications.",
-					],
-				},
-			};
-		} else {
-			await waitUntil(
-				() => {
-					records = parseTranscript(readFileSync(transcriptPath, "utf8"));
-					selected = selectedClientProcess(records);
-					return selected?.outbound.some(frame => frame.method === "turn/start") === true;
-				},
-				frameTimeoutMs,
-				"T3 turn/start",
-			);
-			report = {
-				status: "PASSED",
-				gateId: header.gateId,
-				clientVersion: expectedClientVersion,
-				appBundlePath,
-				serverBundleSha256: serverSha256,
-				header,
-				counts: { projectDispatches: 1, threadDispatches: 1, turnDispatches: 1 },
-			};
+		const completedTurnFrame = selected.inbound[terminalSequence[5]!];
+		expect(isRecord(completedTurnFrame?.params)).toBe(true);
+		const completedTurn = isRecord(completedTurnFrame?.params) ? completedTurnFrame.params.turn : undefined;
+		expect(isRecord(completedTurn)).toBe(true);
+		if (isRecord(completedTurn)) {
+			expect(completedTurn.id).toBeDefined();
+			expect(completedTurn.status).toBe("completed");
 		}
+		if (isRecord(completedTurn)) {
+			const tamperedTurn = { ...completedTurn };
+			delete tamperedTurn.id;
+			const validateTurnCompleted = experimentalValidators.serverNotificationParams["turn/completed"];
+			expect(validateTurnCompleted?.({ ...(completedTurnFrame?.params as JsonObject), turn: tamperedTurn })).toBe(
+				false,
+			);
+		}
+		const deltaFrames = selected.inbound.filter(frame => frame.method === "item/agentMessage/delta");
+		expect(deltaFrames.length).toBeGreaterThan(0);
+		expect(deltaFrames.map(frame => (isRecord(frame.params) ? frame.params.delta : undefined))).toEqual(
+			expect.arrayContaining(["Stub ", "response."]),
+		);
+		report = {
+			status: "PASSED",
+			gateId: header.gateId,
+			clientVersion: expectedClientVersion,
+			wireClientVersion: expectedWireClientVersion,
+			appBundlePath,
+			serverBundleSha256: serverSha256,
+			header,
+			counts: {
+				projectDispatches: 1,
+				threadDispatches: 1,
+				turnDispatches: 1,
+				providerProcesses: records.size,
+				requests: requests.length,
+				responses: responses.length,
+			},
+			terminalSequence: terminalSequence.map(index => selected!.inbound[index]?.method ?? "turn/start response"),
+		};
 	} catch (error) {
 		if (!(error instanceof GateBlocked)) throw error;
 		report = {
 			status: "BLOCKED",
 			gateId: header.gateId,
 			clientVersion: expectedClientVersion,
+			wireClientVersion: expectedWireClientVersion,
 			appBundlePath,
 			serverBundleSha256: serverSha256,
 			header,
-			blocker: { reason: error.message, evidence: error.evidence },
+			blocker: {
+				reason: error.message,
+				evidence: { ...error.evidence, isolatedCodexHomeLogs: captureIsolatedLogs(codexHome) },
+			},
 		};
 	} finally {
 		await terminate(server);
@@ -551,8 +886,9 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 		rmSync(tempRoot, { recursive: true, force: true });
 	}
 	console.log(
-		`G3b REAL-CLIENT ${report.status}: version=${expectedClientVersion} bin.mjs.sha256=${serverSha256} ` +
-			`${JSON.stringify(report.blocker ?? { evidence: "turn/start observed" })}`,
+		`G3b REAL-CLIENT ${report.status}: version=${expectedClientVersion} wireClientVersion=${expectedWireClientVersion} ` +
+			`bin.mjs.sha256=${serverSha256} header=${JSON.stringify(header)} ` +
+			`${JSON.stringify(report.blocker ?? { evidence: "completed turn terminal sequence" })}`,
 	);
 	expect(report.status === "PASSED" || report.status === "BLOCKED").toBe(true);
 }, 240_000);

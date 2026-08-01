@@ -210,14 +210,15 @@ export default class AppServer extends Command {
 			});
 			process.stderr.write(`app-server: ws:// listening on ${host}:${port}\n`);
 			return new Promise(resolve => {
-				process.on("SIGTERM", () => {
+				let shuttingDown = false;
+				const shutdown = (): void => {
+					if (shuttingDown) return;
+					shuttingDown = true;
 					wsServer.stop();
-					resolve();
-				});
-				process.on("SIGINT", () => {
-					wsServer.stop();
-					resolve();
-				});
+					void runtime.close().then(resolve, resolve);
+				};
+				process.on("SIGTERM", shutdown);
+				process.on("SIGINT", shutdown);
 			});
 		}
 		// unix:// — same WebSocket-over-Unix semantics.
@@ -275,14 +276,15 @@ export default class AppServer extends Command {
 			});
 			process.stderr.write(`app-server: unix:// listening on ${socketPath}\n`);
 			return new Promise(resolve => {
-				process.on("SIGTERM", () => {
+				let shuttingDown = false;
+				const shutdown = (): void => {
+					if (shuttingDown) return;
+					shuttingDown = true;
 					wsServer.stop();
-					resolve();
-				});
-				process.on("SIGINT", () => {
-					wsServer.stop();
-					resolve();
-				});
+					void runtime.close().then(resolve, resolve);
+				};
+				process.on("SIGTERM", shutdown);
+				process.on("SIGINT", shutdown);
 			});
 		}
 	}

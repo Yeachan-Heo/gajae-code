@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ThreadRuntimeManager, type EndpointAuthority } from "../../thread-runtime/thread-runtime-manager";
+import { type EndpointAuthority, ThreadRuntimeManager } from "../../thread-runtime/thread-runtime-manager";
 
 const authority = (gen: number): EndpointAuthority => ({
 	endpointGeneration: gen,
@@ -141,7 +141,9 @@ test("terminate: throws on attached ownership (must use detach)", () => {
 test("closeOwned callback: invoked on LRU eviction and terminate with the captured authority", () => {
 	const closed: Array<{ id: string; auth?: EndpointAuthority }> = [];
 	const m = new ThreadRuntimeManager({ maxLoadedThreads: 1, idleTtlMs: 0 });
-	m.onCloseOwned((id, _ownership, auth) => { closed.push({ id, auth }); });
+	m.onCloseOwned((id, _ownership, auth) => {
+		closed.push({ id, auth });
+	});
 	m.register("t1", "spawned", authority(1));
 	// Evict t1 via capacity pressure.
 	m.register("t2", "spawned", authority(2));
@@ -154,7 +156,9 @@ test("closeOwned callback: invoked on LRU eviction and terminate with the captur
 test("shutdown: detaches attached and terminates spawned (callback fires for spawned only)", () => {
 	const closed: string[] = [];
 	const m = new ThreadRuntimeManager();
-	m.onCloseOwned((id) => { closed.push(id); });
+	m.onCloseOwned(id => {
+		closed.push(id);
+	});
 	m.register("t1", "spawned", authority(1));
 	m.register("t2", "attached", undefined);
 	m.register("t3", "spawned", authority(3));
@@ -165,6 +169,31 @@ test("shutdown: detaches attached and terminates spawned (callback fires for spa
 	expect(m.loadedCount).toBe(0);
 });
 
+test("shutdown: waits for async child closures and remains idempotent", async () => {
+	const m = new ThreadRuntimeManager();
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let closeCalls = 0;
+	m.onCloseOwned(async () => {
+		started.resolve();
+		await release.promise;
+		closeCalls += 1;
+	});
+	m.register("t1", "spawned", authority(1));
+	m.shutdown();
+	await started.promise;
+	let settled = false;
+	const waiting = m.waitForClosures().then(() => {
+		settled = true;
+	});
+	await Bun.sleep(0);
+	expect(settled).toBe(false);
+	release.resolve();
+	await waiting;
+	m.shutdown();
+	await m.waitForClosures();
+	expect(closeCalls).toBe(1);
+});
 test("attached threads are never evicted by LRU (only owned)", () => {
 	const m = new ThreadRuntimeManager({ maxLoadedThreads: 1, idleTtlMs: 0 });
 	m.register("t1", "attached", undefined);

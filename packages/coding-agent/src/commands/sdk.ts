@@ -3,8 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
-import type { ProviderConfigInput } from "../config/model-registry";
 import type { Args as ParsedArgs } from "../cli/args";
+import type { ModelRegistry, ProviderConfigInput } from "../config/model-registry";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
@@ -55,7 +55,17 @@ export async function registerTestModelProvider(
 		streamSimple: provider.streamSimple as ProviderConfigInput["streamSimple"],
 		// Deep-copy so registry-side mutation can never corrupt the imported module's live exports.
 		models: structuredClone(provider.models) as ProviderConfigInput["models"],
+		apiKey: "test",
 	});
+}
+
+function requestedLifecycleModel(
+	session: { modelRegistry: ModelRegistry },
+	selector: string,
+): ReturnType<ModelRegistry["find"]> {
+	const slash = selector.indexOf("/");
+	if (slash > 0) return session.modelRegistry.find(selector.slice(0, slash), selector.slice(slash + 1));
+	return session.modelRegistry.getAll().find(model => model.id === selector);
 }
 
 import { runSdkServe } from "../sdk/transport/serve-cli";
@@ -78,6 +88,7 @@ export async function lifecycleArgs(
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
+		...(request.modelId ? { model: request.modelId } : {}),
 		...(request.operation === "session.resume" ? { resume: request.sessionPath } : {}),
 		...(request.modelPreset ? { mpreset: request.modelPreset } : {}),
 		...(request.operation === "session.fork"
@@ -448,6 +459,7 @@ export async function runSessionHost(
 
 		try {
 			created = await createLifecycleAgentSession({
+				modelPattern: opened.parsed.model,
 				cwd,
 				agentDir,
 				sessionManager: opened.sessionManager,
@@ -542,6 +554,17 @@ export async function runSessionHost(
 	try {
 		await beforeCutoff(registerTestModelProvider(session));
 		throwIfCutoff();
+		if (parsed.model && !session.model) {
+			const requested = requestedLifecycleModel(session, parsed.model);
+			if (!requested)
+				throw new Error(`Requested model "${parsed.model}" was not found after provider registration.`);
+			await beforeCutoff(
+				session.setModelTemporary(requested as never, undefined, {
+					persistAsSessionDefault: true,
+					cause: "startup-override",
+				}),
+			);
+		}
 		const modelProfileStartup =
 			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
 				? new Promise<void>(() => {})
@@ -553,6 +576,18 @@ export async function runSessionHost(
 					});
 		await beforeCutoff(modelProfileStartup);
 		throwIfCutoff();
+		await beforeCutoff(registerTestModelProvider(session));
+		if (parsed.model) {
+			const requested = requestedLifecycleModel(session, parsed.model);
+			if (!requested)
+				throw new Error(`Requested model "${parsed.model}" was not found after provider registration.`);
+			await beforeCutoff(
+				session.setModelTemporary(requested as never, undefined, {
+					persistAsSessionDefault: true,
+					cause: "startup-override",
+				}),
+			);
+		}
 		await beforeCutoff(
 			initializeExtensions(session, {
 				reportSendError: () => {},

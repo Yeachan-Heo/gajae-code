@@ -30,7 +30,8 @@ export type TurnControllerErrorCode =
 	| "idempotency_conflict"
 	| "internal"
 	| "projection_corrupt"
-	| "recovery_required";
+	| "recovery_required"
+	| "model_override";
 
 export class TurnControllerError extends Error {
 	readonly code: TurnControllerErrorCode;
@@ -155,6 +156,7 @@ interface ActiveTurn {
 	barrierDelivered: boolean;
 	rolledBack: boolean;
 	terminalCommitted: boolean;
+	modelOverrideRestore?: () => Promise<void>;
 	failure?: TurnControllerError;
 	processingTail: Promise<void>;
 	responseDeliveredPromise?: Promise<void>;
@@ -237,6 +239,44 @@ function textFromInput(params: Readonly<Record<string, unknown>>): string | unde
 	if (isRecord(input) && input.type === "text" && typeof input.text === "string" && input.text.trim().length > 0)
 		return input.text;
 	return undefined;
+}
+
+function turnModelOverride(params: Readonly<Record<string, unknown>>): string | undefined {
+	const topLevel = params.model;
+	const topLevelModel =
+		topLevel === undefined || topLevel === null
+			? undefined
+			: nonEmptyString(topLevel)
+				? topLevel
+				: (() => {
+						throw new TurnControllerError(
+							"model_override",
+							"Turn model override must be a non-empty model reference.",
+						);
+					})();
+	const collaborationMode = params.collaborationMode;
+	if (collaborationMode === undefined || collaborationMode === null) return topLevelModel;
+	if (!isRecord(collaborationMode))
+		throw new TurnControllerError("model_override", "Turn collaborationMode must be an object.");
+	const settings = collaborationMode.settings;
+	if (settings === undefined || settings === null) return topLevelModel;
+	if (!isRecord(settings))
+		throw new TurnControllerError("model_override", "Turn collaborationMode.settings must be an object.");
+	const nestedModel = settings.model;
+	const nestedModelValue =
+		nestedModel === undefined || nestedModel === null
+			? undefined
+			: nonEmptyString(nestedModel)
+				? nestedModel
+				: (() => {
+						throw new TurnControllerError(
+							"model_override",
+							"Turn collaborationMode.settings.model must be a non-empty model reference.",
+						);
+					})();
+	if (topLevelModel !== undefined && nestedModelValue !== undefined && topLevelModel !== nestedModelValue)
+		throw new TurnControllerError("model_override", "Turn model and collaborationMode model overrides must match.");
+	return topLevelModel ?? nestedModelValue;
 }
 
 function identityFrom(record: Record<string, unknown>, field: "commandId" | "turnId"): string | undefined {
@@ -539,6 +579,25 @@ export class TurnController {
 		const turnId = this.#idFactory();
 		// Persist the app-server turn id alongside the child identities for recovery.
 		if (!nonEmptyString(turnId)) throw new TurnControllerError("internal", "Turn id factory returned an empty id.");
+		const requestedModel = turnModelOverride(input.params);
+		let modelOverrideRestore: (() => Promise<void>) | undefined;
+		if (requestedModel !== undefined) {
+			if (!managed.client.setModelForTurn)
+				throw new TurnControllerError(
+					"model_override",
+					`Model override "${requestedModel}" cannot be honoured by this child runtime.`,
+				);
+			try {
+				modelOverrideRestore = await managed.client.setModelForTurn(requestedModel);
+			} catch (error) {
+				if (error instanceof TurnControllerError) throw error;
+				throw new TurnControllerError(
+					"model_override",
+					errorMessage(error, `Model override "${requestedModel}" could not be resolved.`),
+					error,
+				);
+			}
+		}
 		const startedAtMs = this.#clock();
 		const turn = initialTurn(turnId, startedAtMs);
 		const projection = new TurnProjectionReducer();
@@ -557,6 +616,7 @@ export class TurnController {
 			rolledBack: false,
 			terminalCommitted: false,
 			processingTail: Promise.resolve(),
+			modelOverrideRestore,
 		};
 		this.#active.set(input.threadId, active);
 		this.#lastStates.set(input.threadId, "submitting");
@@ -580,13 +640,13 @@ export class TurnController {
 		} catch (error) {
 			const preflightCode = classifyPreflightCode(error);
 			if (preflightCode !== undefined) {
-				this.#discardBeforeAcceptance(active);
+				await this.#discardBeforeAcceptance(active);
 				throw new TurnControllerError(preflightCode, errorMessage(error, `turn.prompt ${preflightCode}.`), error);
 			}
 			// A definite rejection proves no child accepted the prompt and no mapping was persisted,
 			// so the admission slot must be released instead of wedging the thread in recovery.
 			if (!isUncertainAckFailure(error)) {
-				this.#discardBeforeAcceptance(active);
+				await this.#discardBeforeAcceptance(active);
 				throw new TurnControllerError("internal", errorMessage(error, "turn.prompt failed."), error);
 			}
 			const reconciled = await this.#reconcileLostAck(active);
@@ -829,7 +889,11 @@ export class TurnController {
 				await this.#emit(usage);
 			}
 		} finally {
-			this.#disposeActive(active);
+			try {
+				await this.#restoreModelOverride(active);
+			} finally {
+				this.#disposeActive(active);
+			}
 		}
 	}
 
@@ -925,10 +989,29 @@ export class TurnController {
 		active.bufferedFrames.length = 0;
 	}
 
-	#discardBeforeAcceptance(active: ActiveTurn): void {
-		active.rolledBack = true;
-		active.state = "rolled_back";
-		this.#disposeActive(active);
+	async #restoreModelOverride(active: ActiveTurn): Promise<void> {
+		const restore = active.modelOverrideRestore;
+		if (!restore) return;
+		active.modelOverrideRestore = undefined;
+		try {
+			await restore();
+		} catch (error) {
+			throw new TurnControllerError(
+				"recovery_required",
+				errorMessage(error, "The per-turn model override could not be restored."),
+				error,
+			);
+		}
+	}
+
+	async #discardBeforeAcceptance(active: ActiveTurn): Promise<void> {
+		try {
+			await this.#restoreModelOverride(active);
+		} finally {
+			active.rolledBack = true;
+			active.state = "rolled_back";
+			this.#disposeActive(active);
+		}
 	}
 
 	#disposeActive(active: ActiveTurn): void {

@@ -35,6 +35,7 @@ export interface AppServerRuntime {
 	readonly registry: HandlerRegistry;
 	readonly subscriptions: ThreadSubscriptionIndex;
 	readonly broker: ServerRequestBroker;
+	close(): Promise<void>;
 	createConnection(
 		writer: AppServerWriter,
 		transport?: AppServerTransport,
@@ -60,6 +61,7 @@ class Runtime implements AppServerRuntime {
 	readonly #connectionRegistry = new ConnectionRegistry();
 	readonly #frameCodec: FrameCodecOptions | undefined;
 	readonly #threadStartAdapter: ChildBridgeOptions | undefined;
+	#closePromise: Promise<void> | undefined;
 	#nextConnectionId = 1;
 	readonly #serverNotificationStability = new Map<string, "stable" | "experimental">(
 		serverNotifications.map(({ method, stability }) => [method, stability]),
@@ -119,6 +121,18 @@ class Runtime implements AppServerRuntime {
 					}
 				: undefined;
 		registerBuiltinHandlers(this.registry);
+	}
+
+	close(): Promise<void> {
+		this.#closePromise ??= this.#close();
+		return this.#closePromise;
+	}
+
+	async #close(): Promise<void> {
+		this.manager.shutdown();
+		await this.manager.waitForClosures();
+		await this.#threadStartAdapter?.shutdown?.();
+		this.broker.shutdown();
 	}
 
 	createConnection(
@@ -410,9 +424,11 @@ class Connection implements AppServerConnection {
 	async #close(): Promise<void> {
 		this.#closed = true;
 		this.#runtime.removeConnection(this.id);
+		const runtimeClose = this.#transport === "stdio" ? this.#runtime.close() : undefined;
 		const queueClose = this.#queue.close();
 		await this.#inbound;
 		await queueClose;
+		await runtimeClose;
 	}
 }
 

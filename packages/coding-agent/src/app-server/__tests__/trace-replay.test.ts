@@ -186,6 +186,7 @@ async function replayStartupSequence(): Promise<Transcript> {
 			undefined,
 			"websocket",
 			registry,
+			{ accountAuthState: () => false },
 		);
 		if (step.type === "notification") {
 			expect(inbound.response, `${step.method} notification must not produce a response`).toBeUndefined();
@@ -195,13 +196,6 @@ async function replayStartupSequence(): Promise<Transcript> {
 	}
 
 	return { requests, responses };
-}
-
-function expectedNotSupported(response: JsonObject, id: number, method: string): void {
-	expect(response, `${method} is an honest unsupported answer`).toEqual({
-		id,
-		error: { code: -32081, message: "Not supported" },
-	});
 }
 
 function tamperRequiredIdentifier(transcript: Transcript): { responses: JsonObject[]; expectedRule: string } {
@@ -255,7 +249,10 @@ test("trace replay satisfies the shared oracle and committed golden bytes", asyn
 
 	const accountRead = transcript.responses.find(response => response.id === 3);
 	if (!accountRead) throw new Error("account/read response was not replayed.");
-	expectedNotSupported(accountRead, 3, "account/read");
+	expect(accountRead).toEqual({
+		id: 3,
+		result: { account: null, requiresOpenaiAuth: false },
+	});
 	const modelList = transcript.responses.find(response => response.id === 5);
 	expect(modelList?.result).toEqual({ data: [], nextCursor: null });
 

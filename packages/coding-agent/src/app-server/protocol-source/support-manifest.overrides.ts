@@ -88,13 +88,21 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	},
 	"turn/start": {
 		support: "implemented",
-		gjcSeam: "TurnController.start",
-		gjcBackendPath: "packages/coding-agent/src/app-server/thread-runtime/turn-controller.ts",
-		semanticGaps: ["Requires an injected retained-child adapter; the G2 real child remains blocked."],
-		translationNotes: ["Only nonempty text UserInput entries and null/absent turn overrides are admitted."],
+		gjcSeam: "TurnController.start + SessionClient.setModelForTurn",
+		gjcBackendPath:
+			"packages/coding-agent/src/app-server/thread-runtime/turn-controller.ts; packages/coding-agent/src/app-server/thread-runtime/production-child.ts",
+		semanticGaps: [],
+		translationNotes: [
+			"Only nonempty text UserInput entries are admitted; an optional model override is resolved by the retained child and restored after the turn.",
+		],
 		owner: "app-server",
-		testIds: ["turn/start returns a validated response plus both delivery hooks and defers notifications"],
-		reason: "TurnController.start owns admission, durable projection, and notification delivery barriers.",
+		testIds: [
+			"turn/start returns a validated response plus both delivery hooks and defers notifications",
+			"turn/start honours a resolved per-turn model override before prompting the retained child",
+			"turn/start rejects an unknown model override with the requested model named in the error",
+		],
+		reason:
+			"TurnController.start owns admission, durable projection, model-override activation, and notification delivery barriers.",
 	},
 	"thread/resume": {
 		support: "implemented",
@@ -291,26 +299,24 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		["thread/goal/clear drops the persisted goal and get reports no goal"],
 		"Clearing drops the durable goal through the real goal seam.",
 	),
-	"review/start": {
-		support: "not_supported",
-		gjcSeam: null,
-		gjcBackendPath: null,
-		semanticGaps: ["GJC's review tool only reports findings; no reachable review runner exists at this seam."],
-		translationNotes: [],
-		owner: "app-server",
-		testIds: ["goalsReviewHandlers exposes only the three genuinely backed goal methods"],
-		reason: "No live review runner is reachable from the app-server, so no handler is registered.",
-	},
-	"feedback/upload": {
-		support: "not_supported",
-		gjcSeam: null,
-		gjcBackendPath: null,
-		semanticGaps: ["GJC has no feedback upload destination."],
-		translationNotes: [],
-		owner: "app-server",
-		testIds: ["goalsReviewHandlers exposes only the three genuinely backed goal methods"],
-		reason: "There is no real feedback sink to translate to, so no handler is registered.",
-	},
+	"review/start": laneRow(
+		"reviewStartHandler",
+		"suites/goals-review-handlers.ts",
+		[
+			"review/start translates targets into a native turn.prompt and returns inline turn",
+			"review/start rejects detached delivery because GJC has no detached review runner",
+		],
+		"Review starts a native GJC turn.prompt with target-specific instructions; detached review threads remain honestly unsupported.",
+	),
+	"feedback/upload": laneRow(
+		"feedbackUploadHandler",
+		"suites/goals-review-handlers.ts",
+		[
+			"feedback/upload persists a real GJC session custom entry and returns thread id",
+			"feedback/upload refuses log upload without a GJC sink",
+		],
+		"Feedback metadata is durably recorded through SessionManager.appendCustomEntry; remote log uploads fail honestly without a GJC sink.",
+	),
 	"thread/list": laneRow(
 		"threadListHandler",
 		"suites/thread-read-handlers.ts",
@@ -697,9 +703,14 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		testIds: ["threadMutationHandlers exposes only the genuinely backed methods"],
 		reason: "The session format cannot be truncated in place, so no handler is registered.",
 	},
-	// ChatGPT-account-specific surfaces: GJC authenticates per provider and has no account,
-	// credit, workspace-message or account-scoped rate-limit backend to translate.
-	"account/read": unsupported,
+	// ChatGPT-account-specific surfaces remain unsupported; account/read is a narrow
+	// GJC-native projection of provider auth state and does not claim a ChatGPT account.
+	"account/read": laneRow(
+		"accountReadHandler",
+		"suites/account-handlers.ts",
+		["account/read: returns truthful schema-valid API-key and absent responses"],
+		"Projects GJC auth storage and model-registry state into the vendored account/read shape without inventing ChatGPT identity.",
+	),
 	"account/usage/read": unsupported,
 	"account/rateLimits/read": unsupported,
 	"account/rateLimitResetCredit/consume": unsupported,

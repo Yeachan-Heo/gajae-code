@@ -95,10 +95,11 @@ export function serializeError(
 	id: WireId,
 	key: AppServerErrorKey,
 	transport: "stdio" | "websocket" | "unix" = "websocket",
+	messageOverride?: string,
 ): Uint8Array | undefined {
 	if (id === undefined) return undefined;
 	const { code, message } = goldenEnvelope(key);
-	const envelope: Record<string, unknown> = { id, error: { code, message } };
+	const envelope: Record<string, unknown> = { id, error: { code, message: messageOverride ?? message } };
 	const body = JSON.stringify(envelope);
 	if (transport === "stdio") return new TextEncoder().encode(`${body}\n`);
 	return new TextEncoder().encode(body);

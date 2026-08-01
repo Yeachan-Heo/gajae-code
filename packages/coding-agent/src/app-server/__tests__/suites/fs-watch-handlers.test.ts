@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stableValidators } from "../../protocol-source/schema-validators.generated";
@@ -15,7 +15,8 @@ import type { HandlerContext } from "../../suites/handlers";
 
 type Notification = { method: string; params: Record<string, unknown> };
 
-const tempDir = mkdtempSync(join(tmpdir(), "gjc-fs-watch-suite-"));
+// realpath: macOS resolves /var to /private/var, and the runtime reports the canonical path.
+const tempDir = realpathSync(mkdtempSync(join(tmpdir(), "gjc-fs-watch-suite-")));
 
 function contextFor(notifications: Notification[]): HandlerContext {
 	return {

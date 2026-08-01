@@ -119,7 +119,7 @@ export type CloseOwnedCallback = (
 	client?: SessionClient,
 	closeChild?: (authority: EndpointAuthority | undefined) => Promise<void> | void,
 	closeRuntime?: () => Promise<void>,
-) => void;
+) => void | Promise<void>;
 
 type RegisterOptions = {
 	readonly reservation?: AdmissionReservation;
@@ -143,8 +143,10 @@ export class ThreadRuntimeManager {
 	readonly #pendingThreadIds = new Set<string>();
 	readonly #reservations = new Set<AdmissionReservation>();
 	readonly #config: AdmissionConfig;
+	readonly #closing = new Set<Promise<void>>();
 	#activeSpawns = 0;
 	#closeOwned: CloseOwnedCallback | undefined;
+	#shuttingDown = false;
 	#onThreadGone: ((threadId: string, reason: "removed" | "evicted" | "detached" | "terminated") => void) | undefined;
 
 	constructor(config: Partial<AdmissionConfig> = {}) {
@@ -185,12 +187,34 @@ export class ThreadRuntimeManager {
 			return;
 		}
 		this.#closeOwned = (threadId, ownership, authority, client, closeChild, closeRuntime) => {
+			let previousResult: void | Promise<void> | null = null;
+			let callbackResult: void | Promise<void> | null = null;
+			let synchronousError: unknown;
 			try {
-				previous(threadId, ownership, authority, client, closeChild, closeRuntime);
-			} finally {
-				callback(threadId, ownership, authority, client, closeChild, closeRuntime);
+				previousResult = previous(threadId, ownership, authority, client, closeChild, closeRuntime);
+			} catch (error) {
+				synchronousError = error;
 			}
+			try {
+				callbackResult = callback(threadId, ownership, authority, client, closeChild, closeRuntime);
+			} catch (error) {
+				synchronousError ??= error;
+			}
+			const promises = [previousResult, callbackResult].filter(
+				(result): result is Promise<void> => result !== undefined && result !== null,
+			);
+			if (synchronousError !== undefined) {
+				return Promise.allSettled(promises).then(() => {
+					throw synchronousError;
+				});
+			}
+			if (promises.length === 0) return undefined;
+			return Promise.all(promises).then(() => undefined);
 		};
+	}
+	/** Wait until every asynchronous owned-thread close callback has settled. */
+	async waitForClosures(): Promise<void> {
+		while (this.#closing.size > 0) await Promise.allSettled([...this.#closing]);
 	}
 
 	/**
@@ -198,8 +222,10 @@ export class ThreadRuntimeManager {
 	 * committed by register() or explicitly released on every failed startup path.
 	 */
 	reserve(threadId: string, connectionId?: string): AdmissionReservation {
+		if (this.#shuttingDown) throw conflict("Thread runtime manager is shut down.");
 		if (this.#threads.has(threadId) || this.#pendingThreadIds.has(threadId))
 			throw conflict(`Thread ${threadId} is already loaded or loading.`);
+
 		if (this.#threads.size + this.#reservations.size >= this.#config.maxLoadedThreads) {
 			this.evictIdleOwned();
 			if (this.#threads.size + this.#reservations.size >= this.#config.maxLoadedThreads)
@@ -267,9 +293,11 @@ export class ThreadRuntimeManager {
 		options: RegisterOptions = {},
 	): ManagedThread {
 		const reservation = options.reservation;
+		if (this.#shuttingDown) throw conflict("Thread runtime manager is shut down.");
 		if (this.#threads.has(threadId)) throw conflict(`Thread ${threadId} is already loaded.`);
 		if (this.#pendingThreadIds.has(threadId) && reservation?.threadId !== threadId)
 			throw conflict(`Thread ${threadId} is already loading.`);
+
 		if (reservation) {
 			if (!this.#reservations.has(reservation)) throw conflict("Admission reservation is not active.");
 			if (reservation.connectionId !== connectionId)
@@ -370,13 +398,25 @@ export class ThreadRuntimeManager {
 	}
 
 	#invokeClose(thread: ManagedThread): void {
-		this.#closeOwned?.(
-			thread.threadId,
-			thread.ownership,
-			thread.authority,
-			thread.client,
-			thread.closeChild,
-			thread.closeRuntime,
+		let result: void | Promise<void>;
+		try {
+			result = this.#closeOwned?.(
+				thread.threadId,
+				thread.ownership,
+				thread.authority,
+				thread.client,
+				thread.closeChild,
+				thread.closeRuntime,
+			);
+		} catch (error) {
+			result = Promise.reject(error);
+		}
+		if (!result) return;
+		const closing = Promise.resolve(result);
+		this.#closing.add(closing);
+		void closing.then(
+			() => this.#closing.delete(closing),
+			() => this.#closing.delete(closing),
 		);
 	}
 
@@ -429,6 +469,7 @@ export class ThreadRuntimeManager {
 
 	/** Clean up all threads on shutdown: detach attached, terminate spawned. */
 	shutdown(): { detached: string[]; terminated: string[] } {
+		this.#shuttingDown = true;
 		const detached: string[] = [];
 		const terminated: string[] = [];
 		const threads = [...this.#threads.values()];

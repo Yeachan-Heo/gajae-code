@@ -120,6 +120,7 @@ interface FakeClientOptions {
 	readonly history?: readonly ProjectionEnvelope[];
 	readonly promptResult?: unknown;
 	readonly promptError?: unknown;
+	readonly modelOverrideError?: unknown;
 }
 
 class FakeClient implements SessionClient {
@@ -164,6 +165,13 @@ class FakeClient implements SessionClient {
 			};
 		}
 		return {};
+	}
+	async setModelForTurn(requestedModel: string): Promise<() => Promise<void>> {
+		this.calls.push({ operation: "turn.modelOverride", input: { model: requestedModel } });
+		if (this.options.modelOverrideError !== undefined) throw this.options.modelOverrideError;
+		return async () => {
+			this.calls.push({ operation: "turn.modelOverride.restore", input: { model: requestedModel } });
+		};
 	}
 
 	async close(): Promise<void> {
@@ -232,6 +240,7 @@ test("turn/start returns a validated response plus both delivery hooks and defer
 	await result.responseDelivered?.();
 	expect(notifications).toEqual(["turn/started"]);
 	expect(client.calls.filter(call => call.operation === "turn.prompt")).toHaveLength(1);
+	expect(client.calls.filter(call => call.operation === "turn.modelOverride")).toHaveLength(0);
 });
 
 test("turn/start rejects unsupported input variants and overrides before any child control", async () => {
@@ -239,7 +248,6 @@ test("turn/start rejects unsupported input variants and overrides before any chi
 	const cwd = path.resolve("turn-start-unsupported");
 	for (const params of [
 		`{"threadId":"${THREAD_ID}","input":[{"type":"localImage","path":"/tmp/a.png"}]}`,
-		`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"ok","text_elements":[]}],"model":"other"}`,
 		`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"ok","text_elements":[]}],"outputSchema":{"type":"object"}}`,
 		`{"threadId":"${THREAD_ID}","input":[]}`,
 	]) {
@@ -256,6 +264,56 @@ test("turn/start rejects unsupported input variants and overrides before any chi
 	}
 });
 
+test("turn/start honours a resolved per-turn model override before prompting the retained child", async () => {
+	const state = await initialized();
+	const cwd = path.resolve("turn-start-model-override");
+	const client = new FakeClient();
+	const manager = loadedManager(client, cwd);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+	const result = await processInbound(
+		state,
+		manager,
+		turnStartFrame(
+			`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"hello","text_elements":[]}],"model":"provider/turn-model","approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"},"collaborationMode":{"mode":"default","settings":{"model":"provider/turn-model","reasoning_effort":"medium"}}}`,
+		),
+		undefined,
+		"websocket",
+		undefined,
+		{ connectionId: "conn-a", turnController: controller },
+	);
+	const response = dec(result.response);
+	expect(response?.error).toBeUndefined();
+	expect(client.calls.slice(0, 2)).toEqual([
+		{ operation: "turn.modelOverride", input: { model: "provider/turn-model" } },
+		{ operation: "turn.prompt", input: { text: "hello", clientRef: APP_TURN_ID } },
+	]);
+});
+
+test("turn/start rejects an unknown model override with the requested model named in the error", async () => {
+	const state = await initialized();
+	const cwd = path.resolve("turn-start-model-unknown");
+	const client = new FakeClient({
+		modelOverrideError: new Error('Model override "missing/model" could not be resolved.'),
+	});
+	const manager = loadedManager(client, cwd);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+	const result = await processInbound(
+		state,
+		manager,
+		turnStartFrame(
+			`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"hello","text_elements":[]}],"model":"missing/model"}`,
+		),
+		undefined,
+		"websocket",
+		undefined,
+		{ connectionId: "conn-a", turnController: controller },
+	);
+	expect(dec(result.response)).toEqual({
+		id: 2,
+		error: { code: -32602, message: 'Model override "missing/model" could not be resolved.' },
+	});
+	expect(client.calls.some(call => call.operation === "turn.prompt")).toBe(false);
+});
 test("turn/start maps unknown threads, busy, idempotency conflict, and internal failures distinctly", async () => {
 	const state = await initialized();
 	const cwd = path.resolve("turn-start-errors");

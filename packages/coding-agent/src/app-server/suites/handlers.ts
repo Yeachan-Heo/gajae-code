@@ -3,11 +3,12 @@
 // Per the plan D10: every client request has a support manifest row with
 // implemented|not_supported|planned. The handler registry maps implemented methods
 // to their handler functions. Not-supported methods (realtime, remoteControl,
-// marketplace, windowsSandbox, ChatGPT auth) return -32081 automatically by the
+// marketplace, windowsSandbox, and ChatGPT account mutations) return -32081 automatically by the
 // dispatcher (no handler registered = notSupported verdict from dispatchClientRequest).
 
 import type { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
 import type { TurnController } from "../thread-runtime/turn-controller";
+import { accountHandlers } from "./account-handlers";
 import { commandExecHandlers } from "./command-exec-handlers";
 import { environmentAppHandlers } from "./environment-app-handlers";
 import { fsWatchHandlers } from "./fs-watch-handlers";
@@ -25,7 +26,11 @@ import { threadReadHandlers } from "./thread-read-handlers";
 import { threadSessionOpsHandlers } from "./thread-session-ops-handlers";
 import { workspaceQueryHandlers } from "./workspace-query-handlers";
 
+export type AccountAuthStateSource = () => boolean | Promise<boolean>;
+
 export interface HandlerContext {
+	/** Optional account auth source override used by deterministic in-process probes. */
+	readonly accountAuthState?: AccountAuthStateSource;
 	/** Connection the request arrived on; notification handlers target it directly. */
 	readonly connectionId?: string;
 	/** Loaded-thread runtime, for handlers that act on live threads. */
@@ -197,6 +202,7 @@ export function registerBuiltinHandlers(registry: HandlerRegistry): void {
 	registry.register("fs/createDirectory", fsCreateDirectoryHandler);
 	registry.register("fs/remove", fsRemoveHandler);
 	registry.register("experimentalFeature/list", experimentalFeatureListHandler);
+	for (const [method, handler] of Object.entries(accountHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(fsWatchHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(commandExecHandlers)) registry.register(method, handler);
 	for (const [method, handler] of Object.entries(processHandlers)) registry.register(method, handler);

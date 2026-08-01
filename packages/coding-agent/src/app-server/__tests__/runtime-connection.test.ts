@@ -535,6 +535,99 @@ test("runtime connection: production assembly forwards thread/start to the injec
 	expect(runtime.manager.pendingCount).toBe(0);
 });
 
+test("runtime close: waits for every loaded child and process-wide adapter shutdown, idempotently", async () => {
+	const child = injectedChild("runtime-close-session");
+	let clientClose = 0;
+	let childClose = 0;
+	let adapterShutdown = 0;
+	const created = {
+		...child.child,
+		client: {
+			...child.child.client,
+			close: async () => {
+				clientClose += 1;
+			},
+		},
+		closeChild: async () => {
+			childClose += 1;
+		},
+	};
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: {
+			create: async () => created,
+			shutdown: async () => {
+				adapterShutdown += 1;
+			},
+		},
+	});
+	const connection = runtime.createConnection(() => {}, "stdio");
+	await initialize(connection);
+	await connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	expect(runtime.manager.loadedCount).toBe(1);
+
+	await runtime.close();
+	await runtime.close();
+	expect(runtime.manager.loadedCount).toBe(0);
+	expect(clientClose).toBe(1);
+	expect(childClose).toBe(1);
+	expect(adapterShutdown).toBe(1);
+});
+
+test("runtime close: fences a turn in flight and closes its child without waiting for terminal frames", async () => {
+	const child = injectedChild("runtime-close-in-flight-session");
+	const controlStarted = Promise.withResolvers<void>();
+	let rejectControl: ((error: Error) => void) | undefined;
+	let clientClose = 0;
+	let childClose = 0;
+	const created = {
+		...child.child,
+		client: {
+			...child.child.client,
+			control: async (operation: string) => {
+				if (operation !== "turn.prompt") return {};
+				controlStarted.resolve();
+				return await new Promise<never>((_resolve, reject) => {
+					rejectControl = reject;
+				});
+			},
+			query: async () => {
+				throw new Error("connection closed");
+			},
+			close: async () => {
+				clientClose += 1;
+				rejectControl?.(new Error("connection closed"));
+			},
+		},
+		closeChild: async () => {
+			childClose += 1;
+		},
+	};
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: { create: async () => created },
+	});
+	const connection = runtime.createConnection(() => {}, "stdio");
+	await initialize(connection);
+	await connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	const processing = connection.process(
+		enc(
+			'{"id":3,"method":"turn/start","params":{"threadId":"runtime-close-in-flight-session","input":[{"type":"text","text":"hello","text_elements":[]}]}}',
+		),
+	);
+	await controlStarted.promise;
+	await connection.close();
+	await processing;
+	expect(runtime.manager.loadedCount).toBe(0);
+	expect(clientClose).toBe(1);
+	expect(childClose).toBe(1);
+});
 test("runtime connection: injected child frames reach the caller hook and shared turn controller once", async () => {
 	const sessionId = "runtime-turn-hook-session";
 	const child = injectedChild(sessionId);

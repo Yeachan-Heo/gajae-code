@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -21,7 +21,8 @@ import {
 type SuccessResult = { ok: true; result: unknown };
 type HandlerResponse = SuccessResult | { ok: false; errorKey: string };
 
-const root = mkdtempSync(path.join(os.tmpdir(), "gjc-environment-app-suite-"));
+// realpath: macOS resolves /var to /private/var, and the runtime reports the canonical path.
+const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "gjc-environment-app-suite-")));
 const workspace = path.join(root, "workspace");
 const externalHome = path.join(root, "external-home");
 const agentDir = path.join(root, "agent");

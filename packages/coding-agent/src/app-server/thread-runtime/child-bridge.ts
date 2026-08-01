@@ -38,6 +38,11 @@ export interface SessionClient {
 		options?: SessionRequestOptions,
 	): Promise<unknown>;
 	control(operation: string, input?: Record<string, unknown>, options?: SessionRequestOptions): Promise<unknown>;
+	/**
+	 * Resolve and activate a model override for one turn. The returned disposer MUST restore the
+	 * previous model before another turn is admitted; adapters must reject unresolved models.
+	 */
+	setModelForTurn?: (requestedModel: string) => Promise<() => Promise<void>>;
 	close(): Promise<void>;
 }
 
@@ -127,6 +132,8 @@ export interface ChildBridgeOptions {
 	readonly onReconnectFailed?: (child: ChildCreateResult, error: Error) => void;
 	readonly subscribe?: (threadId: string, connectionId?: string) => void | Promise<void>;
 	readonly unsubscribe?: (threadId: string, connectionId?: string) => void | Promise<void>;
+	/** Optional process-wide adapter shutdown hook, invoked after all loaded threads close. */
+	readonly shutdown?: () => Promise<void> | void;
 }
 
 const wiredManagers = new WeakSet<ThreadRuntimeManager>();
@@ -674,7 +681,7 @@ export function wireCloseCallback(opts: ChildBridgeOptions): void {
 	if (wiredManagers.has(opts.manager)) return;
 	wiredManagers.add(opts.manager);
 	opts.manager.addCloseOwned((threadId, ownership, authority, client, closeChild, closeRuntime) => {
-		void (async () => {
+		return (async () => {
 			if (closeRuntime) {
 				await closeRuntime();
 				return;
@@ -684,6 +691,6 @@ export function wireCloseCallback(opts: ChildBridgeOptions): void {
 				if (closeChild) await closeChild(authority);
 				else if (opts.close) await opts.close(threadId, ownership, authority);
 			}
-		})().catch(() => {});
+		})();
 	});
 }
