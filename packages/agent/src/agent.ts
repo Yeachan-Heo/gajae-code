@@ -344,7 +344,7 @@ export class Agent {
 	#listeners = new Set<(e: AgentEvent) => void>();
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScope) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
@@ -395,6 +395,7 @@ export class Agent {
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
+	#mainAttemptScopeObserver?: (scope: AttemptScope) => void;
 
 	get intentTracing(): boolean {
 		return this.#intentTracing;
@@ -418,6 +419,17 @@ export class Agent {
 	/** Return the Agent-owned attempt scope authority for session record injection. */
 	getAttemptScopeAuthority() {
 		return this.#attemptAuthority;
+	}
+	/**
+	 * Observe each main-attempt scope synchronously, before any provider or
+	 * extension-capable lifecycle work can begin.
+	 */
+	setMainAttemptScopeObserver(observer: ((scope: AttemptScope) => void) | undefined): void {
+		this.#mainAttemptScopeObserver = observer;
+	}
+
+	#observeMainAttemptScope(scope: AttemptScope): void {
+		this.#mainAttemptScopeObserver?.(scope);
 	}
 
 	streamFn: StreamFn;
@@ -1439,6 +1451,7 @@ export class Agent {
 		}
 		const logicalRunId = managedLogicalRunOwner ?? runId;
 		const scope = this.#attemptAuthority.mintMain();
+		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
 		options?.onRunAccepted?.(handle);
@@ -1547,7 +1560,13 @@ export class Agent {
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
 			transformContext: this.#transformContext,
-			attemptMinter: { mint: () => this.#attemptAuthority.mintMain() },
+			attemptMinter: {
+				mint: () => {
+					const scope = this.#attemptAuthority.mintMain();
+					this.#observeMainAttemptScope(scope);
+					return scope;
+				},
+			},
 			initialScope: scope,
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,

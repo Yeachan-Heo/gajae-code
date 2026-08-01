@@ -1,18 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { Agent, type AgentOptions } from "@gajae-code/agent-core";
+import { Agent, type AgentOptions, type AgentTool } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
-import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
 import { TempDir } from "@gajae-code/utils";
+import { z } from "zod";
 
 function assistantLifecycleEvents(events: AgentSessionEvent[]): AgentSessionEvent[] {
 	return events.filter(
@@ -62,6 +65,84 @@ function failedStream(model: Model): AssistantMessageEventStream {
 		stream.push({ type: "error", reason: "error", error: message });
 	});
 	return stream;
+}
+function typedFirstEventTimeoutStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+function toolUseStream(model: Model, toolCall: ToolCall): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [toolCall],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "done", reason: "toolUse", message });
+	});
+	return stream;
+}
+
+function extensionRunnerForHandler(
+	cwd: string,
+	sessionManager: SessionManager,
+	modelRegistry: ModelRegistry,
+	eventType: "context" | "message_end",
+	onHandler?: () => void,
+): ExtensionRunner {
+	const extension: Extension = {
+		path: "test-extension",
+		resolvedPath: "test-extension",
+		handlers: new Map([[eventType, [async () => onHandler?.()]]]) as Extension["handlers"],
+		tools: new Map(),
+		messageRenderers: new Map(),
+		commands: new Map(),
+		flags: new Map(),
+		shortcuts: new Map(),
+	};
+	return new ExtensionRunner(
+		[extension],
+		{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+		cwd,
+		sessionManager,
+		modelRegistry,
+	);
 }
 
 function otherTransportFailureStream(model: Model, errorMessage: string): AssistantMessageEventStream {
@@ -146,13 +227,23 @@ describe("AgentSession managed fallback attempt transaction", () => {
 	function createSession(
 		streamFn: AgentOptions["streamFn"],
 		maxAttempts = 3,
+		options: { tools?: AgentTool[]; handler?: "context" | "message_end"; onHandler?: () => void } = {},
 	): { agent: Agent; primary: Model; fallback: Model } {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const sessionManager = SessionManager.inMemory();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const extensionRunner = options.handler
+			? extensionRunnerForHandler(tempDir.path(), sessionManager, modelRegistry, options.handler, options.onHandler)
+			: undefined;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-key`,
-			initialState: { model: primary, systemPrompt: ["test"], tools: [], messages: [] },
+			initialState: { model: primary, systemPrompt: ["test"], tools: options.tools ?? [], messages: [] },
+			transformContext:
+				options.handler === "context"
+					? (messages, _signal, scope) => extensionRunner!.emitContext(messages, scope)
+					: undefined,
 			streamFn,
 		});
 		const settings = Settings.isolated({
@@ -163,9 +254,10 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		settings.setModelRole("default", selector(primary));
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings,
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			extensionRunner,
 		});
 		session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
 		return { agent, primary, fallback };
@@ -399,6 +491,151 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			],
 		});
 		expect(agentEnds).not.toContainEqual(expect.objectContaining({ stopReason: "cancelled" }));
+	});
+	it("admits a clean managed timeout successor after a committed tool attempt", async () => {
+		const toolCall: ToolCall = { type: "toolCall", id: "counted-tool", name: "counted", arguments: {} };
+		const tool: AgentTool = {
+			name: "counted",
+			label: "Counted",
+			description: "Records a committed tool attempt",
+			parameters: z.object({}),
+			execute: async () => ({ content: [{ type: "text", text: "counted" }] }),
+		};
+		const calls: string[] = [];
+		let streamCalls = 0;
+		const { agent, primary, fallback } = createSession(
+			(model, context, options) => {
+				calls.push(selector(model));
+				streamCalls++;
+				if (streamCalls === 1) {
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const message: AssistantMessage = {
+							role: "assistant",
+							content: [toolCall],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse",
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "done", reason: "toolUse", message });
+					});
+					return stream;
+				}
+				if (streamCalls === 2) return typedFirstEventTimeoutStream(model);
+				return createMockModel({ responses: [{ content: ["fallback accepted"] }] }).stream(model, context, options);
+			},
+			1,
+			{ tools: [tool] },
+		);
+		const continueSpy = vi.spyOn(agent, "continue");
+		const scopes: Array<{ attemptId: string; generation: number }> = [];
+		agent.subscribe(event => {
+			const scope = (event as { scope?: { attemptId: string; generation: number } }).scope;
+			if (scope) scopes.push(scope);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("commit tool then admit clean managed timeout successor");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary), selector(fallback)]);
+		const scopeGenerations = [
+			...new Map(scopes.map(scope => [`${scope.attemptId}:${scope.generation}`, scope])).values(),
+		];
+		expect(scopeGenerations).toHaveLength(2);
+		expect(scopeGenerations[1]!.generation).toBeGreaterThan(scopeGenerations[0]!.generation);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(2);
+		expect(session!.messages.filter(message => message.role === "toolResult")).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "fallback accepted" }],
+		});
+	});
+
+	it("rejects a context-handler execution in a managed timeout successor without publishing duplicate content", async () => {
+		const toolCall: ToolCall = { type: "toolCall", id: "prior-tool", name: "counted", arguments: {} };
+		const tool: AgentTool = {
+			name: "counted",
+			label: "Counted",
+			description: "Commits a predecessor attempt",
+			parameters: z.object({}),
+			execute: async () => ({ content: [{ type: "text", text: "counted" }] }),
+		};
+		const calls: string[] = [];
+		let streamCalls = 0;
+		const { primary } = createSession(
+			model => {
+				calls.push(selector(model));
+				return ++streamCalls === 1 ? toolUseStream(model, toolCall) : typedFirstEventTimeoutStream(model);
+			},
+			1,
+			{ tools: [tool], handler: "context" },
+		);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("reject extension-executed managed timeout successor");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary)]);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(2);
+		expect(session!.messages.filter(message => message.role === "toolResult")).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+	});
+	it("rejects a same-scope message_end handler before direct retry admission", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model");
+		const sessionManager = SessionManager.inMemory();
+		const modelRegistry = new ModelRegistry(authStorage);
+		let messageEndHandlers = 0;
+		const extensionRunner = extensionRunnerForHandler(
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+			"message_end",
+			() => {
+				messageEndHandlers++;
+			},
+		);
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-key`,
+			initialState: { model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				calls++;
+				return typedFirstEventTimeoutStream(requestedModel);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", selector(model));
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+
+		await session.prompt("message_end vetoes its own typed timeout");
+		await session.waitForIdle();
+
+		expect(calls).toBe(1);
+		expect(messageEndHandlers).toBeGreaterThan(0);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session.messages).toHaveLength(2);
+		expect(session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
 	});
 	it("settles a rejected managed continuation without duplicate terminal events", async () => {
 		const { agent } = createSession(model => failedStream(model));

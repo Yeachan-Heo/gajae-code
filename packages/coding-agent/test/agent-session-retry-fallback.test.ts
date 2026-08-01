@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -17,6 +17,7 @@ import {
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { z } from "zod";
 
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
@@ -136,6 +137,33 @@ function canonicalFirstEventTimeoutStream(
 			stopReason: "error",
 			errorMessage: "Error: Provider stream timed out while waiting for the first event",
 			...(transportFailure === undefined ? {} : { transportFailure }),
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+function typedServerErrorStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Provider server error",
+			transportFailure: { kind: "transport", status: 503 },
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
@@ -747,7 +775,10 @@ describe("AgentSession retry fallback", () => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				if (requestedModel.provider === primary.provider) {
 					primaryCalls++;
-					return canonicalFirstEventTimeoutStream(requestedModel);
+					return canonicalFirstEventTimeoutStream(requestedModel, [], {
+						kind: "transport",
+						providerCode: "stream_first_event_timeout",
+					});
 				}
 				return createMockModel({ responses: [{ content: ["Fallback recovered"] }] }).stream(
 					requestedModel,
@@ -809,7 +840,10 @@ describe("AgentSession retry fallback", () => {
 			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: requestedModel => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				return canonicalFirstEventTimeoutStream(requestedModel);
+				return canonicalFirstEventTimeoutStream(requestedModel, [], {
+					kind: "transport",
+					providerCode: "stream_first_event_timeout",
+				});
 			},
 		});
 		const settings = Settings.isolated({
@@ -847,9 +881,7 @@ describe("AgentSession retry fallback", () => {
 		]);
 		expect(fallbackNotices[0]?.message).toContain(`${primary.provider}/${primary.id}`);
 		expect(fallbackNotices[0]?.message).toContain(`${fallback.provider}/${fallback.id}`);
-		expect(getLastAssistantMessage(session).errorMessage).toBe(
-			"Error: Provider stream timed out while waiting for the first event",
-		);
+		expect(getLastAssistantMessage(session).errorMessage).toContain("Model fallback chain exhausted");
 	});
 
 	it("does not rotate a managed canonical timeout after partial output", async () => {
@@ -889,6 +921,92 @@ describe("AgentSession retry fallback", () => {
 			stopReason: "error",
 			content: [{ type: "text", text: "already visible" }],
 			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+		});
+	});
+	it("advances managed fallback after an earlier tool execution and a later clean typed timeout", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const toolCall: ToolCall = { type: "toolCall", id: "prior-tool", name: "counted", arguments: {} };
+		let toolRuns = 0;
+		let streamCalls = 0;
+		const countedTool: AgentTool = {
+			name: "counted",
+			label: "Counted",
+			description: "Records a real prior tool execution",
+			parameters: z.object({}),
+			execute: async () => {
+				toolRuns++;
+				return { content: [{ type: "text", text: "counted" }] };
+			},
+		};
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [countedTool], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				streamCalls++;
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				if (streamCalls === 1) {
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const message: AssistantMessage = {
+							role: "assistant",
+							content: [toolCall],
+							api: requestedModel.api,
+							provider: requestedModel.provider,
+							model: requestedModel.id,
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse",
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "done", reason: "toolUse", message });
+					});
+					return stream;
+				}
+				if (streamCalls === 2) {
+					return canonicalFirstEventTimeoutStream(requestedModel, [], {
+						kind: "transport",
+						providerCode: "stream_first_event_timeout",
+					});
+				}
+				return createMockModel({ responses: [{ content: ["fallback recovered"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 1 });
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("prior tool history, current clean managed timeout");
+		await session.waitForIdle();
+
+		expect(toolRuns).toBe(1);
+		expect(requestedModels).toEqual([
+			`${primary.provider}/${primary.id}`,
+			`${primary.provider}/${primary.id}`,
+			`${fallback.provider}/${fallback.id}`,
+		]);
+		expect(getLastAssistantMessage(session)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "fallback recovered" }],
 		});
 	});
 
@@ -943,9 +1061,11 @@ describe("AgentSession retry fallback", () => {
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
 		const requestedModels: string[] = [];
 		const sessionManager = SessionManager.inMemory();
+		const extensionRunner = makeExtensionRunner(["context"], tempDir.path(), sessionManager, modelRegistry);
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			transformContext: (messages, _signal, scope) => extensionRunner.emitContext(messages, scope),
 			streamFn: requestedModel => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				return canonicalFirstEventTimeoutStream(requestedModel, [], {
@@ -961,7 +1081,7 @@ describe("AgentSession retry fallback", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
-			extensionRunner: makeExtensionRunner(["context"], tempDir.path(), sessionManager, modelRegistry),
+			extensionRunner,
 		});
 		session.setConfiguredModelChain(
 			"default",
@@ -1116,18 +1236,17 @@ describe("AgentSession retry fallback", () => {
 
 		const requestedModels: string[] = [];
 		const mock = createMockModel({
-			responses: [
-				{ throw: "Provider server error" },
-				{ content: ["Fallback recovered"] },
-				{ content: ["Fallback remained active"] },
-			],
+			responses: [{ content: ["Fallback recovered"] }, { content: ["Fallback remained active"] }],
 		});
+		let streamCalls = 0;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				return mock.stream(requestedModel, context, options);
+				return streamCalls++ === 0
+					? typedServerErrorStream(requestedModel)
+					: mock.stream(requestedModel, context, options);
 			},
 		});
 		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 1 });
@@ -1161,18 +1280,17 @@ describe("AgentSession retry fallback", () => {
 
 		const requestedModels: string[] = [];
 		const mock = createMockModel({
-			responses: [
-				{ throw: "Provider server error" },
-				{ content: ["Fallback recovered"] },
-				{ content: ["Fallback remained active"] },
-			],
+			responses: [{ content: ["Fallback recovered"] }, { content: ["Fallback remained active"] }],
 		});
+		let streamCalls = 0;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				return mock.stream(requestedModel, context, options);
+				return streamCalls++ === 0
+					? typedServerErrorStream(requestedModel)
+					: mock.stream(requestedModel, context, options);
 			},
 		});
 		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 1 });
@@ -1302,11 +1420,7 @@ describe("AgentSession retry fallback", () => {
 			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				if (requestedModel.provider === primary.provider) {
-					return createMockModel({ responses: [{ throw: "Provider server error" }] }).stream(
-						requestedModel,
-						context,
-						options,
-					);
+					return typedServerErrorStream(requestedModel);
 				}
 				fallbackCalls++;
 				if (fallbackCalls > 1) {

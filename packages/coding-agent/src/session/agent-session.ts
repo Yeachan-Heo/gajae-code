@@ -1869,13 +1869,6 @@ export class AgentSession {
 		this.#retryReplayEpoch++;
 		this.#retryReplayUnsafeEpoch = undefined;
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
-		if (
-			this.#extensionRunner?.hasHandlers("context") ||
-			this.#extensionRunner?.hasHandlers("before_provider_request") ||
-			this.#extensionRunner?.hasHandlers("after_provider_response")
-		) {
-			this.#markRetryReplayUnsafe();
-		}
 	}
 
 	#markRetryReplayUnsafe(): void {
@@ -1884,6 +1877,14 @@ export class AgentSession {
 
 	get #hasCleanRetryReplaySafety(): boolean {
 		return this.#retryReplayEpoch > 0 && this.#retryReplayUnsafeEpoch !== this.#retryReplayEpoch;
+	}
+	#bindAttemptScope(scope: AttemptScope | undefined): void {
+		if (!scope) return;
+		this.#attemptRecordStore.register(scope);
+		this.#attemptRecordStore.establishClean(scope);
+	}
+	#isRetryScopeClean(scope: AttemptScope | undefined): boolean {
+		return scope !== undefined && this.#attemptRecordStore.isClean(scope);
 	}
 	#prePromptContextCheckPromise: Promise<void> | undefined = undefined;
 	/** Display-only context snapshot; pre-prompt compaction estimates deliberately remain uncached. */
@@ -1898,6 +1899,8 @@ export class AgentSession {
 	// Handoff state
 	#handoffAbortController: AbortController | undefined = undefined;
 	#skipPostTurnMaintenanceAssistantTimestamp: number | undefined = undefined;
+	/** Scope cleanliness captured after message_end extension delivery and before terminal agent_end retirement. */
+	#assistantAttemptScopes = new WeakMap<AssistantMessage, { scope?: AttemptScope; wasClean: boolean }>();
 
 	// Retry state
 	#retryAbortController: AbortController | undefined = undefined;
@@ -2606,6 +2609,7 @@ export class AgentSession {
 		if (this.#extensionRunner && typeof this.#extensionRunner.setAttemptRecordStore === "function") {
 			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
 		}
+		this.agent.setMainAttemptScopeObserver(scope => this.#bindAttemptScope(scope));
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
 		this.#customCommands = config.customCommands ?? [];
@@ -3739,11 +3743,7 @@ export class AgentSession {
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	#handleAgentEvent = async (event: AgentEvent, activePromptHandle?: string): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
-		if ((event.type === "agent_start" || event.type === "turn_start") && attemptScope) {
-			this.#attemptRecordStore.register(attemptScope);
-			this.#attemptRecordStore.establishClean(attemptScope);
-		}
-		if (this.#extensionRunner?.hasHandlers(event.type)) this.#markRetryReplayUnsafe();
+
 		if (
 			event.type === "tool_execution_start" ||
 			event.type === "tool_execution_update" ||
@@ -3947,6 +3947,12 @@ export class AgentSession {
 		}
 
 		await this.#emitSessionEvent(displayEvent);
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#assistantAttemptScopes.set(event.message, {
+				scope: attemptScope,
+				wasClean: this.#isRetryScopeClean(attemptScope),
+			});
+		}
 		if (
 			displayEvent !== event &&
 			displayEvent.type === "message_end" &&
@@ -4321,7 +4327,14 @@ export class AgentSession {
 			if (this.#isRetryableError(msg)) {
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
-				const didRetry = await this.#handleRetryableError(msg, false, transportFailure);
+				const messageScope = this.#assistantAttemptScopes.get(msg);
+				const didRetry = await this.#handleRetryableError(
+					msg,
+					false,
+					transportFailure,
+					messageScope?.scope ?? event.scope,
+					messageScope?.wasClean ?? false,
+				);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
 			if (this.#retryAttempt > 0) {
@@ -5838,6 +5851,7 @@ export class AgentSession {
 		this.#abortActiveMidRunBarriers();
 		this.abortCompaction();
 		this.agent.abort();
+		this.agent.setMainAttemptScopeObserver(undefined);
 		// Disconnect the Agent event bridge NOW — before the maintenance join and the
 		// bounded idle / forceAbort below — so no agent_end emitted during teardown
 		// (including the one forceAbort emits) can re-enter #handleAgentEvent and start
@@ -14573,6 +14587,8 @@ export class AgentSession {
 			outcome.failure.message,
 			true,
 			outcome.failure.transportFailure,
+			outcome.scope,
+			this.#isRetryScopeClean(outcome.scope),
 		) as Promise<ManagedAttemptDecision>;
 	}
 
@@ -14733,6 +14749,8 @@ export class AgentSession {
 		message: AssistantMessage,
 		managedOutcome = false,
 		transportFailure?: TransportFailureFacts,
+		scope?: AttemptScope,
+		scopeWasClean = this.#isRetryScopeClean(scope),
 	): Promise<boolean | ManagedAttemptDecision> {
 		const controller = this.#defaultFallbackChain();
 		const managedFallback = controller.chain.entries.length > 1;
@@ -14747,12 +14765,16 @@ export class AgentSession {
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
-		if (!managedFallback && firstEventTimeout) {
-			this.#firstEventTimeoutRetryStartedAt ??= Date.now();
+		if (!managedFallback && firstEventTimeout && this.#retryAttempt === 0) {
+			this.#firstEventTimeoutRetryStartedAt = Date.now();
 		}
-		// First-event timeouts are replay-safe only before any model progress,
-		// abort, or extension/provider lifecycle participation.
-		if (firstEventTimeout && (!this.#hasCleanRetryReplaySafety || assistantMessageHasVisibleOrToolContent(message))) {
+		const requiresScopedFirstEventTimeout = managedFallback || !legacyRetryConfigured;
+		if (
+			firstEventTimeout &&
+			(assistantMessageHasVisibleOrToolContent(message) ||
+				(this.#retryAttempt > 0 && !this.#hasCleanRetryReplaySafety) ||
+				(requiresScopedFirstEventTimeout && (!this.#isTypedFirstEventTimeout(message) || !scope || !scopeWasClean)))
+		) {
 			return managedOutcome
 				? {
 						type: "terminal",
@@ -14780,14 +14802,12 @@ export class AgentSession {
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
 		// content-free check is the replay-safety guarantee for credential rotation.
 		const canReplayRotatedCredential = credentialRotated;
-		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures,
-		// content-free quota/rate-limit credential rotations, and the explicit Codex
-		// capacity-overload event.
+		// Bare defaults retain their narrow watchdog and Codex admissions. A
+		// first-event timeout adds the typed, content-free, current-clean-scope
+		// requirement above; other transient watchdogs preserve legacy behavior.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const bareDefaultWrappedFirstEventTimeout = isBareDefaultWrappedFirstEventTimeout(message);
-			// Content-free Codex overload is replay-safe by the same reasoning as
-			// credential rotation: no partial output means no observable state.
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
 				(!canReplayCodexOverload &&
@@ -14796,7 +14816,7 @@ export class AgentSession {
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
-				(!canReplayCodexOverload && !this.#hasCleanRetryReplaySafety)
+				(!canReplayCodexOverload && !firstEventTimeout && !this.#hasCleanRetryReplaySafety)
 			) {
 				return false;
 			}
