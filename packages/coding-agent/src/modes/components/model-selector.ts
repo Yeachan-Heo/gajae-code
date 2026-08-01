@@ -11,7 +11,9 @@ import {
 	TabBar,
 	Text,
 	type TUI,
+	truncateToWidth,
 } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import {
 	getModelProfilePresentation,
 	groupModelProfilesForPresetLanding,
@@ -94,6 +96,26 @@ type ScopedModelItem = ScopedModelSelection;
 interface RoleAssignment {
 	model: Model;
 	thinkingLevel: ThinkingLevel;
+}
+
+type RoleAssignments = Record<string, RoleAssignment | undefined>;
+
+interface MaterializedCatalog {
+	models: ModelItem[];
+	canonicalModels: CanonicalModelItem[];
+	roles: RoleAssignments;
+}
+
+interface ModelSelectorViewSnapshot {
+	roles: RoleAssignments;
+	allModels: ModelItem[];
+	filteredModels: ModelItem[];
+	canonicalModels: CanonicalModelItem[];
+	filteredCanonicalModels: CanonicalModelItem[];
+	selectedIndex: number;
+	providers: ProviderTabState[];
+	activeTabIndex: number;
+	tabBar: TabBar | null;
 }
 
 export type ModelSelectorSelection =
@@ -246,6 +268,9 @@ function isInheritedRoleSelector(value: string): boolean {
 	return value === "default" || value === "pi/default";
 }
 
+/** Width bound for an unresolvable selector echoed back into the assignment menu. */
+const ROLE_BINDING_MAX_WIDTH = 48;
+
 function getDefaultAliasThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
 	const normalized = value?.trim();
 	if (!normalized?.startsWith("pi/default:")) return undefined;
@@ -327,7 +352,7 @@ export class ModelSelectorComponent extends Container {
 	#canonicalModels: CanonicalModelItem[] = [];
 	#filteredCanonicalModels: CanonicalModelItem[] = [];
 	#selectedIndex: number = 0;
-	#roles = {} as Record<string, RoleAssignment | undefined>;
+	#roles: RoleAssignments = {};
 	#settings = null as unknown as Settings;
 	#modelRegistry = null as unknown as ModelRegistry;
 	#onSelectCallback = (() => {}) as RoleSelectCallback;
@@ -412,7 +437,7 @@ export class ModelSelectorComponent extends Container {
 		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
 		// Load current role assignments from settings
-		this.#loadRoleModels();
+		this.#rebuildRoleModels();
 
 		// Add top border
 		this.addChild(new DynamicBorder());
@@ -495,7 +520,8 @@ export class ModelSelectorComponent extends Container {
 		});
 	}
 
-	#loadRoleModels(): void {
+	#loadRoleModels(): RoleAssignments {
+		const roles: RoleAssignments = {};
 		const allModels = this.#modelRegistry.getAll();
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		const agentModelOverrides = this.#settings.get("task.agentModelOverrides");
@@ -511,7 +537,7 @@ export class ModelSelectorComponent extends Container {
 				modelRegistry: this.#modelRegistry,
 			});
 			if (resolved.model) {
-				this.#roles[role] = {
+				roles[role] = {
 					model: resolved.model,
 					thinkingLevel:
 						resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
@@ -526,11 +552,22 @@ export class ModelSelectorComponent extends Container {
 				this.#isActiveDefaultFallback()) &&
 			this.#currentModel
 		) {
-			this.#roles.default = {
+			roles.default = {
 				model: this.#currentModel,
 				thinkingLevel: this.#currentThinkingLevel ?? ThinkingLevel.Inherit,
 			};
 		}
+		return roles;
+	}
+
+	/**
+	 * Re-resolve every role binding against the CURRENT model catalog. Role bindings
+	 * are resolved snapshots, so any catalog change (initial async load, provider
+	 * refresh) must rebuild them or badges, ranking, and the assignment menu keep
+	 * reporting models that the catalog has since gained or lost.
+	 */
+	#rebuildRoleModels(): void {
+		this.#roles = this.#loadRoleModels();
 	}
 
 	refreshRoleAssignments(
@@ -539,9 +576,7 @@ export class ModelSelectorComponent extends Container {
 		if ("currentModel" in options) this.#currentModel = options.currentModel;
 		if ("currentThinkingLevel" in options) this.#currentThinkingLevel = options.currentThinkingLevel;
 		if ("activeModelProfile" in options) this.#activeModelProfile = options.activeModelProfile;
-		this.#roles = {};
-		this.#loadRoleModels();
-		this.#applyTabFilter();
+		this.#refreshCatalogView();
 	}
 
 	#resolveProviderAuthState(providerId: string): ProviderAuthState {
@@ -550,7 +585,7 @@ export class ModelSelectorComponent extends Container {
 		return this.#modelRegistry.hasConfiguredProviderAuth(providerId) ? "configured" : "none";
 	}
 
-	#sortModels(models: ModelItem[]): void {
+	#sortModels(models: ModelItem[], roles: RoleAssignments = this.#roles): void {
 		// Sort: default-tagged model first, then MRU, then provider ranking
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
@@ -561,7 +596,7 @@ export class ModelSelectorComponent extends Container {
 			}
 		}
 
-		const modelRank = (item: ModelItem) => computeModelRank(item.model, this.#roles);
+		const modelRank = (item: ModelItem) => computeModelRank(item.model, roles);
 
 		const dateRe = /-(\d{8})$/;
 		const latestRe = /-latest$/;
@@ -630,7 +665,7 @@ export class ModelSelectorComponent extends Container {
 		});
 	}
 
-	#sortCanonicalModels(models: CanonicalModelItem[]): void {
+	#sortCanonicalModels(models: CanonicalModelItem[], roles: RoleAssignments = this.#roles): void {
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
 		const providerAuthStateById = new Map<string, ProviderAuthState>();
@@ -640,7 +675,7 @@ export class ModelSelectorComponent extends Container {
 			}
 		}
 
-		const modelRank = (item: CanonicalModelItem) => computeModelRank(item.model, this.#roles);
+		const modelRank = (item: CanonicalModelItem) => computeModelRank(item.model, roles);
 
 		models.sort((a, b) => {
 			const aRank = modelRank(a);
@@ -669,23 +704,40 @@ export class ModelSelectorComponent extends Container {
 		});
 	}
 
-	async #loadModels(): Promise<void> {
+	#buildScopedModelItems(): ModelItem[] {
+		return this.#scopedModels.map(scoped => ({
+			kind: "provider",
+			provider: scoped.model.provider,
+			id: scoped.model.id,
+			model: scoped.model,
+			selector: `${scoped.model.provider}/${scoped.model.id}`,
+			thinkingLevel: scoped.thinkingLevel,
+			explicitThinkingLevel: scoped.explicitThinkingLevel,
+		}));
+	}
+
+	#buildAvailableModelItems(): ModelItem[] {
+		return this.#modelRegistry.getAvailable().map((model: Model) => ({
+			kind: "provider",
+			provider: model.provider,
+			id: model.id,
+			model,
+			selector: `${model.provider}/${model.id}`,
+		}));
+	}
+	async #loadModels(
+		options: { refreshRegistry?: boolean; throwOnCatalogError?: boolean; commit?: boolean } = {},
+	): Promise<MaterializedCatalog | undefined> {
 		let models: ModelItem[];
 
 		// Use scoped models if provided via --models flag
 		if (this.#scopedModels.length > 0) {
-			models = this.#scopedModels.map(scoped => ({
-				kind: "provider",
-				provider: scoped.model.provider,
-				id: scoped.model.id,
-				model: scoped.model,
-				selector: `${scoped.model.provider}/${scoped.model.id}`,
-				thinkingLevel: scoped.thinkingLevel,
-				explicitThinkingLevel: scoped.explicitThinkingLevel,
-			}));
+			models = this.#buildScopedModelItems();
 		} else {
 			// Reload config and cached discovery state without blocking on live provider refresh
-			await this.#modelRegistry.refresh("offline");
+			if (options.refreshRegistry !== false) {
+				await this.#modelRegistry.refresh("offline");
+			}
 
 			// Check for models.json errors
 			const loadError = this.#modelRegistry.getError();
@@ -697,24 +749,25 @@ export class ModelSelectorComponent extends Container {
 
 			// Load available models (built-in models still work even if models.json failed)
 			try {
-				const availableModels = this.#modelRegistry.getAvailable();
-				models = availableModels.map((model: Model) => ({
-					kind: "provider",
-					provider: model.provider,
-					id: model.id,
-					model,
-					selector: `${model.provider}/${model.id}`,
-				}));
+				models = this.#buildAvailableModelItems();
 			} catch (error) {
+				if (options.throwOnCatalogError) throw error;
 				this.#allModels = [];
 				this.#filteredModels = [];
 				this.#canonicalModels = [];
 				this.#filteredCanonicalModels = [];
 				this.#errorMessage = error instanceof Error ? error.message : String(error);
+				this.#rebuildRoleModels();
 				return;
 			}
 		}
 
+		const catalog = this.#materializeModels(models);
+		if (options.commit !== false) this.#commitMaterializedCatalog(catalog);
+		return catalog;
+	}
+
+	#materializeModels(models: ModelItem[]): MaterializedCatalog {
 		const candidateModels = models.map(item => item.model);
 		const canonicalRecords = this.#modelRegistry.getCanonicalModels({
 			availableOnly: this.#scopedModels.length === 0,
@@ -758,20 +811,76 @@ export class ModelSelectorComponent extends Container {
 				return item;
 			})
 			.filter((item): item is CanonicalModelItem => item !== undefined);
+		const roles = this.#loadRoleModels();
 
-		this.#sortModels(models);
-		this.#sortCanonicalModels(canonicalModels);
-		this.#allModels = models;
-		this.#filteredModels = models;
-		this.#canonicalModels = canonicalModels;
-		this.#filteredCanonicalModels = canonicalModels;
-		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, models.length - 1));
+		this.#sortModels(models, roles);
+		this.#sortCanonicalModels(canonicalModels, roles);
+		return { models, canonicalModels, roles };
 	}
 
-	#buildProviderTabs(): void {
+	#commitMaterializedCatalog(catalog: MaterializedCatalog): void {
+		this.#roles = catalog.roles;
+		this.#allModels = catalog.models;
+		this.#filteredModels = catalog.models;
+		this.#canonicalModels = catalog.canonicalModels;
+		this.#filteredCanonicalModels = catalog.canonicalModels;
+		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, catalog.models.length - 1));
+	}
+
+	#captureViewSnapshot(): ModelSelectorViewSnapshot {
+		return {
+			roles: this.#roles,
+			allModels: this.#allModels,
+			filteredModels: this.#filteredModels,
+			canonicalModels: this.#canonicalModels,
+			filteredCanonicalModels: this.#filteredCanonicalModels,
+			selectedIndex: this.#selectedIndex,
+			providers: this.#providers,
+			activeTabIndex: this.#activeTabIndex,
+			tabBar: this.#tabBar,
+		};
+	}
+
+	#restoreViewSnapshot(snapshot: ModelSelectorViewSnapshot): void {
+		this.#roles = snapshot.roles;
+		this.#allModels = snapshot.allModels;
+		this.#filteredModels = snapshot.filteredModels;
+		this.#canonicalModels = snapshot.canonicalModels;
+		this.#filteredCanonicalModels = snapshot.filteredCanonicalModels;
+		this.#selectedIndex = snapshot.selectedIndex;
+		this.#providers = snapshot.providers;
+		this.#activeTabIndex = snapshot.activeTabIndex;
+		this.#tabBar = snapshot.tabBar;
+	}
+
+	#refreshCatalogView(): boolean {
+		const previousView = this.#captureViewSnapshot();
+		try {
+			const models =
+				this.#scopedModels.length > 0 ? this.#buildScopedModelItems() : this.#buildAvailableModelItems();
+			const catalog = this.#materializeModels(models);
+			this.#buildProviderTabs(catalog.models);
+			this.#commitMaterializedCatalog(catalog);
+			this.#updateTabBar();
+			this.#applyTabFilter();
+			return true;
+		} catch (error) {
+			this.#errorMessage = error instanceof Error ? error.message : String(error);
+			this.#restoreViewSnapshot(previousView);
+			try {
+				this.#updateTabBar();
+				this.#applyTabFilter();
+			} catch {
+				// Keep the last-good component state even if the terminal view cannot be rebuilt.
+			}
+			return false;
+		}
+	}
+
+	#buildProviderTabs(models: readonly ModelItem[] = this.#allModels): void {
 		const activeTabId = this.#getActiveTab().id;
 		const providerSet = new Set<string>();
-		for (const item of this.#allModels) {
+		for (const item of models) {
 			providerSet.add(item.provider);
 		}
 		for (const provider of this.#modelRegistry.getDiscoverableProviders()) {
@@ -806,12 +915,58 @@ export class ModelSelectorComponent extends Container {
 		if (this.#scopedModels.length > 0 || !providerId) {
 			return;
 		}
-		await this.#modelRegistry.refreshProvider(providerId);
-		await this.#loadModels();
-		this.#buildProviderTabs();
-		this.#updateTabBar();
-		this.#applyTabFilter();
-		this.#tui.requestRender();
+
+		let refreshError: unknown;
+		try {
+			await this.#modelRegistry.refreshProvider(providerId);
+		} catch (error) {
+			refreshError = error;
+		}
+
+		let catalog: MaterializedCatalog | undefined;
+		try {
+			catalog = await this.#loadModels({
+				refreshRegistry: refreshError === undefined,
+				throwOnCatalogError: true,
+				commit: false,
+			});
+		} catch (catalogError) {
+			if (refreshError !== undefined) {
+				const refreshMessage = refreshError instanceof Error ? refreshError.message : String(refreshError);
+				const recoveryMessage = catalogError instanceof Error ? catalogError.message : String(catalogError);
+				throw new Error(`${refreshMessage}; catalog recovery failed: ${recoveryMessage}`, {
+					cause: refreshError,
+				});
+			}
+			throw catalogError;
+		}
+		if (!catalog) throw new Error("Model catalog could not be materialized.");
+
+		const previousView = this.#captureViewSnapshot();
+		try {
+			this.#buildProviderTabs(catalog.models);
+			this.#commitMaterializedCatalog(catalog);
+			this.#updateTabBar();
+			this.#applyTabFilter();
+			this.#tui.requestRender();
+		} catch (presentationError) {
+			const finalError =
+				refreshError !== undefined
+					? new Error(
+							`${refreshError instanceof Error ? refreshError.message : String(refreshError)}; catalog presentation failed: ${presentationError instanceof Error ? presentationError.message : String(presentationError)}`,
+							{ cause: refreshError },
+						)
+					: presentationError;
+			this.#restoreViewSnapshot(previousView);
+			try {
+				this.#updateTabBar();
+				this.#applyTabFilter();
+			} catch {
+				// Preserve the original presentation failure and the last-good component state.
+			}
+			throw finalError;
+		}
+		if (refreshError !== undefined) throw refreshError;
 	}
 
 	#updateTabBar(): void {
@@ -1193,11 +1348,12 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#formatAssignedModelLabel(model: Model, thinkingLevel: ThinkingLevel | undefined): string {
-		let label = `${model.provider}/${model.id}`;
+		const modelLabel = sanitizeText(`${model.provider}/${model.id}`).replace(/\s+/g, " ").trim();
+		let label = modelLabel;
 		if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
 			label += ` (${getThinkingLevelMetadata(thinkingLevel).label})`;
 		}
-		return label;
+		return truncateToWidth(label, ROLE_BINDING_MAX_WIDTH);
 	}
 
 	#renderPresetLanding(): void {
@@ -1510,7 +1666,7 @@ export class ModelSelectorComponent extends Container {
 			const prefix = i === this.#selectedActionIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[i];
 			const label = role
-				? `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`
+				? `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name}) — now: ${this.#formatRoleBinding(role)}`
 				: i === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
 					? "Set for all role agents"
 					: "Set for all targets";
@@ -1518,6 +1674,43 @@ export class ModelSelectorComponent extends Container {
 				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
 			);
 		}
+	}
+
+	/**
+	 * Describe what a role currently points at so the assignment menu can show the
+	 * existing binding inline. Without it the role rows carry no binding and the
+	 * only way to learn a role's model is to scan the whole (800+ entry) model list
+	 * for role badges.
+	 */
+	#formatRoleBinding(role: GjcModelAssignmentTargetId): string {
+		const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+		const configured =
+			target.settingsPath === "modelRoles"
+				? this.#settings.getModelRole(role)
+				: this.#settings.get("task.agentModelOverrides")[role];
+		const selectors = normalizeModelSelectorValue(configured);
+		const head = selectors[0];
+		const assigned = this.#roles[role];
+		if (!head) {
+			if (assigned) return this.#formatAssignedModelLabel(assigned.model, assigned.thinkingLevel);
+			return role === "default" ? "unset" : "inherits default";
+		}
+		const inheritedThinkingLevel = getDefaultAliasThinkingLevel(head);
+		const isInheritedAlias = head === "pi/default" || inheritedThinkingLevel !== undefined;
+		// A role agent pinned to the `pi/default` alias inherits whatever the default
+		// resolves to. Classify that before the resolved lookup: the alias itself resolves
+		// to the default's model, which would otherwise render as a concrete id and hide the
+		// inheritance. A fallback chain merely headed by the alias is NOT inherited —
+		// resolution can advance to a tail entry — so it falls through to the resolved
+		// binding below.
+		if (role !== "default" && selectors.length === 1 && isInheritedAlias) {
+			return inheritedThinkingLevel ? `inherits default (${inheritedThinkingLevel})` : "inherits default";
+		}
+		if (assigned) return this.#formatAssignedModelLabel(assigned.model, assigned.thinkingLevel);
+		// Configured selectors are permissively validated, so bound and sanitize the raw
+		// value before it reaches the terminal.
+		const displayed = truncateToWidth(sanitizeText(head).replace(/\s+/g, " ").trim(), ROLE_BINDING_MAX_WIDTH);
+		return `${displayed} (unavailable)`;
 	}
 
 	#renderThinkingMenu(choice: PendingThinkingChoice): void {
