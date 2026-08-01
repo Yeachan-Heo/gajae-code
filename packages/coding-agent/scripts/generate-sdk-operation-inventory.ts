@@ -12,6 +12,8 @@ const inventoryPath = process.env.GJC_SDK_OPERATION_INVENTORY
 /** Reviewed seams deliberately excluded from the public SDK operation surface. */
 const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:settings": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:import-session":
+		"local-only trusted command (acp: false, localHeadless: true) that imports external sessions on the operator's machine, not a user-facing SDK control seam",
 	"slash_command:theme": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:copy": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:changelog": "visual/local-only command, not a user-facing SDK control seam",

@@ -13,6 +13,7 @@
 - First-event timeout retries now require a typed, content-free failure from the current clean attempt scope, preventing prior or stale extension activity from suppressing or admitting a later request (#3553).
 - Managed session preparation now preserves native `content_too_large` storage failures as `artifact_capacity_exceeded` instead of misreporting `binding_invalid: prepare:store`.
 - The issue-1979 Korean prose wrap test now cleans up inherited multiplexer env vars (`TMUX`, `TMUX_PANE`, etc.) so it deterministically exercises the plain-terminal render path regardless of the CI runner's terminal session (#1979).
+- The SDK operation inventory now classifies the local-only `/import-session` seam as a locked exclusion and regenerates the committed matrix, fixing the shard-5 `accepts the committed generated matrix` gate failure introduced by the Codex import command (#3714).
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31
