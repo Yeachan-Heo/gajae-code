@@ -105,6 +105,16 @@ function getPromptCacheRetention(baseUrl: string | undefined, cacheRetention: Ca
 	return undefined;
 }
 
+function shouldSendOpenAIResponsesSessionHeaders(
+	model: Model<"openai-responses">,
+	baseUrl: string | undefined,
+): boolean {
+	return (
+		model.provider === "openai" &&
+		((baseUrl !== undefined && isDefaultOpenAIBaseUrl(baseUrl)) || model.compat?.sendSessionHeaders === true)
+	);
+}
+
 export function normalizeOpenAIResponsesPromptCacheKey(sessionId: string | undefined): string | undefined {
 	if (!sessionId || sessionId.length === 0) return undefined;
 	const wellFormed = sessionId.toWellFormed();
@@ -550,7 +560,7 @@ function createClient(
 		copilotPremiumRequests = copilot.premiumRequests;
 		baseUrl = resolveGitHubCopilotBaseUrl(model.baseUrl, rawApiKey) ?? model.baseUrl;
 	}
-	if (sessionId && model.provider === "openai" && (!model.baseUrl || (baseUrl && isDefaultOpenAIBaseUrl(baseUrl)))) {
+	if (sessionId && shouldSendOpenAIResponsesSessionHeaders(model, baseUrl)) {
 		headers.session_id ??= sessionId;
 		headers["x-client-request-id"] ??= sessionId;
 	}
