@@ -44,6 +44,7 @@ import {
 	convertResponsesAssistantMessage,
 	convertResponsesInputContent,
 	createInitialResponsesAssistantMessage,
+	isOpenAIResponsesProgressEvent,
 	normalizeResponsesToolCallIdForTransform,
 	processResponsesStream,
 } from "./openai-responses-shared";
@@ -173,6 +174,8 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 					errorMessage: "Azure OpenAI responses stream stalled while waiting for the next event",
 					onIdle: () => requestAbortController.abort(),
 					onFirstItemTimeout: () => requestAbortController.abort(),
+					isProgressItem: isOpenAIResponsesProgressEvent,
+					abortSignal: options?.signal,
 				}),
 				output,
 				stream,
